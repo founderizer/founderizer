@@ -287,7 +287,7 @@ free text of an agent or a person). Its one field, `after`, is optional. The ans
   `answers`. It is what the app's store knows; the call makes no request of its own.
 - `first_run`: `shows`; `page`, by a fixed name: `welcome`, `paste`, `name` ("Name your
   manager"), `ai_provider` ("Juno's AI provider", with the manager's name), `servers` ("Your fleet's servers"), `vps` ("A VPS for your fleet"), `tailscale`, `tailscale_key`, `token`, `building` (a provider's server is made),
-  `other_vps` (a server by its address), `machine`, `installing`, `address`, `done`, `restore`;
+  `other_vps` (a server by its address), `machine`, `installing`, `address`, `done`;
   `title`, the page's title in English as the app's string table has it, and a title with a
   placeholder as its key ("Your %@ token"; a title that is a server's address is none); `works`,
   whether work of the first run runs now (a check, a build, an install, a connection, Tailscale's

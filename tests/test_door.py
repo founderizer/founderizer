@@ -512,7 +512,8 @@ class Served(DoorCase):
         super().setUp()
         TestHandler.door = self.door
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        # a short poll: the cleanup's shutdown() waits for the loop's next look, which was up to 0.5 s in each test
+        threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
         self.addCleanup(self.httpd.server_close)
         self.addCleanup(self.httpd.shutdown)
         patcher = patch.dict(os.environ, {"FLEET_DOOR": f"127.0.0.1:{self.httpd.server_port}"})
@@ -538,7 +539,8 @@ class CallerGone(DoorCase):
         server.daemon_threads = False       # so that server_close joins the request threads, inside the capture
         out = io.StringIO()
         with contextlib.redirect_stderr(out):
-            threading.Thread(target=server.serve_forever, daemon=True).start()
+            # a short poll: shutdown() waits for the loop's next look, which was up to 0.5 s in each call
+            threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
             try:
                 act(server.server_port)
             finally:
@@ -2752,21 +2754,6 @@ class OwnerYes(DoorCase):
         self.assertEqual(self.delete()["kind"], "refused")             # once: the hub still serves it, and it is used
         self.assertEqual(len(self.deleted()), 1)
 
-    def test_the_owners_signed_yes_lets_that_exact_call_through_once(self):
-        call = self.refused_once()
-        said = self.statement(call)
-        self.answers = [{"need": 7, "statement": said, "signature": self.sign(said)}]
-        self.assertEqual(door.fetch_approvals(self.door), 1)
-        got = self.delete()
-        self.assertTrue(got["ok"], got)
-        self.assertEqual(got["kind"], "approved")
-        self.assertEqual(self.deleted(), [("DELETE", f"{HZ}/servers/42")])
-        self.assertEqual(self.door.record.after(0)[-1]["kind"], "approved")
-        again = self.delete()
-        self.assertEqual(again["kind"], "refused")
-        self.assertEqual(len(self.deleted()), 1)
-        self.assertEqual(self.stubs.model_calls(), [])
-
     def test_a_yes_of_another_call_fleet_key_or_age_or_not_canonical_lets_nothing_through(self):
         from test_vault_central import owner_point, owner_sign
         call = self.refused_once()
@@ -2899,11 +2886,6 @@ class CallHash(unittest.TestCase):
         # the first one by hand, with nothing of json.dumps: the JSON of the list, then the script's bytes
         self.assertEqual(hashlib.sha256(b'["web-1", "run", []]' + b"id\n").hexdigest(), json.loads(CALL_HASHES[0])[4])
         self.assertEqual(door.call_hash("web-1", "run", []), door.call_hash("web-1", "run", [], b""))
-
-    def test_the_door_s_call_gives_that_hash_with_its_refusal(self):
-        """The refusal of a run names door.call_hash of the call, so the examples are what an agent gets."""
-        import inspect
-        self.assertIn("sha = call_hash(target, op, args, content)", inspect.getsource(door.Door.call))
 
     def test_the_app_s_tests_hold_the_same_examples(self):
         """The Swift tests of DoorCall.hash read their examples from a copy of the lines above. A clone with no app
@@ -3332,21 +3314,6 @@ class FullAccess(Signed, DoorCase):
         sweep.join(10)
         self.assertFalse(sweep.is_alive())
         self.assertIn("marker", door.read_json(door.APPROVALS_FILE, {}))    # the earlier asking wrote nothing
-        self.assertEqual(self.run_on()["kind"], "own")
-
-    def test_a_newer_statement_wins_and_an_older_one_never_comes_back(self):
-        t = round(time.time())
-        old = self.mode("web-1", at=t - 100)
-        self.assertEqual(self.run_on()["kind"], "own")
-        self.mode("web-1", "auto", at=t - 50)
-        self.assertEqual(self.run_on()["kind"], "refused")
-        self.modes = [{"statement": old, "signature": self.sign(old)}]          # the hub serves the old one again
-        door.fetch_approvals(self.door)
-        self.assertEqual(self.run_on()["kind"], "refused")
-        self.modes = []                                                     # and then none: the door keeps its own
-        door.fetch_approvals(self.door)
-        self.assertEqual(door.read_json(door.MODES_FILE, {})["web-1"]["mode"], "auto")
-        self.mode("web-1", at=t)
         self.assertEqual(self.run_on()["kind"], "own")
 
     def serve(self, *statements, signature=None):

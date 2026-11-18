@@ -47351,6 +47351,7 @@ MCP_ENDED = "The access of this MCP server ended. Connect it again."
 MCP_PROBE_WAIT = 15             # seconds the hub waits for a machine's answer about a command server's program
 MCP_PROBE_STEP = 0.25           # seconds between two looks for that answer
 MCP_PROBE_MAX = 8               # machines that one check asks; the rest are named as not asked
+MCP_PROBE_WHY = 500             # characters of a machine's reason for a failed install of a package that a check keeps
 MCP_PROBE_FEATURE = "mcp_program"       # the helper step that answers it: an older helper reports it not
 MCP_PACKAGE_FEATURE = "mcp_packages"    # the helper step that installs a package and answers whether it is in place
 MCP_LOOKUP_MOST = 32 << 20      # bytes of a registry's record of one package that the hub reads (POST /ui/mcp/package)
@@ -47548,14 +47549,15 @@ def mcp_probe_waiting(token):
     return bool(probe) and probe["answer"] is None
 
 
-def mcp_probe_answer(agent, token, found, path):
+def mcp_probe_answer(agent, token, found, path, error=None):
     """One machine's answer (POST /helper/mcp/program/<agent>). False when the hub does not wait for it any more: a
-    check that gave up, an answer that came twice, or another agent's token."""
+    check that gave up, an answer that came twice, or another agent's token. error: the machine's reason why the
+    install of a package failed there, or None."""
     with MCP_LOCK:
         probe = MCP["probes"].get(token) if isinstance(token, str) else None
         if not probe or probe["agent"] != agent or probe["answer"] is not None:
             return False
-        probe["answer"] = {"found": found, "path": path}
+        probe["answer"] = {"found": found, "path": path, "error": error}
         return True
 
 
@@ -47565,7 +47567,8 @@ def mcp_probe(names, command, package=None):
     what it found. A machine that has not checked in, and one whose Fleet is older than this check, are not asked at
     all, so the hub waits only for a machine that can answer. One row for each agent, in the order given. package:
     the package of a program server that the helper installs (owner feature mcp_packages); then the helper says
-    whether that package is in place, and a machine whose Fleet cannot install one is not asked."""
+    whether that package is in place, and why its install failed there (state failed), and a machine whose Fleet
+    cannot install one is not asked."""
     t0, rows, waiting = now(), [], {}
 
     def label(agent):
@@ -47603,11 +47606,15 @@ def mcp_probe(names, command, package=None):
             if not got:
                 continue
             made = waiting.pop(token)
-            missing = (f"{command} is not installed yet: its next task session installs it." if package else
-                       f"no {command} on its PATH or in ~/.local/bin.")
-            made.update(state="found" if got["found"] else "missing", path=got["path"],
-                        says=f"{label(made['agent'])}: " + (f"{command} is at {got['path']}." if got["found"]
-                             else missing))
+            why = got.get("error") if package else None
+            if got["found"]:
+                state, says = "found", f"{command} is at {got['path']}."
+            elif why:       # the next task session does not install it: it says this reason too, as the check does
+                state, says = "failed", f"{command} could not be installed: {why}" + ("" if why.endswith(".") else ".")
+            else:
+                state, says = "missing", (f"{command} is not installed yet: its next task session installs it."
+                                          if package else f"no {command} on its PATH or in ~/.local/bin.")
+            made.update(state=state, path=got["path"], says=f"{label(made['agent'])}: {says}")
     for made in waiting.values():
         made.update(state="no_answer",
                     says=f"{label(made['agent'])}: no answer in {MCP_PROBE_WAIT} seconds.")
@@ -47643,8 +47650,8 @@ def check_mcp_server(name, entry, agent=None, new=False):
         if package is not None:
             result["version"] = package["version"]
         where = mcp_probe(mcp_probe_candidates(name, agent), program, package)
-        answered = [w for w in where if w["state"] in ("found", "missing")]
-        open_ones = [w for w in where if w["state"] not in ("found", "missing")]
+        answered = [w for w in where if w["state"] in ("found", "missing", "failed")]
+        open_ones = [w for w in where if w["state"] not in ("found", "missing", "failed")]
         result["machines"] = where
         said = " ".join(w["says"] for w in where)
         what = (f"{package['name']} {package['version']} from {package['registry']} is a program that each agent's "
@@ -47656,9 +47663,10 @@ def check_mcp_server(name, entry, agent=None, new=False):
                 f"no server to ask: give {name} to an agent, or name one.") +
                 " The session's start text says it when the program is not installed."))
             return result
-        missing = any(w["state"] == "missing" for w in answered)
-        result.update(checked=True, answers=bool(package) or not missing,
-                      needs=None if package and not open_ones else "machine" if missing or open_ones else None,
+        # what a server lacks that its next task session does not bring: a command's program, or a package whose
+        # install failed there (a package that is only missing is installed by that session)
+        short = any(w["state"] == ("failed" if package else "missing") for w in answered)
+        result.update(checked=True, answers=not short, needs="machine" if short or open_ones else None,
                       says=f"{what}: each server answered for itself and nobody ran it. {said}")
         return result
     access, url = None, made["url"]
@@ -50105,9 +50113,9 @@ here: the day somebody reads it is the day nothing else is left.
    nothing else on port 8765; a €5 VPS is enough. You type nothing in its console: the app either installs over
    your own SSH connection, or hands you one block to paste into the agent you already run. It claims the hub at
    the end, which is what makes your Mac its owner, and you now have an empty fleet.
-3. **Restore copy**, in the app, and give it this file. The app offers it the moment it has claimed the
-   new hub, beside New fleet; afterwards it is in Settings › Backup. The app reads this file first and
-   tells you what is in it before it sends anything.
+3. **Restore copy**, in the app under Settings › Backup, and give it this file. The app's menu Founderizer ›
+   Settings… opens Settings, also while a setup fills the window. The app reads this file first and tells
+   you what is in it before it sends anything.
 4. The hub checks the copy, writes your configuration back onto its configuration ref, puts the records in place
    and restarts itself. It keeps the new machine's own addresses, so the app stays connected, and it takes back
    this fleet's own id, so it is the same fleet as before.
@@ -61349,18 +61357,33 @@ class Handler(BaseHTTPRequestHandler):
     def helper_mcp_program(self, agent):
         """POST /helper/mcp/program/<agent>: this machine's answer to one program check of POST /ui/mcp/check
         (owner feature mcp_program). The helper resolved the name as a task session does and ran nothing. `taken`
-        is false when the hub does not wait for this answer any more, which is no error of the helper's."""
+        is false when the hub does not wait for this answer any more, which is no error of the helper's. error: why
+        the install of a package failed on that machine, which the hub keeps as one line of at most MCP_PROBE_WHY
+        characters, with no character of Unicode category C and each registered login masked; a helper from before
+        it sends none."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
             return
         f = self.form()
-        found, path = f.get("found"), f.get("path")
+        found, path, error = f.get("found"), f.get("path"), f.get("error")
         if not isinstance(found, bool):
             return self.json(400, {"error": "found must be true or false"})
         if path is not None and not (isinstance(path, str) and 0 < len(path) <= 500):
             return self.json(400, {"error": "path must be the resolved program, or null"})
-        return self.json(200, {"taken": mcp_probe_answer(agent, f.get("probe"), found, path if found else None)})
+        if error is not None and not isinstance(error, str):
+            return self.json(400, {"error": "error must be the reason why an install failed, or null"})
+        why = None
+        if error and not found:         # a long text costs no more than four times what is kept of it
+            raw = cut_whole(error, 4 * MCP_PROBE_WHY)
+            # Each character of Unicode category C (control, format, surrogate, private use, unassigned) goes, but
+            # tab and the line ends, and not as a space. The mask finds a login only whole, so it reads the text as it
+            # came (a login whose own value holds such a character) and again without them (a login that one stood
+            # inside of, which the search of a login keeps, such as a private-use one).
+            kept = "".join(c for c in mask_secrets(raw) if c in "\t\n\r" or unicodedata.category(c)[0] != "C")
+            why = cut_whole(mask_secrets(" ".join(kept.split())), MCP_PROBE_WHY).rstrip()
+        return self.json(200, {"taken": mcp_probe_answer(agent, f.get("probe"), found, path if found else None,
+                                                         why or None)})
 
     def helper_outputs(self, agent):
         """POST /helper/outputs/<agent>: the files of one task's outputs folder, which this agent's helper sends when

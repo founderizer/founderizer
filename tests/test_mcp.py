@@ -7,6 +7,7 @@ python3 -m unittest -v test_mcp
 """
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -456,10 +457,11 @@ class HubSide(OwnerAPI):
         hub.q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET "
               "data=excluded.data", (agent, json.dumps({"features": list(features)}), hub.now()))
 
-    def stand_in_helper(self, machines):
+    def stand_in_helper(self, machines, errors=None):
         """A stand-in helper for each of these agents: it reads its own events as fleet.py does, resolves a program
         check the way lifecycle.exe would and sends the answer back. machines: {agent: the program's path, or None
-        for a machine that does not have it}. It returns the list that each check appends to."""
+        for a machine that does not have it}. errors: {agent: why the install of the package failed there}, read at
+        each answer. It returns the list that each check appends to."""
         stop = threading.Event()
         self.addCleanup(stop.set)
         asked = []
@@ -472,8 +474,10 @@ class HubSide(OwnerAPI):
                         for ev in (data.get("events") or []) if code == 200 else []:
                             if ev["kind"] == "mcp_program":
                                 asked.append((agent, ev["extra"]["command"]))
+                                why = (errors or {}).get(agent)
                                 self.request(f"/helper/mcp/program/{agent}",
-                                             {"probe": ev["extra"]["probe"], "found": bool(path), "path": path})
+                                             dict({"probe": ev["extra"]["probe"], "found": bool(path), "path": path},
+                                                  **({"error": why} if why else {})))
                             self.request(f"/helper/ack/{agent}", {"ids": [ev["id"]]})
                 except OSError:
                     return
@@ -635,6 +639,7 @@ class HubSide(OwnerAPI):
         for agent, body, want in (("ops", {"probe": probes[0], "found": True, "path": "/bin/x"}, (200, {"taken": False})),
                                   ("dev", {"probe": "not-a-probe", "found": False, "path": None}, (200, {"taken": False})),
                                   ("dev", {"probe": probes[0], "found": "yes"}, (400, None)),
+                                  ("dev", {"probe": probes[0], "found": False, "error": ["no"]}, (400, None)),
                                   ("ghost", {"probe": probes[0], "found": True}, (404, None))):
             code, data = self.request(f"/helper/mcp/program/{agent}", body)
             self.assertEqual(code, want[0], data)
@@ -913,9 +918,12 @@ class ProgramRoutes(HubSide):
                          (502, "pypi cannot be reached now", "package_registry_away", {"registry": "pypi"}), data)
 
     def test_a_package_server_is_checked_on_the_machine_that_installs_it(self):
+        """A machine whose install of the package failed says why, and then the check does not say that its next task
+        session installs it: until 18 November 2026 it did, on six servers where each npm install failed."""
         self.machine("dev", features=("mcp_program", "mcp_packages"))
         self.machine("ops")                         # a Fleet that cannot install a package is not asked
-        asked = self.stand_in_helper({"dev": None})
+        errors = {}
+        asked = self.stand_in_helper({"dev": None}, errors)
         for agent in ("dev", "ops"):
             hub.TEAM["agents"][agent]["tools"] = ["odoo"]
         code, data = self.post("/ui/mcp/check", name="odoo", server=ODOO)
@@ -925,6 +933,28 @@ class ProgramRoutes(HubSide):
         self.assertIn("dev (w1): mcp-server-odoo is not installed yet: its next task session installs it.", data["says"])
         self.assertEqual(asked, [("dev", "mcp-server-odoo")])
         self.assertEqual(data["keys"], {"needs": ["ACME_ODOO_KEY"], "missing": ["ACME_ODOO_KEY"]})
+        # registered logins, which no reason of a machine shows: one with an invisible soft hyphen in its own value
+        token, plain = "SPARROW-CAN\u00adARY-9931", "WREN-CANARY-4242"
+        for value in (token, plain):
+            hub.ins("INSERT INTO secrets(label,salt,hash,len) VALUES(?,?,?,?)",
+                    ("canary", "canary-salt", hashlib.sha256(("canary-salt" + value).encode()).hexdigest(), len(value)))
+        tail = "npm error " * 300               # a long reason, of which the check keeps one line of 500 characters
+        errors["dev"] = (f"node 26.13.0 does not start:\nthis machine has no libatomic.so.1 (the system package "
+                         f"libatomic1) {token} \x1b[1mbold\x1b[0m\u202e {tail}")
+        hub.TEAM["agents"]["ops"]["tools"] = []
+        code, data = self.post("/ui/mcp/check", name="odoo", server=ODOO)
+        self.assertEqual((code, data["checked"], data["answers"], data["needs"]), (200, True, False, "machine"), data)
+        self.assertEqual([(m["agent"], m["state"], m["path"]) for m in data["machines"]], [("dev", "failed", None)])
+        line = (f"node 26.13.0 does not start: this machine has no libatomic.so.1 (the system package libatomic1) "
+                f"{hub.MASK} [1mbold[0m {tail}")
+        self.assertEqual(data["machines"][0]["says"], "dev (w1): mcp-server-odoo could not be installed: " +
+                         line[:500].rstrip() + ".")
+        self.assertNotIn("next task session", data["says"])
+        for inside in ("\x1c", "\ue000"):          # a character inside a login, which the search of a login strips
+            errors["dev"] = f"npm error 401: {plain[:4]}{inside}{plain[4:]}"      # (the first) or keeps (the second)
+            code, data = self.post("/ui/mcp/check", name="odoo", server=ODOO)
+            self.assertIn(hub.MASK, data["machines"][0]["says"])
+            self.assertNotIn("CANARY-4242", data["machines"][0]["says"])
 
 
     def test_find_a_server_lists_what_fleet_can_run_and_who_publishes_it(self):
@@ -1342,9 +1372,14 @@ class Programs(unittest.TestCase):
                          files["program"] + ["/srv/shared"])
 
     def test_the_session_waits_for_an_install_that_runs_in_its_own_thread(self):
-        team = dict(TEAM, mcp={"odoo": ODOO})
+        """Four servers of one package are one install, and one start counts once for them all: a failed install is
+        the reason of three starts, and the next start tries again. Until 18 November 2026 each server counted a
+        start, so from the fourth server on each start began a new install and waited for it."""
+        servers = dict({"odoo": ODOO}, **{f"odoo-{n}": dict(ODOO, settings=dict(ODOO["settings"], ODOO_DB=f"acme-{n}"))
+                                          for n in ("b", "c", "d")})
+        team = dict(TEAM, mcp=servers)
         (self.kit / "team.json").write_text(json.dumps(team))
-        answer = {"repos": {}, "tools": ["odoo"], "errors": [], "tokens": [], "mcp": {}, "mcp_problems": []}
+        answer = {"repos": {}, "tools": list(servers), "errors": [], "tokens": [], "mcp": {}, "mcp_problems": []}
         installs = []
 
         def install(package, *a, **k):         # the first install fails, the second leaves the package in place
@@ -1360,7 +1395,7 @@ class Programs(unittest.TestCase):
             for install_ in list(fleet.PACKAGE_INSTALLS.values()):
                 install_["thread"].join(10)
 
-        with patch.object(fleet, "checkout_conf", return_value={"tools": ["odoo"]}), \
+        with patch.object(fleet, "checkout_conf", return_value={"tools": list(servers)}), \
                 patch.object(fleet, "http", lambda *a, **k: (200, answer)), \
                 patch.object(fleet, "prepare_repos", return_value={}), patch.object(fleet, "ensure_package", install), \
                 patch.dict(fleet.PACKAGE_INSTALLS, clear=True):
@@ -1376,9 +1411,11 @@ class Programs(unittest.TestCase):
             joined()
             values = start()
         self.assertNotIn("FLEET_TOOLS", failed)
-        self.assertIn("The tool odoo is not loaded: its program mcp-server-odoo 0.9.0 could not be installed on this "
-                      "machine: the install of mcp-server-odoo 0.9.0 failed: no network.", failed["FLEET_GITHUB_NOTE"])
-        self.assertEqual(values["FLEET_TOOLS"], "odoo")
+        for name in servers:
+            self.assertIn(f"The tool {name} is not loaded: its program mcp-server-odoo 0.9.0 could not be installed on "
+                          f"this machine: the install of mcp-server-odoo 0.9.0 failed: no network.",
+                          failed["FLEET_GITHUB_NOTE"])
+        self.assertEqual(values["FLEET_TOOLS"], " ".join(servers))
         self.assertNotIn("ODOO_API_KEY", values)        # the key reaches the program through mcp-start only
         self.assertEqual(installs, ["mcp-server-odoo", "mcp-server-odoo"])
 
@@ -1615,9 +1652,11 @@ class Programs(unittest.TestCase):
             self.assertIsNone(fleet.start_programs("dev", CLAUDE))
 
     def test_a_start_waits_for_its_programs_before_it_starts_anything(self):
-        (self.kit / "team.json").write_text(json.dumps(dict(TEAM, mcp={"odoo": ODOO, "crm": CRM})))
+        """Two servers of one package are one install, and the start's words name it once."""
+        odoo_b = dict(ODOO, settings=dict(ODOO["settings"], ODOO_DB="acme-b"))
+        (self.kit / "team.json").write_text(json.dumps(dict(TEAM, mcp={"odoo": ODOO, "odoo-b": odoo_b, "crm": CRM})))
         started = []
-        with patch.object(fleet, "checkout_conf", return_value={"tools": ["odoo", "crm"]}), \
+        with patch.object(fleet, "checkout_conf", return_value={"tools": ["odoo", "odoo-b", "crm"]}), \
                 patch.object(fleet, "package_install", lambda package: started.append(package["name"])), \
                 patch.dict(fleet.PACKAGE_INSTALLS, clear=True):
             with self.assertRaisesRegex(fleet.Installing, "the MCP program mcp-server-odoo 0.9.0 is being installed"):
@@ -1724,18 +1763,34 @@ class Programs(unittest.TestCase):
                 self.assertEqual(hub.mcp_public_name(host), public)
 
     def test_the_machine_says_whether_a_package_is_in_place(self):
+        """And why its install failed, from what the helper keeps, with no run of its pinned tool: the owner waits
+        for this answer in the helper's loop."""
         helper = fleet.Helper("dev", CLAUDE)
-        sent = []
+        sent, said = [], []
         http = lambda method, path, data=None, timeout=40: (sent.append(data), (200, {"taken": True}))[1]
-        with patch.object(fleet, "http", http), patch.object(helper, "say", lambda text: None):
+        lost = "the install of mcp-server-odoo 0.9.0 failed: no network"
+        why = "node 26.13.0 does not start: this machine has no libatomic.so.1 (the system package libatomic1)"
+        folder = fleet.package_folder(lifecycle.mcp_package("x", ODOO["package"]))
+        with patch.object(fleet, "http", http), patch.object(helper, "say", said.append), \
+                patch.dict(fleet.PACKAGE_INSTALLS, clear=True), \
+                patch.object(fleet, "program_starts", side_effect=AssertionError("a check runs no program")):
             helper.mcp_program({"probe": "p-1", "command": "mcp-server-odoo", "package": ODOO["package"]})
-            ready = self.ready(ODOO)
+            fleet.PACKAGE_INSTALLS[folder] = {"error": lost, "thread": None, "check": None}
             helper.mcp_program({"probe": "p-2", "command": "mcp-server-odoo", "package": ODOO["package"]})
+            # a pinned tool that did not start: each start runs it again, so that reason can be gone by then
+            fleet.PACKAGE_INSTALLS[folder] = {"error": why, "thread": None, "check": ("node 26.13.0", "/x/node")}
+            helper.mcp_program({"probe": "p-3", "command": "mcp-server-odoo", "package": ODOO["package"]})
+            ready = self.ready(ODOO)
+            helper.mcp_program({"probe": "p-4", "command": "mcp-server-odoo", "package": ODOO["package"]})
             with self.assertRaises(fleet.Refused):
-                helper.mcp_program({"probe": "p-3", "command": "mcp-server-odoo",
+                helper.mcp_program({"probe": "p-5", "command": "mcp-server-odoo",
                                     "package": dict(ODOO["package"], registry="oci")})
         self.assertEqual(sent, [{"probe": "p-1", "found": False, "path": None},
-                                {"probe": "p-2", "found": True, "path": ready["program"][-1]}])
+                                {"probe": "p-2", "found": False, "path": None, "error": lost},
+                                {"probe": "p-3", "found": False, "path": None,
+                                 "error": f"{why}; the next task session checks this again"},
+                                {"probe": "p-4", "found": True, "path": ready["program"][-1]}])
+        self.assertIn(lost, said[1])                # the helper's own log says it too
         self.assertIn("mcp_packages", lifecycle.FEATURES)
 
 

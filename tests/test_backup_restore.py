@@ -424,7 +424,7 @@ class HubOnly(Fixture):
         self.assertIn("6. **Put a GitHub App key back.**", steps)
         # the places the apps have now (D-4): MCP servers are a group of Settings › Apps, and Restore is under Backup
         self.assertIn("in the app under Settings › Apps, MCP servers", steps)
-        self.assertIn("afterwards it is in Settings › Backup.", steps)
+        self.assertIn("**Restore copy**, in the app under Settings › Backup, and give it this file.", steps)
         for gone in ("Settings > MCPs", "System status", "under Details"):
             self.assertNotIn(gone, notes)
 

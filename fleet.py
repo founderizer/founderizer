@@ -1487,7 +1487,7 @@ def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=No
     values.update({k: v for k, v in (data.get("mcp") or {}).items()
                    if isinstance(k, str) and k.startswith("FLEET_MCP_") and isinstance(v, str) and v and "\0" not in v})
     notes += [str(x)[:300] for x in data.get("mcp_problems") or [] if isinstance(x, str)]
-    catalog, tools, waits, refused = team_catalog(), [], [], None
+    catalog, tools, waits, refused, packages = team_catalog(), [], [], None, {}
     for name in (t for t in data.get("tools") or [] if isinstance(t, str)):
         tool = catalog.get(name)
         if not tool:        # a server that a rule of this Fleet refuses says its rule: the hub's own words
@@ -1509,7 +1509,7 @@ def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=No
             notes.append(f"The tool {name} is not loaded: {tool['command']} is not installed on this machine.")
         elif not all((lifecycle.key_variable if tool.get("custom") else key_env)(var) for var in tool.get("env") or {}):
             notes.append(f"The tool {name} is not loaded: its variables must be names of keys.")      # plan 0.2
-        elif tool.get("package") and not package_waits(name, tool["package"], notes, waits):
+        elif tool.get("package") and not package_waits(name, tool["package"], notes, waits, packages):
             continue
         else:
             if not tool.get("custom"):      # an owner's program server gets its keys through mcp-start (program_start)
@@ -6264,24 +6264,34 @@ class Helper:
         """The owner asked, in the app, whether this machine has the program of a command MCP server (owner feature
         mcp_program, the hub's POST /ui/mcp/check). The helper resolves the name exactly as the start of a task
         session resolves it — this machine's PATH, then ~/.local/bin — and never runs the program. The owner waits
-        for this answer, so it goes back at once and in this loop."""
+        for this answer, so it goes back at once and in this loop. For a package whose install failed, the answer is
+        the reason that the helper keeps (PACKAGE_INSTALLS), as the start of a session says it: its pinned tool is not
+        run here (install_again), because the next start checks it again, and a run can take PROGRAM_START_WAIT."""
         probe, command, package = extra.get("probe"), extra.get("command"), extra.get("package")
         if not (isinstance(probe, str) and isinstance(command, str) and MCP_PROGRAM.fullmatch(command)):
             raise Refused("invalid MCP program check")
+        error = None
         if package is not None:         # a package that the helper installs itself (owner feature mcp_packages)
             try:
-                ready = package_ready(lifecycle.mcp_package(command, package))
+                package = lifecycle.mcp_package(command, package)
             except ValueError:
                 raise Refused("invalid MCP package check") from None
+            ready = package_ready(package)
             found = ready["program"][-1] if ready else None
-            self.say(f"MCP server package {package.get('name')} {package.get('version')}: " +
-                     (f"in place at {found}" if found else "not installed yet; the next task session installs it"))
+            install = None if ready else PACKAGE_INSTALLS.get(package_folder(package))
+            error = install.get("error") if install else None
+            if error and install.get("check"):      # a pinned tool that did not start: each start runs it again
+                error += "; the next task session checks this again"
+            self.say(f"MCP server package {package['name']} {package['version']}: " +
+                     (f"in place at {found}" if found else f"its install failed: {error}" if error else
+                      "not installed yet; the next task session installs it"))
         else:
             found = exe(command)
             self.say(f"MCP server program {command}: " + (f"this machine has it at {found}" if found else
                                                           "not on this machine's PATH or in ~/.local/bin"))
         code, _ = http("POST", f"/helper/mcp/program/{self.agent}",
-                       {"probe": probe, "found": bool(found), "path": found}, timeout=10)
+                       dict({"probe": probe, "found": bool(found), "path": found}, **({"error": error} if error else {})),
+                       timeout=10)
         if code != 200:
             raise Refused(f"the hub did not take the answer about {command} ({code})")
 
@@ -8690,13 +8700,17 @@ def programs_wait(agent):
     """Before a task or a tools-on conversation of this agent starts anything (its credential, the vault's read, the
     hub's tokens): Installing while a package of its servers in this checkout's team.json is not in place yet, with
     each missing install started. An install that failed does not wait here: the start says it (package_in_place),
-    unless its pinned tool did not start and starts now (install_again)."""
-    catalog, missing = team_catalog(), []
+    unless its pinned tool did not start and starts now (install_again). Servers of one package are one install, which
+    the words name once."""
+    catalog, missing, seen = team_catalog(), [], set()
     for name in checkout_conf(agent).get("tools") or []:
         tool = catalog.get(name) if isinstance(name, str) else None
         if not (tool and tool.get("package")) or package_ready(tool["package"]):
             continue
         folder = package_folder(tool["package"])
+        if folder in seen:
+            continue
+        seen.add(folder)
         install = PACKAGE_INSTALLS.get(folder)
         if install and install["error"] and not install_again(folder, install):
             continue
@@ -8710,11 +8724,13 @@ def programs_wait(agent):
 PACKAGE_FAILED_STARTS = 3       # starts that say a failed install before the next start tries it again
 
 
-def package_in_place(name, package, notes):
+def package_in_place(name, package, notes, seen=None):
     """True when the package of the owner's program server `name` is in place for this OS user. While its install
     runs, in a thread of its own, the start waits (Installing), so the helper's loop never waits for a download. An
-    install that failed is the reason in notes for this start, which starts without the server, and the next start
-    tries again."""
+    install that failed is the reason in notes for PACKAGE_FAILED_STARTS starts, which start without the server, and
+    the start after them tries again. seen: what this start found for each package folder before this server,
+    {folder: the failure's words, or None while an install runs}, so that servers of one package are one count of a
+    start and one install, and not one each."""
     try:
         package = lifecycle.mcp_package(name, package)
     except ValueError as e:
@@ -8723,26 +8739,32 @@ def package_in_place(name, package, notes):
     if package_ready(package):
         return True
     folder = package_folder(package)
-    install = PACKAGE_INSTALLS.get(folder)
-    if install_again(folder, install):
-        install = None
-    if install and install["error"]:
-        install["told"] = install.get("told", 0) + 1        # a count, not a clock: the third start tries again
-        if install["told"] >= PACKAGE_FAILED_STARTS:
-            PACKAGE_INSTALLS.pop(folder)
+    seen = {} if seen is None else seen
+    if folder not in seen:
+        install = PACKAGE_INSTALLS.get(folder)
+        if install_again(folder, install):
+            install = None
+        if install and install["error"]:
+            install["told"] = install.get("told", 0) + 1        # a count, not a clock: the third start tries again
+            if install["told"] >= PACKAGE_FAILED_STARTS:
+                PACKAGE_INSTALLS.pop(folder)
+            seen[folder] = install["error"]
+        else:
+            seen[folder] = None
+            package_install(package)
+    if seen[folder] is not None:
         notes.append(f"The tool {name} is not loaded: its program {package['name']} {package['version']} could not "
-                     f"be installed on this machine: {install['error']}.")
+                     f"be installed on this machine: {seen[folder]}.")
         return False
-    package_install(package)
     raise Installing(f"the program {package['name']} {package['version']} of the MCP server {name} is being "
                      f"installed on this machine")
 
 
-def package_waits(name, package, notes, waits):
+def package_waits(name, package, notes, waits, seen=None):
     """package_in_place for one server of a session's start: an install that runs goes into waits (Installing), so
-    that every missing program of the start installs at once."""
+    that every missing program of the start installs at once. seen: the start's own record (package_in_place)."""
     try:
-        return package_in_place(name, package, notes)
+        return package_in_place(name, package, notes, seen)
     except Installing as e:
         waits.append(e)
         return False
