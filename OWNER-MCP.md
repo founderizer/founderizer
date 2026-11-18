@@ -182,14 +182,19 @@ Nothing more was measured. **Not measured:** other chains and other shells' form
 Claude Code's own "always allow" button in its window, and Codex, which has no rule here.
 
 **Its tools in this version.** The tools of this server, with the same names, words, fields and
-`readOnlyHint`. 54 come from a table that this file prints, `python3 owner_mcp.py --dump-tools`,
+`readOnlyHint` (one exception: the program's words of `answer_needs_you` have its sentences about the
+door's card after the table's). 54 come from a table that this file prints, `python3 owner_mcp.py --dump-tools`,
 from the same objects that its own tools are: `release.sh` and `run.sh` put it in the app as
 `Contents/Resources/owner-tools.json`, from the same revision as `onboard.py`. Thirteen are written
 again in Swift (the table's kind `swift`): four reads, `fleet_overview`, `fleet_read`,
 `search_history` and `see_costs`, and since 14 November 2026 the nine that write: `save_profile`,
 `attach_file`, `read_attachment`, `take_backup`, `grant_access`, `share_resource`, `send_message`,
 `answer_needs_you` and `decline_secret_request`. Each makes the same requests as its function here,
-in the same order, with the same refusals and the same result. A table of a newer version of this
+in the same order, with the same refusals and the same result, with one exception since 17 November
+2026: `answer_needs_you` with a `choice` of 0 or 1 reads the hub's state first, and sends a door
+card's yes or Full access to the running app, which signs it (below, "`answer_needs_you` on the
+door's card"); the program's words of that tool have sentences about it after the table's. A table
+of a newer version of this
 file can name a `swift` tool that an older program does not have: that program refuses it with
 "not in this version of the app yet" and does not list it. Never in the program, because the app's
 own pages do that work and its own setting says which hub it reads: `install_hub`, `install_log`,
@@ -198,7 +203,8 @@ in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis
 the running app (below). Six more, `save_bot_token`, `prepare_problem_report`, `save_secret`,
 `grant_secret`, `share_secret` and `answer_secret_request`, write on the same link (below). So
 `tools/list` gives 76 tools: the 54 of the table, the thirteen, the three reads of the link and its
-six writes.
+six writes. One request more writes on the link and is no tool of its own: `answer_needs_you`'s
+signed press of a door card.
 
 **The link to the running app.** Some work only the running app can do: its first run, its pages,
 and in later slices its keys and its engine. So the program asks the app on a local socket, the
@@ -934,9 +940,9 @@ goes into the vault first with `save_secret`.
   serves Secrets; only for a call with a give, that the hub lists `signed_grants`; one read of the
   hub's state for the request, one of the fleet's list, and only for a call with a give one of the
   vault's page. Then the request: it is of the database that the app reads, it is there, it asks
-  for a secret, it has no answer, and it is not for the door (its `secret` has `door`, or its
-  proposal `give` names the door: the app's form then gives the door the secret with a signed grant
-  of its own, which this tool does not sign, so the owner answers such a request in the app). Then
+  for a secret, it has no answer, and its door: a request for the door (its `secret` has `door`, or
+  its proposal `give` names the door) has `door` with `use` in `give`, and no other request has
+  `door` there (below). Then
   the secret: the list has it, and it fits the request as in the form's own list (the same kind; an
   API key of the request's variable name; a login whose title starts with the request's host). Then,
   only for a call with a give, what `grant_secret` checks for a give: the fleet's id, the central
@@ -944,6 +950,30 @@ goes into the vault first with `save_secret`.
   that it is a worker or a lead with a server, `read` only for an API key, and no second key of one
   variable name read by that agent. A refusal about one agent names that agent, whose name passed
   the form of an agent's name; nothing else of the request is quoted.
+- **A request for the door** (since 17 November 2026; the owner, that day, of the steps that his own
+  agent left to him, a press of Full access on one of his servers among them: "why can't you press
+  Full access on <server> for me?") is answered as the app's form of that request answers it: the
+  form always gives such a request's secret to the door, with a signed grant of the door's own
+  (`SecretEntryView.doorGrant`), and then answers it; for a request whose `secret` names a key of the
+  door, the hub then keeps the secret as that key of the door (`hub.py` `save_door_credential`). So
+  `give` must name `door` with `use`: a request for the door with no `door` in `give` is refused, and
+  so is the door at `read` (the door uses a secret and never reads it) and the door in `give` of any
+  other request. A request whose `secret` names a key of the door asks for a key that the door alone
+  holds (its proposal is the door alone, so the form shows no row of an agent, and the hub's answer
+  says that no agent holds the key): its `give` is `{"door": "use"}` and nothing more. A request
+  whose proposal names the door beside agents can give those agents too, as the form's rows can. The
+  door's give goes in the byte order of the names with the others: the app signs a grant for the
+  door's own name in the central vault (the machine `door`, as the form signs it), then sends the
+  hub's grant to the door (`POST /ui/secrets/grant` with the agent `door`). When the hub refuses that
+  grant, the app signs its end at once, with no read of the list: the hub's own check refuses the
+  door's grant only when the door does not hold the secret after it, and the team's page does not
+  show the door's hold. A refusal of the whole command before that check (the hub's generation
+  moved) refuses the end in the same way, and the signature then stays. The door's entry in `given`
+  has no `server`. For a request for a key of the door, the same call again after the answer went
+  says that the hub took that answer only while the door held the secret (the hub keeps such a key
+  only then). When a give stands and the call did not answer, the words send the caller to the owner
+  about the door, never to `grant_secret`, which still gives the door nothing and takes nothing back
+  from it.
 - **One line of writes with `grant_secret`.** Both tools write grants, and two calls whose grant
   writes cross can end with a grant in the list whose signature the other call ended. So one call
   of either tool writes at a time, and a call that comes meanwhile is refused with one sentence
@@ -956,8 +986,8 @@ goes into the vault first with `save_secret`.
   meanwhile), with the meaning of `grant_secret`'s own sentence for that failure. The same call
   again is safe: a give that went is given again with no change.
 - **The answer's own outcomes.** Taken: the result has `need`, `login`, `answered` true, `given`
-  (for each agent `agent`, `level`, `server`, `changed`, `vault` when the hub says it, and `note`)
-  and `note`; no free text of the hub is in it. Refused because the request has an answer already
+  (for each agent `agent`, `level`, `server`, `changed`, `vault` when the hub says it, and `note`;
+  the door has no `server`) and `note`; no free text of the hub is in it. Refused because the request has an answer already
   (the hub's code `request_answered`): the app reads the request one time more and says which it is:
   this secret, from an answer before this one; or a close that came first: the owner's decline or
   another secret, or a close by an agent or the hub. The gives of the call stand then, and **the
@@ -968,11 +998,79 @@ goes into the vault first with `save_secret`.
   same ask of the owner. Not known: the same call again, which says that the request has its answer
   with this secret, and sends nothing, when the answer went.
 - **What it does not do:** a new value (`save_secret` first), a replace of a value, a decline
-  (`decline_secret_request`), a request for the door, a take-back, and a give on a fleet with no
-  central vault, where `grant_access` gives the secret and this tool then answers with `give` `{}`.
+  (`decline_secret_request`), a give to the door outside a request for the door, a take-back, and a
+  give on a fleet with no central vault, where `grant_access` gives the secret and this tool then
+  answers with `give` `{}`.
 
 No command lock: the app does the writes, as its form does. What any process of the owner's user
 can do with the tool, its traces and its limits: OWNER-MCP-BOUNDARY.md section 7b.
+
+**`answer_needs_you` on the door's card** (since 17 November 2026; the owner, that day, after his
+agent left him two presses on such cards: "why can't you press Full access on <server> for me?"). The
+door's card of a call that the door refused has two answers that let something through: its first
+option, the yes (`choice` 0; "Run it once" on the door's card of a run), the owner's yes to the item's
+door call, and on the door's card of a run, "Run one root script on <server>?", Full access on
+<server> (`choice` 1), the owner's mode of that server. The hub takes either press only with a
+statement in its form beside it, and the door checks the owner key's signature of that statement
+itself (`hub.py` `phone_submit`: a press of either with no statement is refused with 409, and the
+item stays open; `test_server_access` holds it). Only the app holds the owner key. So the program's
+`answer_needs_you` sends such a press to the running app, which signs it as the owner's own press of
+that option signs it and sends it, with no question to the owner (his "No touch" of 15 November
+2026). Every other answer goes from the program to the hub as before, with no signature. The
+program's own words of the tool say so, after the words that `owner_mcp.py`'s table gives it
+(`AnswerDoor.description`): this server cannot sign, and the hub refuses such a press from it. One gap
+stays, in the hub: on a door card whose options combine (`multi`, which the hub refuses only on the
+door's card of a run), ticked options (`choices`) with the yes among them close the card with no
+statement, and the door then refuses the call again; and on such a card the hub keeps a signed press
+of the yes as a ticked option, so the same call again says that the item has another answer.
+
+- **The route, in the program.** Only a `choice` of 0 or 1, as a JSON integer, with no `answer` and
+  no `choices`, makes the program read the hub's state (one `GET /ui/state`, which also gives the
+  generation that a command after it carries). When the item of `need` there has a door call (a
+  `door_call` that is not empty), and for Full access also a server (`door_host`), the program sends
+  `need`, `choice` and the generation that it read (`db`) to the app on the link, and the hub gets no
+  answer from the program. The item's answer does not decide the route: the app says whether the item
+  has its answer, so that the same call again after a lost answer reads that. A wrong `need` is
+  refused before any request, as on the other route. `owner_mcp.py` keeps its generation between
+  calls, so in a long session this read is one request more than it makes for the same answer, and a
+  read that fails refuses such a call before anything is sent; `owner_mcp.py` sends such a press to
+  the hub, which refuses it for want of a statement.
+- **What the app checks, in this order, before it sends anything:** the fields, each in its form
+  (no other field, and no part after the request line); a current reading of the fleet; that its
+  database is the one that the program read (an item of the same id in another hub or database is
+  another item); one read of the hub's state of its own, and the item of `need` in it; that this
+  option of that item carries a signed statement, by the same facts; and that the item has no answer
+  (an answer with this option has its own sentence). When the hub's database is not the one that the
+  program read, the words send the caller to the item again first: an item of that id can be another
+  item then. Then the signature, by the one rule of the owner's own press (`DoorCallSigning.maker` in
+  the app): the hub lists `door_calls` for the yes and `door_modes` for Full access; Run it once of
+  the door's card of a run only for the script that
+  the card shows (`DoorCall.checked`: the card's server, its script whole and in plain text, and the
+  hash of that server and script is the call's), and Full access only on the door's own card of that
+  server (`DoorCall.names`); the fleet's id from the central vault's status; the owner key of this
+  Mac; and the signature itself. Each "no" has its own fixed sentence, and nothing is sent. The
+  request takes no statement, no hash, no server and no script from its caller.
+- **The one write:** `POST /ui/needs/<need>` with `choice`, `statement` and `signature`, under a new
+  request id of the app, as the owner's own press sends it, and no request of the app's outbox. Taken:
+  the result has `need`, `choice`, `answered` true, `signed` (`door-call` or `door-mode`), `server`
+  (the card's server, in a server's own form) and `note`, and no free text of the hub or of the card.
+  Refused because the item has its answer (the hub's code `request_answered`): one read more says
+  whether that answer is this option. Every other certain refusal has the hub's words after the
+  tool's sentence; one of them is the hub's own "the door takes only a newer one: answer again" for
+  a mode whose time is not after the newest of that server. Not known: the same call again, which
+  says that the item has its answer with this option, and sends nothing, when the answer went. A
+  call whose app is slow (each read and the write have their own time limits, more than a minute in
+  all at the worst) can end in "not known" while the app still works on it: the same call again then runs beside
+  it, and the hub keeps one answer of the item.
+- **What it does not do:** sign anything that the owner's own press would not sign, press an option
+  of an item with no door call, or answer in words: words that are the words of a signed option get
+  the hub's own refusal ("needs the signature of the owner's key, and words carry none").
+
+No command lock and no line of writes: the app makes one write. A second press of the same item
+reads the item's answer and sends nothing; only a press that runs at the same moment as the first
+one reaches the hub, which refuses it because the item has its answer, or, for Full access signed in
+the same second, because its mode is not newer than the first one's ("answer again"). What any process of the
+owner's user can do with it, its traces and its limits: OWNER-MCP-BOUNDARY.md section 7b.
 
 **`prepare_problem_report`** (a write, so `founderizer-cli write` and the MCP form take it, and `call`
 does not): the owner's own agent writes a problem report, and the owner sends it (the owner, 15 November
