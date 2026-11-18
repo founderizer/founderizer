@@ -789,7 +789,7 @@ class Keeping(Base):
             hub.person_remove(gone, self.clock)
         self.assertEqual(self.said(stays, "person", "And the kayak came too"), said)       # the deleted id, again
         raised = hub.call_tool(hub.manager_name(), "raise_needs_you", {
-            "title": "Renew the domain", "why": "It ends on Friday", "what_to_do": "Renew it at the registrar"})
+            "title": "Renew the domain", "why": "It ends on Friday", "what_to_do": "Renew it at the registrar", "reason": "money"})
         self.assertFalse(raised[1], raised[0])
         new = hub.q1("SELECT MAX(id) n FROM needs")["n"]
         self.assertGreater(new, need)

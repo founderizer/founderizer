@@ -72,7 +72,7 @@ class Juno(Servers):
         self.assertEqual(status, 200, sent)
         self.call("tell_owner", {"text": "Hello. The fleet is ready."})
         self.call("raise_needs_you", {"title": "Choose a plan", "why": "The work needs a paid plan.",
-                                      "what_to_do": "Say which plan you want."})
+                                      "what_to_do": "Say which plan you want.", "reason": "money"})
         status, state = self.request(source=OWNER)
         self.assertEqual(status, 200, state)
         self.assertEqual([(a["name"], a["role"], a["reports_to"]) for a in state["agents"]], [(NAME, "manager", None)])
@@ -143,7 +143,7 @@ class Juno(Servers):
             self.call(tool)
         self.assertIn(NAME, self.call("see_team"))
         raised = self.call("raise_needs_you", {"title": "Choose a plan", "why": "The work needs a paid plan.",
-                                               "what_to_do": "Say which plan you want."})
+                                               "what_to_do": "Say which plan you want.", "reason": "money"})
         need = hub.q1("SELECT * FROM needs ORDER BY id DESC LIMIT 1")
         self.assertEqual(need["by"], NAME, raised)
         parts = hub.rules_parts(NAME)

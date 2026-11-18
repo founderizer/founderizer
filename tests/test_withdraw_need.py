@@ -27,7 +27,7 @@ class Withdraw(OwnerAPI):
 
     def raise_item(self, title="Revoke the old shared key?"):
         said = hub.t_raise_needs_you("manager", {"title": title, "why": "The three new keys work.",
-                                                 "what_to_do": "Say yes or no"})
+                                                 "what_to_do": "Say yes or no", "reason": "person"})
         return int(said.split("N-")[1].split(".")[0])
 
     def item(self, nid, **columns):
@@ -140,7 +140,7 @@ class Withdraw(OwnerAPI):
 
     def test_the_answer_of_a_raise_names_it(self):
         said = hub.t_raise_needs_you("manager", {"title": "Revoke the old shared key?", "why": "The new keys work.",
-                                                 "what_to_do": "Say yes or no"})
+                                                 "what_to_do": "Say yes or no", "reason": "person"})
         self.assertIn("If nothing needs it any more before the owner answers, close it at once with withdraw_need.",
                       said)
 
@@ -184,7 +184,8 @@ class AcceptNamesItems(Withdraw):
         qid = hub.q1("SELECT MAX(id) id FROM questions")["id"]
         said, error = hub.call_tool("manager", "raise_needs_you", {
             "title": "Install the two deploy scripts as root", "why": "No agent of the team has a root shell there.",
-            "what_to_do": "Install them, then answer", "question_id": f"Q-{qid}"})
+            "what_to_do": "Install them, then answer", "question_id": f"Q-{qid}",
+            "reason": "access", "needs_access": "a root shell on that server"})
         self.assertFalse(error, said)
         self.assertIn(f"If an agent does the work first, answer Q-{qid} yourself with what was done", said)
         return qid, hub.q1("SELECT MAX(id) id FROM needs")["id"]

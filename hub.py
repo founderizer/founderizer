@@ -2583,144 +2583,15 @@ def need_words(title, why, todo="", options=(), details=""):
 
 # Run on a request's command (owner feature need_run; the owner, 16 November 2026, of a card that told him to run one
 # command on the Mac Studio: "would it be possible to have like a play button to run it? ... like it happens with
-# Claude Code? and then have like a hook?", then "Yes, as drawn"). The manager names the one command of a hand step
-# and the Mac it runs on; the owner's app shows Run on that command's code block, runs it there when he presses it,
-# on his own Mac or over his Mac's SSH connection to a Mac of the fleet, and sends its exit status and the end of its
-# output as his answer. A Linux server is not such a place: a step there goes through the door, whose card is Run it
-# once.
-NEED_RUN_CHARS = 1000           # characters of a run_command: one line, which the card shows whole
+# Claude Code? and then have like a hook?", then "Yes, as drawn"). The owner's app showed Run on the command of a hand
+# step, ran it at their press, and sent its exit status and the end of its output as their answer. Since 17 November
+# 2026 no new item takes a command, because fleet work never goes through the owner's Mac (card_route). An item
+# raised before keeps its Run, and these are the rules of its answer.
 NEED_RUN_OUTPUT_CHARS = 8000    # characters of the output that the answer carries: its end, which says how it ended
 # characters of that output that the item keeps for the apps (needs.run_output): GET /ui/state sends every item that
 # was ever raised, at each read, so the opened card shows the end of the output and the agent's message has the rest
 NEED_RUN_SHOWN_CHARS = 2000
 NEED_RUN_MAC = "mac"            # run_on of the owner's own Mac, the one where he presses Run
-NEED_RUN_SUDO = re.compile(r"(?<![\w-])sudo(?![\w-])")
-NEED_RUN_USER = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}")      # an SSH user that the app takes (MachineStatus.sshURL)
-# the widest run of spaces in a command: more can move a part of it away from the part that the owner reads (the
-# door's rule for a script, DOOR_SCRIPT_GAP, for one line; NeedRun.gapSpaces in the app)
-NEED_RUN_GAP = 8
-
-
-def need_code_blocks(text):
-    """The texts of the code blocks of a card's words, as the apps draw them (MessageBlock.parse): from a line whose
-    first mark after its indent is three backticks, to the next such line or the end, each line without the
-    fence's indent. A tab of an indent is four spaces wide."""
-    def width(line):
-        n = 0
-        for ch in line:
-            if ch == " ":
-                n += 1
-            elif ch == "\t":
-                n += 4
-            else:
-                break
-        return n
-    blocks, block, indent = [], None, 0
-    for line in str(text or "").split("\n"):
-        if block is not None:
-            if line.strip(" \t").startswith("```"):
-                blocks.append("\n".join(block))
-                block = None
-            else:
-                block.append(line[min(indent, width(line)):])
-            continue
-        if line.lstrip(" \t").startswith("```"):
-            block, indent = [], width(line)
-    if block is not None:
-        blocks.append("\n".join(block))
-    return blocks
-
-
-def need_run_place(name):
-    """None when the owner's Mac can run a step's command on the machine `name` (raise_needs_you run_on), else the
-    sentence that says why not. That machine is a Mac of the fleet: an agent runs on it, its newest reading says
-    macOS, and the team's record has the SSH way that the owner's Mac logs in to it with (team.json access and
-    addresses), by the rules of the app's own SSH address (MachineStatus.sshURL): the address a number, the user a
-    plain name, the port 1 to 65535. Else the hub would raise a card on which the app shows no Run."""
-    import ipaddress
-    on = [n for n, a in agents().items() if a.get("machine") == name]
-    if not on:
-        machines = sorted({a.get("machine") for a in agents().values() if a.get("machine")})
-        return (f"run_on is {NEED_RUN_MAC} for the owner's own Mac, or the machine of an agent of this fleet: "
-                f"{', '.join(machines) or 'none'}. {name} is none of them.")
-    way = (TEAM.get("access") or {}).get(name) or {}
-    user, port, address = way.get("ssh_user"), way.get("ssh_port", 22), (TEAM.get("addresses") or {}).get(name)
-    try:
-        number = isinstance(address, str) and bool(ipaddress.ip_address(address))
-    except ValueError:
-        number = False
-    if not (isinstance(user, str) and NEED_RUN_USER.fullmatch(user) and isinstance(port, int)
-            and not isinstance(port, bool) and 1 <= port <= 65535 and number):
-        return (f"The owner's Mac has no SSH way to {name} in the team's record (an address that is a number, a "
-                f"user and a port), so Run cannot reach it. Leave run_command and run_on out: the owner pastes the "
-                f"command there.")
-    if server_kind_of(TEAM, name) != "mac":        # the team's kind of it, else its newest reading
-        return (f"{name} is not a Mac by the fleet's record, and Run runs a command only on a Mac. A step on a "
-                f"server goes through the door: the agent that holds that server at Fix runs it, or the door's card "
-                f"asks the owner for Run it once.")
-    return None
-
-
-def need_run_step(command, run_on, todo):
-    """(command, run_on) of a step that the owner's app runs at his press (raise_needs_you run_command and run_on),
-    (None, None) without one, or a ToolError that says what to change. The rules are the ones of the owner's Mac
-    (NeedRun.command), which decides: a command that the hub takes and the Mac refuses is a card with no Run."""
-    if command is None and run_on is None:
-        return None, None
-    if command is None or run_on is None:
-        raise ToolError("run_command and run_on go together: the command that the owner's app runs at their press, "
-                        "and the Mac that it runs on.")
-    if not isinstance(command, str) or not command or command != command.strip(" "):
-        raise ToolError("run_command is the command, as text, with no space before or after it.")
-    if "\n" in command or "\r" in command:
-        raise ToolError("run_command is one line: Run runs one command, as Claude Code's Run does. Steps of several "
-                        "lines stay a code block that the owner pastes: leave run_command and run_on out.")
-    if len(command) > NEED_RUN_CHARS:
-        raise ToolError(f"run_command is at most {NEED_RUN_CHARS} characters, because the card shows it whole. This "
-                        f"one has {len(command)}.")
-    hidden = door_script_hidden(command)
-    if hidden:
-        raise ToolError(f"run_command holds a character that is not plain text ({hidden}). The owner's Mac runs only "
-                        f"a command of printable ASCII characters, because any other character can change what runs "
-                        f"and not what the owner reads. Write it with spaces for tabs.")
-    if command.startswith("```"):
-        raise ToolError("run_command does not start with ```, which would end its code block on the card.")
-    if " " * (NEED_RUN_GAP + 1) in command:
-        raise ToolError(f"run_command has a run of more than {NEED_RUN_GAP} spaces, which can move a part of the "
-                        f"command away from the part that the owner reads. Write it without that gap.")
-    if NEED_RUN_SUDO.search(command):
-        raise ToolError("run_command holds sudo, which asks for a password, and Run has no place to type one. Leave "
-                        "run_command and run_on out: the owner pastes such a command into Terminal.")
-    if command not in need_code_blocks(todo):
-        raise ToolError("what_to_do shows run_command in a code block of its own, character for character (a line "
-                        "of three backticks, the command, and a line of three backticks): the owner's app puts Run "
-                        "on that block and runs what it shows.")
-    if not isinstance(run_on, str) or not run_on.strip():
-        raise ToolError(f"run_on is {NEED_RUN_MAC} for the owner's own Mac, or the name of a Mac of this fleet.")
-    run_on = run_on.strip()
-    if run_on != NEED_RUN_MAC:
-        wrong = need_run_place(run_on)
-        if wrong:
-            raise ToolError(wrong)
-    # The card's words say where it runs, and Run runs where run_on says: the two must not differ. The words are the
-    # card's outside its code blocks; inline code is words that he reads. A Mac of the fleet is named there by its
-    # name, as the fleet's record has it, and such a card does not say "your Mac" or "this Mac"; no other Mac of the
-    # fleet is named (a command can still name one, and a server's name, which Run never runs on, can stand in the
-    # words). A name matches as written, as a word: not inside a longer name, a path or a host name. A known limit:
-    # the hub reads names, so a card for the owner's own Mac that says "the Mac Studio" in place of that Mac's name is
-    # not refused, and its Run runs on the owner's Mac.
-    words = NEED_FENCED.sub(" ", str(todo))
-    macs = {m for m in (a.get("machine") for a in agents().values()) if m and server_kind_of(TEAM, m) == "mac"}
-    named = {m for m in macs if re.search(rf"(?<![\w/-])(?<!\w\.){re.escape(m)}(?![\w/-])(?!\.\w)", words)}
-    own = re.search(r"(?i)\b(?:your|this) Mac\b(?! (?:Studio|mini|Pro|Air)\b)", words)
-    if run_on != NEED_RUN_MAC and (run_on not in named or own):
-        raise ToolError(f"what_to_do says where the command runs by that machine's name, \"On {run_on}, run:\", and "
-                        f"not \"your Mac\" or \"this Mac\", so that the owner reads the place that Run runs it on.")
-    if named - {run_on}:
-        place = "the owner's own Mac" if run_on == NEED_RUN_MAC else run_on
-        raise ToolError(f"what_to_do names {', '.join(sorted(named - {run_on}))} outside the command, and Run runs it "
-                        f"on {place}: the words and run_on name one place.")
-    return command, run_on
 
 
 def need_run_tail(text, most):
@@ -11504,6 +11375,375 @@ def need_asks_secret(*texts):
             f"without asking for the value itself.")
 
 
+# A card is the manager's last step (the owner, 17 November 2026, after a card that offered their Mac and their own
+# release for a one-line fix that a developer agent could make and release itself: "Creating a card has to be the
+# final resource, not one more tool to be used easily", then "Yes, build it" to the four reasons below). Every item
+# but the hub's own kinds names its reason, and the hub checks what it can see of it before the owner's phone rings.
+# The manager's rules say the rest (rules/manager.md), and these refusals say it again at the moment that it applies.
+# The hub reads words, so a check of words has limits both ways: it catches the usual shapes of fleet work for the
+# owner's hands, and lets each of the owner's own steps through; a money or a person item rests on the manager's word.
+CARD_REASONS = ("money", "access", "decision", "person")
+CARD_WORDS_MIN = 15         # characters of the owner's own words that an item for a decision quotes, at least
+CARD_CODE = re.compile(r"(?m)^[ \t]*```")                 # a code block: a command for the owner to run
+CARD_DETAILS = re.compile(r"(?i)\bdetails\b")             # what_to_do that sends the owner to the item's details
+CARD_SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
+# a command in a line: a verb of running with inline code, a program and its words to type or enter (not a word that
+# a page asks for, "type `DELETE`", nor a code, "enter `482 913`"), a terminal to run or paste in, an SSH session, or
+# a program with a flag ("run gh workflow run release.yml -R acme/web")
+CARD_RUN = re.compile(r"(?i)\b(?:run|paste|execute)\b[^.\n]{0,80}?`[^`\n]+`"
+                      r"|\b(?:type|enter)\b[^.\n]{0,80}?`(?-i:[a-z./~$])[^`\n]*\s[^`\n]*`"
+                      r"|\b(?:run|paste|type|execute)\b[^.\n]{0,80}?\bterminal\b"
+                      r"|\bterminal\b[^.\n]{0,60}?\b(?:run|paste|execute)\b"
+                      r"|\bssh\s+(?:into|to)\b|\brun\s+[a-z0-9_./-]+\s[^\n]{0,80}?\s-{1,2}[a-z]")
+# the buttons of a repository's own pages that start its workflows by hand
+_CARD_BUTTON = r"(?:re-?run\s+(?:all\s+|failed\s+)?jobs|run\s+workflow)"
+CARD_WORKFLOW = re.compile(rf"(?i)\*\*\s*{_CARD_BUTTON}\s*\*\*|\b(?:click|press|choose|select|tap)\b[^.\n]{{0,40}}?"
+                           rf"\b{_CARD_BUTTON}\b")
+# a session on the owner's Mac: "a Mac session" or "my work Mac session" (not one "on studio-1", an agent's), "your
+# Claude Code session" (not one that a sign-in names, a runtime's own), "the Claude session on your Mac"
+CARD_MAC_SESSION = re.compile(r"(?i)\b(?:your|my|a)\s+(?:own\s+)?(?:\w+\s+)?mac\s+sessions?\b")
+CARD_OWNER_SESSION = re.compile(r"(?i)\b(?:your|my)\s+(?:own\s+)?(?:claude\s+code|claude|codex|terminal)\s+sessions?\b"
+                                r"(?!\s+(?:on|in|of|at)\s+(?!your\b|my\b))")
+CARD_SESSION_ON_MAC = re.compile(r"(?i)\bsessions?\s+(?:on|from|in)\s+(?:your|my|the\s+owner's)\s+(?:own\s+)?mac\b"
+                                 r"(?!\s+(?:studio|mini|pro|air)\b)")
+# the owner's own Mac, and fleet work in the same sentence: "Release it from your Mac", "your Mac's Terminal"
+_CARD_MAC = r"(?:mac(?!\s+(?:studio|mini|pro|air)\b)\w*|imac|laptop|computer)"
+CARD_OWN_MAC = re.compile(rf"(?i)\b(?:on|from|in|with|at|using)\s+(?:your|my)\s+(?:own\s+)?{_CARD_MAC}\b"
+                          rf"|\b(?:your|my)\s+(?:own\s+)?{_CARD_MAC}'s\b")
+# a runtime's own app on the owner's Mac is fleet work too, but for an agent's sign-in to it in the owner's app
+_CARD_RUNTIME_APP = r"claude\s+code"
+CARD_RUNTIME_APP = re.compile(rf"(?i)\b{_CARD_RUNTIME_APP}\b")
+CARD_FLEET_WORK = re.compile(rf"(?i)\b(?:run|execute|{_CARD_RUNTIME_APP}|release|push(?!\s+notifications?\b)|deploy|"
+                             r"redeploy|ship|ssh|workflow|kubectl)\b")
+# who a sign-in of an agent in the owner's app names, as the hub's own notice of a signed-out agent asks for it ("open
+# Customer Support in the app and sign it in"), besides the agents' names and roles (card_signs_in)
+CARD_SIGN_WHO = r"it|them|(?:the|your|this|that|its)\s+(?:agent|agents|session|runtime)"
+# an option in the owner's own voice that has them do fleet work: "I release it", "I ran the restart", "I'll ship
+# tonight", "I'll do the release"; not "I'd push it to next month", "I'll sync with the lawyer" or "I ran out of budget"
+_CARD_LATER = r"(?!\s+(?:to|back|until|till|later|next|nothing)\b)"
+CARD_OWNER_DOES = re.compile(
+    r"(?i)\bI(?:'ll|\s+will|'d|\s+would)?\s+(?:then\s+)?(?:run|ran|push|pushed|sync|synced|execute|executed|upload|"
+    r"uploaded)\s+(?:it|them|this|that|the\s+(?:release|fix|change|command|script|restart|deploy|deployment|update|"
+    rf"image|build|workflow|job|server|service|commit|branch|migration|pr))\b{_CARD_LATER}"
+    r"|\bI(?:'ll|\s+will|'d|\s+would)?\s+(?:then\s+)?(?:release|released|deploy|deployed|redeploy|redeployed|ship|"
+    rf"shipped|publish|published|merge|merged)\b{_CARD_LATER}"
+    r"|\bI(?:'ll|\s+will|'d)?\s+restart(?:ed)?\s+the\s+(?:server|service|pod|deployment|container)\b"
+    r"|\bI(?:'ll|\s+will|'d)?\s+do\s+the\s+(?:release|deploy|deployment|restart|push|merge|update|upgrade)\b")
+# A sign-in "to" something that is no site: an AI provider's own account (PROVIDER_SITES, which no login of the fleet
+# may be), the owner's Founderizer app or Apple account, an MCP server's own sign-in in the owner's app, a machine at
+# its own keyboard or screen, or one that the owner approves on their phone. A website is the agent's: its helper
+# signs in with the vault's login.
+CARD_SIGN_IN_TO = re.compile(r"(?i)\b(?:sign|log)(?:s|ed|ged|ing|ging)?(?:\s+back)?(?:[\s-]*(?:in|on)\s+(?:to|into|at)|\s+into)"
+                             r"\s+(?P<to>[^.\n,;:]*?)(?=\s+(?:on|in|with|from|using|at|for|and|then|so|again)\b|"
+                             r"[.\n,;:]|$)")
+CARD_SIGN_IN = re.compile(r"(?i)\b(?:sign|log)(?:s|ed|ged|ing|ging)?(?:\s+back)?[\s-]*(?:in|on|out|into)\b|\blogins?\b")
+CARD_WEBSITE = re.compile(r"(?i)https?://[^\s)>\]*`]+|\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|ai|dev|co|de|es|uk|fr|eu)\b")
+CARD_OWN_SIGN_IN = re.compile(r"(?i)\b(?:claude|chatgpt|codex|openai|anthropic|grok|founderizer|apple\s+id|icloud|"
+                              r"keyboard|screen|display|login\s+window|phone|iphone|mcp|it|them)\b")
+CARD_HAND = re.compile(r"(?i)\b(?:on\s+your\s+(?:phone|iphone)|with\s+your\s+apple\s+id|at\s+(?:its|the)\s+(?:own\s+)?"
+                       r"keyboard)\b")
+# an email address: an account's name, and no website to sign in to; a sentence's last mark stays its own
+CARD_ADDRESS = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+CARD_PLAIN = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-",
+                            "*": None, "`": None, "_": None})
+CARD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\n]*\)")
+# a row of ui_requests that the owner typed: a message, or the answer in words of an item that is no key request and
+# no run, and no row that a connected app sent; the words of a pressed option are the manager's
+CARD_TYPED = ("u.connection IS NULL AND (u.need_id IS NULL OR (n.chosen IS NULL AND n.chose IS NULL AND "
+              "COALESCE(n.kind, '') != 'secret' AND n.run_command IS NULL))")
+CARD_REASON_REFUSAL = (
+    "Not raised: give the item its reason. A card is your last step, because it rings the owner's phone. First decide "
+    "yourself where a policy or a standing rule of the owner's lets you, check the claim of the agent that asks in the "
+    "record, and give the work to the agent that holds the access, or grant what the pool holds. Then reason is one "
+    "of: money, for new money; access, for access that the fleet does not hold, named in needs_access; decision, for "
+    "a decision that the owner's own words keep for them, quoted in owner_words; or person, for a step that only a "
+    "person can do: the owner's sign-in to an AI provider's own account or to an MCP server in their app, their phone, "
+    "or a hand at a machine, to switch it on or to change a setting that it takes only from its own keyboard or mouse.")
+CARD_ROUTE_REFUSAL = (
+    "Not raised: this item gives fleet work to the owner's Mac or to the owner (a command for them to run, here or "
+    "under Details, a session on their Mac, or a run, a release or a push of theirs). Fleet work goes to an agent: give "
+    "it to the agent that holds the access, or grant it. When no agent holds what the work needs, raise an item with "
+    "reason access that asks the owner for that access, and the agent does the work after it. If the step truly needs "
+    "a person at a machine, say what the hand does there, with no command and no session.")
+CARD_SIGN_IN_REFUSAL = (
+    "Not raised: a sign-in to a website is the agent's work. Its helper signs in with the login from the vault "
+    "(sign_in), and an agent that holds no login for that site asks the owner for it once with request_secret. Only "
+    "the owner's own sign-in to an AI provider's account (Claude, ChatGPT), to their Founderizer app or Apple account, "
+    "to an MCP server in their app, or at a machine's own keyboard is theirs.")
+OWNER_TEXT_CACHE = {"key": None, "texts": ()}
+
+
+def card_plain(text):
+    """Text as plain words, to compare a quote with: one case, straight quotes and dashes, no marks of bold, italics,
+    code or a link, and one space between words, so that a quote of a table row or of a list item matches."""
+    text = CARD_LINK.sub(r"\1", unicodedata.normalize("NFKC", str(text or "")))
+    return " ".join(text.translate(CARD_PLAIN).casefold().split())
+
+
+def card_has(text, plain):
+    """True when the plain words of `text` hold the plain words `plain` as whole words."""
+    return re.search(rf"(?<!\w){re.escape(plain)}(?!\w)", text) is not None
+
+
+def card_names(text, names):
+    """True when `text` holds one of `names` as a whole name."""
+    return any(name and re.search(rf"(?<![\w/.@-]){re.escape(name)}(?![\w/@-]|\.\w)", text) for name in names)
+
+
+def card_signs_in(text):
+    """True when the text signs in an agent or its runtime ("sign it in", "sign Customer Support back in", "log the
+    agent in"), as the hub's notice of a signed-out agent asks for it, and not "log the result in the sheet"."""
+    names = {" ".join(str(x).lower().split()) for n in agents() for x in (n, shown_role(n))} - {""}
+    who = "|".join([CARD_SIGN_WHO] + [r"\s+".join(map(re.escape, n.split()))
+                                      for n in sorted(names, key=len, reverse=True)])
+    return re.search(rf"(?i)\b(?:sign|log)(?:s|ed|ged|ing|ging)?\s+(?:{who})\s+(?:back\s+)?in\b", text) is not None
+
+
+def card_machines():
+    """The names of the fleet's machines and servers, in lower case."""
+    return {str(a.get("machine")).lower() for a in agents().values() if a.get("machine")} | \
+        {str(s).lower() for s in (TEAM.get("servers") or {})}
+
+
+def card_route(title, why, todo, details, options):
+    """True when the item gives fleet work to the owner's Mac or to the owner: a command to run (a code block in
+    what_to_do or why, or under Details that what_to_do sends them to; a verb of running with inline code, a terminal,
+    SSH or a program's flag), a repository's button that runs a workflow, a session or fleet work on their Mac, or an
+    option in their voice that runs, releases or pushes."""
+    if CARD_CODE.search(todo) or CARD_CODE.search(why) or (CARD_CODE.search(details) and CARD_DETAILS.search(todo)):
+        return True
+    machines = card_machines()
+    for text in (title, why, todo, *options):
+        if CARD_RUN.search(text) or CARD_WORKFLOW.search(text) or CARD_SESSION_ON_MAC.search(text):
+            return True
+        for s in CARD_SENTENCE.split(text):
+            low = s.lower()
+            signs = CARD_SIGN_IN.search(s) or card_signs_in(s)
+            if CARD_MAC_SESSION.search(s) and not card_names(low, machines):
+                return True
+            if CARD_OWNER_SESSION.search(s) and not signs:
+                return True
+            # an agent's sign-in to Claude Code in the owner's app names the runtime's app, and runs nothing
+            if CARD_OWN_MAC.search(s) and CARD_FLEET_WORK.search(CARD_RUNTIME_APP.sub(" ", s) if signs else s):
+                return True
+    return any(CARD_OWNER_DOES.search(o) for o in options)
+
+
+def card_sign_in(texts):
+    """True when a person's item is a sign-in to a website, which the agent makes: a site's address beside a sign-in
+    (an email address is an account's name, no site), or a sign-in "to" something that is no AI provider, no
+    Founderizer or Apple account, no MCP server and no machine of the fleet, unless the same sentence puts the owner's
+    hand on their phone, their Apple ID or a machine's keyboard."""
+    words = "\n".join(texts)            # one line each, so that a sign-in "to" ends with its own field
+    if not CARD_SIGN_IN.search(words):
+        return False
+    # an email address names an account, and a sentence that puts the owner's hand on their phone, their Apple ID or
+    # a machine's keyboard is theirs ("Approve the sign-in for sales@acme.com on your phone"), but not the sentence
+    # before it ("Sign in to https://shop.example.com. Then approve the code on your phone.")
+    words = "\n".join(s for s in CARD_SENTENCE.split(CARD_ADDRESS.sub(" an account ", words))
+                      if not CARD_HAND.search(s))
+    for site in CARD_WEBSITE.findall(words):
+        host = urllib.parse.urlsplit(site if "://" in site else "https://" + site).hostname or ""
+        if not provider_site(host):
+            return True
+    words = CARD_WEBSITE.sub(" claude ", words)        # each address left is an AI provider's own
+    if re.search(r"(?i)\bmcp\s+servers?\b", words):
+        return False                    # an MCP server's own sign-in, which the owner makes in their app
+    own = card_machines() | {str(n).lower() for n in tool_catalog(TEAM)} | \
+        {str(e.get("title") or "").lower() for e in tool_catalog(TEAM).values() if isinstance(e, dict)} - {""}
+    for m in CARD_SIGN_IN_TO.finditer(words):
+        to = m.group("to").lower()
+        if not (CARD_OWN_SIGN_IN.search(to) or card_names(to, own)):
+            return True
+    return False
+
+
+def owner_file_texts():
+    """(path, plain words) of the owner's own files: the sections of each profile but the manager's, which it may
+    write itself, and each file of knowledge/owner/. Kept while the hub's checkout, its owner files and its agents stay
+    the same, because each read is a git call and the tool runs under the hub's lock."""
+    rev = kit_revision()
+    entries = [e for e in knowledge_entries() if e["scope"] == "owner"]
+    key = (rev, tuple((e["path"], e.get("blob")) for e in entries), tuple(sorted(agents())))
+    if OWNER_TEXT_CACHE["key"] != key:
+        texts = []
+        for name in sorted(agents()):
+            if rev and role_of(name) != "manager":
+                view = profile_view(name, rev)
+                texts.append((view["path"], card_plain(" ".join(s.get("text") or "" for s in view["sections"]))))
+        texts += [(e["path"], card_plain(knowledge_text(e))) for e in entries]
+        OWNER_TEXT_CACHE.update(key=key, texts=tuple(texts))
+    return OWNER_TEXT_CACHE["texts"]
+
+
+def owner_words_source(quote):
+    """Where the owner's own words hold the plain words (card_plain) of this quote, as whole words, or None: a
+    standing item that the owner gave, a message, a steer or an answer that they typed, a profile (the owner's words
+    about an agent) or a file of knowledge/owner/. Not the words of a pressed option, which are the manager's (also as
+    a standing item that such a press is the source of), nor the hub's own words of an answer (a key request's, a
+    run's), nor a connected app's. The longest word of the quote as it was typed narrows the reads of the records
+    first: split at every mark, so that STRIPE_SECRET_KEY gives "stripe", which lower() of the record holds, and not
+    the "stripesecretkey" of its plain words, which it does not."""
+    plain = card_plain(quote).strip(" \"'.")
+    typed = "".join(c if c.isascii() else " " for c in CARD_LINK.sub(r"\1", str(quote or ""))).lower()
+    word = max(re.findall(r"[a-z0-9]{4,}", typed), key=len, default="")
+    narrow = (" AND instr(lower({}), ?) > 0", (word,)) if word else ("", ())
+    for row in read_rows("SELECT s.id, s.words FROM standing s LEFT JOIN ui_requests u ON u.event_id=s.message LEFT "
+                         "JOIN needs n ON n.id=u.need_id WHERE s.author_kind='owner' AND s.ended IS NULL AND "
+                         f"(u.event_id IS NULL OR ({CARD_TYPED}))" + narrow[0].format("s.words"), narrow[1]):
+        if card_has(card_plain(row["words"]), plain):
+            return f"the owner's standing item I-{row['id']}"
+    for row in read_rows("SELECT u.event_id, u.text FROM ui_requests u LEFT JOIN needs n ON n.id=u.need_id WHERE "
+                         f"u.text IS NOT NULL AND {CARD_TYPED}" + narrow[0].format("u.text"), narrow[1]):
+        if card_has(card_plain(row["text"]), plain):
+            return f"the owner's message M-{row['event_id']}"
+    for row in read_rows("SELECT task, text FROM steers WHERE connection IS NULL" + narrow[0].format("text"),
+                         narrow[1]):
+        if card_has(card_plain(row["text"]), plain):
+            return f"the owner's steer of {tref(row['task'])}"
+    return next((path for path, text in owner_file_texts() if card_has(text, plain)), None)
+
+
+def card_holders(kind, what):
+    """The active workers and leads that hold this resource, by the record; a repository's name in any case."""
+    if kind == "repo":
+        held = [{"agent": n, "level": lv} for n, a in sorted(agents().items())
+                for r, lv in (a.get("repos") or {}).items() if str(r).lower() == what]
+    else:
+        held = resource_holders(kind, what)
+    return [h for h in held if agent_active(h["agent"]) and role_of(h["agent"]) in ("worker", "lead")]
+
+
+def card_dead(kind, what):
+    """True when the hub sees that no holder can use this thing now, and no grant puts it right, only the owner: a
+    Google account whose tools refuse it (google_access: the hub cannot read its Google file, the account is not
+    connected, Google refused its saved access, or it does not allow that service), or an MCP server with Connect that
+    is not connected or whose access ended. The hub never sees a key's value, so a key that was revoked is needs_level
+    value. It commits nothing, so grant_check, which calls it, may run inside a transaction()."""
+    if kind in ("drive", "gmail"):
+        saved, bad = google_saved()
+        entry = None if bad else google_entry(saved, what)
+        if not entry:
+            return True
+        with GOOGLE_LOCK:
+            problem = google_problem_of(GOOGLE["problems"], GOOGLE["problem_for"], what, entry)
+        return bool(problem) or GOOGLE_SCOPES[kind] not in google_scopes(entry)
+    if kind == "tool":                  # mcp_state has only the servers with Connect, which the owner connects
+        name = next((n for n in (TEAM.get("mcp") or {}) if str(n).lower() == what), None)
+        entry = mcp_state(TEAM).get(name) if name is not None else None
+        return entry is not None and (not entry.get("connected") or bool(entry.get("ended")) or
+                                      entry.get("problem") == MCP_ENDED)
+    return False
+
+
+def card_named(text):
+    """(kind, what) of a thing of the fleet's record that plain words name, or None: a repository or a server of an
+    agent, a Google account of an agent, a secret by its title or its variable, or an MCP server by its name."""
+    low = text.lower()
+
+    def says(name):
+        return len(name) >= 4 and re.search(rf"(?<![\w/.@-]){re.escape(name)}(?![\w/@-]|\.\w)", low) is not None
+    for n, a in sorted(agents().items()):
+        for kind, names in (("repo", a.get("repos") or {}), ("server", a.get("servers") or {})):
+            for name in names:
+                name = str(name).lower()
+                if says(name) or (kind == "repo" and len(name.rsplit("/", 1)[-1]) >= 6 and
+                                  says(name.rsplit("/", 1)[-1])):
+                    return kind, name
+        for kind, got in sorted((a.get("google") or {}).items()):
+            if isinstance(got, dict) and says(str(got.get("account") or "").lower()):
+                return kind, str(got["account"]).lower()
+    for ref, entry in sorted((TEAM.get("logins") or {}).items()):
+        if any(says(str(entry.get(k) or "").lower()) for k in ("env", "title")):
+            return "secret", ref
+    return next((("tool", str(t)) for t in sorted(tool_catalog(TEAM)) if says(str(t).lower())), None)
+
+
+def card_access(words, level):
+    """The refusal of an item for access that the fleet already holds, else None. The thing is <kind>:<what> as
+    grant_access names it, which the hub reads, or a few plain words for what the fleet's record does not name (a role
+    in a cloud account, a database login, a new agent), which only the owner settles. So are a thing that no holder can
+    use now (card_dead) and a secret's value (needs_level value), which the hub cannot see."""
+    text = str(words or "").strip()
+    if not text:
+        raise ToolError("An item for access names the thing in needs_access: <kind>:<what> for what the fleet's record "
+                        "names (repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com, tool:<MCP server>, "
+                        "server:<name>), with needs_level when the level matters, or a few plain words for what it "
+                        "does not name, such as a role in a cloud account, a database login or a new agent.")
+    if len(text) > 200:
+        raise ToolError("needs_access is at most 200 characters: the thing itself, not its story.")
+    kind, what = resource_parts(text.lower())
+    if not kind:
+        if str(level or "").strip():
+            raise ToolError("needs_level is the level of a thing that the fleet's record names (<kind>:<what>).")
+        named = card_named(text)
+        return (f"needs_access names {named[0]}:{named[1]} in words. Give it as {named[0]}:{named[1]}, with needs_level "
+                f"for the level that the work needs, so that the hub can tell who holds it.") if named else None
+    if not resource_known(kind, what, TEAM):
+        return (f"needs_access {text} is not one thing that the fleet's record names. Give <kind>:<what> exactly as "
+                f"grant_access takes it (repo:acme/web), or a few plain words for what the record does not name. A key "
+                f"or a login that the fleet does not hold goes through request_secret.")
+    if str(level or "").strip().lower() == "value":
+        if kind != "secret":
+            raise ToolError("needs_level value is for a secret: its value itself, which only the owner gives.")
+        return None                     # a new value of a key, or its value in place of a placeholder: the owner's
+    if card_dead(kind, what):
+        return None                     # no holder can use it now, and no grant puts it right: only the owner
+    rid, want = access_needed(text, level)
+    value = (' If its value is wrong or was revoked, or a program cannot use its placeholder, give needs_level '
+             '"value": only the owner gives that.') if kind == "secret" else ""
+    held = [h for h in card_holders(kind, what) if level_at_least(kind, h["level"], want)]
+    if held:
+        return (f"Not raised: {', '.join(h['agent'] + ' (' + h['level'] + ')' for h in held)} holds "
+                f"{resource_phrase(kind, what)} ({rid}) already. Give that part of the work to it with create_task: "
+                f"the owner is not needed. If the work needs more than that level, give needs_level.{value}")
+    top = (resource_pool().get(rid) or {}).get("max")
+    for name in sorted(agents()):
+        if not (agent_active(name) and role_of(name) in ("worker", "lead")):
+            continue
+        for lv in [want] if want else [top] if top else list(RESOURCE_LEVELS[kind]):
+            try:
+                if grant_check(name, rid, lv) is None:
+                    return (f'Not raised: {resource_phrase(kind, what)} ({rid}) is yours to give: grant_access('
+                            f'agent="<the agent that needs it>", resource="{rid}", level="{lv}") gives it, and the '
+                            f'owner is not needed.{value}')
+            except ToolError:
+                continue
+    return None
+
+
+def card_reason(a, title, why, todo, options):
+    """The item's reason, or a ToolError that says why it is not the manager's last step yet: a reason of
+    CARD_REASONS; access that nobody holds and the manager cannot grant; a decision in the owner's own words; and a
+    person's step that is no sign-in to a website, which an agent makes with the vault's login."""
+    reason = str(a.get("reason") or "").strip().lower()
+    if reason not in CARD_REASONS:
+        raise ToolError(CARD_REASON_REFUSAL)
+    for field, own in (("needs_access", "access"), ("needs_level", "access"), ("owner_words", "decision")):
+        if a.get(field) not in (None, "") and reason != own:
+            raise ToolError(f"{field} goes with reason {own}, and this item's reason is {reason}.")
+    if reason == "access":
+        held = card_access(a.get("needs_access"), a.get("needs_level"))
+        if held:
+            raise ToolError(held)
+    elif reason == "decision":
+        plain = card_plain(a.get("owner_words")).strip(" \"'.")
+        if len(plain) < CARD_WORDS_MIN:
+            raise ToolError(f"An item for a decision quotes in owner_words the owner's own words that keep it for "
+                            f"them, word for word and at least {CARD_WORDS_MIN} characters: a line of a policy file or "
+                            f"a profile, a standing rule that they gave, or their own message. If no words of theirs "
+                            f"keep it, the decision is yours: decide it inside the policy.")
+        if owner_words_source(a.get("owner_words")) is None:
+            raise ToolError("Not raised: owner_words are not the owner's own words. Quote them word for word from a "
+                            "policy file of knowledge/owner/, a profile, a standing rule that the owner gave, or a "
+                            "message that they typed. An agent's reading of them, a standing item that an agent wrote, "
+                            "the manager's own profile and an option that the owner pressed do not count. If no words "
+                            "of theirs keep this decision, it is yours: decide it inside the policy.")
+    elif reason == "person" and card_sign_in((title, why, todo, *options)):
+        raise ToolError(CARD_SIGN_IN_REFUSAL)
+    return reason
+
+
 def t_raise_needs_you(agent, a):
     title = str(a.get("title") or "").strip()
     why = str(a.get("why") or "").strip()
@@ -11622,17 +11862,10 @@ def t_raise_needs_you(agent, a):
             raise ToolError(f"An item about the key swap of {key_swap_server} is open already: the hub closes it by "
                             f"itself.")
         options, details = check_need_options(list(KEY_SWAP_CARD_ANSWERS)), key_swap_card_details(key_swap_server)
-    # owner feature need_run: the one command of a hand step, which the owner's app runs where run_on says at his press
-    run_command, run_on = need_run_step(a.get("run_command"), a.get("run_on"), todo)
-    if run_command is not None and (door_call is not None or door_host is not None or github_app is not None or
-                                    add_device is not None or github_key is not None or key_swap_server is not None):
-        raise ToolError("An item with run_command is a hand step of the owner's: it has no door_call, door_host, "
-                        "github_app, add_device, github_key or key_swap_server, which have their own routes.")
-    if run_command is not None and a.get("question_id") not in (None, ""):
-        # the asker would get only the words of the answer: the output comes to you, as data from that machine
-        raise ToolError("An item with run_command takes no question_id: its output comes to you, as data from that "
-                        "machine, and the agent that asked would get only the words \"Ran it on ...\". Raise it "
-                        "without question_id, and answer the question yourself with what the run gave.")
+    # owner feature need_run, until 17 November 2026: a command for the owner to run is fleet work through their Mac,
+    # so no new item takes one (card_route). An item raised before keeps its Run.
+    if a.get("run_command") is not None or a.get("run_on") is not None:
+        raise ToolError(CARD_ROUTE_REFUSAL)
     notice = need_is_notice(title, why, todo, *(json.loads(options) if options else ()))
     if notice:
         raise ToolError(notice)
@@ -11645,6 +11878,13 @@ def t_raise_needs_you(agent, a):
     if mine:
         raise ToolError(mine)
     guard(agent, title, why, todo, details, *(json.loads(options) if options else ()))
+    # A card is the manager's last step: the hub's own kinds (the door's, an App's, a phone's, an App key's and a key
+    # swap's) carry their reason, and every other item names its own, which the hub checks.
+    fixed = any(x is not None for x in (door_call, door_host, github_app, add_device, github_key, key_swap_server))
+    listed = json.loads(options) if options else ()
+    if door_call is None and door_host is None and card_route(title, why, todo, details, listed):
+        raise ToolError(CARD_ROUTE_REFUSAL)     # the door's card shows the call that the owner's yes lets through
+    reason = None if fixed else card_reason(a, title, why, todo, listed)
     ask = need_ask(agent, a.get("ask"))     # owner feature asks: the ask whose work waits for this item
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
         old = need_replaced(agent, replaces) if replaces else None
@@ -11655,12 +11895,11 @@ def t_raise_needs_you(agent, a):
         asking = door_asking_task(door_call, qu) if door_host else None
         door_task = door_task_words(asking["title"]) if asking else None
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,door_host,github_app,"
-                  "add_device,github_key,details,multi,door_script,door_task,door_task_id,key_swap_server,"
-                  "run_command,run_on) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "add_device,github_key,details,multi,door_script,door_task,door_task_id,key_swap_server) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call,
                    door_host, github_app, 1 if add_device else None, github_key, details or None,
-                   1 if multi else None, door_script, door_task, asking["id"] if asking else None, key_swap_server,
-                   run_command, run_on))
+                   1 if multi else None, door_script, door_task, asking["id"] if asking else None, key_swap_server))
         # owner feature asks: the ask that the agent named, else the ask of the item that this one replaces, else the
         # ask of the task whose question it carries to the owner
         if not ask and old:
@@ -11675,6 +11914,8 @@ def t_raise_needs_you(agent, a):
             q("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
               (f"Replaced by {agent} with a new item: {title}", now(), agent, old["id"]))
             q("UPDATE need_talk SET need=? WHERE need=?", (nid, old["id"]))
+    if reason:
+        log(agent, f"raised N-{nid} for the reason {reason}")      # what each card was for, to count them later
     emit("owner", "notify", f"Needs you: {title}" + (f" · {door_task}" if door_task else ""))
     ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
@@ -11710,11 +11951,6 @@ def t_raise_needs_you(agent, a):
                 f"{KEY_SWAP_CARD_ANSWERS[1]} sets the wish off. An answer in words sets no wish. The hub closes N-{nid} "
                 f"by itself when the wish is set another way or nothing on {key_swap_server} waits any more, so do not "
                 f"withdraw it.")
-    if run_command:
-        door = (f" The owner's card shows Run on the command's code block. When they press it, their Mac runs that "
-                f"command on {'their own Mac' if run_on == NEED_RUN_MAC else run_on}, and their answer is its exit "
-                f"status and the end of its output, as data from that machine. When they answer in words instead, "
-                f"the app ran nothing.")
     later = "" if qu or github_key or key_swap_server else (" If nothing needs it any more before the owner answers, "
                                                             "close it at once with withdraw_need.")
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{later}{door}{picks}"
@@ -12517,13 +12753,18 @@ def t_request_secret(agent, a):
         if have:
             rid = f"secret:{have}"
             top = (resource_pool().get(rid) or {}).get("max")
+            holders = [h["agent"] for h in card_holders("secret", have)]
             route = (f'grant_access(agent=..., resource="{rid}", level="{top}") gives it to an agent' if top else
+                     f"it is not in the grantable pool, and {', '.join(holders)} "
+                     f"{'holds' if len(holders) == 1 else 'hold'} it: give that part of the work to {holders[0]} "
+                     f"with create_task" if holders else
                      f"it is not in the grantable pool, so the owner gives it to an agent on the Secrets page: "
                      f"raise_needs_you, naming {have} and the agent")
             raise ToolError(f"The fleet already holds the API key {env}, as {have}, so there is nothing to type: "
-                            f"{route}. If its value is wrong or was revoked, tell the owner with raise_needs_you to "
-                            f"save the new value with Add secret under the name {env}: it goes in the place of the "
-                            f"old one, and each agent that holds {have} keeps it.")
+                            f"{route}. If its value is wrong or was revoked, tell the owner with raise_needs_you "
+                            f'(reason access, needs_access "{rid}", needs_level "value") to save the new value with '
+                            f"Add secret under the name {env}: it goes in the place of the old one, and each agent "
+                            f"that holds {have} keeps it.")
     waits = ("This task waits for the owner's answer: end your turn. If they save it, this session goes on once your "
              "machine's vault has it; if they decline, their words come here.")
     if tid:
@@ -24979,11 +25220,58 @@ def duty_case_view(c, parts=None):
         steps, tasks = duty_steps_of(c["id"]), duty_case_tasks(c["id"])
     return {"id": c["id"], "ref": cref(c), "responsibility": c["responsibility"], "key": c["key"],
             "title": c["title"], "source": c["source"], "state": c["state"], "opened": c["opened"],
-            "opened_by": c["by"], "first_step": c["first_step"], "closed": c["closed"], "closed_by": c["closed_by"],
+            "opened_by": c["by"], "opened_in": c["opened_in"], "first_step": c["first_step"], "closed": c["closed"],
+            "closed_by": c["closed_by"],
             "outcome": c["outcome"], "note": c["note"], "repeated": bool(c["repeated"]),
             "steps": [{"key": s["key"], "text": s["text"], "task": s["task"],
                        "by": s["by"], "at": s["ts"]} for s in steps],
             "tasks": [{"id": t["id"], "state": t["state"]} for t in tasks]}
+
+
+# **The cases that closed in the last three days** (UI-API.md, newest finished work; the owner, 17 November 2026:
+# "'resolved ticket TCK-xxxxx' instead of the specific tasks performed to resolve it", and his "Yes, as drawn"). The
+# state gives them for each duty (`recent`): the card Work of an agent's chat panel names its newest finished things by
+# their cases, a ticket as "TCK-... · Drafted", and the page of one such thing lists the tasks that did it.
+DUTY_RECENT_SECONDS = 72 * 3600
+TYPED_NOTE = re.compile(r"[a-z0-9_]{1,40}=[a-z0-9_]{1,40}(?:, [a-z0-9_]{1,40}=[a-z0-9_]{1,40})*")
+
+
+def recent_case_view(c, lines=None):
+    """One closed case as the state's `recent` gives it: its row without its records and its tasks, which the apps
+    take from the state's own tasks (their `duty_case`), and `facts`, its typed values in words (case_facts). lines:
+    the lines of the lists of its duty's owner file (case_list_lines)."""
+    return {"id": c["id"], "responsibility": c["responsibility"], "key": c["key"], "title": c["title"],
+            "state": c["state"], "opened": c["opened"], "opened_in": c["opened_in"], "closed": c["closed"],
+            "closed_by": c["closed_by"], "outcome": c["outcome"], "note": c["note"],
+            "repeated": bool(c["repeated"]), "facts": case_facts(c["note"], lines)}
+
+
+def case_facts(note, lines=None):
+    """The typed values of a closed case's note, each in words for the owner's apps, or None for a note in an agent's
+    own words. A session whose Shell box is off closes its case with typed values only, and its note is the hub's line
+    of them (typed_line: "cause=ours, resolution=drafted"). lines: {list: {value: its line}} of the duty's file. A
+    list's `other` ("none of the values above") says nothing to the owner, so it is left out: a daily review that
+    ends with resolution=other reads as its outcome, "Handled", and not as "Other"."""
+    if not isinstance(note, str) or not TYPED_NOTE.fullmatch(note):
+        return None
+    pairs = [pair.split("=", 1) for pair in note.split(", ")]
+    return {name: typed_words(value, ((lines or {}).get(name) or {}).get(value, ""))
+            for name, value in pairs if value != "other"}
+
+
+def typed_words(value, line=""):
+    """A typed value in words: its words with spaces and the first letter a capital, each word spelled as the value's
+    own line in the owner's file spells it, whatever its case and its accents: "reassigned_to_ana", whose line says
+    "the ticket went to Ána with a note", is "Reassigned to Ána". The line's first word spells nothing, because
+    a sentence begins with a capital."""
+    def plain(word):
+        return unicodedata.normalize("NFKD", word).encode("ascii", "ignore").decode().lower()
+    spelled = {}
+    for token in re.findall(r"[^\W\d_]+", line)[1:]:
+        if token != token.lower() or not token.isascii():
+            spelled.setdefault(plain(token), token)
+    words = " ".join(spelled.get(word, word) for word in value.split("_") if word)
+    return words[:1].upper() + words[1:]
 
 
 def check_condition_words(condition):
@@ -25020,13 +25308,19 @@ class DutyReads:
     joined: {duty: [the ids of the open cases that it joined]}, in the order of duty_joined_open;
     watches: {duty: [its wake-up rules]}, as duty_watches(live=False) gives them;
     runs: {rule: its last run};
-    parts: duty_case_parts of every case in whole."""
+    parts: duty_case_parts of each open case and of the last case of each duty;
+    recent: {duty: [all columns of each case that closed in the last DUTY_RECENT_SECONDS]}, from the rows of whole,
+    which reads them in its own statement;
+    lines: {path: case_list_lines(path)}, read after the moment of the state, once for each duty's file;
+    catalog: knowledge_entries() for those lines, read once for all of them (each read starts a git process)."""
     def __init__(self):
         self.cases, self.joined, self.watches = {}, {}, {}
         for c in q("SELECT id, responsibility, state, opened, repeated FROM duty_cases ORDER BY id"):
             self.cases.setdefault(c["responsibility"], []).append(c)
         self.whole = {c["id"]: c for c in q("SELECT * FROM duty_cases WHERE state='open' OR id IN "
-                                            "(SELECT MAX(id) FROM duty_cases GROUP BY responsibility) ORDER BY id")}
+                                            "(SELECT MAX(id) FROM duty_cases GROUP BY responsibility) OR "
+                                            "(state='closed' AND closed>?) ORDER BY id",
+                                            (now() - DUTY_RECENT_SECONDS,))}
         for j in q("SELECT j.responsibility, c.id FROM duty_joins j JOIN duty_cases c ON c.id=j.duty_case WHERE "
                    "c.state='open' ORDER BY c.id"):
             self.joined.setdefault(j["responsibility"], []).append(j["id"])
@@ -25042,7 +25336,12 @@ class DutyReads:
         self.runs = {run["trigger_id"]: run for run in q(
             "SELECT * FROM trigger_runs WHERE id IN (SELECT (SELECT r.id FROM trigger_runs r WHERE r.trigger_id=t.id "
             f"ORDER BY r.id DESC LIMIT 1) {rules})", states)}
-        self.parts = duty_case_parts(list(self.whole.values()))
+        last = {cases[-1]["id"] for cases in self.cases.values()}
+        self.parts = duty_case_parts([c for c in self.whole.values() if c["state"] == "open" or c["id"] in last])
+        self.recent, self.lines, self.catalog = {}, {}, None
+        for c in self.whole.values():
+            if c["state"] == "closed" and c["closed"]:
+                self.recent.setdefault(c["responsibility"], []).append(c)
 
 
 def duty_reads():
@@ -25073,7 +25372,7 @@ def duty_view(r, t0=None, reads=None):
         watch = [duty_watch_view(t, t0, reads.runs) for t in reads.watches.get(r["id"], [])]
         joined = [reads.whole[case] for case in reads.joined.get(r["id"], [])]
         parts = reads.parts
-    return {"id": r["id"], "agent": r["agent"], "title": duty_name(r["text"]), "text": r["text"],
+    view = {"id": r["id"], "agent": r["agent"], "title": duty_name(r["text"]), "text": r["text"],
             "state": r["state"],
             "revision": r["revision"], "created": r["created"], "updated": r["updated"], "created_by": r["created_by"],
             "request_id": r["request_id"] or None,
@@ -25087,6 +25386,23 @@ def duty_view(r, t0=None, reads=None):
             "joined": [duty_case_view(c, parts) for c in joined],
             "marker": {"kind": r["marker_kind"], "since": r["marker_since"], "detail": r["marker_detail"]}
             if r["marker_kind"] else None}
+    # UI-API.md, newest finished work: the cases that closed in the last three days, the newest first, each typed value
+    # in words.
+    closed = sorted((c for c in (cases if reads is None else reads.recent.get(r["id"], []))
+                     if c["state"] == "closed" and (c["closed"] or 0) > t0 - DUTY_RECENT_SECONDS),
+                    key=lambda c: (c["closed"], c["id"]), reverse=True)
+    lines = {}
+    if r["lists"] and any(TYPED_NOTE.fullmatch(c["note"] or "") for c in closed):
+        if reads is not None and r["lists"] in reads.lines:
+            lines = reads.lines[r["lists"]]         # a file's lines once for each read of the state
+        elif reads is not None:
+            if reads.catalog is None:
+                reads.catalog = knowledge_entries()
+            lines = reads.lines[r["lists"]] = case_list_lines(r["lists"], reads.catalog)
+        else:
+            lines = case_list_lines(r["lists"], read=False)     # a duty route holds LOCK: no git process in it
+    view["recent"] = [recent_case_view(c, lines) for c in closed]
+    return view
 
 
 def duty_key(t, due):
@@ -30049,6 +30365,15 @@ def grant_check(agent, rid, level):
         return None
     if not entry.get("max"):
         phrase = resource_phrase(kind, what)        # only its first letter: capitalize() would unmake MCP and a name
+        # the owner is asked only for what no agent holds (the owner, 29 October 2026), so an agent that holds it and
+        # can use it does that part, as raise_needs_you also says (card_access)
+        held = [h["agent"] for h in card_holders(kind, what.lower() if kind == "repo" else what)
+                if h["agent"] != agent and level_at_least(kind, h["level"], level if level in RESOURCE_LEVELS[kind]
+                                                          else None)]
+        if held and not card_dead(kind, what):
+            return (f"{phrase[0].upper() + phrase[1:]} is not in the grantable pool, so you cannot give it, and "
+                    f"{', '.join(held)} {'holds' if len(held) == 1 else 'hold'} it: give that part of the work to "
+                    f"{held[0]} with create_task. The owner is asked only for what no agent holds.")
         return (f"{phrase[0].upper() + phrase[1:]} is not in the grantable pool, so you cannot give it. Ask "
                 f"the owner with raise_needs_you to make it grantable, or to grant it once.")
     if not resource_known(kind, what, TEAM):
@@ -33054,13 +33379,25 @@ TOOLS = [
         "what": STR, "task": {"type": "string", "description": "The task that spends it, for example T-7"}},
        ["goal", "amount", "currency", "what"])),
     ("manager", "raise_needs_you", t_raise_needs_you,
-     "Ask the owner for something that only they can do or decide, and that the work needs now: a change only they "
-     "can make, a sign-in only they can complete, new money or a new credential, or a choice they kept. It rings their "
-     "phone, so it is never for a warning, a status, a risk or an FYI, and never for something you will go on with "
-     "by default when they say nothing: those go to tell_owner, which posts with no notification, or nowhere. The "
-     "hub refuses an item whose own words say nothing is needed. Use rarely. When you ask the owner to choose, give "
-     "the choices in options: they press one, and its words come back as the answer. Never ask for a key, a password "
-     "or a token here: request_secret is how the value reaches the vault without passing you. Its title, why and "
+     "Ask the owner for what only they can do or decide, as your last step, because it rings their phone. First decide "
+     "yourself where a policy or a standing rule of the owner's lets you, check the claim of the agent that asks in "
+     "the record (its own runs, what it holds), and give the work to the agent that holds the access, or grant what "
+     "the pool holds. reason says why only the owner can do it, and the hub checks what it can of it: money, for new "
+     "money; access, "
+     "for access that the fleet does not hold, named in needs_access (an agent that holds it does that part of the "
+     "work, and a thing in the grantable pool is yours to grant); decision, for a decision that the owner's own words "
+     "keep for them, quoted word for word in owner_words from a policy file, a profile, a standing rule that they gave "
+     "or their own message; or person, for a step that only a person can do: the owner's sign-in to an AI provider's "
+     "own account or to an MCP server in their app, their phone, or a hand at a machine, to switch it on or to change a setting that it takes only "
+     "from its own keyboard or mouse. A card never gives fleet work to the owner's Mac or to the owner: no command "
+     "for them to run, no session on their Mac, no run, release or push of theirs. When access is missing, ask for "
+     "that access, and the agent does the work after it. A sign-in to a website is the agent's work, with the login "
+     "from the vault. A card is never for a warning, a status, a risk or an FYI, and never for something you will go "
+     "on with by default when they say nothing: news that they must have now (a customer, money, security) goes to "
+     "message_owner, and the rest waits for the next message that they need, or goes nowhere. "
+     "The hub refuses an item whose own words say nothing is needed. When you ask the owner to choose, give the "
+     "choices in options: they press one, and its words come back as the answer. Never ask for a key, a password or "
+     "a token here: request_secret is how the value reaches the vault without passing you. Its title, why and "
      "options are plain words with no codes (T-61, R-3). Read before you raise: an item about a server, a version or "
      "a deploy rests on a reading that is newer than the last change to it, made by you, by an agent that can read "
      "it, or by the next run of its watch, and why says how old that reading is. Raise it only when that reading still "
@@ -33072,23 +33409,14 @@ TOOLS = [
      "\"Yes to A and C\". The owner answers with an option or in their own words, and either one closes the item. "
      "When their words ask you something back or do not settle it, reply with a new item: its why answers what they "
      "asked, with the options that follow from it. When an open item's options or words change, raise it again with "
-     "replaces. what_to_do is what the owner does, and the card shows it under why. For a thing that the owner does "
-     "by hand, write the exact steps there and nothing else. A command is the whole command in a code block (a line "
-     "of three backticks before it and after it), ready to paste, and the sentence before it says where to run it: "
-     "the owner's Mac or a server, and the folder. The command works as written in that place: a file that it reads "
-     "is a file that the owner has there, or the step before it gets that file. A page is its full address, and "
-     "after it what to click there, by the words on the buttons. More than one step is a numbered list, one action "
-     "on each line. When the step is one command on the owner's Mac or on a Mac of the fleet, and it asks for no "
-     "password, give that command in run_command too, with run_on: the card then shows Run on its code block, their "
-     "Mac runs it there at their press, and their answer is its exit status and the end of its output, which reach "
-     "you as data from that machine; check the result yourself. Never describe a command in words (\"apply the Role\"), and never send the owner to a file for "
-     "the steps: when the steps are only in an agent's output, ask that agent for the commands first. For a choice "
-     "that the options settle, what_to_do is one short sentence that names the decision. Two kinds of item have "
-     "their own rule. With a door_call the owner runs nothing: what_to_do shows the call that their yes lets through "
-     "the door one time, and says that they press the first option. The door's card of a run (door_host) takes no "
-     "backtick in why and what_to_do. Use only these marks: `code`, a code block, ** around the words of a button, "
-     "and a numbered list, and write a page's address as it is, with no mark. The Mac app draws them as it draws a "
-     "chat message, and they stay readable as plain text on a phone.",
+     "replaces. what_to_do is what the owner does, and the card shows it under why: for a choice, one short sentence "
+     "that names the decision; for a person's step, the exact steps, a page as its full address with what to click "
+     "there by the words on the buttons, and a numbered list for more than one step. Two kinds of item have their own "
+     "rule. With a door_call the owner runs nothing: what_to_do shows the call that their yes lets through the door "
+     "one time, and says that they press the first option. The door's card of a run (door_host) takes no backtick in "
+     "why and what_to_do. Use only these marks: `code`, a code block for the door's call, ** around the words of a "
+     "button, and a numbered list, and write a page's address as it is, with no mark. The Mac app draws them as it "
+     "draws a chat message, and they stay readable as plain text on a phone.",
      S({"title": {"type": "string",
                   "description": f"What the owner decides, in at most {NEED_TITLE_CHARS} characters."},
         "why": {"type": "string", "description": f"One or two plain sentences, at most {NEED_WHY_CHARS} characters: "
@@ -33102,10 +33430,27 @@ TOOLS = [
                      "example N-12, when its options or its words changed: that item leaves Needs you. Give "
                      "question_id again if it had one."},
         "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now, "
-                       "as the card shows it. For a thing that they do by hand: the exact steps (each command "
-                       "whole in a code block, with where to run it; each page as its full address, with what to "
-                       "click there; a numbered list for more than one step). For a choice: one short sentence. "
-                       "If there is none, do not raise the item."},
+                       "as the card shows it. For a choice: one short sentence. For a person's step: the exact steps "
+                       "(each page as its full address, with what to click there; what the hand does at a machine; "
+                       "a numbered list for more than one step), and never a command. If there is none, do not raise "
+                       "the item."},
+        "reason": {"type": "string", "enum": list(CARD_REASONS), "description": "Why only the owner can do it, for "
+                   "every item but the door's, an App's, a phone's, an App key's and a key swap's: money, access "
+                   "(with needs_access), decision (with owner_words) or person."},
+        "needs_access": {"type": "string", "description": "With reason access: the thing that the fleet does not "
+                         "hold, as grant_access names it (repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, "
+                         "drive:a@b.com, tool:<MCP server>, server:<name>), or a few plain words when the fleet's "
+                         "record does not name it (a role in a cloud account, a database login, a new agent). The hub "
+                         "refuses it when an agent holds it or you can grant it, unless no holder can use it now (a "
+                         "Google account that its tools refuse, an MCP server whose access ended)."},
+        "needs_level": {"type": "string", "description": "With needs_access: the level that the work needs, when an "
+                        "agent holds the thing at a lower one (repo:acme/web at deploy where it holds write). For a "
+                        "secret, value: its value itself, which only the owner gives (a new one when it is wrong or "
+                        "was revoked, or in place of the placeholder that a program cannot use)."},
+        "owner_words": {"type": "string", "description": f"With reason decision: the owner's own words that keep this "
+                        f"decision for them, word for word and at least {CARD_WORDS_MIN} characters: a line of a "
+                        f"policy file or a profile, a standing rule that they gave, or their own message. An agent's "
+                        f"reading of them does not count."},
         "options": {"type": "array", "items": {"type": "string"},
                     "description": f"The answers to offer, 2 to {NEED_OPTIONS_MAX}, each a short sentence of at "
                                    f"most {NEED_OPTION_CHARS} characters, because the app draws one row for each. "
@@ -33160,20 +33505,7 @@ TOOLS = [
                             "site. The title is \"Switch on the key swap on <server>?\", word for word, and why and "
                             "what_to_do are yours; leave options and details out: the hub writes the two answers, "
                             "Switch it on and Leave it off, and the details. The owner's press of an answer is their "
-                            "wish for that server, and the hub closes the item by itself."},
-        "run_command": {"type": "string", "description": f"For a hand step that is one command on a Mac: that "
-                        f"command, character for character as its own code block in what_to_do shows it, one line "
-                        f"of printable ASCII, at most {NEED_RUN_CHARS} characters, with no sudo (Run has no place to "
-                        f"type a password). The owner's card then shows Run on that block, and their Mac runs it at "
-                        f"their press, in the home folder of the user there, in a login shell that reads the login "
-                        f"profile and not ~/.zshrc: a command for another folder starts with cd <folder> &&, and a "
-                        f"program that only ~/.zshrc puts on the PATH is named by its full path. Give run_on with it, "
-                        f"and no question_id: the output comes to you."},
-        "run_on": {"type": "string", "description": f"With run_command: where it runs. {NEED_RUN_MAC} for the "
-                   f"owner's own Mac, where they press Run, or the name of a Mac of this fleet, the machine of an "
-                   f"agent, which the owner's Mac reaches over SSH as the team's record says. A Linux server is not "
-                   f"one: a step there goes through the door. The words of what_to_do say the same place: a Mac of "
-                   f"the fleet by its name (On <machine>, run:), and no other Mac of the fleet."}},
+                            "wish for that server, and the hub closes the item by itself."}},
        ["title", "why", "what_to_do"])),
     ("manager", "withdraw_need", t_withdraw_need,
      "Close an open Needs-you item that you raised and that nothing needs any more: a plan change replaced it, the "
@@ -33672,8 +34004,9 @@ TOOLS = [
      "Move one agent that the hub holds because it may share its user account with another, which the hub told you "
      "of, to a server that the owner picked: one commit of team.json, the install job there and the end of its old "
      "session. Its tasks, memory, duties and grants stay with it; its vault starts again there, and the owner signs it "
-     "in there in the app. Ask the owner first with raise_needs_you which server takes it, with one option for each "
-     "server by its exact name, and give that item as need: the hub moves it only to a server that the owner's pressed "
+     "in there in the app. Ask the owner first with raise_needs_you, reason person (they sign it in there "
+     "after the move), which server takes it, with one option for each server by its exact name, and give "
+     "that item as need: the hub moves it only to a server that the owner's pressed "
      "or ticked option names, and one item serves each move of the agents that it names. One move at a time on a "
      "server: the hub tells you when each install ends, and the same call gives an install that failed again. You move "
      "yourself only while you run as the hub's own user account. Every other move stays the owner's.",
@@ -34206,6 +34539,46 @@ def case_lists(path):
     return CASE_LISTS[key]
 
 
+CASE_LINES = {}                 # (commit, path): the line of each value of one owner file's lists, at that commit
+
+
+def case_list_lines(path, catalog=None, read=True):
+    """The line of each value of an owner file's lists, as {list: {value: the words after it}}, which case_facts
+    spells a value's words from (UI-API.md, newest finished work). The lists and their values are case_lists'; {} for
+    a path that is no owner file at the hub's commit, and a read that failed is not kept. catalog: knowledge_entries(),
+    when the caller read it already. read=False starts no git process, for a caller that holds LOCK (the duty routes,
+    see_responsibilities): the catalog that the hub read last, and the lines that a read of the state kept, or {}."""
+    if catalog is None:
+        catalog = knowledge_entries() if read else KNOWLEDGE_CACHE[1]
+    entry = next((k for k in catalog if k["path"] == path and k["scope"] == "owner"), None) \
+        if isinstance(path, str) else None
+    if not entry:
+        return {}
+    key = (entry["commit"], path)
+    if key not in CASE_LINES:
+        if not read:
+            return {}
+        text = knowledge_text(entry)
+        if text is None:
+            return {}
+        lists, name = {}, None
+        for line in text.splitlines():
+            head = CASE_LIST_HEAD.fullmatch(line)
+            if head:
+                name = re.sub(r"[^a-z0-9]+", "_", head.group(1).lower()).strip("_")[:40] or None
+                continue
+            if line.startswith("#"):
+                name = None
+                continue
+            value = CASE_LIST_VALUE.match(line) if name and line.startswith("- ") else None
+            if value:
+                lists.setdefault(name, {}).setdefault(value.group(1), line[value.end():].lstrip(" :").strip())
+        if len(CASE_LINES) > 64:
+            CASE_LINES.clear()
+        CASE_LINES[key] = lists
+    return CASE_LINES[key]
+
+
 # The names of the typed values that F4 takes from a duty's lists, whatever its file holds: one of them with no list
 # that the hub can read takes no value (fail closed). Any other name of a typed value is a word, as in F1.
 LIST_FIELDS = ("symptom", "component", "cause", "next_step", "resolution")
@@ -34403,7 +34776,8 @@ def gate(agent, task_id, name, args):
 # A field a tool does not take and answers for itself, in words better than the general refusal below:
 # see_notes(agent=...) is how one agent tries to read another's notes, and what it has to read back is why it
 # cannot, not that the field does not exist.
-ANSWERED_FIELDS = {("see_notes", "agent")}
+# raise_needs_you answers run_command and run_on itself, with its rule (card_route: no new item takes a command)
+ANSWERED_FIELDS = {("see_notes", "agent"), ("raise_needs_you", "run_command"), ("raise_needs_you", "run_on")}
 
 
 def unknown_fields(name, sent, role=None):
@@ -47130,8 +47504,11 @@ def mcp_state(team):
         kept = mcp_connection(saved, name) or {}
         ends = kept.get("access_expires_at") if not kept.get("refresh_token") else None
         over = MCP_ENDED if isinstance(ends, (int, float)) and ends - now() <= MCP_REFRESH else None
-        try:                            # the renewal's mark keeps an end of this connection across a restart
-            mark = json.loads(kv_get(f"mcp_renew:{name}") or "{}")
+        # the renewal's mark keeps an end of this connection across a restart; a read that commits nothing, because
+        # grant_check reaches here (card_dead), and a transaction() may hold it
+        row = read_row("SELECT v FROM kv WHERE k=?", (f"mcp_renew:{name}",))
+        try:
+            mark = json.loads((row["v"] if row else None) or "{}")
         except ValueError:
             mark = {}
         kept_end = isinstance(mark, dict) and mark.get("event") == "ended" and kept and \
@@ -53153,13 +53530,17 @@ def need_words_note(need, choice, ticked):
     """The hub's words after an answer that the owner typed to a Needs-you item of the manager's: their own words are
     also their one reply on the card (the owner, 13 November 2026: "lets use the free-type text input as the general
     reply too, so we can remove the discuss option completely"). The words close the item as every answer does, so a
-    question back gets its reply as a new item, where the owner answered. "" for an option, ticked options, a person's
+    question back gets its reply as a new item, where the owner answered. And words that say the item went the wrong
+    way send the manager to the line that sent it (the owner, 17 November 2026: a card is the last step). "" for an option, ticked options, a person's
     question and an item of another agent."""
     if need is None or choice is not None or ticked is not None or need["conversation"] or \
             need["by"] != manager_name():
         return ""
     return (" The owner wrote this in their own words. If it asks you something back or does not settle the item, "
-            "reply with a new item (raise_needs_you) whose why answers what they asked.")
+            "reply with a new item (raise_needs_you) whose why answers what they asked. If it says that the item was "
+            "not needed or went the wrong way, find the line that sent it (a policy, a profile, a standing item, your "
+            "notes) and correct it before your next item: your own at once, and one of the owner's with tell_owner, "
+            "in the new words that you propose.")
 
 
 def door_answer_words(text):

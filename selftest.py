@@ -1010,7 +1010,7 @@ text, err = tool("manager", "raise_needs_you", title="Pick", why="Naming", what_
 check("options that are not texts are refused, not a crash", err and "options is a list" in text, text)
 check("...and a refused item pages nobody", not any(e["kind"] == "notify" and "Needs you" in e["text"] for e in events("owner")))
 text, err = tool("manager", "raise_needs_you", title="Pick the codename", why="Naming is the owner's choice",
-                 what_to_do="Type a name. Nothing else is needed from you.")
+                 what_to_do="Type a name. Nothing else is needed from you.", reason="person")
 check("raise_needs_you, also when it says nothing else is needed", "N-1" in text, text)
 check("the owner gets a notification event", any(e["kind"] == "notify" and e["text"] == "Needs you: Pick the codename"
                                                  for e in events("owner")))
@@ -1091,7 +1091,8 @@ said = json.loads(raw("GET", "/events/manager?after=0&wait=0", base=hubS)[2])["e
 check("a declined secret request reaches the manager in the owner's words",
       code == 200 and "Not given: Use the test account first" in said, text + said)
 text, err = tool("manager", "raise_needs_you", base=hubS, title="Shop key", why="Fleet Vault has none",
-                 what_to_do="Paste the shop's API key into Fleet Vault on your Mac.")
+                 what_to_do="Paste the shop's API key into Fleet Vault on your Mac.", reason="access",
+                 needs_access="the shop's API key")
 check("a Needs-you item that sends the owner to their own app passes", not err and "N-3" in text, text)
 code, _, text = owner_ui("/ui/needs/3/secret", {"decline": ""}, base=hubS)
 check("an item that asks for no secret takes no secure answer", code == 409, text)
@@ -1123,7 +1124,7 @@ started = time.monotonic()
 waiter.start()
 time.sleep(0.5)
 tool("manager", "raise_needs_you", base=hubS, title="Live", why="a selftest check",
-     what_to_do="Nothing: this item is a selftest check.")
+     what_to_do="Nothing: this item is a selftest check.", reason="person")
 waiter.join(25)
 answer = json.loads((woke.get("answer") or (0, {}, "{}"))[2] or "{}")
 check("a change the owner sees wakes a waiting app before its wait ends",

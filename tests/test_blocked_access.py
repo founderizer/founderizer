@@ -315,7 +315,8 @@ class BlockedAccess(OwnerAPI):
             "title": "dev needs the repository acme/billing",
             # owner feature need_talk: the words he reads name the work, never its code
             "why": "Dev's task is blocked: no agent holds repo:acme/billing and it is in no standing of yours.",
-            "what_to_do": "Add acme/billing to the GitHub App, then make it grantable."}))
+            "what_to_do": "Add acme/billing to the GitHub App, then make it grantable.",
+            "reason": "access", "needs_access": "repo:acme/billing"}))
         need = hub.q1("SELECT * FROM needs ORDER BY id DESC LIMIT 1")
         self.assertEqual(need["by"], "manager")
         self.assertIn("repo:acme/billing", need["why"])

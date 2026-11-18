@@ -832,6 +832,39 @@ class Tools(Fleet):
         self.assertFalse(error, text)
         self.assertEqual(hub.q1("SELECT state, note FROM duty_cases WHERE id=?", (case,))["note"], "cause=ours")
 
+    def test_the_state_gives_the_cases_of_three_days_with_their_typed_values_in_words(self):
+        """The card Work of an agent's chat panel names its newest finished things by their cases (UI-API.md, newest
+        finished work; the owner's "Yes, as drawn" of 17 November 2026), a ticket as "T-81 · Reassigned to Ana":
+        each typed value in words, spelled as its line in his file spells it. A case that closed more than three days ago is not in it,
+        an open case is in `cases` as before, a note in an agent's own words has no facts, and a list's catch-all
+        `other` says nothing, so it is left out."""
+        lists_repo(self, {LISTS_PATH: "# Lists\n\n## Cause\n\n- `ours`: our code.\n\n## Resolution\n\n"
+                                      "- `reassigned_to_ana`: the ticket went to Ána with a note.\n"})
+        r = self.duty(lists=LISTS_PATH, watch=[{"kind": "clock", "schedule": EVERY}])
+        cases = []
+        for key in ("T-81", "T-82", "T-83", "T-84", "T-85"):
+            with hub.transaction():
+                cases.append(hub.duty_new_case(r, key, key, "test", "hub", hub.now()))
+        tid, context = self.task("desk", responsibility=r["id"], duty_case=cases[0])
+        text, error = hub.call_tool("desk", "close_case", {
+            "request_id": str(uuid.uuid4()), "task_id": context[1], "outcome": "handled",
+            "values": {"cause": "ours", "resolution": "reassigned_to_ana"}}, context)
+        self.assertFalse(error, text)
+        for case, ago, note in ((cases[1], 3600, "Not ours: the supplier changed its price."),
+                                (cases[2], 4 * 86400, "Not ours."), (cases[4], 7200, "cause=ours, resolution=other")):
+            hub.q("UPDATE duty_cases SET state='closed', closed=?, closed_by='ops', outcome='no_action', note=? "
+                  "WHERE id=?", (self.clock - ago, note, case))
+        code, state = self.request("/ui/state")
+        self.assertEqual(code, 200, state)
+        duty = next(d for d in state["responsibilities"] if d["id"] == r["id"])
+        self.assertEqual([c["id"] for c in duty["recent"]], [cases[0], cases[1], cases[4]])   # the newest first
+        self.assertEqual(duty["recent"][0]["facts"], {"cause": "Ours", "resolution": "Reassigned to Ána"})
+        self.assertEqual([duty["recent"][0][k] for k in ("key", "title", "closed", "repeated")],
+                         ["T-81", "T-81", self.clock, False])
+        self.assertIsNone(duty["recent"][1]["facts"])
+        self.assertEqual(duty["recent"][2]["facts"], {"cause": "Ours"})
+        self.assertEqual([c["id"] for c in duty["cases"]], [cases[3]])
+
     def test_a_duty_names_the_tools_of_its_sessions(self):
         review = self.duty(watch=[{"kind": "clock", "schedule": EVERY}], tools=["remember", "write_notes"])
         _, context = self.task("desk", responsibility=review["id"])

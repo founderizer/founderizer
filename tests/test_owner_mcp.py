@@ -43,6 +43,10 @@ from leftovers import ROOT
 
 HERE = pathlib.Path(ROOT)
 SHELLS = [sh for sh in ("/bin/sh", "/bin/dash") if os.access(sh, os.X_OK)]     # this machine's, Debian's and Ubuntu's
+# A test that reads a file of the apps skips where their folder is not: this checkout has app/ beside the hub, and the
+# published repository, which a person clones to run these tests, never has it (publish.py publishes no file of it).
+needs_the_apps = unittest.skipUnless((HERE / "app").is_dir(),
+                                     "the apps' folder app/ is not in this tree (the published repository has none)")
 
 
 def load_tests(loader, _tests, _pattern):
@@ -520,7 +524,7 @@ class FromNothing(WithServer):
             "request_id": str(uuid.uuid4())})
         self.assertFalse(error, made)
         raised, error = hub.call_tool("manager", "raise_needs_you", {
-            "title": "Which card", "why": "the shop needs one", "what_to_do": "name the card"})
+            "title": "Which card", "why": "the shop needs one", "what_to_do": "name the card", "reason": "money"})
         self.assertFalse(error, raised)
         return (hub.q1("SELECT id FROM goals ORDER BY id DESC")["id"],
                 hub.q1("SELECT id FROM responsibilities ORDER BY id DESC")["id"],
@@ -4788,6 +4792,7 @@ class Parity(unittest.TestCase):
     """**The parity check** (plan 3.3): the fixture that the Swift tests replay against the program inside the app is
     what `owner_mcp.py` does now, case by case, and it covers each tool that both programs have."""
 
+    @needs_the_apps
     def test_the_committed_parity_fixture_is_what_owner_mcp_does_now(self):
         made = parity_text()
         self.assertEqual(PARITY_FIXTURE.read_text() if PARITY_FIXTURE.exists() else "", made,
@@ -4965,6 +4970,7 @@ class Table(unittest.TestCase):
                            ("noext", "application/octet-stream"), ("a.docx", "application/octet-stream")):
             self.assertEqual(owner_mcp.media_type(name), mime, name)
 
+    @needs_the_apps
     def test_the_dump_prints_the_table_and_the_apps_copy_is_that_print(self):
         """`--dump-tools` is what release.sh and run.sh put in the app, and the Swift tests read a committed copy of
         it: when this fails, write the copy again with `python3 owner_mcp.py --dump-tools > <the fixture>`."""
@@ -5277,6 +5283,7 @@ class GoogleConnect(unittest.TestCase):
         self.assertNotIn("/ui/google/connect", owner_mcp.NOT_TOOLS)
         self.assertNotIn("/ui/google/finish", owner_mcp.NOT_TOOLS)
 
+    @needs_the_apps
     def test_the_description_says_the_apps_notice_before_googles_page(self):
         """The notice before Google's page (the owner's "Yes, both as drawn" of 16 November 2026), which Google's policy
         asks for before each consent: the owner's agent says it before the call, word for word as the app shows it

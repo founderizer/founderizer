@@ -33,7 +33,7 @@ class NeedsCase(OwnerAPI):
     def raise_item(self, **extra):
         """The manager's tool, as the manager calls it."""
         return hub.t_raise_needs_you("manager", dict({"title": "Which name?", "why": "The owner names it",
-                                                      "what_to_do": "Press one"}, **extra))
+                                                      "what_to_do": "Press one", "reason": "person"}, **extra))
 
     def row(self, nid=1):
         return hub.q1("SELECT * FROM needs WHERE id=?", (nid,))
@@ -334,10 +334,12 @@ class Talk(NeedsCase):
         self.raise_item(title="Move the shop off .NET 8 by 7 Dec", why="Mia needs write on 8 repositories.")    # no code
 
     def test_a_command_in_a_code_block_is_literal_and_the_words_around_it_are_not(self):
-        # the owner, 15 November 2026: "manager tasks need to be super specific. Like run "xxx""
+        # the owner, 15 November 2026: "manager tasks need to be super specific. Like run "xxx"". Since 17 November
+        # no item gives the owner a command to run (test_card_reasons), so a block stands in details and on the door's
+        # card, and the words around it are read as before.
         command = "openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out key.pem"
-        self.raise_item(what_to_do=f"On your Mac, in the folder of the shop, run:\n\n```\n{command}\n```")
-        self.assertIn(command, self.item()["todo"])                 # as written: the card draws the block
+        self.raise_item(details=f"The agent ran, in the folder of the shop:\n\n```\n{command}\n```")
+        self.assertIn(command, self.item()["details"])              # as written: the card draws the block
         with self.assertRaisesRegex(hub.ToolError, "Say P-256 in plain words"):
             self.raise_item(what_to_do=f"On your Mac, run {command}")                   # in a line of words
         with self.assertRaisesRegex(hub.ToolError, "Say T-61 in plain words"):
@@ -399,7 +401,8 @@ class Talk(NeedsCase):
     def test_his_own_words_are_also_his_reply_and_a_question_back_gets_a_new_item(self):
         """The owner, 13 November 2026: "lets use the free-type text input as the general reply too, so we can remove
         the discuss option completely". Words close the item as every answer does, and the manager reads how to
-        reply to a question back: with a new item, where the owner answered."""
+        reply to a question back: with a new item, where the owner answered. Since 17 November 2026 the same words
+        send the manager to the line that sent a card that went the wrong way, before its next card."""
         self.raise_item(options=["Read on both", "Read on one"])
         code, receipt = self.request("/ui/needs/1", self.command(answer="Does read on the second one show anything?"))
         self.assertEqual(code, 200, receipt)
@@ -407,7 +410,9 @@ class Talk(NeedsCase):
         said = hub.t_read_messages("manager", {})
         self.assertIn("[owner] Answer to Needs-you N-1 (Which name?): Does read on the second one show anything? The "
                       "owner wrote this in their own words. If it asks you something back or does not settle the "
-                      "item, reply with a new item (raise_needs_you) whose why answers what they asked.", said)
+                      "item, reply with a new item (raise_needs_you) whose why answers what they asked. If it says "
+                      "that the item was not needed or went the wrong way, find the line that sent it (a policy, a "
+                      "profile, a standing item, your notes) and correct it before your next item", said)
         self.assertNotRegex(said, r"\b(he|his|him)\b")                 # the hub's words name no owner "he"
         # a press is the agent's own words, so it gets no such sentence
         self.raise_item(options=["Tide", "Harbour"])
@@ -438,13 +443,14 @@ class Talk(NeedsCase):
               (hub.now(),))                                             # a record from before 13 November 2026
         out = hub.t_raise_needs_you("manager", {"title": "Which name now?", "why": "With the third way.",
                                                 "what_to_do": "Press one", "options": ["A", "B", "C"],
-                                                "replaces": "N-1"})
+                                                "replaces": "N-1", "reason": "person"})
         self.assertIn("Raised N-2", out)
         self.assertEqual(self.row(1)["answer"], "Replaced by manager with a new item: Which name now?")
         self.assertEqual([t["text"] for t in self.item(2)["talk"]], ["Can you add a third way?"])
         self.assertEqual(hub.need_talk(1), [])
         with self.assertRaisesRegex(hub.ToolError, "closed already"):
-            hub.t_raise_needs_you("manager", {"title": "Again", "why": "W", "what_to_do": "P", "replaces": "N-1"})
+            hub.t_raise_needs_you("manager", {"title": "Again", "why": "W", "what_to_do": "P", "replaces": "N-1",
+                                              "reason": "person"})
 
     def test_a_question_s_words_go_behind_details_with_no_code(self):
         task = hub.ins("INSERT INTO tasks(title, owner, requester, state, created) VALUES(?,?,?,?,?)",

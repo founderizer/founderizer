@@ -276,11 +276,13 @@ class Resources(OwnerAPI):
         capacity = self.call("manager", "see_capacity", {})[0]
         self.assertIn("gmail:support@shop.test", capacity)
         self.assertNotIn("drive:support@shop.test", capacity)
-        # The manager's card for that Connect reaches the owner, also when it names the Gmail that is there; a card
-        # for the Gmail that it may give does not.
+        # The manager's card for that Connect reaches the owner, also when it names the Gmail that is there and the
+        # Drive that the pool holds, which no grant gives while the account does not allow it; a card for the Gmail
+        # that it may give does not.
         text, error = self.call("manager", "raise_needs_you", {
             "title": "Connect Google Drive of support@shop.test",
-            "why": "It is connected for Gmail only, and the shop's files are on Drive.", "what_to_do": "Connect account"})
+            "why": "It is connected for Gmail only, and the shop's files are on Drive.", "what_to_do": "Connect account",
+            "reason": "access", "needs_access": "drive:support@shop.test"})
         self.assertFalse(error, text)
         self.assertIsNone(hub.need_is_yours("manager", "Gmail of support@shop.test is there: connect "
                                                        "drive:support@shop.test"))

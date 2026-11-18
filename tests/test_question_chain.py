@@ -114,7 +114,8 @@ class Chain(OwnerAPI):
     def raised(self, qid, **extra):
         """The manager's last step for a question that it holds: one Needs-you item linked to it."""
         said = self.ok("manager", "raise_needs_you", dict({"title": "Which colour?", "why": "Only he chose the brand",
-                                                           "what_to_do": "Say blue or green", "question_id": f"Q-{qid}"},
+                                                           "what_to_do": "Say blue or green", "question_id": f"Q-{qid}",
+                                                           "reason": "person"},
                                                           **extra))
         return hub.q1("SELECT * FROM needs ORDER BY id DESC LIMIT 1"), said
 
@@ -303,12 +304,12 @@ class Needs(Chain):
     def test_what_raise_needs_you_refuses_for_a_question(self):
         qid = self.ask()
         self.assertIn("is with mid", self.refused("manager", "raise_needs_you", {
-            "title": "x", "why": "y", "what_to_do": "z", "question_id": f"Q-{qid}"}))       # nobody skips a level
+            "title": "x", "why": "y", "what_to_do": "z", "question_id": f"Q-{qid}", "reason": "person"}))       # nobody skips a level
         self.pass_up("mid", qid, self.t2)
         self.pass_up("top", qid, self.t1)
         self.raised(qid)
         self.assertIn("already takes", self.refused("manager", "raise_needs_you", {
-            "title": "x", "why": "y", "what_to_do": "z", "question_id": f"Q-{qid}"}))
+            "title": "x", "why": "y", "what_to_do": "z", "question_id": f"Q-{qid}", "reason": "person"}))
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], 1)
 
     def item(self, nid):

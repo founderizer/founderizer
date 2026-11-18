@@ -1,9 +1,9 @@
-"""Owner API 1.197 (owner feature need_run): Run on the command of a hand step. The manager names the one command of
-the step and the Mac that it runs on; the owner's app runs it at his press and sends its exit status and the end of
-its output, which the hub writes as his answer, and which the manager reads as data from that machine. An in-process
-hub with the owner API's harness; no fleet, no network and no AI call."""
+"""Owner API 1.197 (owner feature need_run): Run on the command of a hand step. The owner's app ran the command at his
+press and sent its exit status and the end of its output, which the hub writes as his answer, and which the manager
+reads as data from that machine. Since 17 November 2026 no new item takes a command (test_card_reasons: fleet work
+never goes through the owner's Mac), and these tests keep the answer of the items raised before. An in-process hub
+with the owner API's harness; no fleet, no network and no AI call."""
 import hashlib
-import json
 import unittest
 import uuid
 from unittest.mock import patch
@@ -18,26 +18,20 @@ TASK = f"On your Mac, in any folder, run:\n\n```\n{COMMAND}\n```"
 def load_tests(loader, _tests, _pattern):
     """Only this file's checks: the harness comes from OwnerAPI, its own tests stay in its own file."""
     suite = unittest.TestSuite()
-    for cls in (Raise, Place, Ran):
+    for cls in (Ran,):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
 
 class RunCase(OwnerAPI):
     def raise_item(self, todo=TASK, **extra):
-        """The manager's tool, as the manager calls it, with the command and the owner's Mac unless `extra` says
-        otherwise."""
+        """An item with a command, as the manager raised one before 17 November 2026, with the owner's Mac unless
+        `extra` says otherwise."""
         fields = dict({"title": "Sign a login out of the Mac", "why": "An agent session falls back to it.",
-                       "what_to_do": todo, "run_command": COMMAND, "run_on": "mac"}, **extra)
-        return hub.t_raise_needs_you("manager", {k: v for k, v in fields.items() if v is not None})
-
-    def refused(self, **extra):
-        """The sentence of the refusal, and no item raised by this call."""
-        before = self.count("needs")
-        with self.assertRaises(hub.ToolError) as caught:
-            self.raise_item(**extra)
-        self.assertEqual(self.count("needs"), before)
-        return str(caught.exception)
+                       "todo": todo, "run_command": COMMAND, "run_on": "mac"}, **extra)
+        return hub.ins("INSERT INTO needs(id,title,why,todo,raised,by,run_command,run_on) VALUES(?,?,?,?,?,?,?,?)",
+                       (hub.unused_id("needs"), fields["title"], fields["why"], fields["todo"], hub.now(), "manager",
+                        fields["run_command"], fields["run_on"]))
 
     def row(self, nid=1):
         return hub.q1("SELECT * FROM needs WHERE id=?", (nid,))
@@ -47,149 +41,6 @@ class RunCase(OwnerAPI):
         code, state = self.request()
         self.assertEqual(code, 200, state)
         return next(n for n in state["needs"] if n["id"] == nid)
-
-    def mac(self, machine, system="macOS 27.2", user="owner-example"):
-        """A machine of the fleet with one agent on it, its newest reading and the team's SSH user for it."""
-        agent = "agent-" + machine
-        hub.TEAM["agents"][agent] = {"role": "worker", "runtime": "claude", "machine": machine, "can": []}
-        hub.TEAM.setdefault("addresses", {})[machine] = "100.64.0." + str(len(hub.TEAM["addresses"]) + 10)
-        if user:
-            hub.TEAM.setdefault("access", {})[machine] = {"ssh_user": user, "ssh_port": 22}
-        hub.q("INSERT OR REPLACE INTO machine_status(agent,data,reported) VALUES(?,?,?)",
-              (agent, json.dumps({"os": {"name": system, "kernel": "1"}}), hub.now()))
-
-
-class Raise(RunCase):
-    """What the manager may write, and what the hub refuses rather than letting the app show a Run that it should not."""
-
-    def test_a_step_with_its_command_and_the_owners_mac_is_raised(self):
-        said = self.raise_item()
-        self.assertIn("Run", said)
-        self.assertIn("their own Mac", said)
-        self.assertEqual((self.row()["run_command"], self.row()["run_on"]), (COMMAND, "mac"))
-        item = self.item()
-        self.assertEqual((item["run_command"], item["run_on"]), (COMMAND, "mac"))
-        self.assertIsNone(item["run_status"])
-        self.assertIsNone(item["run_output"])
-        self.assertIn("need_run", hub.ui_features())
-
-    def test_an_item_without_a_command_is_the_item_of_before(self):
-        self.raise_item(run_command=None, run_on=None)
-        self.assertIsNone(self.row()["run_command"])
-        self.assertIsNone(self.item()["run_on"])
-
-    def test_the_command_and_its_place_go_together(self):
-        self.assertIn("go together", self.refused(run_on=None))
-        self.assertIn("go together", self.refused(run_command=None))
-
-    def test_the_task_shows_the_command_as_a_code_block_of_its_own(self):
-        self.assertIn("code block of its own", self.refused(todo=f"Run `{COMMAND}` on the Mac."))
-        self.assertIn("code block of its own", self.refused(todo=f"Run:\n\n```\n{COMMAND} --force\n```"))
-        # a block indented in a numbered step is the same block for the apps (MessageBlock.parse)
-        self.raise_item(todo=f"1. Open Terminal.\n2. Run:\n   ```bash\n   {COMMAND}\n   ```")
-        self.assertEqual(self.row()["run_command"], COMMAND)
-
-    def test_the_command_is_one_line_of_printable_ascii(self):
-        two = COMMAND + "\necho done"
-        self.assertIn("one line", self.refused(run_command=two, todo=f"```\n{two}\n```"))
-        for odd in ("gh auth status​", "gh\tauth status", "gh auth status — now"):
-            self.assertIn("not plain text", self.refused(run_command=odd, todo=f"```\n{odd}\n```"))
-        self.assertIn("no space before or after", self.refused(run_command=" " + COMMAND))
-        long = "echo " + "a" * hub.NEED_RUN_CHARS
-        self.assertIn("at most", self.refused(run_command=long, todo=f"```\n{long}\n```"))
-
-    def test_a_wide_gap_of_spaces_is_refused(self):
-        hidden = "gh auth status" + " " * (hub.NEED_RUN_GAP + 1) + "; echo more"
-        self.assertIn("run of more than", self.refused(run_command=hidden, todo=f"```\n{hidden}\n```"))
-        shown = "gh auth status" + " " * hub.NEED_RUN_GAP + "; echo more"
-        self.raise_item(run_command=shown, todo=f"```\n{shown}\n```")
-
-    def test_a_command_that_asks_for_a_password_gets_no_run(self):
-        for command in ("sudo rm -rf /opt/example", "cd /tmp && sudo -v", "echo $(sudo id)", "x;sudo y",
-                        "echo then sudo"):
-            self.assertIn("sudo", self.refused(run_command=command, todo=f"```\n{command}\n```"))
-        # a word that only holds the letters is no sudo
-        self.raise_item(run_command="visudo-check --help", todo="```\nvisudo-check --help\n```")
-
-    def test_a_card_of_another_route_takes_no_command(self):
-        said = self.refused(add_device=True, options=["Show the picture", "Not now"])
-        self.assertIn("own routes", said)
-
-    def test_a_question_of_an_agent_takes_no_command(self):
-        # the agent that asked would get only the words of the answer, and the output comes to the manager
-        said = self.refused(question_id="Q-1")
-        self.assertIn("takes no question_id", said)
-
-
-class Place(RunCase):
-    """Where Run may run: the owner's own Mac, or a Mac of the fleet that his Mac reaches over SSH."""
-
-    def task_on(self, machine):
-        return f"On {machine}, in any folder, run:\n\n```\n{COMMAND}\n```"
-
-    def test_a_mac_of_the_fleet_that_the_owners_mac_reaches(self):
-        self.mac("studio-1")
-        said = self.raise_item(run_on="studio-1", todo=self.task_on("studio-1"))
-        self.assertIn("on studio-1", said)
-        self.assertEqual(self.row()["run_on"], "studio-1")
-
-    def test_the_words_name_the_place_that_run_runs_on(self):
-        self.mac("studio-1")
-        self.mac("studio-2")
-        # a Mac of the fleet: its name stands in the words
-        self.assertIn("by that machine's name", self.refused(run_on="studio-1"))
-        # the words name another Mac of the fleet than the one Run runs on
-        self.assertIn("name one place", self.refused(run_on="studio-1", todo=self.task_on("studio-1") + "\nThen studio-2."))
-        self.assertIn("name one place", self.refused(todo=self.task_on("studio-2")))
-        # a command may name a machine, and a server's name may stand in the words
-        self.mac("web-1", system="Ubuntu 24.04.1 LTS", user="root")
-        named = "ssh studio-2 uptime"
-        self.raise_item(run_command=named, todo=f"On your Mac, for web-1, run:\n\n```\n{named}\n```")
-        self.assertEqual(self.row()["run_command"], named)
-        # a Mac of the fleet's card does not say "your Mac"; a name in inline code is words that he reads
-        self.assertIn("by that machine's name", self.refused(
-            run_on="studio-1", todo=f"On studio-1 (not your Mac), run:\n\n```\n{COMMAND}\n```"))
-        self.raise_item(run_on="studio-1", todo=f"On `studio-1`, run:\n\n```\n{COMMAND}\n```")
-        self.assertEqual(self.row(2)["run_on"], "studio-1")
-        # "this Mac Studio" names a kind of Mac, not the owner's own
-        self.raise_item(run_on="studio-1", todo=f"On studio-1, this Mac Studio, run:\n\n```\n{COMMAND}\n```")
-        self.assertEqual(self.row(3)["run_on"], "studio-1")
-
-    def test_a_name_matches_as_a_word_and_not_inside_a_path_or_a_longer_name(self):
-        self.mac("studio")
-        for words in ("Close Visual Studio Code first.", "Your files are in ~/dev/studio/app.",
-                      "The backup is on studio.example.net.", "See studio-old for the old one."):
-            self.raise_item(todo=f"On your Mac, run:\n\n```\n{COMMAND}\n```\n\n{words}")
-        self.assertEqual(self.count("needs"), 4)
-        self.assertIn("name one place", self.refused(todo=f"On your Mac, run:\n\n```\n{COMMAND}\n```\n\nNot on studio."))
-
-    def test_a_mac_without_an_ssh_way_that_the_app_takes(self):
-        self.mac("studio-1")
-        for change in ({"ssh_user": "-oProxyCommand=x"}, {"ssh_port": 0}, {"ssh_port": "22"}):
-            hub.TEAM["access"]["studio-1"] = dict({"ssh_user": "owner-example", "ssh_port": 22}, **change)
-            self.assertIn("no SSH way", self.refused(run_on="studio-1", todo=self.task_on("studio-1")), change)
-        hub.TEAM["access"]["studio-1"] = {"ssh_user": "owner-example", "ssh_port": 22}
-        hub.TEAM["addresses"]["studio-1"] = "studio-1.example.ts.net"
-        self.assertIn("no SSH way", self.refused(run_on="studio-1", todo=self.task_on("studio-1")))
-
-    def test_a_linux_server_goes_through_the_door(self):
-        self.mac("web-1", system="Ubuntu 24.04.1 LTS", user="root")
-        self.assertIn("door", self.refused(run_on="web-1", todo=self.task_on("web-1")))
-
-    def test_a_machine_with_no_reading_is_no_mac(self):
-        self.mac("new-1")
-        hub.q("DELETE FROM machine_status")
-        self.assertIn("not a Mac", self.refused(run_on="new-1", todo=self.task_on("new-1")))
-
-    def test_a_machine_that_the_team_gives_no_ssh_user(self):
-        self.mac("studio-2", user=None)
-        self.assertIn("no SSH way", self.refused(run_on="studio-2", todo=self.task_on("studio-2")))
-
-    def test_a_name_that_is_no_machine_of_the_fleet(self):
-        self.mac("studio-1")
-        said = self.refused(run_on="laptop-9")
-        self.assertIn("studio-1", said)
-        self.assertIn("laptop-9 is none of them", said)
 
 
 class Ran(RunCase):
@@ -231,7 +82,6 @@ class Ran(RunCase):
         self.assertIn("exit status 1", self.said())
 
     def test_a_mac_of_the_fleet_is_named_in_the_answer(self):
-        self.mac("studio-1")
         self.raise_item(run_on="studio-1", todo=f"On studio-1, run:\n\n```\n{COMMAND}\n```")
         self.assertEqual(self.run_answer(nid=2)[0], 200)
         self.assertEqual(self.row(2)["answer"], "Ran it on studio-1")

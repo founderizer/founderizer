@@ -1190,7 +1190,7 @@ class DoorCalls(Access):
         status, answer = self.request("/door/approvals", source=DOOR)
         self.assertEqual((status, answer["approvals"]), (200, [{"need": nid, "statement": yes, "signature": "c2ln"}]))
         plain = hub.t_raise_needs_you("manager", {"title": "Which name", "why": "The owner names it",
-                                                  "what_to_do": "Answer with a name"})
+                                                  "what_to_do": "Answer with a name", "reason": "person"})
         status, answer = self.owner(f"/ui/needs/{int(plain.split('N-')[1].split('.')[0])}", answer="Yes",
                                     statement=yes, signature="c2ln")
         self.assertEqual((status, answer.get("error")), (400, "this Needs-you item names no door call"))
@@ -1232,7 +1232,7 @@ class DoorCalls(Access):
         self.assertIsNone(raised("ls /opt\n", "T-999999")["door_task"])     # and no task that is not there
         # a card that is not the door's card of a run has none
         plain = hub.t_raise_needs_you("manager", {"title": "Choose the plan", "why": "Two plans fit.",
-                                                  "what_to_do": "Say which one"})
+                                                  "what_to_do": "Say which one", "reason": "money"})
         self.assertIsNone(hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?",
                                                (int(plain.split("N-")[1].split(".")[0]),)))["door_task"])
         self.assertEqual(hub.need_title({"title": "Choose the plan"}), "Choose the plan")
@@ -1432,7 +1432,7 @@ class DoorCalls(Access):
         self.assertEqual(self.owner(f"/ui/needs/{free}", answer="Keep it")[0], 200)
         # an item that is no door card takes the same words as any answer
         plain = int(hub.t_raise_needs_you("manager", {"title": "Which mode?", "why": "One of two.",
-                                                      "what_to_do": "Pick one",
+                                                      "what_to_do": "Pick one", "reason": "person",
                                                       "options": ["Run it once", "Full access on web-1"]}
                                           ).split("N-")[1].split(".")[0])
         self.assertEqual(self.owner(f"/ui/needs/{plain}", answer="Run it once")[0], 200)
@@ -2109,7 +2109,7 @@ class PhoneYes(Devices):
         item = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
         self.assertEqual(item["door_fleet"], self.fleet)
         plain = hub.t_raise_needs_you("manager", {"title": "Which name", "why": "The owner names it",
-                                                  "what_to_do": "Answer with a name"})
+                                                  "what_to_do": "Answer with a name", "reason": "person"})
         item = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (int(plain.split("N-")[1].split(".")[0]),)))
         self.assertIsNone(item["door_fleet"])
 

@@ -115,7 +115,7 @@ class Asks(OwnerAPI):
                             "ask is the owner's message that this work comes from" in said, said)
         # the owner's answer to a Needs-you item is no message that work is filed under
         self.ok("manager", "raise_needs_you", {"title": "Which colour?", "why": "Only he chose the brand",
-                                               "what_to_do": "Say blue or green"})
+                                               "what_to_do": "Say blue or green", "reason": "person"})
         need = hub.q1("SELECT id FROM needs ORDER BY id DESC LIMIT 1")["id"]
         answer = self.command(answer="Blue")
         self.assertEqual(self.request(f"/ui/needs/{need}", answer)[0], 200)
@@ -235,7 +235,7 @@ class Asks(OwnerAPI):
         message = self.says()
         task, _ = self.create(ask=f"M-{message['event_id']}", asked="Move the images")
         self.ok("manager", "raise_needs_you", {"title": "Which colour?", "why": "Only he chose the brand",
-                                               "what_to_do": "Say blue or green", "ask": hub.tref(task["id"])})
+                                               "what_to_do": "Say blue or green", "reason": "person", "ask": hub.tref(task["id"])})
         need = hub.q1("SELECT id FROM needs ORDER BY id DESC LIMIT 1")["id"]
         answer = self.command(answer="Blue")
         self.assertEqual(self.request(f"/ui/needs/{need}", answer)[0], 200)
@@ -308,7 +308,7 @@ class Asks(OwnerAPI):
         ref = f"M-{message['event_id']}"
         task, _ = self.create(ask=ref, asked="Move the images")
         plain, _ = self.create()
-        item = {"title": "Which colour?", "why": "Only he chose the brand", "what_to_do": "Say blue or green"}
+        item = {"title": "Which colour?", "why": "Only he chose the brand", "what_to_do": "Say blue or green", "reason": "person"}
 
         def raised(**more):
             self.ok("manager", "raise_needs_you", dict(item, **more))
@@ -337,7 +337,7 @@ class Asks(OwnerAPI):
         message = self.says()
         task, _ = self.create(ask=f"M-{message['event_id']}", asked="Move the images")
         self.ok("manager", "raise_needs_you", {"title": "Which colour?", "why": "Only he chose the brand",
-                                               "what_to_do": "Say blue or green", "ask": hub.tref(task["id"])})
+                                               "what_to_do": "Say blue or green", "reason": "person", "ask": hub.tref(task["id"])})
         code, state = self.request()
         self.assertEqual(code, 200)
         self.assertIn("asks", state["ui_features"])

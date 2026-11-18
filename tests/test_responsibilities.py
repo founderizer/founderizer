@@ -205,7 +205,8 @@ class Duties(Base):
         r = data["responsibility"]
         self.assertEqual(set(r), {"id", "agent", "title", "text", "state", "revision", "created", "updated",
                                   "created_by", "request_id", "watch", "open_cases", "cases_30d", "repeats_30d",
-                                  "cases_prev_30d", "repeats_prev_30d", "last_case", "cases", "joined", "marker"})
+                                  "cases_prev_30d", "repeats_prev_30d", "last_case", "cases", "joined", "marker",
+                                  "recent"})
         self.assertEqual((r["agent"], r["state"], r["revision"], r["created_by"]), ("vps", "active", 1, "manager"))
         self.assertEqual((r["open_cases"], r["cases_30d"], r["repeats_30d"], r["last_case"], r["marker"]),
                          (0, 0, 0, None, None))

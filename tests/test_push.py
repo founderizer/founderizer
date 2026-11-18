@@ -90,7 +90,7 @@ class PushCase(Devices):
 
     def raise_item(self, title="Pay for the domain?", **extra):
         return int(hub.t_raise_needs_you("manager", dict({"title": title, "why": "The card is the owner's",
-                                                          "what_to_do": "Press one"}, **extra))
+                                                          "what_to_do": "Press one", "reason": "person"}, **extra))
                    .split("N-", 1)[1].split(".", 1)[0])
 
     def pings(self):

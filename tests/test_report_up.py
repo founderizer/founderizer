@@ -713,7 +713,8 @@ class Bugs(Base):
         self.assertIn("raise it again without naming", text)
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], 0)
         text, err = self.tool("manager", "raise_needs_you", title="A Stripe account",
-                              why="the shop takes no money yet", what_to_do="open one")
+                              why="the shop takes no money yet", what_to_do="open one",
+                              reason="access", needs_access="a Stripe account")
         self.assertFalse(err, text)                     # genuinely new: it reaches the owner as before
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], 1)
 

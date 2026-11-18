@@ -2448,7 +2448,8 @@ class JoinLineStops(unittest.TestCase):
 
     CODE = "ABCD-EFGH-JKLM"
     ADDRESS = "100.64.0.9"
-    APP = Path(hub.__file__).with_name("app")
+    APP = Path(hub.__file__).with_name("app")       # the apps' folder, which the published repository never has
+    NO_APP = "the apps' folder app/ is not in this tree (the published repository has none)"
 
     def line(self, kind="linux", tags=("tag:fleet",)):
         with patch.object(hub, "hub_address", lambda: (self.ADDRESS, 8765)):
@@ -2499,6 +2500,7 @@ class JoinLineStops(unittest.TestCase):
             self.assertEqual((status, out.splitlines(), err), (3, [f"ran with {self.CODE}", "end of the input"], ""),
                              shell)
 
+    @unittest.skipUnless(APP.is_dir(), NO_APP)
     def test_a_macs_line_keeps_the_one_shape_that_the_macs_installer_takes(self):
         """The Mac's installer runs only a line of one shape (setup.sh `join`; `MacInstallerLink` in the app), and it
         refuses every other: a Mac's line that took the VPS's stop would end every Mac's link. (The VPS line's words
@@ -2507,6 +2509,7 @@ class JoinLineStops(unittest.TestCase):
         self.assertIsNotNone(shape)
         self.assertRegex(self.line(kind="mac", tags=None), shape[1])
 
+    @unittest.skipUnless(APP.is_dir(), NO_APP)
     def test_the_sentence_is_one_that_the_app_tries_again_after(self):
         """The app reads a stop by its mark (`InstallPlan.stopMarks`) as `installer_stopped`, and by the rows of
         `InstallCause` as `hub_no_answer`, which `InstallRetry` tries again for a join: the sentence must carry both,
