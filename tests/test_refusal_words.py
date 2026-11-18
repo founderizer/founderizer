@@ -99,7 +99,8 @@ OLD = {
 # (an `ast` search of every route of the owner API) and the seven reads of the phone that it did not list. A place
 # keeps its code: a place that moves to another code, or loses it, fails here. A lane may add codes to these functions.
 SITES = {
-    'add_server_agent': {'no_such_server': 1, 'server_no_service': 1, 'server_silent': 1, 'team_changed': 1},
+    'add_server_agent': {'team_changed': 1},
+    'add_server_refusal': {'no_such_server': 1, 'server_no_service': 1, 'server_silent': 1},
     'answer_secret': {'command_reused_message': 1, 'request_answered': 1, 'request_unknown_ended': 1},
     'attachment_check': {'login_as_file': 1},
     'command_run': {'command_interrupted': 1, 'command_reused': 1, 'hub_changed_sending': 1, 'login_as_text': 1},

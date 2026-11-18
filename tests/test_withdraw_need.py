@@ -136,7 +136,7 @@ class Withdraw(OwnerAPI):
         with open("rules/manager.md") as f:     # the manager's start names the brief's rules file; the brief stays short
             rules = f.read()
         self.assertIn("close it at once with `withdraw_need`", rules)
-        self.assertIn("The manager has twenty-five of its own", rules)    # door_rollout, ..., door_fleet, switch_key_site
+        self.assertIn("The manager has twenty-six of its own", rules)    # ..., door_fleet, switch_key_site, change_team
 
     def test_the_answer_of_a_raise_names_it(self):
         said = hub.t_raise_needs_you("manager", {"title": "Revoke the old shared key?", "why": "The new keys work.",

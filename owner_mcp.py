@@ -3148,10 +3148,11 @@ def tools():
         tool("answer_needs_you", "Answer one Needs-you item: the words, or choice, the index of one option the item "
                                  "offers, or choices, the indexes of the options it lets the owner tick together "
                                  "(its multi). Words that ask something back are an answer too: the item closes, "
-                                 "and the manager replies with a new item. attachments: at most four ids from "
-                                 "attach_file. They go with an answer in words, or alone, as in the Founderizer "
-                                 "app. A choice or choices carries no file. An item whose answer goes into a "
-                                 "conversation takes none.",
+                                 "and the manager replies with a new item. A yes of a team card (the manager's plan) "
+                                 "changes the team: it adds or removes an agent, or changes a profile, the reporting "
+                                 "lines or an owner file. attachments: at most four ids from attach_file. They go "
+                                 "with an answer in words, or alone, as in the Founderizer app. A choice or choices "
+                                 "carries no file. An item whose answer goes into a conversation takes none.",
              {"need": S["int"], "answer": S["text"], "choice": S["int"],
               "choices": {"type": "array", "items": {"type": "integer"}},
               "attachments": {"type": "array", "items": {"type": "integer"}}, **rid}, ("need",), answer_need),

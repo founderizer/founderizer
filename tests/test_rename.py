@@ -473,7 +473,8 @@ class Columns(unittest.TestCase):
         "name_told:": "a machine", "owner_pin:": "a machine", "park_ended:": "a reminder",
         "row_floor:": "a table", "screen_frozen:": "a task", "screen_limit:": "a task", "screen_question:": "a task",
         "screen_restart:": "a task", "standing_told:": "a conversation", "start_failed:": "a task",
-        "stuck_notice:": "a task", "turn_ack:": "a task", "turn_checked:": "a task", "turn_empty:": "a task"}
+        "stuck_notice:": "a task", "team_plan:": "a team card (a Needs-you item)", "team_plan_job:": "a server job",
+        "turn_ack:": "a task", "turn_checked:": "a task", "turn_empty:": "a task"}
 
     def test_every_column_that_can_hold_an_agent_is_placed(self):
         kept = hub.DB

@@ -242,7 +242,9 @@ MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "an
                                # AUTONOMY.md P8: the one changer of the agents with no lead
                                "set_agent_model",
                                # the owner, 5 November 2026: the summary of each knowledge file
-                               "summarize_knowledge"]
+                               "summarize_knowledge",
+                               # the owner, 17 November 2026: a plan of team changes, which the owner's press makes
+                               "change_team"]
 WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "ask_my_requester",
                               "deliver_result", "sign_in", "hand_over", "resolve_outcome", "see_earlier_work",
                               "report_up",

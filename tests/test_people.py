@@ -332,7 +332,8 @@ class Conversations(People):
     def test_the_window_has_the_tools_of_the_role_and_nothing_else(self):
         self.assertEqual([t["name"] for t in hub.tools_for("studio", self.context)],
                          ["read_messages", "reply", "ask_owner", "request_work", "remind"])
-        # studio's Shell box is off (DevOps D5), so its owner chat has F1's list: no way to an agent, to work or a key
+        # studio's Shell box is off (DevOps D5), so its owner chat has F1's list: no way to work or a key, and
+        # message_agent to its reporting line alone
         self.assertEqual({t["name"] for t in hub.tools_for("studio", ("test-generation", "owner-chat", "1"))},
                          set(hub.SHELL_OFF_CHAT))
         self.assertEqual([t["name"] for t in hub.tools_for("studio", None) if t["name"] in hub.CONVERSATION_ONLY], [])
