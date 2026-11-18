@@ -1716,6 +1716,10 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # owner's Mac sets from its own language and account (UI-API.md 1.200)
                "error_reports",     # the owner, 16 November 2026 ("Yes, as drawn"): Settings › General › Error
                                     # reports, GET and POST /ui/error-reports, off until he turns it on
+               "jobs",              # the owner, 18 November 2026 ("Yes, build it" to the picture of the Tasks page
+                                    # with one card for each job): tasks[].job, the task whose job a task joins,
+                                    # tasks[].job_name, the name of a job on its first task, and tasks[].plain, a
+                                    # result in plain words, of GET /ui/state
                "code_over_hub_port"]    # the owner, 16 November 2026 ("Yes, build it" to the plan install-auto-repair,
                                     # part 2): the fleet's code over the hub's own port, git's smart HTTP protocol at
                                     # /code/<repo>/..., which join.sh takes when port 9418 does not answer (UI-API.md
@@ -4355,7 +4359,12 @@ def migrate():
                   "scope_person": "INTEGER",
                   # owner feature asks: the owner's own message that this task comes from, as its request UUID
                   # (ui_requests.request_id), written when the task is born and never changed (task_ask)
-                  "ask": "TEXT"},
+                  "ask": "TEXT",
+                  # owner feature jobs: a job is one piece of work, which the owner reads as one card with its tasks
+                  # inside. `job` is the task whose job this task joins (create_task job), written when the task is
+                  # born and never changed; `job_name` is the name of the whole job, on its first task only; `plain`
+                  # is what came of the task, in plain words for the owner (deliver_result plain)
+                  "job": "INTEGER", "job_name": "TEXT", "plain": "TEXT"},
         # manager_as_lead: which step of the plan next_step came from, so a split step whose parts have all ended
         # counts as no next step, exactly as a single ended task does.
         "goals": {"next_step_id": "INTEGER"},
@@ -8502,13 +8511,14 @@ def deliver_result(agent, a, files_said=None):
     tried = None if tried in (None, "") else goal_text_or_error(tried, "tried", MEMORY_TEXT)
     topic = None if a.get("about") in (None, "") else memory_tag(a["about"])
     note = str(a.get("note") or "").strip()             # the last progress note (plan P9.4)
+    plain = plain_result(a)                             # owner feature jobs: what came of it, for the owner's card
     if outcome not in ("completed", "failed", "rejected"):
         raise ToolError("outcome must be completed, failed or rejected.")
     if not what:
         raise ToolError("Say what was done (or, for failed or rejected, the reason).")
     if outcome == "completed" and (not where or not how):
         raise ToolError("A completed result needs where_output_is and how_checked.")
-    guard(agent, what, where, how, learned or "", prevents or "", tried or "", note, topic or "")
+    guard(agent, what, where, how, learned or "", prevents or "", tried or "", note, topic or "", plain or "")
     fence(agent, tid)                   # again here: a cancel or a Stop can land while the helper sends the files
     t = get_task(tid, owner=agent)
     if t["state"] in TERMINAL:
@@ -8539,8 +8549,8 @@ def deliver_result(agent, a, files_said=None):
         return t
     if note:
         ins("INSERT INTO notes(task,agent,ts,text) VALUES(?,?,?,?)", (tid, agent, now(), note))
-    q("UPDATE tasks SET state=?, outcome=?, what=?, where_=?, how=?, delivered=?, waiting_on=NULL WHERE id=?",
-      (outcome, outcome, what, where, how, now(), tid))
+    q("UPDATE tasks SET state=?, outcome=?, what=?, where_=?, how=?, plain=?, delivered=?, waiting_on=NULL WHERE id=?",
+      (outcome, outcome, what, where, how, plain, now(), tid))
     unfile_notices(tid)
     end_waits(tid)
     q("UPDATE attempts SET ended=? WHERE task=? AND attempt=?", (now(), tid, t["attempt"]))
@@ -8921,17 +8931,21 @@ def ask_message(agent, ref):
     return row
 
 
-def task_ask(agent, a, follows, parent, goal_id=None):
+def task_ask(agent, a, follows, parent, goal_id=None, job=None):
     """(the ask of a new task, the name that the task gives that ask or None), or a ToolError. The caller names the
-    owner's message with `ask`, and with `asked` when it is the first task of that message. Without `ask`, the task
-    takes the ask of the task that it follows, or else of the task that it is a subtask of, or else of its goal's
-    first task that has one: so a follow-up, a lead's subtask and a later task of a goal need no field. A lead's one
-    task for its team's results has no ask, and gives none."""
+    owner's message with `ask`, and with `asked` when it is the first task of that message. Without `ask`, a task
+    with a job has the ask of that job's task, also when that is none (owner feature jobs: a task is on the card of its
+    job). Any other task takes the ask of the task that it follows, or else of the task that it is a subtask of, or
+    else of its goal's first task that has one: so a further part of a job, a follow-up, a lead's subtask and a later
+    task of a goal need no field. A lead's one task for its team's results has no ask, and gives none."""
     ref, name = a.get("ask"), " ".join(str(a.get("asked") or "").split())
     if ref in (None, ""):
         if name:
             raise ToolError("asked names what the owner asked for in the message that ask gives: give ask too, the "
                             "M-<n> of that message.")
+        if job:         # a task has the ask of its job, also when that is none: it is on the card of its job
+            row = q1("SELECT ask FROM tasks WHERE id=?", (job,))
+            return (row["ask"] if row else None), None
         for source in (follows, parent):
             row = q1("SELECT ask FROM tasks WHERE id=?", (source,)) if source else None
             if row and row["ask"]:
@@ -9003,6 +9017,97 @@ def ask_missed(agent, tid):
             f"their apps show it as one thing.")
 
 
+# ---------------------------------------------------------------- jobs (owner feature jobs)
+#
+# A job is one piece of work with a start, an end and a result: what the owner asked for in a message, what an agent
+# found in a duty (a ticket, an incident), or what an agent started itself. The owner's apps show one card for each
+# job, with its tasks inside (the owner, 18 November 2026: "I dont really want to see the detailed tasks being
+# performed by each agent ... a higher level ... do not confuse this with DUTIES, we need to define the concepts
+# properly", and "Job" for its name). A duty is standing work that makes jobs; a task is one step of one agent in a
+# job. The hub keeps no row for a job: a job is the tasks that their links make one piece of work, as an ask is. The
+# tasks of one ask are one job, and so are the tasks of one case; every other task is in the job of the task that it
+# names in `job`, or else of the task that it follows; a task with neither begins a job, under its job_name or else
+# its title. The apps read where a job stands from its tasks, with the rules of their Tasks page.
+#
+# `job` is written when the task is born, and by the hub itself for the two links that say "one piece of work" with
+# no word of the agent's: a later part of one step of a plan names the step's first part, and a lead's subtask names
+# the task of the lead's session. `parent` alone is no such link: the hub files the wake-ups, the reviews and the
+# conversation work of a whole team under the lead's one task for its team's results (lead_batch_rows), and those are
+# not one piece of work. A task is in one job, so `job` goes with no `ask` and no `case_id` of the task's own, and
+# the task takes the ask of its job before the ask of the task that it follows.
+TITLE_CHARS = 80                # characters of a title that an agent gives a task: one line of a card of that page,
+#                                 with room for a language whose words are longer than the English ones
+PLAIN_CHARS = 280               # characters of a result in plain words: three lines of a card of that page
+
+
+def title_words(title, field="title"):
+    """What is wrong with a title that the owner reads on a card of their Tasks page, or None: one short line with no
+    code, as the name of an ask is (asked_words). The hub cannot tell whether words are plain, so the tool's own
+    description asks for that; it can count, and it knows its own codes."""
+    if len(title) > TITLE_CHARS:
+        return (f"{field} is at most {TITLE_CHARS} characters: the owner reads it on their Tasks page, so say the "
+                f"work in a few plain words, and put each exact name, version and step in details. This one has "
+                f"{len(title)}.")
+    if any(ord(c) < 32 or ord(c) == 127 for c in title):
+        return f"{field} is one line of plain text."
+    code = NEED_CODES.search(title)
+    if code:
+        return (f"Say {code.group(0)} in plain words in {field}: the owner reads what a thing is about, never a "
+                f"code of the fleet. The code can stand in details. If {code.group(0)} is a name that the owner "
+                f"knows and no code of the fleet, write it in another form, for example with no hyphen.")
+    return None
+
+
+JOB_NAME_UNUSED = " job_name was not used: this task is part of a job that has its name already."
+
+
+def task_job(agent, a, follows, parent, step, case_id):
+    """create_task's `job`: (the task whose job the new task joins or None, whether the agent named it), or a
+    ToolError. With no `job` of the agent's, the hub writes the two links that say "one piece of work" by themselves:
+    a later part of one step of a plan joins the step's first part that nobody canceled, and a lead's subtask joins
+    the task of the lead's session. Not for a task with an ask or a case of its own, or one that follows another: it
+    is in that job already, and a task is in one job. And not for a subtask of the lead's one task for its team's
+    results (lead_batch_rows), under which the hub files work that is no part of one thing."""
+    ref, own_ask = a.get("job"), a.get("ask") not in (None, "")
+    if ref not in (None, "", 0, "0"):
+        job = parse_task(ref)
+        first = q1("SELECT ask FROM tasks WHERE id=?", (job,))
+        if not first:
+            raise ToolError(f"There is no task {tref(job)} whose job this task could join.")
+        # The ask of the job's own task is no second piece of work: the manager may name both, as its rules for an
+        # ask and for a job each ask.
+        if case_id or (own_ask and ask_message(agent, a["ask"])["request_id"] != first["ask"]):
+            other = "case_id" if case_id else "ask"
+            raise ToolError(f"A task is in one job. With job, leave out {other}: the task is then part of the job "
+                            f"of {tref(job)}, and takes its ask. Or leave out job: the task is then part of the "
+                            f"work that {other} names.")
+        return job, True
+    # A task with an ask or a case of its own is in that job, and one that follows a task is in that task's job: the
+    # hub writes no second link beside them.
+    if own_ask or case_id or follows:
+        return None, False
+    if step is not None:
+        first = q1("SELECT id FROM tasks WHERE step=? AND state<>'canceled' ORDER BY id LIMIT 1", (step,))
+        return (first["id"] if first else None), False
+    if parent is not None and kv_get(f"lead_batch:{agent}") != str(parent):
+        return parent, False
+    return None, False
+
+
+def plain_result(a):
+    """deliver_result's `plain`: what came of the task in plain words for the owner, on one line, or None. A result
+    is never refused for its length (rule 2: tasks end cleanly): longer words are cut at a word, and words with no
+    place for a cut (one run of characters, which could hold a login: cut_whole) are left out."""
+    plain = " ".join(str(a.get("plain") or "").split())
+    if len(plain) <= PLAIN_CHARS:
+        return plain or None
+    cut = cut_whole(plain, PLAIN_CHARS - 3)
+    if cut and not plain[len(cut)].isspace() and " " in cut:     # the cut fell in a word: that word goes
+        cut = cut.rsplit(" ", 1)[0]
+    cut = cut.rstrip()
+    return cut + "..." if cut else None
+
+
 def need_ask(agent, ref):
     """raise_needs_you's `ask`: the ask whose work waits for the owner's answer to the item, as its request UUID, or
     None. T-<id> names a task of that work, which is what the manager has at hand, and M-<n> the owner's message
@@ -9061,9 +9166,11 @@ def check_task(agent, a, by_goal=False):
         raise ToolError(f"There is no task {tref(follows)} to follow.")
     if len(why) > 300:
         raise ToolError("why is at most 300 characters.")
+    job_name = " ".join(str(a.get("job_name") or "").split())
+    job, named = task_job(agent, a, follows, parent, step, a.get("case_id"))    # owner feature jobs
     # owner feature asks. The goal gives its ask to a task that hangs on no other: a lead's subtask has its task's.
-    ask, asked = task_ask(agent, a, follows, parent, goal_id if by_goal and parent is None else None)
-    guard(agent, title, done_when, details, goal, why, asked or "")
+    ask, asked = task_ask(agent, a, follows, parent, goal_id if by_goal and parent is None else None, job)
+    guard(agent, title, done_when, details, goal, why, asked or "", job_name)
     case_id, duty_case = a.get("case_id"), None
     if case_id and CASE_REF.match(str(case_id)):
         # A duty's case: the manager gives a case's work to the agent that suits it and keeps the case (RULES.md),
@@ -9081,11 +9188,21 @@ def check_task(agent, a, by_goal=False):
         case_id = None
     elif case_id and not q1("SELECT id FROM cases WHERE id=?", (case_id,)):
         raise ToolError("Unknown case_id. Give a duty's case as R-<id>/C-<id>, or the practice case the owner named.")
+    # owner feature jobs. A task that is in a job already begins none, so the name of one has no place on it: the
+    # hub leaves it out and says so, and refuses nothing for it. Only a name that is kept is read on a card.
+    job_note = ""
+    if job_name and (job is not None or follows or parent or ask or duty_case):
+        job_name, job_note = "", JOB_NAME_UNUSED
+    if job_name:
+        wrong = title_words(job_name, "job_name")
+        if wrong:
+            raise ToolError(wrong)
     return {"owner": owner, "title": title, "details": details, "done_when": done_when, "needs": needs, "goal": goal,
             "goal_id": goal_id, "parent": parent, "step": step, "follows": follows, "case_id": case_id,
             "duty_case": duty_case["id"] if duty_case else None,
             "responsibility": duty_case["responsibility"] if duty_case else None, "why": why or None,
-            "ask": ask, "asked": asked}
+            "ask": ask, "asked": asked, "job": job, "job_name": job_name or None, "job_note": job_note,
+            "job_named": named}
 
 
 def split_step(agent, value, goal_id, parent):
@@ -9125,11 +9242,11 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
     t0 = now()
     tid = DB.execute("INSERT INTO tasks(id,title,details,done_when,needs,goal,goal_id,parent,step,owner,requester,"
                      "state,follows,created,last_activity,case_id,trigger_id,trigger_run,why,responsibility,duty_case,"
-                     "ask) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     "ask,job,job_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                      (unused_id("tasks"), f["title"], f["details"], f["done_when"], f["needs"], f["goal"], f["goal_id"],
                       f["parent"], f.get("step"), f["owner"], requester, "submitted", f["follows"], t0, t0,
                       f["case_id"], trigger_id, trigger_run, f.get("why"), f.get("responsibility"),
-                      f.get("duty_case"), f.get("ask"))).lastrowid
+                      f.get("duty_case"), f.get("ask"), f.get("job"), f.get("job_name"))).lastrowid
     if f.get("ask") and f.get("asked"):         # owner feature asks: the first task of a message names the ask
         ask_name_row(f["ask"], f["asked"])
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,1,?,'created')", (tid, t0))
@@ -9150,6 +9267,11 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
 
 
 def t_create_task(agent, a):
+    # owner feature jobs: the owner reads this title on a card. Only here: the title of a wake-up rule's task is the
+    # rule's own, saved before, and a refusal there would stop each run of the rule.
+    wrong = title_words(str(a.get("title") or "").strip())
+    if wrong:
+        raise ToolError(wrong)
     f = check_task(agent, a, by_goal=True)
     with transaction():             # the task, its first attempt and its start event: all three or none
         tid = admit_task(agent, f)
@@ -9188,9 +9310,11 @@ def t_create_task(agent, a):
                 "one of them is open.")
     if f.get("ask"):
         said += ask_said(f["ask"])
-    elif role_of(agent) == "manager" and not f.get("duty_case") and not f.get("follows"):
-        said += ask_missed(agent, tid)
-    return said + late
+    elif role_of(agent) == "manager" and not f.get("duty_case") and not f.get("follows") and f.get("job") is None:
+        said += ask_missed(agent, tid)      # not after a part of a job: the job has its ask, or is no message's work
+    if f.get("job_named"):              # owner feature jobs. Not that task's title: it can be another team's task
+        said += f" It is part of the same job as {tref(f['job'])}: the owner reads them as one card."
+    return said + f.get("job_note", "") + late
 
 
 def t_cancel_task(agent, a):
@@ -18066,7 +18190,8 @@ def removed_words_rows(tids):
     in_transaction("removed_words_rows")
     marks = ",".join("?" * len(tids))
     DB.execute(f"UPDATE tasks SET title=?, details=?, done_when=?, why=CASE WHEN why IS NULL THEN NULL ELSE ? END, "
-               f"what=CASE WHEN what IS NULL THEN NULL ELSE ? END, where_=NULL, how=NULL, check_note=NULL "
+               f"what=CASE WHEN what IS NULL THEN NULL ELSE ? END, where_=NULL, how=NULL, check_note=NULL, "
+               f"plain=NULL, job_name=NULL "       # owner feature jobs: the words of a result and of a job's name
                f"WHERE id IN ({marks})", (REMOVED_TITLE, REMOVED_WORDS, REMOVED_WORDS, REMOVED_WORDS, REMOVED_WORDS,
                                           *tids))
     DB.execute(f"UPDATE notes SET text=? WHERE task IN ({marks})", (REMOVED_WORDS, *tids))
@@ -33568,6 +33693,10 @@ TOOLS = [
      "with write_skill before you deliver.",
      S({"task_id": TASK_ID, "outcome": {"type": "string", "enum": ["completed", "failed", "rejected"]},
         "what_was_done": STR, "where_output_is": STR, "how_checked": STR,
+        "plain": {"type": "string", "description": "Give it: what is true now, for the owner, in one or two short "
+                  "sentences of plain words, with no code, path or version, for example \"The shop's servers have "
+                  "the security update. No customer saw a stop.\" The owner reads it on the card of this work on "
+                  f"their Tasks page. At most {PLAIN_CHARS} characters"},
         "note": {"type": "string", "description": "Your last progress note, if you have one: it is kept with the "
                  "task's notes, so no report_progress is needed just before this call."},
         "learned": {"type": "string", "description": "What this work showed you that your next sessions need, and "
@@ -33776,7 +33905,8 @@ TOOLS = [
      "its own task session, and its result comes back into this conversation as a line from Fleet. Tell the person "
      "that it started. With task and messages it opens nothing: the person's messages that you name go into the "
      "session of that open work, as their words. Their messages reach that work only so.",
-     S({"title": {"type": "string", "description": "One line: what the work is"},
+     S({"title": {"type": "string", "description": "One line: what the work is, in plain words with no code: "
+                                                   "the owner reads it on a card of their Tasks page"},
         "details": {"type": "string", "description": "What the work needs: what the person asked for and anything that "
                                                      "limits it"},
         "follows": {"type": "string", "description": "Your earlier finished task whose work this fixes, for example "
@@ -33800,6 +33930,13 @@ TOOLS = [
     ("manager", "create_task", t_create_task,
      "Give one agent a task. needs is none, browser or screen; the hub refuses an agent that lacks it. "
      "Use follows to point at an earlier task whose result this one builds on or fixes. "
+     "THE OWNER READS THE TITLE on their Tasks page: say the work in a few plain words that a person outside it "
+     f"understands, at most {TITLE_CHARS} characters, with no code; each exact name, version and step goes in "
+     "details. Every task is part of one job, which the owner reads as one card with its tasks inside. A task with "
+     "ask, case_id or follows is in that job already, and so is a subtask of your own task and a part of a step of "
+     "a plan. When the work is there already and the new task is a further part of it, and no fix of a finished "
+     "task, give job=T-<id>, a task of that work, and no ask and no case_id. A task with none of these begins a "
+     "job, under job_name or else under its title. "
      "Set goal to G-<id> to link the task to an owner goal; the hub refuses a goal that is not active. "
      "WHAT ITS AGENT SEES: title, done_when, details, what the task it follows did, and -- only when goal is a "
      "G-<id> -- that goal's own words, its plan step and its limits, at the start of its session. It does not "
@@ -33824,6 +33961,13 @@ TOOLS = [
                                                      "agent. Use that exact value on every task of it; close_case "
                                                      "ends the case"},
         "follows": {"type": "string", "description": "Earlier task id, for example T-3"},
+        "job": {"type": "string", "description": "T-<id> of any task of the job that this task is a further part "
+                                                 "of: the owner's apps then show them as one card, and the task "
+                                                 "takes that job's ask. With it, give no ask and no case_id"},
+        "job_name": {"type": "string", "description": "Only on a task that begins a job, when its title names only "
+                                                      "the first step: the whole work in a few plain words, at most "
+                                                      f"{TITLE_CHARS} characters, with no code, for example "
+                                                      "\"Install the security update on the shop's servers\""},
         "step": {"type": "integer", "description": "The number of the step of goal's plan that this task is one "
                                                    "part of, when one piece of work is split across agents"},
         "why": {"type": "string", "description": "One line, at most 300 characters: why this agent suits the task "
@@ -34328,7 +34472,8 @@ TOOLS = [
         "responsibility": {"type": "string", "description": "Responsibility id, for example R-1"},
         "key": {"type": "string", "description": "The name of the event, which makes it one thing: a thread, an "
                                                  "alert fingerprint, an order number"},
-        "title": {"type": "string", "description": "What happened, in one line"},
+        "title": {"type": "string", "description": "What happened, in one line of plain words with no code: the "
+                                                   "owner reads it as the name of this work on their Tasks page"},
         "repeat": {"type": "boolean", "description": "True only when the event itself came back after its case "
                                                      "closed: the new case is marked a repeat"}, "task_id": TASK_ID},
        ["request_id", "responsibility", "key", "title"])),
@@ -34783,9 +34928,9 @@ TOOLS = [
         "asked": {"type": "string", "description": "Give it: the thing to be done, as a short verb phrase of at "
                                                    "most 40 characters, for example \"Check the disk of the shop's "
                                                    "server\", with no code and no agent's name. The owner reads it "
-                                                   "as the name of this work in their apps; the title is for the "
-                                                   "task's own session. Without it, the hub makes the name from "
-                                                   "the title"}},
+                                                   "as the name of this work in their apps, and the title inside "
+                                                   "it, so write the title in plain words too. Without it, the hub "
+                                                   "makes the name from the title"}},
        ["title", "done_when", "in_reply_to"])),
     ("all", "message_agent", t_message_agent,
      "Send a message to another agent: a question, an answer or coordination. It has your authority, never the "
@@ -41680,6 +41825,7 @@ def validate_status(data):
                                               ("ssh_keys_only", _optional(sec.get("ssh_keys_only"), bool)),
                                               ("npm_rule", _optional(sec.get("npm_rule"), bool)),
                                               ("memory_guard", _optional(sec.get("memory_guard"), bool)),
+                                              ("restart_guard", _optional(sec.get("restart_guard"), bool)),
                                               ("upgraded_at", upgraded),
                                               ("macos_update", macos_update_status(sec.get("macos_update"))))
                             if k in sec}},
@@ -44449,17 +44595,18 @@ MENDED_WORDS = ("The owner's Mac puts this right by itself: while the Founderize
                 "hardening again on this server, as root. Take no step for it and raise no Needs-you item: if it still "
                 "stands in 3 days, the hub tells you again.")
 MENDED_LATE = ("The owner's Mac has not put it right: it does so only while the Founderizer app runs there, and it "
-               "stops after six tries. Raise one Needs-you item that says this in plain words, with no step by hand in "
-               "it: this server is a fleet machine, where agents run, and no agent holds it through the door.")
+               "stops after six tries. Tell the owner once with message_owner, in plain words and with no step by "
+               "hand, and raise no Needs-you item: this server is a fleet machine, where agents run, and the owner's "
+               "Mac is what puts its SSH and npm right, because the door's forms there do not change them.")
 # The same two messages for the hub's own server, which no join hardened: until release 2026.11.441 the hub's installer
 # did not harden it at all, and the owner's Mac gives it what every server of the fleet gets.
 MENDED_WORDS_HUB = ("The owner's Mac puts this right by itself: while the Founderizer app runs there, it gives the hub's "
                     "own server the hardening of every fleet server, as root. Take no step for it and raise no Needs-you "
                     "item: if it still stands in 3 days, the hub tells you again.")
 MENDED_LATE_HUB = ("The owner's Mac has not put it right: it does so only while the Founderizer app runs there, and it "
-                   "stops after six tries. Raise one Needs-you item that says this in plain words, with no step by "
-                   "hand in it: this is the hub's own server, where the hub runs, and the owner's Mac is what puts its "
-                   "SSH and npm right.")
+                   "stops after six tries. Tell the owner once with message_owner, in plain words and with no step by "
+                   "hand, and raise no Needs-you item: this is the hub's own server, where the hub runs, and the "
+                   "owner's Mac is what puts its SSH and npm right.")
 WATCH = {"at": 0.0}
 WATCH_WORDS = {                 # what stopped holding, and what holds again
     "quiet": ("it has sent no reading for 30 minutes", "it sends its readings again"),
@@ -63400,7 +63547,8 @@ def rpc(agent, m, headers, context=None, credential=None):
 def leak_scan():
     """Look for any registered login in everything the hub has stored."""
     found = []
-    tables = {"tasks": ("title", "details", "done_when", "goal", "what", "where_", "how", "check_note"),
+    tables = {"tasks": ("title", "details", "done_when", "goal", "what", "where_", "how", "check_note", "job_name",
+                        "plain"),
               "notes": ("text",), "questions": ("text", "answer"), "prompts": ("input", "reason"),
               "rules": ("input",), "needs": ("title", "why", "todo", "answer"), "events": ("text", "extra"),
               "reminders": ("note", "ci"), "outbox": ("text",), "log": ("what",),

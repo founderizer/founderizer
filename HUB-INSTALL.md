@@ -271,7 +271,15 @@ notification of a Needs-you item, the chat that opens first), so with those apps
     kernel ends the largest process of an agent's session first (from the helper's start,
     each helper gives the sessions that it starts a higher score than the fleet's own
     services), and SSH and Tailscale, which are not in it, keep the rest, so the server
-    still takes a login. A server that has swap, or a limit of its own, keeps it. Each part
+    still takes a login. A server that has swap, or a limit of its own, keeps it. The server
+    also restarts by itself when it stops: 10 seconds after a kernel panic
+    (`/etc/sysctl.d/60-fleet-restart.conf`, `kernel.panic = 10`, where Ubuntu waits forever),
+    and when systemd stops for 10 minutes, by the kernel's software watchdog
+    (`/etc/systemd/system/fleet-watchdog.service` loads `softdog` at each start, because
+    Ubuntu keeps it from loading by itself, and `/etc/systemd/system.conf.d/00-fleet-watchdog.conf`
+    has systemd ping it). A server that sets `kernel.panic` or `RuntimeWatchdogSec` itself (in a
+    file, as a link at one of these files, or at its boot), or that has a watchdog of its own,
+    keeps that, and a container gets neither part. Each part
     says what it did, a part that cannot be done leaves the server as it was, and none of
     them stops the install. Until 14 November 2026 only the join had this step. A second
     claim (`--reclaim`) leaves it out.
@@ -509,7 +517,8 @@ the checkout and the service of an agent that was added since.
   ```
 
   `harden --check` says what the second would do. It prints one line for SSH, one for npm, one
-  for Tailscale, one for swap and one for the memory limit. A session that is open keeps going. Run them from an SSH session that logged
+  for Tailscale, one for swap, one for the memory limit, one for the restart after a kernel
+  panic and one for the watchdog. A session that is open keeps going. Run them from an SSH session that logged
   in with a key, or in the provider's console: from a session that logged in with a password, SSH
   keeps password login, and its line says so; where SSH takes keys only already, the line tells
   you to add a key of your own before you log out. To undo the SSH part: delete
@@ -517,7 +526,10 @@ the checkout and the service of an agent that was added since.
   memory limit: delete `/etc/systemd/system/user.slice.d/00-fleet-memory.conf`, then
   `systemctl daemon-reload`. To undo the swap file: `swapoff /swapfile`, delete `/swapfile`,
   its line in `/etc/fstab` and `/etc/sysctl.d/60-fleet-swap.conf`, then
-  `sysctl -w vm.swappiness=60`.
+  `sysctl -w vm.swappiness=60`. To undo the restart after a panic: delete
+  `/etc/sysctl.d/60-fleet-restart.conf`, then `sysctl -w kernel.panic=0`. To undo the
+  watchdog: `systemctl disable fleet-watchdog.service`, delete its file and
+  `/etc/systemd/system.conf.d/00-fleet-watchdog.conf`, then `systemctl daemon-reload`.
 - **The owner's Mac is lost, or it has a new address.** Run the line with `--reclaim`: it
   makes a new code, waits for the new Mac, and changes only `addresses.owner` and the key
   of the owner's Mac. The hub is away for the time of the claim; the part below says what

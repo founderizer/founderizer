@@ -356,9 +356,156 @@ class Asks(OwnerAPI):
         self.assertNotIn("asked", chat["start_task"]["inputSchema"].get("required", []))
 
 
+class Jobs(Asks):
+    """A job (owner feature jobs; the owner, 18 November 2026, of the Tasks page: "a higher level ... do not confuse
+    this with DUTIES", and "Job" for its name): the tasks that their links make one piece of work, which the owner's
+    apps show as one card with its tasks inside. The owner reads the title of each task and the plain words of each
+    result on that card."""
+
+    def test_a_further_part_of_work_names_its_job_and_takes_its_ask(self):
+        """Without the link, three tasks of one update are three cards. Without the ask, a further part of what the
+        owner asked for stands on a card of its own beside the card of its ask."""
+        first, _ = self.create(title="Find what uses the old version", job_name=" Install the\n security update ")
+        self.assertEqual((first["job"], first["job_name"]), (None, "Install the security update"))
+        second, said = self.create(owner="lead", title="Update the servers", job=hub.tref(first["id"]),
+                                   job_name="Another name")
+        self.assertEqual((second["job"], second["job_name"]), (first["id"], None))
+        self.assertIn(f"part of the same job as {hub.tref(first['id'])}: the owner reads them as one card", said)
+        self.assertNotIn("Find what uses", said)        # a task of another team can be named: its title stays there
+        self.assertIn("job_name was not used", said)
+        message = self.says()
+        asked, _ = self.create(ask=f"M-{message['event_id']}", asked="Move the shop")
+        part, said = self.create(job=hub.tref(asked["id"]))
+        self.assertEqual((part["job"], part["ask"]), (asked["id"], message["request_id"]))
+        self.assertIn("part of what the owner asked for", said)
+        # a job that is not there takes no task
+        count = hub.q1("SELECT COUNT(*) n FROM tasks")["n"]
+        self.assertIn("There is no task T-999", self.refused("manager", "create_task", {
+            "owner": "solo", "title": "Update the apps", "done_when": "Done.", "job": "T-999"}))
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM tasks")["n"], count)
+        # a fix of a finished task has follows, which is its job already: it begins none, so it names none. A name
+        # that the hub leaves out is not read on a card, so it is not refused for its words either
+        fix, said = self.create(follows=hub.tref(first["id"]), job_name="The fix of T-1 " + "x" * hub.TITLE_CHARS)
+        self.assertEqual((fix["job"], fix["job_name"]), (None, None))
+        self.assertIn("job_name was not used", said)
+        self.assertNotIn("same job as", said)
+
+    def test_a_task_is_in_one_job(self):
+        """The apps put a task on the card of its ask first, so a task with a job and an ask of its own, or a case of
+        its own, would stand on another card than the job that the hub's answer names."""
+        first, _ = self.create(title="Find what uses the old version")
+        message = self.says()
+        ref = f"M-{message['event_id']}"
+        asked, _ = self.create(ask=ref, asked="Move the shop")
+        count = hub.q1("SELECT COUNT(*) n FROM tasks")["n"]
+        fields = {"owner": "solo", "title": "Update the apps", "done_when": "Done."}
+        said = self.refused("manager", "create_task", dict(fields, job=hub.tref(first["id"]), ask=ref))
+        self.assertIn("A task is in one job. With job, leave out ask", said)
+        self.assertIn("With job, leave out ask", self.refused("manager", "create_task", dict(
+            fields, job=hub.tref(asked["id"]), ask=f"M-{self.says(text='Another thing.')['event_id']}",
+            asked="Another thing")))
+        self.assertIn("With job, leave out case_id", self.refused("manager", "create_task", dict(
+            fields, job=hub.tref(first["id"]), case_id="R-1/C-1")))
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM tasks")["n"], count)
+        # the ask of the job's own task is no second job: the manager may name both, and hears nothing about a message
+        same, said = self.create(job=hub.tref(asked["id"]), ask=ref)
+        self.assertEqual((same["job"], same["ask"]), (asked["id"], message["request_id"]))
+        loose, said = self.create(job=hub.tref(first["id"]))
+        self.assertNotIn("names no message of the owner's", said)
+        # with a job and a task that it follows, the job's ask is its ask: the card of its job is its card
+        second = self.says(text="And check the disk.")
+        other, _ = self.create(ask=f"M-{second['event_id']}", asked="Check the disk")
+        part, _ = self.create(job=hub.tref(asked["id"]), follows=hub.tref(other["id"]))
+        self.assertEqual((part["job"], part["ask"]), (asked["id"], message["request_id"]))
+
+    def test_a_lead_s_subtask_is_in_the_job_of_its_task_but_not_of_its_team_s_results(self):
+        """The hub files the wake-ups, the reviews and the chat work of a whole team under the lead's one task for its
+        team's results: as one job they would be one card of work that has nothing in common."""
+        own, _ = self.create(owner="lead", title="Move the shop's images")
+        sub, said = self.create("lead", "w", task=own["id"], title="Copy the images")
+        self.assertEqual((sub["parent"], sub["job"]), (own["id"], own["id"]))
+        self.assertNotIn("same job as", said)                   # the lead named no job: it is its own task's
+        fix, _ = self.create("lead", "w", task=own["id"], follows=hub.tref(sub["id"]))
+        self.assertEqual((fix["parent"], fix["job"]), (own["id"], None))      # a fix is in the job that it follows
+        with hub.transaction():
+            results = hub.lead_batch_rows("lead", hub.now())
+        loose, _ = self.create("lead", "w", task=results, title="Check the disk")
+        self.assertEqual((loose["parent"], loose["job"]), (results, None))
+        # a subtask with an ask of its own is in that ask's job: the hub writes no second link beside it
+        message = self.says("lead", text="Move the logos too.")
+        hub.q("UPDATE tasks SET state='working' WHERE id=?", (own["id"],))
+        logos, _ = self.create("lead", "w", task=own["id"], ask=f"M-{message['event_id']}", asked="Move the logos")
+        self.assertEqual((logos["parent"], logos["job"], logos["ask"]), (own["id"], None, message["request_id"]))
+
+    def test_the_parts_of_one_step_of_a_plan_are_one_job(self):
+        self.ok("manager", "update_goal", {"request_id": str(uuid.uuid4()), "title": "Move the shop",
+                                           "text": "The shop runs on the new server before May."})
+        self.ok("manager", "update_goal", {"request_id": str(uuid.uuid4()), "goal": "G-1",
+                                           "step": "Copy the images and the orders"})
+        message = self.says()
+        wrong, _ = self.create(goal="G-1", step=1, title="Copy the logos")
+        self.ok("manager", "cancel_task", {"task_id": hub.tref(wrong["id"]), "reason": "It went to the wrong agent."})
+        images, _ = self.create(goal="G-1", step=1, title="Copy the images", ask=f"M-{message['event_id']}",
+                                asked="Move the shop")
+        orders, said = self.create(owner="lead", goal="G-1", step=1, title="Copy the orders")
+        # the first part that nobody canceled begins the job, and a later part takes its ask with its job
+        self.assertEqual((images["job"], orders["job"], orders["ask"]),
+                         (None, images["id"], message["request_id"]))
+        self.assertNotIn("same job as", said)                   # the manager named no job: the step did
+        # a task has the ask of its job, also when that is none: not the ask of another task of its goal, which would
+        # put it on another card than its job's
+        loose, _ = self.create(goal="G-1", title="Tell the customers", job=hub.tref(wrong["id"]))
+        self.assertEqual((loose["job"], loose["ask"]), (wrong["id"], None))
+        # a part with an ask of its own is in that ask's job: the hub writes no second link beside it
+        other = self.says(text="And the invoices.")
+        invoices, _ = self.create(goal="G-1", step=1, title="Copy the invoices", ask=f"M-{other['event_id']}",
+                                  asked="Copy the invoices")
+        self.assertEqual((invoices["job"], invoices["ask"]), (None, other["request_id"]))
+
+    def test_the_owner_reads_a_title_so_it_is_short_and_has_no_code(self):
+        fields = {"owner": "solo", "done_when": "Done.", "why": "It suits it."}
+        for more, why in (({"title": "x" * (hub.TITLE_CHARS + 1)}, f"title is at most {hub.TITLE_CHARS} characters"),
+                          ({"title": "Apply the fix and close C-974"}, "Say C-974 in plain words in title"),
+                          ({"title": "Copy the images", "job_name": "y" * (hub.TITLE_CHARS + 1)},
+                           f"job_name is at most {hub.TITLE_CHARS} characters"),
+                          ({"title": "Copy the images", "job_name": "The work of T-12"},
+                           "Say T-12 in plain words in job_name")):
+            self.assertIn(why, self.refused("manager", "create_task", dict(fields, **more)))
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM tasks")["n"], 0)
+        self.create(title="x" * hub.TITLE_CHARS, job_name="y" * hub.TITLE_CHARS)      # the longest that the hub takes
+        # The task of a wake-up rule has the rule's own title, saved before: a refusal there would stop each run of
+        # the rule. Its admission is check_task, which takes the title as it is.
+        long = "R-7: the vulnerability cases that need me, with every open advisory of the week in one run"
+        self.assertEqual(hub.check_task("manager", dict(fields, title=long))["title"], long)
+
+    def test_a_result_keeps_its_plain_words_for_the_owner_s_card(self):
+        def deliver(task, **more):
+            return self.ok("solo", "deliver_result", dict({
+                "task_id": hub.tref(task["id"]), "outcome": "completed", "what_was_done": "Copied 4,212 files.",
+                "where_output_is": "The new server.", "how_checked": "Counted them."}, **more), task["id"])
+
+        for _ in range(3):
+            self.create()
+        first, second, third = hub.q("SELECT * FROM tasks ORDER BY id")
+        deliver(first, plain=" The shop's images are on the\n new server. ")
+        deliver(second, plain="word " * 100)           # a result is never refused for its length: it is cut at a word
+        deliver(third, plain="x" * 400)                # one run has no place for a cut (it could hold a login): none
+        code, state = self.request()
+        self.assertEqual(code, 200)
+        rows = {t["id"]: t for t in state["tasks"]}
+        self.assertEqual(rows[first["id"]]["plain"], "The shop's images are on the new server.")
+        cut = rows[second["id"]]["plain"]
+        self.assertTrue(len(cut) <= hub.PLAIN_CHARS and cut.endswith("word...") and "  " not in cut, cut)
+        self.assertEqual((rows[second["id"]]["state"], rows[first["id"]]["job"], rows[first["id"]]["job_name"]),
+                         ("completed", None, None))
+        self.assertEqual((rows[third["id"]]["state"], rows[third["id"]]["plain"]), ("completed", None))
+        self.assertIn("jobs", state["ui_features"])
+
+
 # unittest runs only this file's cases, not the ones it inherits from the owner API's.
 def load_tests(_loader, _tests, _pattern):
-    return unittest.TestSuite(Asks(name) for name in Asks.__dict__ if name.startswith("test_"))
+    return unittest.TestSuite([*(Asks(name) for name in Asks.__dict__ if name.startswith("test_")),
+                               *(Jobs(name) for name in Jobs.__dict__ if name.startswith("test_"))])
 
 
 if __name__ == "__main__":

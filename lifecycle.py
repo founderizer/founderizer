@@ -125,6 +125,53 @@ def memory_guard(path=USER_SLICE_MAX):
     return False if word == "max" else True if word.isdigit() else None
 
 
+# The kernel's own words for a server that stops: the seconds after a kernel panic until the kernel restarts the server
+# (0: it waits forever), and the state of each watchdog device, which restarts the server when the program that holds
+# it open (systemd, RuntimeWatchdogSec) stops pinging it. Any user reads both.
+PANIC_SECONDS = "/proc/sys/kernel/panic"
+WATCHDOG_DEVICES = "/sys/class/watchdog"
+# The marks of a container, which its host restarts: systemd's own (systemd-detect-virt reads it) and Podman's. Both
+# are in /run, which each start makes new, so neither stays in a disk image that was made from a container, as
+# Docker's /.dockerenv can. A container shows the host's kernel and the host's watchdog devices.
+CONTAINER_MARKS = ("/run/systemd/container", "/run/.containerenv")
+
+
+def in_container(root=""):
+    """Whether this system is a container (CONTAINER_MARKS), under `root` for the tests."""
+    return any(os.path.lexists(root + mark) for mark in CONTAINER_MARKS)
+
+
+def restart_guard(panic=PANIC_SECONDS, watchdogs=WATCHDOG_DEVICES, root=""):
+    """Whether this server restarts by itself when it stops, which the join's hardening sets (hubsetup.py harden):
+    True when a kernel panic restarts it (kernel.panic is not 0) and a watchdog device is active (systemd holds it
+    open and pings it), False when either is not so, and None when the kernel's file of the panic cannot say (a Mac)
+    and in a container, whose kernel and watchdog are its host's.
+
+    With neither, a server whose kernel panicked or whose system stopped answers nothing until somebody restarts it at
+    its provider (17 November 2026: a server of 4 GB stayed silent for 22 minutes, until a restart at its provider)."""
+    if in_container(root):
+        return None
+    try:
+        with open(panic, encoding="ascii") as f:
+            seconds = int(f.read().strip())
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return seconds != 0 and watchdog_active(watchdogs)
+
+
+def watchdog_active(watchdogs=WATCHDOG_DEVICES):
+    """Whether a watchdog device of this server is active: a program holds it open, and the kernel restarts the
+    server when that program stops pinging it. False with no such device."""
+    for state in sorted(glob.glob(glob.escape(watchdogs) + "/watchdog*/state")):
+        try:
+            with open(state, encoding="ascii") as f:
+                if f.read().strip() == "active":
+                    return True
+        except (OSError, UnicodeDecodeError):
+            continue
+    return False
+
+
 def upgraded_at(path=UPGRADE_STAMP):
     """When apt's daily run last ended a security upgrade well, or None when it has not yet."""
     try:
@@ -137,10 +184,11 @@ SSH_UNITS = ("ssh.service", "ssh.socket")      # OpenSSH runs when either is act
 
 
 def hardening(run=None):
-    """The three facts of the join's hardening that any user reads in a moment, with the names that a reading gives
+    """The facts of the join's hardening that any user reads in a moment, with the names that a reading gives
     them: `ssh_keys_only` (sshd_keys_only), None where OpenSSH does not run, because neither its service nor its socket
-    is active and it then lets nobody in with a password (a server that Tailscale's own SSH serves), `npm_rule`, and
-    `memory_guard` (memory_guard), None where the kernel's own file cannot say. A
+    is active and it then lets nobody in with a password (a server that Tailscale's own SSH serves), `npm_rule`,
+    `memory_guard` (memory_guard), None where the kernel's own file cannot say, and `restart_guard` (restart_guard),
+    the same. A
     server's own service reads them for its reading (Lifecycle.security), and the hub reads them of its own server,
     which has no service (hub.hub_hardening_read): one function, so that the two never read them in two ways.
 
@@ -149,7 +197,8 @@ def hardening(run=None):
     and _run gives the same for a call that ran out of time. Such a read cannot say, so the hub keeps what was said of
     it (server_watch_sweep), where a null would end a fault that still stands (14 November 2026, measured)."""
     _code, out, _err = (run or _run)(["systemctl", "is-active", *SSH_UNITS])
-    states, facts = out.split(), {"npm_rule": npm_rule(NPMRC), "memory_guard": memory_guard(USER_SLICE_MAX)}
+    states, facts = out.split(), {"npm_rule": npm_rule(NPMRC), "memory_guard": memory_guard(USER_SLICE_MAX),
+                                  "restart_guard": restart_guard(PANIC_SECONDS, WATCHDOG_DEVICES)}
     if len(states) == len(SSH_UNITS):
         facts["ssh_keys_only"] = sshd_keys_only(SSHD_CONFIG) if "active" in states else None
     return facts

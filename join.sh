@@ -464,8 +464,9 @@ firewall() {    # $1: the checkout. Incoming traffic over the private network on
 }
 
 harden() {      # $1: the checkout. SSH takes keys only with no X11 forwarding, npm takes no package version newer than
-                # seven days, Tailscale updates itself, and the memory gets a swap file and one limit for all users'
-                # processes together (hubsetup.py harden). Each part checks first and says what
+                # seven days, Tailscale updates itself, the memory gets a swap file and one limit for all users'
+                # processes together, and the server restarts by itself after a kernel panic and when systemd stops
+                # (hubsetup.py harden). Each part checks first and says what
                 # it did. A part that cannot be done leaves the server as it was and does not stop the join: the
                 # server's own reading tells the hub what holds.
     python3 "$1/hubsetup.py" harden --user "$WORKER" </dev/null \

@@ -285,7 +285,8 @@ free text of an agent or a person). Its one field, `after`, is optional. The ans
 - `app`: `version` and `build`.
 - `hub`: `none` (no hub's address), `set` (an address, and its last read did not answer), or
   `answers`. It is what the app's store knows; the call makes no request of its own.
-- `first_run`: `shows`; `page`, by a fixed name: `welcome`, `paste`, `name` ("Name your
+- `first_run`: `shows`; `page`, by a fixed name: `welcome`, `paste`, `error_reports` ("Help improve
+  Founderizer", the owner's answer whether the app sends error reports, since 18 November 2026), `name` ("Name your
   manager"), `ai_provider` ("Juno's AI provider", with the manager's name), `servers` ("Your fleet's servers"), `vps` ("A VPS for your fleet"), `tailscale`, `tailscale_key`, `token`, `building` (a provider's server is made),
   `other_vps` (a server by its address), `machine`, `installing`, `address`, `done`;
   `title`, the page's title in English as the app's string table has it, and a title with a
@@ -457,9 +458,11 @@ else `offered` when
 
 **`setup_show`** (marked as a read: it changes no fleet, no server and no file): asks macOS to
 bring the app to the front, on one of its own pages. Fields: `page`, which is `front` (the app as
-it is, with no change of page, from any page), or for a first run `welcome` or `name` ("Name your
-manager", the first page of the setup, from which the owner's own Continue goes on to the VPS
-page; until 15 November 2026 this second page was `vps`, which went past the name), or a place of
+it is, with no change of page, from any page), or for a first run `welcome` or `name` (the first
+page of the setup: since 18 November 2026 the app opens "Help improve Founderizer" for it, which
+the owner answers with a press of their own, and then "Name your manager", from which the owner's
+own Continue goes on; until 15 November 2026 this second page was `vps`, which went past the
+name), or a place of
 the fleet's own pages (below); and `seen`, the place that `setup_state` gave last (`place`). For
 `front`, `welcome` and `name` the short form of before the map passes too (the first run's page
 alone, or `none` with no first run), so a caller of an earlier version still works. It refuses,

@@ -237,6 +237,11 @@ class ServerWatch(Servers):
         self.assertNotIn("unattended_upgrades", hub.validate_status({"security": {}})["security"])
         self.assertIsNone(hub.validate_status({"security": {"unattended_upgrades": None}})["security"]
                           ["unattended_upgrades"])
+        # So do the facts that the owner's Mac reads to put a server right (ServerMemory, ServerRestart in the app):
+        # a fact that the hub dropped would leave each server as it is.
+        for fact in ("memory_guard", "restart_guard"):
+            self.assertNotIn(fact, hub.validate_status({"security": {}})["security"])
+            self.assertIs(hub.validate_status({"security": {fact: False}})["security"][fact], False, fact)
 
     def test_npms_rule_that_is_gone_is_said(self):
         self.report(npm_rule=False)
@@ -273,8 +278,9 @@ class ServerWatch(Servers):
         self.sweep(self.t0 + hub.MENDED_WAIT)
         late = ("[hub] The server box still needs care after 3 days: its SSH lets passwords in. The owner's Mac has "
                 "not put it right: it does so only while the Founderizer app runs there, and it stops after six tries. "
-                "Raise one Needs-you item that says this in plain words, with no step by hand in it: this server is a "
-                "fleet machine, where agents run, and no agent holds it through the door.")
+                "Tell the owner once with message_owner, in plain words and with no step by hand, and raise no Needs-you "
+                "item: this server is a fleet machine, where agents run, and the owner's Mac is what puts its SSH and npm "
+                "right, because the door's forms there do not change them.")
         self.assertEqual(self.said()[-1], late)
         for days in (4, 10):                                    # once
             self.sweep(self.t0 + days * DAY)
@@ -478,9 +484,9 @@ class HubOwnServer(ServerWatch):
             self.own(t, ssh_keys_only=False)
         self.assertEqual(self.said()[1:], [
             "[hub] The server hub still needs care after 3 days: its SSH lets passwords in. The owner's Mac has not put "
-            "it right: it does so only while the Founderizer app runs there, and it stops after six tries. Raise one "
-            "Needs-you item that says this in plain words, with no step by hand in it: this is the hub's own server, "
-            "where the hub runs, and the owner's Mac is what puts its SSH and npm right."])
+            "it right: it does so only while the Founderizer app runs there, and it stops after six tries. Tell the "
+            "owner once with message_owner, in plain words and with no step by hand, and raise no Needs-you item: this "
+            "is the hub's own server, where the hub runs, and the owner's Mac is what puts its SSH and npm right."])
 
     def test_the_hub_s_own_server_is_not_judged_in_the_hour_after_its_claim(self):
         """Its install hardens it after the claim (hub.sh's step 15 comes after its security updates), and the hub runs
@@ -657,7 +663,9 @@ class HardeningRead(unittest.TestCase):
         (self.etc / "sshd_config.d").mkdir()
         (self.etc / "sshd_config").write_text("Include sshd_config.d/*.conf\nKbdInteractiveAuthentication no\n")
         for name, value in (("SSHD_CONFIG", str(self.etc / "sshd_config")), ("NPMRC", str(self.etc / "npmrc")),
-                            ("USER_SLICE_MAX", str(self.etc / "memory.max"))):
+                            ("USER_SLICE_MAX", str(self.etc / "memory.max")), ("PANIC_SECONDS", str(self.etc / "panic")),
+                            ("WATCHDOG_DEVICES", str(self.etc / "watchdog")),
+                            ("CONTAINER_MARKS", (str(self.etc / "container"),))):
             patcher = patch.object(lifecycle, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -676,10 +684,10 @@ class HardeningRead(unittest.TestCase):
     def test_openssh_from_its_socket_or_its_service_is_read_from_its_files(self):
         for says in ("inactive\nactive\n", "active\nactive\n", "active\ninactive\n"):
             self.assertEqual(lifecycle.hardening(self.run_says(says)),
-                             {"ssh_keys_only": False, "npm_rule": True, "memory_guard": None})
+                             {"ssh_keys_only": False, "npm_rule": True, "memory_guard": None, "restart_guard": None})
         (self.etc / "sshd_config.d" / "10-fleet-hardening.conf").write_text("PasswordAuthentication no\n")
         self.assertEqual(lifecycle.hardening(self.run_says("inactive\nactive\n", code=3)),
-                         {"ssh_keys_only": True, "npm_rule": True, "memory_guard": None})
+                         {"ssh_keys_only": True, "npm_rule": True, "memory_guard": None, "restart_guard": None})
         self.assertEqual(self.asked[0], ["systemctl", "is-active", "ssh.service", "ssh.socket"])
         self.assertEqual(self.npm, [str(self.etc / "npmrc")] * 4)
 
@@ -687,13 +695,13 @@ class HardeningRead(unittest.TestCase):
         """Masked or stopped, as on a hub that Tailscale's own SSH serves: systemctl's answer, a state for each unit."""
         for says in ("inactive\ninactive\n", "failed\ninactive\n", "activating\ninactive\n"):
             self.assertEqual(lifecycle.hardening(self.run_says(says, 3)),
-                             {"ssh_keys_only": None, "npm_rule": True, "memory_guard": None})
+                             {"ssh_keys_only": None, "npm_rule": True, "memory_guard": None, "restart_guard": None})
 
     def test_a_systemctl_with_no_answer_leaves_the_fact_out(self):
         """systemd answers nothing for a second or two while it starts itself again (an update of systemd or libc6), and
         _run gives the same for a call that runs out of time: such a read cannot say, so it leaves ssh_keys_only out,
         where a null would end a fault that still stands. Also half an answer. npm's fact is its own."""
-        bus, rest = self.run_says("", 1), {"npm_rule": True, "memory_guard": None}
+        bus, rest = self.run_says("", 1), {"npm_rule": True, "memory_guard": None, "restart_guard": None}
         self.assertEqual(lifecycle.hardening(bus), rest)
         late = lambda argv, timeout=20, cwd=None: lifecycle._run(["sleep", "5"], timeout=0.2)      # the real _run
         self.assertEqual(late(["systemctl"])[:2], (1, ""))
@@ -716,7 +724,27 @@ class HardeningRead(unittest.TestCase):
             self.assertIs(lifecycle.hardening(self.run_says("active\ninactive\n"))["memory_guard"], says, word)
         # A read that systemctl does not answer leaves SSH's fact out, and keeps this one, which is the kernel's own.
         limit.write_text("max\n")
-        self.assertEqual(lifecycle.hardening(self.run_says("", 1)), {"npm_rule": True, "memory_guard": False})
+        self.assertEqual(lifecycle.hardening(self.run_says("", 1)),
+                         {"npm_rule": True, "memory_guard": False, "restart_guard": None})
+
+    def test_a_server_restarts_by_itself_by_the_kernels_own_files(self):
+        """True when a kernel panic restarts the server (kernel.panic is not 0, and below 0 restarts it at once) and a
+        watchdog device is active, False when either is not so, so a softdog that systemd does not ping counts as none,
+        and None when the kernel's file of the panic cannot say (a Mac) and in a container, whose kernel and watchdog
+        devices are its host's."""
+        panic, device = self.etc / "panic", self.etc / "watchdog" / "watchdog0"
+        self.assertIsNone(lifecycle.restart_guard(str(panic), str(device.parent)))
+        panic.write_text("10\n")
+        self.assertIs(lifecycle.restart_guard(str(panic), str(device.parent)), False, "no watchdog device at all")
+        device.mkdir(parents=True)
+        for word, state, says in (("0\n", "active\n", False), ("10\n", "inactive\n", False), ("10\n", "active\n", True),
+                                  ("-1\n", "active\n", True), ("many\n", "active\n", None)):
+            panic.write_text(word)
+            (device / "state").write_text(state)
+            self.assertIs(lifecycle.restart_guard(str(panic), str(device.parent)), says, (word, state))
+            self.assertIs(lifecycle.hardening(self.run_says("active\ninactive\n"))["restart_guard"], says, (word, state))
+        (self.etc / "container").write_text("lxc\n")
+        self.assertIsNone(lifecycle.hardening(self.run_says("active\ninactive\n"))["restart_guard"], "a container")
 
     def test_a_server_s_own_reading_takes_the_same_function(self):
         life = lifecycle.Lifecycle("/kit", None, {"role": "worker", "runtime": "claude"}, None, None,

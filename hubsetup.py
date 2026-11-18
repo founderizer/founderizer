@@ -1360,6 +1360,69 @@ MEMORY_PLACES = ("/etc/systemd/system.control", "/run/systemd/system.control", "
                  "/etc/systemd/system", "/run/systemd/system", "/usr/local/lib/systemd/system",
                  "/usr/lib/systemd/system", "/lib/systemd/system")
 
+# A server that stops (the same words of the owner's): two settings of the kernel's own, so that the server restarts by
+# itself, at night too, with no agent, no owner's Mac and no key of its provider. Ubuntu's kernel waits forever after a
+# panic (kernel.panic = 0), and a server at Hetzner has no watchdog device, so a server that stopped answered nothing
+# until a restart at its provider. The kernel's software watchdog (softdog) is a device that restarts the server when
+# the program that holds it open stops pinging it, and systemd pings it when RuntimeWatchdogSec is set. Ubuntu's
+# kernel package lists softdog among the modules that never load by themselves, and systemd's loader of
+# modules-load.d keeps that list, so a small unit loads it at each start. Measured on Ubuntu 24.04 (kernel 7.0,
+# systemd 255) on 18 November 2026: with process 1 stopped, a watchdog of 30 seconds restarted the machine after
+# about 30; a kernel crash restarted it after about 20 seconds with kernel.panic = 10, and left it dead with 0;
+# systemd took the watchdog at once when softdog loaded after its own start; and `systemctl daemon-reload` reads the
+# drop-in again, both ways, so the step and its undo need no restart. A time given to systemd through D-Bus
+# (RuntimeWatchdogUSec) is not used: it stays over a daemon-reload and a daemon-reexec, until the next boot.
+RESTART_PANIC_KEY = "kernel.panic"
+RESTART_PANIC = 10                      # seconds after a kernel panic until the kernel restarts the server
+RESTART_PANIC_FILE = "/etc/sysctl.d/60-fleet-restart.conf"
+RESTART_PANIC_TEXT = (
+    "# Founderizer writes this file (hubsetup.py harden): after a kernel panic the kernel restarts this server\n"
+    "# after 10 seconds, where with its default (0) it waits forever and the server answers nothing.\n"
+    "# To undo it: delete this file, then run  sysctl -w kernel.panic=0\n"
+    "kernel.panic = 10\n")
+RESTART_WATCHDOG = 600                  # seconds that systemd may stop before the watchdog restarts the server
+RESTART_UNIT_NAME = "fleet-watchdog.service"
+RESTART_UNIT = "/etc/systemd/system/" + RESTART_UNIT_NAME
+# A start of the unit that hangs would hold sysinit.target, and so the boot, with no end: a oneshot unit has no time
+# limit of its own.
+RESTART_UNIT_TEXT = (
+    "# Founderizer writes this file (hubsetup.py harden): it loads the kernel's software watchdog at each start,\n"
+    "# which systemd pings (00-fleet-watchdog.conf). Ubuntu lists softdog among the modules that never load by\n"
+    "# themselves, and systemd's own loader keeps that list, so a file in modules-load.d would not load it.\n"
+    "# To undo it: systemctl disable fleet-watchdog.service, delete this file and 00-fleet-watchdog.conf, then\n"
+    "# run  systemctl daemon-reload\n"
+    "[Unit]\n"
+    "Description=The kernel's software watchdog, which systemd pings\n"
+    "DefaultDependencies=no\n"
+    "Before=sysinit.target\n"
+    "\n"
+    "[Service]\n"
+    "Type=oneshot\n"
+    "TimeoutStartSec=30s\n"
+    "ExecStart=-/sbin/modprobe softdog\n"
+    "\n"
+    "[Install]\n"
+    "WantedBy=sysinit.target\n")
+RESTART_CONF_DIR = "/etc/systemd/system.conf.d"
+# The name sorts before the usual names of such files, as the memory limit's does: systemd takes the drop-ins of its
+# own configuration in the order of their file names, and the last one that sets a value decides.
+RESTART_CONF = RESTART_CONF_DIR + "/00-fleet-watchdog.conf"
+RESTART_CONF_TEXT = (
+    "# Founderizer writes this file (hubsetup.py harden): systemd pings the watchdog device that\n"
+    "# fleet-watchdog.service loads, and when systemd stops for 10 minutes the watchdog restarts this server.\n"
+    "# A drop-in of this server's own that sets RuntimeWatchdogSec decides over this one when its name sorts\n"
+    "# after this file's: systemd takes such files in the order of their names, and the last one decides.\n"
+    "# To undo it: delete this file, then run  systemctl daemon-reload\n"
+    "[Manager]\n"
+    "RuntimeWatchdogSec=10min\n")
+# Where systemd reads its own configuration: its file, and the folders of its drop-ins. A file of the server's own
+# there that sets RuntimeWatchdogSec is the server's choice.
+RESTART_CONF_PLACES = ("/etc/systemd/system.conf", "/etc/systemd/system.conf.d", "/run/systemd/system.conf.d",
+                       "/usr/local/lib/systemd/system.conf.d", "/usr/lib/systemd/system.conf.d")
+# The watchdog program itself (its file in /etc stays after an `apt remove`, so it says nothing): a server that has it
+# has a watchdog of its own, which would find the device held by systemd at its next boot.
+RESTART_DAEMON = "/usr/sbin/watchdog"
+
 
 def swap_now(root=""):
     """The swap that the kernel uses now, by the names in /proc/swaps, or None when that file cannot be read."""
@@ -1581,6 +1644,122 @@ def harden_memory(check, run, root=""):
             "of them when that and their part of the swap are full, and SSH and Tailscale keep the rest")
 
 
+def harden_panic(check, run, root=""):
+    """After a kernel panic the kernel restarts the server (RESTART_PANIC_TEXT), where Ubuntu's default waits forever.
+    Each setting of the server's own stays: a sysctl file that sets kernel.panic (system_sysctl_setting), a link at
+    this step's file (a mask), and a kernel that restarts after a panic already with no file of this step's (a boot
+    parameter). A container, which its host restarts, gets nothing. The words of what it did."""
+    if lifecycle.in_container(root):
+        return "a kernel panic stays as it is: this system is a container, and its host restarts it"
+    path, live = root + RESTART_PANIC_FILE, root + lifecycle.PANIC_SECONDS
+    own = system_sysctl_setting(RESTART_PANIC_KEY, RESTART_PANIC_FILE, root)
+    if own and os.path.lexists(path) and not os.path.islink(path):  # a file of its own that came after an earlier run
+        return (f"a kernel panic keeps this server's own setting: {own} sets {RESTART_PANIC_KEY}, and so does "
+                f"{RESTART_PANIC_FILE} of an earlier run; of the two, the file that a start reads last decides")
+    if own:
+        return f"a kernel panic keeps this server's own setting: {own} sets {RESTART_PANIC_KEY}"
+    if os.path.islink(path):
+        return f"a kernel panic keeps this server's own setting: {RESTART_PANIC_FILE} is a link of this server's own"
+    try:
+        with open(path, encoding="utf-8") as f:
+            before = f.read()
+    except OSError:
+        before = None
+    now = sysctl_value(live)
+    if now is None:
+        return "a kernel panic stays as it is: this system does not say what it does after one"
+    if before is None and now != "0":
+        return f"a kernel panic keeps this server's own setting: the kernel restarts it {now} seconds after one"
+    if before == RESTART_PANIC_TEXT and now != "0":
+        return f"the server restarts {RESTART_PANIC} seconds after a kernel panic already"
+    if check:
+        return f"would restart the server {RESTART_PANIC} seconds after a kernel panic"
+    if before != RESTART_PANIC_TEXT:
+        os.makedirs(root + SYSCTL_DIR, mode=0o755, exist_ok=True)
+        put_file(path, RESTART_PANIC_TEXT, 0o644, *((0, 0) if not root else ()))
+    code, out, err = run(f"sysctl -q -p {RESTART_PANIC_FILE}")
+    if code != 0 or sysctl_value(live) in (None, "0"):
+        return ("the restart after a kernel panic is written and not in force yet: the kernel takes it at the next "
+                f"start ({one_line(err) or one_line(out) or 'the kernel still says 0'})")
+    return f"the server restarts {RESTART_PANIC} seconds after a kernel panic"
+
+
+def own_watchdog_settings(root=""):
+    """The files of this server's own that set systemd's RuntimeWatchdogSec: systemd's own configuration file and each
+    drop-in of it, in each place that systemd reads (RESTART_CONF_PLACES), other than this step's own file. As systemd
+    does, a drop-in whose name starts with a dot is not read (glob), and a folder that is a link is followed."""
+    found = []
+    for place in RESTART_CONF_PLACES:
+        paths = [root + place] if place.endswith(".conf") else sorted(glob.glob(glob.escape(root + place) + "/*.conf"))
+        for path in paths:
+            if path == root + RESTART_CONF:
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            if re.search(r"(?m)^[ \t]*RuntimeWatchdogSec[ \t]*=", text):
+                found.append(path[len(root):])
+    return found
+
+
+def harden_watchdog(check, run, root=""):
+    """When systemd stops for ten minutes, the kernel's software watchdog restarts the server: RESTART_UNIT loads it at
+    each start, and RESTART_CONF has systemd ping it, which systemd takes at its reload. Each setting of the server's
+    own stays: a file of systemd's own configuration that sets RuntimeWatchdogSec (own_watchdog_settings), a link at
+    one of this step's files (a mask), the watchdog program (RESTART_DAEMON), and a watchdog that is active with
+    no file of this step's. Where systemd does not run the system (no /run/systemd/system, which is how systemd's own
+    sd_booted tells), and in a container, nothing is written. The words of what it did."""
+    if lifecycle.in_container(root):
+        return "the watchdog stays as it is: this system is a container, and its host restarts it"
+    if not os.path.isdir(root + "/run/systemd/system"):
+        return "the watchdog stays as it is: systemd does not run this system"
+    watchdogs = root + lifecycle.WATCHDOG_DEVICES
+    own = own_watchdog_settings(root)
+    if own and os.path.lexists(root + RESTART_CONF) and not os.path.islink(root + RESTART_CONF):
+        return (f"the watchdog keeps this server's own setting: {own[0]} sets RuntimeWatchdogSec, and so does "
+                f"{RESTART_CONF} of an earlier run; of the two, the file that systemd reads last decides")
+    if own:
+        return f"the watchdog keeps this server's own setting: {own[0]} sets RuntimeWatchdogSec"
+    masked = [path for path in (RESTART_UNIT, RESTART_CONF) if os.path.islink(root + path)]
+    if masked:
+        return f"the watchdog keeps this server's own setting: {masked[0]} is a link of this server's own"
+    if os.path.lexists(root + RESTART_DAEMON) and os.path.lexists(root + RESTART_CONF):
+        return (f"the watchdog keeps this server's own: the watchdog program is installed ({RESTART_DAEMON}), and "
+                f"this step's files of an earlier run take the device from it at each start: to let the program "
+                f"have it, disable {RESTART_UNIT_NAME} and delete its file and {RESTART_CONF}")
+    if os.path.lexists(root + RESTART_DAEMON):
+        return f"the watchdog keeps this server's own: the watchdog program is installed ({RESTART_DAEMON})"
+    texts = {}
+    for path in (RESTART_UNIT, RESTART_CONF):
+        try:
+            with open(root + path, encoding="utf-8") as f:
+                texts[path] = f.read()
+        except OSError:
+            texts[path] = None
+    active = lifecycle.watchdog_active(watchdogs)
+    if active and texts[RESTART_CONF] is None:
+        return "a watchdog of this server's own is active already"
+    if active and texts[RESTART_UNIT] == RESTART_UNIT_TEXT and texts[RESTART_CONF] == RESTART_CONF_TEXT:
+        return f"the watchdog restarts the server when systemd stops for {RESTART_WATCHDOG // 60} minutes already"
+    if check:
+        return f"would have the watchdog restart the server when systemd stops for {RESTART_WATCHDOG // 60} minutes"
+    for path, text in ((RESTART_UNIT, RESTART_UNIT_TEXT), (RESTART_CONF, RESTART_CONF_TEXT)):
+        if texts[path] != text:
+            os.makedirs(os.path.dirname(root + path), mode=0o755, exist_ok=True)
+            put_file(root + path, text, 0o644, *((0, 0) if not root else ()))
+    for command in ("systemctl daemon-reload", f"systemctl enable {RESTART_UNIT_NAME}",
+                    f"systemctl start {RESTART_UNIT_NAME}"):
+        code, out, err = run(command)
+        if code != 0:
+            return ("the watchdog is written and not in force: a command of systemd failed, and the next run tries "
+                    f"again ({' '.join(command.split()[:2])}: {one_line(err) or one_line(out) or f'status {code}'})")
+    if not lifecycle.watchdog_active(watchdogs):
+        return "the watchdog is written and not in force yet: no watchdog device is active, softdog did not load"
+    return f"the watchdog restarts the server when systemd stops for {RESTART_WATCHDOG // 60} minutes"
+
+
 def harden_part(name, part, *args):
     """One part of the hardening, which never takes the other parts' lines with it: its own line, or a line that
     says what stopped it. A command that runs out of its time and a file that cannot be written are faults of that
@@ -1594,8 +1773,9 @@ def harden_part(name, part, *args):
 def harden(service_user="fleet", check=False, run=None, root="", account=None):
     """The server's own hardening, which the join takes after its firewall (the owner, 3 November 2026: Add server
     ends at the baseline, for any user): SSH takes keys only with no X11 forwarding, npm takes no package version
-    newer than seven days, Tailscale updates itself, and the server's memory has a reserve and a limit (a swap file,
-    and one limit for all users' processes together). Each part checks first, so a second run changes nothing. A
+    newer than seven days, Tailscale updates itself, the server's memory has a reserve and a limit (a swap file,
+    and one limit for all users' processes together), and the server restarts by itself when it stops (after a kernel
+    panic, and when systemd stops). Each part checks first, so a second run changes nothing. A
     part that cannot be done says why and leaves the server as it was, and a part that stops says so and stops no
     other part (harden_part): none of them stops the join, and the server's own reading
     (lifecycle.Lifecycle.security) tells the hub what holds. Returns the lines that it said."""
@@ -1604,7 +1784,9 @@ def harden(service_user="fleet", check=False, run=None, root="", account=None):
             harden_part("npm's rule", harden_npm, service_user, check, root, account),
             harden_part("Tailscale", harden_tailscale, check, run),
             harden_part("swap", harden_swap, check, run, root),
-            harden_part("the memory limit", harden_memory, check, run, root)]
+            harden_part("the memory limit", harden_memory, check, run, root),
+            harden_part("the restart after a kernel panic", harden_panic, check, run, root),
+            harden_part("the watchdog", harden_watchdog, check, run, root)]
     for line in said:
         say(line)
     return said
@@ -1637,39 +1819,45 @@ def sysctl_value(path):
         return None
 
 
-def sets_tcp_key(text):
-    """Whether the text of a sysctl file sets net.ipv4.tcp_slow_start_after_idle: a line `key = value` whose key, read
-    as systemd-sysctl reads one ("/" as ".", a "-" before it, a glob such as net.ipv4.tcp_*), names it. A "*" here
-    also crosses a ".", which systemd's does not: such a key counts too, and the step then writes nothing, the safe
-    side."""
+def sets_sysctl_key(text, name):
+    """Whether the text of a sysctl file sets the key `name`: a line `key = value` whose key, read as systemd-sysctl
+    reads one ("/" as ".", a "-" before it, a glob such as net.ipv4.tcp_*), names it. A "*" here also crosses a ".",
+    which systemd's does not: such a key counts too, and the step then writes nothing, the safe side."""
     for line in text.lstrip("\ufeff").splitlines():
         line = line.strip()
         if not line or line[0] in "#;" or "=" not in line:
             continue
         key = line.split("=", 1)[0].strip().lstrip("-").strip().replace("/", ".")
-        if key and fnmatch.fnmatchcase(HUB_TCP_KEY, key):
+        if key and fnmatch.fnmatchcase(name, key):
             return True
     return False
 
 
-def system_tcp_setting(root=""):
-    """The file of the system itself that sets net.ipv4.tcp_slow_start_after_idle (its path, without `root`), or None.
-    It is a setting of the owner's own, or of the system's vendor, and it decides at every start: hub_tcp leaves it.
-    Only the files that a start reads count: of each file name, the one in the first folder of SYSCTL_SOURCES."""
+def system_sysctl_setting(name, mine, root=""):
+    """The file of the system itself that sets the key `name` (its path, without `root`), or None. It is a setting of
+    the owner's own, or of the system's vendor, and it decides at every start: a step that writes `mine` for the same
+    key leaves it. Only the files that a start reads count: of each file name, the one in the first folder of
+    SYSCTL_SOURCES."""
     first = {}
     for folder in SYSCTL_SOURCES:
         for path in sorted(glob.glob(glob.escape(root + folder) + "/*.conf")):
             first.setdefault(os.path.basename(path), path)
-    for path in [first[name] for name in sorted(first)] + [root + SYSCTL_CONF]:
-        if path == root + HUB_TCP:
+    for path in [first[n] for n in sorted(first)] + [root + SYSCTL_CONF]:
+        if path == root + mine:
             continue
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
-                if sets_tcp_key(f.read()):
+                if sets_sysctl_key(f.read(), name):
                     return path[len(root):]
         except OSError:
             continue
     return None
+
+
+def system_tcp_setting(root=""):
+    """The file of the system itself that sets net.ipv4.tcp_slow_start_after_idle (system_sysctl_setting): hub_tcp
+    leaves it."""
+    return system_sysctl_setting(HUB_TCP_KEY, HUB_TCP, root)
 
 
 def hub_tcp_step(check, root):

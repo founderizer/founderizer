@@ -98,7 +98,7 @@ def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
     for cls in (Template, Repository, Claim, SecondClaim, AgentUsers, FleetId, VerifyStep, Prompt, PromptThroughSudo,
                 CheckMode, Systems, ZoneData, NoProviderCredential, ProviderToolsRefuse, RuntimeInstall, Firewall,
-                Harden, HardenMemory, HubTcp, NetworkStep, PackageStops, PackageLists, AptUpdate):
+                Harden, HardenMemory, HardenRestart, HubTcp, NetworkStep, PackageStops, PackageLists, AptUpdate):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return suite
 
@@ -2268,11 +2268,13 @@ class Harden(unittest.TestCase):
     KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOfTheOwnerForThisTest owner@mac\n"
     HARDENED = "passwordauthentication no\nkbdinteractiveauthentication no\nx11forwarding no\npermitrootlogin " \
                "prohibit-password\n"
-    # The two lines of the memory parts where the kernel's files are not there, as in this fixture until a test of
-    # HardenMemory puts them there: both parts then read nothing and run nothing.
-    NO_MEMORY_FILES = ["swap stays as it is: this system does not say what swap it has",
+    # The lines of the memory and restart parts where the kernel's and systemd's files are not there, as in this
+    # fixture until a test of HardenMemory or HardenRestart puts them there: each part then reads and runs nothing.
+    NO_KERNEL_FILES = ["swap stays as it is: this system does not say what swap it has",
                        "no memory limit for the users' processes: this system has no memory group for them that it "
-                       "can set"]
+                       "can set",
+                       "a kernel panic stays as it is: this system does not say what it does after one",
+                       "the watchdog stays as it is: systemd does not run this system"]
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="fleet-harden-"))
@@ -2356,7 +2358,7 @@ class Harden(unittest.TestCase):
         self.assertEqual(lines, ["SSH takes keys only, with no X11 forwarding",
                                  "made npm take no package version newer than seven days (/etc/npmrc, "
                                  "/home/fleet/.npmrc)",
-                                 "Tailscale updates itself", *self.NO_MEMORY_FILES])
+                                 "Tailscale updates itself", *self.NO_KERNEL_FILES])
 
     def test_a_second_run_writes_nothing_new(self):
         self.harden()
@@ -2488,7 +2490,7 @@ class Harden(unittest.TestCase):
         self.assertEqual(lines, ["would make SSH take keys only, with no X11 forwarding",
                                  "would make npm take no package version newer than seven days (/etc/npmrc, "
                                  "/home/fleet/.npmrc)",
-                                 "would turn on Tailscale's own updates", *self.NO_MEMORY_FILES])
+                                 "would turn on Tailscale's own updates", *self.NO_KERNEL_FILES])
 
     def test_the_join_takes_it_after_its_firewall_as_the_one_hardening_command(self):
         join = shell_function(KIT / "join.sh", "linux")
@@ -2539,8 +2541,8 @@ class Harden(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertNotIn("ran ", out)
         self.assertNotIn("would run", out)
-        self.assertIn("Founderizer:   would leave this server's SSH, npm and Tailscale settings, its swap and its "
-                      "memory limit as they are", out)
+        self.assertIn("Founderizer:   would leave this server's SSH, npm and Tailscale settings, its swap, its memory "
+                      "limit and its restart settings as they are", out)
 
     def test_sshds_words_come_as_one_line_and_keep_their_end(self):
         """sshd says a fault of its files in two lines, and a long path makes them long. The join's line gives them
@@ -2810,7 +2812,7 @@ class Harden(unittest.TestCase):
                 self.hardening.unlink()
             npm = ("made npm take no package version newer than seven days (/etc/npmrc, /home/fleet/.npmrc)"
                    if slow == ("journalctl",) else "npm takes no package version newer than seven days already")
-            self.assertEqual(self.harden(), [self.HARDENS, npm, "Tailscale updates itself", *self.NO_MEMORY_FILES],
+            self.assertEqual(self.harden(), [self.HARDENS, npm, "Tailscale updates itself", *self.NO_KERNEL_FILES],
                              slow)
         self.assertEqual({self.waits[script] for script in self.ran if script.startswith(("journalctl", "loginctl"))},
                          {30}, "each read of the log has 30 seconds")
@@ -3095,7 +3097,7 @@ class HardenMemory(unittest.TestCase):
         self.assertEqual(lines[2], "Tailscale stays as it is: this part stopped (RuntimeError: tailscale is not well)")
         self.assertRegex(lines[3], r"^no swap file: a step stopped \(TimeoutExpired: ")
         self.assertRegex(lines[4], r"^the users' processes together get at most 85% of the memory: ")
-        self.assertEqual(len(said.getvalue().splitlines()), 5)
+        self.assertEqual(len(said.getvalue().splitlines()), 7)
         self.assertEqual(hubsetup.harden_part("swap", lambda: 1 / 0),
                          "swap stays as it is: this part stopped (ZeroDivisionError: division by zero)")
 
@@ -3279,17 +3281,178 @@ class HardenMemory(unittest.TestCase):
         self.assertFalse((self.root / "swapfile").exists())
 
     def test_the_hardening_takes_both_parts_after_tailscale_and_a_fault_of_one_stops_nothing(self):
-        """Through harden itself, as both installers call it: the two lines come last, and a swap that the kernel
-        refuses leaves the limit, which protects the server alone."""
+        """Through harden itself, as both installers call it: the two lines come after Tailscale's, and a swap that the
+        kernel refuses leaves the limit, which protects the server alone."""
         (self.root / "etc/ssh/sshd_config.d").mkdir(parents=True)
         self.fails["swapon"] = (255, "", "swapon: /swapfile: swapon failed: Operation not permitted\n")
         self.fails["sshd"] = (0, "", "")
         with contextlib.redirect_stdout(io.StringIO()) as said:
             lines = hubsetup.harden(run=self.run_cmd, root=str(self.root), account=None)
-        self.assertEqual(lines[3:], ["no swap file: swapon did not work (swapon: /swapfile: swapon failed: Operation not "
-                                     "permitted)", self.LIMIT_SET])
-        self.assertEqual(said.getvalue().splitlines()[3:], ["Founderizer: " + line for line in lines[3:]])
-        self.assertEqual(len(lines), 5)
+        self.assertEqual(lines[3:5], ["no swap file: swapon did not work (swapon: /swapfile: swapon failed: Operation "
+                                      "not permitted)", self.LIMIT_SET])
+        self.assertEqual(said.getvalue().splitlines()[3:5], ["Founderizer: " + line for line in lines[3:5]])
+        self.assertEqual(len(lines), 7)
+
+
+class HardenRestart(unittest.TestCase):
+    """The restart parts of hubsetup.py harden (the owner, 17 November 2026: "I dont want to be doing devops work on the
+    fleet", after a server stopped and answered nothing until a restart at its provider): after a kernel panic the
+    kernel restarts the server, and when systemd stops the kernel's software watchdog does. The kernel's files,
+    systemd's and the server's own are under a folder of the test's own, and each command answers from a stand-in that
+    does what the real one leaves behind."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="fleet-restart-"))
+        self.addCleanup(shutil.rmtree, str(self.root), True)
+        for folder in ("proc/sys/kernel", "sys/class/watchdog", "run/systemd/system", "etc/sysctl.d", "etc/systemd"):
+            (self.root / folder).mkdir(parents=True)
+        self.panic, self.device = self.root / "proc/sys/kernel/panic", self.root / "sys/class/watchdog/watchdog0"
+        self.panic.write_text("0\n")
+        # Ubuntu's own file names the setting in a comment only.
+        (self.root / "etc/systemd/system.conf").write_text("[Manager]\n#RuntimeWatchdogSec=off\n#RebootWatchdogSec=10min\n")
+        self.ran, self.fails, self.loads = [], {}, True
+
+    def run_cmd(self, script, timeout=120):
+        """Each command as the real one leaves the server: sysctl takes the file's value, and the unit's start loads
+        softdog, which systemd holds open at once when its reload read the step's drop-in (measured on systemd 255)."""
+        self.ran.append(script)
+        if script in self.fails:
+            return self.fails[script]
+        if script == f"sysctl -q -p {hubsetup.RESTART_PANIC_FILE}":
+            self.panic.write_text(f"{hubsetup.RESTART_PANIC}\n")
+        if script == f"systemctl start {hubsetup.RESTART_UNIT_NAME}" and self.loads:
+            self.device.mkdir(exist_ok=True)
+            held = (self.root / hubsetup.RESTART_CONF.lstrip("/")).exists()
+            (self.device / "state").write_text("active\n" if held else "inactive\n")
+        return 0, "", ""
+
+    def restart(self, check=False):
+        return [hubsetup.harden_panic(check, self.run_cmd, str(self.root)),
+                hubsetup.harden_watchdog(check, self.run_cmd, str(self.root))]
+
+    def guard(self):
+        return hubsetup.lifecycle.restart_guard(str(self.panic), str(self.root / "sys/class/watchdog"), str(self.root))
+
+    def put(self, path, text):
+        (self.root / path.lstrip("/")).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / path.lstrip("/")).write_text(text)
+
+    def written(self):
+        return [path for path in (hubsetup.RESTART_PANIC_FILE, hubsetup.RESTART_UNIT, hubsetup.RESTART_CONF)
+                if os.path.lexists(self.root / path.lstrip("/"))]
+
+    def test_a_server_that_stops_restarts_by_itself_and_a_second_run_changes_nothing(self):
+        self.assertIs(self.guard(), False)
+        self.assertEqual(self.restart(), ["the server restarts 10 seconds after a kernel panic",
+                                          "the watchdog restarts the server when systemd stops for 10 minutes"])
+        self.assertEqual(self.ran, ["sysctl -q -p /etc/sysctl.d/60-fleet-restart.conf", "systemctl daemon-reload",
+                                    "systemctl enable fleet-watchdog.service", "systemctl start fleet-watchdog.service"])
+        for path, text in ((hubsetup.RESTART_PANIC_FILE, hubsetup.RESTART_PANIC_TEXT),
+                           (hubsetup.RESTART_UNIT, hubsetup.RESTART_UNIT_TEXT),
+                           (hubsetup.RESTART_CONF, hubsetup.RESTART_CONF_TEXT)):
+            written = self.root / path.lstrip("/")
+            self.assertEqual((written.read_text(), written.stat().st_mode & 0o777), (text, 0o644), path)
+        self.assertTrue(hubsetup.RESTART_PANIC_TEXT.endswith("\nkernel.panic = 10\n"))
+        self.assertTrue(hubsetup.RESTART_CONF_TEXT.endswith("\n[Manager]\nRuntimeWatchdogSec=10min\n"))
+        # a start of the unit that hangs holds the boot with no end of its own
+        self.assertIn("\nTimeoutStartSec=30s\nExecStart=-/sbin/modprobe softdog\n", hubsetup.RESTART_UNIT_TEXT)
+        self.assertIs(self.guard(), True)
+        # A second run reads the kernel's files and its own, and changes nothing.
+        del self.ran[:]
+        self.assertEqual(self.restart(), ["the server restarts 10 seconds after a kernel panic already",
+                                          "the watchdog restarts the server when systemd stops for 10 minutes already"])
+        self.assertEqual(self.ran, [])
+
+    def test_a_server_keeps_its_own_files(self):
+        """A sysctl file that sets kernel.panic (in a vendor's folder, or /etc/sysctl.conf) and systemd's own file or
+        a drop-in that sets RuntimeWatchdogSec, and a link at this step's file (a mask): each part writes and runs
+        nothing. A comment is no setting, a key that only starts with kernel.panic is another key, and a vendor's file
+        is not read where /etc has a file of its name."""
+        self.put("/etc/sysctl.d/99-local.conf", "kernel.panic_on_oops = 1\n# kernel.panic = 0\n")
+        self.put("/usr/lib/sysctl.d/50-kdump.conf", "kernel.panic = 0\n")
+        self.put("/etc/sysctl.d/50-kdump.conf", "# masks the vendor's file\n")
+        self.assertEqual(self.restart(check=True)[0], "would restart the server 10 seconds after a kernel panic")
+        (self.root / "etc/sysctl.d/50-kdump.conf").unlink()
+        self.put("/etc/systemd/system.conf.d/90-own.conf", "[Manager]\nRuntimeWatchdogSec=30s\n")
+        self.assertEqual(self.restart(), [
+            "a kernel panic keeps this server's own setting: /usr/lib/sysctl.d/50-kdump.conf sets kernel.panic",
+            "the watchdog keeps this server's own setting: /etc/systemd/system.conf.d/90-own.conf sets "
+            "RuntimeWatchdogSec"])
+        (self.root / "usr/lib/sysctl.d/50-kdump.conf").unlink()
+        (self.root / "etc/systemd/system.conf.d/90-own.conf").unlink()
+        self.put("/etc/sysctl.conf", "kernel.panic=0\n")
+        self.put("/etc/systemd/system.conf", "[Manager]\nRuntimeWatchdogSec=off\n")
+        self.assertEqual(self.restart(), [
+            "a kernel panic keeps this server's own setting: /etc/sysctl.conf sets kernel.panic",
+            "the watchdog keeps this server's own setting: /etc/systemd/system.conf sets RuntimeWatchdogSec"])
+        (self.root / "etc/sysctl.conf").unlink()
+        self.put("/etc/systemd/system.conf", "[Manager]\n")
+        for path in (hubsetup.RESTART_PANIC_FILE, hubsetup.RESTART_UNIT):
+            (self.root / path.lstrip("/")).parent.mkdir(parents=True, exist_ok=True)
+            os.symlink("/dev/null", self.root / path.lstrip("/"))
+        self.assertEqual(self.restart(), [
+            "a kernel panic keeps this server's own setting: /etc/sysctl.d/60-fleet-restart.conf is a link of this "
+            "server's own",
+            "the watchdog keeps this server's own setting: /etc/systemd/system/fleet-watchdog.service is a link of "
+            "this server's own"])
+        self.assertEqual((self.ran, self.written()), ([], [hubsetup.RESTART_PANIC_FILE, hubsetup.RESTART_UNIT]))
+        self.assertTrue(all(os.path.islink(self.root / p.lstrip("/")) for p in self.written()), "the masks stay")
+
+    def test_a_server_keeps_its_own_state(self):
+        """A kernel that restarts after a panic with no file of this step's (a boot parameter), the watchdog program, a
+        watchdog that is active with no file of this step's, and a container, which its host restarts: nothing is
+        written and nothing runs. In a container the reading says nothing, because its kernel is its host's."""
+        self.panic.write_text("30\n")
+        # its file in /etc stays after an `apt remove`, so only the program itself counts
+        (self.root / "etc/watchdog.conf").write_text("watchdog-device = /dev/watchdog\n")
+        self.assertEqual(self.restart(check=True)[1],
+                         "would have the watchdog restart the server when systemd stops for 10 minutes")
+        self.put("/usr/sbin/watchdog", "#!/bin/sh\n")
+        self.assertEqual(self.restart(), [
+            "a kernel panic keeps this server's own setting: the kernel restarts it 30 seconds after one",
+            "the watchdog keeps this server's own: the watchdog program is installed (/usr/sbin/watchdog)"])
+        (self.root / "usr/sbin/watchdog").unlink()
+        self.device.mkdir()
+        (self.device / "state").write_text("active\n")
+        self.assertEqual(self.restart()[1], "a watchdog of this server's own is active already")
+        (self.root / "run/systemd/container").write_text("lxc\n")
+        self.panic.write_text("0\n")
+        self.assertEqual(self.restart(), [
+            "a kernel panic stays as it is: this system is a container, and its host restarts it",
+            "the watchdog stays as it is: this system is a container, and its host restarts it"])
+        self.assertIsNone(self.guard())
+        self.assertEqual((self.ran, self.written()), ([], []))
+
+    def test_the_check_only_reads(self):
+        self.assertEqual(self.restart(check=True), [
+            "would restart the server 10 seconds after a kernel panic",
+            "would have the watchdog restart the server when systemd stops for 10 minutes"])
+        self.assertEqual((self.ran, self.written(), self.panic.read_text()), ([], [], "0\n"))
+
+    def test_a_part_that_is_not_in_force_says_so_and_the_next_run_puts_it_in_force(self):
+        """A command that fails stops its part, so a unit that is not enabled, which no boot would start, is no
+        watchdog in force; and softdog that does not load is none either."""
+        self.fails[f"sysctl -q -p {hubsetup.RESTART_PANIC_FILE}"] = (
+            255, "", 'sysctl: permission denied on key "kernel.panic"\n')
+        self.fails[f"systemctl enable {hubsetup.RESTART_UNIT_NAME}"] = (1, "", "Failed to enable unit: Access denied\n")
+        self.assertEqual(self.restart(), [
+            "the restart after a kernel panic is written and not in force yet: the kernel takes it at the next start "
+            '(sysctl: permission denied on key "kernel.panic")',
+            "the watchdog is written and not in force: a command of systemd failed, and the next run tries again "
+            "(systemctl enable: Failed to enable unit: Access denied)"])
+        self.assertNotIn(f"systemctl start {hubsetup.RESTART_UNIT_NAME}", self.ran)
+        self.fails.clear()
+        self.loads = False          # a kernel with no softdog
+        self.assertEqual(self.restart()[1], "the watchdog is written and not in force yet: no watchdog device is "
+                                            "active, softdog did not load")
+        self.assertIs(self.guard(), False)
+        self.loads = True
+        del self.ran[:]
+        self.assertEqual(self.restart(), ["the server restarts 10 seconds after a kernel panic already",
+                                          "the watchdog restarts the server when systemd stops for 10 minutes"])
+        self.assertEqual(self.ran, ["systemctl daemon-reload", "systemctl enable fleet-watchdog.service",
+                                    "systemctl start fleet-watchdog.service"])
+        self.assertIs(self.guard(), True)
 
 
 class HubTcp(unittest.TestCase):

@@ -891,6 +891,9 @@ class Conversations(Base):
         self.ok("ask_team", self.context(cid), question="My card ends 4242 and I live at Calle Zafiro 7, refund me")
         work = hub.q1("SELECT * FROM tasks WHERE source_conversation=? AND source_message IS NULL", (cid,))
         self.ok("report_progress", ("test-generation", hub.tref(work["id"]), "1"), note="Card 4242 on Calle Zafiro.")
+        # owner feature jobs: the plain words of a result and the name of a job can say the person's words too
+        hub.q("UPDATE tasks SET plain='The refund for Calle Zafiro is sent.', job_name='Refund for Zafiro' WHERE id=?",
+              (work["id"],))
         pcid = self.says(PAT, "What did customers ask today?")["conversation"]
         hub.conversation_start("studio", pcid)
         self.ok("read_messages", self.context(pcid))
@@ -903,7 +906,7 @@ class Conversations(Base):
                                                           "'%Zafiro%'", (work["id"],)))
         self.assertEqual([w for w in ("Zafiro", "4242", "Ana") if w in indexed], [])      # its cancel, and no more
         row = self.task(work["id"])
-        kept = " ".join(str(row[k]) for k in ("title", "details", "done_when", "why", "what"))
+        kept = " ".join(str(row[k]) for k in ("title", "details", "done_when", "why", "what", "plain", "job_name"))
         kept += " ".join(r["text"] for r in hub.q("SELECT text FROM notes WHERE task=?", (work["id"],)))
         self.assertEqual([w for w in ("Zafiro", "4242", "Ana") if w in kept], [])
         self.assertIn(hub.REMOVED_WORDS, row["details"])
