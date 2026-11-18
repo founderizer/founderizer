@@ -34852,9 +34852,10 @@ def stale_instructions(name, extra):
 
 
 # The tools whose function commits team.json under call_tool's LOCK (save_integration, save_grant, move_agent,
-# switch_key_site). A tool left out of it is refused while an owner's write runs its git (KIT_BUSY), and writes nothing.
+# switch_key_site). A tool left out of it is refused while an owner's write runs its git (KIT_BUSY), and writes nothing;
+# test_every_writer_that_takes_the_lock_from_outside_takes_the_turn reads TOOLS for one.
 KIT_TOOLS = ("grant_access", "move_agent", "set_agent_model", "switch_key_site", "door_rollout", "door_hold",
-             "door_gitops", "request_secret")
+             "door_gitops", "door_fleet", "request_secret")
 
 
 def call_tool(agent, name, args, context=None):

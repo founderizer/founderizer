@@ -553,8 +553,9 @@ class ConfigRef(OwnerAPI):
         """A writer that holds LOCK without the turn (KIT) is refused while an owner write runs its git (KIT_BUSY), and
         a caller can read that refusal as final: the first review of 17 November 2026 found an owner's key swap answer
         dropped so, and a restore answered "try again". So an owner route whose act can reach commit_kit_file passes
-        kit or unlocked to ui_command; any other `with LOCK:` around such a call is `with kit_lock():`; and the tick,
-        which holds LOCK for each pass, calls kit_flying() first in each sweep that can commit."""
+        kit or unlocked to ui_command; any other `with LOCK:` around such a call is `with kit_lock():`; the tick,
+        which holds LOCK for each pass, calls kit_flying() first in each sweep that can commit; and a tool of the
+        table TOOLS that call_tool runs under LOCK is in KIT_TOOLS (door_fleet came on 18 November 2026 without it)."""
         tree = ast.parse(Path(hub.__file__).read_text())
         defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
 
@@ -587,6 +588,22 @@ class ConfigRef(OwnerAPI):
                 for sweep in sorted(reach) if owner.name == "tick" else []:
                     if "kit_flying" not in used[sweep]:
                         missing.append(f"tick: {sweep} can commit and does not ask kit_flying()")
+        # call_tool runs a tool's function from TOOLS under `kit_lock() if name in KIT_TOOLS else LOCK`, except the
+        # tools of its tuple that names deliver_result, which it runs with no lock (commit_kit_file takes the turn then)
+        free = next(t for t in ({e.value for e in c.comparators[0].elts} for c in ast.walk(defs["call_tool"])
+                                if isinstance(c, ast.Compare) and isinstance(c.comparators[0], ast.Tuple)
+                                and all(isinstance(e, ast.Constant) for e in c.comparators[0].elts))
+                    if "deliver_result" in t)
+        table = next(n.value for n in tree.body if isinstance(n, ast.Assign) and
+                     [ast.unparse(t) for t in n.targets] == ["TOOLS"])
+        for row in table.elts:
+            if isinstance(row, ast.Tuple) and isinstance(row.elts[1], ast.Constant):
+                if names(row.elts[2]) & writes and row.elts[1].value not in hub.KIT_TOOLS + tuple(free):
+                    missing.append(f"call_tool: the tool {row.elts[1].value} can commit and is not in KIT_TOOLS "
+                                   f"(or in call_tool's tuple of the tools that it runs with no lock)")
+            elif names(row) & writes:       # the triggers' row, made from wakeups.TOOL_SPECS: no name to check here
+                missing.append(f"call_tool: a row of TOOLS at line {row.lineno} names {sorted(names(row) & writes)}, "
+                               f"which can commit: write each such tool as a tuple row of its own, its name in quotes")
         self.assertEqual(missing, [])
 
     # ---- the reload follows the same ref

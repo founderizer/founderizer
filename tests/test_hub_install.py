@@ -5404,7 +5404,8 @@ class PackageLists(unittest.TestCase):
     """Each installer's one package list names the system packages that the fleet's own programs need: tzdata for the
     hub's time zones (ZoneData), and the packages of the system libraries that the fleet's pinned tools load
     (fleet.PROGRAM_LIBRARIES): without libatomic1, which the image of Ubuntu 24.04 does not have, the pinned Node does
-    not start, and no npm program of an MCP server installs."""
+    not start, and no npm program of an MCP server installs. The owner's Mac installs the packages of those libraries
+    on a server that joined before (ServerLibraries in the app), from a list of its own."""
 
     def test_each_package_list_names_tzdata_and_the_libraries_of_the_pinned_tools(self):
         for script in (SCRIPT, KIT / "join.sh"):
@@ -5412,6 +5413,13 @@ class PackageLists(unittest.TestCase):
             self.assertEqual(len(lists), 1, script.name)
             for package in ("tzdata", *fleet.PROGRAM_LIBRARIES.values()):
                 self.assertIn(package, lists[0].split(), script.name)
+
+    @unittest.skipUnless((KIT / "app").is_dir(), "the published repository has no app/")
+    def test_the_owners_mac_installs_the_packages_of_the_pinned_tools_libraries(self):
+        swift = (KIT / "app/Sources/FleetCore/ServerLibraries.swift").read_text()
+        lists = re.findall(r"^    public static let packages = \[([^\]]*)\]$", swift, re.M)
+        self.assertEqual(len(lists), 1)
+        self.assertEqual(sorted(re.findall(r'"([^"]+)"', lists[0])), sorted(set(fleet.PROGRAM_LIBRARIES.values())))
 
 
 class ZoneData(unittest.TestCase):
