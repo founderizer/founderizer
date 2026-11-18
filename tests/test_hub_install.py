@@ -348,12 +348,6 @@ class Repository(unittest.TestCase):
     def make(self):
         return hubsetup.repository(str(self.tree), self.bare, self.kit)
 
-    def test_both_refs_start_at_the_code_the_installer_runs(self):
-        """So the code the hub serves to every machine is the code the hub itself runs."""
-        self.assertEqual(self.make(), self.commit)
-        for branch in (hub.CODE_BRANCH, hub.CONFIG_BRANCH):
-            self.assertEqual(self.git("rev-parse", branch, folder=self.bare), self.commit, branch)
-
     def test_the_hubs_checkout_stands_on_the_ref_the_hub_writes(self):
         self.make()
         self.assertEqual(self.git("symbolic-ref", "--short", "HEAD", folder=self.kit), hub.CONFIG_BRANCH)

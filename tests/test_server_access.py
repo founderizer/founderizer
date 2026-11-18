@@ -19,7 +19,8 @@ DOOR = "127.0.0.20"             # the door's address in these tests: no machine 
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(cls(name) for cls in (ServerKind, DoorTokens, DoorCalls, PhoneYes, AppServers)
+    return unittest.TestSuite(cls(name) for cls in (ServerKind, DoorTokens, DoorCalls, PhoneYes, PhoneRecoveryCopy,
+                                                    AppServers)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -1985,10 +1986,6 @@ class DoorCalls(Access):
                                              "why": "x", "give_to": {"door": "read"}})
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PhoneYes(Devices):
     """DevOps plan 5.4: a phone's own signing key comes with its enrollment, bound by an HMAC to the one-time value of
     the Mac's QR; the Mac certifies it with the owner key; only the door's address reads the certificates."""
@@ -2287,3 +2284,7 @@ class AppServers(Access):
         self.owner("/ui/door/host", host="ci-1", state="passed", said="")
         self.assertEqual(hub.door_waits_after(), "ci-1")
         self.assertEqual(len(self.told("call door_rollout with go true")), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

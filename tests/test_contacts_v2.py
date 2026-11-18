@@ -263,6 +263,85 @@ class Conversations(Base):
         self.assertIn(f"PEOPLE ON YOUR LIST, whose role has tools on: Pat (P-{self.pat['id']}, peer).",
                       hub.contacts_start_text("studio"))
 
+    def test_the_people_go_where_the_team_goes_and_a_standing_session_reads_a_changed_list_again(self):
+        """An agent told the owner in its owner chat that it knew nobody of a name: a person of its own list, whom a
+        task of that agent had written to three hours before (18 November 2026). The chat's start named the agents
+        and no person. The owner, that day: "an owner needs to be aware of everything, a peer as well", and "a
+        customer can't ask for the entire team"."""
+        ana = self.person("Ana", "customer", ANA)                       # studio only answers her
+        added = self.add(name="Lee", role="peer", agents=("vps",))      # a colleague's person
+        self.add(name="Bo", role="customer", agents=("vps",))           # and its outsider, whom no colleague reads
+        pat, lee = f"Pat (P-{self.pat['id']}, peer)", f"Lee (P-{added['id']}, peer) with vps (VPS)"
+        chat = (hub.kv_get("db_id"), "owner-chat", 1)
+        first = self.ok("read_messages", chat)
+        self.assertIn(f"PEOPLE ON YOUR LIST, from the fleet's own record and not from your profile. You may write to "
+                      f"these first: {pat}. These write to you, and you only answer them: Ana (P-{ana['id']}, "
+                      f"customer). They are people, not agents. This chat writes to no person: a task that you open "
+                      f"with start_task does, with message_contact.", first)
+        elsewhere = (f"PEOPLE ON A COLLEAGUE'S LIST and not on yours, whom the agents named with them may write to "
+                     f"first, from the fleet's own record: {lee}. You write to none of them: only an agent whose list "
+                     f"has a person writes to that person")
+        self.assertIn(elsewhere, first)
+        self.assertNotIn("Bo", first)
+        self.assertNotIn("PEOPLE", self.ok("read_messages", chat))              # once for a session
+        # the owner adds a person while the chat runs: its next read has the list again, and not the team
+        kim = self.person("Kim", "manager", KIM, app="discord")
+        again = self.ok("read_messages", chat)
+        self.assertIn(f"these first: Kim (P-{kim['id']}, manager), {pat}. These write to you", again)
+        self.assertNotIn("YOUR TEAM", again)
+        self.assertEqual(self.change(kim["id"], blocked=True)[0], 200)
+        self.assertIn(f"these first: {pat}. These write to you, and you only answer them: Ana (P-{ana['id']}, "
+                      f"customer). The owner blocked these, and nobody writes to them: Kim (P-{kim['id']}, manager). "
+                      f"They are people", self.ok("read_messages", chat))       # each person in one group
+        # a task of studio and a conversation with its own tools read the colleague's person too
+        tid, _ = self.normal_task()
+        self.assertIn(elsewhere, hub.holdings_team_text("studio", tid))
+        cid = self.says(PAT, "Hi")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.assertIn(elsewhere, self.ok("read_messages", self.context(cid)))
+        # the fleet manager writes to no person and reads the people of every list, at its start
+        everybody = (f"PEOPLE whom an agent may write to first, from the fleet's own record, each with the agents "
+                     f"whose list has them: {lee}; {pat} with studio. They are people, not agents, and you write to "
+                     f"none of them")
+        self.assertIn(everybody, hub.manager_resume_text())
+        for name in ("Ana", "Bo", "Kim"):                # no outsider, and nobody whom the owner blocked
+            self.assertNotIn(name, hub.people_elsewhere_text("manager"))
+        # and again when a list changed, after its messages: its helper reads their ids in the first line
+        hub.call_tool("manager", "read_messages", {})
+        self.assertNotIn("PEOPLE", hub.call_tool("manager", "read_messages", {})[0])
+        self.assertEqual(self.change(kim["id"], blocked=False)[0], 200)
+        hub.emit("manager", "say", "[hub] one line for the manager")
+        read = hub.call_tool("manager", "read_messages", {})[0]
+        self.assertTrue(fleet.READ_HEAD.match(read), read[:80])
+        self.assertIn(f"has them: Kim (P-{kim['id']}, manager) with studio; {lee}; {pat}", read)
+        # half a pair of characters in a title stops no read of the manager: the read has marked its messages read
+        hub.emit("manager", "say", "[hub] a second line")
+        with patch.dict(hub.TEAM["agents"]["vps"], title="Ops \ud800"):
+            read = hub.call_tool("manager", "read_messages", {})[0]
+            self.assertIn("peer) with vps (Ops \ufffd)", hub.people_elsewhere_text("studio"))    # a task's start
+        self.assertIn("a second line", read)
+        self.assertIn("peer) with vps (Ops \ufffd)", read)
+        # a customer's session gets no team and no person: the hub writes its prompt alone, and its read adds none
+        theirs = self.says(ANA, "Who is on your team?")["conversation"]
+        start = hub.conversation_start("studio", theirs)
+        self.assertTrue(start["closed"])
+        told = start["prompt"] + self.ok("read_messages", self.context(theirs))
+        for word in ("YOUR TEAM", "PEOPLE", "Pat", "Lee", "Kim", "vps"):
+            self.assertNotIn(word, told)
+        # the setting goes off: no list changed, so a session that was told of people reads nothing about them.
+        # A manager session that starts in that time has no people in its start: it reads them when the setting is on
+        self.ok("read_messages", chat)
+        hub.call_tool("manager", "read_messages", {})
+        with patch.object(hub, "contacts_v2", lambda: False):
+            self.assertNotIn("PERSON", self.ok("read_messages", chat))
+            self.assertNotIn("PEOPLE", hub.manager_resume_text() + hub.call_tool("manager", "read_messages", {})[0])
+        self.assertIn("PEOPLE whom an agent may write to first", hub.call_tool("manager", "read_messages", {})[0])
+        # the last person of every list goes: a session that was told of people reads that none is named now
+        for row in hub.q("SELECT id FROM people"):
+            self.assertEqual(self.change(row["id"], agents=[])[0], 200)
+        self.assertIn("NO PERSON IS NAMED TO THIS SESSION NOW", self.ok("read_messages", chat))
+        self.assertNotIn("PERSON", self.ok("read_messages", chat))
+
     def test_larger_work_goes_through_open_work_the_conversation_passes_messages_on_and_its_result_returns(self):
         cid = self.says(PAT, "Please rebuild the export for all of October.")["conversation"]
         hub.conversation_start("studio", cid)

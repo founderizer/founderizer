@@ -748,6 +748,11 @@ class Tools(Fleet):
         rid, review_context = self.task("desk", title="Review the refunds", responsibility=review["id"])
         chat = (hub.kv_get("db_id"), "owner-chat", 1)
         reading = {"windows": [{"label": "5h", "used_percent": 97, "resets_at": None}]}
+        # a person of its list whom it may write to first: its owner chat reads of the people, and has no
+        # message_contact (the review of 18 November 2026 found that tool's name in the chat's text)
+        pat = hub.ins("INSERT INTO people(name,role,added) VALUES('Pat','peer',?)", (t0,))
+        hub.q("INSERT INTO person_agents(person,agent,added) VALUES(?,'desk',?)", (pat, t0))
+        self.assertIn("You may write to these first: Pat", hub.chat_people_text("desk"))
 
         def checked(texts, state):
             for name, (text, where) in texts.items():
@@ -765,7 +770,8 @@ class Tools(Fleet):
                 said = checked({"start": (hub.start_text("desk", tid), context),
                                 "resume": (hub.start_text("desk", tid, resume=True, note="It stopped."), context),
                                 "review": (hub.start_text("desk", rid), review_context),
-                                "owner chat": (hub.chat_team_once("desk"), chat)}, state["state"])
+                                "owner chat": (hub.chat_team_once("desk") + hub.chat_people_text("desk"), chat)},
+                               state["state"])
                 for kept in ("Read the order before the refund.", "Answer within the day.", "Refunds go to a person.",
                              "which do not fit here", "did not fit", "ONE PART of step 1", "WHAT CAME BEFORE",
                              "YOUR ALLOWANCE"):

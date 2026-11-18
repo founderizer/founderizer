@@ -4810,6 +4810,10 @@ def t_read_messages(agent, a):
             kv_set("mgr_screen_shown", None)        # a session that reads has no question in front of it
             kv_set("mgr_screen_frozen", None)       # and is not frozen
         team = chat_team_once(agent) if chat_context(agent) else ""      # plan P9.1
+        # The fleet manager's standing session reads the people of the fleet's lists again when they changed,
+        # after its messages: the first line of its answer names the messages for the helper (fleet.read_ids).
+        people = people_once(agent, "", people_elsewhere_text(agent)) \
+            if agents()[agent].get("role") == "manager" else ""
         said, head = None, ""
         if not rows:
             if chat_context(agent) or agents()[agent].get("role") == "manager":
@@ -4833,8 +4837,9 @@ def t_read_messages(agent, a):
         key = secret_key()
     with logins_held(key):
         team = mask_message(team)
+        people = "\n" + mask_message(people).rstrip("\n") if people else ""
         if said is None:
-            return team + "No unread messages. Wait for the next signal."
+            return team + "No unread messages. Wait for the next signal." + people
         # Hidden characters go before each message's mask, as at every exit: one inside a login hides it from the
         # mask. Here and not only in call_tool, because unread_tail adds this read to another tool's answer after
         # that answer's strip. The lines go to the hub's output: log() takes the lock, where TeamLock raises Left for
@@ -4847,7 +4852,7 @@ def t_read_messages(agent, a):
                 if failed:
                     print(f"{agent}: {failed}", flush=True)
             shown.append(f"Message M-{n}:\n" + (start or mask_message(text)))
-        out = team + head + "\n\n".join(shown)
+        out = team + head + "\n\n".join(shown) + people
         if removed:
             print(f"{agent}: read_messages: removed {removed} hidden characters (tag characters: {tags})", flush=True)
             out = out.rstrip("\n") + "\n\n" + hidden.count_line(removed, tags)
@@ -4858,14 +4863,18 @@ def chat_team_once(agent):
     """The team directory for the first read of each owner chat session (plan P9.1), then "". A new chat session is a
     new count of its window's tool listings (listed_window), so a chat that starts again, a new one or one that
     continues its conversation, reads it once, whatever its helper wrote at its start; and no tool's description
-    carries it, so a duty given changes no session's fixed text."""
+    carries it, so a duty given changes no session's fixed text.
+
+    The people come with it (chat_people_text), and again at the first read after the lists changed (people_once):
+    the owner adds a person and then asks the agent about that person in the chat that already runs."""
     listed = str(kv_get(f"listed:{agent}:owner-chat") or 0)
+    people = people_once(agent, listed, chat_people_text(agent))
     if kv_get(f"chat_team:{agent}") == listed:
-        return ""
+        return people.strip() + "\n\n" if people else ""
     kv_set(f"chat_team:{agent}", listed)
     # An agent whose Shell box is off has no team directory (support plan F1), and its chat still answers the owner
-    # (tell_owner, message_owner): it gets the owner's name and language alone.
-    team = (owner_start_text() if shell_off(agent) else team_start_text(agent)).strip()
+    # (tell_owner, message_owner): it gets the owner's name and language, and the people of its own list.
+    team = ((owner_start_text() if shell_off(agent) else team_start_text(agent)) + people).strip()
     return team + "\n\n" if team else ""
 
 
@@ -5147,6 +5156,157 @@ def contacts_start_text(agent):
             + ". They are people, not agents: message_contact writes to them"
             + ("." if shell_off(agent) else ", and message_agent reaches only the agents of your team.")   # F1
             + "\n")
+
+
+# ---------------------------------------------------------------- the people go where the team goes
+#
+# An agent told the owner, in its owner chat, that it knew nobody of a name: a person of its own list, whom a task of
+# the same agent had written to three hours before (18 November 2026). The chat's start named the agents and no
+# person, and the agent's profile named one contact, from before the owner added that person. The owner, that day:
+# "an owner needs to be aware of everything, a peer as well", and "a customer can't ask for the entire team".
+#
+# So a session that is told the team is told the people too, from the fleet's own record: the people of its own list
+# (contacts_start_text in a task and in a conversation with the agent's tools, chat_people_text in the owner chat,
+# which names every one of them) and, by name, the staff of its colleagues' lists (people_elsewhere_text), which for
+# the fleet manager is every list. A session that gets no team gets no colleague's people: a closed conversation,
+# whose prompt the hub writes alone (conversation_rules), a narrowed one (scope_holdings_text), and every session of
+# an agent whose Shell box is off. The two standing sessions that the owner writes to, an owner chat and the fleet
+# manager's, read the people again when the lists changed (people_once).
+PEOPLE_CHARS = 600              # the most that one more list of people adds to a session's opening text
+PEOPLE_GONE = ("\nNO PERSON IS NAMED TO THIS SESSION NOW, in the fleet's own record. You do not write to the people "
+               "that an earlier text named, and no colleague writes to them for you: the owner changed a list, a "
+               "block, a role, a setting or the team.\n")
+
+
+def people_on_lists():
+    """Each person who is on the list of an agent that takes work, with those agents, and with whether an agent may
+    write to them first (their role has tools on, and the owner did not block them): [(person, [agent, ...], first)],
+    by the person's name. An agent in setup is in no team directory either, and a name that the team no longer has
+    is no agent. The switch is read once for each role. Reads only (read_rows): a start text runs inside
+    admit_task's transaction."""
+    found, tools = {}, {}
+    for r in read_rows("SELECT p.*, a.agent AS on_list FROM people p JOIN person_agents a ON a.person=p.id "
+                       "ORDER BY p.name COLLATE NOCASE, p.id, a.agent"):
+        if r["on_list"] in agents() and agent_active(r["on_list"]):
+            if r["id"] not in found:
+                if r["role"] not in tools:
+                    tools[r["role"]] = person_access(r)["tools"]
+                found[r["id"]] = (r, [], r["blocked"] is None and tools[r["role"]])
+            found[r["id"]][1].append(r["on_list"])
+    return list(found.values())
+
+
+def person_named(person):
+    """A person in a list of people, as contacts_start_text names one: two people can have one name and one role,
+    and message_contact takes the P-<id>."""
+    return f"{person['name']} (P-{person['id']}, {person['role']})"
+
+
+def names_that_fit(items, limit, between=", "):
+    """(the names that fit in `limit` characters, joined; how many did not fit). The first one always fits, so a
+    list never names nobody."""
+    kept, left = [], 0
+    for item in items:
+        if not kept or sum(len(x) + len(between) for x in kept) + len(item) <= limit:
+            kept.append(item)
+        else:
+            left += 1
+    return between.join(kept), left
+
+
+def people_elsewhere_text(agent, lists=None):
+    """The people of the other agents' lists whom an agent may write to first, each with the agents whose list has
+    them, as the team directory names a colleague: so a session finds the colleague that can write to a person whom
+    it cannot write to itself. For the fleet manager, which writes to no person, these are the people of every list,
+    in the room of the team directory. A person whose role has tools off, or whom the owner blocked, is named to no
+    colleague: such a person is an outsider, and only the agent that answers them reads their name. At most
+    TEAM_ITEMS agents for one person, then a count. "" for an agent whose Shell box is off, which has no team
+    directory, and before contacts.v2. lists: people_on_lists(), when the caller has it. Reads only (read_rows)."""
+    role = role_of(agent)
+    if not contacts_v2() or shell_off(agent) or role not in ("worker", "lead", "manager"):
+        return ""
+
+    def named(name):       # a title can hold half a pair of characters, which no record of a text stores (people_once)
+        title = str((agents().get(name) or {}).get("title") or "").strip()
+        title = title.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+        return name + (f" ({title})" if title else "")
+    items = [f"{person_named(p)} with {named_few([named(a) for a in on], TEAM_ITEMS)}"
+             for p, on, first in (people_on_lists() if lists is None else lists)
+             if first and (role == "manager" or agent not in on)]
+    if not items:
+        return ""
+    names, left = names_that_fit(items, TEAM_CHARS if role == "manager" else PEOPLE_CHARS, "; ")
+    names += f"; and {left} more, for whom this text has no room" if left else ""
+    if role == "manager":
+        return (f"\nPEOPLE whom an agent may write to first, from the fleet's own record, each with the agents whose "
+                f"list has them: {names}. They are people, not agents, and you write to none of them: work that needs "
+                f"a person goes to an agent whose list has that person.\n")
+    return (f"\nPEOPLE ON A COLLEAGUE'S LIST and not on yours, whom the agents named with them may write to first, "
+            f"from the fleet's own record: {names}. You write to none of them: only an agent whose list has a person "
+            f"writes to that person, so work that needs one of them goes to such a colleague, through your line.\n")
+
+
+def chat_people_text(agent):
+    """What an owner chat's session is told about people: every person of the agent's own list, from the fleet's own
+    record and not from its profile, in three groups (the ones that it may write to first, the ones that it only
+    answers, the ones that the owner blocked), then the people of its colleagues' lists (people_elsewhere_text). The
+    owner is the reader of this chat, so it names all of them; a task's list names only the ones that message_contact
+    takes (contacts_start_text). The chat itself writes to no person, so the text says which session does, where the
+    list has a person to write to, and it names no tool that the chat of an agent whose Shell box is off does not
+    have (SHELL_OFF_CHAT). "" before contacts.v2, and where no list has a person for this agent to know. Reads only
+    (read_rows)."""
+    if not contacts_v2() or role_of(agent) not in ("worker", "lead"):
+        return ""
+    lists = people_on_lists()
+    mine, elsewhere = [(p, first) for p, on, first in lists if agent in on], people_elsewhere_text(agent, lists)
+    if not mine:
+        return ("\nNO PERSON IS ON YOUR LIST, in the fleet's own record, whatever your profile says.\n" + elsewhere
+                if elsewhere else "")
+    groups = (("You may write to these first", [p for p, first in mine if first]),
+              ("These write to you, and you only answer them",
+               [p for p, first in mine if not first and p["blocked"] is None]),
+              ("The owner blocked these, and nobody writes to them", [p for p, _ in mine if p["blocked"] is not None]))
+    said = []
+    for words, people in groups:
+        if people:
+            names, left = names_that_fit([person_named(p) for p in people], PEOPLE_CHARS)
+            said.append(f"{words}: {names}" + (f", and {left} more, for whom this text has no room" if left else ""))
+    closed = shell_off(agent)
+    return ("\nPEOPLE ON YOUR LIST, from the fleet's own record and not from your profile. " + ". ".join(said)
+            + ". They are people, not agents. This chat writes to no person"
+            + ("." if not groups[0][1] else ": your task sessions do." if closed else
+               ": a task that you open with start_task does, with message_contact.")
+            + ("" if closed else " search_history with person gives what you and one of them said.")
+            + "\n" + elsewhere)
+
+
+def people_once(agent, session, text):
+    """`text` when this standing session of the agent was not told it yet, else "": the people of an owner chat
+    (session: the count of its window's listings, as chat_team_once has it) or of the fleet manager's session
+    (session "": its start carries them, manager_resume_text, so one note serves each of its sessions). The note is
+    the session and a digest of the text, so a list that changed is told once more, at the session's next read. A
+    text that became empty after the agent was told of people says so (PEOPLE_GONE): its session would go on naming
+    them.
+
+    While contacts.v2 is off it tells nothing, because that changes no list, and it marks a note that there is: a
+    manager session that started in that time had no people in its start, and reads them when the setting is on
+    again. Writes the note, so only read_messages calls it; an agent that was never told of a person has no note, so
+    a fleet with no people writes none.
+
+    A title or a name can hold half a pair of characters, which the record of a tool's answer cannot store
+    (call_tool): the read had marked its messages read by then, and the fleet manager lost them. So the text leaves
+    with the mark that json_plain puts in such a place."""
+    if not contacts_v2():
+        if kv_get(f"people_told:{agent}") is not None:
+            kv_set(f"people_told:{agent}", f"{session}:off")
+        return ""
+    text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    mark = f"{session}:{hashlib.sha256(text.encode()).hexdigest()[:16]}"
+    was = kv_get(f"people_told:{agent}")
+    if was == mark or (was is None and not text):
+        return ""
+    kv_set(f"people_told:{agent}", mark)
+    return text or (PEOPLE_GONE if was and was.startswith(f"{session}:") else "")
 
 
 def allowance_start_text(agent, task_id):
@@ -5452,7 +5612,7 @@ def holdings_team_text(agent, task_id):
     # support plan F1: a session whose Shell box is off holds its fixed list and its duty's servers, as SHELL_OFF_RULE
     # says; the record of the agent names keys, repositories and logins that never reach it
     return ("" if shell_off(agent) else holdings_start_text(agent)) + team_start_text(agent) + \
-        contacts_start_text(agent) + allowance_start_text(agent, task_id)
+        contacts_start_text(agent) + people_elsewhere_text(agent) + allowance_start_text(agent, task_id)
 
 
 def scope_holdings_text(agent, scope):
@@ -33320,6 +33480,7 @@ def manager_resume_text(parts=True):
                             + "Where the fleet stands, as the hub has it (nothing here is only in this session):\n"
                             + "\n".join(resume_lines(t0))
                             + team_start_text(manager_name())               # the team directory (P9.1)
+                            + people_elsewhere_text(manager_name())         # the people of every list
                             + standing_start_text(manager_name()).rstrip("\n")   # its standing items (L3, 6.4)
                             # its skills, where its stable text does not list them (design v4 D3)
                             + skills_start_text(manager_name(), not parts).rstrip("\n")
@@ -45746,6 +45907,7 @@ AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent"
 # kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
 AGENT_KV = ("tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
             "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:",
+            "people_told:",        # the people that a standing session was told of (people_once)
             "first_message:", "settings_finding:", "chat_undelivered:", "read_missing:", "read_told:",
             "service_user:", "caller_user:",       # one OS user for each agent: SERVICE_USER and CALLER_USER
             # the pairs of its lessons that its work wrote close (MEMORY_CLOSE_KEY), a lead's task for its team's

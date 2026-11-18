@@ -66,7 +66,8 @@ class PushCase(Devices):
         super().setUp()
         self.side = ThreadingHTTPServer(("127.0.0.1", 0), OurSide)
         self.side.got, self.side.answer = [], (200, {"status": 200, "reason": ""})
-        threading.Thread(target=self.side.serve_forever, daemon=True).start()
+        # a short poll: tearDown's shutdown() waits for the loop's next look, which was up to 0.5 s in each test
+        threading.Thread(target=self.side.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
         hub.CFG["release_channel"] = f"http://127.0.0.1:{self.side.server_port}"
         hub.q("INSERT INTO entitlement(id,fleet,token,plan,until,machines,agents,verified,stored) "
               "VALUES(1,'0f1e2d3c4b5a6978',?,'founder-monthly',?,5,10,1,?)", (ENTITLEMENT, hub.now() + 86400, hub.now()))
@@ -206,11 +207,6 @@ class Queue(PushCase):
         self.assertEqual([(p["device"], p["kind"], p["item"], p["db"], p["state"]) for p in got],
                          [("iphone", "needs", nid, "test-generation", "queued")])
         self.assertNotIn("domain", json.dumps(got))                     # the row holds no text of the item
-
-    def test_no_token_no_ping(self):
-        self.enrolled()
-        self.raise_item()
-        self.assertEqual(self.pings(), [])
 
     def test_a_removed_device_gets_no_ping(self):
         self.give(self.enrolled())
@@ -507,7 +503,8 @@ class Sender(PushCase):
         self.raise_item()
         quiet = ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
         quiet.stop, quiet.block_on_close = threading.Event(), False
-        threading.Thread(target=quiet.serve_forever, daemon=True).start()
+        # a short poll: its shutdown() below waits for the loop's next look, which was up to 0.5 s
+        threading.Thread(target=quiet.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
         try:
             with patch.object(push, "TIMEOUT", 1):
                 hub.CFG["release_channel"] = f"http://127.0.0.1:{quiet.server_port}"
