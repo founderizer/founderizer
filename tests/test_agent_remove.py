@@ -24,7 +24,7 @@ from test_ui_api import PATIENCE
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(cls(name) for cls in (Remove, Spent, Leaving, RemoveService, Helper)
+    return unittest.TestSuite(cls(name) for cls in (Remove, Spent, Decisions, Leaving, RemoveService, Helper)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -83,6 +83,7 @@ class Remove(Servers):
               (hub.hashlib.sha256(agent.encode()).hexdigest(), agent, "task", "test-generation", t0))
         hub.kv_set(f"tools:{agent}", "[]")
         hub.kv_set(f"listed:{agent}:manager", 1)
+        hub.kv_set(f"memory_close:{agent}", "[]")
 
     def count(self, agent):
         return {table: hub.q1(f"SELECT COUNT(*) c FROM {table} WHERE {column}=?", (agent,))["c"]
@@ -101,6 +102,13 @@ class Remove(Servers):
                     "skills/vps/deploy/SKILL.md": "---\nname: deploy\n---\n"}, team)
         for agent in ("scout", "vps"):
             self.own_rows(agent)
+        hub.kv_set("talk_guard:scout:vps", "1")         # the talk guard's mark of a pair, and of another pair
+        hub.kv_set("talk_guard:ann:vps", "1")
+        hub.history_catch_up()          # the history search has copies of their lessons, items and reports
+
+        def copies():
+            return {a: hub.q1("SELECT COUNT(*) c FROM history WHERE agent=?", (a,))["c"] for a in ("scout", "vps")}
+        self.assertEqual(copies(), {"scout": 3, "vps": 3})
         before = self.head()
         status, receipt = self.remove()
         self.assertEqual(status, 200, receipt)
@@ -125,7 +133,12 @@ class Remove(Servers):
         self.assertEqual(self.count("vps")["standing"], 1)
         self.assertIsNone(hub.kv_get("tools:scout"))
         self.assertIsNone(hub.kv_get("listed:scout:manager"))
-        self.assertEqual(hub.kv_get("tools:vps"), "[]")
+        self.assertIsNone(hub.kv_get("memory_close:scout"))
+        self.assertEqual((hub.kv_get("tools:vps"), hub.kv_get("memory_close:vps")), ("[]", "[]"))
+        self.assertEqual([r["k"] for r in hub.q("SELECT k FROM kv WHERE k LIKE 'talk_guard:%'")],
+                         ["talk_guard:ann:vps"])
+        # the search's copies of what the delete took go with it, so they keep no name; vps's stay
+        self.assertEqual(copies(), {"scout": 0, "vps": 3})
         job = hub.q1("SELECT * FROM server_jobs WHERE id=?", (receipt["job"],))
         self.assertEqual((job["server"], job["kind"], job["agent"], job["runtime"], job["state"]),
                          ("box", "remove", "scout", "codex", "queued"))
@@ -374,6 +387,95 @@ class Remove(Servers):
         self.assertEqual((status, answer["error"]), (409, "owner request is already answered"))
         self.assertEqual((self.count("scout")["ui_requests"], self.count("scout")["events"]), (0, 0))
 
+    def test_the_ids_that_a_delete_frees_bring_no_old_delivery_and_reach_the_history(self):
+        """SQLite gives a deleted newest id to the next row of its table. The owner's message to scout and scout's
+        report to the owner, with the report's delivery and file, are the newest rows of their tables when the delete
+        takes them, and the history search has read them; so are scout's two lessons, in the lesson search too, and
+        scout's standing item, which a conversation window of vps was told of. The next ones take the same ids, except
+        a lesson, whose id is never given again: vps's report in GET /ui/state has no delivery and no file of scout's,
+        the window says nothing of the manager's new item, scout's words find no lesson of vps, and the history search
+        takes in the owner's message to vps, vps's report and its lesson, which went into no history while the search
+        stood past those ids. scout's event is the newest of all, and vps's message to scout names it: its id is never
+        given again, so the next events of others take the ids above it, and the message names none of them. And the
+        next check of vps takes the id of scout's check that waited for its helper's settings, with no mark of it."""
+        t0 = hub.now()
+
+        def owner_says(agent, text):
+            with hub.LOCK, hub.transaction():
+                hub.owner_message_rows(f"m-{agent}", "message", None, text, "test", agent, None, hub.now())
+            return hub.q1("SELECT rowid FROM ui_requests ORDER BY rowid DESC LIMIT 1")["rowid"]
+
+        def reports(agent, text):
+            return hub.ins("INSERT INTO owner_reports(text,about,created,agent) VALUES(?,'chat',?,?)",
+                           (text, hub.now(), agent))
+
+        def steers(agent, words):
+            return hub.ins("INSERT INTO standing(agent,scope,kind,words,author_kind,author,created) VALUES(?,'agent',"
+                           "'instruction',?,'owner','owner',?)", (agent, words, hub.now()))
+
+        def learns(agent, text):
+            """A lesson as remember writes it: in the lesson search too."""
+            with hub.LOCK, hub.transaction():
+                mid = hub.DB.execute("INSERT INTO memories(agent,about,text,prevents,created,request_id) VALUES(?,"
+                                     "'the queue',?,'a missed order',?,?)",
+                                     (agent, text, hub.now(), f"l-{agent}-{text[:8]}")).lastrowid
+                hub.memory_indexed(mid)
+            return mid
+
+        said, told = owner_says("scout", "Look at the queue."), reports("scout", "The queue is empty.")
+        first, last = learns("scout", "Read the queue first."), learns("scout", "Read the queue every morning.")
+        item = steers("scout", "Answer within an hour.")
+        hub.kv_set("standing_told:7", json.dumps({str(item): "as told"}))      # C-7, a window of vps
+        hub.ins("INSERT INTO chat_out(kind,account,state,created,updated,report) VALUES('message','wa1','sent',?,?,?)",
+                (t0, t0, told))
+        hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,agent,report,carried) "
+                "VALUES('up-told','queue.csv','text/csv',5,?,?,'agent','scout',?,?)", ("0" * 64, t0, told, t0))
+        hub.history_catch_up()
+        event = hub.ins("INSERT INTO events(agent,kind,text,created) VALUES('scout','say','[vps] the queue?',?)", (t0,))
+        message = hub.ins("INSERT INTO agent_messages(sender,recipient,text,created,request_id,event_id) "
+                          "VALUES('vps','scout','the queue?',?,'am-queue',?)", (t0, event))
+        check = hub.ins("INSERT INTO machine_checks(agent,requested,state) VALUES('scout',?,'requested')", (t0,))
+        hub.kv_set(hub.CHECK_AFTER + str(check), "scout")
+        status, receipt = self.remove()
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual(hub.ins("INSERT INTO machine_checks(agent,requested,state) VALUES('vps',?,'requested')",
+                                 (t0,)), check)
+        self.assertIsNone(hub.kv_get(hub.CHECK_AFTER + str(check)))
+        self.assertGreater(hub.ins("INSERT INTO events(agent,kind,text,created) VALUES('vps','say','[hub] next',?)",
+                                   (t0,)), event)
+        joined = hub.q1("SELECT e.* FROM agent_messages m JOIN events e ON e.id=m.event_id WHERE m.id=?", (message,))
+        self.assertEqual((joined["agent"].startswith("scout:deleted:"), joined["text"], joined["read_at"] is not None),
+                         (True, "", True))
+        self.assertEqual((owner_says("vps", "Look at the logs."), reports("vps", "The logs are clean.")), (said, told))
+        task = hub.ins("INSERT INTO tasks(title,owner,requester,state,created,attempt) VALUES('Read the logs','vps',"
+                       "'manager','running',?,1)", (t0,))
+        text, error = hub.call_tool("vps", "remember", {
+            "request_id": "lesson-of-vps-1", "about": "the logs", "text": "The logs of acme/web rotate at noon: read them before.",
+            "prevents": "Reading an empty log after the rotation.", "task_id": hub.tref(task)},
+            ("test-generation", hub.tref(task), 1))
+        self.assertFalse(error, text)
+        mine = hub.q1("SELECT MAX(id) n FROM memories WHERE agent='vps'")["n"]
+        self.assertGreater(mine, last)
+        # a lesson that the work writes (deliver_result, close_case) takes an id above the floor too, as after a delete
+        hub.kv_set("row_floor:memories", str(mine + 5))
+        with hub.LOCK, hub.transaction():
+            worked = hub.memory_from_work("vps", "An empty log after noon is the rotation, not an outage.",
+                                          "Calling an outage for the rotation at noon.", "the logs", hub.now(), task=task)
+        self.assertEqual(worked, mine + 6)
+        self.assertEqual(([m["id"] for m in hub.memory_found("vps", "queue", 10)],
+                          sorted(m["id"] for m in hub.memory_found("vps", "logs", 10))), ([], sorted((mine, worked))))
+        self.assertEqual(steers("manager", "Keep the costs low."), item)
+        with hub.LOCK:
+            self.assertEqual(hub.standing_pull("vps", 7), [])
+        hub.history_catch_up()
+        self.assertEqual([r["src"] for r in hub.q("SELECT src FROM history WHERE agent='vps' AND src IN "
+                                                  "('owner_message','owner_report','memory') ORDER BY src")],
+                         ["memory", "memory", "owner_message", "owner_report"])
+        status, state = self.request("/ui/state?db=test-generation", source=OWNER)
+        self.assertEqual(status, 200, state)
+        theirs = next(r for r in state["reports"] if r["id"] == told)
+        self.assertEqual((theirs["agent"], theirs["delivery"], theirs["attachments"]), ("vps", None, []))
+
     def test_a_failed_removal_goes_again_with_the_same_command(self):
         status, receipt = self.remove()
         self.assertEqual(status, 200, receipt)
@@ -621,9 +723,10 @@ class Spent(Remove):
         """The hub's readers take an agent's records by its name. The first scout's records go with its sessions under
         the one name that no agent can have, so a new agent of its name reads none of them as its own: not its model
         changes and checks in its costs, not its refused calls, not its install as its own sign-in, not its rename as
-        its own old name, and not its files of the last hour against its own. The new agent reads its own records, a
-        check that it deleted included. The same rows of vps stay its own, and the owner's page of a moved rule names
-        its agent as it was named, as the apps read an agent's name."""
+        its own old name, not its files of the last hour against its own, not its open job against its runtime switch
+        (switch_busy), and not its receipts against its sends of the day (gmail_sends_today). The new agent reads its
+        own records, a check that it deleted included. The same rows of vps stay its own, and the owner's page of a
+        moved rule names its agent as it was named, as the apps read an agent's name."""
         t0 = hub.now()
 
         def change(agent, effort):
@@ -649,9 +752,9 @@ class Spent(Remove):
                     [m["to"]["effort"] for m in view["model_changes"]], "\n".join(hub.costs_text(view, 7, "manager")))
 
         def held(agent):
-            """How many of the agent's calls, server jobs and files hold this name."""
+            """How many of the agent's calls, server jobs, files, jobs and receipts hold this name."""
             return {table: hub.q1(f"SELECT COUNT(*) c FROM {table} WHERE agent=?", (agent,))["c"]
-                    for table in ("calls", "server_jobs", "attachments")}
+                    for table in ("calls", "server_jobs", "attachments", "jobs", "tool_commands")}
 
         def left(agent):
             """What the agent left outside a task: a call that the hub refused it, and the files of the last hour that
@@ -662,6 +765,10 @@ class Spent(Remove):
                 hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,agent) "
                         "VALUES(?,'notes.txt','text/plain',5,?,?,'agent',?)",
                         (f"up-{agent}-{n}", "0" * 64, t0 - 60, agent))
+            # the probe job of a check that its delete took, and a mail that it sent today
+            hub.ins("INSERT INTO jobs(agent,task,kind,login,created) VALUES(?,NULL,'probe',NULL,?)", (agent, t0 - 60))
+            hub.ins("INSERT INTO tool_commands(agent,request_id,tool,digest,receipt,created) VALUES(?,'mail-1',"
+                    "'gmail_send','d',?,?)", (agent, json.dumps({"state": "done"}), t0 - 60))
 
         self.spend("scout", ("s-now", 1, 1000))
         first = change("scout", "low")
@@ -675,7 +782,8 @@ class Spent(Remove):
         hub.ins("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated) VALUES('box','install','vps',"
                 "'codex','done',?,?)", (t0 - DAY, t0 - DAY))
         vps = held("vps")
-        self.assertEqual(vps, {"calls": 1, "server_jobs": 1, "attachments": hub.CHAT_FILE_LOOSE})
+        self.assertEqual(vps, {"calls": 1, "server_jobs": 1, "attachments": hub.CHAT_FILE_LOOSE, "jobs": 1,
+                               "tool_commands": 1})
         self.assertIn(("rookie", "scout"), hub.agent_old_names())
         checks, changes, text = costs()
         self.assertEqual((checks, changes), ([(active, 1, 0), (deleted, 0, 1)], ["low"]))
@@ -701,13 +809,15 @@ class Spent(Remove):
         self.assertNotIn(("rookie", "scout"), hub.agent_old_names())
         with patch.dict(hub.CHAT_FILE_UPLOADS):
             self.assertIn("Send the file up one time", hub.t_attach_file("scout", {"name": "report.pdf"}))
+        self.assertEqual(((hub.switch_busy("scout") or {}).get("jobs"), hub.gmail_sends_today("scout")), (None, 0))
         # they stay, under the name of the first scout's sessions, and its two checks stay deleted
         gone = hub.q1("SELECT agent FROM session_tokens WHERE session_id='s-now'")["agent"]
         self.assertTrue(gone.startswith("scout:deleted:"), gone)
         self.assertEqual(hub.q1("SELECT agent FROM model_changes WHERE id=?", (first,))["agent"], gone)
         self.assertEqual([tuple(r) for r in hub.q("SELECT agent, state FROM triggers WHERE id IN (?,?)",
                                                   (active, deleted))], [(gone, "deleted")] * 2)
-        self.assertEqual(held(gone), {"calls": 1, "server_jobs": 3, "attachments": hub.CHAT_FILE_LOOSE})
+        self.assertEqual(held(gone), {"calls": 1, "server_jobs": 3, "attachments": hub.CHAT_FILE_LOOSE, "jobs": 1,
+                                      "tool_commands": 1})
         # vps's own stay its own
         self.assertEqual((hub.q1("SELECT agent FROM model_changes WHERE id=?", (theirs,))["agent"],
                           hub.q1("SELECT agent FROM triggers WHERE id=?", (their_check,))["agent"]), ("vps", "vps"))
@@ -726,6 +836,19 @@ class Spent(Remove):
         self.assertIn("manager set scout to its default model, high", text)
         self.job("box", answer["job"], "done", "sign_in")
         self.assertIs(hub.signed_in_now("scout", "codex"), True)
+
+
+class Decisions(unittest.TestCase):
+    """The junction of a delete (the review of 17 November 2026: three changes in two days each closed one more table):
+    each column that can hold an agent's name (hub.AGENT_COLUMNS, which test_rename.Columns holds to the schema, and
+    hub.AGENT_LISTS) has one decision of what a delete does with it (hub.AGENT_REMOVAL). So a lane that adds such a
+    column decides for a delete as for a rename."""
+
+    def test_every_column_that_can_name_an_agent_has_a_decision(self):
+        self.assertEqual(set(hub.AGENT_REMOVAL), set(hub.AGENT_COLUMNS) | set(hub.AGENT_LISTS),
+                         "a column with no decision of what a delete does with it: add it to hub.AGENT_REMOVAL")
+        self.assertLessEqual(set(hub.AGENT_REMOVAL.values()), {"delete", "spent", "history", "team", "row", "stays"})
+        self.assertLessEqual(set(hub.REMOVAL_WHERE), set(hub.AGENT_REMOVAL))
 
 
 class Leaving(Remove):

@@ -284,6 +284,28 @@ class GoogleApiTest(unittest.TestCase):
                          ("founderizer.com answered 403", 403))
         self.g.on("GET", google.CLIENT_PATH, b"[1]")
         self.assertEqual(str(self.refused(google.client_secret)), "founderizer.com gave no readable answer")
+        # An answer with no end is not read into the hub's memory: one byte past SITE_MAX at most, and refused.
+        good = json.dumps({"client_id": cid, "client_secret": SECRET}).encode()
+        self.g.on("GET", google.CLIENT_PATH, good + b" " * (google.SITE_MAX - len(good)))
+        self.assertEqual(google.client_secret(), SECRET)
+
+        class Endless:
+            asked = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, size=-1):
+                self.asked.append(size)
+                if size is None or size < 0:
+                    raise AssertionError("a read with no bound")
+                return good + b" " * size
+        with patch.object(google, "_open", lambda *a, **k: Endless()):
+            self.assertEqual(str(self.refused(google.client_secret)), "founderizer.com gave no readable answer")
+        self.assertEqual(Endless.asked, [google.SITE_MAX + 1])
         self.g.on("GET", google.CLIENT_PATH, {"client_id": cid, "client_secret": "short"})
         self.assertEqual(str(self.refused(google.client_secret)),
                          "founderizer.com gave no client secret of Founderizer's Google app")

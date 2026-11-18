@@ -38,6 +38,7 @@ SCOPES = ("https://www.googleapis.com/auth/drive", "https://www.googleapis.com/a
 CLIENT = {"client_id": "686555588972-bci1m25uqoil3qs9ks3pqscr4iarno6o.apps.googleusercontent.com",
           "client_secret": None}
 CLIENT_PATH = "/google-client.json"     # on HOSTS["founderizer"]: {"client_id", "client_secret"} of CLIENT's app
+SITE_MAX = 65536                    # the most bytes that the hub reads of that answer (it has about 150)
 VERIFIED = False                    # True once Google has verified the app: Google then shows no warning page
 TIMEOUT = 30                        # seconds for one call
 AGENT = "founderizer-hub"
@@ -116,19 +117,25 @@ def _open(method, url, access=None, data=None, headers=None):
         raise GoogleError(LOST, unknown=True) from None
 
 
-def _read(r):
+def _read(r, limit=None):
+    """The answer's bytes. limit: the most that it may hold; the hub reads one byte more at most, and a longer answer
+    is one that cannot be read (LOST)."""
     try:
-        return r.read()
+        raw = r.read() if limit is None else r.read(limit + 1)
     except (http.client.HTTPException, OSError):
         raise GoogleError(LOST, unknown=True) from None
+    if limit is not None and len(raw) > limit:
+        raise GoogleError(LOST, unknown=True)
+    return raw
 
 
-def _call(method, url, access=None, body=None, data=None, ctype=None):
-    """Google's JSON answer ({} for an empty one). body: a JSON request body; data: bytes of the type ctype."""
+def _call(method, url, access=None, body=None, data=None, ctype=None, limit=None):
+    """Google's JSON answer ({} for an empty one). body: a JSON request body; data: bytes of the type ctype. limit: the
+    most bytes that the answer may hold (_read)."""
     if body is not None:
         data, ctype = json.dumps(body).encode(), "application/json; charset=UTF-8"
     with _open(method, url, access, data, {"Content-Type": ctype} if ctype else None) as r:
-        raw = _read(r)
+        raw = _read(r, limit)
     try:
         answer = json.loads(raw) if raw.strip() else {}
     except ValueError:
@@ -213,7 +220,7 @@ def client_secret():
     app. A GoogleError when founderizer.com cannot be reached or answers anything else, whose text names
     founderizer.com (not Google) and never holds the answer."""
     try:
-        answer = _call("GET", HOSTS["founderizer"] + CLIENT_PATH)
+        answer = _call("GET", HOSTS["founderizer"] + CLIENT_PATH, limit=SITE_MAX)
     except GoogleError as e:
         words = (f"founderizer.com answered {e.status}" if e.status else
                  "founderizer.com gave no readable answer" if e.unknown else "founderizer.com cannot be reached now")

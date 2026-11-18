@@ -16148,8 +16148,12 @@ def conversation_refusal(agent, person=None):
 # named it would reach another person. person_remove keeps the highest id that each table gave out in kv
 # row_floor:<table>. A task's number names its folder on the configuration ref, which outlives the records, so the
 # tasks' floor comes from there too (settle_task_numbers). The history's floor rises with each row that leaves it
-# (history_drop_row), because its contentless index can keep a row's words after the row (15 November 2026).
-ID_FLOOR_TABLES = ("conversations", "conversation_messages", "needs", "tasks", "history")
+# (history_drop_row), because its contentless index can keep a row's words after the row (15 November 2026). The
+# lessons' floor is kept by an agent's delete, which takes its lessons (remove_rows): the lesson search index
+# (memory_fts) keeps a lesson's words under its id, and the starts that showed a lesson (memory_shown) and the folds
+# (memory_folds) name it by its id, so the next lesson of another agent would have been found by the old words, shown
+# and folded (17 November 2026).
+ID_FLOOR_TABLES = ("conversations", "conversation_messages", "needs", "tasks", "history", "memories")
 TASK_FOLDER = re.compile(r"outputs/T-([0-9]+)")
 
 
@@ -19914,13 +19918,16 @@ GOOGLE_SECRET_FILE = "This file holds a registered secret. It was not uploaded."
 # problem of each account whose refresh Google refused (with the SHA-256 of the refused refresh token: problem_for), the pending Connect, the one-time links, the secret of
 # Founderizer's Google app that founderizer.com gave or Google took (secrets: {client_id: secret}), when the hub last
 # read the site for it and what the site gave then (read_at: {client_id: time.monotonic()}, site: {client_id: secret}),
-# and how many Disconnects of each account started and ended (revokes and revoked: {email: count}), which a finish and
-# a refresh of the same account compare. A restart ends them all.
+# and how many revokes of each account (a Disconnect's, or a new try of one that Google did not confirm:
+# google_revoke_again) started and ended (revokes and revoked: {email: count}), which a finish and a refresh of the same
+# account compare. A restart ends them all.
 GOOGLE = {"tokens": {}, "problems": {}, "problem_for": {}, "pending": None, "links": {}, "secrets": {}, "read_at": {},
           "site": {}, "revokes": {}, "revoked": {}}
 # Seconds: after Google refused Founderizer's secret, the hub reads founderizer.com again at most once a minute, so a
 # site that gives a refused secret costs one small read a minute and not one at each tool call of each agent.
 GOOGLE_READ_AGAIN = 60
+# Seconds between two tries of the revokes that Google did not confirm at a Disconnect (google_revoke_again).
+GOOGLE_REVOKE_AGAIN = 600
 GOOGLE_LOCK = threading.Lock()
 GOOGLE_READING = threading.Lock()   # one read of founderizer.com at a time: a call that comes meanwhile waits for it
 
@@ -20737,12 +20744,137 @@ def google_allowed(agent, tool):
         google_level(agent, service) >= GOOGLE_LEVELS[service].index(need)
 
 
+def google_revokes(saved):
+    """The revokes that wait in the Google file (`revoke`): the refresh token of each account whose Disconnect Google
+    did not confirm, which the hub took out of `accounts` and tries to revoke again (google_revoke_again). Each one is
+    {account, refresh_token, client_id}: client_id is the client that made the token, or None when the hub did not know
+    it."""
+    found = saved.get("revoke")
+    return [x for x in found if isinstance(x, dict) and google_account(x.get("account")) and
+            isinstance(x.get("refresh_token"), str) and x["refresh_token"]] if isinstance(found, list) else []
+
+
+def google_with_revokes(saved, revokes):
+    """The Google file with these revokes waiting, and no `revoke` when none waits."""
+    rest = {k: v for k, v in saved.items() if k != "revoke"}
+    return dict(rest, revoke=revokes) if revokes else rest
+
+
+def google_revoke_ended(e):
+    """True for Google's answer to a revoke that says the token is no longer valid (400 invalid_token: revoked before,
+    or ended): nothing is left to revoke."""
+    return e.status == 400 and e.reason == "invalid_token"
+
+
+def google_client_id(saved, entry):
+    """The ID of the client that made an entry's token: its own client_id, else the own client at the top (which made
+    every entry from before 1.185), else None."""
+    own = google_own_client(saved)
+    return entry.get("client_id") or (own["client_id"] if own else None)
+
+
+def google_same_project(revoke, client_id):
+    """True when a revoke that waits (google_revokes) would end a token of client_id too: Google's revoke ends the
+    account's whole grant to the token's project. A Google client ID starts with its project's number; a client that
+    the hub does not know counts as the same project."""
+    one, other = revoke.get("client_id"), client_id
+    return not (isinstance(one, str) and isinstance(other, str)) or one.split("-", 1)[0] == other.split("-", 1)[0]
+
+
+# The SHA-256 of each token that waits in `revoke`: Google's reason not to confirm its last try, so that a try that
+# fails again for the same reason writes no new log line (one every GOOGLE_REVOKE_AGAIN seconds while Google is down).
+GOOGLE_REVOKE_SAID = {}
+
+
+def google_revoke_drop(revoke):
+    """Under LOCK: take one revoke that waits out of the Google file. True when it went; a file that cannot be read or
+    written now keeps it, for the next try."""
+    saved, bad = google_saved()
+    waiting = google_revokes(saved)
+    if bad or revoke not in waiting:
+        return False
+    try:
+        google_store(google_with_revokes(saved, [x for x in waiting if x != revoke]))
+    except OSError:
+        return False
+    GOOGLE_REVOKE_SAID.pop(hashlib.sha256(revoke["refresh_token"].encode()).hexdigest(), None)
+    return True
+
+
+def google_revoke_again():
+    """Try again each revoke that waits in the Google file (google_revokes), until Google confirms it or says that the
+    token is no longer valid. A Disconnect whose revoke Google did not confirm (no answer, a lost answer, an error of
+    Google's) took the account's entry out all the same, and its grant at Google can still stand. The hub's own thread
+    calls this every GOOGLE_REVOKE_AGAIN seconds, and no lock is held during Google's call.
+
+    A revoke ends the account's whole grant to the token's project, so no try may end a new connection: no try starts
+    while a Connect waits for its finish, and that Connect counts the revokes from its start (ui_google_connect); each
+    try counts as a revoke of its account, as a Disconnect does, so a finish of the same account that overlaps it
+    writes nothing (google_revoked_during) and a refresh during it keeps no access token; and a revoke of an account
+    that is connected again in the same project goes untried (a finish takes such revokes out itself, but a release
+    from before this one or a file put back does not)."""
+    saved, bad = google_saved()
+    if bad or not google_revokes(saved):
+        return
+    google_vault_ask()          # the key that the write seals with, as before a Disconnect
+    for item in google_revokes(saved):
+        account, counted = item["account"], False
+        try:
+            with LOCK:
+                with GOOGLE_LOCK:
+                    pending = GOOGLE["pending"]
+                    if pending and pending["expires_at"] >= now():
+                        return          # a Connect waits for its finish: a try now could end the grant that it gets
+                    GOOGLE["revokes"][account] = GOOGLE["revokes"].get(account, 0) + 1
+                    counted = True
+                now_saved, bad = google_saved()
+                entry = google_entry(now_saved, account)
+                if bad or item not in google_revokes(now_saved):    # a finish took it out, or a try before this one
+                    continue
+                if entry and google_same_project(item, google_client_id(now_saved, entry)):
+                    if google_revoke_drop(item):
+                        log("hub", f"a Google revoke that waited for {account} goes untried: the account is connected "
+                                   f"again, and the revoke would end that connection too")
+                    continue
+            ended = False
+            try:
+                google.revoke(item["refresh_token"])
+            except google.GoogleError as e:
+                if not google_revoke_ended(e):
+                    key, why = hashlib.sha256(item["refresh_token"].encode()).hexdigest(), google_why(e)
+                    if GOOGLE_REVOKE_SAID.get(key) != why:
+                        GOOGLE_REVOKE_SAID[key] = why
+                        log("hub", f"Google did not confirm the revoke of a token that a Disconnect of {account} left "
+                                   f"({why}): the hub tries it again every {GOOGLE_REVOKE_AGAIN // 60} minutes")
+                    continue                    # it waits for the next try
+                ended = True
+            with LOCK:
+                if google_revoke_drop(item):
+                    log("hub", f"the token that a Disconnect of {account} left " +
+                        ("was no longer valid at Google" if ended else "is revoked at Google") + ": the hub no longer "
+                        "holds it")
+        finally:
+            if counted:
+                with GOOGLE_LOCK:
+                    GOOGLE["revoked"][account] = GOOGLE["revoked"].get(account, 0) + 1
+
+
+def google_revoke_timer():
+    """The hub's own thread for google_revoke_again, so that a slow Google holds up no other timer."""
+    while True:
+        time.sleep(GOOGLE_REVOKE_AGAIN)
+        try:
+            google_revoke_again()
+        except Exception:
+            print_fault()
+
+
 def google_access(email, service):
     """An access token of one account for a tool of one service, refreshed when less than 5 minutes are left. A refresh
     that Google refuses with invalid_grant drops the token and sets the account's problem until its next Connect, for
     that refresh token only (a Connect again or a Disconnect meanwhile leaves no old problem). The hub keeps a new
-    access token only when no Disconnect of the account was running at the refresh's start or started during it: its
-    revoke can have ended that token too."""
+    access token only when no revoke of the account (a Disconnect's, or a new try of one: google_revoke_again) was
+    running at the refresh's start or started during it: that revoke can have ended the token too."""
     saved, bad = google_saved()
     if bad:
         raise ToolError(GOOGLE_NO_CLIENT)
@@ -26267,7 +26399,8 @@ def t_change_duty(agent, a):
 # 19 October is the history's and not this table's. Three verbs: remember, which first answers with the closest
 # lessons the agent already holds so that the agent decides -- the same lesson again, a replacement, or a new one --
 # then recall and forget. In phase 1 a removed lesson keeps its row (dropped, dropped_by, drop_reason, which every
-# release since the first already hides), and there is no DELETE FROM memories anywhere in this file. The columns of
+# release since the first already hides); only the delete of an agent takes the rows of its lessons (remove_rows,
+# REMOVED_OWN). The columns of
 # earlier rounds (reinforced, folded_into, archived, kind, cost_minutes, recheck) keep their data and are read; nothing
 # writes them any more.
 MEMORY_SHOWN = 12               # memories that one page of recall puts into a session
@@ -26819,9 +26952,10 @@ def t_remember(agent, a):
         # and contradicted again reads as the chain it was. It inherits the outside-read count as well, the larger of
         # the two: a lesson written again in a session that read nothing outside still holds the words of the one
         # that did, and a rewrite must never clear the one fact on its line that the agent did not choose.
-        mid = DB.execute("INSERT INTO memories(agent,about,text,prevents,created,by_task,request_id,"
-                         "responsibility,prevents_key,read_untrusted) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                         (agent, tag, mask_secrets(text), mask_secrets(prevents), t0, tid, command[1],
+        mid = DB.execute("INSERT INTO memories(id,agent,about,text,prevents,created,by_task,request_id,"
+                         "responsibility,prevents_key,read_untrusted) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                         (unused_id("memories"), agent, tag, mask_secrets(text), mask_secrets(prevents), t0, tid,
+                          command[1],
                           instead["responsibility"] if instead else None,
                           instead["prevents_key"] if instead else None,
                           max(outside, instead["read_untrusted"] or 0) if instead else outside)).lastrowid
@@ -26887,10 +27021,10 @@ def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility
     if bool(responsibility) != bool(prevents_key):
         raise ToolError("A lesson that claims to stop an event needs both the duty and its key, or neither.")
     close = [m["id"] for m in memory_closest(agent, about, text) if m["id"] not in beside]
-    mid = DB.execute("INSERT INTO memories(agent,about,text,prevents,created,by_task,request_id,"
-                     "responsibility,prevents_key,read_untrusted) VALUES(?,?,?,?,?,?,'',?,?,?)",
-                     (agent, about, mask_secrets(text), mask_secrets(prevents), t0, task, responsibility,
-                      prevents_key, untrusted_reads(task))).lastrowid
+    mid = DB.execute("INSERT INTO memories(id,agent,about,text,prevents,created,by_task,request_id,"
+                     "responsibility,prevents_key,read_untrusted) VALUES(?,?,?,?,?,?,?,'',?,?,?)",
+                     (unused_id("memories"), agent, about, mask_secrets(text), mask_secrets(prevents), t0, task,
+                      responsibility, prevents_key, untrusted_reads(task))).lastrowid
     memory_indexed(mid)
     if close:
         memory_close_rows(agent, [(held, mid) for held in close])
@@ -27912,11 +28046,8 @@ def history_forget_person(person_id, tasks=()):
     all, and so does every record of `tasks`, the tasks that their conversations opened, whose words person_remove
     takes out where they stand (lane L2, removed_words_rows). The owner removed the person, and person_remove deletes
     their messages, so the index forgets them too.
-    It deletes their open Needs-you items as well. SQLite gives a deleted newest id to the next row of its table,
-    unless the writer takes ids above a floor (unused_id: the conversations, their messages and the needs have one,
-    but a release before them did not), and a stream would take that row for one it has read: so each stream of rows
-    goes back to its table's newest id, in the same write. person_remove is the only writer that deletes a stream's
-    rows."""
+    It deletes their open Needs-you items as well, so each stream of rows goes back to its table's newest id
+    (history_streams_back)."""
     in_transaction("history_forget_person")
     for h in DB.execute("SELECT id, agent, text FROM history WHERE person=?", (f"P-{person_id}",)).fetchall():
         history_drop_row(h)
@@ -27924,6 +28055,17 @@ def history_forget_person(person_id, tasks=()):
     for h in DB.execute(f"SELECT id, agent, text FROM history WHERE task IN ({marks})",
                         tuple(tasks)).fetchall() if tasks else []:
         history_drop_row(h)
+    history_streams_back()
+
+
+def history_streams_back():
+    """Inside the caller's write, after it deleted rows of a table that a stream of rows reads: each such stream goes
+    back to its table's newest id. SQLite gives a deleted newest id to the next row of its table, unless the writer
+    takes ids above a floor (unused_id: the conversations, their messages, the needs and the lessons have one, but a
+    release before them did not), and a stream would take that row for one it has read, so the history would never
+    have it. Two writers delete a stream's rows: person_remove (history_forget_person) and an agent's delete
+    (remove_rows)."""
+    in_transaction("history_streams_back")
     for s in HISTORY_STREAMS:
         if not s.at:
             top = DB.execute(f"SELECT MAX(rowid) m FROM {s.table}").fetchone()["m"] or 0
@@ -41402,8 +41544,9 @@ def forget_removed_agents(names, t0):
     for name in names:
         DB.execute("UPDATE agents SET deleted=? WHERE name=?", (t0, name))
         revoke_sessions(name, t0)
-        deleted = sum(DB.execute(f"DELETE FROM {table} WHERE agent=?", (name,)).rowcount
-                      for table in ("agent_keys", "machine_status", "machine_updates"))
+        deleted = sum(DB.execute(f"DELETE FROM {table} WHERE {column}=?", (name,)).rowcount
+                      for table, column in (("agent_keys", "agent"),) +
+                      tuple(c for c, decision in AGENT_REMOVAL.items() if decision == "team"))
         deleted += DB.execute("DELETE FROM kv WHERE k IN (?,?)",
                               (f"default_vault:{name}", f"default_desktop:{name}")).rowcount
         if deleted:
@@ -44140,12 +44283,30 @@ AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent"
 AGENT_KV = ("tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
             "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:",
             "first_message:", "settings_finding:", "chat_undelivered:", "read_missing:", "read_told:",
-            "service_user:", "caller_user:")       # one OS user for each agent: SERVICE_USER and CALLER_USER
+            "service_user:", "caller_user:",       # one OS user for each agent: SERVICE_USER and CALLER_USER
+            # the pairs of its lessons that its work wrote close (MEMORY_CLOSE_KEY), a lead's task for its team's
+            # results (lead_batch_rows) and the machine that it left in its newest move (MOVED): the review of 17
+            # November 2026 found them where test_rename's scan of the kv keys did not look
+            "memory_close:", "lead_batch:", "moved_from:")
 # The same, with more after the name: `<prefix><agent>:<window, task or item>`.
 AGENT_KV_SCOPED = ("listed:", "untaken:", "chased:")
+# Keys that hold two agents' names, in their sorted order: `<prefix><one>:<two>` (agent_limit's talk guard).
+AGENT_KV_PAIRS = ("talk_guard:",)
 # Columns that hold a JSON list of agents' names: the agents that passed a question up (question_passers).
 AGENT_LISTS = (("questions", "passed"),)
 KEY_FEATURE = "rename_key"      # a server service whose rename job moves the agent's key file (server.py `carry_key`)
+
+
+def agent_pair_keys(agent):
+    """Inside the caller's transaction or out of one (it only reads): the keys of AGENT_KV_PAIRS that name the agent,
+    each with the other agent's name. A name holds no ":", so a key splits in exactly one way."""
+    out = []
+    for prefix in AGENT_KV_PAIRS:
+        for (k,) in DB.execute("SELECT k FROM kv WHERE substr(k, 1, ?)=?", (len(prefix), prefix)).fetchall():
+            names = k[len(prefix):].split(":")
+            if len(names) == 2 and agent in names:
+                out.append((prefix, k, names[1] if names[0] == agent else names[0]))
+    return out
 
 
 def renamed_team(team, old, new):
@@ -44220,6 +44381,10 @@ def rename_rows(old, new, t0, key_moves=False):
         was, now_ = f"{prefix}{old}:", f"{prefix}{new}:"
         DB.execute("DELETE FROM kv WHERE substr(k, 1, ?)=?", (len(now_), now_))
         DB.execute("UPDATE kv SET k=? || substr(k, ?) WHERE substr(k, 1, ?)=?", (now_, len(was) + 1, len(was), was))
+    for _, k, _ in agent_pair_keys(new):            # what an earlier agent of the new name left, its pair with old too
+        DB.execute("DELETE FROM kv WHERE k=?", (k,))
+    for prefix, k, other in agent_pair_keys(old):          # in the sorted order of the new pair of names
+        DB.execute("UPDATE kv SET k=? WHERE k=?", (prefix + ":".join(sorted((new, other))), k))
     for table, column in AGENT_LISTS:
         for row in DB.execute(f"SELECT rowid AS row_id, {column} AS names FROM {table} WHERE {column} LIKE ?",
                               (f'%"{old}"%',)).fetchall():
@@ -44507,37 +44672,82 @@ def move_agent(agent, body, by="owner"):
 # its update went when it left team.json (forget_removed_agents). has_history reads the agent's last records where
 # they are written, so that its name never goes free before the history search has taken them in. A name freed
 # before these steps keeps those rows: free_name moves them only at the moment that it frees the name.
-REMOVED_OWN = (("agent_usage", "name"), ("agent_limits", "agent"), ("machine_checks", "agent"),
-               ("mac_setups", "agent"), ("session_credentials", "agent"),
-               ("ui_requests", "recipient"), ("owner_reports", "agent"), ("events", "agent"),
-               ("signin_jobs", "agent"), ("agent_notes", "agent"), ("memories", "agent"), ("rules", "agent"),
-               ("standing", "agent"), ("reminders", "agent"), ("resource_grants", "agent"),
-               ("person_agents", "agent"), ("person_scopes", "agent"), ("sealed", "recipient"))
+#
+# AGENT_REMOVAL gives each column of AGENT_COLUMNS and AGENT_LISTS one decision, and remove_rows, free_name and
+# has_history read it; test_agent_remove.Decisions fails for a column with none, as test_rename.Columns fails for a
+# column that can name an agent and is in neither of its lists. So a lane that adds a column decides for a delete as
+# for a rename (the review of 17 November 2026: three changes in two days each closed one more table, and nothing
+# asked for the next one). Every kv key that names the agent (AGENT_KV, AGENT_KV_SCOPED, AGENT_KV_PAIRS) goes in the
+# delete, and test_rename holds each kv key that it can read in the code to those lists or to its list of keys that
+# name no agent (a key that a function returns is one it cannot read).
+# - "delete": its own rows, which go in the delete (remove_rows, REMOVED_OWN), and with them the history search's
+#   copies of them (their stream's table is one of these), as a person's removal takes theirs (history_forget_person):
+#   the owner's chat with it, its lessons and its standing items. So no copy keeps the name of an agent whose records
+#   are gone: the copy of a new agent's first message to the owner kept its name for good.
+# - "spent": records that a reader takes by the agent's name, as a new agent's own: they stay, and go to spent_name
+#   when the name goes free (free_name): an open job of its own refused a new agent's runtime switch (switch_busy), and
+#   its receipts answered the new agent's request ids, counted against its sends of the day (gmail_sends_today) and
+#   let it change the old agent's drafts (gmail_own_draft).
+# - "history": the fleet's history, which keeps the name while one row names it (has_history); REMOVAL_WHERE says
+#   which rows count.
+# - "team": what the hub holds of its machine, which goes when it leaves team.json (forget_removed_agents), by the
+#   delete or by a reload.
+# - "row": its row in `agents`, which keeps the name until free_name deletes it.
+# - "stays": a record that names it as it was named, read by its own id, its task's, its goal's, its rule's or its
+#   duty's, or as words: no reader takes it for a new agent of the name, except own_rules, which counts the rules that
+#   a manager saved for other agents (`triggers.created_by`) against a new agent of the name of one that was demoted
+#   and deleted.
+AGENT_REMOVAL = {
+    ("agent_usage", "name"): "delete", ("agent_limits", "agent"): "delete", ("machine_checks", "agent"): "delete",
+    ("mac_setups", "agent"): "delete", ("session_credentials", "agent"): "delete",
+    ("ui_requests", "recipient"): "delete", ("owner_reports", "agent"): "delete", ("events", "agent"): "delete",
+    ("signin_jobs", "agent"): "delete", ("agent_notes", "agent"): "delete", ("memories", "agent"): "delete",
+    ("rules", "agent"): "delete", ("standing", "agent"): "delete", ("reminders", "agent"): "delete",
+    ("resource_grants", "agent"): "delete", ("person_agents", "agent"): "delete", ("person_scopes", "agent"): "delete",
+    ("sealed", "recipient"): "delete",
+    ("session_tokens", "agent"): "spent", ("model_changes", "agent"): "spent", ("triggers", "agent"): "spent",
+    ("calls", "agent"): "spent", ("server_jobs", "agent"): "spent", ("attachments", "agent"): "spent",
+    ("jobs", "agent"): "spent", ("tool_commands", "agent"): "spent",
+    ("tasks", "owner"): "history", ("tasks", "requester"): "history", ("agent_messages", "sender"): "history",
+    ("agent_messages", "recipient"): "history", ("history", "agent"): "history", ("conversations", "agent"): "history",
+    ("needs", "by"): "history", ("reports", "from_agent"): "history", ("reports", "to_agent"): "history",
+    ("questions", "asker"): "history", ("questions", "requester"): "history", ("questions", "answered_by"): "history",
+    ("responsibilities", "agent"): "history", ("duty_history", "by"): "history",
+    ("machine_status", "agent"): "team", ("machine_updates", "agent"): "team", ("agents", "name"): "row",
+    ("notes", "agent"): "stays", ("reports", "decided_by"): "stays", ("prompts", "agent"): "stays",
+    ("prompts", "by"): "stays", ("rules", "by"): "stays", ("need_talk", "who"): "stays", ("sealed", "sender"): "stays",
+    ("log", "agent"): "stays", ("holds", "by"): "stays", ("holds", "released_by"): "stays", ("outcomes", "by"): "stays",
+    ("goals", "paused_by"): "stays", ("goal_history", "by"): "stays", ("spends", "by"): "stays",
+    ("restart_holds", "by"): "stays", ("triggers", "paused_by"): "stays", ("triggers", "created_by"): "stays",
+    ("trigger_code", "by"): "stays", ("trigger_history", "by"): "stays", ("responsibilities", "created_by"): "stays",
+    ("duty_cases", "by"): "stays", ("duty_cases", "closed_by"): "stays", ("duty_steps", "by"): "stays",
+    ("agent_notes", "by"): "stays", ("knowledge_summaries", "agent"): "stays", ("memories", "dropped_by"): "stays",
+    ("memory_folds", "by"): "stays", ("resource_grants", "by"): "stays", ("deposits", "agent"): "stays",
+    ("withdrawals", "agent"): "stays", ("placements", "agent"): "stays", ("standing", "author"): "stays",
+    ("standing", "ended_by"): "stays", ("history", "person"): "stays", ("model_changes", "by"): "stays",
+    ("questions", "passed"): "stays"}
+REMOVAL_WHERE = {
+    ("triggers", "agent"): "state='deleted'",       # remove_rows has put each of its rules in that state
+    # an item that a conversation raised is that conversation's, and a conversation with no message is no history
+    ("needs", "by"): "conversation IS NULL",
+    ("conversations", "agent"): "EXISTS (SELECT 1 FROM conversation_messages m WHERE m.conversation=conversations.id)"}
+REMOVED_OWN = tuple(column for column, decision in AGENT_REMOVAL.items() if decision == "delete")
 
 
 def has_history(agent):
-    """Whether the fleet's history names this agent: a task it did or asked for, a message with another agent, or a
-    row of the history search. Its name then stays with that history (remove_agent). A record that the history search
-    takes in a few seconds after it is written, and that a delete leaves, counts from the moment that it is written: a
-    delete with no server job frees the name in its own request, and the records of the agent's last seconds then went
-    into the search after its name was free, as the history of the next agent of that name. As the search's builders
-    name the agent in them, they are a message of a person's conversation with it (history_conversation), a Needs-you
-    item that it raised and that no conversation raised (history_need), a report from it or to it (history_report), a
-    question that it asked, holds or answered (history_question, history_answer), and a duty that it held or a line
-    that it wrote on one (history_duty; each duty has its own lines). The delete takes the agent's other such records
-    (REMOVED_OWN), the rest belong to its tasks, and free_name moves its calls under spent_name, where the search names
-    nobody."""
-    return bool(read_row("SELECT 1 FROM tasks WHERE owner=? OR requester=? LIMIT 1", (agent, agent)) or
-                read_row("SELECT 1 FROM agent_messages WHERE sender=? OR recipient=? LIMIT 1", (agent, agent)) or
-                read_row("SELECT 1 FROM history WHERE agent=? LIMIT 1", (agent,)) or
-                read_row("SELECT 1 FROM conversation_messages m JOIN conversations c ON c.id=m.conversation "
-                         "WHERE c.agent=? LIMIT 1", (agent,)) or
-                read_row("SELECT 1 FROM needs WHERE by=? AND conversation IS NULL LIMIT 1", (agent,)) or
-                read_row("SELECT 1 FROM reports WHERE from_agent=? OR to_agent=? LIMIT 1", (agent, agent)) or
-                read_row("SELECT 1 FROM questions WHERE asker=? OR requester=? OR answered_by=? LIMIT 1",
-                         (agent, agent, agent)) or
-                read_row("SELECT 1 FROM responsibilities WHERE agent=? LIMIT 1", (agent,)) or
-                read_row("SELECT 1 FROM duty_history WHERE by=? LIMIT 1", (agent,)))
+    """Whether the fleet's history names this agent: a row of a column whose decision is "history" (AGENT_REMOVAL), as
+    REMOVAL_WHERE narrows it: a task it did or asked for, a message with another agent, a row of the history search, a
+    message of a person's conversation with it, a Needs-you item that it raised and that no conversation raised, a
+    report from it or to it, a question that it asked, holds or answered, and a duty that it held or a line that it
+    wrote on one. Its name then stays with that history (remove_agent). A record that the history search takes in a few
+    seconds after it is written, and that a delete leaves, counts from the moment that it is written: a delete with no
+    server job frees the name in its own request, and the records of the agent's last seconds then went into the
+    search after its name was free, as the history of the next agent of that name. The delete takes the agent's other
+    such records (REMOVED_OWN) with their copies in the search, the rest belong to its tasks, and free_name moves its
+    calls under spent_name, where the search names nobody."""
+    return any(read_row(f"SELECT 1 FROM {table} WHERE {column}=? AND {REMOVAL_WHERE.get((table, column), '1')} "
+                        f"LIMIT 1", (agent,))
+               for (table, column), decision in AGENT_REMOVAL.items() if decision == "history")
 
 
 def removed_team(team, agent):
@@ -44573,16 +44783,63 @@ def removed_team(team, agent):
 def remove_rows(agent, t0, machine=None):
     """Inside a transaction: what the hub holds of the agent itself, its wake-up rules and its open server jobs. Each
     line deletes what is there, so a second call after a failed removal job finds nothing more to do. Its row stays
-    until its server has removed it (free_name), so the Try again of a removal never meets a new agent of that name."""
+    until its server has removed it (free_name), so the Try again of a removal never meets a new agent of that name.
+
+    The ids of its deleted rows are free again: SQLite gives a deleted newest id to the next row of its table, which
+    then took what still named the id. So, first, the deliveries and the files of its reports to the owner let go of
+    them (GET /ui/state gives a report the newest delivery and the files that name its id); its lessons' ids stay taken
+    (the lessons' floor, unused_id: the lesson search index, the starts that showed a lesson and its folds name it by
+    its id); and the conversation windows that were told of its standing items forget them (standing_pull reads an
+    item that a window was told of and that steers it no more by its id, and told the window that another agent's
+    item, which took that id, had ended, in that item's words). After the deletes, the streams of the history go back
+    to their tables' newest ids (history_streams_back): the owner's next message to another agent, and the next
+    report or standing item, went into no history."""
     in_transaction("remove_rows")
     revoke_sessions(agent, t0)
     os_user_drop(agent, machine, os_user_uid(agent, machine))   # one OS user for each agent: it leaves every kept group
+    for table in ("chat_out", "attachments"):
+        DB.execute(f"UPDATE {table} SET report=NULL WHERE report IN (SELECT id FROM owner_reports WHERE agent=?)",
+                   (agent,))
+    DB.execute("INSERT INTO kv(k,v) VALUES('row_floor:memories',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+               (str(unused_id("memories") - 1),))     # its lessons' ids are never given again
+    items = {str(r[0]) for r in DB.execute("SELECT id FROM standing WHERE agent=?", (agent,)).fetchall()}
+    windows = DB.execute("SELECT k, v FROM kv WHERE k>='standing_told:' AND k<'standing_told;'").fetchall() \
+        if items else ()
+    for r in windows:
+        try:
+            told = json.loads(r["v"])
+        except ValueError:
+            continue
+        if isinstance(told, dict) and items & told.keys():
+            DB.execute("UPDATE kv SET v=? WHERE k=?", (json.dumps({i: d for i, d in told.items() if i not in items}),
+                                                     r["k"]))
+    # An event's id is never given again. SQLite gives a deleted newest id to the next row, and a helper that started
+    # at the newest event (the poll's `last`) reads only the ids above it, so the next event of another agent at that
+    # id never reached it; and the records that name an event by its id (a message, a report, a steer, a line of a
+    # conversation, a run of a check, a goal, a connected app's receipt) named the new one. So when the newest event of
+    # all is the agent's, its row stays as a read line of no agent, with no words, and the delete takes the others.
+    DB.execute("UPDATE events SET agent=?, kind='say', task=NULL, text='', extra='{}', read_at=COALESCE(read_at, ?) "
+               "WHERE id=(SELECT MAX(id) FROM events) AND agent=?", (spent_name(agent, t0), t0, agent))
+    # The marks of its machine checks name a check by its id, which the next check of another agent can take before
+    # settle_checks takes them away: a mark that waits for the helper's settings kept that check from its timeout and
+    # sent it a second time (record_status).
+    for (check,) in DB.execute("SELECT id FROM machine_checks WHERE agent=?", (agent,)).fetchall():
+        DB.execute(f"DELETE FROM kv WHERE k IN ({','.join('?' * len(CHECK_MARKS))})",
+                   tuple(mark + str(check) for mark in CHECK_MARKS))
+    # the history search's copies of what it takes, before its key goes with its kv notes (history_drop_row reads it)
+    taken = sorted(s.name for s in HISTORY_STREAMS if s.table in {table for table, _ in REMOVED_OWN})
+    for h in DB.execute(f"SELECT id, agent, text FROM history WHERE agent=? AND src IN ({','.join('?' * len(taken))})",
+                        (agent, *taken)).fetchall():
+        history_drop_row(h)
     for table, column in REMOVED_OWN:
         DB.execute(f"DELETE FROM {table} WHERE {column}=?", (agent,))
-    keys = [prefix + agent for prefix in AGENT_KV + (MOVED,)]
+    history_streams_back()
+    keys = [prefix + agent for prefix in AGENT_KV]
     DB.execute(f"DELETE FROM kv WHERE k IN ({','.join('?' * len(keys))})", keys)
     for prefix in AGENT_KV_SCOPED:
         DB.execute("DELETE FROM kv WHERE substr(k, 1, ?)=?", (len(prefix + agent) + 1, f"{prefix}{agent}:"))
+    for _, k, _ in agent_pair_keys(agent):
+        DB.execute("DELETE FROM kv WHERE k=?", (k,))
     for t in read_rows("SELECT id, revision, state FROM triggers WHERE agent=?", (agent,)):
         if t["state"] in TRIGGER_ACTIONS["delete"]:
             trigger_state_rows(t["id"], t["revision"], "delete", "owner", t0)
@@ -44611,16 +44868,18 @@ def deleted_at(agent):
 
 def free_name(agent):
     """Inside a transaction: a removed agent's row goes once nothing is left of it on a server and no history names it,
-    and with it the name is free for a new agent (add_server_agent). Its records stay, under one name that no agent can
-    have (spent_name), which keeps the time of the delete: its sessions, model changes, deleted wake-up rules, calls,
-    server jobs and files. A server can report the removal done days after the delete, when the owner gave it again."""
+    and with it the name is free for a new agent (add_server_agent). Its records that a reader takes by its name (the
+    "spent" columns of AGENT_REMOVAL) stay, under one name that no agent can have (spent_name), which keeps the time
+    of the delete: its sessions, model changes, deleted wake-up rules, calls, server jobs, files, jobs and receipts. A
+    server can report the removal done days after the delete, when the owner gave it again."""
     in_transaction("free_name")
     if agent not in agents() and not has_history(agent):
         gone = spent_name(agent, deleted_at(agent) or now())
         DB.execute("DELETE FROM agents WHERE name=?", (agent,))
-        for table in ("session_tokens", "model_changes", "calls", "server_jobs", "attachments"):
-            DB.execute(f"UPDATE {table} SET agent=? WHERE agent=?", (gone, agent))
-        DB.execute("UPDATE triggers SET agent=? WHERE agent=? AND state='deleted'", (gone, agent))
+        for (table, column), decision in AGENT_REMOVAL.items():
+            if decision == "spent":
+                DB.execute(f"UPDATE {table} SET {column}=? WHERE {column}=? AND "
+                           f"{REMOVAL_WHERE.get((table, column), '1')}", (gone, agent))
 
 
 def remove_agent(agent, body):
@@ -56232,9 +56491,12 @@ class Handler(BaseHTTPRequestHandler):
                       had | {GOOGLE_SCOPES[body["service"]]}]
             verifier, challenge = google.pkce()
             state, ends = secrets.token_urlsafe(32), now() + GOOGLE_PENDING
+            # revokes: the revokes of each account that started and ended so far, which the finish compares. A revoke
+            # after the owner's consent at Google, and before the finish, can end the grant that the consent gave.
             with GOOGLE_LOCK:
                 GOOGLE["pending"] = {"state": state, "verifier": verifier, "redirect_uri": body["redirect_uri"],
-                                     "client": client, "kind": kind, "service": body["service"], "expires_at": ends}
+                                     "client": client, "kind": kind, "service": body["service"], "expires_at": ends,
+                                     "revokes": (dict(GOOGLE["revokes"]), dict(GOOGLE["revoked"]))}
             log("owner", "started a Google Connect" + (f" of {GOOGLE_NAMES[body['service']]}" if body["service"] else "") +
                 (f" for {body['account']}" if body["account"] else "") + f" with the {kind} client")
             # app: whose Google app this Connect signs in to. verified: whether Google verified Founderizer's app, so
@@ -56276,7 +56538,6 @@ class Handler(BaseHTTPRequestHandler):
                 if not p or p["expires_at"] < now() or not hmac.compare_digest(p["state"], made["state"]):
                     raise Refusal(409, code="connect_stale")
                 GOOGLE["pending"] = None
-                revokes = (dict(GOOGLE["revokes"]), dict(GOOGLE["revoked"]))
             client = p["client"]
             if p.get("kind") == "founderizer":     # a call took a new secret since the Connect started: that one
                 held = (google_release_client(google_saved()[0]) or {}).get("client_secret")
@@ -56305,15 +56566,15 @@ class Handler(BaseHTTPRequestHandler):
             except google.GoogleError as e:
                 log("owner", f"Google refused a Connect: {google_why(e)}")
                 raise Refusal(502, code="google_refused", names={"reason": google_why(e)}) from None
-            return {"pending": p, "client": client, "got": got, "email": email, "revokes": revokes}
+            return {"pending": p, "client": client, "got": got, "email": email}
 
         def act(body, done):
             p, client, got, email = done["pending"], done["client"], done["got"], done["email"]
             saved, bad = google_saved()
             if bad and bad != GOOGLE_LOST:  # the file went bad meanwhile: nothing is written; the owner connects again
                 raise google_file_refusal(bad)
-            with GOOGLE_LOCK:       # a Disconnect's revoke can end the whole grant, the token of this Connect too
-                started, ended = (counts.get(email, 0) for counts in done["revokes"])
+            with GOOGLE_LOCK:       # a revoke since the Connect started can end the whole grant, this token's too
+                started, ended = (counts.get(email, 0) for counts in p["revokes"])
                 if GOOGLE["revokes"].get(email, 0) != started or started != ended:
                     raise Refusal(409, code="google_revoked_during")
             accounts = dict(saved.get("accounts") or {})
@@ -56334,6 +56595,11 @@ class Handler(BaseHTTPRequestHandler):
             accounts[email] = {"refresh_token": got["refresh_token"], "connected_at": int(now()),
                                "scopes": list(got["scopes"]), "client_id": client["client_id"]}
             top = {k: v for k, v in saved.items() if k != "accounts"}
+            # A revoke that waits for this account (google_revokes) in this client's project would end the new token
+            # too: it goes, and its old token stays valid at Google as a replaced entry's does. One of another project
+            # (an own client's) stays for the hub's next try.
+            top = google_with_revokes(top, [x for x in google_revokes(saved) if x["account"] != email or
+                                            not google_same_project(x, client["client_id"])])
             if p.get("kind") == "founderizer":     # Founderizer's secret stays in the file: no fetch at each restart
                 # The secret that the hub holds now: the one that this finish used, or a newer one that a call took
                 # meanwhile, which an older one of this finish must not replace.
@@ -56370,7 +56636,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def ui_google_disconnect(self):
         """POST /ui/google/disconnect: revoke one account's refresh token at Google and remove its entry. The client
-        and the grants in team.json stay."""
+        and the grants in team.json stay. A token whose revoke Google did not confirm waits in the file for the hub's
+        next try (google_revoke_again)."""
         def read(data):
             self.only(data, ("account",))
             return {"account": self.google_account_field(data.get("account"))}
@@ -56404,6 +56671,8 @@ class Handler(BaseHTTPRequestHandler):
                     google.revoke(entry["refresh_token"])
                     return True
                 except google.GoogleError as e:
+                    if google_revoke_ended(e):      # the token was no longer valid: nothing is left to revoke
+                        return True
                     log("owner", f"Google did not confirm the revoke of {account}: {google_why(e)}")
                     return False
             except BaseException:
@@ -56412,7 +56681,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise
 
         def act(body, revoked):
-            account = body["account"]
+            account, waits = body["account"], False
             try:
                 with GOOGLE_LOCK:   # dropped whatever the file says: the Disconnect means it goes
                     GOOGLE["tokens"].pop(account, None)
@@ -56421,14 +56690,24 @@ class Handler(BaseHTTPRequestHandler):
                     raise google_file_refusal(bad)
                 entry = (saved.get("accounts") or {}).get(account)
                 if entry is not None:
+                    # A token whose revoke Google did not confirm waits in the file (google_revokes), sealed as the
+                    # entry was, and the hub tries its revoke again until Google confirms it (google_revoke_again):
+                    # the grant at Google can still stand, and this is the hub's only copy of the token.
+                    left, waiting = google_entry(saved, account), google_revokes(saved)
+                    if left and not revoked:
+                        waiting.append({"account": account, "refresh_token": left["refresh_token"],
+                                        "client_id": google_client_id(saved, left)})
+                        waits = True
                     try:
-                        google_store(dict(saved, accounts={k: v for k, v in saved["accounts"].items() if k != account}))
+                        google_store(google_with_revokes(
+                            dict(saved, accounts={k: v for k, v in saved["accounts"].items() if k != account}), waiting))
                     except GoogleKeyError:  # the entry stays, with its token, until a Disconnect that can write
                         raise google_file_refusal(refusal_words.words("google_file_key")) from None
             finally:
                 ended(account)
             log("owner", f"disconnected the Google account {account}" +
-                ("" if revoked else "; Google did not confirm a revoke"))
+                ("; Google did not confirm the revoke, and the hub keeps the token only to try it again"
+                 if waits else "" if revoked else "; Google did not confirm a revoke"))
             return {"account": account, "revoked": revoked, "connected": False}
         return self.ui_command("google/disconnect", read, act, outside=outside)
 
@@ -61527,6 +61806,7 @@ def main():
     kv_set("tick_ok", now())
     threading.Thread(target=timers, daemon=True).start()
     threading.Thread(target=central_timer, name="central-vault", daemon=True).start()
+    threading.Thread(target=google_revoke_timer, name="google-revokes", daemon=True).start()
     threading.Thread(target=door_timer, name="door-record", daemon=True).start()       # DevOps plan C4
     threading.Thread(target=knowledge_refresher, name="knowledge-pages", daemon=True).start()
     threading.Thread(target=ping_sender, name="pings", daemon=True).start()

@@ -31,10 +31,47 @@ KV_PREFIX = re.compile(r"[a-z][a-z0-9_]*:")
 
 
 def kv_prefixes(source):
-    """Every prefix that `source` builds a kv key from with a value: f"<prefix>{value}..." or "<prefix>" + value, as
-    the key of kv_get or kv_set, or as a value of a statement that names the kv table."""
-    found = set()
-    for c in ast.walk(ast.parse(source)):
+    """Every prefix that `source` builds a kv key from with a value, as the key of kv_get or kv_set, or as a value of a
+    statement that names the kv table: f"<prefix>{value}...", f"{NAME}{value}...", "<prefix>" + value + ... or
+    NAME + value (NAME a string of the module), also through a name that the same function gave such a key first
+    (`key = f"<prefix>{value}"`, `key, other = f"<prefix>{value}", ...`). A key that a function returns is not read.
+    The review of 17 November 2026 found memory_close:, lead_batch:, moved_from: and talk_guard: on neither side,
+    because the scan saw only a literal in the call itself."""
+    tree = ast.parse(source)
+    named = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
+             and isinstance(n.value.value, str) for t in n.targets if isinstance(t, ast.Name)}
+
+    def head(k):
+        """The string that a key starts with: a literal, or a string of the module."""
+        while isinstance(k, ast.BinOp) and isinstance(k.op, ast.Add):
+            k = k.left
+        k = k.value if isinstance(k, ast.FormattedValue) else k
+        return k.value if isinstance(k, ast.Constant) and isinstance(k.value, str) else \
+            named.get(k.id) if isinstance(k, ast.Name) else None
+
+    def prefix(k, given):
+        if isinstance(k, ast.Name):
+            return prefix(given[k.id], {}) if k.id in given else None
+        if isinstance(k, ast.JoinedStr) and len(k.values) > 1 and isinstance(k.values[1], ast.FormattedValue) or \
+                isinstance(k, ast.BinOp) and isinstance(k.op, ast.Add):
+            return head(k.values[0] if isinstance(k, ast.JoinedStr) else k)
+        return None
+
+    def assigned(f):
+        """The names that function f gives a value, each with its last value (a tuple gives one to each name)."""
+        out = {}
+        for n in (n for n in ast.walk(f) if isinstance(n, ast.Assign)):
+            for t in n.targets:
+                pairs = zip(t.elts, n.value.elts) if isinstance(t, ast.Tuple) and isinstance(n.value, ast.Tuple) \
+                    else [(t, n.value)]
+                out.update({name.id: value for name, value in pairs if isinstance(name, ast.Name)})
+        return out
+
+    found, todo = set(), [(tree, {})]
+    while todo:
+        c, given = todo.pop()
+        given = assigned(c) if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)) else given
+        todo.extend((child, given) for child in ast.iter_child_nodes(c))
         if not isinstance(c, ast.Call):
             continue
         name = c.func.id if isinstance(c.func, ast.Name) else c.func.attr if isinstance(c.func, ast.Attribute) else ""
@@ -42,13 +79,7 @@ def kv_prefixes(source):
         keys = [c.args[0]] if name in ("kv_get", "kv_set") and c.args else \
             list(c.args[1].elts) if isinstance(sql, str) and " kv" in sql and len(c.args) > 1 and \
             isinstance(c.args[1], ast.Tuple) else []
-        for k in keys:
-            if isinstance(k, ast.JoinedStr) and len(k.values) > 1 and isinstance(k.values[0], ast.Constant) and \
-                    isinstance(k.values[1], ast.FormattedValue) and KV_PREFIX.fullmatch(k.values[0].value):
-                found.add(k.values[0].value)
-            elif isinstance(k, ast.BinOp) and isinstance(k.op, ast.Add) and isinstance(k.left, ast.Constant) and \
-                    isinstance(k.left.value, str) and KV_PREFIX.fullmatch(k.left.value):
-                found.add(k.left.value)
+        found |= {p for p in (prefix(k, given) for k in keys) if isinstance(p, str) and KV_PREFIX.fullmatch(p)}
     return found
 
 
@@ -180,20 +211,24 @@ class Rename(Servers):
     def test_a_rename_moves_the_kv_notes_with_more_after_the_name_and_the_lists_of_names(self):
         """The audit of 7 November 2026: chased:<agent>:<item>, untaken:<agent>:<window> and listed:<agent>:<window>
         stayed under the old name, so the renamed agent was chased again for what it had been told; and the agents that
-        passed a question up kept the old name, so its next pass named an agent that no longer exists."""
+        passed a question up kept the old name, so its next pass named an agent that no longer exists. The review of 17
+        November 2026: the talk guard's mark of a pair of agents (talk_guard:<one>:<two>, in their sorted order) stayed
+        under the old name, so the manager heard of the same stop again."""
         base = self.team_sha()
         for key in ("chased:scout:Q-4", "untaken:scout:T-9", "listed:scout:owner-chat", "duty_review:scout",
-                    "chased:scouts:Q-5", "chased:nova:Q-6"):
+                    "chased:scouts:Q-5", "chased:nova:Q-6", "talk_guard:otto:scout", "talk_guard:bob:scout",
+                    "talk_guard:ann:nova", "talk_guard:ann:otto"):
             hub.kv_set(key, "1")
         plant("questions", "asker", "manager")
         hub.q("UPDATE questions SET passed=?", (json.dumps(["scout", "lead"]),))
         status, receipt = self.rename(base=base)
         self.assertEqual(status, 200, receipt)
         held = {r["k"] for r in hub.q("SELECT k FROM kv WHERE k LIKE 'chased:%' OR k LIKE 'untaken:%' OR "
-                                      "k LIKE 'listed:%' OR k LIKE 'duty_review:%'")}
+                                      "k LIKE 'listed:%' OR k LIKE 'duty_review:%' OR k LIKE 'talk_guard:%'")}
         # Another agent's own key stays its own, and what an earlier agent of the new name left goes, as in AGENT_KV.
         self.assertEqual(held, {"chased:nova:Q-4", "untaken:nova:T-9", "listed:nova:owner-chat", "duty_review:nova",
-                                "chased:scouts:Q-5"})
+                                "chased:scouts:Q-5", "talk_guard:nova:otto", "talk_guard:bob:nova",
+                                "talk_guard:ann:otto"})
         self.assertEqual(hub.question_passers(hub.q1("SELECT * FROM questions")), ["nova", "lead"])
 
     def test_a_rename_keeps_the_agents_saved_checks_its_own(self):
@@ -419,10 +454,16 @@ class Columns(unittest.TestCase):
     NOT_AGENT_KV = {
         "check_fails:": "a wake-up rule", "check_lost:": "a run of a check", "check_running:": "a machine check",
         "check_after:": "a machine check", "check_probe:": "a machine check",
-        "check_queued:": "a machine check",
+        "check_queued:": "a machine check", "chat_removed:": "a chat app account",
         "conversation_brief:": "a conversation",
         "deliver_running:": "a task", "desktop_click:": "a Mac", "desktop_seen:": "a Mac", "desktop_told:": "a Mac",
-        "door_mode:": "a server of the door",
+        "door_mode:": "a server of the door", "door_host:": "a host of the door", "door_untaken:": "a host of the door",
+        "door_news:": "a host of the door", "history_outside:": "a task",
+        "seen:": "a task, or the manager's standing session (seen_get)",
+        "door_untaken_seen:": "a host of the door", "github_app_asked:": "a GitHub account or organization",
+        "install_told:": "a server job", "key_swap_answered:": "a server", "key_swap_asked:": "a server",
+        "key_swap_read:": "a server", "knowledge_read:": "a knowledge file", "read_base:": "a wake-up rule",
+        "read_gap:": "a wake-up rule", "sign_in_refused:": "a task",
         "history:": "a stream of the history", "knowledge_asked:": "a knowledge file", "lead_unread:": "an unread item",
         "lost:": "a task", "mcp_renew:": "an MCP server: the manager's notice that its access ended or ends soon",
         "name_told:": "a machine", "owner_pin:": "a machine", "park_ended:": "a reminder",
@@ -454,13 +495,16 @@ class Columns(unittest.TestCase):
         """The audit of 7 November 2026: chased:, untaken:, listed:, duty_review:, checks_brief:, chat_team:, presence:
         and turn_ended: hold an agent's name, and a rename left them under the old one, so the agent was chased again
         or reviewed again. Every prefix the code builds a key from is placed: a rename moves it (hub.AGENT_KV,
-        hub.AGENT_KV_SCOPED), or it is named here with what it holds."""
+        hub.AGENT_KV_SCOPED, hub.AGENT_KV_PAIRS), or it is named here with what it holds."""
         with open(hub.__file__) as f:
             found = kv_prefixes(f.read())
-        placed = set(hub.AGENT_KV) | set(hub.AGENT_KV_SCOPED)
-        self.assertEqual(set(hub.AGENT_KV) & set(hub.AGENT_KV_SCOPED), set())
+        placed = set(hub.AGENT_KV) | set(hub.AGENT_KV_SCOPED) | set(hub.AGENT_KV_PAIRS)
+        self.assertEqual(len(placed), len(hub.AGENT_KV) + len(hub.AGENT_KV_SCOPED) + len(hub.AGENT_KV_PAIRS))
         self.assertEqual(placed & set(self.NOT_AGENT_KV), set())
         self.assertGreater(len(found), 30)              # the scan reads the keys, and not nothing
+        # and the keys built from a string of the module (MEMORY_CLOSE_KEY + agent, f"{SEEN_KEY}{key}") or in a
+        # variable first, also of a tuple (talk_guard, door_news)
+        self.assertLessEqual({"memory_close:", "seen:", "talk_guard:", "door_news:"}, found)
         self.assertEqual(found - placed - set(self.NOT_AGENT_KV), set(),
                          "a kv key built from a value that is on neither side: add its prefix to hub.AGENT_KV (or "
                          "hub.AGENT_KV_SCOPED) when the value is an agent's name, or to NOT_AGENT_KV with what it holds")

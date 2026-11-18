@@ -319,7 +319,7 @@ class GoogleHub(OwnerAPI):
         self.addCleanup(opened.stop)
         self.fake = FakeGoogle()
         for p in (patch.object(hub.Handler, "allowed", lambda handler, who, broker=False: True),
-                  patch.object(hub, "google", self.fake),
+                  patch.object(hub, "google", self.fake), patch.dict(hub.GOOGLE_REVOKE_SAID, clear=True),
                   patch.dict(hub.GOOGLE, {"tokens": {}, "problems": {}, "problem_for": {}, "pending": None,
                                           "links": {}, "secrets": {}, "read_at": {}, "site": {}, "revokes": {},
                                           "revoked": {}})):
@@ -811,7 +811,7 @@ class GoogleHub(OwnerAPI):
         self.assertEqual(self.file.read_bytes(), sealed)
         hub.GOOGLE["pending"] = {"state": "s" * 43, "verifier": "v" * 64, "redirect_uri": REDIRECT, "kind": "founderizer",
                                  "client": {"client_id": APP_ID, "client_secret": APP_SECRET}, "service": None,
-                                 "expires_at": hub.now() + 600}
+                                 "expires_at": hub.now() + 600, "revokes": ({}, {})}
         with patch.dict(hub.CENTRAL, {"status": None}):          # the vault does not answer now
             for code, data in (self.begin(), self.finish("s" * 43), self.owner("/ui/google/disconnect", account=EMAIL)):
                 self.assertEqual((code, data.get("code")), (409, "google_file_key"), data)
@@ -2002,6 +2002,13 @@ class GoogleHub(OwnerAPI):
         self.assertFalse(hub.secret_hit(third))
         code, start = self.begin()                                  # each Disconnect ended: a Connect works again
         self.assertEqual(self.finish(start["state"])[0], 200)
+        # A Disconnect after the owner's consent at Google and before the finish: its revoke can end the grant that
+        # the consent gave, so the finish writes nothing, also when the Disconnect ended before the finish started.
+        code, start = self.begin(account=EMAIL)
+        self.assertEqual(self.owner("/ui/google/disconnect", account=EMAIL)[0], 200)
+        code, data = self.finish(start["state"])
+        self.assertEqual((code, data.get("code"), EMAIL in (self.opened().get("accounts") or {})),
+                         (409, "google_revoked_during", False))
 
     def test_a_refusal_at_the_first_connect_writes_no_file(self):
         code, start = self.begin()
@@ -2031,6 +2038,9 @@ class GoogleHub(OwnerAPI):
         self.assertEqual((code, data["revoked"], held[-1]), (200, True, ("revoke", False)))
 
     def test_disconnect_revokes_one_account_and_keeps_the_client_and_the_grants(self):
+        """A Disconnect revokes the account's token at Google and takes its entry out. When Google does not confirm
+        the revoke, the grant can still stand: the hub keeps that token, sealed, only to try the revoke again until
+        Google confirms it or says that the token is no longer valid, and such a try never ends a new connection."""
         self.connected()
         self.connected(email=EMAIL2, refresh=REFRESH2)
         self.give(drive="read")
@@ -2055,6 +2065,60 @@ class GoogleHub(OwnerAPI):
         code, data = self.owner("/ui/google/disconnect", account=EMAIL2)
         self.assertEqual((code, data["revoked"]), (200, False))
         self.assertEqual(self.opened()["accounts"], {})      # removed in each case
+        waits = [{"account": EMAIL2, "refresh_token": REFRESH2, "client_id": CLIENT_ID}]
+        self.assertEqual(self.opened()["revoke"], waits)    # Google did not confirm: it waits for the hub's next try
+        self.fake.fail["revoke"] = Err("Google answered 503", 503)
+        hub.google_revoke_again()
+        self.assertEqual((self.fake.calls[-1], self.opened()["revoke"]), (("revoke", (REFRESH2,)), waits))
+        self.assertEqual(hub.GOOGLE["revokes"][EMAIL2], hub.GOOGLE["revoked"][EMAIL2])  # no count stays open
+        hub.google_revoke_again()                                   # Google confirms it now
+        hub.google_revoke_again()                                   # and nothing waits
+        self.assertEqual((self.fake.names().count("revoke"), "revoke" in self.opened()), (4, False))
+        self.connected(email=EMAIL2, refresh=REFRESH2)              # a token that Google already ended
+        self.fake.fail["revoke"] = Err("Google answered 400: invalid_token", 400, "invalid_token")
+        code, data = self.owner("/ui/google/disconnect", account=EMAIL2)
+        self.assertEqual((code, data["revoked"], "revoke" in self.opened()), (200, True, False))
+        hub.google_store(dict(self.opened(), revoke=waits))
+        self.fake.fail["revoke"] = Err("Google answered 400: invalid_token", 400, "invalid_token")
+        hub.google_revoke_again()
+        self.assertNotIn("revoke", self.opened())
+        # A try never ends a new connection: Google's revoke ends the account's whole grant to the token's project.
+        # A try that is out when a Connect starts makes that Connect's finish write nothing (as during a Disconnect),
+        # and a finish of another account takes out that account's revoke of the same project, which no try then makes.
+        token = {c: f"1//old-{c.split('.')[0]}-token" for c in (APP_ID, CLIENT_ID)}
+        app, own, app2 = ({"account": a, "refresh_token": token[c], "client_id": c}
+                          for a, c in ((EMAIL, APP_ID), (EMAIL, CLIENT_ID), (EMAIL2, APP_ID)))
+        app2["refresh_token"] += "2"
+        hub.google_store(dict(self.opened(), revoke=[app, app2, own]))
+        answers = []
+
+        def connect(email):
+            self.fake.email, self.fake.refresh_token = email, f"1//new-{email.split('@')[0]}-0123456789abcdef"
+            answers.append(self.finish(self.begin(account=email)[1]["state"])[0])
+        self.fake.during["revoke"] = lambda: (self.fake.during.pop("revoke"), connect(EMAIL2), connect(EMAIL))
+        hub.google_revoke_again()
+        saved = self.opened()
+        self.assertEqual((answers, [c[1][0] for c in self.fake.calls if c[0] == "revoke"][-2:], sorted(saved["accounts"]),
+                          "revoke" in saved), ([200, 409], [app["refresh_token"], own["refresh_token"]], [EMAIL2], False))
+        self.assertEqual(hub.GOOGLE["revokes"][EMAIL], hub.GOOGLE["revoked"][EMAIL])
+        # No try starts while a Connect waits for its finish. That finish takes out the account's revokes of its own
+        # project (another client of it, or a client that the hub does not know), and keeps one of another project.
+        same, unknown = dict(app, client_id="456-other.apps.googleusercontent.com"), dict(app, client_id=None)
+        hub.google_store(dict(self.opened(), revoke=[same, unknown, own]))
+        self.fake.email, self.fake.refresh_token = EMAIL, REFRESH + "x"
+        code, start = self.begin(account=EMAIL)
+        calls = len(self.fake.calls)
+        hub.google_revoke_again()
+        self.assertEqual(self.fake.calls[calls:], [])
+        self.assertEqual(self.finish(start["state"])[0], 200)
+        self.assertEqual(self.opened()["revoke"], [own])
+        # A revoke of the project of a live connection that a release from before this one left goes untried.
+        hub.google_store(dict(self.opened(), revoke=[app, own]))
+        hub.google_revoke_again()
+        saved = self.opened()
+        self.assertEqual(([c for c in self.fake.calls if c[0] == "revoke"][-1], "revoke" in saved, sorted(saved["accounts"])),
+                         (("revoke", (own["refresh_token"],)), False, sorted([EMAIL, EMAIL2])))
+        self.assertNotIn(("revoke", (app["refresh_token"],)), self.fake.calls[calls:])
         for fields in ({}, {"account": "owner"}, {"account": EMAIL, "extra": 1}):
             self.assertEqual(self.owner("/ui/google/disconnect", **fields)[0], 400, fields)
         self.assertEqual(self.begin()[0], 200)                        # the next Connect needs nothing of the file
