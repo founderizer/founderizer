@@ -41692,6 +41692,46 @@ def load_reading(value):
     return {k: figure(value.get(k), k != "cpu_percent") for k in lifecycle.LOAD_KEYS}
 
 
+BROWSER_STATES = ("ready", "missing", "table_missing", "unsupported")
+BROWSER_PROOFS = ("holds", "open", "unread")
+
+
+def browser_status(value):
+    """A Linux server's browser parts as its service read them (lifecycle.browser_reading, with its live proof in
+    server.Service.browser_proof: how many agents got each verdict, and whether the service could keep the verdicts
+    for their helpers), or None. Like
+    load_reading, an optional field of a newer reading: a value of another shape is dropped whole and never refuses
+    the status."""
+    if not isinstance(value, dict) or value.get("state") not in BROWSER_STATES:
+        return None
+    if value["state"] == "unsupported":
+        return {"state": "unsupported"}
+    files, ports, missing = value.get("files"), lifecycle.browser_port_rows(value.get("ports")), value.get("missing")
+    uid = lambda v: v is None or type(v) is int and 0 <= v < 2 ** 32
+    chrome, unit, proof, kept = value.get("chrome"), value.get("unit"), value.get("proof"), value.get("proof_kept")
+    if not isinstance(files, dict) or set(files) != set(lifecycle.BROWSER_PARTS) or not all(
+            v is None or isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) for v in files.values()) \
+            or ports is None or not isinstance(missing, list) or len(missing) > len(lifecycle.BROWSER_PACKAGES) \
+            or not all(isinstance(p, str) and p in lifecycle.BROWSER_PACKAGES for p in missing) \
+            or not (chrome is None or isinstance(chrome, str) and re.fullmatch(r"[0-9A-Za-z.+:~-]{1,60}", chrome)) \
+            or not (unit is None or isinstance(unit, str) and re.fullmatch(r"[a-z-]{1,20}", unit)) \
+            or not (proof is None or isinstance(proof, dict) and set(proof) == set(BROWSER_PROOFS) and all(
+                type(n) is int and 0 <= n <= 99 for n in proof.values())) or kept not in (None, True, False) \
+            or not isinstance(value.get("added"), bool) or not uid(value.get("broker")) or not uid(value.get("worker")):
+        return None
+    return {"state": value["state"], "chrome": chrome, "missing": sorted(set(missing)), "files": dict(files),
+            "unit": unit, "ports": ports, "added": value["added"], "broker": value.get("broker"),
+            "worker": value.get("worker"), "proof": proof, "proof_kept": kept}
+
+
+def room_status(value):
+    """The room for a Linux server's browsers as its service measured it (lifecycle.room_reading), or None: each figure
+    a number, or None."""
+    if not isinstance(value, dict):
+        return None
+    return {k: figure(value.get(k)) for k in lifecycle.ROOM_KEYS}
+
+
 def use_reading(value):
     """What an agent's own processes use, as its helper measured it (lifecycle.agent_use), or None."""
     if not isinstance(value, dict):
@@ -41880,7 +41920,10 @@ def validate_status(data):
             "check": _optional(data.get("check"), int), "features": sorted(set(features)), "settings": settings,
             "models": model_reading(data.get("models")), "verify": verify_items(data.get("verify")),
             "reading_age": reading_age_of(data.get("reading_age")),
-            "load": load_reading(data.get("load")), "use": use_reading(data.get("use"))}
+            "load": load_reading(data.get("load")), "use": use_reading(data.get("use")),
+            # a server service's reading on Linux (plan 04): only where it sent them, as `agents`
+            **{k: v for k, v in (("browser", browser_status(data.get("browser"))),
+                                 ("room", room_status(data.get("room")))) if v is not None}}
 
 
 # ---------------------------------------------------------------- the fleet's settings (AUTONOMY.md section 4)
@@ -44552,7 +44595,11 @@ def server_reading(name, here):
     return {"source": source, "revision": data.get("revision"), "os": data.get("os") or {"name": None, "kernel": None},
             "security": data.get("security"), "runtimes": runtimes or {},
             "user": (data.get("access") or {}).get("user"), "reported_at": row["reported"],
-            "stale": now() - row["reported"] > MACHINE_STALE, "load": data.get("load") if source == "server" else None}
+            "stale": now() - row["reported"] > MACHINE_STALE, "load": data.get("load") if source == "server" else None,
+            # what the owner's Mac reads to put a Linux server's browser parts in place (its ServerBrowser): the parts,
+            # and whom each agent there runs as
+            "browser": data.get("browser") if source == "server" else None,
+            "agents": data.get("agents") if source == "server" else None}
 
 
 HUB_LOAD = {"at": None, "load": None}      # the hub's last measurement of its own machine (server_load)
@@ -52210,9 +52257,9 @@ def untimed(value):
 
 
 def said(reading):
-    """What a machine's or a server's reading says (untimed), without what it measures: its load and its agent's use
-    change at every reading, and the apps read them on their own clock."""
-    return untimed({k: v for k, v in reading.items() if k not in ("load", "use")})
+    """What a machine's or a server's reading says (untimed), without what it measures: its load, its agent's use and
+    the room for its browsers change at every reading, and the apps read them on their own clock."""
+    return untimed({k: v for k, v in reading.items() if k not in ("load", "use", "room")})
 
 
 def machine_said(agent, runtime, reads=None):
@@ -57380,8 +57427,9 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError) as e:
             return self.json(400, {"error": f"invalid status: {e}"})
         reading = {k: data[k] for k in ("revision", "os", "security", "runtimes", "access", "features", "load")}
-        if data.get("agents") is not None:      # one OS user for each agent: whom each agent here runs as
-            reading["agents"] = data["agents"]
+        # one OS user for each agent: whom each agent here runs as; and on Linux the agents' browser parts and the
+        # room for them (plan 04)
+        reading.update({k: data[k] for k in ("agents", "browser", "room") if data.get(k) is not None})
         if secret_hit(json.dumps(reading)):
             return self.json(422, {"error": "registered login refused"})
         old = q1("SELECT data FROM server_status WHERE server=?", (name,))

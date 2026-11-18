@@ -33,6 +33,7 @@ checkout and its files there, by name. The service runs no AI session and reads 
 """
 import argparse
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -40,10 +41,12 @@ import plistlib
 import pwd
 import re
 import secrets
+import select
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -85,6 +88,42 @@ AGENT_USER = "fleet-%s"
 USER_NAME = re.compile(r"fleet-[a-z][a-z0-9-]{1,25}")       # a user a job names: an agent keeps it after a rename
 AGENT_HELPER = "/usr/local/sbin/fleet-agent-user"
 AGENT_PATH = os.pathsep.join(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+# The live proof's listener (Service.prove_port), as an agent and by the system's own Python, never one of the agent's
+# PATH: it takes the agent's lock (lifecycle.BROWSER_LOCK, which the start of its browser takes too) for five seconds
+# at most, then 127.0.0.1:<port> (SO_REUSEADDR: a connection that ended a moment ago holds no port), says `ready`
+# (`taken` where something holds the port, `locked` where the lock stays taken), takes each connection, and ends when
+# its standard input closes, or after 15 seconds.
+PROOF_PYTHON = "/usr/bin/python3"
+PROOF_LISTENER = ("import fcntl, os, select, socket, sys, time\n"
+                  "lock, port = sys.argv[1], int(sys.argv[2])\n"
+                  "os.makedirs(os.path.dirname(lock), mode=0o700, exist_ok=True)\n"
+                  "held = open(lock, 'a')\n"
+                  "end = time.monotonic() + 5\n"
+                  "while True:\n"
+                  "    try:\n"
+                  "        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                  "        break\n"
+                  "    except OSError:\n"
+                  "        if time.monotonic() > end:\n"
+                  "            print('locked', flush=True)\n"
+                  "            sys.exit(0)\n"
+                  "        time.sleep(0.1)\n"
+                  "s = socket.socket()\n"
+                  "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                  "try:\n"
+                  "    s.bind(('127.0.0.1', port))\n"
+                  "    s.listen(8)\n"
+                  "except OSError:\n"
+                  "    print('taken', flush=True)\n"
+                  "    sys.exit(0)\n"
+                  "print('ready', flush=True)\n"
+                  "end = time.monotonic() + 15\n"
+                  "while time.monotonic() < end:\n"
+                  "    ready = select.select([s, sys.stdin], [], [], max(0.0, end - time.monotonic()))[0]\n"
+                  "    if sys.stdin in ready:\n"
+                  "        break\n"
+                  "    if s in ready:\n"
+                  "        s.accept()[0].close()\n")
 # This machine's vault broker: the root-owned copy of vault.py it runs (hubsetup.VAULT_LIB), and the other root
 # command the installers put in place, which brings that copy onto the vault.py of the fleet's configuration ref
 # (hubsetup.VAULT_UPDATE). A release reaches every checkout here and never that copy, so this service asks for it.
@@ -436,6 +475,11 @@ class Service:
         self.desired = self.last_report = None
         self.chrome_opened = self.report_at = None      # keep_chrome: when it last opened Chrome, and the reading due
         self.stuck = None               # a revision that did not fast-forward: no new try for it
+        self.proof_lock = threading.Lock()     # one live proof of the browser ports at a time (browser_proof)
+        self.run_folder = "/run/user"   # where each agent's runtime folder is, with its browser lock
+        self.listening = lifecycle.browser_listening
+        self.lock_path, self.lock_wait = lifecycle.BROWSER_PORTS_LOCK, 10.0     # browser_now
+        self.proof_path = lifecycle.BROWSER_PROOF
         self.vault_tried = None         # when the vault broker was last asked to catch up (vault_program)
 
     @staticmethod
@@ -539,11 +583,134 @@ class Service:
     # ---- the reading
     def reading(self):
         life = self.life
+        try:
+            browser = self.browser_now()
+        except Exception as e:          # the browser parts never stop this server's report
+            print(f"The browser parts of this server could not be read: {e}", flush=True)
+            browser = None
         return {"revision": self.loaded, "os": life.os_info(), "security": life.security(),
                 "runtimes": self.runtimes(), "load": lifecycle.machine_load(self.platform),
                 "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name, uid=os.getuid()),
-                "agents": self.agent_users(),
+                "agents": self.agent_users(), "browser": browser, "room": lifecycle.room_reading(self.platform),
                 "features": [JOB_HEARTBEAT, NAMES_FEATURE, KEY_FEATURE, INSTALL_KEY, MODEL_ACCOUNTS]}
+
+    # ---- the live proof of the agents' browser ports (build plan 04, D11)
+
+    def browser_now(self):
+        """The browser parts (lifecycle.browser_reading) and their live proof, read under a shared hold of the lock
+        under which the owner's Mac writes the ports and loads the table (lifecycle.BROWSER_PORTS_LOCK): so no proof
+        tries a port whose new rule is not loaded yet, and stops every agent's browser for it. Only root can hold that
+        lock (the Mac's step, the root helper): where it stays held, each agent's verdict is `unread`, and no verdict of
+        an earlier reading stays in force."""
+        try:
+            held = os.open(self.lock_path, os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            held = None                 # no lock: no parts that a step of the Mac changes
+        try:
+            free = held is None or self.shared(held)
+            browser = lifecycle.browser_reading(self.platform, run=self.run)
+            if browser is None or browser["state"] == "unsupported":
+                return browser
+            return dict(self.browser_proof(browser, keep=self.proof_path, prove=free), worker=os.getuid())
+        finally:
+            if held is not None:
+                os.close(held)
+
+    def shared(self, held):
+        """A shared hold of that open lock within `lock_wait` seconds: the Mac's step holds it for a moment only."""
+        end = time.monotonic() + self.lock_wait
+        while True:
+            try:
+                fcntl.flock(held, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                if time.monotonic() >= end:
+                    return False
+                time.sleep(0.2)
+
+    def browser_proof(self, browser, keep=lifecycle.BROWSER_PROOF, prove=True):
+        """**The port rule, tested as it works, at each reading.** This service has no root and cannot list nftables,
+        so it tries each agent's DevTools port itself, as this service's user, which the rule refuses with a reset
+        (prove_port). A connection is a table that is not loaded (a flush of the whole ruleset that no event of
+        nftables.service brought, such as `nft flush ruleset` by hand):
+        then it stops each agent's browser and screen units at once, and the reading says `table_missing`. The
+        verdicts, one for each agent, go into `keep` with the version of the table that they tested (the SHA-256 of
+        the ports file): a file of this service's own, in a folder that the owner's Mac made for it and that no agent
+        can write, from which an agent's helper starts its browser only with a verdict `holds` of its own for the
+        current version. The reading says how many agents got each verdict, and `proof_kept` whether that file holds
+        them. One proof at a time: the heartbeat of a job and the report after it can read at once. `prove` false:
+        every verdict is `unread` (browser_now)."""
+        rows = browser.get("ports") or []
+        if not rows:
+            return browser
+        with self.proof_lock:
+            proof = {row["user"]: self.prove_port(row["user"], row["devtools"]) if prove else "unread" for row in rows}
+            if "open" in proof.values():
+                for row in rows:
+                    if self.users(row["user"]):
+                        self.run(self.as_agent(row["user"], ["systemctl", "--user", "stop",
+                                                             *lifecycle.BROWSER_UNITS]), timeout=30)
+            kept = self.keep_proof(browser["files"]["ports"], proof, keep)
+        state = "table_missing" if "open" in proof.values() and browser["state"] == "ready" else browser["state"]
+        # the reading has how many agents got each verdict, so that it keeps its size with many agents; each agent's
+        # own verdict is in the file, for its helper
+        counts = {word: list(proof.values()).count(word) for word in ("holds", "open", "unread")}
+        return dict(browser, proof=counts, proof_kept=kept, state=state)
+
+    def prove_port(self, user, port):
+        """One agent's DevTools port, tried as this service's user (lifecycle.browser_connect, browser_verdict). A
+        reset says nothing where nobody listens there, because the kernel resets that too: so a listener of the
+        agent's own takes the port first (PROOF_LISTENER), or its browser holds it already, and a reset counts only
+        while the kernel lists a socket of the agent's own that listens there. `unread` where the agent has no user
+        here, or its listener could not take its lock or did not start."""
+        found = self.users(user)
+        if not found:
+            return "unread"
+        lock = os.path.join(self.run_folder, str(found[0]), lifecycle.BROWSER_LOCK)
+        try:
+            listener = self.popen(self.as_agent(user, [PROOF_PYTHON, "-I", "-c", PROOF_LISTENER, lock, str(port)]),
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            return "unread"
+        try:
+            word = listener.stdout.readline().strip() if select.select([listener.stdout], [], [], 10)[0] else ""
+            if word not in ("ready", "taken"):
+                return "unread"
+            said = lifecycle.browser_connect(port)
+            return lifecycle.browser_verdict(said, said == "refused" and self.listening(port, found[0]))
+        finally:
+            with contextlib.suppress(OSError):
+                listener.stdin.close()        # the listener ends at the close of its input: sudo's kill is root's
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                listener.wait(timeout=20)
+            with contextlib.suppress(OSError):
+                listener.stdout.close()
+
+    @staticmethod
+    def keep_proof(version, proof, path):
+        """`<version>` and a line `<user> <verdict>` for each agent in `path`, written whole beside itself. False where
+        that could not be done: no folder (the owner's Mac makes it with the parts), or a folder of another mode."""
+        folder = os.path.dirname(path)
+        if not version or not os.path.isdir(folder):
+            return False
+        fd, part = None, None
+        try:
+            fd, part = tempfile.mkstemp(dir=folder, prefix=".state-")
+            with os.fdopen(fd, "w", encoding="ascii") as f:
+                fd = None
+                f.write(version + "\n" + "".join(f"{user} {word}\n" for user, word in proof.items()))
+            os.chmod(part, 0o644)
+            os.replace(part, path)
+            part = None
+            return True
+        except OSError:
+            return False
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if part:
+                with contextlib.suppress(OSError):
+                    os.unlink(part)
 
     def agent_users(self):
         """{agent: {user, uid}} of this machine's agents: the OS user that each one's service runs as (agent_user), or

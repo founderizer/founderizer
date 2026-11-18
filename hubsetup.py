@@ -486,7 +486,29 @@ def remove_script(user):
             "crontab -r -u %(u)s 2>/dev/null || true\n"
             "userdel -r %(u)s 2>/dev/null || true\n"
             'if id -u %(u)s >/dev/null 2>&1; then echo "fleet-agent-user: %(u)s could not be removed" >&2; exit 4; fi\n'
-            "rm -rf -- /home/%(u)s") % {"u": user, "g": AGENT_GROUP, "reserved": "|".join(RESERVED_USERS)}
+            # Its two browser ports and their three rules of the fleet's table go too (build plan 04, D11), after the
+            # user, so that the owner's Mac, which reads the users again under the same lock before it writes them,
+            # never writes them back; and a user made later with its uid takes none of them. Each line of it ends
+            # well, so that nothing of it stops a removal.
+            "if [ -f %(ports)s ]; then\n"
+            # the lock is the owner's Mac's, of mode 640: opened to read only, and never made here
+            "  [ -r %(lock)s ] && command exec 9<%(lock)s && flock -w 60 9 || true\n"
+            '  if l=$(grep "^%(u)s " %(ports)s 2>/dev/null) && set -- $l && [ "$#" = 3 ]; then\n'
+            '    { grep -v "^%(u)s " %(ports)s; [ $? -le 1 ]; } > %(ports)s.fleet-new && chmod 644 %(ports)s.fleet-new'
+            " && mv -f %(ports)s.fleet-new %(ports)s || rm -f %(ports)s.fleet-new\n"
+            "    if [ -f %(table)s ]; then\n"
+            '      { grep -v -F -e "tcp dport $2 meta" -e "tcp dport $3 meta" -e "tcp sport { $2, $3 } meta"'
+            ' -e "tcp dport { $2, $3 } accept" %(table)s;'
+            " [ $? -le 1 ]; } > %(table)s.fleet-new && chmod 644 %(table)s.fleet-new && mv -f %(table)s.fleet-new"
+            " %(table)s && systemctl try-reload-or-restart fleet-browser-ports.service >/dev/null 2>&1"
+            " || rm -f %(table)s.fleet-new\n"
+            "    fi\n"
+            "  fi\n"
+            "  command exec 9<&- || true\n"
+            "fi\n"
+            "rm -rf -- /home/%(u)s") % {"u": user, "g": AGENT_GROUP, "reserved": "|".join(RESERVED_USERS),
+                                        "ports": lifecycle.BROWSER_PARTS["ports"],
+                                        "table": lifecycle.BROWSER_PARTS["table"], "lock": lifecycle.BROWSER_PORTS_LOCK}
 
 
 def _shell(script, timeout=120):

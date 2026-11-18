@@ -326,6 +326,49 @@ class Servers(OwnerAPI):
         self.assertEqual(self.service("/server/mini/status", {"revision": hub.kit_revision(fresh=True),
                                                               "os": {"name": "macOS 15.6"}, "load": "busy"})[0], 200)
         self.assertIsNone(self.servers()[1]["mini"]["load"])
+        # So are a Linux server's browser parts and the room for them (plan 04): a part of another shape drops the
+        # parts whole, and a room figure of another shape is None.
+        for parts in ("ready", {"state": "ready"}, {"state": "fine"}, dict(self.PARTS, ports=[{"user": "root"}]),
+                      dict(self.PARTS, files={"ports": "a" * 64}), dict(self.PARTS, worker=-1),
+                      dict(self.PARTS, missing=[["xvfb"]]), dict(self.PARTS, proof={"holds": 1, "open": 0}),
+                      dict(self.PARTS, proof={"holds": True, "open": 0, "unread": 0}), dict(self.PARTS, proof="holds"),
+                      dict(self.PARTS, proof_kept="yes")):
+            self.assertEqual(self.service("/server/mini/status", {
+                "revision": hub.kit_revision(fresh=True), "os": {"name": "macOS 15.6"}, "browser": parts,
+                "room": {"oom": "many", "swap_fail": 3}})[0], 200, parts)
+            self.assertIsNone(self.servers()[1]["mini"]["reading"]["browser"], parts)
+            stored = json.loads(hub.q1("SELECT data FROM server_status WHERE server='mini'")["data"])
+            self.assertNotIn("browser", stored)
+            self.assertEqual((stored["room"]["oom"], stored["room"]["swap_fail"]), (None, 3))
+
+    # One Linux server's browser parts as its service reads them (lifecycle.browser_reading, server.browser_proof).
+    PARTS = {"state": "ready", "chrome": "157.0.8103.78-1", "missing": [], "unit": "active", "added": True,
+             "broker": 1001, "worker": 1000, "proof": {"holds": 1, "open": 0, "unread": 0}, "proof_kept": True,
+             "files": dict.fromkeys(("unit", "dropin", "default", "origin", "fixed", "policy", "ports", "table",
+                                     "source", "key"), "c" * 64),
+             "ports": [{"user": "fleet-vps", "devtools": 9300, "screen": 5910}]}
+
+    def test_a_linux_server_s_browser_parts_and_its_agents_users_reach_the_owner_s_mac(self):
+        """The owner's Mac puts a server's browser parts in place from its reading (the app's ServerBrowser, plan 04
+        S1b): the parts and whom each agent there runs as are on the servers page, and the room for the browsers is
+        kept for the hub's count of places and is not on that page. A reading of an agent's helper has none."""
+        self.joined("box", "linux")
+        room = dict.fromkeys(hub.lifecycle.ROOM_KEYS, 7)
+        status, answer = self.service("/server/box/status", {
+            "revision": hub.kit_revision(fresh=True), "os": {"name": "Ubuntu 24.04.1 LTS"}, "access": {"user": "fleet"},
+            "agents": {"vps": {"user": "fleet-vps", "uid": 1002}, "gone": {"user": "fleet-gone", "uid": 1003}},
+            "browser": dict(self.PARTS, missing=["xvfb", "xvfb"]), "room": room})
+        self.assertEqual(status, 200, answer)
+        reading = self.servers()[1]["box"]["reading"]
+        self.assertEqual(reading["browser"], dict(self.PARTS, missing=["xvfb"]))
+        self.assertEqual(reading["agents"], {"vps": {"user": "fleet-vps", "uid": 1002}})
+        self.assertNotIn("room", reading)
+        self.assertEqual(json.loads(hub.q1("SELECT data FROM server_status WHERE server='box'")["data"])["room"], room)
+        # A server outside version 1 says only that.
+        self.service("/server/box/status", {"revision": hub.kit_revision(fresh=True), "os": {"name": "Debian 13"},
+                                            "browser": dict(self.PARTS, state="unsupported")})
+        self.assertEqual(self.servers()[1]["box"]["reading"]["browser"], {"state": "unsupported"})
+        self.assertIsNone(self.servers()[1]["vps"]["reading"]["browser"], "a reading of its agent's helper has none")
 
     def test_a_reading_that_differs_only_in_its_load_wakes_no_app(self):
         """The load changes at every reading, and the apps read it on their own clock (live_changes): only `state`
@@ -337,7 +380,7 @@ class Servers(OwnerAPI):
                 "revision": hub.kit_revision(fresh=True), "os": {"name": "macOS 15.6"},
                 "runtimes": {"codex": {"version": None, "signed_in": None},
                              "claude": {"version": "2.1.287", "signed_in": True}}, "access": {"user": "dana"},
-                "load": {"cpu_percent": cpu}})[0], 200)
+                "load": {"cpu_percent": cpu}, "room": {"swap_current": int(cpu * 1000), "full_us": int(cpu)}})[0], 200)
         report(1.0)
         before = hub.CHANGE["state"]
         report(2.0)

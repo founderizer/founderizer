@@ -1259,11 +1259,12 @@ class Helper(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="fleet-agent-remove-"))
         self.addCleanup(subprocess.run, ["rm", "-rf", str(self.tmp)])
         self.script = self.tmp / "fleet-agent-user"
-        self.script.write_text(hubsetup.helper_script().replace("rm -rf -- /home/", f"rm -rf -- {self.tmp}/home/"))
+        self.script.write_text(hubsetup.helper_script().replace("rm -rf -- /home/", f"rm -rf -- {self.tmp}/home/")
+                               .replace("/etc/fleet-browser/", f"{self.tmp}/etc/fleet-browser/"))
         self.log, self.there, self.members = self.tmp / "ran", self.tmp / "users", self.tmp / "members"
         self.stubs = self.tmp / "bin"
         self.stubs.mkdir()
-        for tool in TOOLS + ("pkill", "pgrep", "crontab", "userdel", "sleep"):
+        for tool in TOOLS + ("pkill", "pgrep", "crontab", "userdel", "sleep", "systemctl", "flock"):
             body = ""
             if tool == "id":
                 body = (f'if [ "$#" = 1 ] && [ "$1" = -u ]; then echo 0; exit 0; fi\n'
@@ -1304,6 +1305,64 @@ class Helper(unittest.TestCase):
         self.assertLess(ran.index("pkill -KILL -u fleet-writer"), ran.index("userdel -r fleet-writer"))
         self.assertFalse(home.exists())
         self.assertEqual(self.there.read_text().split(), [])
+
+    def test_its_browser_ports_and_their_rules_go_with_it(self):
+        """Build plan 04, D11: after the user, under the lock that the owner's Mac takes too, its line of the ports file
+        and its four rules of the fleet's table go, and the table is loaded again; the lines of every other agent stay,
+        also of one whose name begins with its name, and so does the last rule, which closes each port that no agent
+        holds. A line that is not whole, and a table that is not there, stop nothing of the removal and leave no file of
+        their own; without a ports file nothing changes there."""
+        folder = self.tmp / "etc" / "fleet-browser"
+        folder.mkdir(parents=True)
+        rules = lambda d, s, uid: (f'\t\toifname "lo" tcp dport {d} meta skuid != {{ 0, 1001, {uid} }} reject with tcp reset\n'
+                                   f'\t\toifname "lo" tcp dport {s} meta skuid != {{ 0, 1000 }} reject with tcp reset\n'
+                                   f'\t\toifname "lo" tcp sport {{ {d}, {s} }} meta skuid != {uid} drop\n'
+                                   f'\t\toifname "lo" tcp dport {{ {d}, {s} }} accept\n')
+        head = "table inet fleet_browser {\n\tchain out {\n"
+        tail = '\t\toifname "lo" tcp flags & (syn | ack) == syn tcp dport { 5910-5999, 9300-9399 } reject with tcp reset\n\t}\n}\n'
+
+        def remove(user, ports, table=None):
+            self.there.write_text(user + "\n")
+            self.members.write_text(user + "\n")
+            (folder / "ports").write_text(ports)
+            if table is not None:
+                (folder / "table.nft").write_text(table)
+            code, said = self.run_helper("--remove=" + user)
+            self.assertEqual(code, 0, said)
+            self.assertEqual(self.there.read_text().split(), [], "the user is removed")
+
+        (folder / "lock").write_text("")                      # the owner's Mac's, which the helper never makes
+        remove("fleet-writer", "fleet-writer 9300 5910\nfleet-writer2 9301 5911\n",
+               head + rules(9300, 5910, 4001) + rules(9301, 5911, 4002) + tail)
+        self.assertEqual((folder / "ports").read_text(), "fleet-writer2 9301 5911\n")
+        self.assertEqual((folder / "table.nft").read_text(), head + rules(9301, 5911, 4002) + tail)
+        ran = self.changes()
+        self.assertIn("systemctl try-reload-or-restart fleet-browser-ports.service", ran)
+        self.assertLess(ran.index("userdel -r fleet-writer"), ran.index("flock -w 60 9"))
+        remove("fleet-writer2", "fleet-writer2 9301 5911\n")
+        self.assertEqual(((folder / "ports").read_text(), (folder / "table.nft").read_text()), ("", head + tail))
+        (folder / "table.nft").unlink()
+        remove("fleet-other", "fleet-other 9302\n")              # not whole: it stays for the owner's Mac to write
+        self.assertEqual((folder / "ports").read_text(), "fleet-other 9302\n")
+        remove("fleet-third", "fleet-third 9303 5913\n")         # no table
+        self.assertEqual((folder / "ports").read_text(), "")
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["lock", "ports"])
+        (folder / "lock").unlink()
+        remove("fleet-fourth", "fleet-fourth 9304 5914\n")       # no lock: the line goes, and no lock is made
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["ports"])
+        # With the lock open, the helper's own errors still reach the service: a home that cannot go says why.
+        (folder / "lock").write_text("")
+        home = self.tmp / "home" / "fleet-fifth"
+        (home / "kept").mkdir(parents=True)
+        (home / "kept" / "file").write_text("x")
+        (home / "kept").chmod(0o555)
+        self.addCleanup((home / "kept").chmod, 0o755)
+        self.there.write_text("fleet-fifth\n")
+        self.members.write_text("fleet-fifth\n")
+        (folder / "ports").write_text("fleet-fifth 9305 5915\n")
+        code, said = self.run_helper("--remove=fleet-fifth")
+        self.assertNotEqual(code, 0)
+        self.assertIn("Permission denied", said)
 
     def test_a_user_that_is_not_there_is_gone_already(self):
         code, said = self.run_helper("--remove=fleet-writer")

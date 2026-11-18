@@ -12,6 +12,7 @@ works: the vendor's own update, a check of the new version, and the previous ver
 import contextlib
 import fcntl
 import glob
+import hashlib
 import http.client
 import json
 import math
@@ -2962,6 +2963,214 @@ def machine_load(platform_name=sys.platform, run=None, loadavg=os.getloadavg, st
     except OSError:
         pass
     return load
+
+
+# ---- the agents' browsers on a Linux server (the owner's "Every agent with shell" of 17 November 2026; build plan 04,
+# D6, D8 and D11 to D15). The server service reads the room for them and their parts at each reading; the hub counts a
+# server's browser places from the room, and the owner's Mac installs and removes the parts as root (the app's
+# ServerBrowser.swift), by the contract of the devops repository's scripts/fleet-browser/README.md.
+USER_SLICE = "/sys/fs/cgroup/user.slice"
+ROOM_KEYS = ("swap_total", "memory_max", "swap_max", "swap_current", "swap_peak", "oom", "swap_fail", "full_us")
+BROWSER_SYSTEMS = ("24.04", "26.04")         # the x86 Ubuntu releases that probe 2 proved (D8)
+BROWSER_PACKAGES = ("google-chrome-stable", "xvfb", "xauth", "openbox", "x11vnc", "ffmpeg", "nftables",
+                    "fonts-noto-core", "fonts-noto-color-emoji", "libatomic1")
+BROWSER_PARTS = {"unit": "/etc/systemd/system/fleet-browser-ports.service",
+                 "dropin": "/etc/systemd/system/nftables.service.d/fleet-browser.conf",     # the table after nftables
+                 "default": "/etc/default/google-chrome",
+                 "origin": "/etc/apt/apt.conf.d/53fleet-google-chrome",
+                 "fixed": "/etc/opt/chrome/policies/managed/fleet-fixed.json",
+                 "policy": "/etc/opt/chrome/policies/managed/fleet-providers.json",
+                 "ports": "/etc/fleet-browser/ports", "table": "/etc/fleet-browser/table.nft",
+                 "source": "/etc/apt/sources.list.d/google-chrome.sources", "key": "/usr/share/keyrings/google-chrome.gpg"}
+BROWSER_PORTS_UNIT = "fleet-browser-ports.service"   # a system unit: root's table
+BROWSER_PORTS_LOCK = "/etc/fleet-browser/lock"   # root's: the Mac's step and the root helper change the ports under it
+BROWSER_RECORD = "/var/lib/fleet-browser/added"         # root's: what the Mac's step added, which its removal takes away
+BROWSER_PROOF = "/var/lib/fleet-browser/proof/state"    # the server service's: the live proof, which each agent reads
+BROWSER_LOCK = "fleet-browser/port.lock"     # in an agent's runtime folder: its proof listener's and its browser's start
+BROWSER_AGENT = re.compile(r"fleet-[a-z][a-z0-9-]{1,25}")
+BROWSER_BROKER = "fleet-vault"               # the vault's broker, which may reach each DevTools port
+BROWSER_PORT = re.compile(r"[1-9][0-9]{3}")
+
+
+def room_reading(platform_name=sys.platform, root=""):
+    """What the hub needs to count a Linux server's browser places (plan 04, D6), as the kernel says it now: the
+    server's swap (`SwapTotal`), and of `user.slice`, where every agent runs, its limits of memory and of swap (None for
+    the kernel's "max"), its swap in use and at its peak, the count of its ends at its own limit (`oom` of
+    memory.events.local), of a full swap (`fail` of memory.swap.events), and the microseconds in which all its processes
+    waited for memory at once (`full` of memory.pressure). The counts start at 0 at each boot, which `os.boot` names. A
+    part that cannot be read is None; None on a Mac."""
+    if platform_name == "darwin":
+        return None
+    room = dict.fromkeys(ROOM_KEYS)
+
+    def text(path):
+        try:
+            with open(root + path, encoding="ascii") as f:
+                return f.read(65536)
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def number(word):
+        return int(word) if word is not None and re.fullmatch(r"[0-9]{1,19}", word) else None
+
+    swap = re.search(r"(?m)^SwapTotal:\s+([0-9]{1,16}) kB$", text("/proc/meminfo") or "")
+    room["swap_total"] = int(swap.group(1)) * 1024 if swap else None
+    for key, name in (("memory_max", "memory.max"), ("swap_max", "memory.swap.max"),
+                      ("swap_current", "memory.swap.current"), ("swap_peak", "memory.swap.peak")):
+        room[key] = number((text(f"{USER_SLICE}/{name}") or "").strip())
+    for key, name, word in (("oom", "memory.events.local", "oom"), ("swap_fail", "memory.swap.events", "fail")):
+        found = re.search(rf"(?m)^{word} ([0-9]+)$", text(f"{USER_SLICE}/{name}") or "")
+        room[key] = number(found.group(1)) if found else None
+    full = re.search(r"(?m)^full .* total=([0-9]+)$", text(f"{USER_SLICE}/memory.pressure") or "")
+    room["full_us"] = number(full.group(1)) if full else None
+    return room
+
+
+def browser_port_rows(rows):
+    """The agents' ports as the contract gives them ([{user, devtools, screen}], in their order), or None: an agent's
+    own user (never the broker's), a DevTools port of 9300 to 9399 and a screen-sharing port of 5910 to 5999, each
+    given once, 99 rows at most."""
+    if not isinstance(rows, list) or len(rows) > 99:
+        return None
+    seen, out = set(), []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"user", "devtools", "screen"}:
+            return None
+        user, devtools, screen = row["user"], row["devtools"], row["screen"]
+        if not (isinstance(user, str) and BROWSER_AGENT.fullmatch(user) and user != BROWSER_BROKER) or not all(
+                type(p) is int for p in (devtools, screen)) or not 9300 <= devtools <= 9399 or \
+                not 5910 <= screen <= 5999 or {user, devtools, screen} & seen:
+            return None
+        seen |= {user, devtools, screen}
+        out.append({"user": user, "devtools": devtools, "screen": screen})
+    return out
+
+
+def browser_ports(text):
+    """The rows of `/etc/fleet-browser/ports` (browser_port_rows), or None for a file that is not of the contract: one
+    line `<user> <DevTools port> <screen-sharing port>` for each agent, each ending with a new line, and nothing else."""
+    if not isinstance(text, str) or (text and not text.endswith("\n")):
+        return None
+    rows = []
+    for line in text[:-1].split("\n") if text else []:
+        parts = line.split(" ")
+        if len(parts) != 3 or not all(BROWSER_PORT.fullmatch(p) for p in parts[1:]):
+            return None
+        rows.append({"user": parts[0], "devtools": int(parts[1]), "screen": int(parts[2])})
+    return browser_port_rows(rows)
+
+
+def browser_reading(platform_name=sys.platform, root="", run=None, machine=lambda: os.uname().machine,
+                    broker=lambda: pwd.getpwnam(BROWSER_BROKER).pw_uid):
+    """The agents' browser parts on this Linux server, as its service reads them with no root (plan 04, S1): `state`
+    is `unsupported` on a system that version 1 does not take (x86 Ubuntu 24.04 and 26.04 only, D8), `missing` while a
+    part is not in place or the table's unit is not active, else `ready` (the service's live proof can make that
+    `table_missing`: server.Service.browser_proof). Then Chrome's version, the packages that are not installed, the
+    SHA-256 of each file of the parts (None where it is not there, and for the drop-in also where systemd does not run
+    its lines), the word of the table's unit, the agents' ports,
+    whether the Mac's step keeps a record of what it added, and the uid of the vault's broker. None on a Mac."""
+    if platform_name == "darwin":
+        return None
+    run = run or _run
+    try:
+        with open(root + "/etc/os-release", encoding="utf-8", errors="replace") as f:
+            release = dict(re.findall(r'(?m)^([A-Z_]+)="?([^"\n]*)"?$', f.read(65536)))
+    except OSError:
+        release = {}
+    if release.get("ID") != "ubuntu" or release.get("VERSION_ID") not in BROWSER_SYSTEMS or \
+            machine() not in ("x86_64", "amd64"):
+        return {"state": "unsupported"}
+    files = {}
+    for key, path in BROWSER_PARTS.items():
+        try:
+            if os.path.isfile(root + path) and not os.path.islink(root + path):
+                with open(root + path, "rb") as f:
+                    files[key] = hashlib.sha256(f.read(1 << 20)).hexdigest()
+            else:
+                files[key] = None
+        except OSError:
+            files[key] = None
+    _, out, _ = run(["dpkg-query", "-W", "-f=${Package}\t${Version}\t${Architecture}\t${db:Status-Abbrev}\n",
+                     *BROWSER_PACKAGES])
+    installed = {}
+    for line in out.splitlines():
+        # installed (`ii`, and `hi` for a package on hold), of this server's own architecture or of all
+        parts = line.split("\t")
+        if len(parts) == 4 and parts[2] in ("amd64", "all") and parts[3][1:2] == "i" and \
+                re.fullmatch(r"[0-9A-Za-z.+:~-]{1,60}", parts[1]):
+            installed[parts[0]] = parts[1]
+    if files["dropin"]:
+        # The drop-in counts only where systemd runs its three lines: a later drop-in that empties a list, or a
+        # drop-in that systemd has not read again yet, leaves the file in place and the table gone after the next
+        # event of nftables.service (a review of 17 November 2026). Any user reads these properties.
+        code, out, _ = run(["systemctl", "show", "nftables.service", "-p", "NeedDaemonReload", "-p", "ExecStartPost",
+                            "-p", "ExecReload", "-p", "ExecStopPost"])
+        said = {}       # systemd gives one line for each command of a list: another part's drop-in adds lines too
+        for line in out.splitlines():
+            key, _, value = line.partition("=")
+            said.setdefault(key, []).append(value)
+        if code != 0 or said.get("NeedDaemonReload") != ["no"] or not all(
+                any(BROWSER_PARTS["table"] in value for value in said.get(key, []))
+                for key in ("ExecStartPost", "ExecReload", "ExecStopPost")):
+            files["dropin"] = None
+    code, out, _ = run(["systemctl", "is-active", BROWSER_PORTS_UNIT])
+    unit = out.strip() if re.fullmatch(r"[a-z-]{1,20}", out.strip()) else None
+    ports = []
+    if files["ports"]:
+        try:
+            with open(root + BROWSER_PARTS["ports"], encoding="ascii") as f:
+                ports = browser_ports(f.read(1 << 20))
+        except (OSError, UnicodeDecodeError):
+            ports = None
+    try:
+        broker_uid = broker()
+    except (KeyError, OSError):
+        broker_uid = None
+    missing = [p for p in BROWSER_PACKAGES if p not in installed]
+    state = "missing" if missing or None in files.values() or unit != "active" or ports is None else "ready"
+    return {"state": state, "chrome": installed.get("google-chrome-stable"), "missing": missing, "files": files,
+            "unit": unit, "ports": ports or [], "added": os.path.isfile(root + BROWSER_RECORD),
+            "broker": broker_uid}
+
+
+def browser_connect(port, timeout=2.0, connect=socket.create_connection):
+    """This user's try of 127.0.0.1:<port> for the live proof (plan 04, D11): `connected`, `refused` (a reset), or
+    `silent` (no answer in time, or another error)."""
+    try:
+        connect(("127.0.0.1", port), timeout=timeout).close()
+        return "connected"
+    except ConnectionRefusedError:
+        return "refused"
+    except OSError:
+        return "silent"
+
+
+def browser_listening(port, uid, opener=open):
+    """True where a socket of this uid (the agent whose port it is) listens on 127.0.0.1:<port> or 0.0.0.0:<port>, by
+    the kernel's own list (any user reads /proc/net/tcp): a try of 127.0.0.1 reaches it. A socket of another user does
+    not count, so that no agent can make another agent's proof hold; an IPv6 socket does not count either, because the
+    list does not say whether it takes IPv4 too."""
+    wanted = {f"0100007F:{port:04X}", f"00000000:{port:04X}"}
+    try:
+        with opener("/proc/net/tcp", encoding="ascii") as f:
+            next(f, None)                   # its head line
+            for line in f:                  # the whole list, a line at a time: in a part of it, an agent with many
+                row = line.split()          # sockets could push another agent's listener out (a review, 17 Nov 2026)
+                if len(row) > 7 and row[1] in wanted and row[3] == "0A" and row[7] == str(uid):
+                    return True
+    except (OSError, UnicodeDecodeError):
+        return False
+    return False
+
+
+def browser_verdict(said, listening):
+    """The live proof of one port (plan 04, D11): `open` where this user's try connected (the port rule is not loaded),
+    `holds` where it was reset while the kernel listed a socket that listens there, else `unread`. A reset alone proves
+    nothing: the kernel resets a try of a port where nothing listens too, and the proof's own listener runs as the
+    agent, which can end it."""
+    if said == "connected":
+        return "open"
+    return "holds" if said == "refused" and listening else "unread"
 
 
 def cpu_seconds(text):

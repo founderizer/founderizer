@@ -3,15 +3,22 @@ to work for ANY user"): the server's reading says what holds, and the hub tells 
 holding and once when it holds again, with the words that send it first to the agent whose duty covers that server.
 No monitoring host and no outside alert route is needed. Against a local hub with a temporary Fleet repository, as
 test_servers."""
+import contextlib
+import io
+import re
 import json
+import os
+import socket
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import hub
+import leftovers
 import lifecycle
-from test_servers import HUB, KEY, NEW, OWNER, Servers, sha
+from test_servers import HUB, KEY, NEW, OWNER, FakeLife, Servers, sha
 
 DAY = 86400
 # What the manager reads of the hub's own server (hub.MENDED_WORDS_HUB), word for word.
@@ -25,7 +32,8 @@ OFF_WORDS = ("[hub] The server box needs care: its automatic security updates ar
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(case(name) for case in (ServerWatch, HubOwnServer, HardeningRead, UpdatesRead)
+    return unittest.TestSuite(case(name) for case in (ServerWatch, HubOwnServer, HardeningRead, UpdatesRead,
+                                                      BrowserRead)
                               for name in case.__dict__ if name.startswith("test_"))
 
 
@@ -753,6 +761,272 @@ class HardeningRead(unittest.TestCase):
             reading = life.security()
         self.assertEqual((reading["ssh_keys_only"], reading["npm_rule"]), ("by hardening", "too"))
 
+
+
+class BrowserRead(unittest.TestCase):
+    """A Linux server's reading of its agents' browser parts and of the room for them (build plan 04, S1b), as its
+    service makes it with no root: what the owner's Mac puts in place by it, and what the hub counts places from."""
+
+    PARTS = {"ports": "fleet-alpha 9300 5910\nfleet-beta 9301 5911\n", "table": "the table\n", "unit": "u",
+             "dropin": "n", "default": "d", "origin": "o", "fixed": "f", "policy": "p", "source": "s", "key": "k"}
+    APP = Path(leftovers.ROOT) / "app"      # the apps' folder, which the published repository never has
+    NO_APP = "the apps' folder app/ is not in this tree (the published repository has none)"
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="fleet-browser-")
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        (self.root / "etc").mkdir()
+        (self.root / "etc/os-release").write_text('NAME="Ubuntu"\nVERSION_ID="24.04"\nID=ubuntu\n')
+        self.installed, self.unit, self.foreign = list(lifecycle.BROWSER_PACKAGES), "active", False
+        # what systemd runs for nftables.service: the drop-in's three lines, read again after its last change
+        table = lifecycle.BROWSER_PARTS["table"]
+        self.systemd = {"NeedDaemonReload": "no", **{key: f"{{ path=/usr/sbin/nft ; argv[]=/usr/sbin/nft -f {table} ; "
+                        f"ignore_errors=yes ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}"
+                        for key in ("ExecStartPost", "ExecReload", "ExecStopPost")}}
+        self.extra, self.show_code = "", 0
+
+    def put(self, **parts):
+        for key, text in parts.items():
+            path = self.root / lifecycle.BROWSER_PARTS[key].lstrip("/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+
+    def commands(self, argv, **_):
+        if argv[0] == "dpkg-query":
+            # each package of this server's architecture, installed; libatomic1 on hold; and a foreign xvfb only
+            return 0, "".join(f"{p}\t1.0\t{'i386' if p == 'xvfb' and self.foreign else 'amd64'}\t"
+                              f"{'hi ' if p == 'libatomic1' else 'ii '}\n" for p in argv[3:] if p in self.installed), ""
+        if argv[:3] == ["systemctl", "show", "nftables.service"]:
+            return self.show_code, "".join(f"{k}={v}\n" for k, v in self.systemd.items()) + self.extra, ""
+        return (0, self.unit + "\n", "") if argv[:2] == ["systemctl", "is-active"] else (1, "", "")
+
+    def read(self, machine="x86_64", broker=1001):
+        def broker_uid():
+            if broker is None:
+                raise KeyError(lifecycle.BROWSER_BROKER)
+            return broker
+        return lifecycle.browser_reading("linux", root=str(self.root), run=self.commands, machine=lambda: machine,
+                                         broker=broker_uid)
+
+    def test_the_parts_are_ready_only_when_each_one_is_in_place(self):
+        """`missing` while a package, a file or the table's unit is not there; `ready` with the SHA-256 of each file
+        and the agents' ports, which the owner's Mac compares with what it would write."""
+        self.put(**self.PARTS)
+        reading = self.read()
+        self.assertEqual((reading["state"], reading["missing"], reading["unit"], reading["broker"], reading["added"]),
+                         ("ready", [], "active", 1001, False))
+        self.assertEqual(reading["files"]["ports"], sha(self.PARTS["ports"]))
+        self.assertEqual(reading["ports"], [{"user": "fleet-alpha", "devtools": 9300, "screen": 5910},
+                                            {"user": "fleet-beta", "devtools": 9301, "screen": 5911}])
+        self.installed.remove("libatomic1")
+        self.assertEqual((self.read()["state"], self.read()["missing"]), ("missing", ["libatomic1"]))
+        self.installed.append("libatomic1")
+        self.foreign = True             # xvfb of another architecture is not this server's xvfb
+        self.assertEqual((self.read()["state"], self.read()["missing"]), ("missing", ["xvfb"]))
+        self.foreign = False
+        self.unit = "failed"
+        self.assertEqual(self.read()["state"], "missing")
+        self.unit = "active"
+        (self.root / lifecycle.BROWSER_PARTS["key"].lstrip("/")).unlink()
+        self.assertEqual((self.read()["state"], self.read()["files"]["key"]), ("missing", None))
+        self.put(key="k", ports="fleet-alpha 9300 5910")        # no new line at its end: not of the contract
+        self.assertEqual((self.read()["state"], self.read()["ports"]), ("missing", []))
+        self.assertIsNone(self.read(broker=None)["broker"])
+
+    def test_the_drop_in_counts_only_where_systemd_runs_its_lines(self):
+        """A later drop-in that empties one of its lists (`systemctl edit` writes `ExecReload=`), or a drop-in that
+        systemd has not read again, leaves the file in place and the table gone after the next event of
+        nftables.service: the reading names it missing, and the owner's Mac writes it and reloads systemd again (a
+        review of 17 November 2026)."""
+        self.put(**self.PARTS)
+        self.assertEqual((self.read()["state"], self.read()["files"]["dropin"]), ("ready", sha(self.PARTS["dropin"])))
+        for key, value in (("ExecReload", ""), ("ExecStopPost", "{ path=/usr/sbin/nft ; argv[]=/usr/sbin/nft -f "
+                                                                 "/etc/founderizer-egress/table.nft ; }"),
+                           ("NeedDaemonReload", "yes")):
+            kept = self.systemd[key]
+            self.systemd[key] = value
+            self.assertEqual((self.read()["state"], self.read()["files"]["dropin"]), ("missing", None), key)
+            self.systemd[key] = kept
+        # another part's drop-in after this one: systemd gives a line for each command of the list (live, systemd 255)
+        self.extra = "ExecReload={ path=/bin/true ; argv[]=/bin/true ; ignore_errors=yes ; }\n"
+        self.assertEqual(self.read()["state"], "ready")
+        self.extra, self.show_code = "", 1                  # a systemctl that did not answer proves nothing
+        self.assertEqual((self.read()["state"], self.read()["files"]["dropin"]), ("missing", None))
+
+    @unittest.skipUnless(APP.is_dir(), NO_APP)
+    def test_the_app_and_the_server_name_the_same_files(self):
+        """The owner's Mac writes the parts at the paths of ServerBrowser.swift, and the server reads them at those
+        of BROWSER_PARTS: a path that differs reads as missing at every reading, and the Mac installs at every round."""
+        swift = (self.APP / "Sources/FleetCore/ServerBrowser.swift").read_text()
+        paths = dict(re.findall(r'public static let (\w+)Path = "([^"]+)"', swift))
+        names = re.search(r"public static let parts = \[(.*?)\]", swift, re.S).group(1)
+        parts = {key: paths[name] for key, name in re.findall(r'"(\w+)": (\w+)Path', names)}
+        self.assertEqual(parts, lifecycle.BROWSER_PARTS)
+
+    def test_only_x86_ubuntu_24_04_and_26_04_are_supported(self):
+        self.assertEqual(self.read(machine="aarch64"), {"state": "unsupported"})
+        (self.root / "etc/os-release").write_text('NAME="Debian GNU/Linux"\nVERSION_ID="13"\nID=debian\n')
+        self.assertEqual(self.read(), {"state": "unsupported"})
+        (self.root / "etc/os-release").write_text('NAME="Ubuntu"\nVERSION_ID="26.04"\nID=ubuntu\n')
+        self.assertEqual(self.read()["state"], "missing")
+        self.assertIsNone(lifecycle.browser_reading("darwin"))
+
+    def test_a_ports_file_is_read_only_as_the_contract_gives_it(self):
+        good = "fleet-alpha 9300 5910\nfleet-beta 9399 5999\n"
+        self.assertEqual(len(lifecycle.browser_ports(good)), 2)
+        self.assertEqual(lifecycle.browser_ports(""), [])
+        for bad in ("fleet-alpha 9300 5910", "fleet-vault 9300 5910\n", "fleet-alpha 9400 5910\n",
+                    "fleet-alpha 9300 5909\n", "fleet-alpha 9300 5910\nfleet-beta 9300 5911\n",
+                    "fleet-alpha 9300 5910\nfleet-alpha 9301 5911\n", "fleet-alpha 9300  5910\n",
+                    "root 9300 5910\n", "fleet-alpha 09300 5910\n", "fleet-alpha 9300 5910\n\n"):
+            self.assertIsNone(lifecycle.browser_ports(bad), bad)
+
+    def test_the_room_is_the_kernels_own_words_of_user_slice(self):
+        """D6's inputs: the swap, the slice's limits ("max" is none), its swap in use and at its peak, and the counts of
+        its own ends, of a full swap and of the time that all its processes waited."""
+        slice_ = self.root / "sys/fs/cgroup/user.slice"
+        slice_.mkdir(parents=True)
+        (self.root / "proc").mkdir()
+        (self.root / "proc/meminfo").write_text("MemTotal:        3910656 kB\nSwapTotal:       1955836 kB\n")
+        for name, text in (("memory.max", "3473678336\n"), ("memory.swap.max", "max\n"),
+                           ("memory.swap.current", "52428800\n"), ("memory.swap.peak", "1073741824\n"),
+                           ("memory.events.local", "low 0\nhigh 0\nmax 35454\noom 1\noom_kill 1\n"),
+                           ("memory.swap.events", "high 0\nmax 0\nfail 38\n"),
+                           ("memory.pressure", "some avg10=0.00 avg60=0.00 avg300=0.00 total=8123456\n"
+                                               "full avg10=0.00 avg60=0.00 avg300=0.00 total=1534000\n")):
+            (slice_ / name).write_text(text)
+        self.assertEqual(lifecycle.room_reading("linux", root=str(self.root)), {
+            "swap_total": 1955836 * 1024, "memory_max": 3473678336, "swap_max": None, "swap_current": 52428800,
+            "swap_peak": 1073741824, "oom": 1, "swap_fail": 38, "full_us": 1534000})
+        (slice_ / "memory.pressure").unlink()
+        self.assertIsNone(lifecycle.room_reading("linux", root=str(self.root))["full_us"])
+        self.assertIsNone(lifecycle.room_reading("darwin"))
+
+    def test_a_reset_is_the_rule_only_where_a_listener_of_the_agent_is_proved(self):
+        """D11: a reset proves the port rule only while the kernel lists a socket of the agent's own that listens on its
+        port, because the kernel resets a try of a port where nothing listens too (a connection that ended a moment
+        ago, a port bound with no listen, a listener that its agent ended), and another agent's listener would let it
+        make this agent's proof hold."""
+        self.assertEqual(lifecycle.browser_verdict("connected", False), "open")
+        self.assertEqual(lifecycle.browser_verdict("refused", True), "holds")
+        for said in ("refused", "silent"):
+            self.assertEqual(lifecycle.browser_verdict(said, False), "unread", said)
+        tcp = ("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+               "   0: 0100007F:2454 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1002  0 81\n"  # 9300
+               "   1: 0100007F:2455 0100007F:C350 06 00000000:00000000 03:00000000 00000000  1002  0 0\n"   # ended
+               "   2: 0A000001:2456 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1002  0 82\n"  # elsewhere
+               "   3: 00000000:2457 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1002  0 83\n"  # 0.0.0.0
+               "   4: 0100007F:2458 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1003  0 84\n")  # another
+        listening = lambda port: lifecycle.browser_listening(port, 1002, opener=lambda *_a, **_k: io.StringIO(tcp))
+        self.assertEqual([listening(p) for p in (9300, 9301, 9302, 9303, 9304)], [True, False, False, True, False])
+
+
+    def test_the_kernels_whole_list_of_sockets_is_read(self):
+        """An agent with many sockets pushed another agent's listener past the first 4 MiB of /proc/net/tcp, which
+        was all that the proof read, and the verdict was `unread` (a review of 17 November 2026)."""
+        head = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+        row = "{:4d}: {} 00000000:0000 {} 00000000:00000000 00:00000000 00000000  {}  0 {}\n"
+        tcp = head + "".join(row.format(n, "0100007F:C000", "01", 1003, 1000 + n) for n in range(50000)) + \
+            row.format(1, "0100007F:2454", "0A", 1002, 81)
+        self.assertGreater(len(tcp), 1 << 22)
+        self.assertTrue(lifecycle.browser_listening(9300, 1002, opener=lambda *_a, **_k: io.StringIO(tcp)))
+        self.assertFalse(lifecycle.browser_listening(9300, 1003, opener=lambda *_a, **_k: io.StringIO(tcp)))
+    def service(self, run=None):
+        """A server service of this test's own user, whose agents' proof runs here with no sudo."""
+        import server
+        svc = server.Service({"name": "vps-2"}, None, kit=str(self.root / "no-kit"), home=str(self.root),
+                             run=run or (lambda argv, **_: (0, "", "")), platform="linux", life=FakeLife(),
+                             users=lambda user: (os.getuid(), str(self.root)))
+        svc.as_agent, svc.run_folder = (lambda user, argv: argv), str(self.root / "run")
+        return svc
+
+    def test_the_proofs_own_listener_takes_the_port_and_ends_with_its_input(self):
+        """server.PROOF_LISTENER as it runs, by the system's own Python (here as this test's own user, on a machine
+        with no port rule): it takes the agent's lock and then the port, the try connects to it, and it ends at once
+        when the service closes its input, and not after its 15 seconds, because the service cannot kill it: it runs
+        as the agent, under root's sudo."""
+        svc = self.service()
+        with socket.socket() as free:
+            free.bind(("127.0.0.1", 0))
+            port = free.getsockname()[1]
+        started = time.monotonic()
+        self.assertEqual(svc.prove_port("fleet-alpha", port), "open")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue((self.root / "run" / str(os.getuid()) / lifecycle.BROWSER_LOCK).is_file())
+
+    def test_a_port_that_is_held_with_no_listener_proves_nothing(self):
+        """The refused branch of the real proof: a port that a socket holds with no listen() (an agent can bind
+        another's port that way) makes the listener say `taken`, and Linux resets the try (here the reset is given:
+        macOS lets such a try wait); that holds only where the kernel lists a listener of the agent's own there, with
+        the agent's uid."""
+        svc, asked = self.service(), []
+        with socket.socket() as held, patch.object(lifecycle, "browser_connect", lambda port: "refused"):
+            held.bind(("127.0.0.1", 0))
+            port = held.getsockname()[1]
+            for listed, verdict in ((False, "unread"), (True, "holds")):
+                svc.listening = lambda p, uid, listed=listed: asked.append((p, uid)) or listed
+                self.assertEqual(svc.prove_port("fleet-alpha", port), verdict)
+        self.assertEqual(asked, [(port, os.getuid())] * 2)
+
+    def test_no_proof_while_the_macs_step_writes_the_ports(self):
+        """The step of the owner's Mac moves a new ports file into place and then loads its table, under a lock: a
+        reading in that moment would find a new port with no rule yet, call the table missing and stop every agent's
+        browser. So the reading takes a shared hold of that lock, and where it stays held (only root can hold it),
+        each agent's verdict is `unread`, so that no verdict of an earlier reading stays in force."""
+        import fcntl
+        svc = self.service()
+        svc.lock_path, svc.lock_wait = str(self.root / "lock"), 0.3
+        svc.proof_path = str(self.root / "proof" / "state")
+        (self.root / "proof").mkdir()
+        self.put(**self.PARTS)
+        Path(svc.lock_path).write_text("")
+        tried, parts = [], self.read()
+        with patch.object(lifecycle, "browser_reading", lambda *a, **k: dict(parts)), \
+                patch.object(svc, "prove_port", lambda user, port: tried.append(user) or "holds"):
+            with open(svc.lock_path) as step:
+                fcntl.flock(step, fcntl.LOCK_EX)
+                busy = svc.browser_now()
+                kept = Path(svc.proof_path).read_text()
+            free = svc.browser_now()
+        self.assertEqual((busy["proof"], busy["proof_kept"], busy["worker"]),
+                         ({"holds": 0, "open": 0, "unread": 2}, True, os.getuid()))
+        self.assertEqual(kept.splitlines()[1:], ["fleet-alpha unread", "fleet-beta unread"])
+        self.assertEqual((free["proof"], tried), ({"holds": 2, "open": 0, "unread": 0}, ["fleet-alpha", "fleet-beta"]))
+
+    def test_a_table_that_is_not_loaded_stops_the_agents_browsers(self):
+        """The service's proof (server.Service.browser_proof), one verdict for each agent: one port that connects is a
+        missing table, which stops each agent's browser and screen units and says `table_missing`; the verdicts go
+        into the service's own file with the version of the table that they tested, and `proof_kept` says whether
+        they are there for the agents' helpers. A fault in the reading of the parts never stops the server's report."""
+        import server
+        ran = []
+        svc = server.Service({"name": "vps-2"}, None, kit=str(self.root / "no-kit"), home=str(self.root),
+                             run=lambda argv, **_: ran.append(argv) or (0, "", ""), platform="linux",
+                             life=FakeLife(), users=lambda user: (4000, "/home/" + user))
+        keep = self.root / "proof" / "state"
+        parts = {"state": "ready", "files": {"ports": "ab" * 32}, "ports": [
+            {"user": "fleet-alpha", "devtools": 9300, "screen": 5910},
+            {"user": "fleet-beta", "devtools": 9301, "screen": 5911}]}
+        with patch.object(svc, "prove_port", side_effect=["holds", "unread"]):
+            got = svc.browser_proof(dict(parts), keep=str(keep))
+        self.assertEqual((got["proof"], got["proof_kept"]), ({"holds": 1, "open": 0, "unread": 1}, False))
+        keep.parent.mkdir()
+        for says, state, stops in ((["holds", "unread"], "ready", 0), (["unread", "open"], "table_missing", 2)):
+            ran.clear()
+            with patch.object(svc, "prove_port", side_effect=says):
+                got = svc.browser_proof(dict(parts), keep=str(keep))
+            self.assertEqual((got["state"], got["proof_kept"]), (state, True))
+            self.assertEqual(keep.read_text(), f"{'ab' * 32}\nfleet-alpha {says[0]}\nfleet-beta {says[1]}\n")
+            self.assertEqual(len([a for a in ran if a[-3:] == ["stop", "fleet_browser.service", "fleet_vnc.service"]]),
+                             stops)
+        self.assertEqual(svc.browser_proof({"state": "missing", "files": {"ports": None}, "ports": []}, keep=str(keep)),
+                         {"state": "missing", "files": {"ports": None}, "ports": []})
+        with patch.object(lifecycle, "browser_reading", side_effect=RuntimeError("a part of another shape")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            reading = svc.reading()
+        self.assertIsNone(reading["browser"])
+        self.assertEqual(reading["os"], FakeLife().os_info())
 
 
 class UpdatesRead(unittest.TestCase):
