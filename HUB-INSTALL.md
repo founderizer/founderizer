@@ -765,8 +765,9 @@ to its own user, and there is no sudoers line and no root helper for it: the hub
 socket, and that is all it can do. The vault seals a copy only to a machine key the owner
 signed, only for a grant to an agent of that machine or a place in the grantable pool that
 the owner signed, and its backup only to a recovery key the owner signed. So a hub that is
-broken into can neither add a machine of its own nor send a secret to a machine that the
-owner did not give it to. It removes a value that the owner took out of the fleet only
+broken into cannot add a machine of its own, and it can send a secret only to a machine whose
+key the owner pinned: the machine of a grant is the one that the hub names for the agent at
+the moment of the Give (VAULT.md, limit 23). It removes a value that the owner took out of the fleet only
 while no grant or pool that the owner signed names it, so the hub cannot take away a secret
 that the owner gives, and it takes no value under a removed name again (UI-API.md, version 1.86).
 

@@ -251,6 +251,22 @@ The vault protects the value of each secret. The design gives these results:
   fleet. It keeps a dated record of each machine, recovery key, grant and pool entry, also after its end, and of the
   newest replace of each reference, and it refuses a statement that is not newer than that record. So the hub cannot
   send an old statement again (`vault.py`).
+- **No statement from ahead.** The central vault keeps no pin, unpin, recovery, grant, ungrant, pool or unpool
+  statement of the owner's that is dated more than one day after its own clock, and the record before it stays
+  (`vault.py` `central_signed`). A replace statement is not checked so (limit 24). The app dates no grant, ungrant,
+  pool, unpool or replace statement more than 23 hours after the Mac's clock: a later time of a clock that ran ahead
+  once is not followed (`Sources/FleetCore/OwnerKey.swift` `GrantClock`). A statement from ahead would stay its
+  record's newest until its time, so no statement dated right could end it (choice C50).
+- **Each signed grant and pooled secret has its standing at the hub.** `GET /ui/vault` says beside each grant that the
+  owner signed, and each secret that the owner signed into the pool, whether the hub's own records still hold it,
+  while the hub's reading of the central vault is fresh and was made after each grant, ungrant, pool and unpool
+  statement that the hub passed on (`hub.py` `central_standing` and `central_statement`, owner API 1.219): a reading
+  from before can miss the statement. A grant is held
+  while an agent of any role on its machine holds the secret, the manager too, and a grant for the door while the door
+  holds it; the hub sends a copy only to a worker or a lead (`machine_secrets`, `central_plan`), so "held" does not
+  say that a copy goes there. A pooled
+  secret is held while the hub's grantable pool has it; once its unpool reaches the central vault, the hub takes the
+  secret back from each machine that held it only through the pool (`central_plan`). The hub signs nothing.
 - The app signs a grant before the hub records it, and it signs the end of a grant after the hub records the end. So
   the central vault's signed grants always include the hub's grants. The app sends each statement through the hub
   (`Sources/Founderizer/GrantSigning.swift`). A `replace` statement goes with the sealed copy that it is about, in
@@ -773,6 +789,24 @@ server that joined before, it is off until root switches it on.
     old value in that machine's store, and the hub sends it again after 6 hours (`hub.py`, `vault.py`). The old
     value also stays in each backup of the central vault that was made before the replace (`vault.py`). So a replace
     in the vault does not end the old key: only the service that made the key can end it.
+23. **The server of a Give is the hub's.** The app signs a grant for the server that the hub names for the agent at
+    the moment of the Give (`Sources/Founderizer/GrantSigning.swift`). A hub that is broken into can name another
+    server there, but only a server whose key the owner pinned, because the central vault seals a copy only to a
+    pinned key (`vault.py` `seal`). So such a hub can send a secret that the owner gives to one of the owner's servers
+    to another of them, and to no other machine (choice C50).
+24. **A statement from ahead.** Before the hub release of owner API 1.219, the central vault kept a grant, ungrant,
+    pool, unpool or recovery statement that was dated more than one day after its own clock, when the owner's Mac had
+    a clock that ran ahead. It still keeps such a replace statement (`vault.py` `intake`). Such a record stays its
+    newest until its time, and no statement dated right can end it before then: for a replace, the owner cannot put a
+    new value under that reference until that time (`vault.py`).
+25. **A signed grant that the hub no longer holds.** The central vault keeps each grant that the owner signed, and seals
+    the secret to that grant's machine, until the owner's ungrant reaches it, also after the agent was deleted,
+    renamed or moved, or after a take-back that signed no ungrant (`vault.py` `sealable`). The hub marks such a grant
+    as not held (`GET /ui/vault` `standing`), and an honest hub asks the vault for no copy of it, but a hub that is
+    broken into can ask, and the vault then seals the secret to that machine's pinned key (choice C50). The vault keeps
+    one record of each secret and agent name: after a rename, the grant stays under the old name, and when a new agent
+    later gets that name and the same secret, the record moves to the new agent's machine, so the renamed agent's
+    machine loses the secret until the owner gives it again, and no mark shows it.
 
 ## What the owner must do
 

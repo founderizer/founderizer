@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import secrets
 import shutil
 import socket
@@ -30,6 +31,7 @@ import unittest
 from unittest.mock import patch
 
 import atrest
+import leftovers
 import vault
 from test_vault import FAKE_AGE, LOGIN
 
@@ -546,8 +548,8 @@ class CentralVault(unittest.TestCase):
         """Package 4 of the vault's gates: the central vault refuses a pin or an unpin whose `at` is more than a day after
         its own clock, so no pin from the future is recorded or kept, and the record before it stays. A statement is kept
         only when it is newer than the record, so a pin that the app signs now could not take the place of one from the
-        future (the manager's reading of central_signed). A grant from ahead is kept as before: its time comes from the
-        app's GrantClock."""
+        future (the manager's reading of central_signed). Since choice C50 the same holds for each kind that
+        central_signed takes (test_no_statement_of_any_kind_from_more_than_a_day_ahead_is_kept)."""
         now = int(time.time())
 
         def pinned(recipient, at):
@@ -568,6 +570,50 @@ class CentralVault(unittest.TestCase):
         self.assertEqual(self.ask("status")["pins"], {"vps": {"recipient": R1, "at": now + 86400 - 60}})
         self.assertEqual(self.ask("unpin", **unpinned(now + 86400 - 30))["saved"], "removed")
         self.assertEqual(self.ask("status")["pins"], {})
+
+    def test_no_statement_of_any_kind_from_more_than_a_day_ahead_is_kept(self):
+        """Choice C50 (the review of 17 November 2026): the central vault keeps no statement of the owner's that is dated
+        more than a day after its own clock, of any kind that central_signed takes, and the record before it stays. One
+        from ahead would stay its record's newest until its time, so a later statement dated right, from a second Mac of
+        the owner or after the app's GrantClock was cleared, could never end it. The app dates none so far ahead: at
+        most GrantClock.ahead after its Mac's clock, and that clock and the hub's, which is the central vault's, differ
+        by at most VaultPlan.clockSkew where the app checks them. A replace, which intake takes, is not checked so
+        (VAULT.md, limit 24)."""
+        now = int(time.time())
+        far, near = now + 2 * 86400, now + 86400 - 60
+        statements = {
+            "grant": lambda at: grant(REF, "vps", "vps", at),
+            "ungrant": lambda at: grant(REF, "vps", None, at, kind="ungrant"),
+            "pool": lambda at: pooled(REF, at),
+            "unpool": lambda at: pooled(REF, at, kind="unpool"),
+            "recovery": lambda at: canon({"v": 1, "kind": "recovery", "fleet": FLEET, "recipient": RR, "at": at}),
+        }
+        for kind, make in statements.items():
+            self.assertEqual(self.refused(kind, statement=make(far), signature=owner_sign(make(far))),
+                             f"the owner's {kind} is dated more than a day after this vault's clock, so it is not kept")
+        status = self.ask("status")
+        self.assertEqual((status["grants"], status["pool"], status["recovery"]), ([], [], None))
+        # within a day, each is kept as before, and one from further ahead still does not take its place
+        self.assertEqual(self.granted(statements["grant"](near))["saved"], "new")
+        self.assertEqual(self.granted(statements["pool"](near))["saved"], "new")
+        self.assertEqual(self.granted(statements["recovery"](near))["saved"], "new")
+        self.assertIn("more than a day after", self.refused("ungrant", statement=statements["ungrant"](far),
+                                                            signature=owner_sign(statements["ungrant"](far))))
+        status = self.ask("status")
+        self.assertEqual(status["grants"], [{"login": REF, "agent": "vps", "machine": "vps"}])
+        self.assertEqual(status["pool"], [REF])
+        # the owner's app: a statement that it signs is never dated more than PIN_AHEAD after the vault's clock. A
+        # published clone has no app folder, so nothing is held there; here a move of these Swift files fails the test
+        app = os.path.join(leftovers.ROOT, "app", "Sources", "FleetCore")
+
+        def constant(file, name):
+            with open(os.path.join(app, file), encoding="utf-8") as f:
+                found = re.findall(rf"public static let {name}(?:: Double)? = ([0-9][0-9 +-]*[0-9])\n", f.read())
+            self.assertEqual(len(found), 1, f"{name} in {file}")
+            return sum(int(term.replace(" ", "")) for term in re.findall(r"[+-]? *[0-9]+", found[0]))
+        if os.path.isdir(os.path.join(leftovers.ROOT, "app")):
+            self.assertLessEqual(constant("OwnerKey.swift", "ahead") + constant("CentralVaultPlan.swift", "clockSkew"),
+                                 vault.PIN_AHEAD)
 
     def test_a_pin_is_kept_until_a_newer_statement_of_the_owner(self):
         self.assertEqual(self.signed("pin", PIN_1, SIG_PIN_1),

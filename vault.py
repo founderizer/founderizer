@@ -239,7 +239,9 @@ MACHINE = re.compile(r"[a-z][a-z0-9-]{0,62}")       # a machine of a pin
 # for 90 days from the time that it names, by this machine's clock. This broker keeps no record of an unpin, so an old pin
 # of a key that the owner took back ends here within that time, and the owner's app signs each pin again after 7 days.
 # A pin dated more than a day after this machine's clock is not taken either, so a clock ahead on the owner's Mac cannot
-# make a pin live longer.
+# make a pin live longer. The central vault keeps no statement of the owner's from that far ahead, of any kind that
+# central_signed takes (choice C50): one from ahead would stay its record's newest until its time, and no statement
+# dated right could end it. A replace (intake) is not checked so.
 PIN_LIFE = 90 * 86400
 PIN_AHEAD = 86400
 STATE = 1                                           # the format of the central vault's state file
@@ -2110,10 +2112,11 @@ def central_signed(conf, req, kind):
     """pin, unpin, recovery, grant, ungrant, pool and unpool: keep one statement that the owner signed. A statement must
     be newer (its `at`) than the record of its machine, of the recovery key, of its grant (one secret to one agent) or
     of its secret in the pool, so an old one cannot be sent again; the exact statement of the record answers "same",
-    so a retry is no error. A pin's key is what seal locks a copy to, a grant or the pool is what lets seal lock that
-    secret at all, and the recovery key is what export locks the store's key to."""
+    so a retry is no error. A statement dated more than PIN_AHEAD after this vault's clock is not kept, of any of
+    these kinds, and the record before it stays. A pin's key is what seal locks a copy to, a grant or the pool is what lets seal lock
+    that secret at all, and the recovery key is what export locks the store's key to."""
     said = owner_statement(conf, req, kind)
-    if kind in ("pin", "unpin") and said["at"] - time.time() > PIN_AHEAD:     # package 4: never kept from the future
+    if said["at"] - time.time() > PIN_AHEAD:     # package 4 and C50: no statement of these kinds kept from the future
         raise Refused(f"the owner's {kind} is dated more than a day after this vault's clock, so it is not kept")
     state = central_state(conf)
     if kind in ("grant", "ungrant"):

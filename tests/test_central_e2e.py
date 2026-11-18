@@ -315,6 +315,99 @@ class EndToEnd(OwnerAPI):
         self.pass_once()
         self.assertEqual(self.held("studio"), {KEY_REF: VALUE})
 
+    def test_standing_marks_each_signed_grant_and_pooled_secret_by_the_hubs_own_rule(self):
+        """Owner API 1.219 (choice C50): GET /ui/vault's `standing` says, beside each grant that the owner signed and
+        each pooled secret, whether the hub's own records still hold it: a grant while an agent of any role on its
+        machine holds the secret. A rename on the same machine keeps a grant held; a take-back under another
+        name, a move and a delete do not; another agent on that machine that holds the secret keeps it held. A grant for
+        the machine `door` follows the door's own secrets, also for a worker on a server of that name, where the hub
+        delivers nothing. A grant to the manager, which the hub places on no machine for the vault and sends no copy,
+        follows the same rule: held while an agent on that machine holds the secret, also after a rename there, and not
+        after a take-back or a move. A pooled secret is held while the hub's pool has it. A status that is not fresh
+        gives none,
+        and so does one that the timers read before a grant or pool statement that the hub passed on, or while one is
+        on its way to the vault: it can miss that statement, and the owner's app takes back what the marks say."""
+        self.add_and_give("vps")
+        self.app("grant", login=KEY_REF, agent="studio", machine="studio")     # signed, and studio holds nothing
+        self.assertIsNone(hub.vault_view()["standing"])                         # its status was read before both
+        with patch.dict(hub.CENTRAL, signing=1):                                # a statement on its way to the vault
+            hub.central_read()
+            self.assertIsNone(hub.vault_view()["standing"])
+        # one that the vault refuses (older than its record) is no longer on its way, and the next read gives marks
+        hub.central_read()
+        old = canon({"v": 1, "kind": "grant", "fleet": hub.fleet_id(), "login": KEY_REF, "agent": "studio",
+                     "machine": "studio", "at": 1})
+        code, body = self.request("/ui/vault/grant", self.cmd(statement=old, signature=owner_sign(old)))
+        self.assertEqual((code, hub.CENTRAL["signing"]), (409, 0), body)
+        self.assertIsNone(hub.vault_view()["standing"])
+        hub.central_read()
+        self.assertIsNotNone(hub.vault_view()["standing"])
+
+        def marks(kind="grants"):
+            hub.central_read()
+            found = hub.vault_view()["standing"][kind]
+            return {(g["agent"], g["machine"]): g["held"] for g in found} if kind == "grants" else \
+                {g["login"]: g["held"] for g in found}
+
+        def same_as_the_plan():
+            """Nothing is held at the vaults yet, so central_plan delivers each secret that it wants where a carrier
+            and a pin are: there the held marks are exactly its deliveries."""
+            hub.central_read()
+            status = hub.CENTRAL["status"]
+            deliver, _ = hub.central_plan(hub.central_pins(status), {KEY_REF}, hub.now(), hub.central_signatures(status))
+            carried = {name for name, m in hub.deposit_machines().items() if m["carrier"]}
+            self.assertEqual({(machine, ref) for machine, ref, _ in deliver},
+                             {(g["machine"], g["login"]) for g in hub.vault_view()["standing"]["grants"]
+                              if g["held"] and g["machine"] in carried})
+
+        self.assertEqual(marks(), {("vps", "vps"): True, ("studio", "studio"): False})
+        same_as_the_plan()
+        hub.TEAM["agents"]["shop"] = hub.TEAM["agents"].pop("vps")                # a rename on the same machine
+        self.assertEqual(marks()[("vps", "vps")], True)
+        hub.TEAM["agents"]["shop"]["secrets"] = {}                                # taken back under the new name
+        self.assertEqual(marks()[("vps", "vps")], False)
+        hub.TEAM["agents"]["shop"]["secrets"] = {KEY_REF: "use"}
+        hub.TEAM["agents"]["shop"]["machine"] = "studio"                          # a move: held where it went
+        self.assertEqual(marks(), {("vps", "vps"): False, ("studio", "studio"): True})
+        same_as_the_plan()
+        del hub.TEAM["agents"]["shop"]                                            # a delete
+        self.assertEqual(marks(), {("vps", "vps"): False, ("studio", "studio"): False})
+        self.app("grant", login=KEY_REF, agent="door", machine="door")           # the door's own grant
+        hub.TEAM["agents"]["legacy"] = {"role": "worker", "runtime": "codex", "machine": "door", "can": [],
+                                        "secrets": {KEY_REF: "use"}}             # a server named door, from before C49
+        self.app("grant", login=KEY_REF, agent="legacy", machine="door")
+        self.assertEqual((marks()[("door", "door")], marks()[("legacy", "door")]), (False, False))
+        hub.TEAM["door"] = {"secrets": [KEY_REF]}
+        self.assertEqual((marks()[("door", "door")], marks()[("legacy", "door")]), (True, True))
+        hub.TEAM["door"] = {}
+        del hub.TEAM["agents"]["legacy"]
+        boss = hub.TEAM["agents"]["manager"]                                      # the manager, on the machine hub
+        boss["secrets"] = {KEY_REF: "use"}
+        self.app("grant", login=KEY_REF, agent="manager", machine="hub")
+        self.assertTrue(marks()[("manager", "hub")])
+        hub.TEAM["agents"]["chief"] = hub.TEAM["agents"].pop("manager")          # a rename on the same machine
+        self.assertTrue(marks()[("manager", "hub")])
+        boss["secrets"] = {}                                                      # taken back in the list
+        self.assertFalse(marks()[("manager", "hub")])
+        boss.update(secrets={KEY_REF: "use"}, machine="vps")                      # a move
+        self.assertFalse(marks()[("manager", "hub")])
+        hub.TEAM["agents"]["manager"] = hub.TEAM["agents"].pop("chief")
+        boss.update(secrets={}, machine="hub")
+        self.app("pool", login=KEY_REF)
+        hub.TEAM["resources"] = {f"secret:{KEY_REF}": {"max": "use"}}
+        self.assertEqual(marks("pool"), {KEY_REF: True})
+        hub.TEAM["resources"] = {}
+        self.assertEqual(marks("pool"), {KEY_REF: False})
+        hub.central_read()
+        with patch.dict(hub.CENTRAL, status=None):                                # no status: no marks
+            self.assertIsNone(hub.vault_view()["standing"])
+        with patch.dict(hub.CENTRAL, error="the central vault did not answer"):   # the last read failed
+            self.assertIsNone(hub.vault_view()["standing"])
+        with patch.dict(hub.CENTRAL, read_at=hub.now() - hub.CENTRAL_FRESH - 1):  # an old status
+            self.assertIsNone(hub.vault_view()["standing"])
+        # a status whose lists are not lists gives empty marks, and no error
+        self.assertEqual(hub.central_standing({"grants": 7, "pool": "bws://x"}), {"grants": [], "pool": []})
+
     def test_when_the_vault_does_not_answer_nothing_is_sent_and_the_agents_keep_their_keys(self):
         self.add_and_give("vps")
         self.pass_once()

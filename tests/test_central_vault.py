@@ -354,7 +354,7 @@ class Central(WithCentral, OwnerAPI):
         the root-owned clone at its one fixed place, never from a path that the hub names (DevOps plan V2)."""
         view = self.view()
         self.assertEqual(set(view), {"db", "fleet", "central", "read_at", "error", "machines", "held", "program",
-                                     "hub"})
+                                     "hub", "standing"})
         self.assertEqual(view["fleet"], hub.fleet_id())
         self.assertRegex(view["fleet"], r"\A[0-9a-f]{16}\Z")
         self.assertNotIn("/", json.dumps({k: v for k, v in view.items() if k != "machines"}))

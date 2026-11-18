@@ -13176,7 +13176,7 @@ CENTRAL_REQUEST = "central:"    # the request_id of a delivery the reconciler ma
 CENTRAL_MEMBER = "vault/central.json"      # the central vault's export in a copy of the fleet (backup_bundle)
 WITHDRAW_WAIT = DEPOSIT_WAIT    # seconds a withdrawal waits for its machine before it is dropped
 CENTRAL_START = {"status": None, "read_at": None, "tried_at": 0.0, "error": None, "due": False, "grants": None,
-                 "passed_at": 0.0, "said": None}
+                 "passed_at": 0.0, "said": None, "signing": 0, "signed_at": None}
 CENTRAL_SEEN = "central_seen"   # kv: a central vault answered this hub once, so its silence is news for the manager
 CENTRAL_DOWN = "central_down"   # kv: {since, told} while the central vault that answered once does not answer
 CENTRAL = dict(CENTRAL_START)   # what the timers last read, in this process only; CENTRAL_LOCK guards it
@@ -13280,6 +13280,42 @@ def central_signatures(status):
     pooled = {str(ref).lower() for ref in (status or {}).get("pool") or []
               if isinstance(ref, str) and BWS_REF.fullmatch(ref)}
     return granted, pooled
+
+
+def central_standing(status):
+    """`standing` of GET /ui/vault (owner API 1.219, choice C50): beside each grant that the owner signed and has not
+    taken back, and each secret that the owner signed into the grantable pool, whether the hub's own records still hold
+    it. {"grants": [{login, agent, machine, held}], "pool": [{login, held}]} in the order of the status, the
+    well-formed ones only. vault_view gives it only with a fresh status.
+
+    A grant is held while an agent of any role on its machine holds that secret (team.json agents.<agent>.secrets),
+    the manager too, which deposit_machines does not place. The hub sends a copy only to a worker or a lead
+    (machine_secrets, central_plan), so held does not say that a copy goes there. A grant for the machine DOOR_PIN,
+    the door's name in the central vault, is held while the door holds the secret (team.json door.secrets,
+    save_door_grant), as the door's own delivery reads it (door_reconcile); the hub delivers to no server of that
+    name. A pooled secret is held while the hub's grantable pool has it (resource_pool), the owner's standing for the
+    manager to hand it out. So a rename on the same machine keeps a grant held, and a delete, a move or a take-back
+    does not, unless another agent on that machine holds the secret. The hub signs nothing. Called with LOCK held."""
+    if not isinstance(status, dict):
+        return None
+    on = {}             # each machine's secrets, as the agents of any role on it hold them
+    for name, a in TEAM["agents"].items():
+        if isinstance(a.get("machine"), str):
+            on.setdefault(a["machine"], set()).update(str(ref).lower() for ref in secret_grants(name))
+    door = {str(ref).lower() for ref in ((TEAM.get("door") or {}).get("secrets") or [])}
+    pool = resource_pool()
+    signed = status.get("grants") if isinstance(status.get("grants"), list) else []
+    pooled = status.get("pool") if isinstance(status.get("pool"), list) else []
+    grants = []
+    for g in signed:
+        if not (isinstance(g, dict) and isinstance(g.get("login"), str) and BWS_REF.fullmatch(g["login"])
+                and isinstance(g.get("agent"), str) and isinstance(g.get("machine"), str)):
+            continue
+        ref = g["login"].lower()
+        held = ref in door if g["machine"] == DOOR_PIN else ref in on.get(g["machine"], ())
+        grants.append({"login": ref, "agent": g["agent"], "machine": g["machine"], "held": held})
+    return {"grants": grants, "pool": [{"login": ref.lower(), "held": f"secret:{ref.lower()}" in pool}
+                                       for ref in pooled if isinstance(ref, str) and BWS_REF.fullmatch(ref)]}
 
 
 def central_read(t0=None):
@@ -13526,6 +13562,14 @@ def value_replaced(ref, sha256, answer, t0=None):
     return True
 
 
+def machine_secrets(m):
+    """The secrets that the agents of one machine of deposit_machines hold (secret_grants), in lower case: what the hub
+    wants on that machine before the owner's signatures and the central vault's inventory (central_plan,
+    central_deliver). One rule for the two of them. central_standing marks a signed grant held by a wider rule, an
+    agent of any role on its machine, while the hub sends a copy only to a worker or a lead."""
+    return {str(ref).lower() for agent in m["agents"] for ref in secret_grants(agent)}
+
+
 def central_plan(pins, inventory, t0, signed=(frozenset(), frozenset())):
     """What one pass of the reconciler does: ([(machine, ref, carrier)] to seal and deliver, [(machine, ref, carrier)]
     to withdraw). It writes nothing; called with LOCK held.
@@ -13554,8 +13598,7 @@ def central_plan(pins, inventory, t0, signed=(frozenset(), frozenset())):
         pin = pins.get(name)
         if not m["carrier"] or not pin or pin != m["recipient"]:
             continue
-        desired = {ref for agent in m["agents"] for ref in secret_grants(agent)
-                   if ref in inventory and ((ref, name) in granted or ref in pooled)}
+        desired = {ref for ref in machine_secrets(m) if ref in inventory and ((ref, name) in granted or ref in pooled)}
         withdraws, replaces = can_withdraw(m["carrier"], t0), can_replace(m["carrier"], t0)
         for ref in sorted(desired | {ref for machine, ref in holdings if machine == name}):
             d, w = holdings.get((name, ref), (None, None))
@@ -13603,7 +13646,7 @@ def central_deliver(machine, ref, text, pin, t0):
     # A copy that the vault holds stops a new one, but not a copy of the value that the owner replaced since. And a
     # pass that started before the replace can carry a seal of the old value: it makes no delivery, the next one does.
     if not m or not m["carrier"] or m["recipient"] != pin or entry is None or \
-            ref not in {one for agent in m["agents"] for one in secret_grants(agent)} or \
+            ref not in machine_secrets(m) or \
             waiting or (held and not value_old(d, value)) or (value is not None and t0 < value["at"]):
         return None
     with transaction():
@@ -13822,8 +13865,9 @@ def vault_view(t0=None):
     t0 = t0 or now()
     with CENTRAL_LOCK:
         status, read_at, error = CENTRAL["status"], CENTRAL["read_at"], CENTRAL["error"]
-    pins, machines = central_pins(status), []
-    for name, m in sorted(deposit_machines(None, t0).items()):
+        signing, signed_at = CENTRAL["signing"], CENTRAL["signed_at"]
+    pins, machines, deposit = central_pins(status), [], deposit_machines(None, t0)
+    for name, m in sorted(deposit.items()):
         key, pinned = store_key(TEAM, name), pins.get(name)
         missing = list(m["missing"])
         if status is not None:
@@ -13839,7 +13883,12 @@ def vault_view(t0=None):
     reach = {"machine": own, "address": (TEAM.get("addresses") or {}).get(own),
              "ssh": {"user": ways["ssh_user"], "port": ways.get("ssh_port", 22)} if ways.get("ssh_user") else None}
     return {"fleet": fleet_id(), "central": status, "read_at": read_at, "error": error, "machines": machines,
-            "held": held, "program": vault_source(kit_revision()), "hub": reach if own else None}
+            "held": held, "program": vault_source(kit_revision()), "hub": reach if own else None,
+            # only with a status that central_ok calls fresh: an older one can name a grant that the vault replaced
+            # since; and only with one that the timers read after each grant and pool statement that the hub passed on
+            # (central_statement): one read before it can miss it, while the owner's app signs on what it says
+            "standing": central_standing(status) if status is not None and error is None and read_at is not None
+            and t0 - read_at < CENTRAL_FRESH and not signing and (signed_at is None or read_at > signed_at) else None}
 
 
 def central_intake(ref, text, statement=None, signature=None):
@@ -13909,9 +13958,22 @@ def central_statement(body):
     central vault's op of the statement's own kind. The hub keeps no copy of the owner's key. Never under LOCK.
 
     A pin that the central vault took is kept as it came too (owner_pin), so that a machine's broker can check with the
-    owner's own keys that a handover goes to a key the owner pinned (DevOps plan 0.3); an unpin ends it."""
+    owner's own keys that a handover goes to a key the owner pinned (DevOps plan 0.3); an unpin ends it.
+
+    A grant, an ungrant, a pool or an unpool counts while it is on its way to the vault (CENTRAL signing), and the
+    hub's time when its call ended stays (signed_at), also for a call that failed: vault_view gives no `standing` of
+    a status that the timers read before that time, because such a status can miss the statement (choice C50)."""
     kind = statement_kind(body["statement"])
-    answer = dict(central_call(kind, {"statement": body["statement"], "signature": body["signature"]}), kind=kind)
+    grants = kind in ("grant", "ungrant", "pool", "unpool")
+    if grants:
+        with CENTRAL_LOCK:
+            CENTRAL["signing"] += 1
+    try:
+        answer = dict(central_call(kind, {"statement": body["statement"], "signature": body["signature"]}), kind=kind)
+    finally:
+        if grants:
+            with CENTRAL_LOCK:
+                CENTRAL.update(signing=CENTRAL["signing"] - 1, signed_at=now())
     machine = answer.get("machine")
     if kind in ("pin", "unpin") and isinstance(machine, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,62}", machine):
         with LOCK:
