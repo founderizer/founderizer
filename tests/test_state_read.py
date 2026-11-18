@@ -69,6 +69,7 @@ records that a backup takes is test_backup_restore's.
     python3 -m unittest -v test_state_read
 """
 import ast
+import builtins
 import functools
 import hashlib
 import http.client
@@ -106,7 +107,7 @@ FIVE = (("tasks", "tasks"), ("notes", "notes"), ("prompts", "permissions"), ("ho
 def load_tests(loader, _tests, _pattern):
     """Only this file's checks: the harness comes from OwnerAPI, its own tests stay in its own file."""
     suite = unittest.TestSuite()
-    for cls in (SameBytes, AfterTheLock, Reads, ScrubLogins, OtherCallers, OwnMoment, RealHub):
+    for cls in (SameBytes, AfterTheLock, Reads, ScrubLogins, OtherCallers, KeptSearch, OwnMoment, RealHub):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -928,9 +929,12 @@ class OtherCallers(StateCase):
     def test_scrub_keeps_all_the_texts_of_a_state_of_more_than_8192(self):
         """Each read of the state asks for the same texts in the same order. A cache that holds fewer of them than the
         state has keeps none that the next read asks for: every read searched every text again. The live state had
-        3,751 different texts on 11 November 2026 and grows each day, and a copy with 2.3 times its rows had 10,400, so
-        scrub()'s own cache keeps 65,536. The general cache, which the guard of each tool call fills with texts that
-        come once each, keeps 8,192 as before, and a read of the state adds nothing to it."""
+        3,751 different texts on 11 November 2026 and 10,052 on 17 November, so scrub()'s own cache keeps 262,144. The
+        general cache, which the guard of each tool call fills with texts that come once each, keeps 8,192 as before,
+        and a read of the state adds nothing to it. Every other scrub fills scrub()'s cache too, and a long text with
+        one letter outside Latin-1 takes 2 bytes a character: so it keeps at most SCRUB_SPANS_BYTES of texts and of
+        their entries, 128 MB and at most a sixteenth of the machine's memory (the app takes a hub's server of 1 GB),
+        and a text that it lets go gives back the bytes that it counted."""
         register(LOGIN, "s1")
         with hub.LOCK:
             hub.DB.executemany("INSERT INTO notes(task,agent,ts,text) VALUES(?,?,?,?)",
@@ -952,8 +956,32 @@ class OtherCallers(StateCase):
         self.assertEqual(hub._secret_spans.cache_info().currsize, general)
         self.assertEqual((hub._scrub_spans.cache_info().maxsize, hub._secret_spans.cache_info().maxsize),
                          (hub.SCRUB_SPANS_KEPT, hub.SECRET_SPANS_KEPT))
-        self.assertGreaterEqual(hub.SCRUB_SPANS_KEPT, 65536)
+        self.assertGreaterEqual(hub.SCRUB_SPANS_KEPT, 262144)
         self.assertEqual(hub.SECRET_SPANS_KEPT, 8192)
+        self.assertEqual((hub._scrub_spans.budget, hub._scrub_spans.entry),
+                         (hub.SCRUB_SPANS_BYTES, hub.SPAN_ENTRY_BYTES))
+        self.assertGreater(hub.machine_memory(), 256 << 20)
+        self.assertEqual(hub.SCRUB_SPANS_BYTES, hub.spans_bytes(hub.machine_memory()))
+        self.assertEqual([hub.spans_bytes(m) for m in (900 << 20, 1 << 30, 4 << 30, None, -1)],
+                         [900 << 16, 64 << 20, 128 << 20, 128 << 20, 128 << 20])
+        key = hub.secret_key()
+        long = [f"{n:04d} \u2014 " + "word " * 800 for n in range(5)]
+        short = [f"short note {n:03d}" for n in range(12)]
+        each = sys.getsizeof(long[0]) + 100
+        cache = hub.SpanCache(10, 3 * each, 100)
+        for text in long:
+            cache(text, key)
+        self.assertEqual((list(cache.texts), cache.size), (long[2:], 3 * each))
+        grows = sqlite3.connect(":memory:")
+        for text in long:
+            grows.execute("SELECT ?", (text,))       # its UTF-8 copy: sys.getsizeof of the text is larger from now on
+        grows.close()
+        self.assertGreater(sys.getsizeof(long[2]) + 100, each)
+        for text in short:
+            cache(text, key)
+        self.assertEqual((list(cache.texts), cache.size), (short[2:], sum(sys.getsizeof(t) + 100 for t in short[2:])))
+        none = hub.SpanCache(10, -1)                # a bound that no text fits: it answers and keeps nothing
+        self.assertEqual((none(long[0], key), list(none.texts), none.size), ((), [], 0))
 
     def test_the_hub_sets_its_switch_interval(self):
         """main() calls sys.setswitchinterval(SWITCH_INTERVAL) as a statement of its own, not in a branch, before it
@@ -1020,6 +1048,182 @@ class OtherCallers(StateCase):
             hub._secret_spans.cache_clear()
             self.assertTrue(hub.secret_hit("Ab3$ef"))
             self.assertEqual(hub.secret_spans("Ab3$ef"), [(0, 6)])
+
+
+class KeptSearch(StateCase):
+    """The search for logins keeps, for each text, the logins that it searched it for (hub.SpanCache), and a start reads
+    what scrub()'s cache searched before it (hub.SPANS_FILE). On the owner's hub on 17 November 2026, each new login and
+    each start searched the state's 10,052 texts again for all its 155 logins: some 6.5 s, and the Mac app's read of the
+    state timed out at 10 s about ten times in six hours."""
+
+    def setUp(self):
+        super().setUp()
+        for cache in (hub._scrub_spans, hub._secret_spans):
+            cache.cache_clear()
+            self.addCleanup(cache.cache_clear)
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        self.file = os.path.join(folder, hub.SPANS_FILE)
+        register(LOGIN, "s1")
+        with hub.LOCK:
+            hub.DB.executemany("INSERT INTO notes(task,agent,ts,text) VALUES(?,?,?,?)",
+                               [(None, "manager", T0 - n, f"note {n} about https://example.com/exports/{n}/file.csv")
+                                for n in range(300)] + [(None, "manager", T0, f"the key is {LOGIN} now"),
+                                                        (None, "manager", T0, f"and later {LATER} too")])
+            hub.commit()
+
+    def read(self):
+        """The plain body of a read of the state, and how many windows the search hashed for it."""
+        made, real = [0], hashlib
+
+        class Counted:
+            def __init__(self, h):
+                self.h = h
+
+            def copy(self):
+                made[0] += 1
+                return Counted(self.h.copy())
+
+            def __getattr__(self, name):
+                return getattr(self.h, name)
+
+        class Counting:
+            sha256 = staticmethod(lambda *args, **kwargs: Counted(real.sha256(*args, **kwargs)))
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+        with patch.object(hub, "hashlib", Counting()):
+            return self.state_bytes(), made[0]
+
+    def start(self):
+        """What a new process of the hub has at its start: empty caches, and the file."""
+        for cache in (hub._scrub_spans, hub._secret_spans):
+            cache.cache_clear()
+        return hub._scrub_spans.read_spans(self.file)
+
+    def test_a_new_login_is_searched_for_alone(self):
+        """After one more login, a read of the state searches its texts for that login only, and a read with the same
+        logins in another order searches nothing. The cache keyed by the whole list searched every text again for every
+        login: 5 s for the 155 logins of the owner's hub, on the owner's Mac."""
+        for n, salt in enumerate(("s4", "s5", "s6")):
+            register(f"An0ther-Login-{n}04{n}", salt)
+        body, first = self.read()
+        self.assertNotIn(LOGIN.encode(), body)
+        self.assertEqual(self.read(), (body, 0))
+        register(LATER, "s3")
+        later, more = self.read()
+        self.assertLess(more, first / 2)            # one login of five, where the old cache searched all five again
+        self.assertNotIn(LATER.encode(), later)
+        searched = [patch.object(hub, "_scrub_spans", hub.find_secret_spans),
+                    patch.object(hub, "_secret_spans", hub.find_secret_spans)]
+        self.assertEqual(self.run_with(searched, self.state_bytes), later)
+        with hub.LOCK, hub.area("quiet"):        # the same logins in another order, and the same change token
+            hub.DB.execute("UPDATE secrets SET id=id+100 WHERE salt='s1'")
+            hub.commit()
+        self.assertEqual(self.read()[1], 0)
+
+    def test_a_start_searches_only_what_its_file_does_not_say(self):
+        """After a start, a read of the state searches again only the texts that hold a login, and every text for a login
+        that the file does not name. A file of another version of the search, or one that does not parse, says
+        nothing. main() reads the file before the hub answers."""
+        body, first = self.read()
+        self.assertIn(LATER.encode(), body)
+        self.assertTrue(hub._scrub_spans.write_spans(self.file))
+        self.assertFalse(hub._scrub_spans.write_spans(self.file))      # nothing searched since: nothing to write
+        self.assertGreater(self.start(), 300)
+        again, few = self.read()
+        self.assertEqual(again, body)
+        self.assertLess(few, first / 50)            # the one text that holds the login
+        register(LATER, "s3")                       # the file says that note was searched for LOGIN only
+        self.start()
+        later, more = self.read()
+        self.assertNotIn(LATER.encode(), later)
+        self.assertLess(more, first * 2)
+        for text in ("{", '{"search": "x"}', '{"search":' + "[" * 100000, json.dumps(
+                {"search": hub.search_version(), "sets": [[]], "texts": [["00" * 32, -1]]})):
+            with open(self.file, "w") as f:
+                f.write(text)
+            self.assertEqual(self.start(), 0, text[:20])
+        self.assertTrue(self.read()[1] > first / 2)
+        self.assertTrue(hub._scrub_spans.write_spans(self.file))
+        with patch.object(hub, "search_version", lambda: "another"):
+            self.assertEqual(self.start(), 0)
+        self.assertGreater(self.start(), 300)
+        main = ast.unparse(ast.parse(textwrap.dedent(inspect.getsource(hub.main))))
+        self.assertLess(main.index("spans_kept(db_path)"), main.index("serve_forever("))
+
+    def test_the_cache_answers_as_the_search(self):
+        """For any rows of the logins, in any order, left out or written twice, and across a start that reads the file:
+        what the search with no cache finds."""
+        rng, chars = random.Random(20261117), "abcXYZ019._-/:"
+        values = ["".join(rng.choice(chars) for _ in range(rng.choice((8, 10, 12, 20)))) for _ in range(10)]
+        rows = []
+        for value in values:
+            salt = f"salt {value}"
+            rows.append((salt, hashlib.sha256((salt + value).encode()).hexdigest(), len(value)))
+            rows.append((salt + "+", hashlib.sha256((salt + "+" + value[:-1]).encode()).hexdigest(), len(value) - 1))
+        texts = [" ".join(rng.choice(values) + rng.choice(("", ".", "x", ")")) if rng.random() < 0.3 else
+                          "".join(rng.choice(chars + "  ") for _ in range(rng.randrange(1, 40)))
+                          for _ in range(rng.randrange(1, 8))) for _ in range(200)]
+        cache, found = hub.SpanCache(150), 0
+        for _ in range(200):
+            key = rng.sample(rows, rng.randrange(len(rows) + 1))
+            key = tuple(key + [rng.choice(key)] if key and rng.random() < 0.2 else key)
+            for text in rng.sample(texts, 30):
+                found += bool(hub.find_secret_spans(text, key))
+                self.assertEqual(cache(text, key), hub.find_secret_spans(text, key), (text, key))
+            if rng.random() < 0.1:
+                cache.write_spans(self.file)
+                cache = hub.SpanCache(150)
+                cache.read_spans(self.file)
+        self.assertGreater(found, 1000)
+
+    def test_every_name_that_the_search_reads_is_in_its_version(self):
+        """search_version is a digest of the code and the values of the search. A name that the search reads, and that
+        is not one of them, could change in a release while the version stays: a start would then take a text as
+        searched by a search that finds less than its own."""
+        modules = {"re", "hashlib", "json", "functools", "collections", "threading", "sys"}
+        passes_on = {"find_secret_spans", "SpanCacheInfo", "write_owner_file", "search_version"}    # change no answer
+        allowed = set(hub.SEARCH_CODE) | set(hub.SEARCH_VALUES) | set(dir(builtins)) | modules | passes_on
+        for name in hub.SEARCH_CODE:
+            fn = ast.parse(textwrap.dedent(inspect.getsource(getattr(hub, name)))).body[0]
+            names = [n for n in ast.walk(fn) if isinstance(n, ast.Name)]
+            own = {a.arg for a in ast.walk(fn) if isinstance(a, ast.arg)} | {
+                n.id for n in names if isinstance(n.ctx, ast.Store)} | {
+                h.name for h in ast.walk(fn) if isinstance(h, ast.ExceptHandler) and h.name}
+            self.assertLessEqual({n.id for n in names if isinstance(n.ctx, ast.Load)} - own, allowed, name)
+
+    def test_the_version_is_the_code_that_runs(self):
+        """search_version reads the code that this process runs and never hub.py on the disk, which a release changes
+        before the hub starts again: an old process would write the version of the new code. It is the same in each
+        process of one code (a set's order changes with the hash seed), and another when the search, one of its values
+        or the cache's own code changes."""
+        version = hub.search_version.__wrapped__()
+        with patch("builtins.open", side_effect=OSError("no disk")):
+            self.assertEqual(hub.search_version.__wrapped__(), version)
+        for seed in ("1",):         # this process has a random seed of its own
+            other = subprocess.run([sys.executable, "-B", "-c", "import hub; print(hub.search_version())"],
+                                   cwd=os.path.dirname(os.path.abspath(hub.__file__)), check=True, text=True,
+                                   capture_output=True, env=dict(os.environ, PYTHONHASHSEED=seed)).stdout.strip()
+            self.assertEqual(other, version)
+        for change in (patch.object(hub, "rest_ends", hub.run_least),
+                       patch.object(hub.SpanCache, "unsearched", lambda self, *args: None),
+                       patch.object(hub, "DOTS_TAIL", hub.DOTS_TAIL + 1)):
+            with change:
+                self.assertNotEqual(hub.search_version.__wrapped__(), version)
+
+    def test_a_login_that_changes_at_each_read_leaves_one_set(self):
+        """GET /site/key makes a new login at each read. A text counts as searched for the logins of the list that it
+        was last searched with, and not for each login of every list before: the file holds one set of them."""
+        cache, base = hub.SpanCache(100), hub.secret_key()
+        texts = [f"text {n} of https://example.com/a/{n}/b" for n in range(20)]
+        for n in range(30):
+            key = base + ((f"site {n}", "0" * 64, 32),)
+            for text in texts:
+                self.assertEqual(cache(text, key), ())
+        self.assertTrue(cache.write_spans(self.file))
+        with open(self.file) as f:
+            self.assertEqual([len(s) for s in json.load(f)["sets"]], [len(base) + 1])
 
 
 class OwnMoment(StateCase):

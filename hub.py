@@ -31,6 +31,7 @@ import hashlib
 import hmac
 import html
 import http.client
+import inspect
 import json
 import math
 import os
@@ -3675,6 +3676,24 @@ DOTS_TAIL = 8                   # and those few close it: a ")", a ":", a "," or
 # The search finds nothing in a text shorter than SECRET_TEXT_LEAST, as it always did, and json_plain makes no text
 # longer, so secret_hit does not look such a text up.
 SECRET_TEXT_LEAST = LOGIN_LEAST
+
+
+def machine_memory():
+    """The bytes of memory of the machine that the hub runs on, or None where Python cannot read them (Windows, or a
+    sysconf that answers -1). In a container these are the host's, not the container's limit."""
+    try:
+        page, pages = os.sysconf("SC_PAGE_SIZE"), os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        return None
+    return page * pages if page > 0 and pages > 0 else None
+
+
+def spans_bytes(memory):
+    """The bound of scrub()'s cache of the search, for a machine of `memory` bytes (None: not known): 128 MB, and a
+    sixteenth of the memory where that is less."""
+    return min(128 * 1024 * 1024, (memory if memory and memory > 0 else 2 ** 40) // 16)
+
+
 # Two caches of the search:
 # - the general one, as it always was: 8,192 texts of any length. The guard of each tool call, the masks of each tool
 #   result, an attachment and a knowledge file use it, and so does a text of the state that is too long for the other;
@@ -3683,13 +3702,23 @@ SECRET_TEXT_LEAST = LOGIN_LEAST
 #   all of them: a cache that holds fewer keeps none that the next read asks for, and each read searches every text
 #   again. With 8,192, a copy of the first fleet's database with 2.3 times its rows (some 10,400 different texts) took
 #   454 to 705 ms for each read in place of 73 to 76 ms, and calls that came in during a read waited up to 177 ms
-#   (11 November 2026). The live state had 3,751 different texts, and it grows each day. An entry keeps its text: an
-#   ASCII text of 340 characters, the mean of the state's, makes an entry of 529 bytes, so a full cache of such texts
-#   is about 35 MB. An ASCII text of 4,000 characters made an entry of 4.2 KB, and one with an emoji in it 16 KB, so
-#   a cache full of the longest texts would be about 275 MB, or about 1 GB: for that, the answers that scrub masks
-#   would have to hold 65,536 different texts of 4,096 characters, where the live state had 3,751 texts in all.
+#   (11 November 2026). The live state had 3,751 different texts, and it grows each day. On 17 November 2026 it had
+#   10,052, some 1,050 more each day, because it carries every ended task: at 65,536 the state would outgrow the cache
+#   in about seven weeks, and then each read of the state would take some 18 s of the hub's processor (a review's
+#   measurement with a smaller cache), every 3 seconds. The bounds below hold about six months of that growth; a
+#   state of the open work only is what ends it. Every other scrub (task events, messages, conversations, an agent's
+#   read of its messages) fills the cache too, so a hub that runs for weeks fills it to its bounds whatever the size of
+#   the state: the texts that the next read of the state asks for stay, as the last asked. An entry keeps its text,
+#   and the text's bytes (sys.getsizeof) and SPAN_ENTRY_BYTES of its own count against SCRUB_SPANS_BYTES: the 9,849
+#   texts that the live state put in it held 5.3 MB, 537 bytes a text, and their entries 142 bytes more each. The
+#   bound is 128 MB, and a sixteenth of the machine's memory where that is less: the app takes a hub's server of 1 GB
+#   (ServerCheck.hubMemory), and there it is some 60 MB. So the cache holds some 195,000 texts of the state's mean size
+#   (about six months of the growth above), some 90,000 on a hub of 1 GB, and fewer longer ones, where 262,144 texts
+#   of 4,000 characters with one emoji in each would have been about 4 GB.
 SECRET_SPANS_KEPT = 8192
-SCRUB_SPANS_KEPT = 65536
+SCRUB_SPANS_KEPT = 262144
+SCRUB_SPANS_BYTES = spans_bytes(machine_memory())
+SPAN_ENTRY_BYTES = 150
 SCRUB_TEXT_MOST = 4096
 
 
@@ -3738,12 +3767,25 @@ def find_secret_spans(text, key):
     Only the runs that can hold a login are read (run_least), which one search of the text finds. In a copy of the
     first fleet's state, 2,922 of 178,399 runs were long enough for logins of 30 characters or more, the shortest of
     the live fleet (11 November 2026). A window is hashed with "surrogatepass": a lone surrogate, which a JSON field
-    can bring, is in no login, and the search used to stop with an exception on it."""
+    can bring, is in no login, and the search used to stop with an exception on it. Each row's own spans:
+    secret_spans_each."""
+    return tuple(sorted(span for spans in secret_spans_each(text, key).values() for span in spans))
+
+
+def secret_spans_each(text, key):
+    """find_secret_spans of a text for each row of key: {row: its spans} for each row that the text holds. A row that
+    key holds twice (register_fingerprints writes a row again before it deletes the old one) is searched once. What a
+    row finds does not depend on the other rows: one search finds the runs long enough for the shortest row
+    (run_least), and a row reads only the runs long enough for itself. So a cache of the search (SpanCache) searches a
+    text again for the rows that it has not searched it for, and for no other."""
+    found = {}
     if len(text) < SECRET_TEXT_LEAST or not key:
-        return ()
+        return found
     runs = [(m.start(), m.group(0)) for m in long_runs(max(1, min(run_least(n) for _, _, n in key))).finditer(text)]
-    spans, ends = [], {}
-    for salt, digest, n in key:
+    ends = {}
+    for row in dict.fromkeys(key):
+        salt, digest, n = row
+        spans = []
         base = hashlib.sha256(salt.encode())
         for start, run in runs:
             if not n:
@@ -3772,11 +3814,276 @@ def find_secret_spans(text, key):
                     h.update(b"." * dots)
                     if h.hexdigest() == digest:
                         spans.append((start + end - size, start + end))
-    return tuple(sorted(spans))
+        if spans:
+            found[row] = spans
+    return found
 
 
-_secret_spans = functools.lru_cache(maxsize=SECRET_SPANS_KEPT)(find_secret_spans)
-_scrub_spans = functools.lru_cache(maxsize=SCRUB_SPANS_KEPT)(find_secret_spans)
+# ---------------------------------------------------------------- the caches of the search, kept for each login
+#
+# The search hashes each window of each run of a text for each registered login, and nothing else can find a login,
+# because the hub keeps only a salted hash of each. A cache that was keyed by the whole list of logins lost every text
+# at each change of that list, and at each start of the hub. On the owner's hub on 17 November 2026 the state held
+# 10,052 different texts and 155 logins: searching all of them again took 5 s on the owner's Mac and some 6.5 s on the
+# hub's server, and the Mac app's read of the state, which waited for it, timed out at 10 s about ten times in six
+# hours: after each release that restarted the hub, when the owner added a key to the central vault, and after a
+# Google Connect, which registers its login. A cache now keeps, for each text, the logins that it has searched it for
+# (each by its fingerprint's digest, fingerprint_digest) and the spans of those that it found, and a new login costs
+# one search of each text for that login only. scrub()'s own cache is kept in a file beside the records
+# (SPANS_FILE) every SPANS_KEEP_EVERY seconds, and a start reads it back: only the texts that hold no login, by the
+# digest of each text and of each login, never a text or a login itself.
+
+SPANS_FILE = "secret-search.json"
+SPANS_KEEP_EVERY = 300          # seconds between two writes of the file, when the cache has searched something new
+SpanCacheInfo = collections.namedtuple("SpanCacheInfo", "hits misses maxsize currsize")
+
+
+def fingerprint_digest(row):
+    """The digest of one login's fingerprint (salt, hash, length): 16 bytes that stand for the row in a cache of the
+    search, the same in every process."""
+    return hashlib.sha256(json.dumps(list(row)).encode()).digest()[:16]
+
+
+def text_digest(text):
+    """The digest of one text, for the file of the search's cache (SPANS_FILE)."""
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).digest()
+
+
+class SpanCache:
+    """find_secret_spans(text, key), kept for `most` texts of at most `budget` bytes in all (sys.getsizeof of each text
+    and `entry` bytes for its entry; None: no bound), the last asked first, and for each text the logins that it was
+    searched for. A text is searched only for the rows of key that it was not searched for before, whatever their order,
+    and whatever rows key no longer holds; the spans of the rows that key holds are its answer. An entry is (the digests
+    of the logins searched for, {digest: spans} of those found or None, the logins that it answered last, that answer,
+    the bytes that its text counts for), and it is replaced whole, never changed: a thread that reads one meanwhile
+    reads one whole entry. A text counts the bytes that it had when it came in, and gives the same back when it goes:
+    sys.getsizeof of a text with a letter outside ASCII grows when sqlite3 binds it (its UTF-8 copy), and the bound
+    would drift. Two threads that search the same text at the same time each search it, and each answer is right for its
+    own key. hits and misses count the asks without and with a search (cache_info)."""
+
+    def __init__(self, most, budget=None, entry=0):
+        self.most, self.budget, self.entry = most, budget, entry
+        self.__wrapped__ = find_secret_spans        # the search with no cache (google_secret_in)
+        self.lock = threading.Lock()                # for the dicts and the counts below, never for a search
+        self.cache_clear()
+
+    def cache_clear(self):
+        with self.lock:
+            self.texts = collections.OrderedDict()  # text -> entry
+            self.loaded = {}                # text_digest -> the logins searched for, from the file that a start read
+            self.none = frozenset()         # no login searched for
+            self.keys, self.sets, self.joins = {}, {self.none: self.none}, {}
+            self.last = None                # (key, its digests, {digest: row}) of the last key asked with
+            self.hits = self.misses = self.fresh = 0
+            self.size = 0                   # the bytes of the texts in self.texts
+
+    def cache_info(self):
+        return SpanCacheInfo(self.hits, self.misses, self.most, len(self.texts))
+
+    def same_set(self, found):
+        """One frozenset for each set of digests (a set that a text was searched for), so that an entry compares its
+        logins by identity."""
+        with self.lock:
+            if len(self.sets) > 4096:
+                self.sets = {self.none: self.none}
+            return self.sets.setdefault(found, found)
+
+    def logins_of(self, key):
+        """(the digests of the rows of key, {digest: row}): for the key of one scrub, which asks for each text with
+        the same tuple, by its identity."""
+        last = self.last
+        if last is not None and last[0] is key:
+            return last[1], last[2]
+        got = self.keys.get(key)
+        if got is None:
+            rows = {}
+            for row in key:
+                rows.setdefault(fingerprint_digest(row), row)
+            got = (self.same_set(frozenset(rows)), rows)
+            with self.lock:
+                if len(self.keys) > 64:
+                    self.keys.clear()
+                self.keys[key] = got
+        self.last = (key, got[0], got[1])
+        return got
+
+    def unsearched(self, searched, logins, rows):
+        """(the rows of logins that a text searched for `searched` was not searched for, as (digest, row) pairs, and
+        what it counts as searched for after them), once for each pair of sets. After a search that is `logins`, and
+        not `searched` with them: a login that the list dropped leaves the set, so a set holds one list of logins and
+        no more, however often a login changes (GET /site/key makes a new one at each read). A login that comes back
+        is searched for again."""
+        pair = (searched, logins)
+        got = self.joins.get(pair)
+        if got is None:
+            missing = logins - searched
+            got = (tuple((d, rows[d]) for d in sorted(missing)), logins if missing else searched)
+            with self.lock:
+                if len(self.joins) > 4096:
+                    self.joins.clear()
+                self.joins[pair] = got
+        return got
+
+    def __call__(self, text, key):
+        if len(text) < SECRET_TEXT_LEAST or not key:
+            return ()
+        logins, rows = self.logins_of(key)
+        with self.lock:
+            entry = self.texts.get(text)
+            if entry is not None:
+                self.texts.move_to_end(text)
+                if entry[2] is logins:
+                    self.hits += 1
+                    return entry[3]
+        if entry is not None:
+            searched, found = entry[0], entry[1]
+        else:
+            loaded = self.loaded
+            searched, found = (loaded.get(text_digest(text)) if loaded else None) or self.none, None
+        missing, searched = self.unsearched(searched, logins, rows)
+        if missing:
+            more = secret_spans_each(text, tuple(row for _, row in missing))
+            digests = {row: d for d, row in missing}
+            found = {d: spans for d, spans in (found or {}).items() if d in logins}     # as searched is now
+            found.update((digests[row], tuple(spans)) for row, spans in more.items())
+            found = found or None
+        answer = tuple(sorted(span for d, spans in found.items() if d in logins for span in spans)) if found else ()
+        with self.lock:
+            if missing:
+                self.misses += 1
+                self.fresh += 1
+            else:
+                self.hits += 1
+            held = self.texts.get(text)
+            counted = sys.getsizeof(text) + self.entry if held is None else held[-1]
+            if held is None:
+                self.size += counted
+            self.texts[text] = (searched, found, logins, answer, counted)
+            self.texts.move_to_end(text)
+            while self.texts and (len(self.texts) > self.most or self.budget is not None and self.size > self.budget):
+                self.size -= self.texts.popitem(last=False)[1][-1]
+        return answer
+
+    def write_spans(self, path):
+        """Write the file of this cache when it searched something since the last write: for each text that holds no
+        login it was searched for, the digest of the text and the digests of those logins, the last asked first, and
+        then what the file of the start held for texts not asked since, `most` in all. A text that holds a login is
+        searched again after a start. The file says which code of the search made it (search_version), and a start
+        of other code reads none of it. True when it wrote."""
+        version = search_version()
+        with self.lock:
+            fresh = self.fresh
+            if not fresh or not version:
+                return False
+            entries, loaded = list(self.texts.items()), dict(self.loaded)
+        kept = {}
+        for text, (searched, found, *_) in reversed(entries):
+            if not found:
+                kept.setdefault(text_digest(text), searched)
+        for digest, searched in loaded.items():
+            if len(kept) >= self.most:
+                break
+            kept.setdefault(digest, searched)
+        sets, texts = {}, []
+        for digest, searched in kept.items():
+            texts.append([digest.hex(), sets.setdefault(searched, len(sets))])
+        write_owner_file(path, json.dumps({"search": version, "sets": [sorted(d.hex() for d in s) for s in sets],
+                                           "texts": texts}, separators=(",", ":")))
+        with self.lock:
+            self.fresh -= fresh
+        return True
+
+    def read_spans(self, path):
+        """What the file of this cache says, for the texts that a read asks for from now on: how many texts. A file
+        that is not there, that does not parse, or that another code of the search wrote, says nothing."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or not search_version() or data.get("search") != search_version():
+                return 0
+            sets = []
+            for logins in data["sets"]:
+                digests = frozenset(bytes.fromhex(d) for d in logins)
+                if any(len(d) != 16 for d in digests):
+                    raise ValueError("a login's digest is not 16 bytes")
+                sets.append(self.same_set(digests))
+            loaded = {}
+            for digest, at in data["texts"][:self.most]:
+                if len(bytes.fromhex(digest)) != 32 or type(at) is not int or not 0 <= at < len(sets):
+                    raise ValueError("a text's line is not a digest and a set")
+                loaded[bytes.fromhex(digest)] = sets[at]
+        except FileNotFoundError:
+            return 0
+        except Exception as e:      # only a cache: a file that cannot be read never stops a start (RecursionError too)
+            print(f"WARNING: the hub did not read its cache of the search for logins, {path}: {e!r}", flush=True)
+            return 0
+        with self.lock:
+            self.loaded = loaded
+        return len(loaded)
+
+
+# What the search finds (secret_spans_each), and what a line of the file of its cache means (SpanCache): a change of
+# any of these is another version of the search, and a start does not read a file of another. test_state_read.KeptSearch
+# holds that every name that these read is here, a builtin, a module or one that only passes the answers on.
+SEARCH_CODE = ("secret_spans_each", "rest_ends", "long_runs", "run_least", "fingerprint_digest", "text_digest",
+               "SpanCache")
+SEARCH_VALUES = ("SECRET_TEXT_LEAST", "LOGIN_LEAST", "DROPPED_DOTS", "DOTS_RUN_MOST", "DOTS_TAIL", "JSON_BREAK")
+
+
+def code_text(value):
+    """What a code object does, as bytes that are the same in each process of one Python: its bytecode, the names it
+    reads, and its constants, a code object inside it as one of its own, and a set's members in one order (a string's
+    hash, and so a set's order, changes from one process to the next). Not its lines: a move of the code is no
+    change."""
+    if isinstance(value, type(code_text.__code__)):
+        return b"\0".join([value.co_code, repr((value.co_names, value.co_varnames, value.co_freevars, value.co_cellvars,
+                                                 value.co_flags, value.co_argcount, value.co_posonlyargcount,
+                                                 value.co_kwonlyargcount)).encode()] +
+                          [code_text(c) for c in value.co_consts])
+    if isinstance(value, (frozenset, set)):
+        return b"{" + b",".join(sorted(code_text(v) for v in value)) + b"}"
+    if isinstance(value, tuple):
+        return b"(" + b",".join(code_text(v) for v in value) + b")"
+    return repr(value).encode()
+
+
+@functools.lru_cache(maxsize=1)
+def search_version():
+    """The version of the search: a digest of the code that this process runs (SEARCH_CODE, each function of a class,
+    with its default values), of its values (SEARCH_VALUES), and of the Python and the Unicode tables that run it (a
+    letter or a space of rest_ends and long_runs). Not the text of hub.py, which a release changes on the disk before
+    the hub starts again."""
+    h = hashlib.sha256(repr((sys.version, unicodedata.unidata_version)).encode())
+    for name in SEARCH_CODE:
+        found = globals()[name]
+        for fn in ([v for _, v in sorted(vars(found).items()) if callable(v)] if isinstance(found, type) else [found]):
+            fn = inspect.unwrap(fn)
+            h.update(b"\0" + code_text(fn.__code__) + code_text((fn.__defaults__, fn.__kwdefaults__)))
+    for name in SEARCH_VALUES:
+        h.update(b"\0" + repr(getattr(globals()[name], "pattern", globals()[name])).encode())
+    return h.hexdigest()
+
+
+def spans_keeper(path):
+    """The thread that writes the file of scrub()'s cache (SpanCache.write_spans)."""
+    while True:
+        time.sleep(SPANS_KEEP_EVERY)
+        try:
+            _scrub_spans.write_spans(path)
+        except Exception:
+            print_fault()
+
+
+def spans_kept(db_path):
+    """At the start: scrub()'s cache reads its file beside the records, and a thread keeps it from then on."""
+    path = os.path.join(os.path.dirname(os.path.abspath(db_path)), SPANS_FILE)
+    search_version()            # of the code that runs now: a release can change hub.py on the disk later
+    _scrub_spans.read_spans(path)
+    threading.Thread(target=spans_keeper, args=(path,), name="search-cache", daemon=True).start()
+
+
+_secret_spans = SpanCache(SECRET_SPANS_KEPT)
+_scrub_spans = SpanCache(SCRUB_SPANS_KEPT, SCRUB_SPANS_BYTES, SPAN_ENTRY_BYTES)
 
 
 def spans_of(text, key):
@@ -61805,6 +62112,7 @@ def main():
     # instead of for ever reading as a hub that has not ticked yet. A process with no timers thread (every test)
     # writes this key nowhere and is asked nothing.
     kv_set("tick_ok", now())
+    spans_kept(db_path)         # the search for logins in the state starts from what the last start searched
     threading.Thread(target=timers, daemon=True).start()
     threading.Thread(target=central_timer, name="central-vault", daemon=True).start()
     threading.Thread(target=google_revoke_timer, name="google-revokes", daemon=True).start()
