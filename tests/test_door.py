@@ -434,6 +434,25 @@ class Access(DoorCase):
         door.validate_access(with_host("100.64.0.3", "rule-only"))
         door.validate_access(with_host("100.64.0.4", "fix"))
 
+    def test_a_machine_of_the_fleet_is_rule_only_in_every_file(self):
+        """A server that runs agents holds their keys, so root there through the door is fixed forms only (the owner,
+        17 November 2026). Root's command refuses a file that says fix for it, and the door reads one that says so as
+        rule-only: the same two halves as for the hub's own server."""
+        data = json.loads(json.dumps(ACCESS))
+        data["hosts"]["fleet-1"]["mode"] = "fix"
+        with self.assertRaisesRegex(ValueError, "host fleet-1 is the fleet's own server: its mode is rule-only, never "
+                                                "fix"):
+            door.validate_access(data)
+        self.write_access(data)
+        self.assertEqual(self.door.access()["hosts"]["fleet-1"]["mode"], "rule-only")
+        self.assertEqual(self.door.access()["hosts"]["web-1"]["mode"], "fix")
+        self.assertEqual(self.call(ONE, "fleet-1", "exec", "ls", "/etc")["why"],
+                         "fleet-1 is rule-only: only rule forms run there, and no file install")
+        self.assertEqual(self.stubs.ssh_calls, [])
+        with patch("sys.stdin", io.TextIOWrapper(io.BytesIO(json.dumps(data).encode()))), \
+                self.assertRaisesRegex(SystemExit, "the fleet's own server"):
+            door.cmd_access(None)
+
     def test_a_file_from_before_that_rule_is_read_with_such_a_host_at_rule_only(self):
         """A new release must leave no door that names nobody: the door reads the old file with the host at
         rule-only, and root's command refuses the next file that says fix."""
@@ -1031,6 +1050,39 @@ class Refusals(DoorCase):
             self.assertEqual((d.kind, d.why),
                              ("refused", f"{host} is rule-only: only rule forms run there, and no file install"))
             self.assertEqual(self.decide(host, "upgrade").kind, "rule")
+
+    def test_what_a_machine_of_the_fleet_takes_and_what_it_refuses(self):
+        """The fleet's own servers through the door (the owner, 17 November 2026: "someone should probably have root",
+        and no root shell there): the holder reads why the server failed and runs the fixed root forms. Every form
+        of its own, the wide read, and the three forms that compare and delete files as root are refused before the
+        host is asked. On a rule-only host that is no machine of the fleet those three stay rule calls."""
+        for op, args, kind in (("help", [], "read"), ("health", [], "read"), ("restart", ["fleet-server"], "rule"),
+                               ("reboot", [], "rule"), ("upgrade", [], "rule"), ("journal-vacuum", [], "rule"),
+                               ("journal", ["lines=50"], "read"), ("status", ["fleet-server"], "read")):
+            with self.subTest(op=op):
+                d = self.decide("fleet-1", op, *args)
+                self.assertEqual((d.kind, d.host, d.business), (kind, "fleet-1", "one"))
+        rule_only = "fleet-1 is rule-only: only rule forms run there, and no file install"
+        for op, args, content, why in (
+                ("exec", ["systemctl", "status"], None, rule_only), ("script", [], b"id\n", rule_only),
+                ("file", ["/etc/x.conf", "0644", "root"], b"x", rule_only),
+                ("run", [], b"id\n", rule_only), ("install", ["htop"], None, rule_only),
+                ("look", [], b"cat /etc/hostname\n",
+                 "fleet-1 is rule-only: it holds the fleet's own keys, and no look runs there")):
+            with self.subTest(op=op):
+                d = self.decide("fleet-1", op, *args, content=content)
+                self.assertEqual((d.kind, d.why), ("refused", why))
+        for op, args, what in (("same", ["/etc/a", "/etc/b"], "compares no files"),
+                               ("covers", ["/etc/a", "/etc/b"], "compares no files"),
+                               ("drop", ["/etc/a"], "deletes no file")):
+            with self.subTest(op=op):
+                d = self.decide("fleet-1", op, *args)
+                self.assertEqual((d.kind, d.why), ("refused", f"fleet-1 is a machine of the fleet, where agents run "
+                                                              f"and their keys are: {op} {what} there"))
+                self.assertIn(self.decide("ci-1", op, *args).kind, ("read", "rule"))
+        self.assertEqual(self.decide("fleet-1", "place", "/etc/a.env", "TOKEN", "0" * 64).why,
+                         "place is the door's own form")
+        self.assertEqual(sorted(door_targets.OPS_ROOT.FLEET_REFUSED), ["covers", "drop", "place", "same"])
 
     def test_a_form_of_a_new_app_on_a_rule_only_host(self):
         """ops-root refuses the forms that make things for a new app on a rule-only host. The door refuses them first,

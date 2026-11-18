@@ -1005,7 +1005,8 @@ def manager_name():
 # code reads it, so a check, a record and a request_id's replay see one spelling of one agent; in a list of agents
 # (door_gitops's agents) each one. A field that also takes other words (report_up's about, search_history's person)
 # changes only when its whole value names an agent.
-AGENT_NAME_FIELDS = {"create_task": ("owner",), "door_gitops": ("agents",), "grant_access": ("agent",),
+AGENT_NAME_FIELDS = {"create_task": ("owner",), "door_fleet": ("agent",), "door_gitops": ("agents",),
+                     "grant_access": ("agent",),
                      "move_agent": ("agent",),
                      "hand_over": ("to",), "message_agent": ("agent",), "report_up": ("about",),
                      "save_trigger": ("agent",), "search_history": ("person",), "see_earlier_work": ("agent",),
@@ -5087,7 +5088,9 @@ def holdings_parts(agent):
                      # incident intake, part 3: the holder at Fix reads a server's files itself, with no item
                      ("; at fix, `ops <server> look --content <script>` reads its files and its apps' logs with a "
                       "bash script that changes nothing, with nobody's yes" if "fix" in a["servers"].values() else "") +
-                     "): " + named_few(f"{h} ({v})" for h, v in sorted(a["servers"].items())))
+                     "): " + named_few(f"{h} ({v})" for h, v in sorted(a["servers"].items())) +
+                     ("; at patch, a machine of the fleet, the fixed root forms only, with `ops <server> health`, "
+                      "which says why it failed or is slow" if "patch" in a["servers"].values() else ""))
     keys = [name for _, name in session_variables(agent)]       # none for an agent with no vault broker
     gone = [k for k in keys if k in vault_missing(agent)]        # C11: not given at its vault's last session read
     if len(gone) < len(keys):
@@ -8133,6 +8136,23 @@ def access_route(asker, rid, requester, want=None, restarts=None):
         out.append("Held now by " + ", ".join(f"{h['agent']} ({h['level']})" for h in others) +
                    f": {holder} can do this part of the work, or answer the question from it" +
                    (f": give that part to {holder} with create_task." if in_team else ", and it is outside your team."))
+    if kind == "server" and fleet_server(what):
+        # One of the fleet's own servers: nobody grants it, and patch is the most that any agent has there. The lines
+        # are this reader's own: a lead never reads the manager's "you".
+        if enough:
+            pass
+        elif mine == "patch":
+            out.append(f"patch is the most that any agent gets on a machine of the fleet: the fixed root forms, and "
+                       f"no command, file or script of its own. If the work cannot be done with them, " +
+                       ("raise a Needs-you item that says what the server needs and why." if manager else
+                        "pass the question up with answer(..., pass_up=true)."))
+        elif not others:
+            out.append(FLEET_SERVER_NOTE.format(server=what) if manager else
+                       "It is one of the fleet's own servers, which no agent holds yet: the manager names the agent "
+                       "that holds them. Pass the question up with answer(..., pass_up=true).")
+        elif not manager and not in_team:
+            out.append(f"Pass the question up with answer(..., pass_up=true): once it is settled, {restart}.")
+        return " ".join(out)
     if not enough and level and not refused:
         out.append((f'It is in the grantable pool, up to {top}: grant_access(agent="{asker}", resource="{rid}", '
                     f'level="{level}") settles it. The grant reaches its next session, so ' +
@@ -12186,6 +12206,63 @@ def t_door_hold(agent, a):
                          f"until you end the hold.",
             "none": f"{host} has no hold now."}[hold] + ("" if result["changed"] else " It was so already.") + \
         " This Mac's app writes the door's file at its next round."
+    with transaction():
+        keep_command(command, {"text": text}, now())
+    return text
+
+
+def t_door_fleet(agent, a):
+    """door_fleet (the manager; the owner, 17 November 2026, after three of the fleet's own servers ran out of memory
+    and each time a card asked him for a root command: "someone should probably have root, I dont want to be doing
+    devops work on the fleet!"): team.json door.fleet, the agent that holds the fleet's own servers through the door,
+    each server that runs agents and the hub's server. With none named, the owner's app gives them to the one DevOps
+    agent of the fleet, or to the manager where the fleet has none (fleet_view). The app takes the agent only when
+    its own server says that it runs alone there, because the door knows a caller by its address, and never one on
+    the hub's server (fleet_holder_refusal). Such a server is rule-only: fixed root forms and the form health, and
+    never a command, a file or a script of the agent's own."""
+    name = str(a.get("agent") or "").strip()
+    why = str(a.get("why") or "").strip()
+    if not name:
+        raise ToolError("agent is the agent that looks after the fleet's own servers, by its role or its name, or "
+                        "none to name nobody.")
+    if not why or len(why) > GRANT_WHY_MAX:
+        raise ToolError(f"why is what made you decide, in 1 to {GRANT_WHY_MAX} characters: the record keeps it.")
+    holder = None if name.lower() == "none" else name
+    if holder is not None:
+        entry = agents().get(holder)
+        if entry is None:
+            raise ToolError(f"{name}: no agent of this fleet has that name or that role.")
+        refused = fleet_holder_refusal(TEAM, holder)
+        if refused:
+            raise ToolError(refused)
+    guard(agent, why)
+    command, stored = agent_write(agent, "door_fleet", a, {"agent": holder, "why": why})
+    if stored:
+        return stored["text"]
+    if not isinstance(TEAM.get("door"), dict) or not TEAM["door"].get("address"):
+        raise ToolError("This fleet has no door, so no agent reaches a server through it.")
+
+    def name_holder(team):
+        door = team.get("door") or {}
+        if door.get("fleet") == holder:
+            return False
+        if holder is None:
+            door.pop("fleet", None)
+        else:
+            door["fleet"] = holder
+        return True
+    try:
+        result = save_integration(None, name_holder, f"the fleet's own servers through the door: "
+                                                     f"{holder or 'nobody named'} ({why})", by=agent)
+    except Refusal as e:
+        raise ToolError(f"The hub refused it: {e}") from None
+    text = (f"{shown_role(holder)} holds the fleet's own servers through the door once the owner's app has put the "
+            f"door's parts on them: fixed root forms and `ops <server> health`, and no command, file or script of its "
+            f"own there. Give it the work on such a server with create_task." if holder else
+            "No agent is named for the fleet's own servers now: the owner's app gives them to the one DevOps agent of "
+            "the fleet, or, where the fleet has none, to you when you run alone on a server that is not the hub's.") + \
+        ("" if result["changed"] else " It was so already.") + \
+        " The owner's app writes the door's file at its next round."
     with transaction():
         keep_command(command, {"text": text}, now())
     return text
@@ -29569,7 +29646,12 @@ def skill_remove(agent, name):
 # resource_grants and a line of the hub's log, and the owner takes any of it back in one step.
 # The levels of each kind run from the lowest to the highest, so a policy's max can be compared.
 GRANT_WHY_MAX = 300          # the manager's own line about one grant, in the owner's record of it
-SERVER_LEVELS = ("read", "fix")         # DevOps plan C4: a server through the door ("the door and server access")
+# DevOps plan C4: a server through the door ("the door and server access"). patch (the owner, 17 November 2026, the
+# fleet's own servers through the door): the level of a machine of the fleet, a server that runs agents or the hub. Its
+# holder runs the fixed root forms there and reads why it failed (`ops <server> health`), and has no command, file or
+# script of its own there, because root on such a server opens every agent's keys. The owner's app records it for the
+# one agent that holds all of them (fleet_view), also on that agent's own server.
+SERVER_LEVELS = ("read", "patch", "fix")
 SERVER_HOST = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}")     # a host's name, as Tailscale and the door's access file give it
 RESOURCE_LEVELS = {"secret": ("use", "read"), "repo": REPO_ACCESS, "drive": GOOGLE_LEVELS["drive"],
                    "gmail": GOOGLE_LEVELS["gmail"], "tool": ("use",), "server": SERVER_LEVELS}
@@ -29882,6 +29964,9 @@ def grant_check(agent, rid, level):
     if a.get("role") not in ("worker", "lead"):
         raise ToolError(f"{agent} is the {a.get('role')}: a repository, a tool, a Google service and a secret reach "
                         f"task sessions, so only a worker or a lead gets one. You never grant to yourself.")
+    if kind == "server" and fleet_server(what):
+        # the owner, 17 November 2026: a problem on one of the fleet's own servers is an agent's work, never his
+        return FLEET_SERVER_NOTE.format(server=what)
     if kind == "server":        # DevOps plan C4 and "Yes, by business": the owner's app gives it, by its tag
         return (f"A server is the owner's alone to give: their app gives each server that carries a business's Tailscale "
                 f"tag to that business's DevOps agent, by itself. Give the work on {what} to the agent that holds it, "
@@ -33060,6 +33145,19 @@ TOOLS = [
                  "description": "parts, rule-only, or none to end the hold"},
         "why": {"type": "string", "description": "The plan step that it waits for, or the reason, in a line"}},
        ["request_id", "host", "hold", "why"])),
+    ("manager", "door_fleet", t_door_fleet,
+     "Name the agent that looks after the fleet's own servers through the door: each server that runs agents, and the "
+     "hub's server. That agent reads why such a server failed (`ops <server> health`, and the fixed reads) and runs "
+     "the fixed root forms there (a restart of a service, a reboot, the upgrades, the clean-up). It gets no command, "
+     "file or script of its own there, because such a server holds every agent's keys. Name the fleet's DevOps "
+     "agent. With nobody named, the owner's app gives these servers to the one DevOps agent of the fleet, or, where "
+     "the fleet has none, to you; with several DevOps agents and nobody named, nobody holds them. The agent must run "
+     "alone on its server, by which the door knows it, and not on the hub's server. A problem on one of these servers "
+     "is that agent's work, as a task: never a Needs-you item that asks the owner for a root command.",
+     S({"request_id": REQUEST_ID,
+        "agent": {"type": "string", "description": "The agent, by its role or its name; none names nobody"},
+        "why": {"type": "string", "description": "What made you decide, in a line: the owner's words, or the duty"}},
+       ["request_id", "agent", "why"])),
     ("manager", "switch_key_site", t_switch_key_site,
      "Switch the site that the table of well-known services gave an API key off, or on again. Off: the sessions of "
      "the agents that read the key hold the key itself from their next start, for a program that cannot use the "
@@ -43496,7 +43594,7 @@ def app_servers_view(team):
     held = {}
     for name, a in sorted((team.get("agents") or {}).items()):
         for host, level in sorted((a.get("servers") or {}).items()):
-            if host not in machines:
+            if host not in machines and level != "patch":       # patch is a machine of the fleet's: no server for apps
                 held.setdefault(host, []).append({"agent": name, "level": level})
     words = {}
     for row in q("SELECT k, v FROM kv WHERE k LIKE 'door_host:%'"):
@@ -44227,6 +44325,7 @@ def remove_server(server, body):
             del team[key][server]
     if "servers" in team and not team["servers"]:
         del team["servers"]
+    unheld = patch_dropped(team, {server})      # the agent that held it as one of the fleet's own servers
     try:
         validate_team(team)
     except ValueError as e:
@@ -44235,6 +44334,8 @@ def remove_server(server, body):
     commit = commit_kit_file("team.json", data, f"Owner removed server {server}")
     apply_team(team)
     with transaction():
+        for holder, _server in unheld:
+            resource_record(f"server:{server}", holder, None, "owner", commit)
         DB.execute("DELETE FROM server_keys WHERE server=?", (server,))
         DB.execute("DELETE FROM server_status WHERE server=?", (server,))
         DB.execute("DELETE FROM mac_setups WHERE server=?", (server,))
@@ -44641,6 +44742,8 @@ def renamed_team(team, old, new):
     for entry in list((door.get("credentials") or {}).values()) + list((door.get("gitops") or {}).values()):
         if isinstance(entry, dict) and isinstance(entry.get("agents"), list):
             entry["agents"] = [new if name == old else name for name in entry["agents"]]
+    if door.get("fleet") == old:        # the agent that the manager named for the fleet's own servers (door_fleet)
+        door["fleet"] = new
     return out
 
 
@@ -44882,7 +44985,7 @@ def move_agent(agent, body, by="owner"):
     commit, digest = rev, current
     if old != server:
         a["machine"] = server
-        if server in (a.get("servers") or {}):      # its own server now: free root there, and no door grant
+        if (a.get("servers") or {}).get(server, "patch") != "patch":    # its own server now: no Read or Fix there
             a["servers"] = {h: v for h, v in a["servers"].items() if h != server}
             if not a["servers"]:
                 del a["servers"]
@@ -45085,6 +45188,8 @@ def removed_team(team, agent):
                 del gitops[repo]
         if not gitops:
             del door["gitops"]
+    if door.get("fleet") == agent:      # the agent that the manager named for the fleet's own servers (door_fleet)
+        del door["fleet"]
     return out
 
 
@@ -45432,6 +45537,7 @@ def renamed_machine_team(team, old, new):
             a["machine"] = new
     if out["hub"].get("machine") == old:
         out["hub"]["machine"] = new
+    patch_dropped(out, {old})           # a holding of the fleet's own servers names the machine by its old name
     return out
 
 
@@ -47947,16 +48053,20 @@ SERVER_ROLES = ("worker", "lead", "manager")     # the manager holds a business'
 
 
 def server_holds(name, a):
-    """team.json agents.<name>.servers: up to 32 hosts, each at read or fix, for a worker, a lead or the manager, and
-    never its own machine, where it has free root with no door. The manager holds a business's servers until the
-    business has a DevOps agent (the owner's answer of 11 November 2026, "The manager"). ValueError with the reason."""
+    """team.json agents.<name>.servers: up to 32 hosts, each at read, patch or fix, for a worker, a lead or the
+    manager, and never its own machine at read or fix. The manager holds a business's servers until the business has
+    a DevOps agent (the owner's answer of 11 November 2026, "The manager"). patch is for a machine of the fleet, and
+    the agent's own machine can be one: the agent that holds the fleet's own servers holds its own too
+    (SERVER_LEVELS). The owner's route gives patch for no other host (grant_server); this check does not ask which
+    hosts are machines, because a machine can leave the fleet or get another name while a holding still names it
+    (patch_dropped). ValueError with the reason."""
     held = a.get("servers", {})
     if not isinstance(held, dict) or len(held) > 32 or not all(
             isinstance(h, str) and SERVER_HOST.fullmatch(h) and v in SERVER_LEVELS for h, v in held.items()):
-        raise ValueError(f"agent {name}: servers must map up to 32 hosts to read or fix")
+        raise ValueError(f"agent {name}: servers must map up to 32 hosts to read, patch or fix")
     if held and a.get("role") not in SERVER_ROLES:
         raise ValueError(f"agent {name}: a server through the door is for a worker, a lead or the manager")
-    if a.get("machine") in held:
+    if held.get(a.get("machine"), "patch") != "patch":
         raise ValueError(f"agent {name} has free root on its own server, {a['machine']}: no door grant there")
 
 
@@ -47969,8 +48079,14 @@ def validate_door(team):
     if door is None:
         return
     if not isinstance(door, dict) or \
-            set(door) - {"address", "port", "secrets", "credentials", "github_apps", "rollout", "holds", "gitops"}:
-        raise ValueError("door must be {address, port, secrets, credentials, github_apps, rollout, holds, gitops}")
+            set(door) - {"address", "port", "secrets", "credentials", "github_apps", "rollout", "holds", "gitops",
+                         "fleet"}:
+        raise ValueError("door must be {address, port, secrets, credentials, github_apps, rollout, holds, gitops, "
+                         "fleet}")
+    if "fleet" in door and (not isinstance(door["fleet"], str) or
+                            (team.get("agents") or {}).get(door["fleet"], {}).get("role") not in SERVER_ROLES):
+        raise ValueError("door.fleet names the agent that holds the fleet's own servers, a worker, a lead or the "
+                         "manager: the manager's door_fleet sets it")
     if not isinstance(door.get("rollout", False), bool):
         raise ValueError("door.rollout is true or false: the manager's door_rollout sets it")
     holds = door.get("holds", {})
@@ -48032,8 +48148,76 @@ def validate_door(team):
 
 
 def fix_holders(team, server):
-    """The agents that hold Fix on this server through the door."""
+    """The agents that hold Fix on this server through the door. A holding at patch is none: fixed root forms on a
+    machine of the fleet, with no way to an agent's files there (SERVER_LEVELS)."""
     return [n for n, a in (team.get("agents") or {}).items() if (a.get("servers") or {}).get(server) == "fix"]
+
+
+def patch_dropped(team, gone):
+    """Each holding at patch on a server of `gone` leaves this team.json, in place: [(agent, server)]. A machine that
+    leaves the fleet, or gets another name, is no machine of the fleet under that name, and the owner's app records
+    the holding again under the name that it reads."""
+    dropped = []
+    for name, a in (team.get("agents") or {}).items():
+        held = a.get("servers") if isinstance(a, dict) else None
+        if not isinstance(held, dict):
+            continue
+        for server in [h for h, v in held.items() if v == "patch" and h in gone]:
+            del held[server]
+            dropped.append((name, server))
+        if not held:
+            del a["servers"]
+    return dropped
+
+
+def fleet_machines(team):
+    """{server: address} of the fleet's own Linux servers: each server that runs agents and the hub's server, which
+    the door takes as rule-only hosts (the owner, 17 November 2026). A Mac is none: the host's root helper is for
+    Linux. A server whose system the fleet has not read yet is none either, until its first reading."""
+    hub_machine = (team.get("hub") or {}).get("machine")
+    kinds = {name: server_kind_of(team, name) for name in server_names(team)}
+    # the hub's own server has no server service of its own while it takes no agents, so its kind can be unknown: a
+    # hub is on Linux unless its reading says a Mac
+    return {name: team["addresses"][name] for name, kind in kinds.items()
+            if kind == "linux" or (name == hub_machine and kind != "mac")}
+
+
+def fleet_server(name):
+    """True for one of the fleet's own Linux servers in a fleet that has a door: only there does an agent hold it."""
+    door = TEAM.get("door")
+    return bool(isinstance(door, dict) and door.get("address")) and name in fleet_machines(TEAM)
+
+
+# What the manager reads when it asks to give an agent one of the fleet's own servers (grant_check), and when a
+# blocked agent names one that nobody holds (access_route).
+FLEET_SERVER_NOTE = (
+    "{server} is one of the fleet's own servers, which the owner's app gives to one agent, all together, at patch: the "
+    "agent that you name with door_fleet, and with nobody named the one DevOps agent of the fleet, or, where the fleet "
+    "has none, you when you run alone on a server that is not the hub's. Give the work on {server} to that agent, "
+    "which does it through the door with the fixed root forms, and raise no Needs-you item that asks the owner for a "
+    "root command.")
+
+
+def fleet_holder_refusal(team, agent):
+    """Why this agent cannot be the holder of the fleet's own servers (door_fleet, fleet_view), or None. The door knows
+    a caller by its server's address, so the holder runs alone on a Linux server, as an agent that holds a business's
+    servers, and not on the hub's server: the door takes no caller at the hub's own address (door.validate_access),
+    and the owner's app gives such an agent nothing."""
+    a = (team.get("agents") or {}).get(agent) or {}
+    if a.get("role") not in SERVER_ROLES:
+        return f"{shown_role(agent)} is the {a.get('role')}: a server through the door is for a worker, a lead or you."
+    if a.get("placed") is False or a.get("machine") not in fleet_machines(team):
+        return (f"{shown_role(agent)} runs on no Linux server of the fleet: the door knows a caller by its server's "
+                f"address.")
+    if a["machine"] == (team.get("hub") or {}).get("machine"):
+        return (f"{shown_role(agent)} runs on the hub's server, and the door takes no caller at the hub's own "
+                f"address: the agent that holds the fleet's own servers runs alone on a server of its own.")
+    mates = [n for n in server_agents(a["machine"], team) if n != agent]
+    if mates:
+        return (f"{shown_role(agent)} shares {a['machine']} with {', '.join(shown_role(n) for n in mates)}: the door "
+                f"knows a caller by its server's address, so the agent that holds servers through the door runs alone "
+                f"on its server.")
+    return None
 
 
 def door_callers_at(team, server):
@@ -48049,9 +48233,9 @@ def server_mode(team, server):
 
 
 def grant_server(body):
-    """POST /ui/servers/grant: the owner gives one agent Read or Fix on one server, or takes it back (level null). One
-    commit of team.json, a record and a line of the log, as every grant; the app then puts the host's parts in place
-    and writes the door's access file."""
+    """POST /ui/servers/grant: the owner gives one agent Read or Fix on one server, or Patch on a machine of the fleet
+    (SERVER_LEVELS), or takes it back (level null). One commit of team.json, a record and a line of the log, as every
+    grant; the app then puts the host's parts in place and writes the door's access file."""
     agent, server, level = body["agent"], body["server"], body["level"]
     a = agents().get(agent)
     if a is None:
@@ -48059,7 +48243,10 @@ def grant_server(body):
     if a.get("role") not in SERVER_ROLES:
         raise Refusal(409, f"{shown_role(agent)} is the {a.get('role')}: a server through the door is for a worker, a "
                            f"lead or the manager.")
-    if a.get("machine") == server:
+    if level == "patch" and server not in fleet_machines(TEAM):
+        raise Refusal(409, f"{server} is no Linux server of the fleet: patch is the level of a server that runs "
+                           f"agents and of the hub's server.")
+    if a.get("machine") == server and level not in (None, "patch"):
         raise Refusal(409, f"{server} is {shown_role(agent)}'s own server, where it has free root with no door.")
     # The reverse of door_callers_at: the door knows a caller by its server's address alone, so an agent beside the
     # holder on one server would be the holder to the door. The app's own check of the box says the same.
@@ -48167,7 +48354,23 @@ def door_view():
             # writes as each agent's target {kind: gitops, sync}
             "gitops": {repo: {"sync": g["sync"], "agents": [u for u in g["agents"] if u in holders]}
                        for repo, g in sorted((door.get("gitops") or {}).items())
-                       if any(u in holders for u in g["agents"])}}
+                       if any(u in holders for u in g["agents"])},
+            # owner API 1.210, the fleet's own servers through the door (the owner, 17 November 2026): each Linux
+            # server of the fleet with its address, the agent that the manager named for them (door_fleet) or null,
+            # and the manager, which holds them in a fleet with no DevOps agent. The app takes a server only when its
+            # own Tailscale and the server itself say the same, and an agent only when its server says that it runs
+            # alone there: the hub proposes, and names no host and no caller to the door.
+            "fleet": fleet_view(TEAM)}
+
+
+def fleet_view(team):
+    """The `fleet` key of GET /ui/door: {servers: {name: address}, holder, manager}. manager: the fleet's manager when
+    it can hold them, alone on a Linux server that is not the hub's (fleet_holder_refusal), else null."""
+    named = (team.get("door") or {}).get("fleet")
+    manager = next((n for n, a in (team.get("agents") or {}).items() if a.get("role") == "manager"), None)
+    return {"servers": dict(sorted(fleet_machines(team).items())),
+            "holder": named if named in (team.get("agents") or {}) else None,
+            "manager": manager if manager and fleet_holder_refusal(team, manager) is None else None}
 
 
 DOOR_PENDING = {}   # {request_id: (token, record)} of one POST /ui/door/secrets: in memory only, never in a record
@@ -49701,6 +49904,11 @@ def restored_team(bundle, reset=None):
         ours = TEAM.get("addresses") or {}
         team["addresses"] = dict({m: ip for m, ip in (team.get("addresses") or {}).items()
                                   if m in ours or ip not in ours.values()}, **ours)
+        # A holding of the fleet's own servers (patch) on a machine that this fleet does not have under that name
+        # goes: the owner's app records it again for the machines that it reads on this hub.
+        named = {h for a in (team.get("agents") or {}).values() if isinstance(a, dict) and
+                 isinstance(a.get("servers"), dict) for h in a["servers"]}
+        patch_dropped(team, named - set(team["addresses"]))
         if TEAM.get("hub"):
             team["hub"] = TEAM["hub"]
         own_vault_store(team, reset if reset is not None else [])     # the hub's own server: this machine's vault

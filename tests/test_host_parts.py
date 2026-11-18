@@ -37,7 +37,8 @@ def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite(cls(name) for cls in (Files, ModeAndLock, ScriptForms, Runners, PristineRunners,
                                                      Accounts, SshdFolder, SshdCalls, SelfUpdate,
                                                      Reader, Scripts, NewApp, AppUnitAndSettings, AppRunner, AppVhost,
-                                                     ReleaseHelper, Look, LookBoxLive)
+                                                     ReleaseHelper, Look, LookBoxLive, FleetMachine, Health,
+                                                     HealthLive)
                                for name in cls.__dict__ if name.startswith("test_"))
     # The release helper again where tarfile has no data filter, as on Debian 12
     suite.addTests(ReleaseHelperWithoutFilter(name) for name in ReleaseHelper.__dict__ if name.startswith("test_"))
@@ -711,7 +712,8 @@ class ScriptForms(HostCase):
         self.assertRegex(said, r"\nscript +own +a bash script in the box of exec, under the rollback timer")
         self.assertRegex(said, r"\nrun +full +a bash script as root with no box, under the rollback timer")
         self.assertRegex(said, r"\nlook +look +a bash script that reads this host's files, in a box with no write")
-        self.assertEqual(ROOT.VERSION, 3)
+        self.assertRegex(said, r"\nhealth +rule +why this host failed or is slow: the last boots")
+        self.assertEqual(ROOT.VERSION, 4)
 
 
 def git(*args, cwd=None):
@@ -3033,6 +3035,355 @@ class Accounts(HostCase):
                 self.call("purge", bad)
 
 
+class FleetMachine(HostCase):
+    """A machine of the fleet, a server that runs agents or the hub (the owner, 17 November 2026: the DevOps agent
+    holds the fleet's own servers through the door, with fixed root forms and no root shell). Its mark is ops-root's
+    own: with it the host is rule-only whatever its mode file says, and no form compares or deletes a file or places
+    a key there."""
+
+    def test_the_mark_makes_the_host_rule_only_whatever_the_mode_file_says(self):
+        self.put("/etc/ops-root/mode", "fix\n")
+        self.assertEqual(ROOT.mode(), "fix")
+        for mark in ("/etc/ops-root/fleet", "/etc/ops-root/fleet-kit"):
+            with self.subTest(mark=mark):
+                self.put(mark, "")
+                self.assertTrue(ROOT.fleet_machine())
+                self.assertEqual(ROOT.mode(), "rule-only")
+                self.assertIn(f"ops-root {ROOT.VERSION}, mode rule-only, release none", self.call("help"))
+                for op, args in (("exec", ["ls", "/etc"]), ("file", ["/etc/nginx/x.conf", "0644", "root"]),
+                                 ("script", []), ("run", []), ("look", []), ("install", ["htop"])):
+                    with self.subTest(op=op), self.assertRaisesRegex(
+                            ROOT.Refused, "this host is rule-only: only rule forms run here, and no file install"):
+                        self.call(op, *args, data=b"x" if op in ("file", "script", "run", "look") else None)
+                os.remove(self.tmp + mark)
+        self.assertFalse(ROOT.fleet_machine())
+        self.assertEqual(ROOT.mode(), "fix")
+
+    def test_no_form_compares_or_deletes_a_file_or_places_a_key_there(self):
+        """Two empty files are "the same", so on a host without the mark drop deletes one of them: on a machine of the
+        fleet that file can be the linger mark of an agent's user, without which its helper does not start again."""
+        os.makedirs(self.tmp + "/var/lib/systemd/linger")
+        self.put("/var/lib/systemd/linger/fleet-ada", "")
+        self.put("/var/lib/systemd/linger/fleet-otto", "")
+        self.put("/etc/nginx/app.env", "TOKEN=old\n")
+        old = hashlib.sha256(b"old").hexdigest()
+        ada, otto = "/var/lib/systemd/linger/fleet-ada", "/var/lib/systemd/linger/fleet-otto"
+        self.assertEqual(sorted(ROOT.FLEET_REFUSED), ["covers", "drop", "place", "same"])
+        self.put("/etc/ops-root/fleet", "")
+        for op, args, data in (("same", [ada, otto], None), ("covers", [ada, otto], None), ("drop", [ada], None),
+                               ("place", ["/etc/nginx/app.env", "TOKEN", old], b"new")):
+            with self.subTest(op=op), self.assertRaisesRegex(
+                    ROOT.Refused, f"this host is a machine of the fleet, where agents run and their keys are: {op} "):
+                self.call(op, *args, data=data)
+        self.assertTrue(os.path.exists(self.tmp + ada))
+        self.assertEqual(self.get("/etc/nginx/app.env"), "TOKEN=old\n")
+        self.assertFalse(os.path.exists(self.tmp + "/var/lib/ops-root/yes.json"))    # no yes was kept for a later drop
+        os.remove(self.tmp + "/etc/ops-root/fleet")         # the same calls on a host that is none
+        self.assertEqual(self.call("same", ada, otto), "yes")
+        self.assertEqual(self.call("drop", ada), f"{ada} deleted")
+        self.assertIn("has its new value", self.call("place", "/etc/nginx/app.env", "TOKEN", old, data=b"new"))
+
+    def test_the_rule_forms_that_the_holder_needs_still_run_there_and_none_takes_the_firewall_away(self):
+        """A review of 17 November 2026: `restart nftables.service` ran on a machine of the fleet, and its stop flushes
+        every rule, ufw's too. Its reload and its enable (a start at each boot, beside ufw's) do the same."""
+        self.put("/etc/ops-root/fleet", "")
+        ran = []
+
+        def run(argv, stdin=None, timeout=900, env=None):
+            ran.append(argv)
+            return 0, ""
+        with patch.object(ROOT, "run", run):
+            self.assertEqual(self.call("restart", "fleet-server"), "fleet-server.service restarted")
+            self.assertEqual(self.call("reboot"), "the host reboots in 5 seconds")
+            self.assertEqual(self.call("daemon-reload"), "systemd read its units again")
+            for op in ("restart", "reload", "enable"):
+                for unit in ("nftables", "nftables.service"):
+                    with self.subTest(op=op, unit=unit), self.assertRaisesRegex(
+                            ROOT.Refused, "nftables.service is not a unit of this form on a machine of the fleet: "
+                                          "each start, reload or stop of it removes every firewall rule"):
+                        self.call(op, unit)
+            self.assertEqual(self.call("restart", "ufw"), "ufw.service restarted")     # ufw applies its own rules
+        self.assertFalse([argv for argv in ran if "nftables.service" in argv])
+        self.assertIn(["systemctl", "--no-pager", "--no-ask-password", "restart", "fleet-server.service"], ran)
+        self.assertTrue(any(argv[:2] == ["systemd-run", "--on-active=5"] and argv[-2:] == ["/usr/bin/systemctl", "reboot"]
+                            for argv in ran))
+        with self.assertRaisesRegex(ROOT.Refused, "this host names no Fleet checkout"):
+            self.call("fleet-helper")       # no install of the owner's app names a kit
+        os.remove(self.tmp + "/etc/ops-root/fleet")     # a business's host can keep its firewall in nftables.conf
+        self.assertEqual(ROOT.check_args("restart", ["nftables"]), ["nftables.service"])
+
+
+class Health(HostCase):
+    """The form health (the owner, 17 November 2026): why a host failed or is slow, read as root, with nothing in the
+    answer that can hold a key. Here with a /proc and a /sys of the test's own and stand-ins for the journal."""
+    MARK = "HEALTH-MARK-6f1d"
+
+    def setUp(self):
+        super().setUp()
+        self.reads, self.ran = [], []
+        for pid, name, uid, rss in ((1, "systemd", 0, 12000), (101, "node", 1001, 900000), (102, "claude", 1001, 400000),
+                                    (201, "python3", 1002, 200000), (7, "kthreadd", 0, None)):
+            os.makedirs(f"{self.tmp}/proc/{pid}")
+            self.put(f"/proc/{pid}/status", f"Name:\t{name}\nUmask:\t0022\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n" +
+                     (f"VmRSS:\t{rss} kB\n" if rss else ""))
+            # what the form must never open: a key in an argument and one in the environment
+            self.put(f"/proc/{pid}/cmdline", f"{name}\0--token={self.MARK}-ARG\0")
+            self.put(f"/proc/{pid}/environ", f"API_KEY={self.MARK}-ENV\0")
+        os.makedirs(self.tmp + "/proc/pressure")
+        self.put("/proc/pressure/memory", "some avg10=12.50 avg60=3.10 avg300=0.80 total=4242\n"
+                                          "full avg10=9.00 avg60=2.00 avg300=0.50 total=3131\n")
+        self.put("/proc/meminfo", "MemTotal:        4005432 kB\nMemFree:  100 kB\nMemAvailable:    1024000 kB\n"
+                                  "SwapTotal:       2097148 kB\nSwapFree:        1048576 kB\n")
+        self.put("/proc/loadavg", "0.52 0.61 0.70 2/345 6789\n")
+        self.put("/proc/uptime", "93784.12 180000.00\n")
+        folder = "/sys/fs/cgroup/user.slice/user-1001.slice"
+        os.makedirs(self.tmp + folder)
+        for name, text in (("memory.current", "1363148800\n"), ("memory.high", "2147483648\n"), ("memory.max", "max\n"),
+                           ("memory.swap.current", "0\n"),
+                           ("memory.events", "low 0\nhigh 7\nmax 2\noom 1\noom_kill 1\noom_group_kill 0\n")):
+            self.put(f"{folder}/{name}", text)
+        # one limit for all users' processes together, on their common group, as a server's install sets it
+        for name, text in (("memory.current", "1572864000\n"), ("memory.high", "max\n"), ("memory.max", "3221225472\n"),
+                           ("memory.swap.current", "104857600\n"),
+                           ("memory.events", "low 0\nhigh 0\nmax 4\noom 2\noom_kill 2\noom_group_kill 0\n")):
+            self.put(f"/sys/fs/cgroup/user.slice/{name}", text)
+        self.boots = ["IDX BOOT ID                          FIRST ENTRY                 LAST ENTRY\n",
+                      " -1 9c849f79ea844b4baadc630ee03469e5 Mon 2026-11-16 20:00:01 UTC Tue 2026-11-17 06:58:04 UTC\n",
+                      "  0 39315ae6f5b44ee4999b3bd839ca7ffc Tue 2026-11-17 06:59:23 UTC Tue 2026-11-17 08:00:00 UTC\n"]
+        self.end = [json.dumps({"__REALTIME_TIMESTAMP": "1794898684000000", "MESSAGE_ID": None,
+                                "_TRANSPORT": "journal"}) + "\n"]
+        self.kernel = {"0": [], "-1": [
+            "2026-11-17T06:36:12+0000 worker-7 kernel: node invoked oom-killer: gfp_mask=0x140cca, order=0\n",
+            "2026-11-17T06:36:12+0000 worker-7 kernel: oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),"
+            "task_memcg=/user.slice/user-1001.slice/user@1001.service/app.slice/x.scope,task=node,pid=101,uid=1001\n",
+            "2026-11-17T06:36:12+0000 worker-7 kernel: Out of memory: Killed process 101 (node) total-vm:1kB\n"]}
+        self.pressure = {"0": [], "-1": ["2026-11-17T06:40:00+0000 worker-7 systemd-journald[300]: Under memory "
+                                         "pressure, flushing caches.\n"] * 25}
+
+        def tail_count(argv, keep=ROOT.HEALTH_LINES, timeout=ROOT.HEALTH_WAIT):
+            self.ran.append(argv)
+            if "--list-boots" in argv:
+                lines = self.boots
+            elif "--output-fields=MESSAGE_ID,_TRANSPORT" in argv:
+                lines = self.end
+            else:
+                boot = argv[argv.index("-b") + 1]
+                lines = (self.kernel if "_TRANSPORT=kernel" in argv else self.pressure)[boot]
+                if not lines:
+                    return 1, 0, []         # journalctl --grep with no entry that fits
+            return 0, len(lines), lines[-keep:]
+
+        def run(argv, stdin=None, timeout=900, env=None):
+            self.ran.append(argv)
+            if argv[0] == "last":
+                return 0, ("fleet    pts/0        100.64.0.9 Tue Nov 17 07:00:00 2026   still logged in\n"
+                           "reboot   system boot  6.8.0-149-generic Tue Nov 17 06:59:23 2026   still running\n"
+                           "shutdown system down  6.8.0-149-generic Mon Nov 16 19:59:50 2026 - Mon Nov 16 20:00:01 2026\n")
+            return 0, "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        38G   12G   25G  33% /\n"
+        real_read, real_health_read = ROOT.read, ROOT.health_read
+
+        def read(path, default=""):
+            self.reads.append(path)
+            return real_read(path, default)
+
+        def health_read(path):
+            self.reads.append(path)
+            return real_health_read(path)
+        for name, stand_in in (("tail_count", tail_count), ("run", run), ("read", read), ("health_read", health_read)):
+            patcher = patch.object(ROOT, name, stand_in)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        names = {1001: "fleet-ada", 1002: "fleet-otto", 0: "root"}
+        patcher = patch.object(ROOT.pwd, "getpwuid", lambda uid: type("U", (), {"pw_name": names[uid]})())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_it_is_a_rule_form_that_reads_and_takes_no_argument_and_nothing_on_stdin(self):
+        f = ROOT.FORMS["health"]
+        self.assertEqual((f["kind"], f["write"], f["window"], f["reboot"]), ("rule", False, None, False))
+        with self.assertRaisesRegex(ROOT.Refused, "health takes no arguments"):
+            self.call("health", "node")
+        with self.assertRaisesRegex(ROOT.Refused, "health takes nothing on stdin"):
+            self.call("health", data=b"x")
+        d = door_targets.decide({"agents": {"theo": {"business": "amura", "servers": {"worker-7": "fix"}}},
+                                 "hosts": {"worker-7": {"business": "fleet", "mode": "rule-only", "kind": "fleet"}}},
+                                "theo", "worker-7", "health", [])
+        self.assertEqual((d.kind, d.write, d.form), ("read", False, "health"))
+
+    def test_it_says_what_the_host_s_memory_did_and_how_the_boot_before_ended(self):
+        out = self.call("health")
+        self.assertIn("up 1 d 2 h 3 min, load 0.52 0.61 0.70", out.splitlines()[0])
+        self.assertIn("  -1 9c849f79ea844b4baadc630ee03469e5 Mon 2026-11-16 20:00:01 UTC Tue 2026-11-17 06:58:04 UTC", out)
+        self.assertNotIn("IDX BOOT ID", out)
+        self.assertIn("the boot before this one did NOT shut down: its journal ends at 2026-11-17 06:58:04 UTC with no "
+                      "stop of the journal, as after a hard restart, a loss of power or a freeze", out)
+        self.assertIn("  reboot   system boot  6.8.0-149-generic Tue Nov 17 06:59:23 2026   still running", out)
+        self.assertIn("  shutdown system down", out)
+        self.assertNotIn("pts/0", out)          # never a login of the login log
+        self.assertIn("memory: 3911 MiB in all, 1000 MiB available; swap: 2047 MiB in all, 1024 MiB free", out)
+        self.assertIn("some avg10=12.50 avg60=3.10 avg300=0.80 total=4242; full avg10=9.00", out)
+        self.assertIn("this boot: no out-of-memory lines of the kernel", out)
+        self.assertIn("this boot: no memory-pressure lines of journald and systemd-oomd", out)
+        self.assertIn("the boot before: 3 out-of-memory lines of the kernel:", out)
+        self.assertIn("  2026-11-17T06:36:12+0000 worker-7 kernel: Out of memory: Killed process 101 (node)", out)
+        self.assertIn("the boot before: 25 memory-pressure lines of journald and systemd-oomd, the newest 20:", out)
+        self.assertEqual(out.count("Under memory pressure, flushing caches."), 20)
+        self.assertIn("  fleet-ada: 1269 MiB in 2 processes\n  fleet-otto: 195 MiB in 1 process\n  root: 11 MiB in 1 "
+                      "process\n", out)
+        # the limit of all users together first (a review of 17 November 2026: it was not read), then each user's
+        self.assertIn("memory limits, of all users together and of each user:\n  all users together: 1500 MiB now, "
+                      "slows at none, stops at 3072 MiB, swap 100 MiB; times slowed 0, times at the stop 4, processes "
+                      "ended by it 2\n  fleet-ada: 1300 MiB now, slows at 2048 MiB, stops at none, swap 0 MiB; times "
+                      "slowed 7, times at the stop 2, processes ended by it 1", out)
+        self.assertIn("  878 MiB fleet-ada node\n  390 MiB fleet-ada claude\n  195 MiB fleet-otto python3\n  11 MiB root "
+                      "systemd", out)
+        self.assertNotIn("kthreadd", out)       # a kernel thread holds no memory of its own
+        self.assertIn("disk:\n  Filesystem      Size  Used Avail Use% Mounted on\n  /dev/sda1        38G", out)
+        self.assertLess(len(out), ROOT.OUT_MAX)
+
+    def test_a_boot_that_shut_down_says_so_and_a_host_with_one_boot_says_nothing_of_another(self):
+        self.end = [json.dumps({"__REALTIME_TIMESTAMP": "1794898680000000", "MESSAGE_ID": "x"}) + "\n",
+                    json.dumps({"__REALTIME_TIMESTAMP": "1794898684000000", "MESSAGE_ID": ROOT.JOURNAL_STOP,
+                                "_TRANSPORT": "driver"}) + "\n"]
+        self.assertIn("the boot before this one ended with a shutdown: its journal stops in order, at 2026-11-17 "
+                      "06:58:04 UTC", self.call("health"))
+        end = [argv for argv in self.ran if "--output-fields=MESSAGE_ID,_TRANSPORT" in argv]
+        self.assertEqual(end[-1][:7], ["journalctl", "--no-pager", "-q", "-b", "-1", "-n", str(ROOT.HEALTH_END)])
+        # A process can write an entry with journald's stop id as the last one before a hard restart: only journald's
+        # own transport counts, a field that a process cannot set (found by a reviewer of this change)
+        self.end = [json.dumps({"__REALTIME_TIMESTAMP": "1794898684000000", "MESSAGE_ID": ROOT.JOURNAL_STOP,
+                                "_TRANSPORT": "journal"}) + "\n",
+                    json.dumps({"__REALTIME_TIMESTAMP": "1794898684000000", "MESSAGE_ID": ROOT.JOURNAL_STOP}) + "\n"]
+        self.assertIn("the boot before this one did NOT shut down", self.call("health"))
+        self.boots = self.boots[:1] + self.boots[2:]
+        self.ran.clear()
+        out = self.call("health")
+        self.assertNotIn("the boot before", out)
+        self.assertFalse([argv for argv in self.ran if "-1" in argv])       # no read of a boot that the journal lacks
+
+    def test_it_never_reads_an_argument_or_an_environment_and_never_prints_one(self):
+        """A machine of the fleet holds every agent's keys, and a key can be in a process's arguments or environment:
+        the answer holds neither, and the form opens neither file. A journal line is the host's own word: its control
+        characters are replaced and it is cut."""
+        self.kernel["0"] = [f"2026-11-17T08:00:00+0000 w kernel: Out of memory: Killed process 9 (evil\x1b[2J‮) "
+                            + "x" * 900 + "\n"]
+        out = self.call("health")
+        self.assertNotIn(self.MARK, out)
+        self.assertEqual([path for path in self.reads if path.endswith(("cmdline", "environ"))], [])
+        opened = {path.rsplit("/", 1)[1] for path in self.reads if path.startswith("/proc/1")}
+        self.assertEqual(opened, {"status"})
+        self.assertIn("(evil?[2J?)", out)
+        self.assertNotIn("\x1b", out)
+        self.assertFalse([line for line in out.splitlines() if len(line) > ROOT.HEALTH_LINE + 2])
+        for argv in self.ran:               # each program gets fixed arguments: nothing of a caller's, and no shell
+            self.assertIn(argv[0], ("journalctl", "last", "df"))
+        journal = [argv for argv in self.ran if argv[0] == "journalctl" and "--grep" in argv]
+        self.assertEqual({tuple(a for a in argv if a.startswith(("_TRANSPORT=", "_SYSTEMD_UNIT="))) for argv in journal},
+                         {("_TRANSPORT=kernel",),
+                          ("_SYSTEMD_UNIT=systemd-journald.service", "_SYSTEMD_UNIT=systemd-oomd.service")})
+        # the kernel's lines are taken with their letters as they are, the two units' lines in any case
+        self.assertEqual({("--case-sensitive=true" in argv, "_TRANSPORT=kernel" in argv) for argv in journal},
+                         {(True, True), (False, False)})
+
+    def test_only_the_kernel_s_own_out_of_memory_lines_fit(self):
+        """A process's name is in other lines of the kernel (a crash names it first), and a process chooses its name:
+        15 characters at most. Each phrase starts the kernel's line and is longer than a name, so a process with a
+        name such as "Out of memory" that crashes makes no line that pushes the real ones out of the answer."""
+        fits = re.compile(ROOT.OOM_WORDS)
+        for line in ("Out of memory: Killed process 1547 (python3) total-vm:1852756kB, anon-rss:1777424kB",
+                     "Out of memory (oom_kill_allocating_task): Killed process 7 (node) total-vm:1kB",
+                     "Memory cgroup out of memory: Killed process 1379 (python3) total-vm:632040kB",
+                     "oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/user.slice",
+                     "python3 invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=200",
+                     "systemd-journal invoked oom-killer: gfp_mask=0x140dca(GFP_HIGHUSER_MOVABLE), order=0",
+                     "oom_reaper: reaped process 1547 (python3), now anon-rss:0kB, file-rss:0kB, shmem-rss:0kB"):
+            self.assertTrue(fits.search(line), line)
+        for line in ("Out of memory[4711]: segfault at 0 ip 0000 sp 0000 error 4 in libc.so",
+                     "Out of memory:[4711]: segfault at 0 ip 0000 sp 0000 error 4",
+                     "oom-kill:constr[4711]: segfault at 0", "out of memory: killed process 1 (x)",
+                     "audit: type=1400 comm=\"x\" name=\"Out of memory: Killed process 1 (y)\"",
+                     "x invoked oom-killer", "EXT4-fs (sda1): Out of memory: Killed process"):
+            self.assertFalse(fits.search(line), line)
+        self.assertTrue(all(len(phrase) > 15 for phrase in ("Out of memory: Killed process ", "oom-kill:constraint=",
+                                                            "Memory cgroup out of memory", " invoked oom-killer: ",
+                                                            "oom_reaper: reaped process ")))
+
+    def test_a_name_that_is_no_utf_8_and_a_part_that_fails_stop_no_other_part(self):
+        """A process chooses its name, and the kernel writes its bytes as they are: one that is no UTF-8 stopped the
+        whole form with a traceback, so each agent of the server could stop it at will (found by a reviewer of this
+        change). And a part whose own read fails says so in one line: the form never ends with a traceback."""
+        with open(self.tmp + "/proc/101/status", "wb") as f:
+            f.write(b"Name:\tcaf\xe9\xff\nUid:\t1001\t1001\t1001\t1001\nVmRSS:\t900000 kB\n")
+        out = self.call("health")
+        self.assertIn("  878 MiB fleet-ada caf", out)
+        self.assertIn("  fleet-ada: 1269 MiB in 2 processes", out)
+        with patch.object(ROOT, "health_processes", side_effect=RuntimeError("no")), \
+                patch.object(ROOT, "health_boots", side_effect=KeyError("x")):
+            out = self.call("health")
+        self.assertIn("the last boots: not read (KeyError)", out)
+        self.assertIn("memory by user: not read (RuntimeError)", out)
+        self.assertIn("memory: 3911 MiB in all", out)
+        self.assertIn("disk:\n  Filesystem", out)
+
+    def test_the_disk_s_rows_stay_when_one_mount_does_not_answer(self):
+        """df ends with 1 when one mount does not answer root, a user's own mount for example: the other rows stay."""
+        rows = "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        38G   12G   25G  33% /\n"
+
+        def run(argv, stdin=None, timeout=900, env=None):
+            if argv[0] == "df":
+                return 1, "df: /run/user/1001/doc: Permission denied\n" + rows
+            return 127, "last is not on this host"
+        with patch.object(ROOT, "run", run):
+            out = self.call("health")
+        self.assertIn("disk:\n  df: /run/user/1001/doc: Permission denied\n  Filesystem", out)
+        self.assertNotIn("reboot and shutdown records", out)        # a host with no such program: no part for it
+        with patch.object(ROOT, "run", lambda argv, stdin=None, timeout=900, env=None: (127, "df is not on this host")):
+            self.assertIn("disk: not read (status 127)", self.call("health"))
+
+    def test_a_journal_that_does_not_answer_fails_no_other_part(self):
+        def tail_count(argv, keep=ROOT.HEALTH_LINES, timeout=ROOT.HEALTH_WAIT):
+            return 124, 0, []
+        with patch.object(ROOT, "tail_count", tail_count):
+            out = self.call("health")
+        self.assertIn("the journal's list of boots was not read (status 124)", out)
+        self.assertIn("this boot: the out-of-memory lines of the kernel were not read (status 124)", out)
+        self.assertIn("memory: 3911 MiB in all", out)
+        self.assertIn("  878 MiB fleet-ada node", out)
+
+    def test_tail_count_counts_every_line_and_keeps_the_newest_and_ends_a_program_that_is_late(self):
+        # the stand-in of setUp is in place of ROOT.tail_count: the real one comes from the file again
+        real = door_targets.load("ops_root_real", os.path.join(door_targets.HERE, "host", "ops-root")).tail_count
+        self.assertEqual(real(["/bin/sh", "-c", "seq 1 500"], keep=3), (0, 500, ["498\n", "499\n", "500\n"]))
+        self.assertEqual(real(["/bin/sh", "-c", "exit 1"]), (1, 0, []))
+        self.assertEqual(real(["/nonexistent/program"]), (127, 0, []))
+        started = time.monotonic()
+        self.assertEqual(real(["/bin/sh", "-c", "echo first; exec sleep 30"], timeout=0.5)[::2], (124, ["first\n"]))
+        self.assertLess(time.monotonic() - started, 10)
+
+
+@unittest.skipUnless(sys.platform == "linux" and os.path.isdir("/proc/self"), "the real /proc of a Linux host")
+class HealthLive(unittest.TestCase):
+    """health against the real /proc of the host that runs this test: a real process holds a marker in its arguments
+    and in its environment, and the whole answer holds neither. As root on a host with systemd it reads the real
+    journal too; the kernel's own lines after a real out-of-memory kill are read on a temporary server."""
+    MARK = "HEALTH-LIVE-MARK-93ac"
+
+    def test_a_real_process_s_arguments_and_environment_are_not_in_the_answer(self):
+        child = subprocess.Popen(["/bin/sleep", "300", f"--token={self.MARK}-ARG"], stdin=subprocess.DEVNULL,
+                                 env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "API_KEY": f"{self.MARK}-ENV"})
+        try:
+            with open(f"/proc/{child.pid}/cmdline", "rb") as f:        # the marker is there for a program that reads it
+                self.assertIn(f"{self.MARK}-ARG".encode(), f.read())
+            out = ROOT.call({"v": 1, "op": "health", "args": []})
+        finally:
+            child.kill()
+            child.wait()
+        self.assertNotIn(self.MARK, out)
+        self.assertIn("memory by user, the sum of its processes:", out)
+        self.assertRegex(out, r"memory: \d+ MiB in all, \d+ MiB available; swap: ")
+        self.assertIn("disk:\n", out)
+
+
 class Scripts(unittest.TestCase):
     """The two install scripts parse, refuse to run as another user, and name each part the plan names."""
 
@@ -3112,6 +3463,55 @@ class Scripts(unittest.TestCase):
         self.assertEqual(commands[:2], ["systemctl kill ops-sshd.service 2>/dev/null || true",
                                         "systemctl disable --now ops-sshd.service 2>/dev/null || true"])
         self.assertIn(f"rm -rf {os.path.dirname(ROOT.SSHD_CALLS_KEEP)}\n", remove)
+
+    def test_a_machine_of_the_fleet_takes_only_a_rule_only_install_and_keeps_its_mark(self):
+        """install.sh --fleet (the owner, 17 November 2026: the DevOps agent holds the fleet's own servers with fixed
+        root forms and no root shell): its own check, run with its paths in a temporary folder. The mark goes on only
+        with --mode rule-only, and a host that has it takes no install at fix or at read until --remove."""
+        with open("host/install.sh") as f:
+            text = f.read()
+        # the owner's app asks the door for exactly this line before it installs a machine of the fleet
+        # (DoorAccess.fleetProbe), so that a door of an older release gets no option that its script does not know
+        self.assertIn("\n        --fleet) FLEET=1; shift ;;\n", text)
+        start = text.index('if [ "$FLEET" = 1 ] || [ -e "$ETC/fleet" ]')
+        check = 'die() { echo "install.sh: $*" >&2; exit 1; }\n' + text[start:text.index("\nfi\n", start) + 4]
+        self.assertLess(start, text.index("apt-get install -y"))        # before the install changes the host
+        self.assertLess(start, text.index('install -d -m 0755 -o root -g root "$ETC" "$LIB"'))
+        with tempfile.TemporaryDirectory() as tmp:
+            def run(level, mode, fleet="0", kit=""):
+                return subprocess.run(["bash", "-c", "set -euo pipefail\n" + check], capture_output=True, text=True,
+                                      env={"PATH": os.environ["PATH"], "ETC": tmp, "LEVEL": level, "MODE": mode,
+                                           "FLEET": fleet, "KIT": kit})
+            self.assertEqual(run("fix", "fix").returncode, 0)                   # a business's server, as before
+            self.assertEqual(run("read", "").returncode, 0)
+            self.assertEqual(run("fix", "rule-only", "1").returncode, 0)
+            for level, mode, fleet, kit in (("fix", "fix", "1", ""), ("read", "", "1", ""), ("fix", "fix", "0", "/k")):
+                refused = run(level, mode, fleet, kit)
+                self.assertEqual(refused.returncode, 1)
+                self.assertIn("a machine of the fleet takes --level fix --mode rule-only and no other", refused.stderr)
+            for mark in ("fleet", "fleet-kit"):                                  # a host that has the mark already
+                open(os.path.join(tmp, mark), "w").close()
+                self.assertEqual(run("fix", "fix").returncode, 1)
+                self.assertEqual(run("read", "").returncode, 1)
+                self.assertEqual(run("fix", "rule-only").returncode, 0)
+                os.remove(os.path.join(tmp, mark))
+            # the level's own block writes the mark, and a later install without --fleet leaves it there
+            start = text.index('if [ "$LEVEL" = fix ]; then')
+            block = text[start:text.index("\nfi\n", start) + 4].replace(
+                'visudo -c -q -f "$SUDOERS.new" >/dev/null', "true").replace(
+                'install -m 0755 -o root -g root "$HERE/ops-root" "$SBIN"', "true")
+            env = {"PATH": os.environ["PATH"], "LEVEL": "fix", "MODE": "rule-only", "ETC": tmp, "KIT": "", "POOL": "",
+                   "BUILD_FILE": "", "RUNNER_USER": "", "SBIN": os.path.join(tmp, "ops-root"),
+                   "SUDOERS": os.path.join(tmp, "sudoers"), "STATE": os.path.join(tmp, "state"), "HERE": tmp}
+            for fleet, there in (("0", False), ("1", True), ("0", True)):
+                subprocess.run(["bash", "-c", "set -euo pipefail\nHIDDEN=()\n" + block], check=True,
+                               capture_output=True, env=dict(env, FLEET=fleet))
+                self.assertEqual(os.path.exists(os.path.join(tmp, "fleet")), there)
+            self.assertEqual(os.stat(os.path.join(tmp, "fleet")).st_mode & 0o777, 0o644)
+            with open(os.path.join(tmp, "mode")) as f:
+                self.assertEqual(f.read(), "rule-only\n")
+        remove = text[text.index("remove() {"):text.index("\n}\n", text.index("remove() {"))]
+        self.assertIn('rm -rf "$ETC" "$LIB" "$STATE" "$SBIN"', remove)          # --remove takes the mark away
 
     def test_read_takes_away_the_files_that_only_ops_root_reads(self):
         """From Fix down to Read, ops-root's own files go with it, so a later Fix without one of their options finds

@@ -10,7 +10,9 @@
 # A remove leaves the apps that ops-root's app-new made, which are the owner's: while one is there, the release helper
 # and the apps' settings stay, because each /usr/local/sbin/<app>-deploy is a link to that helper.
 #
-# Options of a Fix host: --hidden <path> (an app tree or a secret path more, again for each), --fleet-kit <path> (a
+# Options of a Fix host: --fleet (a machine of the fleet, a server that runs agents or the hub: only with --mode
+# rule-only; its mark stays until --remove, and ops-root then runs no form that compares or deletes a file or places a
+# key), --hidden <path> (an app tree or a secret path more, again for each), --fleet-kit <path> (a
 # Fleet machine's checkout), --pool <lvm path> (a CI host's pool volume), --build-file <path> (a CI host's sparse ext4
 # file on a loop device, which holds its runners' builds) and --runner-user <user> (a CI host's rootless Docker user,
 # whose containers are its runners). The app names neither: when an install named neither, ops-root finds both on the
@@ -25,7 +27,7 @@ set -euo pipefail
 umask 022
 
 PORT=2244
-LEVEL="" MODE="" DOOR_KEY="" REMOVE=0 KIT="" POOL="" BUILD_FILE="" RUNNER_USER="" ADDRESS=""
+LEVEL="" MODE="" DOOR_KEY="" REMOVE=0 KIT="" POOL="" BUILD_FILE="" RUNNER_USER="" ADDRESS="" FLEET=0
 HIDDEN=()
 COVERED="ubuntu:24.04 ubuntu:26.04"          # the releases whose test 5 ran on a temporary server
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -43,6 +45,7 @@ while [ $# -gt 0 ]; do
         --mode) MODE="$2"; shift 2 ;;
         --door-key) DOOR_KEY="$2"; shift 2 ;;
         --hidden) HIDDEN+=("$2"); shift 2 ;;
+        --fleet) FLEET=1; shift ;;
         --fleet-kit) KIT="$2"; shift 2 ;;
         --pool) POOL="$2"; shift 2 ;;
         --build-file) BUILD_FILE="$2"; shift 2 ;;
@@ -111,6 +114,12 @@ case "$LEVEL" in
     fix) case "$MODE" in fix|rule-only) ;; *) die "--level fix needs --mode fix or --mode rule-only" ;; esac ;;
     *) die "--level is read or fix" ;;
 esac
+# A machine of the fleet holds every agent's keys: it is rule-only, and it stays one until --remove. So --fleet goes
+# only with --mode rule-only, and a host that has the mark takes no other install.
+if [ "$FLEET" = 1 ] || [ -e "$ETC/fleet" ] || [ -n "$KIT" ] || [ -e "$ETC/fleet-kit" ]; then
+    [ "$LEVEL" = fix ] && [ "$MODE" = rule-only ] || \
+        die "a machine of the fleet takes --level fix --mode rule-only and no other: --remove takes its mark away"
+fi
 [[ "$DOOR_KEY" =~ ^ssh-ed25519\ [A-Za-z0-9+/=]{60,100}(\ [A-Za-z0-9@._-]{1,64})?$ ]] || \
     die "--door-key is the door's ssh-ed25519 public key"
 for f in ops-read inventory app-release release-key.pub; do [ -f "$HERE/$f" ] || die "$f is not beside this script"; done
@@ -253,6 +262,7 @@ if [ "$LEVEL" = fix ]; then
     echo "$MODE" > "$ETC/mode"
     printf '%s\n' "${HIDDEN[@]+"${HIDDEN[@]}"}" | grep '^/' > "$ETC/hidden" || true
     [ -z "$KIT" ] || echo "$KIT" > "$ETC/fleet-kit"
+    if [ "$FLEET" = 1 ]; then : > "$ETC/fleet"; chmod 0644 "$ETC/fleet"; fi
     [ -z "$POOL" ] || echo "$POOL" > "$ETC/pool"
     [ -z "$BUILD_FILE" ] || echo "$BUILD_FILE" > "$ETC/build-file"
     [ -z "$RUNNER_USER" ] || echo "$RUNNER_USER" > "$ETC/runner-user"

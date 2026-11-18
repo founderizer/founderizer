@@ -310,6 +310,11 @@ def decide_host(access, agent, me, host, op, args, never, content=None, lookups=
         checked = OPS_ROOT.check_args(op, list(args))
     except OPS_ROOT.Refused as e:
         return refused(str(e), **common)
+    # A machine of the fleet, a server that runs agents or the hub: ops-root runs no form there that compares or
+    # deletes a file (FLEET_REFUSED), and the door says so first, with the host's own reason
+    if h.get("kind") == "fleet" and op in OPS_ROOT.FLEET_REFUSED:
+        return refused(f"{host} is a machine of the fleet, where agents run and their keys are: {op} "
+                       f"{OPS_ROOT.FLEET_REFUSED[op]} there", **common)
     value = None
     if op in DOOR_VALUE:            # N4: 32 random bytes of the door, or the key that the owner saved for this setting
         if content:

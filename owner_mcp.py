@@ -2913,9 +2913,11 @@ def tools():
                              "(~/.founderizer/cli) gives that secret with the owner's signature, as the owner does "
                              "in the app, on Secrets. A give that the reading "
                              "cannot judge is sent, and an end of a hold (level null) always goes. A server "
-                             "(server:<name> read|fix) is not given here: the owner's app gives each server that "
-                             "carries a business's Tailscale tag to that business's DevOps agent (or the manager "
-                             "while it has none), because it also puts the host's parts in place.",
+                             "(server:<name> read|fix|patch) is not given here, because the owner's app also puts "
+                             "the host's parts in place: it gives each server that carries a business's Tailscale "
+                             "tag to that business's DevOps agent (or the manager while it has none), and each "
+                             "Linux server of the fleet itself at patch (its fixed root forms only) to one agent, "
+                             "which the manager can name with door_fleet.",
              {"resource": S["text"], "agent": S["text"], "level": S["level"], **rid},
              ("resource", "agent", "level"), grant_access),
         tool("share_resource", "The owner's standing for one resource in the grantable pool: the manager may hand it "

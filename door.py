@@ -329,11 +329,15 @@ def own_servers(data):
 
 
 def own_server(own, host):
-    """"hub" or "door" for a host at one of the addresses of own_servers, or None."""
+    """"hub" or "door" for a host at one of the addresses of own_servers, "fleet" for a host that the file marks as a
+    machine of the fleet (kind fleet: a server where agents run, the owner, 17 November 2026), or None. Root on each of
+    them opens keys of the whole fleet, so each is rule-only, never fix: validate_access refuses a file that says fix
+    there, and Door.access reads such a file with the host at rule-only."""
     try:
-        return own.get(ipaddress.ip_address(host.get("address"))) if isinstance(host.get("address"), str) else None
+        found = own.get(ipaddress.ip_address(host.get("address"))) if isinstance(host.get("address"), str) else None
     except ValueError:
-        return None
+        found = None
+    return found or ("fleet" if host.get("kind") == "fleet" else None)
 
 
 def validate_access(data):

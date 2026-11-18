@@ -137,8 +137,112 @@ class ServerKind(Access):
         with self.assertRaisesRegex(ValueError, "free root on its own server"):
             hub.validate_team(team)
         team["agents"]["vps"]["servers"] = {"web-1": "admin"}
-        with self.assertRaisesRegex(ValueError, "read or fix"):
+        with self.assertRaisesRegex(ValueError, "read, patch or fix"):
             hub.validate_team(team)
+
+    def linux(self, *servers):
+        """These servers of the fixture are Linux servers of the fleet, by team.json's own record."""
+        team = self.origin_team()
+        team["servers"] = dict(team.get("servers") or {}, **{name: {"kind": "linux", "user": "fleet"} for name in servers})
+        self.write_team(team)
+
+    def test_a_machine_of_the_fleet_is_held_at_patch_and_its_holder_s_own_server_too(self):
+        """The fleet's own servers through the door (the owner, 17 November 2026, after three of them ran out of
+        memory and each time a card asked him for a root command: "someone should probably have root, I dont want to
+        be doing devops work on the fleet!"). The owner's app records them for one agent at patch: fixed root forms,
+        and no command of the agent's own, so such a holding is no Fix, and the server still takes a new agent."""
+        self.linux("vps")
+        self.assertEqual(hub.fleet_machines(hub.TEAM), {"hub": hub.TEAM["addresses"]["hub"],
+                                                        "vps": hub.TEAM["addresses"]["vps"]})    # no Mac, no unknown
+        status, receipt = self.grant(agent="lead", server="vps", level="patch")
+        self.assertEqual((status, receipt.get("level"), receipt.get("mode")), (200, "patch", "rule-only"), receipt)
+        self.assertEqual(self.grant(agent="lead", server="hub", level="patch")[0], 200)
+        self.assertEqual(self.origin_team()["agents"]["lead"]["servers"], {"hub": "patch", "vps": "patch"})
+        self.assertEqual(hub.resource_recorded("server:vps", "lead"), "patch")
+        self.assertEqual((hub.fix_holders(hub.TEAM, "vps"), hub.fix_holders(hub.TEAM, "hub")), ([], []))
+        self.assertEqual(hub.door_callers_at(hub.TEAM, "lead-box"), ["lead"])       # the door knows it by its server
+        view, servers = self.servers()
+        self.assertNotIn("fix_holder", servers["vps"]["why"])
+        self.assertIn("door_caller", servers["lead-box"]["why"])
+        self.assertEqual(view["apps"], [])              # nothing new on the Servers page: no row, no mode menu
+        hub.validate_team(self.origin_team())
+        # its own server: the 13 November incident was on the DevOps agent's own server
+        self.linux("vps", "lead-box")
+        status, receipt = self.grant(agent="lead", server="lead-box", level="patch")
+        self.assertEqual((status, receipt.get("mode")), (200, "rule-only"), receipt)
+        status, answer = self.grant(agent="lead", server="lead-box", level="fix")
+        self.assertEqual((status, answer["error"]), (409, "lead-box is Lead's own server, where it has free root with "
+                                                          "no door."))
+        # patch is the level of a machine of the fleet, and of no other host
+        for server in ("web-1", "mac-studio"):
+            status, answer = self.grant(agent="lead", server=server, level="patch")
+            self.assertEqual(status, 409, answer)
+            self.assertIn("is no Linux server of the fleet: patch is the level of a server that runs agents", answer["error"])
+        self.assertEqual(self.grant(agent="lead", server="vps", level="root")[0], 400)
+        # the hub's own server on a Mac is no fleet server: the host's root helper is for Linux
+        with patch.object(hub, "server_kind_of", lambda team, name: "mac" if name == "hub" else "linux"):
+            self.assertNotIn("hub", hub.fleet_machines(hub.TEAM))
+            self.assertEqual(self.grant(agent="lead", server="hub", level="patch")[0], 409)
+        # what the agent and its colleagues read
+        text = hub.holdings_start_text("lead")
+        self.assertIn("hub (patch), lead-box (patch), vps (patch); at patch", text)
+        self.assertIn("at patch, a machine of the fleet, the fixed root forms only, with `ops <server> health`, which "
+                      "says why it failed or is slow", text)
+        self.assertNotIn("look --content", text)
+        self.assertIn("servers through the door hub (patch)", hub.colleague_line("lead"))
+        # this fleet has no door, so no agent gets such a server, and the hub's words are the ones of before
+        self.assertFalse(hub.fleet_server("vps"))
+        self.assertEqual(self.grant(agent="lead", server="vps", level=None)[0], 200)
+        self.assertIn("raise a Needs-you item and say what the work needs it for",
+                      hub.access_route("studio", "server:vps", "manager"))
+        self.assertNotIn("door_fleet", hub.access_route("studio", "server:vps", "manager", "fix"))
+        self.assertIn("the owner's alone to give", hub.grant_check("vps", "server:web-1", "read"))     # as before
+
+    def test_a_machine_that_leaves_or_gets_another_name_takes_its_patch_holding_with_it(self):
+        """A holding at patch names a machine of the fleet. Remove server, a machine's new Tailscale name and a restore
+        onto another machine change the fleet's machines, and each of them was refused while the holder still had
+        that server (found by both reviewers of this change): the holding goes with the machine's name, and the
+        owner's app records it again under the name that it reads."""
+        self.joined("box", "linux", source=OTHER, user="fleet")
+        self.linux("vps")
+        for server in ("box", "vps", "hub"):
+            self.assertEqual(self.grant(agent="lead", server=server, level="patch")[0], 200, server)
+        self.assertEqual(self.grant(agent="lead", server="web-1", level="fix")[0], 200)
+        # Remove server
+        status, receipt = self.owner("/ui/servers/box/remove", base_sha256=self.team_sha())
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual(self.origin_team()["agents"]["lead"]["servers"], {"hub": "patch", "vps": "patch", "web-1": "fix"})
+        self.assertIsNone(hub.resource_recorded("server:box", "lead"))
+        # a machine's new name: the holding under the old name goes, and every other one stays
+        team = hub.renamed_machine_team(self.origin_team(), "vps", "vps-2")
+        self.assertEqual(team["agents"]["lead"]["servers"], {"hub": "patch", "web-1": "fix"})
+        hub.validate_team(team)
+        # a restore onto a hub whose machines have other names: only the holdings on machines of that fleet stay
+        copy = self.origin_team()
+        copy["addresses"]["old-box"] = "127.0.0.77"
+        copy["agents"]["lead"]["servers"]["old-box"] = "patch"
+        with patch.dict(hub.TEAM["addresses"], {"old-box": "127.0.0.77"}):
+            kept = json.loads(hub.restored_team({"config": {"team.json": json.dumps(copy)}}))
+        self.assertEqual(kept["agents"]["lead"]["servers"]["old-box"], "patch")
+        here = dict(hub.TEAM["addresses"])
+        del here["vps"]
+        with patch.dict(hub.TEAM, {"addresses": here}):
+            other = dict(copy, addresses={k: v for k, v in copy["addresses"].items() if k != "old-box"})
+            restored = json.loads(hub.restored_team({"config": {"team.json": json.dumps(other)}}))
+        self.assertNotIn("old-box", restored["agents"]["lead"]["servers"])
+        self.assertEqual(restored["agents"]["lead"]["servers"]["web-1"], "fix")
+        # a holding at patch on a host that is no machine is never a row of the servers for apps
+        team = self.origin_team()
+        team["agents"]["lead"]["servers"]["ghost-9"] = "patch"
+        hub.validate_team(team)
+        self.assertEqual([row["name"] for row in hub.app_servers_view(team)], ["web-1"])
+
+    def test_a_move_onto_a_server_that_the_agent_holds_at_patch_keeps_that_holding(self):
+        self.joined("box", "linux", source=OTHER, user="fleet")
+        self.assertEqual(self.grant(agent="lead", server="box", level="patch")[0], 200)
+        status, receipt = self.owner("/ui/team/agents/lead/move", base_sha256=self.team_sha(), server="box")
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual(self.origin_team()["agents"]["lead"]["servers"], {"box": "patch"})
 
     def test_no_new_agent_and_no_move_onto_a_server_where_another_holds_fix(self):
         self.joined("box", "linux", source=OTHER, user="fleet")
@@ -870,6 +974,114 @@ class DoorCalls(Access):
         view = self.request("/ui/door?db=test-generation", source=OWNER)[1]
         self.assertEqual((view["credentials"]["cloudflare:acme"]["agents"],
                           view["credentials"]["cloudflare:new"]["agents"]), ([], ["studio"]))
+
+    def test_door_fleet_names_the_agent_that_holds_the_fleet_s_own_servers(self):
+        """The manager names the DevOps agent (door_fleet), and GET /ui/door gives the app the fleet's Linux servers,
+        that name and the manager. The app decides: it takes a server and an agent only by what its own Tailscale and
+        the servers themselves say. A rename and a removal follow, as for the door's other names."""
+        team = self.origin_team()
+        team["servers"] = {name: {"kind": "linux", "user": "fleet"} for name in ("vps", "lead-box")}
+        self.write_team(team)
+        view = self.request("/ui/door?db=test-generation", source=OWNER)[1]
+        self.assertEqual(view["fleet"], {"servers": {"hub": hub.TEAM["addresses"]["hub"], "lead-box": "127.0.0.9",
+                                                     "vps": hub.TEAM["addresses"]["vps"]},
+                                         "holder": None, "manager": None})      # the manager runs on the hub's server
+        self.assertIn("door_fleet", [t["name"] for t in hub.tools_for("manager")])
+        self.assertNotIn("door_fleet", [t["name"] for t in hub.tools_for("vps", ("vps", "T-1", "1"))])
+        base = {"agent": "lead", "why": "the owner named it for the fleet's servers"}
+        said = hub.t_door_fleet("manager", dict(base, request_id="fleet-test-1"))
+        self.assertIn("Lead holds the fleet's own servers through the door once the owner's app has put the door's "
+                      "parts on them: fixed root forms and `ops <server> health`", said)
+        self.assertEqual(self.origin_team()["door"]["fleet"], "lead")
+        self.assertEqual(hub.t_door_fleet("manager", dict(base, request_id="fleet-test-1")), said)      # one command
+        self.assertIn("It was so already", hub.t_door_fleet("manager", dict(base, request_id="fleet-test-2")))
+        self.assertEqual(self.request("/ui/door?db=test-generation", source=OWNER)[1]["fleet"]["holder"], "lead")
+        # the door knows a caller by its server's address: an agent on a Mac or beside another agent is refused
+        for agent, why in (("studio", "runs on no Linux server of the fleet"), ("ghost", "no agent of this fleet")):
+            with self.subTest(agent=agent), self.assertRaisesRegex(hub.ToolError, why):
+                hub.t_door_fleet("manager", {"request_id": "fleet-test-9", "agent": agent, "why": "a test"})
+        team = self.origin_team()
+        team["agents"]["scout"] = {"role": "worker", "runtime": "codex", "machine": "vps", "can": ["shell"]}
+        self.write_team(team)
+        with self.assertRaisesRegex(hub.ToolError, "Vps shares vps with Scout: the door knows a caller by its "
+                                                   "server's address"):
+            hub.t_door_fleet("manager", {"request_id": "fleet-test-8", "agent": "vps", "why": "a test"})
+        for bad in ({"agent": ""}, {"agent": "lead", "why": ""}):
+            with self.subTest(bad=bad), self.assertRaises(hub.ToolError):
+                hub.t_door_fleet("manager", dict({"request_id": "fleet-test-7", "why": "a test"}, **bad))
+        # a rename and a removal
+        team = self.origin_team()
+        self.assertEqual(hub.renamed_team(team, "lead", "ops")["door"]["fleet"], "ops")
+        gone = hub.removed_team(team, "lead")
+        self.assertNotIn("fleet", gone["door"])
+        hub.validate_team(gone)
+        team["door"]["fleet"] = "nobody"
+        with self.assertRaisesRegex(ValueError, "door.fleet names the agent that holds the fleet's own servers"):
+            hub.validate_door(team)
+        said = hub.t_door_fleet("manager", {"request_id": "fleet-test-3", "agent": "none", "why": "it left"})
+        self.assertIn("No agent is named for the fleet's own servers now", said)
+        self.assertIn("to you when you run alone on a server that is not the hub's", said)
+        self.assertNotIn("fleet", self.origin_team()["door"])
+
+    def test_an_agent_on_the_hub_s_server_holds_none_of_the_fleet_s_own_servers(self):
+        """The door takes no caller at the hub's own address, and the owner's app gives such an agent nothing: so the
+        hub names no manager that runs there, and door_fleet refuses an agent there with the reason."""
+        self.assertEqual(hub.TEAM["agents"]["manager"]["machine"], "hub")
+        view = self.request("/ui/door?db=test-generation", source=OWNER)[1]
+        self.assertIsNone(view["fleet"]["manager"])
+        with self.assertRaisesRegex(hub.ToolError, "Manager runs on the hub's server, and the door takes no caller at "
+                                                   "the hub's own address"):
+            hub.t_door_fleet("manager", {"request_id": "fleet-test-5", "agent": "manager", "why": "a test"})
+        team = self.origin_team()
+        team["addresses"]["manager-box"] = "127.0.0.31"
+        team["servers"] = {"manager-box": {"kind": "linux", "user": "fleet"}}
+        team["agents"]["manager"]["machine"] = "manager-box"
+        self.write_team(team)
+        self.assertEqual(self.request("/ui/door?db=test-generation", source=OWNER)[1]["fleet"]["manager"], "manager")
+        self.assertIn("Manager holds the fleet's own servers", hub.t_door_fleet(
+            "manager", {"request_id": "fleet-test-6", "agent": "manager", "why": "the fleet has no DevOps agent"}))
+
+    def test_a_blocked_agent_that_names_one_of_the_fleet_s_own_servers_gets_its_holder_and_no_step_for_the_owner(self):
+        """In a fleet with a door. Each reader gets its own line: the manager the tool that names the holder, a lead
+        the way up, and the holder that asks for more than patch the fact that no agent gets more there."""
+        team = self.origin_team()
+        team["servers"] = {"vps": {"kind": "linux", "user": "fleet"}}
+        self.write_team(team)
+        self.assertTrue(hub.fleet_server("vps"))
+        line = hub.access_route("studio", "server:vps", "manager", "fix")
+        self.assertIn("vps is one of the fleet's own servers, which the owner's app gives to one agent, all together, "
+                      "at patch: the agent that you name with door_fleet", line)
+        self.assertIn("raise no Needs-you item that asks the owner for a root command", line)
+        self.assertNotIn("say what the work needs it for", line)
+        self.assertIn("the agent that you name with door_fleet", hub.access_route("studio", "server:vps", "manager"))
+        said = hub.access_route("studio", "server:vps", "lead", "fix", restarts="manager")      # a lead reads it
+        self.assertIn("It is one of the fleet's own servers, which no agent holds yet: the manager names the agent "
+                      "that holds them. Pass the question up with answer(..., pass_up=true).", said)
+        self.assertNotIn("you name", said)
+        self.assertNotIn("The manager cannot settle it either", said)
+        self.assertEqual(self.grant(agent="lead", server="vps", level="patch")[0], 200)
+        line = hub.access_route("studio", "server:vps", "manager", "fix")
+        self.assertIn("Held now by lead (patch): lead can do this part of the work", line)
+        self.assertIn("give that part to lead with create_task", line)
+        self.assertNotIn("door_fleet", line)
+        # the holder itself, after the door refused a command of its own there
+        own = hub.access_route("lead", "server:vps", "manager", "fix")
+        self.assertIn("at patch only, which does not reach fix", own)
+        self.assertIn("patch is the most that any agent gets on a machine of the fleet: the fixed root forms, and no "
+                      "command, file or script of its own. If the work cannot be done with them, raise a Needs-you "
+                      "item that says what the server needs and why.", own)
+        self.assertNotIn("Give the work on vps to that agent", own)
+        self.assertIn("at patch already", hub.access_route("lead", "server:vps", "manager", "patch"))
+        # the manager's own grant tool says the same as the route
+        self.assertIn("the agent that you name with door_fleet", hub.grant_check("studio", "server:vps", "patch"))
+
+    def test_door_fleet_needs_a_door(self):
+        team = self.origin_team()
+        del team["door"]
+        team["servers"] = {"lead-box": {"kind": "linux", "user": "fleet"}}
+        self.write_team(team)
+        with self.assertRaisesRegex(hub.ToolError, "This fleet has no door"):
+            hub.t_door_fleet("manager", {"request_id": "fleet-test-4", "agent": "lead", "why": "a test"})
 
     def test_a_deleted_agent_leaves_the_door_s_lists(self):
         """removed_team left the agent's name in the door's lists of agents, so validate_door refused the delete of

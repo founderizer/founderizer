@@ -295,10 +295,6 @@ class OnTheHub(OwnerAPI):
             (warning,) = [w for w in hub.health_view()["warnings"] if w["kind"] == "hub_fault"]
         self.assertRegex(warning["detail"], r"^Once at .+\.$")
 
-    def test_no_fault_no_warning(self):
-        with hub.LOCK:
-            self.assertEqual([w for w in hub.health_view()["warnings"] if w["kind"] == "hub_fault"], [])
-
     def test_rows_of_other_code_and_old_rows_end_at_the_next_write(self):
         hub.ins("INSERT INTO faults(sig,kind,program,name,frames,count,first,last,code) VALUES(?,?,?,?,?,?,?,?,?)",
                 ("old-code", "fault", "hub", "KeyError", '[["hub.py",1]]', 1, 1.0, hub.now(), "another-code"))

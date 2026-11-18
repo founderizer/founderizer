@@ -51,7 +51,7 @@ ADDRESSES = [
 
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
-    for case in (Rule, CentralVault, Catalog):
+    for case in (Rule, CentralVault, Catalog, ProviderSites):
         suite.addTests(case(name) for name in case.__dict__ if name.startswith("test_"))
     return suite
 

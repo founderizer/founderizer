@@ -48,7 +48,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = 3                 # the floor: self-update takes only a file whose VERSION is not lower
+VERSION = 4                 # the floor: self-update takes only a file whose VERSION is not lower
 ROOT = ""                   # a prefix for every path below, which only the tests set
 ETC = "/etc/ops-root"
 MODE_FILE = ETC + "/mode"                   # fix | rule-only
@@ -56,6 +56,9 @@ KEY_FILE = ETC + "/release-key.pub"         # the release keys, as release-key.p
 EARLY_FILE = ETC + "/early-key.pub"         # and the early ones, as early-key.pub, when the bundle had them
 HIDDEN_FILE = ETC + "/hidden"               # this host's app trees and secret paths, one absolute path a line
 KIT_FILE = ETC + "/fleet-kit"               # a Fleet machine's checkout, whose root helper the form fleet-helper runs
+# The mark of a machine of the fleet, a server that runs agents or the hub (install.sh --fleet): it holds every agent's
+# keys, so it is rule-only whatever the mode file says, and the forms of FLEET_REFUSED never run on it.
+FLEET_FILE = ETC + "/fleet"
 POOL_FILE = ETC + "/pool"                   # a CI host's pool volume (an LVM path) for grow-pool
 BUILD_FILE = ETC + "/build-file"            # a CI host's build file (sparse ext4 on a loop device) for grow-file
 RUNNER_USER_FILE = ETC + "/runner-user"     # a CI host's rootless Docker user: each of its containers is a runner
@@ -165,6 +168,10 @@ HIDDEN = ("/var/www", "/srv", "/opt", "/home", "/root", "/etc/letsencrypt", "/et
 POWER_UNITS = ("systemd-poweroff", "systemd-halt", "systemd-reboot", "systemd-kexec", "systemd-soft-reboot",
                "systemd-suspend", "systemd-hibernate", "systemd-hybrid-sleep", "systemd-suspend-then-hibernate",
                "systemd-exit", "emergency", "rescue", "debug-shell")
+# Its stop runs `nft flush ruleset`, and its start and its reload load /etc/nftables.conf, whose stock text begins
+# with the same flush; enabled, it starts at each boot beside ufw, in no fixed order. A machine of the fleet keeps its
+# firewall in ufw (hubsetup.py harden), so there each of them removes every firewall rule: no form takes the unit.
+NFT_UNIT = "nftables.service"
 # Changes that can cut the door off: each arms the rollback timer first.
 TIMED_PATHS = ("/etc/ufw/", "/etc/default/ufw", "/etc/nftables.conf", "/etc/nftables.d/", "/etc/default/tailscaled",
                "/etc/iptables/", "/etc/systemd/system/tailscaled.service.d/", "/etc/netplan/")
@@ -218,10 +225,16 @@ def read(path, default=""):
         return default
 
 
+def fleet_machine():
+    "True on a machine of the fleet: the mark of install.sh --fleet, or a named Fleet checkout."
+    return os.path.lexists(P(FLEET_FILE)) or os.path.lexists(P(KIT_FILE))
+
+
 def mode():
-    """fix or rule-only. A missing or unknown mode file is rule-only: the strict reading."""
+    """fix or rule-only. A missing or unknown mode file is rule-only: the strict reading. A machine of the fleet is
+    rule-only whatever the file says: root there opens the vault and every agent's keys."""
     found = read(MODE_FILE).strip()
-    return found if found in ("fix", "rule-only") else "rule-only"
+    return found if found in ("fix", "rule-only") and not fleet_machine() else "rule-only"
 
 
 # ---------------------------------------------------------------- the forms
@@ -295,6 +308,9 @@ def check_unit(args, kinds=("service",), name="this form"):
                       f"restarts a host")
     if base.startswith("ops-root-"):        # the rollback timer, the reboot and the transient unit of each form
         raise Refused(f"{unit} is ops-root's own, not a unit of this form")
+    if unit == NFT_UNIT and fleet_machine():
+        raise Refused(f"{unit} is not a unit of this form on a machine of the fleet: each start, reload or stop of "
+                      f"it removes every firewall rule of this host, ufw's too")
     return [unit]
 
 
@@ -542,6 +558,15 @@ CHECKS = {
 }
 
 
+# Rule forms that never run on a machine of the fleet (fleet_machine). same, covers and drop compare and delete files
+# as root with no box: two empty files are "the same", and an empty file can be a mark that the machine needs, such as
+# /var/lib/systemd/linger/<user>, without which an agent's helper does not start at the next boot. place puts a key
+# where an old one is, and no key of the door's is placed where agents run. The door refuses them first
+# (door_targets.decide_host, door_providers.key_place).
+FLEET_REFUSED = {"same": "compares no files", "covers": "compares no files", "drop": "deletes no file",
+                 "place": "places no key"}
+
+
 # ---- rule forms
 
 @form("help", write=False, help="the forms of this host, and the release that this file came from")
@@ -625,6 +650,10 @@ def do_tailscale(req, data):
 
 @form("fleet-helper", help="Fleet's root helper, from this machine's signed checkout")
 def do_fleet_helper(req, data):
+    """Runs only where an install named a checkout (--fleet-kit), and the owner's app names none: a machine of the
+    fleet gets the mark of --fleet. `agent-helper` with no argument writes its files for the service user `fleet` and
+    with no repository, so where the machine's installer gave other values this form would replace a working vault
+    helper and sudoers line (read on 17 November 2026). Give the form those values before an install names a kit."""
     kit = read(KIT_FILE).strip()
     if not kit.startswith("/") or not os.path.isfile(P(os.path.join(kit, "hubsetup.py"))):
         raise Refused("this host names no Fleet checkout")
@@ -946,6 +975,289 @@ def check_place(args):
 def do_inventory(req, data):
     status, out = run([P(INVENTORY)])
     return checked((status, out), out)
+
+
+# ---- health: why a host failed or is slow
+#
+# The owner, 17 November 2026, after three of the fleet's own servers ran out of memory and each time a card asked him
+# for a root command: "I dont want to be doing devops work on the fleet!". The agent that holds a host could not read
+# the kernel's log there, so it could not say whether the kernel ended a process, whether the host froze, or whether
+# somebody restarted it. This form reads that, as root, and changes nothing.
+#
+# What it never reads: a process's arguments or its environment, and no file's content, because each of them can hold
+# a key, and a machine of the fleet holds every agent's. It reads counters of /proc and /sys/fs/cgroup, a process's
+# name (the kernel's 15 characters), the kernel's own lines of the journal, which only the kernel and root write, and
+# journald's and systemd-oomd's own lines, by the unit that journald itself names for them. A name and a line are what
+# the host says: every control character in them is replaced, and each line is cut.
+HEALTH_LINES = 20           # the newest lines of each kind and boot that the answer gives
+HEALTH_LINE = 300           # characters of one line of the journal in the answer
+HEALTH_TOP = 10             # the largest processes
+HEALTH_USERS = 30           # users in the sum of memory and in the limits, the largest first
+HEALTH_BOOTS = 5
+HEALTH_END = 5              # the last entries of the boot before, one of which is journald's stop after a shutdown
+HEALTH_WAIT = 60            # seconds for one read of the journal: a host that is short of memory answers slowly
+HEALTH_NAME = 32            # characters of a process's or a user's name
+# The kernel's lines when it is out of memory, each from its first character and with the letters as the kernel
+# writes them: the process that asked, the decision, the process that it ended (for the whole host, "Out of memory",
+# and for one group's limit, "Memory cgroup out of memory") and the memory it freed. Each phrase is longer than a
+# process's name can be (15 characters), and another line of the kernel that names a process starts with that name,
+# so a process with a name such as "Out of memory" that crashes makes no line that fits.
+OOM_WORDS = (r"^Out of memory( \([a-z_]+\))?: Killed process |^Memory cgroup out of memory: Killed process |"
+             r"^oom-kill:constraint=|^oom_reaper: reaped process |^.{1,16} invoked oom-killer: gfp_mask=")
+JOURNAL_STOP = "d93fb3c9c24d451a97cea615ce59c00b"       # journald's own id of its "Journal stopped" line
+JOURNAL_OWN = "driver"      # the transport of journald's own entries: a field that only journald sets
+PRESSURE_UNITS = ("systemd-journald.service", "systemd-oomd.service")
+PRESSURE_WORDS = r"memory pressure|due to memory"        # journald flushes its caches; systemd-oomd ends a group
+MIB = 1024 * 1024
+
+
+def clean(text, limit=HEALTH_LINE):
+    "One line as the answer gives it: no control character, and no more than `limit` characters."
+    return "".join(c if c.isprintable() else " " if c == "\t" else "?" for c in str(text).rstrip("\n"))[:limit]
+
+
+def health_read(path):
+    """The text of a counter file of /proc or /sys, or "" when it is not there. A process's name can hold any byte
+    but a line end, so a byte that is no UTF-8 is replaced and never stops the read."""
+    try:
+        with open(P(path), "rb") as f:
+            return f.read(1024 * 1024).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def tail_count(argv, keep=HEALTH_LINES, timeout=HEALTH_WAIT):
+    """(status, the count of the lines, the newest `keep` of them) of a program's output, read line by line, so that a
+    long answer costs no memory. 124: it took longer than `timeout` seconds. 127: the program is not on this host."""
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             env=dict(ENV))
+    except OSError:
+        return 127, 0, []
+    late = []
+
+    def end():
+        late.append(True)
+        p.kill()
+    timer = threading.Timer(timeout, end)
+    timer.start()
+    count, newest = 0, collections.deque(maxlen=keep)
+    try:
+        for raw in p.stdout:
+            count += 1
+            newest.append(raw[:4 * HEALTH_LINE].decode("utf-8", "replace"))
+        status = p.wait()
+    finally:
+        timer.cancel()
+        p.stdout.close()
+    return (124 if late else status), count, list(newest)
+
+
+def health_boots():
+    "(the lines of the last boots, whether the journal holds the boot before this one)."
+    status, _count, lines = tail_count(["journalctl", "--no-pager", "-q", "--list-boots"], keep=HEALTH_BOOTS + 1)
+    if status != 0:
+        return [f"  the journal's list of boots was not read (status {status})"], False
+    boots = [line for line in lines if re.match(r"\s*-?\d+\s", line)][-HEALTH_BOOTS:]
+    return [f"  {clean(line.strip())}" for line in boots] or ["  the journal names no boot"], \
+        any(re.match(r"\s*-1\s", line) for line in boots)
+
+
+def health_end():
+    """How the boot before this one ended, by the journal's own last entries there: the id and the transport of each
+    one, never its words. journald writes its stop line when systemd ends it at a shutdown, so a boot whose journal
+    ends with none did not shut down: the host was restarted hard, lost its power, or froze until somebody did that.
+    A process can write an entry with that id, so only an entry of journald's own transport counts: that field is
+    journald's to set. A journald that somebody restarted in the last entries before a hard restart reads as a
+    shutdown: the reboot and shutdown records below say it then."""
+    status, _count, lines = tail_count(["journalctl", "--no-pager", "-q", "-b", "-1", "-n", str(HEALTH_END), "-o",
+                                        "json", "--output-fields=MESSAGE_ID,_TRANSPORT"], keep=HEALTH_END)
+    if status != 0 or not lines:
+        return f"the boot before this one: its end was not read (status {status})"
+    stopped, at = False, None
+    for line in lines:
+        with contextlib.suppress(ValueError, TypeError, AttributeError):
+            entry = json.loads(line)
+            stopped = stopped or (entry.get("MESSAGE_ID"), entry.get("_TRANSPORT")) == (JOURNAL_STOP, JOURNAL_OWN)
+            at = int(entry.get("__REALTIME_TIMESTAMP")) // 1000000
+    when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(at)) if at else "a time that was not read"
+    if stopped:
+        return f"the boot before this one ended with a shutdown: its journal stops in order, at {when}"
+    return (f"the boot before this one did NOT shut down: its journal ends at {when} with no stop of the journal, as "
+            f"after a hard restart, a loss of power or a freeze")
+
+
+def health_records():
+    "The reboot and shutdown records of the login log, where the host has that program: never a login."
+    status, out = run(["last", "-x", "-F", "-n", "200"], timeout=30)
+    if status != 0:
+        return []
+    lines = [line for line in out.splitlines() if line.split()[:1] in (["reboot"], ["shutdown"])][:10]
+    return ["reboot and shutdown records, the newest first:"] + [f"  {clean(line)}" for line in lines] if lines else []
+
+
+def health_journal(boot, matches, words, exact=False):
+    """(status, count, the newest lines) of the journal of one boot, for the entries that `matches` selects by fields
+    that journald itself writes, and whose words fit `words`; exact: with the letters as they are written."""
+    status, count, lines = tail_count(["journalctl", "--no-pager", "-q", "-b", str(boot), "-o", "short-iso",
+                                       f"--case-sensitive={'true' if exact else 'false'}", "--grep", words, *matches])
+    # with --grep, journalctl ends with 1 when no entry fits: that is a count of none, not a failed read
+    return (0 if status == 1 and not count else status), count, [clean(line) for line in lines]
+
+
+def health_memory_lines(boot, name):
+    "The kernel's out-of-memory lines and the memory-pressure lines of journald and systemd-oomd, for one boot."
+    out = []
+    for what, matches, words, exact in (
+            ("out-of-memory lines of the kernel", ["_TRANSPORT=kernel"], OOM_WORDS, True),
+            ("memory-pressure lines of journald and systemd-oomd",
+             [f"_SYSTEMD_UNIT={unit}" for unit in PRESSURE_UNITS], PRESSURE_WORDS, False)):
+        status, count, lines = health_journal(boot, matches, words, exact)
+        if status != 0:
+            out.append(f"{name}: the {what} were not read (status {status})")
+        elif not count:
+            out.append(f"{name}: no {what}")
+        else:
+            out.append(f"{name}: {count} {what}" + (f", the newest {len(lines)}:" if count > len(lines) else ":"))
+            out += [f"  {line}" for line in lines]
+    return out
+
+
+def health_numbers(path):
+    "{name: number} of a file of counters, a name and a number on each line (/proc/meminfo, memory.events)."
+    found = {}
+    for line in health_read(path).splitlines():
+        parts = line.replace(":", " ").split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            found[parts[0]] = int(parts[1])
+    return found
+
+
+def health_user(uid):
+    try:
+        return clean(pwd.getpwuid(uid).pw_name, HEALTH_NAME)
+    except (KeyError, OverflowError):
+        return f"uid {uid}"
+
+
+def health_processes():
+    """[(resident bytes, uid, name)] of each process that holds memory, from the counters of /proc/<pid>/status
+    alone: its name there is the kernel's own, at most 15 characters, and never an argument."""
+    found = []
+    try:
+        pids = [name for name in os.listdir(P("/proc")) if name.isdigit()]
+    except OSError:
+        return found
+    for pid in pids:
+        fields = {}
+        for line in health_read(f"/proc/{pid}/status").splitlines():
+            key, _, value = line.partition(":")
+            if key in ("Name", "Uid", "VmRSS"):
+                fields[key] = value.strip()
+        try:
+            found.append((int(fields["VmRSS"].split()[0]) * 1024, int(fields["Uid"].split()[0]),
+                          clean(fields.get("Name", "?"), HEALTH_NAME)))
+        except (KeyError, ValueError, IndexError):
+            continue                # a kernel thread holds no memory of its own, and a process can end meanwhile
+    return found
+
+
+def health_limits():
+    """The group of all users' processes together (user.slice, where one limit for all of them goes), then each
+    user's group, as systemd keeps it (user-<uid>.slice): its memory now, its two limits, its swap, and how often it
+    met a limit. A limit that ended a process there left the host itself alive."""
+    base = "/sys/fs/cgroup/user.slice"
+    try:
+        slices = sorted(name for name in os.listdir(P(base)) if re.fullmatch(r"user-\d+\.slice", name))
+    except OSError:
+        return []
+
+    def row(folder, who):
+        def size(file):
+            text = health_read(f"{folder}/{file}").strip()
+            return "none" if text == "max" else f"{int(text) // MIB} MiB" if text.isdigit() else "?"
+        events = health_numbers(f"{folder}/memory.events")
+        now = health_read(f"{folder}/memory.current").strip()
+        return (int(now) if now.isdigit() else 0,
+                f"  {who}: {size('memory.current')} now, slows at {size('memory.high')}, stops at "
+                f"{size('memory.max')}, swap {size('memory.swap.current')}; times slowed {events.get('high', 0)}, "
+                f"times at the stop {events.get('max', 0)}, processes ended by it {events.get('oom_kill', 0)}")
+    rows = sorted((row(f"{base}/{name}", health_user(int(name[5:-6]))) for name in slices), reverse=True)
+    return ["memory limits, of all users together and of each user:", row(base, "all users together")[1]] + \
+        [text for _, text in rows[:HEALTH_USERS]]
+
+
+@form("health", write=False, help="why this host failed or is slow: the last boots and how the one before ended, "
+                                  "memory and swap, the kernel's out-of-memory lines, memory by user and its "
+                                  "limits, the largest processes by name, and the disk; never an argument, an "
+                                  "environment value or a file's content")
+def do_health(req, data):
+    out = []
+
+    def part(what, lines):
+        """One part of the answer: what a host that is short of memory cannot say stops no other part."""
+        try:
+            out.extend(lines())
+        except Exception as e:      # a read of the host's own counters: the form never ends with a traceback
+            out.append(f"{what}: not read ({type(e).__name__})")
+
+    def start():
+        def spell(seconds):
+            return f"{int(seconds) // 86400} d {int(seconds) % 86400 // 3600} h {int(seconds) % 3600 // 60} min"
+        load = " ".join(health_read("/proc/loadavg").split()[:3]) or "?"
+        up = health_read("/proc/uptime").split()[:1]
+        return [f"health of {clean(os.uname().nodename, 64)}: up {spell(float(up[0])) if up else '?'}, load {load}"]
+
+    def boots():
+        lines, before = health_boots()
+        seen.append(before)
+        return ["the last boots, the newest last:"] + lines + ([health_end()] if before else []) + health_records()
+
+    def memory():
+        mem, lines = health_numbers("/proc/meminfo"), []
+        if mem:
+            swap = (f"{mem['SwapTotal'] // 1024} MiB in all, {mem.get('SwapFree', 0) // 1024} MiB free"
+                    if mem.get("SwapTotal") else "none")
+            lines.append(f"memory: {mem.get('MemTotal', 0) // 1024} MiB in all, {mem.get('MemAvailable', 0) // 1024} "
+                         f"MiB available; swap: {swap}")
+        pressure = [clean(line) for line in health_read("/proc/pressure/memory").splitlines() if line.strip()]
+        if pressure:
+            lines.append("memory pressure (the share of time that work waited for memory): " + "; ".join(pressure))
+        return lines
+
+    def users():
+        processes, sums, lines = health_processes(), collections.defaultdict(lambda: [0, 0]), []
+        for size, uid, _name in processes:
+            sums[uid][0] += size
+            sums[uid][1] += 1
+        if sums:
+            lines.append("memory by user, the sum of its processes:")
+            lines += [f"  {health_user(uid)}: {size // MIB} MiB in {count} process{'es' if count != 1 else ''}"
+                      for uid, (size, count) in sorted(sums.items(), key=lambda item: -item[1][0])[:HEALTH_USERS]]
+        lines += health_limits()
+        if processes:
+            lines.append(f"the {HEALTH_TOP} largest processes, by user and name:")
+            largest = sorted(processes, reverse=True)[:HEALTH_TOP]
+            lines += [f"  {size // MIB} MiB {health_user(uid)} {name}" for size, uid, name in largest]
+        return lines
+
+    def disk():
+        # df ends with 1 when one mount does not answer it (a user's own mount): its rows of the others stay
+        status, said = run(["df", "-h", "-x", "tmpfs", "-x", "devtmpfs", "-x", "overlay", "-x", "squashfs", "-x",
+                            "efivarfs"], timeout=60)
+        rows = [f"  {clean(line)}" for line in said.splitlines()[:40]]
+        return ["disk:"] + rows if status in (0, 1) and rows else [f"disk: not read (status {status})"]
+
+    seen = []
+    part("the host", start)
+    part("the last boots", boots)
+    part("memory", memory)
+    part("this boot's memory lines", lambda: health_memory_lines(0, "this boot"))
+    if seen and seen[0]:
+        part("the memory lines of the boot before", lambda: health_memory_lines(-1, "the boot before"))
+    part("memory by user", users)
+    part("disk", disk)
+    return "\n".join(out)
 
 
 # ---- the agent's own forms: a host in fix mode only
@@ -3383,6 +3695,9 @@ def call(req, data=None):
         raise Refused("this host is rule-only: only rule forms run here, and no file install")
     if op in PLAN_WRITES and mode() != "fix":        # new-projects plan N4: a new app lives on a fix host only
         raise Refused("this host is rule-only: no form of a new app writes here")
+    if op in FLEET_REFUSED and fleet_machine():
+        raise Refused(f"this host is a machine of the fleet, where agents run and their keys are: {op} "
+                      f"{FLEET_REFUSED[op]} here")
     if data is not None and op not in ("file", "self-update", "pro-attach", "runner-register", "place", "unit-new",
                                        "env-new", "env-add", "runner-new", "vhost-new", "script", "run", "look"):
         raise Refused(f"{op} takes nothing on stdin")

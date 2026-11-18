@@ -168,3 +168,38 @@ entries, Docker's folder, other processes' environments, the limits) on a real U
 A look runs only on a server that the door holds at `fix`, for the agent that holds it at Fix. The hub's own machine,
 a machine of the fleet's agents and a CI host that two businesses share hold the fleet's own keys: no look runs
 there.
+
+## What the holder of the fleet's own servers can do there
+
+Each Linux server of a fleet, a server that runs agents or the hub's server, is a host of the door at `rule-only`.
+One agent holds all of them: the fleet's DevOps agent, or, in a fleet with none, the manager when it runs alone on a
+server that is not the hub's. This section says what that agent can do on such a server and what it cannot.
+
+**What it can do.** Run the fixed root forms of `host/ops-root`: restart or reload a service, enable a unit, restart
+the server, run the security upgrades, upgrade Tailscale, empty the journal and the package cache. Read why the
+server failed or is slow with `ops <server> health`. Read the server's logs and its units with the fixed reads, as the
+user `ops-agent`, which has no root. A restart or a reboot can end the work that runs on that server: the holder
+answers for the time.
+
+**What it cannot do, whatever the door's file says.** Run a command, a script or a file install of its own, or the
+wide read `look`: the server's own `ops-root` refuses each of them by its mode and by the mark of a machine of the
+fleet, which only root on that server can take away. Compare or delete a file as root (`same`, `covers`, `drop`), or
+have a key placed there. Restart, reload or enable `nftables.service`: such a server keeps its firewall in ufw, and
+each start, reload or stop of that unit removes every firewall rule, ufw's too. No statement of the owner lifts this,
+and no mode of the server does.
+
+**What `health` and the fixed reads show.** `health` reads counters of `/proc` and of the memory groups, the name of
+a process (the kernel's 15 characters), and the lines of the journal that the kernel, journald and systemd-oomd
+wrote. It reads no process's arguments or environment and no file's content. A process chooses its own name and the
+name of its group, so a line of `health` can hold up to 300 characters that an agent of that server wrote: it is
+data, as every answer of a server is. The fixed read `status <unit>` prints
+the arguments of that unit's processes, as `ps` shows them to every user of the server, and `journal` prints what the
+journal holds: a key that a program writes into its arguments or its log is visible there.
+
+**What the hub decides, and what it does not.** The hub proposes the fleet's servers and the agent that holds them.
+The owner's app takes a server only when its own Tailscale and the server itself say that it is one, and an agent
+only when its own server says that it runs alone there. So a fault of the hub can make another agent that runs alone
+on its server the holder, with the fixed forms above. It cannot add another device as a host, it cannot give more
+than the fixed forms, and it cannot move to another address an entry of the door's file that holds a business's
+servers, a database, a commit target or an account that a Mac session wrote.
+

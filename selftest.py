@@ -228,6 +228,8 @@ MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "an
                                "door_rollout", "door_hold",
                                # DevOps plan X3: a GitOps repository through the door
                                "door_gitops",
+                               # the owner, 17 November 2026: the agent that holds the fleet's own servers
+                               "door_fleet",
                                # the changed key swap, Part C (the owner's C30): a table-made site off and on
                                "switch_key_site",
                                "tell_owner",
