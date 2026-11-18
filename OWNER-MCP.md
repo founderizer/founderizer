@@ -951,8 +951,8 @@ goes into the vault first with `save_secret`.
   that it is a worker or a lead with a server, `read` only for an API key, and no second key of one
   variable name read by that agent. A refusal about one agent names that agent, whose name passed
   the form of an agent's name; nothing else of the request is quoted.
-- **A request for the door** (since 17 November 2026; the owner, that day, of the steps that his own
-  agent left to him, a press of Full access on one of his servers among them: "why can't you press
+- **A request for the door** (since 17 November 2026; the owner, that day, of the steps that their own
+  agent left to them, among them a press of Full access on one of their servers: "why can't you press
   Full access on <server> for me?") is answered as the app's form of that request answers it: the
   form always gives such a request's secret to the door, with a signed grant of the door's own
   (`SecretEntryView.doorGrant`), and then answers it; for a request whose `secret` names a key of the
@@ -1006,8 +1006,8 @@ goes into the vault first with `save_secret`.
 No command lock: the app does the writes, as its form does. What any process of the owner's user
 can do with the tool, its traces and its limits: OWNER-MCP-BOUNDARY.md section 7b.
 
-**`answer_needs_you` on the door's card** (since 17 November 2026; the owner, that day, after his
-agent left him two presses on such cards: "why can't you press Full access on <server> for me?"). The
+**`answer_needs_you` on the door's card** (since 17 November 2026; the owner, that day, after their
+agent left them two presses on such cards: "why can't you press Full access on <server> for me?"). The
 door's card of a call that the door refused has two answers that let something through: its first
 option, the yes (`choice` 0; "Run it once" on the door's card of a run), the owner's yes to the item's
 door call, and on the door's card of a run, "Run one root script on <server>?", Full access on
@@ -1016,7 +1016,7 @@ statement in its form beside it, and the door checks the owner key's signature o
 itself (`hub.py` `phone_submit`: a press of either with no statement is refused with 409, and the
 item stays open; `test_server_access` holds it). Only the app holds the owner key. So the program's
 `answer_needs_you` sends such a press to the running app, which signs it as the owner's own press of
-that option signs it and sends it, with no question to the owner (his "No touch" of 15 November
+that option signs it and sends it, with no question to the owner (their "No touch" of 15 November
 2026). Every other answer goes from the program to the hub as before, with no signature. The
 program's own words of the tool say so, after the words that `owner_mcp.py`'s table gives it
 (`AnswerDoor.description`): this server cannot sign, and the hub refuses such a press from it. One gap
