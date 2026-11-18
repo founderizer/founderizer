@@ -1,7 +1,9 @@
 """One sitting at a new Mac (the owner, 31 October 2026): the app names the first agent with the join code, and the hub
 carries the setup from there, through the real routes, to the page that only a real browser can answer."""
+import contextlib
 import json
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -17,10 +19,26 @@ def load_tests(loader, _tests, _pattern):
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
+@contextlib.contextmanager
+def failed_push():
+    """The next git push fails, as a push to the hub's own repository can (a short fault of git, KitFault). The list
+    holds the push that failed."""
+    real, failed = subprocess.run, []
+
+    def run(argv, *args, **kwargs):
+        if "push" in argv and not failed:
+            failed.append(argv)
+            return subprocess.CompletedProcess(argv, 128, "", "fatal: unable to access the repository")
+        return real(argv, *args, **kwargs)
+    with patch.object(subprocess, "run", run):
+        yield failed
+
+
 class MacSetup(Servers):
     def setUp(self):
         super().setUp()
         self.fresh_fleet()
+        hub.MAC_SETUP_FAULTS.clear()
         self.said = []
         real = hub.emit
         patcher = patch.object(hub, "emit", lambda *a, **k: (self.said.append(a), real(*a, **k))[1])
@@ -64,7 +82,8 @@ class MacSetup(Servers):
         check = hub.q1("SELECT * FROM machine_checks WHERE agent='juno' ORDER BY id DESC LIMIT 1")
         hub.q("UPDATE machine_checks SET state='completed', completed=?, verify='[]' WHERE id=?", (hub.now(), check["id"]))
 
-    def proving(self, restarts=True):
+    def checked(self, restarts=True):
+        """A setup whose check came back: its next pass activates the agent."""
         self.ready_to_finish()
         self.assertEqual(self.finish(restarts=restarts)[0], 200)
         if restarts:
@@ -74,6 +93,9 @@ class MacSetup(Servers):
         self.sweep()
         self.assertEqual(self.row()["state"], "checking")
         self.check_passes()
+
+    def proving(self, restarts=True):
+        self.checked(restarts)
         latest = hub.q1("SELECT * FROM machine_checks WHERE agent='juno' ORDER BY id DESC LIMIT 1")
         with patch.object(hub, "activation_missing", lambda agent: ([], latest)):
             self.sweep()
@@ -233,7 +255,13 @@ class MacSetup(Servers):
         self.desktop()
         self.report(boot="boot-2", chatgpt=False)
         self.desktop()
-        self.assertIn("ChatGPT is signed out", self.manager_heard()[-1])
+        heard = self.manager_heard()[-1]
+        self.assertIn("ChatGPT is signed out", heard)
+        # the one item of a Mac's desktop that needs no hands there, where the Mac has the ChatGPT app: the owner's
+        # sign-in of Codex runs the app's own copy, and the reading is false also for a sign-in that the provider ended
+        self.assertIn("a new sign-in of Codex there puts this right", heard)
+        self.assertIn("a Mac without the app needs the app first", heard)       # the reading is false there too
+        self.assertNotIn("Only hands at that Mac", heard)
 
     def test_the_join_code_of_a_mac_names_its_first_agent(self):
         for body, words in (({"kind": "linux", "agent": "juno", "runtime": "claude"}, "first agent of a Mac"),
@@ -273,28 +301,64 @@ class MacSetup(Servers):
         return json.loads(git("show", "HEAD:team.json", cwd=self.kit))["agents"][agent]
 
     def test_a_refused_add_goes_again_with_each_reading_and_a_count_ends_it(self):
+        """Here git's fetch fails at each try: one more pass with no count, then a try for each reading."""
         self.joined_mac()
-        with patch.object(hub, "add_server_agent", side_effect=hub.Refusal(502, "the fetch failed")):
+        with patch.object(hub, "add_server_agent", side_effect=hub.KitFault(502, "the fetch failed")):
             for tries in range(1, hub.MAC_SETUP_READINGS):
                 self.report()
+                self.sweep()
+                self.assertEqual((self.row()["state"], self.row()["tries"]), ("add", tries - 1))
                 self.sweep()
                 self.sweep()            # no new reading: no new try
                 self.assertEqual((self.row()["state"], self.row()["tries"]), ("add", tries))
             self.report()
+            self.sweep()
             self.sweep()
         self.assertEqual(self.row()["state"], "stopped")
         heard = self.manager_heard()[-1]
         self.assertIn("could not be added", heard)
         self.assertNotIn("Only hands", heard)           # no person at a Mac puts this right
 
-    def test_a_refused_add_that_passes_goes_on(self):
+    def test_a_refused_add_that_passes_goes_on_and_a_failed_push_counts_no_try(self):
         self.joined_mac()
-        with patch.object(hub, "add_server_agent", side_effect=hub.Refusal(502, "the fetch failed")):
+        with patch.object(hub, "add_server_agent", side_effect=hub.Refusal(409, "a release is on its way")):
             self.report()
             self.sweep()
         self.report()
+        with failed_push() as failed:
+            self.sweep()                # a short fault of git: no try counted, and no wait for the next reading
+        self.assertEqual((len(failed), self.row()["state"], self.row()["tries"]), (1, "add", 1))
         self.sweep()
         self.assertEqual((self.row()["state"], self.row()["tries"]), ("waiting", 0))
+
+    def test_a_fault_of_git_in_the_activation_goes_again_and_one_that_lasts_waits_for_the_next_reading(self):
+        self.checked()
+        latest = lambda agent: ([], hub.q1("SELECT * FROM machine_checks WHERE agent=? ORDER BY id DESC LIMIT 1",
+                                           (agent,)))
+        with patch.object(hub, "activation_missing", latest):
+            with patch.object(hub, "save_agent_settings", side_effect=hub.KitFault(502, "the push failed")):
+                self.sweep()
+                self.assertEqual(self.row()["state"], "checking")      # one more pass, with no count
+                self.sweep()
+            self.assertEqual((self.row()["state"], self.row()["checks"]), ("finished", 1))
+            self.report(boot="boot-2")
+            self.sweep()
+            self.check_passes()
+            with failed_push() as failed:
+                self.sweep()
+            self.assertEqual((len(failed), self.row()["state"], self.origin_team_entry("juno")["active"]),
+                             (1, "checking", False))
+            self.sweep()
+        self.assertEqual(self.row()["state"], "proving")
+        self.assertNotIn("active", self.origin_team_entry("juno"))
+
+    def test_a_final_refusal_of_the_activation_stops_the_setup(self):
+        self.checked()
+        with patch.object(hub, "activation_missing", lambda agent: ([], None)), \
+                patch.object(hub, "save_agent_settings", side_effect=hub.Refusal(409, "the agent is busy")):
+            self.sweep()
+        self.assertEqual(self.row()["state"], "stopped")
+        self.assertIn("the agent is busy", self.manager_heard()[-1])
 
     def test_a_hub_restart_between_the_two_writes_of_the_add_loses_nothing(self):
         self.joined_mac()
@@ -653,17 +717,38 @@ class MacService(ServerService):
 class Readings(unittest.TestCase):
     """The reading of a browser with no model: one exchange with the runtime's own Chrome server."""
 
-    def chatgpt(self, there, answer):
-        life = lifecycle.Lifecycle("/tmp", None, {}, None, lambda: False)
+    def chatgpt(self, there, answer, home=None, now=3000.0):
+        if home is None:                # never the real ~/.fleet, where a helper of this machine can have left a word
+            home = tempfile.mkdtemp(prefix="fleet-mac-")
+            self.addCleanup(lambda: __import__("shutil").rmtree(home, True))
+        life = lifecycle.Lifecycle("/tmp", None, {}, None, lambda: False, home=home, clock=lambda: now)
         life.run = lambda argv, **k: answer
         with patch.object(lifecycle.os.path, "exists", lambda path: there):
             return life.chatgpt()
 
-    def test_the_chatgpt_reading_is_the_copy_in_the_app(self):
-        self.assertIs(self.chatgpt(True, (0, "Logged in using ChatGPT\n", "")), True)
+    def test_the_chatgpt_reading_is_the_copy_in_the_app_with_the_word_of_its_account_read(self):
+        """The status command of the app's copy reads only what the Mac keeps: on 18 November 2026 a Mac Studio said
+        "ChatGPT · Signed in" while the provider had ended that sign-in and each screen task failed. This reading
+        has no account read, so it takes the word that the helpers of the same user leave (lifecycle.leave_screen_word,
+        which test_usage holds to the collector's answers)."""
+        signed_in = (0, "Logged in using ChatGPT\n", "")
+        self.assertIs(self.chatgpt(True, signed_in), True)
         self.assertIs(self.chatgpt(True, (1, "Not logged in\n", "")), False)
         self.assertIs(self.chatgpt(False, (0, "", "")), False)        # no app
         self.assertIs(self.chatgpt(True, (1, "", "")), False)         # silence gives no agent a screen
+        home = tempfile.mkdtemp(prefix="fleet-mac-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, True))
+        lifecycle.leave_screen_word(home, True, "ivy", 3000.0)          # the provider ended it, whatever the command says
+        self.assertIs(self.chatgpt(True, signed_in, home), False)
+        # no helper reads that account any more: an old word says nothing, and the command's word stands
+        self.assertIs(self.chatgpt(True, signed_in, home, now=3000.0 + lifecycle.SCREEN_WORD_AGE + 1), True)
+        self.assertIs(self.chatgpt(True, signed_in, home, now=2999.0), True)           # nor a word from a later time
+        lifecycle.leave_screen_word(home, False, "nova", 3000.0)        # the owner signed in again: the account answers
+        self.assertIs(self.chatgpt(True, signed_in, home), True)
+        self.assertIs(self.chatgpt(True, (1, "Not logged in\n", ""), home), False)           # signed out at the Mac
+        with open(lifecycle.screen_word_path(home), "w") as f:          # a file that does not say is no word
+            f.write('{"at": 3000.0, "ended"')
+        self.assertIs(self.chatgpt(True, signed_in, home), True)
 
     def test_a_child_that_holds_the_pipe_does_not_stop_the_limit(self):
         folder = tempfile.mkdtemp(prefix="fleet-mcp-")

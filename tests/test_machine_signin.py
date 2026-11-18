@@ -18,6 +18,7 @@ real credential. That is the operator's first live step, and `runtime_login_comm
 import http.client
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -137,7 +138,7 @@ class Signin(Machines):
                          (True, "starting", "claude"))
         event = hub.q1("SELECT * FROM events WHERE agent='solo' AND kind='login' ORDER BY id DESC")
         self.assertEqual(json.loads(event["extra"]),
-                         {"login": answer["login"]["id"], "runtime": "claude", "replace": False})
+                         {"login": answer["login"]["id"], "runtime": "claude", "replace": False, "another": False})
 
     def test_a_second_start_gives_back_the_open_one(self):
         first = self.start()[1]["login"]["id"]
@@ -252,6 +253,63 @@ class Signin(Machines):
         self.assertEqual(hub.LIVE_LOGINS, {}, "the link and any code must go with the sign-in")
         seen = self.view()
         self.assertEqual((seen["state"], seen["url"], seen["shows_code"]), ("done", None, None))
+
+    def test_a_sign_in_that_ends_done_asks_the_other_agents_of_that_os_user_for_their_status(self):
+        """The agents of one OS user keep one sign-in of each provider, as the agents of a Mac do, and each helper
+        keeps its own word of the account read. After a sign-in from one agent's row, a second agent of that user
+        read "signed out" for up to five minutes more, and a press of Sign in on its row started a second sign-in.
+        So each end "done" asks those agents for their status now, by either way that a sign-in ends."""
+        hub.TEAM["agents"].update(
+            ivy={"role": "worker", "runtime": "claude", "machine": "box", "can": ["shell"]},
+            nova={"role": "worker", "runtime": "codex", "machine": "box", "can": ["shell"]},
+            far={"role": "worker", "runtime": "claude", "machine": "hub", "can": ["shell"]})
+
+        def reading(uid, codex=False):
+            return {"runtimes": {"claude": {"version": "2.1.287", "signed_in": True},
+                                 "codex": {"version": None, "signed_in": codex}},
+                    "access": {"user": "desk", "uid": uid}, "features": ["status_now"]}
+
+        def asked():
+            return sorted(r["agent"] for r in hub.q("SELECT agent FROM events WHERE kind='status_now'"))
+
+        def says(agent, uid, codex=False):
+            hub.q("INSERT OR REPLACE INTO agents(name,last_seen) VALUES(?,?)", (agent, hub.now()))
+            hub.q("INSERT OR REPLACE INTO machine_status(agent,data,reported) VALUES(?,?,?)",
+                  (agent, json.dumps(reading(uid, codex)), hub.now()))
+
+        def machine(agent, lid, **fields):      # that agent's helper, past the key that several agents of a machine send
+            with hub.LOCK:
+                return hub.login_report(agent, lid, hub.login_input(fields))
+
+        # ivy shares solo's user on the same machine; nova has a user of its own there; far is on another machine
+        for agent, uid in (("solo", 501), ("ivy", 501), ("nova", 1002), ("far", 501)):
+            says(agent, uid)
+        code, answer = self.start(runtime="codex")
+        self.assertEqual(code, 200, answer)
+        lid = answer["login"]["id"]
+        machine("solo", lid, state="needs_owner", url=CODEX_URL, wants_code=False, shows_code="WXYZ-1234")
+        self.assertEqual(asked(), [])                               # a sign-in that waits asks nobody
+        says("solo", 501, codex=True)                               # the machine's own status ends it
+        hub.end_signed_in_waits("solo")
+        self.assertEqual((self.row(lid)["state"], asked()), ("done", ["ivy"]))
+        # the helper's own report ends it, where no status came first: a sign-in from ivy's row asks solo
+        hub.q("DELETE FROM events WHERE kind='status_now'")
+        code, answer = self.start(agent="ivy", runtime="codex")
+        self.assertEqual(code, 200, answer)
+        machine("ivy", answer["login"]["id"], state="done", detail="Codex is signed in on this machine.")
+        self.assertEqual((self.row(answer["login"]["id"])["state"], asked()), ("done", ["solo"]))
+        # an end that is not "done" asks nobody
+        hub.q("DELETE FROM events WHERE kind='status_now'")
+        code, answer = self.start(agent="nova", runtime="codex")
+        self.assertEqual(code, 200, answer)
+        machine("nova", answer["login"]["id"], state="failed", detail="Codex printed no sign-in link.")
+        self.assertEqual((self.row(answer["login"]["id"])["state"], asked()), ("failed", []))
+        # an install or a preparation that ends at its sign-in step made such a sign-in too
+        says("solo", 501)
+        jid = self.waiting_job(runtime="codex")
+        says("solo", 501, codex=True)
+        hub.end_signed_in_waits("solo")
+        self.assertEqual((self.job(jid)["state"], asked()), ("done", ["ivy"]))
 
     def test_a_job_that_waits_at_its_sign_in_ends_with_it(self):
         """The sign-in is the last step of an install and of a preparation, so a job parked there is finished. Its
@@ -435,7 +493,7 @@ class AnotherAccount(Machines):
         self.assertEqual(answer["login"]["state"], "signing_out")
         event = hub.q1("SELECT * FROM events WHERE agent='solo' AND kind='login' ORDER BY id DESC")
         self.assertEqual(json.loads(event["extra"]),
-                         {"login": answer["login"]["id"], "runtime": "claude", "replace": True})
+                         {"login": answer["login"]["id"], "runtime": "claude", "replace": True, "another": True})
         self.assertEqual(self.count("signin_jobs"), 1, "one job, not a sign-out job and a sign-in job")
 
     def test_asking_for_another_account_when_it_is_already_signed_out_is_an_ordinary_sign_in(self):
@@ -444,7 +502,10 @@ class AnotherAccount(Machines):
         code, answer = self.start(replace=True)
         self.assertEqual((code, answer["login"]["state"]), (200, "starting"), answer)
         event = hub.q1("SELECT * FROM events WHERE agent='solo' AND kind='login' ORDER BY id DESC")
-        self.assertIs(json.loads(event["extra"])["replace"], False)
+        extra = json.loads(event["extra"])
+        # no sign-out comes first, and the helper still knows that the owner asked for another account: it asks no
+        # account read whether the sign-in that the machine keeps works (fleet.Helper.sign_in_works)
+        self.assertEqual((extra["replace"], extra["another"]), (False, True))
 
     def test_the_machine_still_saying_signed_in_does_not_finish_a_sign_out(self):
         """The reading is about the account he is LEAVING. Before this, the first report after the owner pressed
@@ -766,6 +827,10 @@ class HubRestart(Machines):
         self.assertEqual(fleet.LOGIN_LIFE, hub.LOGIN_LIFE)
 
 
+# A machine that keeps no sign-in: what a sign-in job finds when it asks, before it starts (Helper.sign_in_works).
+SIGNED_OUT = type("Lifecycle", (), {"runtime": lambda _self, name, stored=False: {"signed_in": False}})()
+
+
 class HelperSide(unittest.TestCase):
     """The machine's own half, against stand-ins: what it would run, and what it would type."""
 
@@ -817,7 +882,7 @@ class HelperSide(unittest.TestCase):
         exist in that path — the first owner's very first step — fails this check instead of the fleet."""
         posts, screen = [], f"Use the url below to sign in:\n  {CLAUDE_URL}\n"
         helper = fleet.Helper.__new__(fleet.Helper)
-        helper.agent, helper.lifecycle = "solo", object()
+        helper.agent, helper.lifecycle = "solo", SIGNED_OUT
         helper.await_login_code = lambda *_: False          # the owner has not pasted the code yet
 
         def post(method, path, data=None, timeout=40):
@@ -848,7 +913,8 @@ class HelperSide(unittest.TestCase):
                                                   "report_soon": lambda _self: order.append("soon")})()
         helper.say = lambda *_: None
         helper.await_login_code = lambda *_: True           # the owner pasted the code
-        helper.signed_in = lambda _runtime: True            # and the runtime says it is signed in
+        looks = [False]                                     # no sign-in before the job starts, and then the runtime
+        helper.signed_in = lambda _runtime: looks.pop(0) if looks else True     # says that it is signed in
 
         def post(method, path, data=None, timeout=40):
             order.append(data["state"])
@@ -867,12 +933,15 @@ class HelperSide(unittest.TestCase):
         self.assertEqual(order, ["needs_owner", "status", "done", "soon"])     # the model options, after it
 
     def run_login(self, extra, signed_in, typed, done_wait=None, posts=None,
-                  screen=f"Use the url below to sign in:\n  {CLAUDE_URL}\n", look=None, collector=None):
+                  screen=f"Use the url below to sign in:\n  {CLAUDE_URL}\n", look=None, collector=None,
+                  conf=None, own="/home/solo/.local/bin/claude", windows=None):
         """The helper's sign-in against stand-ins, recording the order of its status reports and its sign-in posts.
-        posts: a list that gets the body of each sign-in post. look: what the hub says of the sign-in (login_look)."""
+        posts: a list that gets the body of each sign-in post. look: what the hub says of the sign-in (login_look).
+        conf: the agent's settings. own: the runtime's own program on this machine, or None. windows: a list that
+        gets (the name, the command) of each window that the sign-in starts."""
         order, seq = [], list(signed_in)
         helper = fleet.Helper.__new__(fleet.Helper)
-        helper.agent, helper.conf = "solo", {"role": "worker"}
+        helper.agent, helper.conf = "solo", conf or {"role": "worker"}
         helper.lifecycle = type("Lifecycle", (), {"report": lambda _self, **_: order.append("status") or True,
                                                   "read_models": lambda _self, **_: None,
                                                   "report_soon": lambda _self: order.append("soon")})()
@@ -891,11 +960,12 @@ class HelperSide(unittest.TestCase):
             return 200, {}
 
         patches = [patch.object(fleet, "http", post),
-                   patch.object(fleet, "exe", lambda *a, **k: "/home/solo/.local/bin/claude"),
+                   patch.object(fleet, "exe", lambda *a, **k: own),
                    patch.object(fleet, "tmux", lambda *a, **k: type("R", (), {"returncode": 0})()),
                    patch.object(fleet, "ensure_session", lambda *a, **k: None),
                    patch.object(fleet, "ready_runtime_config", lambda *a, **k: False),
-                   patch.object(fleet, "start_window", lambda *a, **k: None),
+                   patch.object(fleet, "start_window", lambda _session, name, command, **k:
+                                windows is not None and windows.append((name, command))),
                    patch.object(fleet, "login_screen", lambda *a, **k: screen),
                    patch.object(fleet.time, "sleep", lambda *_: None)]
         if done_wait is not None:
@@ -925,6 +995,12 @@ class HelperSide(unittest.TestCase):
             def account_again(self):
                 self.again += 1
 
+            def polls_started(self):
+                return self.again
+
+            def reads(self, runtime):
+                return self.again, self.again       # each poll that was asked for has started, and its read answered
+
         collector = Collector([True, True, False])
         order = self.run_login({"login": 7, "runtime": "claude"}, [False, True, True, True], typed=True,
                                collector=collector)
@@ -934,7 +1010,125 @@ class HelperSide(unittest.TestCase):
         order = self.run_login({"login": 8, "runtime": "claude"}, [True] * 50, typed=True, done_wait=0,
                                collector=dead)
         self.assertEqual(order, ["needs_owner", "status", "failed"])
-        self.assertEqual(dead.again, 0)
+        self.assertEqual(dead.again, 1)             # the one read that the job asks for before it starts
+
+    def test_codex_of_an_agent_on_another_provider_signs_in_and_out_through_its_screen_runtime(self):
+        """A Mac with Claude Code and the ChatGPT app has no `codex` of its own, and until 18 November 2026 the
+        owner's sign-in of Codex there ended "codex is not installed on this machine." The sign-in and the sign-out
+        run the program that the agent's screen tasks run, also beside an own `codex`; an agent whose own provider is
+        Codex keeps its own program, and a machine with neither program says so."""
+        screen = os.path.join(tempfile.mkdtemp(prefix="fleet-screen-"), "codex")
+        self.addCleanup(shutil.rmtree, os.path.dirname(screen), True)
+        open(screen, "w").close()
+        mac = {"role": "worker", "runtime": "claude", "screen_command": screen}
+        login, page = {"login": 7, "runtime": "codex"}, f"open {CODEX_URL} and enter WXYZ-1234"
+        with patch.object(lifecycle, "SCREEN_COMMANDS", (screen,)):
+            for conf, own, program in ((mac, None, screen), (mac, "/opt/homebrew/bin/codex", screen),
+                                       (dict(mac, runtime="codex"), "/opt/homebrew/bin/codex", "/opt/homebrew/bin/codex")):
+                with self.subTest(runtime=conf["runtime"], own=own):
+                    windows, posts = [], []
+                    order = self.run_login(login, [False], typed=False, done_wait=0, screen=page, conf=conf, own=own,
+                                           windows=windows, posts=posts)
+                    self.assertEqual((order[0], posts[0].get("url")), ("needs_owner", CODEX_URL))
+                    self.assertEqual(windows, [("login", f"exec {program} login --device-auth")])
+                    windows = []            # "Use another account": the sign-out is that program's too
+                    self.run_login(dict(login, replace=True), [True, False, False], typed=False, done_wait=0,
+                                   screen=page, conf=conf, own=own, windows=windows)
+                    self.assertEqual(windows, [("logout", f"exec {program} logout"),
+                                               ("login", f"exec {program} login --device-auth")])
+            # the screen runtime answers for Codex alone: a sign-in of Claude Code runs Claude Code's own program
+            windows = []
+            self.run_login({"login": 9, "runtime": "claude"}, [False], typed=False, done_wait=0,
+                           conf=dict(mac, runtime="codex"), windows=windows)
+            self.assertEqual(windows, [("login", "exec /home/solo/.local/bin/claude /login")])
+            os.remove(screen)               # neither the app's copy nor a `codex` of its own
+            posts = []
+            order = self.run_login(login, [False], typed=False, done_wait=0, screen=page, conf=mac, own=None, posts=posts)
+            self.assertEqual((order, posts[0]["detail"]), (["failed"], "codex is not installed on this machine."))
+
+    def test_a_sign_in_of_another_provider_leaves_the_manager_s_session_open(self):
+        """A manager whose own provider was signed out sits at that provider's sign-in screen, so the end of its
+        sign-in closes the standing session and starts it again (restart_after_login). A sign-in of Codex for the
+        screen tasks of a manager on Claude Code changes nothing for that session, and closing it ends a turn that
+        runs."""
+        closed, manager = [], {"role": "manager", "runtime": "claude"}
+        with patch.object(fleet.Helper, "restart_after_login", lambda _helper: closed.append("manager")):
+            order = self.run_login({"login": 7, "runtime": "claude"}, [False, True], typed=True, done_wait=0,
+                                   conf=manager)
+            self.assertEqual((order[-2], closed), ("done", ["manager"]))
+            order = self.run_login({"login": 8, "runtime": "codex"}, [False, True], typed=True, done_wait=0,
+                                   conf=manager, own="/opt/homebrew/bin/codex",
+                                   screen=f"open {CODEX_URL} and enter WXYZ-1234")
+            self.assertEqual((order[-2], closed), ("done", ["manager"]))
+
+    def test_a_sign_in_that_this_machine_already_has_is_not_made_again(self):
+        """The provider's sign-in removes the stored one at its start, and the agents of one OS user keep one. After
+        a sign-in from one agent's row, the helper of a second agent still had the word "the provider ended it" of
+        its older account read, so a press on that agent's row signed every agent of that user out again. Before it
+        starts anything, the job asks for one account read and waits for an answer that started after it asked."""
+        class Collector:
+            """The collector, look by look. looks: (ended, answered), the newest polls whose read ended and whose
+            read gave an answer, at each look after the job asked (the last one stays); None: no read can answer any
+            more. The word is `word` until an answer of a poll after `started` came, then `fresh`."""
+            def __init__(self, looks, fresh, started=0, word=True):
+                self.looks, self.fresh, self.started, self.word = list(looks), fresh, started, word
+                self.now, self.asked, self.seen = (0, 0), 0, 0
+
+            def polls_started(self):
+                return self.started
+
+            def account_again(self):
+                self.asked += 1
+
+            def reads(self, runtime):
+                if self.asked:
+                    self.seen += 1
+                    if self.looks:
+                        self.now = self.looks.pop(0)
+                return self.now
+
+            def sign_in_ended(self, runtime):
+                return self.fresh if self.now and self.now[1] > self.started else self.word
+
+        def run(lid, collector, signed_in=(True,) * 9, **extra):
+            windows = []
+            order = self.run_login(dict({"login": lid, "runtime": "codex"}, **extra), signed_in, typed=False,
+                                   done_wait=0, collector=collector, windows=windows, own="/opt/homebrew/bin/codex",
+                                   screen=f"open {CODEX_URL} and enter WXYZ-1234")
+            return order, [name for name, _ in windows]
+
+        done, started = (["status", "done", "soon"], []), ["login"]
+        again = Collector([(0, 0), (1, 1)], fresh=False)        # another agent's sign-in made the stored one good
+        self.assertEqual(run(7, again), done)
+        self.assertEqual(again.asked, 2)                        # the read that the job asked for, and the end's own
+        # a poll runs when the job asks: its read answers first, with the older word, and is no answer to the job
+        self.assertEqual(run(8, Collector([(1, 1), (1, 1), (2, 2)], fresh=False, started=1)), done)
+        dead = Collector([(0, 0), (1, 1)], fresh=True)          # the answer says again that the provider ended it
+        order, windows = run(9, dead)
+        self.assertEqual((order[0], windows, dead.asked), ("needs_owner", started, 1))
+        # The read that the job asked for ends with no answer, and three such reads end the word: nothing says that
+        # the sign-in works, so the job goes on, and at once. Taken as "works", a dead sign-in ended "done", and the
+        # hub then refused the next press.
+        silent = Collector([(0, 0), (1, 0)], fresh=False, word=False)
+        self.assertEqual((run(10, silent)[1], silent.seen), (started, 2))
+        with patch.object(fleet, "LOGIN_READ_LOOKS", 5):        # no read ends at all: the looks are the limit
+            stuck = Collector([(0, 0)], fresh=False, word=False)
+            self.assertEqual((run(11, stuck)[1], stuck.seen), (started, 5))
+        # the program of that read left the machine during the wait (the ChatGPT app replaced itself): no answer
+        self.assertEqual(run(12, Collector([(0, 0), None], fresh=False, word=False))[0][0], "needs_owner")
+        self.assertEqual(run(13, None)[1], started)             # and a helper with no collector yet knows nothing
+        other = Collector([(0, 0), (1, 1)], fresh=False)        # "Use another account" asks nothing: that sign-in goes
+        order, windows = run(14, other, signed_in=[True, False, False], replace=True, another=True)
+        self.assertEqual((windows, other.asked), (["logout", "login"], 0))
+        # also where the hub's reading said signed out, so that no sign-out comes first
+        self.assertEqual((run(15, other, another=True)[1], other.asked), (started, 0))
+        # a helper whose reads cannot say "the provider ended it" has the status command's word, as its reading has
+        asked = []
+        none = type("Collector", (), {"reads": lambda _self, _runtime: None,
+                                      "sign_in_ended": lambda _self, _runtime: False,
+                                      "account_again": lambda _self: asked.append("again")})()
+        self.assertEqual(run(16, none, signed_in=[True] * 3), done)
+        self.assertEqual(asked, ["again"])                      # the end's own (account_changed): nothing was waited for
 
     def test_the_helper_asks_what_the_machine_keeps_and_the_account_read_s_word_apart(self):
         """signed_in is the status command's own word, which a sign-out removes; sign_in_ended is the account read's
@@ -1092,7 +1286,7 @@ class HelperSide(unittest.TestCase):
         screens = [theme, theme, method, f"Use the url below to sign in:\n  {CLAUDE_URL}\n"]
         posts, keys = [], []
         helper = fleet.Helper.__new__(fleet.Helper)
-        helper.agent, helper.lifecycle = "solo", object()
+        helper.agent, helper.lifecycle = "solo", SIGNED_OUT
         helper.say = lambda *_: None
         helper.await_login_code = lambda *_: False
 
@@ -1120,7 +1314,7 @@ class HelperSide(unittest.TestCase):
         stuck = "Select login method:\n\u276f 1. Claude account with subscription\n"
         posts, keys, clock = [], [], iter(range(0, 10_000, 30))
         helper = fleet.Helper.__new__(fleet.Helper)
-        helper.agent, helper.lifecycle = "solo", object()
+        helper.agent, helper.lifecycle = "solo", SIGNED_OUT
         helper.say = lambda *_: None
 
         with patch.object(fleet, "http", lambda m, p, d=None, timeout=40: posts.append(d) or (200, {})), \
@@ -1197,9 +1391,10 @@ class HelperSide(unittest.TestCase):
         self.assertNotIn("codex", fleet.LOGIN_SETUP_CURSOR)
         keys, posts = [], []
         helper = fleet.Helper.__new__(fleet.Helper)
-        helper.agent, helper.lifecycle = "solo", object()
+        helper.agent, helper.lifecycle = "solo", SIGNED_OUT
         helper.say = lambda *_: None
         helper.await_login_code = lambda *_: False
+        helper.login_look = lambda *_: (200, {"stop": True, "why": "the test ends it"})     # the hub's word at a look
         screens = ["Starting…\n\u276f 1. Something\n", f"open {CODEX_URL} and enter WXYZ-1234"]
 
         with patch.object(fleet, "http", lambda m, p, d=None, timeout=40: posts.append(d) or (200, {})), \
@@ -1227,7 +1422,8 @@ class HelperSide(unittest.TestCase):
         helper.lifecycle = type("Lifecycle", (), {"report": lambda _self, **_: True, "read_models": lambda _self, **_: None,
                                                   "report_soon": lambda _self: None})()
         helper.say = lambda *_: None
-        helper.signed_in = lambda _runtime: True
+        looks = [False]                                     # no sign-in before the job starts
+        helper.signed_in = lambda _runtime: looks.pop(0) if looks else True
         helper.await_login_code = lambda *_: True           # the owner pasted the code
         helper.collector = type("Stand", (), {"account_again": lambda _self: again.append(True),
                                               "sign_in_ended": lambda _self, _runtime: False})()
@@ -1383,7 +1579,7 @@ class HelperSide(unittest.TestCase):
         time.sleep only records. Returns (steps, said, typed): the calls, windows, sleeps and typing in order, what
         the helper said, and the codes it typed."""
         steps, said, typed = [], [], []
-        looks = list(signed_in) if signed_in is not None else None
+        looks = [False] + list(signed_in) if signed_in is not None else None    # no sign-in before the job starts
         helper = fleet.Helper.__new__(fleet.Helper)
         helper.agent, helper.conf, helper.say = "solo", {"role": "worker"}, said.append
         helper.lifecycle = type("Lifecycle", (), {"report": lambda _self, **_: True,

@@ -1914,16 +1914,23 @@ class HubUpdates(Repositories, HubRoutes):
 
     def test_the_schema_check_gets_a_copy_of_the_records_and_nothing_of_it_is_left(self):
         """The hub hands the released code a copy of its own database (`test_schema_guard.py` runs that check for
-        real). It is the one copy this hub writes on its own machine, so the run must take it away again."""
-        seen = {}
-        made = releases.Update
+        real). It is the one copy this hub writes on its own machine, so the run must take it away again. The run
+        makes it with records_copy and no LOCK of its own: under LOCK it held every request of the hub, 776 ms for
+        358 MB on the owner's hub (18 November 2026)."""
+        seen, copies = {}, []
+        made, copy = releases.Update, hub.records_copy
 
         def watch(*args, **how):
             seen["database"] = how.get("database")
             seen["bytes"] = os.path.getsize(how["database"]) if how.get("database") else None
             return made(*args, **how)
-        with patch.object(releases, "Update", watch):
+
+        def copied(path):
+            copies.append(hub.LOCK._is_owned())
+            return copy(path)
+        with patch.object(releases, "Update", watch), patch.object(hub, "records_copy", copied):
             code, _ = self.run_update(self.publish(self.code(2)))
+        self.assertEqual(copies, [False])
         self.assertEqual(code, 200)
         self.assertEqual(self.newest()["state"], releases.DONE)
         self.assertTrue(seen["bytes"], "the schema check was given no records to read")

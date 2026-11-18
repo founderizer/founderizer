@@ -414,7 +414,9 @@ class Conversations(People):
         self.assertIn("they decide for the owner in this conversation", text)
         need = hub.q1("SELECT * FROM needs ORDER BY id DESC LIMIT 1")
         self.assertEqual((need["conversation"], need["answer"], need["answered_by"]), (self.cid, None, None))
-        self.assertIn(f"Laura decides this in C-{self.cid}", need["todo"])
+        self.assertIn(f"Laura decides this: their next message to {hub.shown_role('studio')} answers it",
+                      need["todo"])
+        self.assertNotIn(f"C-{self.cid}", need["todo"])            # words, not codes (the owner, 17 November 2026)
         # the owner is not interrupted for a decision that he gave away; the item is still there to read
         self.assertFalse([e for e in hub.q("SELECT * FROM events WHERE agent='owner' AND kind='notify'")
                           if f"N-{need['id']}" in e["text"]])

@@ -727,10 +727,16 @@ class TokenRecords(unittest.TestCase):
             self.assertIs(codex.sign_in_ended("codex"), False)         # no word: nothing is asked
         self.assertEqual(len(asked), 2)
 
+    def screen_program(self):
+        """A file that stands for the screen runtime's program on this machine."""
+        program = self.home / "app-codex"
+        program.write_text("")
+        return str(program)
+
     def test_the_screen_route_has_its_own_word(self):
         """Codex as the runtime of a Claude agent's screen tasks, and a Codex agent that also has a screen route:
         its two routes are one sign-in, and its own reading says it."""
-        ivy = self.collector("claude", screen_command="codex")
+        ivy = self.collector("claude", screen_command=self.screen_program())
         for collector, run in ((ivy, ("usage.codex_limits", "usage.claude_limits")),):
             collector.last_poll = 0
             with patch("usage.transcript_tokens", return_value=tokens("claude")), \
@@ -746,6 +752,66 @@ class TokenRecords(unittest.TestCase):
         both.heard("screen", True)                  # never alone: both reads are of one sign-in
         self.assertIs(both.sign_in_ended("codex"), False)
         self.assertIs(self.collector("claude").sign_in_ended("codex"), False)   # an agent with no Codex route
+
+    def test_an_answer_about_the_screen_runtime_is_left_for_the_readers_with_no_account_read(self):
+        """A Mac's server service says whether the ChatGPT app is signed in, and has no account read of its own
+        (lifecycle.Lifecycle.chatgpt): each helper of that user leaves there what its newest read of the screen
+        runtime answered. A read with no answer leaves nothing, so the older word of one agent never stands over the
+        newer answer of another: after a sign-in from one agent's row, a network fault of the second agent's read
+        would say "signed out" again."""
+        screen = self.screen_program()
+        ivy = self.collector("claude", screen_command=screen)
+        nova = usage.Collector(self.kit, "nova", "claude", lambda data: None, self.home, screen_command=screen)
+        word = lambda: usage.lifecycle.screen_word(str(self.home), 3000)        # noqa: E731
+        with patch("usage.time.time", return_value=3000):
+            self.assertIsNone(word())
+            ivy.heard("screen", True)                   # the provider ended the sign-in of the screen runtime
+            self.assertIs(word(), True)
+            nova.heard("screen", False)                 # the owner signed in from the other agent's row
+            self.assertIs(word(), False)
+            ivy.heard("screen", None)                   # ivy's next read gets no answer: its older word stays its own
+            self.assertEqual((word(), ivy.sign_in_ended("codex")), (False, True))
+            ivy.heard("limits", True)                   # the agent's own provider is another sign-in
+            self.assertIs(word(), False)
+
+    def test_a_sign_in_job_can_wait_for_the_answer_of_a_read_that_started_after_it_asked(self):
+        """Before a sign-in job starts the provider's sign-in, it asks whether the stored one works (the helper's
+        sign_in_works, in fleet.py). The word that the collector has can be older than a sign-in of another agent,
+        so the job notes the polls that started, asks for one, and looks at the reads of a later poll. A read that
+        runs when the job asks is not such a read: it can be from before that sign-in. A read with no answer has
+        ended and says nothing, though three of them in a row end the word."""
+        ivy = self.collector("claude", screen_command=self.screen_program())
+        running, answers = [], [ValueError("account read timed out"), usage.SignInAgain("again"), limits("codex")]
+
+        def read(*_):
+            running.append((ivy.polls_started(), ivy.reads("codex")))           # what a job would note and see now
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+        after = []
+        for _ in range(3):
+            ivy.last_poll = 0
+            with patch("usage.transcript_tokens", return_value=tokens("claude")), \
+                    patch("usage.screen_tokens", return_value=None), patch("usage.codex_limits", side_effect=read), \
+                    patch("usage.claude_limits", return_value=limits("claude")), patch("usage.time.time", return_value=3000):
+                ivy.collect()
+            after.append(ivy.reads("codex"))
+        # While a read runs, its poll has started and the read has not ended. Poll 1 ended with no answer.
+        self.assertEqual(running, [(1, (0, 0)), (2, (1, 0)), (3, (2, 2))])
+        self.assertEqual(after, [(1, 0), (2, 2), (3, 3)])
+        # No read here can say that the provider ended the sign-in: nothing to wait for.
+        self.assertIsNone(ivy.reads("claude"))                                  # Claude Code's read never says so
+        self.assertIsNone(ivy.reads("grok"))                                    # no route
+        self.assertIsNone(self.collector("claude").reads("codex"))              # an agent with no screen runtime
+        self.assertIsNone(self.collector(local=True).reads("codex"))            # on a model server: no account read
+        self.assertEqual(self.collector().reads("codex"), (0, 0))               # a Codex agent: its own read can
+        # A screen program that the settings name and the machine does not have: the reading and the sign-in job
+        # ask the runtime's own program then (lifecycle.screen_codex), so no word of the screen route stands over it.
+        gone = self.collector("claude", screen_command=str(self.home / "no-such-codex"))
+        gone.heard("screen", True)
+        self.assertEqual((gone.account_route("codex"), gone.sign_in_ended("codex"), gone.reads("codex")),
+                         (None, False, None))
 
     def test_provider_timeout_retains_prior_numbers_and_original_time(self):
         collector = usage.Collector(self.kit, "manager", "claude", lambda data: None, self.home)

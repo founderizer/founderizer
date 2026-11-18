@@ -736,19 +736,25 @@ class Bugs(Base):
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner' AND kind='notify'")["n"], 1)
 
     def test_a_grant_is_written_into_the_owner_s_chat_with_no_notification(self):
+        """One short line, the agent by its role (the owner, 17 November 2026: "Manager should be capital M - like any
+        other agent name/role", "Dont spam with messages!"), and none for a grant that changed nothing."""
+        hub.TEAM["agents"]["vps"]["title"] = "Shop Deployer"
         with patch.object(hub, "grant_resource", return_value={"changed": True, "revision": "abcdef123456789"}):
             text, err = self.tool("manager", "grant_access", request_id=str(uuid.uuid4()), agent="vps",
                                   resource=f"secret:{LOGIN}", level="use",
-                                  why="T-1 cannot deploy without the shop login.")
+                                  why="the shop's deploy needs its login.")
         self.assertFalse(err, text)
         row = hub.q1("SELECT * FROM owner_reports ORDER BY id DESC LIMIT 1")
         self.assertEqual(row["agent"], "manager")
-        self.assertIn("vps now holds", row["text"])
-        self.assertIn("at level use", row["text"])
-        self.assertIn("I gave it because: T-1 cannot deploy without the shop login. The grant", row["text"])
-        self.assertIn("Resources page", row["text"])
+        self.assertEqual(row["text"], f"I gave Shop Deployer {hub.resource_phrase('secret', LOGIN)} (use): the shop's "
+                                      f"deploy needs its login.")
         self.assertEqual(f"grant secret:{LOGIN} to vps", row["about"])
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner' AND kind='notify'")["n"], 0)
+        with patch.object(hub, "grant_resource", return_value={"changed": False, "revision": "abcdef123456789"}):
+            text, err = self.tool("manager", "grant_access", request_id=str(uuid.uuid4()), agent="vps",
+                                  resource=f"secret:{LOGIN}", level="use", why="again")
+        self.assertFalse(err, text)
+        self.assertEqual(hub.q1("SELECT MAX(id) n FROM owner_reports")["n"], row["id"])     # nothing changed: no line
 
 
 if __name__ == "__main__":

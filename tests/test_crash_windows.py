@@ -245,10 +245,11 @@ class GrantsAccess(Dying, Resources):
 
     def test_a_grant_that_is_already_recorded_still_answers_already_had(self):
         """The healing is only for a hold the record does not carry: an ordinary repeat with a new request_id must
-        still say that nothing changed."""
+        still say that nothing changed, and it writes no second line in the owner's chat (the owner, 17 November
+        2026: "Dont spam with messages!")."""
         self.granted("dev", self.REPO, "write")
         self.assertIn("already had", self.granted("dev", self.REPO, "write"))
-        self.assertEqual(self.records(), ([("dev", "write", "manager")], 2, 2))
+        self.assertEqual(self.records(), ([("dev", "write", "manager")], 2, 1))
 
 
 class OwnerCommands(Dying, Base):

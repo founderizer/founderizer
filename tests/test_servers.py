@@ -1569,7 +1569,7 @@ class ServerService(Servers):
         self.assertEqual(prompts[0][0], {"kind": "signin", "purpose": "claude_login", "agent": "scout",
                                          "login": row["id"]})
         self.assertEqual(json.loads(hub.q1("SELECT * FROM events WHERE agent='scout' AND kind='login'")["extra"]),
-                         {"login": row["id"], "runtime": "claude", "replace": False})
+                         {"login": row["id"], "runtime": "claude", "replace": False, "another": False})
         shown = self.servers()[1]["mini"]["job"]
         self.assertEqual((shown["id"], shown["state"]), (job, "done"))
         # nothing of a terminal is left in what the service said or in what the owner reads

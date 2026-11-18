@@ -7,13 +7,14 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import urllib.parse
 import uuid
 
 import hub
-from test_ui_api import OwnerAPI
+from test_ui_api import PATIENCE, OwnerAPI
 
 LOGIN_A = "bws://11111111-2222-4333-8444-55555555555b"
 LOGIN_B = "bws://21111111-2222-4333-8444-55555555555b"
@@ -847,6 +848,108 @@ class Capacity(OwnerAPI):
         # deva reads the same thing, because the allowance belongs to the account and not to either agent.
         self.assertIn("big spend the same allowance", hub.allowance_ahead("deva")[0])
         self.assertIsNone(hub.account_group("pma"))                   # no reading, so no account identity
+
+    # ---- git reads outside the lock
+    def test_the_reads_of_the_profiles_run_no_git_under_the_lock_and_read_the_owners_new_commit(self):
+        """GET /ui/capacity, /ui/profiles, /ui/team and /ui/resources, see_capacity and create_task read the
+        configuration ref, and under LOCK a git process was a wait for every other request (37 in one capacity read
+        of the owner's hub, 18 November 2026). Each reads its files before LOCK, at the commit of now: right after an
+        owner's commit that takes a login out of a profile, and one before each read, no git process runs while a
+        thread holds LOCK, and each answer is of the new commit, not of the one that the read before it kept."""
+        hub.CFG["artifact_repo"] = str(self.kit)            # the knowledge catalog of the test's own checkout
+        self.addCleanup(hub.CFG.pop, "artifact_repo", None)
+        seo = lambda view: next(a for a in view["agents"] if a["agent"] == "seo")["logins"]["eligible"]
+        self.assertEqual(seo(self.request("/ui/capacity?db=test-generation")[1]), [LOGIN_A, LOGIN_B])
+        reads = {"capacity": lambda: self.request("/ui/capacity?db=test-generation")[1],
+                 "profiles": lambda: self.request("/ui/profiles?db=test-generation")[1],
+                 "team": lambda: self.request("/ui/team?db=test-generation")[1],
+                 "resources": lambda: self.request("/ui/resources?db=test-generation")[1],
+                 "see_capacity": lambda: self.call("manager", "see_capacity", {}),
+                 "create_task": lambda: self.create("pma", "seo", self.create("manager", "pma"))}   # seo's start
+        heads, answers, locked, real = {}, {}, [], subprocess.run
+
+        def run(argv, *args, **kwargs):
+            if list(argv[:1]) == ["git"] and hub.LOCK._is_owned():
+                locked.append(argv)
+            return real(argv, *args, **kwargs)
+        with patch.object(subprocess, "run", run):
+            for n, (name, read) in enumerate(reads.items()):
+                text = profile("seo", [LOGIN_A]).replace("Careful.", f"Careful {n}.")
+                (self.kit / "profiles" / "seo.md").write_text(text)
+                git("commit", "-qam", f"the owner's edit {n}", cwd=self.kit)
+                heads[name], answers[name] = git("rev-parse", "HEAD", cwd=self.kit), read()
+        self.assertEqual(locked, [])
+        self.assertEqual(seo(answers["capacity"]), [LOGIN_A])
+        self.assertEqual([answers[n]["revision"] for n in ("profiles", "team", "resources")],
+                         [heads[n] for n in ("profiles", "team", "resources")])
+        self.assertIn("Careful 1.", next(p["text"] for p in answers["profiles"]["profiles"] if p["agent"] == "seo"))
+        text, error = answers["see_capacity"]
+        self.assertFalse(error, text)
+        self.assertNotIn(LOGIN_B, text)
+
+    def test_the_commit_of_now_and_its_files_are_what_git_says(self):
+        """Every machine is asked to run kit_revision's commit, which head_commit reads from the checkout's files, and
+        a view reads the owner's files of that commit from kit_files, which keeps them. So head_commit says what `git
+        rev-parse HEAD` says in each shape of a checkout, or leaves it to git, and kit_files gives what `git show`
+        gives. A commit that the checkout does not have yet keeps nothing: a worker's own commit comes with a fetch."""
+        kit, rev = str(self.kit), lambda: git("rev-parse", "HEAD", cwd=self.kit)
+        first = rev()
+        (self.kit / "x.txt").write_text("x\n")
+        git("add", "x.txt", cwd=self.kit)
+        git("commit", "-qm", "x", cwd=self.kit)
+        git("branch", "aaa", first, cwd=self.kit)           # another branch, at another commit, before main
+        self.assertEqual(hub.head_commit(kit), rev())       # the branch's own file
+        git("pack-refs", "--all", cwd=self.kit)
+        self.assertFalse((self.kit / ".git" / "refs" / "heads" / "main").exists())
+        self.assertEqual(hub.head_commit(kit), rev())       # its line of packed-refs
+        git("checkout", "-q", "--detach", cwd=self.kit)
+        self.assertEqual(hub.head_commit(kit), rev())       # on no branch
+        git("checkout", "-q", "--orphan", "empty", cwd=self.kit)
+        self.assertEqual((hub.head_commit(kit), hub.kit_revision(fresh=True)), (None, None))    # no commit yet
+        git("checkout", "-q", "main", cwd=self.kit)
+        git("worktree", "add", "-q", str(self.root / "wt"), cwd=self.kit)
+        self.assertIn(hub.head_commit(str(self.root / "wt")), (None, git("rev-parse", "HEAD", cwd=self.root / "wt")))
+        head = rev()
+        for path in ("profiles/seo.md", "profiles/nobody.md", "profiles", "team.json"):
+            shown = subprocess.run(["git", "-C", kit, "show", f"{head}:{path}"], capture_output=True)
+            for _ in range(2):                              # read, then kept
+                self.assertEqual(hub.kit_files(head, [path])[path], shown.stdout if shown.returncode == 0 else None)
+        other = self.root / "other"
+        git("clone", "-q", str(self.root / "origin.git"), str(other))
+        (other / "profiles" / "seo.md").write_text(profile("seo", []))
+        git("commit", "-qam", "later", cwd=other)
+        git("push", "-q", "origin", "main", cwd=other)
+        later = git("rev-parse", "HEAD", cwd=other)
+        self.assertIsNone(hub.git_blob(later, "profiles/seo.md"))
+        git("fetch", "-q", "origin", cwd=self.kit)
+        self.assertEqual(hub.git_blob(later, "profiles/seo.md"), profile("seo", []).encode())
+
+    def test_a_reading_of_the_commit_that_ends_last_does_not_replace_a_later_one(self):
+        """kit_reads_ahead reads the commit without LOCK, while a writer under LOCK moves the checkout and reads it
+        again. A reading that began first and ends last gives its caller its own commit and leaves the later one
+        kept: else the writer's own check could refuse the owner's write ("the hub checkout did not reach origin"),
+        and every machine was told the old commit for 30 seconds."""
+        old, real, read, go, late = git("rev-parse", "HEAD", cwd=self.kit), hub.head_commit, \
+            threading.Event(), threading.Event(), []
+
+        def slow(folder):
+            got = real(folder)
+            if threading.current_thread() is not threading.main_thread():
+                read.set()
+                go.wait(PATIENCE)
+            return got
+        with patch.object(hub, "head_commit", slow):
+            reader = threading.Thread(target=lambda: late.append(hub.kit_revision(fresh=True)))
+            reader.start()
+            self.addCleanup(reader.join, PATIENCE)
+            self.addCleanup(go.set)
+            self.assertTrue(read.wait(PATIENCE))
+            git("commit", "-q", "--allow-empty", "-m", "the checkout moves", cwd=self.kit)
+            new = git("rev-parse", "HEAD", cwd=self.kit)
+            self.assertEqual(hub.kit_revision(fresh=True), new)
+            go.set()
+            reader.join(PATIENCE)
+        self.assertEqual((late, hub.kit_revision()), ([old], new))
 
 
 if __name__ == "__main__":

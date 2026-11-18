@@ -220,7 +220,9 @@ EVERY_AGENT = ["read_messages", "search_knowledge", "read_knowledge", "write_kno
                # support plan F4: a typed report that reached a duty of the agent joins one of its cases
                "join_report",
                # CHAT-APPS.md 20: a file that a message carries to a person in a chat
-               "attach_file"]
+               "attach_file",
+               # the owner, 17 November 2026: the file that he sends with a message, in any session of the agent
+               "read_attachment"]
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "see_team", "see_capacity", "see_goals",
                                "update_goal", "record_spend", "raise_needs_you", "withdraw_need", "request_secret",
@@ -241,7 +243,7 @@ MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "an
                                "set_agent_model",
                                # the owner, 5 November 2026: the summary of each knowledge file
                                "summarize_knowledge"]
-WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "read_attachment", "ask_my_requester",
+WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "ask_my_requester",
                               "deliver_result", "sign_in", "hand_over", "resolve_outcome", "see_earlier_work",
                               "report_up",
                               # plan C17 (the owner, 26 October 2026): a worker writes its own duties

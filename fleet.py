@@ -72,7 +72,8 @@ import lifecycle
 from lifecycle import (APP_SERVER_RUNTIME, CHECK_FILE, CHECK_STORE, FLOOR_FILE, GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS,
                        REPO_NAME, RUNTIMES, TOOL_CATALOG, Lifecycle, Updating, app_server_task, check_stores, exe,
                        facts_now, follow_config_ref, key_env, mcp_variable, no_sign_in, reuse_settings, runtime_fact,
-                       runtimes_with, screen_program, session_reuse, skills_text, start_form, tool_catalog, tool_needs)
+                       runtimes_with, screen_codex, screen_program, session_reuse, skills_text, start_form, tool_catalog,
+                       tool_needs)
 from desktop import Publisher
 import onboard
 from onboard import CLAUDE_UPDATES_OFF
@@ -2944,7 +2945,7 @@ CHAT_SIGNAL = "New fleet messages. Call read_messages now."     # the helper's s
 # test_chat_agents pin on both sides. request_secret is allowed here one release before the hub offers it to a
 # worker's chat (owner feature secret_requests), so that no machine that has not updated yet refuses it.
 CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall",
-              "start_task", "request_secret", "search_history", "read_history")
+              "start_task", "request_secret", "search_history", "read_history", "read_attachment")
 def chat_instructions(agent, conf):
     """The instructions of an owner chat, the head of its start text (chat_command, standing_text)."""
     prompt = (f'You are {agent}, speaking directly with the owner in this agent\'s chat. '
@@ -6362,7 +6363,7 @@ class Helper:
 
         self.say(f"sign-in L-{lid}: {runtime}")
         try:
-            program = exe(runtime, os.path.expanduser("~")) if runtime in LOGIN_URLS else None
+            program = self.login_program(runtime) if runtime in LOGIN_URLS else None
             if not program:
                 return report("failed", detail=f"{runtime} is not installed on this machine.")
             if not getattr(self, "lifecycle", None):
@@ -6372,6 +6373,27 @@ class Helper:
             except Refused as e:
                 return report("failed", detail=str(e))
             label = LOGIN_LABELS.get(runtime, runtime)
+
+            def done():
+                self.account_changed()
+                if runtime == self.conf.get("runtime"):     # a session of another provider sits at no sign-in screen
+                    self.restart_after_login()
+                self.send_status()          # the machine's status first, then the end of the sign-in
+                report("done", detail=f"{label} is signed in on this machine.")
+                with contextlib.suppress(Exception):        # the model options follow the account, in a second
+                    self.lifecycle.read_models(force=True)  # report that nothing waits for
+                    self.lifecycle.report_soon()
+
+            # **A sign-in that this machine has, and that works, is not made again.** The provider's own sign-in
+            # removes the stored one at its start (Codex 0.163.0, probed on 14 November 2026), and all agents of one
+            # OS user keep one. So after a sign-in from one agent's row, a press on the row of a second agent, whose
+            # reading was from before, signed every agent of that user out again until the owner had done the
+            # provider's step a second time. The account is asked once before anything starts (sign_in_works). The
+            # owner's "Use another account" is not asked (`replace`, and `another` where the hub's reading said
+            # signed out): a new sign-in is what that asks for, also while the one that the machine keeps works.
+            if not (extra.get("replace") or extra.get("another")) and self.sign_in_works(runtime):
+                self.say(f"sign-in L-{lid}: {label} is signed in already, so nothing started")
+                return done()
             # **The first half of a different account.** No provider starts a second sign-in while one is live, so
             # the owner's "Use another account" signs this runtime out first, in the same job and the same window
             # session. Nothing of the old credential is read here: the runtime's own sign-out removes it, and this
@@ -6453,14 +6475,7 @@ class Helper:
                 # keeps it while a new sign-in waits): sign_in_ended reads the account again each time it says so,
                 # so the next look here has the word of a read that came after the owner's step.
                 if self.signed_in(runtime) and not self.sign_in_ended(runtime):
-                    self.account_changed()
-                    self.restart_after_login()
-                    self.send_status()      # the machine's status first, then the end of the sign-in
-                    report("done", detail=f"{label} is signed in on this machine.")
-                    with contextlib.suppress(Exception):        # the model options follow the account, in a second
-                        self.lifecycle.read_models(force=True)  # report that nothing waits for
-                        self.lifecycle.report_soon()
-                    return
+                    return done()
                 if time.monotonic() >= deadline:
                     break
                 if not wants:           # Codex waits here for the owner on its page: a restarted hub needs its link
@@ -6865,6 +6880,46 @@ class Helper:
         with no collector yet has no such word."""
         collector = getattr(self, "collector", None)
         return collector is not None and collector.sign_in_ended(runtime) is True
+
+    def login_program(self, runtime):
+        """The program that the owner's sign-in and sign-out of this runtime run on this machine, or None when it
+        has none: for Codex of an agent on another provider with a screen runtime here, the ChatGPT app's own copy,
+        which its screen tasks run (lifecycle.screen_codex, the one rule that the machine's reading and the account
+        read follow too); else the runtime's own program. Until 18 November 2026 it was always the own program: a
+        Mac with Claude Code and the ChatGPT app, and no `codex` of its own, answered that Codex is not installed."""
+        return screen_codex(getattr(self, "conf", None), runtime) or exe(runtime, os.path.expanduser("~"))
+
+    def sign_in_works(self, runtime):
+        """True when this machine keeps a sign-in of this runtime and an account read made now answers that the
+        provider did not end it: the question of a sign-in job before it starts the provider's own sign-in. The word
+        that the helper has can be from before a sign-in that another agent of this OS user made, or that the owner
+        made at the machine. So one account poll is asked for (account_again), and the answer of its read is waited
+        for: of a poll that started after this asked, never of a read that was already running. A read with no
+        answer says nothing of the sign-in: when the read that this asked for ends so, or when none ends in
+        LOGIN_READ_LOOKS looks of a second, or when the program of that read left the machine meanwhile, nothing
+        says that the sign-in works, and the job goes on as before this question existed. A helper whose reads
+        cannot say that the provider ended this runtime's sign-in (an agent on a local model, a runtime with no
+        account read, Claude Code) has the status command's word alone, as its reading has."""
+        if not self.signed_in(runtime):
+            return False
+        collector = getattr(self, "collector", None)
+        if collector is None:
+            return False
+        if collector.reads(runtime) is None:
+            return True
+        asked = collector.polls_started()
+        collector.account_again()
+        for _ in range(LOGIN_READ_LOOKS):
+            reads = collector.reads(runtime)
+            if reads is None:
+                return False
+            ended, answered = reads
+            if answered > asked:
+                return self.signed_in(runtime) and not collector.sign_in_ended(runtime)
+            if ended > asked:
+                return False
+            time.sleep(1)
+        return False
 
     def trigger_check(self, extra):
         """A check run from the hub (owner API 1.8), in its own thread and outside every AI session. No claim expires
@@ -9798,6 +9853,9 @@ LOGIN_URL_WAIT = 90                         # seconds for the provider's link to
 LOGIN_CODE_WAIT = 840                       # seconds for the owner's code to come back through the hub
 LOGIN_SETUP_ANSWERS = 5                     # first-run questions of its own that a sign-in may be asked past
 LOGOUT_WAIT = 120                           # seconds for the runtime to report that it is signed out again
+LOGIN_READ_LOOKS = 90                       # looks, a second apart, for the end of the account read that a
+                                            # sign-in job asks for before it starts (Helper.sign_in_works): a poll
+                                            # that runs now, and the read of the poll after it
 LOGIN_DONE_WAIT = 900                       # seconds for the runtime to report that it is signed in: as long
                                             # as the hub keeps the sign-in open (hub.LOGIN_LIFE), because the
                                             # owner is in a browser and three minutes called a real sign-in

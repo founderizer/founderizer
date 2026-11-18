@@ -1027,6 +1027,10 @@ class Collector:
         # one whose runtime the owner switched (heard, sign_in_ended).
         self.over, self.silent, self.over_asked = {}, {}, float("-inf")
         self.over_changed = None        # () -> None, called when that word changes: the machine's report is due
+        # The account polls that started in this helper's life, and for each route the newest poll whose read of it
+        # ended, and the newest whose read gave an answer: how a sign-in job knows that a word is the answer of a
+        # read that started after it asked (polls_started, reads).
+        self.polls, self.ended, self.answers = 0, {}, {}
         self.takes = 0                  # the hub's last answer took each session's four kinds (1), and its models (2)
         self.scans = {}                 # runtime -> its Scan: each scan reads only what its transcripts gained
         try:
@@ -1060,7 +1064,12 @@ class Collector:
         the status command's word stands again, as before this word existed. Without that end, a sign-in that the
         owner made again would read "signed out" for as long as the account read fails for another reason. The reads
         are the poll clock's, 15 minutes for three, and the early ones of sign_in_ended while a sign-in job looks:
-        then a network fault of under a minute ends the word, until the next read that gets an answer."""
+        then a network fault of under a minute ends the word, until the next read that gets an answer.
+
+        **An answer about the screen runtime is also left for the readers of this OS user that have no account read**
+        (lifecycle.leave_screen_word): a Mac's server service, whose reading says whether the ChatGPT app is signed
+        in, said "signed in" from the status command while the provider had ended that sign-in. A read with no answer
+        writes nothing there, so it never puts an older word over the newer answer of another agent's helper."""
         before = bool(self.over.get(route))
         if word is None:
             self.silent[route] = self.silent.get(route, 0) + 1
@@ -1072,6 +1081,10 @@ class Collector:
                 self.over[route] = True
             else:
                 self.over.pop(route, None)
+            if route == "screen":
+                lifecycle.leave_screen_word(str(self.home), bool(word), self.agent, time.time())
+            self.answers[route] = self.polls    # after the word: a caller that waits for this answer then finds it
+        self.ended[route] = self.polls          # and after the answer: a read that ended with one never looks silent
         if bool(self.over.get(route)) != before and self.over_changed:
             try:
                 self.over_changed()
@@ -1088,14 +1101,43 @@ class Collector:
         this word disagree until the account is read again. So each True also asks for that read now, at most each
         ACCOUNT_AGAIN seconds (account_again), and the read's new word asks for the machine's report (over_changed):
         a sign-in that worked reads so within seconds, and not at the end of the poll clock."""
-        route = "limits" if runtime == self.runtime else \
-            "screen" if runtime == "codex" and self.screen_command else None
+        route = self.account_route(runtime)
         if not route or not self.over.get(route):
             return False
         if time.monotonic() - self.over_asked >= ACCOUNT_AGAIN:
             self.over_asked = time.monotonic()
             self.account_again()
         return True
+
+    def account_route(self, runtime):
+        """The route of the account read that answers for this runtime's sign-in, or None when this agent has none:
+        "limits", its own runtime, read with that runtime's own program; "screen", Codex as the runtime of the screen
+        tasks of an agent on another provider, read with the screen runtime's program while this machine has that
+        program. It is the rule of lifecycle.screen_codex, which the machine's reading and the sign-in job follow:
+        with a screen program that the settings name and the machine does not have, all three ask the runtime's own
+        program, and no read of the screen route stands over that program's word."""
+        return "limits" if runtime == self.runtime else \
+            "screen" if runtime == lifecycle.APP_SERVER_RUNTIME and self.screen_command and \
+            os.path.isfile(self.screen_command) else None
+
+    def reads(self, runtime):
+        """(ended, answered): the number of the newest account poll whose read of this runtime's route ended, and of
+        the newest whose read gave an answer (heard with True or False); 0 before the first. None when no read here
+        can say that the provider ended this runtime's sign-in: no route, an agent that reads no account (a local
+        model, a runtime with no account read), or the own route of a runtime whose read never says so (only Codex's
+        does: codex_account). A caller that needs the answer of a read that started after a moment notes
+        polls_started, asks for a poll (account_again), and looks until `answered` is above what it noted, or until
+        `ended` alone is: then that read gave no answer. A read that was already running when it asked is of the
+        poll that it noted, and a read with no answer says nothing: neither is an answer."""
+        route = self.account_route(runtime)
+        if not route or self.local or self.runtime not in LIMIT_SOURCES or \
+                (route == "limits" and runtime != lifecycle.APP_SERVER_RUNTIME):
+            return None
+        return self.ended.get(route, 0), self.answers.get(route, 0)
+
+    def polls_started(self):
+        """How many account polls started in this helper's life (collect)."""
+        return self.polls
 
     def account_again(self):
         """Read the account at the next scan, whatever the poll clock says. This machine signed in to another
@@ -1136,6 +1178,7 @@ class Collector:
         # each ACP program until its own reader is built.
         if not self.local and self.runtime in LIMIT_SOURCES and time.time() - self.last_poll >= POLL_SECONDS:
             self.last_poll = time.time()
+            self.polls += 1
             if self.screen_command:
                 try:
                     self.data["screen"]["limits"] = keep_windows(self.data["screen"]["limits"],

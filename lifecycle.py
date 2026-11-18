@@ -445,6 +445,10 @@ def web_hosts(value):
 #   screen_counter    a running turn of its terminal session repaints an elapsed counter every second, read live on
 #                     the fleet's machines, so the screen watch takes a running screen that stopped changing for a
 #                     frozen runtime (fleet.Helper.watch_screens, plan C2); False where nobody has read it
+#   tool_pictures     a picture in an MCP tool's answer reaches its model, and the runtime keeps what the model takes
+#                     for many pictures in one request, as its source says: read_attachment gives such an agent the
+#                     owner's picture as the answer's image (hub.ATTACH_PICTURES). False where no source says so, and
+#                     such an agent gets the download line
 #   cache_seconds     how long the provider keeps a session's prompt cache after its last model call, as far as
 #                     the fleet knows; a session told of a message later than that reads its whole context again at
 #                     the price of writing it (plan P9.10, session_reuse). A session's own records can say less (a
@@ -545,6 +549,7 @@ RUNTIMES = {
         "screen_counter": False,
         # a browser task runs in the app-server runner, whose native UI tools work the machine's own screen
         "browser_tabs": False,
+        "tool_pictures": True,          # Codex shows a tool's picture to its model (openai/codex 5600)
         # OpenAI keeps a prompt's cache for some minutes of inactivity, and Codex keys it by its own thread
         # (prompt_cache_key), so a new Codex session reads little of another's
         "cache_seconds": 300,
@@ -614,6 +619,8 @@ RUNTIMES = {
         # with --chrome each session works in a tab group of its own of Claude in Chrome: two sessions read, scrolled
         # and typed in their own tabs at the same time on one Mac, 30 October 2026
         "browser_tabs": True,
+        # Claude Code scales the copy of a tool's picture that it shows (its MCP documentation, since 2.1.283)
+        "tool_pictures": True,
         "cache_seconds": 3600,          # an hour; its own records say when it is five minutes (fleet.claude_context)
         "compact_tokens": 200000,       # fleet.STANDING_COMPACT, the window that Fleet starts its standing sessions with
         "routine": {"model": "sonnet", "effort": "low"},
@@ -677,6 +684,7 @@ RUNTIMES = {
         "sandbox": None,
         "screen_counter": False,
         "browser_tabs": False,
+        "tool_pictures": False,
         "cache_seconds": None,
         "compact_tokens": None,
         "routine": None,
@@ -735,6 +743,7 @@ RUNTIMES = {
         "sandbox": None,
         "screen_counter": False,
         "browser_tabs": False,
+        "tool_pictures": False,
         "cache_seconds": None,
         "compact_tokens": None,
         "routine": None,
@@ -772,7 +781,7 @@ RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manage
                  "compact_tokens", "routine", "default_model", "task_denied", "task_allowed", "conversation_denied",
                  "manager_denied", "task_opening", "token_weights", "memory_off",
                  "acp_auth", "acp_quiet", "acp_models", "acp_allowance", "key_env", "own_env", "pinned", "continues",
-                 "acp_adapter", "own_hosts")
+                 "acp_adapter", "own_hosts", "tool_pictures")
 
 
 # The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":
@@ -2247,6 +2256,74 @@ def screen_program(conf):
     return command if command in SCREEN_COMMANDS else None
 
 
+def screen_codex(conf, name):
+    """The screen runtime's program when the runtime `name` is this agent's Codex of its screen tasks, else None: the
+    ONE rule for which program answers for Codex's sign-in on a machine. Codex is the runtime of every screen runtime
+    (APP_SERVER_RUNTIME, which screen_runner drives). For an agent whose own provider is not Codex and whose settings
+    give it a screen runtime that is on this machine, Codex is that program and no other: its screen tasks run it
+    (screen_runner), so its status command says what the machine keeps (Lifecycle.runtime), its account read confirms
+    that (usage.Collector, route "screen"), and the owner's sign-in and sign-out run it (fleet.Helper.runtime_login).
+    An agent whose own provider is Codex keeps its own program for all three, and so does an agent with no screen
+    runtime here.
+
+    Why not "the plain `codex` of the PATH when the machine has one": nothing of such an agent ever runs that
+    program, and it need not be the same Codex. On the owner's Mac Studio on 18 November 2026 it was 0.166.0 beside
+    the app's 0.163.0-alpha.10.2, which answers an ended sign-in in other words (usage.codex_account); on the Mac
+    that builds this code it is a script that starts a third version. Until that day the reading and the sign-in
+    asked the plain program and only the account read asked the app's copy: that agreed only while both programs
+    kept one sign-in in one file, and a Mac with no plain program read nothing of Codex's sign-in and could not be
+    signed in from the app."""
+    if not isinstance(conf, dict) or name != APP_SERVER_RUNTIME or conf.get("runtime") == name:
+        return None
+    program = screen_program(conf)
+    return program if program and os.path.isfile(program) else None
+
+
+# Where the helpers of one OS user leave the word of the newest account read of the screen runtime that gave an
+# answer (leave_screen_word), for the one reader that has no account read of its own: a Mac's server service,
+# whose reading says whether the ChatGPT app is signed in (Lifecycle.chatgpt). All agents of a Mac run as that
+# service's user, so the file is in the home of them all: ~/.fleet/screen-sign-in.json, {at, ended, agent}.
+SCREEN_WORD_FILE = "screen-sign-in.json"
+# A word that no read gave again in this time says nothing any more: no helper of this user reads that account now
+# (none runs, or each read fails). It is three reads of the account's poll clock, the count after which a helper drops
+# its own word (usage.NO_ANSWER_READS, usage.POLL_SECONDS).
+SCREEN_WORD_AGE = 900
+
+
+def screen_word_path(home):
+    """The file of the newest account read's word on the screen runtime's sign-in (SCREEN_WORD_FILE)."""
+    return os.path.join(home, FLEET_DIR, SCREEN_WORD_FILE)
+
+
+def leave_screen_word(home, ended, agent, at):
+    """Leave the word of one answered account read of the screen runtime (usage.Collector.heard): whole or not at
+    all, through a file of this process's own, because every helper of this user writes here and several read their
+    accounts at the same moment after a sign-in (hub.signed_in_beside). A write that fails leaves the word as it was:
+    the next read that gets an answer writes it again."""
+    path = screen_word_path(home)
+    own = f"{path}.{os.getpid()}.new"
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(own, "w") as f:
+            json.dump({"at": at, "ended": ended, "agent": agent}, f)
+        os.replace(own, path)
+    except OSError:
+        pass
+
+
+def screen_word(home, now):
+    """What the newest account read of the screen runtime said, by any helper of this home's user: True, the provider
+    ended the sign-in that this machine keeps; False, the account answered; None with no word of the last
+    SCREEN_WORD_AGE seconds, or with a file that does not say."""
+    try:
+        with open(screen_word_path(home)) as f:
+            said = json.load(f)
+        ended, at = said["ended"], float(said["at"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    return ended if isinstance(ended, bool) and 0 <= now - at <= SCREEN_WORD_AGE else None
+
+
 # The name of an API key in a session's environment. A team setting names these variables (a login's env, an MCP
 # server's env), so a name must have the shape of a key's name and be none that a session's start or a runtime sets or
 # reads itself: then no team setting can give a session a model address, a proxy or any other setting that a runtime
@@ -3038,8 +3115,9 @@ class Lifecycle:
         return s
 
     def desktop(self):
-        """What only hands at this Mac can put right: its lock, macOS's own setup screens, Chrome, Claude's extension
-        and the ChatGPT app's sign-in, with no AI."""
+        """What only hands at this Mac can put right: its lock, macOS's own setup screens, Chrome and Claude's
+        extension; and the ChatGPT app's sign-in, which the owner's sign-in of Codex for an agent of this Mac puts
+        right too (fleet.Helper.login_program). With no AI."""
         console = console_session(self.run)
         code, _, _ = self.run(["pgrep", "-x", "Google Chrome"])
         extension = chrome_extension(self.home)
@@ -3052,12 +3130,19 @@ class Lifecycle:
     def chatgpt(self):
         """Whether the ChatGPT app of this Mac is signed in: the copy of Codex it carries, which Computer Use runs
         through, and not the one a Codex agent has in its own home. False with no app, and when it says nothing: no agent
-        gets a screen on a silence."""
+        gets a screen on a silence.
+
+        **Its status command reads only what the Mac keeps**, and says "Logged in" after the provider ended that
+        sign-in, while each screen task fails (the owner's Mac Studio, 18 November 2026: "workspace routing discovery
+        unauthorized (401)" on the task, and "ChatGPT · Signed in" on the server's page). This reading has no account
+        read of its own, so it takes the word of the helpers' newest one (screen_word): False while that read says
+        that the provider ended the sign-in. With no such word of the last SCREEN_WORD_AGE seconds, the status
+        command's word stands, as before."""
         if not os.path.exists(CHATGPT_CODEX):
             return False
         _, out, err = self.run([CHATGPT_CODEX, "login", "status"])
         text = out + err
-        return "Logged in" in text and "Not logged in" not in text
+        return "Logged in" in text and "Not logged in" not in text and screen_word(self.home, self.clock()) is not True
 
     def remember_browser(self, connected):
         """Leave the reading of Chrome where `fleet.py verify` reads it: over SSH it cannot read it, as a sign-in
@@ -3174,17 +3259,24 @@ class Lifecycle:
     def runtime(self, name=None, stored=False):
         """{name, version, signed_in} of the agent's runtime, or of another one: status commands only, no model.
         stored: only what the machine keeps, without the account read's word on it (`ended`): the question of a
-        sign-out, which removes what is kept, and of a sign-in job, which asks the account read itself."""
+        sign-out, which removes what is kept, and of a sign-in job, which asks the account read itself.
+
+        **Codex's sign-in is asked of the program that this agent runs as Codex** (screen_codex): for an agent on
+        another provider with a screen runtime here, that is the ChatGPT app's own copy, also on a Mac with no
+        `codex` of its own, which read nothing of this sign-in until 18 November 2026. `version` stays the version
+        of the runtime's own program, None without one: it says what a change of the agent's provider would run
+        (hub.switch_view), and that is never the app's copy."""
         name = name or self.conf.get("runtime")
         result = {"name": name, "version": None, "signed_in": None}
         exe = self.exe(name)
-        if not exe:
+        asked = screen_codex(self.conf, name) or exe
+        if not asked:
             return result
-        code, out, _ = self.run([exe, "--version"])
+        code, out, _ = self.run([exe, "--version"]) if exe else (1, "", "")
         if code == 0 and out.strip():
             result["version"] = out.strip().splitlines()[0][:120]
         if name == "codex":
-            code, out, err = self.run([exe, "login", "status"])
+            code, out, err = self.run([asked, "login", "status"])
             text = out + err
             if text.strip():
                 result["signed_in"] = "Logged in" in text and "Not logged in" not in text

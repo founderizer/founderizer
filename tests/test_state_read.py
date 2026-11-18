@@ -70,6 +70,7 @@ records that a backup takes is test_backup_restore's.
 """
 import ast
 import builtins
+import contextlib
 import functools
 import hashlib
 import http.client
@@ -1543,6 +1544,36 @@ class OwnMoment(StateCase):
             self.assertIs(hub.SNAP.conn, conn)
             self.assertEqual(hub.q1("SELECT COUNT(*) n FROM tasks")["n"], 14)
         self.assertEqual((hub.SNAP.conn, hub.SNAP.team, hub.SNAP.moment), (None, None, None))
+
+    def test_the_copy_for_a_releases_schema_check_is_made_while_another_thread_holds_the_lock(self):
+        """A release's run copies the records for the schema check of the code that it takes (records_copy). Under
+        LOCK the copy held every request of the hub, 776 ms for records of 358 MB on the owner's hub (18 November
+        2026). From a read connection it is made while another thread holds LOCK, and it holds every row. A copy that
+        the read connection cannot make is made under LOCK, after the file of its part is gone (VACUUM INTO refuses a
+        file that is there)."""
+        self.fill()
+        path, held, go, after = os.path.join(self.tmp.name, "copy.db"), threading.Event(), threading.Event(), []
+
+        def holder():
+            with hub.LOCK:
+                held.set()
+                go.wait(PATIENCE)
+            after.append("let go")
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(go.set)
+        self.assertTrue(held.wait(PATIENCE))
+        hub.records_copy(path)
+        self.assertEqual(after, [])                         # made while the other thread still held LOCK
+        go.set()
+        part = os.path.join(self.tmp.name, "part.db")
+        with open(part, "wb") as f:
+            f.write(b"the part of a copy that failed")       # the read connection refuses it, as a part of its own
+        hub.records_copy(part)
+        for made in (path, part):
+            with contextlib.closing(sqlite3.connect(made)) as copy:
+                self.assertEqual(copy.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 14)
 
 
 class RealHub(unittest.TestCase):

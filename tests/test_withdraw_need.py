@@ -357,11 +357,15 @@ class SecondLook(Withdraw):
         door = self.item(62, by="vps", kind="secret", raised=self.T, secret=json.dumps(dict(spec, door="acme:one")))
         site = self.item(63, by="vps", kind="secret", raised=self.T, secret=json.dumps(
             {"kind": "login", "site": "https://shop.example.com/login", "reply": str(uuid.uuid4())}))
+        # another account of that site, and its own login whose password no longer works: neither one is held
+        named, failed = (self.item(nid, by="vps", kind="secret", raised=self.T, secret=json.dumps(
+            dict({"kind": "login", "site": "https://shop.example.com/login", "reply": str(uuid.uuid4())}, **more)))
+            for nid, more in ((64, {"account": "kim"}), (65, {"account": "Sam", "failed": login})))
         hub.TEAM["logins"] = {ref: {"kind": "api_key", "env": "ACME_TOKEN", "title": "ACME_TOKEN"},
                               other: {"kind": "api_key", "env": "ACME_OTHER_TOKEN", "title": "ACME_OTHER_TOKEN"},
                               login: {"kind": "login", "title": "admin.example.com · sam"}}
         hub.TEAM["agents"]["vps"]["secrets"] = {other: "use", login: "use"}     # another name, another site
-        mine = (chat, waited, door, site)
+        mine = (chat, waited, door, site, named, failed)
         for t0 in (self.T + 60, self.T + 60 + 2 * hub.NEED_HELD_WAIT):
             hub.need_look_sweep(t0)
             self.assertEqual([n for n in self.open_ids() if n in mine], list(mine))
@@ -381,7 +385,7 @@ class SecondLook(Withdraw):
                           hub.NEED_CLOSED_BY))
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (site,))["answer"],
                          f"Closed by the hub: vps holds a login for shop.example.com now ({login}), given another way.")
-        self.assertEqual([n for n in self.open_ids() if n in mine], [waited, door])
+        self.assertEqual([n for n in self.open_ids() if n in mine], [waited, door, named, failed])
         self.assertEqual(self.notices(), told)
         self.assertIsNone(hub.kv_get("need_held"))
         self.assertIn(f"[hub] The hub closed N-{chat} (vps: the API key ACME_TOKEN), N-{site} (vps: a login for "

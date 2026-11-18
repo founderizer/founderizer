@@ -51,7 +51,8 @@ EVERY = {"kind": "every", "minutes": 1}
 H1_TASK = ["close_case", "deliver_result", "read_messages", "record_step"]
 H1_CONTACT = ["message_contact"]        # with contacts.v2, which TEAM turns on: its words go to a person (the owner,
                                         # 3 November 2026)
-H1_CHAT = ["message_owner", "read_messages", "recall", "see_responsibilities", "tell_owner"]
+# read_attachment: the owner's own file to it, as data in the answer, which gives no reach (17 November 2026)
+H1_CHAT = ["message_owner", "read_attachment", "read_messages", "recall", "see_responsibilities", "tell_owner"]
 REVIEW_EXTRAS = ["remember", "write_notes"]
 # What no session of an agent whose Shell box is off holds; remember and write_notes only in a duty that names them,
 # and recall only in its owner chat

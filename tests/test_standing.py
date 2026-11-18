@@ -230,7 +230,6 @@ class Keeping(Base):
         text = self.ok("solo", "keep_instruction", words="  answer   in spanish ", scope="agent")
         self.assertIn("I-1 already says this", text)
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM standing")["n"], 1)
-        self.assertEqual(len(self.lines()), 1)
 
     def test_an_agent_with_nobody_in_its_team_keeps_no_team_item(self):
         text = self.refused("solo", "keep_instruction", words="Everybody answers in Spanish", scope="team")
@@ -245,29 +244,32 @@ class Keeping(Base):
         self.assertIn("Blocked", text)
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM standing")["n"], 0)
 
-    def test_the_quiet_line_is_the_one_he_approved_and_rings_nothing(self):
+    def test_only_a_person_s_item_gives_the_owner_a_line_in_plain_words_that_rings_nothing(self):
+        """The owner, 17 November 2026, of "manager set itself I-29: ... Say 'end I-29' to stop it.": "the language is
+        VERY complex, too technical", "Manager should be capital M", "Dont spam with messages!". A line names an agent
+        by its role and no item by its code, and only an item that a person gave gets one."""
+        hub.TEAM["agents"]["hand"]["title"] = "Customer Support"
         self.people_on()
         pid = self.person("Maria")
         said = self.person_says(self.conversation(pid), REFUNDS)
-        self.ok("hand", "keep_instruction", words="the support lead decides refunds up to one month's fee",
-                scope="agent", source=f"CM-{said}")
+        text = self.ok("hand", "keep_instruction", words="the support lead decides refunds up to one month's fee",
+                       scope="agent", source=f"CM-{said}")
+        self.assertIn("The owner reads one line about it.", text)
         row = hub.q1("SELECT * FROM owner_reports ORDER BY id DESC LIMIT 1")
-        self.assertEqual(row["text"], "Maria gave hand I-1: the support lead decides refunds up to one month's fee. "
-                                      "Say 'end I-1' to stop it.")
+        self.assertEqual(row["text"], "Maria gave Customer Support an instruction: the support lead decides refunds up "
+                                      "to one month's fee.")
         self.assertEqual((row["agent"], row["about"], row["in_reply_to"], row["pushed"]),
                          ("manager", "standing I-1 of hand", None, 0))          # as grant_access writes its record
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM pings")["n"], 0)          # no notification
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM chat_out")["n"], 0)       # and no chat app message
-        # the owner's own and an agent's own read the same way
-        self.ok("solo", "set_target", measure="drafts within 2 hours, in percent", number=90, how="the CRM",
-                scope="agent", due="2026-11-30")
-        self.assertEqual(self.lines()[-1], "solo set itself I-2, a target: drafts within 2 hours, in percent: reach "
-                                           "90 by 2026-11-30. Say 'end I-2' to stop it.")
+        # an agent's own item and the owner's own words write none, and the agent is not told that they do
+        text = self.ok("solo", "set_target", measure="drafts within 2 hours, in percent", number=90, how="the CRM",
+                       scope="agent", due="2026-11-30")
+        self.assertNotIn("The owner reads", text)
         event = self.owner_says("lead", "From now on the whole team answers in Spanish.")
         self.ok("lead", "keep_instruction", words="the whole team answers in Spanish", scope="team",
                 source=f"M-{event}")
-        self.assertEqual(self.lines()[-1], "You gave lead's team I-3: the whole team answers in Spanish. "
-                                           "Say 'end I-3' to stop it.")
+        self.assertEqual(len(self.lines()), 1)
 
 
     def test_every_agent_reads_an_item_whole(self):
@@ -279,16 +281,18 @@ class Keeping(Base):
                  "customer, case b, and for no other customer.")
         self.assertGreater(len(words), 300)
         second = self.new_task("hand", title="Close the old plans")
-        self.ok("hand", "keep_instruction", words=words, scope="agent")
+        self.people_on()
+        talk = self.conversation(self.person("Maria"))
+        self.ok("hand", "keep_instruction", words=words, scope="agent", source=f"CM-{self.person_says(talk, words)}")
         self.assertIn(words, hub.standing_start_text("hand"))         # the next session
         self.assertIn(words, self.said("hand", second)[-1])           # a running one
         for reader in ("hand", "lead", "manager"):                    # its own read, its lead's, the fleet manager's
             with self.subTest(reader):
                 self.assertIn(words, self.ok(reader, "see_standing"))
-        self.assertIn(words, self.lines()[-1])                        # the owner's new line
+        self.assertIn(words, self.lines()[-1])                        # the owner's line: a person gave it
         self.ok("hand", "end_standing", id="I-1", why="the case is closed")
         self.assertIn(words, self.said("hand", second)[-1])           # and the end
-        self.assertNotIn(words, self.lines()[-1])
+        self.assertNotIn(words, self.lines()[-1])                     # the line of its end clips the words
         self.assertIn(words[:100], self.lines()[-1])
 
     def test_the_block_shows_each_item_whole_and_names_the_ones_that_do_not_fit(self):
@@ -464,8 +468,7 @@ class Ending(Base):
         self.assertEqual((r["ended"], r["ended_by"], r["ended_why"]),
                          (self.clock, "hand", "the customers write in English now"))
         self.assertIn("Stop following it", self.said("hand", second)[-1])
-        self.assertEqual(self.lines()[-1], f"hand ended I-{item} (Answer in Spanish): the customers write in English "
-                                           f"now.")
+        self.assertEqual(self.lines(), [])                          # its own item: the owner reads no line
         self.assertEqual(hub.standing_start_text("hand"), "")       # new sessions no longer start with it
         self.assertIn("already ended", self.ok("hand", "end_standing", id=f"I-{item}", why="again"))
 
@@ -477,19 +480,19 @@ class Ending(Base):
         stop = self.person_says(talk, "Please stop deciding refunds yourself.")
         self.ok("hand", "end_standing", id=f"I-{item}", why="Maria takes refunds back", asked_by=f"CM-{stop}")
         self.assertEqual(self.item(item)["ended_by"], f"P-{pid}")
-        self.assertEqual(self.lines()[-1], f"hand ended I-{item} (the support lead decides refunds), as Maria asked: "
-                                           f"Maria takes refunds back.")
+        self.assertEqual(self.lines()[-1], "Hand ended Maria's instruction to Hand (the support lead decides refunds), "
+                                           "as Maria asked: Maria takes refunds back.")
 
     def test_words_and_a_reason_with_their_own_full_stop_get_no_second_one(self):
-        item = self.keep(words="Answer in Spanish.")      # the live check's line ended "asked to end it.."
-        self.assertEqual(self.lines()[-1], f"hand set itself I-{item}: Answer in Spanish. Say 'end I-{item}' to stop "
-                                           f"it.")
+        self.people_on()
+        talk = self.conversation(self.person("Maria"))
+        item = self.keep(words="Answer in Spanish.", source=f"CM-{self.person_says(talk, 'Answer in Spanish.')}")
+        self.assertEqual(self.lines()[-1], "Maria gave Hand an instruction: Answer in Spanish.")     # was "it.."
         self.ok("hand", "end_standing", id=f"I-{item}", why="the customers write in English now.")
-        self.assertEqual(self.lines()[-1], f"hand ended I-{item} (Answer in Spanish.): the customers write in English "
-                                           f"now.")
-        loud = self.keep(words="Answer in English!")       # its own "!" takes no full stop after it
-        self.assertEqual(self.lines()[-1], f"hand set itself I-{loud}: Answer in English! Say 'end I-{loud}' to stop "
-                                           f"it.")
+        self.assertEqual(self.lines()[-1], "Hand ended Maria's instruction to Hand (Answer in Spanish.): the customers "
+                                           "write in English now.")
+        self.keep(words="Answer in English!", source=f"CM-{self.person_says(talk, 'Answer in English!')}")
+        self.assertEqual(self.lines()[-1], "Maria gave Hand an instruction: Answer in English!")     # no "!."
 
     def test_the_owner_asks_the_fleet_manager_and_it_ends_any_agent_s_item(self):
         item = self.keep()
@@ -498,8 +501,7 @@ class Ending(Base):
                        asked_by=f"M-{event}")
         self.assertIn("as the owner asked", text)
         self.assertEqual((self.item(item)["ended_by"]), "owner")
-        self.assertEqual(self.lines()[-1], f"manager ended I-{item} (Answer in Spanish), as you asked: the owner "
-                                           f"said end I-1.")
+        self.assertEqual(self.lines(), [])                          # hand's own item: the owner reads no line
         self.assertIn("Stop following it", self.said("hand", self.tasks["hand"])[-1])
 
     def test_no_other_agent_ends_it(self):
@@ -517,7 +519,7 @@ class Ending(Base):
         code, data = self.owner(f"/ui/standing/{item}/end", {"why": "the team is new"})
         self.assertEqual(code, 200, data)
         self.assertEqual((data["standing"]["ended_by"], data["standing"]["ended_why"]), ("owner", "the team is new"))
-        self.assertEqual(self.lines()[-1], f"You ended I-{item} (Answer in Spanish): the team is new.")
+        self.assertEqual(self.lines(), [])                          # the lead's own item: no line
         for member in ("lead", "hand", "sublead", "deep"):
             with self.subTest(member):
                 self.assertIn("Stop following it", self.said(member, self.tasks[member])[-1])
@@ -533,21 +535,22 @@ class Ending(Base):
         for agent in ("hand", "deep"):
             self.keep(who=agent, words="refunds go to Maria",
                       source=f"CM-{self.person_says(self.conversation(maria, agent), 'All refunds go to Maria')}")
+        lines = self.lines()
         code, data = self.owner("/ui/people", {"id": maria, "agents": ["hand"]})
         self.assertEqual(code, 200, data)
         self.assertEqual([self.item(1)["ended"], self.item(2)["ended_by"]], [None, "owner"])
-        self.assertEqual(self.lines()[-1], "You ended I-2 (refunds go to Maria): Maria no longer writes to that "
-                                           "agent.")
+        self.assertEqual(self.lines(), lines)                       # he did it himself: no line about it
         code, data = self.owner("/ui/people", {"id": maria, "blocked": True})
         self.assertEqual(code, 200, data)
         self.assertEqual(self.item(1)["ended_why"], "Maria is blocked")
         lucas = self.person("Lucas")
         self.keep(words="drafts go to Lucas first",
                   source=f"CM-{self.person_says(self.conversation(lucas), 'drafts go to Lucas first')}")
+        lines = self.lines()
         code, data = self.owner("/ui/people", {"id": lucas, "delete": True})
         self.assertEqual(code, 200, data)
         self.assertEqual((self.item(3)["ended_by"], self.item(3)["ended_why"]), ("owner", "Lucas was removed"))
-        self.assertEqual(self.lines()[-1], "You ended I-3 (drafts go to Lucas first): Lucas was removed.")
+        self.assertEqual(self.lines(), lines)
 
 
 class Targets(Base):
@@ -607,7 +610,7 @@ class Targets(Base):
         self.assertIn("progress 25", text)
         r = self.item(1)
         self.assertEqual((r["progress"], r["number"], r["words"]), (25, 5, "open tickets: reach 5"))
-        self.assertEqual(len(self.lines()), 1)              # its own target changes freely, with no line
+        self.assertEqual(self.lines(), [])                  # its own target, new or changed: no line
         self.assertIn("Give what changes", self.refused("hand", "set_target", id="I-1"))
         self.assertIn("keeps the scope", self.refused("hand", "set_target", id="I-1", scope="team"))
         self.assertIn("not yours", self.refused("solo", "set_target", id="I-1", progress=1))
@@ -661,13 +664,8 @@ class Targets(Base):
         self.assertIn("not part of M-", self.refused("hand", "set_target", id="I-1", words="99% of tickets",
                                                      asked_by=f"M-{asks}"))
         text = self.ok("hand", "set_target", id="I-1", number=95, asked_by=f"m{asks}")
-        self.assertIn("The owner reads one quiet line about the change", text)
-        self.assertEqual(self.lines()[-1], f"hand changed I-1 (a first draft within 2 hours for 90% of tickets by 30 "
-                                           f"November), as you asked in M-{asks}: number from 90 to 95. Say 'end "
-                                           f"I-1' to stop it.")
-        row = hub.q1("SELECT * FROM owner_reports ORDER BY id DESC LIMIT 1")
-        self.assertEqual((row["agent"], row["about"], row["in_reply_to"], row["pushed"]),
-                         ("manager", "standing I-1 of hand", None, 0))          # as a new item's line
+        self.assertNotIn("The owner reads", text)                   # he asked for it himself: no line
+        self.assertEqual(self.lines(), [])
         self.assertEqual((self.item(1)["words"], self.item(1)["message"]), (r["words"], given))
         self.assertIn("[hub] Standing item changed: I-1 target, from the owner", self.said("hand", second)[-1])
         self.assertIn("reach 95 by 2026-11-30", self.said("hand", second)[-1])
@@ -681,9 +679,8 @@ class Targets(Base):
         self.ok("hand", "set_target", id="I-1", words="95% of tickets", asked_by=f"M-{asks}")
         r = self.item(1)
         self.assertEqual((r["words"], r["author_kind"], r["message"]), ("95% of tickets", "owner", asks))
-        self.assertIn(f"as you asked in M-{asks}: its words now: 95% of tickets.", self.lines()[-1])
         self.ok("hand", "set_target", id="I-1", words="Make it 95% of tickets, please.", asked_by=f"M-{asks}")
-        self.assertIn("its words now: Make it 95% of tickets, please. Say 'end I-1' to stop it.", self.lines()[-1])
+        self.assertEqual(self.item(1)["words"], "Make it 95% of tickets, please.")
         self.assertIn(f"from the owner (M-{asks})", hub.standing_start_text("hand"))
         self.assertIn("goes with id", self.refused("hand", "set_target", measure="m", number=1, how="x",
                                                    scope="agent", asked_by=f"M-{asks}"))
@@ -696,13 +693,18 @@ class Targets(Base):
                 source=f"CM-{said}", words="keep open tickets under 10")
         self.assertIn("the target that Maria gave in CM-", self.refused("hand", "set_target", id="I-1", number=12))
         again = self.person_says(talk, "Under 12 is fine too.")
-        self.ok("hand", "set_target", id="I-1", number=12, asked_by=f"CM-{again}")
-        self.assertIn(f"as Maria asked in CM-{again}: number from 10 to 12.", self.lines()[-1])
+        text = self.ok("hand", "set_target", id="I-1", number=12, asked_by=f"CM-{again}")
+        self.assertIn("The owner reads one line about the change.", text)
+        self.assertEqual(self.lines()[-1], "Maria changed Hand's target (keep open tickets under 10): the number from "
+                                           "10 to 12.")
+        row = hub.q1("SELECT * FROM owner_reports ORDER BY id DESC LIMIT 1")
+        self.assertEqual((row["agent"], row["about"], row["in_reply_to"], row["pushed"]),
+                         ("manager", "standing I-1 of hand", None, 0))          # as a new item's line
+        lines = len(self.lines())
         event = self.owner_says("hand", "Keep open tickets under 8 from now on.")
         self.ok("hand", "set_target", id="I-1", number=8, words="Keep open tickets under 8", asked_by=f"M-{event}")
         self.assertEqual((self.item(1)["author"], self.item(1)["message"]), ("owner", event))
-        self.assertIn(f"as you asked in M-{event}: its words now: Keep open tickets under 8; number from 12 to 8.",
-                      self.lines()[-1])
+        self.assertEqual(len(self.lines()), lines)                  # his own ask: no line
 
 
 class Proposals(Base):

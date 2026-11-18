@@ -315,6 +315,50 @@ class Delivery(OwnerAPI):
         self.assertEqual(self.request("/helper/outputs/vps", answer, source=VPS), (200, {"taken": False}))
         self.assertFalse(hub.outputs_waiting(token, "vps"))
 
+    def test_a_fault_of_git_keeps_the_delivery_open_once_and_the_next_one_lands_the_files(self):
+        """A short fault of git (KitFault) does not close a delivery without its files: deliver_result tells the agent
+        to call it again, and the next call lands them. Here the push lands and git answers that it failed (a time
+        limit), so the next call finds the files on the ref and makes no second commit."""
+        write(self.checkout, {f"outputs/{self.ref}/report.md": "# Report\n"})
+        before, real, failed = self.origin("rev-parse", hub.CONFIG_BRANCH), subprocess.run, []
+
+        def run(argv, *args, **kwargs):
+            done = real(argv, *args, **kwargs)
+            if "push" in argv and not failed:
+                failed.append(argv)
+                return subprocess.CompletedProcess(argv, 128, "", "fatal: the remote end hung up unexpectedly")
+            return done
+        self.helper()
+        with patch.object(subprocess, "run", run):
+            text, error = self.deliver()
+        self.assertTrue(error, text)
+        self.assertIn(f"{self.ref} is not delivered yet", text)
+        self.assertEqual(hub.q1("SELECT state FROM tasks WHERE id=?", (self.task,))["state"], "working")
+        landed = self.origin("rev-parse", hub.CONFIG_BRANCH)
+        self.assertEqual(self.origin("rev-parse", f"{landed}~1"), before)
+        hub.q("DELETE FROM events WHERE kind='outputs'")     # the next helper takes the next request alone
+        self.helper()
+        text, error = self.deliver()
+        self.assertFalse(error, text)
+        self.assertIn(f"Its files are on the configuration ref as {landed[:12]}", text)
+        self.assertEqual(self.origin("rev-parse", hub.CONFIG_BRANCH), landed)
+
+    def test_a_fault_of_git_that_lasts_refuses_a_delivery_once_in_its_attempt(self):
+        """Refused at every call, a git that stays broken would hold the task open for ever."""
+        write(self.checkout, {f"outputs/{self.ref}/report.md": "# Report\n"})
+        real = subprocess.run
+        broken = lambda argv, *a, **k: subprocess.CompletedProcess(argv, 128, "", "fatal: no space left on device") \
+            if "push" in argv else real(argv, *a, **k)
+        with patch.object(subprocess, "run", broken):
+            self.helper()
+            self.assertTrue(self.deliver()[1])
+            hub.q("DELETE FROM events WHERE kind='outputs'")
+            self.helper()
+            text, error = self.deliver()
+        self.assertFalse(error, text)
+        self.assertIn(f"The files of outputs/{self.ref}/ did not reach the configuration ref: the push failed", text)
+        self.assertEqual(hub.q1("SELECT state FROM tasks WHERE id=?", (self.task,))["state"], "completed")
+
     def test_a_refused_delivery_asks_the_helper_for_nothing(self):
         text, error = self.deliver(where_output_is="")
         self.assertTrue(error, text)
