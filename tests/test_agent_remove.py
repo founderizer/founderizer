@@ -724,9 +724,10 @@ class Spent(Remove):
         the one name that no agent can have, so a new agent of its name reads none of them as its own: not its model
         changes and checks in its costs, not its refused calls, not its install as its own sign-in, not its rename as
         its own old name, not its files of the last hour against its own, not its open job against its runtime switch
-        (switch_busy), and not its receipts against its sends of the day (gmail_sends_today). The new agent reads its
-        own records, a check that it deleted included. The same rows of vps stay its own, and the owner's page of a
-        moved rule names its agent as it was named, as the apps read an agent's name."""
+        (switch_busy), not its receipts against its sends of the day (gmail_sends_today), and not the hosts that the
+        outgoing gate recorded for it (egress_hosts, egress_names). The new agent reads its own records, a check that
+        it deleted included. The same rows of vps stay its own, and the owner's page of a moved rule names its agent as
+        it was named, as the apps read an agent's name."""
         t0 = hub.now()
 
         def change(agent, effort):
@@ -752,9 +753,10 @@ class Spent(Remove):
                     [m["to"]["effort"] for m in view["model_changes"]], "\n".join(hub.costs_text(view, 7, "manager")))
 
         def held(agent):
-            """How many of the agent's calls, server jobs, files, jobs and receipts hold this name."""
+            """How many of the agent's calls, server jobs, files, jobs, receipts and outgoing hosts hold this name."""
             return {table: hub.q1(f"SELECT COUNT(*) c FROM {table} WHERE agent=?", (agent,))["c"]
-                    for table in ("calls", "server_jobs", "attachments", "jobs", "tool_commands")}
+                    for table in ("calls", "server_jobs", "attachments", "jobs", "tool_commands", "egress_hosts",
+                                  "egress_names")}
 
         def left(agent):
             """What the agent left outside a task: a call that the hub refused it, and the files of the last hour that
@@ -769,6 +771,9 @@ class Spent(Remove):
             hub.ins("INSERT INTO jobs(agent,task,kind,login,created) VALUES(?,NULL,'probe',NULL,?)", (agent, t0 - 60))
             hub.ins("INSERT INTO tool_commands(agent,request_id,tool,digest,receipt,created) VALUES(?,'mail-1',"
                     "'gmail_send','d',?,?)", (agent, json.dumps({"state": "done"}), t0 - 60))
+            hub.ins("INSERT INTO egress_hosts(agent,domain,port,verdict,cls,first,last) VALUES(?,'example.com',443,"
+                    "'pass','public',?,?)", (agent, t0 - DAY, t0 - DAY))
+            hub.ins("INSERT INTO egress_names(agent,domain,name) VALUES(?,'example.com','www.example.com')", (agent,))
 
         self.spend("scout", ("s-now", 1, 1000))
         first = change("scout", "low")
@@ -783,7 +788,7 @@ class Spent(Remove):
                 "'codex','done',?,?)", (t0 - DAY, t0 - DAY))
         vps = held("vps")
         self.assertEqual(vps, {"calls": 1, "server_jobs": 1, "attachments": hub.CHAT_FILE_LOOSE, "jobs": 1,
-                               "tool_commands": 1})
+                               "tool_commands": 1, "egress_hosts": 1, "egress_names": 1})
         self.assertIn(("rookie", "scout"), hub.agent_old_names())
         checks, changes, text = costs()
         self.assertEqual((checks, changes), ([(active, 1, 0), (deleted, 0, 1)], ["low"]))
@@ -817,7 +822,11 @@ class Spent(Remove):
         self.assertEqual([tuple(r) for r in hub.q("SELECT agent, state FROM triggers WHERE id IN (?,?)",
                                                   (active, deleted))], [(gone, "deleted")] * 2)
         self.assertEqual(held(gone), {"calls": 1, "server_jobs": 3, "attachments": hub.CHAT_FILE_LOOSE, "jobs": 1,
-                                      "tool_commands": 1})
+                                      "tool_commands": 1, "egress_hosts": 1, "egress_names": 1})
+        self.assertEqual(hub.hosts_view("scout")["agents"][0]["hosts"], [])     # the new scout has no hosts yet
+        # the first scout's hosts are there, under its name and the time of its delete
+        self.assertEqual([(a["agent"], len(a["hosts"])) for a in hub.hosts_view()["agents"] if "deleted" in a],
+                         [("scout", 1)])
         # vps's own stay its own
         self.assertEqual((hub.q1("SELECT agent FROM model_changes WHERE id=?", (theirs,))["agent"],
                           hub.q1("SELECT agent FROM triggers WHERE id=?", (their_check,))["agent"]), ("vps", "vps"))

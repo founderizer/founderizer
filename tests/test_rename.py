@@ -440,6 +440,7 @@ class Columns(unittest.TestCase):
         ("placements", "machine"): "a machine", ("withdrawals", "machine"): "a machine",
         ("faults", "name"): "an exception class, or a tool of the hub's list (diagnostics.py)",
         ("first_stores", "machine"): "a machine",
+        ("egress_names", "name"): "a host's full name in the outgoing gate's records (UI-API.md 1.220)",
         ("door_record", "target"): "a host or a provider account of the door (DevOps plan C4)",
         ("door_record", "caller"): "the door's own record of who called it, kept as the door keeps it (plan C4)",
         ("needs", "answered_by"): "the owner (null), a deputy 'P-<id> <name>' or Fleet",
@@ -460,6 +461,8 @@ class Columns(unittest.TestCase):
         "deliver_running:": "a task", "desktop_click:": "a Mac", "desktop_seen:": "a Mac", "desktop_told:": "a Mac",
         "door_mode:": "a server of the door", "door_host:": "a host of the door", "door_untaken:": "a host of the door",
         "door_news:": "a host of the door", "history_outside:": "a task",
+        "browser_room:": "a server", "browser_refused:": "a server", "browser_place:": "a task",     # build plan 04, S3
+        "browser_place_told:": "a task", "browser_wake_held:": "a Needs-you item",
         "seen:": "a task, or the manager's standing session (seen_get)",
         "door_untaken_seen:": "a host of the door", "github_app_asked:": "a GitHub account or organization",
         "install_told:": "a server job", "key_swap_answered:": "a server", "key_swap_asked:": "a server",

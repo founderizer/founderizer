@@ -130,6 +130,10 @@ PROOF_LISTENER = ("import fcntl, os, select, socket, sys, time\n"
 VAULT_PROGRAM = "/usr/local/lib/fleet-vault/vault.py"
 VAULT_HELPER = "/usr/local/sbin/fleet-vault-program"
 VAULT_EVERY = 600               # seconds before a try that did not settle it is made again
+EGRESS_CONTROL = "/run/founderizer-egress/control.sock"     # vault.EGRESS_CONTROL: the outgoing gate's control socket
+EGRESS_RULES = "/etc/founderizer-egress/rules.nft"          # vault.EGRESS_RULES: root's, there while the gate is on
+EGRESS_LOADED = "/run/founderizer-egress-table"             # vault.EGRESS_LOADED: root's word on the kernel's table
+EGRESS_KEPT = 20000             # rows of the gate's counts that wait here while the hub does not take them
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # The words of `fleet.py install-pinned` when an address of the pin could not be reached: fleet.install_pinned names
 # the failure of each address by its exception ("could not be downloaded (x.ai: URLError; …)"). A refused address
@@ -453,6 +457,16 @@ def cmd_run(args):
     Service(conf, Hub(conf["hub"], key), floor=lifecycle.floor_path(HOME)).loop()
 
 
+def egress_loaded(path=None):
+    """The version of the outgoing gate's table that the kernel has now, by root's word (EGRESS_LOADED), or None."""
+    try:
+        with open(path or EGRESS_LOADED, encoding="ascii") as f:
+            text = f.read(16)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return int(text) if re.fullmatch(r"[0-9]{1,6}\n", text) else None
+
+
 class Service:
     """The loop of one server's service. run(argv, cwd, timeout, env) -> (code, out, err) runs a command; tests replace
     it, popen, the clock and the sleep."""
@@ -462,7 +476,8 @@ class Service:
     # clock steps (NTP correcting a drifted server, a VM's host setting it back), and a step backwards would stop
     # this service's five-minute reading for the whole of the step while the hub went on showing the last one.
     def __init__(self, conf, hub, kit=KIT, home=HOME, run=None, clock=time.monotonic, sleep=time.sleep,
-                 platform=sys.platform, life=None, popen=subprocess.Popen, users=account, lives=None, floor=None):
+                 platform=sys.platform, life=None, popen=subprocess.Popen, users=account, lives=None, floor=None,
+                 egress=EGRESS_CONTROL, egress_rules=EGRESS_RULES):
         self.name, self.repo, self.hub, self.kit, self.home = conf["name"], conf.get("repo"), hub, kit, home
         self.floor = floor              # this user's release floor (lifecycle.floor_path), under which its checkout moves
         self.run, self.popen = run or self.command, popen
@@ -481,6 +496,10 @@ class Service:
         self.lock_path, self.lock_wait = lifecycle.BROWSER_PORTS_LOCK, 10.0     # browser_now
         self.proof_path = lifecycle.BROWSER_PROOF
         self.vault_tried = None         # when the vault broker was last asked to catch up (vault_program)
+        self.egress, self.egress_kept = egress, []      # the gate's control socket, and its rows that wait for the hub
+        self.egress_rules = egress_rules                # root's rules file: this machine has the gate
+        self.egress_on = True           # the hub may hold this machine's gate from before: a machine with none says so
+        self.egress_lock = threading.Lock()             # a report of the job's heartbeat and one of the loop
 
     @staticmethod
     def command(argv, cwd=None, timeout=120, env=None):
@@ -774,7 +793,85 @@ class Service:
             self.desired = answer["desired_revision"]
         if status == 200:
             self.adopt(answer.get("server"))
+            self.egress_round()
         return status
+
+    # ---- the outgoing gate (vault.py, "the outgoing gate"): the service user is the gate's one road to the hub
+    def egress_ask(self, request, timeout=10):
+        """One request on the gate's control socket, and its answer; None when no gate answers. The gate answers this
+        service's own user only (SO_PEERCRED): the policy and the counts never pass an agent's hands."""
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                s.connect(self.egress)
+                s.sendall((json.dumps(request) + "\n").encode())
+                data = b""
+                while not data.endswith(b"\n") and len(data) < 64 * 1024 * 1024:
+                    part = s.recv(1 << 20)
+                    if not part:
+                        break
+                    data += part
+            answer = json.loads(data)
+        except (OSError, ValueError):
+            return None
+        return answer if isinstance(answer, dict) else None
+
+    def egress_round(self):
+        """With each reading, while root's rules file says that this machine has the gate: the gate's state, null
+        when the gate does not answer (also after a boot where it never started, so never made its socket), and the
+        counts that it took since the last one, each row named by its agent (one OS user for each agent), to the hub;
+        and the hub's policy to the gate. Rows that the hub did not take wait for the next round, up to EGRESS_KEPT.
+        With no rules file, once in this process's life until the hub takes it: that the machine has no gate (after
+        `--egress off`, or an install whose gate did not start), so that the hub forgets the gate's state."""
+        if self.platform == "darwin":
+            return
+        with self.egress_lock:
+            if os.path.exists(self.egress_rules):
+                self.egress_on = True
+                self.egress_once()
+            elif self.egress_on:
+                status, _ = self.hub.call("POST", f"/server/{self.name}/egress",
+                                          {"gate": None, "rows": [], "other_users": 0, "installed": False})
+                self.egress_on = status == 0 or status >= 500       # the hub did not answer: next round
+
+    def egress_once(self):
+        status = self.egress_ask({"op": "status"})
+        if status is None:              # with root's word on the table, which the gate gives when it answers
+            self.post_egress({"gate": None, "table": egress_loaded(), "rows": [], "other_users": 0})
+            return
+        counts = self.egress_ask({"op": "counts"}) or {}
+        whose = {v["uid"]: name for name, v in self.agent_users().items() if v.get("uid") is not None}
+        rows, other = [], 0
+        for r in counts.get("rows") or []:
+            agent = whose.get(r.get("uid")) if isinstance(r, dict) else None
+            if agent is None:
+                other += 1
+                continue
+            rows.append({k: r[k] for k in ("host", "port", "verdict", "how", "cls", "dns", "conns", "up", "down",
+                                           "first", "last") if k in r} | {"agent": agent})
+        rows = (self.egress_kept + rows)[-EGRESS_KEPT:]
+        answer, sent = self.post_egress({"gate": {k: status.get(k) for k in ("program", "table", "knows_table",
+                                                                              "lookup", "policy", "mode", "since",
+                                                                              "open", "handover")},
+                                         "rows": rows, "other_users": other})
+        self.egress_kept = rows[sent:]          # a part that the hub took is not posted again
+        policy = (answer or {}).get("policy")
+        if isinstance(policy, dict) and policy != status.get("policy"):
+            said = self.egress_ask({"op": "policy", "policy": policy})
+            if said and not said.get("ok"):
+                print(f"The outgoing gate of this machine kept its policy: {said.get('reason')}", file=sys.stderr,
+                      flush=True)
+
+    def post_egress(self, body):
+        """POST /server/<name>/egress in parts of at most 2,000 rows, each with its number, so that the hub counts the
+        gate's state once for each report: (the hub's last answer or None, the rows that it took)."""
+        rows, answer = body["rows"], None
+        for start in range(0, max(len(rows), 1), 2000):
+            status, answer = self.hub.call("POST", f"/server/{self.name}/egress",
+                                           dict(body, rows=rows[start:start + 2000], part=start // 2000))
+            if status != 200:
+                return None, start
+        return answer, len(rows)
 
     def adopt(self, name):
         """The name the hub gives this server in its answer to a reading: its name in Tailscale. A machine renamed there
@@ -1454,6 +1551,8 @@ class Service:
         if code == 0:
             print(said or f"Fleet brought this machine's vault broker onto the vault.py of "
                           f"{str(self.loaded)[:12]}.", flush=True)
+            if os.path.exists(self.egress):
+                self.egress_ask({"op": "status"})       # the word: the gate lets the new program take over
             return
         # The command says its own name, so a line that does not carry it is sudo refusing the command and not the
         # command refusing the work: the first needs the installer run again, the second needs reading.

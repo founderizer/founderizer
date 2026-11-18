@@ -96,10 +96,13 @@ Standard library only; Python 3.9+.
 import argparse
 import base64
 import codecs
+import errno
 import fcntl
 import hashlib
+import ipaddress
 import json
 import grp
+import queue
 import os
 import pwd
 import re
@@ -3227,15 +3230,20 @@ SWAP_TABLES = (("/proc/net/tcp", False), ("/proc/net/tcp6", True))
 
 
 def swap_peer(conn):
-    """The user ID that owns the other end of this TCP connection on this machine, from the kernel's table of sockets,
-    or None. The row must have exactly this connection's two addresses and ports: while this process holds the
-    connection, no other socket has them. A program with one socket for both IP versions (.NET, Java) is in the IPv6
-    table, with the IPv4 address in its mapped form."""
+    """The user ID that owns the other end of this TCP connection on this machine, from the kernel's own lookup or
+    its table of sockets, or None. The socket must have exactly this connection's two addresses and ports: while this
+    process holds the connection, no other socket has them. A program with one socket for both IP versions (.NET,
+    Java) is in the IPv6 table, with the IPv4 address in its mapped form."""
     try:
         (peer_ip, peer_port), (own_ip, own_port) = conn.getpeername()[:2], conn.getsockname()[:2]
         one, two = socket.inet_aton(peer_ip), socket.inet_aton(own_ip)
     except (OSError, ValueError):
         return None
+    # the kernel's exact lookup first (egress_diag): a scan of /proc for each connection would let an agent with many
+    # idle sockets slow every other agent's (the fourth review round); /proc only where that lookup cannot run
+    found = egress_diag(socket.AF_INET, socket.IPPROTO_TCP, (peer_ip, peer_port), (own_ip, own_port))
+    if found is not False:
+        return found
 
     def form(raw, port, mapped):
         four = "%08X" % int.from_bytes(raw, sys.byteorder)
@@ -3397,12 +3405,44 @@ def swap_say(sock, status, text):
         pass
 
 
-def swap_reach(host, port):
-    """A TCP connection to this host and port, or None."""
+def swap_reach(host, port, uid=None, rules=None, gate=None):
+    """A TCP connection to this host and port, or None. On a machine with the outgoing gate (its root-owned rules
+    file, EGRESS_RULES), through the gate's relay port, with the UID of the agent user whose connection this is: the
+    kernel lets this proxy's user reach nothing else, and the gate decides and counts as for the agent itself (the
+    proposal's section 5.9). The gate looks the host up, so this proxy asks no DNS question there. Elsewhere it
+    connects by itself, as before. rules, gate: a test's own path and address."""
+    if os.path.exists(rules or EGRESS_RULES):
+        return swap_through_gate(host, port, uid, gate or ("127.0.0.1", EGRESS_PORTS["relay"]))
     try:
         sock = socket.create_connection((host, port), timeout=SWAP_PATIENCE)
     except (OSError, UnicodeError):
         return None
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    return sock
+
+
+def swap_through_gate(host, port, uid, gate):
+    """One tunnel through the gate's relay port: a CONNECT head with the agent user's UID, and the gate's 200. None
+    when the gate refuses or does not answer: the proxy then says that it could not reach the host."""
+    if not isinstance(uid, int) or isinstance(uid, bool):
+        return None
+    try:
+        sock = socket.create_connection(gate, timeout=SWAP_PATIENCE)
+    except OSError:
+        return None
+    try:
+        target = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{EGRESS_UID_HEADER}: {uid}\r\n\r\n"
+                     .encode("ascii"))
+        head, rest = swap_head(sock, 4096)
+    except (OSError, UnicodeError):
+        sock.close()
+        return None
+    if not head or not re.match(rb"HTTP/1\.[01] 200 ", head) or rest:
+        sock.close()
+        return None
+    sock.settimeout(None)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     return sock
@@ -3618,6 +3658,16 @@ class SwapProxy:
         """True when this process reads the OS user of a connection on this machine: its own, for a connection to a
         listener of its own. A machine where it cannot (a /proc that it does not read) must not serve, because then
         it knows no caller. Not on the proxy's own listener: in a hand-over another process accepts there too."""
+        if os.path.exists(EGRESS_RULES):
+            # The outgoing gate's table lets this user reach the gate's relay port and nothing else: so the check is
+            # the row of its own connection to that port, which no listener of its own needs. With no gate running,
+            # the check fails, and the unit starts the proxy again in 2 seconds: it could reach no host anyway.
+            try:
+                with socket.create_connection(("127.0.0.1", EGRESS_PORTS["relay"]), timeout=5) as client:
+                    return egress_tcp_uid(client.getsockname()[:2], ("127.0.0.1", EGRESS_PORTS["relay"])) == \
+                        os.getuid()
+            except OSError:
+                return False
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as own:
                 own.bind(("127.0.0.1", 0))
@@ -3787,7 +3837,7 @@ class SwapProxy:
             said = self.ask({"op": "site", "uid": uid, "host": host, "port": port})
             if said and said.get("site") is True:
                 return self.opened(conn, uid, host, port)
-        site = self.reach(host, port)
+        site = self.reach(host, port, uid)
         if site is None:
             return swap_say(conn, "502 Bad Gateway", SWAP_UNREACHABLE)
         with site:
@@ -3857,7 +3907,7 @@ class SwapProxy:
             del kept
             if not self.passes(conn):   # closed at a hand-over while it waited: nothing goes to the site
                 return
-            raw = self.reach(host, port)
+            raw = self.reach(host, port, uid)
             if raw is None:
                 return swap_say(client, "502 Bad Gateway", SWAP_BAD_SITE)
             with raw:
@@ -4006,9 +4056,13 @@ def swap_main(config, take=None):
     proxy = SwapProxy(swap, SwapAuthority(state, public, swap["openssl"]), sock=sock, program=program,
                       spawn=lambda new, listener: swap_candidate(config, new, listener),
                       parent=parent if take else None)
+    lookup = egress_lookup_check(("127.0.0.1", EGRESS_PORTS["relay"]) if os.path.exists(EGRESS_RULES) else None)
+    if lookup["tcp"] is False:
+        log("swap proxy: the kernel's lookup of a socket does not work on this machine: the proxy reads the user of "
+            "each connection from /proc/net/tcp, which is slow when the machine has many sockets")
     if not proxy.reads_users():
-        raise SystemExit("The swap proxy does not start: it cannot read the user of a connection from /proc/net/tcp "
-                         "on this machine, so it would know no caller.")
+        raise SystemExit("The swap proxy does not start: it cannot read the user of a connection on this machine, so "
+                         "it would know no caller.")
     if take:
         if not swap_notify(f"MAINPID={os.getpid()}\nREADY=1"):
             raise SystemExit("The swap proxy cannot take over: systemd did not take its word.")
@@ -4067,6 +4121,2849 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 """
+
+
+# ---------------------------------------------------------------- the outgoing gate (egress)
+#
+# Step 1 of `agent-outgoing-connections-proposal.md` (the owner's "Yes, all nine" of 17 November 2026). On a Linux
+# server where root ran `configure --egress on`, the kernel sends each TCP connection and each DNS question of an
+# agent user to this program, the gate, which runs as a user of its own (EGRESS_USER): root's nftables table matches
+# each packet by the UID of the socket that made it (meta skuid), so it holds for each process of an agent user, also
+# one that reads no proxy variable, a cron job, or a program that the service user starts as that user. The gate
+# reads the original destination and the agent's UID from the kernel, reads the host's name from the first bytes (a
+# TLS ClientHello or an HTTP request head) or from what its own resolver gave this agent, connects for it, and counts.
+#
+# In this step the gate refuses no host: it records ("records only"). The kernel refuses UDP other than DNS and ICMP
+# (the owner's decision 5), and root's closures keep an agent from asking systemd-resolved, tailscaled or snapd to
+# connect for it. Every root-owned part of the whole design comes now (the table, its sets and its version, the
+# units, the launcher and its safe copy, the closures), so that the later steps are releases only.
+#
+# The table stays while the gate does not run (the proposal's section 5.4): an agent's DNS and TCP then fail at once,
+# and the hub still answers. Nothing falls back to a direct connection, because a gate that an agent could make fail
+# would otherwise open everything, also for a connection that the agent keeps open after the gate is back. The
+# restart, the hand-over, the take-back and the launcher keep the gate up; the hub's server watch tells the manager of
+# a gate that does not answer (hub.py, egress_troubles). Root's file EGRESS_LOADED says which table the kernel has
+# now, for the gate's state.
+#
+# The gate's standing rule: it reads the first bytes of a connection (one TLS ClientHello or one HTTP request head)
+# and no byte after them, and it never ends TLS. The swap proxy (`vault.py swap`) keeps its own rule, and they stay
+# two programs with two users: on a machine with the gate, the swap proxy's outgoing connection goes to the gate's
+# relay port with the agent's UID (swap_reach), and the kernel lets the swap proxy's user reach nothing else.
+#
+# Its parts, all root's: the configuration (EGRESS_CONF), the table's text (EGRESS_RULES, which names its version in
+# its first line, and whose existence tells the swap proxy to use the gate), the safe copy of this program and the
+# launcher (EGRESS_LIB), the gate's unit, the unit that loads the table with its sets (`egress-rules`, at boot and at
+# each change of /etc/group, /etc/subuid or the browsers' ports: a path unit for each), the drop-in that loads the
+# table again after nftables.service flushes the kernel's rules, and the drop-ins that put the closures back at each
+# start of systemd-resolved, tailscaled and snapd's socket. `configure --egress on` writes them all, in the order of
+# the proposal's section 8.
+
+EGRESS_KEY = 1                              # the format of EGRESS_CONF
+EGRESS_TABLE = 1                            # the version of the table's text that this program writes and reads
+EGRESS_POLICY = 1                           # the version of the policy that this program takes
+EGRESS_LIB = "/usr/local/lib/founderizer-egress"
+EGRESS_SAFE = EGRESS_LIB + "/vault.py"      # this program as it was at the last root step: what the launcher runs
+EGRESS_LAUNCH = EGRESS_LIB + "/launch"      # when the installed program does not start the gate
+EGRESS_DIR = "/etc/founderizer-egress"
+EGRESS_CONF = EGRESS_DIR + "/egress.json"   # root's, mode 644, no secret
+EGRESS_RULES = EGRESS_DIR + "/rules.nft"
+EGRESS_LOADED = "/run/founderizer-egress-table"     # root's, mode 644: the version of the table in the kernel now
+EGRESS_LOCK = "/run/founderizer-egress-rules.lock"  # one rules step at a time: boot, the path units, nftables
+EGRESS_BROWSER = "/etc/fleet-browser/ports"     # the agents' browser parts (build plan 04, whose contract is devops's
+# scripts/fleet-browser/README.md): `<user> <DevTools port> <screen port>` on each line. Root's table of those parts
+# lets a DevTools port reach only its own agent's user, by the socket's UID, so that agent's own connection to it
+# goes direct and never through the gate, whose own user that table refuses (a review of 17 November 2026)
+EGRESS_DEVTOOLS = range(9300, 9400)             # the contract's DevTools ports
+EGRESS_SUBUID = "/etc/subuid"                   # the sub-uids of each user, which newuidmap maps into a namespace
+EGRESS_USER = "founderizer-egress"          # not a fleet-* name: the service user can make and change those
+EGRESS_SERVICE = "fleet-egress"
+EGRESS_RULES_SERVICE = "fleet-egress-rules"
+EGRESS_SUBUID_PATH = "fleet-egress-subuid"       # the path unit of /etc/subuid
+EGRESS_BROWSER_PATH = "fleet-egress-browser"     # the path unit of the browsers' ports
+EGRESS_UNITS = "/etc/systemd/system"
+EGRESS_RUN = "/run/founderizer-egress"      # the gate's RuntimeDirectory: its control socket
+EGRESS_CONTROL = EGRESS_RUN + "/control.sock"
+EGRESS_RUNNING = EGRESS_RUN + "/running"    # the SHA-256 of the program that the gate's process runs now
+EGRESS_CRASHES = EGRESS_RUN + "/crashes"    # `<SHA-256 of its program> <seconds since boot>` for each end of the
+EGRESS_CRASHES_MOST = 3                     # gate's process that nobody asked for (a crash, a kill), in the last
+EGRESS_CRASHES_HOUR = 3600                  # EGRESS_CRASHES_HOUR: at this many, neither the launcher nor a hand-over
+                                            # runs that program while they are that recent, so for up to an hour
+                                            # after its third end; and a safe copy that does not take the stored policy
+                                            # does not serve in its place (egress_policy_taken), so no fallback drops a
+                                            # later step's refusals (a review of 17 November 2026)
+EGRESS_STATE = "/var/lib/founderizer-egress"    # the gate's StateDirectory: its last policy
+EGRESS_SERVICE_USER = "fleet"               # the machine's Founderizer service: join.sh WORKER, hub.sh HUB_USER
+EGRESS_GROUP = "fleet-agents"               # hubsetup.AGENT_GROUP: every agent user of this machine, and nobody else
+EGRESS_PORTS = {"out": 877, "local": 878, "relay": 879, "dns": 880}     # below 1024: see EGRESS_LOW_PORT
+EGRESS_LOW_PORT = 880                       # each user can listen on a port below ip_unprivileged_port_start only
+EGRESS_GIT_PORT = 9418                      # the hub's git daemon, direct in the table like the hub's own port
+EGRESS_NFT = "/usr/sbin/nft"
+EGRESS_CONTAINER_GROUPS = ("docker", "lxd", "incus", "libvirt")     # each one makes a daemon run a container for
+# its members, whose traffic is forwarded and is no socket of theirs (the proposal's A6): no agent user is in one
+EGRESS_PER_USER = 512                       # connections of one agent user that the gate relays at one time
+EGRESS_DNS_PER_USER = 64                    # DNS questions of one agent user that wait for an answer at one time
+EGRESS_NAMES = 1000                         # different names of one agent user in one batch of counts; past it a
+                                            # new name counts under its last two labels (egress_fold)
+EGRESS_ROWS = 4000                          # rows of one agent user in one batch; past it a new row counts on port 0
+EGRESS_ADDRESSES = 4096                     # addresses that the resolver keeps a name for, for one agent user
+EGRESS_STALL = 5                            # seconds of no answer after which the name's addresses of the same family
+                                            # join (a first address that answers in time is never raced by them)
+EGRESS_FALLBACK = 0.25                      # seconds before the gate also tries the name's other addresses (RFC 8305):
+# the kernel gives the client the gate's handshake at once, so the client's own fallback from a broken IPv6 path to
+# IPv4 cannot run, and the gate runs it (measured on 17 November 2026: without it an agent's request hung where root's
+# went on over IPv4 in 0.25 s)
+EGRESS_PATIENCE = 15                        # seconds for a connection to a host, a CONNECT head, one DNS answer
+EGRESS_FIRST = 16384 + 64                   # bytes of a connection's first record that the gate reads for its name
+EGRESS_HEAD = 8192                          # bytes of the relay port's CONNECT head
+EGRESS_CANDIDATE = 60                       # seconds in which the gate of a new program says that it serves
+EGRESS_SERVES = b"serves\n"
+EGRESS_LINE = 4 * 1024 * 1024               # bytes of one line on the control socket (a merge of counts)
+EGRESS_ASK = 65536                          # bytes of one request of the service user
+EGRESS_CONTROLS = 16                        # requests on the control socket at one time
+EGRESS_THREADS = 8192                       # threads of the gate's connections and questions at one time; past it a
+                                            # new connection gets a reset, so that the gate never fails to start one
+EGRESS_STREAM = 120                         # seconds of one connection of DNS over TCP
+EGRESS_NEW_RATE = "200/second burst 2000 packets"     # new TCP connections of one agent user, in the kernel
+EGRESS_DNS_RATE = "200/second burst 2000 packets"     # DNS questions over UDP of one agent user, in the kernel
+EGRESS_MODPROBE = "/etc/modprobe.d/founderizer-egress.conf"
+EGRESS_FAMILIES = ("rxrpc", "smc", "rds", "tipc")       # socket families whose transport is a kernel socket, which
+# an unprivileged user can open where the module loads (AF_RXRPC did on Ubuntu 24.04 on 17 November 2026): the kernel
+# then sends the agent's bytes from a socket of no user, which the table cannot read as the agent's (the second
+# review round). The step keeps their modules from loading and unloads one that no socket holds; the gate's state
+# names each one that is loaded.
+EGRESS_FOLDED = 1000                        # different folded names of one agent user in one batch; past them, and
+                                            # past EGRESS_ROWS rows, a new host counts as EGRESS_MORE
+EGRESS_UID_HEADER = "X-Founderizer-Agent-Uid"
+EGRESS_MORE = "(more hosts)"                # the one row of a batch past the limits, for each verdict and kind
+EGRESS_NAME = re.compile(r"(?=.{1,253}$)[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}"
+                         r"[a-z0-9_])?)*\.?")
+EGRESS_CLOSED = {                           # the local services that connect or resolve for any local user (A1, A2)
+    "resolved": {"default": "/run/systemd/resolve", "sockets": ("/run/systemd/resolve/io.systemd.Resolve",
+                                                                 "/run/systemd/resolve/io.systemd.Resolve.Monitor")},
+    "tailscaled": {"folder": "/run/tailscale", "sockets": ("/run/tailscale/tailscaled.sock",)},
+    "snapd": {"sockets": ("/run/snapd.socket", "/run/snapd-snap.socket")},
+}
+EGRESS_DROPINS = {                          # unit -> (section, key): where each closure goes back at a start
+    "systemd-resolved.service": ("Service", "ExecStartPre", "resolved"),
+    "tailscaled.service": ("Service", "ExecStartPre", "tailscaled"),
+    "snapd.socket": ("Socket", "ExecStartPost", "snapd"),
+    "docker.socket": ("Socket", "ExecStartPost", "daemons"),
+    "incus.socket": ("Socket", "ExecStartPost", "daemons"),
+    "libvirtd.socket": ("Socket", "ExecStartPost", "daemons"),
+    "snap.lxd.daemon.unix.socket": ("Socket", "ExecStartPost", "daemons"),
+}
+EGRESS_DBUS = "/etc/dbus-1/system.d/founderizer-egress.conf"
+EGRESS_DAEMONS = ("/run/docker.sock", "/var/snap/lxd/common/lxd/unix.socket", "/var/lib/lxd/unix.socket",
+                  "/var/lib/incus/unix.socket", "/run/libvirt/libvirt-sock")    # each container group's own socket:
+# a process of an agent user that still has the group (its user manager, a tmux) loses it only at its next login, so
+# a named user's entry with no right on the socket ends its use at once (a named user's entry decides before a
+# group's)
+EGRESS_CLASSES = (                          # for the records: the kinds of address that are never the open internet
+    ("metadata", ("169.254.169.254/32", "fd00:ec2::254/128")),
+    ("link-local", ("169.254.0.0/16", "fe80::/10")),
+    ("fleet", ("100.64.0.0/10", "fd7a:115c:a1e0::/48")),
+    ("private", ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")),
+    ("reserved", ("0.0.0.0/8", "240.0.0.0/4", "224.0.0.0/4", "ff00::/8", "::/128")),
+)
+
+
+def egress_config(path=EGRESS_CONF, read=None):
+    """The gate's root-owned configuration, checked: a dict with the users and the hub's direct address and ports.
+    Raises Refused with the reason."""
+    if read is None:
+        unchangeable(path, "The gate's configuration")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    else:
+        text = read(path)
+    try:
+        conf = json.loads(text)
+    except ValueError:
+        raise Refused("the gate's configuration is no JSON") from None
+    if not isinstance(conf, dict) or conf.get("egress") != EGRESS_KEY:
+        raise Refused(f"the gate's configuration is not of format {EGRESS_KEY}")
+    for key in ("user", "service_user", "swap_user", "group"):
+        if not isinstance(conf.get(key), str) or not GROUP_NAME.fullmatch(conf[key]):
+            raise Refused(f"the gate's configuration has no valid {key}")
+    hub = conf.get("hub")
+    try:
+        hub_ip = str(ipaddress.ip_address(hub)) if hub is not None else None
+    except ValueError:
+        raise Refused("the hub in the gate's configuration is not an address") from None
+    ports = conf.get("hub_ports") or []
+    if not isinstance(ports, list) or not all(isinstance(p, int) and not isinstance(p, bool) and 0 < p < 65536
+                                              for p in ports):
+        raise Refused("the hub's ports in the gate's configuration are not ports")
+    return dict(conf, hub=hub_ip, hub_ports=ports)
+
+
+def egress_table(conf=None):
+    """The kernel rules, as root's text with no elements (EGRESS_RULES). Its first line names its version. One table
+    for IPv4 and IPv6; its chains are fixed and only its sets change (egress_elements). What they do:
+
+    Each chain jumps to the rules of a user only when the packet's socket names that user (meta skuid matches the
+    set). A packet that no socket of a user makes (the kernel's own: IPv6 neighbour discovery, an ICMP error, an NFS
+    or CIFS mount) cannot be read as a user's, so it never meets those rules; a rule "skuid != @agents" would not
+    match it either, and would send it on to the last refusal (a review of 17 November 2026: that cut IPv6 for the
+    whole probe server, as its neighbour entries ran out).
+
+    - agent_nat: a packet of an agent user that goes to the hub's address and port, to the swap proxy on 127.0.0.1,
+      or to its own browser's DevTools port on the loopback address (the set browser, of each agent user and its port:
+      the browsers' own table lets that port reach only its own agent's user, so the connection must keep that user's
+      UID, and another agent's connection to it goes through the gate, which records it) goes on as it is; each DNS
+      question (UDP or TCP to port 53, to any name server) goes to the gate's resolver; each TCP connection to an
+      address of this machine goes to the gate's local port, and every other one to its port. The chain's priority is
+      one before dstnat, so that a NAT rule of another table (Docker's published ports) does not take an agent's
+      connection first.
+    - agent_out: a flow that is open goes on (the first install cuts nothing, and an agent's listener answers).
+      Every other first packet of an agent user is refused, but those that the kernel sent to the gate and those that
+      go direct: so UDP other than DNS, ICMP and each other protocol are refused, with words that the program sees.
+    - sub_out: a packet of a sub-uid of an agent user (the set subagents, from /etc/subuid) is refused. A process of
+      the agent that newuidmap gave such a UID in a user namespace of its own, in this machine's network, would
+      otherwise meet none of the agent's rules (a review of 17 November 2026).
+    - relay_out: the swap proxy's user reaches the gate's relay port, and nothing else, also no name server.
+
+    Two limits for each agent user, in the kernel, so that one agent's flood of new connections or DNS questions
+    never reaches the gate as more than its share: past them a new TCP connection gets a reset and a question is
+    dropped (EGRESS_NEW_RATE, EGRESS_DNS_RATE)."""
+    p = EGRESS_PORTS
+    return f"""# founderizer-egress table {EGRESS_TABLE}
+# The outgoing gate's kernel rules (vault.py, "the outgoing gate"). Root's: `vault.py configure --egress on` writes
+# this file, and the unit {EGRESS_RULES_SERVICE} loads it with the elements of its sets. Do not edit it.
+table inet founderizer_egress
+delete table inet founderizer_egress
+table inet founderizer_egress {{
+  comment "founderizer-egress {EGRESS_TABLE}"
+  set agents {{ type uid; }}
+  set relays {{ type uid; }}
+  set subagents {{ type uid; flags interval; }}
+  set direct4 {{ type ipv4_addr . inet_service; }}
+  set direct6 {{ type ipv6_addr . inet_service; }}
+  set browser {{ type uid . inet_service; }}
+  set new_rate {{ type uid; flags dynamic; timeout 1m; size 65536; }}
+  set dns_rate {{ type uid; flags dynamic; timeout 1m; size 65536; }}
+  chain nat_out {{
+    type nat hook output priority -101; policy accept;
+    meta skuid @agents jump agent_nat
+  }}
+  chain agent_nat {{
+    ip daddr . tcp dport @direct4 return
+    ip6 daddr . tcp dport @direct6 return
+    ip daddr 127.0.0.1 tcp dport {SWAP_PORT} return
+    ip daddr 127.0.0.1 meta skuid . tcp dport @browser return
+    ip6 daddr ::1 meta skuid . tcp dport @browser return
+    meta l4proto {{ udp, tcp }} th dport 53 redirect to :{p["dns"]}
+    fib daddr type local meta l4proto tcp redirect to :{p["local"]}
+    meta l4proto tcp redirect to :{p["out"]}
+  }}
+  chain filter_out {{
+    type filter hook output priority 0; policy accept;
+    meta skuid @agents jump agent_out
+    meta skuid @subagents jump sub_out
+    meta skuid @relays jump relay_out
+  }}
+  chain agent_out {{
+    ct status dnat ip daddr 127.0.0.1 udp dport {p["dns"]} update @dns_rate {{ meta skuid limit rate over {EGRESS_DNS_RATE} }} drop
+    ct status dnat ip6 daddr ::1 udp dport {p["dns"]} update @dns_rate {{ meta skuid limit rate over {EGRESS_DNS_RATE} }} drop
+    ct state established accept
+    ct state new meta l4proto tcp update @new_rate {{ meta skuid limit rate over {EGRESS_NEW_RATE} }} reject with tcp reset
+    ip daddr . tcp dport @direct4 accept
+    ip6 daddr . tcp dport @direct6 accept
+    ip daddr 127.0.0.1 tcp dport {SWAP_PORT} accept
+    ip daddr 127.0.0.1 meta skuid . tcp dport @browser accept
+    ip6 daddr ::1 meta skuid . tcp dport @browser accept
+    ct status dnat ip daddr 127.0.0.1 meta l4proto {{ tcp, udp }} th dport {{ {p["out"]}, {p["local"]}, {p["dns"]} }} accept
+    ct status dnat ip6 daddr ::1 meta l4proto {{ tcp, udp }} th dport {{ {p["out"]}, {p["local"]}, {p["dns"]} }} accept
+    meta l4proto tcp reject with tcp reset
+    reject with icmpx admin-prohibited
+  }}
+  chain sub_out {{
+    ct state established accept
+    meta l4proto tcp reject with tcp reset
+    reject with icmpx admin-prohibited
+  }}
+  chain relay_out {{
+    ct state established accept
+    ip daddr 127.0.0.1 tcp dport {p["relay"]} accept
+    meta l4proto tcp reject with tcp reset
+    reject with icmpx admin-prohibited
+  }}
+}}
+"""
+
+
+def egress_rules_version(text):
+    """The version that a rules file names in its first line, or None."""
+    found = re.match(r"# founderizer-egress table ([0-9]{1,6})\n", text or "")
+    return int(found.group(1)) if found else None
+
+
+def egress_agents(group=EGRESS_GROUP, never=()):
+    """The UIDs of this machine's agent users: each member of the group, and each user whose own group it is. Never
+    root, and never a user that `never` names (the gate's, the service user's, the swap proxy's)."""
+    try:
+        g = grp.getgrnam(group)
+    except KeyError:
+        return []
+    names = set(g.gr_mem) | {p.pw_name for p in pwd.getpwall() if p.pw_gid == g.gr_gid}
+    out = set()
+    for name in names - set(never):
+        try:
+            uid = pwd.getpwnam(name).pw_uid
+        except KeyError:
+            continue
+        if uid != 0:
+            out.add(uid)
+    return sorted(out)
+
+
+def egress_uid_of(name):
+    try:
+        return pwd.getpwnam(name).pw_uid
+    except KeyError:
+        return None
+
+
+def egress_browser_ports(agents, path=None):
+    """Each agent user's own DevTools port of the agents' browsers (EGRESS_BROWSER), as nft text `<uid> . <port>`:
+    from each whole line of the contract, `<user> <DevTools port> <screen port>`, with a DevTools port of 9300 to 9399
+    and a screen port of 5910 to 5999, whose user is an agent user. A line of another form is left out, so a line
+    that a later contract adds costs no agent its browser."""
+    try:
+        with open(path or EGRESS_BROWSER, encoding="utf-8") as f:
+            text = f.read(65536)
+    except (OSError, UnicodeDecodeError):
+        return []
+    rows = set()
+    for line in text.split("\n")[:-1]:             # only lines with their new line: never half of one in writing
+        found = re.fullmatch(r"(\S+) ([0-9]{4}) ([0-9]{4})", line)
+        if not found or int(found.group(2)) not in EGRESS_DEVTOOLS or not 5910 <= int(found.group(3)) <= 5999:
+            continue
+        uid = egress_uid_of(found.group(1))
+        if uid in agents:
+            rows.add((uid, int(found.group(2))))
+    return [f"{uid} . {port}" for uid, port in sorted(rows)]
+
+
+def egress_subids(agents, path=None, users=None, held=None):
+    """The sub-uid ranges of the agent users in /etc/subuid (a line `<user or UID>:<first>:<count>`), as nft
+    intervals with no overlap. The UID of each user of this machine (root, the gate's, an agent's) is cut out of a
+    range that holds it, so that no user's own packets are ever refused for it, and the rest of the range stays; such
+    a range goes into `held`, as words, because a process of that agent can take that user's UID. users: the UIDs of
+    this machine's users (a test's own)."""
+    try:
+        with open(path or EGRESS_SUBUID, encoding="utf-8") as f:
+            lines = f.read(1 << 20).splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    owners = {str(uid) for uid in agents}
+    for uid in agents:
+        try:
+            owners.add(pwd.getpwuid(uid).pw_name)
+        except KeyError:
+            pass
+    users = ({p.pw_uid for p in pwd.getpwall()} if users is None else set(users)) | {0}
+    spans = []
+    for line in lines:
+        found = re.fullmatch(r"([^:\s]+):([0-9]{1,10}):([0-9]{1,10})", line.strip())
+        if not found or found.group(1) not in owners:
+            continue
+        first, count = int(found.group(2)), int(found.group(3))
+        if count < 1:
+            continue
+        # a range past the UIDs that a socket can have is cut to them, and never left with no rule (a review of 17
+        # November 2026); root's UID 0, as each user's, is cut out below and named
+        first, last = min(first, 0xFFFFFFFE), min(first + count - 1, 0xFFFFFFFE)
+        inside = sorted(u for u in users if first <= u <= last)
+        if inside and held is not None:
+            held.append(f"the sub-uids {first}-{last} of {found.group(1)} hold the UID of a user of this machine "
+                        f"({', '.join(map(str, inside))}), which a process of that agent can take")
+        for user in inside:
+            if user > first:
+                spans.append([first, user - 1])
+            first = user + 1
+        if first <= last:
+            spans.append([first, last])
+    merged = []
+    for first, last in sorted(spans):
+        if merged and first <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], last)
+        else:
+            merged.append([first, last])
+    return [f"{first}-{last}" if last > first else str(first) for first, last in merged]
+
+
+def egress_elements(conf, agents=None):
+    """{set: [elements as nft text]} of the table's six sets, from the machine as it is now."""
+    never = (conf["user"], conf["service_user"], conf["swap_user"])
+    agents = egress_agents(conf["group"], never) if agents is None else agents
+    swap = egress_uid_of(conf["swap_user"])
+    out = {"agents": [str(u) for u in agents], "relays": [str(swap)] if swap is not None else [],
+           "subagents": egress_subids(agents), "direct4": [], "direct6": [], "browser": egress_browser_ports(agents)}
+    if conf.get("hub"):
+        kind = "direct6" if ":" in conf["hub"] else "direct4"
+        out[kind] = [f"{conf['hub']} . {port}" for port in conf["hub_ports"]]
+    return out
+
+
+def egress_load_text(rules, elements):
+    """One nft transaction: the whole table, then the elements of its sets. nft applies a file in one atomic step, so
+    no packet sees half of it (the proposal's F52)."""
+    text = rules
+    for name, items in elements.items():
+        if items:
+            text += f"add element inet founderizer_egress {name} {{ {', '.join(items)} }}\n"
+    return text
+
+
+def egress_loaded(run):
+    """The version of the table that the kernel has now, or None: its comment, read as JSON."""
+    code, out, _ = run(f"{EGRESS_NFT} -j list table inet founderizer_egress 2>/dev/null || true")
+    try:
+        for item in json.loads(out or "{}").get("nftables", []):
+            comment = (item.get("table") or {}).get("comment") if isinstance(item, dict) else None
+            if isinstance(comment, str):
+                found = re.fullmatch(r"founderizer-egress ([0-9]{1,6})", comment)
+                return int(found.group(1)) if found else None
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+# POSIX ACLs as the kernel keeps them (system.posix_acl_access and system.posix_acl_default): a version word, then
+# entries of a tag, a permission and an ID, in order of tag and ID. No program of the acl package is needed.
+ACL_USER_OBJ, ACL_USER, ACL_GROUP_OBJ, ACL_GROUP, ACL_MASK, ACL_OTHER = 1, 2, 4, 8, 16, 32
+ACL_NO_ID = 0xFFFFFFFF
+
+
+def acl_read(path, default=False):
+    """[(tag, perm, id)] of a file's ACL, or None when it has none."""
+    try:
+        raw = os.getxattr(path, "system.posix_acl_default" if default else "system.posix_acl_access",
+                          follow_symlinks=False)
+    except OSError:
+        return None
+    if len(raw) < 4 or struct.unpack_from("<I", raw)[0] != 2 or (len(raw) - 4) % 8:
+        return None
+    return [struct.unpack_from("<HHI", raw, i) for i in range(4, len(raw), 8)]
+
+
+def acl_bytes(entries):
+    return struct.pack("<I", 2) + b"".join(struct.pack("<HHI", t, p, i) for t, p, i in sorted(entries))
+
+
+def acl_with(entries, gid, perm, tag=ACL_GROUP):
+    """The entries with the named group's (or with tag ACL_USER the named user's) entry set to `perm`, and a mask
+    that keeps each other entry's effect: the union of the group class, as setfacl -m makes it."""
+    out = [e for e in entries if not (e[0] == tag and e[2] == gid) and e[0] != ACL_MASK]
+    out.append((tag, perm, gid))
+    mask = 0
+    for t, p, _ in out:
+        if t in (ACL_GROUP_OBJ, ACL_GROUP, ACL_USER):
+            mask |= p
+    out.append((ACL_MASK, mask, ACL_NO_ID))
+    return out
+
+
+def acl_close(path, gid, perm, default=False, tag=ACL_GROUP):
+    """One entry of the agents' group on a file or a folder, so that the kernel refuses them what `perm` leaves out:
+    no write on a socket is no connection to it (unix(7)), no search on a folder is no path through it, and a named
+    group's entry decides before the entry of others (acl(5)). True when it changed the file. A socket that others
+    and the group cannot write needs none. The default ACL of a folder gives each new file of it the entry: each other
+    entry is rwx there, so that the mode of a new file decides as it did before (an entry narrower than rwx would take
+    a right from every user: proved on 17 November 2026, when a default of r-x shut each user out of resolved's new
+    socket)."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return False
+    if default:
+        if not stat.S_ISDIR(info.st_mode):
+            return False
+        have = acl_read(path, default=True)
+        want = acl_with([(ACL_USER_OBJ, 7, ACL_NO_ID), (ACL_GROUP_OBJ, 7, ACL_NO_ID), (ACL_OTHER, 7, ACL_NO_ID)],
+                        gid, perm)
+        if have is not None and sorted(have) == sorted(want):
+            return False
+        os.setxattr(path, "system.posix_acl_default", acl_bytes(want), follow_symlinks=False)
+        return True
+    if stat.S_ISSOCK(info.st_mode) and not info.st_mode & 0o022 and tag == ACL_GROUP:
+        return False
+    have = acl_read(path)
+    base = have or [(ACL_USER_OBJ, (info.st_mode >> 6) & 7, ACL_NO_ID),
+                    (ACL_GROUP_OBJ, (info.st_mode >> 3) & 7, ACL_NO_ID), (ACL_OTHER, info.st_mode & 7, ACL_NO_ID)]
+    want = acl_with(base, gid, perm, tag)
+    if have is not None and sorted(have) == sorted(want):
+        return False
+    os.setxattr(path, "system.posix_acl_access", acl_bytes(want), follow_symlinks=False)
+    return True
+
+
+def acl_open(path, gid, default=False, tag=ACL_GROUP):
+    """The agents' group's entry out again (configure --egress off). True when it changed the file. With no named
+    entry left, the ACL goes, and the group bits of the mode are the group's own again."""
+    have = acl_read(path, default=default)
+    if have is None or not any(t == tag and i == gid for t, _, i in have):
+        return False
+    name = "system.posix_acl_default" if default else "system.posix_acl_access"
+    rest = [e for e in have if not (e[0] == tag and e[2] == gid) and e[0] != ACL_MASK]
+    if any(t in (ACL_USER, ACL_GROUP) for t, _, _ in rest):
+        mask = 0
+        for t, p, _ in rest:
+            if t in (ACL_GROUP_OBJ, ACL_GROUP, ACL_USER):
+                mask |= p
+        os.setxattr(path, name, acl_bytes(rest + [(ACL_MASK, mask, ACL_NO_ID)]), follow_symlinks=False)
+        return True
+    os.removexattr(path, name, follow_symlinks=False)
+    group = next((p for t, p, _ in rest if t == ACL_GROUP_OBJ), None)
+    if not default and group is not None:
+        os.chmod(path, (stat.S_IMODE(os.lstat(path).st_mode) & ~0o070) | (group << 3))
+    return True
+
+
+def egress_close(conf, which=None):
+    """The closures of A1 and A2 for each service (or one): (what changed, what could not be closed), as texts. Root
+    runs this at the root step, at each run of the rules' unit, and in each drop-in at a start of the service, before
+    it opens its socket. A file system that keeps no ACL (a tmpfs of a kernel with no POSIX ACLs) cannot hold a
+    closure: that is said, and nothing else of the gate stops for it."""
+    try:
+        gid = grp.getgrnam(conf["group"]).gr_gid
+    except KeyError:
+        return [], []
+    done, failed = [], []
+    for name, parts in EGRESS_CLOSED.items():
+        if which and name != which:
+            continue
+        steps = ([(parts["default"], 4, True, "each new socket of")] if parts.get("default") else []) + \
+            ([(parts["folder"], 0, False, "")] if parts.get("folder") else []) + \
+            [(sock, 4, False, "") for sock in parts["sockets"]]
+        for path, perm, default, words in steps:
+            try:
+                if acl_close(path, gid, perm, default=default):
+                    done.append(f"{name}: {words + ' ' if words else ''}{path} refuses the agents")
+            except OSError as e:
+                failed.append(f"{name}: {path} ({e.strerror or type(e).__name__})")
+    if failed:
+        log(f"egress: no closure on {', '.join(failed)}: an agent there can still ask that service")
+    return done, failed
+
+
+def egress_open(conf):
+    """The closures out again (configure --egress off)."""
+    try:
+        gid = grp.getgrnam(conf["group"]).gr_gid
+    except KeyError:
+        return
+    for parts in EGRESS_CLOSED.values():
+        for path, default in ([(parts["default"], True)] if parts.get("default") else []) + \
+                [(p, False) for p in ([parts["folder"]] if parts.get("folder") else []) + list(parts["sockets"])]:
+            try:
+                acl_open(path, gid, default=default)
+            except OSError:
+                continue
+    never = (conf["user"], conf["service_user"], conf["swap_user"])
+    for sock in EGRESS_DAEMONS:
+        for uid in egress_agents(conf["group"], never):
+            try:
+                acl_open(sock, uid, tag=ACL_USER)
+            except OSError:
+                continue
+
+
+def egress_dbus(conf, agents):
+    """The D-Bus policy of the closure of systemd-resolved: no agent user asks it for a name over D-Bus. The group's
+    policy takes a supplementary group (proved with dbus-daemon 1.14 on 17 November 2026); one policy for each agent
+    user too, for a bus that reads only a user's own group."""
+    users = []
+    for uid in agents:
+        try:
+            users.append(pwd.getpwuid(uid).pw_name)
+        except KeyError:
+            continue
+    deny = '<deny send_destination="org.freedesktop.resolve1"/>'
+    lines = [f'  <policy group="{conf["group"]}">{deny}</policy>'] + \
+        [f'  <policy user="{u}">{deny}</policy>' for u in sorted(users) if GROUP_NAME.fullmatch(u)]
+    return ('<?xml version="1.0"?>\n<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"\n'
+            ' "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">\n'
+            "<!-- Founderizer's outgoing gate: no agent user asks systemd-resolved for a name over D-Bus. Root's:\n"
+            "     vault.py egress-rules writes it. -->\n<busconfig>\n" + "\n".join(lines) + "\n</busconfig>\n")
+
+
+def egress_inputs():
+    """One hash of the files that the table's sets come from."""
+    digest = hashlib.sha256()
+    for path in ("/etc/passwd", "/etc/group", EGRESS_SUBUID, EGRESS_BROWSER):
+        try:
+            with open(path, "rb") as f:
+                digest.update(f.read(1 << 22))
+        except OSError:
+            digest.update(b"-")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def egress_table_step(conf, run, agents):
+    """The table, inside EGRESS_LOCK: the whole table with its sets, in one nft transaction, whenever root's rules file
+    is there, also while the gate does not run (the proposal's section 5.4); no table with no rules file (before the
+    root step's gate serves, and after `--egress off`). The whole table each time: no refresh of a set depends on how
+    a version of nft takes a flush and an add of an interval in one transaction. Root's file EGRESS_LOADED names the
+    version that the kernel has: written after a load, removed with the table."""
+    try:
+        with open(EGRESS_RULES, encoding="utf-8") as f:
+            rules = f.read()
+    except FileNotFoundError:
+        rules = None
+    if rules is None:
+        run(f"{EGRESS_NFT} delete table inet founderizer_egress >/dev/null 2>&1 || true")
+        if egress_loaded(run) is not None:
+            return {"ok": False, "reason": "the table did not go"}
+        try:
+            os.unlink(EGRESS_LOADED)
+        except FileNotFoundError:
+            pass
+        return {"ok": True, "table": "none"}
+    loaded = egress_loaded(run)
+    code, out, err = run(f"{EGRESS_NFT} -f - <<'FOUNDERIZER_EGRESS'\n"
+                         f"{egress_load_text(rules, egress_elements(conf, agents))}FOUNDERIZER_EGRESS\n")
+    if code != 0:
+        if loaded is None:              # nft applies a file whole or not at all: still no table
+            try:
+                os.unlink(EGRESS_LOADED)
+            except FileNotFoundError:
+                pass
+        return {"ok": False, "reason": f"the table did not load: {(err or out).strip()[-300:]}"}
+    try:
+        egress_write_root(EGRESS_LOADED, f"{egress_rules_version(rules)}\n", 0o644)
+    except OSError:
+        pass                        # the table is there; only the gate's state misses it until the next step
+    return {"ok": True, "table": "loaded"}
+
+
+def egress_rules(conf, run=None, write=None, agents=None, families=None, table_only=False):
+    """The rules' step (root, from the safe copy): at boot and at each change of /etc/group, /etc/subuid or the
+    browsers' ports (the rules' units), and after nftables.service loads or flushes the kernel's rules (its drop-in).
+    The table (egress_table_step); then, unless table_only, the closures, the D-Bus policy and no agent user in a
+    container group. One table step at a time (EGRESS_LOCK). A path unit's event while its step runs starts no second
+    run (the start joins the one that runs), and useradd writes /etc/group and /etc/subuid one after the other: so the
+    step runs again while what it read changed under it. Returns the answer of one JSON line. families: the families
+    of EGRESS_FAMILIES that a socket is made of here (a test's own)."""
+    run = run or root_shell
+    write = write or egress_write_root
+    families = families or egress_open_families
+    never = (conf["user"], conf["service_user"], conf["swap_user"])
+    for _ in range(5):
+        before = egress_inputs()
+        answer = egress_rules_once(conf, run, write, agents, families, table_only, never)
+        if not answer["ok"] or egress_inputs() == before:
+            break
+    return answer
+
+
+def egress_rules_once(conf, run, write, agents, families, table_only, never):
+    """One run of the rules' step (egress_rules)."""
+    lock = os.open(EGRESS_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        agents = egress_agents(conf["group"], never) if agents is None else agents
+        table = egress_table_step(conf, run, agents)
+    finally:
+        os.close(lock)
+    if not table["ok"] or table_only:
+        return table
+    removed = []
+    for uid in agents:
+        try:
+            user = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            continue
+        for group in EGRESS_CONTAINER_GROUPS:
+            try:
+                members = grp.getgrnam(group).gr_mem
+            except KeyError:
+                continue
+            if user in members and run(f"gpasswd -d {shlex.quote(user)} {group} >/dev/null")[0] == 0:
+                removed.append(f"{user}:{group}")
+    if removed:
+        log(f"egress: agent users out of the container groups: {', '.join(removed)}")
+    closed, unclosed = egress_close(conf)
+    for module in egress_open_families(tries=False):    # loaded before the step: out again, when no socket holds it
+        if run(f"modprobe -r {module} >/dev/null 2>&1")[0] == 0:
+            closed.append(f"the module {module} is out")
+    # Then a socket of each family, here: root's unit has no list of families, and the gate's has one, so only this
+    # step can find a family that is built into the kernel (the fourth review round). Only while the modprobe file
+    # keeps each module from loading: without it a try would load the module that it looks for (the fifth round).
+    if egress_modprobe_kept():
+        for family in families():
+            unclosed.append(f"the socket family {family} is open to the agents (built into this kernel, or its "
+                            f"module is in use)")
+    else:
+        unclosed.append(f"{EGRESS_MODPROBE} is missing or changed, so the modules of the socket families of "
+                        f"{', '.join(EGRESS_FAMILIES)} can load: run `vault.py configure --egress on` again")
+    more_closed, more_unclosed = egress_daemons(conf, agents)
+    closed += more_closed
+    unclosed += more_unclosed
+    egress_subids(agents, held=unclosed)
+    try:
+        dbus = write(EGRESS_DBUS, egress_dbus(conf, agents), 0o644)
+    except OSError as e:
+        dbus = False
+        unclosed.append(f"dbus: {EGRESS_DBUS} ({e.strerror or type(e).__name__})")
+    if dbus:
+        run("systemctl reload dbus.service >/dev/null 2>&1 || true")
+    return dict(table, agents=len(agents), groups_removed=removed, closed=closed, unclosed=unclosed, dbus=bool(dbus))
+
+
+def egress_daemons(conf, agents=None):
+    """A named user's entry with no right for each agent user on each container daemon's socket (EGRESS_DAEMONS): at
+    each run of the rules' unit, and at each start of docker.socket (its drop-in)."""
+    if agents is None:
+        agents = egress_agents(conf["group"], (conf["user"], conf["service_user"], conf["swap_user"]))
+    closed, unclosed = [], []
+    for sock in EGRESS_DAEMONS:
+        for uid in agents:
+            try:
+                if acl_close(sock, uid, 0, tag=ACL_USER):
+                    closed.append(f"{sock} refuses the agent user {uid}")
+            except OSError as e:
+                unclosed.append(f"{sock} for {uid} ({e.strerror or type(e).__name__})")
+    return closed, unclosed
+
+
+EGRESS_FAMILY_SOCKETS = {"rxrpc": (33, socket.SOCK_DGRAM, socket.AF_INET), "smc": (43, socket.SOCK_STREAM, 0),
+                         "rds": (21, socket.SOCK_SEQPACKET, 0), "tipc": (30, socket.SOCK_RDM, 0)}
+
+
+def egress_modprobe_kept(path=None):
+    """Whether the modprobe file keeps each module of EGRESS_FAMILIES from loading (an `install <module> /bin/false`
+    line for each)."""
+    try:
+        with open(path or EGRESS_MODPROBE, encoding="utf-8") as f:
+            lines = {line.strip() for line in f}
+    except OSError:
+        return False
+    return all(f"install {module} /bin/false" in lines for module in EGRESS_FAMILIES)
+
+
+def egress_open_families(path="/proc/modules", tries=True):
+    """The families of EGRESS_FAMILIES that are open on this machine now: a loaded module, or (tries) a socket of it
+    that this process can make, which also finds one that is built into the kernel and so in no list of modules. A
+    try cannot load a module that the step keeps from loading."""
+    try:
+        with open(path, encoding="ascii", errors="replace") as f:
+            loaded = {line.split()[0] for line in f if line.strip()}
+    except OSError:
+        loaded = set()
+    out = []
+    for name in EGRESS_FAMILIES:
+        opened = name in loaded
+        if not opened and tries and sys.platform.startswith("linux"):
+            try:
+                socket.socket(*EGRESS_FAMILY_SOCKETS[name]).close()
+                opened = True
+            except OSError:
+                pass
+        if opened:
+            out.append(name)
+    return out
+
+
+def egress_write_root(path, text, mode):
+    """Write a root file only when its text changed: True when it did. Through a file beside it and a rename, so no
+    reader sees half of it."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".new"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    return True
+
+
+def egress_hex(ip, port, mapped=False):
+    """An address and a port as /proc/net/tcp, tcp6, udp and udp6 write them: each 32-bit word of the address in
+    this machine's byte order, then the port. mapped: an IPv4 address in its IPv6 form (::ffff:a.b.c.d), as a program
+    with one socket for both IP versions (Java, .NET) has it in the IPv6 table."""
+    raw = socket.inet_pton(socket.AF_INET6 if ":" in ip else socket.AF_INET, ip)
+    if mapped:
+        raw = b"\0" * 10 + b"\xff\xff" + raw
+    return "".join("%08X" % int.from_bytes(raw[i:i + 4], sys.byteorder) for i in range(0, len(raw), 4)) + \
+        ":%04X" % port
+
+
+EGRESS_WILD = {False: "00000000", True: "0" * 32}
+
+
+def egress_rows(table):
+    """(local, remote, state, uid) of each row of a table of the kernel's sockets."""
+    try:
+        with open(table, encoding="ascii") as f:
+            next(f, None)
+            for row in f:
+                parts = row.split()
+                if len(parts) > 7 and parts[7].isdigit():
+                    yield parts[1], parts[2], parts[3], int(parts[7])
+    except OSError:
+        return
+
+
+# The kernel's own lookup of one socket (NETLINK_SOCK_DIAG, inet_diag): no scan of /proc/net, which an agent could
+# make as large as its open files allow with sockets that send nothing, and then each lookup of each agent would wait
+# behind it (the third and fourth review rounds). The gate's unit allows AF_NETLINK; the swap proxy's has no list.
+NETLINK_SOCK_DIAG, SOCK_DIAG_BY_FAMILY = 4, 20
+NLMSG_ERROR, NLMSG_DONE = 2, 3
+NLM_F_REQUEST, NLM_F_DUMP = 1, 0x300
+EGRESS_PORT_ROWS = 4096         # the sockets of one UDP port that the gate reads to place one DNS question, at most
+
+# Whether the kernel's lookup works in this process, for TCP and for UDP: egress_lookup_check sets it at each start.
+# A kernel with no inet_diag handler for a protocol (a container with no module to load) answers "no such socket"
+# for each one, as it does for a socket that is not there, so only a check with a socket of the process's own tells
+# the two apart. False: the lookups of that protocol read /proc. True until a check says otherwise.
+EGRESS_LOOKUP = {socket.IPPROTO_TCP: True, socket.IPPROTO_UDP: True}
+
+
+def egress_lookup_check(tcp_to=None):
+    """At a process's start: does the kernel's exact lookup find a TCP connection and a UDP socket of this process's
+    own? Sets EGRESS_LOOKUP, and returns {"tcp": ..., "udp": ...}: True when the lookup finds them, False when it
+    runs and does not, and None when there was nothing to look up (no connection to `tcp_to`, as while the gate starts
+    at boot). None keeps that lookup on: a moment with no listener must not send a process to /proc for its whole
+    life (the fifth review round). tcp_to: the listener that the connection goes to, for a user whose table lets it
+    reach no listener of its own (the swap proxy's: the gate's relay port)."""
+    me = os.getuid()
+    EGRESS_LOOKUP[socket.IPPROTO_TCP] = EGRESS_LOOKUP[socket.IPPROTO_UDP] = True
+    tcp = udp = None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as own:
+            if not tcp_to:
+                own.bind(("127.0.0.1", 0))
+                own.listen(1)
+            with socket.create_connection(tcp_to or own.getsockname(), timeout=5) as client:
+                tcp = egress_diag(socket.AF_INET, socket.IPPROTO_TCP, client.getsockname()[:2],
+                                  client.getpeername()[:2]) == me
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as own:
+            own.bind(("127.0.0.1", 0))
+            udp = egress_diag(socket.AF_INET, socket.IPPROTO_UDP, own.getsockname()[:2], ("0.0.0.0", 0)) == me
+    except OSError:
+        pass
+    EGRESS_LOOKUP[socket.IPPROTO_TCP], EGRESS_LOOKUP[socket.IPPROTO_UDP] = tcp is not False, udp is not False
+    return {"tcp": tcp, "udp": udp}
+
+
+def egress_diag(family, protocol, local, remote):
+    """The UID of the one socket of this protocol whose local end is `local` and whose remote end is `remote` (an
+    exact lookup of the kernel, inet_diag), None when the kernel has no such socket, or False when the lookup itself
+    cannot run here (no netlink, or the start check found that it does not work). An IPv4 lookup also finds a socket
+    of both IP versions (Java, .NET)."""
+    if not EGRESS_LOOKUP.get(protocol, True):
+        return False
+
+    def packed(ip):
+        return socket.inet_pton(family, ip).ljust(16, b"\0")
+    try:
+        if protocol == socket.IPPROTO_UDP:          # udp_diag looks the socket up with its two ends swapped
+            sockid = struct.pack("!HH", remote[1], local[1]) + packed(remote[0]) + packed(local[0])
+        else:
+            sockid = struct.pack("!HH", local[1], remote[1]) + packed(local[0]) + packed(remote[0])
+    except (OSError, ValueError):
+        return False
+    sockid += struct.pack("=III", 0, 0xFFFFFFFF, 0xFFFFFFFF)          # any interface, no cookie
+    req = struct.pack("=BBBBI", family, protocol, 0, 0, 0xFFFFFFFF) + sockid
+    msg = struct.pack("=IHHII", 16 + len(req), SOCK_DIAG_BY_FAMILY, NLM_F_REQUEST, 1, 0) + req     # one socket
+    try:
+        with socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, NETLINK_SOCK_DIAG) as nl:
+            nl.settimeout(2)
+            nl.sendto(msg, (0, 0))
+            data = nl.recv(65536)
+    except (OSError, AttributeError):
+        return False
+    i = 0
+    while i + 16 <= len(data):
+        size, kind = struct.unpack_from("=IH", data, i)
+        if kind == SOCK_DIAG_BY_FAMILY and size >= 16 + 72 and i + 16 + 72 <= len(data):
+            return struct.unpack_from("=I", data, i + 16 + 64)[0]            # inet_diag_msg idiag_uid
+        if kind in (NLMSG_ERROR, NLMSG_DONE) or size < 16:
+            return None
+        i += (size + 3) & ~3
+    return None
+
+
+def egress_udp_port(family, port, most=EGRESS_PORT_ROWS):
+    """(packed local address, uid) of each UDP socket of this family whose local port is `port`: one dump of the
+    kernel's own table, in which the kernel keeps that port alone (udp_dump compares it), with no text of /proc. None
+    when the port has more than `most` sockets (a question from it is not placed), False when the dump cannot run."""
+    if not EGRESS_LOOKUP.get(socket.IPPROTO_UDP, True):
+        return False
+    sockid = struct.pack("!HH", port, 0) + bytes(32) + struct.pack("=III", 0, 0xFFFFFFFF, 0xFFFFFFFF)
+    req = struct.pack("=BBBBI", family, socket.IPPROTO_UDP, 0, 0, 0xFFFFFFFF) + sockid
+    msg = struct.pack("=IHHII", 16 + len(req), SOCK_DIAG_BY_FAMILY, NLM_F_REQUEST | NLM_F_DUMP, 1, 0) + req
+    rows = []
+    try:
+        with socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, NETLINK_SOCK_DIAG) as nl:
+            nl.settimeout(2)
+            nl.sendto(msg, (0, 0))
+            while True:
+                data, i = nl.recv(65536), 0
+                if not data:
+                    return False
+                while i + 16 <= len(data):
+                    size, kind = struct.unpack_from("=IH", data, i)
+                    if kind == NLMSG_DONE:
+                        return rows
+                    if kind == NLMSG_ERROR or size < 16:
+                        return False
+                    if kind == SOCK_DIAG_BY_FAMILY and size >= 16 + 72 and i + 16 + 72 <= len(data):
+                        wide = 16 if data[i + 16] == socket.AF_INET6 else 4      # idiag_family, then id.idiag_src
+                        rows.append((data[i + 24:i + 24 + wide], struct.unpack_from("=I", data, i + 16 + 64)[0]))
+                        if len(rows) > most:
+                            return None
+                    i += (size + 3) & ~3
+    except (OSError, AttributeError, struct.error):
+        return False
+
+
+def egress_tcp_uid(peer, dest):
+    """The UID of the program's own socket of a connection that the kernel sent to the gate: the socket whose local
+    end is the peer that the gate sees and whose remote end is the ORIGINAL destination (the NAT is hidden from the
+    program's socket; proved on 13 November 2026, P2). The kernel's exact lookup; the table of /proc only where that
+    lookup does not work (egress_lookup_check). None when no socket has both: no caller, no service."""
+    six = ":" in peer[0]
+    found = egress_diag(socket.AF_INET6 if six else socket.AF_INET, socket.IPPROTO_TCP, peer[:2], dest[:2])
+    if found is not False:
+        return found
+    forms = [("/proc/net/tcp6" if six else "/proc/net/tcp", False)] + ([] if six else [("/proc/net/tcp6", True)])
+    for table, mapped in forms:
+        local, remote = egress_hex(peer[0], peer[1], mapped), egress_hex(dest[0], dest[1], mapped)
+        for loc, rem, _, uid in egress_rows(table):
+            if loc == local and rem == remote:
+                return uid
+    return None
+
+
+def egress_udp_fast(peer, servers):
+    """The UID of the socket that sent a DNS question from `peer`, by the kernel's exact lookup: a socket that did not
+    connect (any remote end), or one that connected to one of this machine's name servers, as glibc's resolver does.
+    None when neither is so (a program that asked another name server: the slow way, egress_udp_uid), False with no
+    netlink."""
+    six = ":" in peer[0]
+    family = socket.AF_INET6 if six else socket.AF_INET
+    wild = "::" if six else "0.0.0.0"
+    for remote in [(wild, 0)] + [(ip, 53) for ip in servers if (":" in ip) == six]:
+        found = egress_diag(family, socket.IPPROTO_UDP, peer[:2], remote)
+        if found is not None:
+            return found
+    return None
+
+
+def egress_udp_uid(peer):
+    """The UID of the socket that sent a DNS question from this address and port, when the exact lookups did not find
+    it (egress_udp_fast: a socket that connected to a name server that is not this machine's): the kernel's own dump
+    of the sockets of that port (egress_udp_port), or its table in /proc where the dump cannot run. A socket on the
+    exact address decides before one of the same port on no address, and the question's own family before the IPv6
+    form of an IPv4 address: a socket that another agent user binds on no address cannot make a question of a
+    connected socket its own, or no one's. None when no socket, or two users at the first level that has one."""
+    six = ":" in peer[0]
+    try:
+        raw = socket.inet_pton(socket.AF_INET6 if six else socket.AF_INET, peer[0])
+    except (OSError, ValueError):
+        return None
+    if six:
+        levels = [(socket.AF_INET6, raw), (socket.AF_INET6, bytes(16))]
+    else:
+        levels = [(socket.AF_INET, raw), (socket.AF_INET6, bytes(10) + b"\xff\xff" + raw),
+                  (socket.AF_INET, bytes(4)), (socket.AF_INET6, bytes(16))]
+    tables = {}
+    for family, want in levels:
+        if family not in tables:
+            tables[family] = egress_udp_port(family, peer[1])
+            if tables[family] is False:
+                return egress_udp_proc(peer)
+            if tables[family] is None:
+                return None
+        found = {uid for local, uid in tables[family] if local == want}
+        if found:
+            return found.pop() if len(found) == 1 else None
+    return None
+
+
+def egress_udp_proc(peer):
+    """egress_udp_uid from the kernel's table of UDP sockets in /proc, with the same levels: where the kernel's own
+    lookup does not work (egress_lookup_check)."""
+    six = ":" in peer[0]
+    if six:
+        exact = egress_hex(peer[0], peer[1])
+        levels = [("/proc/net/udp6", exact), ("/proc/net/udp6", EGRESS_WILD[True] + exact[-5:])]
+    else:
+        exact, mapped = egress_hex(peer[0], peer[1]), egress_hex(peer[0], peer[1], mapped=True)
+        levels = [("/proc/net/udp", exact), ("/proc/net/udp6", mapped),
+                  ("/proc/net/udp", EGRESS_WILD[False] + exact[-5:]), ("/proc/net/udp6", EGRESS_WILD[True] + exact[-5:])]
+    for table, want in levels:
+        found = {uid for loc, _, _, uid in egress_rows(table) if loc == want}
+        if found:
+            return found.pop() if len(found) == 1 else None
+    return None
+
+
+def egress_direct_uid(conn):
+    """The UID of the other end of a connection that came to the gate directly (its relay port): the socket whose
+    local end is the peer and whose remote end is the gate's own address, by the kernel's lookup (egress_tcp_uid)."""
+    try:
+        peer, own = conn.getpeername()[:2], conn.getsockname()[:2]
+    except OSError:
+        return None
+    return egress_tcp_uid(peer, own)
+
+
+def egress_original(conn, six):
+    """(address, port) that the program connected to, before the kernel sent the connection to the gate."""
+    if six:
+        raw = conn.getsockopt(socket.IPPROTO_IPV6, 80, 28)      # IP6T_SO_ORIGINAL_DST
+        return socket.inet_ntop(socket.AF_INET6, raw[8:24]), struct.unpack_from("!H", raw, 2)[0]
+    raw = conn.getsockopt(socket.SOL_IP, 80, 16)                 # SO_ORIGINAL_DST
+    return socket.inet_ntoa(raw[4:8]), struct.unpack_from("!H", raw, 2)[0]
+
+
+def egress_host(value):
+    """A host name as the records keep it (as the program wrote it, no dot at the end: a name can carry data in its
+    labels, and the hub's check of a login's value is exact), or None for one that is not a name."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip().rstrip(".")
+    if not value or not EGRESS_NAME.fullmatch(value.lower()) or re.fullmatch(r"[0-9.]+", value):
+        return None
+    return value
+
+
+def egress_sni(data):
+    """("more", None) while the first TLS handshake message is not whole, else ("done", the server name or None).
+    The message can lie in more than one record. A first byte that is no TLS handshake: ("done", None)."""
+    if not data:
+        return "more", None
+    if data[0] != 0x16:
+        return "done", None
+    body, i = b"", 0
+    while i + 5 <= len(data) and data[i] == 0x16 and len(body) < EGRESS_FIRST:
+        size = struct.unpack_from("!H", data, i + 3)[0]
+        if i + 5 + size > len(data):
+            body += data[i + 5:]
+            break
+        body += data[i + 5:i + 5 + size]
+        i += 5 + size
+        if len(body) >= 4 and len(body) >= 4 + int.from_bytes(body[1:4], "big"):
+            break
+    if len(body) < 4:
+        return ("more", None) if len(data) < EGRESS_FIRST else ("done", None)
+    if body[0] != 0x01:
+        return "done", None
+    need = 4 + int.from_bytes(body[1:4], "big")
+    if len(body) < need:
+        return ("more", None) if len(data) < EGRESS_FIRST else ("done", None)
+    hello = body[4:need]
+    try:
+        j = 2 + 32
+        j += 1 + hello[j]                                       # session id
+        j += 2 + struct.unpack_from("!H", hello, j)[0]          # cipher suites
+        j += 1 + hello[j]                                       # compression methods
+        end = j + 2 + struct.unpack_from("!H", hello, j)[0]
+        j += 2
+        while j + 4 <= end:
+            kind, size = struct.unpack_from("!HH", hello, j)
+            j += 4
+            if kind == 0:                                       # server_name
+                k, last = j + 2, j + size
+                while k + 3 <= last:
+                    form, length = hello[k], struct.unpack_from("!H", hello, k + 1)[0]
+                    if form == 0:
+                        return "done", egress_host(hello[k + 3:k + 3 + length].decode("ascii"))
+                    k += 3 + length
+                return "done", None
+            j += size
+    except (IndexError, struct.error, UnicodeError):
+        pass
+    return "done", None
+
+
+EGRESS_METHOD = re.compile(rb"[A-Z]{1,16} (\S{1,8000}) HTTP/1\.[01]\r?\n")
+
+
+def egress_http_host(data):
+    """("more", None) while an HTTP/1 request head is not whole, else ("done", its host or None): the Host line, or
+    the host of a request line in absolute form."""
+    if not data:
+        return "more", None
+    line = EGRESS_METHOD.match(data)
+    if not line:
+        if re.match(rb"[A-Z]{1,16}( |$)", data[:17]) and b"\n" not in data and len(data) < EGRESS_FIRST:
+            return "more", None
+        return "done", None
+    end = data.find(b"\r\n\r\n")
+    if end < 0:
+        end = data.find(b"\n\n")
+    if end < 0:
+        return ("more", None) if len(data) < EGRESS_FIRST else ("done", None)
+    target = line.group(1).decode("latin-1")
+    if "://" in target:
+        try:
+            return "done", egress_host(urllib.parse.urlsplit(target).hostname)
+        except ValueError:
+            return "done", None
+    for raw in data[line.end():end].split(b"\n"):
+        name, _, value = raw.decode("latin-1").partition(":")
+        if name.strip().lower() == "host":
+            value = value.strip()
+            if value.startswith("["):
+                return "done", None                             # an address, not a name
+            return "done", egress_host(value.rsplit(":", 1)[0] if value.count(":") == 1 else value)
+    return "done", None
+
+
+def egress_first(data):
+    """What the first bytes of a connection say: ("more", None, None), or ("done", name or None, how)."""
+    state, name = egress_sni(data)
+    if state == "more":
+        return "more", None, None
+    if data[:1] == b"\x16":
+        return "done", name, "sni" if name else None
+    state, name = egress_http_host(data)
+    if state == "more":
+        return "more", None, None
+    return "done", name, "host" if name else None
+
+
+def egress_dns_name(msg, i, depth=0):
+    """(name, the index after it) of a DNS name at `i`, with its compression pointers."""
+    labels, jumped, after = [], False, None
+    for _ in range(128):
+        size = msg[i]
+        if size == 0:
+            return ".".join(labels), (after if jumped else i + 1)
+        if size & 0xC0 == 0xC0:
+            if not jumped:
+                after = i + 2
+            jumped, i = True, ((size & 0x3F) << 8) | msg[i + 1]
+            continue
+        labels.append("".join(chr(b) if chr(b).isalnum() and b < 128 or b in b"-_" else "\\%03d" % b
+                              for b in msg[i + 1:i + 1 + size]))      # DNS's own form: \DDD for each other byte
+        i += 1 + size
+    raise ValueError("a name with too many labels")
+
+
+def egress_dns_question(msg):
+    """(name, type) of a DNS question, or None."""
+    try:
+        if len(msg) < 12 or struct.unpack_from("!H", msg, 4)[0] < 1:
+            return None
+        name, i = egress_dns_name(msg, 12)
+        return name.rstrip("."), struct.unpack_from("!H", msg, i)[0]
+    except (IndexError, ValueError, struct.error):
+        return None
+
+
+def egress_dns_answers(msg):
+    """The addresses of the A and AAAA records of a DNS answer, of every name in it (a CNAME chain ends at one)."""
+    out = []
+    try:
+        count_q, count_a = struct.unpack_from("!HH", msg, 4)
+        i = 12
+        for _ in range(count_q):
+            _, i = egress_dns_name(msg, i)
+            i += 4
+        for _ in range(count_a):
+            _, i = egress_dns_name(msg, i)
+            kind, _, _, size = struct.unpack_from("!HHIH", msg, i)
+            i += 10
+            if kind == 1 and size == 4:
+                out.append(socket.inet_ntop(socket.AF_INET, msg[i:i + 4]))
+            elif kind == 28 and size == 16:
+                out.append(socket.inet_ntop(socket.AF_INET6, msg[i:i + 16]))
+            i += size
+    except (IndexError, ValueError, struct.error):
+        pass
+    return out
+
+
+def egress_servfail(msg):
+    """A DNS answer that says that the server failed, for a question that got no answer from this machine's name
+    servers; None for bytes that are no question."""
+    if egress_dns_question(msg) is None:
+        return None
+    _, i = egress_dns_name(msg, 12)
+    flags = struct.unpack_from("!H", msg, 2)[0]
+    return msg[:2] + struct.pack("!HHHHH", 0x8000 | (flags & 0x7900) | 0x0080 | 2, 1, 0, 0, 0) + msg[12:i + 4]
+
+
+def egress_class(ip):
+    """The kind of an address for the records: one of EGRESS_CLASSES, "local" for an address of this machine (the
+    caller knows it), or "public"."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return "public"
+    if a.version == 6 and a.ipv4_mapped:
+        a = a.ipv4_mapped
+    if a.is_loopback:
+        return "local"
+    for kind, nets in EGRESS_CLASSES:
+        if any(a in ipaddress.ip_network(n) for n in nets if ipaddress.ip_network(n).version == a.version):
+            return kind
+    return "public"
+
+
+def egress_fold(name):
+    """A name past the limit of names counts under its last two labels."""
+    return ".".join(name.split(".")[-2:])
+
+
+class EgressCounts:
+    """What the gate counts, in memory: one row for each agent user, host (a name, or an address), port, verdict, how
+    the name was read and the kind of address, with DNS questions, connections and bytes in each direction, and the
+    first and the last time. The service user takes them (take), and they go to the hub with its readings. A count
+    limit for each agent user, and never a clock: past EGRESS_NAMES names a new name counts under its last two labels,
+    and past EGRESS_ROWS rows a new row counts on port 0."""
+
+    FIELDS = ("dns", "conns", "up", "down")
+
+    def __init__(self, clock=time.time):
+        self.lock, self.clock, self.rows, self.names, self.per_user = threading.Lock(), clock, {}, {}, {}
+
+    def key(self, uid, host, port, verdict, how, cls):
+        """The row of one event. Each host is a name or an address: past EGRESS_NAMES of them a new one counts under
+        its last two labels (an address under itself), past EGRESS_FOLDED of those and past EGRESS_ROWS rows as
+        EGRESS_MORE on port 0. So one agent user's rows of a batch stay under EGRESS_ROWS and a few of EGRESS_MORE,
+        whatever names or addresses it makes up."""
+        names = self.names.setdefault(uid, {})
+        if host not in names:
+            if len(names) >= EGRESS_NAMES:
+                folded = host if ":" in host or re.fullmatch(r"[0-9.]+", host) else egress_fold(host)
+                host = folded if folded in names or len(names) < EGRESS_NAMES + EGRESS_FOLDED else EGRESS_MORE
+            names.setdefault(host, True)
+        key = (uid, host, port, verdict, how or "address", cls)
+        if key not in self.rows and self.per_user.get(uid, 0) >= EGRESS_ROWS:
+            key = (uid, EGRESS_MORE, 0, verdict, how or "address", cls)
+        return key
+
+    def add(self, uid, host, port, verdict, how, cls, **counts):
+        """Count one event; returns its row's key, to which a connection adds its bytes."""
+        with self.lock:
+            key = self.key(uid, host, port, verdict, how, cls)
+            self.add_key(key, counts)
+            return key
+
+    def add_key(self, key, counts, first=None, last=None):
+        t = self.clock()
+        if key not in self.rows:
+            self.per_user[key[0]] = self.per_user.get(key[0], 0) + 1
+        row = self.rows.setdefault(key, {"dns": 0, "conns": 0, "up": 0, "down": 0, "first": first or t, "last": t})
+        for field in self.FIELDS:
+            row[field] += int(counts.get(field) or 0)
+        row["first"] = min(row["first"], first or t)
+        row["last"] = max(row["last"], last or t)
+
+    def take(self):
+        """Each row, and the counts start again from zero."""
+        with self.lock:
+            rows, self.rows, self.names, self.per_user = self.rows, {}, {}, {}
+        out = []
+        for (uid, host, port, verdict, how, cls), row in rows.items():
+            try:
+                user = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                user = None
+            out.append(dict(row, uid=uid, user=user, host=host, port=port, verdict=verdict, how=how, cls=cls))
+        return out
+
+    def merge(self, rows):
+        """Rows of another process of the gate (the one before a hand-over), added to these."""
+        with self.lock:
+            for r in rows if isinstance(rows, list) else []:
+                try:
+                    key = self.key(int(r["uid"]), str(r["host"]), int(r["port"]), str(r["verdict"]), str(r["how"]),
+                                   str(r["cls"]))
+                    self.add_key(key, r, first=float(r["first"]), last=float(r["last"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+
+class EgressNames:
+    """For each agent user, which name its DNS answer gave for which address: the name of a connection whose first
+    bytes carry none (SSH, a database, a server that speaks first). A count limit for each user, never a clock."""
+
+    def __init__(self):
+        self.lock, self.by_user = threading.Lock(), {}
+
+    def learn(self, uid, name, addresses):
+        with self.lock:
+            seen = self.by_user.setdefault(uid, {})
+            for address in addresses:
+                seen.pop(address, None)
+                seen[address] = name
+            while len(seen) > EGRESS_ADDRESSES:
+                seen.pop(next(iter(seen)))
+
+    def name(self, uid, address):
+        with self.lock:
+            return self.by_user.get(uid, {}).get(address)
+
+
+def egress_six(address):
+    """True for an IPv6 address, but not for an IPv4 address in its IPv6 form (::ffff:a.b.c.d), which reaches its
+    host over IPv4: the dial's families (the fourth review round)."""
+    if ":" not in address:
+        return False
+    try:
+        return ipaddress.IPv6Address(address.split("%")[0]).ipv4_mapped is None
+    except ValueError:
+        return True
+
+
+def egress_dial(port, first=None, name=None, resolve=None, connect=None, fallback=EGRESS_FALLBACK,
+                patience=EGRESS_PATIENCE, stall=EGRESS_STALL):
+    """A TCP connection for an agent, or None. To `first`, the address that the program chose, as it chose it; when
+    that does not connect in `fallback` seconds and the gate knows the name, also to the name's other addresses, one
+    each `fallback` seconds (RFC 8305): the program's own fallback cannot run, because the kernel gave it the gate's
+    handshake at once. With no first address (the relay port), to the name's addresses in that order."""
+    resolve = resolve or (lambda host: [a[4][0] for a in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)])
+    connect = connect or (lambda address: socket.create_connection((address, port), timeout=patience))
+    cond, made, failed, started, over, refused = threading.Condition(), [], [], [], [], []
+
+    def one(address):
+        try:
+            sock = connect(address)
+        except ConnectionRefusedError:
+            with cond:
+                failed.append(address)
+                if address == first:
+                    refused.append(address)
+                cond.notify_all()
+            return
+        except (OSError, UnicodeError, ValueError):
+            with cond:
+                failed.append(address)
+                cond.notify_all()
+            return
+        with cond:
+            late = bool(over)               # the dial ended: no one takes this connection
+            if not late:
+                made.append(sock)
+                cond.notify_all()
+        if late:
+            sock.close()
+
+    def start(address):
+        started.append(address)
+        threading.Thread(target=one, args=(address,), daemon=True).start()
+
+    deadline = time.monotonic() + patience
+    more, found, same_taken = None, None, False
+    if first:
+        start(first)
+    with cond:
+        while not made and time.monotonic() < deadline:
+            # A refusal is the host's own answer: the program would have had it too. The fallback is for a path that
+            # does not answer, or that has no route, to the name's other addresses, as a program's own fallback
+            # (RFC 8305) goes: the other family after `fallback` seconds with no answer; the same family only after
+            # the first address failed or gave no answer for `stall` seconds, so that a pinned address that answers
+            # in time races no other host of its family.
+            if found is None and name and (not first or (not refused and (failed or
+                                           time.monotonic() - (deadline - patience) >= fallback))):
+                cond.release()
+                try:
+                    found = [a for a in dict.fromkeys(resolve(name)) if a != first][:8]
+                except (OSError, UnicodeError):
+                    found = []
+                finally:
+                    cond.acquire()
+                more = [a for a in found if first and egress_six(a) != egress_six(first)][:4]
+            stalled = time.monotonic() - (deadline - patience) >= stall
+            if found is not None and not same_taken and (not first or ((failed or stalled) and not refused)):
+                same_taken = True
+                same = [a for a in found if not first or egress_six(a) == egress_six(first)]
+                other = list(more or [])
+                more = []                       # the other family first, then in turn
+                while other or same:
+                    more += other[:1] + same[:1]
+                    other, same = other[1:], same[1:]
+                more = [a for a in more if a not in started][:4]
+            if more:
+                start(more.pop(0))
+                cond.wait(fallback)
+                continue
+            if len(failed) >= len(started) and (not name or refused or (found is not None and same_taken)):
+                break
+            cond.wait(min(fallback, max(0.0, deadline - time.monotonic())))
+        winner = made[0] if made else None
+        over.append(True)
+    for sock in made[1:]:
+        sock.close()
+    if winner is not None:
+        for opt in ((socket.IPPROTO_TCP, socket.TCP_NODELAY), (socket.SOL_SOCKET, socket.SO_KEEPALIVE)):
+            try:
+                winner.setsockopt(*opt, 1)
+            except OSError:
+                pass
+        winner.settimeout(None)
+    return winner
+
+
+def egress_reset(sock):
+    """Close a connection with a reset, so that the program hears at once that it failed."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def egress_resolvers(path="/etc/resolv.conf"):
+    """The name servers of this machine, as glibc reads them; 127.0.0.1 when there is none."""
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    try:
+                        out.append(str(ipaddress.ip_address(parts[1].split("%")[0])))
+                    except ValueError:
+                        continue
+    except OSError:
+        pass
+    return out[:3] or ["127.0.0.1"]
+
+
+class EgressFlow:
+    """One connection that the gate relays: its agent user, its row once its name is read, and its bytes. Each
+    direction's own thread writes its own count; take() reads them and adds what is new."""
+
+    def __init__(self, uid, socks):
+        self.uid, self.socks, self.key, self.lock = uid, socks, None, threading.Lock()
+        self.up = self.down = self.told_up = self.told_down = 0
+        self.first, self.named = b"", threading.Event()
+
+
+class Egress:
+    """The gate: its listeners, one thread for each connection's direction, its resolver, its control socket and its
+    counts. In this step it refuses no host ("records only"); it refuses a caller that is no agent user, and an
+    agent user past its limit of connections, and it never relays a connection to one of its own ports."""
+
+    LISTENERS = (("out4", "out", False), ("out6", "out", True), ("local4", "local", False),
+                 ("local6", "local", True), ("relay4", "relay", False), ("dns4", "dns", False),
+                 ("dns6", "dns", True), ("dnst4", "dnst", False), ("dnst6", "dnst", True))
+
+    def __init__(self, conf, socks=None, program=None, spawn=None, parent=None, state=EGRESS_STATE,
+                 clock=time.time, dial=egress_dial, resolvers=egress_resolvers, ports=None):
+        self.conf, self.state, self.clock, self.dial, self.resolvers = conf, state, clock, dial, resolvers
+        self.ports = dict(EGRESS_PORTS, **(ports or {}))
+        self.counts, self.names = EgressCounts(clock), EgressNames()
+        self.lock, self.cond = threading.Lock(), threading.Condition()
+        self.flows, self.open, self.asking = set(), {}, {}
+        self.program, self.spawn, self.parent = program, spawn, parent
+        self.ending, self.heir, self.trying, self.failed = False, None, False, None
+        self.threads = threading.BoundedSemaphore(EGRESS_THREADS)     # each handler's thread holds one
+        self.handlers = 0                       # handlers that run now: a hand-over waits for them too
+        self.slow = queue.Queue(maxsize=256)    # DNS questions that the kernel's exact lookup did not place
+        self.controls = threading.BoundedSemaphore(EGRESS_CONTROLS)
+        self.loops = []
+        self.since, self.agents_at, self.agents = clock(), None, set()
+        self.policy = self.load_policy()
+        self.socks = socks if socks is not None else self.listen()
+        self.installed_at = self.installed = None
+
+    # ---- listeners
+    def listen(self):
+        socks = {}
+        for name, kind, six in self.LISTENERS:
+            port = self.ports[kind if kind != "dnst" else "dns"]
+            family = socket.AF_INET6 if six else socket.AF_INET
+            sock = socket.socket(family, socket.SOCK_DGRAM if kind == "dns" else socket.SOCK_STREAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if six:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                sock.bind(("::1" if six else "127.0.0.1", port))
+                if kind != "dns":
+                    sock.listen(1024)
+            except OSError:
+                sock.close()
+                if six:
+                    continue                # a machine with no IPv6 sends the gate no IPv6
+                raise
+            socks[name] = sock
+        control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        path = self.conf.get("control") or EGRESS_CONTROL
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        control.bind(path)
+        os.chmod(path, 0o666)               # SO_PEERCRED decides who it answers (control)
+        control.listen(64)
+        socks["control"] = control
+        return socks
+
+    def is_agent(self, uid):
+        """An agent user of this machine now: a member of its group, read again when /etc/group changes."""
+        try:
+            at = os.stat("/etc/group").st_mtime_ns
+        except OSError:
+            at = None
+        if at != self.agents_at:
+            never = (self.conf["user"], self.conf["service_user"], self.conf["swap_user"])
+            self.agents, self.agents_at = set(egress_agents(self.conf["group"], never)), at
+        return uid in self.agents
+
+    # ---- the policy (step 1: "records" only)
+    def load_policy(self):
+        try:
+            with open(os.path.join(self.state, "policy.json"), encoding="utf-8") as f:
+                return egress_policy(json.load(f))
+        except (OSError, ValueError, Refused):
+            return None
+
+    def set_policy(self, value):
+        policy = egress_policy(value)       # Refused: the last policy stays
+        tmp = os.path.join(self.state, "policy.json.new")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(policy, f)
+        os.replace(tmp, os.path.join(self.state, "policy.json"))
+        self.policy = policy
+
+    # ---- one connection
+    def begin_flow(self, uid, socks):
+        """A flow of this agent user, or None past its limit of connections."""
+        with self.lock:
+            if self.open.get(uid, 0) >= EGRESS_PER_USER:
+                return None
+            self.open[uid] = self.open.get(uid, 0) + 1
+            flow = EgressFlow(uid, socks)
+            self.flows.add(flow)
+            return flow
+
+    def end(self, flow):
+        self.told(flow)
+        with self.lock:
+            self.flows.discard(flow)
+            self.open[flow.uid] = self.open.get(flow.uid, 1) - 1
+            if self.open[flow.uid] <= 0:
+                self.open.pop(flow.uid, None)
+        with self.cond:
+            self.cond.notify_all()
+
+    def told(self, flow):
+        """A flow's new bytes into its row."""
+        with flow.lock:
+            if not flow.key:
+                return
+            now_up, now_down = flow.up, flow.down          # each read once: a pump adds while this runs
+            up, down = now_up - flow.told_up, now_down - flow.told_down
+            flow.told_up, flow.told_down = now_up, now_down
+        if up or down:
+            with self.counts.lock:
+                self.counts.add_key(flow.key, {"up": up, "down": down})
+
+    def name_flow(self, flow, host, port, how, cls, verdict="pass"):
+        with flow.lock:
+            if flow.key is not None:
+                return
+            flow.key = self.counts.add(flow.uid, host, port, verdict, how, cls, conns=1)
+        flow.named.set()
+
+    def outbound(self, conn, six, local):
+        """A TCP connection of an agent user, from the kernel's redirect: to another host (port out) or to an address
+        of this machine (port local)."""
+        try:
+            peer = conn.getpeername()[:2]
+            dst, dport = egress_original(conn, six)
+        except OSError:
+            return egress_reset(conn)
+        uid = egress_tcp_uid(peer, (dst, dport))
+        if uid is None or not self.is_agent(uid):
+            return egress_reset(conn)       # only the kernel's redirect of an agent user's socket comes here
+        if local and dport in self.ports.values():
+            return egress_reset(conn)       # never one of the gate's own ports: that would be a loop
+        flow = self.begin_flow(uid, [conn])
+        if flow is None:
+            self.counts.add(uid, dst, dport, "busy", "address", "local" if local else egress_class(dst), conns=1)
+            return egress_reset(conn)
+        try:
+            known = self.names.name(uid, dst)
+            up = self.dial(dport, first=dst, name=known)
+            cls = "local" if local else egress_class(dst)
+            if up is None:
+                self.name_flow(flow, known or dst, dport, "dns" if known else "address", cls)
+                return egress_reset(conn)
+            flow.socks.append(up)
+            self.relay(flow, conn, up, dport, cls, known or dst, "dns" if known else "address")
+        finally:
+            self.end(flow)
+
+    def relay(self, flow, client, site, port, cls, plain, plain_how, first=b"", host=None):
+        """Both directions until both ended. The client's first bytes are read for a name as they pass, never held
+        back, and no byte after them; then the kernel moves the rest (os.splice) with no copy in this process.
+        plain, plain_how: the row's host when no first byte names one (the name that the resolver gave this agent for
+        the address, or the address). host: the relay port's CONNECT host, which names the row."""
+        for sock in (client, site):
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+
+        def name_seen(data, done):
+            if flow.named.is_set():
+                return
+            state, name, found = egress_first(data)
+            if state == "more" and not done:
+                return
+            if host:
+                self.name_flow(flow, host, port, "relay", cls)
+                if name and name != host:           # the inner name of a tunnel, as the swap proxy sent it
+                    self.counts.add(flow.uid, name, port, "pass", "relay-sni", cls, conns=1)
+            elif name:
+                self.name_flow(flow, name, port, found, cls)
+            else:
+                self.name_flow(flow, plain, port, plain_how, cls)
+
+        back = threading.Thread(target=self.pump, args=(site, client, flow, "down", lambda data: name_seen(b"", True)),
+                                daemon=True)
+        back.start()
+        self.pump(client, site, flow, "up", lambda data: name_seen(data, False), first=first)
+        name_seen(b"", True)
+        back.join()
+        for sock in (client, site):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def pump(self, source, target, flow, direction, look, first=b""):
+        """One direction until its end. `look` sees the first bytes (up) or hears that the server spoke first
+        (down). Then the end goes to the other side."""
+        seen = first
+        try:
+            if first:
+                look(seen)
+                target.sendall(first)
+                setattr(flow, direction, getattr(flow, direction) + len(first))
+            while not flow.named.is_set() and len(seen) < EGRESS_FIRST:
+                data = source.recv(65536)
+                if not data:
+                    break
+                seen += data
+                look(seen)                  # before the bytes go on: the answer they bring cannot name it first
+                target.sendall(data)
+                setattr(flow, direction, getattr(flow, direction) + len(data))
+            else:
+                self.splice(source, target, flow, direction)
+        except (OSError, ValueError):
+            pass
+        try:
+            target.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    def splice(self, source, target, flow, direction):
+        """The rest of one direction: os.splice through a pipe where the kernel has it (measured on 17 November
+        2026: 3.8 to 4.5 GB/s for the relay alone, a quarter of the CPU of a copy), else recv and sendall."""
+        if hasattr(os, "splice"):
+            r, w = os.pipe()
+            moved = 0
+            try:
+                while True:
+                    try:
+                        n = os.splice(source.fileno(), w, 65536, flags=os.SPLICE_F_MOVE)
+                    except OSError as e:
+                        if e.errno == errno.EINVAL and not moved:
+                            break                       # no splice for this pair: the copy below
+                        raise
+                    if n == 0:
+                        return
+                    left = n
+                    while left:
+                        left -= os.splice(r, target.fileno(), left, flags=os.SPLICE_F_MOVE)
+                    moved += n
+                    setattr(flow, direction, getattr(flow, direction) + n)
+            finally:
+                os.close(r)
+                os.close(w)
+        while True:
+            data = source.recv(65536)
+            if not data:
+                return
+            target.sendall(data)
+            setattr(flow, direction, getattr(flow, direction) + len(data))
+
+    def relayed(self, conn):
+        """The relay port: the swap proxy's connection for an agent user (the key swap with the gate), and nobody
+        else's. One CONNECT head with the agent's UID; the gate looks the host up, connects, answers 200, and relays
+        as for the agent itself."""
+        try:
+            self.relay_port(conn)
+        except OSError:
+            egress_reset(conn)
+
+    def relay_port(self, conn):
+        uid = egress_direct_uid(conn)
+        if uid is None or uid != egress_uid_of(self.conf["swap_user"]):
+            return egress_reset(conn)
+        conn.settimeout(EGRESS_PATIENCE)
+        head, rest = swap_head(conn, EGRESS_HEAD)
+        conn.settimeout(None)
+        found = SWAP_CONNECT.match(head or b"")
+        agent = None
+        for line in (head or b"").split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == EGRESS_UID_HEADER.lower().encode() and value.strip().isdigit():
+                agent = int(value.strip())
+        port = int(found.group(3)) if found else 0
+        host = (found.group(1) or found.group(2)).decode("ascii").lower() if found else None
+        if not found or not 0 < port < 65536 or agent is None or not self.is_agent(agent):
+            swap_say(conn, "400 Bad Request", "The gate's relay port takes CONNECT host:port with the agent user's "
+                                              "UID, from the swap proxy only.")
+            conn.close()
+            return
+        flow = self.begin_flow(agent, [conn])
+        if flow is None:
+            self.counts.add(agent, host, port, "busy", "relay", "public", conns=1)
+            swap_say(conn, "503 Service Unavailable", "This agent user has too many connections.")
+            conn.close()
+            return
+        try:
+            literal = None
+            try:
+                literal = str(ipaddress.ip_address(host))
+            except ValueError:
+                pass
+            up = self.dial(port, first=literal, name=None if literal else host)
+            cls = egress_class(up.getpeername()[0]) if up is not None else "public"
+            if up is None:
+                self.name_flow(flow, host, port, "relay", cls)
+                swap_say(conn, "502 Bad Gateway", "The gate could not reach this host.")
+                return conn.close()
+            flow.socks.append(up)
+            try:
+                conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            except OSError:
+                up.close()
+                return conn.close()
+            self.relay(flow, conn, up, port, cls, host, "relay", first=rest, host=host)
+        finally:
+            self.end(flow)
+
+    # ---- DNS
+    def asked(self, data, peer, uid=None):
+        """(uid, question) of a DNS question over UDP that the gate takes, counted in its user's limit; None for one
+        that it drops. uid: from the kernel's exact lookup, or else the slow lookup here."""
+        if uid is None:
+            uid = egress_udp_uid(peer[:2])
+        asked = egress_dns_question(data)
+        if uid is None or asked is None or not self.is_agent(uid):
+            return None
+        with self.lock:
+            if self.asking.get(uid, 0) >= EGRESS_DNS_PER_USER:
+                return None
+            self.asking[uid] = self.asking.get(uid, 0) + 1
+        return uid, asked
+
+    def question(self, sock, data, peer, uid, asked):
+        """One DNS question over UDP that `asked` took, from its own thread."""
+        try:
+            answer = self.upstream(data)
+            self.counts.add(uid, asked[0] or ".", 53, "pass", "dns", "", dns=1)
+            if answer is not None:
+                self.names.learn(uid, asked[0], egress_dns_answers(answer))
+            reply = answer if answer is not None else egress_servfail(data)
+            if reply:
+                try:
+                    sock.sendto(reply, peer)
+                except OSError:
+                    pass
+        finally:
+            self.done_asking(uid)
+
+    def done_asking(self, uid):
+        with self.lock:
+            self.asking[uid] = self.asking.get(uid, 1) - 1
+            if self.asking[uid] <= 0:
+                self.asking.pop(uid, None)
+        with self.cond:
+            self.cond.notify_all()
+
+    def held(self, target, *args):
+        """A handler in a thread that holds one of EGRESS_THREADS, counted from before its thread starts (start_held),
+        so that a process that gives way ends only after it (a connection that its loop took last is not cut before
+        its flow begins)."""
+        try:
+            target(*args)
+        finally:
+            self.threads.release()
+            with self.lock:
+                self.handlers -= 1
+            with self.cond:
+                self.cond.notify_all()
+
+    def upstream(self, data):
+        """The answer of this machine's own name servers, asked as the gate's user, or None."""
+        for server in self.resolvers():
+            with socket.socket(socket.AF_INET6 if ":" in server else socket.AF_INET, socket.SOCK_DGRAM) as u:
+                u.settimeout(4)
+                try:
+                    u.connect((server, 53))
+                    u.send(data)
+                    for _ in range(4):
+                        answer = u.recv(65535)
+                        if answer[:2] == data[:2]:
+                            return answer
+                except OSError:
+                    continue
+        return None
+
+    def stream_dns(self, conn, six):
+        """DNS over TCP (a long answer, or a program that asks so): each question as it comes, to the first name
+        server over TCP."""
+        try:
+            peer = conn.getpeername()[:2]
+            dst = egress_original(conn, six)
+        except OSError:
+            return egress_reset(conn)
+        uid = egress_tcp_uid(peer, dst)
+        if uid is None or not self.is_agent(uid):
+            return egress_reset(conn)
+        flow = self.begin_flow(uid, [conn])          # in the agent user's own limit, as each of its connections
+        if flow is None:
+            return egress_reset(conn)
+        flow.key = ()                           # no row of its own: each question counts as DNS
+        up, deadline = None, time.monotonic() + EGRESS_STREAM
+        try:
+            conn.settimeout(EGRESS_PATIENCE)
+            for _ in range(256):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return
+                conn.settimeout(min(EGRESS_PATIENCE, left))
+                size = self.exactly(conn, 2, deadline)
+                if size is None:
+                    return
+                data = self.exactly(conn, struct.unpack("!H", size)[0], deadline)
+                if data is None:
+                    return
+                asked = egress_dns_question(data)
+                if up is None:
+                    server = self.resolvers()[0]
+                    up = socket.create_connection((server, 53), timeout=EGRESS_PATIENCE)
+                up.sendall(size + data)
+                head = self.exactly(up, 2)
+                answer = self.exactly(up, struct.unpack("!H", head)[0]) if head else None
+                if answer is None:
+                    return
+                if asked:
+                    self.counts.add(uid, asked[0] or ".", 53, "pass", "dns", "", dns=1)
+                    self.names.learn(uid, asked[0], egress_dns_answers(answer))
+                conn.sendall(head + answer)
+        except (OSError, struct.error):
+            pass
+        finally:
+            for s in (conn, up):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+            self.end(flow)
+
+    @staticmethod
+    def exactly(sock, size, deadline=None):
+        """`size` bytes, or None; with a deadline, each read waits no longer than the time that is left."""
+        data = b""
+        while len(data) < size:
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                sock.settimeout(min(EGRESS_PATIENCE, left))
+            try:
+                part = sock.recv(size - len(data))
+            except socket.timeout:
+                return None
+            if not part:
+                return None
+            data += part
+        return data
+
+    # ---- the control socket: the service user's word, and the gate's own counts at a hand-over
+    def control(self, conn):
+        """One request on the control socket. The caller's UID first (SO_PEERCRED): a caller that is neither the
+        service user nor the gate's own user is closed before one byte is read. Then one line, with a deadline for
+        the whole of it, and at most EGRESS_CONTROLS requests at one time."""
+        try:
+            cred = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            _, uid, _ = struct.unpack("3i", cred)
+        except OSError:
+            conn.close()
+            return
+        own = uid == os.getuid()
+        if not own and uid != egress_uid_of(self.conf["service_user"]):
+            conn.close()
+            return
+        if not self.controls.acquire(blocking=False):
+            conn.close()
+            return
+        try:
+            line = egress_line(conn, EGRESS_LINE if own else EGRESS_ASK, 30)
+            try:
+                request = json.loads(line) if line else None
+            except ValueError:
+                request = None
+            answer = self.control_answer(uid, request if isinstance(request, dict) else {})
+            conn.sendall((json.dumps(answer) + "\n").encode())
+        except OSError:
+            pass
+        finally:
+            self.controls.release()
+            conn.close()
+
+    def control_answer(self, uid, request):
+        op = request.get("op")
+        if uid == os.getuid() and op == "merge":
+            if self.ending:                 # a process that gives way takes no counts: the one that serves does
+                return {"ok": False, "reason": "this gate gives way"}
+            self.counts.merge(request.get("rows"))
+            return {"ok": True}
+        if uid != egress_uid_of(self.conf["service_user"]):
+            return {"ok": False, "reason": "the gate answers this machine's Founderizer service only"}
+        if op == "status":
+            self.consider()
+            return self.gate_state()
+        if op == "counts":
+            with self.lock:
+                flows = list(self.flows)
+            for flow in flows:
+                self.told(flow)
+            return {"ok": True, "rows": self.counts.take(), "since": self.since}
+        if op == "policy":
+            try:
+                self.set_policy(request.get("policy"))
+            except (Refused, OSError) as e:
+                return {"ok": False, "reason": str(e)}
+            return {"ok": True}
+        return {"ok": False, "reason": "op is status, counts or policy"}
+
+    @staticmethod
+    def crashed(program):
+        """How often the gate's process ended, with no stop that anybody asked for, while this program served, in the
+        last EGRESS_CRASHES_HOUR (EGRESS_CRASHES, which the launcher writes from the unit's ExecStopPost)."""
+        since = egress_uptime() - EGRESS_CRASHES_HOUR
+        try:
+            with open(EGRESS_CRASHES, encoding="ascii") as f:
+                lines = f.read(1 << 20).splitlines()
+        except (OSError, UnicodeDecodeError):
+            return 0
+        count = 0
+        for line in lines:
+            parts = line.split()
+            try:
+                count += len(parts) == 2 and parts[0] == program and float(parts[1]) > since
+            except ValueError:
+                pass
+        return count
+
+    def gate_state(self):
+        """table: the version of the table that the kernel has now, by root's word (EGRESS_LOADED), or None."""
+        try:
+            with open(EGRESS_LOADED, encoding="ascii") as f:
+                text = f.read(16)
+            table = int(text) if re.fullmatch(r"[0-9]{1,6}\n", text) else None
+        except (OSError, UnicodeDecodeError):
+            table = None
+        with self.lock:
+            open_now = sum(self.open.values())
+        return {"ok": True, "program": self.program, "table": table, "knows_table": EGRESS_TABLE,
+                "lookup": {"tcp": EGRESS_LOOKUP[socket.IPPROTO_TCP], "udp": EGRESS_LOOKUP[socket.IPPROTO_UDP]},
+                "policy": self.policy, "mode": "records", "since": self.since,
+                "open": open_now, "handover": "trying" if self.trying else None,
+                "failed": {"program": self.failed[0], "tries": self.failed[1]} if self.failed else None}
+
+    # ---- a new program: the hand-over with no cut (the swap proxy's, SwapProxy.consider and candidate)
+    def consider(self):
+        """At the service user's word: when the installed program is another than this process's own, it gets its
+        try to take over. A program that failed gets its next try only after more words (4, then 16, 64, 256 and
+        then each 1024)."""
+        program = self.installed_program()
+        if not (self.spawn and program and program != self.program):
+            return
+        with self.lock:
+            if self.ending or self.trying:
+                return
+            if self.failed and self.failed[0] == program and self.failed[2] > 0:
+                self.failed = (program, self.failed[1], self.failed[2] - 1)
+                return
+            if self.crashed(program) >= EGRESS_CRASHES_MOST:     # it ended that often after it took over
+                return
+            self.trying = True
+        threading.Thread(target=self.candidate, args=(program,), daemon=True).start()
+
+    def installed_program(self):
+        """The SHA-256 of the installed vault program, read again only when the file changed."""
+        try:
+            info = os.stat(INSTALLED)
+        except OSError:
+            return None
+        at = (info.st_mtime_ns, info.st_size, info.st_ino)
+        if at != self.installed_at:
+            try:
+                with open(INSTALLED, "rb") as f:
+                    self.installed = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                return None
+            self.installed_at = at
+        return self.installed
+
+    def candidate(self, program):
+        try:
+            taken = self.spawn(program, self.socks)
+        except Exception as e:              # never a detail
+            taken = f"the try failed ({type(e).__name__})"
+        with self.lock:
+            self.trying = False
+            if taken is None:
+                return
+            if isinstance(taken, str):
+                tries = self.failed[1] + 1 if self.failed and self.failed[0] == program else 1
+                self.failed = (program, tries, min(4 ** tries, 1024))
+            else:
+                self.heir, self.ending = taken, True
+        if isinstance(taken, str):
+            log(f"egress: the gate of the new vault program did not start ({taken}): this gate goes on with the "
+                f"program that it runs, and tries that program again later (try {tries})")
+            return
+        log("egress: the gate of a new vault program serves now")
+        with self.cond:
+            self.cond.notify_all()
+        if self.parent and self.parent > 1 and os.getppid() == self.parent:
+            try:
+                os.kill(self.parent, signal.SIGTERM)
+            except OSError:
+                pass
+
+    # ---- the loops
+    def accept(self, name, kind, six):
+        sock = self.socks[name]
+        sock.settimeout(1)
+        while not self.ending:
+            try:
+                conn, _ = sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.ending:
+                    return
+                time.sleep(0.05)
+                continue
+            conn.settimeout(None)
+            target = {"out": lambda c: self.outbound(c, six, False), "local": lambda c: self.outbound(c, six, True),
+                      "relay": self.relayed, "dnst": lambda c: self.stream_dns(c, six),
+                      "control": self.control}[kind]
+            if not self.start_held(target, conn):
+                egress_reset(conn)
+
+    def datagrams(self, name):
+        sock = self.socks[name]
+        sock.settimeout(1)
+        while not self.ending:
+            try:
+                data, peer = sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.ending:
+                    return
+                continue
+            uid = egress_udp_fast(peer[:2], self.resolvers())
+            if uid is None or uid is False:         # a socket that the exact lookup does not find: the slow way
+                try:
+                    self.slow.put_nowait((sock, data, peer))
+                except queue.Full:
+                    pass                            # the program asks again; no other agent waits behind it
+                continue
+            self.take_question(sock, data, peer, uid)
+
+    def take_question(self, sock, data, peer, uid=None):
+        took = self.asked(data, peer, uid)
+        if took is None:
+            return
+        if not self.start_held(self.question, sock, data, peer, *took):
+            self.done_asking(took[0])
+
+    def start_held(self, target, *args):
+        """Start one handler's thread, holding one of EGRESS_THREADS and counted in `handlers` before it starts. False
+        when there is no room or no thread."""
+        if not self.threads.acquire(blocking=False):
+            return False
+        with self.lock:
+            self.handlers += 1
+        try:
+            threading.Thread(target=self.held, args=(target,) + args, daemon=True).start()
+        except RuntimeError:
+            self.threads.release()
+            with self.lock:
+                self.handlers -= 1
+            return False
+        return True
+
+    def slow_questions(self):
+        """The one worker of the questions that the exact lookups did not place: a dump of the sockets of the
+        question's port for each (egress_udp_uid), and it holds back no other question."""
+        while not self.ending:
+            try:
+                sock, data, peer = self.slow.get(timeout=1)
+            except queue.Empty:
+                continue
+            self.take_question(sock, data, peer)
+
+    def serve_gate(self):
+        """Serve until a new process serves; then end with the connections that this one holds, and give the new one
+        the counts."""
+        threads = []
+        for name, kind, six in self.LISTENERS + (("control", "control", False),):
+            if name in self.socks:
+                loop = self.datagrams if kind == "dns" else self.accept
+                args = (name,) if kind == "dns" else (name, kind, six)
+                threads.append(threading.Thread(target=loop, args=args, daemon=True))
+        threads.append(threading.Thread(target=self.slow_questions, daemon=True))
+        for t in threads:
+            t.start()
+        self.loops = threads
+        with self.cond:
+            while not self.ending:
+                self.cond.wait()
+        for t in threads:                       # each loop sees `ending` within a second: no new connection after it
+            t.join()
+        with self.cond:
+            while self.flows or self.asking or self.handlers:   # its connections, questions and handlers
+                self.cond.wait()
+        for flow in list(self.flows):
+            self.told(flow)
+        egress_merge(self.counts.take(), self.conf.get("control") or EGRESS_CONTROL)
+
+
+def egress_line(conn, limit, seconds):
+    """One line of at most `limit` bytes, within `seconds` for the whole of it (a caller that sends one byte at a
+    time does not hold the gate's thread), or "" when it does not come."""
+    deadline, data = time.monotonic() + seconds, b""
+    while not data.endswith(b"\n") and len(data) < limit:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return ""
+        conn.settimeout(left)
+        try:
+            part = conn.recv(min(65536, limit - len(data)))
+        except socket.timeout:
+            return ""
+        if not part:
+            break
+        data += part
+    return data.decode("utf-8", "replace") if data.endswith(b"\n") else ""
+
+
+def egress_merge(rows, path=EGRESS_CONTROL, tries=5):
+    """The counts of a gate that gave way, to the gate that serves now (its own user: Egress.control_answer, merge). A gate
+    that gives way answers no: then the next one in a moment."""
+    if not rows:
+        return True
+    line = (json.dumps({"op": "merge", "rows": rows}) + "\n").encode()
+    for _ in range(tries):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(10)
+                s.connect(path)
+                s.sendall(line)
+                if json.loads(egress_line(s, 4096, 10) or "{}").get("ok") is True:
+                    return True
+        except (OSError, ValueError):
+            pass
+        time.sleep(1)
+    log(f"egress: {len(rows)} rows of counts did not reach the gate that serves now")
+    return False
+
+
+def egress_policy(value):
+    """The policy that the hub gives through the service user, checked. Step 1 knows version 1 with the mode
+    "records" (pass each connection, and count it); a policy of another version or mode is refused, and the gate keeps
+    the last one."""
+    if not isinstance(value, dict) or value.get("version") != EGRESS_POLICY:
+        raise Refused(f"this gate takes a policy of version {EGRESS_POLICY}")
+    if value.get("mode") != "records":
+        raise Refused("this gate takes the mode records only")
+    return {"version": EGRESS_POLICY, "mode": "records"}
+
+
+def egress_uptime():
+    """Seconds since this machine's boot (/proc/uptime): the clock of EGRESS_CRASHES, which lasts one boot in /run, as
+    the launcher reads it too. No step of the wall clock moves it."""
+    try:
+        with open("/proc/uptime", encoding="ascii") as f:
+            return float(f.read(64).split()[0])
+    except (OSError, ValueError, IndexError):
+        return time.monotonic()
+
+
+def egress_policy_taken(state=None):
+    """Whether this program takes the policy that a gate stored here (no policy is taken too). A policy of a version
+    or a mode that this program does not know was stored by a later program, so this one must not serve in its place:
+    it would refuse less than that policy says. So the launcher's fallback to the safe copy of an earlier root step
+    never drops a later step's refusals (a review of 17 November 2026); the table stays while no gate serves. Two
+    rules follow for each later program: it takes every older policy, and it stores an older one that the hub gives
+    (a release that goes back); else a server can be left with no program that starts."""
+    try:
+        with open(os.path.join(state or EGRESS_STATE, "policy.json"), encoding="utf-8") as f:
+            value = json.load(f)
+    except (OSError, ValueError):
+        return True
+    try:
+        egress_policy(value)
+    except Refused:
+        return False
+    return True
+
+
+def egress_take_spec(socks, pipe):
+    """The --take argument of a hand-over: name=fd for each listener, and the pipe."""
+    return ",".join(f"{name}={sock.fileno()}" for name, sock in sorted(socks.items())) + f",pipe={pipe}"
+
+
+def egress_candidate(config, program, socks):
+    """Start the installed program as the gate that takes over from this process (Egress.candidate): a child with
+    each listener and one pipe, as swap_candidate does for the swap proxy. The child (a Popen) when it says that it
+    serves; None when the installed file changed again (an update is in the middle); else the reason as text.
+
+    The contract that a later version keeps: the arguments `egress --config <file> --take name=fd,...,pipe=fd`, the
+    word EGRESS_SERVES on the pipe only after systemd has MAINPID, the counts of a gate that gave way through its
+    own user's op "merge", and SIGTERM as the end of the process before."""
+    try:
+        with open(INSTALLED, "rb") as f:
+            if hashlib.sha256(f.read()).hexdigest() != program:
+                return None
+    except OSError:
+        return None
+    if not os.environ.get("NOTIFY_SOCKET"):
+        return SWAP_NO_UNIT
+    mine = theirs = child = None
+    try:
+        mine, theirs = os.pipe()
+        fds = tuple(s.fileno() for s in socks.values()) + (theirs,)
+        child = subprocess.Popen([sys.executable, "-I", INSTALLED, "egress", "--config", config, "--take",
+                                  egress_take_spec(socks, theirs)], pass_fds=fds, stdin=subprocess.DEVNULL)
+        os.close(theirs)
+        theirs = None
+        look = select.poll()
+        look.register(mine, select.POLLIN)
+        ready = look.poll(EGRESS_CANDIDATE * 1000)
+        if ready and os.read(mine, 16) == EGRESS_SERVES:
+            return child
+        if ready:
+            try:
+                reason = f"exit {child.wait(timeout=5)}"
+            except subprocess.TimeoutExpired:
+                reason = "it did not say that it serves"
+        else:
+            reason = f"no word in {EGRESS_CANDIDATE} seconds"
+    except Exception as e:              # never a detail
+        reason = f"the try failed ({type(e).__name__})"
+    finally:
+        for end in (mine, theirs):
+            if end is not None:
+                try:
+                    os.close(end)
+                except OSError:
+                    pass
+    if child is not None and child.poll() is None:
+        child.kill()
+        child.wait()
+        reason += ", and it was ended"
+    if child is not None:
+        swap_notify(f"MAINPID={os.getpid()}")
+    return reason
+
+
+def egress_taken(spec, ports=None):
+    """{name: socket} and the pipe from a --take argument, each checked: the gate's own listener at its own address
+    and port, and no other socket. Raises SystemExit."""
+    ports = dict(EGRESS_PORTS, **(ports or {}))
+    want = {name: (socket.AF_INET6 if six else socket.AF_INET,
+                   socket.SOCK_DGRAM if kind == "dns" else socket.SOCK_STREAM,
+                   ("::1" if six else "127.0.0.1", ports[kind if kind != "dnst" else "dns"]))
+            for name, kind, six in Egress.LISTENERS}
+    socks, pipe = {}, None
+    for part in spec.split(","):
+        name, _, number = part.partition("=")
+        if not number.isdigit():
+            raise SystemExit("--take is for the gate's own hand-over.")
+        if name == "pipe":
+            pipe = int(number)
+            continue
+        try:
+            sock = socket.socket(fileno=int(number))
+        except OSError:
+            raise SystemExit(f"The gate cannot take over: {name} is no socket.") from None
+        if name == "control":
+            ok = sock.family == socket.AF_UNIX and sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 0
+        elif name in want:
+            family, kind, address = want[name]
+            here = sock.getsockname()[:2]
+            ok = sock.family == family and sock.type == kind and here == address and \
+                (kind == socket.SOCK_DGRAM or sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 0)
+        else:
+            ok = False
+        if not ok:
+            raise SystemExit(f"The gate cannot take over: it did not get its own {name}.")
+        socks[name] = sock
+    if pipe is None or "control" not in socks or "out4" not in socks:
+        raise SystemExit("The gate cannot take over: its listeners or its pipe are missing.")
+    return socks, pipe
+
+
+def egress_selftest():
+    """The readers on fixed bytes: a program that cannot read a name must not serve (the launcher then starts the
+    safe copy)."""
+    name = b"example.test"
+    sni = struct.pack("!HHHBH", 0, len(name) + 5, len(name) + 3, 0, len(name)) + name
+    body = b"\x03\x03" + bytes(32) + b"\x00\x00\x02\x13\x01\x01\x00" + struct.pack("!H", len(sni)) + sni
+    hello = b"\x16\x03\x01" + struct.pack("!H", len(body) + 4) + b"\x01" + struct.pack("!I", len(body))[1:] + body
+    question = bytes.fromhex("12340100000100000000000003777777076578616d706c6503636f6d0000010001")
+    return egress_sni(hello) == ("done", "example.test") and \
+        egress_sni(hello[:20]) == ("more", None) and \
+        egress_http_host(b"GET / HTTP/1.1\r\nHost: example.test:8080\r\n\r\n") == ("done", "example.test") and \
+        egress_dns_question(question) == ("www.example.com", 1)
+
+
+def egress_main(config, take=None, check=False):
+    """`vault.py egress`: the gate, as its own user, from the launcher (EGRESS_LAUNCH). With check: the start check
+    alone (the launcher's), and nothing listens. take: the listeners and the pipe of a hand-over."""
+    unchangeable(os.path.realpath(__file__), "The vault program")
+    try:
+        conf = egress_config(config)
+    except Refused as e:
+        raise SystemExit(f"The gate does not start: {e}.") from None
+    if os.getuid() != egress_uid_of(conf["user"]):
+        raise SystemExit(f"The gate runs as {conf['user']}, and as no other user.")
+    try:
+        with open(SWAP_LOW_PORTS, encoding="ascii") as f:
+            low = int(f.read().strip())
+    except (OSError, ValueError):
+        low = None
+    if low is not None and low <= EGRESS_LOW_PORT:
+        raise SystemExit(f"The gate does not start: on this machine each user can listen on its ports "
+                         f"(net.ipv4.ip_unprivileged_port_start is {low}).")
+    try:
+        with open(EGRESS_RULES, encoding="utf-8") as f:
+            table = egress_rules_version(f.readline() + "\n")
+    except OSError:
+        table = None
+    if table is not None and table > EGRESS_TABLE:      # none yet: the root step writes it after the gate serves
+        raise SystemExit(f"The gate of this program knows the table up to version {EGRESS_TABLE}, and the table is "
+                         f"{table}: the safe copy, which matches it, serves.")
+    if not egress_policy_taken():
+        raise SystemExit(f"The gate does not start: a later program stored a policy that this program does not take "
+                         f"(it takes version {EGRESS_POLICY}), and it would refuse less than that policy says. The "
+                         f"table stays, so each agent reaches the hub and nothing else until a program that takes the "
+                         f"policy serves. To go back to this program on purpose, remove "
+                         f"{os.path.join(EGRESS_STATE, 'policy.json')} as root: the gate then takes the hub's policy "
+                         f"at the service's next reading.")
+    if not os.access("/proc/net/tcp", os.R_OK) or not egress_selftest():
+        raise SystemExit("The gate does not start: it cannot read the kernel's table of sockets, or its own readers "
+                         "fail their check.")
+    lookup = egress_lookup_check()
+    for protocol, works in lookup.items():
+        if works is False and not check:
+            log(f"egress: the kernel's lookup of a {protocol} socket does not work on this machine: the gate reads "
+                f"/proc for it, which is slow when the machine has many sockets")
+    if check:
+        return 0
+    if take and not os.environ.get("NOTIFY_SOCKET"):
+        raise SystemExit("The gate cannot take over under this unit: systemd gave it no NOTIFY_SOCKET.")
+    socks, pipe, parent = None, None, os.getppid()
+    if take:
+        socks, pipe = egress_taken(take)
+    gate = Egress(conf, socks=socks, program=swap_program(),
+                  spawn=lambda new, listeners: egress_candidate(config, new, listeners),
+                  parent=parent if take else None)
+
+    def gave_way(signum, frame):
+        """SIGTERM: a process that gave way gives the one that serves its counts first."""
+        if gate.ending:
+            with gate.lock:
+                flows = list(gate.flows)
+            for flow in flows:
+                gate.told(flow)
+            egress_merge(gate.counts.take())
+        os._exit(0)
+    signal.signal(signal.SIGTERM, gave_way)
+    if take:
+        if not swap_notify(f"MAINPID={os.getpid()}\nREADY=1"):
+            raise SystemExit("The gate cannot take over: systemd did not take its word.")
+        try:                        # an end of this process now counts against its own program (the launcher)
+            egress_write_root(EGRESS_RUNNING, f"{gate.program}\n", 0o644)
+        except OSError:
+            pass
+        try:
+            os.write(pipe, EGRESS_SERVES)
+            os.close(pipe)
+        except OSError:
+            if os.getppid() == parent:
+                raise SystemExit("The gate does not take over: the process that serves did not take its word.") \
+                    from None
+        log("egress: the outgoing gate serves, in the place of the process that served before")
+    else:
+        swap_notify("READY=1")
+        log(f"egress: the outgoing gate serves the agent users of this machine (records only), table {table}")
+    gate.serve_gate()
+    return 0
+
+
+# The gate's own service: its own user, the right to its low ports and no other, and nothing of the store. A new
+# vault program takes over as a new process with no cut (Egress.consider, at the service user's word), and
+# NotifyAccess=all lets that process tell systemd that it is the main process now. Its launcher, not the program,
+# is ExecStart: it starts the installed program when that program passes its own start check, else the safe copy;
+# and ExecStopPost, as the gate's own user, counts an end of the gate that nobody asked for against its program.
+EGRESS_UNIT = """[Unit]
+Description=Founderizer's outgoing gate (each connection and DNS question of an agent user, recorded)
+Before=systemd-user-sessions.service cron.service
+StartLimitIntervalSec=0
+
+[Service]
+User={user}
+Group={user}
+ExecStart={launch}
+ExecStopPost={launch} --stopped
+NotifyAccess=all
+RuntimeDirectory=founderizer-egress
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=founderizer-egress
+StateDirectoryMode=0700
+UMask=0077
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LimitCORE=0
+LimitNOFILE=65536
+TasksMax=16384
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+# The kernel rules at boot, before a user's services and cron, and again at each change of the machine's groups (a
+# new agent user, the swap proxy's user), of the agents' sub-uids and of the browsers' ports (a path unit for each).
+# Root runs the safe copy, which only a root step changes, as it does the table: the two always match.
+EGRESS_RULES_UNIT = """[Unit]
+Description=Founderizer's outgoing gate: the kernel rules, their sets and the closures
+DefaultDependencies=no
+StartLimitIntervalSec=0
+Wants=network-pre.target
+After=local-fs.target
+Before=network-pre.target shutdown.target systemd-user-sessions.service cron.service
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I {safe} egress-rules --config {conf}
+
+[Install]
+WantedBy=sysinit.target
+"""
+
+# One path unit for each file that the step reads. systemd watches the folder above a file that is not there (/etc
+# for /etc/fleet-browser/ports, before the browsers' parts come), at each new file there sets every watch of the same
+# path unit up again, and loses the events that its other watches had waiting: under systemd 255 a new agent user and
+# a change of the group docker then started no step at all (17 November 2026).
+EGRESS_PATH_UNIT = """[Unit]
+Description=Founderizer's outgoing gate: the kernel rules again at each change of {watched}
+
+[Path]
+PathChanged={watched}
+Unit={rules}.service
+
+[Install]
+WantedBy=paths.target
+"""
+
+EGRESS_LAUNCHER = """#!/bin/sh
+# Founderizer's outgoing gate (vault.py, "the outgoing gate"). Root's: `vault.py configure --egress on` writes it.
+# It starts the gate of the installed vault program, or, when that program does not start it, the gate of the safe
+# copy that the last root step kept, which always matches the kernel rules. With --stopped (the unit's ExecStopPost)
+# it counts an end of the gate that nobody asked for (a crash, a kill, a start that failed) against the program that
+# ran ({running}); while the installed program has {most} such ends in the last {hour} seconds since boot, the safe copy
+# serves, so a program that passes its check and stops later does not keep the gate down. The file keeps that hour.
+conf={conf}
+installed={installed}
+if [ "$1" = "--stopped" ]; then
+    if [ "$SERVICE_RESULT" != "success" ] && [ -f {running} ] && read -r hash < {running}; then
+        now=$(cut -d. -f1 /proc/uptime)
+        {{ if [ -f {crashes} ]; then awk -v since=$((now - {hour})) '$2 > since' {crashes}; fi
+          echo "$hash $now"; }} > {crashes}.new && mv -f {crashes}.new {crashes} || true
+    fi
+    exit 0
+fi
+rm -f {running}
+hash=$(sha256sum "$installed" 2>/dev/null | cut -d' ' -f1)
+ended=0
+if [ -n "$hash" ] && [ -f {crashes} ]; then
+    since=$(($(cut -d. -f1 /proc/uptime) - {hour}))
+    ended=$(awk -v h="$hash" -v since="$since" '$1 == h && $2 > since' {crashes} | wc -l)
+fi
+for program in "$installed" {safe}; do
+    if [ "$program" = "$installed" ] && [ "${{ended:-0}}" -ge {most} ]; then
+        echo "founderizer-egress: $program ended $ended times with no stop asked for, so the safe copy serves" >&2
+        continue
+    fi
+    if /usr/bin/python3 -I "$program" egress --config "$conf" --check; then
+        sha256sum "$program" 2>/dev/null | cut -d' ' -f1 > {running} || true
+        exec /usr/bin/python3 -I "$program" egress --config "$conf"
+    fi
+    echo "founderizer-egress: $program does not start the gate" >&2
+done
+exit 1
+"""
+
+
+# The rules' step again every 5 minutes: it loads the table again after a flush that no unit saw (`nft flush ruleset`
+# or `nft -f /etc/nftables.conf` by hand), and tries again a load that failed, or a set whose change no path unit saw.
+EGRESS_TIMER_UNIT = """[Unit]
+Description=Founderizer's outgoing gate: the kernel rules again every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+Unit={rules}.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+# nftables.service loads /etc/nftables.conf at its start and its reload, and the stock text of that file begins with
+# `flush ruleset`; its stop runs `nft flush ruleset`. Each one takes the gate's table away with every other table, so
+# root's rules step runs after each of them and loads the table again (a review of 17 November 2026). Its own file
+# name: the browsers' parts have a drop-in of their own for the same unit.
+EGRESS_NFT_UNIT = "nftables.service"
+EGRESS_NFT_DROPIN = """# Founderizer's outgoing gate: its kernel rules again after this unit loads or flushes the
+# kernel's rules (vault.py, egress_rules). Root's: `vault.py configure --egress on` writes it.
+[Service]
+ExecStartPost=-+/usr/bin/python3 -I {safe} egress-rules --config {conf} --table
+ExecReload=-+/usr/bin/python3 -I {safe} egress-rules --config {conf} --table
+ExecStopPost=-+/usr/bin/python3 -I {safe} egress-rules --config {conf} --table
+"""
+
+
+def egress_paths():
+    """{path unit: the file that it watches}: the groups (a new agent user), the sub-uids and the browsers' ports."""
+    return {EGRESS_RULES_SERVICE: "/etc/group", EGRESS_SUBUID_PATH: EGRESS_SUBUID, EGRESS_BROWSER_PATH: EGRESS_BROWSER}
+
+
+def egress_watch_units():
+    """The units that start the rules' step, for one systemctl command: a path unit for each file, and the timer."""
+    return " ".join([f"{unit}.path" for unit in egress_paths()] + [f"{EGRESS_RULES_SERVICE}.timer"])
+
+
+def egress_unload():
+    """The shell that takes the table and the rules file away, under the rules' step's lock, so that no step that read
+    the rules file before loads the table after its delete. The table first, and root's files only once it is gone:
+    each agent then connects as before, and the swap proxy by itself."""
+    return (f"flock {EGRESS_LOCK} sh -c 'if {EGRESS_NFT} list table inet founderizer_egress >/dev/null 2>&1; then "
+            f"{EGRESS_NFT} delete table inet founderizer_egress || exit 1; fi; rm -f {EGRESS_LOADED}; "
+            f"rm -f {EGRESS_RULES}' || true\n")
+
+
+def egress_dropin(section, key, which):
+    return (f"# Founderizer's outgoing gate: the closure of this service for the agent users, at each start, before\n"
+            f"# the service opens its socket (vault.py, egress_close). Root's: `vault.py configure --egress on`.\n"
+            f"[{section}]\n{key}=-{'+' if section == 'Service' else ''}/usr/bin/python3 -I {EGRESS_SAFE} egress-close "
+            f"--config {EGRESS_CONF} {which}\n")
+
+
+def egress_files(conf_text):
+    """{path: (text, mode)} of each root-owned file of the gate but the safe copy and the D-Bus policy."""
+    files = {EGRESS_CONF: (conf_text, 0o644), EGRESS_RULES: (egress_table(None), 0o644),
+             EGRESS_LAUNCH: (EGRESS_LAUNCHER.format(conf=EGRESS_CONF, installed=INSTALLED, safe=EGRESS_SAFE,
+                                                    running=EGRESS_RUNNING, crashes=EGRESS_CRASHES,
+                                                    most=EGRESS_CRASHES_MOST, hour=EGRESS_CRASHES_HOUR), 0o755),
+             f"{EGRESS_UNITS}/{EGRESS_SERVICE}.service":
+                 (EGRESS_UNIT.format(user=EGRESS_USER, launch=EGRESS_LAUNCH), 0o644),
+             f"{EGRESS_UNITS}/{EGRESS_RULES_SERVICE}.service":
+                 (EGRESS_RULES_UNIT.format(safe=EGRESS_SAFE, conf=EGRESS_CONF), 0o644),
+             **{f"{EGRESS_UNITS}/{unit}.path": (EGRESS_PATH_UNIT.format(watched=watched, rules=EGRESS_RULES_SERVICE),
+                                                0o644) for unit, watched in egress_paths().items()},
+             f"{EGRESS_UNITS}/{EGRESS_RULES_SERVICE}.timer": (EGRESS_TIMER_UNIT.format(rules=EGRESS_RULES_SERVICE),
+                                                             0o644),
+             f"{EGRESS_UNITS}/{EGRESS_NFT_UNIT}.d/founderizer-egress.conf":
+                 (EGRESS_NFT_DROPIN.format(safe=EGRESS_SAFE, conf=EGRESS_CONF), 0o644)}
+    for unit, (section, key, which) in EGRESS_DROPINS.items():
+        files[f"{EGRESS_UNITS}/{unit}.d/founderizer-egress.conf"] = (egress_dropin(section, key, which), 0o644)
+    files[EGRESS_MODPROBE] = ("# Founderizer's outgoing gate: the socket families whose transport is a kernel socket, "
+                              "which the kernel rules\n# cannot read as an agent's (vault.py, EGRESS_FAMILIES). Root's: "
+                              "`vault.py configure --egress on` writes it.\n" +
+                              "".join(f"install {m} /bin/false\n" for m in EGRESS_FAMILIES), 0o644)
+    return files
+
+
+def egress_reading():
+    """The shell that reads the gate's state for the root step. It changes nothing."""
+    files = " ".join(shlex.quote(p) for p in sorted(egress_files("").keys()) + [EGRESS_SAFE])
+    return ("id -u %(u)s >/dev/null 2>&1 && echo euser=yes || echo euser=no\n"
+            "echo elow=$(cat %(low)s 2>/dev/null)\n"
+            "test -x %(nft)s && echo enft=yes || echo enft=no\n"
+            "echo eactive=$(systemctl is-active %(gate)s 2>/dev/null || true)\n"
+            "echo eenabled=$(systemctl is-enabled %(gate)s 2>/dev/null || true)\n"
+            "echo erestarts=$(systemctl show -p NRestarts --value %(gate)s 2>/dev/null || echo unknown)\n"
+            "echo epath=$(for u in %(watch)s; do systemctl is-active $u 2>/dev/null || true; done | sort -u | "
+            "paste -sd, -)\n"
+            "echo erules=$(systemctl is-enabled %(rules)s.service 2>/dev/null || true)\n"
+            "echo eswap=$(systemctl is-active %(swap)s 2>/dev/null || true)\n"
+            "echo eswap_at=$(date -d \"$(systemctl show -p ExecMainStartTimestamp --value %(swap)s 2>/dev/null)\" +%%s "
+            "2>/dev/null)\n"
+            "echo eprogram_at=$(stat -c %%Y %(installed)s 2>/dev/null)\n"
+            "echo elisten=$(ss -Hltn 'sport = :%(out)d' 2>/dev/null | wc -l)\n"
+            "echo eports=$(ss -Hltnu 2>/dev/null | awk '{print $5}' | grep -oE ':(877|878|879|880)$' | tr -d : | "
+            "sort -u | tr '\\n' ' ')\n"
+            "for f in %(files)s; do echo \"hash $(sha256sum \"$f\" 2>/dev/null | cut -d' ' -f1) $f\"; done\n") % {
+                "u": EGRESS_USER, "low": SWAP_LOW_PORTS, "nft": EGRESS_NFT, "gate": EGRESS_SERVICE,
+                "rules": EGRESS_RULES_SERVICE, "swap": SWAP_SERVICE, "installed": INSTALLED,
+                "watch": egress_watch_units(),
+                "out": EGRESS_PORTS["out"], "files": files}
+
+
+def egress_conf_text(broker, service_user=EGRESS_SERVICE_USER):
+    """The gate's configuration, from the broker's (its hub, the address that the join line gave)."""
+    hub = urllib.parse.urlsplit(str(broker.get("hub") or ""))
+    try:
+        address = str(ipaddress.ip_address(hub.hostname or ""))
+    except ValueError:
+        raise ConfigureStop("The hub's address in this machine's vault configuration is no IP address, so the gate "
+                            "cannot let its connections go direct. Nothing changed.") from None
+    ports = sorted({hub.port or 80, EGRESS_GIT_PORT})
+    return json.dumps({"egress": EGRESS_KEY, "user": EGRESS_USER, "service_user": service_user,
+                       "swap_user": SWAP_USER, "group": str(broker.get("worker_group") or EGRESS_GROUP),
+                       "hub": address, "hub_ports": ports}, indent=2) + "\n"
+
+
+def configure_egress(egress, check, run, broker, settle, rules=None, close=None):
+    """The gate's part of the root step (`configure --egress on|off|keep`): the parts of the proposal's section 8 in
+    its order. Returns (changes, {the answer's egress fields}) or raises ConfigureStop. rules: the rules' step
+    (egress_rules), which a test gives."""
+    rules = rules or (lambda conf: egress_rules(conf, run))
+    before = readings(run(egress_reading())[1])
+    hashes = {}
+    for line in run(egress_reading())[1].splitlines():
+        if line.startswith("hash "):
+            parts = line.split(" ", 2)
+            if len(parts) == 3:
+                hashes[parts[2]] = parts[1]
+    loaded = egress_loaded(run)
+    state = {"egress": before.get("eactive") == "active" and loaded is not None, "egress_table": loaded}
+    if egress == "keep":
+        return [], state
+    # Each agent user in a container group, which the step takes out: said first, so that a person who put an agent
+    # into the group docker by hand learns it before the table loads (the proposal's section 8)
+    members, agents = [], set(egress_agents(str(broker.get("worker_group") or EGRESS_GROUP),
+                                            (EGRESS_USER, EGRESS_SERVICE_USER, SWAP_USER)))
+    for group in EGRESS_CONTAINER_GROUPS:
+        try:
+            g = grp.getgrnam(group)
+        except KeyError:
+            continue
+        members += [f"{u}:{group}" for u in g.gr_mem if egress_uid_of(u) in agents]
+    if members:
+        state["groups_to_leave"] = members
+    if egress == "off":
+        on_disk = any(hashes.get(p) for p in egress_files("").keys())
+        if not on_disk and loaded is None and before.get("eactive") in ("", "inactive", "failed", "unknown"):
+            return [], state
+        if check:
+            return ["the gate"], state
+        try:
+            conf = egress_config(EGRESS_CONF)
+        except (Refused, OSError, SystemExit):
+            conf = None
+        # The order of the way back: the table first (each agent connects as before, and the swap proxy's own way
+        # goes on through the gate that still runs), then the rules file (the swap proxy connects by itself), then the
+        # gate, the units, the drop-ins and the closures.
+        run(egress_unload(), timeout=300)
+        if egress_loaded(run) is not None:      # the gate still runs, and the agents still connect through it
+            raise ConfigureStop("The gate's kernel rules did not go, so nothing else of the gate changed. Run this "
+                                "step again.")
+        script = (f"systemctl disable --now {egress_watch_units()} >/dev/null 2>&1 || true\n"
+                  f"systemctl disable {EGRESS_RULES_SERVICE}.service >/dev/null 2>&1 || true\n"
+                  f"systemctl disable --now {EGRESS_SERVICE} >/dev/null 2>&1 || true\nrm -rf {EGRESS_RUN}\n"
+                  f"systemctl reset-failed {EGRESS_SERVICE} {EGRESS_RULES_SERVICE}.service >/dev/null 2>&1 || true\n"
+                  + "".join(f"rm -f {shlex.quote(p)}\n" for p in egress_files("").keys() if p not in (EGRESS_CONF,))
+                  + f"rm -f {EGRESS_DBUS}\nsystemctl daemon-reload\n"
+                  "systemctl reload dbus.service >/dev/null 2>&1 || true\n")
+        code, out, err = run(script, timeout=300)
+        if conf is not None:
+            (close or egress_open)(conf)
+        if code != 0:
+            raise ConfigureStop(f"The gate could not be taken away: {(err or out).strip()[-300:]}")
+        return ["the gate"], {"egress": False, "egress_table": None}
+    # on
+    if before.get("enft") != "yes":
+        raise ConfigureStop(f"This machine has no {EGRESS_NFT} (the package nftables), so the gate's kernel rules "
+                            f"cannot load. Nothing of the gate changed.")
+    low = before.get("elow", "")
+    if low.isdigit() and int(low) <= EGRESS_LOW_PORT:
+        raise ConfigureStop(f"On this machine each user can listen on the gate's ports "
+                            f"(net.ipv4.ip_unprivileged_port_start is {low}), so an agent could take the gate's place. "
+                            f"The gate is not switched on. Set net.ipv4.ip_unprivileged_port_start to 1024, its "
+                            f"default, and run this step again.")
+    if egress_uid_of(EGRESS_SERVICE_USER) is None:
+        raise ConfigureStop(f"This machine has no user {EGRESS_SERVICE_USER}, the user of its Founderizer service, "
+                            f"which gives the gate its policy. Nothing of the gate changed.")
+    try:
+        with open(INSTALLED, "rb") as f:
+            program = f.read()
+    except OSError:
+        raise ConfigureStop(f"{INSTALLED} is not readable. Nothing of the gate changed.") from None
+    files = egress_files(egress_conf_text(broker))
+    want = {path: hashlib.sha256(text.encode()).hexdigest() for path, (text, _) in files.items()}
+    want[EGRESS_SAFE] = hashlib.sha256(program).hexdigest()
+    new_files = sorted(p for p, h in want.items() if hashes.get(p) != h)
+    gate_again = before.get("eactive") != "active"
+    if gate_again and before.get("eports"):
+        raise ConfigureStop(f"Another program listens on the gate's port {before['eports'].split()[0]} of this "
+                            f"machine, so the gate cannot start. Nothing of the gate changed.")
+    table_new = loaded != EGRESS_TABLE
+    installed_before = bool(hashes.get(EGRESS_RULES))      # root's rules file: a gate that this machine had already
+    path_again = before.get("epath") != "active" or before.get("erules") != "enabled"
+    swap_again = table_new and before.get("eswap") == "active" and \
+        (before.get("eswap_at") or "0").isdigit() and (before.get("eprogram_at") or "0").isdigit() and \
+        int(before.get("eswap_at") or 0) < int(before.get("eprogram_at") or 0)
+    changes = [name for name, needed in (("the gate's user", before.get("euser") != "yes"),
+                                         ("the gate's files", bool(new_files)), ("the gate", gate_again),
+                                         ("the kernel rules", table_new), ("the rules' unit", path_again),
+                                         ("the swap proxy", swap_again)) if needed]
+    if check or not changes:
+        return changes, dict(state, egress_state="would make" if changes else "there")
+    if before.get("euser") != "yes":
+        code, out, err = run(f"id -u {EGRESS_USER} >/dev/null 2>&1 || useradd --system --user-group --home-dir "
+                             f"{EGRESS_STATE} --no-create-home --shell /usr/sbin/nologin {EGRESS_USER}\n")
+        if code != 0:
+            raise ConfigureStop(f"The user {EGRESS_USER} of the gate could not be made: {(err or out).strip()[-300:]}")
+    folder = tempfile.mkdtemp(prefix="fleet-egress-configure-")
+
+    def put(paths):
+        script = f"install -d -o root -g root -m 755 {EGRESS_DIR} {EGRESS_LIB}\n"
+        for i, path in enumerate(paths):
+            local = os.path.join(folder, str(i))
+            if path == EGRESS_SAFE:
+                with open(local, "wb") as f:
+                    f.write(program)
+                mode = 0o644
+            else:
+                text, mode = files[path]
+                with open(local, "w", encoding="utf-8") as f:
+                    f.write(text)
+            script += (f"install -d -o root -g root -m 755 {shlex.quote(os.path.dirname(path))}\n"
+                       f"install -o root -g root -m {mode:o} {shlex.quote(local)} {shlex.quote(path + '.new')}\n"
+                       f"mv -f {shlex.quote(path + '.new')} {shlex.quote(path)}\n")
+        code, out, err = run(script + "systemctl daemon-reload\n", timeout=300)
+        if code != 0:
+            raise ConfigureStop(f"The gate's files could not be put in place: {(err or out).strip()[-300:]}")
+
+    try:
+        # 1. Every file but the rules file, whose existence tells the swap proxy to use the gate: it comes only after
+        # the gate serves. A gate that runs keeps running: a new unit or launcher counts from its next start, and a
+        # new program comes by the hand-over, which cuts nothing.
+        put([p for p in new_files if p != EGRESS_RULES or installed_before])
+        if gate_again:
+            run(f"systemctl enable {EGRESS_SERVICE} >/dev/null 2>&1\nsystemctl reset-failed {EGRESS_SERVICE} "
+                f">/dev/null 2>&1 || true\nsystemctl restart {EGRESS_SERVICE}\nsleep {settle}\n", timeout=300)
+        now = readings(run(egress_reading())[1])
+        if now.get("eactive") != "active" or now.get("elisten") in ("", "0"):
+            if installed_before or loaded is not None:
+                # A gate that this machine had already: its table stays, as while any gate does not run (the
+                # proposal's section 5.4), with the new rules file, and the hub's server watch tells the manager
+                raise ConfigureStop(f"The gate of this machine is {now.get('eactive') or 'not running'} {settle} "
+                                    f"seconds after its start. Its kernel rules stay, so each agent reaches the hub "
+                                    f"and nothing else until the gate serves. Read `journalctl -u {EGRESS_SERVICE} "
+                                    f"-n 30` on this machine: the gate says why on its first line.")
+            # A first install whose gate does not start: the table, the rules file and the rules' units go, so that
+            # each agent and the swap proxy connect as before, with no record.
+            run(egress_unload()
+                + f"systemctl disable --now {egress_watch_units()} >/dev/null 2>&1 || true\n"
+                f"systemctl disable {EGRESS_RULES_SERVICE}.service >/dev/null 2>&1 || true\n", timeout=300)
+            raise ConfigureStop(f"The gate of this machine is {now.get('eactive') or 'not running'} {settle} seconds "
+                                f"after its start, so the kernel rules are not loaded and each agent connects as "
+                                f"before. Read `journalctl -u {EGRESS_SERVICE} -n 30` on this machine: the gate says "
+                                f"why on its first line.")
+        # 2. The rules file, now that the gate serves; then the swap proxy of an older program starts again, so that
+        # it uses the gate's relay port before the table keeps its user to that port.
+        if EGRESS_RULES in new_files and not installed_before:
+            put([EGRESS_RULES])
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    if swap_again:
+        run(f"systemctl restart {SWAP_SERVICE}\nsleep {settle}\n", timeout=300)
+    # 3. The table, its sets, the closures, the D-Bus policy and the container groups; then its unit and the path
+    # unit, for each boot and each change of the groups.
+    try:
+        done = rules(egress_config(EGRESS_CONF))
+    except (Refused, OSError, SystemExit) as e:
+        done = {"ok": False, "reason": str(e)}
+    if not done.get("ok"):
+        raise ConfigureStop(f"The gate runs, and its kernel rules did not load: {done.get('reason')}. Each agent "
+                            f"connects as before, with no record.")
+    run(f"systemctl enable {EGRESS_RULES_SERVICE}.service >/dev/null 2>&1\n"
+        f"systemctl enable --now {egress_watch_units()} >/dev/null 2>&1\n", timeout=300)
+    after = readings(run(egress_reading())[1])
+    loaded = egress_loaded(run)
+    if loaded != EGRESS_TABLE or after.get("epath") != "active":
+        raise ConfigureStop(f"The gate's kernel rules are {'not loaded' if loaded is None else f'of version {loaded}'}"
+                            f", or their path unit does not run ({after.get('epath') or 'not there'}). Read "
+                            f"`journalctl -u {EGRESS_RULES_SERVICE} -n 30` on this machine.")
+    return changes, {"egress": True, "egress_table": loaded, "egress_state": "made",
+                     "groups_removed": done.get("groups_removed") or [], "closed": done.get("closed") or [],
+                     "unclosed": done.get("unclosed") or []}
+
+
+def egress_root_main(args, euid=None):
+    """`vault.py egress-rules` and `vault.py egress-close`: as root, from a root-owned copy, with root's own
+    configuration of the gate. One JSON line."""
+    if (os.geteuid() if euid is None else euid) != 0:
+        raise SystemExit(f"Run {args.cmd} as root.")
+    unchangeable(os.path.realpath(__file__), "The vault program")
+    try:
+        conf = egress_config(args.config)
+    except Refused as e:
+        print(json.dumps({"ok": False, "reason": str(e)}))
+        return 1
+    if args.cmd == "egress-close" and args.which == "daemons":
+        closed, unclosed = egress_daemons(conf)
+        print(json.dumps({"ok": True, "closed": closed, "unclosed": unclosed}))
+        return 0
+    if args.cmd == "egress-close":
+        closed, unclosed = egress_close(conf, args.which)
+        print(json.dumps({"ok": True, "closed": closed, "unclosed": unclosed}))
+        return 0
+    answer = egress_rules(conf, table_only=args.table)
+    print(json.dumps(answer))
+    return 0 if answer.get("ok") else 1
 
 
 # ---------------------------------------------------------------- the fleet's own store: its operations
@@ -4318,7 +7215,7 @@ def configure_answer(state, conf, reading, changes):
 
 
 def configure(config=VAULT_CONF_PATH, owner_keys=(), fleet=None, swap="keep", check=False, run=None, read=None,
-              settle=CONFIGURE_SETTLE, lock=CONFIGURE_LOCK):
+              settle=CONFIGURE_SETTLE, lock=CONFIGURE_LOCK, egress="keep", egress_rules_step=None):
     """This machine's own root step (the section above). `owner_keys` are added to the vault's list, `fleet` is set
     where the vault has none, and `swap` is "on", "off" or "keep". With `check` it reads and changes nothing.
 
@@ -4331,11 +7228,22 @@ def configure(config=VAULT_CONF_PATH, owner_keys=(), fleet=None, swap="keep", ch
     above, or raises ConfigureStop."""
     run = run or root_shell
     read = read or (lambda path: open(path, encoding="utf-8").read())
-    if swap not in ("on", "off", "keep"):
-        raise ConfigureStop("swap is on, off or keep. Nothing changed.")
+    if swap not in ("on", "off", "keep") or egress not in ("on", "off", "keep"):
+        raise ConfigureStop("swap and egress are on, off or keep. Nothing changed.")
     held = configure_lock(lock) if lock and not check else None
     try:
-        return configure_locked(config, list(owner_keys), fleet, swap, check, run, read, settle)
+        answer = configure_locked(config, list(owner_keys), fleet, swap, check, run, read, settle)
+        # The outgoing gate (configure_egress): read where the machine has it, changed only on its own word.
+        if egress != "keep" or os.path.exists(EGRESS_CONF):
+            changes, part = configure_egress(egress, check, run, json.loads(read(config)), settle,
+                                             rules=egress_rules_step)
+            state = part.pop("egress_state", None)
+            answer.update(part, changed=answer["changed"] + changes)
+            if changes:
+                answer["state"] = "would make" if check else "made"
+            elif state and answer["state"] == "there":
+                answer["state"] = state
+        return answer
     finally:
         if held is not None:
             os.close(held)
@@ -4491,7 +7399,8 @@ def configure_main(args, euid=None, program=None):
             unchangeable(here, "The vault broker program")
         except SystemExit as e:
             raise ConfigureStop(str(e)) from None
-        answer = configure(args.config, args.add_owner_key, args.fleet, args.swap, args.check)
+        answer = configure(args.config, args.add_owner_key, args.fleet, args.swap, args.check,
+                           egress=getattr(args, "egress", "keep"))
     except ConfigureStop as e:
         print(json.dumps(dict({"ok": False, "reason": str(e)}, **({"undone": True} if e.undone else {}))))
         return 1
@@ -4535,10 +7444,30 @@ def main(argv=None):
     p.add_argument("--fleet", help="the fleet's ID, 16 lowercase hex characters: set where the vault has none")
     p.add_argument("--swap", choices=("on", "off", "keep"), default="keep",
                    help="the key swap: on, off, or as it is (the default)")
+    p.add_argument("--egress", choices=("on", "off", "keep"), default="keep",
+                   help="the outgoing gate (its kernel rules, its units and the closures): on, off, or as it is")
     p.add_argument("--check", action="store_true", help="read, and change nothing")
+    p = sub.add_parser("egress", help="Run this machine's outgoing gate, as its own user, from its launcher: each "
+                                      "connection and DNS question of an agent user, recorded")
+    p.add_argument("--config", default=EGRESS_CONF)
+    p.add_argument("--check", action="store_true", help="the start check alone: nothing listens")
+    p.add_argument("--take", help=argparse.SUPPRESS)       # name=fd,...,pipe=fd: a hand-over
+    p = sub.add_parser("egress-rules", help="As root: load the gate's kernel rules with their sets (none without "
+                                            "root's rules file), close the local services that resolve or connect "
+                                            "for any user, and take each agent user out of the container groups")
+    p.add_argument("--config", default=EGRESS_CONF)
+    p.add_argument("--table", action="store_true", help="the kernel rules alone (the drop-in of nftables.service)")
+    p = sub.add_parser("egress-close", help="As root: close one local service for the agent users (a drop-in runs "
+                                            "it at the service's start)")
+    p.add_argument("--config", default=EGRESS_CONF)
+    p.add_argument("which", choices=sorted(EGRESS_CLOSED) + ["daemons"])
     args = parser.parse_args(argv)
     if args.cmd == "configure":
         return configure_main(args)
+    if args.cmd == "egress":
+        return egress_main(args.config, take=args.take, check=args.check)
+    if args.cmd in ("egress-rules", "egress-close"):
+        return egress_root_main(args)
     if args.cmd in ("store-init", "store-list"):
         unchangeable(os.path.realpath(__file__), "The vault broker program")     # the installed copy, not a checkout
         if args.cmd == "store-init":

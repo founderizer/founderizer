@@ -131,6 +131,7 @@ fail for a moment: run the line again."
     agent_users "/home/$WORKER/fleet-server"
     vault_broker "/home/$WORKER/fleet-server"
     key_swap "/home/$WORKER/fleet-server"
+    egress "/home/$WORKER/fleet-server"
     verify_step "/home/$WORKER/fleet-server" as_worker
     say "done. Add an agent to this server in Founderizer: Settings, Servers, this server, Add agent."
 }
@@ -271,6 +272,14 @@ key_swap() {     # $1: the checkout. The key swap (VAULT.md): an API key that an
     say "this machine's key swap: an API key that has a site stays out of the agents' sessions"
     python3 "$1/hubsetup.py" key-swap </dev/null \
         || say "the install goes on, and this machine gives each API key to a session as a value."
+}
+
+egress() {       # $1: the checkout. The outgoing gate: the kernel sends each connection and DNS question of an agent to
+                 # a gate that records where it connects, with no host refused. The step is the installed vault
+                 # program's own (vault.py configure --egress on). An install goes on when it stops.
+    say "this machine's outgoing gate: each agent's connections are recorded"
+    python3 "$1/hubsetup.py" egress </dev/null \
+        || say "the install goes on, and the agents of this machine connect with no record of their hosts."
 }
 
 # The Mac vault as the app's own Vault/install.py and Vault/update.zsh check it: signed by our Developer ID team, with

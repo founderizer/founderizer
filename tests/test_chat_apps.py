@@ -1393,7 +1393,6 @@ def jpeg(comment):
 
 
 PDF_FILE = pdf((b"", b"BT /F1 12 Tf 72 712 Td (Invoice for October) Tj ET"))
-XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # PDFs whose pages draw their words in a font's codes (CHAT-APPS.md 20.2), as Chrome writes them: a Type0 font with
 # Identity-H, whose ToUnicode map gives the letters of glyph numbers of two bytes, A at <0024> (glyphs), in each of a
 # map's three forms (bfchar, bfrange, and bfrange with an array), and "fi" in one glyph, <00C0>, as Chrome draws it.

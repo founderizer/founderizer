@@ -515,6 +515,100 @@ server that joined before, it is off until root switches it on.
 - **The model's own calls.** The variable `NO_PROXY` names the hosts of the provider of the agent's own program,
   the hub and the machine itself, so the calls to them do not go through the proxy (`lifecycle.py`, `fleet.py`).
   For a check, it names only the hub and the machine itself (`fleet.py`).
+- **The proxy and the outgoing gate.** On a server with the outgoing gate (the next section), the proxy connects to
+  no host by itself: it sends `CONNECT <host>:<port>` with the UID of the agent's OS user to the gate's relay port,
+  and the gate looks the host up, connects and counts as for the agent itself. The kernel lets the proxy's user reach
+  that port and nothing else, also no name server. The proxy knows the gate by its root-owned rules file
+  (`/etc/founderizer-egress/rules.nft`); with no such file it connects as before (`vault.py`, `swap_reach`). While the
+  gate does not run, a session that holds a placeholder has no HTTPS through the proxy.
+
+## The outgoing gate
+
+On a Linux server where root ran the step, the kernel sends each TCP connection and each DNS question of an agent's OS
+user to one process, the gate, which runs as a user of its own (`founderizer-egress`) and records where each agent
+connects. It is the network part of `agent-outgoing-connections-proposal.md`; this is its step 1, which refuses no
+host.
+
+- **The step.** `vault.py configure --egress on`, as root and only as the installed program, as the key swap's step
+  (`vault.py`). A new Linux server takes it at its install after the key swap (`join.sh`, and `hub.sh` for a hub's own
+  server that takes agents, through `hubsetup.py egress`); an install goes on when it stops. It makes the gate's user,
+  its root-owned files (`/etc/founderizer-egress/`, the launcher and a safe copy of the vault program in
+  `/usr/local/lib/founderizer-egress/`), its units, and the drop-ins of the closures; it starts the gate, and only
+  then loads the kernel rules, so no connection meets a table without a gate. A gate that does not start leaves no
+  table: each agent then connects as before. It stops where each user can listen on the gate's ports (877 to 880).
+  A second run changes nothing. `--egress off` takes the table first, then the rules file, the gate, its units, the
+  drop-ins and the closures.
+- **A gate that does not run.** The table stays (`agent-outgoing-connections-proposal.md`, section 5.4): an agent's DNS
+  and TCP fail at once, and the hub still answers. Nothing falls back to a direct connection, because a gap with no
+  table would let an agent open a connection that it keeps after the gate is back. The unit starts the gate again in 2
+  seconds; a new program comes by the hand-over with no cut, and one that does not start is not taken; at a cold start
+  the launcher runs the installed program, or the safe copy when that program fails its start check. The unit's
+  ExecStopPost counts each end of the gate that nobody asked for (a crash, a kill, a start that failed, also for a cause
+  outside the program, as a port that another program holds) against the program that ran; while a program has three
+  such ends in the last hour since boot, neither the launcher nor a hand-over runs it, so a program that passes its
+  check and stops later does not keep the gate down. A program does not serve in the place of a stored policy that it
+  does not take (a later program's), so this fallback never drops a later step's refusals: then no gate serves, and the
+  table stays. Each later gate program takes every older policy, and stores an older one that the hub gives after a
+  release that goes back; a program that goes back on purpose past a policy that it does not take needs root to remove
+  `/var/lib/founderizer-egress/policy.json` (the gate's words say so). A later root step whose gate does not start keeps
+  the table and the rules file of a gate that the server had already; only a first install takes them back. While root's
+  rules file is there, the server's service posts the gate's state with each reading, also when the gate never started
+  (then with root's word on the table); when it finds no gate in two reports in a row, or no table in the kernel in two
+  reports in a row, the hub tells the manager once, and once when a report ends it (`hub.py` `egress_troubles`, the
+  server watch). Root's file `/run/founderizer-egress-table` names the version of the table that the kernel has, and the
+  gate's state (`table` in `GET /ui/hosts`) reads it. `nftables.service` flushes every table of the kernel at its start,
+  its reload and its stop (the stock `/etc/nftables.conf` begins with `flush ruleset`): a drop-in of that unit runs the
+  rules' step after each of them, which loads the table again. A timer runs the step every 5 minutes too, for a flush
+  that no unit saw (`nft flush ruleset` or `nft -f /etc/nftables.conf` by hand) and for a load that failed. In the
+  second or so after a flush by `nftables.service`, and until the timer's next run after one by hand, an agent connects
+  with no rule, and a connection that it opens then stays outside the records for its life.
+- **The kernel rules.** One nftables table, `inet founderizer_egress`, matches each packet by the UID of the socket
+  that made it, so it holds for each process of an agent's OS user: a session, a cron job, a program that ignores
+  proxy variables. The hub's address with its port and its git port goes direct, also while the gate does not run,
+  and so does the swap proxy on `127.0.0.1:876`, and an agent's connection to its own browser's DevTools port on the
+  loopback address (`/etc/fleet-browser/ports`): the browsers' own table lets that port reach only its own agent's
+  user, by that user's UID, which a connection through the gate would not keep; another agent's connection to it goes
+  through the gate, which records it. Each DNS
+  question, to any name server, goes to the gate's resolver; each other TCP connection goes to the gate; every other
+  packet of an agent user is refused (UDP other than DNS, ICMP). Each packet of a sub-uid of an agent user
+  (`/etc/subuid`) is refused: `newuidmap` can give a process of the agent such a UID in a user namespace of its own,
+  in the server's network, where none of the agent's rules would match it. The UID of each user of the server is cut
+  out of a range that holds it. A connection that was open before the rules loaded goes on to its end. Root's unit
+  `fleet-egress-rules.service` loads the whole table with its sets at boot, before the users' services and cron, and
+  again at each change of `/etc/group`, `/etc/subuid` or `/etc/fleet-browser/ports` (a path unit for each, and once
+  more when one changed while the step ran) and every 5 minutes, with the agents of the group `fleet-agents`; it also
+  takes each agent's OS user out of the groups `docker`, `lxd`, `incus` and `libvirt`, whose daemons would run a
+  container for it outside the rules. A sub-uid range of an agent that holds the UID of a user of the server is named
+  in the step's answer: a process of that agent can take that UID.
+  Each agent user makes at most 200 new connections and 200 DNS questions a second (2,000 at once), in the kernel. The
+  socket families whose transport is a socket of the kernel itself (RxRPC, SMC, RDS, TIPC) carry no agent's UID, so
+  their modules cannot load (`/etc/modprobe.d/founderizer-egress.conf`): the step takes a loaded one out, and names a
+  family that is built into the kernel or in use.
+- **The closures.** A local service that resolves or connects for any user would be a way around the rules. So no
+  agent's OS user can connect to the Varlink socket of `systemd-resolved` or ask its D-Bus name, connect to the
+  socket of `tailscaled`, or to the sockets of `snapd`: an ACL entry of the group `fleet-agents` with no write, and a
+  D-Bus policy. A drop-in puts each one back at each start of the service, before it opens its socket. Proved on a
+  real server on 17 November 2026: without them, an agent resolved names through `systemd-resolved` and opened a
+  connection through `tailscaled` that the rules never saw. A file system that keeps no ACL cannot hold a closure; the
+  step then names it, and the rest of the gate goes on.
+- **The gate.** The gate reads the original destination and the agent's UID from the kernel (its exact lookup of one
+  socket, `sock_diag`; the tables in `/proc` only on a kernel where that lookup does not work), reads the host's name
+  from the first bytes (a TLS ClientHello or an HTTP request head) or from what its resolver gave this agent, connects,
+  and counts. It reads no byte after the first ones, and it never ends TLS. In this step it connects to the address that
+  the program chose; when that address does not answer, it also tries the name's other addresses, because the program's
+  own fallback from IPv6 to IPv4 cannot run behind it. It answers only the service user on its control socket. The
+  service user takes its counts with each reading and posts them to the hub, which keeps one row for each agent,
+  registrable domain, port and verdict (UI-API.md 1.220; the owner reads them with `fleet_read hosts`). An agent cannot
+  write a record: the gate counts, and the service user carries the counts with its own key. The record can miss a host,
+  so a host list made from it must be checked: the counts that the gate gave the service when the service did not get
+  them, rows past 20,000 that wait for the hub, the rows that wait at a restart of the service, the counts of a gate
+  that ended with no hand-over, and the hosts of a UID that is no agent's (it counts only as another user); a part of a
+  report whose answer is lost counts twice.
+- **A new program.** The gate's code is the vault program, so each release brings it with `fleet-vault-program`. At
+  the service user's word after that, the installed program takes over as a new process with no cut, as the swap
+  proxy does; a program that does not start is not taken, and gets its next try later. At a cold start, the launcher
+  runs the installed program when it passes its own start check, and else the safe copy, which matches the kernel
+  rules, because only the step changes either.
 
 ## How the vault's code is updated
 
@@ -711,7 +805,9 @@ server that joined before, it is off until root switches it on.
 18. **An export file.** After an import, the export file stays on the disk until the owner deletes it
     (`Sources/Founderizer/SecretImportView.swift`).
 19. **The connections of an agent's shell.** Founderizer has no list of the hosts to which the shell of a session can
-    connect. The helper starts each session as a program of the agent's OS user (`fleet.py`). A task session
+    connect. On a Linux server with the outgoing gate (see "The outgoing gate"), the gate records each host
+    that each agent connects to, and the kernel refuses an agent's UDP other than DNS and its ICMP; it refuses no
+    host yet, so the rest of this limit holds there too, with a record. The helper starts each session as a program of the agent's OS user (`fleet.py`). A task session
     in a terminal, and the manager's session, start with full access: Codex with `--sandbox danger-full-access`, and
     Claude Code with its shell tool allowed (`lifecycle.py`, `fleet.py`). These sessions do not start with full
     access. An owner chat of Claude Code, a session of an agent whose Shell box is off, and a locked conversation with

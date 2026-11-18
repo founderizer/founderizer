@@ -17,7 +17,6 @@ import test_ui_api
 
 ANA = "34600111999@s.whatsapp.net"          # a person's WhatsApp ID
 JORDI = "500600700"                         # a person's Discord user ID
-CONV = ("test-generation", "conversation", "1")
 CLAUDE = {"runtime": "claude", "machine": "studio-host"}
 
 

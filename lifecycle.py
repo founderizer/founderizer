@@ -3060,6 +3060,80 @@ def browser_ports(text):
     return browser_port_rows(rows)
 
 
+
+BROWSER_PROOF_AGE = 900         # seconds: a live proof older than this proves nothing (two readings, and a late one)
+LINUX_BROWSER = ("claude", "codex")         # D4: the runtimes whose sessions get Google's DevTools MCP server on Linux
+
+
+def linux_browser_refusal(conf):
+    """Why this agent (its entry of team.json) gets no browser on a Linux server (build plan 04, D4), or None. Version 1
+    runs it in a terminal session of Claude Code or Codex with its shell: an agent whose Shell box is off has closed
+    sessions (D2), another runtime gets it only after a live check of its own, and Codex's sandboxed app-server start
+    runs each task in screen_runner.py (app_server_task), which has no browser of its own on Linux yet. The hub and the
+    helper use this one rule."""
+    if conf.get("role") in ("worker", "lead") and "shell" not in (conf.get("can") or []):
+        return "a browser on a Linux server needs the agent's Shell box, and its Shell box is off"
+    if conf.get("runtime") not in LINUX_BROWSER:
+        return ("a browser on a Linux server runs in a Claude Code or Codex session in this version, and this agent "
+                f"runs on {runtime_fact(conf.get('runtime'), 'label', conf.get('runtime'))}")
+    if app_server_task(conf, "browser"):
+        return ("this agent's start policy (app-server) runs its tasks in Codex's sandbox, which has no browser of its "
+                "own on Linux yet")
+    return None
+
+
+def browser_port(user=None, ports=BROWSER_PARTS["ports"]):
+    """This OS user's DevTools port by the root-owned ports file (D11), or None."""
+    try:
+        user = user or pwd.getpwuid(os.getuid()).pw_name
+        with open(ports, encoding="ascii") as f:
+            rows = browser_ports(f.read(1 << 20))
+    except (OSError, KeyError, UnicodeDecodeError):
+        return None
+    return next((row["devtools"] for row in rows or [] if row["user"] == user), None)
+
+
+def browser_proof_holds(user, ports=BROWSER_PARTS["ports"], proof=BROWSER_PROOF, now=None):
+    """True where the server service's live proof of the port rule says `holds` for this user, for the ports file as
+    it is now (its SHA-256 is the table's version), from a reading of the last BROWSER_PROOF_AGE seconds (D11)."""
+    try:
+        with open(ports, "rb") as f:
+            version = hashlib.sha256(f.read(1 << 20)).hexdigest()
+        with open(proof, encoding="ascii") as f:
+            lines = f.read(1 << 16).splitlines()
+        age = (now or time.time()) - os.path.getmtime(proof)
+    except (OSError, UnicodeDecodeError):
+        return False
+    return bool(lines) and lines[0] == version and f"{user} holds" in lines[1:] and -60 <= age <= BROWSER_PROOF_AGE
+
+
+def browser_item(conf, user, reading, port=None, proof=None):
+    """The setup check's item of the Browser box on a Linux server (build plan 04, S3): ("capability", "browser",
+    state, detail), ok where a browser task of this agent can start now by its helper's own rule
+    (fleet.Helper.browser_start): a session that gets the browser (linux_browser_refusal), the server's browser parts
+    in place (`reading`, browser_reading), a port of this agent's own user, and the server service's current live proof
+    `holds` for it. Else failed. The owner reads its detail behind the item's mark, so it has one sentence of two forms
+    and three reasons (his yes to them waits); the agents read the exact cause in the refusals of their browser
+    tasks."""
+    port, proof = port or browser_port, proof or browser_proof_holds
+
+    def failed(reason):
+        return "capability", "browser", "failed", BROWSER_NOT_YET.format(reason=reason)
+    if linux_browser_refusal(conf):
+        return failed(BROWSER_NEEDS)
+    if (reading or {}).get("state") == "unsupported":
+        return failed(BROWSER_SYSTEMS_ONLY)
+    if (reading or {}).get("state") != "ready" or not port(user) or not proof(user):
+        return failed(BROWSER_PARTS_NOT_READY)
+    return "capability", "browser", "ok", BROWSER_READY
+
+
+BROWSER_READY = "This agent's own Chrome is ready on this server."
+BROWSER_NOT_YET = "This agent's own Chrome cannot start on this server yet: {reason}."
+BROWSER_NEEDS = "it needs Claude Code or Codex, with its Shell box on"
+BROWSER_SYSTEMS_ONLY = "only a server with x86 Ubuntu 24.04 or 26.04 runs one"
+BROWSER_PARTS_NOT_READY = "its browser parts there are not ready yet"
+
 def browser_reading(platform_name=sys.platform, root="", run=None, machine=lambda: os.uname().machine,
                     broker=lambda: pwd.getpwnam(BROWSER_BROKER).pw_uid):
     """The agents' browser parts on this Linux server, as its service reads them with no root (plan 04, S1): `state`
@@ -3171,6 +3245,54 @@ def browser_verdict(said, listening):
     if said == "connected":
         return "open"
     return "holds" if said == "refused" and listening else "unread"
+
+
+# A host of a site that a clear names: a DNS name or an IPv4 address, in lower case (plan 04, S2 and S5).
+BROWSER_HOST = re.compile(r"[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*")
+
+
+def browser_clear_valid(extra):
+    """**The clear of a site login's grant end**, or None where it is not one (plan 04: S5's hub part checks its event
+    `browser_clear` with this rule before it sends it; the agent's helper runs it, S2).
+    - `origins`: 1 to 50 addresses of the sign-in's top-level pages, the login's own among them. Each becomes its
+      origin `scheme://host[:port]`: http or https, no path, query or fragment, no default port, a lower-case host.
+    - `cookies` (none where it is missing or null): at most 200 cookies that the sign-in made on embedded domains,
+      each `{name, domain}` as Chrome lists it (a domain cookie's domain begins with a dot), with `path` and
+      `partitionKey` ({topLevelSite}) where the record has them.
+    A host with a dot at its end, or one that is not ASCII (not punycode), makes no clear."""
+    if not isinstance(extra, dict):
+        return None
+    origins, cookies = extra.get("origins"), extra.get("cookies")
+    cookies = [] if cookies is None else cookies
+    if not (isinstance(origins, list) and 0 < len(origins) <= 50 and isinstance(cookies, list) and len(cookies) <= 200):
+        return None
+    clear = {"origins": [], "cookies": []}
+    for origin in origins:
+        try:
+            parts = urllib.parse.urlsplit(origin) if isinstance(origin, str) and len(origin) <= 4096 else None
+            port, host = (parts.port, parts.hostname) if parts else (None, None)
+        except ValueError:
+            return None
+        scheme = parts.scheme.lower() if parts else ""
+        if scheme not in ("http", "https") or not host or not BROWSER_HOST.fullmatch(host) or \
+                parts.username is not None or parts.password is not None:
+            return None
+        one = f"{scheme}://{host}" + (f":{port}" if port and port != {"http": 80, "https": 443}[scheme] else "")
+        if one not in clear["origins"]:
+            clear["origins"].append(one)
+    for cookie in cookies:
+        if not isinstance(cookie, dict):
+            return None
+        name, domain, path, key = cookie.get("name"), cookie.get("domain"), cookie.get("path"), cookie.get("partitionKey")
+        domain = domain.lower() if isinstance(domain, str) else None
+        if not (isinstance(name, str) and 0 < len(name) <= 4096 and domain and BROWSER_HOST.fullmatch(domain.removeprefix("."))
+                and (path is None or isinstance(path, str) and path.startswith("/") and len(path) <= 4096)
+                and (key is None or isinstance(key, dict) and isinstance(key.get("topLevelSite"), str)
+                     and 0 < len(key["topLevelSite"]) <= 4096)):
+            return None
+        clear["cookies"].append(dict({"name": name, "domain": domain}, **({"path": path} if path is not None else {}),
+                                     **({"partitionKey": {"topLevelSite": key["topLevelSite"]}} if key else {})))
+    return clear
 
 
 def cpu_seconds(text):
@@ -3766,7 +3888,12 @@ class Lifecycle:
             for item in desktop_items(self.run, self.home, user, tabs, browser_connected(exe) if exe else None):
                 add(*item)
         else:
-            add("capability", "browser", "failed", "A Linux worker has no desktop session for a browser.")
+            # build plan 04, S3: an agent's own Chrome on its Linux server, by its parts and its port's live proof
+            try:
+                reading = browser_reading(self.platform, run=self.run)
+            except Exception:       # noqa: BLE001 - one item of the check, which goes on
+                reading = None
+            add(*browser_item(self.conf, user, reading))
             add("capability", "screen", "failed", "A Linux worker has no desktop session.")
         items += self.login_items(probe_job)
         code, out, _ = self.run(["id", "-Gn"])

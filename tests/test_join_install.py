@@ -22,9 +22,10 @@ KIT = Path(ROOT)
 SCRIPT = KIT / "join.sh"
 TEXT = SCRIPT.read_text()
 # The Linux path, in the order the script takes it. The firewall and the security updates come before the per-agent
-# users and verify, because verify reads the firewall and says whether this machine is healthy as it now stands.
+# users and verify, because verify reads the firewall and says whether this machine is healthy as it now stands. The
+# outgoing gate comes after the vault broker, because the installed vault program is what switches it on.
 LINUX = ["reach", "checkout ", "server.py\" join", "updates", "firewall ", "harden ", "current ", "agent_users ",
-         "vault_broker ", "key_swap ", "verify_step "]
+         "vault_broker ", "key_swap ", "egress ", "verify_step "]
 
 
 def run_step(name, call, stubs):

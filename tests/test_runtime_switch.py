@@ -271,6 +271,18 @@ class Switch(OwnerAPI):
         self.assertEqual(code, 409)
         self.assertEqual(self.team()["agents"]["studio"], TEAM["agents"]["studio"])
 
+    def test_a_linux_agent_s_browser_goes_with_it_to_codex_but_not_to_codex_s_sandbox(self):
+        """Build plan 04, D4: on a Linux server an agent's browser is its runtime's terminal session with Google's
+        DevTools MCP server, so a switch between Claude Code and Codex keeps it; on a Mac it stays Claude's
+        (RUNTIME_CAN), and Codex's app-server start, which runs a task in its sandbox, has none on Linux yet."""
+        team = json.loads(json.dumps(TEAM))
+        team["agents"]["studio"]["can"] = ["shell", "web", "browser"]
+        self.assertIn("capability_not_supported", hub.runtime_switch("studio", team)["missing"])        # a Mac
+        team["servers"] = {"mac-studio": {"kind": "linux", "user": "fleet"}}
+        self.assertNotIn("capability_not_supported", hub.runtime_switch("studio", team)["missing"])
+        team["agents"]["studio"]["runtime_policies"] = {"codex": {"start": "app-server"}}
+        self.assertIn("capability_not_supported", hub.runtime_switch("studio", team)["missing"])
+
     def test_a_lost_receipt_replays_and_a_second_switch_waits_for_the_first(self):
         body = {"request_id": str(uuid.uuid4()), "db": "test-generation", "base_sha256": self.sha(), "runtime": "claude"}
         code, first = self.request("/ui/team/agents/vps", body)

@@ -2199,6 +2199,50 @@ def swap_install(check=False, run=None):
     return state
 
 
+def egress_install(check=False, run=None):
+    """This machine's outgoing gate (`agent-outgoing-connections-proposal.md`, step 1), on a machine that has its
+    vault broker: the kernel sends each TCP connection and each DNS question of an agent user to the gate, which runs
+    as a user of its own and records where each agent connects. In this step it refuses no host. The kernel refuses
+    an agent's UDP other than DNS and its ICMP, and no agent asks systemd-resolved, tailscaled or snapd to connect
+    for it. `hubsetup.py egress` runs it, as join.sh and hub.sh do at an install after the key swap.
+
+    The step is the installed program's own `configure --egress on` (vault.py configure_egress), as the key swap's is:
+    one implementation for an install and for a later root step on a live server, and root runs only root's own
+    program. It makes the gate's user, its files, units and launcher, starts the gate before the table, loads the
+    table, the closures and the path unit, and takes each agent user out of the container groups. A gate that does
+    not start leaves no table, so that each agent connects as before. Safe to run again. Returns "made", "there" or
+    "would make"."""
+    run = run or _shell
+    code, out, err = run(f"python3 -I {VAULT_LIB}/vault.py configure --config {VAULT_CONF} --egress on"
+                         + (" --check" if check else ""), timeout=300)
+    answer = json_line(out)
+    if answer is None and check:
+        say("  would switch this machine's outgoing gate on, after its vault broker is in place")
+        return "would make"
+    if answer is None:
+        raise Stop(f"the vault program of this machine does not know this step, so nothing changed: "
+                   f"{(err or out).strip()[-300:]}. Run `hubsetup.py vault` from a checkout at the release first.")
+    if answer.get("ok") is not True:
+        raise Stop(str(answer.get("reason") or "the outgoing gate was not switched on, and the program said no reason."))
+    state = answer.get("state")
+    for words in answer.get("groups_to_leave") or []:
+        say(f"  would take this agent user out of a container group, which would run its containers outside the "
+            f"gate: {words}")
+    removed = answer.get("groups_removed") or []
+    if removed:
+        say(f"  each of these agent users left a container group, which would run its containers outside the gate: "
+            f"{', '.join(removed)}")
+    for words in answer.get("unclosed") or []:
+        say(f"  this machine cannot close a local service for the agents, so an agent can still ask it: {words}")
+    if state == "would make":
+        say("  would switch this machine's outgoing gate on: the user founderizer-egress, its kernel rules, its "
+            "units and the closures of the local services that resolve or connect for any user")
+    elif answer.get("egress"):
+        say("this machine's outgoing gate is on: each connection and DNS question of an agent goes through it and is "
+            "recorded, and no host is refused")
+    return state
+
+
 def keep_fleet_id(db=None):
     """This fleet's own id in the hub's key store: sixteen hex characters, made once and never again.
 
@@ -4441,6 +4485,19 @@ def cmd_key_swap(args):
         raise SystemExit(1) from None
 
 
+def cmd_egress(args):
+    """egress: this machine's outgoing gate on, alone (egress_install). join.sh and hub.sh run it after the key swap,
+    and an install goes on when it stops: its line says only that the gate is not switched on, and why (exit 1)."""
+    if platform.system() != "Linux":
+        say("the outgoing gate is for a Linux server: nothing was switched on for it on this machine")
+        return
+    try:
+        egress_install(check=args.check)
+    except Stop as e:
+        say(f"the outgoing gate is not switched on: {e}")
+        raise SystemExit(1) from None
+
+
 def cmd_firewall(args):
     firewall(check=args.check)
 
@@ -4600,6 +4657,10 @@ def main(argv=None):
                                          "configure --swap on); an install goes on when it stops")
     ks.add_argument("--check", action="store_true", help="say what it would do, change nothing")
     ks.set_defaults(fn=cmd_key_swap)
+    eg = sub.add_parser("egress", help="this machine's outgoing gate on, from the installed vault program (vault.py "
+                                       "configure --egress on); an install goes on when it stops")
+    eg.add_argument("--check", action="store_true", help="say what it would do, change nothing")
+    eg.set_defaults(fn=cmd_egress)
     fw = sub.add_parser("firewall")
     fw.add_argument("--check", action="store_true", help="say what it would do, change nothing")
     fw.set_defaults(fn=cmd_firewall)

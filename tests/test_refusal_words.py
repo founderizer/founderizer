@@ -85,6 +85,14 @@ OLD = {
     "mcp_no_endpoints": "the MCP server {server} gave no OAuth endpoints: {reason}",
     "server_name_kept": "This server is called {name} in Tailscale, and Fleet keeps that name for itself. Rename this "
                         "server in Tailscale, then run the line again.",
+    # an agent's browser on a Linux server (build plan 04, S3; UI-API.md 1.218): its Shell box (D2), a server that runs
+    # none (D8), and a server with no room for it (D6)
+    "browser_shell_off": "{agent} cannot have a browser on a Linux server while its Shell box is off: turn its Shell "
+                         "box on, or its Browser box off",
+    "browser_server": "{server} runs no browser for an agent: in this version only a Linux server with x86 Ubuntu "
+                      "24.04 or 26.04 that is not the hub's own server runs one",
+    "browser_no_room": "{server} has no room for the browser of {agent} beside its other agents: turn its Browser box "
+                       "off first, or move it to a server with more memory",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
@@ -124,6 +132,9 @@ SITES = {
     'rename_agent': {'agent_open_signin': 1, 'no_such_agent': 1, 'server_silent': 1, 'team_changed': 1},
     'save_access': {'team_changed': 1},
     'save_agent_settings': {'no_such_agent': 1, 'team_changed': 1},
+    # build plan 04, S3 (UI-API.md 1.218)
+    'browser_rule': {'browser_shell_off': 1, 'browser_server': 1}, 'browser_box_refusal': {'browser_server': 1},
+    'browser_move_refusal': {'browser_no_room': 1, 'browser_shell_off': 1},
     'save_grant': {'no_such_agent': 1},
     'save_integration': {'team_changed': 1},
     'save_lines': {'team_changed_lines': 1},
@@ -427,7 +438,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 158)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 163)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

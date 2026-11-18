@@ -32,6 +32,7 @@ import hmac
 import html
 import http.client
 import inspect
+import ipaddress
 import json
 import math
 import os
@@ -426,6 +427,19 @@ CREATE TABLE IF NOT EXISTS mac_setups(server TEXT PRIMARY KEY, agent TEXT NOT NU
   checks INTEGER NOT NULL DEFAULT 0, token TEXT, task INTEGER, seen REAL, created REAL NOT NULL, updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS server_keys(server TEXT PRIMARY KEY, sha256 TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS server_status(server TEXT PRIMARY KEY, data TEXT NOT NULL, reported REAL NOT NULL);
+-- The outgoing gate's records (agent-outgoing-connections-proposal.md, step 1): one row for each agent, registrable
+-- domain, port, verdict and kind of address, never one for each connection; the full names under each, up to
+-- EGRESS_NAMES_MOST; and each server's gate as its service last read it.
+CREATE TABLE IF NOT EXISTS egress_hosts(agent TEXT NOT NULL, domain TEXT NOT NULL, port INTEGER NOT NULL,
+  verdict TEXT NOT NULL, cls TEXT NOT NULL, dns INTEGER NOT NULL DEFAULT 0, conns INTEGER NOT NULL DEFAULT 0,
+  up INTEGER NOT NULL DEFAULT 0, down INTEGER NOT NULL DEFAULT 0, first REAL NOT NULL, last REAL NOT NULL,
+  over INTEGER NOT NULL DEFAULT 0, longest INTEGER NOT NULL DEFAULT 0, server TEXT,
+  PRIMARY KEY(agent, domain, port, verdict, cls));
+CREATE TABLE IF NOT EXISTS egress_names(agent TEXT NOT NULL, domain TEXT NOT NULL, name TEXT NOT NULL,
+  PRIMARY KEY(agent, domain, name));
+CREATE INDEX IF NOT EXISTS egress_hosts_last ON egress_hosts(agent, last);
+CREATE TABLE IF NOT EXISTS egress_servers(server TEXT PRIMARY KEY, gate TEXT, other_users INTEGER NOT NULL DEFAULT 0,
+  reported REAL NOT NULL, down INTEGER NOT NULL DEFAULT 0, unloaded INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS server_jobs(id INTEGER PRIMARY KEY, server TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT,
   runtime TEXT, state TEXT NOT NULL, step TEXT, detail TEXT, prompt TEXT, created REAL NOT NULL, updated REAL NOT NULL,
   was TEXT, timed_out INTEGER, user TEXT);
@@ -1682,6 +1696,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "default_models",    # the owner, 9 November 2026: "a default for each [AI provider] somewhere under
                                     # settings, and then each agent can be changed individually"
                "web_hosts",         # the host list of an agent whose Shell box is off (UI-API.md, "the host list")
+               "hosts",             # the owner, 17 November 2026 ("Yes, all nine"), step 1 of the outgoing gate:
+                                    # POST /server/<name>/egress takes a gate's counts, GET /ui/hosts reads them
                "hub_shared",        # the owner, 14 November 2026 (the slider's first step, "Yes, as shown"): the
                                     # hub's own server takes agents when team.json says "hub": {"shared": true};
                                     # GET /ui/servers has hub_shared, and the door's refusals have `why`
@@ -3105,8 +3121,10 @@ def mobile_chat(agent, since):
 
 
 def browser_tabs(agent):
-    """True when this agent's browser tasks work in tabs of their own (lifecycle.RUNTIMES "browser_tabs")."""
-    return bool(runtime_fact((agents().get(agent) or {}).get("runtime"), "browser_tabs"))
+    """True when this agent's browser tasks work in tabs of their own (lifecycle.RUNTIMES "browser_tabs"): a Mac's
+    fact. On a Linux server an agent's browser tasks share its one Chrome, so they run one at a time (build plan 04,
+    D8 and D9)."""
+    return not linux_agent(agent) and bool(runtime_fact((agents().get(agent) or {}).get("runtime"), "browser_tabs"))
 
 
 def desktop_busy(name, needs="screen"):
@@ -3118,8 +3136,9 @@ def desktop_busy(name, needs="screen"):
     task holds it, also a paused or held one and one that waits to start. A task that ended holds it until its session
     is confirmed closed: its helper (1.12 or later) acknowledged the task's stop event, which it does only after it
     closed the window and ended what is left of the task, and then reported its windows without this one. A window
-    report from before that acknowledgement is not enough."""
-    here = machine_agents(name)
+    report from before that acknowledgement is not enough. On a Linux server each agent has a screen and a Chrome of
+    its own (build plan 04, S3), so only its own tasks hold its desktop."""
+    here = [name] if linux_agent(name) else machine_agents(name)
     if not here:
         return None
     beside = needs == "browser" and browser_tabs(name)
@@ -3137,13 +3156,15 @@ def desktop_busy(name, needs="screen"):
     return None
 
 
-def desktop_refusal(owner, needs, caller):
+def desktop_refusal(owner, needs, caller, keep=False):
     """Why a new browser or screen task for `owner` must wait (owner API 1.12: a screen task alone on each machine,
     and browser tasks side by side in tabs of their own; desktop_busy), or None. Only the fleet manager sees the
     other task's ID."""
     if needs not in ("browser", "screen"):
         return None
     machine = agents()[owner].get("machine")
+    if needs == "browser" and linux_agent(owner):
+        return browser_refusal(owner, caller, keep)     # build plan 04, S3: its own Chrome, and a place of its server
     if needs == "screen":
         # Screen control on them could press Agree on terms that are the owner's to accept (4 November 2026). The one
         # screen task that they let through is the hub's own SETUP_CLICK (setup_click), which no agent can ask for.
@@ -3156,6 +3177,503 @@ def desktop_refusal(owner, needs, caller):
     which = tref(busy["id"]) if caller == manager_name() else "another browser or screen task"
     return f"The desktop of {machine} is busy with {which}; wait until it ends."
 
+
+
+# ---------------------------------------------------------------- the agents' browsers on Linux servers (plan 04, S3)
+# The owner's "Every agent with shell" of 17 November 2026 (~/dev/founderizer-plans/superbot-ideas/04-linux-browser-
+# build-plan.md): an agent on a Linux server runs its browser tasks in a Chrome of its own (fleet.Helper.browser_start),
+# one at a time (D9), while its server has a free place (D6). A place is a Chrome that runs at one time, not an agent.
+# The hub counts a server's places from the room that its service reads (lifecycle.room_reading). A browser task that
+# the hub admits takes a place (BROWSER_HOLD) and keeps it while it is open and after its end until its session is
+# confirmed closed. A wait for the owner or for a usage limit gives it back once the helper says that it closed the
+# task's Chrome (browser_waits, D10), and its end takes a free place again or waits for one.
+GIB = 1 << 30
+BROWSER_PLACE = 5 * GIB // 4        # D6: the unit's cap of 1 GiB, and the DevTools MCP server of its session
+BROWSER_NEED_SHELL = 3 * GIB // 2   # D6: an agent with a shell, the manager too: its sessions and one Node build
+BROWSER_NEED_CLOSED = 3 * GIB // 5  # D6: an agent without one: its sessions
+BROWSER_MARGIN = GIB // 2           # D6: what stays free of the room
+BROWSER_STALL = 5_000_000           # D6: microseconds of `full` stall in 300 s of readings that is a real shortage
+BROWSER_ROOM = "browser_room:"      # kv + server: its counts at its last reading, and the places that real shortages
+#                                     took since its boot or since its limits or its swap changed (browser_room_seen)
+BROWSER_HOLD = "browser_place:"     # kv + task id: this browser task holds a place of {server} since {since}
+BROWSER_WAIT_TOLD = "browser_place_told:"   # kv + task id: its session knows that its browser waits for a place
+BROWSER_WAKE_HELD = "browser_wake_held:"    # kv + need id: its saved secret waits only for a browser place now
+BROWSER_REFUSED = "browser_refused:"        # kv + server: {requester: its own task or null} that found no free place
+BROWSER_CLOSED_TOLD = "browser_closed_told:"    # kv + agent: the manager knows of its kept breach of D2
+
+
+def browser_kv(k, v):
+    """kv_set of a key of this region, quiet: the hub's own rule reads them, and no app does."""
+    with area("quiet"):
+        kv_set(k, v)
+
+
+def browser_kv_rows(prefix):
+    """The kv rows whose keys begin with `prefix`, by a range of the primary key. read_rows only."""
+    return read_rows("SELECT k, v FROM kv WHERE k >= ? AND k < ?", (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)))
+
+
+def linux_agent(name, team=None):
+    """True for an agent on a server that joined as Linux (team.json alone, so that a transaction may read it)."""
+    team = team or TEAM
+    a = (team.get("agents") or {}).get(name) or {}
+    return ((team.get("servers") or {}).get(a.get("machine")) or {}).get("kind") == "linux"
+
+
+def browser_server(name, team=None):
+    """The Linux server on which this agent's browser runs, or None: one that joined as Linux and is not the hub's own,
+    whose slice holds the hub and the central vault (D6). An agent with no server yet has none."""
+    team = team or TEAM
+    a = (team.get("agents") or {}).get(name) or {}
+    if a.get("placed") is False or a.get("machine") == (team.get("hub") or {}).get("machine"):
+        return None
+    return a.get("machine") if linux_agent(name, team) else None
+
+
+def browser_room_seen(server, reading, t0):
+    """At each reading of a server's service (Handler.server_status): the places that a real shortage takes away
+    (D6). A new `oom` count of user.slice (an end at its own limit; a browser's end at its own cap is not counted
+    there), a new `fail` count of its swap, or more than BROWSER_STALL microseconds of `full` stall for each 300 seconds
+    since the last reading (never fewer than one) is a sign, and each reading with a sign takes one place. They stay
+    until the server boots again (its boot id, when both counters start again at 0) or its limits or its swap change.
+    A reading with no room changes nothing."""
+    room = reading.get("room")
+    if not isinstance(room, dict):
+        return
+    number = lambda v: v if type(v) is int else None       # noqa: E731
+    now_ = {k: number(room.get(k)) for k in ("memory_max", "swap_max", "swap_total", "oom", "swap_fail", "full_us")}
+    now_["boot"] = (reading.get("os") or {}).get("boot")
+    try:
+        old = json.loads(kv_get(BROWSER_ROOM + server) or "null")
+    except ValueError:
+        old = None
+    less = 0
+    if isinstance(old, dict) and all(old.get(k) == now_[k] for k in ("boot", "memory_max", "swap_max", "swap_total")):
+        less = old.get("less") if type(old.get("less")) is int else 0
+        grew = lambda k: now_[k] is not None and type(old.get(k)) is int and now_[k] > old[k]     # noqa: E731
+        gap = max(t0 - old["at"], 0.0) if isinstance(old.get("at"), (int, float)) else 0.0
+        stall = now_["full_us"] is not None and type(old.get("full_us")) is int and \
+            now_["full_us"] - old["full_us"] > BROWSER_STALL * max(1.0, gap / 300)
+        less += 1 if grew("oom") or grew("swap_fail") or stall else 0
+    browser_kv(BROWSER_ROOM + server, json.dumps(dict(now_, at=t0, less=less), sort_keys=True))
+
+
+def browser_places(server, team=None):
+    """How many browsers can run at one time on this Linux server (D6): of the room of user.slice (its MemoryMax and
+    its swap, min(memory.swap.max, SwapTotal)), the need of every agent on it and the margin, in places of BROWSER_PLACE,
+    never more than its workers and leads with a shell (one browser task each, D9; only they can have a browser, D2),
+    less what real shortages took (browser_room_seen). 0 without a reading of its room or a limit of the slice: no
+    browser runs before part 1 of the memory route is on a server. read_row only: an admission reads it inside a
+    transaction."""
+    team = team or TEAM
+    row = read_row("SELECT data FROM server_status WHERE server=?", (server,))
+    try:
+        room = (json.loads(row["data"]) if row else {}).get("room") or {}
+    except (ValueError, TypeError, AttributeError):
+        room = {}
+    memory, swap = room.get("memory_max"), room.get("swap_total")
+    if type(memory) is not int:
+        return 0
+    swap = swap if type(swap) is int else 0
+    swap = min(swap, room["swap_max"]) if type(room.get("swap_max")) is int else swap
+    here = [a for a in (team.get("agents") or {}).values() if a.get("machine") == server and a.get("placed") is not False]
+    shell = lambda a: a.get("role") == "manager" or "shell" in (a.get("can") or [])       # noqa: E731
+    need = sum(BROWSER_NEED_SHELL if shell(a) else BROWSER_NEED_CLOSED for a in here)
+    takers = sum(1 for a in here if a.get("role") in ("worker", "lead") and shell(a))
+    try:
+        less = json.loads(kv_read(BROWSER_ROOM + server) or "{}").get("less")
+    except (ValueError, TypeError, AttributeError):
+        less = 0
+    return max(0, min((memory + swap - need - BROWSER_MARGIN) // BROWSER_PLACE, takers) - (less if type(less) is int else 0))
+
+
+def browser_active(owner, alive=None):
+    """The one browser task of this agent that may hold or take a place now (D9, by the helper's own rule,
+    fleet.Helper.browser_start: a browser task starts only while no other open browser task of the agent has a
+    window): its open browser task whose window is alive (`alive`, the poll's list, else the hub's last one), else its
+    oldest open browser task that waits for no secret and no usage limit, the next that can start, else its oldest. None
+    with none. read_rows only."""
+    rows = read_rows(f"SELECT id, state, waiting_on FROM tasks WHERE owner=? AND needs='browser' AND {OPEN_TASK} "
+                     f"ORDER BY id", (owner,))
+    if not rows:
+        return None
+    if alive is None:
+        row = read_row("SELECT alive FROM agents WHERE name=?", (owner,))
+        alive = set(((row["alive"] if row else None) or "").split(","))
+    windowed = [r["id"] for r in rows if tref(r["id"]) in alive]
+    if windowed:
+        return windowed[0]
+    if read_row("SELECT 1 FROM agent_limits WHERE agent=? AND ended IS NULL", (owner,)):
+        return rows[0]["id"]
+    free = [r["id"] for r in rows if not (r["state"] == "input-required" and str(r["waiting_on"] or "").startswith("N-"))]
+    return free[0] if free else rows[0]["id"]
+
+
+def browser_holds():
+    """{task id: {server, since}} of every place mark (BROWSER_HOLD). read_rows only."""
+    out = {}
+    for row in browser_kv_rows(BROWSER_HOLD):
+        try:
+            hold = json.loads(row["v"])
+            tid = int(row["k"][len(BROWSER_HOLD):])
+        except (ValueError, TypeError):
+            continue
+        if isinstance(hold, dict) and isinstance(hold.get("server"), str):
+            out[tid] = hold
+    return out
+
+
+def browser_holding(tid, hold):
+    """True while this task's mark holds its place (D6): while its agent is still in the team on the server of the mark
+    (a move, a delete or an unplaced agent ends it), and while the task is open, or after its end until its session is
+    confirmed closed as for a busy desktop (desktop_busy: its helper acknowledged its stop event, which it does only
+    after it closed the task's Chrome, and then reported its windows without it). read_row only."""
+    t = read_row("SELECT t.id, t.owner, t.state, a.alive, a.alive_ts, (SELECT MAX(e.helper_ack) FROM events e WHERE e.task=t.id "
+                 "AND e.kind='stop') AS closed FROM tasks t LEFT JOIN agents a ON a.name=t.owner WHERE t.id=?", (tid,))
+    return bool(t) and browser_server(t["owner"]) == hold["server"] and (
+        t["state"] not in TERMINAL or not t["closed"] or not t["alive_ts"] or t["alive_ts"] <= t["closed"]
+        or tref(t["id"]) in (t["alive"] or "").split(","))
+
+
+def browser_holders(server):
+    """The browser tasks that hold a place of this server now, the oldest first. read_rows only."""
+    return [tid for tid, hold in sorted(browser_holds().items(), key=lambda kv: (kv[1].get("since") or 0, kv[0]))
+            if hold["server"] == server and browser_holding(tid, hold)]
+
+
+def browser_pending(server, team=None):
+    """The open browser tasks of this server's agents that have no place and take the next ones before a new task
+    (D10): each whose usage limit ended and that found no free place, and each whose wait for a secret waits now only
+    for a place (secret_wakes marks it). Only the agent's one task that may start now (browser_active), and none of an
+    agent whose other browser task holds a place: an agent runs one at a time (D9). read_rows only."""
+    team = team or TEAM
+    names = [n for n in (team.get("agents") or {}) if browser_server(n, team) == server]
+    if not names:
+        return []
+    holders = browser_holders(server)
+    holding = {r["owner"] for r in read_rows(f"SELECT owner FROM tasks WHERE id IN ({','.join('?' * len(holders)) or 'NULL'})",
+                                             holders)}
+    held = {int(r["k"][len(BROWSER_WAKE_HELD):]) for r in browser_kv_rows(BROWSER_WAKE_HELD)
+            if r["k"][len(BROWSER_WAKE_HELD):].isdigit()}
+    limited = {r["agent"] for r in read_rows("SELECT agent FROM agent_limits WHERE ended IS NULL")}
+    out = []
+    for r in read_rows(f"SELECT id, owner, state, waiting_on FROM tasks WHERE needs='browser' AND {OPEN_TASK} AND owner "
+                       f"IN ({','.join('?' * len(names))}) ORDER BY id", names):
+        if r["owner"] in holding or r["owner"] in limited or r["id"] != browser_active(r["owner"]):
+            continue
+        secret = r["state"] == "input-required" and str(r["waiting_on"] or "").startswith("N-")
+        if not secret or (str(r["waiting_on"])[2:].isdigit() and int(str(r["waiting_on"])[2:]) in held):
+            out.append(r["id"])
+    return out
+
+
+def browser_free(server, team=None):
+    """The places of this server that a new browser task can take now (D6, D10): its places less the tasks that hold
+    one and those that take the next ones (browser_pending). read_rows only."""
+    return browser_places(server, team) - len(browser_holders(server)) - len(browser_pending(server, team))
+
+
+def browser_not_ready(owner, server):
+    """Why the helper of `owner` would not start its browser on `server` now, by the server's own reading, or None:
+    the parts are not `ready` there (missing, a table that the live proof found gone, a system of another kind, or no
+    reading of them), its server service cannot keep its live proof (`proof_kept`), the agent runs as the server
+    service's own user, or the ports file gives its user no port (the owner's Mac writes both). The hub admits no browser task that its helper refuses (fleet.Helper.browser_start)."""
+    reading = server_reading(server, []) or {}
+    browser = reading.get("browser") if isinstance(reading.get("browser"), dict) else {}
+    if browser.get("state") != "ready":
+        return {"unsupported": "its system runs no browser for an agent",
+                "table_missing": "the table of its browser ports is not loaded now"}.get(
+            browser.get("state"), "its browser parts are not in place yet: the owner's Mac puts them there")
+    if browser.get("proof_kept") is False:
+        return "its server service cannot keep the live proof of the browser ports now, so no helper starts one there"
+    user = ((reading.get("agents") or {}).get(owner) or {}).get("user") if isinstance(reading.get("agents"), dict) else None
+    if service_user_agents([owner]) or not user or user == (((TEAM.get("servers") or {}).get(server) or {}).get("user")):
+        return "this agent does not run as an OS user of its own there yet"
+    if not any(isinstance(p, dict) and p.get("user") == user for p in browser.get("ports") or []):
+        return "this agent has no browser port there yet: the owner's Mac gives it one"
+    return None
+
+
+def browser_refusal(owner, caller, keep=False):
+    """Why a new browser task of `owner`, an agent on a Linux server, must not start now (build plan 04, S3), or None.
+    Its session would get no browser (lifecycle.linux_browser_refusal: its runtime, its Shell box, Codex's app-server
+    start), the hub's own server runs none (D6), or its helper would not start it there now (browser_not_ready); another
+    browser task of its own is open (D9: two sessions on one Chrome share its tabs); or its server has no free place
+    (D6). `keep` (create_task's own refusal, which only an agent reads): its exact words, and the hub keeps the
+    requester and tells it when a place is free there (browser_place_sweep), a refusal and an event with no queue. A
+    run of a wake-up rule or of a duty records its refusal as the run's reason, which the owner's apps show: the busy
+    desktop's words where a task holds the place, else BROWSER_RUN_NOT_NOW (the owner's yes to it waits). Only the
+    fleet manager sees another task's ID."""
+    a, server = agents()[owner], browser_server(owner)
+    machine = a.get("machine")
+    why = (lifecycle.linux_browser_refusal(a) or browser_not_ready(owner, server)) if server else \
+        "a browser of an agent runs on a Linux server that joined, and not on the hub's own"
+    if why:
+        return f"{owner} gets no browser on {machine}: {why}." if keep else BROWSER_RUN_NOT_NOW.format(
+            agent=shown_role(owner), server=machine)
+    busy = desktop_busy(owner, "browser")
+    other = "another browser task" if keep else "another browser or screen task"        # a run's: the known words
+    if busy is not None:
+        which = tref(busy["id"]) if caller == manager_name() else other
+        return f"The desktop of {machine} is busy with {which}; wait until it ends."
+    if browser_free(server) > 0:
+        return None
+    if keep:
+        try:
+            refused = json.loads(kv_get(BROWSER_REFUSED + server) or "{}")
+        except ValueError:
+            refused = {}
+        refused = refused if isinstance(refused, dict) else {}
+        if caller not in refused:
+            browser_kv(BROWSER_REFUSED + server, json.dumps(dict(refused, **{caller: lead_task(caller)}), sort_keys=True))
+    holders = browser_holders(server)
+    which = tref(holders[0]) if caller == manager_name() and holders else other
+    if not keep:            # a run's reason, which the owner's apps show: a busy desktop's, else that it cannot now
+        return f"The desktop of {machine} is busy with {which}; wait until it ends." if holders else \
+            BROWSER_RUN_NOT_NOW.format(agent=shown_role(owner), server=machine)
+    if not browser_places(server):
+        return (f"{machine} has no place for a browser now: the memory of its agents, or a shortage of it, leaves none. "
+                f"The hub tells you when a browser place is free there.")
+    return f"The desktop of {machine} is busy with {which}; wait until it ends. The hub tells you when a browser place " \
+           f"is free there."
+
+
+def browser_hold_rows(tid, server, t0):
+    """Inside the caller's transaction: this browser task takes a place of its server now."""
+    in_transaction("browser_hold_rows")
+    DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+               (BROWSER_HOLD + str(tid), json.dumps({"server": server, "since": t0}, sort_keys=True)))
+
+
+def browser_admit_rows(tid, owner, t0):
+    """Inside admit_task's transaction (build plan 04, D6): a Linux agent's new browser task takes its place now,
+    before its helper reads the task and starts its Chrome, unless another browser task of its agent is open (a duty's
+    run admits up to three at once, and the helper runs one at a time, D9): each later one takes a place when it is the
+    agent's next (browser_active, browser_places_turn). The admission said that a place is free (browser_refusal); two
+    admissions that raced for the last one both run: each Chrome's cap holds the browser itself, and part 1's limit of
+    user.slice the rest, at the cost of a real shortage, which takes a place at the next reading."""
+    server = browser_server(owner)
+    if server and not read_row(f"SELECT 1 FROM tasks WHERE owner=? AND needs='browser' AND {OPEN_TASK} AND id<>?",
+                               (owner, tid)):
+        browser_hold_rows(tid, server, t0)
+
+
+def browser_wake_late(task_ids):
+    """True when the end of a secret's wait would give one of these tasks its browser with no free place (D10): each
+    open browser task of a Linux agent without a place needs one, if it is its agent's active one (browser_active,
+    D9): another starts after it. The wait then stays until one is free (secret_wakes). read_rows only."""
+    want, holds = {}, browser_holds()
+    for tid in task_ids:
+        r = read_row(f"SELECT owner FROM tasks WHERE id=? AND needs='browser' AND {OPEN_TASK}", (tid,))
+        server = browser_server(r["owner"]) if r and browser_active(r["owner"]) == tid else None
+        if server and not (tid in holds and browser_holding(tid, holds[tid])):
+            want[server] = want.get(server, 0) + 1
+    return any(browser_places(s) - len(browser_holders(s)) < n for s, n in want.items())
+
+
+def browser_wake_rows(need_id, task_ids, late, t0):
+    """Inside secret_wakes's transaction, at each pass over a saved secret: its mark while it waits only for a browser
+    place (`late`: browser_pending counts its task), and at its wake each open browser task of a Linux agent takes its
+    place; a session that read that its browser waits for a place reads that it runs again."""
+    in_transaction("browser_wake_rows")
+    key = BROWSER_WAKE_HELD + str(need_id)
+    if late:
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING", (key, str(t0)))
+        return
+    DB.execute("DELETE FROM kv WHERE k=?", (key,))
+    holds = browser_holds()
+    for tid in task_ids:
+        r = read_row(f"SELECT owner FROM tasks WHERE id=? AND needs='browser' AND {OPEN_TASK}", (tid,))
+        server = browser_server(r["owner"]) if r and browser_active(r["owner"]) == tid else None
+        if not server or (tid in holds and browser_holding(tid, holds[tid])):
+            continue
+        browser_hold_rows(tid, server, t0)
+        if read_row("SELECT 1 FROM kv WHERE k=?", (BROWSER_WAIT_TOLD + str(tid),)):
+            DB.execute("DELETE FROM kv WHERE k=?", (BROWSER_WAIT_TOLD + str(tid),))
+            event_rows([(r["owner"], "say", tid, BROWSER_RUNS_AGAIN.format(server=server), {})], t0)
+
+
+BROWSER_RUNS_AGAIN = "[hub] Your browser on {server} runs again: a place is free there now."
+BROWSER_RUN_NOT_NOW = "{agent} cannot run a browser task on {server} now."      # a run's reason (S3)
+BROWSER_CLOSED_NOW = ("[hub] Your browser on {server} is closed until a browser place is free there. Do not use the "
+                      "browser until the hub says that it runs again.")
+
+
+def browser_places_turn(agent, rows, waits, closed, alive=None):
+    """At each poll of a Linux agent's helper (browser_waits): its browser tasks and their places. A task that waits
+    gives its place back once the helper says that it closed the task's Chrome (`closed`, its poll's `browser_closed`:
+    the tasks whose Chrome it closed or never started, and each of its tasks while its unit is not active; a helper
+    that does not say gives it back at once), D10. Only the agent's one task that may start now holds or takes a place
+    (browser_active, with `alive`, the poll's windows; D9): the mark of another goes, and another with no window is
+    `place` where it could take no place (its agent's active task holds none and none is free), so that a session of
+    it that starts gets no Chrome; where it could, it starts with its Chrome and takes the agent's place at the next
+    poll. The active one, when it does not wait and has no place, takes a free one, or waits for one as `place`; its
+    session hears both once. Under LOCK from the
+    read to the write: two helpers of one server poll at the same time."""
+    server = browser_server(agent)
+    if not server:
+        return
+    with LOCK:
+        holds, t0 = browser_holds(), now()
+        valid = lambda tid: tid in holds and browser_holding(tid, holds[tid])       # noqa: E731
+        active = browser_active(agent, alive)
+        # the tasks that are open now, under LOCK: one that ended since `rows` holds its place until its session is
+        # confirmed closed (browser_holding, the sweep), and has no turn here
+        still = {r["id"] for r in read_rows(f"SELECT id FROM tasks WHERE owner=? AND needs='browser' AND {OPEN_TASK}",
+                                            (agent,))}
+        mine = [r for r in rows if r["needs"] == "browser" and r["id"] in still]
+        for r in mine:          # first the marks that hold nothing for this agent now, so that the active one sees
+            tid = r["id"]       # its agent's own place as free
+            if tid in holds and (holds[tid]["server"] != server or tid != active):
+                browser_kv(BROWSER_HOLD + str(tid), None)   # a mark of the server that it left, or of a task that waits
+                del holds[tid]                              # for the agent's other browser task (D9)
+        for r in sorted(mine, key=lambda r: r["id"] != active):     # then the active one, then the others
+            ref, tid = tref(r["id"]), r["id"]
+            if tid != active:
+                if (alive is None or ref not in alive) and not valid(active) and \
+                        browser_places(server) - len(browser_holders(server)) <= 0:
+                    waits.setdefault(ref, "place")      # a session of it that starts now gets no Chrome either
+                continue
+            if ref in waits:
+                if tid in holds and (closed is None or ref in closed):
+                    browser_kv(BROWSER_HOLD + str(tid), None)
+                    del holds[tid]
+                continue
+            if valid(tid):
+                continue
+            if browser_places(server) - len(browser_holders(server)) > 0:
+                browser_kv(BROWSER_HOLD + str(tid), json.dumps({"server": server, "since": t0}, sort_keys=True))
+                holds[tid] = {"server": server, "since": t0}
+                if kv_get(BROWSER_WAIT_TOLD + str(tid)):
+                    browser_kv(BROWSER_WAIT_TOLD + str(tid), None)
+                    emit(agent, "say", BROWSER_RUNS_AGAIN.format(server=server), task=tid)
+                continue
+            waits[ref] = "place"
+            if not kv_get(BROWSER_WAIT_TOLD + str(tid)):
+                browser_kv(BROWSER_WAIT_TOLD + str(tid), t0)
+                emit(agent, "say", BROWSER_CLOSED_NOW.format(server=server), task=tid)
+
+
+def browser_place_wait(t):
+    """The server whose browser place this open task waits for (browser_places_turn's `place`), or None: a browser
+    task of a Linux agent with no place, whose wait is not one of the hub's own (a usage limit, a secret). A reason of
+    live_reason: its session waits on purpose, as the hub's line told it."""
+    try:
+        server = browser_server(t["owner"]) if t["needs"] == "browser" else None
+    except (KeyError, IndexError):          # a row with no needs (a test's stand-in) waits for no browser
+        return None
+    if not server or not kv_get(BROWSER_WAIT_TOLD + str(t["id"])):
+        return None
+    hold = browser_holds().get(t["id"])
+    return None if hold and browser_holding(t["id"], hold) else server
+
+
+def browser_place_sweep(t0):
+    """Each pass of the tick (build plan 04, S3): a place mark goes once it holds nothing (its task's session confirmed
+    closed, its task gone, its agent moved or deleted), and so do the marks of a session told and of a secret held for
+    a task that ended; each requester that found no free place on a server hears once that one is free there, in the
+    task session that asked (a worker's or a lead's), else as the manager; and the manager hears once of each agent
+    whose Browser box stays on a Linux server with its Shell box off, a breach of D2 from before it, which validate_team
+    keeps and the helper never serves."""
+    for tid, hold in browser_holds().items():
+        if not browser_holding(tid, hold):
+            browser_kv(BROWSER_HOLD + str(tid), None)
+    for prefix in (BROWSER_WAIT_TOLD, BROWSER_WAKE_HELD):
+        for row in browser_kv_rows(prefix):
+            ref = row["k"][len(prefix):]
+            alive = q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (ref,)) if prefix == BROWSER_WAIT_TOLD else \
+                q1(f"SELECT 1 FROM needs n, json_each(n.secret, '$.tasks') j, tasks t WHERE n.id=? AND "
+                   f"json_extract(n.secret, '$.woken') IS NULL AND t.id=j.value AND t.{OPEN_TASK}", (ref,))
+            if not alive:
+                browser_kv(row["k"], None)
+    for row in browser_kv_rows(BROWSER_REFUSED):
+        server = row["k"][len(BROWSER_REFUSED):]
+        if not any(browser_server(n) == server for n in agents()):
+            browser_kv(row["k"], None)
+            continue
+        if browser_free(server) <= 0:
+            continue
+        browser_kv(row["k"], None)
+        try:
+            requesters = json.loads(row["v"])
+        except ValueError:
+            requesters = {}
+        for requester, tid in (requesters.items() if isinstance(requesters, dict) else ()):
+            if requester not in agents() or (tid and not q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (tid,))):
+                continue
+            emit(requester, "say", f"[hub] A browser place is free on {server} now. If you still need the browser task "
+                                   f"that the hub refused for want of one, create it again.", task=tid or None)
+    breaches = {name for kind, name in browser_breaches(TEAM) if kind == "closed"}
+    for name in sorted(breaches):
+        if not kv_get(BROWSER_CLOSED_TOLD + name):
+            browser_kv(BROWSER_CLOSED_TOLD + name, t0)
+            emit(manager_name(), "say", f"[hub] {shown_role(name)} has its Browser box on {agents()[name].get('machine')} "
+                                        f"with its Shell box off, so it gets no browser there: a browser on a Linux "
+                                        f"server needs the Shell box. Tell the owner, who can turn its Shell box on or "
+                                        f"its Browser box off.")
+    for row in browser_kv_rows(BROWSER_CLOSED_TOLD):
+        if row["k"][len(BROWSER_CLOSED_TOLD):] not in breaches:
+            browser_kv(row["k"], None)
+
+
+def browser_rename_rows(old, new):
+    """Inside rename_machine_rows's transaction: a server's browser records under its new name: its room's counts, its
+    refused requesters and the server of each place mark."""
+    in_transaction("browser_rename_rows")
+    for prefix in (BROWSER_ROOM, BROWSER_REFUSED):
+        DB.execute("DELETE FROM kv WHERE k=?", (prefix + new,))
+        DB.execute("UPDATE kv SET k=? WHERE k=?", (prefix + new, prefix + old))
+    DB.execute("UPDATE kv SET v=json_set(v, '$.server', ?) WHERE k >= ? AND k < ? AND json_valid(v) AND "
+               "json_extract(v, '$.server')=?", (new, BROWSER_HOLD, BROWSER_HOLD[:-1] + ";", old))
+
+
+def browser_breaches(team):
+    """What team.json alone says against a browser on a Linux server, as a set of (kind, name): ("closed", a) for a
+    worker or a lead with the Browser box and its Shell box off on a server that joined as Linux (build plan 04, D2: a
+    closed session could open file:// pages and read its own session files, and a Browser box removes an agent's host
+    list), and ("hub", a) for a worker or a lead with the Browser box on the hub's own server where it joined as Linux
+    (D6: the hub's slice holds the hub and the central vault; the manager runs no browser task, so its box there harms
+    nothing)."""
+    if not team_shaped(team):
+        return set()
+    servers, hub_machine = team.get("servers") or {}, (team.get("hub") or {}).get("machine")
+    out = set()
+    for n, a in team["agents"].items():
+        can = a.get("can") if isinstance(a.get("can"), list) else []
+        if "browser" not in can or (servers.get(a.get("machine")) or {}).get("kind") != "linux":
+            continue
+        if a.get("role") in ("worker", "lead") and "shell" not in can:
+            out.add(("closed", n))
+        if a.get("machine") == hub_machine and a.get("role") in ("worker", "lead"):
+            out.add(("hub", n))
+    return out
+
+
+def browser_rule(team, kept):
+    """Raise refusal_words.Coded for a breach (browser_breaches) that `kept` does not hold, by the pattern of
+    os_user_rule: validate_team passes the breaches of its reference team, so a write may keep or end one and never add
+    one. D2 refuses a tick of the Browser box with the Shell box off, a Shell box that goes off under it, and a move of
+    such an agent to Linux. A browser that the default gives goes with the Shell box (D1, S3b), so it meets only one
+    that the owner ticked."""
+    order = list(team["agents"])
+    new = sorted(browser_breaches(team) - set(kept), key=lambda b: (order.index(b[1]), b[0]))
+    if new and new[0][0] == "closed":
+        raise refusal_words.Coded("browser_shell_off", agent=shown_role(new[0][1]))
+    if new:
+        raise refusal_words.Coded("browser_server", server=team["agents"][new[0][1]].get("machine"))
+
+
+def browser_box_refusal(team, agent, server):
+    """The refusal of a Browser box of `agent` on `server` that the owner adds now, by the server's reading (D8, D6), or
+    None: the hub's own server runs no agent's browser, and a server whose service says `unsupported` (any system but
+    x86 Ubuntu 24.04 and 26.04) none either. Only the save and move routes have the readings; validate_team refuses the
+    hub's own server only where it joined as Linux."""
+    if server_kind_of(team, server) != "linux":
+        return None
+    reading = server_reading(server, server_agents(server, team)) or {}
+    if server == (team.get("hub") or {}).get("machine") or (reading.get("browser") or {}).get("state") == "unsupported":
+        return Refusal(409, code="browser_server", names={"server": server})
+    return None
 
 def know(agent):
     """Make sure the hub has a row for this agent."""
@@ -4532,6 +5050,8 @@ def migrate():
         # agent_remove: when the agent whose row keeps its name left team.json (forget_removed_agents), which the costs
         # reading of the whole fleet says (costs_deleted)
         "agents": {"deleted": "REAL"},
+        # the outgoing gate: the posts in a row whose gate did not answer, and whose gate had no table (egress_troubles)
+        "egress_servers": {"down": "INTEGER NOT NULL DEFAULT 0", "unloaded": "INTEGER NOT NULL DEFAULT 0"},
     }.items():
         try:
             have = {r["name"] for r in q(f"PRAGMA table_info({table})")}
@@ -5734,6 +6254,33 @@ def active_hold(task_id):
     return q1("SELECT * FROM holds WHERE task=? AND state<>'released' ORDER BY id DESC LIMIT 1", (task_id,)) if task_id else None
 
 
+def browser_waits(agent, closed=None, alive=None):
+    """{T-<id>: "secret", "limit" or "place"} of this agent's open tasks that wait now for a long time with nothing to
+    do: a task that waits on the owner's answer to a request of its session (secret_parked: N-<id>), and, while a
+    usage limit holds the agent, each of its open tasks (build plan 04, D10); on a Linux server also a browser task
+    whose wait ended and found no free place of its server (browser_places_turn, S3; `closed` and `alive` are what its
+    helper said: the tasks whose Chrome it closed, and its windows). Only for an agent with the Browser box, or one on
+    a Linux server with an open browser task (the owner can untick the box under it): no other agent's helper has a
+    browser of its own to close, and its poll asks the database nothing more."""
+    if "browser" not in ((agents().get(agent) or {}).get("can") or []) and not (browser_server(agent) and q1(
+            f"SELECT 1 FROM tasks WHERE owner=? AND needs='browser' AND {OPEN_TASK}", (agent,))):
+        return {}
+    held = active_limit(agent) is not None
+    rows = q(f"SELECT id, state, waiting_on, needs FROM tasks WHERE owner=? AND state NOT IN "
+             f"({','.join('?' * len(TERMINAL))}) ORDER BY id", (agent, *TERMINAL))
+    waits = {tref(r["id"]): "limit" if held else "secret" for r in rows
+             if held or (r["state"] == "input-required" and str(r["waiting_on"] or "").startswith("N-"))}
+    browser_places_turn(agent, rows, waits, closed, alive)      # S3: and on Linux, `place` for one that has none
+    return waits
+
+
+def browser_poll_sets(query):
+    """(closed, alive) of a helper's poll (S3): the tasks whose Chrome it closed (`browser_closed`), and its windows
+    (`alive`); None where it did not say."""
+    split = lambda key: None if query.get(key) is None else {x for x in str(query[key]).split(",") if x}     # noqa: E731
+    return split("browser_closed"), split("alive")
+
+
 def active_limit(agent):
     return q1("SELECT * FROM agent_limits WHERE agent=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (agent,))
 
@@ -6197,6 +6744,9 @@ def live_reason(t, state):
     found = secret_wait(tid)            # owner feature secret_requests: the owner's secret, until it reaches the task
     if found:
         return "need", f"N-{found['id']}"
+    found = browser_place_wait(t)       # build plan 04 (D10): its browser waits for a place of its server, as told
+    if found:
+        return "place", f"a browser place on {found}"
     if waits_on_parts(tid):
         return "parts", "its open subtasks"
     if unread_for(t):
@@ -9164,7 +9714,7 @@ def check_task(agent, a, by_goal=False):
         hint = " It has a screen: give it this task with needs screen." if needs == "browser" and \
             "screen" in agents()[owner].get("can", []) else ""
         raise ToolError(f"{owner} has no {needs}.{hint} Agents with a {needs}: {', '.join(able) or 'none'}.")
-    busy = desktop_refusal(owner, needs, agent)
+    busy = desktop_refusal(owner, needs, agent, keep=by_goal)       # S3: create_task's own requester hears later
     if busy:
         raise ToolError(busy)
     if follows and not q1("SELECT 1 FROM tasks WHERE id=?", (follows,)):
@@ -9263,6 +9813,8 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
                                  "generation": generation[0] if generation else None},
                                 **stable_extra(f["owner"], opening),
                                 **closed_extra(f["owner"], f.get("responsibility"))))))
+    if f["needs"] == "browser":
+        browser_admit_rows(tid, f["owner"], t0)     # build plan 04 (D6): its place, before its helper reads it
     memory_shown_rows(f["owner"], tid, 1, t0)
     seen_start_row(tid)
     seen_notes_row(f["owner"], tid, start)
@@ -13678,13 +14230,19 @@ def secret_wakes(t0=None):
                         state = "delivered"
                     elif d and (not d["finished"] or d["ok"] or str(d["request_id"]).startswith(CENTRAL_REQUEST)):
                         state = "waiting"
+                if state != "delivered":        # build plan 04 (D10): no place is held for a secret on its way
+                    DB.execute("DELETE FROM kv WHERE k=?", (BROWSER_WAKE_HELD + str(need_id),))
                 if state == "waiting" or (state == "missing" and spec.get("told")):
                     continue
                 tasks = [t for t in spec.get("tasks") or []
                          if DB.execute(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (t,)).fetchone()]
+                if state == "delivered" and browser_wake_late(tasks):
+                    browser_wake_rows(need_id, tasks, True, t0)     # D10: its browser task on Linux waits for a place
+                    continue
                 if state == "delivered":
                     spec["woken"] = t0
                     words = secret_woken_words(r, spec)
+                    browser_wake_rows(need_id, tasks, False, t0)    # and takes it now, in this transaction
                 else:
                     spec["told"] = t0
                     words = (f"[hub] N-{r['id']}: the owner saved it, and your machine's vault does not have it yet. "
@@ -38320,10 +38878,13 @@ def save_agent_settings(agent, body):
             a[c["field"]] = c["after"]
     if "screen" in (a.get("can") or []) and not a.get("screen_command") and server_kind_of(team, a.get("machine")) == "mac":
         a["screen_command"] = MAC_SCREEN_COMMAND        # a Mac's own screen runtime, also at his own tick
+    if "browser" in (a.get("can") or []) and "browser" not in old["can"] and \
+            browser_box_refusal(team, agent, a.get("machine")):        # build plan 04 (D8), at his tick
+        raise browser_box_refusal(team, agent, a.get("machine"))
     try:
         validate_team(team)
     except ValueError as e:
-        raise Refusal(400, str(e)) from None
+        raise Refusal(400, str(e), extra=getattr(e, "extra", None)) from None
     data = (json.dumps(team, indent=2) + "\n").encode()
     commit = commit_kit_file("team.json", data, f"Owner changed the settings of {agent}")
     apply_team(team)
@@ -38600,7 +39161,12 @@ def runtime_switch(name, team=None):
             missing.append("access_not_equivalent")
     elif not pair and (not full_access(runtime, runtime_policy(a)) or not full_access(to, stored or FULL_ACCESS[to])):
         missing.append("access_not_equivalent")
-    if set(a.get("can") or []) - RUNTIME_CAN[to] - ({"browser"} if pair else set()):     # the runner has browser tasks
+    # A Mac's browser is its runtime's (RUNTIME_CAN), and a pair's runner has browser tasks there; on a Linux server it
+    # is the runtime's terminal session with Google's DevTools MCP server (build plan 04, D4)
+    linux = {"browser"} if linux_agent(name, team or TEAM) and not lifecycle.linux_browser_refusal(
+        dict({k: v for k, v in a.items() if k not in ("start", "allow")}, runtime=to, **switch_policy(a, to))) else set()
+    if set(a.get("can") or []) - RUNTIME_CAN[to] - ({"browser"} if pair and not linux_agent(name, team or TEAM)
+                                                   else set()) - linux:
         missing.append("capability_not_supported")
     elif a.get("role") in ("worker", "lead") and isinstance(a.get("can"), list) and "shell" not in a["can"] and \
             not closed_versions(to):
@@ -40404,6 +40970,7 @@ def tick():
         step(mac_setup_sweep, t0)           # the owner, 31 October 2026: one sitting at a new Mac
         step(server_watch_sweep, t0)        # the owner, 3 November 2026: each server against its own baseline
         step(os_user_sweep, t0)             # the owner, 10 November 2026: one OS user for each agent
+        step(browser_place_sweep, t0)       # the owner, 17 November 2026: a browser for each agent with a shell
         step(mac_desktop_sweep)             # what only hands at a Mac can put right
         step(first_message_sweep, t0)       # the owner, 4 November 2026: a new fleet's manager writes first, once
         step(agent_first_message_sweep, t0)     # the owner, 12 November 2026: and so does each new agent
@@ -42400,15 +42967,16 @@ def move_refusal(team, agent, a, server):
     """Why `agent` (its entry `a`) may not move to `server`, in one sentence, or None (one OS user for each agent). A
     move between kinds is allowed: what decides is what runs on the target. A Mac target takes it only when empty; a
     Linux target beside other agents needs what Add agent there needs (an agent key from the install, a vault for
-    both, nobody that can become it); an agent with a Mac's browser or screen stays on a Mac; and on Linux its own
-    user, fleet-<name> or the one it kept, must be a user name that Linux takes."""
+    both, nobody that can become it); an agent with a Mac's screen stays on a Mac (one with the Browser box gets a browser
+    of its own on a Linux server with a place for it, browser_move_refusal); and on Linux its own user, fleet-<name> or
+    the one it kept, must be a user name that Linux takes."""
     here = [n for n in server_agents(server, team) if n != agent]
     refused = placement_refusal(team, server, agent, here)
     if refused:
         return refused
     if server_kind_of(team, server) != "linux":
         return None
-    if {"browser", "screen"} & set(a.get("can") or []):
+    if "screen" in (a.get("can") or []):        # a browser of its own it has there (build plan 04, S3)
         return (f"{shown_role(agent)} uses a Mac's browser and screen, which a Linux server does not have: turn them "
                 f"off in its settings, or move it to an empty Mac.")
     if not AGENT_OS_USER.fullmatch(a.get("user") or f"fleet-{agent}"):
@@ -42419,6 +42987,26 @@ def move_refusal(team, agent, a, server):
     if here and not_shareable(team, here):
         return (f"{', '.join(shown_role(n) for n in not_shareable(team, here))} on {server} cannot share it yet: an "
                 f"agent beside another needs its own agent key and a vault that serves both.")
+    return None
+
+
+def browser_move_refusal(team, agent, server):
+    """Why `agent`, which has the Browser box, may not move to `server`, or None (build plan 04, S3): a Linux server
+    whose reading runs no browser (browser_box_refusal, D8), or one that has no place for its browser with it counted
+    there (D6: an agent that moves counts on its target), and before both its Shell box (D2, validate_team's rule,
+    whose sentence is the true reason). A wait for a place that is busy now is no reason: that place ends."""
+    if server_kind_of(team, server) != "linux":
+        return None
+    a = team["agents"][agent]
+    if a.get("role") in ("worker", "lead") and "shell" not in (a.get("can") or []):     # D2 first: its true reason
+        return Refusal(400, code="browser_shell_off", names={"agent": shown_role(agent)})
+    refused = browser_box_refusal(team, agent, server)
+    if refused:
+        return refused
+    moved = json.loads(json.dumps(team))
+    moved["agents"][agent]["machine"] = server
+    if not browser_places(server, moved):
+        return Refusal(409, code="browser_no_room", names={"server": server, "agent": shown_role(agent)})
     return None
 
 
@@ -42850,14 +43438,14 @@ def os_user_sweep(t0):
         kv_set(INSTALL_TOLD + str(job["id"]), "1")
 
 
-def validate_team(team, kept=None, shared_ok=None):
+def validate_team(team, kept=None, shared_ok=None, browser_ok=None):
     """A team.json that the hub can run: one manager, known runtimes, an IP address for every machine. kept: the MCP
     servers that it may carry on as they are without the check of today's rules (None: those of the running team), so
     that a rule which came later never refuses the owner's other changes. No session gets such a server
     (lifecycle.tool_catalog leaves it out and the start text says its rule), and team_problem passes {}, so the board
     says the rule until the owner changes or removes it.
     shared_ok: the breaches of one OS user for each agent that may stay (os_user_rule), by default those of the
-    reference team."""
+    reference team; browser_ok the same for a Browser box on Linux with the Shell box off (browser_rule)."""
     import ipaddress
     if not isinstance(team, dict) or not isinstance(team.get("agents"), dict) or not team["agents"]:
         raise ValueError("team.json needs agents")
@@ -43129,6 +43717,9 @@ def validate_team(team, kept=None, shared_ok=None):
     # hub that is the team it runs; outside one (fleet.py verify, hubsetup.py, an installer) the file itself.
     os_user_rule(team, shared_ok if shared_ok is not None else
                  os_user_breaches(TEAM if (TEAM.get("agents") or {}) else team))
+    # build plan 04 (D2): no browser on a Linux server for an agent whose Shell box is off, by the same rule
+    browser_rule(team, browser_ok if browser_ok is not None else
+                 browser_breaches(TEAM if (TEAM.get("agents") or {}) else team))
     placed = {}             # owner API 1.12: agents may share a machine, which has one name for its address
     for name, a in team["agents"].items():
         other = placed.setdefault(addresses[a["machine"]], a["machine"])
@@ -43211,7 +43802,8 @@ def team_problem(team):
         # Two agents of one OS user break no rule of the file: the hub reports that state itself (os_user_faults), and
         # a fleet from before the rule must still start, verify and take its releases.
         # Every MCP server by today's rules, also one that a write carried on (kept={}).
-        validate_team(team, kept={}, shared_ok=os_user_breaches(team) if team_shaped(team) else None)
+        validate_team(team, kept={}, shared_ok=os_user_breaches(team) if team_shaped(team) else None,
+                      browser_ok=browser_breaches(team))
     except Exception as e:
         reason = e if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
         return f"team.json does not validate: {reason}"
@@ -43299,7 +43891,7 @@ def reload_team(revision):
     try:
         new = validate_team(json.loads(text))
     except (ValueError, TypeError) as e:
-        raise Refusal(422, f"team.json at that revision is not valid: {e}")
+        raise Refusal(422, f"team.json at that revision is not valid: {e}", extra=getattr(e, "extra", None))
     groups = {}                     # owner API 1.12: agents share a machine only when all of them can prove who they are
     for name, a in new["agents"].items():
         groups.setdefault(new["addresses"][a["machine"]], []).append(name)
@@ -44709,6 +45301,11 @@ WATCH_WORDS = {                 # what stopped holding, and what holds again
     "memory": ("{share}% of its memory is in use ({used} of {total} GB)", "its memory in use is under 85%"),
     "macos_update": ("a macOS update has waited 14 days: macOS has not installed it, and only the owner can, by Screen "
                      "Sharing with the Mac user's password", "its macOS update is installed"),
+    "egress": ("its outgoing gate does not answer, so its agents reach the hub and nothing else (`journalctl -u "
+               "fleet-egress` there says why)", "its agents' connections go out again"),
+    "egress_table": ("its outgoing gate's table is not loaded, so its agents connect with no record (`journalctl -u "
+                     "fleet-egress-rules` there says why)",
+                     "its outgoing gate has its table again, or the gate is off"),
 }
 # Percent of a server's disk or memory (lifecycle.machine_load): it needs care from the first, and holds again under the
 # second, so a figure that moves about 90 is said once (the owner, 4 November 2026: the manager must "see if there are
@@ -44737,6 +45334,22 @@ def watch_words(key, load, ended=False):
         used, total = load[f"{key}_used"], load[f"{key}_total"]
         words = words.format(share=round(used * 100 / total), used=gb(used), total=gb(total))
     return words
+
+
+def egress_troubles(server, t0, told=()):
+    """The server's facts of its outgoing gate, as WATCH_WORDS keys, from its own service's posts, each after two posts
+    in a row (one is a restart, or a load that runs): "egress_table" while a gate that answers has no table in the
+    kernel (its agents then connect with no record), and it holds while the gate does not answer; and "egress" while
+    the gate does not answer and its table is there, so that the server's agents reach the hub and nothing else
+    (VAULT.md, "The outgoing gate"). Only a post ends a fact: a server whose service posts nothing for SERVER_QUIET
+    while it reads keeps what was said, and one that said that it has no gate (`--egress off`) has no row, so
+    neither."""
+    row = q1("SELECT down, unloaded, reported FROM egress_servers WHERE server=?", (server,))
+    if row is None:
+        return set()
+    if row["reported"] <= t0 - SERVER_QUIET:
+        return set(told) & {"egress", "egress_table"}
+    return {"egress_table"} if row["unloaded"] >= 2 else {"egress"} if row["down"] >= 2 else set()
 
 
 def server_troubles(reading, joined, restart_since, t0):
@@ -44906,6 +45519,7 @@ def server_watch_sweep(t0):
             since = (since or t0) if sec.get("reboot_required") else None
             now_found = set(server_troubles(reading, joined[name], since, t0) + load_troubles(load, told))
             now_found |= left_out(sec, told, READING_FACTS)     # what this reading cannot say holds
+            now_found |= egress_troubles(name, t0, told)
         if own and kind == "linux":     # its SSH and npm by the hub's own read, never by a reading of its service
             now_found = (now_found - set(MENDED_BY_MAC)) | hub_hardening_troubles(hub_read, claimed, told, t0)
         new, ended = sorted(now_found - told), sorted(told - now_found)
@@ -44959,6 +45573,209 @@ def not_shareable(team, here):
 def installing(job, agent):
     """This server's newest job installs this agent now: the job gives it its key (install_key)."""
     return bool(job and job["state"] in JOB_OPEN and job["kind"] == "install" and job["agent"] == agent)
+
+
+# ---------------------------------------------------------------- the outgoing gate's records
+#
+# Step 1 of agent-outgoing-connections-proposal.md (the owner's "Yes, all nine" of 17 November 2026). On a Linux server
+# with the gate (vault.py, "the outgoing gate"), the server's own service takes the gate's counts with each of its
+# readings and posts them here (POST /server/<name>/egress), each row named by its agent, which only that service can
+# say: the gate counts by OS user, and the service user's key is one that no agent user reads. The hub keeps one row
+# for each agent, registrable domain (the Public Suffix List, psl/), port, verdict and kind of address, with the DNS
+# questions, the connections, the bytes in each direction, the first and the last time, the number of different full
+# names under the domain and the length of its longest label, and those names up to EGRESS_NAMES_MOST. So the rows grow
+# with the domains, not with the traffic, and many names with long labels under one domain show data that a program
+# put into names. The owner reads them with GET /ui/hosts (his MCP server's fleet_read): nothing of it is on his screen
+# (his decision 8). The hub never decides access by a record, and in this step its policy is "records" for each gate.
+
+EGRESS_POLICY = {"version": 1, "mode": "records"}
+EGRESS_ROWS_MOST = 2000         # rows of one post of a server
+EGRESS_NAMES_MOST = 1000        # full names under one domain and agent; past it, `over` counts the rest
+EGRESS_PAGE = 200               # rows of each agent on GET /ui/hosts when no agent is named
+EGRESS_ONE_AGENT = 5000         # rows of the one agent that GET /ui/hosts?agent=<name> names
+EGRESS_AGENT_ROWS = 20000       # rows that the hub keeps for one agent; past it a new one counts as EGRESS_MORE: the
+                                # rows that the hub has stay, so an agent cannot push its own record out with new names
+EGRESS_AGENT_NAMES = 50000      # full names that the hub keeps for one agent; past it no new one, and `over` says so
+EGRESS_VERDICTS = ("pass", "busy")      # step 1 refuses no host: busy is an agent past its own limit of connections
+EGRESS_CLASSES = ("", "public", "local", "metadata", "link-local", "fleet", "private", "reserved")
+EGRESS_HELD = "(a name that holds the value of a login)"       # a name that secret_hit finds is kept as this
+EGRESS_MORE = "(more hosts)"    # the gate's one row of a batch past its limits for an agent (vault.EGRESS_MORE)
+PSL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "psl", "public_suffix_list.dat")
+
+
+@functools.lru_cache(maxsize=1)
+def public_suffixes():
+    """(rules, wildcards, exceptions) of the Public Suffix List, each in its ASCII form. Both of its sections count:
+    a name that a provider gives its users (github.io) is a registrable domain of each user."""
+    rules, wild, exceptions = set(), set(), set()
+    try:
+        with open(PSL_FILE, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        rule = line.strip().lower()
+        if not rule or rule.startswith("//"):
+            continue
+        kind = exceptions if rule.startswith("!") else wild if rule.startswith("*.") else rules
+        rule = rule[1:] if rule.startswith("!") else rule[2:] if rule.startswith("*.") else rule
+        try:
+            rule = ".".join(label.encode("idna").decode("ascii") if not label.isascii() else label
+                            for label in rule.split("."))
+        except UnicodeError:
+            continue
+        kind.add(rule)
+    return frozenset(rules), frozenset(wild), frozenset(exceptions)
+
+
+def registrable_domain(host):
+    """The registrable domain of a host's name by the Public Suffix List's own rule: the public suffix with one more
+    label; the name itself when it is a public suffix; an address as it is."""
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+        return host
+    except ValueError:
+        pass
+    rules, wild, exceptions = public_suffixes()
+    labels = host.lower().rstrip(".").split(".")
+    for i in range(len(labels)):
+        here = ".".join(labels[i:])
+        if here in exceptions:
+            return here
+        if here in rules or (i + 1 < len(labels) and ".".join(labels[i + 1:]) in wild):
+            return ".".join(labels[i - 1:]) if i > 0 else host
+    return ".".join(labels[-2:])
+
+
+def egress_row(r, agents_here):
+    """One row of a server's post, checked, or None."""
+    if not isinstance(r, dict) or r.get("agent") not in agents_here:
+        return None
+    host, port, verdict, cls = r.get("host"), r.get("port"), r.get("verdict"), r.get("cls", "")
+    numbers = [r.get(k, 0) for k in ("dns", "conns", "up", "down")]
+    times = [r.get(k) for k in ("first", "last")]
+    # a name as the gate read it: its case kept, and each byte of a label that is no letter, digit, - or _ as DNS's
+    # own escape \DDD, so a name that carries data in its labels is kept and shown as it went out
+    if not isinstance(host, str) or not 0 < len(host) <= 1024 or \
+            (host != EGRESS_MORE and not re.fullmatch(r"[A-Za-z0-9_.:\[\]\\-]+", host)):
+        return None
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port < 65536 or verdict not in \
+            EGRESS_VERDICTS or cls not in EGRESS_CLASSES:
+        return None
+    if not all(isinstance(n, int) and not isinstance(n, bool) and 0 <= n < 2 ** 62 for n in numbers) or \
+            not all(isinstance(t, (int, float)) and not isinstance(t, bool) for t in times):
+        return None
+    # the check of a login's value is exact, so it reads the name as it went out, and with its \DDD escapes undone
+    # too (a value with '/', '+' or '=' in a label comes escaped); the hub keeps it in lower case
+    plain = re.sub(r"\\([0-9]{3})", lambda m: chr(int(m.group(1)) % 256), host)
+    host = host.lower() if not secret_hit(host, plain) else EGRESS_HELD   # before the transaction: secret_hit reads
+    return dict(agent=r["agent"], host=host, port=port, verdict=verdict, cls=cls,
+                **dict(zip(("dns", "conns", "up", "down"), numbers)), first=float(times[0]), last=float(times[1]))
+
+
+def egress_keep(server, gate, rows, other_users, table=False, counted=True):
+    """A server's post into the records, inside one transaction (DB.execute only: q and q1 commit at once). Its gate's
+    state, and each row under its registrable domain. A name that holds a login's value came as EGRESS_HELD
+    (egress_row): the record says that such a name left, and the hub keeps no copy of the value. table: root's word
+    on the table, which the service posts when the gate does not answer; counted: the first part of a report, the one
+    that moves the counts of the server watch."""
+    in_transaction("egress_keep")
+    # For the server watch (egress_troubles): `down`, the reports in a row whose gate did not answer, and `unloaded`,
+    # the reports in a row with no table in the kernel, by the gate's word or, when it does not answer, by root's
+    # (a service from before that word leaves `unloaded` as it was). Each report counts once, by its first part.
+    was = DB.execute("SELECT down, unloaded FROM egress_servers WHERE server=?", (server,)).fetchone()
+    down, unloaded = (was[0], was[1]) if was else (0, 0)
+    if counted:
+        loaded = gate.get("table") if gate is not None else table
+        down = down + 1 if gate is None else 0
+        if gate is not None or table is not False:
+            unloaded = unloaded + 1 if loaded is None else 0
+    DB.execute("INSERT INTO egress_servers(server,gate,other_users,reported,down,unloaded) VALUES(?,?,?,?,?,?) "
+               "ON CONFLICT(server) DO UPDATE SET gate=excluded.gate, other_users=excluded.other_users, "
+               "reported=excluded.reported, down=excluded.down, unloaded=excluded.unloaded",
+               (server, json.dumps(gate) if gate is not None else None, other_users, now(), down, unloaded))
+    counts, names, totals = {}, {}, {}     # counted once in each post, then kept here (the fourth review round)
+    for r in rows:
+        name = r["host"]
+        domain = registrable_domain(name) if name not in (EGRESS_HELD, EGRESS_MORE) else name
+        if r["agent"] not in counts:
+            counts[r["agent"]] = DB.execute("SELECT COUNT(*) FROM egress_hosts WHERE agent=?",
+                                            (r["agent"],)).fetchone()[0]
+        if counts[r["agent"]] >= EGRESS_AGENT_ROWS and not DB.execute(
+                "SELECT 1 FROM egress_hosts WHERE agent=? AND domain=? AND port=? AND verdict=? AND cls=?",
+                (r["agent"], domain, r["port"], r["verdict"], r["cls"])).fetchone():
+            name = domain = EGRESS_MORE                 # one row of the rest, so the hub's rows stay bounded
+            r = dict(r, port=0)
+        elif not DB.execute("SELECT 1 FROM egress_hosts WHERE agent=? AND domain=? AND port=? AND verdict=? AND "
+                            "cls=?", (r["agent"], domain, r["port"], r["verdict"], r["cls"])).fetchone():
+            counts[r["agent"]] += 1
+        longest = max((len(label) for label in name.split(".")), default=0) if name not in (EGRESS_HELD,
+                                                                                           EGRESS_MORE) else 0
+        DB.execute("INSERT INTO egress_hosts(agent,domain,port,verdict,cls,dns,conns,up,down,first,last,longest,server) "
+                   "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,domain,port,verdict,cls) DO UPDATE SET "
+                   "dns=dns+excluded.dns, conns=conns+excluded.conns, up=up+excluded.up, down=down+excluded.down, "
+                   "first=MIN(first,excluded.first), last=MAX(last,excluded.last), "
+                   "longest=MAX(longest,excluded.longest), server=excluded.server",
+                   (r["agent"], domain, r["port"], r["verdict"], r["cls"], r["dns"], r["conns"], r["up"], r["down"],
+                    r["first"], r["last"], longest, server))
+        if name == domain or DB.execute("SELECT 1 FROM egress_names WHERE agent=? AND domain=? AND name=?",
+                                        (r["agent"], domain, name)).fetchone():
+            continue
+        if (r["agent"], domain) not in names:
+            names[r["agent"], domain] = DB.execute("SELECT COUNT(*) FROM egress_names WHERE agent=? AND domain=?",
+                                                   (r["agent"], domain)).fetchone()[0]
+        if r["agent"] not in totals:
+            totals[r["agent"]] = DB.execute("SELECT COUNT(*) FROM egress_names WHERE agent=?",
+                                            (r["agent"],)).fetchone()[0]
+        if names[r["agent"], domain] < EGRESS_NAMES_MOST and totals[r["agent"]] < EGRESS_AGENT_NAMES:
+            DB.execute("INSERT INTO egress_names(agent,domain,name) VALUES(?,?,?)", (r["agent"], domain, name))
+            names[r["agent"], domain] += 1
+            totals[r["agent"]] += 1
+        else:                           # a flag: the hub keeps no more names of this domain, and more came
+            DB.execute("UPDATE egress_hosts SET over=1 WHERE agent=? AND domain=?", (r["agent"], domain))
+
+
+EGRESS_COLUMNS = ("domain", "port", "verdict", "cls", "dns", "conns", "up", "down", "first", "last", "longest",
+                  "server")
+
+
+def hosts_view(agent=None):
+    """GET /ui/hosts: each server's gate as its service last read it, and each agent's rows, the newest first. With an
+    agent: that agent's rows only, each with its full names. `names` is counted here, from the kept names of the
+    row's agent and domain, and `over` says that more names came than the hub keeps."""
+    servers = [{"server": r["server"], "gate": json.loads(r["gate"]) if r["gate"] else None,
+                "other_users": r["other_users"], "reported": r["reported"]}
+               for r in q("SELECT server,gate,other_users,reported FROM egress_servers ORDER BY server")]
+    names = [agent] if agent else [r["agent"] for r in q("SELECT DISTINCT agent FROM egress_hosts ORDER BY agent")]
+    out = []
+    for name in names:
+        most = EGRESS_ONE_AGENT if agent else EGRESS_PAGE
+        rows = [dict(r) for r in q("SELECT * FROM egress_hosts WHERE agent=? ORDER BY last DESC, domain LIMIT ?",
+                                   (name, most))]
+        total = q1("SELECT COUNT(*) AS n FROM egress_hosts WHERE agent=?", (name,))["n"]
+        counted = {r["domain"]: r["n"] for r in q("SELECT domain, COUNT(*) AS n FROM egress_names WHERE agent=? "
+                                                  "GROUP BY domain", (name,))}
+        over = {r["domain"] for r in q("SELECT DISTINCT domain FROM egress_hosts WHERE agent=? AND over=1",
+                                       (name,))}
+        full = {}
+        if agent:                               # the names of the rows shown, in parts: q holds the lock each time
+            shown = sorted({r["domain"] for r in rows})
+            for start in range(0, len(shown), 500):
+                part = shown[start:start + 500]
+                for r in q(f"SELECT domain, name FROM egress_names WHERE agent=? AND domain IN "
+                           f"({','.join('?' * len(part))}) ORDER BY domain, name", (name, *part)):
+                    full.setdefault(r["domain"], []).append(r["name"])
+        hosts = []
+        for r in rows:
+            row = {k: r[k] for k in EGRESS_COLUMNS}
+            row.update(names=counted.get(r["domain"], 0), over=1 if r["domain"] in over else 0)
+            if agent:
+                row["full_names"] = full.get(r["domain"], [])
+            hosts.append(row)
+        shown, _, at = name.partition(":deleted:")     # a deleted agent's records, once its name went free
+        out.append(dict({"agent": shown, "hosts": hosts, "more": max(0, total - len(rows))},
+                        **({"deleted": float(at)} if at else {})))
+    return {"servers": servers, "agents": out, "policy": EGRESS_POLICY}
 
 
 def servers_view():
@@ -45701,8 +46518,8 @@ def set_shape(body):
     team["shape"] = {"step": step}
     try:
         validate_team(team)
-    except ValueError as e:
-        raise Refusal(400, str(e)) from None
+    except ValueError as e:         # a coded refusal keeps its code (build plan 04, S3)
+        raise Refusal(400, str(e), extra=getattr(e, "extra", None)) from None
     data = (json.dumps(team, indent=2) + "\n").encode()
     commit, digest = rev, hashlib.sha256(data).hexdigest()
     if digest != current:
@@ -46134,10 +46951,13 @@ AGENT_COLUMNS = (
     # holds the agent's key and not its name (history_key), so a rename leaves the index as it is.
     ("history", "agent"), ("history", "person"),
     ("model_changes", "agent"), ("model_changes", "by"),       # AUTONOMY.md P8: whose model, and its one changer
-    ("questions", "answered_by"))           # the agent that answered, or 'owner'
+    ("questions", "answered_by"),           # the agent that answered, or 'owner'
+    ("egress_hosts", "agent"), ("egress_names", "agent"))      # the outgoing gate's records of the agent's hosts
 # The tables with one row for each agent. A row under the new name is what an agent of that name left before it
 # was removed by hand, so it goes first, and the renamed agent's own row takes the name.
-AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent"}
+AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent",
+              # the outgoing gate's records: rows under the new name are an earlier agent's of that name, and they go
+              "egress_hosts": "agent", "egress_names": "agent"}
 # The hub's own notes about one agent in kv, each kept under a prefix and the agent's name. test_rename reads every
 # kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
 AGENT_KV = ("tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
@@ -46148,7 +46968,8 @@ AGENT_KV = ("tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "
             # the pairs of its lessons that its work wrote close (MEMORY_CLOSE_KEY), a lead's task for its team's
             # results (lead_batch_rows) and the machine that it left in its newest move (MOVED): the review of 17
             # November 2026 found them where test_rename's scan of the kv keys did not look
-            "memory_close:", "lead_batch:", "moved_from:")
+            "memory_close:", "lead_batch:", "moved_from:",
+            "browser_closed_told:")     # build plan 04, S3: BROWSER_CLOSED_TOLD
 # The same, with more after the name: `<prefix><agent>:<window, task or item>`.
 AGENT_KV_SCOPED = ("listed:", "untaken:", "chased:")
 # Keys that hold two agents' names, in their sorted order: `<prefix><one>:<two>` (agent_limit's talk guard).
@@ -46329,9 +47150,10 @@ def rename_agent(agent, body):
         raise Refusal(409, f"A profile for {new} is in the fleet already. Choose another name.")
     renamed = renamed_team(team, agent, new)
     try:
-        validate_team(renamed, shared_ok=renamed_breaches(agent, new))     # what it shared, it shares under its new name
+        validate_team(renamed, shared_ok=renamed_breaches(agent, new),     # what it shared, it shares under its new name
+                      browser_ok={(kind, new if n == agent else n) for kind, n in browser_breaches(TEAM)})
     except ValueError as e:
-        raise Refusal(400, str(e)) from None
+        raise Refusal(400, str(e), extra=getattr(e, "extra", None)) from None
     data = (json.dumps(renamed, indent=2) + "\n").encode()
     more = None if profile is None else {f"profiles/{agent}.md": None,
                                          f"profiles/{new}.md": renamed_profile(profile, agent, new)}
@@ -46423,6 +47245,8 @@ def move_agent(agent, body, by="owner"):
         raise Refusal(409, "No agent runs on the hub's server.")
     elif move_refusal(team, agent, a, server):           # one OS user for each agent
         raise Refusal(409, move_refusal(team, agent, a, server))
+    elif "browser" in (a.get("can") or []) and browser_move_refusal(team, agent, server):     # build plan 04, S3
+        raise browser_move_refusal(team, agent, server)
     elif [n for n in fix_holders(team, server) if n != agent]:
         raise Refusal(409, f"{', '.join(n for n in fix_holders(team, server) if n != agent)} holds Fix on {server}: "
                            f"an agent goes to a server where no other agent has root.")
@@ -46456,8 +47280,8 @@ def move_agent(agent, body, by="owner"):
                 a.update(policy, runtime=runtime, **({"runtime_policies": stored} if stored else {}))
         try:
             validate_team(team)
-        except ValueError as e:
-            raise Refusal(400, str(e)) from None
+        except ValueError as e:         # a coded refusal keeps its code (build plan 04, D2)
+            raise Refusal(400, str(e), extra=getattr(e, "extra", None)) from None
         data = (json.dumps(team, indent=2) + "\n").encode()
         actor = "Owner" if by == "owner" else shown_name(by)
         commit = commit_kit_file("team.json", data, f"Owner gave agent {agent} its server {server}, with {runtime}"
@@ -46571,6 +47395,7 @@ AGENT_REMOVAL = {
     ("session_tokens", "agent"): "spent", ("model_changes", "agent"): "spent", ("triggers", "agent"): "spent",
     ("calls", "agent"): "spent", ("server_jobs", "agent"): "spent", ("attachments", "agent"): "spent",
     ("jobs", "agent"): "spent", ("tool_commands", "agent"): "spent",
+    ("egress_hosts", "agent"): "spent", ("egress_names", "agent"): "spent",     # the outgoing gate's records
     ("tasks", "owner"): "history", ("tasks", "requester"): "history", ("agent_messages", "sender"): "history",
     ("agent_messages", "recipient"): "history", ("history", "agent"): "history", ("conversations", "agent"): "history",
     ("needs", "by"): "history", ("reports", "from_agent"): "history", ("reports", "to_agent"): "history",
@@ -46735,8 +47560,9 @@ def free_name(agent):
     """Inside a transaction: a removed agent's row goes once nothing is left of it on a server and no history names it,
     and with it the name is free for a new agent (add_server_agent). Its records that a reader takes by its name (the
     "spent" columns of AGENT_REMOVAL) stay, under one name that no agent can have (spent_name), which keeps the time
-    of the delete: its sessions, model changes, deleted wake-up rules, calls, server jobs, files, jobs and receipts. A
-    server can report the removal done days after the delete, when the owner gave it again."""
+    of the delete: its sessions, model changes, deleted wake-up rules, calls, server jobs, files, jobs, receipts and
+    the hosts that the outgoing gate recorded. A server can report the removal done days after the delete, when the
+    owner gave it again."""
     in_transaction("free_name")
     if agent not in agents() and not has_history(agent):
         gone = spent_name(agent, deleted_at(agent) or now())
@@ -46971,9 +47797,9 @@ def agent_first_message_sweep(t0):
 MACHINE_COLUMNS = (("server_keys", "server"), ("server_status", "server"), ("server_jobs", "server"),
                    ("deposits", "machine"), ("withdrawals", "machine"), ("placements", "machine"),
                    ("place_codes", "machine"), ("place_hosts", "machine"), ("mac_setups", "server"),
-                   ("first_stores", "machine"))
+                   ("first_stores", "machine"), ("egress_servers", "server"), ("egress_hosts", "server"))
 MACHINE_ROWS = (("server_status", "server"), ("place_hosts", "machine"),    # a key of their own: an old row goes
-                ("first_stores", "machine"))
+                ("first_stores", "machine"), ("egress_servers", "server"))
 MACHINE_MAPS = ("addresses", "servers", "access", "vault_stores")      # the team.json maps keyed by a machine
 
 
@@ -47006,6 +47832,7 @@ def rename_machine_rows(old, new):
         DB.execute("DELETE FROM kv WHERE k=?", (prefix + new,))
         DB.execute("UPDATE kv SET k=? WHERE k=?", (prefix + new, prefix + old))
     DB.execute("UPDATE needs SET key_swap_server=? WHERE key_swap_server=?", (new, old))
+    browser_rename_rows(old, new)       # build plan 04 (S3): its browser places, its room's counts, its requesters
     DB.execute("DELETE FROM kv WHERE k='machine_rename'")
     os_user_keep([dict(g, machine=new) if g.get("machine") == old else g for g in os_user_kept()])
 
@@ -51379,7 +52206,8 @@ def restored_team(bundle, reset=None):
         # says it on the board, and no session gets such a server)
         # The owner's own copy, from before a rule perhaps: two agents of one OS user in it restore, and the hub holds
         # their work until they run in users of their own (os_user_held).
-        validate_team(team, kept=team.get("mcp"), shared_ok=os_user_breaches(team) if team_shaped(team) else None)
+        validate_team(team, kept=team.get("mcp"), shared_ok=os_user_breaches(team) if team_shaped(team) else None,
+                      browser_ok=browser_breaches(team))
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise Refusal(422, f"this copy and this server do not make a team.json the hub can run: {e}") from None
     return json.dumps(team, indent=2).encode() + b"\n"
@@ -57436,7 +58264,55 @@ class Handler(BaseHTTPRequestHandler):
         with area("state" if not old or said(json.loads(old["data"])) != said(reading) else "activity"):
             q("INSERT INTO server_status(server,data,reported) VALUES(?,?,?) ON CONFLICT(server) DO UPDATE SET "
               "data=excluded.data, reported=excluded.reported", (name, json.dumps(reading), now()))
+        browser_room_seen(name, reading, now())         # build plan 04 (D6): a real shortage takes a place
         return self.json(200, {"ok": True, "desired_revision": kit_revision(), "server": name})
+
+    def server_egress(self, name):
+        """POST /server/<name>/egress (owner feature hosts): the outgoing gate's counts, which the server's own service
+        took from the gate with its reading, each row named by an agent of that server, and the gate's state. The
+        answer is the gate's policy, which the service gives the gate: "records" for every gate in this step."""
+        name = self.server_caller(name)
+        if name is None:
+            return
+        if len(self.body()) > 4 * 1024 * 1024:
+            return self.json(413, {"error": "the gate's counts are too large: post at most 2,000 rows at a time"})
+        data = self.form()
+        rows, gate = data.get("rows"), data.get("gate")
+        other = data.get("other_users", 0)
+        if data.get("installed") is False:      # the server has no gate (`--egress off`): its gate's state goes
+            with LOCK, area("activity"), transaction():
+                DB.execute("DELETE FROM egress_servers WHERE server=?", (name,))
+            return self.json(200, {"ok": True, "kept": 0, "policy": EGRESS_POLICY})
+        if not isinstance(rows, list) or len(rows) > EGRESS_ROWS_MOST or \
+                (gate is not None and not isinstance(gate, dict)) or isinstance(other, bool) or \
+                not isinstance(other, int) or not 0 <= other < 2 ** 31:
+            return self.json(400, {"error": f"rows is a list of at most {EGRESS_ROWS_MOST} rows, and gate an object"})
+        if gate is not None and len(json.dumps(gate)) > 4096:
+            return self.json(400, {"error": "gate is the gate's short state"})
+        # root's word on the table, which the service posts when the gate does not answer (False: a service from
+        # before that word), and the number of this part of the report
+        table, part = data.get("table", False), data.get("part", 0)
+        if (table is not False and table is not None and (isinstance(table, bool) or not isinstance(table, int))) or \
+                isinstance(part, bool) or not isinstance(part, int) or part < 0:
+            return self.json(400, {"error": "table is root's version of the table or null, and part a number"})
+        with LOCK:
+            here = {a for a, entry in agents().items() if entry.get("machine") == name}
+            kept = [r for r in (egress_row(r, here) for r in rows) if r is not None]
+            with area("activity"), transaction():
+                egress_keep(name, gate, kept, other + len(rows) - len(kept), table, part == 0)
+        return self.json(200, {"ok": True, "kept": len(kept), "policy": EGRESS_POLICY})
+
+    def ui_hosts(self, query):
+        """GET /ui/hosts (owner feature hosts): where each agent's connections went, on each server with the outgoing
+        gate, as the gate recorded them (hosts_view). ?agent=<name> gives that agent's rows with their full names."""
+        if not self.ui_allowed():
+            return
+        if query.get("db") != kv_get("db_id"):
+            return self.json(409, refusal_words.answer("hub_changed"))
+        agent = query.get("agent")
+        if agent is not None and not AGENT_NAME.match(str(agent)):
+            return self.json(400, {"error": "agent is an agent's name"})
+        return self.json(200, scrub(hosts_view(agent)), {"Cache-Control": "no-store"})     # q takes the lock
 
     def server_setup(self, name):
         """POST /server/<name>/setup: the installer's last press on a new Mac. `boot` is this boot of the Mac, and
@@ -61008,6 +61884,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_goal(int(parts[2]), query)
         if parts == ["ui", "resources"]:
             return self.ui_resources(query)
+        if parts == ["ui", "hosts"]:                # owner feature hosts
+            return self.ui_hosts(query)
         if parts == ["ui", "github", "repos"]:      # owner feature repo_picker
             return self.ui_github_repos(query)
         if len(parts) == 3 and parts[:2] == ["ui", "notes"] and AGENT_NAME.match(parts[2]):
@@ -61391,6 +62269,10 @@ class Handler(BaseHTTPRequestHandler):
                 # plan C5: a conversation window closes when its conversation is not open any more
                 "conversations": [r["id"] for r in q("SELECT id FROM conversations WHERE agent=? AND state='open'",
                                                      (agent,))] if worker else None,
+                # build plan 04 (D10): the open tasks of this agent that wait for the owner (a secret) or for the
+                # end of a usage limit; on Linux its helper closes a browser task's Chrome for such a wait, and starts
+                # it again with its pages at the wait's end (fleet.Helper.browser_waits)
+                "waits": browser_waits(agent, *browser_poll_sets(query)) if worker else None,
                 # 4 November 2026: each task works in its own clones, which the helper deletes once the task is no
                 # longer open (fleet.Helper.sweep_places)
                 "open_tasks": [tref(r["id"]) for r in q(f"SELECT id FROM tasks WHERE owner=? AND state NOT IN "
@@ -61724,6 +62606,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.server_setup(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "status":
             return self.server_status(parts[1])
+        if len(parts) == 3 and parts[0] == "server" and parts[2] == "egress":     # owner feature hosts
+            return self.server_egress(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "signin":       # owner feature agent_signin
             return self.server_signin(parts[1])
         if len(parts) == 4 and parts[0] == "server" and parts[2] == "jobs" and re.fullmatch(r"[1-9][0-9]{0,17}", parts[3]):

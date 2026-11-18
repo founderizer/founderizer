@@ -150,7 +150,7 @@ Read `knowledge/services.md` first, with `read_knowledge`. If the service is lis
 
 Say in your result which route you used. A long command may run in the background: the hub counts it as work, and its end brings you back.
 
-If your browser tools say that the browser extension is not connected, stop. Do not use another route, and do not repeat your last action. Ask your requester with `ask_my_requester`, and give your attempt number (`$FLEET_ATTEMPT`).
+If your browser tools say that the browser extension is not connected, stop. Do not use another route, and do not repeat your last action. Ask your requester with `ask_my_requester`, and give your attempt number (`$FLEET_ATTEMPT`). On a Linux server your browser is a Chrome of your own: when the hub says that it is closed until a place is free, wait for the hub's line that it runs again; when its tools fail with no such line, stop in the same way.
 
 `$FLEET_HUB`, `$FLEET_AGENT`, `$FLEET_TASK`, `$FLEET_ATTEMPT` and `$FLEET_GENERATION` are set in your session.
 

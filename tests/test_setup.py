@@ -512,6 +512,16 @@ class Helper(unittest.TestCase):
         linux = self.items(self.life(platform="linux"))
         self.assertFalse([k for k in linux if k[0] == "mac"])
         self.assertEqual((linux[("capability", "browser")][0], linux[("capability", "web")][0]), ("failed", "not_verified"))
+        # build plan 04 (S3): on a Linux server the item reads the browser parts, the agent's port and its live proof
+        conf = {"role": "worker", "runtime": "claude", "can": ["shell", "browser"]}
+        with patch.object(lifecycle, "browser_reading", lambda *a, **k: {"state": "ready", "chrome": "158.0"}), \
+                patch.object(lifecycle, "browser_port", lambda user=None: 9301), \
+                patch.object(lifecycle, "browser_proof_holds", lambda user, **k: True):
+            self.assertEqual(self.items(self.life(platform="linux", conf=conf))[("capability", "browser")],
+                             ("ok", "This agent's own Chrome is ready on this server."))
+            with patch.object(lifecycle, "browser_proof_holds", lambda user, **k: False):
+                self.assertEqual(self.items(self.life(platform="linux", conf=conf))[("capability", "browser")][0],
+                                 "failed")
 
     def test_a_browser_on_claude_needs_its_extension_on_in_chrome(self):
         def browser(life):

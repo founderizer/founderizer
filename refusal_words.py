@@ -103,6 +103,14 @@ WORDS = {
     # a server whose name in Tailscale is the door's name in the central vault (UI-API.md 1.188)
     "server_name_kept": "This server is called {name} in Tailscale, and Fleet keeps that name for itself. Rename this "
                         "server in Tailscale, then run the line again.",
+    # an agent's browser on a Linux server (build plan 04, S3; UI-API.md 1.218): its Shell box (D2), a server that runs
+    # none (D8), and a server with no room for it (D6)
+    "browser_shell_off": "{agent} cannot have a browser on a Linux server while its Shell box is off: turn its Shell "
+                         "box on, or its Browser box off",
+    "browser_server": "{server} runs no browser for an agent: in this version only a Linux server with x86 Ubuntu "
+                      "24.04 or 26.04 that is not the hub's own server runs one",
+    "browser_no_room": "{server} has no room for the browser of {agent} beside its other agents: turn its Browser box "
+                       "off first, or move it to a server with more memory",
 }
 
 

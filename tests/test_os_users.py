@@ -302,11 +302,57 @@ class Moves(Servers):
         job = hub.q1("SELECT * FROM server_jobs WHERE id=?", (receipt["job"],))
         self.assertEqual((job["server"], job["kind"], job["agent"]), ("box", "install", "desk"))
 
+    def box_reads(self, browser="ready", memory=5000):
+        """box's service reads its browser parts and the room of its user.slice (build plan 04, S1b and D6)."""
+        row = hub.q1("SELECT data FROM server_status WHERE server='box'")
+        data = dict(json.loads(row["data"]), browser={"state": browser},
+                    room={"memory_max": memory << 20, "swap_max": None, "swap_total": 1910 << 20})
+        hub.q("UPDATE server_status SET data=? WHERE server='box'", (json.dumps(data),))
+
     def test_a_desktop_agent_stays_on_a_mac(self):
-        self.write_can("desk", ["shell", "web", "browser"])
+        """A Mac's screen stays on a Mac. The Browser box moves to a Linux server that runs a browser for it (build plan
+        04, S3): with the Shell box on (D2), on a supported system (D8), and with a place for it there (D6)."""
+        self.write_can("desk", ["shell", "web", "browser", "screen"])
         status, answer = self.move("desk", "box")
         self.assertEqual(status, 409, answer)
         self.assertIn("uses a Mac's browser and screen", answer["error"])
+        self.write_can("desk", ["shell", "web", "browser"])
+        status, answer = self.move("desk", "box")           # box has sent no room yet: no place
+        self.assertEqual((status, answer.get("code"), answer.get("names")),
+                         (409, "browser_no_room", {"server": "box", "agent": "Desk"}), answer)
+        self.box_reads(memory=2500)                         # no place with both agents there (D6)
+        status, answer = self.move("desk", "box")
+        self.assertEqual((status, answer.get("code")), (409, "browser_no_room"), answer)
+        self.write_can("desk", ["web", "browser"])          # a closed agent hears its true reason first (D2), also
+        self.box_reads(memory=1500)                         # where its smaller need leaves no place either
+        status, answer = self.move("desk", "box")
+        self.assertEqual((status, answer.get("code"), answer.get("names")),
+                         (400, "browser_shell_off", {"agent": "Desk"}), answer)
+        self.write_can("desk", ["shell", "web", "browser"])
+        self.box_reads(browser="unsupported")
+        status, answer = self.move("desk", "box")
+        self.assertEqual((status, answer.get("code"), answer.get("names")),
+                         (409, "browser_server", {"server": "box"}), answer)
+        self.box_reads()
+        status, receipt = self.move("desk", "box")
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual(hub.agents()["desk"]["machine"], "box")
+
+    def test_a_tick_of_the_browser_box_on_linux_is_refused_where_the_server_runs_none(self):
+        """Build plan 04, D8 and D2, through the owner's settings route: a server whose service reads `unsupported`,
+        and an agent whose Shell box is off, get no Browser box; the refusal has its code."""
+        tick = lambda can: self.owner("/ui/team/agents/scout", base_sha256=self.team_sha(), can=can)    # noqa: E731
+        self.box_reads(browser="unsupported")
+        status, answer = tick(["shell", "web", "browser"])
+        self.assertEqual((status, answer.get("code"), answer.get("names")),
+                         (409, "browser_server", {"server": "box"}), answer)
+        self.write_can("scout", ["web"])
+        self.box_reads()
+        status, answer = tick(["web", "browser"])
+        self.assertEqual((status, answer.get("code")), (400, "browser_shell_off"), answer)
+        status, answer = tick(["shell", "web", "browser"])
+        self.assertEqual(status, 200, answer)
+        self.assertIn("browser", self.origin_team()["agents"]["scout"]["can"])
 
     def test_no_move_onto_a_mac_that_runs_an_agent(self):
         status, answer = self.move("scout", "mini")

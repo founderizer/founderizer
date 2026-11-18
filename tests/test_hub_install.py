@@ -5169,7 +5169,8 @@ class CheckMode(unittest.TestCase):
         until 15 November 2026 an agent that the owner added there had no vault: the hub gives an agent its vault
         only when its server's broker reports (hub.py vault_grant, no_vault_store). With the word, the step runs
         hubsetup.py's vault as root from the hub's checkout, with the hub's own address and port, before the services
-        and the first agent start. Without the word, and on a hub that was installed without it, it runs nothing."""
+        and the first agent start, then the key swap and the outgoing gate: either one that stops says why, and the
+        install goes on. Without the word, and on a hub that was installed without it, it runs nothing."""
         body = shell_function(SCRIPT, "hub_word") + shell_function(SCRIPT, "vault_broker") + "vault_broker\n"
         tmp = Path(tempfile.mkdtemp(prefix="fleet-hub-vault-step-"))
         self.addCleanup(shutil.rmtree, str(tmp), True)
@@ -5182,18 +5183,23 @@ class CheckMode(unittest.TestCase):
         real = stubs.replace("'python3 -c') \"$@\"", f"'python3 -c') shift; {sys.executable} \"$@\"")
         code, out = run_shell(body, extra=real + "hub_shared=yes\n")
         self.assertEqual(code, 0, out)
-        self.assertEqual([line for line in out.splitlines() if line.startswith(("RAN: ", "ROOT: "))],
-                         [f"ROOT: python3 {tmp}/hubsetup.py vault --hub http://100.80.1.2:8765 --kit {tmp}",
-                          f"ROOT: python3 {tmp}/hubsetup.py key-swap"])     # Part B of the key swap: on at the install
+        steps = [f"ROOT: python3 {tmp}/hubsetup.py vault --hub http://100.80.1.2:8765 --kit {tmp}",
+                 f"ROOT: python3 {tmp}/hubsetup.py key-swap",      # Part B of the key swap: on at the install
+                 f"ROOT: python3 {tmp}/hubsetup.py egress"]        # the outgoing gate: on at the install, records only
+        self.assertEqual([line for line in out.splitlines() if line.startswith(("RAN: ", "ROOT: "))], steps)
         self.assertIn("Founderizer step 1: this server's vault, kept by its own user", out)
-        # a key swap that stops does not stop the install: the line says why, and each key is a value there
-        stopped = real.replace("python3() { printf 'ROOT: python3 %s\\n' \"$*\"; }",
-                               "python3() { case \"$*\" in *key-swap*) return 1 ;; *) printf 'ROOT: python3 %s\\n' "
-                               "\"$*\" ;; esac; }")
-        self.assertNotEqual(stopped, real)
-        code, out = run_shell(body, extra=stopped + "hub_shared=yes\n")
-        self.assertEqual(code, 0, out)
-        self.assertIn("the install goes on, and this server gives each API key to a session as a value", out)
+        # a key swap or a gate that stops does not stop the install: the line says why, and the other step still runs
+        for step, words in (("key-swap", "this server gives each API key to a session as a value"),
+                            ("egress", "the agents of this server connect with no record of their hosts")):
+            stopped = real.replace("python3() { printf 'ROOT: python3 %s\\n' \"$*\"; }",
+                                   "python3() { case \"$*\" in *' " + step + "') return 1 ;; *) "
+                                   "printf 'ROOT: python3 %s\\n' \"$*\" ;; esac; }")
+            self.assertNotEqual(stopped, real)
+            code, out = run_shell(body, extra=stopped + "hub_shared=yes\n")
+            self.assertEqual(code, 0, out)
+            self.assertIn(f"the install goes on, and {words}", out)
+            self.assertEqual([line for line in out.splitlines() if line.startswith("ROOT: ")],
+                             [line for line in steps if not line.endswith(" " + step)])
         code, out = run_shell(body, extra=real + "hub_shared=no\n")
         self.assertEqual((code, out), (0, ""))
         team.write_text(json.dumps(hubsetup.template(HUB_IP, owner="100.90.3.4")))

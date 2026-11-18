@@ -184,7 +184,8 @@ class Reading(unittest.TestCase):
         near = (row("127.0.0.1", 40001, "127.0.0.1", 876, 2001) + row("127.0.0.1", 40000, "127.0.0.1", 877, 2002)
                 + row("127.0.0.2", 40000, "127.0.0.1", 876, 2003) + row("127.0.0.1", 876, "127.0.0.1", 40000, 990))
         self.assertEqual(vault.SWAP_TABLES, (("/proc/net/tcp", False), ("/proc/net/tcp6", True)))
-        with patch.object(vault, "SWAP_TABLES", ((str(v4), False), (str(v6), True))):
+        with patch.object(vault, "SWAP_TABLES", ((str(v4), False), (str(v6), True))), \
+                patch.dict(vault.EGRESS_LOOKUP, {socket.IPPROTO_TCP: False}):      # the table: no kernel lookup here
             v4.write_text(top + near)
             v6.write_text(top)
             self.assertIsNone(vault.swap_peer(Conn()))          # other ports, another address, and the proxy's own end
@@ -495,7 +496,7 @@ class Proxy(unittest.TestCase):
             return {"ok": True, "site": (request["host"], request["port"]) in self.sites}
         return self.answer
 
-    def reach(self, host, port):
+    def reach(self, host, port, uid=None):
         """Each example host is this test's own local site."""
         if host not in (HOST, OTHER_HOST):
             return None
@@ -869,9 +870,9 @@ class Proxy(unittest.TestCase):
         self.addCleanup(late.set)
         reached, reach = [], self.reach
 
-        def counted(host, port):
+        def counted(host, port, uid=None):
             reached.append(host)
-            return reach(host, port)
+            return reach(host, port, uid)
         self.reach = counted                                                # each connection that the proxy makes to a site
         old, served = self.fresh()
         self.proxy = old

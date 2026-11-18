@@ -838,6 +838,8 @@ handover key belong to fleet-vault alone, and no agent of this server can read t
         plan "read and change nothing of the owner's: no account, no token and no password"
         plan "run: python3 $kit/hubsetup.py key-swap, which switches on the key swap of this server's vault: an API \
 key that has a site stays out of the agents' sessions. An install goes on when it stops"
+        plan "run: python3 $kit/hubsetup.py egress, which switches on this server's outgoing gate: each connection \
+and DNS question of an agent is recorded, and no host is refused. An install goes on when it stops"
         return 0
     fi
     python3 "$kit/hubsetup.py" vault --hub "http://$address:$port" --kit "$kit" </dev/null \
@@ -847,6 +849,10 @@ read or changed. Run the line again."
     # it stops, and this server then gives each API key to a session as a value.
     python3 "$kit/hubsetup.py" key-swap </dev/null \
         || say "the install goes on, and this server gives each API key to a session as a value."
+    # The outgoing gate (vault.py configure --egress on), as join.sh switches it on: the install goes on when it
+    # stops, and the agents of this server then connect with no record of their hosts.
+    python3 "$kit/hubsetup.py" egress </dev/null \
+        || say "the install goes on, and the agents of this server connect with no record of their hosts."
 }
 
 fleet_identity() {  # this fleet's own id, after the hub has answered, so its records are there to keep it in

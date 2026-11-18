@@ -130,6 +130,67 @@ class ServerWatch(Servers):
                                           "[hub] The server box is in order again: its SSH takes keys only."])
         self.assertIsNone(hub.kv_get("server_watch"), "a server in order keeps no record")
 
+    def test_a_gate_that_does_not_answer_in_two_posts_is_said_once_and_ends_only_by_a_post(self):
+        """The outgoing gate's table stays while the gate is down, so the server's agents reach the hub and nothing
+        else (agent-outgoing-connections-proposal.md, section 5.4): the manager hears it once, and once when a post
+        ends it: a gate that answers, or a server that has no gate any more. One post with no gate is a restart and
+        says nothing, and posts that stop end nothing (a review of 17 November 2026: nobody was told, and a server
+        whose gate never started after a boot posted nothing). A gate with no table is said too."""
+        self.report()
+
+        def post(at, gate, **more):
+            """The server's own service's post, at the time of the sweep after it."""
+            with patch.object(hub, "now", lambda: at):
+                status, answer = self.service("/server/box/egress", dict(
+                    {"gate": gate, "rows": [], "other_users": 0}, **more), source=NEW)
+            self.assertEqual(status, 200, answer)
+            self.sweep(at)
+        t0, later = self.t0, self.t0 + hub.SERVER_QUIET + 600
+        post(t0, None)
+        self.assertEqual(self.said(), [])
+        post(t0 + 60, None)
+        self.assertEqual(self.said(), [
+            "[hub] The server box needs care: its outgoing gate does not answer, so its agents reach the hub and "
+            "nothing else (`journalctl -u fleet-egress` there says why). Give it to the agent whose duty covers this "
+            "server; fix it yourself when no duty covers it; raise Needs-you only for a step that no agent can take."])
+        self.sweep(later)                       # its readings go on, its posts stopped: nothing ends
+        self.assertEqual(len(self.said()), 1)
+        post(later + 60, {"table": 1, "mode": "records"})
+        self.assertEqual(self.said()[1:], ["[hub] The server box is in order again: its agents' connections go out "
+                                           "again."])
+        post(later + 120, {"table": None, "mode": "records"})       # one post: a load that runs now
+        self.assertEqual(len(self.said()), 2)
+        post(later + 180, {"table": None, "mode": "records"})
+        self.assertIn("its outgoing gate's table is not loaded, so its agents connect with no record", self.said()[2])
+        # the gate stops answering: with no table the agents reach everything, so the table's fact holds and no word
+        # says that they reach only the hub
+        post(later + 240, None)
+        post(later + 300, None)
+        self.assertEqual(len(self.said()), 3)
+        post(later + 360, None, installed=False)    # `--egress off`: the server has no gate any more
+        self.assertEqual(self.said()[3:], ["[hub] The server box is in order again: its outgoing gate has its table "
+                                           "again, or the gate is off."])
+        self.assertIsNone(hub.q1("SELECT 1 FROM egress_servers WHERE server='box'"))
+
+    def test_root_s_word_on_the_table_names_the_fault_and_a_report_counts_once(self):
+        """After a boot where both the table's load and the gate failed, the service posts root's word that the kernel
+        has no table: the manager hears that the agents connect with no record, never that they reach only the hub.
+        A report in two parts counts once (a review of 17 November 2026)."""
+        self.report()
+
+        def post(at, gate, **more):
+            with patch.object(hub, "now", lambda: at):
+                status, answer = self.service("/server/box/egress", dict(
+                    {"gate": gate, "rows": [], "other_users": 0}, **more), source=NEW)
+            self.assertEqual(status, 200, answer)
+            self.sweep(at)
+        post(self.t0, None, table=None, part=0)
+        post(self.t0 + 1, None, table=None, part=1)            # the second part of the same report
+        self.assertEqual(self.said(), [])
+        post(self.t0 + 60, None, table=None)
+        self.assertEqual(len(self.said()), 1)
+        self.assertIn("its outgoing gate's table is not loaded, so its agents connect with no record", self.said()[0])
+
     def test_security_updates_that_stop_count_from_the_last_good_one_or_from_the_join(self):
         self.report(upgraded_at=self.t0 - 2 * DAY)
         self.sweep()

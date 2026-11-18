@@ -950,7 +950,7 @@ class Tools(Fleet):
                 return hub.save_agent_settings(agent, {"base_sha256": sha, "can": ["web"]})
         with patch.object(hub, "team_view", lambda rev: (json.loads(json.dumps(hub.TEAM)), "s" * 64, None)), \
                 patch.object(hub, "kit_revision", lambda fresh=False: "r" * 40), \
-                patch.object(hub, "validate_team", lambda team: None):
+                patch.object(hub, "validate_team", lambda team, **_: None):
             with self.assertRaisesRegex(hub.Refusal, "cannot be held to a fixed list of tools"):
                 turn_off("cx")
             helper_reports("ops", *(f for f in FEATURES if f != "shell_box"))
@@ -982,7 +982,7 @@ class Tools(Fleet):
         for name in ("cx", "ops"):      # no switch where no closed version lets the write take Shell off
             with self.subTest(name), patch.object(hub, "kit_revision", lambda fresh=False: "r" * 40), \
                     patch.object(hub, "team_view", lambda rev: (json.loads(json.dumps(hub.TEAM)), "s" * 64, None)), \
-                    patch.object(hub, "validate_team", lambda team: None), \
+                    patch.object(hub, "validate_team", lambda team, **_: None), \
                     patch.object(hub, "commit_kit_file", lambda *a, **k: "c" * 40), \
                     patch.object(hub, "apply_team", lambda team: None), \
                     patch.object(hub, "request_update", lambda *a: "requested"):
@@ -998,7 +998,7 @@ class Tools(Fleet):
         self.assertEqual(hub.owner_boxes(hub.TEAM, hub.TEAM["agents"]["cx"])["on"], ["shell", "web"])
         with patch.object(hub, "kit_revision", lambda fresh=False: "r" * 40), \
                 patch.object(hub, "team_view", lambda rev: (json.loads(json.dumps(hub.TEAM)), "s" * 64, None)), \
-                patch.object(hub, "validate_team", lambda team: None), \
+                patch.object(hub, "validate_team", lambda team, **_: None), \
                 patch.object(hub, "commit_kit_file", lambda *a, **k: "c" * 40), \
                 patch.object(hub, "apply_team", lambda team: None), \
                 patch.object(hub, "request_update", lambda *a: "requested"):

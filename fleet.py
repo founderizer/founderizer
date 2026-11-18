@@ -46,6 +46,7 @@ import os
 import pwd
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -1300,14 +1301,16 @@ def kept_user_settings():
 NO_SUGGESTION = {"promptSuggestionEnabled": False}
 
 
-def settings_arg(agent, conf, task, tools=(), needs="none"):
+def settings_arg(agent, conf, task, tools=(), needs="none", browser=False):
     """Claude Code settings for one session: what runs without asking, what never runs, the two hooks
     that carry a worker's permission prompts and activity to the hub, and the clean hook, which the manager has too. The owner's full-access manager has no
     Fleet-added deny rule that limits a command or a file, only UNSEEN_TOOLS and its runtime's manager_denied, and
     starts with the recorded unattended permission-mode choice. tools: the catalog tools
     of this task session, which the owner gave the agent; they run without asking (owner feature integrations).
     needs: a browser task also runs Chrome's tools without asking. They come with {chrome} (--chrome), and a
-    full-access worker starts in dontAsk, which refuses every tool that its allow list does not name."""
+    full-access worker starts in dontAsk, which refuses every tool that its allow list does not name. browser: on
+    Linux its own browser's tools instead, each by its name (BROWSER_MCP_TOOLS), so that a tool that a later version
+    of the server adds runs nowhere (build plan 04, S2)."""
     runtime = conf.get("runtime")
     if not runtime_fact(runtime, "session_settings"):
         return ""
@@ -1328,7 +1331,9 @@ def settings_arg(agent, conf, task, tools=(), needs="none"):
         elif task == "conversation":
             # a conversation with the agent's own tools: a task session's list, and Workflow, which is task work
             deny += runtime_fact(runtime, "conversation_denied") or []
-        if needs == "browser" and CHROME_TOOLS not in allow:
+        if browser:
+            allow += [f"mcp__{BROWSER_SERVER}__{name}" for name in sorted(BROWSER_MCP_TOOLS)]
+        elif needs == "browser" and CHROME_TOOLS not in allow:
             allow.append(CHROME_TOOLS)
         settings = {"permissions": {"allow": allow, "deny": deny}}
     if conf.get("role") == "manager" or (task and task != "conversation"):
@@ -2019,6 +2024,8 @@ def codex_server(name, catalog=None):
         options = [key + "command=" + json.dumps(exe(tool["command"]) or tool["command"]),
                    key + "args=" + json.dumps(list(tool.get("args") or []))] + \
             ([key + "env_vars=" + json.dumps(sorted(tool["env"]))] if tool.get("env") else [])
+    if isinstance(tool.get("tools"), list):     # the agent's own browser (build plan 04, S2): its pinned tools only
+        options.append(key + "enabled_tools=" + json.dumps(tool["tools"]))
     return "".join("-c " + shlex.quote(o) + " " for o in options + [key + 'default_tools_approval_mode="approve"'])
 
 
@@ -2348,7 +2355,7 @@ def sweep_acp_folders(runtime):
 
 
 def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, generation="", session="", token=None,
-                    resume=False, env=None, opening=None, rules=None, closed=None, minted=None):
+                    resume=False, env=None, opening=None, rules=None, closed=None, minted=None, browser=None):
     """token: the session credential (owner API 1.12); None starts the session as before, without one. resume: the
     standing session continues its conversation `session` and gets no first prompt: Claude's session (--resume, never
     with a new --session-id) or Codex's thread (codex resume). Everything else is the command of a new start: the same
@@ -2356,7 +2363,9 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     by which the helper finds its rollout. env: {NAME: value} of session_env, which the session gets as the
     credential, from a file that its window reads and removes. opening and rules: how the hub said this task's
     session starts (stable_start); with them, `prompt` is the task's own block and comes last. closed: what the hub
-    said of a closed start (support plan F1), and minted: {server: token} of its mint servers (F3, mint_tokens)."""
+    said of a closed start (support plan F1), and minted: {server: token} of its mint servers (F3, mint_tokens).
+    browser: the catalog tool of the agent's own browser on Linux (Helper.browser_start), which the session gets as
+    the MCP server BROWSER_SERVER, in place of Claude Code's --chrome (build plan 04, S2)."""
     if resume and (task or conf.get("runtime") not in MANAGER_RUNTIMES or not session):
         raise Refused("only the standing Claude or Codex session continues a conversation")
     if task and (shell_off(conf) or isinstance(closed, dict)):     # this checkout's box, or the hub's start says so
@@ -2381,6 +2390,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     # its developer instructions (codex_rules), in each Codex start: with its stable text or without, new or resumed.
     served = codex_rules() + [w for t in tools for w in shlex.split(codex_server(t, catalog))] \
         if runtime == "codex" else []
+    if browser and runtime == "codex":
+        served += shlex.split(codex_server(BROWSER_SERVER, {BROWSER_SERVER: browser}))
     window = task or "manager"
     if task:
         stable = stable_text(agent, opening, rules) if stable_start(conf, needs, opening, rules) else None
@@ -2454,8 +2465,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         core = rules_file()                                 # the folder's CLAUDE.md loads no more
         first = " ".join(x for x in ("--append-system-prompt-file " + shlex.quote(core) if core else "", first) if x)
     cmd = checked_start(conf).format(prompt=" ".join(x for x in (flags, first) if x),
-                               chrome="--chrome" if needs == "browser" else "",
-                               settings=settings_arg(agent, conf, task, tools, needs))
+                               chrome="--chrome" if needs == "browser" and not linux_browser(needs) else "",
+                               settings=settings_arg(agent, conf, task, tools, needs, browser=bool(browser)))
     if conf.get("runtime") == "codex" and "--no-daemon" not in cmd:
         cmd = cmd.replace("codex ", "codex --no-daemon ", 1)
     if conf.get("runtime") == "codex":
@@ -2473,6 +2484,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         else:
             servers = {t: claude_server(t, catalog, {catalog[t]["bearer"]: minted[t]} if t in minted else None)
                        for t in tools}
+            if browser:
+                servers[BROWSER_SERVER] = claude_server(BROWSER_SERVER, {BROWSER_SERVER: browser})
             # A file also without a credential: its catalog servers grow with the owner's. Only a file whose fleet
             # server sends a credential counts as one (holds_credential).
             config = mcp_config_file(agent, window, url, token, servers) if token else \
@@ -4639,6 +4652,12 @@ class Helper:
         # False before the first, None from a hub that does not say (sweep_places)
         self.open_tasks, self.poll_db, self.places_at = False, None, 0.0
         self.browser_at = None          # when sweep_browser last swept; None: not yet in this start of the helper
+        self.browser_waiting = None     # browser_waits: the browser tasks that wait now; None before its first round
+        self.browser_waits_seen = {}    # S3: the last poll's waits, which a task's start reads
+        self.browser_fresh = None       # S3: the tasks whose session started with no Chrome, for a wait (run=False):
+        #                                 kept in a file of its own (fresh_tasks), which a restart of the helper reads
+        self.browser_retry, self.browser_told = {}, {}     # browser_try: {key: (wait, due)} and {key: the reason told}
+        self.browser_checked = None     # browser_start: the tool check that passed, by its package and its command
         self.outside, self.outside_lock = 0, threading.Lock()      # checks and login jobs that run now
         self.logins = set()             # the sign-ins that run now, by id (begin_signin)
         self.loop_wake = threading.Event()      # ends the loop's pause, so an owner's request acts at once
@@ -5154,6 +5173,378 @@ class Helper:
             return
         if not stop_browser_units(stop):
             self.browser_at -= PLACES_EVERY - 60
+
+    def browser_start(self, task, keep=False, closed=False, run=True):
+        """**This agent's own browser, for a browser task on Linux** (build plan 04, S2): the catalog tool of its
+        DevTools MCP server, once its browser unit runs. It refuses (Refused, with the reason) a session that would not
+        get the browser (`closed`: no shell; not a terminal of Claude Code or Codex; Codex's sandboxed app-server
+        policy), an agent with no OS user or port of its own, a port rule whose live proof does not hold now (D11), and
+        a second browser task of the agent (D9). The pinned package installs in a thread of its own (Installing). The
+        tool server must give exactly the pinned tools, run as the session will run it (browser_tools_fault; once for
+        each package and command in this helper). Then the unit, under the agent's browser lock: written again where
+        its text changed, its start count reset (D5), a run that is left stopped. `keep`, at a wait's end, keeps the
+        profile's session files for one start, unless a clear waits; a task's start deletes them, and a big profile's
+        caches. The clears that wait run before a session gets the browser. `run=False` (S3: a task that the poll's
+        `waits` names when its session starts) gives the tool with no unit started: the task's browser starts at the
+        wait's end, as a new one (browser_fresh), so that no page of an earlier task opens in it."""
+        # one rule with the hub (lifecycle.linux_browser_refusal): a closed session, another runtime, and Codex's
+        # app-server start, whose screen_runner.py runs a task in Codex's sandbox (workspace-write, approvals on
+        # request) with no Linux browser yet, where a terminal start would give its browser task full access instead
+        refused = "a browser on a Linux server needs a session with the agent's shell, and this one is closed" \
+            if closed else lifecycle.linux_browser_refusal(self.conf)
+        if refused:
+            raise Refused(f"{refused}: its browser task does not start here")
+        user = pwd.getpwuid(os.getuid()).pw_name
+        port = browser_port(user)
+        if not self.own_user() or not port:
+            raise Refused("this agent has no browser port on this server yet: the owner's Mac puts the browser "
+                          "parts there for an agent with the Browser box and an OS user of its own")
+        if not browser_proof_holds(user):
+            raise Refused("this server's live proof of the browser's port rule does not hold for this agent now: "
+                          "its server service proves it at each reading")
+        r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{@fleet_needs}")
+        if r.returncode != 0 and not (r.returncode == 1 and any(w in r.stderr for w in NO_SESSION)):
+            raise Refused("tmux did not list this agent's windows, so its browser does not start now")
+        others = sorted(name for name, _, needs in (line.partition("\t") for line in r.stdout.splitlines())
+                        if r.returncode == 0 and needs == "browser" and name != task and re.fullmatch(r"T-\d+", name)
+                        and (not isinstance(self.open_tasks, list) or name in self.open_tasks))   # an ended task's
+                                                                                                  # window goes later
+        if others:
+            raise Refused(f"another browser task of this agent ({others[0]}) has its browser: one browser task for "
+                          f"each agent at a time, so this one starts when that one ends")
+        tool = browser_tool(port)
+        try:
+            package = lifecycle.mcp_package(BROWSER_SERVER, tool["package"])
+        except ValueError as e:
+            raise Refused(f"the browser's tool server cannot be installed: {e}")
+        if not package_ready(package):
+            install = PACKAGE_INSTALLS.get(package_folder(package))
+            if install and install["error"]:
+                PACKAGE_INSTALLS.pop(package_folder(package))       # the next start tries the install again
+                raise Refused(f"the browser's tool server could not be installed: {install['error']}")
+            package_install(package)
+            raise Installing(f"the browser's tool server {package['name']} {package['version']} is being "
+                             f"installed on this machine")
+        command, args = program_start(tool)
+        try:
+            installed = os.path.getmtime(os.path.join(package_folder(package), "ready.json"))
+        except OSError:
+            installed = None
+        check = hashlib.sha256(json.dumps([command, args, tool["settings"], installed]).encode()).hexdigest()
+        if self.__dict__.get("browser_checked") != check:      # each start of a wait's end need not run it again
+            failed = self.__dict__.get("browser_check_failed")      # (check, reason, when): a server that hangs
+            if failed and failed[0] == check and time.monotonic() - failed[2] < BROWSER_CHECK_AGAIN:
+                raise Refused(failed[1])                            # holds the helper's loop 90 s at each try
+            try:
+                fault = browser_tools_fault(mcp_tool_list(command, args, env=dict(os.environ, **tool["settings"])))
+                reason = f"the browser's tool server gives no browser: {fault}" if fault else None
+            except Refused as e:
+                reason = str(e)
+            if reason:
+                self.browser_check_failed = (check, reason, time.monotonic())
+                raise Refused(reason)
+            self.browser_checked = check
+        if not run:
+            # no other browser window is open (D9 above), so a Chrome that runs is an earlier session's: it ends as at a
+            # wait (browser_close: Chrome's own close keeps its cookies, then the unit's stop), and the new session
+            # reaches none of its pages; one that does not end is tried again after the back-off
+            if systemctl_user("is-active", lifecycle.BROWSER_UNITS[0])[1].strip() not in ("inactive", "failed", "") \
+                    and not self.browser_close():
+                raise Refused("an earlier session's browser did not end, so this session waits for it")
+            self.browser_waiting = (self.browser_waiting or set()) | {task}
+            self.fresh_tasks(self.fresh_tasks() | {task})
+            return tool
+        unit = lifecycle.BROWSER_UNITS[0]
+        path = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user", unit)
+        text = browser_unit_text(locale=browser_locale())
+        try:
+            with open(path, encoding="utf-8") as f:
+                same = f.read() == text
+        except OSError:
+            same = False
+        if not same:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + ".new", "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(path + ".new", path)
+            systemctl_user("daemon-reload")
+        folder = browser_folder()
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        flag = os.path.join(folder, "keep-session")
+        with open(os.path.join(folder, os.path.basename(lifecycle.BROWSER_LOCK)), "a") as lock:
+            end = time.monotonic() + 15
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() > end:
+                        raise Refused("the browser's lock stayed taken for 15 s")
+                    time.sleep(0.2)
+            systemctl_user("reset-failed", unit)
+            if systemctl_user("is-active", unit)[1].strip() not in ("inactive", "failed", ""):
+                systemctl_user("stop", unit, timeout=30)
+            keep = keep and not browser_clears_read(self.clears_file())
+            if keep:
+                open(flag, "w").close()
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(flag)
+                self.browser_caches()           # at a task's start, with no Chrome running
+            code, out, err = systemctl_user("start", unit, timeout=90)
+            if code != 0:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(flag)
+                systemctl_user("stop", unit, timeout=30)      # no restart of its own after a start that failed
+                raise Refused(f"the browser did not start: {(err or out).strip()[-200:]}")
+            try:
+                self.browser_clears(port)       # before a session gets it: the logins whose grants ended go
+            except Refused:
+                systemctl_user("stop", unit, timeout=30)
+                raise
+        if task in self.fresh_tasks():          # its pages are its own from now on (S3)
+            self.fresh_tasks(self.fresh_tasks() - {task})
+        return tool
+
+    def fresh_tasks(self, tasks=None):
+        """**The tasks whose session started with no Chrome** (S3, browser_start's `run=False`): their browser starts
+        as a new one at their wait's end, so that no page of an earlier task opens in it. Kept in a file of this
+        agent's own in ~/.fleet, which a restart of the helper reads; `tasks` writes it (a write that fails keeps the
+        set in memory). Returns the set."""
+        path = os.path.join(HOME, f"browser-fresh-{self.agent}.json")
+        if tasks is not None:
+            self.browser_fresh = set(tasks)
+            with contextlib.suppress(OSError):          # a full disk: the set stays in memory, and no loop stops
+                with open(path + ".new", "w", encoding="utf-8") as f:
+                    json.dump(sorted(tasks), f)
+                os.replace(path + ".new", path)
+        elif self.__dict__.get("browser_fresh") is None:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    got = json.load(f)
+            except (OSError, ValueError):
+                got = []
+            self.browser_fresh = {x for x in got if isinstance(x, str) and re.fullmatch(r"T-\d+", x)} \
+                if isinstance(got, list) else set()
+        return self.browser_fresh
+
+    def browser_closed(self):
+        """The poll's `browser_closed` (S3, D10): the tasks whose Chrome this helper closed for a wait or never started
+        (browser_waiting), and every open task of this agent while its unit is not active, so that a place goes back
+        only once no Chrome of it runs. systemd is asked only while the helper has browser work (a browser task's
+        window, a wait that the last poll named, a Chrome that it closed), for at most 5 s. "" on a Mac, and for an
+        agent with no OS user of its own; a systemd that does not answer adds none."""
+        if sys.platform == "darwin" or not self.own_user():
+            return ""
+        closed = set(self.browser_waiting or ())
+        if not (closed or self.__dict__.get("browser_waits_seen") or self.__dict__.get("browser_tasks")):
+            return "&browser_closed="       # no browser work: no unit to ask about, and no place to give back
+        code, out, _ = systemctl_user("is-active", lifecycle.BROWSER_UNITS[0], timeout=5)
+        if out.strip() in ("inactive", "failed") and isinstance(self.open_tasks, list):
+            closed |= {x for x in self.open_tasks if isinstance(x, str)}
+        return "&browser_closed=" + urllib.parse.quote(",".join(sorted(closed)))
+
+    def clears_file(self, done=False):
+        """This agent's list of clears that wait ({mark: clear}), or (`done`) the marks of the last ones that ran."""
+        return os.path.join(HOME, f"browser-{'done' if done else 'clears'}-{self.agent}.json")
+
+    def browser_clear(self, event, extra):
+        """**A site login's grant ended for this agent** (S2; the hub's event, from S5's record, by the rule
+        lifecycle.browser_clear_valid). The clear goes into this agent's list, by a mark of its event and its content:
+        an event that comes again adds nothing, and one whose clear ran already (its mark among the last ones done)
+        runs none again. Where Chrome runs, the clear runs now (browser_try: a failure tries again after its back-off,
+        at a round of browser_waits); else at Chrome's next start, before a session gets it. The event never waits on
+        Chrome. Linux and an OS user of the agent's own only. A limit: Chrome writes its cookies to disk up to 30 s
+        late, so a crash in that time can bring deleted ones back; the agent's own user can read its profile anyway,
+        so the clear ends the use of a login whose grant ended, and walls nothing off."""
+        if sys.platform == "darwin" or not self.own_user():
+            return
+        clear = lifecycle.browser_clear_valid(extra)
+        if clear is None:
+            self.say(f"browser clear {event}: not a clear of the contract (lifecycle.browser_clear_valid), so it is "
+                     f"left")
+            return
+        mark = f"{event}:{hashlib.sha256(json.dumps(clear, sort_keys=True).encode()).hexdigest()[:16]}"
+        done = browser_clears_read(self.clears_file(done=True)).get("done")
+        if isinstance(done, list) and mark in done:
+            return
+        path = self.clears_file()
+        clears = browser_clears_read(path)
+        if mark not in clears:
+            clears[mark] = clear
+            browser_clears_write(path, clears)
+        if systemctl_user("is-active", lifecycle.BROWSER_UNITS[0])[1].strip() == "active":
+            self.browser_try("browser clears", lambda: self.browser_clears(browser_port()))
+
+    def browser_clears(self, port):
+        """This agent's list of clears (browser_clear), done in its running Chrome through a blank page of its own.
+        Each clear runs on its own, so one that fails does not stop the others; a lost connection (CdpLost) ends the
+        run. A clear that ran goes into the done marks first, and then off the list. The run has 60 s at most. At its
+        end the blank page goes, unless it is the last page that stays (Chrome ends with its last window; a page that
+        a clear closed may be still on its way out). Raises Refused when a clear did not finish: it stays on the list,
+        and a start refuses the browser until it runs. That is on purpose: no session gets a browser that may still
+        hold a login whose grant ended, and the requester hears why at each start."""
+        path, done_path = self.clears_file(), self.clears_file(done=True)
+        clears = browser_clears_read(path)
+        if not clears:
+            return
+        if not port:
+            raise Refused("the browser did not lose a login whose grant ended: this agent has no DevTools port")
+        failed, closed, target = [], set(), None
+        try:
+            with Cdp(port, 15) as cdp:
+                cdp.limit = time.monotonic() + 60
+                try:
+                    target = cdp.call("Target.createTarget", {"url": "about:blank", "background": True})["targetId"]
+                    session = cdp.call("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
+                    for mark in list(clears):
+                        clear = lifecycle.browser_clear_valid(clears[mark]) if isinstance(clears[mark], dict) else None
+                        try:
+                            if clear is not None:
+                                cdp_clear(cdp, session, clear, own=target, closed=closed)
+                        except CdpLost:
+                            raise
+                        except (KeyError, TypeError, CdpError) as e:
+                            failed.append(f"{mark.split(':')[0]}: {e}")
+                            continue
+                        done = browser_clears_read(done_path).get("done")
+                        browser_clears_write(done_path,
+                                             {"done": (done if isinstance(done, list) else [])[-499:] + [mark]})
+                        del clears[mark]
+                        browser_clears_write(path, clears)
+                        self.say(f"browser clear {mark.split(':')[0]}: " + (
+                            f"the logins of {', '.join(clear['origins'])} are gone from this agent's browser"
+                            if clear is not None else "an invalid clear in the list was dropped"))
+                finally:
+                    cdp.limit = time.monotonic() + 5            # the page's own close has a time of its own
+                    with contextlib.suppress(OSError, ValueError, KeyError, TypeError, CdpError):
+                        if target and any(isinstance(x, dict) and x.get("type") == "page" and
+                                          x.get("targetId") not in closed | {target}
+                                          for x in cdp.call("Target.getTargets").get("targetInfos") or []):
+                            cdp.call("Target.closeTarget", {"targetId": target})
+        except (OSError, ValueError, KeyError, TypeError, CdpError) as e:
+            raise Refused(f"the browser did not lose a login whose grant ended: {e}") from None
+        if failed:
+            raise Refused(f"the browser did not lose a login whose grant ended: {'; '.join(failed)[:300]}")
+
+    def browser_caches(self, most=None):
+        """A profile above `most` bytes (BROWSER_PROFILE_MOST) loses Chrome's caches before its browser starts (S2):
+        DiskCacheSize bounds the HTTP cache only."""
+        most = BROWSER_PROFILE_MOST if most is None else most
+        profile = browser_profile()
+        size = 0
+        for root, _dirs, files in os.walk(profile):
+            for name in files:
+                with contextlib.suppress(OSError):
+                    size += os.lstat(os.path.join(root, name)).st_size
+        if size <= most:
+            return
+        for name in ("Cache", "Code Cache", "GPUCache", os.path.join("Service Worker", "CacheStorage"),
+                     os.path.join("Service Worker", "ScriptCache")):
+            shutil.rmtree(os.path.join(profile, "Default", name), ignore_errors=True)
+
+    def browser_close(self):
+        """**This agent's browser ends** (D10): by Chrome's own Browser.close, which keeps its cookies; a Chrome that
+        has not ended in BROWSER_CLOSE_WAIT seconds, and a unit in the middle of a restart, stop with the unit, whose
+        stop is short. True once the unit is inactive: only then does a wait or a task's end give its place back. A
+        user's systemd with no bus socket, or no systemctl, runs no unit of the user's: that is closed too. One that
+        no bus reaches for BROWSER_NO_BUS rounds in a row is closed then; a systemctl that ran out of time says
+        nothing, and the close tries again."""
+        unit = lifecycle.BROWSER_UNITS[0]
+
+        said = []
+
+        def state():        # no systemctl, or no bus socket at all, runs no unit; any other failure says nothing
+            code, out, err = systemctl_user("is-active", unit)
+            said.append("no bus" if code != 0 and not out.strip() and re.search(
+                r"Failed to connect|not defined|No medium found|Connection refused", err) else "")
+            return out.strip() or ("unreachable" if code != 0 and "No such file or directory" in err else "")
+        done = lambda s: s in ("inactive", "failed", "unreachable")
+        if done(state()):
+            self.browser_no_bus = 0
+            return True
+        port = browser_port()
+        if port and cdp_browser_close(port):    # Chrome's own end needs no bus
+            end = time.monotonic() + BROWSER_CLOSE_WAIT
+            while time.monotonic() < end and not done(state()):
+                time.sleep(0.25)
+        if not done(state()):
+            systemctl_user("stop", unit, timeout=30)
+        if done(state()):
+            self.browser_no_bus = 0
+            return True
+        if said[-1] == "no bus":        # a bus that no try reaches, round after round: the user's manager is gone
+            self.browser_no_bus = self.__dict__.get("browser_no_bus", 0) + 1
+            return self.browser_no_bus >= BROWSER_NO_BUS
+        self.browser_no_bus = 0
+        return False
+
+    def browser_try(self, key, act, now=None):
+        """One step of browser_waits for `key` (a task, or the list of clears), at most once in its back-off: 15 s
+        after a failure, doubled up to 5 minutes. Each fault of the step stays in it, told once for each reason. True
+        when it ran and did not fail."""
+        now = time.monotonic() if now is None else now
+        wait, due = self.browser_retry.get(key, (0, 0))
+        if now < due:
+            return False
+        try:
+            act()
+        except Exception as e:      # one task's browser step: no fault of it may stop the helper's loop
+            wait = 15 if isinstance(e, Installing) else min(300, wait * 2 or 15)   # an install ends by itself
+            self.browser_retry[key] = (wait, now + wait)
+            reason = str(e) if isinstance(e, Refused) else f"{type(e).__name__}: {e}"
+            if self.browser_told.get(key) != reason:
+                self.browser_told[key] = reason
+                self.say(f"{key}: {reason[:300]}; its browser step is tried again in {wait} s")
+            return False
+        self.browser_retry.pop(key, None)
+        self.browser_told.pop(key, None)
+        return True
+
+    def browser_waits(self, waits):
+        """**A wait closes the browser, and its end opens it again** (D10): `waits` is the poll's {task: kind} of this
+        agent's tasks that wait for the owner (a secret) or for a usage limit's end. When such a wait starts for a
+        live window of an open browser task, Chrome ends (browser_close) and so gives its memory back: a secret wait
+        has no clock. When it ends, Chrome starts again with its pages (keep). At the first round of a helper that
+        started again, a browser task that does not wait gets its browser where its unit does not run. A step that
+        fails is tried again after its back-off, its reason told once (browser_try). A clear that came while systemd
+        restarted Chrome by itself runs at a round with Chrome active. Linux only; nothing on a tmux that does not
+        answer or on a poll that does not say."""
+        if sys.platform == "darwin" or not isinstance(waits, dict) or not isinstance(self.open_tasks, list) or \
+                not self.own_user():
+            return
+        self.browser_waits_seen = dict(waits)
+        r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{@fleet_needs}")
+        if r.returncode != 0 and not (r.returncode == 1 and any(w in r.stderr for w in NO_SESSION)):
+            return
+        tasks = [name for name, _, needs in (line.partition("\t") for line in r.stdout.splitlines())
+                 if needs == "browser" and re.fullmatch(r"T-\d+", name) and name in self.open_tasks] \
+            if r.returncode == 0 else []
+        self.browser_tasks = tasks          # S3: browser_closed asks systemd only while there is browser work
+        first, unit = self.browser_waiting is None, lifecycle.BROWSER_UNITS[0]
+        waiting = set() if first else set(self.browser_waiting)
+        active = lambda: systemctl_user("is-active", unit)[1].strip() == "active"
+
+        def close():
+            if not self.browser_close():
+                raise Refused("its browser did not end for its wait")
+        for task in tasks:
+            if task in waits and task not in waiting:
+                self.doing("browser wait", task)
+                if self.browser_try(task, close):
+                    waiting.add(task)
+            elif task not in waits and (task in waiting or (first and not active())):
+                waiting.add(task)               # until its browser runs again
+                self.doing("browser wait end", task)
+                if self.browser_try(task, lambda task=task: self.browser_start(task, keep=task not in self.fresh_tasks())):
+                    waiting.discard(task)
+                    if task in self.fresh_tasks():
+                        self.fresh_tasks(self.fresh_tasks() - {task})
+        self.browser_waiting = waiting & set(tasks)
+        if self.fresh_tasks() - set(self.open_tasks):
+            self.fresh_tasks(self.fresh_tasks() & set(self.open_tasks))
+        if browser_clears_read(self.clears_file()) and active():
+            self.browser_try("browser clears", lambda: self.browser_clears(browser_port()))
 
     def report_start(self, task, reason):
         """Why the start of a task's session failed (plan C6), told to the hub once for each distinct reason: the hub
@@ -6171,18 +6562,30 @@ class Helper:
                     # or a mint server (decision D24). Its cause is told once (report_start), as before.
                     start_refusal(self.agent, conf)
                     programs_wait(self.agent)       # its MCP programs install first: no credential, no vault read yet
-                    token = session_credential(self.agent, "task", extra.get("generation", ""), task=task,
-                                               attempt=extra.get("attempt", 1))
-                    env = session_env(self.agent, self.conf, "task",
-                                      task_place(self.agent, extra.get("generation"), task),
-                                      closed=isinstance(extra.get("shell_off"), dict), attempt=extra.get("attempt", 1))
-                    return session_command(self.agent, conf, ev["text"],
-                        task=task, needs=needs, attempt=extra.get("attempt",1), generation=extra.get("generation",""),
-                        session=session, token=token, env=env, opening=extra.get("opening"), rules=extra.get("rules"),
-                        closed=extra.get("shell_off"),    # support plan F1: the hub's closed start
-                        minted=mint_tokens(self.agent, task, extra.get("attempt", 1), env,      # F3
-                                           closed=extra["shell_off"] if isinstance(extra.get("shell_off"), dict)
-                                           else {} if shell_off(self.conf) else None, held=self.jobs_held))
+                    # build plan 04 (S2): on Linux, the agent's own browser runs before its session starts, and ends
+                    # again when the rest of the start fails, so that no Chrome waits for a session that never comes
+                    browser = self.browser_start(task, closed=isinstance(extra.get("shell_off"), dict) or
+                                                 shell_off(self.conf),
+                                                 run=task not in self.browser_waits_seen) if linux_browser(needs) else None
+                    try:
+                        token = session_credential(self.agent, "task", extra.get("generation", ""), task=task,
+                                                   attempt=extra.get("attempt", 1))
+                        env = session_env(self.agent, self.conf, "task",
+                                          task_place(self.agent, extra.get("generation"), task),
+                                          closed=isinstance(extra.get("shell_off"), dict),
+                                          attempt=extra.get("attempt", 1))
+                        return session_command(self.agent, conf, ev["text"],
+                            task=task, needs=needs, attempt=extra.get("attempt",1),
+                            generation=extra.get("generation",""), session=session, token=token, env=env,
+                            opening=extra.get("opening"), rules=extra.get("rules"),
+                            closed=extra.get("shell_off"),    # support plan F1: the hub's closed start
+                            browser=browser, minted=mint_tokens(self.agent, task, extra.get("attempt", 1), env,  # F3
+                                               closed=extra["shell_off"] if isinstance(extra.get("shell_off"), dict)
+                                               else {} if shell_off(self.conf) else None, held=self.jobs_held))
+                    except BaseException:
+                        if browser:
+                            self.browser_close()
+                        raise
                 self.start(task, command, extra.get("attempt",1), extra.get("generation",""), session, needs=needs)
                 self.say(f"{task}: session started, attempt {extra.get('attempt',1)}")
                 # plan C6: the ack says only "started once"; the event stays pending until the session reads it
@@ -6224,6 +6627,8 @@ class Helper:
             if task in self.look_sure():
                 tmux("kill-window", "-t", f"={self.session}:={task}", check=True)
                 self.say(f"{task}: finished, session closed")
+            if linux_browser(extra.get("needs")) and self.own_user() and not self.browser_close():
+                raise Refused(f"{task}: its browser has not ended yet")     # build plan 04, D10: the event comes again
             if desktop and generation:
                 quiet, ended, left = self.quiesce(task, generation, keep_runtime=False, also=before)
                 if not quiet:
@@ -6268,6 +6673,8 @@ class Helper:
                 self.say("manager: the owner asked for its session; it starts at this round")
                 if getattr(self, "loop_wake", None):
                     self.loop_wake.set()        # this round, not after the loop's pause
+        elif kind == "browser_clear":   # build plan 04, S2: a site login's grant ended for this agent
+            self.browser_clear(ev["id"], extra)
         elif kind == "update":
             if getattr(self, "lifecycle", None):
                 self.lifecycle.request(extra)
@@ -8456,6 +8863,66 @@ NODE_BUILDS = {  # (the archive's target, its SHA-256 in the release's SHASUMS25
     "macOS_amd64": ("darwin-x64", "525c9b29bb0263d687de60a4cec0e2a6db876a8eb032369e5795eca71e7c358e"),
     "macOS_arm64": ("darwin-arm64", "d38bd5e5a2ddce6bbb5ce45e46e208337da4d51fffe611e567fd32073d6439f6"),
 }
+# Google's Chrome DevTools MCP, the one browser tool of an agent on a Linux server (build plan 04, D4 and D13): the
+# fleet's own package, pinned beside the Node that runs it, and installed by the route of the owner's npm servers
+# (ensure_package: the pinned version as of its day, npm's seven-day rule, no install scripts, a lock check). A change
+# of the pin goes in one commit with BROWSER_MCP_TOOLS.
+BROWSER_MCP_PACKAGE = {"registry": "npm", "name": "chrome-devtools-mcp", "version": "1.12.0", "as_of": "2026-11-10",
+                       "bin": "chrome-devtools-mcp"}
+# Its flags (S2): no tool of the network, of memory, of extensions, of the experimental and PWA categories, and no
+# script (D4); no usage data; no page address to Google's CrUX service; no source map that its own process would
+# fetch, outside Chrome's rules. Its variables: no usage data, no configuration file of the agent's (one could turn on
+# more tools), no update check.
+BROWSER_MCP_ARGS = ["--categoryNetwork=false", "--javascriptEvaluation=false", "--categoryMemory=false",
+                    "--usageStatistics=false", "--no-performance-crux", "--no-source-maps",
+                    "--categoryExtensions=false", "--categoryExperimentalThirdParty=false",
+                    "--categoryExperimentalWebmcp=false", "--categoryPwa=false"]
+BROWSER_MCP_SETTINGS = {"CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS": "1", "CHROME_DEVTOOLS_MCP_NO_CONFIG_DISCOVERY": "1",
+                        "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS": "1"}
+# The tools that this pin gives with these flags, each with the SHA-256 of its input schema as canonical JSON
+# (tool_schema_hash). A server that gives another tool, or another input for one, gives no browser
+# (browser_tools_fault): Codex runs this server's tools without asking, and Claude Code's list names each one.
+BROWSER_MCP_TOOLS = {     # chrome-devtools-mcp 1.12.0 with BROWSER_MCP_ARGS, read on x86 Ubuntu 24.04 (S2's check)
+    "click": "d607ae2f9744c7206202ac28884cce22636bf91313d310f229ad589a5854e35c",
+    "close_page": "4dd8f2c6def9d29f424ceb2425e0ccfc62a5f228111c04876fb88d4bb6959042",
+    "drag": "4657f22eabd55238c458cb843a87d3cbee851e1195025958ccb4e0d360b8594a",
+    "emulate": "8dcb17abb2a8d00fb810433055d9bd3ddfc24b3fd77c1513cb43685982d5f089",
+    "fill": "02c4fa7845b25952f0a94c4ad76ccc253edc85fad905e7003c58c9ccf79f71e1",
+    "fill_form": "9992ca135e79cb42934c76f2c1156fc163756bce9a6cee8919efd7dd6c54f2b2",
+    "get_console_message": "2ff0917d561b22f4f770182f79bf63d08ede0f19ef0ebd40c829b70050b34007",
+    "get_css_styles": "f6f3134bfb054138d7eb214758872c9e8911673100952dca8446a75cf889bfaf",
+    "handle_dialog": "c50c3253fd8d612feb23c9c3027fe17ca5418252ca083797cdf4bb44b0747229",
+    "hover": "5d77b0fcc66a5cc14adecc7a5b3266b15324639b30a178079b4125e880727015",
+    "lighthouse_audit": "26cd877e07322817de158349ef07554992dc36ae172cd9e29e06963d9e92cf77",
+    "list_console_messages": "5536f8a6b5cbea2dc4380adde1d53b893223e5352eb6ec3f915b13e601198290",
+    "list_pages": "71fc596a20f27da3dec80050e5d1f553eba34aea24c2853b853488a811e6b892",
+    "navigate_page": "0a7eabf34eff9e057243ae44844eebadd04b639db2d0828873a739f661b8a6e7",
+    "new_page": "8e94580b1e45e9a84de471093deef9c2285602e5f3d71d7f88e4dd1161c090d7",
+    "performance_analyze_insight": "703f506f571dc3f3933f1c374b21bb1ca42d49a0a0288c578946e9f36ba33101",
+    "performance_start_trace": "b7395a3033703f0ff5f17b0deb266c2dfb44e6095e1f2fd624fbd5e961866069",
+    "performance_stop_trace": "56a055c235f74c1993a66e1711987ccf4a84f0859fa46e2440d2702c5c1782dc",
+    "press_key": "3b048d268032ece8c1289f3153a5a12fbb0925f4b5f3d81051041c66bb908759",
+    "resize_page": "bbbf02209ee63c903b625062ec7df9c96fbaa9279543f80bda30b8309c3025cc",
+    "screencast_start": "e333a50addfd6379efa298aa27582bb013a90b6422f43d16eb6f746111bbd27c",
+    "screencast_stop": "6d9d14b333c9379fed3f60f49719d086239864a07e1a2e18a795d5f7e85c1dbb",
+    "select_page": "e27120315084bc9bda4f610d7ccdee9bb105de7a94cbea41511ce9e36fca5215",
+    "take_screenshot": "f1da2ce09379988fb34eba3d55ad588d5e7850aea5dc0b3be589b9bf756d9d92",
+    "take_snapshot": "7f8ba09ecd3286173bc772ff2241c87a99b53fc25a7f5d79ef52e9507917df43",
+    "type_text": "c1e5421817377e6777a07eb4d8a803bac8750848451c6c6d9cb776d3627a18ab",
+    "upload_file": "6753d5cfcc6ba27bea1f7de7d540b8f1456c89a88cb8f84930dec41532892ea4",
+    "wait_for": "516e59f22dbd2398daadb7b4b0a63c3ff2a4c3fb497ed1e4fffee61735b8979a"
+}
+# The agent's own browser in a session's MCP configuration (Claude Code's tools: mcp__fleet_browser__*): no owner's
+# MCP server can have this name, because lifecycle.MCP_NAME has no "_".
+BROWSER_SERVER = "fleet_browser"
+BROWSER_PLACE = "1G"            # the browser unit's MemoryMax: one place is 1 GiB of Chrome (D6), its server beside it
+BROWSER_CHROME = "/opt/google/chrome/google-chrome"
+BROWSER_PROFILE_MOST = 1 << 30  # bytes of a profile above which a task's start takes its caches away (S2)
+BROWSER_PROOF_AGE = lifecycle.BROWSER_PROOF_AGE     # seconds: a live proof older than this proves nothing
+BROWSER_CHECK_AGAIN = 600       # seconds in which a failed tool check of the same package and command stays failed
+BROWSER_PAGES_WAIT = 2          # seconds that a clear waits for the pages that it closed to go
+BROWSER_NO_BUS = 3              # rounds in a row with no bus to the user's systemd: then it runs no unit
+BROWSER_CLOSE_WAIT = 5          # seconds that Chrome has to end after Browser.close, before the unit stops (D10)
 PROGRAM_ARCHIVE_MOST = 160 << 20    # bytes of the archive of uv (about 17 MB) or of Node (about 55 MB)
 PROGRAM_ROOM = 2 << 30          # bytes free on the disk of ~/.fleet before an install: Node, a Python and packages
 PROGRAM_WAIT = 600              # seconds that one install of a package may take
@@ -8912,6 +9379,552 @@ def program_start(tool):
         program + list(tool.get("args") or [])
 
 
+# ---- the agent's own browser on a Linux server (build plan 04, S2)
+
+def systemctl_user(*args, timeout=30):
+    """(exit code, its output, its errors) of one systemctl call to this user's own systemd; 1 with the reason where
+    it did not run."""
+    try:
+        done = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=timeout)
+        return done.returncode, done.stdout, done.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, "", str(e)
+
+
+def linux_browser(needs):
+    """True for a browser task of an agent on Linux: it runs with the agent's own Chrome in its browser unit and
+    Google's Chrome DevTools MCP, never with Claude Code's --chrome, which needs a person's Chrome with Claude's
+    extension (D4)."""
+    return needs == "browser" and sys.platform != "darwin"
+
+
+# one rule with the setup check's item of the Browser box (lifecycle.browser_item)
+browser_port, browser_proof_holds = lifecycle.browser_port, lifecycle.browser_proof_holds
+
+
+def browser_tool(port):
+    """This agent's DevTools MCP server as a catalog tool (claude_server, codex_server, program_start): the pinned
+    package, its DevTools port and its flags, and its fixed variables as settings."""
+    return {"custom": True, "package": dict(BROWSER_MCP_PACKAGE),
+            "args": ["--browserUrl", f"http://127.0.0.1:{port}"] + BROWSER_MCP_ARGS,
+            "settings": dict(BROWSER_MCP_SETTINGS), "tools": sorted(BROWSER_MCP_TOOLS)}
+
+
+def tool_schema_hash(schema):
+    """The SHA-256 of a tool's input schema as canonical JSON."""
+    return hashlib.sha256(json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def mcp_tool_list(command, args, env=None, timeout=90, popen=subprocess.Popen):
+    """[{name, inputSchema}] of a stdio MCP server, by its own protocol: initialize, then each page of tools/list.
+    Raises Refused where it gives no whole list in time. Its lines are read from the pipe into a buffer of this
+    function's own: a server that writes two lines at once leaves the second one in no buffer that select sees."""
+    try:
+        proc = popen([command] + list(args), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                     stderr=subprocess.DEVNULL, env=env)
+    except OSError as e:
+        raise Refused(f"the browser's tool server did not start: {e}")
+    end, held = time.monotonic() + timeout, [b""]
+
+    def line():
+        while b"\n" not in held[0]:
+            if len(held[0]) > 1 << 23:
+                raise Refused("the browser's tool server wrote a line above 8 MiB")
+            if not select.select([proc.stdout], [], [], max(0.0, end - time.monotonic()))[0]:
+                return None
+            part = os.read(proc.stdout.fileno(), 1 << 16)
+            if not part:
+                return None
+            held[0] += part
+        one, held[0] = held[0].split(b"\n", 1)
+        return one
+
+    def send(message):
+        proc.stdin.write(json.dumps(message).encode() + b"\n")
+        proc.stdin.flush()
+
+    def ask(number, method, params):
+        send({"jsonrpc": "2.0", "id": number, "method": method, "params": params})
+        while time.monotonic() < end:
+            one = line()
+            if one is None:
+                break
+            with contextlib.suppress(ValueError):
+                message = json.loads(one)
+                if isinstance(message, dict) and message.get("id") == number:
+                    if not isinstance(message.get("result"), dict):
+                        raise Refused(f"the browser's tool server refused {method}")
+                    return message["result"]
+        raise Refused(f"the browser's tool server gave no answer to {method} in {timeout} s")
+    try:
+        ask(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                              "clientInfo": {"name": "founderizer-helper", "version": "1"}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        tools, cursor = [], None
+        for page in range(2, 12):
+            result = ask(page, "tools/list", {"cursor": cursor} if cursor else {})
+            tools += [t for t in result.get("tools") or [] if isinstance(t, dict)]
+            cursor = result.get("nextCursor")
+            if not cursor:
+                return tools
+        raise Refused("the browser's tool server gave more pages of tools than any server of its kind")
+    except (OSError, ValueError) as e:
+        raise Refused(f"the browser's tool server ended: {e}")
+    finally:
+        with contextlib.suppress(OSError):
+            proc.kill()
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            proc.wait(timeout=10)
+        for pipe in (proc.stdin, proc.stdout):
+            with contextlib.suppress(OSError, AttributeError):
+                pipe.close()
+
+
+def browser_tools_fault(tools):
+    """None where a DevTools MCP server gives exactly BROWSER_MCP_TOOLS, each by its name and its input schema; else
+    the words of the first difference."""
+    names = [t.get("name") for t in tools]
+    if not all(isinstance(n, str) for n in names) or len(set(names)) != len(names):
+        return "its tools have a name that is not text, or a name twice"
+    given = {t.get("name"): t.get("inputSchema") for t in tools}
+    if set(given) != set(BROWSER_MCP_TOOLS):
+        more, fewer = sorted(set(given) - set(BROWSER_MCP_TOOLS), key=str), sorted(set(BROWSER_MCP_TOOLS) - set(given))
+        return f"its tools are not the pinned ones: more {more or 'none'}, fewer {fewer or 'none'}"
+    for name in sorted(given):
+        if tool_schema_hash(given[name]) != BROWSER_MCP_TOOLS[name]:
+            return f"its tool {name} takes another input than the pinned one"
+    return None
+
+
+def browser_folder():
+    """The agent's runtime folder of its browser (D5, D11): its lock, its screen's display and its one-shot flag. A
+    reboot clears it."""
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "fleet-browser")
+
+
+def browser_profile():
+    """The agent's Chrome profile (D5): its cookies and the sign-ins of its websites, in the helper's own folder
+    (HOME), never in the agent's home, so that what the helper does to the profile (its mode, its session files and
+    its caches) never touches a folder of the agent's own work."""
+    return os.path.join(HOME, "browser")
+
+
+def browser_unit_text(python=None, kit=None, locale=(None, None)):
+    """The agent's browser unit (D5): the screen, its window manager and Chrome in one unit of the user's systemd
+    (browser-run), with the memory of one place, no swap, the first to go when memory runs out, two restarts at most
+    after a crash (the helper's own start is the third of StartLimitBurst), a short stop, and a start that fails
+    unless a process of the unit's own cgroup listens on the agent's port (browser-ready). It is never enabled: nothing
+    starts it but the helper. `locale` is (LANG, TZ) of browser_locale (D12)."""
+    python, kit = python or sys.executable, kit or KIT
+    lang, zone = locale
+    return ("[Unit]\nDescription=Founderizer: this agent's own browser (build plan 04, D5)\n"
+            "StartLimitIntervalSec=infinity\nStartLimitBurst=3\n\n[Service]\nType=simple\n"
+            f"ExecStart={python} -E -s {kit}/fleet.py browser-run\n"
+            f"ExecStartPost={python} -E -s {kit}/fleet.py browser-ready\n"
+            + (f"Environment=LANG={lang}\n" if lang else "") + (f"Environment=TZ={zone}\n" if zone else "") +
+            f"Restart=on-failure\nRestartSec=2\nTimeoutStopSec=10\nMemoryMax={BROWSER_PLACE}\nMemorySwapMax=0\n"
+            "OOMScoreAdjust=900\n")
+
+
+def browser_locale(team=None, zones="/usr/share/zoneinfo"):
+    """(LANG, TZ) of the agent's Chrome (D12): its language from the owner's (team.json settings owner.language, a
+    BCP 47 tag such as "es-ES", which the hub checks) and its time zone from the fleet's (team.json goals.timezone,
+    UTC by default, as the hub's). Each is None where it is not well formed or the server has no such zone: the
+    unit's text holds them, so nothing else gets there."""
+    team = checkout_team() if team is None else team        # a new language or zone needs no helper restart
+    settings = team.get("settings") if isinstance(team.get("settings"), dict) else {}
+    goals = team.get("goals") if isinstance(team.get("goals"), dict) else {}
+    m = re.fullmatch(r"([A-Za-z]{2,3})(?:-[A-Za-z]{4})?(?:-([A-Za-z]{2}|[0-9]{3}))?(?:-[A-Za-z0-9-]*)?",
+                     str(settings.get("owner.language") or ""))
+    lang = None if not m else m.group(1).lower() + \
+        (f"_{m.group(2).upper()}" if m.group(2) and m.group(2).isalpha() else "") + ".UTF-8"
+    zone = str(goals.get("timezone") or "UTC")
+    if not (re.fullmatch(r"[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+){0,2}", zone) and os.path.isfile(os.path.join(zones, zone))):
+        zone = None
+    return lang, zone
+
+
+def listening_inodes(port, uid=None, opener=open):
+    """The socket inodes that listen on 127.0.0.1:<port> or 0.0.0.0:<port> by the kernel's own list, of this uid
+    when one is given. The whole list, a line at a time: a part of it would let an agent with many sockets push
+    another agent's listener out of the part that is read (a review of 17 November 2026)."""
+    wanted, found = {f"0100007F:{port:04X}", f"00000000:{port:04X}"}, set()
+    try:
+        with opener("/proc/net/tcp", encoding="ascii") as f:
+            next(f, None)                   # its head line
+            for line in f:
+                row = line.split()
+                if len(row) > 9 and row[1] in wanted and row[3] == "0A" and (uid is None or row[7] == str(uid)):
+                    found.add(row[9])
+    except (OSError, UnicodeDecodeError):
+        return set()
+    return found
+
+
+class CdpError(Exception):
+    """This agent's Chrome did not answer a DevTools call as asked."""
+
+
+class CdpLost(CdpError):
+    """The DevTools connection itself failed (no answer in time, an end, a frame cut off, the run's time out): what
+    comes on it after this is not to be read, so a run of calls on it ends."""
+
+
+class Cdp:
+    """**A DevTools connection to this agent's own Chrome** on 127.0.0.1:<port>, and only to a listener of the agent's
+    own uid (D11: an answer of another process proves nothing). One call at a time: `call` sends a method and reads
+    until its answer, past Chrome's events, within its own time; the start has one time for all of it. Raises
+    CdpError, OSError or ValueError."""
+
+    MOST = 1 << 26          # the largest message that it reads, 64 MiB: a profile's list of cookies is far smaller
+
+    def __init__(self, port, timeout=10.0):
+        if not listening_inodes(port, os.getuid()):
+            raise CdpError(f"no process of this agent listens on 127.0.0.1:{port}")
+        self.timeout, self.last, self.rest, self.limit = timeout, 0, b"", None   # limit: a run's end (monotonic)
+        end = time.monotonic() + timeout
+        try:
+            path = urllib.parse.urlparse(self.version(port, end)["webSocketDebuggerUrl"]).path
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            raise CdpError(f"no DevTools address ({type(e).__name__})") from None
+        if not re.fullmatch(r"/devtools/browser/[A-Za-z0-9-]{1,64}", path):
+            raise CdpError("no DevTools address of Chrome's own form")
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        try:
+            key = base64.b64encode(os.urandom(16)).decode()
+            self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+                               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                               ).encode())
+            while b"\r\n\r\n" not in self.rest:
+                part = self.recv(end)
+                if not part or len(self.rest) > 65536:
+                    raise CdpError("DevTools ended the connection at its start")
+                self.rest += part
+            head, self.rest = self.rest.split(b"\r\n\r\n", 1)
+            if b" 101 " not in head.split(b"\r\n", 1)[0]:
+                raise CdpError("DevTools refused the connection")
+        except BaseException:
+            self.sock.close()
+            raise
+
+    @staticmethod
+    def version(port, end):
+        """Chrome's /json/version, by HTTP on a socket of its own and before `end`: a slow answer holds nobody past it,
+        and no proxy of the environment comes between. At most 64 KiB."""
+        with socket.create_connection(("127.0.0.1", port), timeout=max(0.1, end - time.monotonic())) as sock:
+            sock.sendall(f"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".encode())
+            said, length = b"", None
+            while length is None or len(said.partition(b"\r\n\r\n")[2]) < length:
+                left = end - time.monotonic()
+                if left <= 0:
+                    raise CdpLost("DevTools did not answer in time")
+                sock.settimeout(left)
+                try:
+                    part = sock.recv(1 << 16)
+                except TimeoutError:
+                    raise CdpLost("DevTools did not answer in time") from None
+                if not part:
+                    break
+                said += part
+                if len(said) > 1 << 16:
+                    raise CdpLost("DevTools' answer is above 64 KiB")
+                head, cut, _ = said.partition(b"\r\n\r\n")
+                found = re.search(rb"(?im)^content-length:[ \t]*([0-9]{1,6})[ \t]*\r?$", head) if cut else None
+                length = int(found.group(1)) if found else length
+        head, cut, body = said.partition(b"\r\n\r\n")
+        if not cut or not re.match(rb"HTTP/1\.[01] 200 ", head):
+            raise CdpError("DevTools gave no address")
+        return json.loads(body[:length] if length is not None else body)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.sock.close()
+
+    def recv(self, end):
+        """One read before `end`: a peer that sends a byte now and then holds nobody past it."""
+        left = end - time.monotonic()
+        if left <= 0:
+            raise CdpLost("DevTools did not answer in time")
+        self.sock.settimeout(left)
+        try:
+            return self.sock.recv(1 << 16)
+        except TimeoutError:
+            raise CdpLost("DevTools did not answer in time") from None
+
+    def send(self, message, opcode=0x1):
+        data = message if isinstance(message, bytes) else json.dumps(message).encode()
+        size, mask = len(data), os.urandom(4)
+        length = bytes([0x80 | size]) if size < 126 else bytes([0x80 | 126]) + size.to_bytes(2, "big") \
+            if size < 65536 else bytes([0x80 | 127]) + size.to_bytes(8, "big")
+        self.sock.sendall(bytes([0x80 | opcode]) + length + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def take(self, n, end):
+        while len(self.rest) < n:
+            part = self.recv(end)
+            if not part:
+                raise CdpLost("DevTools ended the connection")
+            self.rest += part
+        data, self.rest = self.rest[:n], self.rest[n:]
+        return data
+
+    def message(self, end):
+        """Chrome's next whole message, before `end`; a ping gets its pong."""
+        parts = []
+        while True:
+            first, second = self.take(2, end)
+            size = second & 0x7F
+            if size >= 126:
+                size = int.from_bytes(self.take(2 if size == 126 else 8, end), "big")
+            if size + sum(map(len, parts)) > self.MOST:
+                raise CdpLost("a DevTools message above 64 MiB")
+            mask = self.take(4, end) if second & 0x80 else None
+            data = self.take(size, end)
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            opcode = first & 0x0F
+            if opcode == 0x8:
+                raise CdpLost("DevTools ended the connection")
+            if opcode == 0x9:
+                self.send(data, 0xA)
+            elif opcode != 0xA:
+                parts.append(data)
+                if first & 0x80:
+                    return json.loads(b"".join(parts))
+
+    def call(self, method, params=None, session=None):
+        self.last += 1
+        end = time.monotonic() + self.timeout
+        if self.limit is not None:
+            if time.monotonic() >= self.limit:
+                raise CdpLost(f"{method}: the run of DevTools calls ran out of its time")
+            end = min(end, self.limit)
+        self.send({"id": self.last, "method": method, "params": params or {},
+                   **({"sessionId": session} if session else {})})
+        while True:
+            answer = self.message(end)
+            if isinstance(answer, dict) and answer.get("id") == self.last:
+                if "error" in answer:
+                    raise CdpError(f"{method}: {str((answer['error'] or {}).get('message'))[:200]}")
+                result = answer.get("result")
+                return result if isinstance(result, dict) else {}
+
+
+def cdp_browser_close(port, timeout=5.0):
+    """Chrome's own end (Browser.close, D10): it keeps its cookies, session cookies too. False where no process of
+    this agent listens on its port (Cdp), or it did not take the call."""
+    try:
+        with Cdp(port, timeout) as cdp:
+            cdp.send({"id": 1, "method": "Browser.close"})
+        return True
+    except (OSError, ValueError, CdpError):
+        return False
+
+
+def browser_clears_read(path):
+    """This agent's list of clears ({event: clear}, Helper.browser_clear); {} where there is none."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def browser_clears_write(path, clears):
+    """The list of clears, whole or not at all, in a file that only this user reads."""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    new = f"{path}.{os.getpid()}.new"
+    with contextlib.suppress(OSError):
+        os.remove(new)
+    write_private(new, json.dumps(clears, sort_keys=True))
+    os.replace(new, path)
+
+
+def cookie_domain_of(host, cookies):
+    """The cookie domain of an origin's host (S2): the shortest parent domain among the cookies that Chrome sends to
+    it. Chrome refuses a cookie on a public suffix, so it is never one; the host itself where it has none."""
+    sent = [c["domain"].lstrip(".") for c in cookies
+            if (host == c["domain"].lstrip(".") or c["domain"].startswith(".") and host.endswith(c["domain"]))]
+    return min(sent, key=len) if sent else host
+
+
+def cdp_clear(cdp, session, clear, own=None, closed=None):
+    """One clear (lifecycle.browser_clear_valid) in this agent's running Chrome (S2).
+    - First each page of the cleared sites closes: an open page keeps its login in its memory and sets its cookies
+      again. Target.closeTarget runs no unload handler, so no page can stop it with a dialog. `own`, the clear's own
+      blank page, stays, so that Chrome never closes its last window and ends.
+    - Then, for each origin, each cookie of its cookie domain and of that domain's subdomains, partitioned ones too;
+      each named cookie of an embedded domain, as Chrome lists it by its name, its exact domain and its partition
+      (none, or the top-level site that the clear names), and its path where the clear names one.
+    - Then the other storage of each origin, localStorage included. Storage.clearDataForOrigin keeps the domain's
+      cookies (probe 2), and it answers only in a page's session (live).
+    Raises CdpError when a deleted cookie stayed with its value (CdpLost when the connection failed). A cookie that
+    a page set again, with a new value, is no login of the grant that ended. Each page that it closes goes into
+    `closed` at once, also when it raises later: such a page may be still on its way out."""
+    def named(c, n):        # a cookie with no partition in the record is the unpartitioned one: another site's own
+        return c.get("name") == n["name"] and c.get("domain") == n["domain"] and \
+            ("path" not in n or c.get("path") == n["path"]) and \
+            (c.get("partitionKey") or {}).get("topLevelSite") == (n.get("partitionKey") or {}).get("topLevelSite")
+
+    def ident(c):
+        return (c.get("name"), c.get("domain"), c.get("path"), json.dumps(c.get("partitionKey"), sort_keys=True),
+                c.get("value"))
+    cookies = cdp.call("Storage.getCookies").get("cookies") or []
+    bases = {cookie_domain_of(urllib.parse.urlsplit(o).hostname, cookies) for o in clear["origins"]}
+    within = lambda host: any(host == b or host.endswith("." + b) for b in bases)
+    sent, closed = [], set() if closed is None else closed
+    for target in cdp.call("Target.getTargets").get("targetInfos") or []:
+        url = target.get("url") if isinstance(target, dict) else None
+        if isinstance(url, str) and target.get("type") == "page" and target.get("targetId") != own and \
+                within(urllib.parse.urlsplit(url).hostname or ""):
+            try:
+                closed.add(target["targetId"])          # before the call: a close that took and then lost its answer
+                cdp.call("Target.closeTarget", {"targetId": target["targetId"]})
+                sent.append(target["targetId"])
+            except CdpLost:
+                raise
+            except (CdpError, KeyError, TypeError):                     # one that is gone already: the check decides
+                pass
+    end = time.monotonic() + BROWSER_PAGES_WAIT      # a page goes a moment after its close: the deletes wait for it
+    while sent and time.monotonic() < end:
+        now = {t.get("targetId") for t in cdp.call("Target.getTargets").get("targetInfos") or [] if isinstance(t, dict)}
+        if not now & set(sent):
+            break
+        time.sleep(0.1)
+    doomed = [c for c in cdp.call("Storage.getCookies").get("cookies") or []
+              if within(str(c.get("domain")).lstrip(".")) or any(named(c, n) for n in clear["cookies"])]
+    for c in doomed:
+        cdp.call("Network.deleteCookies", {"name": c["name"], "domain": c["domain"], "path": c["path"],
+                                           **({"partitionKey": c["partitionKey"]} if c.get("partitionKey") else {})},
+                 session)
+    for origin in clear["origins"]:     # in the page's session: on the browser's own target Chrome 158 answers
+        cdp.call("Storage.clearDataForOrigin", {"origin": origin, "storageTypes": "all"}, session)  # "Internal error"
+    gone = {ident(c) for c in doomed}
+    left = [c for c in cdp.call("Storage.getCookies").get("cookies") or [] if ident(c) in gone]
+    if left:
+        raise CdpError(f"{len(left)} cookie(s) of a login whose grant ended stayed")
+
+
+def drop_session_files(profile, flag):
+    """D5: a start deletes both of Chrome's copies of the profile's session, except the start at a wait's end, which
+    the one-shot `flag` names. The flag goes at once, before anything else of the start: a start that stopped before
+    it read the flag left it for a later task. True when the files went."""
+    try:
+        os.remove(flag)
+        return False
+    except FileNotFoundError:
+        pass
+    for name in ("Sessions", "Sessions_Encrypted"):
+        shutil.rmtree(os.path.join(profile, "Default", name), ignore_errors=True)
+    return True
+
+
+def screen_display(read_end, wait=10.0):
+    """The display number that Xvfb writes to its -displayfd pipe, or None where it wrote none in `wait` seconds.
+    Xvfb writes the number and its newline in two writes, and a pipe closed at the second one ends it (seen on x86
+    Ubuntu 24.04, 17 November 2026: "Cannot write display number", half of all starts), so this reads to the
+    newline."""
+    said, end = b"", time.monotonic() + wait
+    while b"\n" not in said and len(said) < 64 and \
+            select.select([read_end], [], [], max(0.0, end - time.monotonic()))[0]:
+        part = os.read(read_end, 64)
+        if not part:
+            break
+        said += part
+    display = said.decode("ascii", "replace").strip()
+    return display if said.endswith(b"\n") and display.isdigit() else None
+
+
+def cmd_browser_run(args):
+    """The agent's browser unit's own program (browser_unit_text), as the agent: a new screen key, Xvfb on a display
+    that it chooses itself (-displayfd, screen_display) with no TCP, Openbox, and Chrome on the agent's DevTools port
+    with its own profile, with no session bus; the profile's session files go first (D5), except at the end of a
+    wait, which leaves a one-shot flag (keep-session), so that Chrome restores its pages (RestoreOnStartup, D12).
+    When Chrome ends, the rest ends, and the unit's result is Chrome's."""
+    run = browser_folder()
+    os.makedirs(run, mode=0o700, exist_ok=True)
+    profile = browser_profile()
+    os.makedirs(profile, mode=0o700, exist_ok=True)
+    os.chmod(profile, 0o700)
+    drop_session_files(profile, os.path.join(run, "keep-session"))
+    port = browser_port()
+    if not port:
+        sys.exit("this agent has no DevTools port in /etc/fleet-browser/ports")
+    key, cookie = os.path.join(run, "screen-key"), secrets.token_hex(16)
+    with contextlib.suppress(OSError):
+        os.remove(key)
+
+    def allow(display):             # the screen's key: Xvfb reads it once, at its start, so it holds the cookie first
+        old = os.umask(0o077)
+        try:
+            subprocess.run(["xauth", "-q", "-f", key, "add", f":{display}", ".", cookie], check=True, timeout=10,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        finally:
+            os.umask(old)
+    allow(0)
+    read_end, write_end = os.pipe()
+    xvfb = subprocess.Popen(["Xvfb", "-auth", key, "-nolisten", "tcp", "-nopn", "-displayfd", str(write_end),
+                             "-screen", "0", "1280x800x24"], pass_fds=(write_end,), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.close(write_end)
+    display = screen_display(read_end)
+    os.close(read_end)
+    if display is None:
+        xvfb.kill()
+        sys.exit("the screen did not start")
+    allow(display)
+    # No session bus: through it Chrome moves itself out of this unit into a scope of its own, where the unit's memory
+    # cap does not hold it (seen on x86 Ubuntu 24.04, 17 November 2026; browser-ready then refuses the start).
+    env = dict(os.environ, DISPLAY=f":{display}", XAUTHORITY=key, DBUS_SESSION_BUS_ADDRESS="disabled:")
+    # --hide-crash-restore-bubble: after one hard stop (a stop of the unit, a crash), Chrome waits for a person to
+    # answer its "Restore pages?" bubble, and until then it saves no session and restores none, at every later start
+    # (its own session log, live on 17 November 2026): so a wait's end brought back no page.
+    openbox = subprocess.Popen(["openbox"], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+    chrome = subprocess.Popen([BROWSER_CHROME, f"--user-data-dir={profile}", f"--remote-debugging-port={port}",
+                               "--no-first-run", "--no-default-browser-check", "--password-store=basic",
+                               "--disable-back-forward-cache", "--hide-crash-restore-bubble",
+                               "--window-size=1280,800", "--window-position=0,0",
+                               "about:blank"], env=env, stdin=subprocess.DEVNULL)
+    code = chrome.wait()
+    for process in (openbox, xvfb):
+        with contextlib.suppress(OSError):
+            process.terminate()
+    sys.exit(code)
+
+
+def cmd_browser_ready(args, wait=10.0, proc="/proc", cgroups="/sys/fs/cgroup"):
+    """The browser unit's ExecStartPost (D11): within `wait` seconds, a socket of a process of this unit's own
+    cgroup listens on 127.0.0.1:<the agent's port>; else the start fails. An answer of /json/version proves nothing:
+    with the port taken by another process of the agent, Chrome goes to [::1] and that process answers."""
+    port = browser_port()
+    if not port:
+        sys.exit("this agent has no DevTools port")
+    try:
+        with open(f"{proc}/self/cgroup", encoding="ascii") as f:
+            path = next(line.split(":", 2)[2].strip() for line in f if line.startswith("0::"))
+    except (OSError, StopIteration):
+        sys.exit("this unit's cgroup cannot be read")
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        listening = listening_inodes(port, os.getuid())
+        try:
+            with open(os.path.join(cgroups, path.lstrip("/"), "cgroup.procs"), encoding="ascii") as f:
+                pids = f.read().split()
+        except OSError:
+            pids = []
+        for pid in pids:
+            with contextlib.suppress(OSError):
+                for fd in os.listdir(f"{proc}/{pid}/fd"):
+                    with contextlib.suppress(OSError):
+                        if os.readlink(f"{proc}/{pid}/fd/{fd}") in {f"socket:[{inode}]" for inode in listening}:
+                            return
+        time.sleep(0.2)
+    sys.exit(f"no process of this unit listens on 127.0.0.1:{port} after {wait:.0f} s")
+
+
 def cmd_run(args):
     agent, conf = args.agent, agent_conf(args.agent)
     if not shutil.which("tmux"):
@@ -8978,7 +9991,8 @@ def cmd_run(args):
             held = ",".join(str(j) for j in list(h.jobs_held) if isinstance(j, int))    # plan C7: the jobs it holds
             checks = ",".join(str(r) for r in list(h.check_runs) if isinstance(r, int))  # C12: its check runs
             asked = time.monotonic()
-            code, data = http("GET", f"/events/{agent}?delivery=1&after=0&wait=8&{listed}&jobs={held}&checks={checks}")
+            code, data = http("GET", f"/events/{agent}?delivery=1&after=0&wait=8&{listed}&jobs={held}&checks={checks}"
+                                     f"{h.browser_closed()}")       # S3, D10: a wait's place, once Chrome is closed
             polled = time.monotonic() - asked
             if code == 403 and data.get("auth") == "moved":
                 h.moved_away()          # agent_move: the owner moved this agent to another server
@@ -9005,6 +10019,7 @@ def cmd_run(args):
             if data.get("hold") == "os_user":
                 h.close_held()      # one OS user for each agent: no window of it runs while the hub holds it
             h.sweep_browser()       # before this round's starts: a unit that no open task holds goes first
+            h.browser_waits(data.get("waits"))      # build plan 04, D10: a wait closes the browser, its end opens it
             h.handle_events(data.get("events", []))
             h.sweep_places()
             h.doing("screen watch")
@@ -10314,6 +11329,8 @@ def main():
     p = sub.add_parser("run"); p.add_argument("agent")
     p.set_defaults(fn=cmd_run)
     p = sub.add_parser("start"); p.add_argument("agent"); p.set_defaults(fn=cmd_start)
+    p = sub.add_parser("browser-run"); p.set_defaults(fn=cmd_browser_run)          # build plan 04, D5: the unit's own
+    p = sub.add_parser("browser-ready"); p.set_defaults(fn=cmd_browser_ready)      # and its start's check (D11)
     p = sub.add_parser("hook"); p.add_argument("kind", choices=["permission", "activity"])
     p.add_argument("agent"); p.add_argument("task"); p.set_defaults(fn=cmd_hook)
     p = sub.add_parser("service"); p.add_argument("name"); p.set_defaults(fn=cmd_service)
