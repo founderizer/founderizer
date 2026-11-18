@@ -8,10 +8,11 @@ Then we close the pull request with a link to that release. The release commit n
 you as a contributor. Under section 5 of the license, what you send is under the Apache License 2.0.
 
 **Before you send it.** Run `python3 selftest.py` and the tests of the files that you changed, one file at a time, from
-the folder of this repository: for example `python3 -m unittest test_servers`. The tests of a file are the `test_*.py`
-files that import it. Use `unittest` and not `pytest`: each test file keeps only its own checks. A test makes its own
-hubs, folders and git repositories in a temporary folder and removes them at its end. All of them, one file after the
-other, take about an hour on a Mac: `for f in test_*.py; do python3 -m unittest "${f%.py}"; done`.
+the top folder of this repository: for example `python3 -m unittest discover -s tests -p test_servers.py`. The tests
+are in `tests/`, and the tests of a file are the `test_*.py` files there that import it. Use `unittest` and not
+`pytest`: each test file keeps only its own checks. A test makes its own hubs, folders and git repositories in a
+temporary folder and removes them at its end. All of them, one file after the other, take about an hour on a Mac:
+`for f in tests/test_*.py; do python3 -m unittest discover -s tests -p "${f#tests/}"; done`.
 
 **With a coding agent.** `AGENTS.md` and `CLAUDE.md` in this repository are the rules that the agents of a fleet read at
 every start, because each machine of a fleet runs a clone of this repository. They are not instructions for your coding

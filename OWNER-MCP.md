@@ -297,7 +297,7 @@ free text of an agent or a person). Its one field, `after`, is optional. The ans
 - `place` (set `owner` only, since 15 November 2026): the page that the window shows now, or where
   it would open when it is closed, by a fixed name (`AppPlace`): `needs`, `tasks`, `agents`;
   `task.<number>` (`task` alone for a task that the hub no longer has); `agent.<name>` (the agent's
-  chat); `agent.<name>.<part>` with part `runs_on`,
+  chat); `agent.<name>.<part>` with part `runs_on`, `capabilities`,
   `behaviour`, `tasks`, `people`, `can_use`; `agent.<name>.rule` (one rule's editor, never the
   rule's id); `agent.<name>.setup.<page>` with page `name`, `servers` (the first two pages of the
   setup of a manager with no server, on a hub that keeps the fleet's shape: the manager's name, whose
@@ -1223,7 +1223,8 @@ local folder and for the hub's address; both programs run on one fixed clock (th
 which the Swift test gives to `OwnerContext.now`), so a fallback name of a copy is compared whole.
 Its class `Parity` fails, with the
 command in its words, when the committed fixture is not what this file does now; remake it with
-`python3 test_owner_mcp.py --parity-fixture` and read its diff. The Swift test `OwnerParityTests`
+`python3 test_owner_mcp.py --parity-fixture` in the development repository, which holds the
+apps, and read its diff. The Swift test `OwnerParityTests`
 replays each case against a stand-in hub with the same answers in the same order and compares the
 requests (method, path, parsed query, `Content-Type`, `X-Fleet-Request-Id`, `X-Fleet-Name`, that
 `X-Fleet-Client` is there and that `Authorization` and `Origin` are not, and the parsed body, with

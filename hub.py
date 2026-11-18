@@ -7765,6 +7765,16 @@ def access_route(asker, rid, requester, want=None, restarts=None):
     own = restarts in (None, requester)
     restart = ("restart_task starts this task again in a session that has it" if own else
                f"{restarts}, its requester, starts it again with restart_task in a session that has it")
+    why = google_refusal(what, kind) if kind in ("drive", "gmail") else None
+    if why:
+        # No grant settles it, nor a restart of a session that holds it already: the account itself does not allow the
+        # service, so its tools refuse in every session (google_access) until the owner puts that right.
+        return (f"ACCESS NEEDED: {asker} needs {resource_phrase(kind, what)} ({rid})" + (f" at {want}" if want else "") +
+                f", and no grant gives it now. {why} " +
+                ("Raise a Needs-you item and say what the work needs it for. " if manager else
+                 "Pass the question up with answer(..., pass_up=true). ") +
+                (f"team.json gives it at {mine} already: once the owner has done that, {restart}." if enough else
+                 "Once the owner has done that, this question says how to give the access."))
     out = [f"ACCESS NEEDED: {asker} needs {resource_phrase(kind, what)} ({rid})" + (f" at {want}" if want else "") +
            ", and team.json gives it " +
            (f"at {mine} already, so its next session has it: a running session keeps what it started with, so "
@@ -11051,12 +11061,21 @@ def need_is_yours(agent, *texts):
     owner's own rule is that a grant is the authorization and the manager answers for giving it; that rule only works
     if the owner is never asked for what he has already delegated."""
     blob = " ".join(t for t in texts if t).lower()
+    words, services = re.sub(r"\S+@\S+", " ", blob), None      # its words without addresses: x@gmail.com is no Gmail
     for rid, entry in sorted(resource_pool().items()):
         kind, what = resource_parts(rid)
         if not kind or not entry.get("max") or not resource_known(kind, what, TEAM):
             continue
         if rid not in blob and not (len(what) >= 4 and what in blob):
             continue
+        if kind in ("drive", "gmail"):
+            # The owner's Connect of a service that the account does not allow is what such an item asks for, and no
+            # grant gives it (grant_check): of this service, or of the account's other one that the item names.
+            services = google_services_now()[0] if services is None else services
+            allowed, other = services.get(what, set()), "gmail" if kind == "drive" else "drive"
+            if kind not in allowed or other not in allowed and (f"{other}:{what}" in blob or
+                                                                re.search(rf"\b{other}\b", words)):
+                continue
         who = [n for n in agents() if grant_fits(n, entry) and agent_active(n)]
         if not who:
             continue
@@ -20081,6 +20100,37 @@ def google_scopes(entry):
     return [s.rsplit("/", 1)[-1] for s in (entry or {}).get("scopes") or [] if isinstance(s, str)]
 
 
+def google_services(account):
+    """The services that one account of google_view allows now: it is connected, and its scopes hold the service's
+    (GOOGLE_SCOPES), as a tool of that service needs (google_access). A Connect asks Google for one service only (owner
+    API 1.185), so an account can allow Gmail and not Drive."""
+    return {s for s, short in GOOGLE_SCOPES.items() if account["connected"] and short in account["scopes"]}
+
+
+def google_services_now():
+    """({email: the services that it allows now} of each connected account of the hub's Google file, the file's problem
+    or None), from one read: the manager gives no other Google service (grant_check, grant_pool)."""
+    saved, bad = google_saved()
+    if bad:
+        return {}, bad
+    return {email: {s for s, short in GOOGLE_SCOPES.items() if short in google_scopes(google_entry(saved, email))}
+            for email in saved.get("accounts") or {} if google_entry(saved, email)}, None
+
+
+def google_refusal(email, service):
+    """Why no grant gives this service of this account now, in words for the manager, or None when the account allows
+    it (google_services_now). The tools of the service refuse it then too (google_access)."""
+    services, bad = google_services_now()
+    if bad:
+        return f"The hub cannot read its Google file now ({bad}), so it cannot see what {email} allows: the owner must " \
+               f"put it right."
+    if service in services.get(email, ()):
+        return None
+    name = GOOGLE_NAMES[service]
+    return (f"The Google account {email} does not allow {name} now: only the owner can connect it for {name}, with "
+            f"Connect account in Settings › Apps › {'Google Drive' if service == 'drive' else 'Gmail'}.")
+
+
 def google_fingerprints(email, refresh_token, client_secret=None):
     """At Connect: the salted fingerprints of the account's refresh token and of its client's secret (an own client's,
     or Founderizer's, which founderizer.com gives and no public code holds), as for a chat app token, so that every text
@@ -27877,10 +27927,15 @@ def history_query(agent, phrases, since, until, people, task, kinds, owner_chats
         # bm25 and not the index's own `rank`: the index ranks every id that it holds the words at before the join, and
         # bm25 here ranks only what joins a row, so the words of an id with no row are never ranked (history_drop_row).
         # When the index answers that it is damaged, the newest first, and then the words read linearly.
+        # CROSS JOIN keeps the index the outer loop: it is read once, and each id that it gives reads its one row.
+        # With a plain JOIN, SQLite, which keeps no statistics of these tables, read the rows of a filter's own index
+        # first when the filter came with a date (history_agent_at, history_of_person, history_of_task), and then the
+        # index once for each of them: on 17 November 2026 an agent's search from a date read its 9,230 records that
+        # way in 28 s, under LOCK, and every other request of the hub waited. With the index first it took 0.01 s.
         for order in ("bm25(history_fts)", "h.at DESC, h.id DESC"):
             try:
-                return read_rows(f"SELECT h.* FROM history_fts f JOIN history h ON h.id=f.rowid WHERE history_fts "
-                                 f"MATCH ? AND {cond} ORDER BY {order} LIMIT ?",
+                return read_rows(f"SELECT h.* FROM history_fts f CROSS JOIN history h ON h.id=f.rowid WHERE "
+                                 f"history_fts MATCH ? AND {cond} ORDER BY {order} LIMIT ?",
                                  (f"agent : {key} AND ({words})" if key else words, *args, limit + 1))
             except sqlite3.OperationalError:
                 return []       # a query the index cannot read, which the phrases above are made never to be
@@ -28079,8 +28134,8 @@ def history_messages_query(tokens, limit):
               (*HISTORY_MESSAGE_KINDS, *[f"%{t}%" for t in tokens]))]
     if HISTORY_FTS[0]:          # the index first, and the words read linearly when it answers that it is damaged
         words = " AND ".join(f'text : "{t}"' + ("*" if i == len(tokens) - 1 else "") for i, t in enumerate(tokens))
-        reads.insert(0, (one.format(src="history_fts f JOIN history h ON h.id=f.rowid", match="history_fts MATCH ?"),
-                         (*HISTORY_MESSAGE_KINDS, words)))
+        src = "history_fts f CROSS JOIN history h ON h.id=f.rowid"      # the index first, as in history_query
+        reads.insert(0, (one.format(src=src, match="history_fts MATCH ?"), (*HISTORY_MESSAGE_KINDS, words)))
     for inner, args in reads:
         try:
             return read_rows(f"SELECT h.* FROM history h WHERE h.id IN ({inner}) ORDER BY h.at DESC, h.id DESC "
@@ -28746,11 +28801,13 @@ def resource_history(rid, limit=RESOURCE_HISTORY):
 
 def resource_view(rid, team, accounts):
     """One resource for GET /ui/resources: what it is, the secrets it needs, the owner's standing for it, and the
-    agents that hold it now. No value and no token: a secret is its reference and its name."""
+    agents that hold it now. No value and no token: a secret is its reference and its name. accounts: the services
+    that each Google account allows now (google_services), so a Drive or Gmail service is connected only when its
+    account allows it."""
     kind, what = resource_parts(rid)
     entry = (team.get("resources") or {}).get(rid) or {}
     uses, credential = resource_uses(kind, what, team)
-    ready = True if kind not in ("drive", "gmail") else accounts.get(what, False)
+    ready = True if kind not in ("drive", "gmail") else kind in accounts.get(what, ())
     return {"id": rid, "kind": kind, "what": what, "title": resource_title(kind, what, team),
             "needs": RESOURCE_NEEDS[kind], "levels": list(RESOURCE_LEVELS[kind]), "uses": uses,
             "credential": credential, "connected": ready,
@@ -28760,12 +28817,13 @@ def resource_view(rid, team, accounts):
 
 def resource_ids(team, accounts):
     """Every resource that the owner's page shows: each secret of the catalog, each tool of the catalog, each
-    repository and each Google service that an agent already has, both services of each account that the hub knows
-    (connected, or named by an agent), and each entry of team.json "resources", so one that nobody holds yet shows
-    too."""
+    repository and each Google service that an agent already has, each service that a connected account allows, and
+    each entry of team.json "resources", so one that nobody holds yet shows too. A Connect asks Google for one service
+    (owner API 1.185), so an account that allows Gmail only is no Drive account: its Drive shows only while an agent
+    or the owner's standing still names it, and then as not connected."""
     ids = {f"secret:{ref}" for ref in (team.get("logins") or {})}
     ids |= {f"tool:{name}" for name in tool_catalog(team)}
-    ids |= {f"{service}:{email}" for email in accounts for service in GOOGLE_LEVELS}
+    ids |= {f"{service}:{email}" for email, services in accounts.items() for service in services}
     for a in (team.get("agents") or {}).values():
         ids |= {f"repo:{repo}" for repo in (a.get("repos") or {})}
         ids |= {f"{service}:{got['account']}" for service, got in (a.get("google") or {}).items()
@@ -28776,7 +28834,7 @@ def resource_ids(team, accounts):
 
 def resources_view(team):
     """GET /ui/resources: the kinds, the owner's marks and every resource with its standing and its holders."""
-    accounts = {a["email"]: bool(a["connected"]) for a in google_view(team)["accounts"]}
+    accounts = {a["email"]: google_services(a) for a in google_view(team)["accounts"]}
     return {"kinds": [{"kind": kind, "title": RESOURCE_TITLES[kind], "word": RESOURCE_WORDS[kind],
                        "levels": list(levels), "needs": RESOURCE_NEEDS[kind]}
                       for kind, levels in RESOURCE_LEVELS.items() if kind != "server"],     # the app gives these
@@ -28854,11 +28912,15 @@ def grant_pool(names, team=None):
     """What the manager may hand out now, for see_capacity: each resource of the pool with its level, its audience, the
     agents of this view that could be given it, and who holds it today. The pool is the authority — grant_access
     refuses everything outside it — so the manager reads it here instead of waiting for a message about it."""
-    pool = []
+    pool, services = [], None
     for rid, entry in sorted((((team or TEAM).get("resources")) or {}).items()):
         kind, what = resource_parts(rid)
         if not kind or not entry.get("max"):
             continue
+        if kind in ("drive", "gmail"):
+            services = google_services_now()[0] if services is None else services      # one read for the pool
+            if kind not in services.get(what, ()):
+                continue        # grant_check refuses it: the account does not allow that service now
         pool.append({"resource": rid, "kind": kind, "title": resource_title(kind, what, team),
                      "max": entry["max"], "to": entry.get("to", RESOURCE_AUDIENCE),
                      "levels": list(RESOURCE_LEVELS[kind]),
@@ -28905,6 +28967,11 @@ def grant_check(agent, rid, level):
                 f"the owner with raise_needs_you to make it grantable, or to grant it once.")
     if not resource_known(kind, what, TEAM):
         return f"The fleet does not hold {resource_phrase(kind, what)} any more. Tell the owner."
+    why = google_refusal(what, kind) if kind in ("drive", "gmail") else None
+    if why:
+        # A Connect asks Google for one service (owner API 1.185): an account connected for Gmail is no Drive account.
+        return (f"You cannot give {resource_phrase(kind, what)}. {why} Ask the owner with raise_needs_you, and say what "
+                f"the work needs it for.")
     levels = RESOURCE_LEVELS[kind]
     if level not in levels:
         raise ToolError(f"level must be one of {', '.join(levels)} for a {RESOURCE_WORDS[kind]}.")
@@ -35852,7 +35919,10 @@ def save_agent_settings(agent, body):
                                    f"server first.")
             if new["screen"]["model"] or new["screen"]["effort"]:
                 offered(agent, new["screen"]["model"], new["screen"]["effort"], reading="screen_models")
-    if "can" in new and "shell" in old["can"] and "shell" not in new["can"] and a.get("role") in ("worker", "lead"):
+    # An entry with no Tools list has the shell of its runtime (shell_off): a new list without it turns the shell off
+    # too. Its `can` reads [] (ui_team), which every settings write sends back unchanged: that one changes nothing.
+    if "can" in new and ("shell" in old["can"] or not isinstance(a.get("can"), list) and new["can"] != old["can"]) \
+            and "shell" not in new["can"] and a.get("role") in ("worker", "lead"):
         # support plan F1: Shell off is real only where a session can be held to a fixed list of tools, and only on a
         # helper that starts it so (helper feature shell_box)
         if not closed_versions(a.get("runtime")):
@@ -41573,6 +41643,34 @@ def desktop_defaults(team, machine, runtime):
             and (c != "screen" or mac_chatgpt(machine) is not False)]
 
 
+def owner_boxes(team, a):
+    """The Tools boxes that the owner's app shows for an agent (owner API 1.216), in CAPABILITIES order. `on`: the boxes
+    that it has in effect: its Tools list, or, for an entry with no list, the shell and the web of its runtime (shell_off
+    reads such an entry as Shell on). `offered`: each box that does something for it, and each box that it has, so that
+    the owner can always turn one off. A box does something when its runtime can use it (RUNTIME_CAN), the browser and
+    the screen only on a Mac (as desktop_defaults gives them, which also waits for the ChatGPT app's sign-in before it
+    gives the screen), and the screen only with the Shell box on (fleet.closed_task_command refuses a screen task of a
+    closed session); a Codex worker or lead on app-server runs browser tasks in its runner too (runtime_switch says so).
+    `idle`: the boxes of `offered` that do nothing for it now. `stays_on`: Shell, where no box turns
+    it off: for a runtime with no closed version, whose Shell off save_agent_settings refuses, and for the manager,
+    whose sessions have the shell and the web whatever its boxes say (the app shows no Capabilities for it)."""
+    can, runtime = a.get("can"), a.get("runtime")
+    runs = RUNTIME_CAN.get(runtime, set())
+    on = list(can) if isinstance(can, list) else [c for c in ("shell", "web") if c in runs]
+    mac = server_kind_of(team, a.get("machine")) == "mac"
+    closed = "shell" not in on
+
+    def works(box):
+        runner = box == "browser" and app_server_task(a, "browser")
+        return (box in runs or runner) and (mac or box in ("shell", "web")) and not (box == "screen" and closed)
+    offered = [c for c in CAPABILITIES if works(c) or c in on]
+    worker = a.get("role") in ("worker", "lead")
+    # A worker's list without the shell reads off, and goes on again; the manager's shell is on whatever it says.
+    stays = "shell" in offered and ("shell" in on or not worker) and not (worker and closed_versions(runtime))
+    return {"on": [c for c in CAPABILITIES if c in on], "offered": offered,
+            "idle": [c for c in offered if not works(c)], "stays_on": ["shell"] if stays else []}
+
+
 def screen_waits(team, a):
     """True for an agent of a Mac whose screen waits only for the ChatGPT app's sign-in there: its default stays open."""
     return server_kind_of(team, a.get("machine")) == "mac" and "screen" in RUNTIME_CAN.get(a.get("runtime"), set()) and \
@@ -42490,11 +42588,26 @@ def join_line(code, kind, tags=None):
     own installer (TAILSCALE_INSTALL) and joins the private network with the tags of hub_tags, and with no
     --advertise-tags when it gives none (one sign-in link, or none with a key that the app makes), under the name its
     provider gave it, which becomes its name in Fleet. Then the line runs this hub's join script, with the code in that
-    script's environment: never in a URL."""
+    script's environment: never in a URL.
+
+    **A VPS's line stops when the join script does not come** (the plan install-auto-repair, part 1, and its live check
+    of 17 November 2026). `curl ... | sh` ends with the status of `sh`, and an `sh` that reads no script ends with 0:
+    a hub that did not answer at that moment made a join step that passed, and the install stopped later, at its
+    checks, which no try repeats. Now a curl that fails prints the sentence of join.sh's own `reach` ("This machine
+    cannot reach the Founderizer hub at ..."), which the app reads as `hub_no_answer` and tries again, and gives `sh` an
+    empty line and then `exit 1`: the empty line ends a line that a curl cut in its middle left open, so that `exit 1`
+    stands on a line of its own (a review of 17 November 2026: "echo par" and "exit 1" ran as "echo parexit 1", and the
+    line ended with 0). A curl that works gives `sh` the script as before. The line keeps no `"`, `'`, `$` or new line,
+    as INSTALL-PROMPT.md B3 tells the owner's agent. A Mac's line keeps its one shape: the Mac's installer and the app
+    check it word for word (setup.sh `join`, `MacInstallerLink`), and that installer reads the join's own server.json in
+    place of the line's status."""
     ip, port = hub_address()
-    join = f"curl -fsS http://{ip}:{port}/join | FLEET_JOIN={code} sh"
+    address = f"http://{ip}:{port}"
     if kind == "mac":
-        return join
+        return f"curl -fsS {address}/join | FLEET_JOIN={code} sh"
+    unreached = (f"Founderizer join stopped: This machine cannot reach the Founderizer hub at {address}. Check that "
+                 "Tailscale is connected, and run the line again.")
+    join = f"{{ curl -fsS {address}/join || {{ echo {unreached} >&2; echo; echo exit 1; }}; }} | FLEET_JOIN={code} sh"
     up = "tailscale up" + (f" --advertise-tags={','.join(tags)}" if tags else "") + " --accept-dns=false"
     return f"command -v tailscale >/dev/null || {TAILSCALE_INSTALL}; tailscale status >/dev/null 2>&1 || {up}; " + join
 
@@ -54934,6 +55047,7 @@ class Handler(BaseHTTPRequestHandler):
                 line.update(active=a.get("active", True) is not False, model=a.get("model"), effort=a.get("effort"),
                             can=list(a.get("can") or []), settings_pending=settings_pending(line["agent"]),
                             web_hosts=list(a.get(WEB_HOSTS) or []),
+                            boxes=owner_boxes(team, a),                     # owner API 1.216
                             reported_model=reported_model(line["agent"]),
                             screen=screen_settings(a), reported_screen_model=reported_model(line["agent"], screen=True),
                             title=a.get("title"), expertise=list(a.get("expertise") or []), account=a.get("account"),

@@ -1171,7 +1171,7 @@ DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TO
 CHROME_TOOLS = "mcp__claude-in-chrome__*"      # the tools that Claude Code's --chrome adds to a browser task
 # The files of this checkout that no worker session edits: Fleet's code, the rules, the owner's files, and the agents'
 # skills, which an agent changes with write_skill only (design v4 D1).
-PROTECTED = ("fleet.py", "hook_clean.py", "hook_hosts.py", "hidden.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "acp_programs.py", "prices/**", "pins.py", "prices.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
+PROTECTED = ("fleet.py", "hook_clean.py", "hook_hosts.py", "hidden.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "acp_programs.py", "prices/**", "pins.py", "prices.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "tests/test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
 # No Claude session that a helper starts loads a setting source of its machine (--setting-sources ''). A Mac keeps one
 # desktop user for its agents (PRODUCT.md P2), so that person's own CLAUDE.md, rules, skills, agents, plugins and hooks
 # would steer every agent there unseen, and an agent could write them to steer its own later sessions; and the
@@ -8276,29 +8276,80 @@ PYPI_INDEX = "https://pypi.org/simple"
 PYPI_PYTHON = ">=3.10,<3.14"   # the Pythons that uv may take for a PyPI program: maintained, with wheels for most
 NPM_REGISTRY = "https://registry.npmjs.org/"
 PROGRAM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"      # the PATH of an installed program, after its own folder
+PROGRAM_START_WAIT = 10         # seconds that the program of a pinned tool may take to end its --version
+# The system libraries that the program of a pinned tool loads and that a system can lack, each with the package of
+# Ubuntu and Debian that has it: Node's Linux builds load libatomic.so.1, and the image of Ubuntu 24.04 does not have
+# it (26.04's has it). join.sh and hub.sh install these packages.
+PROGRAM_LIBRARIES = {"libatomic.so.1": "libatomic1"}
 
 
 def program_tool(kind, fetch=None, run=subprocess.run):
     """The folder of Fleet's pinned uv ("uv") or Node ("node") for this system, which the helper installs once for
-    this OS user under ~/.fleet/programs/tools. The archive is held to its pinned SHA-256 in memory and unpacked
-    with tarfile's data filter, or with the same checks where this Python has none, so no member leaves the folder.
-    Refused where the vendor builds nothing for this system or where the disk is nearly full."""
+    this OS user under ~/.fleet/programs/tools (program_unpack), and whose program starts on this machine
+    (program_starts). Refused where the vendor builds nothing for this system, and with the reason where its program
+    does not start: the folder stays, so a try after the cause has gone downloads nothing."""
     platform = gh_platform(run)
     builds, version = (UV_BUILDS, UV_VERSION) if kind == "uv" else (NODE_BUILDS, NODE_VERSION)
     if platform not in builds:
         raise Refused(f"Founderizer installs no {kind} for {os.uname().sysname} {os.uname().machine}")
     target, digest = builds[platform]
     folder = os.path.join(programs_dir(), "tools", f"{kind}-{version}-{target}")
-    if os.path.exists(os.path.join(folder, "ready")):
-        return folder
+    name = f"uv-{target}" if kind == "uv" else f"node-v{version}-{target}"
+    if not os.path.exists(os.path.join(folder, "ready")):
+        program_unpack(kind, version, digest, folder, name, fetch)
+    program_starts(f"{kind} {version}",
+                   os.path.join(folder, name, "uv") if kind == "uv" else os.path.join(folder, name, "bin", "node"), run)
+    return folder
+
+
+class NotStarting(Refused):
+    """The program of a pinned tool does not start on this machine (program_starts). check: its name and its path,
+    with which each later session start checks it again (package_in_place)."""
+
+    def __init__(self, words, check):
+        super().__init__(words)
+        self.check = check
+
+
+def program_starts(name, program, run=subprocess.run):
+    """Nothing when the program of a pinned tool (name: "node 26.13.0") starts on this machine: its --version ends
+    with 0. Else NotStarting, in plain words: the system's loader names a library that is missing
+    (PROGRAM_LIBRARIES), or this machine cannot run the program at all. The install's npm or uv step would fail in
+    its place, with the loader's own words."""
+    def refused(words):
+        return NotStarting(f"{name} does not start" + words, (name, program))
+    try:
+        done = run([program, "--version"], env={"HOME": os.path.expanduser("~"), "PATH": PROGRAM_PATH},
+                   cwd=programs_dir(), capture_output=True, text=True, timeout=PROGRAM_START_WAIT,
+                   stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise refused(f": its --version did not end in {PROGRAM_START_WAIT} seconds") from None
+    except OSError as e:
+        raise refused(f" on this machine: {e.strerror or type(e).__name__}") from None
+    if done.returncode == 0:
+        return
+    said = " ".join((done.stderr or done.stdout or "").split())
+    missing = re.search(r"error while loading shared libraries: ([^\s:]+): cannot open shared object file", said)
+    if missing:
+        library = missing.group(1)
+        package = PROGRAM_LIBRARIES.get(library)
+        raise refused(f": this machine has no {library}" +
+                      (f" (the system package {package})" if package else ", a system library that it needs"))
+    raise refused(f" on this machine: {said[-300:] or f'exit {done.returncode}'}")
+
+
+def program_unpack(kind, version, digest, folder, name, fetch=None):
+    """The archive `name` of a pinned tool (program_tool), downloaded and unpacked into folder, which is in place once
+    it has its file ready. One helper of this OS user at a time. The archive is held to its pinned SHA-256 in memory
+    and unpacked with tarfile's data filter, or with the same checks where this Python has none, so no member leaves
+    the folder. Refused where the disk is nearly full."""
     os.makedirs(os.path.dirname(folder), mode=0o700, exist_ok=True)
     with open(os.path.join(programs_dir(), "tools.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if os.path.exists(os.path.join(folder, "ready")):
-            return folder                       # another helper of this user installed it a moment ago
+            return                              # another helper of this user installed it a moment ago
         if shutil.disk_usage(programs_dir()).free < PROGRAM_ROOM:
             raise Refused(f"the disk of {programs_dir()} has less than {PROGRAM_ROOM >> 20} MB free")
-        name = f"uv-{target}" if kind == "uv" else f"node-v{version}-{target}"
         url = f"{UV_RELEASES}/{version}/{name}.tar.gz" if kind == "uv" else f"{NODE_DIST}/v{version}/{name}.tar.gz"
         archive, got, size = io.BytesIO(), hashlib.sha256(), 0
         with (fetch or urllib.request.urlopen)(urllib.request.Request(url, headers={"User-Agent": OUTSIDE_AGENT}),
@@ -8329,7 +8380,6 @@ def program_tool(kind, fetch=None, run=subprocess.run):
                 tar.extractall(folder)
         with open(os.path.join(folder, "ready"), "w") as f:
             f.write(f"{kind} {version} {digest}\n")
-    return folder
 
 
 def package_folder(package):
@@ -8509,6 +8559,7 @@ def package_thread(package, install):
     try:
         ensure_package(package)
     except Exception as e:              # the next start says it; a failure here must not end the helper
+        install["check"] = e.check if isinstance(e, NotStarting) else None      # before the error, which starts read
         install["error"] = str(e) if isinstance(e, (Refused, ValueError)) else type(e).__name__
         print(time.strftime("%H:%M:%S"), f"MCP: {package.get('name')} {package.get('version')}: "
               f"{install['error']}", flush=True)
@@ -8528,17 +8579,34 @@ def package_install(package):
     return install
 
 
+def install_again(folder, install):
+    """For the record of a failed install whose pinned tool did not start (NotStarting, its check): the tool's program
+    checked again, with one run of it and no download. True when it starts now: the record is gone, and the start
+    installs again at once. Else False, and the record's words say the cause of now."""
+    if not (install and install["error"] and install.get("check")):
+        return False
+    try:
+        program_starts(*install["check"])
+    except Refused as e:
+        install["error"] = str(e)
+        return False
+    PACKAGE_INSTALLS.pop(folder, None)
+    return True
+
+
 def programs_wait(agent):
     """Before a task or a tools-on conversation of this agent starts anything (its credential, the vault's read, the
     hub's tokens): Installing while a package of its servers in this checkout's team.json is not in place yet, with
-    each missing install started. An install that failed does not wait here: the start says it (package_in_place)."""
+    each missing install started. An install that failed does not wait here: the start says it (package_in_place),
+    unless its pinned tool did not start and starts now (install_again)."""
     catalog, missing = team_catalog(), []
     for name in checkout_conf(agent).get("tools") or []:
         tool = catalog.get(name) if isinstance(name, str) else None
         if not (tool and tool.get("package")) or package_ready(tool["package"]):
             continue
-        install = PACKAGE_INSTALLS.get(package_folder(tool["package"]))
-        if install and install["error"]:
+        folder = package_folder(tool["package"])
+        install = PACKAGE_INSTALLS.get(folder)
+        if install and install["error"] and not install_again(folder, install):
             continue
         package_install(tool["package"])
         missing.append(f"{tool['package']['name']} {tool['package']['version']}")
@@ -8564,6 +8632,8 @@ def package_in_place(name, package, notes):
         return True
     folder = package_folder(package)
     install = PACKAGE_INSTALLS.get(folder)
+    if install_again(folder, install):
+        install = None
     if install and install["error"]:
         install["told"] = install.get("told", 0) + 1        # a count, not a clock: the third start tries again
         if install["told"] >= PACKAGE_FAILED_STARTS:

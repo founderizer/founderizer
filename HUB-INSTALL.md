@@ -144,7 +144,7 @@ notification of a Needs-you item, the chat that opens first), so with those apps
 
 1. **This server and this copy of Founderizer.** Root, the system, systemd, and that the
    copy is a Founderizer checkout with a commit.
-2. **Base packages:** `git tmux python3 curl ca-certificates ufw unattended-upgrades sudo tzdata`.
+2. **Base packages:** `git tmux python3 curl ca-certificates ufw unattended-upgrades sudo tzdata libatomic1`.
 3. **The user `fleet`:** created, password locked, out of `sudo`, `admin` and `wheel`,
    home mode 700, and lingering on, so its services run after logout and after a
    restart. It runs the hub and the git daemon, and no agent's session: each agent has
@@ -771,7 +771,8 @@ that the owner gives, and it takes no value under a removed name again (UI-API.m
 
 ## The test
 
-`python3 -m unittest test_hub_install.py test_join_install.py` proves both installers
+`python3 -m unittest discover -s tests -p test_hub_install.py`, and the same with
+`test_join_install.py`, from the top folder of this repository, prove both installers
 — with `test_agent_users.py` for the per-agent user, the root helper and the agent-add
 path — without touching a machine: the first `team.json` is one the hub can run and holds no
 credential, the claim takes one code once and refuses the rest, a second claim on a hub

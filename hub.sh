@@ -85,7 +85,9 @@ ROOT_KIT=/usr/local/lib/founderizer-kit
 # the mark cannot know.
 NEW_HUB_MARK=/root/.founderizer-new-hub
 # tzdata: the hub reads time zones, also UTC (hub.goal_settings), and a small image of Ubuntu has no zone data.
-PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo tzdata"
+# libatomic1: the fleet's pinned Node (fleet.py NODE_VERSION), which installs and runs the npm programs of MCP servers,
+# loads libatomic.so.1, and the image of Ubuntu 24.04 does not have it.
+PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo tzdata libatomic1"
 # The Founderizer files this installer needs in the copy it runs from. The rules, the manager's parts of them and its
 # profile are in the list because the manager reads them at every start: a hub without them runs but has no manager
 # worth the name.
