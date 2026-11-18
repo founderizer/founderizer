@@ -828,6 +828,8 @@ class Servers(OwnerAPI):
         self.assertEqual(mini["job"]["state"], "queued")
 
     def test_the_start_settings_come_from_a_server_of_the_same_kind(self):
+        """A fleet that has a worker keeps copying it, with its allow list, from a server of the same kind first (the
+        Linux vps's policy, not the Mac studio's): the installer's own line is for the first worker only."""
         self.joined("box", "linux", source=OTHER, user="fleet")
         self.assertEqual(self.add_agent("box", "coder", "claude")[0], 200)
         entry = self.origin_team()["agents"]["coder"]
@@ -864,14 +866,6 @@ class Servers(OwnerAPI):
         # The one that matters: the manager's Claude line bypasses permissions, and a first worker never takes it.
         self.assertNotEqual(hubsetup.WORKER_STARTS["claude"], hubsetup.STARTS["claude"])
         self.assertIn("bypassPermissions", hubsetup.STARTS["claude"])
-
-    def test_a_worker_of_the_fleet_still_wins_over_the_installers_line(self):
-        """The fallback is for the first worker only: a fleet that has one keeps copying it, with its allow list."""
-        self.joined("box", "linux", source=OTHER, user="fleet")
-        self.assertEqual(self.add_agent("box", "coder", "claude")[0], 200)
-        entry = self.origin_team()["agents"]["coder"]
-        self.assertEqual(entry["start"], "claude --permission-mode dontAsk {settings} {prompt}")
-        self.assertEqual(entry["allow"], ["Bash", "mcp__fleet__*"])
 
     def test_a_codex_agent_never_takes_the_app_server_policy(self):
         self.joined()
@@ -2092,15 +2086,8 @@ class ServerService(Servers):
         self.assertEqual(self.asked(), [])
         self.broker()                                       # the release changed vault.py; the broker has not
         svc.vault_program()
-        self.assertEqual(self.asked(), [["sudo", "-n", self.mod.VAULT_HELPER]])
-
-    def test_what_it_asks_for_carries_no_argument_at_all(self):
-        """Root fetches the program itself, so this service passes no bytes, no path and no revision: a wrong
-        reading here can cost root one fetch that finds nothing to do, and nothing else."""
-        self.join_by_script(self.code()["code"])
-        svc = self.service()
-        self.broker()
-        svc.vault_program()
+        # The whole command, with no argument: root fetches the program itself, so a wrong reading here can cost
+        # root one fetch that finds nothing to do, and nothing else.
         self.assertEqual(self.asked(), [["sudo", "-n", self.mod.VAULT_HELPER]])
 
     def test_a_machine_with_no_broker_and_a_mac_are_never_asked(self):
@@ -2475,11 +2462,6 @@ class InstallRetries(unittest.TestCase):
         for text in ("", None, "error: this system is not supported: linux armv6l", "No space left on device",
                      "curl: (22) The requested URL returned error: 404"):
             self.assertFalse(onboard.network_failure(text), text)
-
-
-def lifecycle_exe(name, home):
-    import lifecycle
-    return lifecycle.exe(name, str(home))
 
 
 class JoinLineStops(unittest.TestCase):

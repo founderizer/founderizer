@@ -15797,19 +15797,55 @@ def t_start_task(agent, a):
     same message again gives the same task. Its result comes back into this chat by itself (chat_result).
 
     The checks of create_task that apply run here, and not check_task: its lead_task reads this call's context, which
-    is the owner chat of the agent and no session of the lead's."""
+    is the owner chat of the agent and no session of the lead's.
+
+    needs (18 November 2026): the task's session has a browser or the screen when the agent names that need, under
+    create_task's two checks: the agent holds it, and the desktop of its machine is free (desktop_refusal). Until
+    then each task from a chat had the need "none", which nobody had decided: the first version gave check_task no
+    need. So the owner's "use the screen" in the chat of an agent that holds a screen started a session with no
+    screen tool, two times, and the task failed. The lead's one task that such a task hangs on keeps the need
+    "none" (lead_batch_rows)."""
     chat_fence(agent)
     source = owner_message(agent, a.get("in_reply_to"))
     title, done_when = str(a.get("title") or "").strip(), str(a.get("done_when") or "").strip()
     asked = " ".join(str(a.get("asked") or "").split())     # owner feature asks: the name of this work for the owner
-    guard(agent, title, done_when, asked)
-    # asked is no part of the receipt's body: the same message again is the same task, whatever name comes with it
-    command, stored = agent_write(agent, "start_task", {"request_id": source["request_id"]},
-                                  {"title": title, "done_when": done_when})
+    needs = str(a.get("needs") or "none").strip().lower()
+    guard(agent, title, done_when, asked, needs)
+    # asked is no part of the receipt's body: the same message again is the same task, whatever name comes with it.
+    # needs is part of it when the task has one: a repeat that names another need is another call and is refused,
+    # where the first answer would say that the task it asks for is open. A task with none keeps the body of before
+    # the field, so the receipt of an earlier release still answers its repeat.
+    body = {"title": title, "done_when": done_when}
+    if needs != "none":
+        body["needs"] = needs
+    try:
+        command, stored = agent_write(agent, "start_task", {"request_id": source["request_id"]}, body)
+    except ToolError:
+        # The message has its task, and this call names another body. agent_write's own words ask for a new
+        # request_id, which this tool does not take: the owner's message is the request. Its sentence before the
+        # task is the message's reply by now (early_word_rows), and tell_owner refuses a second one, so the words
+        # name message_owner. With no task, the id is the receipt of another tool (an agent gave the message's UUID
+        # as the request_id of a message_owner or a message_agent), and agent_write's words stand, as before.
+        opened = task_of_message(agent, source["request_id"])
+        if not opened:
+            raise
+        raise ToolError(f"{tref(opened)} was opened for this message already, and one message is one task: this "
+                        f"call names another title, done_when or needs, and it changes nothing. If that task has "
+                        f"no browser or screen and the work cannot be done without one, tell the owner so with "
+                        f"message_owner (with tell_owner, if this message has no reply of yours yet): their next "
+                        f"message can open a task that has it.") from None
     if stored:
         return stored["text"]
     if not title or not done_when:
         raise ToolError("A task needs a title and a done_when line.")
+    if needs not in ("none", "browser", "screen"):
+        raise ToolError("needs must be none, browser or screen.")
+    can = agents()[agent].get("can") or []
+    if needs != "none" and needs not in can:
+        if needs == "browser" and "screen" in can:
+            raise ToolError("You have no browser, but you have a screen: give needs screen.")
+        raise ToolError(f"You have no {needs}. Leave needs out if the work can be done without one. If it cannot, "
+                        f"tell the owner so with tell_owner: the work is for an agent that has a {needs}.")
     wrong = asked_words(asked) if asked else None
     if wrong:
         raise ToolError(wrong)
@@ -15822,9 +15858,9 @@ def t_start_task(agent, a):
     if route is None or route["kind"] != "task":
         raise ToolError(f"No task can be opened for you: {why_not or 'there is no line to request it'}")
     requester = route["requester"]
-    busy = desktop_refusal(agent, "none", requester)               # the task needs no browser and no screen
+    busy = desktop_refusal(agent, needs, agent)         # the agent is the caller: it reads no other task's ID
     if busy:
-        raise ToolError(busy)
+        raise ToolError(busy + " No task is open for this message: tell the owner so with tell_owner.")
     details = HISTORY_OWNER_TASK + agent + "'s chat: " + clip(source["text"] or "", 2000)
     why = f"The owner asked {agent} for it in its own chat."
     guard(agent, details, why)
@@ -15832,13 +15868,14 @@ def t_start_task(agent, a):
     with transaction():
         parent = lead_batch_rows(requester, t0) if route["parent"] else None    # plan P9.11: the lead's one task
         tid = admit_task(requester, {"owner": agent, "title": title, "details": details, "done_when": done_when,
-                                     "needs": "none", "goal": "", "goal_id": None, "parent": parent, "step": None,
+                                     "needs": needs, "goal": "", "goal_id": None, "parent": parent, "step": None,
                                      "follows": None, "case_id": None, "why": why, "ask": ask, "asked": asked})
         # **The sentence before the task becomes the reply now** (after_task_words; the chat's rules since 13
         # November 2026, fleet.chat_command): a request for work got its first words only after this call, which
         # the model wrote for 5 to 8 seconds.
+        has = f", which has the {needs}" if needs != "none" else ""
         text = (f"Opened {tref(tid)} ({title}) for you, with {requester} as its requester. It starts in its own task "
-                f"session: do the work there, not here. " + after_task_words(agent, source["request_id"]) +
+                f"session{has}: do the work there, not here. " + after_task_words(agent, source["request_id"]) +
                 f"Its result comes back into this chat by itself when it ends: then tell the owner with message_owner.")
         # with the receipt: a repeat of this call answers from the receipt alone, so a notice after it could be lost
         event_rows([(requester, "say", filed_under(requester, "say", tid),
@@ -35776,11 +35813,19 @@ TOOLS = [
      "sentence that does not say that a task is open: call only tell_owner in that step, and call this when it "
      "returns, with the same in_reply_to. The owner then reads your sentence while you write this call, and this call "
      "makes it the reply to their message. It runs in its own task session, with your line as its requester (the "
-     "manager, or your lead), which checks the result. Its result comes back into this chat by itself when it ends: "
+     "manager, or your lead), which checks the result. That session has no browser and no screen unless you give "
+     "needs: browser for work that must click, type or sign in on a web page, screen for work in an app on your "
+     "machine's own screen. Give one only when the work cannot be done without it or the owner's words ask for it: "
+     "a browser or screen task holds the desktop of your machine while it is open. Give it in this call, because "
+     "the task cannot get it later. The hub refuses one that you do not hold, and one while that desktop is busy "
+     "with another such task. Its result comes back into this chat by itself when it ends: "
      "tell them then with message_owner. Give in_reply_to, the request UUID of the owner's message: one message is "
      "one task, and a message from another agent starts nothing.",
      S({"title": STR, "done_when": {"type": "string", "description": "The line a stranger could test the result "
                                                                    "against"},
+        "needs": {"type": "string", "enum": ["none", "browser", "screen"],
+                  "description": "A browser, or the screen of your machine. A screen task runs in another program, "
+                                 "without your MCP servers. Leave it out for work that needs neither"},
         "in_reply_to": {"type": "string", "description": "The request UUID of the owner's message that asks for the "
                                                          "work: the one that your sentence before this call named"},
         "asked": {"type": "string", "description": "Give it: the thing to be done, as a short verb phrase of at "
@@ -64766,7 +64811,8 @@ def rpc(agent, m, headers, context=None, credential=None):
                                        "reply to the owner with tell_owner using the request UUID in in_reply_to, and "
                                        "to an agent with message_agent and its AM id in in_reply_to. Discussion only; "
                                        "no task execution here: when the owner asks you in their own words to do work, "
-                                       "open it with start_task and the request UUID of their message, and it runs in "
+                                       "open it with start_task and the request UUID of their message (and with needs, "
+                                       "when the work cannot be done without a browser or the screen), and it runs in "
                                        "its own task session; its result comes back here by itself, and you tell "
                                        "them with message_owner. A key or a login that the owner wants you to use and "
                                        "the fleet does not hold: ask them with request_secret, in reply to their "
