@@ -14,7 +14,8 @@ import unittest
 import uuid
 
 import hub
-from test_ui_api import OwnerAPI
+# not `from test_ui_api import OwnerAPI`: a test class among this module's names runs all its tests here again
+import test_ui_api
 from leftovers import ROOT
 
 
@@ -29,7 +30,7 @@ TEAM = {"hub": {"machine": "hub", "port": 8765},
                    "vps": {"role": "worker", "runtime": "codex", "machine": "vps", "can": ["shell", "web"]}}}
 
 
-class Machines(OwnerAPI):
+class Machines(test_ui_api.OwnerAPI):
     def setUp(self):
         super().setUp()
         self.server.machines = True             # each request comes from the machine that its route names

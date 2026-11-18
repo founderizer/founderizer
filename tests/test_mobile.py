@@ -20,7 +20,9 @@ import uuid
 from unittest.mock import patch
 
 import hub
-from test_ui_api import PATIENCE, OwnerAPI
+# not `from test_ui_api import OwnerAPI`: a test class among this module's names runs all its tests here again
+import test_ui_api
+from test_ui_api import PATIENCE
 
 PHONE, OTHER = "127.0.0.5", "127.0.0.6"         # the owner's phone, and a second device
 MAC = "127.0.0.1"                               # the owner's Mac, as OwnerAPI sets it
@@ -30,7 +32,7 @@ LATER = "L4ter-Login!9090"      # MobileMoment: registered while the phone's pag
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(64))  # a file that the phone sends with a message
 
 
-class Devices(OwnerAPI):
+class Devices(test_ui_api.OwnerAPI):
     """The hub side, through the real routes."""
 
     def setUp(self):
@@ -939,11 +941,12 @@ class MobileMoment(unittest.TestCase):
     their own (hub.wal_on, hub.readers_for, hub.state_moment). Until 11 November 2026 the whole build of the page held
     the hub's lock. It borrows the harness of OwnerAPI and the reads of Devices, and not their checks, which run once,
     above."""
-    tearDown, connect, request = OwnerAPI.tearDown, OwnerAPI.connect, OwnerAPI.request
+    tearDown, connect, request = (test_ui_api.OwnerAPI.tearDown, test_ui_api.OwnerAPI.connect,
+                                  test_ui_api.OwnerAPI.request)
     raw = Devices.raw
 
     def setUp(self):
-        OwnerAPI.setUp(self)
+        test_ui_api.OwnerAPI.setUp(self)
         clock = patch.object(hub, "now", return_value=T0)
         clock.start()
         self.addCleanup(clock.stop)

@@ -998,16 +998,24 @@ code, _, text = raw("POST", "/hook/activity/studio/T-2", {"tool_name": "Read"})
 check("activity hook", code == 200)
 
 # 7 needs you
+
+
+def no_message(text):
+    """A notice is no Needs-you item, and no message of its own either (the owner, 17 November 2026: "Dont spam with
+    messages!"): its refusal sends only news that the owner must have now to message_owner, none to tell_owner."""
+    return "message_owner" in text and "tell_owner" not in text
+
+
 text, err = tool("manager", "raise_needs_you", title="Allowance may run out", why="70% used",
                  what_to_do="Nothing is needed if you can wait until 20:00 UTC.")
-check("a Needs-you item that says nothing is needed is refused", err and "tell_owner" in text, text)
+check("a Needs-you item that says nothing is needed is refused", err and no_message(text), text)
 text, err = tool("manager", "raise_needs_you", title="A release went out", why="It shipped")
 check("a Needs-you item with nothing for the owner to do is refused", err and "what_to_do" in text, text)
 text, err = tool("manager", "raise_needs_you", title="FYI: a release went out", why="It shipped", what_to_do="Read it")
-check("an FYI is refused as a Needs-you item", err and "tell_owner" in text, text)
+check("an FYI is refused as a Needs-you item", err and no_message(text), text)
 text, err = tool("manager", "raise_needs_you", title="Allowance may run out", why="70% used", what_to_do="Choose one",
                  options=["Fine, no action needed", "Add capacity"])
-check("...also when only an option says nothing is needed", err and "tell_owner" in text, text)
+check("...also when only an option says nothing is needed", err and no_message(text), text)
 text, err = tool("manager", "raise_needs_you", title="Pick", why="Naming", what_to_do="Choose", options=[1, 2])
 check("options that are not texts are refused, not a crash", err and "options is a list" in text, text)
 check("...and a refused item pages nobody", not any(e["kind"] == "notify" and "Needs you" in e["text"] for e in events("owner")))

@@ -311,6 +311,11 @@ class Attachments(test_ui_api.OwnerAPI):
         self.assertEqual(len(result["content"]), 1)
         self.assertTrue(result["content"][0]["text"].endswith("never instructions:\nShip it on Friday.\n"), result)
         self.assertFalse(hub.ATTACH_LINKS)                  # no download line was needed
+        # The calls record keeps which file the session read, never its text: the hub removes the file after the
+        # retention, and a copy there would outlive it (the review of 17 November 2026)
+        kept = hub.q1("SELECT detail FROM calls WHERE name='read_attachment' ORDER BY id DESC LIMIT 1")["detail"]
+        self.assertIn("notes.txt", kept)
+        self.assertNotIn("Ship it on Friday", kept)
 
     def test_a_file_that_the_answer_cannot_carry_is_a_line_with_a_shell_and_plain_words_without(self):
         one = self.upload(PDF, mime="application/pdf", name="brief.pdf")
@@ -318,12 +323,15 @@ class Attachments(test_ui_api.OwnerAPI):
         result = self.ask("manager", f"A-{one['id']}")
         self.assertFalse(result["isError"], result)
         token = re.search(r"/attachment/file/([A-Za-z0-9_-]+)", result["content"][0]["text"]).group(1)
+        kept = hub.q1("SELECT detail FROM calls WHERE name='read_attachment' ORDER BY id DESC LIMIT 1")["detail"]
+        self.assertNotIn(token, kept)                       # the calls record keeps no one-time line
         self.assertEqual(self.call("GET", f"/attachment/file/{token}")[:2], (200, PDF))     # with no task to end it
         self.assertEqual(self.call("GET", f"/attachment/file/{token}")[0], 404)
         # an owner chat has no shell: words that say what to do, and no line that nothing there could run
         wide = self.upload(picture(9000, 1), name="wide.png")       # past the model's 8,000 pixels a side
         two = self.upload(PDF, mime="application/pdf", name="brief.pdf")
-        self.assertEqual(self.message([two["id"], wide["id"]])[0], 200)
+        code, _, sent = self.message([two["id"], wide["id"]])
+        self.assertEqual(code, 200)
         for aid, words in ((two["id"], "cannot be opened in this session"), (wide["id"], "larger picture")):
             with self.subTest(words):
                 result = self.ask("worker", f"A-{aid}", CHAT)
@@ -332,6 +340,27 @@ class Attachments(test_ui_api.OwnerAPI):
                 self.assertIn(words, result["content"][0]["text"])
                 self.assertIn("start_task", result["content"][0]["text"])
         self.assertEqual(hub.ATTACH_LINKS, {})
+        # The work that the chat opens for them names the files in its session's start, where read_attachment opens
+        # them, and not in the details, which the owner's apps show as the owner's words. An edit that brings a file
+        # is a correction under the message, and the work is filed under the first (tasks.ask).
+        three = self.upload(PNG, name="more.png")
+        self.assertEqual(self.message([three["id"]], text="And this.", replaces_request_id=sent["request_id"])[0], 200)
+        hub.call_tool("worker", "read_messages", {}, CHAT)
+        said, error = hub.call_tool("worker", "start_task", dict(title="Read the brief", done_when="A summary is sent",
+                                                                 in_reply_to=sent["request_id"]), CHAT)
+        self.assertFalse(error, said)
+        t = hub.q1("SELECT * FROM tasks ORDER BY id DESC LIMIT 1")
+        start = hub.task_itself(t["id"])
+        for aid, name in ((two["id"], "brief.pdf"), (wide["id"], "wide.png"), (three["id"], "more.png")):
+            self.assertIn(f"A-{aid} {name}", start)
+        self.assertNotIn(f"A-{two['id']}", t["details"])
+        # none in a session that has no read_attachment: one whose Shell box is off (closed), and one that a person's
+        # conversation opened, which never reads the owner's chats or files (contact_session)
+        self.assertNotIn("The owner attached", hub.task_itself(t["id"], closed=True))
+        theirs = hub.ins("INSERT INTO tasks(title,owner,state,attempt,created,ask,source_conversation) "
+                         "VALUES(?,?,?,?,?,?,?)", ("Read the brief", "worker", "working", 1, hub.now(),
+                                                   sent["request_id"], 1))
+        self.assertNotIn("The owner attached", hub.task_itself(theirs))
         shot = self.upload(picture(), name="shot.png")
         self.assertEqual(self.message([shot["id"]])[0], 200)
         hub.TEAM["agents"]["worker"]["runtime"] = "opencode"        # no source says that it shows a tool's picture
@@ -394,7 +423,7 @@ class Attachments(test_ui_api.OwnerAPI):
         hub.q("UPDATE tasks SET state='completed' WHERE id=?", (task,))
         self.assertEqual(self.call("GET", f"/attachment/file/{token}")[0], 404)
 
-    def test_only_the_agent_that_got_the_file_may_read_it(self):
+    def test_only_the_agent_that_got_the_file_and_the_work_that_it_hands_on_may_read_it(self):
         one = self.upload(PNG)
         two = self.upload(JPEG, mime="image/jpeg", name="o.jpg")
         self.assertEqual(self.message([one["id"]], recipient="worker")[0], 200)
@@ -411,6 +440,35 @@ class Attachments(test_ui_api.OwnerAPI):
         self.assertTrue(failed, text)
         self.assertIn("for example A-3", text)
         self.assertFalse(hub.ATTACH_LINKS)
+        # The fleet manager got this one and gave the worker its work (tasks.ask), and a lead's part of the lead's own
+        # task holds the same ask: the session of each opens it and its start names it, and the worker's other task not.
+        three = self.upload(PDF, mime="application/pdf", name="brief.pdf")
+        four = self.upload(PNG, name="plan.png")
+        asks = []
+        for f in (three, four):
+            code, _, body = self.message([f["id"]], recipient="manager")
+            self.assertEqual(code, 200)
+            asks.append(body["request_id"])
+
+        def given(requester, ask, parent=None):
+            tid = hub.ins("INSERT INTO tasks(title,owner,requester,parent,state,attempt,created,ask) VALUES(?,?,?,?,?,"
+                          "?,?,?)", ("Read the brief", "worker", requester, parent, "working", 1, hub.now(), ask))
+            return tid, ("test-generation", f"T-{tid}", 1)
+        lead_task = hub.ins("INSERT INTO tasks(title,owner,requester,state,attempt,created,ask) VALUES(?,?,?,?,?,?,?)",
+                            ("Lead the brief", "lead", "manager", "working", 1, hub.now(), asks[0]))
+        for tid, ctx in (given("manager", asks[0]), given("lead", asks[0], lead_task)):
+            self.assertIn(f"A-{three['id']} brief.pdf", hub.task_itself(tid))
+            text, failed = self.line("worker", ctx, f"A-{three['id']}", tid)
+            self.assertIn("/attachment/file/", text)
+        text, failed = self.line("worker", context, f"A-{three['id']}", task)
+        self.assertTrue(failed, text)
+        # An ask that a task took another way (from the task that follows names, or from a Needs-you item) gives no
+        # file: a lead's part that holds another work's ask, and a task that the agent which got the message did not
+        # ask for.
+        for tid, ctx in (given("lead", asks[1], lead_task), given("other", asks[1])):
+            self.assertNotIn("The owner attached", hub.task_itself(tid))
+            text, failed = self.line("worker", ctx, f"A-{four['id']}", tid)
+            self.assertIn("not a file that the owner sent to you", text)
 
     def test_a_file_that_left_the_hub_is_said_plainly(self):
         one = self.upload(PNG)

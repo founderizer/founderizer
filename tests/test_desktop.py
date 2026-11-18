@@ -10,7 +10,8 @@ import desktop
 import hub
 import usage
 import worker_install
-from test_ui_api import OwnerAPI
+# not `from test_ui_api import OwnerAPI`: a test class among this module's names runs all its tests here again
+import test_ui_api
 
 
 def frame(ts):
@@ -41,10 +42,10 @@ class DesktopFrames(unittest.TestCase):
 
 
 class DesktopAPI(unittest.TestCase):
-    setUp = OwnerAPI.setUp
-    tearDown = OwnerAPI.tearDown
-    connect = OwnerAPI.connect
-    request = OwnerAPI.request
+    setUp = test_ui_api.OwnerAPI.setUp
+    tearDown = test_ui_api.OwnerAPI.tearDown
+    connect = test_ui_api.OwnerAPI.connect
+    request = test_ui_api.OwnerAPI.request
 
     def prepare(self):
         hub.DESKTOP = desktop.Frames()

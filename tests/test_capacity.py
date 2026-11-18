@@ -691,9 +691,11 @@ class Capacity(OwnerAPI):
         self.assertIn('the claude window "7 days" of your account is 92% used and resets at', said)
         self.assertIn("At the pace of this window so far it is gone before then (123% of it by the reset)", said)
         self.assertIn("when it is gone the fleet stops with you", said)
-        # A warning for the manager, never a page to the owner (22 October 2026): it names tell_owner instead.
+        # A warning for the manager, never a page to the owner (22 October 2026), and no message of its own either
+        # (the owner, 17 November 2026: "Dont spam with messages!"): what it puts off waits for the next message.
         self.assertNotIn("raise_needs_you", said)
-        self.assertIn("tell_owner, which posts it with no notification", said)
+        self.assertNotIn("tell_owner", said)
+        self.assertIn("what you put off waits for the next message that they need", said)
         self.assertIn("fewer and bigger steps", said)
         self.assertIn("not a reason to move work to an agent with more left: suitability comes first", said)
         # Once per window instance. A second tick says nothing; a worse stage says it again.
@@ -781,7 +783,8 @@ class Capacity(OwnerAPI):
         self.assertFalse(error, text)
         self.assertIn("YOUR OWN ALLOWANCE:", text)
         self.assertIn("is 92% used", text)
-        self.assertIn("Fewer and bigger turns until the reset. A warning, not a Needs-you item: tell_owner", text)
+        self.assertIn("Fewer and bigger turns until the reset. A warning, not a Needs-you item: what you put off "
+                      "waits for the next message that the owner needs.", text)
         self.assertIn("no reason to pass work to an agent that does not suit it", text)
         self.assertIn("Choose by suitability first", text)            # the order it always had, unchanged
         self.assertNotIn("manager:", text.split("ACCOUNTS")[0])       # still not one of the agents it may choose
