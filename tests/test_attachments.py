@@ -460,6 +460,9 @@ class Attachments(test_ui_api.OwnerAPI):
             self.assertIn(f"A-{three['id']} brief.pdf", hub.task_itself(tid))
             text, failed = self.line("worker", ctx, f"A-{three['id']}", tid)
             self.assertIn("/attachment/file/", text)
+        with patch.dict(hub.TEAM["agents"]["worker"], {"can": []}):     # Shell off: a steer's file only (1.223)
+            text, failed = self.line("worker", ctx, f"A-{three['id']}", tid)
+            self.assertIn("opens only the files of the owner's steers", text)
         text, failed = self.line("worker", context, f"A-{three['id']}", task)
         self.assertTrue(failed, text)
         # An ask that a task took another way (from the task that follows names, or from a Needs-you item) gives no
@@ -478,6 +481,75 @@ class Attachments(test_ui_api.OwnerAPI):
         text, failed = self.line("worker", context, f"A-{one['id']}", task)
         self.assertTrue(failed, text)
         self.assertIn("no longer on the hub", text)
+
+    def test_a_steer_carries_files_that_only_the_tasks_own_session_reads(self):
+        """Owner API 1.223: the owner's files reach a task's session with his guidance (the route dropped them in
+        silence before), only that task's agent reads them, the requester learns their names and no way to them, his
+        apps show them, and a file goes with one message or one steer, never an agent's own file."""
+        text, failed = hub.call_tool("manager", "create_task", {"owner": "worker", "title": "Fix the page",
+                                                                "done_when": "The page is fixed."})
+        self.assertFalse(failed, text)
+        task = hub.q1("SELECT id FROM tasks WHERE owner='worker'")["id"]
+        context = ("test-generation", f"T-{task}", 1)
+        one = self.upload(PNG, name="mockup.png")
+        code, result = self.request(f"/ui/tasks/{task}/steer",
+                                    self.command(text="Match this mockup.", attachments=[one["id"]]))
+        self.assertEqual(code, 200, result)
+        self.assertEqual([a["id"] for a in result["steer"]["attachments"]], [one["id"]])
+        said = hub.call_tool("worker", "read_messages", {"task_id": f"T-{task}"}, context=context)[0]
+        self.assertIn(f"A-{one['id']} mockup.png (image/png", said)
+        copy = hub.q1("SELECT text FROM events WHERE agent='manager' AND text LIKE '[hub] The owner steered%'")["text"]
+        self.assertIn("mockup.png (image/png", copy)
+        self.assertNotIn(f"A-{one['id']}", copy)
+        text, failed = self.line("worker", context, f"A-{one['id']}", task)
+        self.assertFalse(failed, text)
+        second, second_context = self.task("worker")        # the same agent, in a session of another task
+        text, failed = self.line("worker", second_context, f"A-{one['id']}", second)
+        self.assertTrue(failed, text)
+        self.assertIn("is not a file that the owner sent to you",          # an owner chat has no task
+                      self.ask("worker", f"A-{one['id']}", CHAT)["content"][0]["text"])
+        # owner API 1.223: a closed session (Shell box off) has the tool for its own steer's file, with words that it
+        # can act on, and no file of the owner's messages
+        note = self.upload(b"Ship it.\n", mime="text/plain", name="note.txt")
+        code, _, sent = self.message([note["id"]])
+        self.assertEqual(code, 200)
+        # a request id is a message's or a steer's, never both, each way (a shared one opens its files for nobody)
+        steered = hub.q1("SELECT request_id FROM steers WHERE task=?", (task,))["request_id"]
+        self.assertEqual(self.request(f"/ui/tasks/{task}/steer", self.command(request_id=sent["request_id"]))[0], 409)
+        self.assertEqual(self.message([], request_id=steered)[0], 409)
+        with patch.dict(hub.TEAM["agents"]["worker"], {"can": []}):
+            self.assertIn("read_attachment", {t["name"] for t in hub.tools_for("worker", context)})
+            text, failed = self.line("worker", context, f"A-{one['id']}", task)
+            self.assertTrue(failed, text)
+            self.assertIn("end the task with deliver_result, outcome failed", text)
+            text, failed = self.line("worker", context, f"A-{note['id']}", task)
+            self.assertIn("opens only the files of the owner's steers", text)
+        # the fleet manager: in the session of its own task, and not in its standing session, which has none
+        mine, mine_context = self.task("manager")
+        hub.q("UPDATE tasks SET requester='worker' WHERE id=?", (mine,))
+        own = self.upload(PDF, mime="application/pdf", name="brief.pdf")
+        self.assertEqual(self.request(f"/ui/tasks/{mine}/steer",
+                                      self.command(text="Read the brief.", attachments=[own["id"]]))[0], 200)
+        self.assertFalse(self.ask("manager", f"A-{own['id']}", mine_context)["isError"])
+        self.assertTrue(self.ask("manager", f"A-{own['id']}")["isError"])
+        self.assertEqual([a["id"] for a in self.request()[1]["steers"][0]["attachments"]], [one["id"]])
+        page = self.request(f"/ui/mobile/task/{task}")[1]           # a device's task page, as the state gives it
+        self.assertEqual([a["id"] for a in page["steers"][0]["attachments"]], [one["id"]])
+        with patch.object(hub, "owner_device_at", return_value="phone"), \
+                patch.object(hub.Handler, "device_allowed", return_value=True):     # the phone opens what it shows
+            self.assertEqual(self.call("GET", f"/ui/attachments/{one['id']}?db=test-generation")[0], 200)
+        self.assertEqual(self.request(f"/ui/tasks/{task}/steer", self.command(attachments=[one["id"]]))[0], 409)
+        self.assertEqual(self.message([one["id"]])[0], 409)
+        theirs = hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,agent) "
+                         "VALUES(?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), "chart.png", "image/png", len(PNG),
+                                                     one["sha256"], hub.now(), "agent/worker", "worker"))
+        # an agent's file (attach_file), also for an owner app whose X-Fleet-Client is the label of that upload
+        self.assertEqual(self.request(f"/ui/tasks/{task}/steer", self.command(attachments=[theirs]),
+                                      {"Content-Type": "application/json", "X-Fleet-Client": "agent/worker"})[0], 409)
+        gone = self.upload(JPEG, mime="image/jpeg", name="gone.jpg")         # its bytes left the hub before the steer
+        os.remove(os.path.join(self.files.name, gone["sha256"] + ".jpg"))
+        self.assertEqual(self.request(f"/ui/tasks/{task}/steer", self.command(attachments=[gone["id"]]))[0], 404)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM steers WHERE task=?", (task,))["n"], 1)
 
     def test_the_bytes_stay_outside_the_checkout(self):
         one = self.upload(PNG)

@@ -1089,7 +1089,7 @@ def with_profile_base(args):
 def attach_file(args):
     """`POST /ui/attachments`: one file of this Mac to the hub, before the message that carries it. Its own
     `request_id` is a header here and not a field, because the body is the file itself, so a repeat is one file and
-    never a second one. Give the id it answers with to `send_message` or `answer_needs_you`."""
+    never a second one. Give the id it answers with to `send_message`, `steer_task` or `answer_needs_you`."""
     where = args.get("path")
     if not isinstance(where, str) or not where.strip():
         raise Refused("path must be the file on this Mac to send.")
@@ -2904,7 +2904,7 @@ def tools():
              {"id": S["text"], "account": {"type": ["object", "null"]}, **rid}, ("id", "account"),
              with_base("/ui/team/chat-apps", ("id", "account"), "this chat app account")),
         tool("attach_file", "Send one file of this Mac to the hub, so a message can carry it. Give the id it "
-                            "answers with to send_message or answer_needs_you. At most 25 MiB.",
+                            "answers with to send_message, steer_task or answer_needs_you. At most 25 MiB.",
              {"path": S["text"], "mime": S["text"], **rid}, ("path",), attach_file),
         tool("save_mcp_server", "Add one of the owner's own MCP servers, change it, or remove it with delete true. "
                                 "An agent loads it only once it also holds tool:<name> — share_resource puts that "
@@ -3141,8 +3141,10 @@ def tools():
              plain("/ui/team/reload", ("revision",), "the reload of team.json")),
         tool("send_message", "Say something to an agent, by default the fleet manager. This is how a goal is set: "
                              "the manager writes down what the owner says they want the fleet to reach, and plans it. "
-                             "A duty is the same — say the standing work and the manager writes it.",
-             {"text": S["text"], "recipient": S["text"], **rid}, ("text",), write_message),
+                             "A duty is the same — say the standing work and the manager writes it. "
+                             "attachments: the ids that attach_file gave.",
+             {"text": S["text"], "recipient": S["text"], "attachments": {"type": "array", "items": {"type": "integer"}},
+              **rid}, ("text",), write_message),
         tool("answer_needs_you", "Answer one Needs-you item: the words, or choice, the index of one option the item "
                                  "offers, or choices, the indexes of the options it lets the owner tick together "
                                  "(its multi). Words that ask something back are an answer too: the item closes, "
@@ -3163,9 +3165,13 @@ def tools():
              {"task": S["int"], "action": {"type": "string", "enum": ["pause", "stop", "resume", "resume_check"]},
               "note": S["note"], **rid}, ("task", "action"),
              plain("/ui/tasks/{task}/control", ("action", "note"), "this task control")),
-        tool("steer_task", "Send a steering message into one open task's own session, with a copy to its requester.",
-             {"task": S["int"], "text": S["text"], **rid}, ("task", "text"),
-             plain("/ui/tasks/{task}/steer", ("text",), "the steering")),
+        tool("steer_task", "Send a steering message into one open task's own session, with a copy to its requester. "
+                           "attachments: the ids that attach_file gave. The files open in that task's session; when a "
+                           "person's conversation opened the task, that person's messages drive it, so they can get "
+                           "what a file says.",
+             {"task": S["int"], "text": S["text"], "attachments": {"type": "array", "items": {"type": "integer"}},
+              **rid}, ("task", "text"),
+             plain("/ui/tasks/{task}/steer", ("text", "attachments"), "the steering")),
         tool("goal_state", "Pause, resume, mark done, drop or reopen one goal.",
              {"id": S["int"], "action": {"type": "string", "enum": ["pause", "resume", "done", "drop", "reopen"]},
               "note": S["note"], **rid}, ("id", "action"),

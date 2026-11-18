@@ -48,7 +48,8 @@ LINE_CHECK = {"path": "checks/url_lines.py", "commit": "a" * 40, "sha256": "b" *
 EVERY = {"kind": "every", "minutes": 1}
 # Support plan H1's lists, written out here and not read from the hub's constants, so that a tool added to a constant
 # fails these tests instead of passing them (the focused review of 2 November 2026)
-H1_TASK = ["close_case", "deliver_result", "read_messages", "record_step"]
+# read_attachment: the file of the owner's steer of its own task, as data in the answer (owner API 1.223)
+H1_TASK = ["close_case", "deliver_result", "read_attachment", "read_messages", "record_step"]
 H1_CONTACT = ["message_contact"]        # with contacts.v2, which TEAM turns on: its words go to a person (the owner,
                                         # 3 November 2026)
 # read_attachment: the owner's own file to it, as data in the answer, which gives no reach (17 November 2026)

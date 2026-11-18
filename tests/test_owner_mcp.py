@@ -4874,6 +4874,9 @@ class Table(unittest.TestCase):
             else:
                 self.assertFalse(hasattr(run, "kind"), t["name"])
                 self.assertNotIn("route", entry, t["name"])
+            if t["name"] in ("send_message", "steer_task"):     # attach_file's ids, in a schema that names its fields
+                self.assertEqual((entry["inputSchema"]["additionalProperties"], entry["inputSchema"]["properties"].get(
+                    "attachments")), (False, {"type": "array", "items": {"type": "integer"}}), t["name"])
 
     def test_the_kinds_are_complete_and_the_counts_are_the_plans(self):
         table = owner_mcp.dump_tools()

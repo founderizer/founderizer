@@ -1,5 +1,6 @@
 """Numeric usage checks. Fixtures only: no AI or provider calls."""
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -921,6 +922,51 @@ class UsageAPI(OwnerAPI):
             self.assertEqual(self.request("/helper/usage/manager", dict(tokens=tokens(), limits=None))[0], 200)
             kept = self.request()[1]["agents"][0]["usage"]["limits"]                                   # sends no reading
             self.assertEqual((kept["error"], kept["account_email"]), (marked, named))   # does not turn it into a refresh
+
+    def register(self, login, length=True):
+        """The owner registers `login`: the hub keeps its salted hash, and its length unless `length` is False (a row
+        that matches whole letter-and-digit tokens)."""
+        hub.ins("INSERT INTO secrets(label,salt,hash,len,username) VALUES(?,?,?,?,'')",
+                (f"login {login[:4]}", "5a1t", hashlib.sha256(("5a1t" + login).encode()).hexdigest(),
+                 len(login) if length else None))
+
+    def test_a_report_that_holds_a_registered_login_is_refused_as_a_search_of_the_whole_text_refuses_it(self):
+        """A helper writes the session ids of its report, so the hub refuses a report that holds a registered login
+        (422) and keeps nothing of it. It searches the report run by run through a cache (runs_hold_login), which must
+        find what secret_hit finds in the whole text: also a login that a JSON escape, an invisible character or a
+        control character splits (the skeleton of the whole text joins two runs), one whose final dots a name dropped,
+        and one of a row with no length; and nothing where secret_hit finds nothing."""
+        key, dots, bare = "Kq7vRw2pXz9TfLm4", "Bq4nVt7yHs2kQe8w...", "Hn3sYb8cJd6GvWa1"
+        self.register(key), self.register(dots), self.register(bare, length=False)
+        for text, holds in ((f"x {key} y", True), (json.dumps({"a": f"{key[:5]}​{key[5:]}"}), True),
+                            (f"{key[:5]}\x1c{key[5:]}", True), (f"the duty {dots[:-3]}, done", True),
+                            (f"id={bare};", True), (f"{key[:8]} {key[8:]}", False), (json.dumps(tokens()), False)):
+            self.assertEqual((hub.runs_hold_login(text), hub.secret_hit(text)), (holds, holds), text)
+        report = dict(tokens=dict(tokens(), by_session=[dict(session_id=f"s-{key}", total=5, last_activity=2000)]),
+                      limits=limits())
+        self.assertEqual(self.request("/helper/usage/manager", report)[0], 422)
+        self.assertEqual((self.count("agent_usage"), self.count("session_tokens")), (0, 0))
+        report["tokens"]["by_session"][0]["session_id"] = "s-1"
+        self.assertEqual(self.request("/helper/usage/manager", report)[0], 200)
+
+    def test_the_next_report_of_a_helper_searches_only_its_new_runs(self):
+        """A helper sends its report every 30 s: its newest sessions' totals, which differ from its report before in a
+        few runs, mostly where a session spent since. On the owner's hub on 18 November 2026 a search of each whole
+        report took 0.28 to 0.53 s of the processor, before LOCK, and a thread that held LOCK meanwhile ran some 100
+        times slower for the interpreter lock: the lock probe waited 0.25 to 1.5 s about three times a minute. So the
+        next report searches only the runs that the reports before did not have."""
+        hub._report_spans.cache_clear()             # the runs of this test only, also when it runs again
+        self.addCleanup(hub._report_spans.cache_clear)
+        self.register("Kq7vRw2pXz9TfLm4")
+        rows = [dict(session_id=f"session-{n:04d}-{'ab' * 8}", total=10 ** 12 + n, last_activity=2000.5 + n)
+                for n in range(200)]
+        report = dict(tokens=dict(tokens(), by_session=rows), limits=limits())
+        self.assertEqual(self.request("/helper/usage/manager", report)[0], 200)
+        rows[0]["total"] += 10 ** 6                 # one session spent since
+        searched, search = [], hub.secret_spans_each
+        with patch.object(hub, "secret_spans_each", lambda text, key: searched.append(text) or search(text, key)):
+            self.assertEqual(self.request("/helper/usage/manager", report)[0], 200)
+        self.assertEqual([run.strip(",}]") for run in searched], ["1000001000000"])  # the one run that is new
 
     def test_older_failure_cannot_erase_measured_values(self):
         self.request("/helper/usage/manager", dict(tokens=tokens(), limits=limits()))

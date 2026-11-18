@@ -1492,10 +1492,10 @@ would read as an empty fleet instead of as a mistake.
 | `attach_file` / `read_attachment` / `keep_attachment` | `/ui/attachments*` | A file to the hub, a file back to this Mac, and keeping one. |
 | `owner_device` / `device_code` | `/ui/owner/devices[/<d>/code]` | The owner's phones, and one enrollment code. Its key is the phone's. |
 | `reload_team` | `/ui/team/reload` | Apply `team.json` from a pushed revision without restarting the hub. |
-| `send_message` | `/ui/messages` | Say something to an agent. **This is how a goal or a duty is set.** |
+| `send_message` | `/ui/messages` | Say something to an agent, with files from `attach_file`. **This is how a goal or a duty is set.** |
 | `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words, by choosing an option, or by ticking the options of an item that lets them combine (`choices`). A secret request takes neither: the app's secure form answers it. Since 18 November 2026 it also takes files (the owner's "Yes, build it" to "Should your agent be able to attach files to its answers on Needs you?"). `attachments` holds at most four ids that `attach_file` gave, and they go with an answer in words or alone, as the files that the owner drops on the item in the app do. Beside a `choice` or `choices` they are refused before any request, with one sentence in both programs, so that a door card's press never leaves a file behind. An item whose answer goes into a conversation takes no file, and the hub says so. |
 | `decline_secret_request` | `/ui/needs/<id>/secret` | Decline a secret request, with a reason or none. A decline carries no value, so this server sends it; an answer with a value stays the app's secure form. |
-| `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task. |
+| `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task, with files from `attach_file` (owner API 1.223), which open in that task's session: when a person's conversation opened the task, that person's messages drive it, so they can get what a file says. |
 | `goal_state` / `duty_state` / `trigger_state` | `/ui/goals/<id>/state` and the two beside it | Pause, resume, finish, drop. |
 | `end_standing` | `/ui/standing/<id>/end` | End one standing instruction or target of any agent. `fleet_read(page="standing")` lists them. |
 | `settle_outcome` | `/ui/outcomes/<id>` | Record whether an unknown outcome took effect. |

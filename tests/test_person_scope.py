@@ -214,7 +214,9 @@ class Narrowed(Base):
         other = self.says(KIM, "Hello", account="discord-studio")["conversation"]
         names = {x["name"] for x in hub.tools_for("studio", self.context(other))}
         self.assertTrue({"open_work", "message_contact", "keep_instruction"} <= names)
-        # the owner's files are not for a session that a person drives, as his chats are not (17 November 2026)
+        # the owner's files are not for a session that a person drives, as his chats are not (17 November 2026): not
+        # for the window, nor for the conversation's task that it runs. A task that the conversation opened reads a
+        # steer's file of its own task only (owner API 1.223, test_contacts_v2)
         task = {x["name"] for x in hub.tools_for("studio", self.task_context(other))}
         self.assertNotIn("read_attachment", names | task)
         self.assertEqual(names & set(hub.REPO_CALLS), set())         # the door's calls are a narrowed thread's only

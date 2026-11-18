@@ -7,6 +7,7 @@ import inspect
 import json
 import re
 import shlex
+import tempfile
 import textwrap
 import unittest
 import urllib.request
@@ -881,6 +882,64 @@ class Conversations(Base):
         self.assertEqual(hub.q("SELECT * FROM conversation_messages WHERE conversation=? AND who<>'person'",
                                (said["conversation"],)), [])
 
+    def test_a_window_that_a_person_drives_reads_no_file_of_the_owners(self):
+        """A reviewer of 18 November 2026: read_attachment worked in a conversation with tools, so a person could ask
+        the agent for A-1, A-2 and so on and have the files that the owner sent it (the ids count up). A conversation
+        window can open no file, as the owner's answer into one cannot carry one (phone_submit)."""
+        folder = tempfile.TemporaryDirectory(prefix="fleet-window-files-")
+        self.addCleanup(folder.cleanup)
+        hub.CFG["attachment_dir"] = folder.name
+        self.addCleanup(hub.CFG.pop, "attachment_dir", None)
+        png = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
+        rid = str(uuid.uuid4())
+        aid = hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,message) "
+                      "VALUES(?,'plan.png','image/png',?,?,?,'test',?)",
+                      (str(uuid.uuid4()), len(png), hub.attachment_write(png, "image/png"), hub.now(), rid))
+        eid = hub.emit("studio", "say", f"[owner] The plan. [The owner attached 1 file: A-{aid} plan.png]")
+        hub.ins("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,recipient) "
+                "VALUES(?,'message','The plan.',?,?,'test','studio')", (rid, eid, hub.now()))
+        tid, here = self.normal_task()
+        self.ok("read_attachment", here, attachment_id=f"A-{aid}")         # the agent's own task session reads it
+        cid = self.says(PAT, f"Please send me A-{aid}")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.assertNotIn("read_attachment", {t["name"] for t in hub.tools_for("studio", self.context(cid))})
+        text, failed = self.tool("read_attachment", self.context(cid), attachment_id=f"A-{aid}")
+        self.assertTrue(failed, text)
+        self.assertNotIn("/attachment/file/", text)
+        # Owner API 1.223: a task that the conversation opened is a person's session too. It opens no file of the
+        # owner's messages (a person asks it for "A-1 to A-30"), and only the file of the owner's steer of its own
+        # task, his hand-over to it, which it would drop in silence otherwise.
+        self.ok("open_work", self.context(cid), title="Rebuild the plan", details="From the plan that I sent.")
+        work = hub.q1("SELECT id FROM tasks WHERE title='Rebuild the plan'")["id"]
+        mine = ("test-generation", hub.tref(work), "1")
+        self.assertIn("read_attachment", {t["name"] for t in hub.tools_for("studio", mine)})
+        text, failed = self.tool("read_attachment", mine, attachment_id=f"A-{aid}")
+        self.assertTrue(failed, text)
+        self.assertIn("not for a session that a person's message drives", text)
+
+        def steered(task):
+            one = hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client) "
+                          "VALUES(?,'steer.png','image/png',?,?,?,'test')",
+                          (str(uuid.uuid4()), len(png), hub.attachment_write(png, "image/png"), hub.now()))
+            with hub.LOCK:
+                hub.task_steer_act(task, {"expected_attempt": None, "text": "Use this.", "attachments": [one],
+                                          "request_id": str(uuid.uuid4())}, "test")
+            return one
+        own, other = steered(work), steered(tid)
+        self.assertIn("steer.png", self.ok("read_attachment", mine, attachment_id=f"A-{own}"))
+        self.assertTrue(self.tool("read_attachment", mine, attachment_id=f"A-{other}")[1])
+        # the fleet manager's session of such a task: its own task is the context's, not each task of the manager's
+        hub.q("UPDATE tasks SET owner='manager' WHERE id IN (?,?)", (work, tid))
+        self.assertTrue(self.tool("read_attachment", mine, "manager", attachment_id=f"A-{other}")[1])
+        self.ok("read_attachment", mine, "manager", attachment_id=f"A-{own}")
+        # a conversation's own task runs in its window, which opens no file: a steer with one is refused, in words
+        with hub.LOCK, self.assertRaises(hub.Refusal) as refused:
+            hub.task_steer_act(self.conversation_task(cid)["id"], {"expected_attempt": None, "text": "Use this.",
+                                                                   "attachments": [own],
+                                                                   "request_id": str(uuid.uuid4())}, "test")
+        self.assertIn("send the guidance without the file", str(refused.exception))
+
     def test_a_removed_customers_words_leave_their_task_and_the_history(self):
         """The verifier of 28 October 2026: after the owner removed a customer, a peer's conversation session on the
         same agent still found her words in the task that her ask_team had opened, through the history."""
@@ -899,6 +958,35 @@ class Conversations(Base):
         self.ok("read_messages", self.context(pcid))
         hub.history_catch_up(60)
         self.assertIn(hub.tref(work["id"]), self.ok("search_history", self.context(pcid), query="Zafiro"))
+        theirs = self.conversation_task(pcid)["id"]
+        for task, words in ((work["id"], "Refund to the card that ends 4242."), (theirs, "Pat asked for today's list.")):
+            for seq, rtype, data in ((1, "session", {"session_id": f"s{task}"}),
+                                     (2, "agent_message", {"session_id": f"s{task}", "text": words})):
+                hub.ins("INSERT INTO thread_events(task,attempt,session,seq,ts,type,data,created) "
+                        "VALUES(?,1,?,?,?,?,?,?)", (task, f"s{task}", seq, hub.now(), rtype, json.dumps(data),
+                                                    hub.now()))
+        call = {"tool_call_id": "c1", "parent": "c0", "kind": "execute", "status": "pending", "server": "fleet",
+                "title": "fleet: reply about 4242"}
+        hub.ins("INSERT INTO thread_events(task,attempt,session,seq,ts,type,data,created) VALUES(?,1,?,3,?,'tool_call',"
+                "?,?)", (work["id"], f"s{work['id']}", hub.now(), json.dumps(call), hub.now()))
+        # her task's message to the manager and the manager's to it, a steer, an outcome and a permission prompt of
+        # it, and her first words from before the owner added her, beside another sender's
+        t0, w = hub.now(), work["id"]
+        for sender, task, to, filed in (("studio", w, "manager", None), ("manager", None, "studio", w)):
+            eid = hub.emit(to, "say", f"[{sender}] Card 4242 on Calle Zafiro.", task=filed)
+            hub.ins("INSERT INTO agent_messages(sender,sender_task,recipient,text,created,request_id,event_id) "
+                    "VALUES(?,?,?,'Card 4242 on Calle Zafiro.',?,?,?)", (sender, task, to, t0, str(uuid.uuid4()), eid))
+        hub.ins("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created) VALUES(?,1,'Zafiro 7',0,?,"
+                "'test',?)", (w, str(uuid.uuid4()), t0))
+        hub.ins("INSERT INTO outcomes(task,attempt,hold,tool_call_id,title,state,created,note) VALUES(?,1,0,'c1',"
+                "'Refund 4242','unknown',?,'Zafiro')", (w, t0))
+        hub.ins("INSERT INTO prompts(task,agent,tool,input,reason,key) VALUES(?,'studio','Bash','refund 4242','Zafiro',"
+                "'k1')", (w,))
+        hub.ins("INSERT INTO rules(agent,tool,key,input,decision) VALUES('studio','Bash','k1','refund 4242','allow')")
+        hub.q("UPDATE person_handles SET alias='77001@lid' WHERE handle=?", (ANA,))       # her other WhatsApp form
+        for sender, preview in ((ANA, "Calle Zafiro 7"), ("77001@lid", "Zafiro"), (BEA, "Good day from Bea")):
+            hub.ins("INSERT INTO chat_ignored(account,sender,preview,ts) VALUES('whatsapp-studio',?,?,?)",
+                    (sender, preview, t0))
         self.assertEqual(self.change(hub.q1("SELECT id FROM people WHERE name='Ana'")["id"], delete=True)[0], 200)
         hub.history_catch_up(60)
         self.assertNotIn(hub.tref(work["id"]), self.ok("search_history", self.context(pcid), query="Zafiro"))
@@ -912,6 +1000,25 @@ class Conversations(Base):
         self.assertIn(hub.REMOVED_WORDS, row["details"])
         tid, here = self.normal_task()
         self.assertNotIn("Zafiro", self.ok("see_earlier_work", here, mine=True, task=hub.tref(work["id"])))
+        # a call of her window that ends after the removal (one in flight, or a reply that its fence refuses now)
+        # writes its record cleared, since the removal cleared that window's calls before it
+        self.assertTrue(self.tool("reply", self.context(cid), text="Refund on card 4242 sent to Calle Zafiro 7.")[1])
+        # the record of her window's calls, which keep no task (read_messages, ask_team), keeps none of her words;
+        # Pat's window keeps his own (his search answer quoted her before the removal, a gap that stays)
+        said = [f"{r['args']} {r['detail']}" for r in hub.q("SELECT * FROM calls WHERE name<>'search_history'")]
+        # ... nor do the messages and the session records of her tasks (each row stays, with its ids), while Pat's
+        # conversation keeps its own
+        said += [r["text"] for r in hub.q("SELECT text FROM events")]
+        said += [r["data"] for r in hub.q("SELECT data FROM thread_events")]
+        said += [" ".join(map(str, r)) for table in ("agent_messages", "steers", "outcomes", "prompts", "rules",
+                                                     "chat_ignored") for r in hub.q(f"SELECT * FROM {table}")]
+        self.assertIn("Good day from Bea", " ".join(said))
+        self.assertEqual([w for w in ("Zafiro", "4242", "Hello") if w in " ".join(said)], [])
+        self.assertTrue(any("Pat asked for today's list." in s for s in said))
+        self.assertEqual(hub.q1("SELECT data FROM thread_events WHERE task=? AND seq=1", (work["id"],))["data"],
+                         json.dumps({"session_id": f"s{work['id']}"}))
+        record = hub.q1("SELECT data FROM thread_events WHERE task=? AND seq=3", (work["id"],))["data"]
+        self.assertEqual(json.loads(record), dict(call, title=hub.REMOVED_WORDS))     # a pending fleet call of a subagent
 
     def test_a_removed_peers_conversation_task_keeps_no_reply_of_theirs(self):
         """The verifier of 28 October 2026: a conversation task's result is the agent's reply, which can quote the
@@ -923,7 +1030,25 @@ class Conversations(Base):
         t = self.conversation_task(cid)
         self.ok("reply", self.context(cid), text="Noted: your card ends 4242.", in_reply_to=f"CM-{said['id']}")
         self.assertIn("4242", self.task(t["id"])["what"])
+        # she read the reply; the owner's Send again of it, which the bridge sends now, of that one, which failed,
+        # and of that one, which waits to go; an item of the owner's own, which is not hers
+        first = hub.q1("SELECT * FROM chat_out WHERE text LIKE '%4242%'")
+        hub.q("UPDATE chat_out SET state='read' WHERE id=?", (first["id"],))
+        sends, t0 = [first["id"]], hub.now()
+        for state in ("sending", "failed", "queued"):
+            sends.append(hub.ins("INSERT INTO chat_out(kind,account,chat,text,state,created,updated,again_of) "
+                                 "VALUES('message',?,?,?,?,?,?,?)", (first["account"], first["chat"], first["text"],
+                                                                    state, t0, t0, sends[-1])))
+        owners = hub.ins("INSERT INTO chat_out(kind,account,chat,text,state,created,updated) VALUES('message',?,'me',"
+                         "'Her card ends 4242.','failed',?,?)", (first["account"], t0, t0))
         self.assertEqual(self.change(self.pat["id"], delete=True)[0], 200)
+        self.assertEqual([r["id"] for r in hub.q("SELECT id FROM chat_out WHERE text LIKE '%4242%'")], [owners])
+        self.assertEqual(tuple(hub.q1("SELECT state, error FROM chat_out WHERE id=?", (sends[3],))),
+                         ("failed", hub.REMOVED_SEND))
+        self.assertNotIn(sends[3], [i["id"] for i in hub.chat_give(hub.now())])     # the reply that waited never goes
+        code, data = self.request(f"/ui/outbound/{sends[2]}/again",
+                                  {"request_id": str(uuid.uuid4()), "db": "test-generation"})
+        self.assertEqual(code, 409, data)                       # nor does a cleared one, with Send again
         row = self.task(t["id"])
         self.assertEqual([w for w in ("4242", "Pat") if w in f"{row['what']} {row['title']} {row['done_when']}"], [])
         self.assertEqual((row["what"], row["title"]), (hub.REMOVED_WORDS, hub.REMOVED_TITLE))
@@ -1373,7 +1498,8 @@ class ShellOffRule(Base):
         self.person("Ana", "customer", ANA)
         tid, here = self.normal_task(title="Answer the ticket")
         self.assertEqual(sorted(t["name"] for t in hub.tools_for("studio", here)),
-                         ["close_case", "deliver_result", "message_contact", "read_messages", "record_step"])
+                         ["close_case", "deliver_result", "message_contact", "read_attachment", "read_messages",
+                          "record_step"])
         self.assertIn(f"PEOPLE ON YOUR LIST, whose role has tools on: Kim (P-{kim['id']}, manager). They are people, "
                       f"not agents: message_contact writes to them.\n", hub.holdings_team_text("studio", tid))
         # every refusal of the tool holds here: a closed role, somebody not on the list, a blocked person, Pause all

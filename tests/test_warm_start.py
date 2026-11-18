@@ -8,12 +8,16 @@ what followed it. Every block has a hard cap, and the tool holds the depth. In-p
 repositories; no helper, vault, fleet or AI calls."""
 import hashlib
 import json
+import os
+import tempfile
 import unittest
 import uuid
 from unittest.mock import patch
 
 import hub
 from test_capacity import Capacity, DEVA, LOGIN_A, LOGIN_B, SEO, SHARED
+
+PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
 
 
 def load_tests(loader, _tests, _pattern):
@@ -156,16 +160,33 @@ class WarmStart(Capacity):
         self.assertNotIn("Call the fleet tool list_my_tasks", text)
 
     def test_a_second_attempt_carries_the_steers_that_a_session_read_and_not_the_unread_ones(self):
+        """... with the files of a read steer that are still on the hub, which the new attempt may read (owner API
+        1.223): without them a session that starts again does not know which files came with the guidance."""
+        folder = tempfile.TemporaryDirectory(prefix="fleet-warm-files-")
+        self.addCleanup(folder.cleanup)
+        hub.CFG["attachment_dir"] = folder.name
+        self.addCleanup(hub.CFG.pop, "attachment_dir", None)
+        rid = None
         for n, text in enumerate(("Use the small images.", "Keep the old URL."), 1):
             eid = hub.emit("seo", "say", f"[owner] Steering from the owner: {text}", task=self.first,
                            extra={"steer": True, "attempt": 1})
+            rid = rid or str(uuid.uuid4())
             hub.ins("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created) VALUES(?,1,?,?,?,?,?)",
-                    (self.first, text, eid, str(uuid.uuid4()), "test", hub.now()))
+                    (self.first, text, eid, rid if n == 1 else str(uuid.uuid4()), "test", hub.now()))
             if n == 1:
                 hub.q("UPDATE events SET read_at=? WHERE id=?", (hub.now(), eid))
+        files = {}
+        for name, data in (("mockup.png", PNG), ("gone.png", PNG + b"x")):
+            files[name] = hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,message) "
+                                  "VALUES(?,?,'image/png',?,?,?,'test',?)", (str(uuid.uuid4()), name, len(data),
+                                                                            hub.attachment_write(data, "image/png"),
+                                                                            hub.now(), rid))
+        os.remove(os.path.join(folder.name, hashlib.sha256(PNG + b"x").hexdigest() + ".png"))   # the sweep took it
         text = self.lost(self.first)
         self.assertIn("The owner steered this task, and a session before this one read it (1)", text)
         self.assertIn("Use the small images.", text)
+        self.assertIn(f"A-{files['mockup.png']} mockup.png (image/png", text)
+        self.assertNotIn("gone.png", text)
         self.assertNotIn("Keep the old URL.", text.split("WHERE ATTEMPT 1 STOPPED")[1])   # carried as a message
 
     def test_a_session_that_wrote_little_hands_on_what_it_said_and_what_its_commands_answered(self):
