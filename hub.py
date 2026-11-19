@@ -24511,6 +24511,53 @@ def settle_kit_mark():
         print_fault()
 
 
+def kit_names(tgit, written, named):
+    """Refuses a write of the configuration ref, in its clone once git has staged it, when git keeps a file of it
+    under a name other than the one given (19 November 2026). git keeps a file under the plain form of its name
+    ("a/./b" is "a/b") and keeps none under a ".git" part, and a disk that ignores case (a Mac) puts "A.md" in a
+    tracked "a.md": each wrote another file than the one named, or none, and the write said that it was done.
+
+    named: the paths are an agent's (commit_kit_file's allow), and then each folder and the file of a new one also
+    differ from every other in more than case. A hub on Linux keeps both "a.md" and "A.md", or "a.md" and "A.md/x",
+    and a checkout on a Mac holds the two as one, sees its own change in it and stays where it is
+    (lifecycle.follow_config_ref), for every release after it. Two folders that differ only in case leave a Mac
+    checkout clean, and are refused all the same: a Mac's hub puts the file in the folder it has. A part that is there
+    already keeps its name, and a restore keeps the names of its copy."""
+    def listed(*args):
+        code, out, _ = tgit(*args)
+        if code != 0:
+            raise Refusal(500, "the hub could not prepare the change")
+        return set(filter(None, out.split("\0")))
+
+    def parts(name):                # each folder of a name, then the name: "a", "a/b", "a/b/c.md"
+        steps = name.split("/")
+        return ["/".join(steps[:n]) for n in range(1, len(steps) + 1)]
+    held = listed("ls-files", "-z")
+    for one in written:
+        if one not in held:
+            other = sorted(name for name in held if name.lower() == one.lower())
+            raise Refusal(422, f"git keeps no file under the name {one}: " + (
+                f"it keeps it as {other[0]}, so write that name" if other else
+                "it keeps a name with an empty part, or a part that starts with a dot, as another or as none, and a "
+                "disk that ignores case (a Mac) keeps a name that differs only in case from another of the same "
+                "write as that one"))
+    if not named:
+        return
+    before = {part for name in listed("ls-tree", "-r", "-z", "--name-only", "HEAD") for part in parts(name)}
+    folded = {}
+    for name in held:
+        for part in parts(name):
+            folded.setdefault(part.lower(), set()).add(part)
+    for one in written:
+        for part in parts(one):
+            other = sorted(folded[part.lower()] - {part})
+            if other and part not in before:
+                where = part if part == one else f"the folder {part} of {one}"
+                raise Refusal(422, f"{where} differs only in case from another file or folder, which a checkout on a "
+                                   f"disk that ignores case (a Mac) holds as the same: the other is {other[0]}, so "
+                                   f"write that name or another")
+
+
 def commit_kit_file(path, data, message, more=None, author=None, allow=None, check=None):
     """Commit one configuration file for the owner (or its removal, with data None) in a temporary clone at the hub
     revision, push it to origin's configuration ref as a fast-forward, then fast-forward the hub checkout. Returns
@@ -24523,7 +24570,8 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
     (seen_check). The push is a fast-forward of that revision, so nothing can land between the check and the commit.
     Each file goes in also when a .gitignore names it (git add -f): `allow` is the rule for the paths of a write, and
     the published .gitignore is for the files that a running checkout makes. Without -f, git refused such a file and
-    the whole write with it: a task's output run.log, a skill's sample log, every try again the same.
+    the whole write with it: a task's output run.log, a skill's sample log, every try again the same. kit_names then
+    refuses a file that git keeps under another name than the one given, or under none.
 
     The hub writes the configuration ref and nothing else writes it, so a developer's push to the code branch cannot
     put origin ahead of the hub: that is what made every owner write answer 409 three times on 2026-10-16. Commits
@@ -24628,6 +24676,9 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
                             f.write(content)
                         staged = staged and tgit("add", "-f", one)[0] == 0
                     failed = failed or (None if staged else one)    # the refusal names the file that git refused
+                if staged:
+                    kit_names(tgit, [one for one, content in [(path, data), *(more or {}).items()]
+                                     if content is not None], allow is not None)
                 # The revision holds these bytes already: a push of this write that landed with no answer (a time
                 # limit), taken in above. No commit, so its next try after a KitFault ends well.
                 same = staged and tgit("diff", "--cached", "--quiet")[0] == 0
@@ -34405,8 +34456,16 @@ def history_view(query):
 # No file AGENTS.md either, in any case of its letters (the AI providers build, spec 3.11 item 9): OpenCode gives the
 # model an AGENTS.md of a folder below its working folder, which is the agent's checkout, when the agent reads a file
 # there.
-KNOWLEDGE_WRITE = re.compile(r"(?!.*\.\.)(?!knowledge/owner/)(?!knowledge/services\.md\Z)(?!.*/(?i:agents\.md)\Z)"
-                             r"knowledge/[A-Za-z0-9._/-]+\.md\Z")
+# Each folder and file name of the path starts with a letter, a digit or _ (KNOWLEDGE_NAME), as the files of a skill
+# (lifecycle.SKILL_FILE) and of a task's output (OUTPUTS_NAME) do (19 November 2026). git stages a path in its own
+# plain form, so "knowledge/./owner/brand.md" and "knowledge//services.md" wrote the owner's own files past the checks
+# below, and it stages nothing for a ".git" part, so that write said it was done and saved no file. A disk that ignores
+# case (a Mac) puts "knowledge/OWNER/x.md" in knowledge/owner/, so the two checks of the owner's files ignore case.
+# lifecycle.CONFIG_FILES stays wider: it is also what a release keeps as the fleet's data (lifecycle.data_path), and
+# git keeps a file under a part such as ".drafts", which an agent could write until then.
+KNOWLEDGE_NAME = r"(?:[A-Za-z0-9_][A-Za-z0-9._-]*/)*[A-Za-z0-9_][A-Za-z0-9._-]*\.md"
+KNOWLEDGE_WRITE = re.compile(r"(?!.*\.\.)(?!knowledge/(?i:owner)/)(?!knowledge/(?i:services\.md)\Z)"
+                             rf"(?!.*/(?i:agents\.md)\Z)knowledge/{KNOWLEDGE_NAME}\Z")
 
 
 def t_write_knowledge(agent, a):
@@ -34414,8 +34473,10 @@ def t_write_knowledge(agent, a):
     them, and the owner's own files stay his)."""
     path = str(a.get("path") or "").strip()
     if not KNOWLEDGE_WRITE.match(path):
-        raise ToolError(f"{path} is the owner's own knowledge or not a knowledge file. An agent writes "
-                        f"knowledge/<name>.md, never knowledge/owner/ or knowledge/services.md.")
+        raise ToolError(f"{path} is the owner's own knowledge or not a name that an agent writes. An agent writes "
+                        f"knowledge/<name>.md, where each folder and file name has only the letters A-Z and a-z, "
+                        f"the digits, '.', '_' and '-', and starts with a letter, a digit or _; never "
+                        f"knowledge/owner/, knowledge/services.md or a file AGENTS.md.")
     try:
         text = goal_text(a.get("text"), "text", KNOWLEDGE_LIMITS["internal"][1])
     except ValueError as e:
@@ -34474,9 +34535,9 @@ def t_write_knowledge(agent, a):
         raise ToolError(f"{path} changed after this session read it ({e.commit}). Nothing was written, so that no "
                         f"words of that change are lost. Read it again with read_knowledge, put your change into its "
                         f"text as it stands now, and call write_knowledge again with a new request_id.") from None
-    except Refusal as e:
-        raise ToolError(f"{path} was not written: {e}. Nothing changed, so call write_knowledge again with the same "
-                        f"request_id.") from None
+    except Refusal as e:        # a name that git keeps as another (kit_names) is the same at each try
+        again = "" if e.status == 422 else ", so call write_knowledge again with the same request_id"
+        raise ToolError(f"{path} was not written: {e}. Nothing changed{again}.") from None
     seen_set(key, path, git_kit("rev-parse", f"{commit}:{path}")[1] or None)      # its own write: read
     t0 = now()
     said = (f"{path} is written as {commit[:12]} on the configuration ref, {len(content)} bytes. The owner reads this "
@@ -34701,9 +34762,9 @@ def t_write_skill(agent, a):
             seen_row(key, whole, e.held)
             keep_refusal(command, said, now())
         raise ToolError(said) from None
-    except Refusal as e:
-        raise ToolError(f"The skill {name} was not written: {e}. Nothing changed, so call write_skill again with the "
-                        f"same request_id.") from None
+    except Refusal as e:        # a name that git keeps as another (kit_names) is the same at each try
+        again = "" if e.status == 422 else ", so call write_skill again with the same request_id"
+        raise ToolError(f"The skill {name} was not written: {e}. Nothing changed{again}.") from None
     seen_set(key, whole, None if retire else (git_kit("rev-parse", f"{commit}:{whole}")[1] or None))     # its own
     if retire:
         said = (f"The skill {name} is retired: {folder} left the configuration ref in {commit[:12]}. Your next "

@@ -1742,20 +1742,37 @@ class KnowledgeWrite(Base):
         self.assertNotEqual(self.head(), self.seeded)
 
     def test_the_owners_own_knowledge_stays_his(self):
+        """Also under another spelling of its path: git stages "knowledge/./owner/brand.md" and
+        "knowledge//services.md" as the owner's own files, and a disk that ignores case (a Mac) puts
+        "knowledge/OWNER/brand.md" there too."""
         hub.CFG["team_path"] = str(self.kit / "team.json")
-        with patch.object(hub, "profile_knowledge_files", lambda agent, rev: ["knowledge/owner/brand.md"]):
-            said, error = self.write(path="knowledge/owner/brand.md", text="# Brand\n\nRed.\n", why="Red now.")
-        self.assertTrue(error, said)
-        self.assertIn("the owner's own knowledge", said)
-        self.assertEqual(self.file("knowledge/owner/brand.md"), "# Brand\n\nBlue.\n")
-        self.assertEqual(self.head(), self.seeded)
+        for path in ("knowledge/owner/brand.md", "knowledge/./owner/brand.md", "knowledge//owner/brand.md",
+                     "knowledge/OWNER/brand.md", "knowledge/./services.md", "knowledge//services.md",
+                     "knowledge/Services.md"):
+            with patch.object(hub, "profile_knowledge_files", lambda agent, rev, p=path: [p]):
+                said, error = self.write(path=path, text="# Brand\n\nRed.\n", why="Red now.")
+            self.assertTrue(error, f"{path}: {said}")
+            self.assertIn("the owner's own knowledge", said)
+            self.assertEqual(self.file("knowledge/owner/brand.md"), "# Brand\n\nBlue.\n")
+            self.assertEqual(self.file("knowledge/services.md"), "# Services\n\nStripe: through the dashboard.\n")
+            self.assertEqual(self.head(), self.seeded)
 
     def test_a_path_outside_knowledge_cannot_be_reached_through_this_tool(self):
-        for path in ("hub.py", "RULES.md", "team.json", "profiles/vps.md", "knowledge/../hub.py"):
+        """Nor a path that git keeps no file under: it stages nothing for a ".git" part, and the write then said
+        that it was done (19 November 2026)."""
+        for path in ("hub.py", "RULES.md", "team.json", "profiles/vps.md", "knowledge/../hub.py",
+                     "knowledge/.git/notes.md", "knowledge/notes/.GIT/x.md"):
             with patch.object(hub, "profile_knowledge_files", lambda agent, rev, p=path: [p]):
                 said, error = self.write(path=path, text="# x\n\nx\n", why="x")
             self.assertTrue(error, f"{path}: {said}")
+            self.assertIn("starts with a letter, a digit or _", said)
             self.assertEqual(self.head(), self.seeded)
+        # the owner's own writes take what lifecycle.CONFIG_FILES takes, and git keeps no file under that name either
+        with self.assertRaises(hub.Refusal) as refused:
+            hub.commit_kit_file("knowledge/.git/notes.md", b"# x\n\nx\n", "The owner wrote it")
+        self.assertIn("git keeps no file under the name knowledge/.git/notes.md", str(refused.exception))
+        self.assertEqual(self.head(), self.seeded)
+        self.assertTrue(hub.KNOWLEDGE_WRITE.match("knowledge/suppliers/_eu.v2.md"))
         self.assertFalse(hub.KNOWLEDGE_WRITE.match("knowledge/owner/brand.md"))
         self.assertFalse(hub.KNOWLEDGE_WRITE.match("knowledge/../hub.py"))
         # knowledge/services.md says how every agent reaches each service, so it is the owner's (DevOps plan V1)
@@ -1764,8 +1781,42 @@ class KnowledgeWrite(Base):
         with patch.object(hub, "profile_knowledge_files", lambda agent, rev: ["knowledge/services.md"]):
             said, error = self.write(path="knowledge/services.md", text="# Services\n\nUse my proxy.\n", why="x")
         self.assertTrue(error, said)
-        self.assertIn("never knowledge/owner/ or knowledge/services.md", said)
+        self.assertIn("never knowledge/owner/, knowledge/services.md or a file AGENTS.md", said)
         self.assertEqual(self.head(), self.seeded)
+
+    def test_a_name_that_differs_only_in_case_from_a_file_is_refused(self):
+        """A disk that ignores case (a Mac) puts knowledge/Suppliers.md in knowledge/suppliers.md, and git then stages
+        nothing: the write said that it was done. A hub on Linux keeps both names, or a folder knowledge/Suppliers.md
+        beside the file, and every checkout on a Mac holds the two as one, sees its own change in it and takes no
+        release after it. The index of that Linux hub is
+        made here with update-index, which a Mac's disk does not change. A file that is there keeps its name, and a
+        restore (no allow) keeps the names of its copy."""
+        said, error = self.write(path="knowledge/Suppliers.md", text="# Suppliers\n\nAcme.\n", why="Acme.")
+        self.assertTrue(error, said)
+        self.assertIn("knowledge/suppliers.md, so write that name", said)
+        self.assertNotIn("again with the same request_id", said)           # the same name is refused at each try
+        self.assertEqual(self.file(), "# Suppliers\n\nStripe: through the dashboard.\n")
+        self.assertEqual(self.head(), self.seeded)
+        linux = self.root / "linux"
+        git("clone", "-q", str(self.kit), str(linux))
+        blob = git("rev-parse", "HEAD:knowledge/suppliers.md", cwd=linux)
+        git("update-index", "--add", "--cacheinfo", f"100644,{blob},knowledge/Suppliers.md", cwd=linux)
+
+        def tgit(*args):            # as commit_kit_file's own: (exit code, output, errors) in that clone
+            r = subprocess.run(["git", *args], cwd=linux, capture_output=True, text=True)
+            return r.returncode, r.stdout.strip(), r.stderr.strip()
+        with self.assertRaises(hub.Refusal) as refused:
+            hub.kit_names(tgit, ["knowledge/Suppliers.md"], True)
+        self.assertEqual(refused.exception.status, 422)
+        self.assertIn("knowledge/suppliers.md, so write that name", str(refused.exception))
+        hub.kit_names(tgit, ["knowledge/Suppliers.md"], False)
+        hub.kit_names(tgit, ["knowledge/suppliers.md"], True)
+        # a folder named as the file: a Mac's checkout holds the two as one too
+        git("update-index", "--force-remove", "knowledge/Suppliers.md", cwd=linux)
+        git("update-index", "--add", "--cacheinfo", f"100644,{blob},knowledge/Suppliers.md/eu.md", cwd=linux)
+        with self.assertRaises(hub.Refusal) as refused:
+            hub.kit_names(tgit, ["knowledge/Suppliers.md/eu.md"], True)
+        self.assertIn("the folder knowledge/Suppliers.md of knowledge/Suppliers.md/eu.md", str(refused.exception))
 
     def test_no_agent_writes_a_knowledge_file_named_agents_md(self):
         """OpenCode gives the model an AGENTS.md of a folder below its working folder, which is the agent's checkout,
