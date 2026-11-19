@@ -2079,7 +2079,8 @@ class ShellOffRule(Base):
         tid, here = self.normal_task(title="Answer the ticket")
         self.assertEqual(sorted(t["name"] for t in hub.tools_for("studio", here)),
                          ["close_case", "deliver_result", "message_agent", "message_contact", "read_attachment",
-                          "read_messages", "record_step"])         # message_agent: to its reporting line alone
+                          "read_messages", "record_step",          # message_agent: to its reporting line alone
+                          "set_reminder"])                         # a time and no words (test_shell_box.Times)
         self.assertIn(f"PEOPLE ON YOUR LIST, whose role has tools on: Kim (P-{kim['id']}, manager). They are people, "
                       f"not agents: message_contact writes to them.\n", hub.holdings_team_text("studio", tid))
         # every refusal of the tool holds here: a closed role, somebody not on the list, a blocked person, Pause all

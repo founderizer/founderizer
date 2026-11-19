@@ -6529,6 +6529,12 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
              f'waits. Call the fleet tool list_my_tasks with task_id "{tref(task_id)}" for the task. Do not go on '
              f'with its own work now, and do not deliver it for the message alone.'
              if resume == PARK_MESSAGE and not closed else
+             # the same for a session whose Shell box is off, whose task waits for its time (shell_reminder): it has
+             # no list_my_tasks, so the task itself stands here
+             f'You are in task {tref(task_id)} again, in a new session, and only for a message: the task itself still '
+             f'waits. ' + task_itself(task_id, closed).removesuffix(TASK_ITSELF_CLOSED_END) +
+             '\nDo not go on with its own work now, and do not deliver it for the message alone.'
+             if resume == PARK_MESSAGE else
              f'You are RESUMING task {tref(task_id)} after your earlier session stopped. '
              # T3 Code idea 3: the task itself, as a first start has it, so that the new session needs no call to
              # learn it (87 of 92 later attempts called list_my_tasks for it)
@@ -6613,6 +6619,9 @@ def details_kept(text, most):
     return text[:end]
 
 
+TASK_ITSELF_CLOSED_END = "\nDo the task and finish with deliver_result."    # the last line of a closed session's task
+
+
 def task_itself(task_id, closed=False):
     """The task as list_my_tasks gives it, in its own start (plan P9.4): its title, its requester, its done-when line
     and its details, so that a session needs no call to learn its task, and the files of the owner's message that it
@@ -6651,7 +6660,7 @@ def task_itself(task_id, closed=False):
             + ((f'\nIt belongs to {gref(goal["id"])} "{aim}".' if closed else
                 f'\nIt belongs to {gref(goal["id"])} "{aim}": list_my_tasks gives that goal\'s words, its '
                 f'plan step and its limits as they stand now, and they hold for this task.') if goal else "")
-            + ("\nDo the task and finish with deliver_result." if closed else
+            + (TASK_ITSELF_CLOSED_END if closed else
                "\nDo the task and finish with deliver_result. Report progress at each real step of longer work; "
                "deliver_result keeps your last note too, so a short task needs no other call."))
 
@@ -7389,6 +7398,8 @@ TURN_CONTINUE = ("[hub] {task} is open and nothing is waiting for it. Deliver it
 # Support plan F1: the same for a session whose Shell box is off, with only the tools that it has
 TURN_CONTINUE_CLOSED = ("[hub] {task} is open and nothing is waiting for it. Deliver it with deliver_result, in typed "
                         "fields, failed with a typed reason if you cannot finish it.")
+# and, for a session that has a time (shell_tools), the other way: a task that must wait is no failed task
+TURN_CLOSED_TIME = " When its work waits for something, come back at a time with set_reminder, and do as its answer says."
 TURN_ACK = ("[hub] Your turn ended with {task} open. The hub counts {command} as work and will not ask again while it "
             "runs. If you are done, deliver.")
 SHELL_TITLES = ("Bash", "Monitor")      # a Claude background command or monitor; an async subagent is the other kind
@@ -7508,7 +7519,8 @@ def turn_end_check(t, state, t0, force=False):
             event = emit(t["owner"], "say", chase[0], task=tid)
             chased(t["owner"], chase[1], event)
         else:
-            event = emit(t["owner"], "say", (TURN_CONTINUE_CLOSED if closed else TURN_CONTINUE).format(task=tref(tid)),
+            event = emit(t["owner"], "say", (TURN_CONTINUE_CLOSED + (TURN_CLOSED_TIME if session_holds(
+                t["owner"], tid, "set_reminder") else "") if closed else TURN_CONTINUE).format(task=tref(tid)),
                          task=tid)
         kv_set(f"turn_empty:{tid}", json.dumps({"attempt": attempt, "turn": state["turns"], "event": event, "told": 0}))
         log("hub", f"{tref(tid)} ended a turn with nothing waiting; {t['owner']} was asked once")
@@ -11278,8 +11290,8 @@ def t_set_reminder(agent, a):
     Two tools, two owners, two vocabularies, for one idea, and nothing at all for the agent that must wait four
     hours for a build. This is the one idea; the wake-up rules keep what this does not do, which is recurring work
     and a saved code check that costs no model turn."""
-    if shell_task(agent):       # a session whose Shell box is off: a time for its case, and no words
-        return case_reminder(agent, a)
+    if shell_task(agent):       # a session whose Shell box is off: a time and no words (shell_reminder)
+        return shell_reminder(agent, a)
     minutes, at, ci = a.get("minutes"), a.get("at"), a.get("ci")
     if sum(v not in (None, "") for v in (minutes, at, ci)) != 1:
         raise ToolError("Give one of minutes (a count from now), at (a time) or ci (a commit whose GitHub Actions runs "
@@ -18849,13 +18861,15 @@ def t_message_agent(agent, a):
         if waits and not tid:
             raise ToolError("waits=true is for a task session whose task cannot go on without the answer.")
         if waits and line is not None and (staff_question(tid)[0] is None or question_record(tid)):
-            # of an agent whose Shell box is off only a colleague's question waits: a task of a duty would hold a
-            # place of the duty's watch (CASE_POOL), and a customer's question one session for each question, at
-            # the word of a stranger's text (19 November 2026)
-            # (and a task that reads a record holds a token for an hour: it waits for nobody either)
+            # of an agent whose Shell box is off only a colleague's question waits for an answer: a task of a duty
+            # would hold a place of the duty's watch (CASE_POOL), and a customer's question one session for each
+            # question, at the word of a stranger's text (19 November 2026)
+            # (and a task that reads a record holds a token for an hour: it waits for no answer either)
+            # A wait for a time is another thing: set_reminder, in each session that has it (shell_reminder)
             raise ToolError("waits=true is for a task that a colleague's question opened and that reads no record. A "
-                            "task of your duty waits for nobody: go on inside its words, or deliver failed with a "
-                            "typed reason.")
+                            "task of your duty waits for no answer: go on inside its words, " +
+                            ("come back at a time with set_reminder, " if session_holds(agent, tid, "set_reminder")
+                             else "") + "or deliver failed with a typed reason.")
         # A session whose Shell box is off has no ask_my_requester, so it waits for its requester's answer here.
         if waits and line is None and q1("SELECT 1 FROM tasks WHERE id=? AND requester=?", (tid, to)):
             raise ToolError(f"{to} gave you {tref(tid)}: to wait for its answer, use ask_my_requester, which pauses "
@@ -31177,48 +31191,42 @@ def report_notices(t0):
 
 # ---------------------------------------------------------------- a time for a case (set_reminder, typed)
 # A session whose Shell box is off works one event of a case and ends. No task of a line watch waits, because a wait
-# would hold a place of the watch's pool, and such a session keeps no wake-up. So "come back to this case at this
-# time" is a row of the hub's own: the session names a time and no words (SHELL_TYPED), delivers as it always does,
-# and at that time the hub starts one new session for the case's key in the duty's line watch, as report_notices
-# does for a covered ticket. A session that a new event of the key started after the call (a new line of the watch,
-# the close of a case that covers it, an earlier time) takes the time away when it completed, and is waited for
-# while it is open; one that failed worked nothing, and the session that answers a question about a report works
-# that question alone. Only a session that the duty's line watch started has this. Of the other tasks of such an
-# agent only a colleague's question waits, for an answer of its line (t_message_agent's waits): a stranger's text
-# would else hold a task open. The owner, 19 November 2026,
-# of a support agent that waits for a developer's answer before it writes to the customer: "if developer needs more
-# time than what we can afford, then support can write", and of this time: "make sure it is available to any
-# founderizer agent" (an agent with a shell has set_reminder for each task).
-CASE_REMINDER_MIN = 15 * 60         # seconds: the soonest time, because a session that comes back at once is a loop
-CASE_REMINDER_MAX = 30 * 86400      # seconds: the latest time
-CASE_REMINDERS = 4                  # the cost limit: the sessions that such times started for one key in 30 days
-CASE_REMINDER_DAYS = 30
+# would hold a place of the watch's pool. So "come back to this case at this time" is a row of the hub's own: the
+# session names a time and no words (SHELL_TYPED), delivers as it always does, and at that time the hub starts one
+# new session for the case's key in the duty's line watch, as report_notices does for a covered ticket. A session
+# that a new event of the key started after the call (a new line of the watch, the close of a case that covers it,
+# an earlier time) takes the time away when it completed, and is waited for while it is open; one that failed worked
+# nothing, and the session that answers a question about a report works that question alone. In any other task of
+# such an agent the task itself waits, as the task of an agent with a shell does, with the hub's own note and no
+# word of the session. The owner, 19 November 2026, of a support agent that waits for a developer's answer before it
+# writes to the customer: "if developer needs more time than what we can afford, then support can write"; of this
+# time: "make sure it is available to any founderizer agent"; and of the first form of it, which had a soonest and
+# a latest time, four sessions for a key in 30 days and no wait for the other tasks: "if something needs to wait, it
+# needs to wait!", and "why limiting them??? I dont like these rules, everything becomes too strict". So a time has
+# the bounds of an agent with a shell, which are none, and a case that comes back again and again with nothing new
+# is a line of the hub's circles (circles), which the manager decides: the hub reports it and stops nothing.
 CASE_REMINDER_STEP = "comes_back"   # the step of the case that says the time, in the hub's words alone
+CASE_REMINDER_CIRCLE = 3            # the times in a row, with no new event of the case between, that are a circle
 CASE_REMINDER_FAULTS = set()        # the times whose start raised in this run of the hub (case_reminder_notices)
+SHELL_REMINDER_NOTE = "the time came that this task's session set"      # the note of a task that waits: the hub's
 
 
-def case_reminder(agent, a):
-    """set_reminder of a session whose Shell box is off, which its duty's line watch started: a time inside
-    CASE_REMINDER_MIN and CASE_REMINDER_MAX, and no words. One time waits for one key, so a second call moves it. The
-    hub writes the step of the case that says the time. The task stays as it is: its session delivers as it always
-    does. Called with LOCK held."""
+def shell_reminder(agent, a):
+    """set_reminder of a task session of an agent whose Shell box is off: a time and no words. In a session that its
+    duty's line watch started, the time is the case's (case_reminder). In any other task the task itself waits, as
+    the task of an agent with a shell does (t_set_reminder), with the hub's own note. Called with LOCK held."""
     t = get_task(parse_task(a.get("task_id")), owner=agent)
     if t["state"] in TERMINAL:
         raise ToolError(f"{tref(t['id'])} is already {t['state']}; there is nothing to come back to.")
-    if not case_line_task(t):
-        raise ToolError("No time brings this task back: only a session that its duty's watch started for one line of "
-                        "its check sets one. Finish this task as usual.")
-    c = case_row(t["duty_case"])
-    r = duty_row(c["responsibility"])
-    if not r or r["state"] == "retired":
-        raise ToolError(f"{rref(c['responsibility'])} is retired, so no session of it starts again. Finish this task.")
     minutes, at = a.get("minutes"), a.get("at")
     if sum(v not in (None, "") for v in (minutes, at)) != 1:
         raise ToolError("Give one of minutes (a count from now) or at (a time), and not both.")
-    # The task is part of the call, so the same request_id from the session that came back is another call: a count
-    # of minutes means another time there. And the receipt comes before the checks of the time, so a repeat of a call
-    # whose answer was lost gets that answer, also when its time is too near by then.
-    command, stored = agent_write(agent, "set_reminder", a, {"task": t["id"], "minutes": minutes, "at": at})
+    # The task and its attempt are part of the call, so the same request_id from the session that came back is
+    # another call: a count of minutes means another time there. And the receipt comes before the check of the
+    # time, so a repeat of a call whose answer was lost gets that answer, also when its time has passed by then.
+    came = q1("SELECT COUNT(*) n FROM reminders WHERE task=? AND fired IS NOT NULL", (t["id"],))["n"]
+    command, stored = agent_write(agent, "set_reminder", a, {"task": t["id"], "attempt": t["attempt"], "came": came,
+                                                             "minutes": minutes, "at": at})
     if stored:
         return stored["text"]
     t0 = now()
@@ -31229,20 +31237,33 @@ def case_reminder(agent, a):
             due = t0 + float(minutes) * 60
         except (TypeError, ValueError):
             raise ToolError("minutes must be a number.") from None
-        if isinstance(minutes, bool) or not math.isfinite(due):
+        if isinstance(minutes, bool) or not math.isfinite(due) or due < t0:
             raise ToolError("minutes must be a number of minutes from now.")
-    if due - t0 < CASE_REMINDER_MIN:
-        raise ToolError(f"The time must be at least {CASE_REMINDER_MIN // 60} minutes from now: a session that comes "
-                        f"back at once reads what this one reads.")
-    if due - t0 > CASE_REMINDER_MAX:
-        raise ToolError(f"The time must be within {CASE_REMINDER_MAX // 86400} days from now.")
-    started = q1("SELECT COUNT(*) n FROM case_reminders WHERE responsibility=? AND key=? AND told_task IS NOT NULL "
-                 "AND done>?", (r["id"], c["key"], t0 - CASE_REMINDER_DAYS * 86400))["n"]
-    if started >= CASE_REMINDERS:
-        raise ToolError(f"No more: {started} sessions of this case started in {CASE_REMINDER_DAYS} days at a time "
-                        f"that a session of it set, and {CASE_REMINDERS} is the most. Say what the case still waits "
-                        f"for in the record that a person reads, so that the person can act.")
-    when = goal_time(due)
+    try:
+        when = goal_time(due)
+    except (ValueError, OverflowError, OSError):        # a year that no date has
+        raise ToolError("That time is too far ahead for a date. Give a nearer one.") from None
+    if case_line_task(t):
+        return case_reminder(agent, t, due, when, command, t0)
+    with transaction():
+        DB.execute("UPDATE reminders SET done=1 WHERE task=? AND done=0", (t["id"],))     # one task comes back once
+        DB.execute("INSERT INTO reminders(due,note,agent,task,created) VALUES(?,?,?,?,?)",
+                   (due, SHELL_REMINDER_NOTE, agent, t["id"], t0))
+        text = (f"The hub brings you back to {tref(t['id'])} at {when}. Until then the task waits: do not "
+                f"deliver it, and stop work on it now. A message for it still reaches you. If this session has ended "
+                f"by then, a new session starts with the task's own words, the hub's line and the last words of this "
+                f"session, so leave what else it must know in a record that it reads with its own tools.")
+        keep_command(command, {"task": t["id"], "text": text}, t0)
+    return text
+
+
+def case_reminder(agent, t, due, when, command, t0):
+    """The time of a case (shell_reminder): one time waits for one key, so a second call moves it. The hub writes the
+    step of the case that says the time. The task stays as it is: its session delivers as it always does."""
+    c = case_row(t["duty_case"])
+    r = duty_row(c["responsibility"])
+    if not r or r["state"] == "retired":
+        raise ToolError(f"{rref(c['responsibility'])} is retired, so no session of it starts again. Finish this task.")
     with transaction():
         for old in DB.execute("SELECT * FROM case_reminders WHERE responsibility=? AND key=? AND done IS NULL",
                               (r["id"], c["key"])).fetchall():
@@ -31271,6 +31292,40 @@ def case_reminder(agent, a):
                 f"it waits: the session that comes back closes it.")
         keep_command(command, {"task": t["id"], "text": text}, t0)
     return text
+
+
+def case_reminder_circles():
+    """[(signature, one line)] of what comes back again and again at a time that its own sessions set, while it still
+    goes on: a case that came back CASE_REMINDER_CIRCLE times or more in a row, with no session of a new event of its
+    key between them (a line of the watch, a covering close), while its next time waits or its newest such session is
+    open; and an open task of an agent whose Shell box is off that came back so often (shell_reminder). A circle that
+    the manager decides (circles): the hub reports it and stops nothing, and a case or a task that ended is no line
+    any more. It reads the times that wait and the open tasks, never the whole history."""
+    found, keys = [], []
+    for row in q("SELECT responsibility, key FROM case_reminders WHERE done IS NULL UNION SELECT c.responsibility, "
+                 f"c.key FROM tasks t JOIN duty_cases c ON c.id=t.duty_case WHERE t.{OPEN_TASK} AND EXISTS (SELECT 1 "
+                 "FROM case_reminders cr WHERE cr.told_task=t.id) ORDER BY 1, 2"):
+        keys.append((row["responsibility"], row["key"]))
+    for duty_id, key in keys:
+        other = q1("SELECT MAX(t.id) m FROM tasks t JOIN duty_cases c ON c.id=t.duty_case WHERE c.responsibility=? "
+                   "AND c.key=? AND t.trigger_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM case_reminders cr WHERE "
+                   "cr.told_task=t.id) AND NOT EXISTS (SELECT 1 FROM report_questions rq WHERE rq.task=t.id)",
+                   (duty_id, key))["m"] or 0
+        came = q1("SELECT COUNT(*) n, MAX(told_task) last FROM case_reminders WHERE responsibility=? AND key=? AND "
+                  "told_task>?", (duty_id, key, other))
+        if came["n"] >= CASE_REMINDER_CIRCLE:
+            duty = duty_row(duty_id)
+            found.append((f"times:{duty_id}:{key}:{came['n']}",
+                          f"{key} of {rref(duty_id)} ({duty['agent'] if duty else 'no agent'}) came back {came['n']} "
+                          f"times in a row at a time that its own session set, with no new event of it between, and "
+                          f"it goes on: {tref(came['last'])} is the newest of those sessions."))
+    for row in q(f"SELECT t.id task, t.owner, t.title, COUNT(*) n FROM tasks t JOIN reminders f ON f.task=t.id WHERE "
+                 f"t.{OPEN_TASK} AND f.note=? AND f.fired IS NOT NULL GROUP BY t.id HAVING COUNT(*)>=? ORDER BY t.id",
+                 (SHELL_REMINDER_NOTE, CASE_REMINDER_CIRCLE)):
+        found.append((f"waits:{row['task']}:{row['n']}",
+                      f"{tref(row['task'])} ({row['owner']}) came back {row['n']} times at a time that its own "
+                      f"session set and is still open: {clip(row['title'], 100)}"))
+    return found
 
 
 def case_reminding(tid):
@@ -38525,6 +38580,8 @@ def circles(t0):
         found.append((f"refusals:{r['task']}:{r['name']}:{r['n'] // CIRCLE_REFUSALS}",
                       f"{r['agent']} called {r['name']} on {tref(r['task'])} {r['n']} times and was refused every "
                       f"time: {refusal_said(r['agent'], r['detail'], 160)}"))
+    # 5. a case, or a task of an agent whose Shell box is off, that comes back again and again at its own times
+    found += case_reminder_circles()
     # Two agents that only talk are no circle here: the talk guard refuses their next message and tells the manager
     # once (agent_limit).
     return found
@@ -40457,9 +40514,9 @@ CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "
 # duty or a wake-up, messages an agent outside its reporting line, asks a requester, calls an API with a key, or
 # reads memory, history, earlier work or knowledge. And record_step, close_case and deliver_result take typed fields
 # only (SHELL_TYPED): what such a session writes reaches a session with a shell as ids and short words of a-z 0-9 _,
-# never as its own text (H7). The set_reminder of a session that its duty's line watch started is a time and no
-# words (case_reminder, 19 November 2026): the hub writes every word that comes back at that time, so it is no
-# wake-up that keeps the session's text. Its own words go to a person, with message_contact: a role with tools on, whose next
+# never as its own text (H7). Its set_reminder is a time and no words (shell_reminder, 19 November 2026): the call
+# takes no text, so it is no wake-up that keeps one. The new session of a case reads the hub's words alone; a task
+# that waits starts again as each new attempt of such a task does, which shows its session's last words (warm_attempt). Its own words go to a person, with message_contact: a role with tools on, whose next
 # message comes back to it; and to the agents of its reporting line, with message_agent (shell_line), which get them
 # in quotation marks after the hub's label, as data (SHELL_LINE_FORM). The owner, 18 November 2026, of a support
 # agent: "Fix immediately, any agent can talk to the manager or its lead!", and "it can message the manager and other
@@ -40514,17 +40571,19 @@ SHELL_TYPED = {
         "it touched in ids. After this call the task is closed for good.",
         S({"task_id": TASK_ID, "outcome": {"type": "string", "enum": ["completed", "failed", "rejected"]},
            "values": TYPED_VALUES_FIELD, "ids": TYPED_IDS_FIELD}, ["task_id", "outcome"])),
-    # only in a session that its duty's line watch started (shell_tools): a time and no words (case_reminder)
+    # in each task session but two kinds (shell_tools): a time and no words (shell_reminder)
     "set_reminder": (
-        "Come back to this case at a time that you name: when it waits for an answer that no event of its own "
-        "brings, or when somebody must hear from you by a time. Give minutes or at, and no words. Then deliver this "
-        "task as usual, and do not close the case while it waits: at the time the hub starts a new session for the "
-        "case, which closes it. That session reads the hub's own line and nothing of this session, so leave what it "
-        "must know in the record that it reads with its own tools. A session that a new event of the case starts "
-        "before the time, and that does the work, takes the time away. Calling it again moves the time.",
+        "Come back at a time that you name: when the work waits for an answer that no event brings, or when somebody "
+        "must hear from you by a time. Give minutes or at, and no words. The answer says which of two things the hub "
+        "does: do what it says. In a session that your duty's watch started for one line of its check, the time is "
+        "the case's: deliver this task and do not close the case, and at the time the hub starts a new session for "
+        "the case, which closes it. A session that a new event of the case starts first, and that does the work, "
+        "takes the time away. In any other task the task itself waits: do not deliver it, and the hub brings you "
+        "back at the time, in a new session if this one has ended. A new session knows little or nothing of this "
+        "one, so leave what it must know in a record that it reads with its own tools. Calling it again moves the "
+        "time.",
         S({"request_id": REQUEST_ID,
-           "minutes": {"type": "number", "description": f"A count of minutes from now, at least "
-                                                        f"{CASE_REMINDER_MIN // 60}"},
+           "minutes": {"type": "number", "description": "A count of minutes from now"},
            "at": {"type": "string", "description": "A time instead: an ISO date or date and time, for example "
                   "2026-10-21T09:00. With no zone it is read in the fleet's own time zone."},
            "task_id": TASK_ID}, ["request_id"])),
@@ -40601,11 +40660,12 @@ def shell_tools(agent, context=None):
         # a colleague's question keeps their own wish; one that reads a record holds a token, and keeps none
         staff = staff_question(int(str(context[1])[2:]))[1] is not None and \
             not question_record(int(str(context[1])[2:]))
-        # a time for its case (case_reminder): only a session that its duty's line watch started, which the hub can
-        # start again for that key, and never the session that only answers a question about a report. Of its
-        # other tasks only a colleague's question waits (t_message_agent's waits): no stranger's text holds a task open
-        own = read_row("SELECT trigger_id, duty_case FROM tasks WHERE id=?", (int(str(context[1])[2:]),))
-        timed = bool(own) and not asked and case_line_task(own)
+        # a time and no words (shell_reminder), in each task session: for the case of a session that its duty's
+        # line watch started, and else for the task itself. Two kinds of session have none: the one that only answers
+        # a question about a report, whose answer is all of its task, and the one that reads one record through a
+        # token for a colleague's question, whose new attempt would ask for a token of a question that has its count
+        # (question_record: the service's refusal would tell the colleague that the question has no access)
+        timed = not asked and not question_record(int(str(context[1])[2:]))
     return SHELL_OFF_TOOLS + (("report_defect",) if reports else ()) + (("answer_report",) if asked else ()) + \
         (("set_reminder",) if timed else ()) + \
         tuple(n for n in named or () if n in SHELL_OFF_DUTY_TOOLS) + (SHELL_OFF_ASKED_TOOLS if staff else ())
@@ -41065,7 +41125,7 @@ def typed_args(agent, name, a):
                     where_output_is="the case of this task and its records",
                     how_checked="typed fields of a session whose Shell box is off",
                     plain=None if plain and secret_hit(plain) else plain)
-    if name == "set_reminder":      # a time alone: the hub writes the line of the case's record (case_reminder)
+    if name == "set_reminder":      # a time alone, of a task with a case or with none (shell_reminder)
         return dict(out, request_id=a.get("request_id"), minutes=a.get("minutes"), at=a.get("at"))
     row = read_row("SELECT duty_case FROM tasks WHERE id=? AND owner=?", (parse_task(a.get("task_id")), agent))
     c = case_row(row["duty_case"]) if row and row["duty_case"] else None
@@ -45474,10 +45534,12 @@ def liveness(t0):
                 comes = until_clock(park["due"], t0)
                 again = (f"Then call set_reminder again, with at=\"{at}\" unless the message changes the time, so "
                          f"that the task waits quietly until then.")
+            # (a session whose Shell box is off gave a time and no note: shell_reminder's note is the hub's own)
+            noted = "" if park["note"] == SHELL_REMINDER_NOTE else f"; your note for it was: \"{park['note']}\""
             new_attempt(t, PARK_MESSAGE, note=(
                 f"This session starts for a message, and not because the wait is over. {tref(tid)} waits for its "
-                f"reminder R-{park['id']}, which comes {comes}; your note for it was: "
-                f"\"{park['note']}\". Its session was not running any more when the message came. Read the message "
+                f"reminder R-{park['id']}, which comes {comes}{noted}. Its session was not running any more when the "
+                f"message came. Read the message "
                 f"with read_messages and do what it asks. Leave what waits for the reminder alone, unless the message "
                 f"changes it. {again}"))
             log("hub", f"a message brought {owner} back to {tref(tid)} in a new session; R-{park['id']} still comes "
