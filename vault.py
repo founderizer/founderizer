@@ -20,7 +20,8 @@ broker has no `agent` of its own and every request to it names its caller, which
 machine, before it has its first agent (`hubsetup.vault_install`). `worker_uid`, one user, is the form of a machine
 that ran one agent, and it still works.
 
-A Linux broker does handovers. Signing in needs a browser, so it is the Mac vault helper's work (same protocol).
+A Linux broker does handovers. It signs an agent in in the agent's own browser on that server (plan 04, S5), as the
+Mac vault helper does in the owner's Chrome (same protocol).
 
 A Linux broker also makes a new login for a confirmed job (create_login): it makes the password, keeps a record
 before its one save, and answers with the login's name. It needs nothing more, because the store writes itself.
@@ -99,6 +100,7 @@ import codecs
 import errno
 import fcntl
 import hashlib
+import hmac
 import ipaddress
 import json
 import grp
@@ -909,6 +911,707 @@ def withdraw(conf, number):
     log(f"withdraw job={number}: {ref.lower()} {removed}")
     swap_taken(conf, ref.lower())
     return {"ok": True, "v": PROTOCOL, "withdrawal": number, "login": ref.lower(), "removed": removed}
+
+
+# ---------------------------------------------------------------- the sign-in on a Linux server (plan 04, S5)
+# On a Linux server an agent's browser is its own Chrome (plan 04, S2). It listens for DevTools on 127.0.0.1 and the
+# agent's port of root's ports file, where the fleet's table (D11) lets in only the agent's user, this broker's user and
+# root. The broker fills a sign-in form there as the Mac's vault helper fills one in the owner's Chrome
+# (VaultBrowser.swift): the page's origin and the form's action are checked in the page, in the same script that fills.
+# Its scripts run in a world of their own and reach the DOM only through that world's prototypes, so neither a script
+# nor the markup of the page changes what they read. The agent gets only the outcome. The broker records the origins of
+# the sign-in's top-level pages and the cookies of other sites that the sign-in created (their names, never a value);
+# the hub keeps them with the agent's use of the login, and when that use ends it has the agent's helper clear them in
+# that browser (S2's clear, hub signin_clear_sweep). What an agent's own programs can still reach in its own browser is
+# in VAULT.md (item 26).
+
+SIGNIN_PORTS = "/etc/fleet-browser/ports"       # root's file: one line <user> <DevTools port> <screen-sharing port>
+SIGNIN_STEP = 20.0          # seconds that one step of a sign-in (a submit, a code) waits for its page at most
+SIGNIN_TICK = 1.0           # seconds between two looks at a page that changes with no event (a page of scripts)
+SIGNIN_QUIET = 2.0          # seconds with no new top-level page, document request or load before a page's state counts
+SIGNIN_FIRST_LOOK = 3.0     # seconds after a submit before the first look, which wipes the fields: as the Mac's one look
+SIGNIN_TOTAL = 60.0         # seconds for the whole fill in the browser: below the helper's wait for the broker (90)
+SIGNIN_TABS = 3             # the most tabs of the login's origin that a fill tries
+SIGNIN_CLEANUP = 5.0        # seconds that the clean-up of a fill has, also after the whole fill's time ran out
+SIGNIN_OTP = ("input[autocomplete=one-time-code],input[name*=otp i],input[id*=otp i],input[name=code],"
+              "input[id=code]")             # VaultBrowser.otpSelector
+SIGNIN_ORIGINS, SIGNIN_COOKIES = 50, 200    # the most that one record names (lifecycle.browser_clear_valid)
+# lifecycle.BROWSER_HOST: a host that a clear can name (a DNS name or an IPv4 address, in lower case)
+SIGNIN_HOST = re.compile(r"[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*")
+SIGNIN_EVENTS = ("Page.frameNavigated", "Page.loadEventFired", "Page.navigatedWithinDocument",
+                 "Network.requestWillBeSent")       # the events that signin_settle reads; no other is kept
+SIGNIN_KEPT = 1 << 22       # bytes of such events that a connection keeps between two waits, each 1 KiB at least
+SIGNIN_EVENT = 1 << 10      # what one kept event counts at least: a flood of small events holds 4096 at most
+SIGNING = set()             # the uids whose sign-in runs now, while the broker's lock is free (signin)
+
+
+def signin_port(user, path=None):
+    """The DevTools port of this OS user by root's ports file (D11), or a refusal: the file must be a plain file of
+    root's that only root writes, and the user's line of the contract's form."""
+    try:
+        fd = os.open(SIGNIN_PORTS if path is None else path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        raise Refused("this server has no browser of an agent (no ports file)") from None
+    with os.fdopen(fd, encoding="ascii", errors="replace") as f:
+        info = os.fstat(f.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise Refused("the browsers' ports file is not root's own, so it names no port")
+        text = f.read(1 << 20)
+    for line in text.split("\n"):
+        parts = line.split(" ")
+        if len(parts) == 3 and parts[0] == user and re.fullmatch(r"93[0-9]{2}", parts[1]):
+            return int(parts[1])
+    raise Refused("this agent has no browser port on this server")
+
+
+def signin_sockets(match, tables=None):
+    """The uids of the sockets of the kernel's own whole lists (IPv4 and IPv6) whose row `match` takes. A list that
+    cannot be read adds a uid of -1, which no agent has; a kernel with no IPv6 has no such socket either."""
+    uids = set()
+    for path, _six in SWAP_TABLES if tables is None else tables:
+        try:
+            with open(path, encoding="ascii") as f:
+                next(f, None)               # its head line
+                for line in f:
+                    row = line.split()
+                    if len(row) > 7 and match(row):
+                        uids.add(int(row[7]))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, UnicodeDecodeError):
+            uids.add(-1)
+    return uids
+
+
+def signin_listeners(port, tables=None):
+    """The uids of every socket that listens on this TCP port, on any address (a dual-stack socket on [::] takes
+    connections to 127.0.0.1 too)."""
+    return signin_sockets(lambda row: row[3] == "0A" and row[1].rpartition(":")[2] == f"{port:04X}", tables)
+
+
+def signin_peer(port, local, tables=None):
+    """The uids of the sockets whose own port is `port` and whose other end is this broker's port `local`: on
+    loopback, the far end of the broker's own connection (in the IPv4 list, or in the IPv6 one as a mapped address)."""
+    return signin_sockets(lambda row: row[1].rpartition(":")[2] == f"{port:04X}" and
+                          row[2].rpartition(":")[2] == f"{local:04X}", tables)
+
+
+class SigninCdp:
+    """**A DevTools connection to one agent's own Chrome** on 127.0.0.1:<port>, only where each socket that listens on
+    that port is of the agent's uid, and only where the far end of the connection is of it too (D11: another user's
+    answer proves nothing and gets no fill). One call at a time; the events that signin_settle reads, up to SIGNIN_KEPT
+    bytes, are kept for `wait`. Every read has an end, and `limit` (monotonic) ends them all: a peer that sends a byte
+    now and then holds nobody past it. Raises Refused. (fleet.Cdp is the helper's copy of this client.)"""
+
+    MOST = 1 << 23          # the largest message that it reads, 8 MiB
+
+    def __init__(self, port, uid, timeout=10.0, tables=None, limit=None):
+        self.timeout, self.limit, self.last, self.rest, self.events, self.kept, self.size = \
+            timeout, limit, 0, b"", [], 0, 0
+        if signin_listeners(port, tables) != {uid}:
+            raise Refused(f"no browser of this agent alone listens on its port {port}: start its browser task first")
+        end = self.end(timeout)
+        try:
+            path = urllib.parse.urlsplit(self.version(port, end)["webSocketDebuggerUrl"]).path
+        except (KeyError, TypeError, ValueError, AttributeError, OSError) as e:
+            raise Refused(f"the agent's browser gave no DevTools address ({type(e).__name__})") from None
+        if not re.fullmatch(r"/devtools/browser/[A-Za-z0-9-]{1,64}", path):
+            raise Refused("the agent's browser gave no DevTools address of Chrome's own form")
+        try:
+            self.sock = socket.create_connection(("127.0.0.1", port), timeout=max(0.1, end - time.monotonic()))
+        except OSError as e:
+            raise Refused(f"the agent's browser took no DevTools connection: {e}") from None
+        try:
+            key = base64.b64encode(os.urandom(16)).decode()
+            self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+                               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                               ).encode())
+            while b"\r\n\r\n" not in self.rest:
+                part = self.recv(end)
+                if not part or len(self.rest) > 65536:
+                    raise Refused("the agent's browser ended the DevTools connection at its start")
+                self.rest += part
+            head, self.rest = self.rest.split(b"\r\n\r\n", 1)
+            if b" 101 " not in head.split(b"\r\n", 1)[0]:
+                raise Refused("the agent's browser refused the DevTools connection")
+            if signin_peer(port, self.sock.getsockname()[1], tables) != {uid}:
+                raise Refused(f"the far end of the connection to port {port} is not this agent's browser")
+        except BaseException:
+            self.sock.close()
+            raise
+
+    def end(self, seconds):
+        """When a read that may take `seconds` ends: never after the whole fill's limit."""
+        end = time.monotonic() + seconds
+        return end if self.limit is None else min(end, self.limit)
+
+    @staticmethod
+    def version(port, end):
+        """Chrome's /json/version, by HTTP on a socket of its own and before `end`, at most 64 KiB."""
+        with socket.create_connection(("127.0.0.1", port), timeout=max(0.1, end - time.monotonic())) as sock:
+            sock.sendall(f"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".encode())
+            said, length = b"", None
+            while length is None or len(said.partition(b"\r\n\r\n")[2]) < length:
+                left = end - time.monotonic()
+                if left <= 0:
+                    raise OSError("no answer in time")
+                sock.settimeout(left)
+                part = sock.recv(1 << 16)
+                if not part:
+                    break
+                said += part
+                if len(said) > 1 << 16:
+                    raise ValueError("an answer above 64 KiB")
+                head, cut, _ = said.partition(b"\r\n\r\n")
+                found = re.search(rb"(?im)^content-length:[ \t]*([0-9]{1,6})[ \t]*\r?$", head) if cut else None
+                length = int(found.group(1)) if found else length
+        head, cut, body = said.partition(b"\r\n\r\n")
+        if not cut or not re.match(rb"HTTP/1\.[01] 200 ", head):
+            raise ValueError("no address")
+        return json.loads(body[:length] if length is not None else body)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def close(self):
+        self.sock.close()
+
+    def recv(self, end):
+        left = end - time.monotonic()
+        if left <= 0:
+            raise Refused("the sign-in ran out of its time in the agent's browser"
+                          if self.limit is not None and time.monotonic() >= self.limit else
+                          "the agent's browser did not answer in time")
+        self.sock.settimeout(left)
+        try:
+            return self.sock.recv(1 << 16)
+        except (TimeoutError, socket.timeout):
+            raise Refused("the agent's browser did not answer in time") from None
+        except OSError as e:
+            raise Refused(f"the DevTools connection to the agent's browser failed: {e}") from None
+
+    def send(self, message, opcode=0x1):
+        data = message if isinstance(message, bytes) else json.dumps(message).encode()
+        size, mask = len(data), os.urandom(4)
+        length = bytes([0x80 | size]) if size < 126 else bytes([0x80 | 126]) + size.to_bytes(2, "big") \
+            if size < 65536 else bytes([0x80 | 127]) + size.to_bytes(8, "big")
+        try:
+            self.sock.sendall(bytes([0x80 | opcode]) + length + mask +
+                              bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+        except OSError as e:
+            raise Refused(f"the DevTools connection to the agent's browser failed: {e}") from None
+
+    def take(self, n, end):
+        while len(self.rest) < n:
+            part = self.recv(end)
+            if not part:
+                raise Refused("the agent's browser ended the DevTools connection")
+            self.rest += part
+        data, self.rest = self.rest[:n], self.rest[n:]
+        return data
+
+    def message(self, end):
+        """Chrome's next whole message; its first bytes before `end`, and a message that began is read whole within a
+        call's own time, so that the connection never stops in the middle of one. A ping gets its pong."""
+        parts = []
+        while True:
+            first, second = self.take(2, end)
+            end = max(end, self.end(self.timeout))
+            size = second & 0x7F
+            if size >= 126:
+                size = int.from_bytes(self.take(2 if size == 126 else 8, end), "big")
+            if size + sum(map(len, parts)) > self.MOST:
+                raise Refused("a DevTools message above 8 MiB")
+            mask = self.take(4, end) if second & 0x80 else None
+            data = self.take(size, end)
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            opcode = first & 0x0F
+            if opcode == 0x8:
+                raise Refused("the agent's browser ended the DevTools connection")
+            if opcode == 0x9:
+                self.send(data, 0xA)
+            elif opcode != 0xA:
+                parts.append(data)
+                if first & 0x80:
+                    self.size = sum(map(len, parts))
+                    try:
+                        return json.loads(b"".join(parts))
+                    except ValueError:
+                        raise Refused("the agent's browser sent a DevTools message that is not JSON") from None
+
+    def keep(self, event):
+        """An event that signin_settle reads (a document request of a frame, a navigation, a load), with only the
+        fields that it reads, while the kept events stay under SIGNIN_KEPT bytes on the connection; every other
+        message goes."""
+        params = event.get("params") if isinstance(event, dict) and isinstance(event.get("params"), dict) else {}
+        size = max(self.size, SIGNIN_EVENT)
+        if not isinstance(event, dict) or event.get("method") not in SIGNIN_EVENTS or \
+                self.kept + size > SIGNIN_KEPT or \
+                event["method"] == "Network.requestWillBeSent" and params.get("type") != "Document":
+            return
+        frame = params.get("frame") if isinstance(params.get("frame"), dict) else {}
+        request = params.get("request") if isinstance(params.get("request"), dict) else {}
+        text = lambda v: v[:8192] if isinstance(v, str) else None
+        self.events.append({"method": event["method"], "sessionId": text(event.get("sessionId")),
+                            "params": {"type": text(params.get("type")), "frameId": text(params.get("frameId")),
+                                       "request": {"url": text(request.get("url"))},
+                                       "frame": {"id": text(frame.get("id")), "url": text(frame.get("url")),
+                                                 "parentId": text(frame.get("parentId"))}}})
+        self.kept += size
+
+    def call(self, method, params=None, session=None):
+        """The result of one DevTools call; Refused for an error of Chrome's, and with nothing sent once the whole
+        fill's time ran out."""
+        if self.limit is not None and time.monotonic() >= self.limit:
+            raise Refused("the sign-in ran out of its time in the agent's browser")
+        self.last += 1
+        end = self.end(self.timeout)
+        self.send({"id": self.last, "method": method, "params": params or {},
+                   **({"sessionId": session} if session else {})})
+        while True:
+            answer = self.message(end)
+            if isinstance(answer, dict) and answer.get("id") == self.last:
+                if "error" in answer:
+                    raise Refused(f"the agent's browser refused {method}: "
+                                  f"{str((answer['error'] or {}).get('message'))[:200]}")
+                result = answer.get("result")
+                return result if isinstance(result, dict) else {}
+            self.keep(answer)
+
+    def wait(self, end):
+        """The events that came since the last wait, and then each new one until `end`, as they come: an iterator."""
+        end = end if self.limit is None else min(end, self.limit)
+        while True:
+            while self.events:
+                event = self.events.pop(0)
+                self.kept = 0 if not self.events else self.kept
+                yield event
+            try:
+                if end - time.monotonic() <= 0:
+                    return
+                self.keep(self.message(end))
+            except Refused:
+                if time.monotonic() >= end:
+                    return
+                raise
+
+
+class signin_free:
+    """`with signin_free(conf):` the broker's lock is free while the agent's browser works (as a request's curl child
+    runs with it free), so that every other agent's vault calls go on meanwhile."""
+
+    def __init__(self, conf):
+        self.lock = conf.get("_lock")
+
+    def __enter__(self):
+        if self.lock is not None:
+            self.lock.release()
+
+    def __exit__(self, *_):
+        if self.lock is not None:
+            self.lock.acquire()
+
+
+def signin_origin(url):
+    """The origin of a login's address as a page's location.origin says it: scheme://host[:port], with no default
+    port."""
+    parts = urllib.parse.urlsplit(url)
+    scheme, host = parts.scheme.lower(), (parts.hostname or "").lower()
+    port = parts.port
+    return f"{scheme}://{host}" + (f":{port}" if port and port != {"http": 80, "https": 443}.get(scheme) else "")
+
+
+# The scripts' helpers are VaultBrowser.dom of the Mac's Fleet Vault, byte for byte (test_vault_signin holds it, and
+# the Mac's VaultBrowserFlowTests run them in a stand-in page): each reaches the DOM only through the prototypes of its
+# own world, which a page's markup cannot shadow by a name (<input name="action">, <img name="querySelector">). `read` a
+# getter, `$` and `$$` a query, `form` the form of an HTML field (none for an `input` inside `<svg>`), `own` the first
+# field of the form itself (through its elements, also one that form= ties to it), `away` a form's action off the
+# page's origin, `post` a GET form and its buttons made to send by POST (a formaction to another origin goes), `send`
+# the submit with the vault's own submitter, a GET submit that only the page could make held, and the secret wiped
+# after it (at pagehide when the page sends it itself), `set` a value with the events that a framework listens to,
+# `secret` a secret only into a field of a kind that takes one, with no pattern, min, max, step or dir, made readonly
+# (no validity, so no `:valid` or `:user-valid` rule matches it) and with a fixed style, which it reads back from the
+# computed style with a throwaway value in the field before it types (a shadow root's `::slotted` rule with
+# `!important` beats an inline style: Fleet Vault 0.3.17, b9dfa593), and `wipe` the emptying of such a field, which
+# takes readonly away again. `valid` reads each field's validity through the prototypes, so that `send` submits no
+# form that checks its fields (no `novalidate`) while one of them is not valid: the browser would lay the page out
+# and focus that field while the secret is in its own field. `closes` reads whether the nearest HTML dialog around a
+# dialog form is open, the only case that sends (Fleet Vault 0.3.18, 12553a04). The gaps that the Mac's `dom`
+# comment names as not closed hold here too: a `::slotted` rule whose condition comes true after the look, while the
+# secret stays in the page (a handler of the page took the submit, or a dialog form), can still give a password's
+# length or a code's digits.
+SIGNIN_DOM = ("const D=Document.prototype,E=Element.prototype,F=HTMLFormElement.prototype,I=HTMLInputElement.prototyp"
+              "e,N=Node.prototype,T=EventTarget.prototype,V=Event.prototype;const read=(P,n,o)=>Object.getOwnProperty"
+              "Descriptor(P,n).get.call(o),$=(n,s)=>(n===document?D:E).querySelector.call(n,s),$$=s=>D.querySelectorA"
+              "ll.call(document,s),form=e=>e instanceof HTMLInputElement?read(I,'form',e):null,own=(f,s)"
+              "=>{const c=read(F,'elements',f);for(let i=0;i<c.length;i++)if(E.matches.call(c[i],s))return c[i];"
+              "return null},away=f=>{try{return new URL(read(F,'action',f)).origin!==location.origin}catch("
+              "x){return true}},post=f=>{const g=read(F,'method',f)==='get';if(g)E.setAttribute.call(f,"
+              "'method','post');const c=$$('button,input');for(let i=0;i<c.length;i++){const b=c[i],P=b instanceof HT"
+              "MLButtonElement?HTMLButtonElement.prototype:b instanceof HTMLInputElement?I:null;if(!P||read("
+              "P,'form',b)!==f)continue;if(E.hasAttribute.call(b,'formmethod')&&read(P,'formMethod',b)==='get')"
+              "E.setAttribute.call(b,'formmethod','post');if(E.hasAttribute.call(b,'formaction')){let o=null;"
+              "try{o=new URL(read(P,'formAction',b)).origin}catch(x){}if(o!==location.origin)E.removeAttribute.call("
+              "b,'formaction')}}return g},closes=f=>{for(let a=read(N,'parentElement',f);a;a=read(N,'parentElement',"
+              "a))if(a instanceof HTMLDialogElement)return read(HTMLDialogElement.prototype,'open',a);return false}"
+              ",valid=f=>{const c=read(F,'elements',f);for(let i=0;i<c.length;i++){const x=c[i],P=x instanceof HTMLIn"
+              "putElement?I:x instanceof HTMLSelectElement?HTMLSelectElement.prototype:x instanceof HTMLTextAreaEleme"
+              "nt?HTMLTextAreaElement.prototype:x instanceof HTMLButtonElement?HTMLButtonElement.prototype:null;"
+              "if(P&&read(P,'willValidate',x)&&!read(ValidityState.prototype,'valid',read(P,'validity',"
+              "x)))return false}return true},send=(f,e,get)=>{if(!read(F,'noValidate',f)&&!valid(f)){wipe("
+              "e);return false}const open=closes(f);let b=null,ev=null,held=false;if(get){b=D.createElement.call("
+              "document,'button');E.setAttribute.call(b,'type','submit');E.setAttribute.call(b,'formmethod',"
+              "'post');E.setAttribute.call(b,'hidden','');N.appendChild.call(f,b)}const c=x=>{if(read(V,"
+              "'target',x)===f)ev=x},h=x=>{if(read(V,'target',x)===f&&!read(V,'defaultPrevented',x)&&get)"
+              "{V.preventDefault.call(x);held=true}};T.addEventListener.call(window,'submit',c,true);T.addEventListen"
+              "er.call(window,'submit',h);try{F.requestSubmit.call(f,b)}catch(x){ev=null}finally{T.removeEventListene"
+              "r.call(window,'submit',c,true);T.removeEventListener.call(window,'submit',h);if(b)E.remove.call("
+              "b)}const took=!!ev&&read(V,'defaultPrevented',ev),dialog=read(F,'method',f)==='dialog',went=!!ev&&!hel"
+              "d&&(took||!dialog||open),page=went&&(took||dialog);if(page)T.addEventListener.call(window,"
+              "'pagehide',()=>wipe(e),{once:true});else wipe(e);return went},set=(e,v)=>{Object.getOwnPropertyDescrip"
+              "tor(I,'value').set.call(e,v);const q=x=>{V.preventDefault.call(x);V.stopImmediatePropagation.call("
+              "x)};T.addEventListener.call(window,'submit',q,true);try{T.dispatchEvent.call(e,new Event("
+              "'input',{bubbles:true}));T.dispatchEvent.call(e,new Event('change',{bubbles:true}))}finally{"
+              "T.removeEventListener.call(window,'submit',q,true)}},fits=e=>e instanceof HTMLInputElement&&['text',"
+              "'tel','password','number'].includes(read(I,'type',e)),secret=(e,v)=>{if(!fits(e))return false;"
+              "['pattern','min','max','step','dir'].forEach(n=>E.removeAttribute.call(e,n));E.setAttribute.call("
+              "e,'readonly','');const s=read(HTMLElement.prototype,'style',e),C=CSSStyleDeclaration.prototype,"
+              "u=Object.getOwnPropertyDescriptor(I,'value').set,w=[['field-sizing','fixed'],['-webkit-text-security',"
+              "'disc'],['transition','none'],['animation','none']];w.forEach(([n,x])=>C.setProperty.call("
+              "s,n,x,'important'));u.call(e,'1');const k=getComputedStyle(e),beaten=[['field-sizing','fixed'],"
+              "['-webkit-text-security','disc'],['transition-property','none'],['animation-name','none']].some("
+              "([n,x])=>{const y=C.getPropertyValue.call(k,n);return y!==''&&y!==x});u.call(e,'');if(beaten)"
+              "{E.removeAttribute.call(e,'readonly');return false}set(e,v);return true},wipe=e=>{if(fits("
+              "e)){set(e,'');E.removeAttribute.call(e,'readonly')}};")
+
+
+def signin_fill(origin, login):
+    """VaultBrowser.fillScript: the user name and the password into the form of the page's password field, and its
+    submit, only on the login's origin and only for a form whose answer goes to that origin. The user name goes into
+    the first user field of that form itself (`own`). The origin and the action are read again just before the submit,
+    because the page's own listeners of the input events run between."""
+    return ("(()=>{" + SIGNIN_DOM + "if(location.origin!==%s)return 'wrong-origin';"
+            "const p=$(document,'input[type=password]');const f=p&&form(p);if(!f)return 'no-form';"
+            "if(away(f))return 'wrong-action';const g=post(f),u=own(f,'input[type=email],input[type=text],"
+            "input:not([type])');if(u)set(u,%s);if(!secret(p,%s))return 'bad-field';"
+            "if(away(f)||location.origin!==%s){wipe(p);return 'moved';}return send(f,p,g)?'filled':'not-sent';})()"
+            % (json.dumps(origin), json.dumps(login.get("username", "")), json.dumps(login["password"]),
+               json.dumps(origin)))
+
+
+def signin_check(origin):
+    """VaultBrowser.checkScript: `form` while a password field is there, `otp` on a code page, `loading` before the
+    page has its fields, `none` when the sign-in went through. A password or a code that is still in the page after
+    its submit (a page that did not go) is wiped, so that no later click of the page sends it."""
+    return ("(()=>{" + SIGNIN_DOM + "if(location.origin!==%s)return 'wrong-origin';"
+            "const p=$(document,'input[type=password]'),k=$(document,%s);wipe(p);wipe(k);"
+            "return p?'form':k?'otp':read(D,'readyState',document)==='loading'?'loading':'none';})()"
+            % (json.dumps(origin), json.dumps(SIGNIN_OTP)))
+
+
+def signin_code(origin, code):
+    """VaultBrowser.otpScript: the authenticator code into the code field's form, and its submit, with the same checks
+    as the fill."""
+    return ("(()=>{" + SIGNIN_DOM + "if(location.origin!==%s)return 'wrong-origin';"
+            "const e=$(document,%s);const f=e&&form(e);if(!f)return 'no-form';"
+            "if(away(f))return 'wrong-action';const g=post(f);if(!secret(e,%s))return 'bad-field';"
+            "if(away(f)||location.origin!==%s){wipe(e);return 'moved';}return send(f,e,g)?'filled':'not-sent';})()"
+            % (json.dumps(origin), json.dumps(SIGNIN_OTP), json.dumps(code), json.dumps(origin)))
+
+
+# A sign-in that is not confirmed: each password and code field of the page is emptied, with the events that a page's
+# framework listens to, so that no field and no state of the page keeps what the vault typed for the agent's tools
+SIGNIN_EMPTY = ("(()=>{" + SIGNIN_DOM + "$$(%s).forEach(x=>wipe(x));return 'emptied';})()"
+                % json.dumps("input[type=password]," + SIGNIN_OTP))
+
+
+def totp_now(seed, at=None):
+    """An RFC 6238 authenticator code from a base32 seed or an otpauth:// URI (fleet.totp_code's rule)."""
+    digits, period, algorithm = 6, 30, "sha1"
+    if seed.startswith("otpauth://"):
+        params = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(seed).query))
+        seed = params.get("secret", "")
+        try:
+            digits, period = int(params.get("digits", 6)), int(params.get("period", 30))
+        except ValueError:
+            raise Refused("the login's authenticator settings are not supported") from None
+        algorithm = params.get("algorithm", "SHA1").lower()
+    if algorithm not in ("sha1", "sha256", "sha512") or not 6 <= digits <= 8 or not 1 <= period <= 300:
+        raise Refused("the login's authenticator settings are not supported")
+    seed = re.sub(r"[\s=-]", "", seed).upper()
+    try:
+        key = base64.b32decode(seed + "=" * (-len(seed) % 8))
+    except ValueError:
+        key = b""
+    if not key:
+        raise Refused("the login's authenticator seed is not base32")
+    mac = hmac.new(key, struct.pack(">Q", int((time.time() if at is None else at) // period)),
+                   getattr(hashlib, algorithm)).digest()
+    offset = mac[-1] & 0x0F
+    return str((struct.unpack(">I", mac[offset:offset + 4])[0] & 0x7FFFFFFF) % 10 ** digits).zfill(digits)
+
+
+def signin_run(cdp, session, script):
+    """One script in the page's main frame, in a world of the vault's own: its answer, or None where the page went
+    away under it (a navigation in between). A new world for each run: a navigation ends the old one."""
+    try:
+        frame = (((cdp.call("Page.getFrameTree", session=session).get("frameTree") or {}).get("frame")) or {}).get("id")
+        world = cdp.call("Page.createIsolatedWorld", {"frameId": frame, "worldName": "fleet-vault"},
+                         session=session).get("executionContextId")
+        said = cdp.call("Runtime.evaluate", {"expression": script, "contextId": world, "returnByValue": True},
+                        session=session)
+    except Refused:
+        return None
+    value = (said.get("result") or {}).get("value") if not said.get("exceptionDetails") else None
+    return value if isinstance(value, str) else None
+
+
+def signin_saw(seen, url):
+    """The origin of a top-level page's address into `seen`: http and https only, at most SIGNIN_ORIGINS."""
+    if isinstance(url, str) and url.split(":", 1)[0].lower() in ("http", "https") and len(seen) < SIGNIN_ORIGINS:
+        try:
+            seen.add(signin_origin(url))
+        except ValueError:
+            pass
+
+
+def signin_settle(cdp, session, frame, origin, seen, step=SIGNIN_STEP, tick=SIGNIN_TICK, quiet=SIGNIN_QUIET,
+                  first=SIGNIN_FIRST_LOOK, watch=None):
+    """After a submit: the page's state by signin_check once the tab has been quiet for `quiet` seconds (no new
+    top-level page, no document request of its main frame, no load, no same-page navigation of its main frame):
+    `none`, `otp`, `wrong-origin` (a sign-in that ends on another site), or `form` on a page that loaded after a new
+    top-level page (the site gave its form back). Else the last state when `step` runs out, or the whole fill's
+    limit. It reads the tab's events as they come and looks at the page once each `tick`, but not before `first`
+    seconds after the submit: each look wipes a password or a code that is still in the page (signin_check), and a
+    page's own handler may still read its field until then, as the Mac's one look comes 3 s after the submit. Each
+    top-level page that the tab goes to, each redirect on the way too, goes into `seen`: a single sign-on page that
+    comes after the landing page also, while the tab is not quiet yet. `watch`, a dict, gets `navigated`: whether a
+    new top-level page came after the submit (the form went), also one that has not loaded yet."""
+    end, last, navigated, loaded = time.monotonic() + step, time.monotonic(), False, False
+    look = time.monotonic() + first
+    if getattr(cdp, "limit", None) is not None:
+        end = min(end, cdp.limit)           # the whole fill's time: no look that would only meet the limit
+    while True:
+        for event in cdp.wait(min(end, time.monotonic() + tick)):
+            params = event.get("params") if isinstance(event.get("params"), dict) else {}
+            if event.get("sessionId") != session:
+                continue
+            method = event.get("method")
+            if method == "Page.frameNavigated" and not (params.get("frame") or {}).get("parentId"):
+                signin_saw(seen, (params.get("frame") or {}).get("url"))
+                navigated, last = True, time.monotonic()
+            elif method == "Network.requestWillBeSent" and params.get("type") == "Document" and \
+                    params.get("frameId") == frame:
+                signin_saw(seen, (params.get("request") or {}).get("url"))
+                last = time.monotonic()
+            elif method == "Page.loadEventFired":
+                loaded, last = loaded or navigated, time.monotonic()
+            elif method == "Page.navigatedWithinDocument" and params.get("frameId") == frame:
+                last = time.monotonic()     # the main frame's own history; a widget's frame keeps nothing open
+        if time.monotonic() < min(look, end):
+            continue
+        state = signin_run(cdp, session, signin_check(origin))
+        settled = state in ("none", "otp", "wrong-origin") or state == "form" and loaded
+        if settled and time.monotonic() - last >= quiet or time.monotonic() >= end:
+            if watch is not None:
+                watch["navigated"] = navigated
+            return state
+
+
+def signin_cookies(cdp):
+    """Every cookie of the agent's browser, as Chrome lists them (S2: Storage.getCookies answers on the browser)."""
+    cookies = cdp.call("Storage.getCookies").get("cookies")
+    return [c for c in cookies if isinstance(c, dict)] if isinstance(cookies, list) else []
+
+
+def signin_host(host):
+    """A host that a clear can name (lifecycle.browser_clear_valid): not an IPv6 address, no dot at its end."""
+    return isinstance(host, str) and bool(SIGNIN_HOST.fullmatch(host))
+
+
+def signin_record(seen, before, after):
+    """What the hub keeps for the clear at the end of the login's use (lifecycle.browser_clear_valid): the origins of
+    the sign-in's top-level pages, and each cookie that the sign-in created on a domain of none of them (embedded
+    content), by its name, its domain, its path and its partition; never a value. A cookie that was there before stays
+    out, also with a new value: it is of another session of that site (plan 04, round 11). A domain of a top-level page
+    loses all its cookies at the clear anyway. An entry that the rule would refuse stays out, so that the rest gets
+    through: an IPv6 host, a host with a dot at its end, a cookie with no name."""
+    key = lambda c: (c.get("name"), c.get("domain"), c.get("path"), json.dumps(c.get("partitionKey"), sort_keys=True))
+    old = {key(c) for c in before}
+    origins = sorted(o for o in seen if signin_host(urllib.parse.urlsplit(o).hostname or ""))
+    hosts = {urllib.parse.urlsplit(o).hostname for o in origins}
+    made = []
+    for c in after:
+        name, domain = c.get("name"), str(c.get("domain") or "").lower()
+        path, part = c.get("path"), c.get("partitionKey")
+        bare = domain.removeprefix(".")
+        site = part.get("topLevelSite") if isinstance(part, dict) else None
+        if key(c) in old or not (isinstance(name, str) and 0 < len(name) <= 4096) or not signin_host(bare) or \
+                any(h == bare or h.endswith("." + bare) for h in hosts) or \
+                not (path is None or isinstance(path, str) and path.startswith("/") and len(path) <= 4096) or \
+                not (site is None or isinstance(site, str) and 0 < len(site) <= 4096):
+            continue
+        made.append(dict({"name": name, "domain": domain}, **({"path": path} if path is not None else {}),
+                         **({"partitionKey": {"topLevelSite": site}} if site is not None else {})))
+    return {"origins": origins[:SIGNIN_ORIGINS], "cookies": made[:SIGNIN_COOKIES]}
+
+
+def signin_page(cdp, login, code=None, keep=None, step=SIGNIN_STEP, tick=SIGNIN_TICK, quiet=SIGNIN_QUIET,
+                first=SIGNIN_FIRST_LOOK):
+    """**The fill in the agent's own Chrome**, as VaultBrowser.signIn fills in the owner's: in the first of at most
+    SIGNIN_TABS tabs of the login's origin whose page takes the fill (a `not-sent` or a fill with no answer ends the
+    search: no later tab gets the secret), the user name and the password and their submit;
+    then, where the site asks for one and the login has a seed, the authenticator code (`code()` makes it now). Once it
+    typed: a sign-in that is not confirmed, also one that an error ends, empties each password and code field of its
+    page, and `keep` gets the record (signin_record) in each case. A tab whose fill stopped after it may have typed is
+    emptied too. After a fill or a code that answered `not-sent` (a listener of the page can hide a submit that went)
+    or nothing (the fill can still run in the page), the broker watches that tab as after a submit, so that a sign-in
+    that went is taken and its record kept, and types into no other tab; a watch that ends on a code page or on
+    another site, or after a new page came, shows that the form went, and ends as a fill that went. Returns (signed
+    in, with a code)."""
+    origin = signin_origin(login["url"])
+    before = signin_cookies(cdp)
+    tabs = [t for t in cdp.call("Target.getTargets").get("targetInfos") or []
+            if isinstance(t, dict) and t.get("type") == "page" and str(t.get("url") or "").startswith(origin + "/")]
+    if not tabs:
+        raise Refused(f"no tab of the agent's browser shows {origin}: open the site's sign-in page there first, then "
+                      f"ask again")
+    session = frame = state = said = None
+    seen, with_code, said_all, coded = {origin}, False, set(), ""
+    try:
+        for tab in tabs[:SIGNIN_TABS]:
+            session = cdp.call("Target.attachToTarget", {"targetId": tab.get("targetId"), "flatten": True}).get(
+                "sessionId")
+            cdp.call("Page.enable", session=session)
+            cdp.call("Network.enable", session=session)
+            frame = (((cdp.call("Page.getFrameTree", session=session).get("frameTree") or {}).get("frame")) or {}).get(
+                "id")
+            said = signin_run(cdp, session, signin_fill(origin, login))
+            said_all.add(said)
+            if said in ("filled", "not-sent", None):
+                break       # a submit that a page's listener hid, or a fill with no answer, can still send the
+                #             password: the broker watches this tab, and no second tab gets it
+            if said not in ("wrong-origin", "no-form", "wrong-action"):
+                signin_run(cdp, session, SIGNIN_EMPTY)          # it may have typed before it stopped
+            cdp.call("Target.detachFromTarget", {"sessionId": session})
+            session = None
+        if session is None:
+            if "bad-field" in said_all:
+                raise Refused(f"the sign-in form on {origin} has a password field that the vault types no secret "
+                              f"into: the page's style takes back its size or its glyphs, or puts a transition or an "
+                              f"animation on it")
+            raise Refused(f"no tab on {origin} shows a sign-in form whose answer goes to {origin}")
+        watch = {}
+        state = signin_settle(cdp, session, frame, origin, seen, step, tick, quiet, first, watch)
+        if state == "otp" and code is not None:
+            coded = signin_run(cdp, session, signin_code(origin, code()))
+            if coded == "bad-field":
+                raise Refused(f"the code page on {origin} has a code field that the vault types no code into: it takes "
+                              f"no code, or the page's style takes back its size or its glyphs, or puts a transition "
+                              f"or an animation on it")
+            if coded in ("filled", "not-sent", None):       # as at the fill: a code that can have gone is watched
+                with_code = coded in ("filled", "not-sent")
+                state = signin_settle(cdp, session, frame, origin, seen, step, tick, quiet, first)
+        if state != "none" and state != "wrong-origin":    # on another site the form went: signin's own words
+            if coded == "not-sent":
+                raise Refused(f"the code form on {origin} sent nothing that the vault saw: it sends by GET in the "
+                              f"page's address, a field of it is not valid, it is a dialog form with no HTML dialog "
+                              f"around it or whose nearest one is not open, or a listener of the page stopped its "
+                              f"submit or hid it from the vault, and then the code can have gone to {origin}")
+            if coded is None:
+                raise Refused(f"the code page on {origin} gave the vault no answer, and the page did not sign in after "
+                              f"it")
+            went = state == "otp" or watch.get("navigated")   # a code page, or a new page: the form went
+            if coded == "" and said == "not-sent" and not went:
+                raise Refused(f"the sign-in form on {origin} sent nothing that the vault saw: it sends by GET in the "
+                              f"page's address, a field of it is not valid (required and empty, or refused by its type "
+                              f"or pattern), it is a dialog form with no HTML dialog around it or whose nearest one "
+                              f"is not open, or a listener of the page stopped its submit or hid it from the vault, "
+                              f"and then the form can have gone to {origin}. "
+                              f"The vault typed into no other tab: close this page and ask again to use another one")
+            if coded == "" and said is None and not went:
+                raise Refused(f"the sign-in form on {origin} gave the vault no answer, and the page did not sign in "
+                              f"after it; the vault typed into no other tab")
+    finally:
+        if session is not None:
+            if getattr(cdp, "limit", None) is not None:     # the clean-up has its own seconds, also after the limit
+                cdp.limit = max(cdp.limit, time.monotonic() + SIGNIN_CLEANUP)
+            if state != "none":
+                signin_run(cdp, session, SIGNIN_EMPTY)
+            if keep is not None:
+                try:
+                    after = signin_cookies(cdp)
+                except Refused:
+                    after = before                  # the cookies cannot be read now: the record keeps its origins
+                keep(signin_record(seen, before, after))
+            try:
+                cdp.call("Target.detachFromTarget", {"sessionId": session})
+            except Refused:
+                pass
+    return state == "none", with_code
+
+
+def signin_keep(conf, job, record):
+    """The hub keeps a sign-in's record with the agent's use of the login (POST /helper/vault/<agent>/signed). Refused
+    where it did not say that it kept it."""
+    code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}/signed", dict(record, job=job))
+    if code != 200 or not isinstance(data, dict) or data.get("ok") is not True or data.get("job") != job:
+        reason = data.get("error") if isinstance(data, dict) else None
+        raise Refused("the hub did not keep the record of this sign-in" +
+                      (f": {reason}" if isinstance(reason, str) else ""))
+
+
+def signin(conf, job, uid, ports=None, tables=None):
+    """sign_in on a Linux server (plan 04, S5): the job's login, opened inside the broker, filled in the calling
+    agent's own Chrome. The caller's OS user names the port (root's ports file), and the connection to that agent's
+    browser comes first, so that an agent with no browser running uses up no job. Then the hub confirms the job and
+    the grant and checks that the request came from the agent's own user (confirm_job, with the caller fields that
+    `handle` requires). Before the fill the hub keeps the login's own origin, so that the end of the login's use clears
+    at least that site, and a seed that makes no code refuses before anything is typed; after the fill, the whole
+    record, also after an error. The broker's lock is free while the browser works (signin_free), one sign-in of an
+    agent at a time, and the whole fill has SIGNIN_TOTAL seconds. The answer has the origin, the login's name and
+    whether a code was used, as the Mac's vault helper answers: never a value."""
+    if not isinstance(job, int) or isinstance(job, bool) or job < 1:
+        raise Refused("a sign-in needs a job number")
+    if uid in SIGNING:
+        raise Refused("a sign-in of this agent runs already")
+    store = LocalStore(conf)            # a store that does not open refuses before the hub's job is used
+    port = signin_port(caller_user(uid), ports)
+    SIGNING.add(uid)
+    try:
+        with signin_free(conf):
+            cdp = SigninCdp(port, uid, tables=tables, limit=time.monotonic() + SIGNIN_TOTAL)
+        with cdp:
+            confirmed = confirm_job(conf, job, "signin")
+            login, label, source = open_login(conf, confirmed["login"], confirmed.get("task"), store)
+            if confirmed.get("source") is not None and source != confirmed["source"]:
+                raise Refused("the hub and the copy name different source logins, so the login is not used")
+            protect(conf, confirmed, login)
+            if login.get("totp"):
+                totp_now(login["totp"])
+            origin = signin_origin(login["url"])
+            signin_keep(conf, job, {"origins": [origin], "cookies": []})
+
+            def keep(record):
+                try:
+                    signin_keep(conf, job, record)
+                except Refused as e:            # the login's own origin is kept already
+                    log(f"sign-in job {job}: {e}")
+            with signin_free(conf):
+                signed, with_code = signin_page(cdp, login, (lambda: totp_now(login["totp"])) if login.get("totp")
+                                                else None, keep)
+    finally:
+        SIGNING.discard(uid)
+    if not signed:
+        raise Refused(f"the sign-in on {origin} could not be confirmed: the page still asks for the login, or it went "
+                      f"to another site" + (", after the authenticator code" if with_code else "") +
+                      ". The password was never shown to you.")
+    log(f"signed {conf['agent']} in on {origin} with {label!r} for job {job}" + (" and a code" if with_code else ""))
+    return {"ok": True, "v": PROTOCOL, "job": job, "origin": origin, "label": label, "authenticator": with_code}
 
 
 # ---------------------------------------------------------------- the fleet's own store
@@ -2477,8 +3180,10 @@ def handle(conf, line, uid):
         if not isinstance(job, int) or isinstance(job, bool) or job < 1:
             raise Refused("a withdrawal needs the number of its job")
         return withdraw(conf, job)
-    if op == "signin":
-        raise Refused("signing in needs a browser: only the Mac vault helper signs in")
+    if op == "signin":                  # plan 04, S5: the agent's own Chrome on this Linux server
+        if not who:                     # the hub checks the caller's OS user only with them (Handler.broker_allowed)
+            raise Refused("a sign-in needs the caller fields")
+        return signin(conf, req.get("job"), uid)
     if op == "read":
         return read(conf, req.get("for"), uid)
     if op == "probe":

@@ -189,6 +189,7 @@ class OldHelper(unittest.TestCase):
                 patch.dict(__import__("os").environ, {"HOME": home}), \
                 patch.object(fleet, "tmux", lambda *args, **kw: tmux.append(args)), \
                 patch.object(fleet.sys, "platform", platform), patch.object(h, "own_user", lambda: own, create=True), \
+                patch.object(fleet, "BROWSER_MOVED_WAIT", 0), \
                 patch.object(fleet.subprocess, "run",
                              lambda argv, **kw: runs.append(argv) or fleet.subprocess.CompletedProcess(argv, 0, "", "")), \
                 patch.object(fleet.os, "remove", lambda path: runs.append(["rm", path])):
@@ -204,7 +205,7 @@ class OldHelper(unittest.TestCase):
         # An agent with an OS user of its own: its browser and its screen-sharing server here stop too (build plan 04,
         # S2a), and never a unit of another name.
         _tmux, runs = self.run_it("linux", own=True)
-        self.assertEqual([r for r in runs if r[0] == "systemctl"],
+        self.assertEqual([r for r in runs if r[0] == "systemctl" and "is-active" not in r],     # S5: its units' end
                          [["systemctl", "--user", "--no-block", "stop", "fleet_browser.service"],
                           ["systemctl", "--user", "--no-block", "stop", "fleet_vnc.service"],
                           ["systemctl", "--user", "--no-block", "disable", "--now", "fleet-scout.service"]])

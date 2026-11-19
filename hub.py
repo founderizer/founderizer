@@ -540,6 +540,11 @@ CREATE INDEX IF NOT EXISTS deposit_of ON deposits(login, machine, id);
 CREATE TABLE IF NOT EXISTS withdrawals(id INTEGER PRIMARY KEY, login TEXT NOT NULL, machine TEXT NOT NULL,
   agent TEXT NOT NULL, created REAL NOT NULL, released REAL, finished REAL, ok INTEGER, result TEXT);
 CREATE INDEX IF NOT EXISTS withdrawal_of ON withdrawals(login, machine, id);
+-- Plan 04, S5: what the vault broker of a Linux server signed an agent in to, in the agent's own browser, by login: the
+-- origins of the sign-in's top-level pages and the cookies of other sites that it set or changed (names, never a
+-- value), and the task of its last sign-in. signin_clear_sweep sends the clear when the agent's grant ends.
+CREATE TABLE IF NOT EXISTS signin_records(agent TEXT NOT NULL, login TEXT NOT NULL, task INTEGER, origins TEXT NOT NULL,
+  cookies TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(agent, login));
 -- Owner feature secret_replace: the value of one reference that the owner replaced in the central vault (the vault's
 -- signed replace): when the hub knew it, the newest delivery that there was then (`after`), the checksum of the
 -- owner's sealed copy, and the fingerprints of the value that the central vault holds since, as that vault named
@@ -1247,10 +1252,10 @@ def secret_grants(agent, team=None):
     return dict(((team or TEAM)["agents"].get(agent) or {}).get("secrets") or {})
 
 
-def granted_logins(agent):
+def granted_logins(agent, rev=None):
     """The bws:// logins that the owner gives this agent: its grants, and the references in its profile section
-    "Logins it may use"."""
-    return profile_logins(agent) | set(secret_grants(agent))
+    "Logins it may use" (at this revision of the owner's files, else at the hub's fresh one)."""
+    return profile_logins(agent, rev) | set(secret_grants(agent))
 
 
 def secret_words(agent, ref):
@@ -3671,6 +3676,114 @@ def browser_place_sweep(t0):
     for row in browser_kv_rows(BROWSER_CLOSED_TOLD):
         if row["k"][len(BROWSER_CLOSED_TOLD):] not in breaches:
             browser_kv(row["k"], None)
+
+
+# ---- the vault's sign-ins in an agent's own browser on a Linux server (plan 04, S5)
+SIGNIN_RECORD_WINDOW = 3600     # seconds after the broker opened a sign-in's login in which it may keep its record
+SIGNIN_CLEAR_EVERY = 60         # seconds between two passes of signin_clear_sweep
+SIGNIN_CLEAR = {"at": 0.0}
+SIGNIN_TOLD = set()             # the rows and profiles whose read failed, each told once (signin_clear_sweep)
+
+
+def signin_record_keep(agent, login, task, clear):
+    """One sign-in's record (lifecycle.browser_clear_valid) merged into the one that the agent's use of that login
+    keeps, the newest entries first, within the rule's limits (50 origins, 200 cookies). The agent's own processes can
+    post a record of their job too, which the hub cannot tell from the broker's: one posted after the broker's can push
+    the broker's entries out (VAULT.md item 26 says so: such an agent can copy its cookies anyway). Called with LOCK
+    held."""
+    row = q1("SELECT origins, cookies FROM signin_records WHERE agent=? AND login=?", (agent, login))
+    origins, cookies = (json.loads(row["origins"]), json.loads(row["cookies"])) if row else ([], [])
+    origins = (clear["origins"] + [o for o in origins if o not in clear["origins"]])[:50]
+    cookies = (clear["cookies"] + [c for c in cookies if c not in clear["cookies"]])[:200]
+    q("INSERT INTO signin_records(agent,login,task,origins,cookies,at) VALUES(?,?,?,?,?,?) ON CONFLICT(agent,login) "
+      "DO UPDATE SET task=excluded.task, origins=excluded.origins, cookies=excluded.cookies, at=excluded.at",
+      (agent, login, task, json.dumps(origins), json.dumps(cookies), now()))
+
+
+PROFILE_LOGINS = re.compile(r"bws://[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+
+def signin_grants(agent, rev):
+    """granted_logins at this revision of the owner's files, or None where the agent's profile could not be read now
+    (a git call that failed or ran out of time): then its records wait for a later pass. A profile that the revision
+    does not have gives no logins: git says so in its own words, which it never translates under LC_ALL=C. The same
+    sources as granted_logins (test_vault_signin keeps the two equal)."""
+    try:
+        r = subprocess.run(["git", "-C", kit_dir(), "show", f"{rev}:profiles/{agent}.md"], capture_output=True,
+                           timeout=30, stdin=subprocess.DEVNULL, env=dict(os.environ, LC_ALL="C", LANGUAGE="C"))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 and not re.search(rb"does not exist|exists on disk, but not in", r.stderr):
+        return None
+    text = r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+    section = next((x["text"] for x in parse_profile(text) if x["key"] == "logins"), "")
+    return {m.lower() for m in PROFILE_LOGINS.findall(section)} | set(secret_grants(agent))
+
+
+def signin_ended(agent, login, task, granted):
+    """Whether the agent can no longer use this login (login_refusal's rule): it has no vault broker any more; or the
+    login is not among the owner's grants (`granted`, read once for the agent in a pass), and no task of its own still
+    gives it: a login that the task of its last sign-in made in its current attempt (made_here), or a sealed copy of a
+    handover, whose use is that task's. So an owner's grant that ends clears at once, also while that task runs."""
+    if (agents().get(agent) or {}).get("vault") != "broker":
+        return True
+    login = str(login).lower()
+    if login in granted:
+        return False
+    t = q1("SELECT * FROM tasks WHERE id=?", (task,)) if task else None
+    if not t or t["state"] in TERMINAL:
+        return True
+    return not (login.startswith("sealed:") or made_here(agent, t, login))
+
+
+def signin_clear_sweep(t0):
+    """**A grant's end clears its sign-ins** (plan 04, S5): for each record of an agent whose use of the login has
+    ended (signin_ended), its helper gets the event `browser_clear` with the record, and S2's clear takes those
+    sites' data out of the agent's own browser; the record goes. A record of an agent that left team.json goes with
+    no event: its user and its browser went with it. The owner's revision is read once in a pass, and only for an
+    agent with a vault broker: where it cannot be read, such an agent's records wait for a later pass, and the records
+    of an agent with no broker still clear. Every SIGNIN_CLEAR_EVERY seconds."""
+    if t0 - SIGNIN_CLEAR["at"] < SIGNIN_CLEAR_EVERY:
+        return
+    SIGNIN_CLEAR["at"] = t0
+    grants, rev = {}, False
+    for row in q("SELECT * FROM signin_records ORDER BY at"):
+        agent, login = row["agent"], row["login"]
+        if agent in agents():
+            try:
+                if (agents()[agent] or {}).get("vault") == "broker":    # an agent with no broker needs no profile
+                    if agent not in grants:
+                        if rev is False:
+                            rev = kit_revision(fresh=True)
+                        grants[agent] = signin_grants(agent, rev) if rev else None
+                    if grants[agent] is None:
+                        if ("profile", agent) not in SIGNIN_TOLD:
+                            SIGNIN_TOLD.add(("profile", agent))
+                            log(agent, "the clear of sign-ins could not read its profile: its records wait")
+                        continue
+                    SIGNIN_TOLD.discard(("profile", agent))
+                ended = signin_ended(agent, login, row["task"], grants.get(agent, set()))
+                SIGNIN_TOLD.discard(("row", agent, login))     # decided: a later failure of this row is told again
+                if not ended:
+                    continue                # still in use
+            except Exception as e:          # one row that the hub's own reads stop waits alone, and the others go on
+                if ("row", agent, login) not in SIGNIN_TOLD:
+                    SIGNIN_TOLD.add(("row", agent, login))
+                    log(agent, f"the clear of {login} could not be decided ({type(e).__name__}): it waits")
+                continue
+            try:
+                clear = lifecycle.browser_clear_valid({"origins": json.loads(row["origins"]),
+                                                       "cookies": json.loads(row["cookies"])})
+            except (ValueError, TypeError):     # a stored record that does not read stops no other row
+                clear = None
+            if clear:
+                emit(agent, "browser_clear", f"the use of {login} ended: its sites' sign-ins leave your browser",
+                     extra=clear)
+                log(agent, f"the use of {login} ended: its browser clears {len(clear['origins'])} site(s) and "
+                           f"{len(clear['cookies'])} cookie(s) of other sites")
+            else:
+                log(agent, f"the use of {login} ended, and its record names nothing that a clear can take")
+        q("DELETE FROM signin_records WHERE agent=? AND login=?", (agent, login))
 
 
 def browser_rename_rows(old, new):
@@ -23071,9 +23184,10 @@ def profile_paths():
     return [f"profiles/{name}.md" for name in agents()]
 
 
-def profile_logins(agent):
-    """The bws:// logins in the owner's profile section "Logins it may use", from the hub checkout's commit."""
-    rev = kit_revision(fresh=True)               # an owner who removes a login is obeyed at once
+def profile_logins(agent, rev=None):
+    """The bws:// logins in the owner's profile section "Logins it may use", from the hub checkout's commit (or from
+    the revision that the caller read once for many agents)."""
+    rev = rev or kit_revision(fresh=True)        # an owner who removes a login is obeyed at once
     text = next((x["text"] for x in profile_view(agent, rev)["sections"] if x["key"] == "logins"), "") if rev else ""
     return {m.lower() for m in re.findall(r"bws://[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", text)}
 
@@ -44496,6 +44610,7 @@ def tick():
         step(server_watch_sweep, t0)        # the owner, 3 November 2026: each server against its own baseline
         step(os_user_sweep, t0)             # the owner, 10 November 2026: one OS user for each agent
         step(browser_place_sweep, t0)       # the owner, 17 November 2026: a browser for each agent with a shell
+        step(signin_clear_sweep, t0)        # plan 04, S5: a grant's end clears its sign-ins in the agent's browser
         step(mac_desktop_sweep)             # what only hands at a Mac can put right
         step(first_message_sweep, t0)       # the owner, 4 November 2026: a new fleet's manager writes first, once
         step(agent_first_message_sweep, t0)     # the owner, 12 November 2026: and so does each new agent
@@ -50786,6 +50901,7 @@ AGENT_COLUMNS = (
     ("reports", "from_agent"), ("reports", "to_agent"), ("reports", "decided_by"), ("prompts", "agent"),
     ("prompts", "by"), ("rules", "agent"), ("rules", "by"), ("needs", "by"), ("need_talk", "who"), ("events", "agent"), ("reminders", "agent"),
     ("sealed", "sender"), ("sealed", "recipient"), ("jobs", "agent"), ("log", "agent"), ("agents", "name"),
+    ("signin_records", "agent"),        # plan 04, S5: the sign-ins of the vault in the agent's own browser
     ("agent_usage", "name"), ("calls", "agent"), ("ui_requests", "recipient"), ("owner_reports", "agent"),
     ("holds", "by"), ("holds", "released_by"), ("outcomes", "by"), ("agent_limits", "agent"),
     ("machine_status", "agent"), ("machine_updates", "agent"), ("goals", "paused_by"), ("goal_history", "by"),
@@ -51266,6 +51382,7 @@ AGENT_REMOVAL = {
     ("questions", "asker"): "history", ("questions", "requester"): "history", ("questions", "answered_by"): "history",
     ("responsibilities", "agent"): "history", ("duty_history", "by"): "history",
     ("machine_status", "agent"): "team", ("machine_updates", "agent"): "team", ("agents", "name"): "row",
+    ("signin_records", "agent"): "team",        # build plan 04, S5: the sites of its sign-ins in its own browser
     ("notes", "agent"): "stays", ("reports", "decided_by"): "stays", ("prompts", "agent"): "stays",
     ("prompts", "by"): "stays", ("rules", "by"): "stays", ("need_talk", "who"): "stays", ("sealed", "sender"): "stays",
     ("log", "agent"): "stays", ("holds", "by"): "stays", ("holds", "released_by"): "stays", ("outcomes", "by"): "stays",
@@ -67163,6 +67280,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_vault_read(parts[2])
         if parts[:2] == ["helper", "vault"] and len(parts) == 4 and parts[3] == "swap":
             return self.helper_vault_swap(parts[2])
+        if parts[:2] == ["helper", "vault"] and len(parts) == 4 and parts[3] == "signed":
+            return self.helper_vault_signed(parts[2])     # plan 04, S5
         if parts[:2] == ["helper", "ack"] and len(parts) == 3:
             agent = parts[2]
             if agent not in agents():       # it sent no answer at all, and the helper of a deleted agent waited it out
@@ -68177,6 +68296,33 @@ class Handler(BaseHTTPRequestHandler):
         # after a rename, else fleet-<name>. A vault keeps its placeholders by OS user, and a name can change hands
         # on one machine, so the vault takes this yes only for an entry of this user (vault.swap_asks).
         return self.json(200, {"ok": True, "login": ref, "user": a.get("user") or f"fleet-{agent}"})
+
+    def helper_vault_signed(self, agent):
+        """**The record of a sign-in in the agent's own browser** (plan 04, S5), from the vault broker of its Linux
+        server: the origins of its top-level pages and the cookies of other sites that it set or changed (names, never
+        a value; lifecycle.browser_clear_valid). The hub keeps it with the agent's use of that login, for the clear when
+        that use ends (signin_clear_sweep). Only for a sign-in job of this agent whose login the broker opened, within
+        SIGNIN_RECORD_WINDOW; two records of one login merge."""
+        if agent not in agents():
+            return self.json(404, {"error": "unknown agent"})
+        if not self.allowed(agent, broker=True):
+            return
+        f = self.form()
+        job = f.get("job")
+        clear = lifecycle.browser_clear_valid({"origins": f.get("origins"), "cookies": f.get("cookies")})
+        if not isinstance(job, int) or isinstance(job, bool) or clear is None:
+            return self.json(400, {"error": "job, origins (1 to 50 page addresses) and cookies (at most 200, each "
+                                            "{name, domain}) are required"})
+        with LOCK:
+            row = q1("SELECT * FROM jobs WHERE id=? AND agent=?", (job, agent))
+            if not row or row["kind"] != "signin" or not row["released"]:
+                return self.json(404, {"error": "no sign-in job of this agent whose login the vault opened"})
+            if now() - row["released"] > SIGNIN_RECORD_WINDOW:
+                return self.json(409, {"error": "the vault opened this sign-in's login too long ago"})
+            signin_record_keep(agent, row["login"], row["task"], clear)
+        log(agent, f"kept the record of sign-in job {job}: {len(clear['origins'])} site(s), "
+                   f"{len(clear['cookies'])} cookie(s) of other sites")
+        return self.json(200, {"ok": True, "job": job})
 
     def helper_vault(self, agent):
         """The vault broker on the agent's machine asks before it opens a login: once, for an open sign-in or

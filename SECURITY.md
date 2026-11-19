@@ -88,6 +88,18 @@ alone: Founderizer says so in System status when it cannot register one, and a s
 [VAULT.md](VAULT.md) tells what the vault protects, how it protects it, what it does not protect, and what the owner
 of a fleet must do.
 
+## An agent's own browser on a Linux server
+
+Each agent with its Shell box and its Browser box on a Linux server has a Chrome of its own (build plan 04). The
+fleet's own nftables table lets only the agent's user, the vault's broker and root reach its DevTools port on that
+server, and closes each port of both ranges that no agent holds; after a flush of the ruleset by hand, that rule has
+a gap of one reading of the server (at most five minutes). The vault signs the agent in there, and the end of the
+agent's use of a login clears the sites of that sign-in in that browser within a minute while it runs, else at its
+next start. What the agent's own programs
+can still reach in its own browser (a filled field, the vault's script, the browser's cookies) is item 26 of
+[VAULT.md](VAULT.md), "What the vault does not protect": a copied session works until the site ends it, so after a
+grant's end the owner's step is the site's "sign out everywhere" or a new password.
+
 ## What an agent's read of a server shows, and what it does not
 
 The agent that holds a server at Fix through the door can read that server's files with `ops <server> look`: a bash

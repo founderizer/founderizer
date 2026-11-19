@@ -1079,6 +1079,7 @@ class Service:
                                              f"{shown_name(agent)} starts.")
         self.retire(job, was, user)
         self.carry_key(was, agent, user)
+        self.carry_browser(was, agent, user)
         self.service_step(job, agent, runtime, folder, user)
         self.post(job, "done", "service", f"{shown_name(agent)} runs on {self.name}.")
 
@@ -1155,6 +1156,20 @@ class Service:
             if code != 0:
                 raise failed("service", f"The key of {shown_name(agent)} could not take its new name. Try again.",
                              err or out)
+
+    def carry_browser(self, was, agent, user=None):
+        """The helper's own lists of the agent's browser under its new name (build plan 04, S2 and S5): the clears that
+        wait for the browser's next start (a login whose use ended), the clears done, and the tasks whose browser starts
+        new. Its Chrome profile stays where it is, with the OS user (~/.fleet/browser). A list that is not there is no
+        failure; one that does not move is, so that no clear is lost."""
+        for kind in ("clears", "done", "fresh"):
+            old, new = (os.path.join(self.home_of(user), ".fleet", f"browser-{kind}-{name}.json")
+                        for name in (was, agent))
+            if self.there(old, user):
+                code, out, err = self.run(self.as_agent(user, ["mv", "-f", old, new]))
+                if code != 0:
+                    raise failed("service", f"The browser lists of {shown_name(agent)} could not take its new name. "
+                                            f"Try again.", err or out)
 
     def retire(self, job, was, user=None):
         """The old name of a renamed agent ends on this server: its service stops and never starts again, and its tmux

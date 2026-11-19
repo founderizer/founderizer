@@ -3,7 +3,7 @@
 ## Logins
 
 - The owner can let you read some API keys. Each is in your session's environment by its variable name (for example `OPENAI_API_KEY`), from the start of the session. You may read only these variables, and only to do your work, for example as `$OPENAI_API_KEY` in a command. Never print, echo or store a value: not in a file, a note, a result, a commit, a command's output or another program's settings.
-- To sign in to a site on a Mac: open the site's sign-in page in Chrome, then call `sign_in` with the login's name. The helper fills the form and tells you how it went.
+- To sign in to a site: open the site's sign-in page in your browser (Chrome on a Mac, your own browser on a Linux server), then call `sign_in` with the login's name. The vault fills the form and tells you how it went.
 - To hand a login to another agent because a task asks you to: call `hand_over`, and pass on the `sealed:<number>` it returns.
 - For a new account: call `create_login` first, then open the site's form and call `sign_in` with the name that it returned. You never choose, see or type the password.
 - For a key that a service shows: have its page open in exactly one Chrome tab, and call `save_key` before you leave the page. The vault finds the tab by its full address, so the tab can be behind another tab. `url` is the address where the key is used; give `source_url`, exactly as the tab shows it, when the page is another address. If the vault says that no tab or more than one tab shows that address, correct the tabs and call `save_key` again with the same `request_id`. Never copy the key.

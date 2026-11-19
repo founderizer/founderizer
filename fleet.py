@@ -1378,6 +1378,10 @@ PLACES_TOLD = set()     # the task places whose clones could not keep their comm
 BROWSER_TOLD = set()    # the failures of a stop of the browser units, each told once (stop_browser_units)
 
 
+BROWSER_MOVED_WAIT = 20        # seconds that a moved agent's helper waits for its units to end: more than the browser
+                               # unit's TimeoutStopSec (10), so that a Chrome that takes its whole stop ends first
+
+
 def stop_browser_units(run=None):
     """This OS user's browser and screen-sharing units (lifecycle.BROWSER_UNITS) stop, each one queued (`--no-block`),
     so that nothing waits for them. True where systemd took each stop or has no such unit (exit 5); False otherwise,
@@ -4863,6 +4867,11 @@ class Helper:
         tmux("kill-session", "-t", f"={self.session}:")
         if sys.platform != "darwin" and self.own_user():
             stop_browser_units()    # its browser and its screen-sharing server here end too (build plan 04, S2a)
+            end = time.monotonic() + BROWSER_MOVED_WAIT
+            while not browser_units_ended() and time.monotonic() < end:
+                time.sleep(0.5)
+            if browser_units_ended():   # plan 04, S5: its sign-ins here go too, so that a move back finds none
+                self.browser_data_gone()
         try:
             names = os.listdir(SESSIONS)
         except OSError:
@@ -6907,6 +6916,8 @@ class Helper:
                 raise Refused("the hub did not take the ack of a job, so it does not run; the next poll tries again")
             if kind == "request":
                 self.request_job(task, extra)
+            elif kind == "signin" and sys.platform != "darwin":
+                self.signin_job(task, extra)    # plan 04, S5: the fill in the agent's own browser takes up to a minute
             else:
                 self.login_job(kind, task, extra)
         elif kind == "deposit":
@@ -8817,11 +8828,39 @@ class Helper:
             raise Refused(f"the hub did not take the outcome of withdrawal {number}")
         self.say(f"withdrawal {number}: {'removed' if ok else 'refused: ' + text[:120]}")
 
-    def login_job(self, kind, task, extra):
-        """A sign-in or a handover an agent asked for. It happens here, outside the agent's session."""
+    def signin_job(self, task, extra):
+        """A sign-in on a Linux server (plan 04, S5), in a thread of its own, as a request runs: the vault's fill in the
+        agent's own browser takes up to a minute, and the helper's loop serves a pause or a stop meanwhile. An event
+        that comes again while its job runs starts nothing."""
+        job = extra.get("job")
+        with self.outside_lock:
+            running = self.__dict__.setdefault("signins", set())
+            if job in running:
+                return
+            running.add(job)
+        try:
+            self.begin_outside()        # during an update it raises Updating, and the event stays for the new helper
+        except BaseException:
+            with self.outside_lock:
+                running.discard(job)
+            raise
+
+        def run():
+            try:
+                self.login_job("signin", task, extra, outside=False)
+            finally:
+                self.end_outside()
+                with self.outside_lock:
+                    running.discard(job)
+        threading.Thread(target=run, daemon=True, name=f"signin-{job}").start()
+
+    def login_job(self, kind, task, extra, outside=True):
+        """A sign-in or a handover an agent asked for. It happens here, outside the agent's session. `outside`: it
+        marks itself as outside work (begin_outside); signin_job marked it already."""
         login, to = str(extra.get("login") or ""), str(extra.get("to") or "")
         unknown = False
-        self.begin_outside()
+        if outside:
+            self.begin_outside()
         try:
             try:
                 text = (do_save(self.agent, extra.get("job"), kind) if kind in SAVES else
@@ -8840,7 +8879,8 @@ class Helper:
             if self.report_job(extra.get("job"), report) is False:
                 self.report_waits[extra.get("job")] = (2, time.monotonic() + 2)     # send_reports sends it again
         finally:
-            self.end_outside()
+            if outside:
+                self.end_outside()
         self.say(f"{task}: {kind}" + (f" with {login}" if login else "") +
                  f": {'done' if ok else 'outcome not known' if unknown else 'refused: ' + text[:120]}")
 
@@ -11352,9 +11392,8 @@ def type_login_code(session, code):
 def do_signin(name, agent, task="", job=None):
     if vault_mode(agent) == "none":
         raise Refused(NO_CREDENTIALS)
-    if sys.platform != "darwin":
-        raise Refused("signing in needs a Mac with Google Chrome")
-    if vault_mode(agent) == "broker":           # the signed Mac vault helper fills the form; no login comes here
+    if vault_mode(agent) == "broker":   # the signed Mac vault helper, or a Linux server's broker in the agent's own
+        # browser (plan 04, S5), fills the form; no login comes here
         done = broker_job_request(agent, {"op": "signin", "job": broker_job(agent, job)})
         return (f"Signed in on {done.get('origin')} with the login \"{done.get('label')}\"" +
                 (", with its authenticator code" if done.get("authenticator") is True else "") +

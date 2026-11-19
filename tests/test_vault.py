@@ -257,7 +257,7 @@ class VaultBroker(OwnerAPI):
         self.assertIsNone(self.opens(raw["ciphertext"], "agent"))
         self.assertEqual(self.reads(), [SECRET_ID])
 
-    def test_no_operation_gives_a_login_and_the_linux_broker_never_signs_in(self):
+    def test_no_operation_gives_a_login_and_a_sign_in_names_its_caller(self):
         for op in ("login", "get"):
             with self.assertRaises(fleet.Refused) as refused:
                 fleet.vault_call({"op": op, "job": self.job(), "ref": REF})
@@ -268,7 +268,8 @@ class VaultBroker(OwnerAPI):
         job = self.job(kind="signin", target="")
         with self.assertRaises(fleet.Refused) as refused:
             fleet.vault_call({"op": "signin", "job": job})
-        self.assertIn("only the Mac vault helper signs in", str(refused.exception))
+        # plan 04, S5: the hub checks the caller's OS user only with the caller fields
+        self.assertIn("a sign-in needs the caller fields", str(refused.exception))
         self.assertIsNone(self.released(job))                               # refused before the hub was asked
         status = fleet.vault_call({"op": "status"})
         self.assertEqual(set(status), {"ok", "v", "agent", "store", "user", "recipient", "callers", "backend", "source",

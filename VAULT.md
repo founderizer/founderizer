@@ -307,8 +307,15 @@ The vault protects the value of each secret. The design gives these results:
 
 - **A sign-in.** On a Mac, Fleet Vault types the user name, the password and the authenticator code into the page in
   Chrome. First it checks the origin of the page and the origin where the form sends its data. The agent gets only
-  the outcome (`Sources/FleetVaultCore/VaultBrowser.swift`, `Sources/FleetVaultCore/VaultBroker.swift`). A Linux
-  broker does not sign in (`vault.py`).
+  the outcome (`Sources/FleetVaultCore/VaultBrowser.swift`, `Sources/FleetVaultCore/VaultBroker.swift`). On a Linux
+  server the broker does the same in the agent's own Chrome, over DevTools on 127.0.0.1 and the agent's port of
+  root's ports file, only where each socket that listens there, and the far end of its own connection, is of the
+  agent's own user. Its scripts run in a world of their own and reach the page only through that world's prototypes,
+  so neither a script nor the markup of the page changes what they read. The whole fill has one minute, and the
+  broker's other work goes on meanwhile. It records the origins of the sign-in's top-level pages and the cookies of
+  other sites that the sign-in created (their names, never a value), and the hub has the agent's helper clear them in
+  that browser when the agent's use of the login ends (`vault.py` `signin`, `hub.py` `signin_clear_sweep`; build plan
+  04, S5). Item 26 says what this does not protect.
 - **An API request** (`call_api`). The broker sends the request with the key only to the origin of the saved login,
   over HTTPS. It uses plain HTTP only inside the private range 100.64.0.0/10. The request follows no redirect. The
   agent gets the status and the body, but not a body that holds a key of 8 or more characters (`vault.py`,
@@ -907,6 +914,42 @@ host.
     one record of each secret and agent name: after a rename, the grant stays under the old name, and when a new agent
     later gets that name and the same secret, the record moves to the new agent's machine, so the renamed agent's
     machine loses the secret until the owner gives it again, and no mark shows it.
+26. **A page in the agent's own browser on a Linux server** (build plan 04, S5 and section 6). The broker types the
+    password and the code into the page of the agent's own Chrome, so the agent's own programs can reach them:
+    - An agent with the Shell box can run a program as its own user. That program can connect to its own DevTools
+      port and read a filled field before its submit, or the request that sends it. With its Chrome stopped, it can
+      also be the listener on that port itself and get the vault's script, password included: the broker's check of
+      the listener's user stops only another user.
+    - The broker types into each tab of the login's origin that it tries (three at most), and any page of that origin
+      gets what it types: a page of the site that the agent opened there, a page of the site's own users' content
+      too.
+    - The browser's "show password" control and a snapshot of the page can show a field that stays filled; the
+      broker empties each password and code field of a sign-in that it could not confirm, also after an error, as far
+      as its DevTools connection to that browser still works.
+    - The page's CSS: the vault types a secret only into a readonly field whose size and glyphs it read back from the
+      computed style, with no transition or animation on it. A shadow root's `::slotted` rule whose condition comes
+      true after that look (a container query after an animation, `:target`, the focus that the page's script gives,
+      a class), while the secret stays in the page (a handler of the page took the submit, or a dialog form), can
+      still give another site a password's length or a code's digits (the comment of `VaultBrowser.dom`).
+    - A listener of the page can hide a submit from the vault, which then answers that the form sent nothing, though
+      the browser may have sent it to the login's own origin. The broker then watches that tab as after a submit
+      (a sign-in that went counts, and the record keeps where it went) and types the secret into no other tab; so
+      after a fill that gave no answer, whose script can still run in the page.
+    - With no keyring on a server, Chrome keeps its cookies where the agent's own programs can read them, so a
+      signed-in session can be copied, and a copy works until the site ends that session: the owner's step is the
+      site's "sign out everywhere" or a new password.
+    - The end of the agent's use of a login clears the sign-in's sites in its browser at the hub's next pass (within a
+      minute) while that browser runs, else at its next start, which waits for the clear. The owner's grant ends that
+      use at once; a login that the task made, and a sealed copy, end with their task. The agent's own processes can
+      post a record of a sign-in job, which the hub cannot tell from the broker's, so an agent can keep a site of its
+      own sign-in out of the clear, as it can copy its cookies.
+    - The port rule has a gap of one reading after a flush of the nftables ruleset by hand (at most five minutes),
+      and an agent can start a Chrome of its own outside its unit, its memory cap and its port, as any program of its
+      own. A page of a loopback address (an agent's own development server) reaches the vault's swap proxy port, which
+      answers each request that is not a CONNECT line with 405 (`SWAP_ONLY_CONNECT`), and a page cannot send CONNECT.
+      The blocked providers' sites come from the owner's app, so a new provider's site is blocked on a server only
+      after that app has the new list.
+    - During a take-over the agent can see what the owner types.
 
 ## What the owner must do
 
