@@ -48084,12 +48084,13 @@ def unlinked_steps(name, account, linked, blocked=False, sharers=(), unknown=Fal
 
 
 def account_sharers(server, email):
-    """The agents on other machines whose Claude account reading names this email (usage_routes): Claude's extension
-    on this server links to every session of that account. An agent in setup counts too: its activation brings its
+    """The agents on other machines whose account reading of a runtime that works in Chrome through Claude's extension
+    (its fact browser_tabs) names this email (usage_routes): Claude's extension on this server links to every session
+    of that account. An agent in setup counts too: its activation brings its
     sessions on the same account."""
     here, email = set(server_agents(server)), email.lower()
     return sorted(n for n in agents() if n not in here and any(
-        runtime == "claude" and str((reading or {}).get("account_email") or "").lower() == email
+        runtime_fact(runtime, "browser_tabs") and str((reading or {}).get("account_email") or "").lower() == email
         for _route, runtime, reading in usage_routes(n)))
 
 
