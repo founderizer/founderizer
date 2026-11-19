@@ -800,16 +800,41 @@ class MacService(ServerService):
 
     def test_a_chrome_folder_that_macos_will_not_list_stops_no_service(self):
         """Live, 4 November 2026: after macOS 27.2 installed itself, listing Chrome's folder raised PermissionError
-        ("Operation not permitted") in keep_chrome, and the server service of danas-mac-studio stopped with it."""
+        ("Operation not permitted") in keep_chrome, and the server service of danas-mac-studio stopped with it. Such a
+        Chrome stays closed on a Mac with no agent that works in it; on a Mac with one, it opens: until 19 November
+        2026 it stayed closed after each restart, and the manager heard "Chrome does not run". The installer's reading
+        says that the folder is hidden, so that the installer starts Claude Code's sign-in all the same."""
         self.chrome({"state": 1})
         svc = self.service(platform="darwin", report=False, answers={"pgrep": (1, "", "")})
         real = os.listdir
         refused = lambda path: (_ for _ in ()).throw(PermissionError(1, "Operation not permitted", path)) \
             if path.endswith(os.path.join("Google", "Chrome")) else real(path)
+        opened = lambda: [c[0] for c in self.commands if c[0][0] == "open"]
+        team = json.loads((self.own / "team.json").read_text())
+        browser = {"machine": "mini", "runtime": "claude", "can": ["shell", "web", "browser"]}
         with patch("lifecycle.os.listdir", side_effect=refused):
             self.assertIsNone(lifecycle.chrome_extension(str(self.home)))
             svc.keep_chrome()
-        self.assertFalse([c for c in self.commands if c[0][0] == "open"])       # nothing to keep that it cannot read
+            # No agent of this Mac works in its Chrome: a paused one, one not placed yet, or one whose runtime has no
+            # tabs there, neither.
+            team["agents"].update(juno=dict(browser, active=False), lia=dict(browser, placed=False),
+                                  kai=dict(browser, runtime="codex"))
+            (self.own / "team.json").write_text(json.dumps(team))
+            svc.keep_chrome()
+            self.assertEqual(opened(), [])
+        team["agents"]["ivy"] = browser
+        (self.own / "team.json").write_text(json.dumps(team))
+        (self.home / "Library/Application Support/Google/Chrome/Default/Secure Preferences").write_text("{}")
+        svc.keep_chrome()
+        self.assertEqual(opened(), [])                      # a Chrome that macOS lets it read, with no extension
+        with patch("lifecycle.os.listdir", side_effect=refused):
+            svc.keep_chrome()
+            self.assertEqual(opened(), [["open", "-g", "-a", "Google Chrome"]])
+            for extension, hidden in ((None, True), (False, False)):     # a profile that reads it as off says so
+                with patch.object(lifecycle.Lifecycle, "desktop", lambda life: {"extension": extension}), \
+                        patch("builtins.print") as said:
+                    self.mod.cmd_desktop(None)
+                self.assertIs(json.loads(said.call_args.args[0])["hidden"], hidden)
 
     def test_a_chrome_that_runs_and_a_linux_server_are_left_alone(self):
         self.chrome({"state": 1})

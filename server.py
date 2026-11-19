@@ -420,8 +420,15 @@ def cmd_add_claude(args):
 
 
 def cmd_desktop(args):
-    """What this Mac's desktop is now, as one line of JSON: the reading of its status report, for the installer."""
-    print(json.dumps(lifecycle.Lifecycle(KIT, None, {}, None, lambda: False).desktop()))
+    """What this Mac's desktop is now, as one line of JSON: the reading of its status report, for the installer, with
+    `hidden` beside it (lifecycle.chrome_hidden). macOS 27 refused a list of Chrome's folder also over SSH and in a tmux
+    of the Mac's own user (the owner's Mac Studio, 17 November 2026), so the installer's reading can be refused too:
+    `extension` is null there whatever Chrome has, and only `hidden` tells the installer to start Claude Code's sign-in
+    all the same. The hub tells such a Mac by its `browser`, which nobody reads before that sign-in."""
+    life = lifecycle.Lifecycle(KIT, None, {}, None, lambda: False, home=HOME)
+    desktop = life.desktop()
+    # Lifecycle.desktop's own rule: a profile that reads the extension as off says so, whatever another one hides.
+    print(json.dumps(dict(desktop, hidden=desktop["extension"] is None and lifecycle.chrome_hidden(life.home))))
 
 
 def cmd_chrome_script(args):
@@ -784,6 +791,16 @@ class Service:
         except (OSError, ValueError, AttributeError):
             return []
 
+    def works_in_chrome(self):
+        """Whether an active agent of this server has the browser among its tools, on a runtime whose browser tasks
+        work in tabs of this Mac's Chrome through Claude's extension: the hub's rule for a Mac with a browser agent
+        (hub.mac_desktop_sweep, hub.server_agents, hub.browser_tabs), read from this service's team.json (agents_here).
+        A value of another shape counts as no such agent: it never stops the loop."""
+        return any(entry.get("active", True) is not False and entry.get("placed") is not False and
+                   isinstance(entry.get("can"), list) and "browser" in entry["can"] and
+                   isinstance(entry.get("runtime"), str) and lifecycle.runtime_fact(entry["runtime"], "browser_tabs")
+                   for _name, entry in self.agents_here())
+
     def report(self):
         reading = self.reading()
         reading["security"]["tailscale"] = self.life.private_network()      # as it leaves (Lifecycle.report)
@@ -896,10 +913,19 @@ class Service:
     def keep_chrome(self):
         """Chrome stays open on a Mac whose extension is on, so browser tasks work after a restart with no hands. A
         Chrome that opens gets a reading of its own soon: it answers the runtime's account some seconds later. It is
-        opened once in REPORT_EVERY, so a Chrome that does not start stops no reading, and a person can quit it."""
-        if self.platform != "darwin" or lifecycle.chrome_extension(self.home) is not True or \
-                (self.chrome_opened is not None and self.clock() - self.chrome_opened < REPORT_EVERY) or \
-                self.run(["pgrep", "-x", "Google Chrome"])[0] == 0:
+        opened once in REPORT_EVERY, so a Chrome that does not start stops no reading, and a person can quit it.
+
+        An extension that macOS hides (lifecycle.chrome_hidden) is kept too, on a Mac with an agent that works in
+        Chrome (works_in_chrome): until 19 November 2026 such a Mac's Chrome stayed closed after each restart, its
+        browser tasks waited, and the manager heard "Chrome does not run" (hub.mac_desktop_sweep, which says that line
+        only for a Mac with such an agent). macOS 27 can hide that folder from any Mac's service, so a Mac with no such
+        agent keeps its Chrome closed, as before."""
+        if self.platform != "darwin" or \
+                (self.chrome_opened is not None and self.clock() - self.chrome_opened < REPORT_EVERY):
+            return
+        extension = lifecycle.chrome_extension(self.home)
+        hidden = extension is None and self.works_in_chrome() and lifecycle.chrome_hidden(self.home)
+        if not (extension is True or hidden) or self.run(["pgrep", "-x", "Google Chrome"])[0] == 0:
             return
         self.run(["open", "-g", "-a", "Google Chrome"])
         self.chrome_opened = self.clock()
