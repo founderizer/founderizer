@@ -420,6 +420,9 @@ CREATE TABLE IF NOT EXISTS conversations(id INTEGER PRIMARY KEY, person INTEGER 
 CREATE TABLE IF NOT EXISTS conversation_messages(id INTEGER PRIMARY KEY, conversation INTEGER NOT NULL, who TEXT NOT NULL,
   text TEXT NOT NULL, created REAL NOT NULL, read_at REAL, msg_id TEXT, reply_to INTEGER, need INTEGER,
   outbound INTEGER, event INTEGER);
+-- The tasks of a removed person's conversations, and their parts (person_remove). Their link to the conversation is
+-- gone with it, so this row is what says, at each later write of one of their sessions, that its words are not kept.
+CREATE TABLE IF NOT EXISTS removed_tasks(task INTEGER PRIMARY KEY, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS join_codes(id INTEGER PRIMARY KEY, sha256 TEXT NOT NULL, name TEXT NOT NULL,
   kind TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, used REAL, canceled REAL, address TEXT,
   key_sha256 TEXT);
@@ -684,6 +687,18 @@ def wal_on():
     with contextlib.suppress(sqlite3.Error):
         DB.execute(f"PRAGMA journal_size_limit={WAL_MOST}").fetchone()
     return True, None
+
+
+def secure_delete_on():
+    """Text that the hub clears or deletes is written over in the tables of the records' file (PRAGMA secure_delete),
+    whatever this build of SQLite does by itself: person_remove clears a person's words, and a copy of the file must
+    not hold them in space that SQLite gave back. Not covered: the write-ahead file until SQLite starts it again, and
+    the history index's own storage until SQLite merges its parts. A setting of this connection, not of the file, so
+    main() sets it at each start. True when SQLite says that it is on."""
+    try:
+        return DB.execute("PRAGMA secure_delete=ON").fetchone()[0] == 1
+    except (sqlite3.Error, TypeError):
+        return False
 
 
 def readers_for(path):
@@ -3727,6 +3742,8 @@ def when(ts):
 
 
 EVENT = "INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)"
+# ... with the task that the message is about, for one that is filed under another task (filed_about)
+EVENT_ABOUT = "INSERT INTO events(agent,kind,task,text,created,extra,about) VALUES(?,?,?,?,?,?,?)"
 
 
 def filed_under(agent, kind, task):
@@ -3740,6 +3757,24 @@ def filed_under(agent, kind, task):
         if link and link["parent"]:
             return link["parent"]
     return task
+
+
+def filed_about(agent, kind, task):
+    """(the task that a message for this agent is filed under, the task that it is about when that is another one,
+    else None). A lead reads the news of a task of its team in a task of its own (filed_under), and nothing else of
+    that row says which task the news is about: person_remove clears a lead's lines about a removed person's tasks by
+    this key (events.about). The line of a report (t_report_up) has no such key and needs none: the report's own
+    record names it (reports.event_id), and a removal clears the line by that, while the report stays as its agent's
+    own record. read_row only, as filed_under."""
+    filed = filed_under(agent, kind, task)
+    return filed, (task if task and filed != task else None)
+
+
+def event_row(agent, kind, filed, text, t0, extra, about):
+    """(the statement, its values) of one message: EVENT, as every message was written before events.about, or
+    EVENT_ABOUT for a message that is filed under another task than the one that it is about."""
+    row = (agent, kind, filed, text, t0, extra)
+    return (EVENT, row) if about is None else (EVENT_ABOUT, row + (about,))
 
 
 CHAIN_MAX = 12          # tasks of one parent chain that a walk reads: a lead's lead's lead is far less
@@ -3774,15 +3809,18 @@ def questions_under(lead, task_id):
 def emit(agent, kind, text, task=None, extra=None):
     """Queue a message for one agent's helper. Kinds: task, say, chat, stop, control, signin, handover, create,
     capture, request, deposit, withdraw, notify, mcp_program, manager_start, outputs."""
-    return ins(EVENT, (agent, kind, filed_under(agent, kind, task), str(text), now(), json.dumps(extra or {})))
+    filed, about = filed_about(agent, kind, task)
+    return ins(*event_row(agent, kind, filed, str(text), now(), json.dumps(extra or {}), about))
 
 
 def event_rows(rows, t0):
     """Inside a transaction: emit's rows, each (agent, kind, task, text, extra). The task is the one from
-    filed_under, which the caller reads before its transaction starts."""
+    filed_under, which the caller reads before its transaction starts, or the pair of filed_about for a line about a
+    task that its requester reads: the row then keeps the task that it is about (events.about)."""
     in_transaction("event_rows")
     for agent, kind, task, text, extra in rows:
-        DB.execute(EVENT, (agent, kind, task, str(text), t0, json.dumps(extra or {})))
+        filed, about = task if isinstance(task, tuple) else (task, None)
+        DB.execute(*event_row(agent, kind, filed, str(text), t0, json.dumps(extra or {}), about))
 
 
 def waiting_say_rows(agent, task_id):
@@ -4970,8 +5008,11 @@ def migrate():
         # plan C8: the sender's task waits for the answer, and why that wait ended
         "agent_messages": {"waits": "INTEGER", "wait_end": "TEXT"},
         "events": {"read_at": "REAL", "helper_ack": "REAL",
-                   "handed": "REAL"},           # plan P0: the first poll answer that carried a conversation's signal
-        #                                         or, since 19 November 2026, a task's start (attempt_began)
+                   "handed": "REAL",            # plan P0: the first poll answer that carried a conversation's signal
+                   #                              or, since 19 November 2026, a task's start (attempt_began)
+                   # the task that a message is about when it is filed under another one (filed_about: a lead reads
+                   # its team's news in its own task), so that person_remove finds a lead's line about a person's task
+                   "about": "INTEGER"},
         # AUTONOMY.md P2 (lane L2): the task that a message of the conversation belongs to, and, on an agent's
         # message_contact with waits, the task that waits for the person's next message
         "conversation_messages": {"task": "INTEGER", "waits": "INTEGER"},
@@ -5072,7 +5113,11 @@ def migrate():
                           "turn_word": "TEXT"},
         "chat_out": {"recipient": "TEXT",           # chat apps round 2: a Discord user ID when chat is null
                      "files": "TEXT",               # CHAT-APPS.md 20: the attachment ids of a message, as JSON
-                     "begun": "REAL"},              # and when the bridge said that it begins the item (chat_sweep)
+                     "begun": "REAL",               # and when the bridge said that it begins the item (chat_sweep)
+                     # the person whose chat an item is for (owner API 1.232), so that person_remove takes their
+                     # chat ids by this key and never by a chat, which can be another person's or the owner's later
+                     "person": "INTEGER"},
+        "chat_in": {"person": "INTEGER"},           # ... and the person whom a message came from (chat_inbound)
         "owner_device_push": {"seal": "TEXT",       # sealed_push: the phone's own key for what a ping says, base64
                               "badge": "INTEGER"},  # the icon's number that Apple took last for this token (badge_look)
         # plan V12: the phone's own key that the recovery code is sealed to, and its HMAC of the QR's one-time value
@@ -5208,6 +5253,12 @@ def migrate():
         "CREATE INDEX IF NOT EXISTS prompt_task ON prompts(task) WHERE task IS NOT NULL",
         # person_remove clears the calls of the person's windows under the lock, by the column that the block above adds
         "CREATE INDEX IF NOT EXISTS call_conversation ON calls(conversation) WHERE conversation IS NOT NULL",
+        # ... and, by a key of each: a lead's lines about the person's tasks (events.about, the column above) and the
+        # API calls of those tasks (removed_words_rows)
+        "CREATE INDEX IF NOT EXISTS event_about ON events(about) WHERE about IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS job_task ON jobs(task) WHERE task IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS chat_out_person ON chat_out(person) WHERE person IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS chat_in_person ON chat_in(person) WHERE person IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS trigger_open_run ON trigger_runs(trigger_id) "
         "WHERE state IN ('waiting','sent') AND check_now=0",
         # memory_contradicted's lookup, which runs on every case a watch opens. It is here and not in SCHEMA because
@@ -5369,6 +5420,8 @@ def fence(agent, tid, context=None):
     t = q1("SELECT * FROM tasks WHERE id=? AND owner=?", (tid, agent))
     if not t or generation != kv_get("db_id") or str(task) != tref(tid) or str(attempt) != str(t["attempt"]):
         raise ToolError("STOP: stale or wrong task attempt. Do not report, deliver, or continue work.")
+    if removed_task(tid):       # a task of a removed person's conversation: its sessions do nothing more, on any
+        raise ToolError(REMOVED_STOP)       # route that fences them (a tool call, a permission prompt, a delivery)
     return t
 
 
@@ -7381,7 +7434,7 @@ def request_hold(task_id, kind, by, note=""):
     h = active_hold(task_id)
     taken = q1("SELECT * FROM restart_holds WHERE hold=?", (h["id"],)) if h else None
     if taken:           # the end of the restart, the hold's new holder and the message go together
-        told = [(taken["by"], "say", filed_under(taken["by"], "say", task_id),
+        told = [(taken["by"], "say", filed_about(taken["by"], "say", task_id),
                  f"[hub] The {by} {'paused' if kind == 'pause' else 'stopped'} {tref(task_id)} ({t['title']}, owner "
                  f"{t['owner']}) while its restart waited. The restart is over: {tref(task_id)} starts no new session by "
                  f"itself. Only the {by} resumes it.", None)] if taken["state"] == "pending" and by != taken["by"] else []
@@ -7457,6 +7510,8 @@ def settle_hold(h, confirmed, detail, ran=False, ended=0):
     An open call that an earlier hold of the attempt recorded explains nothing: that hold ended its processes."""
     state = "stopped" if confirmed else "not_confirmed"
     t0 = now()
+    if removed_task(h["task"]) and detail:      # a task of a removed person's conversation: the helper's words can
+        detail = REMOVED_WORDS                  # name the commands that still ran (person_remove)
     # The hold's own state and the unknown outcomes are one write. The hold used to be marked `stopped` first and the
     # outcomes written after it, each with its own commit: a hub that died in between left a stopped hold with
     # nobody told to check whether a send, a post or a payment went out, which is the one thing rule 9 exists to
@@ -7536,7 +7591,7 @@ def resume_plan(task_id, mode, by, via=None, note="", why=""):
     how = "message to its session" if live else "new session"
     events = [(t["owner"], "say", filed_under(t["owner"], "say", task_id), "[hub] " + text, None)] if live else []
     if by != t["requester"]:
-        events.append((t["requester"], "say", filed_under(t["requester"], "say", task_id),
+        events.append((t["requester"], "say", filed_about(t["requester"], "say", task_id),
                        f"[hub] The {by} resumed {tref(task_id)} ({t['title']}) with a {how}." +
                        (f" {why}" if why else "") + (f" Outcomes: {checked}." if checked else ""), None))
     return {"task": t, "hold": h, "by": by, "mode": mode if unknown else "resume", "how": how,
@@ -7759,7 +7814,7 @@ def restart_continue(hold_id):
 
     def held(why, stopped=True):
         """The restart is over and its requester knows why: one write."""
-        told = (r["by"], "say", filed_under(r["by"], "say", tid),
+        told = (r["by"], "say", filed_about(r["by"], "say", tid),
                 f"[hub] {name} ({t['title']}, owner {t['owner']}) was not restarted: {why} " +
                 ("It stays stopped." if stopped else "It stays held, but the hub does not know whether its session stopped.") +
                 f" It starts no new session by itself. Call restart_task again with a new request_id when the cause is "
@@ -7816,7 +7871,7 @@ def restart_continue(hold_id):
         plan = resume_plan(tid, "check", r["by"], note=note)
     except ToolError as e:
         return held(str(e))
-    again = (r["by"], "say", filed_under(r["by"], "say", tid),
+    again = (r["by"], "say", filed_about(r["by"], "say", tid),
              f"[hub] {name} ({t['title']}) runs again in a new session, as attempt {t['attempt'] + 1}. {t['owner']} first "
              f"checks: {outcome_text(tid)}.", None)
     with transaction():
@@ -7849,7 +7904,7 @@ def restart_sweep(t0):
         h = q1("SELECT h.*, t.owner, t.title FROM holds h JOIN tasks t ON t.id=h.task WHERE h.id=?", (r["hold"],))
         if h and h["state"] == "requested":
             if START_ONCE not in helper_features(h["owner"]) and t0 - r["created"] > CFG["silence"]:
-                told = (r["by"], "say", filed_under(r["by"], "say", h["task"]),
+                told = (r["by"], "say", filed_about(r["by"], "say", h["task"]),
                         f"[hub] The stop of {tref(h['task'])} ({h['title']}, owner {h['owner']}) for its restart has no "
                         f"report from {h['owner']}'s helper after {span(t0 - r['created'])}. It stays held, but the hub "
                         f"does not know whether its session stopped. It starts no new session by itself. Call "
@@ -10362,7 +10417,8 @@ def answer_rows(qu, t, text, by, t0):
                                f"...) starts it once more in a session that has the access, with everything it "
                                f"already did.", None))
     for to, said, extra in rows:
-        DB.execute(EVENT, (to, "say", filed_under(to, "say", tid), said, t0, json.dumps(extra or {})))
+        filed, about = filed_about(to, "say", tid)
+        DB.execute(*event_row(to, "say", filed, said, t0, json.dumps(extra or {}), about))
     question_needs_close("id=?", (qid,), f"Closed: Q-{qid} was answered by {who}: {clip(text, 300)}", t0)
     return {"held": held, "restarter": restarts if held else None}
 
@@ -10439,7 +10495,7 @@ def pass_question(agent, qid, note):
         with transaction():
             DB.execute("UPDATE questions SET requester=?, passed=? WHERE id=? AND answer IS NULL",
                        (up, json.dumps(passed), qid))
-            event_rows([(reader, "say", filed_under(reader, "say", t["id"]), said, None)], t0)
+            event_rows([(reader, "say", filed_about(reader, "say", t["id"]), said, None)], t0)
         log(agent, f"passed Q-{qid} up to {up}")
     return (f"Q-{qid} is with {up} now. {tref(t['id'])} keeps waiting for its answer, and your own work goes on: the "
             f"hub counts {tref(t['id'])} as work in progress for you. You may still answer Q-{qid} yourself while "
@@ -16836,9 +16892,10 @@ def chat_queue(kind, account, t0, **fields):
                       tuple(cols.values())).lastrowid
 
 
-def chat_reply(account, chat, text, t0):
+def chat_reply(account, chat, text, t0, person=None):
     """Inside a transaction: a fixed reply (no AI turn)."""
-    return chat_queue("message", account, t0, chat=chat, text=text, reply_to=None)
+    return chat_queue("message", account, t0, chat=chat, text=text, reply_to=None,
+                      **({"person": person} if person is not None else {}))
 
 
 def owner_message_text(request_id, value, recipient, origin, replaces, files, device=False, connection=None):
@@ -17100,7 +17157,8 @@ def chat_link_attempt(account, acc, m, code, t0):
                      (app, digest, t0)).fetchone()
     if not row:
         DB.execute("INSERT INTO link_failures(app,sender,ts) VALUES(?,?,?)", (app, sender, t0))
-        chat_reply(account, m["chat"], "That code is not valid.", t0)
+        person = None if owner_handle(app, sender, m["sender_alt"]) else person_at(app, sender, m["sender_alt"])
+        chat_reply(account, m["chat"], "That code is not valid.", t0, person["id"] if person else None)
         return "stored"
     DB.execute("UPDATE link_codes SET used=? WHERE id=?", (t0, row["id"]))
     DB.execute("INSERT INTO owner_handles(app,id,alias,name,linked) VALUES(?,?,?,?,?) ON CONFLICT(app,id) DO UPDATE SET "
@@ -17208,8 +17266,13 @@ def chat_inbound(m):
         if DB.execute("SELECT 1 FROM chat_in WHERE account=? AND msg_id=?", (account, m["id"])).fetchone():
             return "duplicate"
         result, request_id = chat_route(account, acc, m, t0, hit, preview)
-        DB.execute("INSERT INTO chat_in(account,msg_id,chat,sender,result,request_id,created) VALUES(?,?,?,?,?,?,?)",
-                   (account, m["id"], m["chat"], m["sender"], result, request_id, t0))
+        # the person whom it came from (owner API 1.232: person_remove takes their chat ids by this key); the owner's
+        # own message is no person's, and nor is a link code that made its sender the owner (chat_route ran first)
+        person = None if owner_handle(acc["app"], m["sender"], m["sender_alt"]) else \
+            person_at(acc["app"], m["sender"], m["sender_alt"])
+        DB.execute("INSERT INTO chat_in(account,msg_id,chat,sender,result,request_id,created,person) "
+                   "VALUES(?,?,?,?,?,?,?,?)", (account, m["id"], m["chat"], m["sender"], result, request_id, t0,
+                                               person["id"] if person else None))
     return result
 
 
@@ -18714,7 +18777,10 @@ def conversation_refusal(agent, person=None):
 # (memory_fts) keeps a lesson's words under its id, and the starts that showed a lesson (memory_shown) and the folds
 # (memory_folds) name it by its id, so the next lesson of another agent would have been found by the old words, shown
 # and folded (17 November 2026).
-ID_FLOOR_TABLES = ("conversations", "conversation_messages", "needs", "tasks", "history", "memories")
+ID_FLOOR_TABLES = ("conversations", "conversation_messages", "needs", "tasks", "history", "memories",
+                   # a removed person's number stays in the records that a removal keeps (a standing item's author, who
+                   # answered a Needs-you item), so the next person must not get it and be read as that author
+                   "people")
 TASK_FOLDER = re.compile(r"outputs/T-([0-9]+)")
 
 
@@ -18779,13 +18845,13 @@ def conversation_of(person, agent, m, account, t0):
     return DB.execute("SELECT * FROM conversations WHERE id=?", (cid,)).fetchone(), True
 
 
-def fixed_once(account, chat, text, t0):
+def fixed_once(account, chat, text, t0, person=None):
     """A fixed reply that one chat gets at most once a day (CHAT-APPS.md 8.5): a reached limit must not answer every
     message. DB.execute only."""
     if DB.execute("SELECT 1 FROM chat_out WHERE account=? AND chat=? AND text=? AND created>=?",
                   (account, chat, text, day_start(t0))).fetchone():
         return None
-    return chat_reply(account, chat, text, t0)
+    return chat_reply(account, chat, text, t0, person)
 
 
 def conversation_signal(agent, cid, t0):
@@ -18817,7 +18883,7 @@ def person_route(account, acc, person, m, t0, hit):
         if refusal is None and hit:
             refusal = "That message held a saved secret. It was not stored."
     if refusal is not None:
-        fixed_once(account, m["chat"], refusal, t0)     # a fixed reply at most once a day, so no answer can be spammed
+        fixed_once(account, m["chat"], refusal, t0, person["id"])   # at most once a day, so no answer can be spammed
         return "stored"
     if m["sender_alt"]:     # WhatsApp sends two forms of one ID: learn the other one, as an owner handle does
         DB.execute("UPDATE person_handles SET alias=? WHERE app=? AND person=? AND alias IS NULL AND handle<>? AND "
@@ -18827,12 +18893,13 @@ def person_route(account, acc, person, m, t0, hit):
         return "ignored"
     daily = person_daily(person, agent)     # None: no limit, which only contacts.v2 gives (staff, plan P1)
     if daily is not None and person_today(person["id"], t0) >= daily:
-        fixed_once(account, m["chat"], "You reached today's limit. Try again tomorrow.", t0)
+        fixed_once(account, m["chat"], "You reached today's limit. Try again tomorrow.", t0, person["id"])
         return "ignored"
     chat_count("*", "inbound", t0, 1)
     conv, first = conversation_of(person, agent, m, account, t0)
     if first:
-        chat_reply(account, m["chat"], CONVERSATION_NOTICE.format(agent=agent_display(agent)), t0)      # EU AI Act 50
+        chat_reply(account, m["chat"], CONVERSATION_NOTICE.format(agent=agent_display(agent)), t0,       # EU AI Act 50
+                   person["id"])
     cm = DB.execute("INSERT INTO conversation_messages(id,conversation,who,text,created,msg_id) VALUES(?,?,?,?,?,?)",
                     (unused_id("conversation_messages"), conv["id"], "person", m["text"].strip(), t0,
                      m["id"])).lastrowid
@@ -18912,11 +18979,12 @@ def conversation_read(agent):
             q("UPDATE tasks SET state='working', started=? WHERE id=? AND state='submitted'", (t0, t["id"]))
         if rows:
             with transaction():         # the person sees that the agent is reading, as the owner does
-                chat_queue("typing", conv["account"], t0, chat=conv["chat"], seconds=CHAT_TYPING)
+                chat_queue("typing", conv["account"], t0, chat=conv["chat"], seconds=CHAT_TYPING, person=conv["person"])
                 if (chat_apps().get(conv["account"]) or {}).get("app") == "whatsapp":
                     ids = [r["msg_id"] for r in rows if r["msg_id"]]
                     if ids:
                         chat_queue("read", conv["account"], t0, chat=conv["chat"], sender=conv["sender"],
+                                   person=conv["person"],
                                    ids=json.dumps(ids))
         heads = [f"Message {cm_ref(r['id'])}:\n{conversation_header(conv, person, r)}\n" for r in rows]
         last = [f"These are {tref(t['id'])}, the open conversation task: your task tools work for it, and your "
@@ -19322,7 +19390,7 @@ def t_reply(agent, a):
         with transaction():
             new = unused_id("conversation_messages")
             files = chat_files_carry(rows, t0, cm=new)
-            item = chat_queue("message", conv["account"], t0, chat=conv["chat"], text=text,
+            item = chat_queue("message", conv["account"], t0, chat=conv["chat"], text=text, person=conv["person"],
                               reply_to=row["msg_id"] if row["who"] == "person" else None, files=files)
             new = DB.execute("INSERT INTO conversation_messages(id,conversation,who,text,created,reply_to,outbound) "
                              "VALUES(?,?,?,?,?,?,?)", (new, conv["id"], "agent", text, t0, row["id"], item)).lastrowid
@@ -19498,41 +19566,104 @@ def person_handle_free(h, pid):
 
 def person_remove(pid, t0):
     """The owner removes a person: their handles, their agents, their conversations with every message, and the
-    questions of those conversations that nobody answered. An answer that the owner already gave stays in Needs you,
-    and a running window of theirs stops at its next call, because its credential is revoked. No id of theirs comes
-    back (unused_id), a task that waits for their answer goes on without it, and the tasks of their conversations
-    lose their link to them and their words (removed_words_rows), their history records leave the index, and the
-    open ones end (removed_conversation_tasks_end): nothing of a removed person's conversation can reach anybody
-    else. What stays (UI-API.md 1.223): the words of a reply that the bridge sends at that moment, in the bridge
-    only; what a session of such a task writes or uploads after the removal; the subtasks of those tasks; a message
-    that filed_under filed under a lead's parent task; reports.text and duty_steps.text; memories, notes, standing
-    items (theirs end) and knowledge that a session of the conversation wrote; an answered Needs-you item; log.what;
-    the owner's own command records (ui_controls); another session's search answer that quoted them; the call
-    records from before this version; an ignored message of a sender form that is not their handle or alias, or of
-    an account that is no longer in chat_apps; the agent's files that went to them in a reply (names and bytes);
-    their chat ids in chat_out and chat_in; the owner's answers to their Needs-you items (ui_requests.text); a
-    typing or read item to their chat that waits to go. Between this commit and the end of their open tasks, a
-    helper's poll can start a session of one, with REMOVED_WORDS for its words, which the end then stops."""
+    questions of those conversations that nobody answered. A running window of theirs stops at its next call, because
+    its credential is revoked. No id of their conversations, messages, questions or tasks comes back (unused_id), a
+    task that waits for their answer goes on without it, and the tasks of their conversations lose their link to them
+    and their words (removed_words_rows), their history records leave the index, and the open ones end
+    (removed_conversation_tasks_end). The person's own rows go, as before: the person, their handles, their
+    conversations and messages, their open questions, their reminders' history, their ignored messages, their wrong
+    link codes, and the history's rows of their records. No other record is deleted: each row stays, with its times
+    and its own id, and its words go, with the other values of the same field (the owner, 18 November 2026: "I dont
+    want to be missing info").
+
+    Cleared with them since owner API 1.232 (the owner's "Yes, as recommended" of 19 November 2026 to the list of what
+    a removal kept): the parts of those tasks, at any depth (removed_part_ids); what a session of one of those tasks
+    does after the removal, which the hub refuses (fence) or writes with no word (call_record, the helper's routes of
+    session records and of an API call's answer: removed_tasks); the turn state, the notes of a reminder and of a hold
+    with what the helper said of its stop, a restart's reason, the API calls, the receipts of the writes, the access
+    that a question named and a goal that is a plain label, of those tasks; a lead's line about one of them, for each
+    line written since that version (events.about) and for each line of a report; what passed between the person and a
+    task that no conversation opened (removed_other_work_rows); the standing items that the person gave, and no notice
+    of their end names the person (removed_standing_rows); the person's chat ids, by keys only (removed_ids_rows: the
+    new chat_in.person and chat_out.person among them); the owner's own command records about them, their tasks, their
+    items and their reminders (removed_commands_rows); and the Needs-you items of their conversations that have an
+    answer, except the owner's own answer, with the notice of each item, open or answered (removed_needs_rows). And a
+    person's own number never comes back either (ID_FLOOR_TABLES), because the records that stay name their person by
+    it.
+
+    What stays (UI-API.md 1.232 has the same list, with the reason of each). By the owner's word, what the agent wrote
+    down from that work, which is its own and the fleet's: memories, notes, skills, knowledge and its summaries,
+    duties and their cases (title, key, note, steps, history, typed reports and the answers about them), wake-up rules
+    with their code, history and runs, the standing items that it kept for itself, reports.text with the receiver's
+    decision and note, the jobs of the logins that it made, saved or handed over and sealed.label, what it told the
+    owner (tell_owner, message_owner), a message that it wrote to another person from one of those tasks, in that
+    person's conversation, and the files of outputs/T-<id>/ on the configuration ref, with the task's title in their
+    commit (the history's own rows of a lesson and of the sender's side of a report go with the task's rows). By the
+    owner's word, what another session read or wrote before the removal, in its own records: the call record and the
+    session record of another session's read (a requester's, a peer's), a search answer, the hub's notices to a lead
+    or to the fleet manager that quote several tasks, the lists of people in the start texts and the reads of the
+    agents (each agent's own list, the staff of other agents, every list for the fleet manager), a standing item of
+    theirs in the start texts of the agents that it steered, in what another person's window read of it, in a
+    see_standing call and in a refused call that named it, another author's item that this person asked to change or
+    to end (the reason of its end, its notices, the owner's line), what the session of other work wrote in its own
+    words about the person's answer, a task that follows one of theirs, a card that the manager raised for a question
+    or a step of one, and log.what. With no key: a lead's line from before 1.232; the call records of their windows
+    from before 1.223, which keep no conversation; a notice of an item of theirs from before 10 November 2026, which
+    has no item number; an ignored message of a sender form that is not their handle or alias, or of an account that
+    is no longer in chat_apps; from before 1.232, an item to their chat that is no reply in their conversation (it can
+    still go when it waits), and a message of theirs that no conversation kept (a refused one, a wrong link code); a
+    wrong link code of theirs, and the reply to it, from a form that is the owner's or another person's; a message of
+    theirs from before they were a person; a refused message_contact, whose record has no message number; a record of
+    a call of other work that its helper sends after the removal; the receipt of a write that ran while the removal
+    did, and the receipt of a refusal that the hub kept or of a failed write; a target whose words a later message of
+    another person replaced, and what was said of their own target before they gave it new words; the vault's words of
+    an API call that it refused (jobs.result) and the bridge's words of why an item to them failed (chat_out.error).
+    The owner's own words: the messages in the chats with the agents, and the answers to their Needs-you items
+    (ui_requests.text). Until the sweep: the agent's files that went to them in a reply (names and bytes), and a file
+    that a session of theirs sends up with an upload line from before the removal. Outside the records: the words of a
+    reply that the bridge sends at that moment, the bridge's log and the store of its WhatsApp library; the session
+    files of their windows and tasks on the agent's machine, and the task's folder there; the branch, the commits and
+    the pull request of a conversation with a list of repositories, and what their sessions sent out; what the owner's
+    devices hold; a copy of the records from before; the chat itself in the chat app. In the records' file: the
+    write-ahead file until SQLite starts it again, and the history's search index (the words of a tool record for
+    good, with no row to reach them, and of each other dropped record until SQLite merges it). A removal from before
+    1.232 keeps what the list of its version names, and its person's number can still come back. Between this commit
+    and the end of their open tasks, a helper's poll can start a session of one, with REMOVED_WORDS for its words,
+    which its first call stops."""
     p = q1("SELECT * FROM people WHERE id=?", (pid,))
     if not p:
         raise Refusal(404, "no such person")
     with transaction():
-        standing_person_rows(pid, f"{p['name']} was removed", t0)    # L3 (AUTONOMY.md P3), while the name is there
-        convs = [r["id"] for r in DB.execute("SELECT id FROM conversations WHERE person=?", (pid,)).fetchall()]
+        rows = DB.execute("SELECT * FROM conversations WHERE person=? ORDER BY id", (pid,)).fetchall()
+        convs = [r["id"] for r in rows]
+        items = removed_standing_rows(pid)      # first, so that no notice of an item's end carries its words
+        standing_person_rows(pid, REMOVED_GIVER, t0)        # L3 (AUTONOMY.md P3): their items end, with no name
         marks = ",".join("?" * len(convs))
         linked = DB.execute(f"SELECT * FROM tasks WHERE source_conversation IN ({marks}) ORDER BY id",
                             tuple(convs)).fetchall() if convs else []
+        # ... and their parts: a lead gave them to its team in the session of one of those tasks
+        parts = removed_part_ids([t["id"] for t in linked])
+        cleared = [t["id"] for t in linked] + parts
+        part_rows = [r for some in id_lists(parts) for r in DB.execute(
+            f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(some))}) ORDER BY id", tuple(some)).fetchall()]
         for table in ID_FLOOR_TABLES:
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                        (f"row_floor:{table}", str(unused_id(table) - 1)))
-        conversation_waits_end_rows("SELECT id FROM conversations WHERE person=?", (pid,), "they were removed", t0)
+        conversation_waits_end_rows("SELECT id FROM conversations WHERE person=?", (pid,), REMOVED_ASKED, t0,
+                                    named=False)
+        for some in id_lists(cleared):          # a person of many messages has many tasks: in parts (ID_LIST)
+            removed_words_rows(some)
+            for tid in some:            # what their sessions write from now on is not kept (removed_task)
+                DB.execute("INSERT OR IGNORE INTO removed_tasks(task,at) VALUES(?,?)", (tid, t0))
+        sends = []
         if linked:
-            removed_words_rows([t["id"] for t in linked])
             DB.execute(f"UPDATE tasks SET source_conversation=NULL, source_message=NULL WHERE source_conversation IN "
                        f"({marks})", tuple(convs))
         if convs:       # the calls of their windows: read_messages and reply keep no task (calls.conversation)
+            removed_receipts_rows(f"conversation IN ({marks})", tuple(convs))       # while their arguments are there
             DB.execute(f"UPDATE calls SET args='{{}}', detail=? WHERE conversation IN ({marks})",
                        (REMOVED_WORDS, *convs))
+            removed_other_work_rows(rows, cleared)          # while their messages are there
             # The agent's replies to them: the outbound item of each message of their conversations and each Send
             # again of it, down the whole chain (again_of), found from those ids by their keys (conversation_message_of,
             # chat_out_again) and written by id. A reply that waits to go (queued) stops as a failed one, with why, so
@@ -19547,6 +19678,8 @@ def person_remove(pid, t0):
                 DB.execute("UPDATE chat_out SET state='failed', error=?, updated=? WHERE id=? AND kind='message' AND "
                            "state='queued'", (REMOVED_SEND, t0, oid))
                 DB.execute("UPDATE chat_out SET text=? WHERE id=? AND kind='message'", (REMOVED_WORDS, oid))
+            removed_needs_rows(convs)                       # the answered ones stay, with no word of the person
+        removed_ids_rows(pid, rows, sends, t0)      # while their conversations, messages and handles are there
         for cid in convs:
             DB.execute("DELETE FROM conversation_messages WHERE conversation=?", (cid,))
             DB.execute("DELETE FROM needs WHERE conversation=? AND answer IS NULL", (cid,))
@@ -19554,7 +19687,7 @@ def person_remove(pid, t0):
                        "revoked IS NULL", (t0, cid))
             DB.execute("DELETE FROM kv WHERE k=?", (f"standing_told:{cid}",))      # L3: what its window was told
         DB.execute("DELETE FROM conversations WHERE person=?", (pid,))
-        history_forget_person(pid, [t["id"] for t in linked])     # AUTONOMY.md P6: and the history's index forgets
+        history_forget_person(pid, cleared)     # AUTONOMY.md P6: and the history's index forgets
         # the first words of their messages from before they were a person (chat_ignored), by the sender that
         # person_at matches a handle with: its handle or its alias, on an account of its app in chat_apps (a row of an
         # account that left chat_apps has no app to match, and stays)
@@ -19566,20 +19699,22 @@ def person_remove(pid, t0):
                            f"({','.join('?' * len(senders))})", (*accounts, *senders))
         DB.execute("DELETE FROM person_handles WHERE person=?", (pid,))
         reminder_person_rows(convs, t0)         # WAKEUPS-INTERFACE.md 8: their reminders, with their words
+        removed_commands_rows(pid, convs, cleared, items)   # and the owner's own commands about all of these
         DB.execute("DELETE FROM person_agents WHERE person=?", (pid,))
         DB.execute("DELETE FROM person_scopes WHERE person=?", (pid,))         # person access plan, section 2
         DB.execute("DELETE FROM people WHERE id=?", (pid,))
-    ended = removed_conversation_tasks_end(linked, REMOVED_REASON)
+    ended = removed_conversation_tasks_end(list(linked) + part_rows, REMOVED_REASON)
     log("owner", f"removed P-{pid}, with {len(convs)} conversation(s) and every message of them"
                  + (f"; {', '.join(tref(t) for t in ended)} ended with them" if ended else ""))
     return {"person": {"id": pid, "name": p["name"]}, "deleted": True, "conversations": len(convs)}
 
 
-def conversation_waits_end_rows(scope, args, why, t0):
+def conversation_waits_end_rows(scope, args, why, t0, named=True):
     """Inside the caller's transaction, while the conversations are there (lane L2): each message_contact of the
     conversations that the query `scope` gives that waits for its person's answer waits no more, because no answer
-    can come now (`why`, said of the person: removed, or their tools changed). Its task goes on without it, its
-    session is told so, and no later message of that person reaches it as the answer."""
+    can come now (`why`, said of the person: their tools changed; or, with named False, a whole sentence part that
+    names nobody: a removed person's name stays in no task). Its task goes on without it, its session is told so, and
+    no later message of that person reaches it as the answer."""
     in_transaction("conversation_waits_end_rows")
     for w in DB.execute(f"SELECT m.id, m.waits, t.owner, p.name FROM conversation_messages m JOIN tasks t ON "
                         f"t.id=m.waits JOIN conversations c ON c.id=m.conversation JOIN people p ON p.id=c.person "
@@ -19588,8 +19723,9 @@ def conversation_waits_end_rows(scope, args, why, t0):
         if DB.execute("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' AND "
                       "waiting_on=?", (w["waits"], cm_ref(w["id"]))).rowcount:
             secret_rewait(w["waits"])       # the owner's secret holds it still (secret_requests)
-            DB.execute(EVENT, (w["owner"], "say", w["waits"], f"[hub] No answer to your {cm_ref(w['id'])} comes from "
-                                                              f"{w['name']} now: {why}. Go on without it.", t0, "{}"))
+            said = f"comes from {w['name']} now: {why}" if named else f"comes now: {why}"
+            DB.execute(EVENT, (w["owner"], "say", w["waits"], f"[hub] No answer to your {cm_ref(w['id'])} {said}. "
+                                                              f"Go on without it.", t0, "{}"))
 
 
 # What stands in a task of a removed person's conversation in place of their words (lane L2): nothing of theirs, not
@@ -19599,33 +19735,55 @@ REMOVED_WORDS = "Removed with the person whose conversation this came from."
 REMOVED_TITLE = "Work from the conversation of a removed person"
 REMOVED_REASON = "the person whose conversation it came from was removed"
 REMOVED_SEND = "Not sent: the person whom it was for was removed."      # chat_out.error of a reply that waited
+# Since owner API 1.232, what the removal itself says names nobody: why a standing item of theirs ended, and why no
+# answer comes to a task that waited for them (standing_person_rows, conversation_waits_end_rows)
+REMOVED_GIVER = "the person who gave it was removed"
+REMOVED_ASKED = "the person whom you asked was removed"
+REMOVED_NEED = "A question from the conversation of a removed person"       # needs.title of an answered item
+REMOVED_COMMAND = json.dumps({"removed": True})     # ui_controls.body and result of a command about them
+# What a session of one of their tasks reads at each call after the removal (fence): its work ended with them
+REMOVED_STOP = ("STOP: this task ended, because the person whose conversation it came from was removed. Do not "
+                "report, deliver, or continue work.")
 
 
 def removed_words_rows(tids):
     """Inside person_remove's transaction (lane L2): the tasks that a removed person's conversations opened (its
-    conversation tasks, ask_team and open_work) lose that person's words and name, in their title, details, reason
-    and result, their progress notes, their questions, the text of their calls, the text of the messages filed under
-    them (events: each row stays, because an event's id never comes back and the helper's cursor reads by it), the
-    agent messages that their sessions sent or got, with the recipient's copy, the owner's steers of them, their
-    outcomes' titles and notes, their permission prompts' input and reason, with an "always" rule's copy of one, and the
-    words of their session records (thread_events: each row stays with its type and its ids, so a late upload of the
-    same record is still the one that is there, removed_record). history_forget_person takes their records out of the
-    index in the same write."""
+    conversation tasks, ask_team and open_work) lose that person's words and name, in their title, details, done-when
+    line, reason and result (with its plain line and the name of its job), their progress notes, their questions (with
+    the access that one named), the text of their calls, the text of the messages filed under them (events: each row
+    stays, because an event's id never comes back and the helper's cursor reads by it), the agent messages that their
+    sessions sent or got, with the recipient's copy, the owner's steers of them, their outcomes' titles and notes,
+    their permission prompts' input and reason, with an "always" rule's copy of one, and the words of their session
+    records (thread_events: each row stays with its type and its ids, so a late upload of the same record is still the
+    one that is there, removed_record). history_forget_person takes their records out of the index in the same write.
+    Since owner API 1.232 `tids` holds the parts of those tasks too (removed_part_ids), at most ID_LIST of them in one
+    call, and each one also loses the words of its turn state (removed_turn), the note of its reminders and of its
+    holds, the reason of a restart of it, what its API calls sent and got (removed_jobs_rows), the words of the
+    receipts of its sessions' writes (removed_receipts_rows) and each line about it that its requester reads in a task
+    of its own (events.about, filed_about; a report's line by reports.event_id)."""
     in_transaction("removed_words_rows")
     marks = ",".join("?" * len(tids))
     DB.execute(f"UPDATE tasks SET title=?, details=?, done_when=?, why=CASE WHEN why IS NULL THEN NULL ELSE ? END, "
                f"what=CASE WHEN what IS NULL THEN NULL ELSE ? END, where_=NULL, how=NULL, check_note=NULL, "
-               f"plain=NULL, job_name=NULL "       # owner feature jobs: the words of a result and of a job's name
+               f"plain=NULL, job_name=NULL, "      # owner feature jobs: the words of a result and of a job's name
+               # a goal that is a plain label, as a lead writes one for a part (task_goal); a goal's own name stays
+               f"goal=CASE WHEN goal IS NULL OR goal='' OR goal_id IS NOT NULL THEN goal ELSE ? END "
                f"WHERE id IN ({marks})", (REMOVED_TITLE, REMOVED_WORDS, REMOVED_WORDS, REMOVED_WORDS, REMOVED_WORDS,
-                                          *tids))
+                                          REMOVED_WORDS, *tids))
     DB.execute(f"UPDATE notes SET text=? WHERE task IN ({marks})", (REMOVED_WORDS, *tids))
-    DB.execute(f"UPDATE questions SET text=?, answer=CASE WHEN answer IS NULL THEN NULL ELSE ? END, assumed=NULL "
+    DB.execute(f"UPDATE questions SET text=?, answer=CASE WHEN answer IS NULL THEN NULL ELSE ? END, assumed=NULL, "
+               f"access=NULL "         # the thing that a question named as the access that it needs, in free words
                f"WHERE task IN ({marks})", (REMOVED_WORDS, REMOVED_WORDS, *tids))
+    removed_receipts_rows(f"task IN ({marks})", tuple(tids))        # while their calls' arguments are there
     DB.execute(f"UPDATE calls SET args='{{}}', detail=? WHERE task IN ({marks})", (REMOVED_WORDS, *tids))
     # The agent messages that their sessions sent (sender_task) and the recipient's copy of each (event_id), and
     # those sent to them (the copy is filed under the task): agent_message_sender, agent_message_event
     DB.execute(f"UPDATE events SET text=? WHERE id IN (SELECT event_id FROM agent_messages WHERE sender_task IN "
                f"({marks}) AND event_id IS NOT NULL)", (REMOVED_WORDS, *tids))
+    # (the history's row of each one for the other agent has no task, so it leaves the index by its reference)
+    for m in DB.execute(f"SELECT id FROM agent_messages WHERE sender_task IN ({marks}) OR event_id IN (SELECT id FROM "
+                        f"events WHERE task IN ({marks}))", (*tids, *tids)).fetchall():
+        history_drop_ref(am_ref(m["id"]))
     DB.execute(f"UPDATE agent_messages SET text=? WHERE sender_task IN ({marks}) OR event_id IN (SELECT id FROM events "
                f"WHERE task IN ({marks}))", (REMOVED_WORDS, *tids, *tids))
     DB.execute(f"UPDATE events SET text=? WHERE task IN ({marks})", (REMOVED_WORDS, *tids))
@@ -19646,6 +19804,29 @@ def removed_words_rows(tids):
     for r in DB.execute(f"SELECT id, type, data FROM thread_events WHERE task IN ({marks}) AND type<>'session'",
                         tuple(tids)).fetchall():
         DB.execute("UPDATE thread_events SET data=? WHERE id=?", (removed_record(r["data"]), r["id"]))
+    for r in DB.execute(f"SELECT task, attempt, turn FROM attempts WHERE task IN ({marks}) AND turn IS NOT NULL",
+                        tuple(tids)).fetchall():
+        DB.execute("UPDATE attempts SET turn=? WHERE task=? AND attempt=?",
+                   (removed_turn(r["turn"]), r["task"], r["attempt"]))
+    DB.execute(f"UPDATE reminders SET note=? WHERE task IN ({marks}) AND note IS NOT NULL", (REMOVED_WORDS, *tids))
+    DB.execute(f"UPDATE holds SET note=? WHERE task IN ({marks}) AND note IS NOT NULL AND note<>''",
+               (REMOVED_WORDS, *tids))
+    # (what the helper said of a stop can name the commands that still ran: settle_hold)
+    DB.execute(f"UPDATE holds SET detail=? WHERE task IN ({marks}) AND detail IS NOT NULL AND detail<>''",
+               (REMOVED_WORDS, *tids))
+    DB.execute(f"UPDATE restart_holds SET reason=? WHERE reason IS NOT NULL AND hold IN (SELECT id FROM holds WHERE "
+               f"task IN ({marks}))", (REMOVED_WORDS, *tids))
+    # an API call that the vault has not asked for yet is never sent: it ends here, and helper_vault gives no job
+    # that has ended. One that the vault sends now goes on with the copy that it got (request_done clears its answer)
+    DB.execute(f"UPDATE jobs SET ok=0, result=?, finished=? WHERE kind='request' AND task IN ({marks}) AND "
+               f"released IS NULL AND finished IS NULL AND unknown IS NULL",
+               (f"The request was not sent: {REMOVED_REASON}.", now(), *tids))
+    removed_jobs_rows(f"task IN ({marks})", tuple(tids))
+    # the lines about them that their requester reads in a task of its own: by the line's own key (filed_about),
+    # and the line of each report by the report's (the report is its agent's own record, and stays)
+    DB.execute(f"UPDATE events SET text=? WHERE about IN ({marks})", (REMOVED_WORDS, *tids))
+    DB.execute(f"UPDATE events SET text=? WHERE id IN (SELECT event_id FROM reports WHERE from_task IN ({marks}) "
+               f"AND event_id IS NOT NULL)", (REMOVED_WORDS, *tids))
 
 
 # What a session record of a removed person's task keeps (removed_words_rows): the keys that tie it to its session and
@@ -19667,11 +19848,350 @@ def removed_record(data):
     return json.dumps(kept)
 
 
+def removed_turn(turn):
+    """The turn state of an attempt of a removed person's task (attempts.turn, turn_records) with no word of its
+    session: its last message, what it does now and the titles of its open calls. Its session, its counts of records
+    and of turns and whether a turn runs stay, so a record that comes late counts once."""
+    try:
+        state = json.loads(turn)
+    except (TypeError, ValueError):
+        state = None
+    if not isinstance(state, dict):
+        return "null"
+    if state.get("said"):
+        state["said"] = REMOVED_WORDS
+    if "doing" in state:
+        state["doing"] = None
+    if isinstance(state.get("calls"), dict):
+        state["calls"] = {k: ([REMOVED_WORDS if c[0] else c[0]] + list(c[1:]) if isinstance(c, list) and c else c)
+                          for k, c in state["calls"].items()}
+    return json.dumps(state)
+
+
+def removed_part_ids(tids):
+    """The parts of the tasks `tids`, at any depth (tasks.parent), that are not among them: a lead gave them to its
+    team in the session of a person's task, so a person's words drive their sessions too (contact_session walks the
+    same chain upward). read_rows only."""
+    found = set()
+    for some in id_lists(tids):
+        found |= {r["id"] for r in read_rows(
+            f"WITH RECURSIVE parts(id) AS (SELECT id FROM tasks WHERE parent IN ({','.join('?' * len(some))}) UNION "
+            f"SELECT t.id FROM tasks t JOIN parts p ON t.parent=p.id) SELECT id FROM parts", tuple(some))}
+    return sorted(found - set(tids))
+
+
+def removed_task(tid):
+    """True for a task of a removed person's conversations, or a part of one (removed_tasks, which person_remove
+    writes). Its link to the conversation went with the conversation, so this is what the hub reads at each later
+    write of one of its sessions: a tool call is refused (call_tool) and its record keeps no word (call_record), and a
+    session record or an API call's answer that comes late is kept with no word (the helper's routes). read_row only."""
+    return tid is not None and read_row("SELECT 1 FROM removed_tasks WHERE task=?", (tid,)) is not None
+
+
+def removed_jobs_rows(where, args):
+    """Inside the caller's transaction: the API calls (call_api) of a removed person's tasks that `where` names lose
+    what the session sent and what the service answered: the path, the headers, the body and the answer. Each row
+    stays, with its login, its method, its status, its times and the hub's own line about how it ended. person_remove
+    names every call of those tasks: one that the vault has not asked for yet ended there as not sent, so the
+    vault is never given it; one that the vault sends now goes on with the copy that it got, and the answer that the
+    helper reports after the removal is written with no word (request_done)."""
+    in_transaction("removed_jobs_rows")
+    DB.execute(f"UPDATE jobs SET path=CASE WHEN path IS NULL THEN NULL ELSE ? END, headers='{{}}', "
+               f"body=CASE WHEN body IS NULL THEN NULL ELSE ? END, "
+               f"response=CASE WHEN response IS NULL THEN NULL ELSE ? END WHERE kind='request' AND {where}",
+               (REMOVED_WORDS, REMOVED_WORDS, REMOVED_WORDS, *args))
+
+
+def removed_other_work_rows(convs, cleared):
+    """Inside person_remove's transaction, while the messages of the conversations `convs` (their rows) are there:
+    what passed between the person and a task that no conversation opened. An agent writes to a person first from any
+    task of its own (message_contact), and with waits the person's answer goes into that task, word for word
+    (conversation_waiting_rows). Such a task is not theirs, so only this goes from it: the line that carried each
+    answer, the record of each such message_contact call with its receipt, the record of each read that gave an
+    answer out, and the session's own records of those calls. Each one is found by words that only the hub writes,
+    with numbers that never come back (unused_id): the head "[conversation C-<id>] " of the answer's line, and the
+    hub's answer to the call, which begins with the message's own CM number. A read's record goes whole, also when the
+    read gave other messages out with the answer: each of those stays in its own record. The history has none of
+    them: a message to a person and a fleet tool's record are the conversation's records there (HISTORY_CALLS,
+    history_tool), which leave with the person. What the session of that task wrote in its own words about the
+    answer stays, and so does a record of such a call that its helper sends after the removal: nothing ties them to
+    the person."""
+    in_transaction("removed_other_work_rows")
+    skip = set(cleared)
+    for conv in convs:
+        cid, head = conv["id"], f"[conversation C-{conv['id']}] "
+        rows = DB.execute("SELECT id, who, task FROM conversation_messages WHERE conversation=? AND task IS NOT NULL "
+                          "AND who IN ('agent','person') ORDER BY id", (cid,)).fetchall()
+        sent = {}               # task -> the first words of the hub's answer to each message_contact that it made
+        for r in rows:
+            if r["who"] == "agent":
+                sent.setdefault(r["task"], []).extend((f"Sent as {cm_ref(r['id'])} to ",
+                                                       f"{cm_ref(r['id'])} is in C-{cid}, but not sent to "))
+        for tid in sorted({r["task"] for r in rows} - skip):
+            said = tuple(sent.get(tid, ()))
+            DB.execute("UPDATE events SET text=? WHERE task=? AND kind='say' AND substr(text, 1, ?)=?",
+                       (REMOVED_WORDS, tid, len(head), head))
+            # the calls of that task, and, when it is the conversation task of another person's window, the calls of
+            # that window: its message_contact and its read_messages keep no task (calls.conversation)
+            t = DB.execute("SELECT source_conversation, source_message FROM tasks WHERE id=?", (tid,)).fetchone()
+            calls = DB.execute("SELECT id, name, detail FROM calls WHERE task=? AND name IN ('message_contact',"
+                               "'read_messages')", (tid,)).fetchall()
+            if is_conversation_task(t):
+                calls += DB.execute("SELECT id, name, detail FROM calls WHERE conversation=? AND name IN "
+                                    "('message_contact','read_messages')", (t["source_conversation"],)).fetchall()
+            for c in calls:
+                if head in (c["detail"] or "") if c["name"] == "read_messages" else \
+                        bool(said) and (c["detail"] or "").startswith(said):
+                    removed_receipts_rows("id=?", (c["id"],))
+                    DB.execute("UPDATE calls SET args='{}', detail=? WHERE id=?", (REMOVED_WORDS, c["id"]))
+            removed_call_records(tid, (head, *said))
+
+
+def removed_call_records(tid, said):
+    """Inside the caller's transaction: the session's own records (thread_events) of the tool calls of task `tid`
+    whose answer holds one of the texts `said`, which only the hub writes. The record that holds such a text names its
+    call, and each record of that call loses its words (the call, with what it sent, and its answer)."""
+    in_transaction("removed_call_records")
+    words = [json.dumps(w)[1:-1] for w in said]         # as a record's JSON writes them
+    keys = set()
+    for h in DB.execute("SELECT attempt, session, data FROM thread_events WHERE task=? AND type IN "
+                        "('tool_call','tool_call_update')", (tid,)).fetchall():
+        if any(w in h["data"] for w in words):
+            keys.add((h["attempt"], h["session"], removed_record_call(h["data"])))
+    for attempt, session, call in sorted(k for k in keys if k[2] is not None):
+        for e in DB.execute("SELECT id, data FROM thread_events WHERE task=? AND attempt=? AND session=? AND "
+                            "type IN ('tool_call','tool_call_update') AND json_extract(data, '$.tool_call_id')=?",
+                            (tid, attempt, session, call)).fetchall():
+            DB.execute("UPDATE thread_events SET data=? WHERE id=?", (removed_record(e["data"]), e["id"]))
+
+
+def removed_receipts_rows(where, args):
+    """Inside the caller's transaction, before the calls that `where` names lose their arguments: the receipt of each
+    write among those calls (tool_commands, which a repeat of the call answers with, and which can name the person or
+    quote what the session wrote) loses its words, which are its `text`. Every other value of a receipt stays: other
+    flows read them (a day's count of sent mail, an agent's own draft, a rule's revision). The receipt is found by the
+    call's own request id in the record of its arguments, in its stored form (wakeups.request_ref), for the same
+    tool, and only for a call that was done (an exact repeat of another session's write is that same write). A refused
+    call's request id can be another session's write, so the
+    receipt that a refusal kept (keep_refusal) or a failed write left (google_end) stays: its words are the agent's
+    own record that the refusal showed, or the service's reason."""
+    in_transaction("removed_receipts_rows")
+    for c in DB.execute(f"SELECT agent, name, args FROM calls WHERE {where} AND ok=1 AND args LIKE '%request_id%'",
+                        args).fetchall():
+        try:
+            rid = wakeups.request_ref(json.loads(c["args"]).get("request_id"))
+        except (ValueError, AttributeError):
+            continue
+        key = (c["agent"], rid, c["name"])
+        row = DB.execute("SELECT receipt FROM tool_commands WHERE agent=? AND request_id=? AND tool=?",
+                         key).fetchone() if rid else None
+        try:
+            receipt = json.loads(row["receipt"]) if row else None
+        except ValueError:
+            continue
+        if isinstance(receipt, dict) and isinstance(receipt.get("text"), str):
+            DB.execute("UPDATE tool_commands SET receipt=? WHERE agent=? AND request_id=? AND tool=?",
+                       (json.dumps(dict(receipt, text=REMOVED_WORDS)), *key))
+
+
+def removed_record_call(data):
+    """The call that a session record of a tool call belongs to (its tool_call_id), or None."""
+    try:
+        call = json.loads(data).get("tool_call_id")
+    except (ValueError, AttributeError):
+        return None
+    return call if isinstance(call, str) else None
+
+
+def removed_standing_rows(pid):
+    """Inside person_remove's transaction, before the person's items end (standing_person_rows): each standing item
+    that the person gave, ended or not, loses its words, so that no notice of its end carries them: what it says, its
+    measure, how it is measured, and why it ended, whoever wrote that. The item stays, with its kind, its author's
+    number, its holder and its times. With it go the words of the owner's line about it in the chat with the fleet
+    manager (standing_said writes one when a person gives an item, and one when an agent ends it), of each notice of
+    it in a task (standing_news_rows writes the item's number into the notice's extra since 10 November 2026; a
+    person's item steers the agent of their conversation and its team, never the fleet manager, whose notice has no
+    such number), and of each call that kept, changed or ended it, in the records of its agent or of the fleet
+    manager (the hub's answer to each such call names the item's number in its first words; these tools keep no
+    receipt), with its session's own records of it, and its history records.
+
+    Each of these is cleared from the time of this person's message that last gave the item its words (or of the
+    item, when that is later), and no earlier: before it the words can be another author's (a target whose words a
+    later message made this person's), or an earlier item's of the same number, which an agent's delete lets come
+    back. So when the person gave their own target new words later, what was said of it before that stays. What
+    stays besides: the item whole in the start text of each task of the agents that it steered while it was active,
+    what a conversation window of another person or a task session read about it, and the owner's line about an item
+    of another author that this person asked to change or to end. Returns the items' ids."""
+    in_transaction("removed_standing_rows")
+    rows = DB.execute("SELECT s.id, s.agent, s.created, m.created AS said FROM standing s LEFT JOIN "
+                      "conversation_messages m ON m.id=s.message WHERE s.author_kind='person' AND s.author=? "
+                      "ORDER BY s.id", (f"P-{pid}",)).fetchall()
+    since = {}          # item -> the time from which its records are this person's
+    calls = {}          # agent -> [(the first words of the hub's answers about one item, that item's time)]
+    for r in rows:
+        item = r["id"]
+        since[item] = max(r["created"] or 0, r["said"] or 0) - 1
+        DB.execute("UPDATE standing SET words=?, measure=CASE WHEN measure IS NULL THEN NULL ELSE ? END, "
+                   "how=CASE WHEN how IS NULL THEN NULL ELSE ? END, "
+                   "ended_why=CASE WHEN ended_why IS NULL THEN NULL ELSE ? END WHERE id=?",
+                   (REMOVED_WORDS, REMOVED_WORDS, REMOVED_WORDS, REMOVED_WORDS, item))
+        about = f"standing {iref(item)} of "
+        for line in DB.execute("SELECT id FROM owner_reports WHERE created>=? AND substr(about, 1, ?)=?",
+                               (since[item], len(about), about)).fetchall():
+            DB.execute("UPDATE owner_reports SET text=? WHERE id=?", (REMOVED_WORDS, line["id"]))
+            history_drop_ref(f"OR-{line['id']}")
+        history_drop_ref(iref(item), since[item])
+        said = (f"Kept as {iref(item)}.", f"{iref(item)} ended.", f"{iref(item)} ended, as ",
+                f"{iref(item)} stands as: ", f"{iref(item)} already ")
+        for who in {r["agent"], manager_name()}:
+            calls.setdefault(who, []).append((said, since[item]))
+    for some in id_lists(sorted(since)):        # one read of the notices for each list of items: no index names one
+        for e in DB.execute(f"SELECT id, created, json_extract(extra, '$.standing') item FROM events WHERE "
+                            f"kind='say' AND extra LIKE '%\"standing\"%' AND CASE WHEN json_valid(extra) THEN "
+                            f"json_extract(extra, '$.standing') END IN ({','.join('?' * len(some))})",
+                            tuple(some)).fetchall():
+            if (e["created"] or 0) >= since.get(e["item"], float("inf")):
+                DB.execute("UPDATE events SET text=? WHERE id=?", (REMOVED_WORDS, e["id"]))
+    for who in sorted(calls):           # by the index call_agent, from the time of the agent's oldest such item on
+        for c in DB.execute("SELECT id, ts, task, detail FROM calls WHERE agent=? AND ts>=? AND name IN "
+                            "('keep_instruction','set_target','end_standing')",
+                            (who, min(t for _said, t in calls[who]))).fetchall():
+            said = next((words for words, t in calls[who]
+                         if (c["ts"] or 0) >= t and (c["detail"] or "").startswith(words)), None)
+            if said:
+                DB.execute("UPDATE calls SET args='{}', detail=? WHERE id=?", (REMOVED_WORDS, c["id"]))
+                if c["task"] is not None:
+                    removed_call_records(c["task"], said)
+    return [r["id"] for r in rows]
+
+
+def removed_ids_rows(pid, convs, sends, t0):
+    """Inside person_remove's transaction, while the person's conversations (`convs`, their rows), their messages and
+    their handles are there: the ids that the chat app knows the person by, a phone number among them, leave the
+    record of each message that came in from them (chat_in) and of each item that went out to them or waits
+    (chat_out). Only by keys that are certainly theirs, and never by a chat or a sender: a chat or a number can be
+    another person's or the owner's at another time (the owner moves a handle, or links it as his own), and nothing
+    of theirs may go with this one.
+
+    The keys: the person of each record and item (person, which the hub writes since owner API 1.232: chat_inbound,
+    a wrong link code's reply, and each item that it queues for a person's chat); each message of their
+    conversations by the chat app's own number of it, on any account; and each item of their conversations' messages
+    (`sends`). What none of these keys finds stays: from before that version, an item to their chat that is no reply
+    in their conversation (a signal, a notice, a fixed sentence of the hub's) and a message of theirs that no
+    conversation kept (a refused one); at any time, a message of theirs from before they were a person, whose first
+    words person_remove takes from the list of ignored messages, and the reply to a wrong link code of theirs from a
+    form that is also the owner's.
+
+    An item for them that waits never goes: a typing or a read signal expires, and a sentence of the hub's own fails
+    with why, as a reply that waited does. Each message item for them loses its text too, so that Send again refuses
+    it (ui_outbound_again). The record that a message came in stays, with the chat app's own number of it, so the
+    same message never comes in twice. Their wrong link codes of the last hour (link_failures, by the forms of their
+    handles since each handle was added, when a form is no handle or alias of the owner or of another person) go."""
+    in_transaction("removed_ids_rows")
+    ids = set(sends)
+    DB.execute("UPDATE chat_in SET chat='', sender=NULL WHERE person=?", (pid,))
+    ids |= {r["id"] for r in DB.execute("SELECT id FROM chat_out WHERE person=?", (pid,)).fetchall()}
+    for h in DB.execute("SELECT app, handle, alias, added FROM person_handles WHERE person=?", (pid,)).fetchall():
+        forms = [s for s in (h["handle"], h["alias"]) if s and not owner_handle(h["app"], s) and not DB.execute(
+            "SELECT 1 FROM person_handles WHERE app=? AND person<>? AND (handle=? OR alias=?)",
+            (h["app"], pid, s, s)).fetchone()]
+        if forms:
+            DB.execute(f"DELETE FROM link_failures WHERE app=? AND ts>=? AND sender IN ({','.join('?' * len(forms))})",
+                       (h["app"], (h["added"] or 0) - 1, *forms))
+    every = [r["account"] for r in DB.execute("SELECT DISTINCT account FROM chat_in").fetchall()]
+    for c in convs:
+        sent = [r["msg_id"] for r in DB.execute("SELECT msg_id FROM conversation_messages WHERE conversation=? AND "
+                                                "msg_id IS NOT NULL", (c["id"],)).fetchall()]
+        for some in id_lists(sent):     # by the index of UNIQUE(account, msg_id)
+            for account in every:
+                DB.execute(f"UPDATE chat_in SET chat='', sender=NULL WHERE account=? AND (person IS NULL OR person=?) "
+                           f"AND msg_id IN ({','.join('?' * len(some))})", (account, pid, *some))
+    for some in id_lists(sorted(ids)):
+        marks = ",".join("?" * len(some))
+        DB.execute(f"UPDATE chat_out SET state='expired', updated=? WHERE state='queued' AND kind<>'message' AND "
+                   f"id IN ({marks})", (t0, *some))
+        DB.execute(f"UPDATE chat_out SET state='failed', error=?, updated=? WHERE state='queued' AND kind='message' "
+                   f"AND id IN ({marks})", (REMOVED_SEND, t0, *some))
+        DB.execute(f"UPDATE chat_out SET text=? WHERE kind='message' AND id IN ({marks})", (REMOVED_WORDS, *some))
+        DB.execute(f"UPDATE chat_out SET chat=NULL, recipient=NULL, sender=NULL, ids=NULL, reply_to=NULL WHERE "
+                   f"id IN ({marks})", tuple(some))
+
+
+def removed_commands_rows(pid, convs, cleared, items):
+    """Inside person_remove's transaction: the owner's own commands about the person (ui_controls) lose their body and
+    their receipt, which held the person's name, role and handles, the owner's note, or words of their records:
+    adding and changing them, each handle given or taken, a pause or a resume of a conversation of theirs (ids
+    `convs`; its receipt holds the newest message), the owner's steer and hold of each of their tasks (`cleared`) and
+    the outcomes that the owner settled there, the end of a standing item that they gave (`items`), and a change of
+    the state of a reminder of theirs. The row stays, so a repeat of such a command is refused as another command and
+    writes nothing. The removal's own command keeps its body, which is the person's number and nothing else, and its
+    receipt is kept with no name (removed_receipt). One read of the commands' routes: no index names a route."""
+    in_transaction("removed_commands_rows")
+    routes = {f"people/{pid}/handles"} | {f"conversations/{cid}" for cid in convs} | \
+        {f"standing/{item}/end" for item in items} | \
+        {f"tasks/{tid}/{what}" for tid in cleared for what in ("steer", "control")}
+    for some in id_lists(cleared):
+        routes |= {f"outcomes/{r['id']}" for r in DB.execute(
+            f"SELECT id FROM outcomes WHERE task IN ({','.join('?' * len(some))})", tuple(some)).fetchall()}
+    for r in DB.execute("SELECT id, task FROM triggers WHERE task LIKE '%\"conversation\"%'").fetchall():
+        send = send_rule(r)             # a reminder of theirs, also after reminder_person_rows took its words
+        if send and send.get("to") == "conversation" and send.get("conversation") in convs:
+            routes.add(f"triggers/{r['id']}/state")
+    for r in DB.execute("SELECT request_id, route FROM ui_controls").fetchall():
+        if r["route"] == "people":
+            full = DB.execute("SELECT body, result FROM ui_controls WHERE request_id=?", (r["request_id"],)).fetchone()
+            try:
+                body, result = json.loads(full["body"]), json.loads(full["result"] or "{}")
+            except ValueError:
+                continue
+            person = result.get("person") if isinstance(result, dict) else None
+            theirs = (isinstance(body, dict) and body.get("id") == pid and body.get("delete") is not True) or \
+                (isinstance(person, dict) and person.get("id") == pid and not result.get("deleted"))
+            if not theirs:
+                continue
+        elif r["route"] not in routes:
+            continue
+        DB.execute("UPDATE ui_controls SET body=?, result=? WHERE request_id=?",
+                   (REMOVED_COMMAND, REMOVED_COMMAND, r["request_id"]))
+
+
+def removed_needs_rows(convs):
+    """Inside person_remove's transaction, before it deletes the open ones: the Needs-you items of the conversations
+    `convs` that have an answer stay, as the record of that answer, with no word of the person: the title named them,
+    the reason was their question in the agent's words, the line of what to do named them, and a deputy's answer was
+    their own message (conversation_decided). The owner's own answer stays as he gave it. The owner's notice of each
+    item, open or answered ("Needs you: <title>", written in the moment that the item was raised), loses the title
+    too."""
+    in_transaction("removed_needs_rows")
+    marks = ",".join("?" * len(convs))
+    for n in DB.execute(f"SELECT id, title, raised, answer, answered_by FROM needs WHERE conversation IN ({marks}) "
+                        f"ORDER BY id", tuple(convs)).fetchall():
+        DB.execute("UPDATE events SET text=? WHERE agent='owner' AND kind='notify' AND text=? AND created>=? AND "
+                   "created<?", (f"Needs you: {REMOVED_NEED}", f"Needs you: {n['title']}", n["raised"] or 0,
+                                 (n["raised"] or 0) + 60))
+        if n["answer"] is None:
+            continue
+        DB.execute("UPDATE needs SET title=?, why=?, todo=CASE WHEN todo IS NULL THEN NULL ELSE ? END WHERE id=?",
+                   (REMOVED_NEED, REMOVED_WORDS, REMOVED_WORDS, n["id"]))
+        if str(n["answered_by"] or "").startswith("P-"):
+            DB.execute("UPDATE needs SET answer=?, answered_by=? WHERE id=?",
+                       (REMOVED_WORDS, n["answered_by"].split()[0], n["id"]))
+
+
+def removed_receipt(result):
+    """What the hub keeps of the receipt of a person's removal (command_run keep): no name. A repeat of the command
+    answers with it; the first answer names the person once more, and that answer is kept nowhere."""
+    if result.get("deleted") and isinstance(result.get("person"), dict):
+        return dict(result, person={"id": result["person"].get("id")})
+    return result
+
+
 def removed_conversation_tasks_end(linked, reason):
     """After person_remove's commit (lane L2): each task of the removed conversations (`linked`, its rows as they were
-    before their link broke) that is still open ends, as a requester's cancel ends a task (t_cancel_task). Its result
-    has no conversation to go back to, and no message of that person reaches it again. Committing. Returns the tasks
-    that ended."""
+    before their link broke, and after them the parts of those tasks: an open part ends with its parent, and this ends
+    one whose parent was not open) that is still open ends, as a requester's cancel ends a task (t_cancel_task). Its
+    result has no conversation to go back to, and no message of that person reaches it again. Committing. Returns the
+    tasks that this loop ended: a part that ended with its parent is not among them."""
     ended = []
     for t in linked:
         if not q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (t["id"],)):
@@ -20475,10 +20995,12 @@ def t_message_contact(agent, a):
                                                                account, "", recipient, "open", t0, t0)).lastrowid
                 conv = DB.execute("SELECT * FROM conversations WHERE id=?", (cid,)).fetchone()
                 chat_queue("message", account, t0, chat=chat, recipient=recipient, reply_to=None,     # EU AI Act 50
+                           person=person["id"],
                            text=CONVERSATION_NOTICE.format(agent=agent_display(agent)))
             cm = unused_id("conversation_messages")
             files = chat_files_carry(rows, t0, cm=cm)
             item = chat_queue("message", account, t0, chat=chat, recipient=recipient, text=text, reply_to=None,
+                              person=person["id"],
                               files=files)
             # CHAT-APPS.md 20: a message that its number's daily limit failed at once reached nobody, so its task
             # waits for no answer to it
@@ -20793,7 +21315,8 @@ def send_way(t, send):
 def send_rows(t, send, way, t0):
     """Inside run_send's transaction: the text of one run, queued for the bridge where it goes. To the owner it is also
     the agent's message in the owner's app (as message_owner makes one); a reminder is also the agent's message in the
-    conversation's record. Returns the outbound item."""
+    conversation's record. Returns the outbound item, or None for a reminder whose conversation went since send_way
+    read its way (its person was removed): the run then sends nothing."""
     in_transaction("send_rows")
     text = send["text"]
     if send["to"] == "owner":
@@ -20801,7 +21324,11 @@ def send_rows(t, send, way, t0):
                          "1)", (text, t0, t["agent"])).lastrowid
         return chat_queue("message", way["account"], t0, chat=way["chat"], recipient=way["recipient"], text=text,
                           reply_to=None, report=rid, request_id=way["request"])
-    item = chat_queue("message", way["account"], t0, chat=way["chat"], text=text, reply_to=None)
+    conv = DB.execute("SELECT person FROM conversations WHERE id=?", (way.get("conversation"),)).fetchone()
+    if send["to"] == "conversation" and conv is None:
+        return None             # its person was removed since send_way read the way: nothing goes (person_remove)
+    item = chat_queue("message", way["account"], t0, chat=way["chat"], text=text, reply_to=None,
+                      person=conv["person"] if conv else None)
     if send["to"] == "conversation":
         DB.execute("INSERT INTO conversation_messages(id,conversation,who,text,created,outbound) VALUES(?,?,?,?,?,?)",
                    (unused_id("conversation_messages"), way["conversation"], "agent", text, t0, item))
@@ -20836,6 +21363,8 @@ def run_send(t, due, manual, t0):
            (t["id"], t["revision"]))["n"] < SEND_HOLD_TRIES - 1
     with transaction():
         item = send_rows(t, send, way, t0) if why is None else None
+        if why is None and item is None:        # its person was removed since send_way (send_rows): it ends, as there
+            why, ends = "The person or the conversation is gone, so this reminder ended.", True
         run = DB.execute("INSERT INTO trigger_runs(trigger_id,revision,due,manual,state,reason,created,finished,"
                          "outbound) VALUES(?,?,?,?,?,?,?,?,?)", (t["id"], t["revision"], due, int(manual),
                                                                  "started" if item else "not_sent", why, t0, t0,
@@ -20844,8 +21373,9 @@ def run_send(t, due, manual, t0):
             pause_trigger(t["id"], "hub", "Its text holds a registered login.", t0)
         elif why and t["agent"] not in agents():
             pause_trigger(t["id"], "hub", why, t0)
-        elif ends:
-            DB.execute("UPDATE triggers SET state='done', next_due=NULL, updated=? WHERE id=?", (t0, t["id"]))
+        elif ends:          # (a reminder that person_remove deleted stays deleted: reminder_person_rows)
+            DB.execute("UPDATE triggers SET state='done', next_due=NULL, updated=? WHERE id=? AND state<>'deleted'",
+                       (t0, t["id"]))
         elif item and schedule["kind"] == "once":      # a one-time text has gone, also by Run now: it goes once only
             DB.execute("UPDATE triggers SET state='done', next_due=NULL, updated=? WHERE id=?", (t0, t["id"]))
         elif wait:
@@ -31188,6 +31718,16 @@ def history_note(agent, kind, ref, text, at=None, task=None, person=None, owner_
                                               task=task, owner_chat=owner_chat)], {}, keep=True)
 
 
+# ids in one statement: under the 999 values of an old SQLite, also where a statement names each one twice
+ID_LIST = 400
+
+
+def id_lists(ids):
+    """`ids` in lists of at most ID_LIST, for statements that name each id as a value."""
+    ids = list(ids)
+    return [ids[i:i + ID_LIST] for i in range(0, len(ids), ID_LIST)]
+
+
 def history_forget_person(person_id, tasks=()):
     """Inside the caller's transaction: every record of one person's conversations leaves the history, words and
     all, and so does every record of `tasks`, the tasks that their conversations opened, whose words person_remove
@@ -31198,10 +31738,13 @@ def history_forget_person(person_id, tasks=()):
     in_transaction("history_forget_person")
     for h in DB.execute("SELECT id, agent, text FROM history WHERE person=?", (f"P-{person_id}",)).fetchall():
         history_drop_row(h)
-    marks = ",".join("?" * len(tasks))
-    for h in DB.execute(f"SELECT id, agent, text FROM history WHERE task IN ({marks})",
-                        tuple(tasks)).fetchall() if tasks else []:
-        history_drop_row(h)
+    # (but a message to another person, which a session of one of those tasks wrote: it stays in that person's
+    # conversation, so it stays here)
+    for some in id_lists(tasks):        # a person of many messages has many tasks: no statement names them all
+        for h in DB.execute(f"SELECT id, agent, text FROM history WHERE task IN ({','.join('?' * len(some))}) AND "
+                            f"(person IS NULL OR person=? OR substr(person, 1, 2)<>'P-')",
+                            (*some, f"P-{person_id}")).fetchall():
+            history_drop_row(h)
     history_streams_back()
 
 
@@ -31249,6 +31792,17 @@ def history_drop_row(h):
                    (h["id"], h["text"], key))
     history_floor(h["id"])
     DB.execute("DELETE FROM history WHERE id=?", (h["id"],))
+
+
+def history_drop_ref(ref, since=None):
+    """Inside the caller's transaction: the history rows of one record that is not a tool's, by what read_history opens
+    it by (the index history_of_ref), from the time `since` on when it is given, leave the history and the index. For
+    a record whose words the caller cleared where they stand (person_remove: a standing item that the person gave,
+    the owner's line about it)."""
+    in_transaction("history_drop_ref")
+    for h in DB.execute("SELECT id, agent, text FROM history WHERE ref=? AND kind<>'tool' AND at>=?",
+                        (ref, -1 if since is None else since)).fetchall():
+        history_drop_row(h)
 
 
 def history_floor(top):
@@ -35988,7 +36542,8 @@ def circles(t0):
     found = []
     # 1. the same question twice: an answer that lives nowhere, so it is asked again
     groups = {}
-    for r in q("SELECT * FROM questions WHERE asked>?", (t0 - CIRCLE_QUESTION_DAYS * 86400,)):
+    # (but the questions of a removed person's tasks, which all read the same now: person_remove, REMOVED_WORDS)
+    for r in q("SELECT * FROM questions WHERE asked>? AND text<>?", (t0 - CIRCLE_QUESTION_DAYS * 86400, REMOVED_WORDS)):
         groups.setdefault((r["asker"], normal_words(r["text"])), []).append(r)
     for (asker, _), rows in sorted(groups.items()):
         if len(rows) < 2:
@@ -38561,14 +39116,19 @@ def tool_reads_ahead(name, args):
         kit_reads_ahead(profile_paths(), starts=args["owner"])
 
 
-def call_record(agent, tid, attempt, name, ok, args, detail, window):
+def call_record(agent, tid, attempt, name, ok, args, detail, window, own=None):
     """The row of `calls` of one call, with the args and the detail as they are, or with REMOVED_WORDS when the call
     came from a conversation window whose conversation the owner removed while the call ran (person_remove cleared
-    that window's calls already, and a read_messages works without the lock). The read of the conversation and the
-    write are one hold of LOCK, so that no removal commits between them; the caller builds args and detail before it,
-    because a mask of large args takes long and every other call of the hub waits for LOCK."""
+    that window's calls already, and a read_messages works without the lock), or from a session of a task of a
+    removed person's conversations (removed_task: fence refuses each call of one, and the record of what the session
+    tried to send keeps no word). `own` is the task of the session itself (context_task): a call that the hub refuses
+    before it knows its task (a tool that the session has not), or that names another task of the agent, is recorded
+    under no task or under that other one, and is still a call of that session. The read and the write are one hold
+    of LOCK, so that no removal commits between them; the caller builds args and detail before it, because a mask of
+    large args takes long and every other call of the hub waits for LOCK."""
     with area("activity"), LOCK:
-        if window is not None and not q1("SELECT 1 FROM conversations WHERE id=?", (window,)):
+        if (window is not None and not q1("SELECT 1 FROM conversations WHERE id=?", (window,))) or \
+                removed_task(tid) or removed_task(own):
             args, detail = "{}", REMOVED_WORDS
         ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail,conversation) VALUES(?,?,?,?,?,?,?,?,?)",
             (now(), agent, tid, attempt, name, args, ok, detail, window))
@@ -38580,8 +39140,10 @@ def call_tool(agent, name, args, context=None):
     sent = dict(args)                   # what the caller wrote, before the fence adds its task_id
     tid, attempt = None, None
     CALL.context = context
-    # the conversation window of this call, from the session's own context (its record keeps it: person_remove)
+    # the conversation window of this call, from the session's own context (its record keeps it: person_remove),
+    # and the task of a task session, whatever task the call names (call_record)
     window = int(context[2]) if conversation_context(agent, context) else None
+    own = context_task(context)
     try:
         conversation = conversation_context(agent, context)
         if conversation:
@@ -38676,7 +39238,7 @@ def call_tool(agent, name, args, context=None):
                             text.split("\n", 1)[0] if name == "read_attachment" else
                             text[:GOOGLE_CALL_KEEP] if name in GOOGLE_READS or name in ("read_knowledge", "repo_read",
                                                                                         "repo_files", "repo_search")
-                            else text, window)
+                            else text, window, own)
                 return text, False
         raise ToolError(f"You have no tool named {name}.")
     except ToolError as e:
@@ -38686,7 +39248,7 @@ def call_tool(agent, name, args, context=None):
         said = mask_secrets(hidden_gone(str(e), agent, name))
         log(agent, f"{name} refused: {said}")
         call_record(agent, tid, attempt, name, 0,
-                    "[blocked]" if secret_hit(json.dumps(args)) else call_record_args(name, args), said, window)
+                    "[blocked]" if secret_hit(json.dumps(args)) else call_record_args(name, args), said, window, own)
         return said, True
     finally:
         CALL.context = None
@@ -58416,7 +58978,7 @@ def task_steer_act(task_id, body, client, via=None, connection=None):
                                  f"Follow it within this task. Your requester ({t['requester']}) has a copy."
                                  + attachment_words(files), t0,
                                  json.dumps({"steer": True, "attempt": t["attempt"]}))).lastrowid
-        event_rows([(t["requester"], "say", filed_under(t["requester"], "say", task_id),
+        event_rows([(t["requester"], "say", filed_about(t["requester"], "say", task_id),
                      f"[hub] The owner steered {tref(task_id)} ({t['title']}, owner {t['owner']})"
                      f"{f' through the app {via}' if via else ''}: {text}" + attachment_names(files), None)], t0)
         sid = DB.execute("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created,connection) "
@@ -64206,6 +64768,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise Refusal(409, f"the account {r['account']} is not in chat_apps")
             with transaction():
                 new = chat_queue("message", r["account"], now(), chat=r["chat"], recipient=r["recipient"],
+                                 person=r["person"] if "person" in r.keys() else None,
                                  text=r["text"], reply_to=r["reply_to"], report=r["report"],
                                  request_id=r["request_id"], again_of=r["id"],
                                  files=r["files"])          # CHAT-APPS.md 20: the words and their files again
@@ -64315,8 +64878,9 @@ class Handler(BaseHTTPRequestHandler):
                 for h in body.get("handles", ()):
                     person_handle_free(h, None)
                 with transaction():
-                    pid = DB.execute("INSERT INTO people(name,role,note,daily,added) VALUES(?,?,?,?,?)",
-                                     (body["name"], body["role"], body.get("note"), body.get("daily"), t0)).lastrowid
+                    pid = DB.execute("INSERT INTO people(id,name,role,note,daily,added) VALUES(?,?,?,?,?,?)",
+                                     (unused_id("people"), body["name"], body["role"], body.get("note"),
+                                      body.get("daily"), t0)).lastrowid
                     for agent in body["agents"]:
                         DB.execute("INSERT INTO person_agents(person,agent,added) VALUES(?,?,?)", (pid, agent, t0))
                     for h in body.get("handles", ()):
@@ -64356,7 +64920,7 @@ class Handler(BaseHTTPRequestHandler):
                     log("owner", line)
             log("owner", f"changed P-{p['id']}: {', '.join(changed) or 'nothing'}")
             return {"person": person_view(q1("SELECT * FROM people WHERE id=?", (p["id"],)), t0), "changed": changed}
-        return self.ui_command("people", read, act)
+        return self.ui_command("people", read, act, keep=removed_receipt)
 
     def ui_person_handles(self, pid):
         """POST /ui/people/<id>/handles: the owner adds one chat handle to a person, or removes one. A handle belongs
@@ -64665,8 +65229,14 @@ class Handler(BaseHTTPRequestHandler):
         task = q1("SELECT * FROM tasks WHERE id=?", (tid,))
         if not task:
             raise ToolError("No such task.")
-        fence(agent or task["owner"], tid, (generation, tref(tid), attempt))
         key = (generation, tid, task["attempt"])
+        try:
+            fence(agent or task["owner"], tid, (generation, tref(tid), attempt))
+        except ToolError as e:
+            if str(e) != REMOVED_STOP:
+                raise
+            DESKTOP.drop(key)       # a task of a removed person's conversation: its view ends as any ended task's
+            raise ToolError("Desktop viewing is stopped for this task.") from None
         owner = agents().get(task["owner"]) or {}
         browser = task["needs"] == "browser" and ("screen" in owner.get("can", []) or
                                                   server_kind_of(TEAM, owner.get("machine")) == "mac")
@@ -67081,6 +67651,7 @@ class Handler(BaseHTTPRequestHandler):
         request can have gone out. A job that already has an unknown outcome stays unknown after a refusal: that
         refusal is about a second question, not about the request. Called with LOCK held."""
         status = f.get("status")
+        gone = removed_task(row["task"])    # a call of a removed person's task: its answer is not kept (person_remove)
         if ok and not row["released"]:
             return self.json(409, {"error": "this job was not confirmed, so it has no answer"})
         if ok and isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
@@ -67100,7 +67671,8 @@ class Handler(BaseHTTPRequestHandler):
                 (["None of it is kept: it is one run of characters with no space across the cut, and a part of it could "
                   "be part of a login. Ask for less of it."] if not held and answer.strip() and not kept else [])
             q("UPDATE jobs SET ok=1, status=?, response=?, result=?, finished=?, unknown=NULL WHERE id=?",
-              (status, kept, " ".join([f"HTTP {status}."] + notes), now(), row["id"]))
+              (status, REMOVED_WORDS if gone and kept is not None else kept, " ".join([f"HTTP {status}."] + notes),
+               now(), row["id"]))
             request_settled(row, "done", f"the service answered (HTTP {status})")
             log(agent, f"helper, request job {row['id']}: HTTP {status}")
             if (row["target"] or "").startswith("mint:") and f.get("minted") is False and 400 <= status <= 499 \
@@ -67149,6 +67721,12 @@ class Handler(BaseHTTPRequestHandler):
             last = q1("SELECT COALESCE(MAX(seq),0) m FROM thread_events WHERE task=? AND attempt=? AND session=?", key)["m"]
             before = turn_state(tid, attempt)
             state = turn_records(before, session, records, now())
+            # a task of a removed person's conversation: what its session still sends is kept with no word, as
+            # person_remove left the records that were there (removed_record, removed_turn), and the turn-end check
+            # below reads the state with no word too
+            gone = removed_task(tid)
+            if gone:
+                state = json.loads(removed_turn(json.dumps(state)))
             with area("activity"), committed():         # thread records: the apps read them on their own clock
                 if state != before:
                     DB.execute("UPDATE attempts SET turn=? WHERE task=? AND attempt=?", (json.dumps(state), tid, attempt))
@@ -67166,8 +67744,11 @@ class Handler(BaseHTTPRequestHandler):
                         failed, error = ((seq, error) if data["stop_reason"] == "error" else failed), None
                     # Every record is kept, however long the attempt (AUTONOMY.md P6): the cap of 5,000 and its
                     # `truncated` marker are gone, and a marker an older release wrote stays where it is.
+                    kept = json.dumps(data)
                     if DB.execute("INSERT OR IGNORE INTO thread_events(task,attempt,session,seq,ts,type,data,created) "
-                                  "VALUES(?,?,?,?,?,?,?,?)", (*key, seq, ts, kind, json.dumps(data), now())).rowcount:
+                                  "VALUES(?,?,?,?,?,?,?,?)",
+                                  (*key, seq, ts, kind, removed_record(kept) if gone and kind != "session" else kept,
+                                   now())).rowcount:
                         stored += 1
             last = max([last] + [e["seq"] for e in events if isinstance(e, dict) and isinstance(e.get("seq"), int)
                                  and not isinstance(e["seq"], bool)])      # skipped records count as taken
@@ -67781,6 +68362,9 @@ def main():
     DB.row_factory = sqlite3.Row
     schema_problems = build_schema()        # it raises nothing: a hub that cannot start cannot be reached
     walled, unwalled = wal_on()             # a read of the state reads its own moment, without LOCK (state_moment)
+    if not secure_delete_on():              # cleared text is written over on the disk (person_remove)
+        print("WARNING: SQLite did not turn secure_delete on: text that the hub clears can stay in the records' file.",
+              flush=True)
     if walled:
         readers_for(os.path.abspath(db_path))
     try:

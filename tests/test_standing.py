@@ -543,14 +543,62 @@ class Ending(Base):
         code, data = self.owner("/ui/people", {"id": maria, "blocked": True})
         self.assertEqual(code, 200, data)
         self.assertEqual(self.item(1)["ended_why"], "Maria is blocked")
-        lucas = self.person("Lucas")
+        lucas = self.person("Lucas", agents=("hand", "deep"))
+        second = self.new_task("hand", title="Another ticket")      # a session of the agent that is told of the item
         self.keep(words="drafts go to Lucas first",
                   source=f"CM-{self.person_says(self.conversation(lucas), 'drafts go to Lucas first')}")
-        lines = self.lines()
+        self.assertIn("drafts go to Lucas first", self.lines()[-1])     # the owner's line about a person's item
+        self.assertIn("drafts go to Lucas first", self.said("hand", second)[-1])
+        # ... a target of his, and an item of his that the owner ended in the app, whose receipt the hub keeps
+        deep = self.conversation(lucas, "deep")
+        self.ok("deep", "set_target", measure="drafts that Lucas accepts, of 10", number=9, how="the sheet of Lucas",
+                scope="agent", words="Lucas wants 9 of 10 drafts accepted",
+                source=f"CM-{self.person_says(deep, 'Lucas wants 9 of 10 drafts accepted')}")
+        self.assertIn("I-4 stands as: Lucas wants", self.ok("deep", "set_target", id="I-4", progress=4))
+        self.keep(who="deep", words="Lucas reads each invoice",
+                  source=f"CM-{self.person_says(deep, 'Lucas reads each invoice')}")
+        self.assertEqual(self.owner("/ui/standing/5/end", {"why": "he is on leave"})[0], 200)
+        # the session's own record of the call that kept his first item, and the fleet manager's end of his target
+        kept = hub.q1("SELECT * FROM calls WHERE name='keep_instruction' AND detail LIKE 'Kept as I-3.%'")
+        for seq, kind, data in ((1, "tool_call", {"title": "fleet: keep_instruction: drafts go to Lucas first",
+                                                 "kind": "other", "server": "fleet"}),
+                                (2, "tool_call_update", {"output": kept["detail"]})):
+            hub.ins("INSERT INTO thread_events(task,attempt,session,seq,ts,type,data,created) "
+                    "VALUES(?,1,'s',?,?,?,?,?)",
+                    (kept["task"], seq, self.clock, kind, json.dumps(dict(data, tool_call_id="c1", status="completed")),
+                     self.clock))
+        # his agent ends his target as he asks, and the fleet manager's later call reads who asked: both name him
+        asked = self.person_says(deep, "Please end my drafts target")
+        self.assertIn("as Lucas asked", self.ok("deep", "end_standing", id="I-4", why="the drafts are done",
+                                                asked_by=f"CM-{asked}"))
+        self.assertIn("as Lucas asked", self.ok("manager", "end_standing", id="I-4", why="the drafts are done"))
+        hub.history_catch_up(60)
         code, data = self.owner("/ui/people", {"id": lucas, "delete": True})
         self.assertEqual(code, 200, data)
-        self.assertEqual((self.item(3)["ended_by"], self.item(3)["ended_why"]), ("owner", "Lucas was removed"))
-        self.assertEqual(self.lines(), lines)
+        # Owner API 1.232: the item stays, ended, with none of the removed person's words, and neither the reason of
+        # its end, its notices in the agent's task, the owner's line about it nor the history holds them or the name
+        gone = self.item(3)
+        self.assertEqual((gone["ended_by"], gone["ended_why"], gone["words"], gone["author"]),
+                         ("owner", hub.REMOVED_GIVER, hub.REMOVED_WORDS, f"P-{lucas}"))
+        target = self.item(4)
+        self.assertEqual((target["kind"], target["number"], target["words"], target["measure"], target["how"],
+                          target["ended_why"]),
+                         ("target", 9, hub.REMOVED_WORDS, hub.REMOVED_WORDS, hub.REMOVED_WORDS, hub.REMOVED_WORDS))
+        self.assertEqual((self.item(5)["words"], self.item(5)["ended_why"]), (hub.REMOVED_WORDS, hub.REMOVED_WORDS))
+        notices = self.said("hand", second)
+        self.assertEqual(notices[0], hub.REMOVED_WORDS)             # the notice of the item stays, with no word
+        self.assertIn("Standing item I-3 ended (the person who gave it was removed)", notices[-1])
+        self.assertEqual(len(notices), 2)
+        hub.history_catch_up(60)
+        kept = notices + self.lines() + [r["what"] for r in hub.q("SELECT what FROM log")] + \
+            [r["text"] or "" for r in hub.q("SELECT text FROM history")] + \
+            [f"{r['body']} {r['result']}" for r in hub.q("SELECT body, result FROM ui_controls")] + \
+            [r["text"] for r in hub.q("SELECT text FROM events")] + \
+            [f"{r['args']} {r['detail']}" for r in hub.q("SELECT args, detail FROM calls")] + \
+            [r["receipt"] for r in hub.q("SELECT receipt FROM tool_commands")] + \
+            [r["data"] for r in hub.q("SELECT data FROM thread_events")]
+        self.assertEqual([w for w in ("Lucas", "drafts go to", "invoice") if w in " ".join(kept)], [])
+        self.assertIn("refunds go to Maria", " ".join(kept))        # another person's item keeps its words
 
 
 class Targets(Base):

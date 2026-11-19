@@ -12,6 +12,7 @@ did not write it would leave the new machine with a stranger's team. Nothing her
 call is made.
 """
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -286,6 +287,25 @@ class Copy(Fixture):
             self.addCleanup(copy.close)
             copy.deserialize(records)
             self.assertEqual(copy.execute("SELECT title FROM tasks").fetchone()[0], "Write the October report")
+
+    def test_a_copy_made_after_text_was_cleared_does_not_hold_it(self):
+        """A person's removal clears their words where they stand and deletes their messages (hub.person_remove), and
+        SQLite leaves cleared text in the pages of its file unless secure_delete is on. A copy of the records has
+        those pages as they are. So the hub turns the setting on at its start (hub.secure_delete_on), whatever its
+        build of SQLite does by itself: a copy that the owner saves after a removal holds none of the removed words."""
+        def copy_after_clearing(marker):
+            ids = [hub.ins("INSERT INTO notes(task,agent,ts,text) VALUES(1,'vps',?,?)", (hub.now(), "x" * 300 + marker))
+                   for _ in range(2)]
+            hub.q("UPDATE notes SET text='cleared' WHERE id=?", (ids[0],))
+            hub.q("DELETE FROM notes WHERE id=?", (ids[1],))
+            code, _headers, data = self.download()
+            self.assertEqual(code, 200)
+            return zipfile.ZipFile(io.BytesIO(data)).read("fleet.sqlite3")
+        hub.DB.execute("PRAGMA secure_delete=OFF")
+        self.assertIn(b"Calle-Zafiro-7781", copy_after_clearing("Calle-Zafiro-7781"))      # SQLite, left to itself
+        self.assertTrue(hub.secure_delete_on())
+        self.assertNotIn(b"Calle-Zafiro-9431", copy_after_clearing("Calle-Zafiro-9431"))
+        self.assertIn("secure_delete_on()", inspect.getsource(hub.main))    # each start of the hub turns it on
 
     def test_a_copy_whose_records_say_wal_mode_is_read_too(self):
         """Records with the header of WAL mode in a copy (a hub's file put in a zip by hand) pass the check of a

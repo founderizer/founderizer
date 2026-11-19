@@ -3,10 +3,12 @@ contacts.v2 on, and the fleet exactly as before with it off. An in-process hub w
 repository (test_people's fixture), and the helper with tmux, the hub and the windows as stand-ins: no bridge, no
 platform, no model, no runtime and no live hub."""
 import ast
+import datetime
 import inspect
 import json
 import re
 import shlex
+import sqlite3
 import tempfile
 import textwrap
 import unittest
@@ -871,11 +873,37 @@ class Conversations(Base):
         work = hub.q1("SELECT * FROM tasks WHERE source_conversation=? AND source_message IS NULL", (cid,))
         self.person("Kim", "manager", KIM, app="discord")           # and a task of the agent waits for Kim
         tid, here = self.normal_task(title="Plan the refunds")
+        # ... after her answer to an earlier message of it, which went into that task word for word
+        self.ok("message_contact", here, person="Kim", text="May I refund order 7781?", request_id=str(uuid.uuid4()),
+                waits=True)
+        self.assertEqual(self.inbound(text="Yes, 7781 goes back to my card.", account="discord-studio", sender=KIM,
+                                      chat="dm-9")[0], "stored")
+        self.assertIn("7781 goes back", self.ok("read_messages", here))
+        # the session's own records of that read: the call, and its answer
+        read = hub.q1("SELECT detail FROM calls WHERE task=? AND name='read_messages'", (tid,))["detail"]
+        for seq, kind, data in ((1, "tool_call", {"title": "fleet: read_messages", "kind": "read", "server": "fleet"}),
+                                (2, "tool_call_update", {"output": read}),
+                                (3, "agent_message", {"text": "I plan the refund."})):
+            hub.ins("INSERT INTO thread_events(task,attempt,session,seq,ts,type,data,created) "
+                    "VALUES(?,1,'s',?,?,?,?,?)",
+                    (tid, seq, hub.now(), kind, json.dumps(dict(data, tool_call_id="c1", status="completed")
+                                                           if kind != "agent_message" else data), hub.now()))
+        self.ok("report_progress", here, note="The refund is planned.")
+        # ... and the window of another person asked Kim for that person, and read her answer there
+        pcid = self.says(PAT, "Is order 7781 paid? Ask Kim.")["conversation"]
+        hub.conversation_start("studio", pcid)
+        self.ok("read_messages", self.context(pcid))
+        self.ok("message_contact", self.context(pcid), person="Kim", text="Is order 7781 paid?",
+                request_id=str(uuid.uuid4()), waits=True)
+        self.assertEqual(self.inbound(text="Order 7781 is paid.", account="discord-studio", sender=KIM,
+                                      chat="dm-9")[0], "stored")
+        self.assertIn("7781 is paid", self.ok("read_messages", self.context(pcid)))
         self.ok("message_contact", here, person="Kim", text="May I go on?", request_id=str(uuid.uuid4()), waits=True)
         top = [hub.q1(f"SELECT MAX(id) n FROM {table}")["n"] for table in ("conversations", "conversation_messages")]
         hub.history_catch_up(60)                    # the history's cursor stands at the highest message
-        for name in ("Ana", "Kim"):
-            code, data = self.change(hub.q1("SELECT id FROM people WHERE name=?", (name,))["id"], delete=True)
+        gone = [hub.q1("SELECT id FROM people WHERE name=?", (name,))["id"] for name in ("Ana", "Kim")]
+        for pid in gone:
+            code, data = self.change(pid, delete=True)
             self.assertEqual(code, 200, data)
         ended = self.task(work["id"])
         self.assertEqual((ended["state"], ended["what"]), ("canceled", f"Canceled: {hub.REMOVED_REASON}"))
@@ -884,9 +912,32 @@ class Conversations(Base):
         self.assertEqual((waiting["state"], waiting["waiting_on"]), ("working", None))
         told = hub.q1("SELECT text FROM events WHERE task=? AND kind='say' ORDER BY id DESC LIMIT 1", (tid,))["text"]
         self.assertIn("No answer to your CM-", told)
-        self.assertIn("comes from Kim now: they were removed. Go on without it.", told)
+        self.assertIn("comes now: the person whom you asked was removed. Go on without it.", told)
+        # Owner API 1.232: what passed between Kim and that task leaves it (her answer, the agent's messages to her,
+        # the read that gave her answer out, in the calls record and in the session's own, and the receipts), and no
+        # line of the removal names her. The task is not hers, so everything else of it stays.
+        passed = [r["text"] for r in hub.q("SELECT text FROM events WHERE task=? AND kind='say'", (tid,))]
+        passed += [f"{r['args']} {r['detail']}" for r in hub.q("SELECT args, detail FROM calls WHERE task=?", (tid,))]
+        passed += [r["receipt"] for r in hub.q("SELECT receipt FROM tool_commands")]
+        passed += [r["data"] for r in hub.q("SELECT data FROM thread_events WHERE task=?", (tid,))]
+        self.assertEqual([w for w in ("Kim", "7781", "May I go on") if w in " ".join(passed)], [])
+        self.assertIn("The refund is planned.", " ".join(passed))               # its own progress note's call
+        self.assertIn("I plan the refund.", " ".join(passed))                   # and what its session said itself
+        self.assertEqual(json.loads(hub.q1("SELECT data FROM thread_events WHERE task=? AND seq=1", (tid,))["data"]),
+                         {"tool_call_id": "c1", "kind": "read", "status": "completed", "server": "fleet",
+                          "title": hub.REMOVED_WORDS})                          # the call itself, with its answer
+        # the window of the other person keeps its own calls, but the message to Kim and the read of her answer
+        window = [(r["name"], r["detail"]) for r in hub.q("SELECT name, detail FROM calls WHERE conversation=? "
+                                                          "ORDER BY id", (pcid,))]
+        self.assertEqual([(name, detail == hub.REMOVED_WORDS) for name, detail in window],
+                         [("read_messages", False), ("message_contact", True), ("read_messages", True)])
+        self.assertEqual((waiting["title"], hub.q1("SELECT text FROM notes WHERE task=?", (tid,))["text"]),
+                         ("Plan the refunds", "The refund is planned."))
         # the next person's conversation and messages take new numbers, and nothing of a removed one reaches them
-        self.person("Bea", "customer", BEA)
+        # the agent's first words to Kim on Discord, the notice that it is an agent, is no reply: only the key finds it
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM chat_out WHERE recipient=? OR chat='dm-9'", (KIM,))["n"], 0)
+        bea = self.person("Bea", "customer", BEA)
+        self.assertGreater(bea["id"], max(gone))        # nor does a person's own number: kept records name it
         said = self.says(BEA, "Hello")
         self.assertGreater(said["conversation"], top[0])
         self.assertGreater(said["id"], top[1])
@@ -980,6 +1031,7 @@ class Conversations(Base):
         self.ok("read_messages", self.context(cid))
         self.ok("ask_team", self.context(cid), question="My card ends 4242 and I live at Calle Zafiro 7, refund me")
         work = hub.q1("SELECT * FROM tasks WHERE source_conversation=? AND source_message IS NULL", (cid,))
+        ana = hub.q1("SELECT id FROM people WHERE name='Ana'")["id"]
         self.ok("report_progress", ("test-generation", hub.tref(work["id"]), "1"), note="Card 4242 on Calle Zafiro.")
         # owner feature jobs: the plain words of a result and the name of a job can say the person's words too
         hub.q("UPDATE tasks SET plain='The refund for Calle Zafiro is sent.', job_name='Refund for Zafiro' WHERE id=?",
@@ -1018,22 +1070,189 @@ class Conversations(Base):
         for sender, preview in ((ANA, "Calle Zafiro 7"), ("77001@lid", "Zafiro"), (BEA, "Good day from Bea")):
             hub.ins("INSERT INTO chat_ignored(account,sender,preview,ts) VALUES('whatsapp-studio',?,?,?)",
                     (sender, preview, t0))
-        self.assertEqual(self.change(hub.q1("SELECT id FROM people WHERE name='Ana'")["id"], delete=True)[0], 200)
+        # Owner API 1.232. The parts of her task, which a lead gave on in that task's session, at two depths:
+        asked = {"details": "Card 4242.", "done_when": "found", "needs": "none", "goal": None, "goal_id": None,
+                 "follows": None, "case_id": None}
+        with hub.LOCK, hub.transaction():
+            part = hub.admit_task("studio", dict(asked, owner="vps", title="Find the payment of Calle Zafiro",
+                                                 parent=w))
+        with hub.LOCK, hub.transaction():
+            deep = hub.admit_task("vps", dict(asked, owner="grok", title="Zafiro once more", parent=part,
+                                              goal="The refund of Calle Zafiro"))
+        self.ok("report_progress", ("test-generation", hub.tref(part), "1"), "vps", note="Zafiro 7 paid with 4242.")
+        hub.q("UPDATE tasks SET state='completed' WHERE id=?", (part,))    # an open part below one that is not open
+        for n in range(10):                 # and more parts than one statement of the removal names (ID_LIST, below)
+            with hub.LOCK, hub.transaction():
+                hub.admit_task("studio", dict(asked, owner="vps", title=f"Zafiro, part {n}", parent=w))
+        # ... what her task's session said last and does now, the note of its reminder, and an API call of it:
+        hub.q("UPDATE attempts SET turn=? WHERE task=? AND attempt=1", (json.dumps(
+            {"session": f"s{w}", "seq": 3, "turns": 1, "running": True, "how": None, "at": t0,
+             "calls": {"c1": ["Shell: refund 4242", t0, False]}, "said": "The refund goes to Calle Zafiro.",
+             "doing": "Refunding card 4242"}), w))
+        hub.ins("INSERT INTO reminders(due,note,agent,task,created) VALUES(?,'Ask Calle Zafiro again','studio',?,?)",
+                (t0 + 3600, w, t0))
+        api = ("INSERT INTO jobs(agent,task,kind,login,target,created,request_id,attempt,method,path,body,auth,headers,"
+               "ok,status,response,result,released,finished) VALUES('studio',?,'request','bws://x','',?,?,1,'POST',"
+               "'/refunds?card=4242','{\"street\": \"Calle Zafiro\"}','bearer','{\"X-Card\": \"4242\"}',?,?,?,?,?,?)")
+        job = hub.ins(api, (w, t0, str(uuid.uuid4()), 1, 200, "refunded 4242", "HTTP 200.", t0, t0))
+        # ... one that the vault sends at the removal, and one that it has not asked for yet
+        sending = hub.ins(api, (w, t0, str(uuid.uuid4()), None, None, None, None, t0, None))
+        waiting = hub.ins(api, (w, t0, str(uuid.uuid4()), None, None, None, None, None, None))
+        # ... the owner's hold of her task with a note, and a report of its session to its line, with its receipt
+        hold = hub.ins("INSERT INTO holds(task,kind,by,note,state,created,attempt,detail) VALUES(?,'pause','owner',"
+                       "'Wait for Calle Zafiro','released',?,1,'processes of the task still run: 7 refund --card "
+                       "4242')", (w, t0))
+        hub.ins("INSERT INTO restart_holds(hold,by,reason,created,state) VALUES(?,'desk','Calle Zafiro was wrong',?,"
+                "'done')", (hold, t0))
+        # ... and two questions of its session with the same words, which the hub tells the manager as a circle
+        for _ in range(2):
+            hub.ins("INSERT INTO questions(task,asker,requester,text,asked,access) VALUES(?,'studio','desk','Which "
+                    "card of Calle Zafiro?',?,'gmail:Zafiro@example.com')", (w, t0))
+        self.assertTrue([one for one in hub.circles(hub.now()) if one[0].startswith("question:")])
+        reported = str(uuid.uuid4()).upper()            # as uuidgen prints one: the hub keeps it in lower case
+        self.ok("report_up", ("test-generation", hub.tref(w), "1"), kind="risk", text="The bank may refuse it.",
+                request_id=reported)
+        # ... and the receipt of a mail that its session sent, whose other values other flows read
+        mailed = str(uuid.uuid4())
+        hub.ins("INSERT INTO tool_commands(agent,request_id,tool,digest,receipt,created) VALUES('studio',?,"
+                "'gmail_send','d',?,?)", (mailed, json.dumps({"text": "Sent to Calle Zafiro.", "state": "sent",
+                                                               "account": "shop@example.com"}), t0))
+        hub.ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,'studio',?,1,'gmail_send',?,1,"
+                "'Sent.')", (t0, w, json.dumps({"request_id": mailed})))
+        # ... a message of her task's session to another person, which is a line of that person's conversation
+        self.ok("message_contact", ("test-generation", hub.tref(w), "1"), person="Pat", request_id=str(uuid.uuid4()),
+                text="Do refunds take a week?")
+        asked = hub.q1("SELECT id FROM conversation_messages WHERE who='agent' AND task=?", (w,))["id"]
+        # ... a lead's line about her task, which the lead reads in a task of its own (filed_under), beside a line
+        # of that task itself: the owner's steer of her task, as its requester is told of it
+        hub.TEAM["agents"]["desk"] = {"role": "lead", "runtime": "claude", "machine": "hub", "can": []}
+        batch = self.normal_task(owner="desk", title="The results of the team")[0]
+        hub.q("UPDATE tasks SET requester='desk', parent=? WHERE id=?", (batch, w))
+        steer = self.command(text="Send it to Calle Zafiro 7.")     # the owner's command, which the hub keeps too
+        self.assertEqual(self.request(f"/ui/tasks/{w}/steer", steer)[0], 200)
+        hub.emit("desk", "say", "[hub] Result for her task from studio: the refund to Calle Zafiro is sent.", task=w)
+        hub.emit("desk", "say", "[hub] The day of the team is planned.", task=batch)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM events WHERE agent='desk' AND task=? AND about=? AND "
+                                "text LIKE '%Zafiro%'", (batch, w))["n"], 2)
+        # ... and the line of a report of her task's session, which has the report's own key (the report stays)
+        line = hub.ins(hub.EVENT, ("desk", "say", batch, "[hub] Report UP-9 from studio: That street floods.", t0,
+                                   "{}"))
+        hub.ins("INSERT INTO reports(from_agent,from_task,to_agent,kind,text,severity,delivered,created,request_id,"
+                "event_id) VALUES('studio',?,'desk','risk','That street floods.','now','now',?,?,?)",
+                (w, t0, str(uuid.uuid4()), line))
+        # ... and the owner's change of her, with a note; a pause of her conversation, whose receipt has her newest
+        # message; the outcome of her task that the owner settled; and her reminder, which the owner paused
+        noted = dict(self.command(), id=ana, note="Lives at Calle Zafiro 7.")
+        noted.pop("text")
+        self.assertEqual(self.request("/ui/people", noted)[0], 200)
+        commands = {f"/ui/conversations/{cid}": {"action": "pause"},
+                    f"/ui/tasks/{w}/control": {"action": "pause", "note": "Wait for Calle Zafiro."},
+                    "/ui/outcomes/%d" % hub.q1("SELECT id FROM outcomes WHERE task=?", (w,))["id"]:
+                        {"finding": "done", "note": "Calle Zafiro has the refund."}}
+        reminded = str(uuid.uuid4())
+        tomorrow = (datetime.datetime.now(hub.goal_settings()[2]) + datetime.timedelta(days=1)).strftime(
+            "%Y-%m-%dT10:00")
+        self.ok("remind", self.context(cid), request_id=reminded, text="Bring the card 4242 to the shop.",
+                schedule={"kind": "once", "at": tomorrow})
+        rule = hub.q1("SELECT id, revision FROM triggers ORDER BY id DESC LIMIT 1")
+        commands[f"/ui/triggers/{rule['id']}/state"] = {"base_revision": rule["revision"], "action": "pause"}
+        for path, body in commands.items():
+            body.update(request_id=str(uuid.uuid4()), db="test-generation")
+            self.assertEqual(self.request(path, body)[0], 200, path)
+        self.assertEqual(self.request(f"/ui/conversations/{cid}", {"action": "resume", "db": "test-generation",
+                                                                    "request_id": str(uuid.uuid4())})[0], 200)
+        kept = " ".join(f"{r['body']} {r['result']}" for r in hub.q("SELECT body, result FROM ui_controls"))
+        self.assertEqual([word for word in ("Hello", "Zafiro", "4242", "Ana") if word not in kept], [])
+        # ... two cards of her conversation from before contacts.v2 (ask_owner), which the owner and she answered:
+        for by, answer in ((None, "Yes, refund it."), (f"P-{ana} Ana", "Refund my card 4242")):
+            hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,conversation,answer,answered,answered_by) "
+                    "VALUES('Studio asks you, for Ana (customer)','Does the refund go to Calle Zafiro 7?','Answer "
+                    "here, and Studio tells Ana.',?,'studio','question',?,?,?,?)", (t0, cid, answer, t0, by))
+        told = hub.ins(hub.EVENT, ("owner", "notify", None, "Needs you: Studio asks you, for Ana (customer)", t0, "{}"))
+        hub.history_catch_up(60)            # the history has the parts, the lines and both rows of each message
+        gone = dict(self.command(), id=ana, delete=True)
+        gone.pop("text")
+        # A person of many messages has more tasks than SQLite takes values in one statement, so no statement of the
+        # removal names them all (hub.ID_LIST): here 5 at a time, on a connection that takes 20 values
+        self.assertTrue(hasattr(hub.DB, "setlimit"), "this check needs Python 3.11 or later")
+        limit = hub.DB.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 20)
+        try:
+            with patch.object(hub, "ID_LIST", 5):
+                code, receipt = self.request("/ui/people", gone)
+        finally:
+            if limit:
+                hub.DB.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, limit)
+        self.assertEqual((code, receipt.get("person")), (200, {"id": ana, "name": "Ana"}), receipt)
+        # the receipt that the hub keeps has no name: a repeat of the command answers with it
+        self.assertEqual(self.request("/ui/people", gone)[1]["person"], {"id": ana})
+        # each other command of the owner about her keeps its row and none of its words: its repeat is refused
+        self.assertEqual([self.request(path, body)[0] for path, body in [("/ui/people", noted),
+                                                                         (f"/ui/tasks/{w}/steer", steer)] +
+                          list(commands.items())], [409] * (2 + len(commands)))
         hub.history_catch_up(60)
         self.assertNotIn(hub.tref(work["id"]), self.ok("search_history", self.context(pcid), query="Zafiro"))
         indexed = " ".join(r["text"] or "" for r in hub.q("SELECT text FROM history WHERE task=? OR text LIKE "
                                                           "'%Zafiro%'", (work["id"],)))
         self.assertEqual([w for w in ("Zafiro", "4242", "Ana") if w in indexed], [])      # its cancel, and no more
         row = self.task(work["id"])
-        kept = " ".join(str(row[k]) for k in ("title", "details", "done_when", "why", "what", "plain", "job_name"))
-        kept += " ".join(r["text"] for r in hub.q("SELECT text FROM notes WHERE task=?", (work["id"],)))
+        kept = " ".join(str(t[k]) for t in hub.q("SELECT * FROM tasks WHERE owner<>'desk'")
+                        for k in ("title", "details", "done_when", "why", "what", "plain", "job_name", "goal"))
+        kept += " ".join(r["text"] for r in hub.q("SELECT text FROM notes"))
         self.assertEqual([w for w in ("Zafiro", "4242", "Ana") if w in kept], [])
         self.assertIn(hub.REMOVED_WORDS, row["details"])
+        # the parts keep their place in the records, and each open one ended: also the one below a part that was done
+        self.assertEqual([(t["title"], t["state"], t["parent"]) for t in map(self.task, (part, deep))],
+                         [(hub.REMOVED_TITLE, "completed", w), (hub.REMOVED_TITLE, "canceled", part)])
+        self.assertEqual(hub.q1(f"SELECT COUNT(*) n FROM tasks WHERE parent=? AND {hub.OPEN_TASK}", (w,))["n"], 0)
         tid, here = self.normal_task()
         self.assertNotIn("Zafiro", self.ok("see_earlier_work", here, mine=True, task=hub.tref(work["id"])))
         # a call of her window that ends after the removal (one in flight, or a reply that its fence refuses now)
         # writes its record cleared, since the removal cleared that window's calls before it
         self.assertTrue(self.tool("reply", self.context(cid), text="Refund on card 4242 sent to Calle Zafiro 7.")[1])
+        # ... and so does a session of her task or of a part of it, which is told to stop: its link to her
+        # conversation went with the conversation, and before owner API 1.232 its record kept what it sent
+        for task, agent in ((w, "studio"), (part, "vps")):
+            self.assertEqual(self.tool("report_progress", ("test-generation", hub.tref(task), "1"), agent,
+                                       note="Card 4242 on Calle Zafiro."), (hub.REMOVED_STOP, True))
+        with self.assertRaisesRegex(hub.ToolError, "^Desktop viewing is stopped for this task.$"):
+            hub.Handler.desktop_task(None, hub.tref(w), "test-generation", 1)       # the owner's view of its screen
+        # ... also a call that the hub refuses before it knows its task, or that names another task of the agent
+        other = self.normal_task(title="Count the stock")[0]
+        for name, args in (("no_such_tool", {"note": "Card 4242."}),
+                           ("report_progress", {"note": "Calle Zafiro.", "task_id": hub.tref(other)})):
+            self.assertTrue(self.tool(name, ("test-generation", hub.tref(w), "1"), **args)[1])
+        # what its session said last and does now went at the removal, and its counts stay
+        turn = hub.turn_state(w, 1)
+        self.assertEqual((turn["session"], turn["seq"], turn["turns"], turn["said"], turn["doing"], turn["calls"]),
+                         (f"s{w}", 3, 1, hub.REMOVED_WORDS, None, {"c1": [hub.REMOVED_WORDS, t0, False]}))
+        # ... and the session records that its helper sends after the removal are kept with no word
+        late = [{"seq": 11, "ts": hub.now(), "type": "agent_message", "text": "The refund to Calle Zafiro 7 is sent."},
+                {"seq": 12, "ts": hub.now(), "type": "tool_call", "tool_call_id": "c9", "status": "in_progress",
+                 "kind": "execute", "title": "Shell: refund 4242"}]
+        code, data = self.request("/helper/events/studio", {"generation": "test-generation", "task": hub.tref(w),
+                                                            "attempt": 1, "session": SESSION, "events": late},
+                                  source="127.0.0.3")
+        self.assertEqual((code, data["stored"]), (200, 2))
+        self.assertEqual(json.loads(hub.q1("SELECT data FROM thread_events WHERE session=? AND seq=12",
+                                           (SESSION,))["data"]),
+                         {"tool_call_id": "c9", "kind": "execute", "status": "in_progress", "server": None,
+                          "title": hub.REMOVED_WORDS})
+        # ... and so is the answer of the API call that the vault was sending; the one that waited was never sent
+        code, data = self.request(f"/helper/job/studio/{sending}", {"ok": True, "status": 200,
+                                                                    "body": "refunded 4242 to Calle Zafiro"},
+                                  source="127.0.0.3")
+        self.assertEqual(code, 200, data)
+        self.assertEqual([tuple(r) for r in hub.q("SELECT ok, status, response, result FROM jobs WHERE id IN (?,?) "
+                                                  "ORDER BY id", (sending, waiting))],
+                         [(1, 200, hub.REMOVED_WORDS, "HTTP 200."),
+                          (0, None, None, f"The request was not sent: {hub.REMOVED_REASON}.")])
+        # ... and what its helper says of the stop that the end of her task asked for, while that call could run
+        stop = hub.q1("SELECT * FROM holds WHERE task=? AND kind='stop' ORDER BY id DESC LIMIT 1", (w,))
+        hub.settle_hold(stop, False, "processes of the task still run: 9 refund --street Zafiro")
+        # the message to Pat stays in Pat's conversation, and in the history, as that conversation's line
+        self.assertEqual((hub.q1("SELECT text FROM conversation_messages WHERE id=?", (asked,))["text"],
+                          hub.q1("SELECT COUNT(*) n FROM history WHERE ref=?", (f"CM-{asked}",))["n"]),
+                         ("Do refunds take a week?", 1))
         # the record of her window's calls, which keep no task (read_messages, ask_team), keeps none of her words;
         # Pat's window keeps his own (his search answer quoted her before the removal, a gap that stays)
         said = [f"{r['args']} {r['detail']}" for r in hub.q("SELECT * FROM calls WHERE name<>'search_history'")]
@@ -1042,14 +1261,68 @@ class Conversations(Base):
         said += [r["text"] for r in hub.q("SELECT text FROM events")]
         said += [r["data"] for r in hub.q("SELECT data FROM thread_events")]
         said += [" ".join(map(str, r)) for table in ("agent_messages", "steers", "outcomes", "prompts", "rules",
-                                                     "chat_ignored") for r in hub.q(f"SELECT * FROM {table}")]
+                                                     "chat_ignored", "attempts", "reminders", "jobs", "needs",
+                                                     "holds", "restart_holds", "questions", "ui_controls")
+                 for r in hub.q(f"SELECT * FROM {table}")]
         self.assertIn("Good day from Bea", " ".join(said))
         self.assertEqual([w for w in ("Zafiro", "4242", "Hello") if w in " ".join(said)], [])
+        # what each of those records is stays: the turn of the late session, the call's method and status, the
+        # lead's own line, and the owner's own answer to her card (hers goes, with her name)
+        turn = hub.turn_state(w, 1)
+        self.assertEqual((turn["session"], turn["seq"], turn["said"], turn["calls"]),
+                         (SESSION, 12, hub.REMOVED_WORDS, {"c9": [hub.REMOVED_WORDS, late[1]["ts"], False]}))
+        self.assertEqual(tuple(hub.q1("SELECT method, status, login, path, response, result FROM jobs WHERE id=?",
+                                      (job,))),
+                         ("POST", 200, "bws://x", hub.REMOVED_WORDS, hub.REMOVED_WORDS, "HTTP 200."))
+        self.assertEqual([r["text"] for r in hub.q("SELECT text FROM events WHERE agent='desk' AND kind='say' AND "
+                                                   "task=? ORDER BY id", (batch,))],
+                         [hub.REMOVED_WORDS, hub.REMOVED_WORDS, "[hub] The day of the team is planned.",
+                          hub.REMOVED_WORDS, hub.REMOVED_WORDS])       # the last: the owner's pause of her task
+        self.assertEqual(hub.q1("SELECT text FROM reports WHERE from_task=? AND event_id=?", (w, line))["text"],
+                         "That street floods.")                     # the agent's own record, which a removal keeps
+        self.assertEqual([json.loads(hub.q1("SELECT receipt FROM tool_commands WHERE request_id=?", (rid,))["receipt"])
+                          for rid in (reported.lower(), mailed)],
+                         [{"text": hub.REMOVED_WORDS},
+                          {"text": hub.REMOVED_WORDS, "state": "sent", "account": "shop@example.com"}])
+        self.assertEqual(json.loads(hub.q1("SELECT receipt FROM tool_commands WHERE request_id=?",
+                                           (reminded,))["receipt"])["text"], hub.REMOVED_WORDS)    # her window's write
+        self.assertEqual([tuple(r) for r in hub.q("SELECT title, why, todo, answer, answered_by FROM needs ORDER BY "
+                                                  "id")],
+                         [(hub.REMOVED_NEED, hub.REMOVED_WORDS, hub.REMOVED_WORDS, "Yes, refund it.", None),
+                          (hub.REMOVED_NEED, hub.REMOVED_WORDS, hub.REMOVED_WORDS, hub.REMOVED_WORDS, f"P-{ana}")])
+        self.assertEqual(hub.q1("SELECT text FROM events WHERE id=?", (told,))["text"],
+                         f"Needs you: {hub.REMOVED_NEED}")
+        # her task's two questions read the same now, and that is no circle for the manager
+        self.assertEqual([one for one in hub.circles(hub.now()) if one[0].startswith("question:")], [])
+        # her number in the chat app, her name and the owner's note leave the records of the messages that came in
+        # and went out and of the owner's own commands about her; Pat's stay, and so does each record itself
+        ids = [" ".join(map(str, r)) for table in ("chat_in", "chat_out", "ui_controls")
+               for r in hub.q(f"SELECT * FROM {table}")]
+        self.assertEqual([w for w in (ANA.split("@")[0], "77001", "Ana") if w in " ".join(ids)], [])
+        self.assertIn(PAT, " ".join(ids))
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM chat_in WHERE chat='' AND sender IS NULL")["n"], 1)
         self.assertTrue(any("Pat asked for today's list." in s for s in said))
         self.assertEqual(hub.q1("SELECT data FROM thread_events WHERE task=? AND seq=1", (work["id"],))["data"],
                          json.dumps({"session_id": f"s{work['id']}"}))
         record = hub.q1("SELECT data FROM thread_events WHERE task=? AND seq=3", (work["id"],))["data"]
         self.assertEqual(json.loads(record), dict(call, title=hub.REMOVED_WORDS))     # a pending fleet call of a subagent
+
+    def test_a_line_that_is_filed_under_another_task_keeps_the_task_that_it_is_about(self):
+        """A lead reads the news of a task of its team in a task of its own (hub.filed_under), and a person's removal
+        finds such a line only by the task that it is about (events.about), which only hub.filed_about gives: emit
+        and each place that writes a requester's line inside a transaction go through it. A new place that files a
+        line with filed_under alone would write a line that no removal clears, and no test of that place would say
+        so. So each function that calls filed_under itself is one of those whose line needs no key: the line goes to
+        the task's own agent (the owner's line of a resume and of a steer, a late permission word, a job's outcome, a
+        reminder), it is about no task (a machine's notices, the door's report), it is about a task that an owner
+        chat opened (start_task), or it has a key of its own (a report: reports.event_id)."""
+        direct = {node.name for node in ast.walk(ast.parse(inspect.getsource(hub)))
+                  if isinstance(node, ast.FunctionDef) and any(
+                      isinstance(c, ast.Call) and getattr(c.func, "id", None) == "filed_under"
+                      for c in ast.walk(node))}
+        self.assertEqual(direct, {"filed_about", "questions_under", "resume_plan", "task_steer_act",
+                                  "late_permission_word", "job_told", "reminder_sweep", "record_status",
+                                  "door_host_report", "t_start_task", "t_report_up"})
 
     def test_a_removed_peers_conversation_task_keeps_no_reply_of_theirs(self):
         """The verifier of 28 October 2026: a conversation task's result is the agent's reply, which can quote the
@@ -1072,11 +1345,113 @@ class Conversations(Base):
                                                                     state, t0, t0, sends[-1])))
         owners = hub.ins("INSERT INTO chat_out(kind,account,chat,text,state,created,updated) VALUES('message',?,'me',"
                          "'Her card ends 4242.','failed',?,?)", (first["account"], t0, t0))
+        # ... and an earlier reply, to the other form of her WhatsApp id, which her conversation no longer has
+        hub.q("UPDATE person_handles SET alias='88002@lid' WHERE handle=?", (PAT,))
+        hub.ins("INSERT INTO chat_out(kind,account,chat,text,state,created,updated,person) VALUES('message',?,"
+                "'88002@lid','Good morning.','sent',?,?,?)", (first["account"], t0, t0, self.pat["id"]))
+        # ... and a message of her conversation from a number that the owner took from her since, with the hub's own
+        # answer to that number: the conversation's record and the bridge's keep the chat app's number of the message
+        old = "34600999000@s.whatsapp.net"
+        hub.ins("INSERT INTO chat_in(account,msg_id,chat,sender,result,created) VALUES(?,'old-1',?,?,'stored',?)",
+                (first["account"], old, old, t0))
+        hub.ins("INSERT INTO conversation_messages(conversation,who,text,created,read_at,msg_id) VALUES(?,'person',"
+                "'From my old number.',?,?,'old-1')", (cid, t0, t0))
+        hub.ins("INSERT INTO chat_out(kind,account,chat,text,state,created,updated,person) VALUES('message',?,?,"
+                "'I can read text only for now.','sent',?,?,?)", (first["account"], old, t0, t0, self.pat["id"]))
+        # ... and a message that the hub refused, from a number that she had then and the owner took from her since:
+        # only the key of the person finds it, and the hub's answer to it
+        pat3 = "34600222555@s.whatsapp.net"
+        hub.ins("INSERT INTO person_handles(app,handle,person,added) VALUES('whatsapp',?,?,?)",
+                (pat3, self.pat["id"], t0))
+        self.assertEqual(self.inbound(text="x" * 4001, account="whatsapp-studio", sender=pat3, chat=pat3)[0],
+                         "stored")
+        hub.q("DELETE FROM person_handles WHERE handle=?", (pat3,))
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM chat_out WHERE chat=? AND person=?",
+                                (pat3, self.pat["id"]))["n"], 1)
+        # ... and one from a number that the owner gave to another person since, who writes from it now: that chat
+        # is hers, and only Pat's own message of it goes
+        hers, mine = "77003@lid", "34600777000@s.whatsapp.net"
+        self.person("Bea", "customer", BEA)
+        said, _ = self.inbound(text="Hello from Bea", account="whatsapp-studio", sender=BEA, chat=hers)
+        self.assertEqual(said, "stored")
+        beas_own = hub.q1("SELECT msg_id FROM chat_in ORDER BY id DESC LIMIT 1")["msg_id"]
+        # ... and one from a number that the owner linked as their own since, where a line for the owner waits
+        hub.q("INSERT INTO owner_handles(app,id,name,linked) VALUES('whatsapp',?,'me',?)", (mine, t0))
+        hub.ins("INSERT INTO chat_out(kind,account,chat,text,state,created,updated) VALUES('message',?,?,"
+                "'Your report is ready.','queued',?,?)", (first["account"], mine, t0, t0))
+        for number, chat in (("old-2", hers), ("old-3", mine)):
+            hub.ins("INSERT INTO chat_in(account,msg_id,chat,sender,result,created) VALUES(?,?,?,?,'stored',?)",
+                    (first["account"], number, chat, chat, t0))
+            hub.ins("INSERT INTO conversation_messages(conversation,who,text,created,read_at,msg_id) VALUES(?,"
+                    "'person','From a number that is not hers now.',?,?,?)", (cid, t0, t0, number))
+        # ... and one from a number that the owner gave since to a person who has no conversation: their message
+        # there and the hub's answer that waits for them stay; and one from Pat's own number before Pat had it
+        given = "34600555000@s.whatsapp.net"
+        hub.ins("INSERT INTO chat_in(account,msg_id,chat,sender,result,created) VALUES(?,'old-4',?,?,'stored',?)",
+                (first["account"], given, given, t0))
+        hub.ins("INSERT INTO conversation_messages(conversation,who,text,created,read_at,msg_id) VALUES(?,'person',"
+                "'From a number that the owner gave to another person.',?,?,'old-4')", (cid, t0, t0))
+        hub.ins("INSERT INTO chat_in(account,msg_id,chat,sender,result,created) VALUES(?,'new-4',?,?,'stored',?)",
+                (first["account"], given, given, t0))
+        hub.ins("INSERT INTO chat_out(kind,account,chat,text,state,created,updated) VALUES('message',?,?,"
+                "'I can read text only for now.','queued',?,?)", (first["account"], given, t0, t0))
+        # ... and a second number of hers, from which somebody else wrote before she had it: no key makes that hers
+        pat2 = "34600222444@s.whatsapp.net"
+        hub.ins("INSERT INTO person_handles(app,handle,person,added) VALUES('whatsapp',?,?,?)",
+                (pat2, self.pat["id"], t0))
+        hub.ins("INSERT INTO chat_in(account,msg_id,chat,sender,result,created) VALUES(?,'before-1',?,?,'stored',?)",
+                (first["account"], pat2, pat2, t0 - 86400))
+        # ... and a number of hers that is also the owner's, from which the owner wrote: the owner's message stays
+        hub.ins("INSERT INTO person_handles(app,handle,person,added) VALUES('whatsapp',?,?,?)",
+                (mine, self.pat["id"], t0))
+        hub.ins("INSERT INTO chat_in(account,msg_id,chat,sender,result,created) VALUES(?,'own-1',?,?,'stored',?)",
+                (first["account"], mine, mine, t0))
+        # ... and a number that the owner gave to Dan, who never wrote from it: what waits for it stays his
+        dan = "34600666000@s.whatsapp.net"
+        self.person("Dan", "customer", dan)
+        hub.ins("INSERT INTO chat_in(account,msg_id,chat,sender,result,created) VALUES(?,'old-5',?,?,'stored',?)",
+                (first["account"], dan, dan, t0))
+        hub.ins("INSERT INTO conversation_messages(conversation,who,text,created,read_at,msg_id) VALUES(?,'person',"
+                "'From the number that Dan has now.',?,?,'old-5')", (cid, t0, t0))
+        hub.ins("INSERT INTO chat_out(kind,account,chat,text,state,created,updated) VALUES('message',?,?,"
+                "'You reached today''s limit. Try again tomorrow.','queued',?,?)", (first["account"], dan, t0, t0))
+        # ... and a message from her alias that no conversation kept, from before the hub kept its person: no key finds
+        # it, so it stays; her wrong link code since then has the key; and her wrong link codes of the hour
+        self.assertEqual(self.inbound(text="link ABCD-EFGH", account="whatsapp-studio", sender=PAT, chat=PAT)[0],
+                         "stored")
+        hub.ins("INSERT INTO chat_in(account,msg_id,chat,sender,result,created) VALUES(?,'refused-1',?,?,'stored',?)",
+                (first["account"], "dm-pat", "88002@lid", t0))
+        for sender, ts in ((PAT, t0), ("88002@lid", t0), ("34600111000@s.whatsapp.net", t0),
+                           (mine, t0),                  # the owner's
+                           (PAT, t0 - 86400)):          # and one of her number from before she had it
+            hub.ins("INSERT INTO link_failures(app,sender,ts) VALUES('whatsapp',?,?)", (sender, ts))
+        # ... and the record of another person's message on another account with the number of one of hers
+        hub.ins("INSERT INTO chat_in(account,msg_id,chat,sender,result,created,person) VALUES('discord-vps','old-1',"
+                "'dm-other','4004','stored',?,?)", (t0, hub.q1("SELECT id FROM people WHERE name='Bea'")["id"]))
+        beas = [tuple(r) for r in hub.q("SELECT id, state, chat, text FROM chat_out WHERE chat IN (?,?,?,?) ORDER BY "
+                                        "id", (hers, mine, given, dan))]
+        self.assertEqual([b[1] for b in beas], ["queued"] * 4)    # Bea's notice, the owner's line, theirs, Dan's
         self.assertEqual(self.change(self.pat["id"], delete=True)[0], 200)
         self.assertEqual([r["id"] for r in hub.q("SELECT id FROM chat_out WHERE text LIKE '%4242%'")], [owners])
         self.assertEqual(tuple(hub.q1("SELECT state, error FROM chat_out WHERE id=?", (sends[3],))),
                          ("failed", hub.REMOVED_SEND))
+        # Owner API 1.232: nor does the typing or the read signal that waited for that chat, and no record of what came
+        # in from Pat or went out to Pat keeps Pat's number in the chat app; the owner's own item keeps its chat
+        self.assertEqual([tuple(r) for r in hub.q("SELECT id, state, chat, text FROM chat_out WHERE state='queued' "
+                                                  "ORDER BY id")], beas)        # what waits for them still waits
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM chat_out WHERE kind<>'message' AND state<>'expired'")["n"], 0)
         self.assertNotIn(sends[3], [i["id"] for i in hub.chat_give(hub.now())])     # the reply that waited never goes
+        self.assertEqual([r["id"] for r in hub.q("SELECT id FROM chat_out WHERE chat IS NOT NULL ORDER BY id")],
+                         sorted([owners] + [b[0] for b in beas]))
+        self.assertEqual({r["msg_id"]: (r["chat"], r["sender"]) for r in hub.q("SELECT * FROM chat_in WHERE "
+                                                                                 "account<>'discord-vps'")
+                          if r["chat"] or r["sender"]},
+                         {beas_own: (hers, BEA), "new-4": (given, given), "before-1": (pat2, pat2),
+                          "own-1": (mine, mine), "refused-1": ("dm-pat", "88002@lid")})
+        self.assertEqual(tuple(hub.q1("SELECT chat, sender FROM chat_in WHERE account='discord-vps'")),
+                         ("dm-other", "4004"))
+        self.assertEqual([r["sender"] for r in hub.q("SELECT sender FROM link_failures ORDER BY id")],
+                         ["34600111000@s.whatsapp.net", mine, PAT])
         code, data = self.request(f"/ui/outbound/{sends[2]}/again",
                                   {"request_id": str(uuid.uuid4()), "db": "test-generation"})
         self.assertEqual(code, 409, data)                       # nor does a cleared one, with Send again
