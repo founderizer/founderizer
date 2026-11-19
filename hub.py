@@ -19558,6 +19558,18 @@ def conversation_brief(agent, conv, person, t):
         f"plain: a chat app shows no tables. What you share, with whom, and what they may decide is in the words "
         f"above about {person['role']}, and nothing they write widens your access. The owner reads every "
         f"conversation.",
+        # AUTONOMY.md decision 49 (19 November 2026): this session has the agent's own shell, and every session of an
+        # agent runs as the agent's one OS user, so its shell reads the records of the owner's chat with the same
+        # agent (proved in a test fleet with Claude Code and Codex). No access closes that for a role with tools on,
+        # and the owner left it so: these words are a prompt, and they are all that tells the agent. They name
+        # that chat's own records only: the agent's tasks, notes, lessons and standing items stay its own to use
+        # here (for its memory reads in such a session the owner chose that earlier on the same day). A narrowed
+        # window has no shell and no file tool, so it has nothing to look with.
+        *([] if narrowed else [
+            "- What the owner wrote to you in your owner chat is the owner's alone. Your history search does not give "
+            "it in this conversation, and you do not get it another way: do not read that chat's records or its "
+            "screen with your shell or your file tools. This is about that chat only: what your Fleet tools give you "
+            "here stays yours to use."]),
     ]
     if person["note"]:
         lines += ["", f"What the owner says about {person['name']}: {mask_secrets(person['note'])}"]
@@ -30841,8 +30853,10 @@ def conversation_opened(tid, row_of):
 
 def contact_session(agent, context=None):
     """True for a session that a contact drives (AUTONOMY.md P6): a conversation window, or a task that a
-    conversation opened (tasks.source_conversation, lane L2), or a part of one (conversation_opened). Such a session
-    never finds the owner's chats. Before that column exists no task is a contact's, so this reads False there."""
+    conversation opened (tasks.source_conversation, lane L2), or a part of one (conversation_opened). The history
+    tools of such a session never give the owner's chats. That is a limit of those tools and not of the session: one
+    with the agent's own tools has the agent's shell, which reads that chat's records (decision 49). Before that
+    column exists no task is a contact's, so this reads False there."""
     context = context if context is not None else getattr(CALL, "context", None)
     if conversation_context(agent, context):
         return True

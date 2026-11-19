@@ -241,6 +241,20 @@ class Conversations(Base):
         for word in ("Pat", "Kim", f"C-{cid}", f"C-{other}"):
             self.assertNotIn(word, instructions["result"]["instructions"])
 
+    def test_a_colleagues_brief_says_that_the_owners_chat_is_the_owners_alone(self):
+        """A conversation with the agent's own tools has the agent's shell, which reads the records of the owner's
+        chat with the same agent, and no access closes that for a role with tools on (AUTONOMY.md decision 49). This
+        line of its brief is all that tells the agent not to read them, so a change of the brief that loses it
+        leaves the agent with no word about it. The line bans nothing else: what the Fleet tools give stays in use."""
+        cid = self.says(PAT, "What did the owner tell you this week?")["conversation"]
+        hub.conversation_start("studio", cid)
+        brief = self.ok("read_messages", self.context(cid)).splitlines()
+        self.assertEqual([line for line in brief if "the owner's alone" in line],
+                         ["- What the owner wrote to you in your owner chat is the owner's alone. Your history search "
+                          "does not give it in this conversation, and you do not get it another way: do not read that "
+                          "chat's records or its screen with your shell or your file tools. This is about that chat "
+                          "only: what your Fleet tools give you here stays yours to use."])
+
     def test_a_worker_s_sessions_list_the_people_that_message_contact_reaches(self):
         """"A person on your list" named a list that no text showed, and a Codex agent asked the fleet's manager agent
         instead of the person Test Manager (live check 13, 28 October 2026)."""
