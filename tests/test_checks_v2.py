@@ -367,6 +367,7 @@ class Lines(OwnerAPI):
         answer, run = self.once(t, ok=False, error="exit", detail="exit code 1", tail=tail)
         fix = hub.q1("SELECT * FROM tasks WHERE id=?", (answer["task"],))
         self.assertEqual((answer["decision"], fix["owner"], fix["trigger_id"]), ("error", "vps", t["id"]))
+        self.assertEqual(fix["title"], 'The check "New tickets" fails')         # the rule by its title, as on its cards
         self.assertIn(f"The check of trigger {t['id']} (New tickets) failed 3 times in a row", fix["details"])
         self.assertIn("KeyError", fix["details"])
         self.assertIn('\\"', fix["details"])                 # the tail is JSON-encoded

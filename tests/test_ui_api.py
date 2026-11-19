@@ -568,6 +568,10 @@ class OwnerAPI(unittest.TestCase):
                     "agents": {"manager": {"role": "manager", "runtime": "claude", "machine": "hub", "can": []}}}
         hub.kv_set("db_id", "test-generation")
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), SourceHandler)
+        # The hub's listen queue, not socketserver's 5: test_concurrent_repeat_dispatches_once sends 8 requests at one
+        # moment, and when the accept loop was late, as under ship's 8 modules at a time, macOS reset one connection and
+        # a ship run stopped for no fault of its change (19 November 2026).
+        self.server.socket.listen(hub.HubServer.request_queue_size)
         self.server.busy, self.server.idle = 0, threading.Condition()      # the requests that run now (SourceHandler)
         # a short poll: tearDown's shutdown() waits for the loop's next look, which was up to 0.5 s in each test
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)

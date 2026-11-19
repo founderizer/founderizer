@@ -964,7 +964,8 @@ TOOL_SPECS = (
           "schedule": {"type": "object", "description": "When the rule runs. See the forms above."},
           "task": {"type": "object", "description": "What the agent does when the rule wakes it. The owner reads "
                                                     "its title on a card of their Tasks page at each run: a few "
-                                                    "plain words, with no code."},
+                                                    "plain words, at most 80 characters, with no code, and an "
+                                                    "agent by its role."},
           "check": {"description": READ_WORDS},
           "send": {"type": "object",
                    "description": "In place of task and check (WAKEUPS-INTERFACE.md 8): {\"to\": \"owner\", "

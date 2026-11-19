@@ -490,6 +490,9 @@ class Reads(OwnerAPI):
             said = self.save(request_id=f"req-sched-{len(words):04d}", ok=False, schedule=schedule,
                              check={"read": "gmail_label", "args": {"hours": 1}})
             self.assertIn(words, said)
+        # its task's title is on a card at each wake, as every rule's: the same check (rule_title)
+        self.assertIn("Say R-3 in plain words in task.title",
+                      self.save(request_id="req-title-0001", ok=False, task=dict(TASK, title="R-3 mail for support")))
         self.assertIsNone(hub.q1("SELECT 1 FROM triggers"))
         t = self.save(check={"read": "gmail_label", "args": {"hours": 1}})
         text, error = self.tool("support", "save_trigger", {"request_id": "req-sched-edit1", "trigger_id": t["id"],
@@ -497,6 +500,13 @@ class Reads(OwnerAPI):
                                                             "schedule": {"kind": "every", "minutes": 90}})
         self.assertTrue(error)                                  # also in an edit that gives no check
         self.assertIn("would look less often", text)
+        # a rule keeps the title that it has: a change that gives its old words again is not refused for them
+        old = dict(TASK, title="R-3 mail for support")
+        hub.q("UPDATE triggers SET task=? WHERE id=?", (json.dumps(old), t["id"]))
+        text, error = self.tool("support", "save_trigger", {"request_id": "req-title-0002", "trigger_id": t["id"],
+                                                            "base_revision": t["revision"], "task": old,
+                                                            "check": {"read": "gmail_label", "args": {"hours": 2}}})
+        self.assertFalse(error, text)
         # the fixed name of a stored read check is no file: neither the owner nor a duty's watch list can pin it
         with self.assertRaisesRegex(ValueError, "is the name of no file"):
             hub.trigger_check_spec({"path": w.READ_PATH, "commit": "0" * 40, "sha256": "a" * 64,

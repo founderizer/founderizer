@@ -566,6 +566,164 @@ class Cases(Base):
         self.assertIn(f"Watch {own['id']} (own) [paused by vps]", seen)
         self.assertNotIn("None", seen)
 
+    def test_an_agent_s_title_of_a_case_and_of_a_rule_s_task_is_checked_as_a_task_s_is(self):
+        """19 November 2026, the owner: "Hub titles first", then "Yes, build it" to the words. A card of the owner's
+        Tasks page has a case's title as the name of its work, and each task that a wake-up rule starts has the title
+        of the rule's task; a watch of a duty is such a rule. The hub checked none of them: in 7 days of his fleet,
+        cases of 100 characters and more, and 17 of 36 running rules with a code or more than 80 characters. The
+        check is create_task's, and its refusal names the place that the same tool has for the exact names. A rule
+        keeps the title that it has: a change of its times, or a duty's watch list given again as it was read, is
+        not refused for words that an earlier hub took, and does not put the duty's name in their place."""
+        r = self.duty()
+        rule = self.watches(r["id"])[0]
+        self.fire(rule["id"])
+        mine = hub.tref(self.first_case_task()["id"])
+        for title, said in (("Sort out T-12 for the shop", "Say T-12 in plain words in title"),
+                            ("x" * 81, "title is at most 80 characters")):
+            text, error = self.tool("vps", "open_case", request_id=str(uuid.uuid4()), responsibility="R-1", key="k/1",
+                                    title=title, task_id=mine)
+            self.assertTrue(error, text)
+            self.assertIn(said, text)
+        self.assertIn("put each exact name, version and step in the case's records", text)     # a case has no details
+        self.assertFalse(self.tool("vps", "open_case", request_id=str(uuid.uuid4()), responsibility="R-1", key="k/1",
+                                   title="The shop's check fails", task_id=mine)[1])
+        task = {"title": "R-3 recheck of the shop", "details": "Look.", "needs": "none", "goal_id": None,
+                "done_when": "It is looked at."}
+        every = {"kind": "every", "minutes": 10}
+        text, error = self.tool("vps", "save_trigger", request_id=str(uuid.uuid4()), agent="vps", schedule=every,
+                                task=task, task_id=mine)
+        self.assertTrue(error, text)
+        self.assertIn("Say R-3 in plain words in task.title", text)
+        old = self.own_rule(title=task["title"])                # a rule of before the check
+        text, error = self.tool("vps", "save_trigger", request_id=str(uuid.uuid4()), trigger_id=old["id"],
+                                base_revision=old["revision"], schedule={"kind": "every", "minutes": 30},
+                                task=dict(task, details="Look again."), task_id=mine)
+        self.assertFalse(error, text)                           # its own title, with other words beside it
+        now = hub.trigger_row(old["id"])
+        text, error = self.tool("vps", "save_trigger", request_id=str(uuid.uuid4()), trigger_id=old["id"],
+                                base_revision=now["revision"], task=dict(task, title="R-3 recheck of the store"),
+                                task_id=mine)
+        self.assertTrue(error, text)                            # a new title is checked
+        self.assertIn("Say R-3 in plain words in task.title", text)
+        self.assertFalse(self.tool("vps", "save_trigger", request_id=str(uuid.uuid4()), trigger_id=old["id"],
+                                   base_revision=now["revision"], task=dict(task, title="Recheck of the shop"),
+                                   task_id=mine)[1])
+        # a watch of a duty: set_duty checks its new title, and takes the list as the session read it
+        hub.q("UPDATE triggers SET task=? WHERE id=?",
+              (json.dumps(dict(json.loads(rule["task"]), title="R-3 watch of the queue")), rule["id"]))
+        watch = {"kind": "clock", "trigger": rule["id"], "schedule": every}
+        self.assertFalse(self.tool("vps", "see_responsibilities", task_id=mine)[1])
+
+        def duty(**fields):
+            return self.tool("vps", "set_duty", request_id=str(uuid.uuid4()), task_id=mine, responsibility="R-1",
+                             **fields)
+        text, error = duty(watch=[dict(watch, title="R-3 watch of the line")])
+        self.assertTrue(error, text)
+        self.assertIn("Say R-3 in plain words in watch.title", text)
+        self.assertNotIn("The code can stand in", text)     # a watch has no details, and he reads its duty's words
+        text, error = duty(watch=[dict(watch, title="R-3 watch of the queue")], text=DUTY["text"] + " Each day.")
+        self.assertFalse(error, text)
+        # a watch that names its rule and no title keeps the rule's own, and not the duty's name
+        text, error = duty(watch=[dict(watch, schedule={"kind": "every", "minutes": 20})])
+        self.assertFalse(error, text)
+        kept = hub.trigger_row(rule["id"])
+        self.assertEqual((json.loads(kept["task"])["title"], json.loads(kept["schedule"])["minutes"]),
+                         ("R-3 watch of the queue", 20))
+
+    def test_a_rule_s_title_that_the_owner_cannot_read_is_news_once_for_the_agent_that_can_write_it_again(self):
+        """The rules that an earlier hub took keep their titles, and each of their tasks shows them on a card. So a
+        title that the check refuses, or that may name an agent by its name where the apps say its role, is news for
+        a review, once for each rule and title, for the agent that the hub lets change the rule: its own agent for a
+        rule that it set for itself, and the fleet manager for every other one (a duty's watch, a rule of an agent
+        whose Shell box is off). The line says the whole call, and the agent that reads it can make it. A name counts
+        only as a whole word outside a role that the title says (a hyphen of it can be a space), never for the
+        manager or an agent with no role, and the line asks whether it is the agent's. The manager reads the lines
+        under words of their own, and an agent that holds no duty reads that its rules have news. No news: a rule
+        that the owner wrote, a rule that sends, a deleted rule, and a rule of an agent in setup. No mark on the
+        duty: the owner's apps would show it on every such duty at once."""
+        team = hub.TEAM["agents"]
+        team["manager"]["title"], team["studio"]["title"] = "Fleet Manager", "Designer"
+        team["desk"] = {"role": "worker", "runtime": "claude", "machine": "vps", "can": [], "title": "Help Desk"}
+        team["web-dev"] = {"role": "worker", "runtime": "claude", "machine": "vps", "can": ["shell"], "title": "Sites"}
+        team["fresh"] = {"role": "worker", "runtime": "claude", "machine": "vps", "can": ["shell"], "active": False}
+        r = self.duty()
+        self.sweep()
+        hub.q("UPDATE tasks SET state='completed' WHERE id=?", (self.review_task()["id"],))
+        coded = self.own_rule(title="R-3 pictures that studio left open")       # both reasons, said at once
+        kept = self.own_rule(title="R-4 old words")
+        spaced = self.own_rule(title="What web dev left open")                  # a hyphen of a name as a space
+        fine = [self.own_rule(title=title) for title in (
+            "Look at the support mailbox",
+            "Tell the manager of new studios",      # the manager's name is a word, and a name in a word is none
+            "Hand it to the Help Desk",             # a role that holds its agent's name
+            "The studioDesigner pictures",          # a role is taken out as whole words only
+            "The checks that vps keeps")]           # an agent with no role has only its name
+        alone = self.own_rule(agent="studio", title="R-5 pictures")             # an agent that holds no duty
+        shut = self.own_rule(agent="desk", title="R-7 tickets")                 # its own, from before its box went off
+        gone = self.own_rule(title="R-6 no longer")
+        hub.q("UPDATE triggers SET state='deleted' WHERE id=?", (gone["id"],))
+        watch = self.watches(r["id"])[0]                                        # the manager set it, as every watch
+        hub.q("UPDATE triggers SET task=? WHERE id=?",
+              (json.dumps(dict(json.loads(watch["task"]), title="R-9 watch")), watch["id"]))
+        with hub.LOCK:
+            common = {"check": None, "late_minutes": 60, "max_tasks_per_day": 24,
+                      "schedule": {"kind": "every", "minutes": 10}}
+            task = {"details": "x", "needs": "none", "goal_id": None, "done_when": "y"}
+
+            def rule(agent, by, **words):
+                return hub.trigger_create(dict(common, agent=agent, request_id=str(uuid.uuid4()),
+                                               task=dict(task, **words)), by, self.clock, created_by=by)
+            closed = rule("desk", "manager", title="Tickets (see C-9)")
+            setup = rule("fresh", "manager", title="R-8 first steps")           # it changes for nobody yet
+            owners = rule("vps", "owner", title="My own R-3 words")
+            sends = rule("vps", "vps", title="R-2 is late. " * 9, send={"to": "owner"})     # a text, not a title
+        reviews, heard = self.reviews(), len(self.manager_said())
+        self.sweep(self.clock + 60)
+        self.assertEqual(self.reviews(), reviews + 1)
+        mine = self.review_task()
+        self.assertIn(f'Wake-up rule {coded["id"]} of vps, "R-3 pictures that studio left open": Say R-3 in plain '
+                      f"words in its task's title", mine["details"])
+        for part in ("It may name studio, the agent that the owner's apps call Designer",
+                     "if it is another studio, leave the title as it is",
+                     f"save_trigger: trigger_id {coded['id']}, base_revision 1 ", 'needs "none", goal_id null',
+                     "The code can stand in details."):      # an agent's own rule has details of its own
+            self.assertIn(part, mine["details"])
+        self.assertIn(f"Wake-up rule {kept['id']} of vps", mine["details"])
+        self.assertIn(f'Wake-up rule {spaced["id"]} of vps, "What web dev left open": It may name web-dev, the agent '
+                      f"that the owner's apps call Sites", mine["details"])
+        told = "\n".join(self.manager_said()[heard:])
+        self.assertIn("[hub] These wake-up rules have a title that the owner cannot read well", told)
+        self.assertIn(f'Wake-up rule {watch["id"]} of vps, "R-9 watch": Say R-9 in plain words', told)
+        self.assertNotIn("The code can stand in", told.split(f"Wake-up rule {watch['id']} ")[1].split("\n")[0])
+        self.assertNotIn("Your duties have news", told)             # they are no news of the manager's own duties
+        for other in (watch, closed, shut):         # only the manager can change these: the hub's rule, and no tool
+            which = json.loads(other["task"])["title"]
+            self.assertIn(f"Wake-up rule {other['id']} of ", told, which)
+            self.assertNotIn(f"Wake-up rule {other['id']} ", mine["details"], which)
+        for other in (*fine, owners, setup, sends, gone):
+            self.assertNotIn(f"Wake-up rule {other['id']} ", mine["details"] + told, json.loads(other["task"])["title"])
+        self.assertIsNone(hub.duty_row(r["id"])["marker_kind"])
+        # an agent that holds no duty: the same review, and its words say what started it
+        its = self.review_task("studio")
+        self.assertEqual((its["title"], its["why"]), (hub.DUTY_REVIEW_TASK["title"],
+                                                      "A wake-up rule of its own has a title to write again."))
+        self.assertIn(f"because your wake-up rules have news since your last one:\nWake-up rule {alone['id']} of "
+                      f"studio", its["details"])
+        # the agent that read the line makes the call that it says
+        now = hub.trigger_row(coded["id"])
+        text, error = self.tool("vps", "save_trigger", request_id=str(uuid.uuid4()), task_id=hub.tref(mine["id"]),
+                                trigger_id=coded["id"], base_revision=now["revision"],
+                                task=dict(json.loads(now["task"]), title="Pictures that the Designer left open"))
+        self.assertFalse(error, text)
+        # Listed once: a review that ends with a title as it was starts no second one for it, and new words do.
+        hub.q("UPDATE tasks SET state='completed' WHERE id=?", (mine["id"],))
+        self.sweep(self.clock + 120)
+        self.assertEqual(self.reviews(), reviews + 1)
+        hub.q("UPDATE triggers SET task=? WHERE id=?",
+              (json.dumps(dict(json.loads(kept["task"]), title="R-4 other old words")), kept["id"]))
+        self.sweep(self.clock + 180)
+        self.assertEqual(self.reviews(), reviews + 2)
+
     def own_rule(self, agent="vps", title="Look at the support mailbox"):
         """One wake-up rule that the agent made for itself, as save_trigger writes it after its plan."""
         with hub.LOCK:

@@ -1273,7 +1273,8 @@ class Cases(Fleet):
         self.assertEqual([(t["owner"], t["requester"], t["parent"]) for t in tasks],
                          [("desk", "lead", None), ("desk", "lead", None)])
         cases = hub.q("SELECT * FROM duty_cases WHERE responsibility=? ORDER BY id", (self.r["id"],))
-        self.assertEqual([(c["key"], c["title"], c["repeated"]) for c in cases], [("T-81", "T-81", 0), ("T-82", "T-82", 0)])
+        self.assertEqual([(c["key"], c["title"], c["repeated"]) for c in cases],       # a case's title is its task's,
+                         [("T-81", "Ticket: T-81", 0), ("T-82", "Ticket: T-82", 0)])    # as a card shows it
         self.assertEqual([t["duty_case"] for t in tasks], [c["id"] for c in cases])
         self.assertIn('JSON-encoded: ["T-81 message 10:00"]', tasks[0]["details"])
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM tasks WHERE owner='lead' AND id>?", (self.first_task,))["n"], 0)
@@ -1502,7 +1503,10 @@ class Reports(Cases):
         task = self.task_of(rep["task"])
         self.assertEqual((task["owner"], task["responsibility"], task["duty_case"], task["parent"]),
                          ("ops", self.dev["id"], None, None))
-        self.assertEqual(task["title"], f"Report D-{rep['id']} from {hub.cref(hub.case_row(case_task['duty_case']))}")
+        self.assertEqual(task["title"], "Desk reports a problem: T-81")        # who and which ticket, and no code
+        # a line's key can be an address, a path or a host, and this task's reader has a shell: only a plain id is
+        for key in ("http://x.io/a", "files.example"):                              # in a title
+            self.assertEqual(hub.report_title("desk", key), "Desk reports a problem")
         self.assertIn("ticket T-81: symptom=wrong_price, component=price_update, supplier=8812, ids L-1.",
                       task["details"])
         step = hub.q1("SELECT text FROM duty_steps WHERE duty_case=? AND key='reported'", (case_task["duty_case"],))
@@ -1817,7 +1821,8 @@ class Reports(Cases):
         with hub.LOCK:
             hub.report_notices(hub.now())                               # the tick, once a place is free
         later = hub.q1("SELECT * FROM tasks WHERE id=(SELECT told_task FROM duty_reports WHERE id=?)", (d2["id"],))
-        self.assertEqual(hub.case_row(later["duty_case"])["key"], "T-82")           # a new case of that key
+        fresh = hub.case_row(later["duty_case"])                                    # a new case of that key,
+        self.assertEqual((fresh["key"], fresh["title"]), ("T-82", later["title"]))  # by the title of its task
         history = " ".join(h["detail"] for h in hub.q("SELECT detail FROM duty_history"))
         self.assertIn("(it covers 2 tickets)", history)
         self.assertNotIn("wrong_price", history)                        # other readers get ids and counts
@@ -1845,7 +1850,12 @@ class Reports(Cases):
         for task in (self.task_of(first["id"]), told):
             self.assertEqual(task["title"], hub.cut_whole(title, 200 - 2 - len(login)) + ": " + login)    # the key whole
             assert_no_part(self, hub.mask_secrets(task["title"]), login)
+        self.assertEqual(hub.case_row(first["duty_case"])["title"], self.task_of(first["id"])["title"])    # its case's
+        self.assertEqual(t1["title"], "Desk reports a problem: " + login)       # the report's task: the key whole
+        assert_no_part(self, hub.mask_secrets(t1["title"]), login)
         self.assertEqual(hub.case_title(title, "T-81"), title + ": T-81")       # a short key, as before
+        long = ("Ticket " * 30)[:197]                                           # no room for all of the key:
+        self.assertEqual(hub.case_title(long, "T-81"), long[:194] + ": T-81")   # the title gives way, never the key
         self.assertEqual(hub.case_title(title, "K" * 200), "K" * 200)            # open_case's longest key, alone
 
     def test_the_details_of_a_ticket_session_keep_no_part_of_a_login(self):
@@ -2264,7 +2274,8 @@ class Questions(Reports):
         asked = self.questions()[-1]
         session = self.task_of(asked["task"])
         self.assertNotEqual(session["duty_case"], self.case_task["duty_case"])
-        self.assertEqual(hub.case_row(session["duty_case"])["key"], "T-81")
+        fresh = hub.case_row(session["duty_case"])
+        self.assertEqual((fresh["key"], fresh["title"]), ("T-81", session["title"]))    # by the title of its task
         # the asking task ends before the answer: the answer goes nowhere, and says so
         self.end(self.reader)
         text, error = self.answer(session, words="The title is wrong.")

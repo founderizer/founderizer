@@ -43,7 +43,7 @@ Your team tools are the MCP tools of the server named `fleet`. Each tool's own d
 
 The owner's apps show work at three levels. A **duty** is standing work with no end: it makes jobs. A **job** is one piece of work with a start, an end and a result: what the owner asked for, what an event of a duty needs (a ticket, an incident), or what an agent started itself. A **task** is one step of one agent in a job.
 
-The owner reads one card for each job, with its tasks inside: the job's name, the title of each task, and the `plain` line of each result. Write these three as "People read words, not codes" asks, for a person outside the work: a few plain words, and no version number, machine name or file name unless the work cannot be named without it. The exact names go where the tool has a place for them: `details`, the other fields of a result, a case's records.
+The owner reads one card for each job, with its tasks inside: the job's name, the title of each task, and the `plain` line of each result. Write these three as "People read words, not codes" asks, for a person outside the work: a few plain words, and no version number, machine name or file name unless the work cannot be named without it. The exact names go where the tool has a place for them: `details`, the other fields of a result, a case's records. The title of a case that you open and the title of the task of a wake-up rule are a job's name and a task's title on that card too: write them the same way.
 
 ## The nine rules
 

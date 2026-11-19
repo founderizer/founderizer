@@ -145,6 +145,7 @@ class Conversations(Base):
         t = self.conversation_task(cid)
         self.assertEqual((t["owner"], t["requester"], t["state"], t["source_conversation"], t["source_message"],
                           t["stop_sent"]), ("studio", "manager", "submitted", cid, said["id"], 1))
+        self.assertEqual(t["title"], "Answer Pat")              # on a card: no code of the hub
         self.assertEqual(said["task"], t["id"])
         # no task session starts for it: it runs in the conversation's own session, which the conversation's event
         # starts or wakes
@@ -433,6 +434,7 @@ class Conversations(Base):
         self.ok("ask_team", self.context(closed), question="Can I move my plan to next month?")
         works = hub.q("SELECT * FROM tasks WHERE source_conversation IS NOT NULL AND source_message IS NULL ORDER BY id")
         self.assertEqual(len(works), len(titles) + 1)
+        self.assertEqual(works[-1]["title"], "A question of Ana (customer)")    # on a card: no code of the hub
         lead = self.task(works[0]["parent"])
         self.assertEqual((lead["owner"], lead["requester"], lead["title"]),
                          ("boss", "manager", hub.wakeups.batch_fields("boss")["title"]))
