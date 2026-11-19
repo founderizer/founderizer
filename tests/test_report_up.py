@@ -739,7 +739,11 @@ class Bugs(Base):
         """One short line, the agent by its role (the owner, 17 November 2026: "Manager should be capital M - like any
         other agent name/role", "Dont spam with messages!"), and none for a grant that changed nothing."""
         hub.TEAM["agents"]["vps"]["title"] = "Shop Deployer"
-        with patch.object(hub, "grant_resource", return_value={"changed": True, "revision": "abcdef123456789"}):
+        # A clock that moves at each read of it, as the real one does: the line and the record of the grant must
+        # still have one time, which is what makes the line a grant line for the apps (owner API 1.236).
+        ticks = iter(range(10 ** 6))
+        with patch.object(hub, "grant_resource", return_value={"changed": True, "revision": "abcdef123456789"}), \
+                patch.object(hub, "now", lambda: self.clock + next(ticks) / 1000):
             text, err = self.tool("manager", "grant_access", request_id=str(uuid.uuid4()), agent="vps",
                                   resource=f"secret:{LOGIN}", level="use",
                                   why="the shop's deploy needs its login.")
@@ -750,6 +754,32 @@ class Bugs(Base):
                                       f"deploy needs its login.")
         self.assertEqual(f"grant secret:{LOGIN} to vps", row["about"])
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner' AND kind='notify'")["n"], 0)
+        # Owner API 1.236: the app's reading gives the line's parts, which are those of the record that the same call
+        # wrote at the same time, so the app shows a run of such lines as one record.
+        parts = {"agent": "vps", "resource": f"secret:{LOGIN}", "kind": "secret", "word": "secret",
+                 "title": hub.resource_title("secret", LOGIN), "level": "use", "words": "use"}
+        # A report with no such record has none, whatever its `about` says: tell_owner takes `about` as free text, so
+        # an agent's own reply can say it. "grant to vps" stopped every read of the state with an error.
+        others = [hub.ins("INSERT INTO owner_reports(text,about,created,agent,in_reply_to) VALUES('Done.',?,?,'manager',NULL)",
+                          (about, self.clock - 60)) for about in ("status", "grant to vps", f"grant secret:{LOGIN} to vps")]
+        read = {r["id"]: r["grant"] for r in self.request()[1]["reports"] if r["id"] in [row["id"]] + others}
+        self.assertEqual(read, {row["id"]: parts, **{other: None for other in others}})
+        hub.q(f"DELETE FROM owner_reports WHERE id IN ({','.join('?' * len(others))})", tuple(others))
+
+        def grants():
+            return hub.report_grants(hub.q("SELECT * FROM owner_reports"),
+                                     hub.q("SELECT ts, resource, agent, level, by FROM resource_grants"))
+        # A rename of the agent moves the record: the parts name the agent as it is named now.
+        hub.q("UPDATE resource_grants SET agent='shop'")
+        self.assertEqual(grants(), {row["id"]: dict(parts, agent="shop")})
+        # A record of another manager's grant at that time is not this line's.
+        hub.q("UPDATE resource_grants SET by='other'")
+        self.assertEqual(grants(), {})
+        # A removal of the agent deletes the record: the line has no parts, and an app shows it as a line.
+        hub.q("DELETE FROM resource_grants")
+        self.assertEqual(grants(), {})
+        hub.q("INSERT INTO resource_grants(ts,resource,agent,level,by,revision) VALUES(?,?,'vps','use','manager','r')",
+              (self.clock, f"secret:{LOGIN}"))
         with patch.object(hub, "grant_resource", return_value={"changed": False, "revision": "abcdef123456789"}):
             text, err = self.tool("manager", "grant_access", request_id=str(uuid.uuid4()), agent="vps",
                                   resource=f"secret:{LOGIN}", level="use", why="again")

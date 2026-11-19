@@ -33517,6 +33517,55 @@ def t_grant_access(agent, a):
     return text
 
 
+def report_grants(reports, records, team=None):
+    """Owner API 1.236: {report id: the parts of its grant}, for each line of the owner's that says a grant
+    (t_grant_access), so that an app shows the lines of one run as one record, with the agent, the resource and the
+    level in columns (the owner, 19 November 2026, of eight such lines in a row in his chat with the manager: "Yes,
+    draw it", and "A: the card" to its picture). The parts: {"agent", "resource", "kind", "word", "title", "level",
+    "words"}.
+
+    **The record of the grant is what makes a line a grant line.** t_grant_access writes the line and one row of
+    resource_grants in one transaction, with one time (t0): a report has parts only when such a row of that time
+    names the report's agent as the one that gave, and the resource that the report's `about` starts with ("grant
+    <resource> to <agent>"). `about` alone is no proof: it is free text of tell_owner, so an agent's own reply could
+    say "grant repo:acme/web to nova" and would then be drawn as a row of a record, with its words hidden; no agent
+    chooses the time of a report or of a record. The agent, the resource and the level are the record's: a rename of
+    the agent moves it, so the app names the agent as it is named now. A removal of the agent deletes its records,
+    and its lines then have no parts: an app shows each as the line that it is.
+
+    `title` is the resource in the owner's words (resource_title), `word` what kind of thing it is as the line says
+    it (RESOURCE_WORDS: a mail account and a Drive account of one address have one title), and `words` the level as
+    the line says it (GRANT_LEVEL_WORDS). `reports`: rows of owner_reports; `records`: rows of resource_grants; `team`: the team of
+    the read's moment. It reads no row itself."""
+    by_time = {}
+    for record in records:
+        if record["level"] is not None:         # a row with no level takes a hold back, and no line says that
+            by_time.setdefault(record["ts"], []).append(record)
+    parts, named, catalog = {}, {}, []
+    for report in reports:
+        about = report["about"] or ""
+        if not about.startswith("grant "):
+            continue
+        for record in by_time.get(report["created"], ()):
+            rid, level = record["resource"], record["level"]
+            if record["by"] != report["agent"] or not about.startswith(f"grant {rid} to "):
+                continue
+            if rid not in named:                # each resource's kind and title once for a read
+                kind, what = resource_parts(rid)
+                if kind == "tool":              # one build of the MCP catalog for a read, not one for each line
+                    if not catalog:
+                        catalog.append(tool_catalog(team or TEAM))
+                    named[rid] = (kind, (catalog[0].get(what) or {}).get("title") or what)
+                else:
+                    named[rid] = (kind, resource_title(kind, what, team) if kind else rid)
+            parts[report["id"]] = {
+                "agent": record["agent"], "resource": rid, "kind": named[rid][0],
+                "word": RESOURCE_WORDS.get(named[rid][0]), "title": named[rid][1],
+                "level": level, "words": GRANT_LEVEL_WORDS.get(level, level.replace("_", " "))}
+            break
+    return parts
+
+
 # ---------------------------------------------------------------- standing items (AUTONOMY.md P3)
 #
 # A standing item is a lasting wish that steers an agent from then on: an instruction (how to behave, what to decide)
@@ -59885,6 +59934,8 @@ class Handler(BaseHTTPRequestHandler):
             outbound = q("SELECT * FROM chat_out WHERE id IN (SELECT MAX(id) FROM chat_out WHERE kind='message' "
                          "AND report IS NOT NULL GROUP BY report)")
             reports = q("SELECT * FROM owner_reports ORDER BY id")
+            grant_records = q("SELECT ts, resource, agent, level, by FROM resource_grants")      # owner API 1.236
+            grant_team = team_read()            # the team of this moment, for the titles of those records' resources
             result["messages"] = result["reports"] = None      # their places: they are made after the lock
             result["chat_apps"] = {"paused": chat_paused(), "problems": chat_problems()}
             goals = q("SELECT * FROM goals ORDER BY id")
@@ -59945,9 +59996,11 @@ class Handler(BaseHTTPRequestHandler):
         # turn (owner API 1.190): the owner's message whose turn the report took in the runtime turn that read it
         # (turn_word), which is no link and never in_reply_to: the apps place the row of what the owner asked for under
         # it (ChatAskPlaces), and nothing else. The hub's own turn stays its own (t_tell_owner).
+        # grant (owner API 1.236): the parts of a line that says a grant, so an app shows a run of them as one record
+        granted = report_grants(reports, grant_records, grant_team)
         result["reports"] = [dict({k: r[k] for k in r.keys() if k not in ("turn", "turn_word")}, pushed=bool(r["pushed"]),
                                   delivery=delivery.get(r["id"]), turn=r["turn_word"],
-                                  attachments=reported.get(r["id"], []))
+                                  attachments=reported.get(r["id"], []), grant=granted.get(r["id"]))
                              for r in reports]
         result["knowledge"] = [knowledge_public(k) for k in knowledge_entries()]
         # Keys, ciphertext, helper jobs, raw worker queues and runtime configuration are excluded.
