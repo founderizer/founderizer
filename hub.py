@@ -9856,7 +9856,7 @@ def deliver_result(agent, a, files_said=None):
     if left:
         raise ToolError(f"{tref(tid)} still has open subtasks: {', '.join(tref(r['id']) for r in left)}. "
                         f"Check or cancel them first.")
-    # Rule 3: whoever gave a task checks its result. check_result reaches a subtask only from this session, so a
+    # Rule 3 and check_result's text: whoever gave a task checks its result. check_result reaches a subtask only from this session, so a
     # result left unchecked here could never be checked by anybody again.
     unchecked = [r for r in q("SELECT id, owner, peer FROM tasks WHERE parent=? AND state IN ('completed','failed',"
                               "'rejected') AND accepted IS NULL ORDER BY id", (tid,))
@@ -39206,10 +39206,12 @@ TOOLS = [
        ["task_id", "request_id", "expected_attempt", "reason"])),
     ("manager", "answer", t_answer,
      "Answer a question that is with you: its asker's task goes on with your words. The lowest level that can answer "
-     "does. A lead, or an agent that gave its peer the asker's task, that cannot answer passes it up with "
+     "does: answer it yourself whenever the answer is in the task, the goal, your own profile or knowledge/. A lead, or an agent that gave its peer the asker's task, that cannot answer passes it up with "
      "pass_up=true, and a note in text if that helps: it moves to its own requester, the asker's task keeps waiting, "
      "and its own work goes on. Whoever passed a question "
-     "may still answer it, and the first answer wins. The manager passes nothing up: what only the owner can settle "
+     "may still answer it, and the first answer wins: an answer cannot be changed or sent twice, so a question whose "
+     "answer needs the owner to act first stays unanswered until the owner has acted, and the open question is what "
+     "lets you start the agent again afterwards. The manager passes nothing up: what only the owner can settle "
      "goes to them with raise_needs_you and question_id, and their answer goes back to the asker by itself.",
      S({"question_id": {"type": "string", "description": "Question id, for example Q-4"},
         "text": {"type": "string", "description": "The answer; with pass_up, an optional note for the level above"},
@@ -39217,7 +39219,11 @@ TOOLS = [
                                                       "it"}},
        ["question_id"])),
     ("manager", "check_result", t_check_result,
-     "Accept a delivered result, or refuse it with a note. A refused task is never reopened: create a follow-up.",
+     "Accept a delivered result, or refuse it with a note. Check it first against its done-when line, and look at "
+     "the thing itself: the output that it names (git fetch origin, then git show origin/config:outputs/T-<id>/"
+     "<file>), the repository that it changed, or the counts that the work left behind. For a browser or a screen "
+     "task, the proof is the one that the task permitted, or the effect verified another way: never ask for an "
+     "output that the task forbade. A refused task is never reopened: create a follow-up.",
      S({"task_id": TASK_ID, "accepted": {"type": "boolean"}, "note": STR}, ["task_id", "accepted"])),
     ("manager", "decide_permission", t_decide_permission,
      "Decide a worker's permission prompt: allow or deny. Set always=true to remember the answer for the same request "
