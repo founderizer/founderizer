@@ -929,6 +929,21 @@ class Conversations(Base):
         own, other = steered(work), steered(tid)
         self.assertIn("steer.png", self.ok("read_attachment", mine, attachment_id=f"A-{own}"))
         self.assertTrue(self.tool("read_attachment", mine, attachment_id=f"A-{other}")[1])
+        # Owner API 1.231: so the state names each task whose session is a person's, as read_attachment reads it (the
+        # task that the conversation opened, a part of it, and the conversation's own task), and the owner's app
+        # offers no file on its guidance: the person could get what the file says, as the read two lines up shows.
+        part, of_part = self.normal_task(title="Draw the plan's first page")
+        deep, of_deep = self.normal_task(title="Measure the first page")       # a part of the part: two tasks up
+        hub.q("UPDATE tasks SET parent=? WHERE id=?", (work, part))
+        hub.q("UPDATE tasks SET parent=? WHERE id=?", (part, deep))
+        self.assertTrue(hub.contact_session("studio", of_part) and hub.contact_session("studio", of_deep))
+        state = self.request("/ui/state")[1]
+        self.assertIn("steer_files", state["ui_features"])
+        self.assertEqual({t["id"]: t["from_conversation"] for t in state["tasks"]},
+                         {work: True, part: True, deep: True, self.conversation_task(cid)["id"]: True, tid: False})
+        # true and false, never a number (1 == True passes the line above): the apps read the field as a Bool, and a
+        # number there stops their read of the whole state
+        self.assertEqual({type(t["from_conversation"]) for t in state["tasks"]}, {bool})
         # the fleet manager's session of such a task: its own task is the context's, not each task of the manager's
         hub.q("UPDATE tasks SET owner='manager' WHERE id IN (?,?)", (work, tid))
         self.assertTrue(self.tool("read_attachment", mine, "manager", attachment_id=f"A-{other}")[1])

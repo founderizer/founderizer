@@ -1648,6 +1648,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "mcp_find",          # the same answers: Find a server, POST /ui/mcp/find over the official MCP Registry
                "server_prepare",
                "mobile", "attachments", "resource_grants", "machine_signin",
+               "steer_files",       # the owner, 19 November 2026 ("Yes, build it" to the pictures of the file "+" on a
+                                    # task's guidance box): POST /ui/tasks/<id>/steer takes `attachments` (owner API
+                                    # 1.223), and each task of GET /ui/state says from_conversation (UI-API.md 1.231)
                "mobile_ended",      # owner API 1.166: GET /ui/mobile/ended and the ended_mark of GET /ui/mobile
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
@@ -30818,28 +30821,38 @@ def history_index_again(hid):
     return 1
 
 
-def contact_session(agent, context=None):
-    """True for a session that a contact drives (AUTONOMY.md P6): a conversation window, or a task that a
-    conversation opened (tasks.source_conversation, lane L2), or a part of one. Such a session never finds the
-    owner's chats. Before that column exists no task is a contact's, so this reads False there."""
-    context = context if context is not None else getattr(CALL, "context", None)
-    if conversation_context(agent, context):
-        return True
-    if not context or len(context) != 3 or not re.fullmatch(r"T-[1-9][0-9]{0,17}", str(context[1])):
-        return False
-    tid, seen = parse_task(context[1]), set()
+def conversation_opened(tid, row_of):
+    """True when a conversation opened the task `tid` or a task that it is a part of: tasks.source_conversation (lane
+    L2) on it or on a parent. The walk reads the task and at most 99 tasks above it, and a ring of parents ends it. The
+    one walk for a session that a contact drives (contact_session) and for from_conversation of a task in GET
+    /ui/state (owner API 1.231), so that the state's field and that rule name the same tasks. row_of(id) gives a
+    task's row, or None."""
+    seen = set()
     while tid and tid not in seen and len(seen) < 100:
         seen.add(tid)
-        try:
-            row = read_row("SELECT source_conversation, parent FROM tasks WHERE id=?", (tid,))
-        except sqlite3.OperationalError:
-            return False
+        row = row_of(tid)
         if not row:
             return False
         if row["source_conversation"] is not None:
             return True
         tid = row["parent"]
     return False
+
+
+def contact_session(agent, context=None):
+    """True for a session that a contact drives (AUTONOMY.md P6): a conversation window, or a task that a
+    conversation opened (tasks.source_conversation, lane L2), or a part of one (conversation_opened). Such a session
+    never finds the owner's chats. Before that column exists no task is a contact's, so this reads False there."""
+    context = context if context is not None else getattr(CALL, "context", None)
+    if conversation_context(agent, context):
+        return True
+    if not context or len(context) != 3 or not re.fullmatch(r"T-[1-9][0-9]{0,17}", str(context[1])):
+        return False
+    try:
+        return conversation_opened(parse_task(context[1]), lambda tid: read_row(
+            "SELECT source_conversation, parent FROM tasks WHERE id=?", (tid,)))
+    except sqlite3.OperationalError:
+        return False
 
 
 def history_terms(query):
@@ -59358,6 +59371,13 @@ class Handler(BaseHTTPRequestHandler):
                 task["works"] = turns[task["id"]]["works"]      # what its running turn does
                 if turns[task["id"]]["doing"]:
                     task["doing"] = turns[task["id"]]["doing"]
+        # Owner API 1.231 (feature steer_files): whether a person's conversation opened the task or a task that it is
+        # a part of, by contact_session's own walk. That session can open the file of a steer of its task
+        # (owner_file_refused), so the person can get what the file says: the owner's app offers no file there. Every
+        # task is in this answer, so the walk reads its rows and nothing else.
+        task_rows = {task["id"]: task for task in result["tasks"]}
+        for task in result["tasks"]:
+            task["from_conversation"] = conversation_opened(task["id"], task_rows.get)
         # The needs, the messages, the reports and the duties from the rows read in the lock, after it too: with the
         # rows that they were given, these views read nothing themselves (11 November 2026).
         result["needs"] = [need_view(r, needs_read) for r in needs]

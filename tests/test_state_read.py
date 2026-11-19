@@ -496,9 +496,13 @@ class SameBytes(StateCase):
                          [(True, None, 1), (False, None, 2), (True, None, 3), (False, None, None)])
         # the hub's own turn stays its own; the apps' turn is turn_word, which these reports have not (owner API 1.190)
         # The five tables have no twin of before: their rows, in their order and with the logins masked, are the
-        # database's own.
+        # database's own. A task has one value more that is no column: from_conversation (owner API 1.231), false
+        # here, where no conversation opened a task.
         for table, key in FIVE:
-            self.assertEqual(state[key], hub.scrub([dict(r) for r in hub.q(f"SELECT * FROM {table} ORDER BY id")]), key)
+            rows = hub.scrub([dict(r) for r in hub.q(f"SELECT * FROM {table} ORDER BY id")])
+            if key == "tasks":
+                rows = [dict(r, from_conversation=False) for r in rows]
+            self.assertEqual(state[key], rows, key)
 
     def test_the_five_tables_keep_their_place_in_the_answer(self):
         """Their rows become dicts after the lock, and each key keeps the place that it had before."""
