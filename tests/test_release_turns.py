@@ -231,10 +231,10 @@ def windows(owner, *names):
     hub.q("UPDATE agents SET alive=?, alive_ts=? WHERE name=?", (",".join(names), hub.now(), owner))
 
 
-def turn(task, running):
-    """The turn state of the task's current attempt, as its session's records leave it (plan C1): a turn that runs
-    now, or one that ended."""
-    attempt = hub.q1("SELECT attempt FROM tasks WHERE id=?", (task,))["attempt"]
+def turn(task, running, attempt=None):
+    """The turn state of the task's current attempt, or of `attempt`, as its session's records leave it (plan C1): a
+    turn that runs now, or one that ended."""
+    attempt = attempt or hub.q1("SELECT attempt FROM tasks WHERE id=?", (task,))["attempt"]
     state = {"session": "0" * 8 + "-0000-4000-8000-" + "0" * 12, "seq": 4, "turns": 0 if running else 1,
              "running": running, "how": None if running else "end_turn", "at": hub.now(), "calls": {}, "said": None}
     hub.q("INSERT INTO attempts(task,attempt,created,turn) VALUES(?,?,?,?) ON CONFLICT(task,attempt) DO UPDATE SET "
@@ -481,8 +481,60 @@ class Turns(test_releases.HubUpdates):
         self.assertFalse(hub.release_holds_starts())
         self.assertIn(hub.tref(later), self.delivered("task"))
 
+    def test_a_new_attempt_whose_start_a_release_holds_does_not_keep_that_release_waiting(self):
+        """19 November 2026, the owner's fleet: while a release waited for a running turn and held new sessions, a
+        message for a task whose session was cold started that task fresh (plan P9.10), in a new attempt whose start
+        the release held. Its helper still listed the window T-<id> of the attempt before, and the new attempt had no
+        turn state yet, so running_turns took that window for the new attempt's first turn: the release waited for a
+        start that it held itself, and no release landed for 84 minutes. Meanwhile the message went to the old
+        window, whose cold session ran a turn that only read STOP. A start that waits in the hub runs nothing: only a
+        turn of the attempt before, which its own record shows, counts then, and the message waits with the start."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        key = secrets.token_urlsafe(32)
+        hub.q("INSERT INTO agent_keys(agent,sha256,created,source) VALUES('vps',?,?,'owner')",
+              (hashlib.sha256(key.encode()).hexdigest(), hub.now()))
+        as_vps = {"Content-Type": "application/json", "Authorization": "Bearer " + key}
+
+        def poll():
+            """One poll of the helper of vps: the tasks of the starts and of the messages that it is given."""
+            code, data = self.request("/events/vps?delivery=1&after=0&wait=0", headers=as_vps,
+                                      source=hub.address_of("vps"))
+            self.assertEqual(code, 200, data)
+            return [[e["task"] for e in data["events"] if e["kind"] == kind] for kind in ("task", "say")]
+        working, cold = self.task_for(), self.task_for()
+        for task in (working, cold):            # each session took its credential, started and read its task
+            hub.q("INSERT INTO session_credentials(sha256,agent,kind,generation,task,attempt,created) "
+                  "VALUES(?,'vps','task','test-generation',?,1,?)", (secrets.token_hex(32), task, hub.now()))
+            hub.q("UPDATE events SET helper_ack=?, read_at=? WHERE kind='task' AND task=?",
+                  (hub.now(), hub.now(), task))
+        windows("vps", hub.tref(working), hub.tref(cold))
+        turn(working, running=True)
+        turn(cold, running=False)
+        with self.channel(manifest(self.publish(self.code(2)))), \
+                patch.object(releases, "Update", functools.partial(releases.Update, run=self.runner())):
+            hub.release_sweep(hub.now())
+            self.finish()
+            self.assertTrue(hub.release_holds_starts())
+            hub.emit("vps", "say", "[hub] An answer for the cold task", task=cold)
+            code, said = self.request(f"/helper/fresh/vps/{hub.tref(cold)}",
+                                      {"attempt": 1, "why": "its cache is cold after 76 quiet minutes"},
+                                      headers=as_vps, source=hub.address_of("vps"))
+            self.assertEqual((code, said), (200, {"attempt": 2}))
+            self.assertEqual(poll(), [[], []])                  # its start and its message wait for the release
+            turn(working, running=False)                        # the one turn that ran ends
+            turn(cold, running=True, attempt=1)                 # a turn of the attempt before still counts
+            self.assertEqual(hub.fleet_idle(), (False, [cold]))
+            turn(cold, running=False, attempt=1)
+            self.assertEqual(hub.fleet_idle(), (True, []))      # T-<cold> is attempt 1's window, between turns
+            hub.release_sweep(hub.now())                        # so the next tick takes the release
+            self.finish()
+        self.assertEqual(self.newest()["state"], releases.DONE)
+        self.assertEqual(poll(), [[hub.tref(cold)], [hub.tref(cold)]])     # after the release, its start and message
+        self.assertEqual(hub.fleet_idle(), (False, [cold]))     # go out, and its helper starts it: a first turn counts
+
     def test_a_waiting_release_holds_new_sessions_for_one_poll_time_only(self):
-        """A turn that does not end cannot stop the fleet's new work: the release still waits, and holds nothing."""
+        """A turn that does not end cannot stop the fleet's new work: the release still waits, and holds nothing, also
+        when a newer release takes its place."""
         self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
         working = self.task_for()
         windows("vps", hub.tref(working))
@@ -502,6 +554,27 @@ class Turns(test_releases.HubUpdates):
             self.finish()
             self.assertEqual(hub.release_waiting()["since"], waits["since"] - hub.RELEASE_POLL - 1)
             self.assertFalse(hub.release_holds_starts())
+        # Until 19 November 2026 a newer release began the wait again, with one more poll time of held sessions: on a
+        # fleet of the early track, where releases came 5 to 12 minutes apart, for an hour only a duty's case started.
+        newer = self.publish(self.code(3))
+        with self.channel(manifest(newer, version="2026.10.3")), \
+                patch.object(releases, "Update", functools.partial(releases.Update, run=self.runner())):
+            hub.release_sweep(hub.now() + 2 * hub.RELEASE_POLL + 2)
+            self.finish()
+        self.assertEqual(hub.release_waiting(), {"revision": newer, "since": waits["since"] - hub.RELEASE_POLL - 1})
+        self.assertFalse(hub.release_holds_starts())
+        # A newer release two poll times after the wait began has a hold of its own again. A wait that begins after
+        # now (the clock went back) holds nothing, and a newer release does not keep its time.
+        with hub.LOCK:
+            hub.kv_set("release_waits", json.dumps({"revision": newer, "since": hub.now() - 2 * hub.RELEASE_POLL - 1}))
+            hub.release_wait({"revision": "c" * 40, "version": "2026.10.4"})
+        self.assertTrue(hub.release_holds_starts())
+        for revision in ("c" * 40, "d" * 40):       # the same release or a newer one begins that wait again
+            hub.kv_set("release_waits", json.dumps({"revision": "c" * 40, "since": hub.now() + 3600}))
+            self.assertFalse(hub.release_holds_starts())
+            with hub.LOCK:
+                hub.release_wait({"revision": revision, "version": "2026.10.4"})
+            self.assertTrue(hub.release_holds_starts())
 
     def test_a_dutys_case_passes_the_wait_before_a_release_but_not_the_run(self):
         """DevOps plan V1: the work of a duty's case (a watch's wake, an outage) starts while a release waits for the

@@ -879,6 +879,36 @@ class Tools(Fleet):
         said = hub.q1("SELECT text FROM events WHERE agent='lead' AND kind='say' ORDER BY id DESC LIMIT 1")["text"]
         self.assertIn("cause=supplier, next=relist", said)
 
+    def test_the_owner_reads_a_typed_result_in_the_words_of_their_lists_file(self):
+        """A session whose Shell box is off can write no plain line, so a card of its work said "completed:
+        resolution=drafted, symptom=wrong_price". The hub writes the line (`tasks.plain`) from the owner's own file:
+        the line of the symptom and then of the resolution, each as a sentence; a value with no line says its own
+        words, `other` says nothing, and a result that did not succeed gets no line. A duty with no
+        lists file gets none: its values are the session's own words. A line that holds a login gives none, and never
+        blocks the delivery, whose words the session cannot change."""
+        login = "Synthetic-Lists-Login-4471"
+        lists_repo(self, {LISTS_PATH: "# Lists\n\n## Symptom\n\n- `wrong_price`: the price does not follow the "
+                                      "`rules`\n\n## Resolution\n\n- `drafted`\n- `sent` — the reply went out.\n"
+                                      f"- `cut`: -10% on the price.\n- `held`: {login} held it.\n"
+                                      "- `other`: none of the values above.\n"})
+        register(login)
+        r = self.duty(lists=LISTS_PATH, watch=[{"kind": "clock", "schedule": EVERY}])["id"]
+        bare = self.duty(watch=[{"kind": "clock", "schedule": EVERY}])["id"]
+        for duty, outcome, values, plain in (
+                (r, "completed", {"symptom": "wrong_price", "resolution": "sent", "supplier": "8812"},
+                 "The price does not follow the rules. The reply went out."),
+                (r, "completed", {"resolution": "drafted"}, "Drafted."),
+                (r, "completed", {"resolution": "cut"}, "-10% on the price."),
+                (r, "completed", {"resolution": "held"}, None),
+                (r, "completed", {"symptom": "wrong_price", "resolution": "other"}, "The price does not follow the rules."),
+                (r, "failed", {"symptom": "wrong_price", "resolution": "sent"}, None),
+                (bare, "completed", {"resolution": "drafted"}, None)):
+            tid, context = self.task("desk", responsibility=duty)
+            text, error = hub.call_tool("desk", "deliver_result", {"task_id": context[1], "outcome": outcome,
+                                                                   "values": values}, context)
+            self.assertFalse(error, text)
+            self.assertEqual(hub.q1("SELECT plain FROM tasks WHERE id=?", (tid,))["plain"], plain, values)
+
     def test_a_typed_step_and_close_take_the_case_of_the_task(self):
         r = self.duty(watch=[{"kind": "clock", "schedule": EVERY}])
         with hub.transaction():

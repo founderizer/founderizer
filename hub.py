@@ -4969,6 +4969,7 @@ def migrate():
         "agent_messages": {"waits": "INTEGER", "wait_end": "TEXT"},
         "events": {"read_at": "REAL", "helper_ack": "REAL",
                    "handed": "REAL"},           # plan P0: the first poll answer that carried a conversation's signal
+        #                                         or, since 19 November 2026, a task's start (attempt_began)
         # AUTONOMY.md P2 (lane L2): the task that a message of the conversation belongs to, and, on an agent's
         # message_contact with waits, the task that waits for the person's next message
         "conversation_messages": {"task": "INTEGER", "waits": "INTEGER"},
@@ -38044,7 +38045,8 @@ def case_lists(path):
     if not entry:
         return {}
     key = (entry["commit"], path)
-    if key not in CASE_LISTS:
+    kept = CASE_LISTS.get(key)      # one read of the cache: another thread can clear it between two
+    if kept is None:
         text = knowledge_text(entry)
         if text is None:
             return {}               # a read that failed is not kept: the next call reads the file again
@@ -38068,8 +38070,8 @@ def case_lists(path):
                 lists[name].append(value.group(1))
         if len(CASE_LISTS) > 64:
             CASE_LISTS.clear()
-        CASE_LISTS[key] = {k: v or None for k, v in lists.items()}        # a list with no value takes none either
-    return CASE_LISTS[key]
+        kept = CASE_LISTS[key] = {k: v or None for k, v in lists.items()}  # a list with no value takes none either
+    return kept
 
 
 CASE_LINES = {}                 # (commit, path): the line of each value of one owner file's lists, at that commit
@@ -38088,7 +38090,8 @@ def case_list_lines(path, catalog=None, read=True):
     if not entry:
         return {}
     key = (entry["commit"], path)
-    if key not in CASE_LINES:
+    kept = CASE_LINES.get(key)      # one read of the cache: another thread can clear it between two
+    if kept is None:
         if not read:
             return {}
         text = knowledge_text(entry)
@@ -38108,8 +38111,8 @@ def case_list_lines(path, catalog=None, read=True):
                 lists.setdefault(name, {}).setdefault(value.group(1), line[value.end():].lstrip(" :").strip())
         if len(CASE_LINES) > 64:
             CASE_LINES.clear()
-        CASE_LINES[key] = lists
-    return CASE_LINES[key]
+        kept = CASE_LINES[key] = lists
+    return kept
 
 
 # The names of the typed values that F4 takes from a duty's lists, whatever its file holds: one of them with no list
@@ -38152,6 +38155,33 @@ def resolution_refusal(path, values):
              f"cannot be read now") + ".")
 
 
+PLAIN_LISTS = ("symptom", "resolution")       # what the ticket was, then how it ended
+
+
+def typed_plain(path, values):
+    """What came of a typed result, in plain words for the owner (`tasks.plain`), or None: the line of its symptom
+    and then the line of its resolution in the lists of its duty's owner file, each as a sentence ("The price does
+    not follow the rules. A draft is saved, and a person sends it."; the owner, 19 November 2026, to its picture:
+    "Ticket and its end"). A session whose Shell box is off can write no plain line itself, so a card of its work
+    said "completed: resolution=drafted, symptom=wrong_price; ids ...". The words are the owner's own, never the
+    session's: a value comes from its list (listed_values), a value with no line there says its own words
+    (typed_words), and a list's `other` ("none of the values above") says nothing. A duty that names no file gets no
+    line, because its values are a session's own words (F1)."""
+    if not path:
+        return None
+    lines, said = case_list_lines(path), []
+    for name in PLAIN_LISTS:
+        value = values.get(name)
+        if value in (None, "other"):
+            continue
+        words = " ".join(((lines.get(name) or {}).get(value) or typed_words(value)).replace("`", "").split())
+        # A line may follow its value with a dash and a space in place of a colon; "-10% on the price" keeps its sign
+        words = re.sub(r"^[-–—]\s+", "", words).rstrip(" ,;:")
+        if words:
+            said.append(words[:1].upper() + words[1:] + ("" if words[-1] in ".!?" else "."))
+    return " ".join(said) or None
+
+
 def task_lists(t):
     """The lists file of the duty of a task, or None. read_row only."""
     row = read_row("SELECT lists FROM responsibilities WHERE id=?", (t["responsibility"],)) \
@@ -38167,14 +38197,20 @@ def typed_args(agent, name, a):
         outcome = str(a.get("outcome") or "").strip().lower()
         values, ids = typed_values(a.get("values")), typed_list(a.get("ids"), "ids")
         t = read_row("SELECT * FROM tasks WHERE id=? AND owner=?", (parse_task(a.get("task_id")), agent))
-        listed_values(task_lists(t), values)
-        why = resolution_refusal(task_lists(t), values) if outcome == "completed" and t and t["duty_case"] else None
+        path = task_lists(t)
+        listed_values(path, values)
+        why = resolution_refusal(path, values) if outcome == "completed" and t and t["duty_case"] else None
         if why:
             raise ToolError(why)
         line = typed_line(values, ids)
+        # A result that did not succeed keeps the hub's line of its values alone: its reason is there, and the line
+        # of a resolution would say that the ticket ended well. A login in the owner's file never blocks the
+        # delivery (guard): the session could not change those words, so the line is left out
+        plain = typed_plain(path, values) if outcome == "completed" else None
         return dict(out, outcome=outcome, what_was_done=f"{outcome}: {line}",
                     where_output_is="the case of this task and its records",
-                    how_checked="typed fields of a session whose Shell box is off")
+                    how_checked="typed fields of a session whose Shell box is off",
+                    plain=None if plain and secret_hit(plain) else plain)
     row = read_row("SELECT duty_case FROM tasks WHERE id=? AND owner=?", (parse_task(a.get("task_id")), agent))
     c = case_row(row["duty_case"]) if row and row["duty_case"] else None
     if not c:
@@ -56135,7 +56171,9 @@ def running_turns(owner=None, t0=None):
     turn runs, or says nothing yet: a session's first turn, or a runtime that reports no turns. Where the hub has no
     window list of the helper, an open task counts unless its turn state says it is between turns. An offline helper's
     sessions do not reach the hub, so a restart cuts nothing of theirs, and they never keep a release waiting, and
-    neither does a session that stands at a question on its own screen with nothing moving (screen_stuck)."""
+    neither does a session that stands at a question on its own screen with nothing moving (screen_stuck). An attempt
+    whose start waits in the hub (attempt_began) runs nothing: the window T-<id> that its helper may still list is an
+    earlier attempt's, which counts only while that attempt's own turn state says that a turn runs (turn_before)."""
     t0 = t0 or now()
     rows = q(f"SELECT id, owner, attempt, state, source_conversation, source_message, scope_person FROM tasks WHERE "
              f"{OPEN_TASK}" +
@@ -56158,6 +56196,14 @@ def running_turns(owner=None, t0=None):
         if state is None and is_conversation_task(t) and task_scope(t) is not None:
             continue                        # person access plan, section 4: a locked narrowed window sends no turn
             #                                 records, so nothing would ever say that its turn ended
+        if state is None and not is_conversation_task(t) and not attempt_began(t):
+            # The start of its current attempt waits in the hub, so no session of that attempt runs. A turn of the
+            # session before it, which the helper closes only at that start, counts while its own record says it runs.
+            before = turn_before(t)
+            if before and before.get("running") and \
+                    (not listed(row) or conversation_window(t) in (row["alive"] or "").split(",")):
+                busy.append(t["id"])
+            continue
         if listed(row):
             # Starting: the helper's step names it, or it took the session's credential after its last window list,
             # which therefore cannot show the window yet. A list taken after that credential is the fact. A
@@ -56176,6 +56222,41 @@ def running_turns(owner=None, t0=None):
         if state is None or state.get("running"):
             busy.append(t["id"])
     return busy
+
+
+def attempt_began(t):
+    """False while the start of the current attempt of task row `t` waits in the hub (plan P0): its agent holds a key,
+    no poll answer handed the attempt's start event to its helper (Handler.events marks it), its helper and its session
+    took none, and no session of the attempt took its credential. A helper starts an attempt's session only from that
+    event (Helper.handle: it closes the window of the attempt before, then takes the credential, then starts the
+    window), and every task call of an earlier attempt's session gets STOP (fence). True in every other case, also
+    where the hub cannot tell: an attempt with no start event, and an agent with no key, whose sessions start with no
+    credential (fleet.session_credential) and whose helper can be older than owner API 1.12 and take its starts by the
+    older route of the poll, which marks nothing.
+
+    Until 19 November 2026 running_turns took the window of the attempt before, which the helper still listed, for the
+    first turn of an attempt whose start a waiting release held (release_holds_starts), so that release waited for
+    starts that it held itself. On the owner's fleet, fresh attempts of plan P9.10 (from 07:35 UTC) and a reminder's
+    attempt kept the releases waiting so until 08:33, and none landed from 07:25 to 08:49."""
+    if agent_key(t["owner"]) is None:
+        return True
+    start = q1("SELECT COUNT(*) AS n, MAX(handed IS NOT NULL OR helper_ack IS NOT NULL OR read_at IS NOT NULL) AS took "
+               "FROM events WHERE task=? AND kind='task' AND agent=? AND "
+               "COALESCE(json_extract(extra, '$.attempt'), 1)=?", (t["id"], t["owner"], t["attempt"]))
+    if not start["n"] or start["took"]:
+        return True                     # no start event to tell by, or its helper has it
+    return q1("SELECT 1 AS began FROM session_credentials WHERE agent=? AND kind='task' AND task=? AND attempt=? "
+              "LIMIT 1", (t["owner"], t["id"], t["attempt"])) is not None
+
+
+def turn_before(t):
+    """The turn state (turn_state) of the newest attempt before the current one of task row `t` that has one, or None:
+    the session whose window T-<id> its helper can still list while the start of the current attempt waits in the hub
+    (attempt_began). A turn can run there: one that ran when a reminder or a restart made the new attempt, or one that
+    a line typed into the window began. Each task call of it gets STOP, but a restart of the hub would cut the call."""
+    row = q1("SELECT MAX(attempt) AS attempt FROM attempts WHERE task=? AND attempt<? AND turn IS NOT NULL",
+             (t["id"], t["attempt"]))
+    return turn_state(t["id"], row["attempt"]) if row and row["attempt"] is not None else None
 
 
 def conversation_signalled(t):
@@ -56238,13 +56319,18 @@ def release_waiting():
 def release_wait(row):
     """Inside LOCK: this release waits for the turns that run now (plan P0). The time it began stays while the same
     release waits, so its hold on new sessions (release_holds_starts) lasts one RELEASE_POLL however often the sweep
-    finds it again."""
+    finds it again. A newer release that takes the place of the one that waits keeps that time too, for two RELEASE_POLL
+    after it: so a hold never begins again in the middle of a hold, and one poll time with no hold comes after each.
+    Until 19 November 2026 each newer release began the wait and its hold again: on the owner's fleet, which takes the
+    early track, releases came 5 to 12 minutes apart from 07:25 UTC, and from then until 08:33 only the task sessions
+    of a duty's case started; 22 other starts waited, for up to 68 minutes."""
     waits = release_waiting()
-    if waits and waits.get("revision") == row["revision"]:
+    if waits and waits.get("revision") == row["revision"] and waits["since"] <= now():
         return
-    kv_set("release_waits", json.dumps({"revision": row["revision"], "since": now()}))
-    log("hub", f"release {row['version']} ({row['revision'][:12]}) waits for the turns that run now; no new session "
-               f"starts meanwhile")
+    since = waits["since"] if waits and 0 <= now() - waits["since"] < 2 * RELEASE_POLL else now()
+    kv_set("release_waits", json.dumps({"revision": row["revision"], "since": since}))
+    log("hub", f"release {row['version']} ({row['revision'][:12]}) waits for the turns that run now" +
+               ("; meanwhile only a duty's case starts a new task session" if now() - since < RELEASE_POLL else ""))
 
 
 def release_rolled_said():
@@ -56294,13 +56380,14 @@ def release_rests(row):
 
 def release_holds_starts():
     """True while no new session starts, because the hub restarts soon (plan P0): for the whole update run
-    (release_applying), and for the first RELEASE_POLL of a release that waits for the turns that run now, so that
+    (release_applying), and for the first RELEASE_POLL of a wait for the turns that run now (release_wait), so that
     those turns end without new sessions beginning new ones. After that the release still takes the first moment no
-    turn runs (release_sweep), and holds nothing: a turn that does not end cannot stop the fleet's new work."""
+    turn runs (release_sweep), and holds nothing: a turn that does not end cannot stop the fleet's new work. A wait
+    that began after now (the clock went back) holds nothing."""
     if release_applying():
         return True
     waits = release_waiting()
-    return bool(waits) and now() - waits["since"] < RELEASE_POLL
+    return bool(waits) and 0 <= now() - waits["since"] < RELEASE_POLL
 
 
 def release_row_view(row):
@@ -64775,6 +64862,7 @@ class Handler(BaseHTTPRequestHandler):
             # a sign-in that lands during the wait reaches the next call.
             signed_out = runtime_signed_out(agent)
             waits = {}          # task id: its refused session waits for the machine's word or its fresh start
+            began = {}          # (task id, attempt): whether the start of that attempt left the hub (attempt_began)
 
             def sign_in_holds(r, t, conf):
                 """True when the sign-in holds this event (needs_sign_in): a session of the runtime that is signed out,
@@ -64814,7 +64902,7 @@ class Handler(BaseHTTPRequestHandler):
                 # plan C5: a conversation's event stays until its session read the message, for a helper that
                 # waits for that read (conversation_reads); an older one takes it at its ack, as before
                 reads = "conversation_reads" in helper_features(agent)
-                keep = []
+                keep, waiting = [], set()      # waiting: own tasks whose new attempt's start waits in the hub
                 worker = conf.get("role") in ("worker", "lead")       # a lead works like a worker
                 limited = active_limit(agent)          # the manager's own limit holds its signals too
                 shared = os_user_held(agent)           # one OS user for each agent: no session of it starts
@@ -64858,6 +64946,12 @@ class Handler(BaseHTTPRequestHandler):
                                         # a duty's case passes the wait before it (DevOps plan V1), not the run
                     if updating and worker and r["kind"] == "say" and t:
                         continue        # plan P0: a line would begin a turn of a session that waits between turns
+                    if worker and r["kind"] == "say" and t and t["owner"] == agent and \
+                            t["state"] not in TERMINAL and not is_conversation_task(t):
+                        if (t["id"], t["attempt"]) not in began:    # one read for each task in this call
+                            began[(t["id"], t["attempt"])] = attempt_began(t)
+                        if not began[(t["id"], t["attempt"])]:
+                            waiting.add(t["id"])        # its new attempt's start waits in the hub (below)
                     if r["kind"] == "control":
                         h = q1("SELECT state, kind FROM holds WHERE id=?", (extra.get("hold"),))
                         if not h or h["state"] != "requested" or h["kind"] != extra.get("action"):
@@ -64900,7 +64994,12 @@ class Handler(BaseHTTPRequestHandler):
                     if r["kind"] == "place":
                         continue        # Targets left the hub (24 October 2026): a placement from before asks nobody
                     keep.append(r)
-                rows = keep
+                # A worker's message for its own task whose new attempt's start waits in the hub goes in the answer that
+                # hands that start out, or after it, never before: only that attempt's session reads it (fence), and a
+                # line in the window of the attempt before would begin a turn there, with a cold cache, that reads only
+                # STOP (on 19 November 2026 old sessions ran such turns while a release held the starts).
+                starts = {r["task"] for r in keep if r["kind"] == "task"}
+                rows = [r for r in keep if not (r["kind"] == "say" and r["task"] in waiting - starts)]
                 # Owner feature chat_warm: whether this agent's owner chat should run now, before any message, and
                 # whether its session has its tools. A change ends the wait, so the chat starts as soon as it may.
                 chat = {"warm": chat_wanted(agent, limited or pending or holding or shared),
@@ -64913,7 +65012,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(404, {"error": "unknown agent"})
             # plan P0: this answer hands out these conversation signals, so a turn of their task may begin now
             # (conversation_signalled). The helper sends no ack of one: it types it, or starts the window, at once.
-            handed = [r["id"] for r in rows if r["kind"] == "conversation" and r["handed"] is None]
+            # So does a task's start, whose ack comes only once its session runs: from here its helper closes the
+            # window of the attempt before and starts this one (attempt_began).
+            handed = [r["id"] for r in rows if r["kind"] in ("conversation", "task") and r["handed"] is None]
             if handed:
                 with area("quiet"):
                     q(f"UPDATE events SET handed=? WHERE handed IS NULL AND id IN ({','.join('?' * len(handed))})",
