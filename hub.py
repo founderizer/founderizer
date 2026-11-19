@@ -18237,6 +18237,18 @@ def owner_route(agent):
     return None
 
 
+def owner_wrote_last_in_app(agent):
+    """True when the owner's newest chat message to this agent came from the app (it has no origin): message_owner
+    then stays in the app, where the owner talks to the agent now, as its description says ("where the owner last
+    wrote to you"). owner_route skips such a message, so the words went to the chat app of an older message from one:
+    the result of work that the owner had asked for in the app reached a Discord chat where they had asked for nothing,
+    and the agent, which sees one chat, told them that they had asked there. A rule that sends to the owner keeps
+    owner_route (send_way): the owner asked for that text in a chat app."""
+    row = q1("SELECT origin FROM ui_requests WHERE recipient=? AND kind='message' AND need_id IS NULL "
+             "ORDER BY created DESC, rowid DESC LIMIT 1", (agent,))
+    return bool(row) and not row["origin"]
+
+
 def t_message_owner(agent, a):
     """16.1: the agent writes to the owner first: one owner report (pushed), and one message item when a route
     exists."""
@@ -18253,7 +18265,7 @@ def t_message_owner(agent, a):
     if chat_paused():
         raise ToolError("Refused: the owner turned on Pause all for chat apps. Nothing was sent.")
     t0 = now()
-    route = owner_route(agent)
+    route = None if owner_wrote_last_in_app(agent) else owner_route(agent)
     rows = chat_files_rows(agent, ids, route["app"] if route else None, t0)
     with transaction():
         rid = DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to,pushed) "
@@ -39598,10 +39610,9 @@ TOOLS = [
      "work they asked you for, or news they must have now (a customer, money, security). Never to say that nothing is "
      "needed from them, never for progress, and never to correct a message that needed nothing from them: what can "
      "wait goes into the next message they need. Say it once, with the answer first, and short (RULES.md, \"Short, "
-     "like a text to a friend\"). It goes to "
-     "the chat app where the owner last wrote to you, else to your own WhatsApp number, Discord bot or Telegram bot; "
-     "without one it stays in the app. Answer an owner message with tell_owner instead. One request_id is one "
-     "message: the same request_id again sends nothing more. Never put a login in the text. Name a task or a duty "
+     "like a text to a friend\"). It goes where the owner last wrote to you (the app, or a chat app), else to your "
+     "own WhatsApp number, Discord bot or Telegram bot; without one it stays in the app. Answer an owner message with "
+     "tell_owner instead. One request_id is one message: the same request_id again sends nothing more. Never put a login in the text. Name a task or a duty "
      "by what it is about, never by its code (T-61, R-3), and an agent by its role.",
      S({"request_id": REQUEST_ID,
         "text": {"type": "string", "description": "The message in Markdown, 1 to 4,000 characters"},
