@@ -511,7 +511,7 @@ class Restore(Fixture):
         """The restart the hub asks for, done here: a real process on the staged records."""
         port = free_port()
         pipe, fds = parent_pipe(self.tmp.name)
-        proc = subprocess.Popen([sys.executable, os.path.join(KIT, "hub.py"), "--host", "127.0.0.1",
+        proc = subprocess.Popen([sys.executable, "-m", "hub", "--host", "127.0.0.1",
                                  "--port", str(port), "--db", self.path,
                                  "--team", os.path.join(self.kit, "team.json"),
                                  "--chat-apps", os.path.join(self.tmp.name, "chat-apps"), "--parent-pipe", str(pipe)],
@@ -1042,7 +1042,9 @@ class ThroughAFile(Restore):
 
 class ByHand(Fixture):
     def test_the_hub_machine_can_take_a_copy_from_a_shell(self):
-        """`python3 hub.py --restore <copy>`: the same staging, for a person whose app cannot reach this hub."""
+        """`python3 hub.py --restore <copy>`: the same staging, for a person whose app cannot reach this hub. It runs
+        hub.py by its path, as UI-API.md and each copy's RESTORE.md tell that person to type; the other tests start
+        the hub as a module (`-m hub`), which reads a compiled copy and does not compile hub.py again."""
         self.work()
         data = self.download()[2]
         path = os.path.join(self.tmp.name, "copy.zip")
@@ -1061,7 +1063,7 @@ class ByHand(Fixture):
         path = os.path.join(self.tmp.name, "holiday.jpg")
         with open(path, "wb") as f:
             f.write(b"\xff\xd8\xff\xe0 not a fleet")
-        done = subprocess.run([sys.executable, os.path.join(KIT, "hub.py"), "--restore", path,
+        done = subprocess.run([sys.executable, "-m", "hub", "--restore", path,
                                "--db", os.path.join(self.tmp.name, "fresh.db"),
                                "--team", os.path.join(self.kit, "team.json")],
                               capture_output=True, text=True, timeout=120, cwd=KIT)

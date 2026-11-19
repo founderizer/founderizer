@@ -1699,11 +1699,11 @@ class HubThatStarts(unittest.TestCase):
         out = open(root / "out.txt", "w+")
         self.addCleanup(out.close)
         pipe, fds = parent_pipe(root)
-        started = subprocess.Popen([sys.executable, str(Path(hub.__file__).resolve().parent / "hub.py"),
+        started = subprocess.Popen([sys.executable, "-m", "hub",
                                     "--host", "127.0.0.1", "--port", str(port), "--db", str(root / "records" / "pilot.db"),
                                     "--team", str(root / "team.json"), "--tick", "60", "--parent-pipe", str(pipe)],
                                    pass_fds=fds, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                   env=dict(os.environ, HOME=str(root)))
+                                   cwd=str(Path(hub.__file__).resolve().parent), env=dict(os.environ, HOME=str(root)))
         self.addCleanup(started.wait)
         self.addCleanup(started.terminate)
         base = f"http://127.0.0.1:{port}"

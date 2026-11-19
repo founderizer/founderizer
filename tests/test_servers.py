@@ -96,11 +96,11 @@ class TeamAtStartup(unittest.TestCase):
         out = open(root / "out.txt", "w+")
         self.addCleanup(out.close)
         pipe, fds = parent_pipe(root)
-        started = subprocess.Popen([sys.executable, str(Path(ROOT) / "hub.py"),
+        started = subprocess.Popen([sys.executable, "-m", "hub",
                                     "--host", "127.0.0.1", "--port", str(port), "--db", str(root / "hub.db"),
                                     "--team", str(root / "team.json"), "--tick", "60", "--parent-pipe", str(pipe)],
                                    pass_fds=fds, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                   env=dict(os.environ, HOME=str(root)))     # its timer sweeps ~/.fleet/attachments
+                                   cwd=ROOT, env=dict(os.environ, HOME=str(root)))     # its timer sweeps ~/.fleet/attachments
         self.addCleanup(started.wait)
         self.addCleanup(started.terminate)
         url = f"http://127.0.0.1:{port}"

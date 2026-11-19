@@ -284,6 +284,16 @@ class Sender(PushCase):
         # as the apps write it (Swift's capitalized), not Python's capitalize() (review A9)
         self.assertEqual(self.opened(hub.ping_payload(dict(need, by="acme-dev"), "g", SEAL))["title"], "Acme-Dev")
 
+    def test_full_access_of_the_door_s_card_gets_no_button_and_the_others_keep_their_index(self):
+        """Owner API 1.245: the hub takes Full access only with the owner key on the Mac, so a button for it on the
+        phone could only be refused. Bug: the ping draws it, or a phone that skips it numbers No as Full access."""
+        card = {"id": 7, "title": "Run one root script on web-1?", "by": "atlas", "door_host": "web-1",
+                "options": json.dumps(["Run it once", "Full access on web-1", "No"])}
+        said = self.opened(hub.ping_payload(card, "g", SEAL))
+        self.assertEqual((said["options"], said["no_button"]), (["Run it once", "Full access on web-1", "No"], [1]))
+        for other in (dict(card, door_host=None), {k: v for k, v in card.items() if k != "door_host"}):
+            self.assertNotIn("no_button", self.opened(hub.ping_payload(other, "g", SEAL)))
+
     def test_an_option_that_does_not_fit_a_button_opens_the_app(self):
         self.give(self.enrolled(), seal=SEAL)
         fits = "Stop the task and keep what it has written so far."

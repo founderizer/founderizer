@@ -1601,11 +1601,11 @@ class RealHub(unittest.TestCase):
             port = s.getsockname()[1]
         pipe, fds = parent_pipe(folder)
         records = os.path.join(folder, "hub.db")
-        proc = subprocess.Popen([sys.executable, os.path.join(KIT, "hub.py"), "--host", "127.0.0.1",
+        proc = subprocess.Popen([sys.executable, "-m", "hub", "--host", "127.0.0.1",
                                  "--port", str(port), "--db", records, "--team", os.path.join(folder, "team.json"),
                                  "--parent-pipe", str(pipe)],
                                 pass_fds=fds, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, env=dict(os.environ, HOME=folder))
+                                stderr=subprocess.STDOUT, text=True, cwd=KIT, env=dict(os.environ, HOME=folder))
 
         def stop():
             proc.kill()

@@ -2478,6 +2478,11 @@ def ping_payload(need, generation, seal=None, badge=None):
     if 2 <= len(options) <= NEED_OPTIONS_MAX and all(len(o) <= PUSH_BUTTON for o in options) \
             and scrub(options) == options and need_give_view(need) is None:
         said["options"] = options         # the phone's notification content extension draws one button for each
+        # the lane "Give on the iPhone" (owner API 1.245): Full access, the door card's second answer, counts only with
+        # the owner key's signature on the Mac (phone_submit), so the phone draws no button for it, and the other
+        # buttons keep their own index, which their press sends
+        if "door_host" in need.keys() and need["door_host"]:
+            said["no_button"] = [1]
     sealed = push.seal(push.seal_key(seal), json.dumps(said, ensure_ascii=False, separators=(",", ":")).encode())
     payload["sealed"] = base64.b64encode(sealed).decode()
     payload["aps"]["mutable-content"] = 1

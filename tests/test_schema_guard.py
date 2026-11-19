@@ -132,15 +132,15 @@ def get(url):
 # ---------------------------------------------------------------- the check itself
 
 class CheckSchema(unittest.TestCase):
-    """`python3 hub.py --check-schema <copy>`: this code's schema against a real database, and the one line that
-    `releases.schema_summary` reads."""
+    """`python3 -m hub --check-schema <copy>`, as a release runs it (`releases.Update.schema_check`): this code's
+    schema against a real database, and the one line that `releases.schema_summary` reads."""
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="fleet-schema-check-"))
         self.addCleanup(shutil.rmtree, str(self.root), True)
 
     def check(self, path):
-        done = subprocess.run([sys.executable, os.path.join(KIT, "hub.py"), "--check-schema", str(path)],
+        done = subprocess.run([sys.executable, "-m", "hub", "--check-schema", str(path)],
                               capture_output=True, text=True, timeout=120, cwd=KIT)
         return done.returncode, done.stdout
 
@@ -188,7 +188,7 @@ class StartingHub(unittest.TestCase):
     def start(self, db):
         port = free_port()
         pipe, fds = parent_pipe(self.root)
-        proc = subprocess.Popen([sys.executable, os.path.join(KIT, "hub.py"), "--host", "127.0.0.1",
+        proc = subprocess.Popen([sys.executable, "-m", "hub", "--host", "127.0.0.1",
                                  "--port", str(port), "--db", str(db), "--team", str(self.root / "team.json"),
                                  "--chat-apps", str(self.root / "chat-apps"), "--parent-pipe", str(pipe)],
                                 pass_fds=fds, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=KIT,

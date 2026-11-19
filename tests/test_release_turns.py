@@ -130,10 +130,10 @@ class SessionSurvivesRestart(unittest.TestCase):
 
     def start(self):
         pipe, fds = parent_pipe(self.tmp)
-        self.proc = subprocess.Popen([sys.executable, os.path.join(KIT, "hub.py"), "--host", "127.0.0.1",
+        self.proc = subprocess.Popen([sys.executable, "-m", "hub", "--host", "127.0.0.1",
                                       "--port", str(self.port), "--db", self.db, "--team", self.team, "--tick", "1",
                                       "--parent-pipe", str(pipe)],
-                                     pass_fds=fds, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     pass_fds=fds, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=KIT,
                                      # a home of this test's own: ~/.fleet holds the owner's files of this machine
                                      env=dict(os.environ, HOME=self.tmp))
         for _ in range(100):

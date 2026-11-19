@@ -146,21 +146,22 @@ def a_test_with_a_hub_and_a_server():
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     pipe, fds = parent_pipe(folder)
-    subprocess.Popen([sys.executable, os.path.join(KIT, "hub.py"), "--host", "127.0.0.1", "--port", str(port),
+    subprocess.Popen([sys.executable, "-m", "hub", "--host", "127.0.0.1", "--port", str(port),
                       "--db", os.path.join(folder, "hub.db"), "--team", os.path.join(folder, "team.json"),
                       "--parent-pipe", str(pipe)],
                      pass_fds=fds, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     env=dict(os.environ, HOME=folder))     # its timer sweeps ~/.fleet/attachments
+                     cwd=KIT, env=dict(os.environ, HOME=folder))     # its timer sweeps ~/.fleet/attachments
     time.sleep(600)
 
 
 @functools.lru_cache(maxsize=1)
 def hub_starts():
-    """Each subprocess.Popen of hub.py in a test file: (file:line, the call)."""
+    """Each subprocess.Popen of the hub in a test file, as a module (`-m hub`) or by its path: (file:line, the
+    call)."""
     return [(f"{path.name}:{node.lineno}", node) for path in sorted(Path(TEST_DIR).glob("test_*.py"))
             for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
             if isinstance(node, ast.Call) and ast.unparse(node.func) == "subprocess.Popen" and node.args
-            and re.search(r"\bhub\.py\b", ast.unparse(node.args[0]))]
+            and re.search(r"\bhub\.py\b|'-m', 'hub'", ast.unparse(node.args[0]))]
 
 
 def hubs_with_no_files(texts):
@@ -1523,6 +1524,14 @@ class HubProcesses(unittest.TestCase):
                 self.assertIn("pass_fds", [k.arg for k in call.keywords])
         self.assertGreater(len(hub_starts()), 3, "the scan found too few: its pattern no longer matches the tests")
 
+    def test_a_test_starts_the_hub_as_a_module(self):
+        """`python3 -m hub` from the code's folder, as the hub's service and selftest.py start it: Python keeps a
+        compiled copy of a module and reads it at the next start, but it compiles a file that it runs by its path
+        at every start, hub.py in seconds and with some hundreds of MB."""
+        for where, call in hub_starts():
+            with self.subTest(where):
+                self.assertIn("'-m', 'hub'", ast.unparse(call.args[0]))
+
     def test_a_test_process_that_is_killed_leaves_no_process_and_no_folder(self):
         """SIGKILL, which a caller sends at its time-out: the test process runs no cleanup, its hub stops itself, the
         keeper stops its server, and the guard runs its commands, which stop the tmux server, and then removes the
@@ -1564,7 +1573,7 @@ class HubProcesses(unittest.TestCase):
             records = list(Path(tmp).glob("*/hub.db"))
             time.sleep(0.1)
         self.assertTrue(records, f"the test process started no hub (it ended with {run.poll()})")
-        self.assertTrue([line for line in naming() if "hub.py" in line], "its hub is not running")
+        self.assertTrue([line for line in naming() if " -m hub " in line], "its hub is not running")
         self.assertTrue([line for line in naming() if "time.sleep(600)" in line], "its server is not running")
         if shutil.which("tmux"):
             tmux.append((records[0].parent / "tmux-socket").read_text())
