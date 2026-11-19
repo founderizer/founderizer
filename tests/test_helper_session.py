@@ -381,6 +381,11 @@ class StartText(unittest.TestCase):
         self.assertNotEqual(text(), first)
         for rules in (5, "lead", {"lead": 1}):                                  # a record that something else wrote
             self.assertEqual(fleet.standing_text("dev-two", rules), fleet.standing_text("dev-two", None))
+        # a helper that knows one more part leaves the conversation of a helper that did not: that one kept only the
+        # parts of its own list (opening_rules), so its record names a start that lacks the new part
+        before = fleet.standing_text("dev-two", ["lead"])
+        with patch.object(fleet, "RULES_PARTS", fleet.RULES_PARTS + ("a-new-part",)):
+            self.assertNotEqual(fleet.standing_text("dev-two", ["lead"]), before)
 
 
 class ChatDelivery(unittest.TestCase):

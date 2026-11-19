@@ -2057,7 +2057,7 @@ def codex_server(name, catalog=None):
 # as its appended system prompt, from a file, and takes no CLAUDE.md of the folder (--setting-sources ''); its task
 # is the first answer of read_messages. Codex gets RULES.md as its developer instructions (codex_rules) and reads no
 # AGENTS.md of the folder (CODEX_NO_FOLDER_RULES), and the parts, its profile and then its task as its first prompt.
-RULES_PARTS = ("lead", "manager", "conversations", "logins", "github")     # hub.RULES_PARTS, in that order
+RULES_PARTS = ("lead", "manager", "conversations", "logins", "github", "servers")  # hub.RULES_PARTS, in that order
 STABLE_TASK = ('You are agent "{agent}" in Founderizer, in a session for one task of yours. {where} Your helper '
                'brought this folder up to date just before this session; do not pull at the start. ')
 STABLE_RULES = "{rules} are in your context, so do not read them again."
@@ -2150,9 +2150,15 @@ def standing_text(agent, rules, head=""):
     tools for that (Helper.chat_changed, manager_start). `head` for the manager's session is the form of its first
     prompt (MANAGER_START), and the words that name the rules in a stable start are in it too. The list of its skills
     and its knowledge files are not in it: they change with the agent's own work, and a new one reaches its next new
-    conversation. rules that are no list (a record that something else wrote) count as none."""
+    conversation. rules that are no list (a record that something else wrote) count as none.
+
+    This helper's own list of the parts is in it too (19 November 2026, with the part on servers). A helper keeps
+    only the parts of its own list (opening_rules), so a conversation that a helper of before a new part began has
+    that part's agent without it, and its record names a start that looks whole. The helper that knows the part
+    leaves such a conversation one time."""
     parts = rules if isinstance(rules, (list, tuple)) else ()
-    digest = hashlib.sha256("\0".join([head, STABLE_RULES, json.dumps(STABLE_WHERE, sort_keys=True)]).encode())
+    digest = hashlib.sha256("\0".join([head, STABLE_RULES, json.dumps(STABLE_WHERE, sort_keys=True),
+                                       ",".join(RULES_PARTS)]).encode())
     for name in ["RULES.md"] + [f"rules/{part}.md" for part in RULES_PARTS if part in parts] + [f"profiles/{agent}.md"]:
         try:
             with open(os.path.join(KIT, name), "rb") as f:
