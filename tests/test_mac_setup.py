@@ -251,17 +251,41 @@ class MacSetup(Servers):
         self.proving()
         hub.q("UPDATE mac_setups SET state='done' WHERE server='mini'")
         self.said.clear()
-        self.report(boot="boot-2", chatgpt=False)
-        self.desktop()
-        self.report(boot="boot-2", chatgpt=False)
-        self.desktop()
-        heard = self.manager_heard()[-1]
+
+        def heard_of(**desktop):
+            for _ in range(2):                          # the second reading that shows it is the news
+                self.report(boot="boot-2", chatgpt=False, **desktop)
+                self.desktop()
+            return self.manager_heard()[-1]
+
+        heard = heard_of()                  # a server service from before `chatgpt_app` does not say which it is
         self.assertIn("ChatGPT is signed out", heard)
         # the one item of a Mac's desktop that needs no hands there, where the Mac has the ChatGPT app: the owner's
         # sign-in of Codex runs the app's own copy, and the reading is false also for a sign-in that the provider ended
         self.assertIn("a new sign-in of Codex there puts this right", heard)
         self.assertIn("a Mac without the app needs the app first", heard)       # the reading is false there too
         self.assertNotIn("Only hands at that Mac", heard)
+        self.report(boot="boot-2", chatgpt=True)
+        self.desktop()                                  # put right: the next time is news again
+        heard = heard_of(chatgpt_app=True)  # the Mac says that it has the app: the sign-in alone, with no hands there
+        self.assertIn("ChatGPT is signed out. Its tasks on its screen wait. A new sign-in of Codex for an agent of "
+                      "that Mac puts this right, with no hands at that Mac", heard)
+        self.assertNotIn("needs the app first", heard)
+        self.assertNotIn("installer", heard)
+        # One reading with no app (the app replaces itself) is no news, also not as the first of two on a later day.
+        self.report(boot="boot-2", chatgpt=False, chatgpt_app=False)
+        self.desktop()
+        self.report(boot="boot-2", chatgpt=False, chatgpt_app=True)
+        self.desktop()
+        self.report(boot="boot-2", chatgpt=False, chatgpt_app=False)
+        self.desktop()
+        self.assertEqual(len(self.manager_heard()), 2)
+        heard = heard_of(chatgpt_app=False)             # the app left that Mac: a sign-in there does not help
+        self.assertIn("the ChatGPT app is not installed", heard)
+        self.assertIn("Founderizer's installer at that Mac brings the app", heard)
+        self.assertNotIn("sign-in of Codex", heard)
+        self.assertNotIn("Only hands at that Mac", heard)
+        self.assertEqual(len(self.manager_heard()), 3)          # each of the three once
 
     def test_the_join_code_of_a_mac_names_its_first_agent(self):
         for body, words in (({"kind": "linux", "agent": "juno", "runtime": "claude"}, "first agent of a Mac"),
@@ -727,8 +751,8 @@ class Readings(unittest.TestCase):
             return life.chatgpt()
 
     def test_the_chatgpt_reading_is_the_copy_in_the_app_with_the_word_of_its_account_read(self):
-        """The status command of the app's copy reads only what the Mac keeps: on 18 November 2026 a Mac Studio said
-        "ChatGPT · Signed in" while the provider had ended that sign-in and each screen task failed. This reading
+        """The status command of the app's copy reads only what the Mac keeps: on 18 November 2026 the reading of a
+        Mac Studio said "signed in" while the provider had ended that sign-in and each screen task failed. This reading
         has no account read, so it takes the word that the helpers of the same user leave (lifecycle.leave_screen_word,
         which test_usage holds to the collector's answers)."""
         signed_in = (0, "Logged in using ChatGPT\n", "")

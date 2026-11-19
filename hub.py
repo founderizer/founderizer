@@ -44029,12 +44029,14 @@ def reading_age_of(value):
 
 
 def desktop_status(value):
-    """A Mac's own reading of what only hands there can put right (lifecycle.Lifecycle.desktop), or None."""
+    """A Mac's own reading of what only hands there can put right (lifecycle.Lifecycle.desktop), or None.
+    `chatgpt_app` is None from a server service older than 19 November 2026, which does not say."""
     if value is None:
         return None
     if not isinstance(value, dict):
         raise ValueError("desktop must be an object or null")
-    return {k: _optional(value.get(k), bool) for k in ("locked", "setup", "chrome", "extension", "browser", "chatgpt")}
+    return {k: _optional(value.get(k), bool)
+            for k in ("locked", "setup", "chrome", "extension", "browser", "chatgpt", "chatgpt_app")}
 
 
 def macos_update_status(value):
@@ -46800,6 +46802,13 @@ def setup_click(name, here, desktop, reported):
 
 
 CHATGPT_SIGNED_OUT = "ChatGPT is signed out"    # the words of mac_desktop_sweep for a false `chatgpt` reading
+CHATGPT_NO_APP = "the ChatGPT app is not installed"     # and for one of a Mac that says that it has no such app
+# What puts each of the two right, and both for a Mac whose server service does not say which it is (chatgpt_app).
+CHATGPT_SIGN_IN = ("A new sign-in of Codex for an agent of that Mac puts this right, with no hands at that Mac, and it "
+                   "is the owner's own step.")
+CHATGPT_INSTALL = "Founderizer's installer at that Mac brings the app, and it is the owner's own step at that Mac."
+CHATGPT_EITHER = ("With the ChatGPT app on that Mac, a new sign-in of Codex there puts this right, and it is the "
+                  "owner's own step; a Mac without the app needs the app first, at that Mac.")
 
 
 def mac_desktop_sweep():
@@ -46807,7 +46816,7 @@ def mac_desktop_sweep():
     is reopening Chrome is no news. A Mac whose owner sits at it, and a Mac with no agent that works in its Chrome, are
     none either. macOS's setup screens go to the Mac's screen agent first (setup_click). A signed-out ChatGPT reaches
     the manager in the same way, with words of its own: the owner's sign-in of Codex puts it right where the Mac has
-    the ChatGPT app."""
+    the ChatGPT app, and a Mac that says that it has no such app gets the words of that."""
     for name in server_names():
         st = q1("SELECT data, reported FROM server_status WHERE server=?", (name,))
         desktop = ((json.loads(st["data"]).get("security") or {}).get("desktop") or {}) if st else {}
@@ -46823,7 +46832,8 @@ def mac_desktop_sweep():
                  "Claude's extension is off in Chrome" if browser and desktop.get("extension") is False else
                  "Chrome does not run" if browser and desktop.get("extension") and desktop.get("chrome") is False else
                  "Claude's extension in Chrome is signed out" if browser and desktop.get("browser") is False else
-                 CHATGPT_SIGNED_OUT if screen and desktop.get("chatgpt") is False else None)
+                 CHATGPT_NO_APP if screen and desktop.get("chatgpt") is False and desktop.get("chatgpt_app") is False
+                 else CHATGPT_SIGNED_OUT if screen and desktop.get("chatgpt") is False else None)
         if not desktop.get("setup") and kv_get(f"desktop_click:{name}"):
             kv_set(f"desktop_click:{name}", None)       # the screens of the next update get a task of their own
         seen, told = kv_get(f"desktop_seen:{name}"), kv_get(f"desktop_told:{name}")
@@ -46833,6 +46843,10 @@ def mac_desktop_sweep():
                 kv_set(f"desktop_told:{name}", None)
             continue
         if told == words:
+            # One reading with other words between two of these is no first reading of those words for a later day:
+            # without this, a single such reading then told the manager at once.
+            if seen and json.loads(seen)[0] != words:
+                kv_set(f"desktop_seen:{name}", None)
             continue
         said = json.dumps([words, st["reported"]])
         if not seen or json.loads(seen)[0] != words:
@@ -46845,12 +46859,13 @@ def mac_desktop_sweep():
             # A signed-out ChatGPT is the one item that needs no hands at a Mac that has the ChatGPT app: the owner's
             # sign-in of Codex for an agent of that Mac runs the app's own copy there (fleet.Helper.login_program),
             # and the reading is false also while the provider ended a sign-in that the Mac still keeps
-            # (lifecycle.Lifecycle.chatgpt). The reading is false with no app too, and this hub cannot tell which.
-            emit(manager_name(), "say", f"[hub] On the Mac {name}, {words}. Its tasks on its screen wait. With the "
-                                        f"ChatGPT app on that Mac, a new sign-in of Codex there puts this right, and "
-                                        f"it is the owner's own step; a Mac without the app needs the app first, at "
-                                        f"that Mac. Raise it for the owner with raise_needs_you."
-                 if words == CHATGPT_SIGNED_OUT else
+            # (lifecycle.Lifecycle.chatgpt). The reading is false with no app too: the Mac's `chatgpt_app` says
+            # which of the two it is, and a server service that does not say it yet gets the words of both.
+            route = (CHATGPT_INSTALL if words == CHATGPT_NO_APP else
+                     CHATGPT_SIGN_IN if desktop.get("chatgpt_app") is True else CHATGPT_EITHER)
+            emit(manager_name(), "say", f"[hub] On the Mac {name}, {words}. Its tasks on its screen wait. {route} "
+                                        f"Raise it for the owner with raise_needs_you."
+                 if words in (CHATGPT_SIGNED_OUT, CHATGPT_NO_APP) else
                  f"[hub] On the Mac {name}, {words}{click}. Its tasks in Chrome and on its screen wait. Only hands at that "
                  f"Mac, or the app's Screen Sharing button, can put this right: raise it for the "
                  f"owner with raise_needs_you.")

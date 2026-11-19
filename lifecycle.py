@@ -3497,7 +3497,12 @@ class Lifecycle:
     def desktop(self):
         """What only hands at this Mac can put right: its lock, macOS's own setup screens, Chrome and Claude's
         extension; and the ChatGPT app's sign-in, which the owner's sign-in of Codex for an agent of this Mac puts
-        right too (fleet.Helper.login_program). With no AI."""
+        right too (fleet.Helper.login_program). With no AI.
+
+        `chatgpt_app` says whether this Mac has the ChatGPT app with its copy of Codex at all: `chatgpt` is false
+        without it and also for an app that is signed out, and only the first of the two needs the app's install at
+        this Mac (Founderizer's installer); the second needs a sign-in of Codex, which the owner starts from
+        Founderizer on their own computer."""
         console = console_session(self.run)
         code, _, _ = self.run(["pgrep", "-x", "Google Chrome"])
         extension = chrome_extension(self.home)
@@ -3505,7 +3510,7 @@ class Lifecycle:
         claude = self.exe("claude") if extension and self.runtime("claude")["signed_in"] else None
         return {"locked": console[1] if console else None, "setup": setup_screens(self.run), "chrome": code == 0,
                 "extension": extension, "browser": browser_connected(claude) if claude else None,
-                "chatgpt": self.chatgpt()}
+                "chatgpt": self.chatgpt(), "chatgpt_app": os.path.exists(CHATGPT_CODEX)}
 
     def chatgpt(self):
         """Whether the ChatGPT app of this Mac is signed in: the copy of Codex it carries, which Computer Use runs
@@ -3514,7 +3519,7 @@ class Lifecycle:
 
         **Its status command reads only what the Mac keeps**, and says "Logged in" after the provider ended that
         sign-in, while each screen task fails (the owner's Mac Studio, 18 November 2026: "workspace routing discovery
-        unauthorized (401)" on the task, and "ChatGPT · Signed in" on the server's page). This reading has no account
+        unauthorized (401)" on the task, while this reading said "signed in"). This reading has no account
         read of its own, so it takes the word of the helpers' newest one (screen_word): False while that read says
         that the provider ended the sign-in. With no such word of the last SCREEN_WORD_AGE seconds, the status
         command's word stands, as before."""
