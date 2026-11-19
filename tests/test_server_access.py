@@ -2024,6 +2024,9 @@ class DoorCalls(Access):
         # the script as an agent's words carry it: without its last line feed, or with one that the file has not
         got = item(hub.t_raise_needs_you("manager", dict(base, door_script=script[:-1])))
         self.assertEqual((got["door_script"], got["details"]), (script, "```\n" + script + "```"))
+        # or as a read of messages gives it, each line two spaces in (hub.stand_in): the card holds the script itself
+        got = item(hub.t_raise_needs_you("manager", dict(base, door_script=hub.stand_in(script))))
+        self.assertEqual((got["door_script"], got["details"]), (script, "```\n" + script + "```"))
         bare = hashed("id")
         got = item(hub.t_raise_needs_you("manager", dict(base, door_call=bare, door_script="id\n")))
         self.assertEqual((got["door_script"], got["details"]), ("id", "```\nid\n```"))

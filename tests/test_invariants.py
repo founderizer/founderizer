@@ -207,7 +207,7 @@ class SecretThroughAnEscape(Base):
         self.register()
         said = self.ok("manager", "read_messages")
         self.assertIn("Use the staging shop first.", said)
-        self.assertIn(f"The shop answered:\n{hub.MASK}", said)
+        self.assertIn(f"The shop answered:\n  {hub.MASK}", said)         # a later line of a message stands in
         self.assertNotIn("assw0rd", said)
 
     def test_the_team_directory_of_a_chat_read_is_masked_on_its_own(self):
@@ -492,7 +492,7 @@ class SecretThroughAnEscape(Base):
             seen, real = [], hub.read_rows
             with patch.object(hub, "read_rows", lambda sql, args=(): seen.append(sql) or real(sql, args)):
                 said = self.ok("manager", "read_messages")
-            self.assertIn(hub.json_one_line("Call me at noon."), said.splitlines())
+            self.assertIn("  " + hub.json_one_line("Call me at noon."), said.splitlines())     # it stands in
             return sum("FROM secrets" in sql for sql in seen)
         self.assertEqual(reads(5), reads(200))
 

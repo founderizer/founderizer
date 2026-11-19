@@ -745,8 +745,13 @@ def lines_decision(new, check_now, wake_open, held):
 
 def lines_text(lines):
     """Lines of a check as they go into a text that an agent reads: one JSON array, so a quote or a bracket in a line
-    cannot end it, and a reader sees where each line begins and ends."""
-    return json.dumps(list(lines), ensure_ascii=False)
+    cannot end it, and a reader sees where each line begins and ends. The three line ends that JSON keeps as they are
+    (U+0085, U+2028, U+2029) are written as escapes, as hub.json_one_line does: a read splits a message at each kind of
+    line end (hub.stand_in), which would cut the array inside a string."""
+    said = json.dumps(list(lines), ensure_ascii=False)
+    for end, escape in (("\x85", "\\u0085"), ("\u2028", "\\u2028"), ("\u2029", "\\u2029")):
+        said = said.replace(end, escape)
+    return said
 
 
 def split_lines(lines, budget):

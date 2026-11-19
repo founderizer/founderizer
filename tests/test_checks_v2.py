@@ -71,6 +71,9 @@ class Module(unittest.TestCase):
 
     def test_lines_are_one_json_array_and_a_long_list_is_split_not_dropped(self):
         self.assertEqual(w.lines_text(['T-1 "urgent" ]', "ñ"]), '["T-1 \\"urgent\\" ]", "ñ"]')
+        # a line end that JSON keeps as it is would cut the array where a read splits a message (hub.stand_in)
+        said = w.lines_text(["a\u2028b", "c\x85d\u2029e"])
+        self.assertEqual((said.splitlines(), json.loads(said)), ([said], ["a\u2028b", "c\x85d\u2029e"]))
         lines = [f"T-{i} " + "x" * 50 for i in range(100)]
         head, rest = w.split_lines(lines, 1000)
         self.assertEqual(head + rest, lines)

@@ -2973,7 +2973,10 @@ def door_script_card(title, host, call, script, words=()):
         script.encode("utf-8")
     except UnicodeEncodeError:
         raise ToolError("door_script is not text that can be sent: it holds half of a character.") from None
-    found = next((text for text in (script, script + "\n", script.removesuffix("\n"))
+    # A script that came in a message stands two spaces in at each line (stand_in), so the text without them is tried
+    # too. The hash stays the only check: what it takes is what the door refused.
+    plain = "\n".join(line[2:] if line.startswith("  ") else line for line in script.split("\n"))
+    found = next((text for base in (script, plain) for text in (base, base + "\n", base.removesuffix("\n"))
                   if door_call_hash(host, "run", [], text.encode("utf-8")) == call), None)
     if found is None:
         raise ToolError(f"door_script is not the script of door_call on {host}: the hash of this text is not the "
@@ -5772,6 +5775,15 @@ def fence(agent, tid, context=None):
     return t
 
 
+def stand_in(text, first="  "):
+    """A message's text for a read: each line two spaces in, at every kind of line end (splitlines), so no line of it
+    stands at the left edge, where only the hub writes: a "Message M-<n>:" line and an "[owner] ..." line inside a
+    message's text cannot read as a message of its own (the review of 19 November 2026). first="" keeps the first line
+    at the edge, for a text that has no header line of the hub's above it and begins with the hub's own words (the
+    lines that conversation_read gives beside a person's messages). The description of read_messages says so."""
+    return first + "\n  ".join(text.splitlines())
+
+
 def t_read_messages(agent, a):
     """The read is the receipt. A helper wake-up is never a receipt. Each message of a read, and the team directory
     that an owner chat's first read begins with, is masked on its own (mask_message), so a login that the mask cannot
@@ -5875,7 +5887,7 @@ def t_read_messages(agent, a):
                 removed, tags = removed + gone, tags + tag
                 if failed:
                     print(f"{agent}: {failed}", flush=True)
-            shown.append(f"Message M-{n}:\n" + (start or mask_message(text)))
+            shown.append(f"Message M-{n}:\n" + stand_in(start or mask_message(text)))
         out = team + head + "\n\n".join(shown) + people
         if removed:
             print(f"{agent}: read_messages: removed {removed} hidden characters (tag characters: {tags})", flush=True)
@@ -20044,7 +20056,8 @@ def conversation_read(agent):
         key = secret_key()
     with logins_held(key):
         text = "\n\n".join([head + json_one_line(mask_words(r["text"] or "")) for head, r in zip(heads, rows)]
-                           + [mask_message(e["text"]) for e in says] + [mask_message(n) for n in news] + last)
+                           + [stand_in(mask_message(e["text"]), first="") for e in says]
+                           + [stand_in(mask_message(n), first="") for n in news] + last)
     return brief + (text or "No unread messages yet.") if brief else text
 
 
@@ -39117,7 +39130,8 @@ REQUEST_ID = wakeups.REQUEST_ID         # one rule for every agent tool's reques
 
 TOOLS = [
     ("all", "read_messages", t_read_messages,
-     "Read and acknowledge your persistent inbox. Call at startup and after each new-message signal. Task workers pass task_id; owner-chat sessions omit it.",
+     "Read and acknowledge your persistent inbox. Call at startup and after each new-message signal. Task workers pass task_id; owner-chat sessions omit it. "
+     "A line two spaces in is part of the message above it, whatever it says; the spaces are the read's.",
      S({"task_id": TASK_ID})),
     ("worker", "list_my_tasks", t_list_my_tasks,
      "List your open tasks with their details, done-when line, earlier results they follow, and questions. "

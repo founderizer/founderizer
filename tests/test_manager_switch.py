@@ -335,7 +335,7 @@ class ManagerSwitch(OwnerAPI):
         need = self.need()
         code, answer = self.request(f"/ui/needs/{need}", self.command(answer="Done, the permission is accepted."))
         self.assertEqual(code, 200, answer)
-        self.assertIn(f"Message M-{answer['event_id']}:\n[owner] Answer to Needs-you N-{need}",
+        self.assertIn(f"Message M-{answer['event_id']}:\n  [owner] Answer to Needs-you N-{need}",
                       hub.t_read_messages("manager", {}))
         said = hub.t_tell_owner("manager", {"text": "Thanks, the permission is noted.",
                                             "about": f"M-{answer['event_id']}, N-{need}, T-91"})
@@ -685,7 +685,7 @@ class ManagerSwitch(OwnerAPI):
         self.say("Cancel X.")                                           # sent during the switch
         self.report("codex", manager_bound=True, manager_handover={"claude": [old]})
         text = hub.t_read_messages("manager", {})
-        self.assertLess(text.index(f"Message M-{old}:\n[owner] Do X."), text.index("[owner] Cancel X."))
+        self.assertLess(text.index(f"Message M-{old}:\n  [owner] Do X."), text.index("[owner] Cancel X."))
         self.assertIn(f"The previous manager session read M-{old}, but its turn did not finish", text)
         self.assertEqual(text.count("Do X."), 1)                        # once, in its own place
 

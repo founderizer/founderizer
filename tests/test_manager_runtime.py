@@ -59,7 +59,7 @@ def setUpModule():
 def read_answer(*ids, body=None):
     """The hub's answer to the manager's read_messages with these messages (hub t_read_messages)."""
     return "Unread messages: " + ", ".join(f"M-{i}" for i in ids) + ".\n\n" + GUIDANCE + "\n\n".join(
-        f"Message M-{i}:\n" + (body or f"[owner] Message {i}.") for i in ids)
+        f"Message M-{i}:\n  " + "\n  ".join((body or f"[owner] Message {i}.").splitlines()) for i in ids)
 
 
 def claude_read(call, *ids):
