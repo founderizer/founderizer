@@ -614,8 +614,19 @@ class HelperSide(unittest.TestCase):
                                           "acme/lib. Before you work in one, run `"), prompt)
         for words_ in ("work on the default branch of origin: git pull --rebase", "do not open a pull request",
                        "Give your commit in where_output_is", "one hour", "Your MCP servers besides Fleet's: github (GitHub).",
-                       "GH_TOKEN (gh and the GitHub tool) works for acme/web; for acme/lib use git only."):
+                       # not "use git only" (19 November 2026): each other repository has its own token, and the
+                       # start says how gh gets it
+                       "GH_TOKEN (plain gh and the GitHub tool) works for acme/web; for acme/lib run gh as the start "
+                       "says (fleet.py gh).",
+                       "gh holds one token, GH_TOKEN, and yours covers only some of your repositories. For each other "
+                       "one, run gh as `", "fleet.py gh <gh arguments>`: it gives gh the token of the repository that "
+                       "the call is for"):
             self.assertIn(words_, prompt)
+        # a session whose GH_TOKEN covers each of its repositories reads nothing about a second way to run gh
+        whole = fleet.github_text({"FLEET_REPOS": "acme/web:write", "GH_TOKEN": WRITE,
+                                   "FLEET_GIT_TOKENS": json.dumps({"acme/web": WRITE})}, [])
+        self.assertIn("GH_TOKEN and git's credentials", whole)
+        self.assertNotIn("fleet.py gh", whole)
 
     def test_a_codex_task_gets_the_tool_as_options_and_a_runner_gets_no_tool(self):
         command = self.command(CODEX_CONF)
@@ -767,8 +778,8 @@ class HelperSide(unittest.TestCase):
             note = fleet.integration_env("dev", CLAUDE)["FLEET_GITHUB_NOTE"]
         self.assertIn("No GitHub token for acme/r200, acme/r201, acme/r202, acme/r203 and 96 more: not in the App's "
                       "installation.", note)
-        self.assertIn("GH_TOKEN (gh and the GitHub tool) works for acme/web; for your other 200 repositories use git "
-                      "only.", note)
+        self.assertIn("GH_TOKEN (plain gh and the GitHub tool) works for acme/web; for your other 200 repositories run "
+                      "gh as the start says (fleet.py gh).", note)
         self.assertLess(len(note), 400)
 
     def test_the_one_hook_gives_a_task_its_read_keys_and_its_github_and_a_chat_only_its_keys(self):

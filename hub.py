@@ -10829,6 +10829,7 @@ def t_create_task(agent, a):
         late += (f" Note: {owner} is not signed in to {runtime_label(agents()[owner].get('runtime'))}, so no session "
                  f"of it can work; the task waits until the owner signs it in.")
     late += shell_off_note(owner, tid, agent)   # a Shell-off agent: what this task's session holds
+    late += same_work_note(agent, owner, tid, a, f)     # it names work that the same agent runs already
     lim = active_limit(owner)
     if lim:
         source = limit_source(lim)      # account_limits: an allowance another agent spent is not this one's limit
@@ -18715,6 +18716,80 @@ def linked_tasks(agent, tid, to):
     return out
 
 
+def given_task(agent, to, task_id):
+    """True for an open task of the worker or lead `to` that `agent` gave it."""
+    return role_of(to) in ("worker", "lead") and bool(
+        q1(f"SELECT 1 FROM tasks WHERE id=? AND owner=? AND requester=? AND {OPEN_TASK}", (task_id, to, agent)))
+
+
+def given_reach(agent, to, task_id):
+    """True when the words of this session of `agent` reach the open task `task_id` of `to` by its id: `agent` gave
+    that task (given_task), from any session of its own. Not from a session whose Shell box is off, which reads
+    strangers' text, and not from one that a person's conversation drives: their words are no order for another
+    agent's task (peer_task_refusal). linked_choice opens the road with it, and same_work_note names the road only
+    where it is open."""
+    return not shell_off(agent) and not contact_session(agent) and given_task(agent, to, task_id)
+
+
+# The ids that a task's words name: a task (T-7), a report (D-3), a case (C-12, also after its duty: R-5/C-12).
+SAME_WORK_REF = re.compile(r"(?<![A-Za-z0-9])([TDC])-([0-9]{1,9})(?![A-Za-z0-9])")
+SAME_WORK_MOST = 3          # the running tasks that one note names
+
+
+def same_work(owner, tid, words, case_id=None):
+    """The open tasks of `owner`, other than the new task `tid`, that the new task names: in its words by its own id,
+    by a report whose task it is or by a case that it works in, and by the case that the new task is work of
+    (create_task case_id). The oldest first, at most SAME_WORK_MOST."""
+    found, cases = set(), {case_id} if case_id else set()
+    for kind, number in SAME_WORK_REF.findall(words or ""):
+        n = int(number)
+        if kind == "T":
+            found.add(n)
+        elif kind == "D":
+            rep = q1("SELECT task FROM duty_reports WHERE id=?", (n,))
+            if rep and rep["task"]:
+                found.add(rep["task"])
+        else:
+            cases.add(n)
+    for n in sorted(cases):
+        found.update(r["id"] for r in q(f"SELECT id FROM tasks WHERE duty_case=? AND owner=? AND {OPEN_TASK}",
+                                        (n, owner)))
+    found.discard(tid)
+    if not found:
+        return []
+    return q(f"SELECT id, title FROM tasks WHERE owner=? AND {OPEN_TASK} AND id IN ({','.join('?' * len(found))}) "
+             f"ORDER BY id LIMIT ?", (owner, *sorted(found), SAME_WORK_MOST))
+
+
+def same_work_note(agent, owner, tid, a, f):
+    """A note for create_task's answer when the new task names work that `owner` already runs: in the giver's own
+    words (the fields of the call, not what the hub adds to the details) or by its case_id. A second task is a second
+    session of the same agent, and two sessions of one agent do not see each other's work. On 19 November 2026 a
+    lead's new task for a fault named the report and the task of that same fault, which its worker already ran: both
+    sessions found the cause, each opened a case, and their lists of orders differed. The note names the other road,
+    which linked_choice opens: the giver's words into a running task that it gave. It refuses nothing, because parts
+    of one piece of work name each other too, an id of another system can look like one of the hub's, and the giver
+    knows which this is."""
+    rows = same_work(owner, tid, " ".join(str(a.get(k) or "") for k in ("title", "details", "done_when", "why")),
+                     f.get("duty_case"))
+    if not rows:
+        return ""
+    names = ", ".join(f"{tref(r['id'])} ({cut_whole(r['title'], 60)})" for r in rows)
+    mine = next((r["id"] for r in rows if given_reach(agent, owner, r["id"])), None)
+    own = next((r["id"] for r in rows if given_task(agent, owner, r["id"])), None)
+    if mine:
+        say = (f"cancel {tref(tid)} with cancel_task and send your words into the running task with message_agent, "
+               f"agent {owner} and to_task {tref(mine)}")
+    elif own:       # the giver's own task, from a session whose words do not reach it (given_reach): cancel nothing
+        say = (f"your words reach {tref(own)} only from a session of your own that no person's conversation drives "
+               f"and whose Shell box is on")
+    else:
+        say = f"cancel {tref(tid)} with cancel_task and ask whoever gave {tref(rows[0]['id'])} to send your words into it"
+    return (f" Note: this task names work that {owner} runs now: {names}. {tref(tid)} starts a second session of "
+            f"{owner} beside it, and two sessions of one agent do not see each other's work. If this is the same "
+            f"work, {say}.")
+
+
 def linked_choice(agent, tid, to, to_task):
     """(task id, relation, limit) of the recipient's task that a new message goes to (plan C11), or None for its chat
     window as before. Refused: a to_task that is not linked, several links with none named, and a task that waits on
@@ -18722,6 +18797,11 @@ def linked_choice(agent, tid, to, to_task):
     links = linked_tasks(agent, tid, to)
     if to_task not in (None, ""):
         want = parse_task(to_task)
+        if want not in links and given_reach(agent, to, want):
+            # A task that the sender gave itself, named by its id, from any session of the sender: a lead's session
+            # sees only the subtasks of its own task (linked_tasks), so until 19 November 2026 its words for work
+            # that already ran under another task of its own could only start a second session of the same agent.
+            links[want] = (None, REQUESTER_LIMIT)
         if want not in links:
             raise ToolError(f"{tref(want)} is no open task of {to} that the hub links to yours"
                             + (f"; the linked ones: {', '.join(tref(x) for x in links)}." if links else "."))
@@ -30371,6 +30451,37 @@ def t_write_notes(agent, a):
     return said
 
 
+# One incident is one case, also for two sessions of one agent. A key joins only two calls that give the same
+# words, and each session writes a key in words of its own. On 19 November 2026 one fault reached one agent as two
+# tasks, from a customer's ticket and from the owner's own message: each session opened a case, 12 minutes apart, and
+# the two cases named different orders. So open_case's answer names the duty's other open cases that are news.
+CASE_TIME_SOURCE = "a time that its session set"       # duty_cases.source of a case that a time opened (check_opened)
+CASE_TWINS = 5              # the most of them that one answer names, the newest first
+CASE_TWIN_AGE = 86400       # seconds: a case that opened before that is no news to the agent that holds its duty
+
+
+def case_twins(duty_id, case_id, tid, t0):
+    """One sentence for open_case's answer: the other open cases of the duty that opened in the last day, the newest
+    first, each with its title, its age and the open task that works in it; "" with none. Not the cases that the same
+    task `tid` opened: a wake-up with several new lines opens a case for each, and they are different events. It
+    refuses nothing: only the agent can say whether two cases are one event. Called inside open_case's transaction,
+    so it reads with read_rows."""
+    rows = read_rows("SELECT * FROM duty_cases WHERE responsibility=? AND state='open' AND id<>? AND opened>=? AND "
+                     "(opened_in IS NULL OR opened_in<>?) ORDER BY id DESC LIMIT ?",
+                     (duty_id, case_id, t0 - CASE_TWIN_AGE, tid if tid is not None else -1, CASE_TWINS))
+    if not rows:
+        return ""
+    said = []
+    for c in rows:
+        work = read_row(f"SELECT id FROM tasks WHERE duty_case=? AND {OPEN_TASK} ORDER BY id LIMIT 1", (c["id"],))
+        said.append(f"{cref(c)} ({c['title']}; opened {span(t0 - c['opened'])} ago"
+                    + (f"; {tref(work['id'])} works in it" if work else "") + ")")
+    return (" This duty has " + ("another open case" if len(said) == 1 else "other open cases")
+            + " since yesterday: " + "; ".join(said) + ". Check that this event is none of them. If it is one, it "
+            "has two cases now: end this one with close_case, outcome no_action and a note that names the other, and "
+            "work in that one.")
+
+
 def t_open_case(agent, a):
     """An agent or the manager opens a case that it found itself."""
     r = duty_ref(a.get("responsibility"))
@@ -30441,7 +30552,8 @@ def t_open_case(agent, a):
         text = (f"Opened R-{r['id']}/C-{case_id} of {rref(r['id'])}. "
                 + ("This key came back inside the last 30 days, so say in the preventive step why the earlier action "
                    "did not hold. " if back else "")
-                + "Record each close-out step with record_step, and close it with close_case.")
+                + "Record each close-out step with record_step, and close it with close_case."
+                + case_twins(r["id"], case_id, tid, t0))
         keep_command(command, {"case": case_id, "text": text}, t0)
     return text
 
@@ -30569,6 +30681,9 @@ def t_close_case(agent, a):
         if left:
             text += (" Not covered, so no session tells " + ("that ticket" if len(left) == 1 else "those tickets")
                      + ": " + ", ".join(f"{dref(x['id'])} ({x['ticket']})" for x in left) + ".")
+        if outcome == "handled" and not check_opened(c) and DB.execute(
+                "SELECT 1 FROM duty_reports WHERE duty_case=? LIMIT 1", (c["id"],)).fetchone():
+            text += PERSON_FOUND_CLOSED
         if learned:
             # The key is what makes it checkable later: the same event again contradicts this lesson by itself.
             mid = memory_from_work(agent, learned, f"{rref(r['id'])} opening a case with the key '{c['key']}' again",
@@ -31057,6 +31172,50 @@ def case_covers(c, r, a, words=None):
     return covers, cause, step
 
 
+def report_home(rep, c, tid):
+    """(task, case) when a join of this report to the case `c` from the task `tid` would give one incident a second
+    case, or None: the report's own task is open and works in an open case of the same duty that is older than `c`,
+    and the call comes from another task or names none. The first case keeps the report: a join to a case that is
+    older than the one of the report's own task goes through, because that one came first. A join to a case that a
+    check opened goes through too, whatever its age: the check keeps that case's key, and a case of it that ended as
+    no_action would open again at the check's next run. On 19 November 2026 a second session of the report's reader,
+    which the same fault had reached by another road, opened a case of its own and joined the report to it, 12
+    minutes after the report's own task had opened its case: two cases, two lists of orders, and the result that was
+    accepted named the shorter one. The report's own task still moves its report: it is the one that read it."""
+    work = q1("SELECT * FROM tasks WHERE id=?", (rep["task"],)) if rep["task"] else None
+    if not work or work["id"] == tid or work["state"] in TERMINAL or not work["duty_case"] or \
+            work["duty_case"] >= c["id"] or check_opened(c):
+        return None
+    at = case_row(work["duty_case"])
+    return (work, at) if at and at["state"] == "open" and at["responsibility"] == c["responsibility"] else None
+
+
+# A person's report joined a case that no check opened: a report from a ticket is a customer's own words that
+# something failed, and the hub knows of no check that saw the event first. The reader of the report is told so when
+# the first report joins the case, while the work is open, and once more when the case closes as handled (19 November
+# 2026: a false purchase confirmation that a customer found; the case closed with the fix and with no check, and the
+# owner's own review asked for one). The words say what the hub knows and no more: a check can exist and be late, and
+# then the step says so. The hub refuses nothing here (the incident plan, part 5: close_case refuses nothing).
+PERSON_FOUND = (" A person's report joined this case, and no check of the fleet opened it. If a check can see this "
+                "event the next time, building it is part of the case (save_trigger, attach_watch). If a check "
+                "exists already, or none can see it, record that in a step.")
+PERSON_FOUND_CLOSED = (" A person's report joined this case, and no check of the fleet opened it. If no check sees "
+                       "this event the next time yet, the check is still yours to build (save_trigger, "
+                       "attach_watch), or say in your result why none can see it.")
+
+
+def check_opened(c):
+    """True for a case that a check of the fleet opened: a watch of its duty (duty_new_case's source), a time that a
+    session of the case set, or open_case in a task that a wake-up rule started (a rule with no key tells its task
+    to open one case for each event that it finds). A task of any wake-up rule counts, also one of a plain
+    schedule: the hub then says nothing of a person's report, which is never false. Inside a transaction too: it
+    reads with read_row."""
+    if str(c["source"]).startswith("watch ") or c["source"] == CASE_TIME_SOURCE:
+        return True
+    opener = read_row("SELECT trigger_id FROM tasks WHERE id=?", (c["opened_in"],)) if c["opened_in"] else None
+    return bool(opener and opener["trigger_id"])
+
+
 def t_join_report(agent, a):
     """Support plan F4: the agent of a duty joins a report to an open case of that duty, so one incident is one case.
     A join from the report's own task, when that task works no case of its own and has no open subtask, ends the task:
@@ -31084,6 +31243,24 @@ def t_join_report(agent, a):
                         (", and that case covered it." if rep["covered"] else "."))
     if c["state"] != "open":
         raise ToolError(f"{cref(c)} is closed. Join the report to an open case, or open one.")
+    home = report_home(rep, c, tid)
+    if home:
+        work, at = home
+        steps = (f" If {cref(c)} is the same event, record your steps in {cref(at)} with record_step, and end "
+                 f"{cref(c)} with close_case, outcome no_action and a note that names {cref(at)}."
+                 if duty_read_allowed(agent, r) else "")     # a worker of one task of `c` writes in no other case
+        if work["requester"] != agent:
+            ask = f"ask {work['requester']}, the requester of {tref(work['id'])}, to cancel it or to send your words into it"
+        elif given_reach(agent, work["owner"], work["id"]):     # the road that linked_choice opens, and only there
+            ask = (f"you are the requester of {tref(work['id'])}: cancel it with cancel_task, or send your words "
+                   f"into it with message_agent, agent {work['owner']} and to_task {tref(work['id'])}")
+        else:
+            ask = f"you are the requester of {tref(work['id'])}: cancel it with cancel_task"
+        raise ToolError(f"{dref(rep['id'])} is the report of {tref(work['id'])}, which works in {cref(at)}: "
+                        f"{at['title']}. That case came first, and one incident is one case, so no other task joins "
+                        f"the report to a newer case that no check opened.{steps} Only the session of "
+                        f"{tref(work['id'])} moves its report to such a case or closes its case: if {cref(c)} must "
+                        f"keep the report, {ask}.")
     own = q1("SELECT * FROM tasks WHERE id=? AND owner=?", (tid, agent)) if tid else None
     ends = bool(own and own["id"] == rep["task"] and not own["duty_case"] and own["state"] not in TERMINAL and
                 not q1(f"SELECT 1 FROM tasks WHERE parent=? AND {OPEN_TASK} LIMIT 1", (own["id"],)))
@@ -31099,6 +31276,8 @@ def t_join_report(agent, a):
             " That was all of this task: the hub ended it as completed. Stop now and end your turn." if ends else
             " When you close the case, name in covers the tickets that its fix covers, with cause, next_step and "
             "for_customer.")
+        if not ends and len(joined) == 1 and not check_opened(c):
+            text += PERSON_FOUND
         if ends:        # with the receipt that says so: a repeat of this call answers from the receipt alone
             DB.execute("UPDATE tasks SET state='completed', outcome='completed', what=?, where_=?, how=?, delivered=?, "
                        "waiting_on=NULL, accepted=1, checked_at=?, check_note=? WHERE id=?",
@@ -31429,7 +31608,7 @@ def case_reminder_start(rem, t0):
         case = DB.execute("SELECT id FROM duty_cases WHERE responsibility=? AND key=? AND state='open'",
                           (duty["id"], rem["key"])).fetchone()
         case_id = case["id"] if case else duty_new_case(
-            duty, rem["key"], case_title(task["title"], rem["key"]), "a time that its session set", "hub", t0,
+            duty, rem["key"], case_title(task["title"], rem["key"]), CASE_TIME_SOURCE, "hub", t0,
             repeats=False)
         if not case:
             DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,'hub','case_opened',?)",
@@ -39946,7 +40125,8 @@ TOOLS = [
     ("all", "join_report", t_join_report,
      "Join a typed report (D-<n>) that reached your duty to one open case of that duty, so that one incident is one "
      "case and two causes with one symptom stay two cases. Called from the report's own task when that task works "
-     "no case of its own, it ends that task, and the hub takes its result. When you close the case, close_case's "
+     "no case of its own, it ends that task, and the hub takes its result. The first case keeps a report: no other "
+     "task joins it to a newer one that no check opened. When you close the case, close_case's "
      "covers names the tickets of its reports that the fix covers, with cause, next_step and for_customer.",
      S({"request_id": REQUEST_ID,
         "report": {"type": "string", "description": "The report, for example D-3"},
@@ -40402,7 +40582,8 @@ TOOLS = [
         "waits": {"type": "boolean", "description": "true only when your task cannot go on without the answer. Not "
                                                      "for your own requester: ask it with ask_my_requester"},
         "to_task": {"type": "string", "description": "The colleague's task that the message is about, for example "
-                                                     "T-15, when your task is linked to more than one of theirs"}},
+                                                     "T-15, when your task is linked to more than one of theirs, or "
+                                                     "an open task that you gave them"}},
        ["request_id", "agent", "text"])),
     # owner feature google: only the tools of the agent's level in team.json now (tools_for)
     ("worker", "drive_search", t_drive_search,

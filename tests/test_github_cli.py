@@ -6,9 +6,11 @@ no hub."""
 import hashlib
 import inspect
 import io
+import json
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -355,6 +357,73 @@ class GitHubCLI(unittest.TestCase):
                 t.join(10)
         self.assertEqual(most[0], 1)
         self.assertTrue(os.path.exists(os.path.join(self.home, ".fleet", "gh.lock")))
+
+    def test_gh_gets_the_token_of_the_repository_that_the_call_is_for(self):
+        """19 November 2026: a session's GH_TOKEN covers only its first group of repositories, and its start said of
+        the others "use git only". An agent that released from one of them got 404 from gh for its build run, and
+        reported that it could not read the run, though that repository's own token reads it. `fleet.py gh` gives gh
+        the token of the repository that the call names: by -R, by a path of gh api, by gh repo, by GH_REPO, and
+        last by the clone that the call runs in."""
+        tokens = {"acme/deploys": "ghs_" + "a" * 36, "acme/web": "ghs_" + "b" * 36, "acme/lib": "ghs_" + "c" * 36}
+        env = {"FLEET_GIT_TOKENS": json.dumps(tokens), "GH_TOKEN": tokens["acme/deploys"]}
+
+        def no_clone():
+            return None
+
+        def clone():
+            return "https://github.com/acme/lib.git"
+        for words, repo in ((["run", "list", "-R", "Acme/Web"], "acme/web"),
+                            (["run", "view", "7", "--repo=acme/web"], "acme/web"),
+                            (["run", "view", "7", "-Racme/web"], "acme/web"),
+                            (["issue", "list", "-R", "https://github.com/acme/web.git"], "acme/web"),
+                            # the value of another option is no -R, and the real one after it still counts
+                            (["release", "create", "v1", "--notes", "-Removed the old route", "-R", "acme/web"],
+                             "acme/web"),
+                            (["api", "-H", "Accept: application/json", "repos/acme/web/actions/runs"], "acme/web"),
+                            (["api", "/repos/acme/deploys/git/ref/tags/1.0"], "acme/deploys"),
+                            (["api", "https://api.github.com/repos/acme/web/actions/runs?per_page=5"], "acme/web"),
+                            (["api", "repos/acme/web?per_page=1"], "acme/web"),
+                            # the value of an option of gh api is no path of the call
+                            (["api", "--input", "repos/x/body.json", "repos/acme/web/dispatches"], "acme/web"),
+                            (["repo", "view", "acme/web", "--json", "name"], "acme/web")):
+            self.assertEqual(fleet.gh_token(words, env, no_clone), (tokens[repo], repo), words)
+        # the order: a word of the call, then GH_REPO, then the clone; gh itself takes an api path whatever GH_REPO is
+        named = dict(env, GH_REPO="acme/web")
+        self.assertEqual(fleet.gh_token(["run", "list"], named, clone)[1], "acme/web")
+        self.assertEqual(fleet.gh_token(["run", "list", "-R", "acme/deploys"], named, clone)[1], "acme/deploys")
+        self.assertEqual(fleet.gh_token(["api", "repos/acme/deploys/actions/runs"], named, clone)[1], "acme/deploys")
+        self.assertEqual(fleet.gh_token(["run", "list"], env, clone), (tokens["acme/lib"], "acme/lib"))
+        # only the word after the command of gh repo: a later one is an option's value, and the clone still counts
+        self.assertEqual(fleet.gh_token(["repo", "view", "--branch", "release/1.2"], env, clone)[1], "acme/lib")
+        self.assertEqual(fleet.gh_token(["run", "list", "-R", "acme/deploys"], env, self.fail)[1], "acme/deploys")
+        # a repository that the session does not hold has no token, and a call for none names none
+        self.assertEqual(fleet.gh_token(["run", "list", "-R", "other/repo"], env, no_clone), (None, "other/repo"))
+        for words in (["api", "graphql"], ["auth", "status"], ["run", "list", "-R"]):
+            self.assertEqual(fleet.gh_token(words, env, no_clone), (None, None), words)
+
+    def test_the_helpers_gh_command_runs_gh_with_that_token_and_every_word(self):
+        """The command itself, as a session runs it: gh's own process gets the token, and every word reaches gh, also
+        one that starts with "-" (the helper's own options take none of them)."""
+        tokens = {"acme/deploys": "ghs_" + "a" * 36, "acme/web": "ghs_" + "b" * 36}
+        os.makedirs(self.bin)
+        with open(self.target, "w") as f:
+            f.write('#!/bin/sh\necho "$GH_TOKEN|$*"\n')
+        os.chmod(self.target, 0o755)
+        env = dict(os.environ, PATH=self.bin + os.pathsep + os.environ.get("PATH", ""), GH_TOKEN=tokens["acme/deploys"],
+                   FLEET_GIT_TOKENS=json.dumps(tokens))
+        env.pop("GH_REPO", None)
+        script = os.path.join(os.path.dirname(os.path.abspath(fleet.__file__)), "fleet.py")
+        for words, token, said in ((["-R", "acme/web", "run", "list", "--limit", "1"], tokens["acme/web"], ""),
+                                   (["api", "graphql"], tokens["acme/deploys"], ""),
+                                   # a repository with no token of the session: gh as it is, and the reason beside it
+                                   (["run", "list", "-R", "other/repo"], tokens["acme/deploys"],
+                                    "this session holds no token for other/repo")):
+            done = subprocess.run([sys.executable, script, "gh", *words], env=env, cwd=self.empty, capture_output=True,
+                                  text=True, timeout=60)
+            self.assertEqual((done.returncode, done.stdout.strip()), (0, f"{token}|{' '.join(words)}"), done.stderr)
+            self.assertEqual("holds no token" in done.stderr, bool(said), done.stderr)
+            self.assertIn(said, done.stderr)
+            self.assertNotIn("ghs_", done.stderr)
 
     def test_a_worker_or_a_lead_starts_it_and_a_manager_does_not(self):
         """The roles whose task sessions get GitHub repositories (integration_env). The thread starts at the helper's

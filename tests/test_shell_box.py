@@ -2025,6 +2025,151 @@ class Reports(Cases):
         self.assertTrue(error)
         self.assertIn("is not a case of your duties", text)
 
+    def second_session(self):
+        """Another task of the reports' reader: its row, for the tool calls of its own session."""
+        tid, _ = self.task("ops")
+        return {"id": tid}
+
+    def test_a_report_stays_with_the_first_case_unless_its_own_task_moves_it(self):
+        """19 November 2026: one fault reached the reader of a report by two roads, a customer's ticket and the
+        owner's own message. Its second session opened a case of its own, 12 minutes after the report's own task had
+        opened one, and joined the report to it: two cases with different lists of orders, and the one that was
+        accepted held the shorter list. No other task joins a report to a case that is newer than the one of the
+        report's own task. A join to an older case goes through, because that case came first; so does a join to a
+        check's case, which would open again at the check's next run if it ended; and the report's own task still
+        moves its report."""
+        self.once(["T-81 message", "T-82 message", "T-83 message"])
+        for task in self.tasks()[:3]:
+            self.assertFalse(self.report(task, symptom="wrong_price", component="price_update")[1])
+        d1, d2, d3 = self.reports()
+        own1, own2, own3 = (self.task_of(d["task"]) for d in (d1, d2, d3))
+        early, late = self.second_session(), self.second_session()
+        older = self.open_dev_case(early, "old-cause")              # a case that was there first
+        home = self.open_dev_case(own1, "price-rules")              # the report's own task opened its case
+        twin = self.open_dev_case(late, "prices-wrong-again")       # and the reader's second session a newer one
+        text, error = self.tool("ops", "join_report", late, report=f"D-{d1['id']}", case=hub.cref(twin))
+        self.assertTrue(error, text)
+        self.assertIn(f"D-{d1['id']} is the report of {hub.tref(own1['id'])}, which works in {hub.cref(home)}: "
+                      f"price-rules. That case came first", text)
+        self.assertIn(f"record your steps in {hub.cref(home)} with record_step, and end {hub.cref(twin)} with "
+                      f"close_case, outcome no_action", text)
+        self.assertIn(f"ask {own1['requester']}, the requester of {hub.tref(own1['id'])}, to cancel it or to send "
+                      f"your words into it", text)
+        self.assertIsNone(self.reports()[0]["duty_case"])
+        text, error = self.tool("ops", "join_report", early, report=f"D-{d1['id']}", case=hub.cref(older))
+        self.assertFalse(error, text)                               # the older case keeps the report
+        self.open_dev_case(own2, "stock-rules")
+        checks = self.second_session()
+        hub.q("UPDATE tasks SET trigger_id=? WHERE id=?", (self.t["id"], checks["id"]))     # a wake-up rule's task
+        checked = self.open_dev_case(checks, "stock-check")
+        text, error = self.tool("ops", "join_report", checks, report=f"D-{d2['id']}", case=hub.cref(checked))
+        self.assertFalse(error, text)                               # a check's case takes it, though it is newer
+        mine = self.open_dev_case(own3, "label-rules")
+        newer = self.open_dev_case(self.second_session(), "labels-wrong-again")
+        self.assertLess(mine["id"], newer["id"])
+        text, error = self.tool("ops", "join_report", own3, report=f"D-{d3['id']}", case=hub.cref(newer))
+        self.assertFalse(error, text)                               # its own task read it: it moves its report
+
+    def test_open_case_names_the_other_new_cases_of_the_duty_and_not_those_of_the_same_task(self):
+        """A key joins only two calls with the same words, and each session writes a key of its own (19 November
+        2026: two cases of one fault, 12 minutes apart). open_case's answer names the duty's other open cases of the
+        last day with the task that works in each, so the agent can see a twin. Not the cases of the same task: a
+        wake-up with several new lines opens one for each, and those are different events."""
+        duty = f"R-{self.dev['id']}"
+
+        def opened(task, key, title):
+            text, error = self.tool("ops", "open_case", task, responsibility=duty, key=key, title=title)
+            self.assertFalse(error, text)
+            return text, hub.q1("SELECT * FROM duty_cases WHERE key=?", (key,))
+        one, two = self.second_session(), self.second_session()
+        text, first = opened(one, "price-rules", "Price rules")
+        self.assertNotIn("open case", text)                         # the duty's first case: none to name
+        text, second = opened(two, "prices-wrong-again", "Prices are wrong again")
+        self.assertIn(f"This duty has another open case since yesterday: {hub.cref(first)} (Price rules; opened ", text)
+        self.assertIn(f"; {hub.tref(one['id'])} works in it). Check that this event is none of them.", text)
+        text, third = opened(two, "labels", "Labels")               # the same task again: its own case is no twin
+        self.assertIn(hub.cref(first), text)
+        self.assertNotIn(hub.cref(second), text)
+        hub.q("UPDATE duty_cases SET opened=opened-? WHERE id=?", (hub.CASE_TWIN_AGE + 60, first["id"]))
+        hub.q("UPDATE duty_cases SET state='closed' WHERE id=?", (second["id"],))
+        text, _ = opened(self.second_session(), "stock", "Stock")
+        self.assertIn(hub.cref(third), text)                        # open and new: named
+        self.assertNotIn(hub.cref(first) + " ", text)               # older than a day: no news
+        self.assertNotIn(hub.cref(second) + " ", text)              # closed: no twin
+
+    def test_create_task_says_when_the_new_task_names_work_that_the_same_agent_runs(self):
+        """19 November 2026: a lead's new task for a fault named the report and the task of that same fault, which
+        its worker already ran. A second task is a second session of the same agent, and the two did not see each
+        other's work. The note names the running task and the other road: the giver's words into it."""
+        self.once(["T-81 message"])
+        self.assertFalse(self.report(self.tasks()[0], symptom="wrong_price", component="price_update")[1])
+        d, = self.reports()
+        own = self.task_of(d["task"])
+        home = self.open_dev_case(own, "price-rules")
+        _, at_work = Fleet.task(self, "lead")
+
+        def give(giver, context, **fields):
+            text, error = hub.call_tool(giver, "create_task", dict(
+                {"owner": "ops", "title": "Stop the wrong prices", "done_when": "The prices are right."}, **fields),
+                context)
+            self.assertFalse(error, text)
+            return text, hub.q1("SELECT * FROM tasks ORDER BY id DESC LIMIT 1")
+        for fields in ({"details": f"The same thing, probably: report D-{d['id']}."},
+                       {"details": f"See {hub.tref(own['id'])}."}, {"why": f"It is {hub.cref(home)} again."},
+                       {"case_id": hub.cref(home)}):
+            with self.subTest(fields=fields):
+                text, new = give("lead", at_work, **fields)
+                self.assertIn(f"this task names work that ops runs now: {hub.tref(own['id'])} (", text)
+                self.assertIn(f"cancel {hub.tref(new['id'])} with cancel_task and send your words into the running "
+                              f"task with message_agent, agent ops and to_task {hub.tref(own['id'])}", text)
+                hub.q("UPDATE tasks SET state='canceled' WHERE id=?", (new["id"],))
+        # the note names the road only where it is open: not from a session that a person's conversation drives,
+        # whose to_task the hub refuses for a task that is not linked, and not for a task that another agent gave
+        with patch.object(hub, "contact_session", return_value=True):
+            text, new = give("lead", at_work, details=f"See {hub.tref(own['id'])}.")
+        self.assertIn(f"your words reach {hub.tref(own['id'])} only from a session of your own that no person's "
+                      f"conversation drives", text)
+        self.assertNotIn("cancel_task", text)                   # nothing to cancel for a road that is closed here
+        hub.q("UPDATE tasks SET state='canceled' WHERE id=?", (new["id"],))
+        hub.q("UPDATE tasks SET requester='manager' WHERE id=?", (own["id"],))
+        text, new = give("lead", at_work, details=f"See {hub.tref(own['id'])}.")
+        self.assertIn(f"ask whoever gave {hub.tref(own['id'])} to send your words into it", text)
+        hub.q("UPDATE tasks SET state='canceled' WHERE id=?", (new["id"],))
+        hub.q("UPDATE tasks SET state='completed' WHERE owner='ops'")               # finished work is no running work
+        text, _ = give("lead", at_work, details=f"See {hub.tref(own['id'])} and D-{d['id']}.")
+        self.assertNotIn("names work that ops runs now", text)
+
+    def test_the_reader_is_told_when_a_person_s_report_joined_a_case_that_no_check_opened(self):
+        """19 November 2026: a customer found a false purchase confirmation, the case closed with its fix and with no
+        check, and the owner's own review asked for one. A report from a ticket is a person's own words that
+        something failed: its reader is told so once, at the first join, while the work is open, and when the case
+        closes as handled. A case that the task of a wake-up rule opened was seen by a check first."""
+        self.once(["T-81 message", "T-82 message", "T-83 message"])
+        for task in self.tasks()[:3]:
+            self.assertFalse(self.report(task, symptom="wrong_price", component="price_update")[1])
+        d1, d2, d3 = self.reports()
+        t1, t3 = self.task_of(d1["task"]), self.task_of(d3["task"])
+        found = self.open_dev_case(t1, "price-rules")
+        text, error = self.tool("ops", "join_report", t1, report=f"D-{d1['id']}", case=hub.cref(found))
+        self.assertFalse(error, text)
+        self.assertIn("A person's report joined this case, and no check of the fleet opened it. If a check can see "
+                      "this event the next time, building it is part of the case", text)
+        text, error = self.tool("ops", "join_report", t1, report=f"D-{d2['id']}", case=hub.cref(found))
+        self.assertFalse(error, text)
+        self.assertNotIn("A person's report", text)                 # said once, at the first report
+        text, error = self.close(t1, found, covers=[])
+        self.assertFalse(error, text)
+        self.assertIn("A person's report joined this case, and no check of the fleet opened it. If no check sees "
+                      "this event the next time yet, the check is still yours to build", text)
+        hub.q("UPDATE tasks SET trigger_id=? WHERE id=?", (self.t["id"], t3["id"]))   # as a wake-up rule's task is
+        watched = self.open_dev_case(t3, "stock-rules")
+        text, error = self.tool("ops", "join_report", t3, report=f"D-{d3['id']}", case=hub.cref(watched))
+        self.assertFalse(error, text)
+        self.assertNotIn("A person's report", text)
+        text, error = self.close(t3, watched, covers=[])
+        self.assertFalse(error, text)
+        self.assertNotIn("A person's report", text)
+
     def test_a_case_that_reports_joined_closes_only_with_close_case(self):
         """The review of 3 November 2026: a close that names no covers would close the case and tell no ticket.
         covers=[] says that the fix covers none, and its reports may then join another case. A result closes no case

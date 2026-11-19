@@ -1540,9 +1540,11 @@ def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=No
         values["GH_TOKEN"] = groups[0]["token"]
         others = sorted(set(tokens) - set(groups[0]["repos"]))
         if others:
-            notes.append(f"GH_TOKEN (gh and the GitHub tool) works for {few(groups[0]['repos'])}; for " +
-                         (f"{', '.join(others)} use git only." if len(others) <= FEW else
-                          f"your other {len(others)} repositories use git only."))
+            # not "use git only", as it said until 19 November 2026: each other repository has its own token, which
+            # reads what its level reads, and `fleet.py gh` gives it to gh (cmd_gh; github_text says how)
+            notes.append(f"GH_TOKEN (plain gh and the GitHub tool) works for {few(groups[0]['repos'])}; for " +
+                         (f"{', '.join(others)}" if len(others) <= FEW else
+                          f"your other {len(others)} repositories") + " run gh as the start says (fleet.py gh).")
     if repos and place:
         values["FLEET_WORK"] = place
     held = held_repos(repos, place)
@@ -1970,6 +1972,15 @@ def empty_trash(agent):
     shutil.rmtree(os.path.join(task_work(), agent, ".trash"), ignore_errors=True)
 
 
+def gh_token_partial(values):
+    """True when a repository of the session has a token other than GH_TOKEN: plain gh then answers 404 for it."""
+    try:
+        tokens = json.loads(values.get("FLEET_GIT_TOKENS") or "{}")
+    except ValueError:
+        return False
+    return isinstance(tokens, dict) and any(t != values.get("GH_TOKEN") for t in tokens.values())
+
+
 def github_text(values, tools):
     """The part of a task's start text for its GitHub repositories and tools (owner feature integrations)."""
     repos = [r.rsplit(":", 1) for r in values.get("FLEET_REPOS", "").split()]
@@ -2012,6 +2023,11 @@ def github_text(values, tools):
         text += ("deploy is write and the repository's own deployment: its .github/workflows files, which a write "
                  "token may not push at all, and the start of its GitHub Actions runs (gh workflow run, "
                  "gh run rerun). ")
+    if "GH_TOKEN" in values and gh_token_partial(values):
+        gh = shlex.join([sys.executable, os.path.join(KIT, "fleet.py"), "gh"]) + " <gh arguments>"
+        text += ("gh holds one token, GH_TOKEN, and yours covers only some of your repositories. For each other one, "
+                 f"run gh as `{gh}`: it gives gh the token of the repository that the call is for, which is the one "
+                 "that -R names, the one in a repos/<owner>/<name> path of gh api, or the clone that you are in. ")
     if "GH_TOKEN" in values:
         text += ("GH_TOKEN and git's credentials for these repositories stop working one hour after this start. Never "
                  "show them or put them in a note, a file, a command or a commit. ")
@@ -11863,7 +11879,96 @@ def cmd_git_credential(args):
         print(f"username=x-access-token\npassword={token}")
 
 
+# gh with the token of the repository that a call is for. A session's GH_TOKEN is the token of its first group of
+# repositories only (integration_env: the highest access first), because GitHub makes one App token for one level, and
+# gh takes one token. Until 19 November 2026 the start said of the other repositories "use git only". On that day an
+# agent with 2 repositories at deploy and 164 at write released from one of the 164: gh answered 404 for the build
+# run, and the agent and a second one reported that they could not read the run or the tag, though that repository's
+# own token reads both (hub.github_permissions). The tokens of every group are in FLEET_GIT_TOKENS already, for git.
+GH_REPO_VALUE = re.compile(r"(?:https://github\.com/|git@github\.com:|github\.com/)?"
+                           r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?")
+GH_API_REPO = re.compile(r"(?:https://api\.github\.com)?/?repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)(?:[/?].*)?")
+
+
+# The options of `gh api` that take a value: the word after one is that value, and no path of the call.
+GH_API_VALUES = frozenset(("-H", "--header", "-f", "--raw-field", "-F", "--field", "-X", "--method", "--input", "-q",
+                           "--jq", "-t", "--template", "--hostname", "--cache", "-p", "--preview"))
+
+
+def gh_repo(words, environ, origin):
+    """The repository that a gh call is for, in lower case, or None. In this order: the value of -R or --repo; for
+    `gh api`, its first word that is a repos/<owner>/<name> path and no value of an option (gh itself takes a path as
+    it is, whatever GH_REPO says); for `gh repo <command> <owner>/<name>`, that word; GH_REPO; the origin of the git
+    repository that the call runs in (origin: a function that gives that address or None, asked only when nothing
+    else names one). A word counts as a repository only in the form of one, so the value of another option that
+    starts with -R (--notes "-Removed ...") names nothing, and the words after it are still read."""
+    def repo(value):
+        m = GH_REPO_VALUE.fullmatch((value or "").strip())
+        return m.group(1).lower() if m else None
+    for i, word in enumerate(words):
+        if word in ("-R", "--repo"):
+            named = repo(words[i + 1]) if i + 1 < len(words) else None
+        elif word.startswith("--repo="):
+            named = repo(word[len("--repo="):])
+        elif word.startswith("-R") and len(word) > 2:
+            named = repo(word[2:].lstrip("="))
+        else:
+            continue
+        if named:
+            return named
+    if words[:1] == ["api"]:
+        for i, word in enumerate(words[1:], 1):
+            m = None if words[i - 1] in GH_API_VALUES else GH_API_REPO.fullmatch(word)
+            if m:
+                return m.group(1).lower()
+    if words[:1] == ["repo"] and len(words) > 2 and not words[2].startswith("-") and repo(words[2]):
+        return repo(words[2])           # only the word after the command: a later one can be an option's value
+    return repo(environ.get("GH_REPO")) or repo(origin())
+
+
+def gh_origin():
+    """The address of origin in the git repository of the current folder, or None."""
+    try:
+        r = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() or None if r.returncode == 0 else None
+
+
+def gh_token(words, environ, origin=gh_origin):
+    """(token, repository) for a gh call: the session's token for the repository that the call is for (gh_repo), from
+    FLEET_GIT_TOKENS, and that repository. The token is None for no repository, for one that the session does not
+    hold, and for a value that is no token; the repository is None when the call names none or the session has no
+    tokens at all."""
+    try:
+        tokens = json.loads(environ.get("FLEET_GIT_TOKENS") or "{}")
+    except ValueError:
+        return None, None
+    repo = gh_repo(words, environ, origin) if isinstance(tokens, dict) and tokens else None
+    token = tokens.get(repo) if repo else None
+    return (token if isinstance(token, str) and GITHUB_TOKEN.fullmatch(token) else None), repo
+
+
+def cmd_gh(words):
+    """fleet.py gh <gh arguments>: gh itself, with the session's token for the repository that the call is for in
+    GH_TOKEN (gh_token); with no such token, gh as the session has it, and one line on stderr when the call is for a
+    repository that the session holds no token for, so that a 404 of gh has its reason beside it. The token goes to
+    gh's own process and nowhere else: nothing here prints it."""
+    program = shutil.which("gh")
+    if not program:
+        die("gh is not on this machine's PATH")
+    token, repo = gh_token(words, os.environ)
+    if token:
+        os.environ["GH_TOKEN"] = token
+    elif repo:
+        print(f"fleet.py gh: this session holds no token for {repo} (its repositories are in FLEET_REPOS), so gh "
+              f"runs with GH_TOKEN as it is.", file=sys.stderr, flush=True)
+    os.execv(program, ["gh", *words])
+
+
 def main():
+    if sys.argv[1:2] == ["gh"]:         # every word after it is gh's own, also one that starts with "-"
+        return cmd_gh(sys.argv[2:])
     ap = argparse.ArgumentParser(description="Founderizer helper")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("addresses"); p.add_argument("pairs", nargs="*", metavar="name=address")
