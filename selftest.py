@@ -255,7 +255,11 @@ WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "ask_my_reques
                               # the owner, 29 October 2026: it asks him itself for a secret that its task needs
                               "request_secret",
                               # the owner, 16 November 2026 (need_takeover): and for one step on its own screen
-                              "request_takeover"]
+                              "request_takeover",
+                              # peer tasks (the owner, 19 November 2026): a part of its task for a peer, and the
+                              # tools of that part, as a lead's for its subtask
+                              "create_task", "cancel_task", "restart_task", "answer", "check_result",
+                              "decide_permission", "decide_report", "see_team"]
 # A lead: its own task's worker tools, and the eleven team tools of RULES.md -- the first nine limited to that
 # task's subtasks, the two duty writes to its own team. No check ever listed a lead's tools, because the hub these
 # checks start has no lead -- which is how LEAD_TEAM_TOOLS came to hold nine where RULES.md named eight, for weeks.

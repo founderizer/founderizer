@@ -3769,7 +3769,7 @@ def filed_under(agent, kind, task):
     parent task, and a question that a lead under it passed up (answer pass_up) in the session of its own task above
     that lead's: the walk goes up the parent chain to the task this lead requested. read_row only, so it is safe
     inside a transaction (owner_message_rows answers a question there)."""
-    if task and kind == "say" and role_of(agent) == "lead":
+    if task and kind == "say" and gives_subtasks(agent):
         t = read_row("SELECT * FROM tasks WHERE id=?", (task,))
         link = chain_link(agent, t) if t and t["owner"] != agent else None
         if link and link["parent"]:
@@ -5009,7 +5009,10 @@ def migrate():
                   # inside. `job` is the task whose job this task joins (create_task job), written when the task is
                   # born and never changed; `job_name` is the name of the whole job, on its first task only; `plain`
                   # is what came of the task, in plain words for the owner (deliver_result plain)
-                  "job": "INTEGER", "job_name": "TEXT", "plain": "TEXT"},
+                  "job": "INTEGER", "job_name": "TEXT", "plain": "TEXT",
+                  # peer tasks (the owner, 19 November 2026): 1 for a task that its requester gave a peer, written
+                  # when the task is born and never changed; its giver acts on it while they are peers (lead_left)
+                  "peer": "INTEGER"},
         # manager_as_lead: which step of the plan next_step came from, so a split step whose parts have all ended
         # counts as no next step, exactly as a single ended task does.
         "goals": {"next_step_id": "INTEGER"},
@@ -5786,12 +5789,16 @@ def team_start_text(agent):
         duties.setdefault(r["agent"], []).append(duty_name(r["text"]))
     requester, mine = reports_to(agent), \
         [n for n in agents() if reports_to(n) == agent] if role_of(agent) in ("lead", "manager") else []
+    # peer tasks: an equal on the line, which this agent may give a part of a task of its own (the start of a task
+    # says how)
+    peer = [n for n in agents() if gives_subtasks(agent) and peers(agent, n)[0]]
     kept, left = [], 0
     for name in agents():
         if name == agent or not agent_active(name):
             continue
         line = colleague_line(name, " -- it gives you your tasks" if name == requester else
-                              " -- you give it tasks" if name in mine else "",
+                              " -- you give it tasks" if name in mine else
+                              " -- your peer" if name in peer else "",
                               looks_after_text(name, rev, duties.get(name, []))
                               if responsible_line(name, rev) or duties.get(name) else "")
         if sum(len(x) + 3 for x in kept) + len(line) <= TEAM_CHARS:
@@ -6209,6 +6216,18 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
     # parts -- a part that does not know it is a part does the whole piece.
     part = part_start_text(task_id, closed)
     said += " " + part.rstrip() if part else ""
+    # peer tasks: the equals on its line that it may give a part of this task, unless a peer gave it the task
+    mates = [n for n in agents() if not closed and gives_subtasks(agent) and peers(agent, n)[0]]
+    given = read_row("SELECT peer FROM tasks WHERE id=?", (task_id,)) if mates else None
+    if (given and given["peer"]) or (mates and contact_session(agent, ("", tref(task_id), "1"))):
+        mates = []                      # peer_task_refusal's two refusals
+    if role_of(agent) == "worker" and mates:
+        said += (f' Your peers report to {reports_to(agent)} as you do: {", ".join(mates)}. You may give one of them a '
+                 f'part of {tref(task_id)} with create_task: it becomes a subtask of {tref(task_id)}, and its result, '
+                 f'questions, reports and permission prompts arrive in this session: check the result with '
+                 f'check_result, answer with answer, decide prompts with decide_permission and reports with '
+                 f'decide_report, and deliver {tref(task_id)} only when it is finished; see_team shows each part and what '
+                 f'waits on you. {reports_to(agent)} is told, and may cancel it.')
     if role_of(agent) == "lead" and not closed:      # F1: a closed session gives out no part
         team = ", ".join(n for n in agents() if reports_to(n) == agent) or "nobody yet"
         said += (f' You lead {team}. Give parts of {tref(task_id)} to them with create_task: each becomes a subtask of '
@@ -6218,7 +6237,9 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
                  f'Deliver {tref(task_id)} only when its subtasks are finished. Standing work of your team is yours to '
                  f'write as a duty, with set_duty and change_duty: your team\'s and your own, and nobody else\'s. '
                  f'{manager_name()} stays the authority over every duty of the fleet, so it reads what you write and '
-                 f'it writes a duty outside your team.')
+                 f'it writes a duty outside your team.' +
+                 (f' Your peers report to {reports_to(agent)} as you do: {", ".join(mates)}. You may give one of them a '
+                  f'part of {tref(task_id)} the same way, and {reports_to(agent)} is told.' if mates else ''))
     if resume:
         t = row or read_row("SELECT * FROM tasks WHERE id=?", (task_id,))
         said += ((" " + mask_secrets(note) if note else "") + unknown_start_text(task_id, closed, note) +
@@ -7146,7 +7167,7 @@ def turn_end_check(t, state, t0, force=False):
         stretch = None                          # a message came between: a new stretch
     closed = shell_off(t["owner"])          # support plan F1, H7: its own tools, and no words of it go up
     if not stretch:
-        chase = requester_chase(t["owner"], t0, task=t) if role_of(t["owner"]) == "lead" and not closed else None
+        chase = requester_chase(t["owner"], t0, task=t) if gives_subtasks(t["owner"]) and not closed else None
         if chase:           # a lead whose own team waits on it gets that, in place of the continue
             event = emit(t["owner"], "say", chase[0], task=tid)
             chased(t["owner"], chase[1], event)
@@ -7863,7 +7884,9 @@ def restart_authority(agent, t):
     acting for a lead that cannot (lead_left), because the manager is the authority over the whole fleet."""
     if agent != t["requester"] and acts_for(agent, t):
         return True, None
-    return authority(agent, t["owner"], "task")
+    allowed, reason = authority(agent, t["owner"], "task")
+    return (True, None) if allowed or (agent == t["requester"] and t["peer"] and peers(agent, t["owner"])[0]) \
+        else (False, reason)
 
 
 def restart_continue(hold_id):
@@ -8559,6 +8582,15 @@ def warm_attempt(t):
                                          "NULL ORDER BY m.id", (t["id"],)):
         lines.append(f"It read AM-{m['id']} from {m['sender']}, which waits for the answer, and did not answer it: "
                      f'answer with message_agent(in_reply_to="AM-{m["id"]}").')
+    # The parts that this task gave (a lead's subtasks, a worker's peer tasks), still open or with a result to check:
+    # the session before read their news, and a lost session took that with it.
+    parts = [] if closed or not gives_subtasks(t["owner"]) else \
+        read_rows("SELECT id, owner, state FROM tasks WHERE parent=? AND (state NOT IN (?,?,?,?) OR (accepted IS NULL "
+                  "AND state<>'canceled')) ORDER BY id", (t["id"],) + TERMINAL)
+    if parts:
+        lines.append("Its parts that are open or wait for check_result: " +
+                     ", ".join(f"{tref(p['id'])} ({p['owner']}, {p['state']})" for p in parts[:WARM_ACTIONS]) +
+                     ". see_team shows each one and what waits on you.")
     # Its last words often say where it stopped when no note does (4 November 2026: a fresh session got the notes and
     # the last command, and not the summary that its session ended with). Last, so that the cap cuts them first.
     said = (turn_state(t["id"], attempt) or {}).get("said")
@@ -9486,9 +9518,10 @@ def deliver_result(agent, a, files_said=None):
                         f"Check or cancel them first.")
     # Rule 3: whoever gave a task checks its result. check_result reaches a subtask only from this session, so a
     # result left unchecked here could never be checked by anybody again.
-    unchecked = [r for r in q("SELECT id, owner FROM tasks WHERE parent=? AND state IN ('completed','failed','rejected') "
-                              "AND accepted IS NULL ORDER BY id", (tid,))
-                 if role_of(agent) == "lead" and authority(agent, r["owner"], "task")[0]]
+    unchecked = [r for r in q("SELECT id, owner, peer FROM tasks WHERE parent=? AND state IN ('completed','failed',"
+                              "'rejected') AND accepted IS NULL ORDER BY id", (tid,))
+                 if (role_of(agent) == "lead" and authority(agent, r["owner"], "task")[0]) or
+                 (r["peer"] and peers(agent, r["owner"])[0])]
     # (one whose agent left its team, or a lead that became a worker, may check none of them: it is not held to it)
     if unchecked:
         raise ToolError(f"{tref(tid)} has subtask results that you have not checked: "
@@ -9571,6 +9604,11 @@ LEAD_TEAM_TOOLS = ("create_task", "cancel_task", "restart_task", "answer", "chec
                    "set_agent_model")       # AUTONOMY.md P8: a lead is its team's one changer
 # A worker writes its own duties in its task sessions (plan C17), and duty_write_allowed keeps them its own.
 WORKER_OWN_TOOLS = ("set_duty", "change_duty")
+# Peer tasks (the owner, 19 November 2026): a worker gives a task to a peer from a task session of its own, and acts
+# on it as a lead acts on its subtask. A Shell-off session has its own fixed list, and a chat or a conversation
+# window takes none of these (CHAT_TOOLS, CONVERSATION_NOT_WORK).
+PEER_TOOLS = ("create_task", "cancel_task", "restart_task", "answer", "check_result", "decide_permission",
+              "decide_report", "see_team")
 # The one tool that only the owner chat of a worker or a lead has: it opens the work the owner asks for there.
 CHAT_ONLY = ("start_task",)
 # The tools that a worker or a lead has only in its owner chat, where the owner talks to it, and the manager wherever
@@ -9584,9 +9622,9 @@ WORKER_CHAT_ONLY = ("tell_owner", "message_owner")
 
 def role_offers(role, r, name):
     """True when a tool of role `r` (TOOLS) is one that an agent of `role` has: its own and every agent's, a lead's
-    worker tools and team tools, and a worker's own duty writes."""
+    worker tools and team tools, and a worker's own duty writes and its peer tasks' tools."""
     return r in (role, "all") or (role == "lead" and (r == "worker" or name in LEAD_TEAM_TOOLS)) or \
-        (role == "worker" and name in WORKER_OWN_TOOLS)
+        (role == "worker" and (name in WORKER_OWN_TOOLS or name in PEER_TOOLS))
 
 
 def role_of(name):
@@ -9594,8 +9632,9 @@ def role_of(name):
 
 
 def lead_task(agent):
-    """The task whose session calls a lead's team tool; None for any other caller (owner API 1.6)."""
-    if role_of(agent) != "lead":
+    """The task whose session calls a lead's team tool, or a worker's tool of a peer task (gives_subtasks); None for
+    any other caller (owner API 1.6)."""
+    if not gives_subtasks(agent):
         return None
     context = getattr(CALL, "context", None)
     if not context or len(context) != 3 or context[1] == "owner-chat":
@@ -9615,6 +9654,8 @@ def in_scope(agent, t):
     if not link or link["parent"] != parent:
         raise ToolError(f"{tref(t['id'])} is not a subtask of {tref(parent)}, the task of this session.")
     allowed, reason = authority(agent, link["owner"], "task")
+    if not allowed and link["peer"] and peers(agent, link["owner"])[0]:
+        allowed = True                  # a task that it gave its peer (peer tasks)
     if not allowed:
         raise ToolError(f"{reason} You can no longer act on {tref(t['id'])}. Tell your requester with ask_my_requester; "
                         f"the owner can stop it in Fleet.")
@@ -9627,9 +9668,12 @@ def lead_left(lead, t):
     that chain. Never for the manager, which acts for itself. read_row only."""
     if not lead or lead == manager_name():
         return False
+    link = chain_link(lead, t) if t is not None else None
+    if link and link["peer"]:           # peer tasks: its giver, while the two are peers
+        up = read_row("SELECT state FROM tasks WHERE id=?", (link["parent"],)) if link["parent"] else None
+        return up is None or up["state"] in TERMINAL or not peers(lead, link["owner"])[0]
     if role_of(lead) != "lead":
         return True
-    link = chain_link(lead, t) if t is not None else None
     up = read_row("SELECT state FROM tasks WHERE id=?", (link["parent"],)) if link and link["parent"] else None
     return up is None or up["state"] in TERMINAL or not authority(lead, link["owner"], "task")[0]
 
@@ -9707,7 +9751,8 @@ LEAD_LOOK_ROWS = 12
 
 def lead_overview(agent, parent):
     team = [n for n in agents() if reports_to(n) == agent]
-    out = [f"YOUR TEAM ({agent})"]
+    # a worker reads the parts that it gave its peers (peer tasks), and has no team of its own
+    out = [f"YOUR TEAM ({agent})"] if role_of(agent) != "worker" else [f"WHAT YOU GAVE YOUR PEERS ({agent})"]
     for name in team:
         row = q1("SELECT last_seen FROM agents WHERE name=?", (name,))
         a = agents()[name]
@@ -9801,6 +9846,97 @@ def authority(actor, target, action):
     if not agent_active(target):
         return False, f"{target} is in setup. The owner activates it in Fleet."
     return True, None
+
+
+# ---------------------------------------------------------------- peer tasks
+#
+# The owner, 19 November 2026: "agents in the same level, like [a lead] and Browser Agent (peers) should be able to
+# talk to each other without bothering their boss (in this case, the Fleet Manager)", and "ok lets do it on the main
+# thread" to the design: a peer gives a peer a task, which starts at once; the boss that both report to is told and
+# may cancel it, and is not asked; only an agent whose Shell box is on gives one, because a Shell-off session reads
+# customers' text, which must not reach a peer's access as an order; the receiver judges it by its own profile and
+# access, as every task. authority() stays the reporting line's own rule, which duties, wake-up rules and remembered
+# answers read too: a peer gives tasks and nothing else.
+#
+# A peer task is a subtask of the giver's task, as a lead's subtask is (lead_task): its result, questions and
+# permission prompts come back to that session, and the giver checks it. So a worker whose Shell box is on gives
+# subtasks too (gives_subtasks), to its peers alone, with the tools of a lead's subtasks (PEER_TOOLS).
+
+
+def peers(actor, target):
+    """(True, None) when `actor` and `target` are peers that may give each other work: two workers or leads, each
+    other's equal on the reporting line (the same agent above them), with the actor's Shell box on and the target
+    active; else (False, the reason). It holds while the task lives, as authority() does for a lead's team, so a peer
+    that moved to another line acts on nothing more."""
+    team = agents()
+    if actor == target or actor not in team or target not in team:
+        return False, f"{target} is not your peer."
+    if role_of(actor) not in ("worker", "lead") or role_of(target) not in ("worker", "lead"):
+        return False, f"{target} is not your peer."
+    boss = reports_to(actor)
+    if boss is None or reports_to(target) != boss:
+        return False, f"{target} is not your peer: it reports to {reports_to(target)}, and you to {boss}."
+    if shell_off(actor):
+        return False, ("Your Shell box is off, so you give no task to a peer: your sessions read other people's words. "
+                       f"Ask {boss} with ask_my_requester.")
+    if not agent_active(target):
+        return False, f"{target} is in setup. The owner activates it in Fleet."
+    return True, None
+
+
+def may_give(actor, target):
+    """Whether `actor` may still act on the work of `target` that it gave: its reporting line (authority) or its peer
+    (peers)."""
+    return authority(actor, target, "task")[0] or peers(actor, target)[0]
+
+
+def gives_subtasks(agent):
+    """True for an agent whose task sessions give subtasks: a lead, to its team and to its peers, and a worker whose
+    Shell box is on, to its peers (peers). A subtask's result, questions and prompts come back to that session."""
+    role = role_of(agent)
+    return role == "lead" or (role == "worker" and not shell_off(agent))
+
+
+def peer_task_refusal(agent, parent):
+    """Why `agent` gives no peer task from the session of its task `parent`, or None: that task is one that a peer gave
+    it (one step sideways, so no work goes round past the boss), or a person's conversation drives the session (its
+    words are no order for a peer, as a Shell-off session's are not)."""
+    if parent is None:
+        return "A peer task is a part of one of your tasks: give it from that task's session."
+    above = read_row("SELECT requester, peer FROM tasks WHERE id=?", (parent,))
+    if above and above["peer"]:         # its mark, whatever the team is now: a team change opens no chain of peers
+        return (f"{tref(parent)} is a task that {above['requester']} gave you as its peer, and a task that a peer gave "
+                f"passes to no other peer. Do the work, or ask {above['requester']} with ask_my_requester.")
+    if contact_session(agent):
+        return ("A person's conversation drives this session, and their words are no order for a peer. Ask your "
+                "requester with ask_my_requester.")
+    return None
+
+
+def peer_told(agent, owner, tid, title):
+    """Tells the agent above both peers of the task that `agent` gave `owner` (peer tasks: told, not asked): one line
+    with the next read, under the task that it reads its news in, and how it cancels the task. Not typed into a
+    session of its own."""
+    boss, manager = reports_to(agent), manager_name()
+    if not boss:
+        return
+    # A lead reads only in a task session of its own, above the giver's task (filed_about, as emit files the line).
+    # A giver whose task came from another (a team change while it ran) has none, and then the manager, which reads
+    # every line, is told.
+    reader = boss if boss == manager or filed_about(boss, "say", tid)[0] != tid else manager
+    head = f"[hub] {agent} gave its peer {owner} {tref(tid)}, {json.dumps(title, ensure_ascii=False)}, directly, as a " \
+           f"part of its own task."
+    stop = f" Nothing is asked of you: cancel_task with task_id {tref(tid)} ends it if it is wrong."
+    if reader != manager and shell_off(reader):
+        # a lead whose Shell box is off has no cancel_task: the manager, which may cancel any peer task, is told too,
+        # by the hub and not by that lead's words
+        emit(reader, "say", head + f" Nothing is asked of you: your Shell box is off, so {manager} is told too, and "
+                                   f"may cancel it.", task=tid, extra=QUIET_SAY)
+        emit(manager, "say", head + f" They report to {boss}, whose Shell box is off, so the cancel is yours." + stop,
+             task=tid, extra=QUIET_SAY)
+        return
+    emit(reader, "say", head + (f" They report to {boss}, which reads no task session above it, so this is yours."
+                                if reader != boss else "") + stop, task=tid, extra=QUIET_SAY)
 
 
 # ---------------------------------------------------------------- what the owner asked for (owner feature asks)
@@ -10192,6 +10328,13 @@ def check_task(agent, a, by_goal=False):
     follows = parse_task(a["follows"]) if a.get("follows") not in (None, "", 0, "0") else None
     step = split_step(agent, a.get("step"), goal_id, parent)
     allowed, reason = authority(agent, owner, "task")
+    peer = False
+    if not allowed and owner in agents() and reports_to(owner) == reports_to(agent) and owner != agent:
+        allowed, reason = peers(agent, owner)       # peer tasks: a part of the giver's own task, the boss told
+        refusal = peer_task_refusal(agent, parent) if allowed else None
+        if refusal:
+            allowed, reason = False, refusal
+        peer = allowed
     if not allowed:
         raise ToolError(reason)
     if not title or not done_when:
@@ -10199,7 +10342,7 @@ def check_task(agent, a, by_goal=False):
     if needs not in ("none", "browser", "screen"):
         raise ToolError("needs must be none, browser or screen.")
     if needs != "none" and needs not in agents()[owner].get("can", []):
-        able = [n for n, x in agents().items() if needs in x.get("can", []) and authority(agent, n, "task")[0]]
+        able = [n for n, x in agents().items() if needs in x.get("can", []) and may_give(agent, n)]
         hint = " It has a screen: give it this task with needs screen." if needs == "browser" and \
             "screen" in agents()[owner].get("can", []) else ""
         raise ToolError(f"{owner} has no {needs}.{hint} Agents with a {needs}: {', '.join(able) or 'none'}.")
@@ -10246,7 +10389,7 @@ def check_task(agent, a, by_goal=False):
             "duty_case": duty_case["id"] if duty_case else None,
             "responsibility": duty_case["responsibility"] if duty_case else None, "why": why or None,
             "ask": ask, "asked": asked, "job": job, "job_name": job_name or None, "job_note": job_note,
-            "job_named": named}
+            "job_named": named, "peer": peer}
 
 
 def split_step(agent, value, goal_id, parent):
@@ -10286,11 +10429,12 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
     t0 = now()
     tid = DB.execute("INSERT INTO tasks(id,title,details,done_when,needs,goal,goal_id,parent,step,owner,requester,"
                      "state,follows,created,last_activity,case_id,trigger_id,trigger_run,why,responsibility,duty_case,"
-                     "ask,job,job_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     "ask,job,job_name,peer) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                      (unused_id("tasks"), f["title"], f["details"], f["done_when"], f["needs"], f["goal"], f["goal_id"],
                       f["parent"], f.get("step"), f["owner"], requester, "submitted", f["follows"], t0, t0,
                       f["case_id"], trigger_id, trigger_run, f.get("why"), f.get("responsibility"),
-                      f.get("duty_case"), f.get("ask"), f.get("job"), f.get("job_name"))).lastrowid
+                      f.get("duty_case"), f.get("ask"), f.get("job"), f.get("job_name"),
+                      1 if f.get("peer") else None)).lastrowid
     if f.get("ask") and f.get("asked"):         # owner feature asks: the first task of a message names the ask
         ask_name_row(f["ask"], f["asked"])
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,1,?,'created')", (tid, t0))
@@ -10322,6 +10466,8 @@ def t_create_task(agent, a):
     with transaction():             # the task, its first attempt and its start event: all three or none
         tid = admit_task(agent, f)
     owner = f["owner"]
+    if f["peer"]:
+        peer_told(agent, owner, tid, f["title"])
     seen = q1("SELECT last_seen FROM agents WHERE name=?", (owner,))
     late = "" if seen and now() - (seen["last_seen"] or 0) < 90 else f" Note: {owner}'s helper has not checked in recently."
     if os_user_held(owner):             # one OS user for each agent
@@ -10345,6 +10491,11 @@ def t_create_task(agent, a):
                      "with create_task step=<n>. see_capacity says who suits it and which accounts have allowance "
                      "left. Never place a part on an agent that does not suit it because it is free.")
     said = f"Created {tref(tid)} for {owner}."
+    if f["peer"]:
+        said += (f" {owner} is your peer: the task is a part of {tref(f['parent'])}, its result, questions, "
+                 f"reports and permission prompts come to this session, and you check its result with "
+                 f"check_result. "
+                 f"{reports_to(agent)} is told, and may cancel it.")
     if f.get("duty_case"):
         said += f" It is work of {cref(case_row(f['duty_case']))}, and close_case ends that case."
     if f.get("step") is not None:
@@ -10367,8 +10518,18 @@ def t_cancel_task(agent, a):
     tid = parse_task(a.get("task_id"))
     reason = str(a.get("reason") or "").strip() or "no reason given"
     guard(agent, reason)
-    t = get_task(tid, requester=agent)
-    in_scope(agent, t)
+    t = get_task(tid)
+    # peer tasks: the agent above both peers was told of a peer task, and may end it; it is no requester of it, so
+    # it acts from any session of its own, but never from one that a person's conversation drives (peer_task_refusal)
+    boss = bool(t["peer"]) and t["requester"] not in (agent, t["owner"]) and \
+        (agent == manager_name() or (reports_to(t["owner"]) == agent and reports_to(t["requester"]) == agent))
+    if t["requester"] != agent and not boss:
+        raise ToolError(f"{tref(tid)} was not requested by you.")
+    if boss and contact_session(agent):
+        raise ToolError(f"A person's conversation drives this session, and their words cancel no task that "
+                        f"{t['requester']} gave its peer {t['owner']}. Cancel {tref(tid)} from a session of your own.")
+    if not boss:
+        in_scope(agent, t)
     if t["state"] in TERMINAL:
         raise ToolError(f"{tref(tid)} is already {t['state']}.")
     stop_for_cancel(t)
@@ -10376,8 +10537,13 @@ def t_cancel_task(agent, a):
       (f"Canceled: {reason}", now(), tid))
     unfile_notices(tid)
     end_waits(tid)
-    emit(t["owner"], "say", f"[hub] {tref(tid)} was canceled by your requester: {full_stop(reason)} Stop working on it "
+    by = (f"{agent}, which you and {t['requester']} report to" if reports_to(t["owner"]) == agent else agent) \
+        if boss else "your requester"
+    emit(t["owner"], "say", f"[hub] {tref(tid)} was canceled by {by}: {full_stop(reason)} Stop working on it "
                             f"now.", task=tid)
+    if boss:
+        emit(t["requester"], "say", f"[hub] {agent} canceled {tref(tid)}, which you gave your peer {t['owner']}: "
+                                    f"{full_stop(reason)}", task=tid)
     cancel_subtasks(tid, reason)
     left = case_left_open(case_id=t["duty_case"]) if t["duty_case"] else None
     return f"{tref(tid)} is canceled." + (" " + case_left_open_text(left) if left else "")
@@ -10702,8 +10868,9 @@ def late_permission_word(by, p, decision, reason):
         event_rows([(p["agent"], "say", filed, said, None)], now())
     log(by, f"passed a late {decision} of P-{pid} to {p['agent']} on {tref(p['task'])}")
     return plain + (f" {p['agent']} has been told in its own task session that you say {decision}" +
-                    (f", so its next attempt reaches you as a new prompt: answer that one with always=true if it "
-                     f"should never ask again." if decision == "allow" else ", so it will not run it."))
+                    ((", so its next attempt reaches you as a new prompt" +
+                      (": answer that one with always=true if it should never ask again." if not t["peer"] or
+                       by == manager_name() else ".")) if decision == "allow" else ", so it will not run it."))
 
 
 def t_decide_permission(agent, a):
@@ -10727,6 +10894,11 @@ def t_decide_permission(agent, a):
             raise ToolError(f"P-{pid} is for {t['requester']} to decide: it requested {tref(t['id'])}.")
         if t:
             in_scope(agent, t)
+        if always and t and agent != manager_name() and not authority(agent, t["owner"], "task")[0]:
+            # peer tasks: a remembered answer holds only while its decider gives the agent work on its line
+            # (remembered), so a peer decides one prompt at a time
+            raise ToolError(f"{t['owner']} is your peer, so you decide its prompts one at a time: send this again "
+                            f"with no always.")
         if p["decision"] == "expired":
             raise ToolError(late_permission_word(agent, p, decision, reason))
         if p["decision"] == "screen":       # runtime gaps A6: a new session first, a person only if it comes back
@@ -17843,7 +18015,7 @@ def linked_tasks(agent, tid, to):
         lead = q1(f"SELECT id FROM tasks WHERE id=? AND owner=? AND {OPEN_TASK}", (mine["parent"], to))
         if lead:
             out[lead["id"]] = (f"whose task {tref(tid)} you requested", COLLEAGUE_LIMIT)
-    scope = "AND parent=?" if mine and role_of(agent) == "lead" else ""
+    scope = "AND parent=?" if mine and gives_subtasks(agent) else ""
     for r in q(f"SELECT id FROM tasks WHERE owner=? AND requester=? AND {OPEN_TASK} {scope}",
                (to, agent) + ((tid,) if scope else ())):
         out[r["id"]] = (None, REQUESTER_LIMIT)
@@ -35743,12 +35915,13 @@ def report_for_manager(r):
     was refused it as another agent's, the lead was refused it in its next task, and the owner's screen asked him to
     have it decided. The manager is the authority over the whole fleet, so it is the one left to decide it. A lead
     that lost its authority over the agent that reported cannot decide either (lead_left, the owner, 29 October
-    2026), and the same rule hands its questions, permission prompts and results to the manager."""
+    2026), and the same rule hands its questions, permission prompts and results to the manager. A worker that gave
+    its peer a part of its task decides that part's reports as a lead does (peer tasks, the owner, 19 November 2026)."""
     if r["to_agent"] == manager_name():
         return False
-    if role_of(r["to_agent"]) != "lead":
-        return True
     sub = read_row("SELECT * FROM tasks WHERE id=?", (r["from_task"],)) if r["from_task"] else None
+    if role_of(r["to_agent"]) != "lead" and not (sub and sub["peer"]):
+        return True
     return sub is None or lead_left(r["to_agent"], sub)
 
 
@@ -35867,6 +36040,10 @@ def t_decide_report(agent, a):
         raise ToolError(f"There is no report {upref(rid)}.")
     if r["to_agent"] != agent and not (agent == manager_name() and report_for_manager(r)):
         raise ToolError(f"{upref(rid)} was reported to {r['to_agent']}, not to you.")
+    if agent != manager_name() and report_for_manager(r):
+        # its task above ended, or the agent that reported is no longer its to act on (a team change): the manager
+        # decides it now, as it takes that agent's questions, prompts and results (lead_left)
+        raise ToolError(f"You can no longer act on what {upref(rid)} is about, so {manager_name()} decides it now.")
     if r["collapsed_into"]:
         raise ToolError(f"{upref(rid)} says the same as {upref(r['collapsed_into'])}. Decide that one: this one takes "
                         f"its decision with it.")
@@ -36927,15 +37104,15 @@ def lead_unread_sweep(t0):
     for r in open_reports(kinds=False):
         receiver, key = r["to_agent"], upref(r["id"])
         told = kv_get(f"chased:{receiver}:{key}")
-        if not told or receiver == mgr or role_of(receiver) != "lead" or report_for_manager(r) or \
+        if not told or receiver == mgr or not gives_subtasks(receiver) or report_for_manager(r) or \
                 kv_get(f"lead_unread:{key}") or not not_acting(receiver, int(told)):
             continue
         lines.append(f"{key} [{r['kind']}] from {r['from_agent']}: {receiver} was named it to decide")
         keys.append(key)
     if not lines:
         return
-    event = emit(mgr, "say", "[hub] A lead had a turn after these and left them unread:\n" +
-                 "\n".join(f"  {line}" for line in lines) + "\nAsk the lead with message_agent, or settle them "
+    event = emit(mgr, "say", "[hub] An agent that gave out this work had a turn after these and left them unread:\n" +
+                 "\n".join(f"  {line}" for line in lines) + "\nAsk that agent with message_agent, or settle them "
                  "yourself where it cannot act any more. The owner sees them only if you leave them too.")
     for key in keys:
         kv_set(f"lead_unread:{key}", event)
@@ -37490,7 +37667,11 @@ TOOLS = [
         "files": CHAT_FILES_FIELD},
        ["person", "text", "request_id"])),
     ("manager", "create_task", t_create_task,
-     "Give one agent a task. needs is none, browser or screen; the hub refuses an agent that lacks it. "
+     "Give one agent a task: one that reports to you, or, from the session of a task of yours and with your Shell box "
+     "on, a peer, which reports to the same agent as you; a peer's task is a part of yours, its result comes to this "
+     "session, and the agent above you both is told and may cancel it. A task that a peer gave you goes to no other "
+     "peer, and a session that a person's conversation drives gives none. needs is none, browser or screen; the hub "
+     "refuses an agent that lacks it. "
      "Use follows to point at an earlier task whose result this one builds on or fixes, and, with no job, at the "
      "task that failed or was not accepted when this one takes its work over (its card stays red until a task "
      "follows it), unless this one is the task for the cause of a circle of follow-ups or the fix that follows "
@@ -37549,7 +37730,8 @@ TOOLS = [
                                                    "it as the name of this work"}},
        ["owner", "title", "done_when"])),
     ("manager", "cancel_task", t_cancel_task,
-     "Cancel a task you requested that is not finished yet.",
+     "Cancel a task that you requested and that is not finished yet, or one that an agent of yours gave its peer (the "
+     "hub told you of it; the fleet manager cancels any such task).",
      S({"task_id": TASK_ID, "reason": STR}, ["task_id", "reason"])),
     ("manager", "restart_task", t_restart_task,
      "Start a task that you requested once more in a new session, whenever you judge that a new session helps: its "
@@ -37568,8 +37750,9 @@ TOOLS = [
        ["task_id", "request_id", "expected_attempt", "reason"])),
     ("manager", "answer", t_answer,
      "Answer a question that is with you: its asker's task goes on with your words. The lowest level that can answer "
-     "does. A lead that cannot passes it up with pass_up=true, and a note in text if that helps: it moves to the "
-     "lead's own requester, the asker's task keeps waiting, and the lead's own work goes on. Whoever passed a question "
+     "does. A lead, or an agent that gave its peer the asker's task, that cannot answer passes it up with "
+     "pass_up=true, and a note in text if that helps: it moves to its own requester, the asker's task keeps waiting, "
+     "and its own work goes on. Whoever passed a question "
      "may still answer it, and the first answer wins. The manager passes nothing up: what only the owner can settle "
      "goes to them with raise_needs_you and question_id, and their answer goes back to the asker by itself.",
      S({"question_id": {"type": "string", "description": "Question id, for example Q-4"},
@@ -37581,12 +37764,15 @@ TOOLS = [
      "Accept a delivered result, or refuse it with a note. A refused task is never reopened: create a follow-up.",
      S({"task_id": TASK_ID, "accepted": {"type": "boolean"}, "note": STR}, ["task_id", "accepted"])),
     ("manager", "decide_permission", t_decide_permission,
-     "Decide a worker's permission prompt: allow or deny. Set always=true to remember the answer for the same request.",
+     "Decide a worker's permission prompt: allow or deny. Set always=true to remember the answer for the same request "
+     "(not for a prompt of a task that you gave your peer: decide those one at a time).",
      S({"prompt_id": {"type": "string", "description": "Prompt id, for example P-2"},
         "decision": {"type": "string", "enum": ["allow", "deny"]}, "always": {"type": "boolean"}, "reason": STR},
        ["prompt_id", "decision"])),
     ("manager", "see_team", t_see_team,
-     "See every agent, every open task, open questions, pending permission prompts and Needs-you items.",
+     "See every agent, every open task, open questions, pending permission prompts and Needs-you items. A lead sees "
+     "its team and the parts of this session's task, a worker the parts of this task that it gave its peers, each "
+     "with the questions, prompts and reports that wait on you.",
      S({})),
     ("manager", "see_capacity", t_see_capacity,
      "See who can take work now: for each agent its suitability (expertise, capabilities, logins it may use "
@@ -38597,7 +38783,7 @@ TOOLS = [
     ("all", "message_agent", t_message_agent,
      "Send a message to another agent: a question, an answer or coordination. It has your authority, never the "
      "owner's, and a message that you get has its sender's authority. Work that needs tools is still a task, through "
-     "the line above. Answer a message with in_reply_to set to its id (AM-<n>). The call returns at once and says "
+     "the line above or from a peer. Answer a message with in_reply_to set to its id (AM-<n>). The call returns at once and says "
      "where the message landed and whether that session runs now; an answer comes later as a message. A message to a "
      "colleague whose task the hub links to yours (you requested it, it requested yours, or both are parts of one "
      "step or one parent) reaches that task's session; any other reaches its chat window. In a task "
@@ -39445,7 +39631,8 @@ def call_tool(agent, name, args, context=None):
             chat_fence(agent, context)
         elif role in ("worker", "lead") and not conversation:
             attempt = context[2] if context else None
-            team = role == "lead" and name in LEAD_TEAM_TOOLS      # these name subtasks; the fence is the session's task
+            team = (role == "lead" and name in LEAD_TEAM_TOOLS) or (role == "worker" and name in PEER_TOOLS)
+            # these name subtasks; the fence is the session's task
             tid = parse_task((None if team else args.get("task_id")) or (context[1] if context else ""))
             t = fence(agent, tid, context)
             attempt = t["attempt"]
@@ -68296,7 +68483,9 @@ class Handler(BaseHTTPRequestHandler):
                     q("UPDATE tasks SET state='input-required', waiting_on=? WHERE id=?", (f"P-{pid}", tid))
                 emit(requester, "say",
                      f"[hub] Permission prompt P-{pid} from {agent} on {tref(tid)}: it wants to use {tool}: {shown} "
-                     f"-- Decide with decide_permission(prompt_id=\"P-{pid}\", decision=\"allow\" or \"deny\", always=true or false).",
+                     f"-- Decide with decide_permission(prompt_id=\"P-{pid}\", decision=\"allow\" or \"deny\"" +
+                     (", always=true or false)." if not (t and t["peer"]) or requester == manager_name() else
+                      "): a prompt of a task that a peer was given is decided one at a time."),
                      task=tid or None)
         deadline = now() + (HOOK_POLL if poll else CFG["hook_wait"])
         while now() < deadline:

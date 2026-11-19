@@ -462,7 +462,11 @@ class RestartTask(Dying, Capacity):
                     **changes), session))
         self.assertEqual((hub.q1("SELECT COUNT(*) c FROM holds")["c"], hub.q1("SELECT COUNT(*) c FROM tool_commands")["c"]),
                          (0, 0))                                        # a refused call keeps nothing
-        self.assertNotIn("restart_task", [t["name"] for t in hub.tools_for("seo", ("test-generation", f"T-{self.task}", 1))])
+        # a worker restarts only a part of its task that it gave a peer (peer tasks, 19 November 2026), so its own task
+        # is not one: seo did not request it
+        self.assertIn(f"T-{self.task} was not requested by you.", self.refused("seo", "restart_task", {
+            "task_id": f"T-{self.task}", "request_id": str(uuid.uuid4()), "expected_attempt": 1, "reason": WHY},
+            self.task))
         # A usage limit of its owner, and a task that ended.
         limit = hub.ins("INSERT INTO agent_limits(agent,since,until,reset_known,task) VALUES('seo',?,?,1,?)",
                         (hub.now(), hub.now() + 3600, plain))

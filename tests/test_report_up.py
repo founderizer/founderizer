@@ -255,10 +255,15 @@ class Deciding(Base):
         self.assertFalse(err, text)
         self.assertIn("I know about it", hub.report_feedback("hand"))
 
-    def test_a_worker_has_report_up_and_no_decide_report(self):
+    def test_a_worker_decides_no_report_but_one_of_a_part_that_it_gave_its_peer(self):
+        """A worker has report_up, and since peer tasks (19 November 2026) decide_report for the reports of a part
+        that it gave its peer (test_capacity), never for one that went to another agent."""
         names = [t["name"] for t in hub.tools_for("vps")]
         self.assertIn("report_up", names)
-        self.assertNotIn("decide_report", names)
+        self.assertFalse(self.report("vps")[1])
+        text, err = self.tool("vps", "decide_report", report_id="UP-1", decision="wrong")
+        self.assertTrue(err)
+        self.assertIn("reported to manager, not to you", text)
         # AUTONOMY.md decision 34: a worker reads its own costs with see_history, and no other mode of it
         self.assertEqual(next(t for t in hub.tools_for("vps") if t["name"] == "see_history")
                          ["inputSchema"]["properties"]["what"]["enum"], ["costs"])

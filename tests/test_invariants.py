@@ -640,7 +640,8 @@ class InstructionIsNotAPermission(Base):
         """Nothing a worker is told can reach grant_access, because its session is never offered it; and set_duty, which
         it holds since 26 October 2026 for its own standing work (plan C17), writes no other agent's duty."""
         names = {t["name"] for t in hub.tools_for("vps", ("test-generation", hub.tref(self.task), 1))}
-        self.assertEqual(names & {"grant_access", "raise_needs_you", "create_task"}, set())
+        # create_task it has since 19 November 2026, for a peer alone (peer tasks): no grant and no card
+        self.assertEqual(names & {"grant_access", "raise_needs_you", "set_agent_model"}, set())
         self.assertIn("no tool named", self.refused("vps", "grant_access", agent="vps", resource="repo:acme/web",
                                                     level="read"))
         self.assertIn("for yourself only", self.refused("vps", "set_duty", agent="studio", text="Watch the shop.",

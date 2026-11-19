@@ -558,7 +558,7 @@ class WarmStart(Capacity):
         said = hub.start_text("seo", self.first)
         self.assertIn("YOUR TEAM, from the fleet's own record and not from profiles:", said)
         self.assertIn("pma [lead, Codex] -- it gives you your tasks:", said)         # its requester, marked
-        self.assertIn("deva [worker, Codex]: expertise development; GitHub "
+        self.assertIn("deva [worker, Codex] -- your peer: expertise development; GitHub "      # both report to pma
                       "acme/api-node (write); MCP servers github", said)
         self.assertIn("big [worker, Codex]: Drive at the level write", said)
         self.assertIn("manager [manager, Claude Code]", said)
@@ -630,7 +630,7 @@ class WarmStart(Capacity):
         said = next(t["description"] for t in hub.tools_for("seo", chat) if t["name"] == "message_agent")
         self.assertNotIn("looks after", said)
         first, _ = hub.call_tool("seo", "read_messages", {}, chat)
-        self.assertIn("deva [worker, Codex]: expertise development; GitHub acme/api-node (write)",
+        self.assertIn("deva [worker, Codex] -- your peer: expertise development; GitHub acme/api-node (write)",
                       first)
         self.assertNotIn("YOUR TEAM", hub.call_tool("seo", "read_messages", {}, chat)[0])     # once per session
         hub.listed_window("seo", chat)                                  # a new session lists its tools

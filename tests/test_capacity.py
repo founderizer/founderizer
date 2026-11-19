@@ -135,8 +135,10 @@ class Capacity(OwnerAPI):
         rows = {r["id"]: r for r in hub.q("SELECT * FROM tasks")}
         self.assertEqual((rows[child]["parent"], rows[child]["requester"], rows[child]["why"]),
                          (parent, "pma", "Its expertise."))
-        self.assertIn("big reports to manager", self.refused("pma", "create_task", {
+        hub.TEAM["agents"]["big"]["reports_to"] = "pmb"            # no peer of pma's then (peer tasks)
+        self.assertIn("big reports to pmb", self.refused("pma", "create_task", {
             "owner": "big", "title": "x", "done_when": "y", "why": "z"}, parent))
+        del hub.TEAM["agents"]["big"]["reports_to"]
         other = self.create("manager", "big")
         self.assertIn("was not requested by you", self.refused("pma", "check_result", {
             "task_id": f"T-{other}", "accepted": True}, parent))
@@ -149,6 +151,137 @@ class Capacity(OwnerAPI):
         self.assertIn("You can no longer act on", self.refused("pma", "cancel_task", {
             "task_id": f"T-{child}", "reason": "no longer needed"}, parent))
         self.assertEqual(hub.q1("SELECT state FROM tasks WHERE id=?", (child,))["state"], "submitted")
+
+    # ---- peer tasks
+    def test_a_worker_gives_its_peer_a_part_of_its_task_as_a_lead_gives_a_subtask(self):
+        """Peer tasks (the owner, 19 November 2026: "agents in the same level ... should be able to talk to each other
+        without bothering their boss"): seo and deva report to pma, and seo gives deva a part of its task. The part is
+        a subtask of seo's task, deva's question, its report and its result come to seo's session, seo delivers only
+        after it checked the part, and pma is told with no question. The bugs that this catches: a worker with no way
+        to give its peer work, a part whose news reaches nobody (a worker's news was filed for a lead alone, and its
+        reports went to the manager), and a giver that delivers over a part that nobody checked."""
+        lead = self.create("manager", "pma")
+        mine = self.create("pma", "seo", lead)
+        part = self.create("seo", "deva", mine)
+        row = hub.q1("SELECT * FROM tasks WHERE id=?", (part,))
+        self.assertEqual((row["parent"], row["requester"], row["peer"]), (mine, "seo", 1))
+        self.assertFalse(hub.lead_left("seo", row))         # its giver acts on it, and not the manager
+        told = hub.q1("SELECT * FROM events WHERE agent='pma' AND kind='say' AND text LIKE ?", (f"%gave its peer deva T-{part}%",))
+        self.assertEqual((told["task"], json.loads(told["extra"])), (lead, hub.QUIET_SAY))      # in pma's own session
+        self.assertFalse(self.call("deva", "ask_my_requester", {"question": "Which page?"}, part)[1])
+        question = hub.q1("SELECT id FROM questions WHERE task=?", (part,))["id"]
+        self.assertTrue(hub.q1("SELECT 1 FROM events WHERE agent='seo' AND task=? AND text LIKE '%Which page?%'", (mine,)))
+        self.assertFalse(self.call("seo", "read_messages", {}, mine)[1])
+        self.assertEqual(hub.turn_end_check(hub.q1("SELECT * FROM tasks WHERE id=?", (mine,)), {"turns": 1}, hub.now()),
+                         "continue")
+        self.assertTrue(hub.q1("SELECT 1 FROM events WHERE agent='seo' AND task=? AND text LIKE '%left them open%' AND "
+                               "text LIKE ?", (mine, f"%Q-{question}%")))     # its turn end names the part's question
+        self.assertFalse(self.call("seo", "answer", {"question_id": f"Q-{question}", "text": "Pricing."}, mine)[1])
+        self.assertFalse(self.call("deva", "report_up", {"kind": "risk", "text": "The price list is old.",
+                                                         "request_id": "peer-report-1"}, part)[1])
+        report = hub.q1("SELECT * FROM reports WHERE from_task=?", (part,))
+        self.assertEqual(report["to_agent"], "seo")
+        self.assertFalse(hub.report_for_manager(report))            # its giver decides it, and not the manager
+        self.assertIn("Your peers report to pma", hub.start_text("seo", mine))
+        hub.TEAM["agents"]["seo"]["can"] = ["web", "browser"]      # its giver's Shell box off: still a peer's task
+        self.assertNotIn("Your peers report to", hub.start_text("deva", part))     # so it goes to no other peer
+        hub.TEAM["agents"]["seo"]["can"] = ["shell", "web", "browser"]
+        hub.TEAM["agents"]["seo"]["reports_to"] = "pmb"              # no peers then: the manager decides the report
+        self.assertTrue(hub.report_for_manager(report))
+        self.assertIn("can no longer act", self.refused("seo", "decide_report", {
+            "report_id": hub.upref(report["id"]), "decision": "noted"}, mine))
+        hub.TEAM["agents"]["seo"]["reports_to"] = "pma"
+        self.assertFalse(self.call("seo", "decide_report", {"report_id": hub.upref(report["id"]), "decision": "noted"},
+                                   mine)[1])
+        done = {"outcome": "completed", "what_was_done": "x", "where_output_is": "y", "how_checked": "z"}
+        self.assertIn(f"T-{part}", self.refused("seo", "deliver_result", done, mine))            # its part is open
+        pid = hub.ins("INSERT INTO prompts(task,agent,tool,input,key,created) VALUES(?,?,?,?,?,?)",
+                      (part, "deva", "Bash", "make deploy", "k2", hub.now()))
+        self.assertIn("make deploy", self.call("seo", "see_team", {}, mine)[0])      # its parts and what waits on it
+        self.assertIn(f"T-{part} (deva, ", hub.warm_attempt(hub.q1("SELECT * FROM tasks WHERE id=?", (mine,))))
+        self.assertIn("one at a time", self.refused("seo", "decide_permission", {
+            "prompt_id": f"P-{pid}", "decision": "allow", "always": True}, mine))
+        self.assertFalse(self.call("seo", "decide_permission", {"prompt_id": f"P-{pid}", "decision": "deny"}, mine)[1])
+        self.assertFalse(self.call("deva", "deliver_result", done, part)[1])
+        self.assertIn(f"T-{part}", self.refused("seo", "deliver_result", done, mine))            # and not checked
+        self.assertFalse(self.call("seo", "check_result", {"task_id": f"T-{part}", "accepted": True}, mine)[1])
+        self.assertFalse(self.call("seo", "deliver_result", done, mine)[1])
+        self.assertTrue(hub.lead_left("seo", hub.q1("SELECT * FROM tasks WHERE id=?", (part,))))   # its task ended
+
+    def test_a_peer_task_takes_a_shell_a_task_session_and_no_peer_above_it(self):
+        """What keeps a peer task inside the owner's rules: a lead gives its peer one as a worker does (pma, big), an
+        agent whose Shell box is off gives none, a task that a peer gave goes to no other peer, a person's
+        conversation gives none, a peer decides its peer's prompts one at a time, and an agent of another line is
+        refused by the reporting line as before. The bugs: a Shell-off session (customers' words) ordering a peer's
+        access, and work going round from peer to peer past the boss."""
+        lead = self.create("manager", "pma")
+        part = self.create("pma", "big", lead)                    # both report to the manager
+        self.assertTrue(hub.q1("SELECT 1 FROM events WHERE agent='manager' AND task=? AND text LIKE '%gave its peer big%'",
+                               (part,)))
+        work = {"title": "x", "done_when": "y"}
+        self.assertIn("passes to no other peer", self.refused("big", "create_task", dict(work, owner="pmb"), part))
+        hub.TEAM["agents"]["pma"]["can"] = []                      # its giver no peer of big's now: still its mark
+        self.assertIn("passes to no other peer", self.refused("big", "create_task", dict(work, owner="pmb"), part))
+        hub.TEAM["agents"]["pma"]["can"] = ["shell"]
+        mine = self.create("pma", "seo", lead)
+        self.assertIn("deva reports to pma", self.refused("big", "create_task", dict(work, owner="deva"), part))
+        with patch.object(hub, "contact_session", lambda agent, context=None: True):
+            self.assertIn("conversation drives", self.refused("seo", "create_task", dict(work, owner="deva"), mine))
+            self.assertNotIn("Your peers report to", hub.start_text("seo", mine))
+        hub.TEAM["agents"]["seo"]["can"] = ["web", "browser"]      # its Shell box off
+        self.assertIn("Shell box is off", hub.peers("seo", "deva")[1])
+        self.assertNotIn("create_task", {t["name"] for t in hub.tools_for("seo", ("test-generation", f"T-{mine}", 1))})
+        pid = hub.ins("INSERT INTO prompts(task,agent,tool,input,key,created) VALUES(?,?,?,?,?,?)",
+                      (part, "big", "Bash", "make deploy", "k1", hub.now()))
+        self.assertIn("one at a time", self.refused("pma", "decide_permission", {
+            "prompt_id": f"P-{pid}", "decision": "allow", "always": True}, lead))
+        self.assertFalse(self.call("pma", "decide_permission", {"prompt_id": f"P-{pid}", "decision": "allow"}, lead)[1])
+
+    def test_the_agent_above_two_peers_may_cancel_the_task_that_one_gave_the_other(self):
+        """Told, not asked, and still in charge: the manager cancels pma's task for big, and both hear of it; another
+        agent of the same line may not, nor may the manager cancel a task between them that is no peer task, or act
+        on a person's words in a conversation. A lead above two peers cancels too, the manager cancels any peer task,
+        and the line about a peer task reaches a session that reads it. The bugs: a boss told of work that it cannot
+        stop, a boss's cancel that reaches more than peer tasks, and a line filed where no session reads it."""
+        lead = self.create("manager", "pma")
+        part = self.create("pma", "big", lead)
+        other = self.create("manager", "pmb")
+        self.assertIn("was not requested by you", self.refused("pmb", "cancel_task", {
+            "task_id": f"T-{part}", "reason": "Mine now."}, other))
+        old = hub.ins("INSERT INTO tasks(title,details,done_when,needs,owner,requester,state,created,attempt) "
+                      "VALUES(?,?,?,?,?,?,?,?,?)", ("Old work", "x", "y", "none", "big", "pma", "working", hub.now(), 1))
+        self.assertIn("was not requested by you", self.refused("manager", "cancel_task", {   # no peer task
+            "task_id": f"T-{old}", "reason": "Mine now."}))
+        with patch.object(hub, "contact_session", lambda agent, context=None: True):
+            self.assertIn("conversation drives", self.refused("manager", "cancel_task", {
+                "task_id": f"T-{part}", "reason": "A customer asked."}))
+        self.assertFalse(self.call("manager", "cancel_task", {"task_id": f"T-{part}", "reason": "Not this week."})[1])
+        self.assertEqual(hub.q1("SELECT state FROM tasks WHERE id=?", (part,))["state"], "canceled")
+        said = lambda agent: " ".join(r["text"] for r in hub.q("SELECT text FROM events WHERE agent=?", (agent,)))
+        self.assertIn("canceled by manager, which you and pma report to", said("big"))
+        self.assertIn(f"manager canceled T-{part}, which you gave your peer big", said("pma"))
+        mine = self.create("pma", "seo", lead)
+        state = lambda tid: hub.q1("SELECT state FROM tasks WHERE id=?", (tid,))["state"]
+        stop = lambda agent, tid, task=None: self.call(agent, "cancel_task", {"task_id": f"T-{tid}", "reason": "No."}, task)
+        self.assertFalse(stop("pma", self.create("seo", "deva", mine), lead)[1])        # the lead above both
+        self.assertFalse(stop("manager", self.create("seo", "deva", mine))[1])          # the manager: any peer task
+        last = self.create("seo", "deva", mine)
+        self.assertFalse(self.call("seo", "restart_task", {"task_id": f"T-{last}", "request_id": "peer-restart-1",
+                                                           "expected_attempt": 1, "reason": "Its session froze."},
+                                   mine)[1])                                   # a worker giver restarts its part
+        self.assertFalse(stop("pma", mine, lead)[1])
+        self.assertEqual(state(last), "canceled")                                       # a worker's parts follow it
+        mine = self.create("pma", "seo", lead)
+        hub.TEAM["agents"]["pma"]["can"] = []                      # the lead above both with its Shell box off
+        self.create("seo", "deva", mine)
+        self.assertIn("your Shell box is off", said("pma"))
+        self.assertIn("whose Shell box is off, so the cancel is yours", said("manager"))    # told by the hub itself
+        hub.TEAM["agents"]["pma"]["can"] = ["shell"]
+        odd = hub.ins("INSERT INTO tasks(title,details,done_when,needs,owner,requester,state,created,attempt) "
+                      "VALUES(?,?,?,?,?,?,?,?,?)", ("Before a move", "x", "y", "none", "seo", "manager", "working",
+                                                    hub.now(), 1))
+        self.create("seo", "deva", odd)                          # pma reads no task session above it: the manager does
+        self.assertIn("reads no task session above it, so this is yours", said("manager"))
 
     # ---- remembered permissions
     def test_a_remembered_permission_lasts_while_its_decider_can_still_give_the_agent_work(self):
