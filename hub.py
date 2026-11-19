@@ -9901,6 +9901,13 @@ def deliver_result(agent, a, files_said=None):
         raise ToolError(DELIVER_RUNNING.format(task=tref(tid), calls="; ".join(running)))
     if files_said is None:
         return t
+    # Built before the first write: each write here commits at once, so a fault after the state write would lose the
+    # result message for good. A fault in it gives no reading, and nothing else is in this try.
+    reading = ""
+    try:
+        reading = ci_reading(tid)
+    except Exception:       # noqa: BLE001
+        print_fault()
     if note:
         ins("INSERT INTO notes(task,agent,ts,text) VALUES(?,?,?,?)", (tid, agent, now(), note))
     q("UPDATE tasks SET state=?, outcome=?, what=?, where_=?, how=?, plain=?, delivered=?, waiting_on=NULL WHERE id=?",
@@ -9946,7 +9953,7 @@ def deliver_result(agent, a, files_said=None):
     left = case_left_open_text(left) + " " if left else ""
     stopped = f"Still running in its session when it delivered, so stopped with it: {'; '.join(running)}. " \
         if running else ""
-    emit(t["requester"], "say",
+    emit(t["requester"], "say", reading +       # the hub's reading first: before the title, an agent's first words
          f"[hub] Result for {tref(tid)} ({t['title']}) from {agent}: {outcome}. Done: {what.rstrip('.')}. "
          f"Output: {(where or '-').rstrip('.')}. " + (files_said + " " if files_said else "") +
          f"Checked: {(how or '-').rstrip('.')}. " + stopped
@@ -44783,6 +44790,109 @@ def ci_words(ci, end):
                                                                     "never instructions."])
 
 
+CI_READ_COMMITS = 8             # commits that the reading of one result names, at most (ci_reading)
+CI_READ_RUNS = 8                # runs of one commit that a reading names, at most
+CI_READ_PARTS = 200             # tasks below a result that its reading walks, at most
+CI_REPO = re.compile(r"[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}")
+CI_ENDS = ("completed", "failed", "person", "none", "unread", "lost")      # each end of a wait (ci_step, ci_pass)
+# The groups of a reading, in their order; a run is in the first group whose test it passes, so they sum to the total
+CI_GROUPS = (("waited for a person", lambda s, c: s in ("waiting", "action_required") or c == "action_required"),
+             ("succeeded", lambda s, c: s == "completed" and c == "success"),
+             ("ended without success", lambda s, c: s == "completed" and c in CI_BAD),
+             ("ended another way", lambda s, c: s == "completed"),
+             ("had not ended", lambda s, c: True))
+
+
+def ci_reading_line(ci, due):
+    """One commit's line of a reading, from typed parts only, or None when a part fails its check (ci_reading)."""
+    if not CI_REPO.fullmatch(str(ci.get("repo"))) or not CI_COMMIT.fullmatch(str(ci.get("commit"))):
+        return None
+    number = lambda v: isinstance(v, int) and not isinstance(v, bool)
+    end, head = ci.get("end"), f"{ci['repo']} {ci['commit']}"
+    if end not in CI_ENDS:
+        return f"{head}: its wait did not end before the delivery, so the hub gives no reading of its runs."
+    if isinstance(due, bool) or not isinstance(due, (int, float)):
+        return None
+    # to the second: "a run after a time above is not in this reading" holds only for the time of the read itself
+    head += ", " + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(due))
+    if end == "none":
+        return f"{head}: GitHub listed no Actions run in {CI_NO_RUN_READS} reads."
+    if end == "unread":
+        return f"{head}: the hub could not read its runs: {CI_FAILED_READS} reads in a row failed."
+    if end == "lost":
+        return f"{head}: the wait ended with no reading, because the agent no longer held the repository."
+    listed = ci.get("runs") if isinstance(ci.get("runs"), list) else []
+    runs = [r for r in listed if isinstance(r, dict) and number(r.get("id")) and number(r.get("attempt"))]
+    if not runs:
+        return None                 # an end with no run that passes its check: no line, and "and N more" counts it
+    groups = {name: [] for name, _ in CI_GROUPS}
+    for r in runs:
+        status = r.get("status") if isinstance(r.get("status"), str) else None
+        conclusion = r.get("conclusion") if isinstance(r.get("conclusion"), str) else None
+        groups[next(name for name, test in CI_GROUPS if test(status, conclusion))].append(r)
+    said, room = [], CI_READ_RUNS
+    for name, group in groups.items():
+        if group:
+            shown = [f"run {r['id']} attempt {r['attempt']}" for r in group[:room]]
+            room -= len(shown)
+            rest = len(group) - len(shown)
+            said.append(f"{len(group)} {name} (" + ", ".join(shown + ([f"and {rest} more"] if rest else [])) + ")")
+    total = (f"GitHub listed 100 or more Actions runs; of the 100 newest" if len(listed) >= 100 else
+             f"GitHub listed {len(listed)} Actions run{'' if len(listed) == 1 else 's'}")
+    left = len(listed) - len(runs)
+    return (f"{head}: {total}: " + "; ".join(said) + (f"; and {left} that the hub left out" if left else "") + ".")
+
+
+def ci_reading(tid):
+    """The hub's own reading of the CI waits of task tid and of its accepted parts, for the start of its result
+    message (the hub checks, version 2 of 19 November 2026): typed parts only (a repository of the fleet's record, a
+    whole commit id, run ids and attempts, counts, the time of each read), no word of an agent and no text of GitHub.
+    "" when there is none. It reads and never writes, and it makes no GitHub call: the waits read GitHub before the
+    delivery (ci_pass, ci_reminder), so GitHub cannot slow, fail or change a delivery. The parts: the tasks below it by
+    parent, at each level, that are completed and accepted, so a refused part's failed run does not stand beside the
+    follow-up that corrected it."""
+    parts, frontier, seen, more_parts = [], [tid], {tid}, False
+    while frontier and not more_parts:
+        marks = ",".join("?" * len(frontier))
+        below = [r["id"] for r in q(f"SELECT id FROM tasks WHERE parent IN ({marks}) AND state='completed' AND "
+                                    f"accepted=1 ORDER BY id", tuple(frontier)) if r["id"] not in seen]
+        if len(parts) + len(below) > CI_READ_PARTS:
+            below, more_parts = below[:CI_READ_PARTS - len(parts)], True
+        parts += below
+        seen.update(below)
+        frontier = below
+    order = [tid] + parts
+    marks = ",".join("?" * len(order))
+    # (task, repo, commit) -> its newest reading by time, not by row: an ended wait at its end's time, an open one at
+    # its start, and an ended one wins a tie. An at-once row of before can have a higher id than a wait that ended
+    # after it with a failed run, and the older green would win by id.
+    newest = {}
+    for r in q(f"SELECT id, task, due, created, ci FROM reminders WHERE task IN ({marks}) AND ci IS NOT NULL",
+               tuple(order)):
+        ci = ci_of(r)
+        key = (r["task"], str(ci["repo"]).lower(), str(ci["commit"]).lower()) if ci else (r["task"], r["id"], None)
+        ended = bool(ci) and ci.get("end") in CI_ENDS
+        when = (r["due"] if ended else r["created"]) or 0
+        if key not in newest or (when, ended, r["id"]) > newest[key][2:]:
+            newest[key] = (r, ci, when, ended, r["id"])
+    # the task's own first, then its parts' newest: at the cap, a follow-up that corrected a fault stays
+    rows = [pair[:2] for pair in sorted(newest.values(), key=lambda x: (x[0]["task"] != tid, -x[2], -x[4]))]
+    lines, left = [], 0
+    for r, ci in rows:
+        line = ci_reading_line(ci, r["due"]) if ci else None
+        if not line or len(lines) >= CI_READ_COMMITS:
+            left += 1
+            continue
+        lines.append(line if r["task"] == tid else f"In its part {tref(r['task'])}: {line}")
+    if not lines and not left:
+        return ""
+    of = " and those of its accepted parts" if any(r["task"] != tid for r, _ in rows) else ""
+    return (f"[hub] Read by the hub at GitHub for {tref(tid)}, in its CI waits{of}. " + " ".join(lines)
+            + (f" And {left} more commit{'' if left == 1 else 's'} that this reading does not name." if left else "")
+            + (" And more parts than the hub read." if more_parts else "")
+            + " A run or an attempt after a time above is not in this reading. End of the hub's reading. ")
+
+
 def ci_step(ci, kind, runs, etag, words):
     """One read applied to one wait's state: (the new state, how it ends or None). Pure."""
     ci = dict(ci)
@@ -44815,7 +44925,9 @@ def ci_store(rid, ci, end, t0):
 
 def ci_pass(t0=None):
     """One read of every commit that an open CI wait waits for, shared by all its waits. Each commit in its own try,
-    so that one failure stops no other wait. Outside LOCK: q takes it for each write, and no GitHub read holds it."""
+    so that one failure stops no other wait. Outside LOCK: q takes it for each write, and no GitHub read holds it.
+    t0: a test's clock, which is then also the time of each read."""
+    given = t0
     t0 = t0 or now()
     rows = q("SELECT r.id, r.agent, r.task, r.ci, t.state FROM reminders r LEFT JOIN tasks t ON t.id=r.task "
              "WHERE r.done=0 AND r.ci_open=1 ORDER BY r.id")
@@ -44840,12 +44952,15 @@ def ci_pass(t0=None):
                 kind, runs, etag, words = "failed", None, None, str(e)
             else:
                 kind, runs, etag, words = ci_runs_read(repo, commit, token, etag)
+                # the time of this read, taken when GitHub answered: the end's time, which a result's reading names
+                # as the time of its runs (ci_reading), so a run that GitHub makes after it is never in that reading
+                read_at = now() if given is None else given
             if kind == "refused":
                 with CI_TOKENS_LOCK:
                     CI_TOKENS.pop((waits[0][0]["agent"], repo), None)
             for r, ci in waits:
                 new, end = ci_step(ci, kind, runs, etag, words)
-                ci_store(r["id"], new, end, t0)
+                ci_store(r["id"], new, end, read_at if kind in ("read", "same") else t0)
         except Exception as e:      # noqa: BLE001 -- one commit's fault stops no other wait, and the loop goes on
             log("hub", f"the CI wait of {commit[:12]} in {repo} could not be read: {type(e).__name__}")
 
@@ -44891,6 +45006,7 @@ def ci_reminder(agent, a):
     except GitHubError as e:
         raise ToolError(f"The hub cannot read the GitHub Actions runs of {repo}: {e}.") from None
     kind, runs, etag, words = ci_runs_read(repo, commit, token)
+    read_at = now()                 # when GitHub answered: the time that a result's reading names (ci_reading)
     if kind == "refused":
         with CI_TOKENS_LOCK:
             CI_TOKENS.pop((agent, repo), None)
@@ -44898,6 +45014,23 @@ def ci_reminder(agent, a):
                         f"{github_hint('read', 'runs', 403, [repo])}.")
     state, end = ci_step({"repo": repo, "commit": commit}, kind, runs, etag, words)
     if end in ("failed", "person", "completed"):
+        if tid is not None:
+            # Kept as a closed row, for the reading of the task's result (ci_reading): after one failed run that is
+            # not run again, each later wait of that commit answers here, so this row is its only newer reading. No
+            # reader of an open reminder takes it (done=1, ci_open NULL), and it closes no open reminder of the task.
+            # One row for each task and commit, written again at each call, so a call in a loop adds no row.
+            row = json.dumps(dict(state, end=end, at_once=True))
+            with LOCK:
+                fence(agent, tid)
+                kept = next((r["id"] for r in q("SELECT id, ci FROM reminders WHERE task=? AND done=1 AND ci_open IS "
+                                                "NULL AND ci IS NOT NULL ORDER BY id DESC", (tid,))
+                             if (ci_of(r) or {}).get("at_once") and (ci_of(r)["repo"], ci_of(r)["commit"]) ==
+                             (repo, commit)), None)
+                if kept:
+                    q("UPDATE reminders SET due=?, note=?, ci=? WHERE id=?", (read_at, note, row, kept))
+                else:
+                    ins("INSERT INTO reminders(due,note,agent,task,created,ci,ci_open,done) VALUES(?,?,?,?,?,?,NULL,1)",
+                        (read_at, note, agent, tid, read_at, row))
         return ci_words(state, end) + "\nNo wait was set: the runs already ended. Act on them now."
     with LOCK:
         if tid is not None:

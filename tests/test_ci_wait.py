@@ -134,12 +134,128 @@ class CiWait(BlockedAccess):
         self.assertTrue(self.github.seen and all(seen["lock_free"] for seen in self.github.seen), self.github.seen)
 
     def test_runs_that_already_ended_are_said_at_once_with_no_wait(self):
+        """With no wait, and the reading is kept as a closed row for the task's result: after one failed run that is
+        not run again, each later wait of that commit answers at once, so this row is its only newer reading."""
+        other = hub.ins("INSERT INTO reminders(due,note,agent,task,created) VALUES(?,?,?,?,?)",
+                        (hub.now() + 3600, "Look again at noon.", "ops", self.task, hub.now()))
         self.answer(run(11, status="completed", conclusion="success"))
         text, error = self.wait()
         self.assertFalse(error, text)
         self.assertIn("All GitHub Actions runs of", text)
         self.assertIn("No wait was set", text)
-        self.assertIsNone(hub.q1("SELECT id FROM reminders WHERE task=?", (self.task,)))
+        r, ci = self.row()
+        self.assertEqual((r["done"], r["ci_open"], ci["end"], ci["runs"][0]["id"]), (1, None, "completed", 11))
+        self.assertEqual(hub.q1("SELECT done FROM reminders WHERE id=?", (other,))["done"], 0)    # not closed
+        self.assertEqual(hub.parked(self.task)["id"], other)        # and the closed row parks nothing
+        # a call again, as an agent in a loop makes it, writes the same row again and adds none
+        self.answer(run(11, status="completed", conclusion="success"), run(12, status="completed", conclusion="success"))
+        self.assertFalse(self.wait()[1])
+        again, ci = self.row()
+        self.assertEqual((again["id"], len(ci["runs"])), (r["id"], 2))
+        self.assertGreaterEqual(again["due"], r["due"])
+
+    # ---- the reading at the start of a result (the hub checks, version 2)
+    def deliver(self, task):
+        return self.ok("ops", "deliver_result", {"what_was_done": "Shipped it.", "where_output_is": f"{REPO} {COMMIT}",
+                                                 "how_checked": "CI is green."}, task)
+
+    def closed_wait(self, task, ci, due=1763560320.0):
+        """A CI wait of `task` that ended, as ci_store or the at-once read leaves it: its runs as ci_runs_read keeps
+        them (attempt, not GitHub's run_attempt)."""
+        ci = dict(ci, runs=[{"id": r["id"], "attempt": r["run_attempt"], "name": r["name"], "status": r["status"],
+                             "conclusion": r["conclusion"]} for r in ci.get("runs") or []])
+        return hub.ins("INSERT INTO reminders(due,note,agent,task,created,ci,ci_open,done) VALUES(?,?,?,?,?,?,NULL,1)",
+                       (due, "x", "ops", task, due, json.dumps(dict({"repo": REPO, "commit": COMMIT}, **ci))))
+
+    def test_a_result_starts_with_the_hubs_reading_of_its_ci_waits_and_one_with_none_reads_as_before(self):
+        self.waiting()
+        self.answer(run(11, status="completed", conclusion="success"),
+                    run(12, name="Deploy", status="completed", conclusion="failure", attempt=2))
+        t0 = hub.now()
+        hub.ci_pass(t0)
+        reads = len(self.github.seen)
+        self.deliver(self.task)
+        said = self.said_to("manager")
+        self.assertEqual(len(self.github.seen), reads)              # a delivery makes no GitHub call
+        when = __import__("time").strftime("%Y-%m-%d %H:%M:%S UTC", __import__("time").gmtime(t0))
+        self.assertTrue(said.startswith(
+            f"[hub] Read by the hub at GitHub for {hub.tref(self.task)}, in its CI waits. {REPO} {COMMIT}, {when}: "
+            f"GitHub listed 2 Actions runs: 1 succeeded (run 11 attempt 1); 1 ended without success (run 12 attempt "
+            f"2). A run or an attempt after a time above is not in this reading. End of the hub's reading. "
+            f"[hub] Result for {hub.tref(self.task)} "), said)
+        self.assertNotIn("Deploy", said.split("[hub] Result for")[0])       # no text of GitHub in the reading
+        plain = self.task_for("ops")
+        self.deliver(plain)
+        self.assertTrue(self.said_to("manager").startswith(f"[hub] Result for {hub.tref(plain)} "))
+
+    def test_each_end_has_true_words_and_every_run_is_in_one_group(self):
+        """A wait that read nothing never reads as "0 ended without success", a false green; a run of a status that
+        the hub does not know is in a group, and the groups sum to the total."""
+        line = lambda **ci: hub.ci_reading_line(dict({"repo": REPO, "commit": COMMIT}, **ci), 1763560320.0)
+        self.assertEqual(line(end="none"), f"{REPO} {COMMIT}, 2025-11-19 13:52:00 UTC: GitHub listed no Actions run in "
+                                           f"15 reads.")
+        self.assertIn("the hub could not read its runs: 8 reads in a row failed.", line(end="unread"))
+        self.assertIn("the agent no longer held the repository", line(end="lost"))
+        self.assertEqual(line(runs=[run(11)]), f"{REPO} {COMMIT}: its wait did not end before the delivery, so the "
+                                               f"hub gives no reading of its runs.")
+        runs = [{"id": 1, "attempt": 1, "status": None, "conclusion": None},
+                {"id": 2, "attempt": 1, "status": "completed", "conclusion": "skipped"},
+                {"id": 3, "attempt": 1, "status": "waiting", "conclusion": None},
+                {"id": "4", "attempt": 1, "status": "completed", "conclusion": "success"},
+                {"id": 5, "attempt": 1, "status": "completed", "conclusion": "action_required"}]
+        self.assertEqual(line(end="person", runs=runs).split(": ", 1)[1],
+                         "GitHub listed 5 Actions runs: 2 waited for a person (run 3 attempt 1, run 5 attempt 1); 1 "
+                         "ended another way (run 2 attempt 1); 1 had not ended (run 1 attempt 1); and 1 that the hub "
+                         "left out.")
+        self.assertIsNone(line(end="completed", repo="acme/web; rm -rf"))
+        self.assertIsNone(line(end="completed", runs=[{"id": "1", "attempt": 1}]))     # no run left: no line at all
+
+    def test_the_newest_reading_by_time_wins_not_the_newest_row(self):
+        """A green at-once row of before can have a higher id than a wait of the same commit that ended after it with
+        a failed run; by id, the reading would give the old green while the hub holds the newer failure."""
+        failed = {"end": "failed", "runs": [run(9, status="completed", conclusion="failure", attempt=2)]}
+        self.closed_wait(self.task, failed, due=1763560320.0 + 600)
+        self.closed_wait(self.task, {"end": "completed", "at_once": True,
+                                     "runs": [run(9, status="completed", conclusion="success")]}, due=1763560320.0)
+        said = hub.ci_reading(self.task)
+        self.assertIn("1 ended without success (run 9 attempt 2)", said)
+        self.assertNotIn("succeeded", said)
+        # a wait that started after that end and has not ended is the newest: the hub gives no counts of before
+        hub.ins("INSERT INTO reminders(due,note,agent,task,created,ci,ci_open) VALUES(?,?,?,?,?,?,1)",
+                (hub.now() + 7200, "x", "ops", self.task, 1763560320.0 + 900,
+                 json.dumps({"repo": REPO, "commit": COMMIT, "runs": [run(10)]})))
+        said = hub.ci_reading(self.task)
+        self.assertIn("its wait did not end before the delivery", said)
+        self.assertNotIn("ended without success", said)
+
+    def test_a_fault_of_the_reading_loses_no_result_message(self):
+        """The state write commits at once, so a fault after it would lose the result message for good."""
+        self.closed_wait(self.task, {"end": "completed", "runs": [run(11, status="completed", conclusion="success")]})
+        with patch.object(hub, "ci_reading", side_effect=RuntimeError("broken")), patch.object(hub, "print_fault"):
+            self.deliver(self.task)
+        self.assertTrue(self.said_to("manager").startswith(f"[hub] Result for {hub.tref(self.task)} "))
+
+    def test_a_parents_reading_carries_its_accepted_parts_at_each_level_and_says_what_it_left_out(self):
+        part, refused, deeper, under_refused = (self.task_for("ops") for _ in range(4))
+        for tid, parent, accepted in ((part, self.task, 1), (refused, self.task, 0), (deeper, part, 1),
+                                      (under_refused, refused, 1)):
+            hub.q("UPDATE tasks SET parent=?, state='completed', accepted=? WHERE id=?", (parent, accepted, tid))
+        ended = {"end": "completed", "runs": [run(7, status="completed", conclusion="success")]}
+        for n, tid in enumerate((part, refused, deeper, under_refused)):
+            self.closed_wait(tid, ended, due=1763560320.0 + 60 * n)     # deeper read after part
+        said = hub.ci_reading(self.task)
+        self.assertTrue(said.startswith(f"[hub] Read by the hub at GitHub for {hub.tref(self.task)}, in its CI waits "
+                                        f"and those of its accepted parts. In its part {hub.tref(deeper)}: "), said)
+        self.assertIn(f"In its part {hub.tref(part)}: {REPO} {COMMIT}", said)
+        self.assertNotIn(hub.tref(refused), said)
+        self.assertNotIn(hub.tref(under_refused), said)
+        for n in range(7):          # the task's own come first, then the parts' newest, and the cap says what it left
+            self.closed_wait(self.task, dict(ended, commit=f"{n:040x}"))
+        said = hub.ci_reading(self.task)
+        self.assertEqual(said.count(f"{REPO} "), hub.CI_READ_COMMITS)
+        self.assertIn(f"In its part {hub.tref(deeper)}: ", said)                 # the newer part stays
+        self.assertNotIn(f"In its part {hub.tref(part)}: ", said)
+        self.assertIn("And 1 more commit that this reading does not name.", said)
 
     def test_the_wait_parks_the_task_with_no_time_for_the_apps(self):
         rid = self.waiting()
