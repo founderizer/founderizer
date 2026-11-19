@@ -488,20 +488,82 @@ class Patience(Tools, Runtime):
         self.turn(tid, "Waiting for it.")
         self.assertEqual((len([t for t in self.said("studio") if "counts Bash" in t]), self.continues(tid)), (1, []))
 
-    def test_a_reminder_keeps_its_park_through_its_own_turn_and_a_later_turn_wakes_it(self):
+    def test_a_message_wakes_a_parked_task_only_while_its_session_works(self):
+        """A parked task that a message wakes is work while its session works, and parked again on the same reminder
+        once nothing of it runs (owner API 1.240). The owner's board depends on it: on 19 November 2026 a standing
+        item for the whole team woke four parked tasks, each said "it does not change this task" and stopped, and
+        all four showed as Working for hours, one until the next day, while each waited for its reminder."""
         tid = self.task()
         self.alive("studio", f"T-{tid}")
         text, error = self.tool("studio", "set_reminder", tid, note="Look at the build again.", minutes=120)
         self.assertFalse(error, text)
+        rid = hub.q1("SELECT id FROM reminders WHERE task=?", (tid,))["id"]
         self.turn(tid, "I will look again in two hours.")      # the turn that set it: no continue, and still parked
         self.assertEqual(self.continues(tid), [])
         self.assertIsNotNone(hub.parked(tid))
+
+        def path():
+            hub.liveness(hub.now())
+            return hub.q1("SELECT live_path FROM tasks WHERE id=?", (tid,))["live_path"]
         hub.emit("studio", "say", "[message from manager on T-9 id=AM-3] A quick question.", task=tid)
-        self.turn(tid, "Answered it.")                          # a later turn: awake for liveness
-        self.assertIsNone(hub.parked(tid))
+        hub.q("UPDATE events SET read_at=? WHERE agent='studio' AND task=? AND read_at IS NULL", (hub.now(), tid))
+        self.assertEqual(self.records(tid, [{"seq": 101, "type": "user_message", "text": "Go on."}])[0], 200)
+        self.assertIsNone(hub.parked(tid))                      # a later turn runs: awake
+        self.assertNotIn("waiting until", path())
+        self.assertEqual(self.records(tid, [
+            {"seq": 102, "type": "tool_call", "tool_call_id": "b1", "title": "Bash: npm run build", "kind": "execute",
+             "status": "in_progress"},
+            {"seq": 103, "type": "tool_call_update", "tool_call_id": "b1", "status": "in_progress", "background": True,
+             "interrupted": False},
+            # more calls than the turn record keeps, each sent when it had already ended, as Codex sends them
+            *[{"seq": 104 + n, "type": "tool_call", "tool_call_id": f"c{n}", "title": "Bash: ls", "kind": "execute",
+               "status": "completed"} for n in range(hub.TURN_CALLS + 6)],
+            {"seq": 180, "type": "agent_message", "text": "Answered it; the build runs."},
+            {"seq": 181, "type": "result", "stop_reason": "end_turn"}])[0], 200)
+        self.assertIsNone(hub.parked(tid))                      # its turn ended with a command running: still awake
+        self.assertNotIn("waiting until", path())
+        # the command ends after the turn, with no turn after it (a Codex session's background command)
+        self.assertEqual(self.records(tid, [{"seq": 190, "type": "tool_call_update", "tool_call_id": "b1",
+                                             "status": "completed", "interrupted": False}])[0], 200)
+        self.assertEqual(hub.parked(tid)["id"], rid)            # nothing of it runs: parked again, on the same reminder
         self.assertEqual(self.continues(tid), [])               # the open reminder is still a live reason
-        hub.liveness(hub.now())
-        self.assertNotIn("waiting until", hub.q1("SELECT live_path FROM tasks WHERE id=?", (tid,))["live_path"])
+        self.assertTrue(path().startswith(hub.PARKED_PATH), path())
+        clock = Clock(hub.now() + 600)
+        with patch.object(hub, "now", clock):
+            hub.emit("studio", "say", "[message from manager on T-9 id=AM-4] One more question.", task=tid)
+            hub.q("UPDATE events SET read_at=? WHERE agent='studio' AND task=? AND read_at IS NULL", (hub.now(), tid))
+            self.assertEqual(self.records(tid, [{"seq": 301, "type": "user_message", "text": "Go on."}])[0], 200)
+            self.assertIsNone(hub.parked(tid))                  # a second wake: awake again
+            with hub.LOCK:
+                since = hub.task_since(hub.parked_until())
+            self.assertEqual(since[tid], clock())               # at work since this wake, not since the first one
+            # its turn stops at an error (a usage limit, a sign-in refusal): its own rule brings it back, so no park
+            self.assertEqual(self.records(tid, [
+                {"seq": 302, "type": "error", "code": "server_error", "message": "Overloaded.", "retryable": True},
+                {"seq": 303, "type": "result", "stop_reason": "error"}])[0], 200)
+            self.assertIsNone(hub.parked(tid))
+            # an older Codex rollout: its usage limit as a record of its own, then a turn end with no error; first as
+            # its turn's first record, then in a turn that runs, in the batch of the turn's start
+            for rows in ([{"seq": 304, "type": "error", "code": "usage_limit", "message": "Limit.", "retryable": True},
+                          {"seq": 305, "type": "result", "stop_reason": "end_turn"}],
+                         [{"seq": 306, "type": "user_message", "text": "Go on."},
+                          {"seq": 307, "type": "error", "code": "usage_limit", "message": "Limit.", "retryable": True},
+                          {"seq": 308, "type": "result", "stop_reason": "end_turn"}]):
+                self.assertEqual(self.records(tid, rows)[0], 200)
+                self.assertIsNone(hub.parked(tid))              # resume_held brings it back at the reset
+            # a fresh attempt, for a message to a session whose cache was cold, takes its own session's rule
+            hub.q("UPDATE attempts SET created=?, reason=? WHERE task=?", (clock() + 5, hub.FRESH_REASON, tid))
+            self.seq = 400
+            self.turn(tid, "I wait for my reminder.")
+            self.assertEqual(hub.parked(tid)["id"], rid)
+            # a usage limit that reaches it while it rests (an account's rate-limit update of a Codex app-server, met
+            # by another task of the same account) is no reason to start it before its time
+            self.assertEqual(self.records(tid, [{"seq": 460, "type": "error", "code": "usage_limit",
+                                                 "message": "Limit.", "retryable": True}])[0], 200)
+            self.assertEqual(hub.parked(tid)["id"], rid)
+            # a new attempt of any other cause keeps the park ended: the message wake's sessions are not counted
+            hub.q("UPDATE attempts SET reason=? WHERE task=?", (hub.PARK_MESSAGE, tid))
+            self.assertIsNone(hub.parked(tid))
 
     def test_a_submitted_task_whose_first_turn_ends_before_list_my_tasks_is_asked(self):
         tid = self.task(state="submitted")

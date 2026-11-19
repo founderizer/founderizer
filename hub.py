@@ -6476,12 +6476,46 @@ def parked(task_id):
         # until the runs ended.
         return r
     # plan C9: the park ends early at a turn start of the task's session after a turn end stored after the reminder
-    # was set (helper_events), or when a new attempt came up after it; the reminder itself still fires
-    newest = read_row("SELECT created FROM attempts WHERE task=? ORDER BY attempt DESC LIMIT 1", (task_id,))
-    if read_row("SELECT 1 FROM kv WHERE k=?", (f"park_ended:{r['id']}",)) or \
-            (newest and newest["created"] > r["created"]):
+    # was set (helper_events), or when a new attempt came up after it; the reminder itself still fires.
+    newest = read_row("SELECT created, turn, reason FROM attempts WHERE task=? ORDER BY attempt DESC LIMIT 1",
+                      (task_id,))
+    later = bool(newest and newest["created"] > r["created"])
+    if later and newest["reason"] != FRESH_REASON:
+        return None
+    # **A park that a turn of the same session ended holds again once that session rests** (owner API 1.240), and so
+    # does one that a fresh attempt ended: a message to a session whose cache was cold, which is no restart and cannot
+    # repeat by itself (fresh_attempt). The woken session stopped as an agent stops, at end_turn, set no new reminder,
+    # and nothing of it runs, so the task waits for this one again, as live_reason already judged at that turn end.
+    # On the owner's fleet on 19 November 2026 a standing item for the whole team woke four parked tasks, each
+    # answered "it does not change this task" and stopped, and the board showed all four as work for hours, one until
+    # the next day. A turn that runs or a call that it left in the background keeps the park ended (task_turns
+    # "works"), and so does a turn that ended at an error or was cancelled, or that a usage limit hit (an older Codex
+    # rollout gives a limit as a record of its own and ends that turn with no error; turn_records "limited"):
+    # each brings the task back by its own rule (resume_held, the sign-in restart, liveness), which a park would
+    # silence. Any other new attempt keeps the rule above: the message wake (liveness, `woken`) starts sessions that
+    # no count limits, so a park that came back after one could start another.
+    woke = read_row("SELECT 1 FROM kv WHERE k=?", (f"park_ended:{r['id']}",)) or later
+    if woke and not session_rests(newest["turn"] if newest else None):
         return None
     return r
+
+
+def session_rests(turn):
+    """True when an attempt's turn record (its JSON, as attempts.turn holds it) says that its session stopped as an
+    agent stops (its last turn ended at end_turn, which every runtime's reader writes for a turn that completed, and
+    no usage limit hit it) and nothing of it runs now: no turn, and no call that it started in the background (task_turns "works" false)."""
+    try:
+        state = json.loads(turn) if turn else None
+    except (TypeError, ValueError):
+        return False
+    return isinstance(state, dict) and bool(state.get("turns")) and state.get("how") == "end_turn" and \
+        not state.get("limited") and not turn_busy(state)
+
+
+def turn_busy(state):
+    """Whether a turn state (turn_state) says that its session works now: a turn runs, or a tool call that it started
+    in the background is open (each counts until its own end notice)."""
+    return bool(state.get("running")) or any(len(c) > 2 and c[2] for c in (state.get("calls") or {}).values())
 
 
 PARKED_PATH = "waiting until "  # how the live path of a parked task begins (liveness); the owner's state reads it
@@ -6698,7 +6732,7 @@ def task_turns():
             state = json.loads(r["turn"])
         except ValueError:
             continue
-        busy = bool(state.get("running")) or any(len(c) > 2 and c[2] for c in (state.get("calls") or {}).values())
+        busy = turn_busy(state)
         if busy or state.get("turns"):
             doing = state.get("doing") if state.get("running") else None
             out[r["task"]] = {"works": busy, "doing": doing if isinstance(doing, str) and doing.strip() else None}
@@ -6952,11 +6986,19 @@ def turn_records(state, session, records, t0):
             continue
         state["seq"], at, main = seq, ts or t0, "parent" not in data
         if kind == "result" and main:
-            state.update(turns=state["turns"] + 1, running=False, how=data["stop_reason"], at=at, doing=None)
-        elif kind not in ("session", "model", "error", "result") and main and not state["running"]:
-            state.update(running=True, how=None, at=at)         # the first record of a new turn
+            limited = bool(state.get("limited") or state.pop("limit_ahead", None))
+            state.update(turns=state["turns"] + 1, running=False, how=data["stop_reason"], at=at, doing=None,
+                         limited=limited)
+        # The end of a call is no start of a turn (owner API 1.240): a background command of a Codex session can end
+        # after its turn's end, and the reader ends a session's open calls after its last turn (Translator.remaining),
+        # each with no turn after it. As a start, it made the session look busy until a next turn that may never
+        # come, and it ended a park with no message (helper_events).
+        elif kind not in ("session", "model", "error", "result", "tool_call_update") and main and not state["running"]:
+            state.update(running=True, how=None, at=at, limited=False)     # the first record of a new turn
+            state.pop("limit_ahead", None)
         if kind == "tool_call":
-            state["calls"][data["tool_call_id"]] = [data.get("title"), at, False]
+            if data.get("status") not in ("completed", "failed"):   # Codex sends a call that already ended as one
+                state["calls"][data["tool_call_id"]] = [data.get("title"), at, False]
             state["doing"] = doing_words(data) or state.get("doing")    # owner API 1.148: what the session does now
         elif kind == "tool_call_update" and data["status"] in ("completed", "failed"):
             state["calls"].pop(data["tool_call_id"], None)
@@ -6965,6 +7007,11 @@ def turn_records(state, session, records, t0):
             state["calls"][data["tool_call_id"]] = [title, started, True]
         elif kind == "agent_message" and main:
             state["said"] = cut_whole(data["text"], TURN_SAID) or ("..." if data["text"] else "")
+        elif kind == "error" and main and data.get("code") == "usage_limit":
+            # this turn met its agent's usage limit, whatever its end says (session_rests). A limit with no turn
+            # running counts for the turn whose end comes next with no start before it (an older Codex rollout can
+            # give it as its turn's first record), and not for a session that rests (an account's rate-limit update)
+            state["limited" if state["running"] else "limit_ahead"] = True
     if len(state["calls"]) > TURN_CALLS:
         state["calls"] = dict(sorted(state["calls"].items(), key=lambda c: c[1][1] or 0)[-TURN_CALLS:])
     return state
@@ -43297,7 +43344,8 @@ def liveness(t0):
         # lost meanwhile gets its new attempt after that, which then holds the secret
         secret = secret_wait(tid)
         # **A message brings a parked task back when its session is gone.** A task that waits for its reminder reads
-        # a message in its own session, which stands open meanwhile, and a turn there ends the park (parked). A
+        # a message in its own session, which stands open meanwhile, and a turn there ends the park until that
+        # session rests again (parked). A
         # session that was lost meanwhile, when its machine started again, reads nothing, and nothing started one
         # before the reminder's own time: on the first fleet a lead's task that was parked for 34 hours got a question
         # of its team and a message of its requester, and both waited two hours for the reminder (5 November 2026),
@@ -67871,9 +67919,9 @@ class Handler(BaseHTTPRequestHandler):
             if attempt == t["attempt"] and started:
                 q("UPDATE tasks SET nudge_level=0 WHERE id=? AND nudge_level=2", (tid,))     # plan C9: a new turn
                 for r in q("SELECT id, created FROM reminders WHERE task=? AND done=0", (tid,)):
-                    if (before or {}).get("at") and before["at"] > r["created"] and \
-                            kv_get(f"park_ended:{r['id']}") is None:
-                        kv_set(f"park_ended:{r['id']}", now())      # a turn after the one that set it: awake, once
+                    if (before or {}).get("at") and before["at"] > r["created"]:
+                        # a turn after the one that set it: awake, since the newest such turn (parked; task_since)
+                        kv_set(f"park_ended:{r['id']}", now())
             if attempt == t["attempt"] and state["turns"] > ((before or {}).get("turns", 0)
                                                              if (before or {}).get("session") == session else 0):
                 unanswered(agent, now(), tid)       # plan C8: a turn of the task's session ended
