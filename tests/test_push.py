@@ -619,22 +619,43 @@ class Badge(PushCase):
         hub.q("UPDATE needs SET answer='Pay it', answered=? WHERE id=?", (hub.now(), nid))
 
     def test_the_count_is_the_tabs_open_items_and_tasks_only_he_can_move(self):
-        """The twin of MobileStore.needsYouCount: open items, and each task once whose outcome is not known or whose
-        stop was not confirmed. An answered item, a known outcome and a released hold are not counted."""
+        """The twin of MobileStore.needsYouCount: open items, and each task once whose stop was not confirmed or whose
+        outcome is not known while no session of its agent comes to check it: a hold holds the task (a requester's
+        restart stop too), it ended, the hub no longer has it, or its agent is a worker with no "shell" box, read as
+        the apps read it (TaskOutcome.waitsOnOwner). An answered item, a known outcome, a released hold, and an
+        outcome of a task that runs or waits for its next session are not counted: its agent checks that one first,
+        as after a restart with a check (19 November 2026: such a task put an orange check in the owner's Needs you)."""
         self.assertEqual(hub.owner_count(), 0)
         first, _ = self.raise_item(), self.raise_item(title="Second")
         self.answer(first)
         t0 = hub.now()
-        for task, state, resolved in ((7, "unknown", None), (7, "unknown", None), (8, "unknown", t0), (9, "done", None)):
+        for task, state, owner in ((20, "working", "open"), (21, "submitted", "manager"), (22, "working", "manager"),
+                                   (23, "failed", "manager"), (24, "working", "closed"), (25, "working", "manager"),
+                                   (26, "working", "legacy")):
+            hub.q("INSERT INTO tasks(id,title,owner,requester,state,created,needs,attempt) "
+                  "VALUES(?,'Work',?,'owner',?,?,'none',2)", (task, owner, state, t0))
+        for task, state, resolved in ((7, "unknown", None), (7, "unknown", None), (8, "unknown", t0), (9, "done", None),
+                                      (13, "unknown", None), (20, "unknown", None), (21, "unknown", None),
+                                      (22, "unknown", None), (23, "unknown", None), (24, "unknown", None),
+                                      (25, "unknown", None), (26, "unknown", None)):
             hub.q("INSERT INTO outcomes(task,attempt,hold,tool_call_id,state,created,resolved) VALUES(?,1,0,?,?,?,?)",
                   (task, uuid.uuid4().hex, state, t0, resolved))
-        for task, state, released in ((7, "not_confirmed", None), (10, "not_confirmed", None),
-                                      (11, "not_confirmed", t0), (12, "stopped", None)):
-            hub.q("INSERT INTO holds(task,kind,by,state,created,attempt,released) VALUES(?,'stop','owner',?,?,1,?)",
-                  (task, state, t0, released))
-        self.assertEqual(hub.owner_count(), 1 + 2)                      # one open item; tasks 7 and 10
-        with patch.object(hub, "PUSH_BADGE_MOST", 2):
-            self.assertEqual(hub.owner_count(), 2)                      # never more than our side takes
+        for task, state, released, by in ((7, "not_confirmed", None, "owner"), (10, "not_confirmed", None, "owner"),
+                                          (11, "not_confirmed", t0, "owner"), (12, "stopped", None, "owner"),
+                                          (21, "released", t0, "manager"), (22, "stopped", None, "owner"),
+                                          (25, "stopped", None, "manager")):
+            hub.q("INSERT INTO holds(task,kind,by,state,created,attempt,released) VALUES(?,'stop',?,?,?,1,?)",
+                  (task, by, state, t0, released))
+        # one open item; tasks 7 and 10, 13 that the hub no longer has, the held 22 and 25 (a restart's stop that stays),
+        # the ended 23, and 24 and 26 of workers with no "shell" box (26 has no Tools list, which the apps get as []);
+        # not 20, which runs with a worker whose Shell box is on, nor 21, whose restart released its hold: their agents
+        # check first
+        team = dict(hub.agents(), closed={"role": "worker", "can": ["web"]}, legacy={"role": "worker"},
+                    open={"role": "worker", "can": ["shell", "web"]})
+        with patch.object(hub, "agents", lambda: team):
+            self.assertEqual(hub.owner_count(), 1 + 8)
+            with patch.object(hub, "PUSH_BADGE_MOST", 2):
+                self.assertEqual(hub.owner_count(), 2)                  # never more than our side takes
 
     def test_each_needs_you_ping_carries_the_count(self):
         self.give(self.enrolled(), seal=SEAL)

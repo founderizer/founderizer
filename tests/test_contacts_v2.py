@@ -158,7 +158,11 @@ class Conversations(Base):
                          (False, "tools", list(hub.CONVERSATION_WORK_TOOLS)))
         self.assertIn(f"conversation C-{cid} with Pat", start["prompt"])
         self.assertLess(len(start["prompt"]), 1000)             # one line; the brief comes with the first read
+        # an unknown outcome that an earlier session of the task left: the brief names it (rule 9 by name)
+        oid = hub.ins("INSERT INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) "
+                      "VALUES(?,1,0,'c1','Click Send','other','unknown',?)", (t["id"], hub.now()))
         text = self.ok("read_messages", self.context(cid))
+        self.assertIn(f"Not known yet whether these actions of this task took effect:\n  - O-{oid} Click Send\n", text)
         self.assertIn(f"CONVERSATION C-{cid} with Pat, who is peer: {hub.ROLE_DEFAULTS['peer'][0]}", text)
         self.assertIn("Can you add Lucia to the newsletter list?", text)
         self.assertIn(f"These are {hub.tref(t['id'])}, the open conversation task", text)

@@ -2360,15 +2360,32 @@ def ping_need(nid):
 
 def owner_count():
     """The count of what needs the owner now: the open Needs-you items, and each task that only he can move once (an
-    outcome that nobody knows, a stop that the helper did not confirm). It is the iPhone's Needs you tab count, and its
-    twin is MobileStore.needsYouCount in app/ios/Sources/MobileStore.swift, which counts the same rows of GET
-    /ui/mobile (mobile_state): a change to one is a change to the other. It commits nothing. At most PUSH_BADGE_MOST,
-    the most that our side's push route takes, so that no count can make it refuse a Needs-you ping."""
+    outcome that nobody knows of a task that a hold holds or that ended, a stop that the helper did not confirm). It is
+    the iPhone's Needs you tab count, and its twin is MobileStore.needsYouCount in app/ios/Sources/MobileStore.swift,
+    which counts the same rows of GET /ui/mobile (mobile_state): a change to one is a change to the other. It commits
+    nothing. At most PUSH_BADGE_MOST, the most that our side's push route takes, so that no count can make it refuse a
+    Needs-you ping.
+
+    An outcome of a task that runs or waits for its next session is not the owner's: each new session of its agent gets
+    the list first (unknown_start_text) and records each one with resolve_outcome, and the outcome gate holds a
+    completed result until then, as FleetCore's TaskOutcome.waitsOnOwner says for both apps. The owner, 19 November
+    2026, of such a task's orange check: "what does this mean?? who needs to check?". It stays the owner's when no
+    such session comes: a hold holds the task (any hold, also the stop of a requester's restart, which a restart that
+    does not go on leaves in place), the task ended or the hub no longer has it, or its agent is a worker or a lead
+    with no "shell" box, whose sessions have no resolve_outcome. That last part reads the boxes as the apps do, which
+    get a missing Tools list as [] (mobile_agent): shell_off reads such an agent as Shell on, and the tab and the icon
+    would count apart."""
+    team = agents()
     with LOCK:
         needs = read_row("SELECT COUNT(*) n FROM needs WHERE answer IS NULL")["n"]
-        tasks = read_row("SELECT COUNT(*) n FROM (SELECT task FROM outcomes WHERE resolved IS NULL AND state='unknown' "
-                         "UNION SELECT task FROM holds WHERE released IS NULL AND state='not_confirmed')")["n"]
-    return min(needs + tasks, PUSH_BADGE_MOST)
+        rows = read_rows("SELECT o.task, t.owner, t.state, EXISTS (SELECT 1 FROM holds h WHERE h.task=o.task AND "
+                         "h.released IS NULL) held FROM outcomes o LEFT JOIN tasks t ON t.id=o.task WHERE o.resolved "
+                         "IS NULL AND o.state='unknown'")
+        tasks = {r["task"] for r in rows if r["state"] is None or r["state"] in TERMINAL or r["held"] or
+                 ((team.get(r["owner"]) or {}).get("role") in ("worker", "lead") and
+                  "shell" not in ((team.get(r["owner"]) or {}).get("can") or []))}
+        tasks |= {r["task"] for r in read_rows("SELECT task FROM holds WHERE released IS NULL AND state='not_confirmed'")}
+    return min(needs + len(tasks), PUSH_BADGE_MOST)
 
 
 def badge_look():
@@ -6199,7 +6216,8 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
                  f'it writes a duty outside your team.')
     if resume:
         t = row or read_row("SELECT * FROM tasks WHERE id=?", (task_id,))
-        said += (" " + mask_secrets(note) if note else "") + (warm_attempt(t) if t else "")
+        said += ((" " + mask_secrets(note) if note else "") + unknown_start_text(task_id, closed, note) +
+                 (warm_attempt(t) if t else ""))
     else:
         t = read_row("SELECT follows FROM tasks WHERE id=?", (task_id,))
         said += warm_follows(t["follows"] if t else None, closed)
@@ -8411,6 +8429,27 @@ def warm_follows(follows, closed=False):
     return "\n\n" + "\n".join(capped(lines) + ([] if closed else [       # support plan F1: no see_earlier_work
         f'Read the rest yourself: see_earlier_work with task="{tref(p["id"])}" gives it in full, and with '
         f'search="<words>" looks over everything that came before.']))
+
+
+def unknown_start_text(task_id, closed, note=""):
+    """Rule 9 by name, for every resumed session: each action of the task whose outcome nobody knows yet, and that the
+    session's own note does not name already (resume_plan's check names each one). Only the first session after a
+    resume with a check had them: a session after a lost one, a usage limit or a sign-in began with "check before
+    repeating" and no list, and one that a message started for a parked task with none either (the review of 19
+    November 2026), while the owner's apps leave such a check to the agent of a task that runs
+    (TaskOutcome.waitsOnOwner, owner_count). Not for a Shell-off session, which has no resolve_outcome: the owner
+    checks its outcomes. One line for each outcome, each masked on its own, so that a login in one title takes no
+    other line with it. read_rows only: the start text is made inside the transaction that writes the attempt."""
+    if closed:
+        return ""
+    rows = [r for r in read_rows("SELECT id, title FROM outcomes WHERE task=? AND state='unknown' ORDER BY id",
+                                 (task_id,)) if f"O-{r['id']} " not in (note or "")]
+    if not rows:
+        return ""
+    return ("\n\nNot known yet whether these actions of this task took effect:\n" +
+            "".join(f"  - O-{r['id']} {mask_secrets(clip(r['title'])) or 'an action with no name'}\n" for r in rows) +
+            "Before anything else, find out for each one, without repeating it, and record what you found with "
+            f'resolve_outcome(task_id="{tref(task_id)}", outcome_id=..., finding="done" or "not_done", evidence=...).')
 
 
 def warm_attempt(t):
@@ -20743,7 +20782,9 @@ def conversation_brief(agent, conv, person, t):
                 "owner": "The owner"}           # one line each, as clip makes each message: a name begins no line
         lines += ["", "What was said before, oldest first:"] + \
                  [f"{said[r['who']]}: {mask_secrets(clip(r['text'], 600))}" for r in reversed(rows)]
-    first = "\n".join(lines) + "\n"
+    # rule 9 by name: the unknown outcomes that an earlier session of this conversation's task left, which its next
+    # session got from nothing else (unknown_start_text; the review of 19 November 2026)
+    first = "\n".join(lines) + (unknown_start_text(t["id"], shell_off(agent)) if t else "") + "\n"
     # how this session started (conversation_start), which says whether its stable text lists the agent's skills
     if t:
         return start_text(agent, t["id"], first=first, opening=stable_opening(agent, "none"))

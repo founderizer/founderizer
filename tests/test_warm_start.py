@@ -251,6 +251,26 @@ class WarmStart(Capacity):
         self.assertNotIn("THE RECORD OF ATTEMPT", text)
         self.assertNotIn("I will time the page first.", text)
 
+    def test_every_resumed_session_names_the_outcomes_that_nobody_knows(self):
+        """Only the first session after a resume with a check had them, in resume_plan's note: a session after a lost
+        one, or one that a message started for a parked task, began with no list, while the owner's apps leave that
+        check to the agent of a task that runs (the review of 19 November 2026). A Shell-off session has no
+        resolve_outcome, and no list."""
+        ids = [hub.ins("INSERT INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) "
+                       "VALUES(?,1,0,?,?,'other','unknown',?)", (self.first, f"call_{n}", title, hub.now()))
+               for n, title in enumerate(("Click Post", ""))]
+        text = self.lost(self.first)
+        self.assertIn(f"Not known yet whether these actions of this task took effect:\n  - O-{ids[0]} Click Post\n"
+                      f"  - O-{ids[1]} an action with no name\nBefore anything else", text)
+        self.assertIn(f'resolve_outcome(task_id="T-{self.first}"', text)
+        named = hub.unknown_start_text(self.first, False, note=f"O-{ids[0]} Click Post: unknown")
+        self.assertNotIn(f"O-{ids[0]} ", named)                 # the note of a resume with a check names it already
+        self.assertIn(f"O-{ids[1]} an action with no name", named)
+        hub.new_attempt(hub.q1("SELECT * FROM tasks WHERE id=?", (self.first,)), hub.PARK_MESSAGE)
+        self.assertIn(f"  - O-{ids[0]} Click Post", self.start_text(self.first))
+        hub.TEAM["agents"]["seo"]["can"] = ["web", "browser"]  # its Shell box is off
+        self.assertNotIn("Not known yet", self.lost(self.first))
+
     def test_a_fleet_call_of_kind_execute_and_its_result_are_not_in_the_records(self):
         self.record(self.first, 1, 1, "agent_message", text="I will report first.")
         self.record(self.first, 1, 2, "tool_call", tool_call_id="c1", kind="execute", status="in_progress",
