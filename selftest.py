@@ -577,10 +577,21 @@ try:
     loose = sorted(set(API) - named - set(owner_mcp.NOT_TOOLS))
     check("every owner command route is a tool of the owner's MCP server, or in its NOT_TOOLS with a reason",
           not loose, f"neither a tool nor excluded: {loose}")
-    gone = sorted(r for r in owner_mcp.NOT_TOOLS if r not in API and not re.search(
-        r"parts(?:\[:\d\])?\s*==\s*\[" + re.escape(", ".join(f'"{s}"' for s in r.strip("/").split("/")
-                                                                  if s != "{}")) + r"\]",
-        open(os.path.join(KIT, "hub.py")).read()))
+    def dispatched(route, src):
+        """A route of NOT_TOOLS in the dispatch itself: `parts == [...]` with its fixed parts, or, for an id in the
+        middle, `parts[:k] == [...]` and each fixed part after it as `parts[i] == "..."` on the same line."""
+        segs = route.strip("/").split("/")
+        if re.search(r"parts(?:\[:\d\])?\s*==\s*\[" + re.escape(", ".join(f'"{s}"' for s in segs if s != "{}"))
+                     + r"\]", src):
+            return True
+        if "{}" not in segs[:-1]:
+            return False
+        k = segs.index("{}")
+        return bool(re.search(r"parts\[:%d\]\s*==\s*\[%s\]" % (k, re.escape(", ".join(f'"{s}"' for s in segs[:k])))
+                              + "".join(r".*parts\[%d\]\s*==\s*\"%s\"" % (i, re.escape(s))
+                                        for i, s in enumerate(segs) if i > k and s != "{}"), src))
+    hub_src = open(os.path.join(KIT, "hub.py")).read()
+    gone = sorted(r for r in owner_mcp.NOT_TOOLS if r not in API and not dispatched(r, hub_src))
     check("every route the owner's MCP server leaves out is still a route of the owner API", not gone,
           f"NOT_TOOLS names routes the hub no longer has: {gone}")
 

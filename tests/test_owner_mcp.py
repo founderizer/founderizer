@@ -309,7 +309,13 @@ class Shape(WithServer):
             # /ui/restore and /ui/owner/enroll read their own bodies instead of going through ui_command, so they
             # are found in the dispatch itself. A route in NOT_TOOLS that is in neither place is gone from the hub.
             parts = ", ".join(f'"{p}"' for p in route.strip("/").split("/") if p != "{}")
-            self.assertRegex(src, r"parts(?:\[:\d\])?\s*==\s*\[" + re.escape(parts) + r"\]",
+            whole = r"parts(?:\[:\d\])?\s*==\s*\[" + re.escape(parts) + r"\]"
+            segs = route.strip("/").split("/")      # an id in the middle: its fixed parts around it, on one line
+            middle = "{}" in segs[:-1] and r"parts\[:%d\]\s*==\s*\[%s\]" % (
+                segs.index("{}"), re.escape(", ".join(f'"{p}"' for p in segs[:segs.index("{}")]))) + "".join(
+                r".*parts\[%d\]\s*==\s*\"%s\"" % (i, re.escape(p)) for i, p in enumerate(segs)
+                if i > segs.index("{}") and p != "{}")
+            self.assertRegex(src, whole + (f"|{middle}" if middle else ""),
                              f"{route} is in NOT_TOOLS but is not an owner route any more")
 
     def test_every_field_an_owner_route_takes_can_be_sent_by_some_tool(self):

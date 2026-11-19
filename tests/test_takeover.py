@@ -4,6 +4,8 @@ step, the task waits
 for his answer with no clock, his answer reaches the task's session, and the task's end takes an open request out of
 Needs you. An in-process hub with the owner API's harness; no fleet, no network and no AI call."""
 import json
+import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -11,6 +13,7 @@ import urllib.request
 import uuid
 
 import hub
+import test_mobile
 import test_ui_api
 
 TITLE = "Solve the CAPTCHA on its screen"
@@ -26,7 +29,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 def load_tests(loader, _tests, _pattern):
     """Only this file's checks: the harness comes from OwnerAPI, its own tests stay in its own file."""
     suite = unittest.TestSuite()
-    for cls in (Ask, Answer, Refusals):
+    for cls in (Ask, Answer, Refusals, Linux):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -284,6 +287,218 @@ class Refusals(Fixture):
         self.addCleanup(hub.TEAM.pop, "settings", None)
         self.assertFalse(self.ask(tid)[1])
         self.assertEqual(hub.q1("SELECT title FROM needs")["title"], "Resuelve el CAPTCHA en su pantalla")
+
+
+PASSWORD = "Ab3dEf7h"           # a one-time password of 8 letters and digits, as the helper makes one
+
+
+class Linux(Fixture):
+    """Build plan 04, S6 (D7): Take over for an agent on a Linux server. His press asks the hub, the hub asks the agent's
+    helper, and the helper's answer (the agent's screen port and a one-time password) reaches his press once and no
+    row and no log line. At his answer the helper stops the sharing first, and the session gets the answer after that
+    stop."""
+
+    def setUp(self):
+        super().setUp()
+        hub.TEAM["addresses"]["srv1"] = "127.0.0.7"
+        hub.TEAM["servers"] = {"srv1": {"kind": "linux", "user": "fleet"}}
+        hub.TEAM["agents"]["nora"] = dict(role="worker", runtime="claude", machine="srv1",
+                                          can=["shell", "web", "browser"])
+        self.reading(state="ready")
+        self.helper(features=[hub.TAKEOVER_FEATURE])
+        self.addCleanup(hub.TAKEOVER_OPENS.clear)
+
+    call, code, enroll, enrolled = (test_mobile.Devices.call, test_mobile.Devices.code, test_mobile.Devices.enroll,
+                                    test_mobile.Devices.enrolled)
+
+    def reading(self, state="ready", user="fleet-nora", screen=5911):
+        """The server's own reading of its browser parts (S1b): their state, and the ports of the agent's OS user."""
+        data = {"browser": {"state": state, "ports": [{"user": user, "devtools": 9301, "screen": screen}]},
+                "agents": {"nora": {"user": "fleet-nora"}}}
+        hub.q("DELETE FROM server_status WHERE server='srv1'")
+        hub.q("INSERT INTO server_status(server, data, reported) VALUES('srv1', ?, ?)", (json.dumps(data), hub.now()))
+
+    def helper(self, features, seen=None):
+        hub.q("DELETE FROM machine_status WHERE agent='nora'")
+        hub.q("INSERT INTO machine_status(agent, data, reported) VALUES('nora', ?, ?)",
+              (json.dumps({"features": features}), hub.now()))
+        hub.q("INSERT INTO agents(name, last_seen) VALUES('nora', ?) ON CONFLICT(name) DO UPDATE SET "
+              "last_seen=excluded.last_seen", (hub.now() if seen is None else seen,))
+
+    def asked(self):
+        tid = self.task(owner="nora")
+        text, err = self.ask(tid, agent="nora")
+        self.assertFalse(err, text)
+        return tid, hub.q1("SELECT id FROM needs WHERE by='nora' AND takeover_task=?", (tid,))["id"]
+
+    def press(self, nid, answer=None, wait=5.0):
+        """His press of Take over; `answer` is what the agent's helper sends once the hub asked it (None: no answer)."""
+        played, floor = {}, hub.q1("SELECT COALESCE(MAX(id), 0) m FROM events")["m"]
+
+        def play():
+            end = time.monotonic() + wait
+            while time.monotonic() < end:
+                ev = hub.q1("SELECT * FROM events WHERE agent='nora' AND kind='takeover_open' AND id>? ORDER BY id DESC "
+                            "LIMIT 1", (floor,))
+                if ev:
+                    nonce = json.loads(ev["extra"])["nonce"]
+                    played["first"] = self.request("/helper/takeover/nora", dict(answer, nonce=nonce))
+                    played["again"] = self.request("/helper/takeover/nora", dict(answer, nonce=nonce))
+                    return
+                time.sleep(0.05)
+        player = threading.Thread(target=play, daemon=True)
+        if answer is not None:
+            player.start()
+        got = self.request(f"/ui/needs/{nid}/takeover", {"db": "test-generation"})
+        if answer is not None:
+            player.join(wait)
+        return got, played
+
+    def test_the_linux_way_is_its_servers_ready_screen_and_an_online_helper_with_the_step(self):
+        self.assertTrue(hub.takeover_way("nora"))
+        self.assertEqual(hub.takeover_screen_port("nora"), 5911)
+        self.asked()                                    # request_takeover takes it as a way
+        for change in (lambda: self.reading(state="missing"), lambda: self.reading(user="fleet-other"),
+                       lambda: self.helper(features=[]), lambda: self.helper([hub.TAKEOVER_FEATURE], seen=1.0)):
+            change()
+            self.assertFalse(hub.takeover_way("nora"))
+            self.reading()
+            self.helper([hub.TAKEOVER_FEATURE])
+        self.assertTrue(hub.takeover_way("nora"))
+        self.assertIn("takeover_linux", hub.UI_FEATURES)
+        hub.TEAM["access"]["srv1"] = {"ssh_user": "owner-example", "ssh_port": 22, "screen_sharing": True}
+        self.helper(features=[])
+        self.assertFalse(hub.takeover_way("nora"))      # a Linux agent has only its own browser's screen
+        self.assertTrue(hub.device_may("/ui/needs/5", "POST"))
+        self.assertFalse(hub.device_may("/ui/needs/5/takeover", "POST"))      # the password goes to the Mac only
+
+    def test_his_press_gets_the_screen_and_its_password_once_and_no_row_or_log_line_holds_it(self):
+        tid, nid = self.asked()
+        (code, body), played = self.press(nid, {"port": 5911, "password": PASSWORD})
+        self.assertEqual((code, body), (200, {"agent": "nora", "server": "srv1", "port": 5911, "password": PASSWORD}))
+        self.assertEqual(played["first"], (200, {"taken": True}))
+        self.assertEqual(played["again"], (200, {"taken": False}))      # given once: the press took it
+        self.assertEqual(hub.TAKEOVER_OPENS, {})
+        for (table,) in hub.DB.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+            for row in hub.DB.execute(f"SELECT * FROM {table}").fetchall():
+                self.assertNotIn(PASSWORD, json.dumps([str(v) for v in row]), table)
+        self.assertEqual(self.state(tid), ("input-required", f"N-{nid}"))     # the press is no answer
+
+    def test_the_helpers_answer_is_its_own_agents_and_port_only(self):
+        _, nid = self.asked()
+        kept = hub.TAKEOVER_OPEN_WAIT
+        hub.TAKEOVER_OPEN_WAIT = 1.0
+        self.addCleanup(setattr, hub, "TAKEOVER_OPEN_WAIT", kept)
+        (code, body), played = self.press(nid, {"port": 5912, "password": PASSWORD}, wait=2.0)
+        self.assertEqual(played["first"], (200, {"taken": False}))      # not the agent's screen-sharing port
+        self.assertEqual(body.get("code"), "takeover_late")
+        for bad in ({"port": 5911, "password": "short"}, {"port": "5911", "password": PASSWORD},
+                    {"refused": "tired"}, {"port": 5911, "password": PASSWORD, "more": 1}):
+            self.assertEqual(self.request("/helper/takeover/nora", dict(bad, nonce="n" * 24))[0], 400, bad)
+        self.assertEqual(self.request("/helper/takeover/ivy", {"nonce": "n" * 24, "refused": "screen"},
+                                      source="127.0.0.5")[0], 403)      # another agent's machine
+
+    def test_the_helpers_refusal_and_no_answer_in_time_reach_his_card_with_their_codes(self):
+        _, nid = self.asked()
+        for reason, code in (("provider", "takeover_provider"), ("no_browser", "takeover_no_browser"),
+                             ("screen", "takeover_screen_failed")):
+            hub.q("DELETE FROM events WHERE kind='takeover_open'")
+            (status, body), _ = self.press(nid, {"refused": reason})
+            self.assertEqual((status, body.get("code"), body.get("names")), (409, code, {"agent": "Nora"}), reason)
+        kept = hub.TAKEOVER_OPEN_WAIT
+        hub.TAKEOVER_OPEN_WAIT = 0.5
+        self.addCleanup(setattr, hub, "TAKEOVER_OPEN_WAIT", kept)
+        (status, body), _ = self.press(nid)
+        self.assertEqual((status, body.get("code")), (409, "takeover_late"))
+
+    def test_an_owner_device_gets_no_screen_and_no_password(self):
+        """D7: the password goes to the owner's Mac app, which opens the tunnel; an enrolled phone or PC with its own key
+        is refused, and the agent's sharing does not start again for it (a start ends a viewer that runs)."""
+        hub.TEAM["owner_devices"] = {"iphone": {"label": "iPhone", "address": test_mobile.PHONE}}
+        key = self.enrolled()
+        _, nid = self.asked()
+        for path in (f"/ui/needs/{nid}/takeover", f"/ui/needs//{nid}/takeover", f"/ui/needs/{nid}//takeover",
+                     f"/ui/needs/{nid}/%74akeover"):           # the router reads each one as the take-over route
+            status, _ = self.call(path, {"db": "test-generation"}, source=test_mobile.PHONE, token=key)
+            self.assertEqual(status, 403, path)
+        self.assertEqual(hub.q("SELECT * FROM events WHERE kind='takeover_open'"), [])
+        self.assertEqual(self.call(f"/ui/needs/{nid}", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                         "answer": "Done"}, source=test_mobile.PHONE, token=key)[0],
+                         200)                   # his answer from the phone still goes as on the Mac
+
+    def test_a_second_press_takes_the_place_of_the_first_and_no_open_is_handed_out_again(self):
+        _, nid = self.asked()
+        first = {}
+        waiting = threading.Thread(target=lambda: first.update(got=self.press(nid)[0]), daemon=True)
+        waiting.start()                         # no helper answers the first press
+        for _ in range(100):
+            if hub.TAKEOVER_OPENS:
+                break
+            time.sleep(0.02)
+        (code, body), _ = self.press(nid, {"port": 5911, "password": PASSWORD})
+        waiting.join(5)
+        self.assertEqual((code, body["password"]), (200, PASSWORD))
+        self.assertEqual(first["got"][1].get("code"), "takeover_late")     # the newer press took its place
+        opens = hub.q("SELECT helper_ack FROM events WHERE kind='takeover_open'")
+        self.assertEqual((len(opens), all(o["helper_ack"] for o in opens)), (2, True))   # none goes out again
+
+    def test_an_answer_during_the_wait_gives_no_password(self):
+        tid, nid = self.asked()
+
+        def answered(*args, **kwargs):          # his answer lands while the press waits for the helper
+            hub.q("UPDATE needs SET answer='Done', answered=? WHERE id=?", (hub.now(), nid))
+            return real(*args, **kwargs)
+        real = hub.takeover_answer
+        hub.takeover_answer = answered
+        self.addCleanup(setattr, hub, "takeover_answer", real)
+        (code, body), _ = self.press(nid, {"port": 5911, "password": PASSWORD})
+        self.assertEqual((code, body.get("code")), (409, "takeover_closed"))
+        self.assertNotIn(PASSWORD, json.dumps(body))
+
+    def test_no_screen_for_a_closed_item_or_one_with_no_linux_way(self):
+        tid, nid = self.asked()
+        self.helper(features=[])
+        self.assertEqual(self.press(nid)[0][1].get("code"), "takeover_no_screen")
+        self.helper([hub.TAKEOVER_FEATURE])
+        self.assertEqual(self.answer(nid, answer="Done")[0], 200)
+        self.assertEqual(self.press(nid)[0][1].get("code"), "takeover_closed")
+        ivy = self.task()
+        self.assertFalse(self.ask(ivy)[1])
+        mac = hub.q1("SELECT id FROM needs WHERE by='ivy'")["id"]
+        self.assertEqual(self.press(mac)[0][1].get("code"), "takeover_no_screen")      # a Mac's take-over: its way
+        self.assertEqual(hub.q("SELECT * FROM events WHERE kind='takeover_open'"), [])
+
+    def test_at_his_answer_in_the_app_or_on_the_board_the_sharing_stops_before_the_session_reads_it(self):
+        for way in ("app", "board"):
+            tid, nid = self.asked()
+            if way == "app":
+                self.assertEqual(self.answer(nid, answer="Done")[0], 200)
+            else:
+                self.assertEqual(self.board(nid, "Done"), 303)
+            close = hub.q1("SELECT * FROM events WHERE kind='takeover_close' AND task=?", (tid,))
+            say = hub.q1("SELECT * FROM events WHERE kind='say' AND task=?", (tid,))
+            self.assertLess(close["id"], say["id"], way)                # the helper reads the stop first
+            self.assertEqual(json.loads(close["extra"]), {"need": nid})
+            read = lambda: hub.call_tool("nora", "read_messages", {}, ("test-generation", f"T-{tid}", "1"))[0]
+            self.assertNotIn("Done", read(), way)                      # the stop is not acknowledged yet
+            polled = lambda: [e["id"] for e in self.request("/events/nora?delivery=1&after=0&wait=0")[1]["events"]]
+            self.assertIn(close["id"], polled(), way)
+            self.assertNotIn(say["id"], polled(), way)                 # nor does its helper get it to tell the session
+            self.assertEqual(self.request("/helper/ack/nora", {"ids": [close["id"]]})[0], 200)
+            self.assertIn(say["id"], polled(), way)
+            self.assertIn("Done", read(), way)
+            hub.q("UPDATE tasks SET state='completed' WHERE id=?", (tid,))
+        mac = self.task()
+        self.assertFalse(self.ask(mac)[1])
+        self.assertEqual(self.answer(hub.q1("SELECT id FROM needs WHERE by='ivy'")["id"], answer="Done")[0], 200)
+        self.assertEqual(hub.q("SELECT * FROM events WHERE kind='takeover_close' AND task=?", (mac,)), [])
+
+    def test_the_tasks_end_stops_the_sharing_of_its_screen(self):
+        tid, nid = self.asked()
+        hub.secret_waits_end(tid)
+        close = hub.q1("SELECT * FROM events WHERE kind='takeover_close' AND task=?", (tid,))
+        self.assertEqual(json.loads(close["extra"]), {"need": nid})
+
 
 if __name__ == "__main__":
     unittest.main()

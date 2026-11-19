@@ -508,14 +508,16 @@ class Hook(unittest.TestCase):
         self.assertIn("hook_clean.py", fleet.PROTECTED)
         self.assertIn("hidden.py", fleet.PROTECTED)
 
-    def test_the_managers_session_has_the_clean_hook_and_no_other(self):
+    def test_the_managers_session_has_the_clean_hook_and_no_task_hook(self):
         manager = {"role": "manager", "runtime": "claude", "machine": "hub", "can": []}
         with tempfile.TemporaryDirectory(prefix="fleet-hidden-") as tmp, \
                 patch.object(fleet, "CLAUDE_USER_SETTINGS", os.path.join(tmp, "settings.json")):
             words = shlex.split(fleet.settings_arg("manager", manager, None))
         settings = json.loads(words[words.index("--settings") + 1])
         self.assertEqual(settings["hooks"], {"PostToolUse": [fleet.clean_hook()],
-                                             "PostToolUseFailure": [fleet.clean_hook()]})
+                                             "PostToolUseFailure": [fleet.clean_hook()],
+                                             # and the two of a compaction (decision 50)
+                                             **fleet.compaction_hooks(fleet.MANAGER_COMPACTED_LINE)})
         self.assertIn("Bash", fleet.CLEAN_MATCHER)
         self.assertIn("WebFetch", fleet.CLEAN_MATCHER)
 

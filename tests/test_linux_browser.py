@@ -1148,6 +1148,190 @@ class ProofGate(unittest.TestCase):
         self.assertFalse(fleet.browser_proof_holds("fleet-ivy", ports=ports, proof=proof))
 
 
+class TakeOver(unittest.TestCase):
+    """Build plan 04, S6 (D7): the sharing of the agent's screen for the owner's take-over. One viewer on loopback with no
+    clipboard and a one-time password that x11vnc reads from a file and deletes; never on an AI provider's page; and
+    the stop at his answer, acknowledged only once systemd says that the unit ended."""
+
+    PAGES = [{"type": "page", "url": "https://shop.example/check"}, {"type": "service_worker", "url": "https://x/"}]
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp(prefix="fleet-takeover-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.folder, True))
+
+    def test_the_sharing_is_one_viewer_on_loopback_with_no_clipboard_and_its_password_from_a_file(self):
+        args = fleet.vnc_arguments("7", "/run/key", 5911, "/run/vnc-password")
+        for flag in ("-norc", "-nocmds", "-localhost", "-noipv6", "-nosel", "-noremote", "-novncconnect", "-once"):
+            self.assertIn(flag, args)
+        self.assertEqual(args[args.index("-passwdfile") + 1], "rm:/run/vnc-password")
+        self.assertEqual(args[args.index("-rfbport") + 1], "5911")
+        self.assertFalse({"-forever", "-shared", "-passwd", "-nopw"} & set(args))
+        unit = fleet.vnc_unit_text(python="/usr/bin/python3", kit="/kit")
+        self.assertIn("ExecStart=/usr/bin/python3 -E -s /kit/fleet.py vnc-run\n", unit)
+        self.assertIn("Restart=no\n", unit)
+        self.assertNotIn("[Install]", unit)             # never enabled: only the helper starts it
+
+    def test_vnc_run_starts_x11vnc_only_on_a_running_screen_with_a_new_password(self):
+        ran = []
+        with patch.object(fleet, "browser_folder", lambda: self.folder), \
+                patch.object(fleet.lifecycle, "screen_port", lambda user=None: 5911), \
+                patch.object(fleet.os, "execv", lambda program, args: ran.append((program, args))):
+            with self.assertRaisesRegex(SystemExit, "screen does not run"):
+                fleet.cmd_vnc_run(None)
+            Path(self.folder, "display").write_text("7")
+            with self.assertRaisesRegex(SystemExit, "no new one-time password"):
+                fleet.cmd_vnc_run(None)
+            Path(self.folder, fleet.VNC_PASSWORD).write_text("Ab3dEf7h\n")
+            fleet.cmd_vnc_run(None)
+            with patch.object(fleet.lifecycle, "screen_port", lambda user=None: None), \
+                    self.assertRaisesRegex(SystemExit, "no screen-sharing port"):
+                fleet.cmd_vnc_run(None)
+        self.assertEqual(ran, [("/usr/bin/x11vnc", fleet.vnc_arguments(
+            "7", os.path.join(self.folder, "screen-key"), 5911, os.path.join(self.folder, fleet.VNC_PASSWORD)))])
+
+    def press(self, pages=None, browser="active", listens=True, taken=True, cdp_fault=None, fault=None, keep=False,
+              helper_h=None):
+        """One takeover_open on a stand-in helper. Returns (what it posted, systemctl's calls, its lines, the mode of the
+        password's file at the start)."""
+        posted, modes, secret = [], [], os.path.join(self.folder, fleet.VNC_PASSWORD)
+
+        def start(args):            # x11vnc reads the file at its start and deletes it
+            modes.append(oct(os.stat(secret).st_mode & 0o777))
+            if listens:
+                os.remove(secret)
+            return 0, ""
+        calls, call = systemd({"is-active": (0, browser + "\n"), "start": start})
+
+        class FakeCdp:
+            def __init__(self, port, timeout):
+                if cdp_fault:
+                    raise cdp_fault
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def call(self, method, params=None):
+                return {"targetInfos": pages if pages is not None else TakeOver.PAGES}
+
+        def http(method, path, body=None, timeout=10):
+            posted.append((path, dict(body)))
+            if fault:
+                raise fault
+            return 200, {"taken": taken}
+        h = helper_h or helper()
+        with patch.object(fleet, "systemctl_user", call), patch.object(fleet, "Cdp", FakeCdp), \
+                patch.object(fleet, "http", http), patch.object(fleet, "browser_folder", lambda: self.folder), \
+                patch.object(fleet.lifecycle, "browser_port", lambda user=None: 9301), \
+                patch.object(fleet.lifecycle, "screen_port", lambda user=None: 5911), \
+                patch.object(fleet, "listening_inodes", lambda port, uid=None: {7} if listens and port == 5911 else set()), \
+                patch.object(fleet, "VNC_LISTEN_WAIT", 0.5), patch.object(fleet.sys, "platform", "linux"), \
+                patch.object(fleet.os.path, "expanduser", lambda p: p.replace("~", self.folder)):
+            fleet.Helper.takeover_open(h, {"nonce": "n" * 24, "need": 5})
+        return (posted, calls, h) if keep else (posted, calls, h.said, modes)
+
+    def test_a_press_starts_the_sharing_with_a_new_password_and_answers_once(self):
+        posted, calls, said, modes = self.press()
+        self.assertEqual(len(posted), 1)
+        path, body = posted[0]
+        self.assertEqual((path, body["nonce"], body["port"]), ("/helper/takeover/ivy", "n" * 24, 5911))
+        self.assertRegex(body["password"], r"\A[A-Za-z0-9]{8}\Z")
+        self.assertEqual(modes, ["0o600"])
+        self.assertLess(calls.index(("stop", "fleet_vnc.service")), calls.index(("start", "fleet_vnc.service")))
+        self.assertFalse(any(body["password"] in line for line in said), said)
+        self.assertFalse(os.path.exists(os.path.join(self.folder, fleet.VNC_PASSWORD)))
+        self.assertNotEqual(self.press()[0][0][1]["password"], body["password"])      # each press a new one
+
+    def test_a_providers_page_or_no_browser_opens_nothing(self):
+        for kind, fault, browser, reason in (
+                ([{"type": "page", "url": "https://claude.ai/login"}], None, "active", "provider"),
+                ([{"type": "iframe", "url": "https://auth.openai.com/authorize"}], None, "active", "provider"),
+                (None, None, "inactive", "no_browser"),
+                (None, fleet.CdpError("no process of this agent listens"), "active", "no_browser"),
+                ([{"type": "page", "url": "http://[::1"}], None, "active", "provider")):   # fails closed
+            posted, calls, _, _ = self.press(pages=kind, browser=browser, cdp_fault=fault)
+            self.assertEqual(posted[0][1], {"nonce": "n" * 24, "refused": reason}, reason)
+            self.assertNotIn(("start", "fleet_vnc.service"), calls, reason)
+        posted, calls, _, _ = self.press(pages=[{"type": "page", "url": "https://platform.claude.com/keys"}])
+        self.assertIn("password", posted[0][1])         # a provider's API console is no sign-in (provider_site)
+
+    def test_a_start_that_fails_stops_and_answers_screen_at_once(self):
+        """A sharing that does not listen in time, and a start whose file step fails (the unit's file or the password's,
+        a full disk), answer `screen` to the press at once, with no sharing (an earlier press's sharing ends too) and no
+        password file left: else the owner waits out the press's whole time and reads that the screen did not open in
+        time."""
+        posted, calls, _, _ = self.press(listens=False)
+        self.assertEqual(posted[0][1], {"nonce": "n" * 24, "refused": "screen"})
+        self.assertEqual(calls[-1], ("stop", "fleet_vnc.service"))
+        self.assertFalse(os.path.exists(os.path.join(self.folder, fleet.VNC_PASSWORD)))
+
+        unit = os.path.join(self.folder, ".config", "systemd", "user", "fleet_vnc.service")
+        Path(unit).write_text("an older unit\n")
+        os.makedirs(unit + ".new")      # its new text cannot be written: an error before the stop of the sharing before
+        posted, calls, said, _ = self.press()
+        self.assertEqual(posted, [("/helper/takeover/ivy", {"nonce": "n" * 24, "refused": "screen"})])
+        self.assertNotIn(("start", "fleet_vnc.service"), calls)
+        self.assertEqual(calls[-1], ("stop", "fleet_vnc.service"))
+        self.assertTrue(any("could not start (IsADirectoryError)" in line for line in said), said)
+        os.rmdir(unit + ".new")
+
+        def full(path, text):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text[:3])
+            raise OSError(28, "No space left on device")
+        with patch.object(fleet, "write_private", full):
+            posted, calls, said, _ = self.press()
+        self.assertEqual(posted, [("/helper/takeover/ivy", {"nonce": "n" * 24, "refused": "screen"})])
+        self.assertNotIn(("start", "fleet_vnc.service"), calls)
+        self.assertFalse(os.path.exists(os.path.join(self.folder, fleet.VNC_PASSWORD)))
+        self.assertTrue(any("could not start (OSError)" in line for line in said), said)
+
+    def test_a_press_is_answered_once_also_when_its_ack_failed(self):
+        """A pending takeover_open that a later poll hands out again (its ack failed) starts nothing: a second start
+        would end the viewer that the owner types into."""
+        posted, calls, h = self.press(keep=True)
+        self.assertEqual(calls.count(("start", "fleet_vnc.service")), 1)
+        posted2, calls2, _ = self.press(helper_h=h, keep=True)
+        self.assertEqual((posted2, calls2), ([], []))
+
+    def test_a_screen_from_before_its_display_file_is_found_by_its_key(self):
+        ran = []
+        listed = "app-1/unix:0  MIT-MAGIC-COOKIE-1  00ff\napp-1/unix:7  MIT-MAGIC-COOKIE-1  00ff\n"
+        Path(self.folder, fleet.VNC_PASSWORD).write_text("Ab3dEf7h\n")
+        with patch.object(fleet, "browser_folder", lambda: self.folder), \
+                patch.object(fleet.lifecycle, "screen_port", lambda user=None: 5911), \
+                patch.object(fleet.subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0, listed, "")), \
+                patch.object(fleet.os, "execv", lambda program, args: ran.append(args)):
+            fleet.cmd_vnc_run(None)
+        self.assertEqual(ran[0][ran[0].index("-display") + 1], ":7")
+
+    def test_a_press_that_nobody_waits_for_any_more_stops_the_sharing(self):
+        posted, calls, said, _ = self.press(taken=False)
+        self.assertIn("password", posted[0][1])
+        self.assertEqual(calls[-1], ("stop", "fleet_vnc.service"))
+        import http.client
+        posted, calls, said, _ = self.press(fault=http.client.IncompleteRead(b""))   # a fault that it did not name
+        self.assertEqual(calls[-1], ("stop", "fleet_vnc.service"))                  # answered once: no second start
+
+    def test_the_close_returns_only_once_systemd_says_that_the_unit_ended(self):
+        Path(self.folder, fleet.VNC_PASSWORD).write_text("left\n")
+        for state, ends in (("active", False), ("deactivating", False), ("", False), ("inactive", True),
+                            ("failed", True)):
+            calls, call = systemd({"is-active": (0 if state == "active" else 3, state + "\n")})
+            h = helper()
+            with patch.object(fleet, "systemctl_user", call), patch.object(fleet, "browser_folder", lambda: self.folder), \
+                    patch.object(fleet.sys, "platform", "linux"):
+                if ends:
+                    fleet.Helper.takeover_close(h, {"need": 5})
+                else:
+                    with self.assertRaises(fleet.Refused):
+                        fleet.Helper.takeover_close(h, {"need": 5})
+            self.assertEqual(calls[0], ("stop", "fleet_vnc.service"), state)
+        self.assertFalse(os.path.exists(os.path.join(self.folder, fleet.VNC_PASSWORD)))
+
+
 class HubWaits(unittest.TestCase):
     """hub.browser_waits, the poll's `waits` (D10): the open tasks of an agent that wait long with nothing to do."""
 
@@ -1176,6 +1360,14 @@ class HubWaits(unittest.TestCase):
                 hub.q("UPDATE tasks SET state=?, waiting_on=? WHERE id=?", (state, waiting_on, made[-1]))
             secret, colleague, working = (f"T-{n}" for n in made[:3])
             self.assertEqual(hub.browser_waits("ivy"), {secret: "secret"})      # a colleague's answer comes soon
+            # S6 (D10): a take-over's wait keeps its Chrome and its place, also under a usage limit: he needs that screen
+            text = hub.t_create_task("manager", {"owner": "ivy", "title": "Solve the page", "done_when": "solved",
+                                                 "needs": "browser"})
+            taking = int(text.split()[1][2:].rstrip("."))
+            nid = hub.ins("INSERT INTO needs(id,title,why,todo,raised,by,kind,takeover_task) VALUES(7,'t','','',?,"
+                          "'ivy','takeover',?)", (hub.now(), taking))
+            hub.q("UPDATE tasks SET state='input-required', waiting_on=? WHERE id=?", (f"N-{nid}", taking))
+            self.assertEqual(hub.browser_waits("ivy"), {secret: "secret"})
             self.assertEqual(hub.browser_waits("kai"), {})                      # no Browser box: nothing to close
             hub.q("INSERT INTO agent_limits(agent,since,until,reset_known) VALUES('ivy',?,?,1)",
                   (hub.now(), hub.now() + 3600))

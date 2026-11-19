@@ -273,6 +273,8 @@ NOT_TOOLS = {
                        "takes the value from a file or a pipe on this Mac, or has the app read the clipboard, and "
                        "never as a field",
     "/ui/secrets/import": "the values of an import's logins, as /ui/secrets/add",
+    "/ui/needs/{}/takeover": "the one-time password of an agent's screen on a Linux server, which only the owner's "
+                             "app puts in Screen Sharing's address (build plan 04, S6)",
     "/ui/secrets/fingerprints": "the owner's own secret catalog",
     "/ui/needs/{}/secret": "a secret request's answer with a login, which the app's secure form gives once the value "
                            "is in a vault, and for a secret that the fleet's list has, the app's program on the "

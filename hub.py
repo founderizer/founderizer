@@ -1772,6 +1772,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "need_give",         # the owner, 19 November 2026 (his picks of the mockup of a card for access): an
                                     # item that carries its grant, needs[].give, whose first option, Give, makes it
                                     # at his press (UI-API.md, "Give on a card")
+               "takeover_linux",    # build plan 04, S6 (D7): Take over for an agent on a Linux server, POST
+                                    # /ui/needs/<id>/takeover with the agent's screen port and a one-time password
+                                    # (UI-API.md 1.225)
                "code_over_hub_port",    # the owner, 16 November 2026 ("Yes, build it" to the plan install-auto-repair,
                                     # part 2): the fleet's code over the hub's own port, git's smart HTTP protocol at
                                     # /code/<repo>/..., which join.sh takes when port 9418 does not answer (UI-API.md
@@ -1807,7 +1810,7 @@ MOBILE_HEAD = ("id", "title", "state", "owner", "requester", "goal", "needs", "a
 MOBILE_ANSWERED = 50            # answered Needs-you items that the phone reads, for the folded cards of its chats
 MOBILE_SEEN = 60                # seconds: a helper seen this recently is online in both apps (helperIsRecent)
 DEVICE_PATHS = (("/ui/mobile", ("GET",)), ("/ui/state", ("GET",)), ("/ui/knowledge", ("GET",)),
-                ("/ui/owner/devices", ("GET",)), ("/ui/messages", ("POST",)), ("/ui/needs", ("POST",)),
+                ("/ui/owner/devices", ("GET",)), ("/ui/messages", ("POST",)),
                 ("/ui/tasks", ("GET", "POST")), ("/ui/wait", ("GET",)))
 DEVICE_PUSH = re.compile(r"/ui/owner/devices/[a-z][a-z0-9-]{1,30}/(push|recovery/held)")   # a device's own token
 #                                                       (push), and that it holds its copy of the recovery code (V12)
@@ -1815,6 +1818,12 @@ DEVICE_PUSH = re.compile(r"/ui/owner/devices/[a-z][a-z0-9-]{1,30}/(push|recovery
 # and GET /ui/attachments/<id> reads the bytes of one that a chat shows (ui_attachment_file). The prefix rule of
 # DEVICE_PATHS would also take POST /ui/attachments/<id>/keep, which stays on the owner's Mac.
 DEVICE_FILE = re.compile(r"/ui/attachments/[^/]+")
+# An item: POST /ui/needs/<id> answers it and POST /ui/needs/<id>/secret its secret request, and no other route under
+# /ui/needs is a device's. Build plan 04, S6: the one-time password of a Linux agent's screen (POST
+# /ui/needs/<id>/takeover) goes to the owner's Mac app only, which opens the tunnel to it. A prefix would give a device
+# each later route under /ui/needs with nobody having said so (test_access_refusals.DeviceRoutes), and a path as it
+# came (/ui/needs/12/%74akeover, which the router reads as the take-over) matches no entry here.
+DEVICE_NEED = re.compile(r"/ui/needs/[^/]+(?:/secret)?")
 
 
 def owner_devices():
@@ -1889,6 +1898,8 @@ def device_may(path, method):
         return True
     if (method, path) == ("POST", "/ui/attachments") or (method == "GET" and DEVICE_FILE.fullmatch(path)):
         return True                                             # a file of a chat, never its keep (DEVICE_FILE)
+    if method == "POST" and DEVICE_NEED.fullmatch(path):       # an item and its secret request, and no other route
+        return True
     return any(method in methods and (path == p or path.startswith(p + "/")) for p, methods in DEVICE_PATHS)
 
 
@@ -5614,8 +5625,8 @@ def t_read_messages(agent, a):
             t = fence(agent, tid)
             rows = q("SELECT * FROM events WHERE agent=? AND task=? AND kind IN ('say','task') "
                      "AND read_at IS NULL ORDER BY id", (agent, tid))
-            rows = [r for r in rows if (r["kind"] != "task" and not json.loads(r["extra"] or "{}").get("steer")) or
-                    json.loads(r["extra"] or "{}").get("attempt", 1) == t["attempt"]]
+            rows = [r for r in rows if ((r["kind"] != "task" and not json.loads(r["extra"] or "{}").get("steer")) or
+                    json.loads(r["extra"] or "{}").get("attempt", 1) == t["attempt"]) and not takeover_held(r)]
         else:
             if manager_held(agent):         # owner feature runtime_switch: only the new session reads them
                 return "No unread messages. Wait for the next signal."
@@ -6599,8 +6610,11 @@ def browser_waits(agent, closed=None, alive=None):
     held = active_limit(agent) is not None
     rows = q(f"SELECT id, state, waiting_on, needs FROM tasks WHERE owner=? AND state NOT IN "
              f"({','.join('?' * len(TERMINAL))}) ORDER BY id", (agent, *TERMINAL))
-    waits = {tref(r["id"]): "limit" if held else "secret" for r in rows
-             if held or (r["state"] == "input-required" and str(r["waiting_on"] or "").startswith("N-"))}
+    # a take-over's wait keeps its Chrome and its place, also under a usage limit: he works on that screen (S6)
+    taking = {r["takeover_task"] for r in q("SELECT takeover_task FROM needs WHERE kind='takeover' AND answer IS NULL "
+                                            "AND by=?", (agent,))}
+    waits = {tref(r["id"]): "limit" if held else "secret" for r in rows if r["id"] not in taking and
+             (held or (r["state"] == "input-required" and str(r["waiting_on"] or "").startswith("N-")))}
     browser_places_turn(agent, rows, waits, closed, alive)      # S3: and on Linux, `place` for one that has none
     return waits
 
@@ -15145,12 +15159,149 @@ def takeover_title(step):
 def takeover_way(agent):
     """True when the owner's Mac app can open this agent's screen: its machine has an address and a Screen Sharing way
     in team.json (access.<machine> with screen_sharing and an ssh_user), as the machine's page reads it for its
-    Screen Sharing button (GET /ui/machines `access.screen_sharing`). Take over shows only then, so a card is never
+    Screen Sharing button (GET /ui/machines `access.screen_sharing`); or, for an agent on a Linux server, the screen
+    of its own browser there (takeover_linux_way, build plan 04, S6). Take over shows only then, so a card is never
     raised that he cannot act on with it."""
+    if linux_agent(agent):          # its own browser's screen only, also where team.json names a way to the server
+        return takeover_linux_way(agent)
     machine = (agents().get(agent) or {}).get("machine")
     ways = (TEAM.get("access") or {}).get(machine) or {}
     return bool(machine and (TEAM.get("addresses") or {}).get(machine) and ways.get("screen_sharing") is True and
                 ways.get("ssh_user"))
+
+
+# Take over on a Linux server (build plan 04, S6; D7). His press calls POST /ui/needs/<id>/takeover. The hub tells the
+# agent's helper (the event takeover_open), which reads the pages of the agent's Chrome and refuses while one is an AI
+# provider's site, then starts the sharing of the agent's own screen (fleet_vnc.service: x11vnc on 127.0.0.1 and the
+# agent's screen-sharing port, for one viewer, with no shared clipboard) with a new one-time password that x11vnc reads
+# from a file and deletes. The helper's answer (POST /helper/takeover/<agent>) carries that password: the hub keeps it
+# in memory, gives it to the press that waits for it, and writes it to no row and no log line. The port rule (D11)
+# stays the guard: only root and the worker's user reach that port, and the agent's own user does not. At his answer
+# the helper stops the sharing first (the event takeover_close, which it acknowledges only once systemd says that the
+# unit ended), and the session gets his answer only after that (takeover_held). A take-over's wait keeps Chrome open
+# and its place (D10: browser_waits leaves it out), because he needs the screen.
+TAKEOVER_FEATURE = "takeover_screen"    # the helper step that opens and closes the agent's screen (lifecycle.FEATURES)
+TAKEOVER_OPEN_WAIT = 20         # seconds that his press waits for the helper's answer
+TAKEOVER_OPEN_STEP = 0.2        # seconds between two looks for that answer
+TAKEOVER_PASSWORD = re.compile(r"[A-Za-z0-9]{8}")       # 8 letters and digits, the most that a VNC password holds
+TAKEOVER_REASONS = ("no_browser", "provider", "screen")     # the helper's reasons why it opened no screen
+TAKEOVER_LOCK = threading.Lock()
+TAKEOVER_OPENS = {}             # nonce -> {"agent", "need", "port", "answer"}: in memory only (takeover_open)
+
+
+def takeover_screen_port(agent, team=None):
+    """The screen-sharing port of this agent on its Linux server, as the server's own reading names it (S1b: the
+    parts ready, and the row of the ports file of the OS user that the agent runs as), or None."""
+    server = browser_server(agent, team)
+    reading = (server_reading(server, []) or {}) if server else {}
+    browser = reading.get("browser") if isinstance(reading.get("browser"), dict) else {}
+    users = reading.get("agents") if isinstance(reading.get("agents"), dict) else {}
+    user = (users.get(agent) or {}).get("user") if isinstance(users.get(agent), dict) else None
+    if browser.get("state") != "ready" or not user:
+        return None
+    return next((row["screen"] for row in browser.get("ports") or []
+                 if isinstance(row, dict) and row.get("user") == user and isinstance(row.get("screen"), int)), None)
+
+
+def takeover_linux_way(agent):
+    """True for an agent on a Linux server whose screen the owner's app can open now (S6): its server reads its
+    browser parts ready with the agent's screen-sharing port, and its helper is online with the step that opens it.
+    With no helper online the card has no Take over, and he answers in words."""
+    return bool(browser_server(agent) and takeover_screen_port(agent) and helper_online(agent, now()) and
+                TAKEOVER_FEATURE in helper_features(agent))
+
+
+def takeover_open(nid):
+    """His press of Take over on a Linux agent's open item (S6): the agent's helper starts the sharing of its screen
+    with a new one-time password, and this returns {agent, server, port, password} once the helper answered. A second
+    press starts it again with a new password, and the first press's answer no longer counts. It waits up to
+    TAKEOVER_OPEN_WAIT seconds, with LOCK free; Refusal with a code for an item that is closed, a screen that cannot be
+    opened now, the helper's refusal, or no answer in time."""
+    with LOCK:
+        need = q1("SELECT * FROM needs WHERE id=?", (nid,))
+        task = q1("SELECT state FROM tasks WHERE id=?", (need["takeover_task"],)) \
+            if need and need["kind"] == "takeover" and need["takeover_task"] is not None else None
+        if not task or need["answer"] is not None or task["state"] in TERMINAL:
+            raise Refusal(409, code="takeover_closed")
+        agent = need["by"]
+        port = takeover_screen_port(agent)
+        if not port or not takeover_linux_way(agent):
+            raise Refusal(409, code="takeover_no_screen", names={"agent": shown_role(agent)})
+        nonce = secrets.token_urlsafe(18)
+        with TAKEOVER_LOCK:
+            for old in [k for k, v in TAKEOVER_OPENS.items() if v["agent"] == agent]:
+                TAKEOVER_OPENS.pop(old)
+            TAKEOVER_OPENS[nonce] = {"agent": agent, "need": nid, "port": port, "answer": None}
+        opened = emit(agent, "takeover_open", f"The owner takes over your screen for N-{nid}",
+                      task=need["takeover_task"], extra={"nonce": nonce, "need": nid})
+    end = time.monotonic() + TAKEOVER_OPEN_WAIT
+    try:
+        while True:
+            with TAKEOVER_LOCK:
+                wait = TAKEOVER_OPENS.get(nonce)
+                got = wait["answer"] if wait else None
+            if got is not None or wait is None or time.monotonic() >= end:
+                break                       # wait None: a newer press of the same agent took its place
+            time.sleep(TAKEOVER_OPEN_STEP)
+    finally:
+        with TAKEOVER_LOCK:
+            TAKEOVER_OPENS.pop(nonce, None)
+        # no later poll hands it out again, also when the helper's ack failed: a second start would cut his viewer
+        q("UPDATE events SET helper_ack=COALESCE(helper_ack, ?) WHERE id=?", (now(), opened))
+    if got is None:
+        raise Refusal(409, code="takeover_late", names={"agent": shown_role(agent)})
+    with LOCK:                      # his answer may have come during the wait: its close stops the sharing then
+        now_need = q1("SELECT answer FROM needs WHERE id=?", (nid,))
+    if not now_need or now_need["answer"] is not None:
+        raise Refusal(409, code="takeover_closed")
+    if got.get("refused"):
+        log(agent, f"its screen did not open for the owner's take-over of N-{nid}: {got['refused']}")
+        if got["refused"] == "no_browser":
+            raise Refusal(409, code="takeover_no_browser", names={"agent": shown_role(agent)})
+        if got["refused"] == "provider":
+            raise Refusal(409, code="takeover_provider", names={"agent": shown_role(agent)})
+        raise Refusal(409, code="takeover_screen_failed", names={"agent": shown_role(agent)})
+    log(agent, f"its screen is open for the owner's take-over of N-{nid}")
+    return {"agent": agent, "server": browser_server(agent), "port": got["port"], "password": got["password"]}
+
+
+def takeover_answer(agent, nonce, answer):
+    """The helper's answer to one takeover_open (POST /helper/takeover/<agent>): True when a press of this agent waits
+    for it and the port is the agent's own screen-sharing port; then the press gets it."""
+    with TAKEOVER_LOCK:
+        wait = TAKEOVER_OPENS.get(nonce) if isinstance(nonce, str) else None
+        if not wait or wait["agent"] != agent or wait["answer"] is not None or \
+                ("port" in answer and answer["port"] != wait["port"]):
+            return False
+        wait["answer"] = answer
+        return True
+
+
+def takeover_close_rows(agent, need_id, task, t0):
+    """Inside a transaction: the event that has the agent's helper stop the sharing of its screen (takeover_close,
+    S6), for an agent on a Linux server whose helper does the step, before his answer to that item or its task's end.
+    Its id, or None where no such step runs. read_row: helper_features' q1 does not run inside a transaction."""
+    in_transaction("takeover_close_rows")
+    status = read_row("SELECT data FROM machine_status WHERE agent=?", (agent,)) if browser_server(agent) else None
+    if not status or TAKEOVER_FEATURE not in (json.loads(status["data"]).get("features") or []):
+        return None
+    return DB.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)",
+                      (agent, "takeover_close", task, f"The owner's take-over of N-{need_id} ends", t0,
+                       json.dumps({"need": need_id}))).lastrowid
+
+
+def takeover_held(event):
+    """True for the owner's answer to a take-over on a Linux server while the agent's helper has not acknowledged the
+    stop of that item's screen sharing (takeover_close): the session gets the answer after that ack, so the agent never
+    goes on while the owner can still type on its screen (S6). read_row: read_messages reads it in its turn."""
+    try:
+        extra = json.loads(event["extra"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    nid = extra.get("takeover") if isinstance(extra, dict) else None
+    return bool(isinstance(nid, int) and read_row(
+        "SELECT 1 FROM events WHERE agent=? AND kind='takeover_close' AND helper_ack IS NULL AND "
+        "json_extract(extra, '$.need')=? LIMIT 1", (event["agent"], nid)))
 
 
 def t_request_takeover(agent, a):
@@ -15465,9 +15616,11 @@ def secret_waits_end(task_id):
             DB.execute("DELETE FROM needs WHERE id=?", (r["id"],))
             DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
                        (now(), "hub", f"N-{r['id']} left Needs you: {tref(task_id)}, the task that asked, ended"))
-        # owner feature need_takeover: a step on the screen of a task that ended is nothing for him to do any more
-        for r in DB.execute("SELECT id FROM needs WHERE kind='takeover' AND answer IS NULL AND takeover_task=?",
+        # owner feature need_takeover: a step on the screen of a task that ended is nothing for him to do any more,
+        # and on a Linux server its helper stops the sharing of the agent's screen (build plan 04, S6)
+        for r in DB.execute("SELECT id, by FROM needs WHERE kind='takeover' AND answer IS NULL AND takeover_task=?",
                             (task_id,)).fetchall():
+            takeover_close_rows(r["by"], r["id"], task_id, now())
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                        ("row_floor:needs", str(unused_id("needs") - 1)))
             DB.execute("DELETE FROM needs WHERE id=?", (r["id"],))
@@ -17409,11 +17562,14 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     takeover = need is not None and need["kind"] == "takeover" and need["takeover_task"] is not None
     if takeover and task is None:
         task = need["takeover_task"]
+    # build plan 04, S6: on a Linux server the agent's helper stops the sharing of its screen first, and the session
+    # gets this answer once its helper acknowledged that stop (takeover_held)
+    closing = takeover_close_rows(recipient, need["id"], task, t0) if takeover else None
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     generation = generation["v"] if generation else None
     extra = json.dumps({"generation": generation} if worker_chat else
                        {"generation": generation, "need": need["id"]} if secret_chat else
-                       {"quiet": True} if quiet else {})
+                       {"quiet": True} if quiet else {"takeover": need["id"]} if closing else {})
     event_id = DB.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)",
                           (recipient, "chat" if worker_chat or secret_chat else "say", task, text, t0,
                            extra)).lastrowid
@@ -45089,6 +45245,36 @@ LOGIN_FORM = ("<form method='post' action='/site/login'>"
               "<p><button type='submit'>Sign in</button></p></form>")
 
 
+CHECK_KEY = "site_check"        # kv: the fingerprint of the code that /site/check drew last, and "passed" after it
+
+
+def check_page():
+    """The practice page of a step that a person does (build plan 04, S6): a code of six letters drawn on a canvas,
+    new at each visit, and a field for it. Its text has no code: the page draws it from numbers. Called with LOCK."""
+    code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(6))
+    kv_set(CHECK_KEY, hashlib.sha256(code.encode()).hexdigest())
+    points = ",".join(str(ord(c) - 60) for c in code)
+    body = ("<p>Type the letters that you see.</p><canvas id='c' width='300' height='80'></canvas><script>"
+            "var g=document.getElementById('c').getContext('2d');g.font='40px serif';"
+            f"[{points}].forEach(function(n,i){{g.save();g.translate(20+i*45,55);g.rotate((i%2?1:-1)*0.18);"
+            "g.fillText(String.fromCharCode(n+60),0,0);g.restore();});</script>"
+            "<form method='post' action='/site/check'><p><input name='code' autocomplete='off'> "
+            "<button type='submit'>Check</button></p></form>")
+    log("site", "the practice check page drew a new code")
+    return site_page("Pilot site: check", body)
+
+
+def check_step(form):
+    """POST /site/check: the code that a person typed. Right once: the page says so, with `checked` yes, and the code
+    is spent. Wrong: a new code. Called with LOCK."""
+    want, code = kv_get(CHECK_KEY), str(form.get("code") or "").strip().upper()
+    if want and want != "passed" and hmac.compare_digest(want, hashlib.sha256(code.encode()).hexdigest()):
+        kv_set(CHECK_KEY, "passed")
+        log("site", "the practice check page was passed")
+        return site_page("Pilot site: check", "<p>Checked: <b id='checked'>yes</b></p>")
+    return check_page()
+
+
 PRACTICE_HOLD = 50              # the most seconds that the practice send keeps its answer back
 SITE_KEY = "pilot-site-key"     # the label of the one record of the key that the page /site/key showed last
 
@@ -46697,7 +46883,9 @@ SETTINGS = {
                       "Session reuse (on), its growth factor (growth) and its margin in seconds (margin): a standing "
                       "session is told of a new message only while its cache is warm, its context has grown by at "
                       "most the growth factor and there is room before compaction; otherwise it starts again with "
-                      "the hub's brief. A task's own session is not started again for its growth alone."),
+                      "the hub's brief. A task's own session is not started again for its growth, nor for the room "
+                      "before its compaction when it started with its compaction window: it compacts, and then reads "
+                      "its task again."),
     # AUTONOMY.md P10 (lane L2): what a closed conversation runs on, whatever the agent's own runtime is
     "conversations.closed_runtime": (CLOSED_RUNTIMES[0], closed_runtime_check,
                                      "The runtime that runs a closed conversation (a role with tools off), for every "
@@ -67090,6 +67278,12 @@ class Handler(BaseHTTPRequestHandler):
                     f"value='{esc(practice_key())}'></p><p>This page shows a new key each time that it opens.</p>")
             log("site", "the practice site showed a new key")
             return self.send(200, site_page("Pilot site: key", body), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
+        if parts == ["site", "check"]:
+            # build plan 04, S6: the practice page of a step that a person does, for a take-over: a code that the page
+            # draws on a canvas, new at each visit; the hub keeps only its fingerprint
+            with LOCK:
+                page = check_page()
+            return self.send(200, page, "text/html; charset=utf-8", {"Cache-Control": "no-store"})
         if parts == ["site", "price"]:
             self.hit("/site/price (web page)")
             body = "<p>Pilot Widget</p><p>Price today: <b id='price'>42 credits</b></p><p>Stock: <b id='stock'>17 left</b></p>"
@@ -67242,6 +67436,8 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     if held and r["kind"] == "say":
                         continue        # held until the manager's new session runs; the read receipt stays open
+                    if r["kind"] == "say" and takeover_held(r):
+                        continue        # build plan 04, S6: his answer waits until the sharing of the screen stopped
                     if r["kind"] == "say" and quiet_waits(r["created"], extra, now()):
                         continue        # a quiet message comes with the agent's next read; nothing is typed for it
                     if worker and r["kind"] in ("task", "say") and t and active_hold(t["id"]):
@@ -67703,6 +67899,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_submit(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["ui", "needs"] and parts[3] == "secret" and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
             return self.ui_need_secret(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["ui", "needs"] and parts[3] == "takeover" and \
+                re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):     # build plan 04, S6: Take over on a Linux server
+            return self.ui_need_takeover(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["ui", "tasks"] and parts[3] == "control" and re.fullmatch(r"[1-9][0-9]*", parts[2]):
             return self.ui_control(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["ui", "tasks"] and parts[3] == "steer" and re.fullmatch(r"[1-9][0-9]*", parts[2]):
@@ -67748,6 +67947,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_mint(parts[2])
         if parts[:3] == ["helper", "mcp", "program"] and len(parts) == 4:
             return self.helper_mcp_program(parts[3])
+        if parts[:2] == ["helper", "takeover"] and len(parts) == 3:      # build plan 04, S6
+            return self.helper_takeover(parts[2])
         if parts[:2] == ["helper", "outputs"] and len(parts) == 3:
             return self.helper_outputs(parts[2])
         if parts[:2] == ["helper", "vault"] and len(parts) == 3:
@@ -67855,8 +68056,10 @@ class Handler(BaseHTTPRequestHandler):
                         # owner feature need_takeover: the answer to a step on an agent's screen goes to the task that
                         # waits for it, and ends that wait, as owner_message_rows does it
                         takeover = row["takeover_task"] if row["kind"] == "takeover" else None
+                        closing = takeover_close_rows(row["by"], nid, takeover, t0) if takeover is not None else None
                         event_rows([(row["by"], "say", takeover, f"[owner] Answer to Needs-you N-{nid} "
-                                     f"({row['title']}): {answer}{passed}", None)], t0)
+                                     f"({row['title']}): {answer}{passed}", {"takeover": nid} if closing else None)],
+                                   t0)
                         if takeover is not None:
                             secret_wait_moved(takeover)
                         key_swap_answered_rows(row, chosen, t0)     # a press of a server's key swap item
@@ -67974,6 +68177,10 @@ class Handler(BaseHTTPRequestHandler):
             log("site", "a sign-in to the practice site FAILED")
             return self.send(200, site_page("Pilot site: sign in", "<p style='color:#b00'>Wrong login.</p>" + LOGIN_FORM),
                              "text/html; charset=utf-8")
+        if parts == ["site", "check"]:      # build plan 04, S6: the practice page's code, typed by a person
+            with LOCK:
+                page = check_step(self.form())
+            return self.send(200, page, "text/html; charset=utf-8", {"Cache-Control": "no-store"})
         if parts == ["site", "mfa"]:
             page, token = mfa_step(self.headers.get("Cookie"), self.form())
             if page:
@@ -68437,6 +68644,57 @@ class Handler(BaseHTTPRequestHandler):
             why = cut_whole(mask_secrets(" ".join(kept.split())), MCP_PROBE_WHY).rstrip()
         return self.json(200, {"taken": mcp_probe_answer(agent, f.get("probe"), found, path if found else None,
                                                          why or None)})
+
+    def helper_takeover(self, agent):
+        """POST /helper/takeover/<agent> (helper feature takeover_screen, build plan 04 S6): its answer to one
+        takeover_open: {nonce, port, password}, the agent's screen-sharing port and the new one-time password of the
+        sharing of its screen, or {nonce, refused} with its reason (no_browser, provider, screen). The password goes
+        to the press that waits for it, in memory, and to no row and no log line. `taken` is false when no press
+        waits for this answer any more."""
+        if agent not in agents():
+            return self.json(404, {"error": "unknown agent"})
+        if not self.allowed(agent):
+            return
+        f = self.form()
+        nonce, refused = f.get("nonce"), f.get("refused")
+        if not isinstance(nonce, str) or not 16 <= len(nonce) <= 64:
+            return self.json(400, {"error": "nonce must be the nonce of the takeover_open event"})
+        if refused is not None:
+            if refused not in TAKEOVER_REASONS or set(f) - {"nonce", "refused"}:
+                return self.json(400, {"error": "refused must be no_browser, provider or screen, alone"})
+            answer = {"refused": refused}
+        else:
+            port, password = f.get("port"), f.get("password")
+            if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535 or \
+                    not isinstance(password, str) or not TAKEOVER_PASSWORD.fullmatch(password) or \
+                    set(f) - {"nonce", "port", "password"}:
+                return self.json(400, {"error": "send port and password (8 letters and digits), or refused"})
+            answer = {"port": port, "password": password}
+        return self.json(200, {"taken": takeover_answer(agent, nonce, answer)})
+
+    def ui_need_takeover(self, need_id):
+        """POST /ui/needs/<id>/takeover (owner feature takeover_linux, build plan 04 S6): his press of Take over on a
+        Linux agent's item. The answer {agent, server, port, password}: the agent's screen-sharing port on its server
+        and the one-time password of that sharing, which the app puts in Screen Sharing's address and keeps nowhere.
+        No record is kept of it, and a repeat is a new press with a new password. It waits for the agent's helper with
+        LOCK free (takeover_open)."""
+        if not self.ui_allowed():
+            return
+        # The owner's Mac only, which opens the tunnel: here, and not only in device_may, which reads the path as it
+        # came, where the router reads /ui/needs//12/takeover and /ui/needs/12/%74akeover as this route too
+        if owner_device_at(self.client_address[0]) is not None:
+            return self.json(403, {"error": "an agent's screen opens from the owner's Mac, not from a device"})
+        if len(self.body()) > 4096:
+            return self.json(413, {"error": "request is too large"})
+        data = self.form()
+        if not isinstance(data, dict) or set(data) - {"db"}:
+            return self.json(400, {"error": "send only db"})
+        if data.get("db") is not None and data["db"] != kv_get("db_id"):
+            return self.json(409, refusal_words.answer("hub_changed"))
+        try:
+            return self.json(200, takeover_open(need_id))
+        except Refusal as e:
+            return self.json(e.status, refusal_body(e))
 
     def helper_outputs(self, agent):
         """POST /helper/outputs/<agent>: the files of one task's outputs folder, which this agent's helper sends when

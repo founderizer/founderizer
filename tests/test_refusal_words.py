@@ -99,6 +99,13 @@ OLD = {
     "agent_no_telegram_bot": "{agent} has no Telegram bot",
     "bot_name_unknown": "the bot has not said its name yet: try again when the bot is connected",
     "token_bot_account": "a token is for a Discord or Telegram account",
+    # Take over for an agent on a Linux server (build plan 04, S6; UI-API.md 1.225)
+    "takeover_closed": "This step is answered or no longer open",
+    "takeover_no_screen": "{agent}'s screen cannot be opened now: its server or its Founderizer is not ready for it",
+    "takeover_late": "{agent}'s server did not open its screen in time: press Take over again",
+    "takeover_no_browser": "{agent}'s browser does not run now, so there is no screen to take over",
+    "takeover_provider": "{agent}'s browser shows an AI provider's site, which is never taken over",
+    "takeover_screen_failed": "{agent}'s server could not share its screen: press Take over again",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
@@ -146,6 +153,9 @@ SITES = {
     # build plan 04, S3 (UI-API.md 1.218)
     'browser_rule': {'browser_shell_off': 1, 'browser_server': 1}, 'browser_box_refusal': {'browser_server': 1},
     'browser_move_refusal': {'browser_no_room': 1, 'browser_shell_off': 1},
+    # build plan 04, S6 (UI-API.md 1.225)
+    'takeover_open': {'takeover_closed': 2, 'takeover_no_screen': 1, 'takeover_late': 1, 'takeover_no_browser': 1,
+                      'takeover_provider': 1, 'takeover_screen_failed': 1},
     'save_grant': {'no_such_agent': 1},
     'save_integration': {'team_changed': 1},
     'save_lines': {'team_changed_lines': 1},
@@ -452,7 +462,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 174)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 181)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

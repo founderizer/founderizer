@@ -402,8 +402,9 @@ def session_file(agent, window, ext, text):
 # Claude session's own --settings (settings_arg) names each of its catalog servers once (team.json holds at most
 # lifecycle.MCP_LIMIT servers) and this checkout's path in each of its rules for PROTECTED and its hooks, about 40 bytes
 # for each character of that path. A Claude task with the most servers measured 7,682 bytes with a checkout path of 73
-# characters, 9,609 with 120 and 12,889 with 200 (the reviews of 16 November 2026), so only a path of about 280
-# characters comes near what tmux takes. It stays in the command, where each rule's path means what it meant before.
+# characters, 9,609 with 120 and 12,889 with 200 (the reviews of 16 November 2026), and the two compaction hooks of
+# decision 50 add about 800 bytes that no path changes, so only a path of about 260 characters comes near what tmux
+# takes. It stays in the command, where each rule's path means what it meant before.
 
 
 def arg_most(sysconf=os.sysconf, linux=sys.platform.startswith("linux")):
@@ -947,6 +948,17 @@ CLEAN_MATCHER = (r"^(Bash|BashOutput|TaskOutput|Monitor|Read|NotebookRead|Grep|G
 CLEAN_TIMEOUT = 10          # seconds: at its limit, Claude Code keeps the original output
 
 
+def compaction_hooks(line=None):
+    """The two hooks of a Claude session around a compaction (STANDING_COMPACT): what the summary keeps (PreCompact,
+    whose output Claude Code appends to the summary's instructions) and the line that the session reads right after
+    it (SessionStart with the matcher "compact", whose output the model reads): COMPACTED_LINE for a task session,
+    MANAGER_COMPACTED_LINE for the manager. Each prints a fixed text, so that no hub call can fail in it."""
+    def say(text):
+        return {"type": "command", "timeout": 10, "command": "printf '%s\\n' " + shlex.quote(text)}
+    return {"PreCompact": [{"hooks": [say(COMPACT_KEEP)]}],
+            "SessionStart": [{"matcher": "compact", "hooks": [say(line or COMPACTED_LINE)]}]}
+
+
 def clean_hook():
     """The synchronous PostToolUse entry that removes hidden characters from what a tool read (hook_clean.py). A
     synchronous hook, because an async one cannot change the output; a program of its own with python3 -S, because it
@@ -1324,22 +1336,23 @@ def settings_arg(agent, conf, task, tools=(), needs="none", browser=False):
         deny = DENY + [f"Edit(/{KIT}/{name})" for name in PROTECTED]
         allow = conf.get("allow", ["mcp__fleet__*"]) + [f"mcp__{t}__*" for t in tools]
         if task and task != "conversation":
-            # AUTONOMY.md decisions 36 and 41 (helper features task_denied and workflow_tasks): a task session, a
-            # duty's case and a wake included, has every built-in tool but the ones that the owner took away, and
-            # runs Workflow without asking. The owner chat has no built-in tool, and the manager has its own list.
+            # AUTONOMY.md decisions 36, 41 and 50 (helper features task_denied and workflow_tasks): a task session, a
+            # duty's case and a wake included, has every built-in tool but the ones that the owner took away, and runs
+            # its runtime's task_allowed without asking. The owner chat has no built-in tool, and the manager has its
+            # own list.
             deny += runtime_fact(runtime, "task_denied") or []
             allow += [name for name in runtime_fact(runtime, "task_allowed") or [] if name not in allow]
         elif task == "conversation":
-            # a conversation with the agent's own tools: a task session's list, and Workflow, which is task work
+            # a conversation with the agent's own tools: its own list (conversation_denied)
             deny += runtime_fact(runtime, "conversation_denied") or []
         if browser:
             allow += [f"mcp__{BROWSER_SERVER}__{name}" for name in sorted(BROWSER_MCP_TOOLS)]
         elif needs == "browser" and CHROME_TOOLS not in allow:
             allow.append(CHROME_TOOLS)
         settings = {"permissions": {"allow": allow, "deny": deny}}
-    if conf.get("role") == "manager" or (task and task != "conversation"):
-        # Workflow for every agent (decision 41), also where its account's plan has it off until a setting turns it
-        # on, as on Pro: that setting was the user's, which no session loads (kept_user_settings)
+    if conf.get("role") == "manager":
+        # Workflow for the manager (decisions 41 and 50), also where its account's plan has it off until a setting
+        # turns it on, as on Pro: that setting was the user's, which no session loads (kept_user_settings)
         settings["enableWorkflows"] = True
     settings["prefersReducedMotion"] = False        # the screen watch reads its counters (MOTION)
     settings.update(NO_SUGGESTION)
@@ -1360,11 +1373,13 @@ def settings_arg(agent, conf, task, tools=(), needs="none", browser=False):
                             clean_hook()],      # hidden characters out of what a tool read (hook_clean.py)
             # a failed call keeps its output, so the same program only says that hidden characters are in it
             "PostToolUseFailure": [clean_hook()],
+            **compaction_hooks(),           # the owner, 19 November 2026: a long task session compacts at 200K
         }
     elif conf.get("role") == "manager":
         # The manager's session has WebFetch and Bash too: the clean hook alone, and no permission or activity hook,
         # which are a task's
-        settings["hooks"] = {"PostToolUse": [clean_hook()], "PostToolUseFailure": [clean_hook()]}
+        settings["hooks"] = {"PostToolUse": [clean_hook()], "PostToolUseFailure": [clean_hook()],
+                             **compaction_hooks(MANAGER_COMPACTED_LINE)}    # its standing session compacts at 200K
     settings.update(kept_user_settings())
     return "--settings " + shlex.quote(json.dumps(settings))
 
@@ -2531,7 +2546,7 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     env = f"FLEET_ATTEMPT={attempt} FLEET_GENERATION={shlex.quote(generation)} FLEET_HUB={shlex.quote(HUB)} FLEET_AGENT={shlex.quote(agent)} FLEET_TASK={shlex.quote(task or '')}"
     if conf.get("runtime") == "claude":
         env += f" {NO_TIMERS} {NO_TEAMS} {NO_FILE_MENTIONS} {MOTION}" + (f" {TODO_TOOLS}" if task else "")
-    if not task and conf.get("runtime") == "claude":
+    if conf.get("runtime") == "claude":     # a task session too, since the owner's answer of 19 November 2026
         env += f" CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"
     # Its env file last, with its credential, its keys and its catalog servers' options: a start that fails above (a
     # file that cannot be written) leaves none of them behind.
@@ -2739,12 +2754,31 @@ def minted_token(report):
 
 # The runtimes whose standing session continues its own conversation (lifecycle.RUNTIMES "manager").
 MANAGER_RUNTIMES = tuple(sorted(runtimes_with("manager")))
-# Tokens of context at which a standing Claude session (the manager's, an owner chat) compacts its conversation. A
-# model with a native 1M window compacts at about 967K by default, and every turn of a session reads its whole context
-# again: a standing session gathers weeks of unrelated turns, so it paid for all of them at each new message. The
-# fleet's state is in the hub (goals, plans, duties, tasks), never only in a session, so a summary loses nothing that
-# a read cannot give back. CLAUDE_CODE_AUTO_COMPACT_WINDOW wins over the owner's own /autocompact and settings.
+# Tokens of context at which a Claude session (the manager's, an owner chat, a conversation, and since the owner's
+# answer of 19 November 2026 "200,000 tokens" a task's that session_command starts; a Shell-off task session starts
+# with none) compacts its conversation. A model with a native 1M window
+# compacts at about 967K by default, and every turn of a session reads its whole context again: a standing session
+# gathers weeks of unrelated turns, and a task session above 300K tokens read all of them at each call. The fleet's
+# state is in the hub (goals, plans, duties, tasks), never only in a session, so a summary loses nothing that a read
+# cannot give back: COMPACTED_LINE sends the session to those reads after each compaction.
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW wins over the owner's own /autocompact and settings.
 STANDING_COMPACT = 200000
+# What a Claude session reads right after a compaction (its SessionStart hook with the matcher "compact"): the summary
+# keeps the user's messages, but a task, its steers and the hub's answers came as tool results. A fixed text, so that it
+# reaches the session when the hub cannot. The same words stand in the core rules for a runtime with no such hook, and
+# the manager, which has no task, reads its own reads.
+COMPACTED_LINE = ("Your conversation was just summarized, and the summary keeps only part of what tools gave you. "
+                  "Before you go on, read your task again: list_my_tasks, and read_history with its ref (T-<id>), give "
+                  "the task, its done-when line, its steers and the answers; see_standing gives your standing items.")
+MANAGER_COMPACTED_LINE = ("Your conversation was just summarized, and the summary keeps only part of what tools gave "
+                          "you. Before you go on, read again what your work needs: read_messages for what came in, "
+                          "see_goals for the goals and their plans, see_standing for your standing items, and see_team "
+                          "for your team.")
+# What the summary keeps (the PreCompact hook): the hub holds no record of what a session did through its shell, and
+# rule 9 asks it never to repeat a send, a post or a payment; and no tool gives again what the session holds.
+COMPACT_KEEP = ("In the summary, keep each act that left the building (a send, a post, a push, a payment, a release), "
+                "with its time and where it went; what this session holds (its repositories, keys, logins and "
+                "servers), as its start listed them; and the ref of your task.")
 # A standing Claude session that is told of a message after the provider's cache of it has expired reads its whole
 # context again at the price of writing it. Claude keeps a session's cache for an hour (five minutes on some plans,
 # which its own records say), and the manager's session waited for hours between messages, so each of those messages
@@ -5571,6 +5605,111 @@ class Helper:
         """This agent's list of clears that wait ({mark: clear}), or (`done`) the marks of the last ones that ran."""
         return os.path.join(HOME, f"browser-{'done' if done else 'clears'}-{self.agent}.json")
 
+    def takeover_open(self, extra):
+        """**The owner takes over this agent's screen** (build plan 04, S6; D7): while no page of the agent's Chrome is
+        an AI provider's site (provider_site), the sharing of its screen starts again (fleet_vnc.service) with a new
+        one-time password of 8 letters and digits, in a file of mode 600 that x11vnc deletes at its start, and its
+        port and password go to the press that waits for them (POST /helper/takeover/<agent>); else that press gets
+        the reason (no_browser, provider, screen). It answers once and raises nothing: a later poll never starts the
+        sharing again for a press that has gone. The password is in no log line."""
+        nonce = extra.get("nonce")
+        if not isinstance(nonce, str):
+            self.say("a take-over with no nonce: nothing opened")
+            return
+        done = self.__dict__.setdefault("takeovers_done", [])
+        if nonce in done:               # its ack failed: it answered already, and a second start would cut his viewer
+            return
+        done[:] = (done + [nonce])[-20:]
+        if sys.platform == "darwin" or not self.own_user():
+            reason, password, screen = "screen", None, None
+        else:
+            try:
+                reason, password, screen = self.takeover_start()
+            except Exception as e:      # a failed step (a full disk): no sharing runs, and the press hears it now
+                systemctl_user("stop", lifecycle.BROWSER_UNITS[1])
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(browser_folder(), VNC_PASSWORD))
+                self.say(f"the owner's take-over: its sharing could not start ({type(e).__name__})")
+                reason, password, screen = "screen", None, None
+        body = {"nonce": nonce, "refused": reason} if reason else {"nonce": nonce, "port": screen, "password": password}
+        try:
+            code, data = http("POST", f"/helper/takeover/{self.agent}", body, timeout=10)
+        except Exception as e:          # it answers once: never a second start of the sharing at a later poll
+            code, data = type(e).__name__, None
+        taken = code == 200 and isinstance(data, dict) and data.get("taken") is True
+        if reason:
+            self.say(f"the owner's take-over: its screen did not open ({reason})")
+        elif taken:
+            self.say(f"the owner's take-over: its screen is shared on 127.0.0.1:{screen} for one viewer")
+        else:                           # nobody waits for this screen any more: it ends here
+            systemctl_user("stop", lifecycle.BROWSER_UNITS[1])
+            self.say(f"the owner's take-over: the hub did not take its screen ({code}), so its sharing stopped")
+
+    def takeover_start(self):
+        """(reason, password, port) of one start of the sharing of this agent's screen: reason None once x11vnc
+        listens on the agent's screen-sharing port and has deleted the password's file."""
+        port, screen = lifecycle.browser_port(), lifecycle.screen_port()
+        if not port or not screen:
+            return "screen", None, None
+        if systemctl_user("is-active", lifecycle.BROWSER_UNITS[0])[1].strip() != "active":
+            return "no_browser", None, None
+        try:
+            with Cdp(port, 5.0) as cdp:
+                pages = [t.get("url") for t in cdp.call("Target.getTargets").get("targetInfos") or []
+                         if isinstance(t, dict) and t.get("type") in ("page", "iframe")]
+        except (OSError, ValueError, CdpError):
+            return "no_browser", None, None
+        if any(provider_page(url) for url in pages):
+            return "provider", None, None           # never a take-over on a provider's sign-in (D7, rules/logins.md)
+        unit = lifecycle.BROWSER_UNITS[1]
+        path = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user", unit)
+        text = vnc_unit_text()
+        try:
+            with open(path, encoding="utf-8") as f:
+                same = f.read() == text
+        except OSError:
+            same = False
+        if not same:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + ".new", "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(path + ".new", path)
+            systemctl_user("daemon-reload")
+        systemctl_user("stop", unit)                # a press before: its viewer and its password end here
+        folder = browser_folder()
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        secret = os.path.join(folder, VNC_PASSWORD)
+        with contextlib.suppress(OSError):
+            os.remove(secret)
+        password = "".join(secrets.choice(VNC_LETTERS) for _ in range(8))
+        write_private(secret, password + "\n")
+        systemctl_user("start", unit)
+        end = time.monotonic() + VNC_LISTEN_WAIT
+        while time.monotonic() < end:
+            if listening_inodes(screen, os.getuid()) and not os.path.exists(secret):
+                return None, password, screen
+            time.sleep(0.2)
+        systemctl_user("stop", unit)
+        with contextlib.suppress(OSError):
+            os.remove(secret)
+        return "screen", None, None
+
+    def takeover_close(self, extra):
+        """**The owner's take-over ends** (build plan 04, S6): at his answer and at the task's end the sharing of this
+        agent's screen stops, and this returns only once systemd says that its unit ended, so that the hub gives his
+        answer to the session only after the stop (the event's ack, hub.takeover_held). Raises Refused while it has
+        not ended: the event stays pending, and the next poll tries again."""
+        if sys.platform == "darwin" or not self.own_user():
+            return
+        unit = lifecycle.BROWSER_UNITS[1]
+        systemctl_user("stop", unit)
+        state = systemctl_user("is-active", unit)[1].strip()
+        if state not in ("inactive", "failed"):
+            raise Refused(f"{unit} has not ended ({state or 'no answer'})")
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(browser_folder(), VNC_PASSWORD))
+        self.say(f"the owner's take-over of N-{extra.get('need')} ended: the sharing of this agent's screen stopped")
+
     def browser_clear(self, event, extra):
         """**A site login's grant ended for this agent** (S2; the hub's event, from S5's record, by the rule
         lifecycle.browser_clear_valid). The clear goes into this agent's list, by a mark of its event and its content:
@@ -6946,6 +7085,10 @@ class Helper:
             self.browser_clear(ev["id"], extra)
         elif kind == "forget":          # the owner removed a person: their windows and their sessions' files go
             self.forget(ev["id"], extra)
+        elif kind == "takeover_open":   # build plan 04, S6: the owner pressed Take over on this agent's item
+            self.takeover_open(extra)
+        elif kind == "takeover_close":  # build plan 04, S6: his answer or the task's end; the hub waits for its ack
+            self.takeover_close(extra)
         elif kind == "update":
             if getattr(self, "lifecycle", None):
                 self.lifecycle.request(extra)
@@ -7398,21 +7541,30 @@ class Helper:
             typed = time.time() - (time.monotonic() - self.typed_at.get(window, float("-inf")))
             seen = seen[:2] + (max(seen[2], typed),) + seen[3:]
         team = checkout_team()
-        settings = reuse_settings(team)
+        settings, facts = reuse_settings(team), facts_now(team, runtime)
         if re.fullmatch(r"T-\d+", window):
             # The owner, 4 November 2026: a task's session grows with its work, and a fresh one did that work again.
             settings = dict(settings, growth=None)
+            if "CLAUDE_CODE_AUTO_COMPACT_WINDOW=" in start:
+                # Nor does the room before its compaction start it fresh when it started with its compaction window
+                # (session_command, decision 50): it compacts and reads its task again (compaction_hooks). A task
+                # session that started without one keeps the room reason, whose fresh start is how it gets the hub's
+                # brief: one that an older helper started, and a Codex session. (A Shell-off task session runs a
+                # pinned program, which window_runtime does not read as its runtime, so this rule never reaches it:
+                # an open gap, lanes/agent-context-size.md.) The room reason started 16 Claude task sessions fresh
+                # from 12 to 19 November 2026, at 162K to 252K tokens, while they had no window.
+                facts = dict(facts, compact_tokens=None)
         started = dict(started_runs(start, runtime), account=account or None) if start.strip() else None
-        reuse, why = session_reuse(runtime, seen, started, self.reuse_runs(started, runtime), settings,
-                                   facts=facts_now(team, runtime))
+        reuse, why = session_reuse(runtime, seen, started, self.reuse_runs(started, runtime), settings, facts=facts)
         return reuse, why, int(attempt)
 
     def fresh_task(self, target, window):
         """True when the hub started this task window's task fresh (plan P9.10, helper feature fresh_tasks): the
-        session reuse rule found its session cold, without room before its compaction or on another runtime, model,
-        effort or account (its growth alone is no reason), and the hub made a new attempt with its short brief, whose
-        start replaces this window at the next poll. Between two turns of a terminal session only; anything unknown,
-        and a refusal of the hub, tells the session as before."""
+        session reuse rule found its session cold, without room before its compaction (only a session that started
+        with no compaction window), or on another runtime, model, effort or account (its growth is no reason:
+        window_reuse), and the hub made a new attempt with its short brief, whose start replaces this window at the
+        next poll. Between two turns of a terminal session only;
+        anything unknown, and a refusal of the hub, tells the session as before."""
         decided = self.window_reuse(target, window)
         if decided is None or decided[0]:
             return False
@@ -9827,6 +9979,36 @@ def browser_unit_text(python=None, kit=None, locale=(None, None)):
             "OOMScoreAdjust=900\n")
 
 
+def vnc_unit_text(python=None, kit=None):
+    """The sharing of the agent's screen for the owner's take-over (build plan 04, S6; D7): x11vnc in a unit of the
+    user's systemd (vnc-run), which the helper starts at each press of Take over and stops at his answer. It is never
+    enabled and never starts again by itself: with -once it ends when his window closes."""
+    python, kit = python or sys.executable, kit or KIT
+    return ("[Unit]\nDescription=Founderizer: the sharing of this agent's screen for the owner (build plan 04, D7)\n\n"
+            "[Service]\nType=simple\n"
+            f"ExecStart={python} -E -s {kit}/fleet.py vnc-run\n"
+            "Restart=no\nTimeoutStopSec=5\nMemoryMax=256M\nMemorySwapMax=0\n")
+
+
+VNC_PASSWORD = "vnc-password"   # the one-time password's file in browser_folder(), which x11vnc deletes at its start
+VNC_LISTEN_WAIT = 10            # seconds that a start of fleet_vnc.service has to listen on the agent's port
+VNC_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"     # of a one-time password
+X11VNC = "/usr/bin/x11vnc"      # the package's program (S1b installs x11vnc), by its path, never by PATH
+
+
+def vnc_arguments(display, key, port, secret):
+    """x11vnc's arguments for the owner's take-over (D7): the agent's own screen and its key, on 127.0.0.1 and the
+    agent's screen-sharing port only, for one viewer (-once), with no clipboard in either direction (-nosel), no remote
+    control, no reverse connection and no IPv6, and the one-time password of the helper's file, which x11vnc reads
+    and deletes at its start (rm:), so that it is on no command line and a second press never meets an old one; and
+    no rc file of the agent's (-norc) and no command of a viewer's (-nocmds) adds to them. They hold for an agent that
+    does not interfere: x11vnc runs as the agent's own user, so an agent that turns against the owner can replace it
+    (SECURITY.md)."""
+    return ["x11vnc", "-norc", "-nocmds", "-display", f":{display}", "-auth", key, "-rfbport", str(port),
+            "-localhost", "-noipv6", "-nosel", "-noremote", "-novncconnect", "-once", "-passwdfile", f"rm:{secret}",
+            "-quiet"]
+
+
 def browser_locale(team=None, zones="/usr/share/zoneinfo"):
     """(LANG, TZ) of the agent's Chrome (D12): its language from the owner's (team.json settings owner.language, a
     BCP 47 tag such as "es-ES", which the hub checks) and its time zone from the fleet's (team.json goals.timezone,
@@ -10176,6 +10358,10 @@ def cmd_browser_run(args):
         xvfb.kill()
         sys.exit("the screen did not start")
     allow(display)
+    shown = os.path.join(run, "display")        # build plan 04, S6: the sharing of this screen reads it (vnc-run)
+    with contextlib.suppress(OSError):
+        os.remove(shown)
+    write_private(shown, str(display))
     # No session bus: through it Chrome moves itself out of this unit into a scope of its own, where the unit's memory
     # cap does not hold it (seen on x86 Ubuntu 24.04, 17 November 2026; browser-ready then refuses the start).
     env = dict(os.environ, DISPLAY=f":{display}", XAUTHORITY=key, DBUS_SESSION_BUS_ADDRESS="disabled:")
@@ -10194,6 +10380,41 @@ def cmd_browser_run(args):
         with contextlib.suppress(OSError):
             process.terminate()
     sys.exit(code)
+
+
+def screen_key_display(key):
+    """The display number of the screen that this key unlocks, by xauth's list of it: the largest, because browser-run
+    adds display 0 first and its screen's own after it. For a screen that started before browser-run wrote its display
+    file (build plan 04, S6). "" where the key names none."""
+    try:
+        out = subprocess.run(["xauth", "-q", "-f", key, "list"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    numbers = {int(n) for n in re.findall(r"/unix:(\d+)\s", out or "")}
+    return str(max(numbers)) if numbers else ""
+
+
+def cmd_vnc_run(args):
+    """fleet_vnc.service's own program (vnc_unit_text), as the agent: x11vnc on the screen that browser-run started
+    (its display and its key), with vnc_arguments. It stops when no screen runs, no port is the agent's, or no new
+    password waits for it."""
+    run = browser_folder()
+    port = lifecycle.screen_port()
+    if not port:
+        sys.exit("this agent has no screen-sharing port in /etc/fleet-browser/ports")
+    try:
+        with open(os.path.join(run, "display"), encoding="ascii") as f:
+            display = f.read(16).strip()
+    except (OSError, UnicodeDecodeError):
+        display = ""
+    if not display.isdigit():           # a screen that a browser-run from before this file started
+        display = screen_key_display(os.path.join(run, "screen-key"))
+    if not display.isdigit():
+        sys.exit("this agent's screen does not run")
+    secret = os.path.join(run, VNC_PASSWORD)
+    if not os.path.isfile(secret):
+        sys.exit("no new one-time password waits for this start")
+    os.execv(X11VNC, vnc_arguments(display, os.path.join(run, "screen-key"), port, secret))
 
 
 def cmd_browser_ready(args, wait=10.0, proc="/proc", cgroups="/sys/fs/cgroup"):
@@ -11139,6 +11360,15 @@ PROVIDER_KEY_SITES = ("platform.claude.com", "api.x.ai")   # an API console or a
                                                             # read there stays allowed (api.x.ai: the AI providers build)
 
 
+def provider_page(url):
+    """True for a page of a model provider's sign-in site (provider_site), and for an address that does not read: a
+    take-over's check fails closed (build plan 04, S6)."""
+    try:
+        return provider_site(urllib.parse.urlsplit(str(url or "")).hostname)
+    except ValueError:
+        return True
+
+
 def provider_site(host):
     """True for a model provider's own sign-in site, with its subdomains. Fleet holds no provider credential: the
     owner signs in to their own account in their own session, through the provider's own flow, and that is the
@@ -11631,6 +11861,7 @@ def main():
     p = sub.add_parser("start"); p.add_argument("agent"); p.set_defaults(fn=cmd_start)
     p = sub.add_parser("browser-run"); p.set_defaults(fn=cmd_browser_run)          # build plan 04, D5: the unit's own
     p = sub.add_parser("browser-ready"); p.set_defaults(fn=cmd_browser_ready)      # and its start's check (D11)
+    p = sub.add_parser("vnc-run"); p.set_defaults(fn=cmd_vnc_run)                  # build plan 04, S6: the take-over
     p = sub.add_parser("hook"); p.add_argument("kind", choices=["permission", "activity"])
     p.add_argument("agent"); p.add_argument("task"); p.set_defaults(fn=cmd_hook)
     p = sub.add_parser("service"); p.add_argument("name"); p.set_defaults(fn=cmd_service)

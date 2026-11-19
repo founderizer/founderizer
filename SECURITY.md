@@ -100,6 +100,24 @@ can still reach in its own browser (a filled field, the vault's script, the brow
 [VAULT.md](VAULT.md), "What the vault does not protect": a copied session works until the site ends it, so after a
 grant's end the owner's step is the site's "sign out everywhere" or a new password.
 
+At the owner's Take over (UI-API.md 1.225), the agent's helper shares that browser's screen with `x11vnc` on loopback
+and the agent's screen-sharing port, for one viewer, with no shared clipboard, and with a new one-time password at each
+press; only root and the server's worker user reach that port, so the owner's Mac opens it through its own SSH tunnel
+as root. The password is in no row and no log line of the hub, it goes to the owner's Mac app only (never to a phone),
+and the app keeps it nowhere. The helper refuses while a page of that browser is an AI provider's site.
+
+What this does not protect: `x11vnc` runs as the agent's own user, so those settings hold for an agent that does not
+interfere. An agent that turns against the owner (a page that took over its session, for example) can replace that
+server with a program of its own on the same port, and then it decides what the owner sees, and it reads what the
+owner's viewer sends: what the owner types, and the clipboard of the owner's Mac where Screen Sharing sends it to such
+a server (not yet measured). The address of that screen names a user of its own (`takeover-<agent>`), so that Screen
+Sharing should not take the sign-in that it keeps for 127.0.0.1, which can be another Mac's, when such a server asks
+for an Apple sign-in (not yet measured either: the live check of the take-over measures it). On a Mac the other end is
+Apple's own server, but its shared clipboard reaches the agent's Mac too (an open point of the take-over). So a
+take-over is for a CAPTCHA only: the owner types nothing there that they would not type into the agent's own browser,
+and copies no password before it. The agent's session gets the owner's answer only after the sharing has stopped,
+which holds for an agent that reads its messages with `read_messages`.
+
 ## What an agent's read of a server shows, and what it does not
 
 The agent that holds a server at Fix through the door can read that server's files with `ops <server> look`: a bash

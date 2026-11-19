@@ -607,8 +607,8 @@ class HelperSide(unittest.TestCase):
         self.assertEqual(servers["github"], {"type": "stdio", "command": PROGRAM, "args": ["stdio"],
                                              "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"}})
         settings = json.loads(words[words.index("--settings") + 1])
-        # and Workflow, which a task session runs unasked (AUTONOMY.md decision 41)
-        self.assertEqual(settings["permissions"]["allow"], ["mcp__fleet__*", "mcp__github__*", "Workflow"])
+        # and no Workflow: a task session has none (AUTONOMY.md decision 50)
+        self.assertEqual(settings["permissions"]["allow"], ["mcp__fleet__*", "mcp__github__*"])
         prompt = start_text(words)
         self.assertTrue(prompt.startswith("Do T-3.\n\nYour GitHub repositories (2), by access: write: acme/web; read: "
                                           "acme/lib. Before you work in one, run `"), prompt)

@@ -370,10 +370,13 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "check_lines",      # it runs checks that print lines, with the agent's read keys and its error output (P4)
             "chat_tools",       # an owner chat whose tools changed starts again between turns, on its conversation
             "stuck_screens",    # a question that stands on a screen nobody reads ends its session (runtime gaps C1, C2)
-            # AUTONOMY.md decision 41: a task session runs Workflow, and its records keep a workflow open until its own
-            # end notice; no session of it offers a tool that asks a person on its screen
+            # AUTONOMY.md decision 41: its records keep a workflow open until its own end notice (since decision 50 only
+            # the manager runs Workflow); no session of it offers a tool that asks a person on its screen
             "workflow_tasks",
             "stable_skills",    # a session's stable text lists the agent's own skills (skills_text, design v4 D3)
+            # build plan 04, S6: it opens the sharing of its agent's screen on a Linux server for the owner's take-over
+            # (takeover_open) and stops it at his answer (takeover_close)
+            "takeover_screen",
             # its usage report gives each session's tokens by model, its sub-agents' and workflow agents' with them,
             # and each scan reads only what the transcripts gained (plan P8, decision 41)
             "session_models",
@@ -675,7 +678,7 @@ RUNTIMES = {
         # Claude Code scales the copy of a tool's picture that it shows (its MCP documentation, since 2.1.283)
         "tool_pictures": True,
         "cache_seconds": 3600,          # an hour; its own records say when it is five minutes (fleet.claude_context)
-        "compact_tokens": 200000,       # fleet.STANDING_COMPACT, the window that Fleet starts its standing sessions with
+        "compact_tokens": 200000,       # fleet.STANDING_COMPACT, the window that Fleet starts its sessions with
         "routine": {"model": "sonnet", "effort": "low"},
         "default_model": None,
         # The owner, 27 October 2026: "Yes, remove Artifact, Workflow, AskUserQuestion, ReportFindings, Skill and
@@ -683,12 +686,14 @@ RUNTIMES = {
         # (recorded against stand-ins), Claude Code then offers ArtifactComments and ArtifactData no more either, as
         # it offers them only together with Artifact. AUTONOMY.md decision 41, the owner on 28 October 2026: "when
         # AskUserQuestion from an agent, it should be its boss who gets the question! ... same for Workflows etc, I
-        # think they are great". Workflow is back, and runs from the allow list, because it asks and dontAsk refuses
-        # what asks. EnterPlanMode and ExitPlanMode go with AskUserQuestion: an approval card that nobody reads is a
-        # question too. A question goes up with ask_my_requester.
+        # think they are great". EnterPlanMode and ExitPlanMode go with AskUserQuestion: an approval card that nobody
+        # reads is a question too. A question goes up with ask_my_requester. Workflow came back with decision 41, and
+        # leaves again with decision 50 (the owner, 19 November 2026: "Remove it"): 22,358 of the 102,372 characters of
+        # a task session's first request on 2.1.311, and one call by all agents in 1,713 sessions in three weeks.
+        # Sub-agents (the Agent tool) stay.
         "task_denied": ["Artifact", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "ReportFindings", "Skill",
-                        "ListAgents"],
-        "task_allowed": ["Workflow"],
+                        "ListAgents", "Workflow"],
+        "task_allowed": None,
         # a conversation with a person is no task work: it splits none of it
         "conversation_denied": ["Artifact", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "ReportFindings",
                                 "Skill", "ListAgents", "Workflow"],
@@ -3195,6 +3200,17 @@ def browser_port(user=None, ports=BROWSER_PARTS["ports"]):
     except (OSError, KeyError, UnicodeDecodeError):
         return None
     return next((row["devtools"] for row in rows or [] if row["user"] == user), None)
+
+
+def screen_port(user=None, ports=BROWSER_PARTS["ports"]):
+    """This OS user's screen-sharing port by the root-owned ports file (D11), or None (build plan 04, S6)."""
+    try:
+        user = user or pwd.getpwuid(os.getuid()).pw_name
+        with open(ports, encoding="ascii") as f:
+            rows = browser_ports(f.read(1 << 20))
+    except (OSError, KeyError, UnicodeDecodeError):
+        return None
+    return next((row["screen"] for row in rows or [] if row["user"] == user), None)
 
 
 def browser_proof_holds(user, ports=BROWSER_PARTS["ports"], proof=BROWSER_PROOF, now=None):

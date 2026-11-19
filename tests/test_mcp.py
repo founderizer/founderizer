@@ -707,7 +707,7 @@ class HelperSide(unittest.TestCase):
         self.assertEqual(servers["crm"], {"type": "http", "url": "https://mcp.example.org/",
                                           "headers": {"Authorization": "Bearer ${%s}" % TOKEN}})
         self.assertEqual(json.loads(words[words.index("--settings") + 1])["permissions"]["allow"],
-                         ["mcp__fleet__*", "mcp__crm__*", "Workflow"])          # AUTONOMY.md decision 41
+                         ["mcp__fleet__*", "mcp__crm__*"])      # no Workflow (AUTONOMY.md decision 50)
         prompt = start_text(words)                  # from the file of its appended system prompt
         self.assertIn("Your MCP servers besides Fleet's: crm (Acme CRM). Their tools are mcp__<server>__*.", prompt)
 

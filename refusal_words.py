@@ -119,6 +119,14 @@ WORDS = {
     "bot_name_unknown": "the bot has not said its name yet: try again when the bot is connected",
     # a bot's token (POST /ui/chat-apps/<account>/token)
     "token_bot_account": "a token is for a Discord or Telegram account",
+    # Take over for an agent on a Linux server (build plan 04, S6; UI-API.md 1.225): the item, the agent's screen, and
+    # what its server said
+    "takeover_closed": "This step is answered or no longer open",
+    "takeover_no_screen": "{agent}'s screen cannot be opened now: its server or its Founderizer is not ready for it",
+    "takeover_late": "{agent}'s server did not open its screen in time: press Take over again",
+    "takeover_no_browser": "{agent}'s browser does not run now, so there is no screen to take over",
+    "takeover_provider": "{agent}'s browser shows an AI provider's site, which is never taken over",
+    "takeover_screen_failed": "{agent}'s server could not share its screen: press Take over again",
 }
 
 
