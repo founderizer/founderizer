@@ -1273,14 +1273,169 @@ def granted_logins(agent, rev=None):
     return profile_logins(agent, rev) | set(secret_grants(agent))
 
 
-def secret_words(agent, ref):
-    """One secret of an agent in see_capacity: its name in the catalog and its kind, whether the agent reads an API key
-    in its sessions, then the reference that the login tools take. A reference without a catalog entry stays bare."""
+# A secret's note (the owner, 19 November 2026, of several accounts of one site: "the need of adding notes/context to
+# each key/secret", then "only use when adding valuable context, otherwise leave empty. If a context needs to be added,
+# the agent can prepopulate it directly. Agents can modify the NOTES of the secrets too."). team.json logins.<ref>
+# holds `note`, one line, and `note_by`, "owner" or "agent": who wrote the words that stand there. The note is not in
+# the vault, and every agent with a shell can read team.json, so it never holds a value (note_text, and guard or
+# secret_hit at each writer). An agent reads it in quotation marks and with its writer (note_words, holdings_notes): it
+# is data about the secret, and it opens nothing. So its words are made plain as a report's are (note_text), and an
+# agent's start gives the notes in a sentence of their own, after the block's facts and outside their cap.
+SECRET_NOTE_MAX = 200           # characters of a secret's note
+SECRET_NOTE_BY = ("owner", "agent")
+SECRET_NOTES_PER_TASK = 5       # note_secret calls of one task of a worker or a lead: each one is a commit of team.json
+HOLDINGS_NOTES = 12             # notes that a start gives whole, before the rest become a count
+SECRET_NOTE_FIELD = (f"Only when the secret's name does not say which account or key it is, or when to use it: one "
+                     f"line of at most {SECRET_NOTE_MAX} characters, which each agent that holds the secret reads "
+                     f"beside its name. Never a value. Else leave it out")
+
+
+# Marks that read as a quotation mark and are no punctuation of the kinds Pi and Pf: the primes (NFKC makes single ones
+# of a double or a triple one), the modifier letters, the Hebrew gershayim, the ornaments, the ditto mark, and the low
+# quotation marks, which are of the kind Ps. note_mark makes each a single quote, with every opening and closing
+# quotation mark, and note_clean makes one of a run of them, so that two apostrophes are no double quotation mark;
+# each bracket of any script, and a letter that reads as an angle bracket, is a round one. So no note writes
+# "[owner]", a tag or a second quotation beside the hub's own. No list has every likeness that a script can draw: the
+# hub also names a note's writer before its quotation (holdings_notes, note_words).
+NOTE_QUOTES = frozenset('"`\u02ba\u02dd\u02ee\u02f5\u02f6\u05f4\u201a\u201e\u2032\u2033\u2034\u2035\u2036\u2037\u2057'
+                        '\u275b\u275c\u275d\u275e\u275f\u2760\u3003\u301d\u301e\u301f\uff02\U0001f676\U0001f677\U0001f678')
+NOTE_OPEN, NOTE_CLOSE = frozenset("<\u02c2\u1438"), frozenset(">\u02c3\u1433")
+NOTE_DROPPED = frozenset("\u030b\u030e")         # the combining double marks over a letter
+
+
+def note_mark(ch):
+    """One character of a note as the hub keeps it: a quotation mark of any kind is a single quote, an opening bracket
+    of any kind "(" and a closing one ")", the two angle brackets of ASCII too, and every other character itself."""
+    kind = unicodedata.category(ch)
+    if ch in NOTE_DROPPED:
+        return ""
+    if ch in NOTE_QUOTES or kind in ("Pi", "Pf"):
+        return "'"
+    if kind in ("Ps", "Pe") or ch in NOTE_OPEN or ch in NOTE_CLOSE:
+        return "(" if kind == "Ps" or ch in NOTE_OPEN else ")"
+    return ch
+
+
+def note_clean(value):
+    """A text made plain as a note is, with no rule for its length: NFKC, which folds the wide forms; each kind of
+    blank a space, and runs of them one; no character that draws nothing and none of category C (controls, format
+    marks, surrogates, which no record can store); each mark by note_mark; and no backslash before the hub's closing
+    quotation mark. The passes run until the text stays as it is, so that the hub's words for a text are the hub's
+    words for those words: a letter, a removed character and a combining mark made a text that the second pass
+    changed, and the asker's own note then read as words that the owner changed (answer_note)."""
+    text = value
+    for _ in range(4):
+        made = unicodedata.normalize("NFKC", text)
+        made = "".join(" " if ch.isspace() or unicodedata.category(ch)[0] == "Z" else ch for ch in made)
+        made = "".join(note_mark(ch) for ch in REPORT_UNSEEN.sub("", made) if unicodedata.category(ch)[0] != "C")
+        made = " ".join(re.sub("'{2,}", "'", made).split()).rstrip("\\ ")
+        if made == text:
+            return made
+        text = made
+    return ""           # a text that four passes do not settle is no note
+
+
+def note_text(value):
+    """A secret's note as the catalog keeps it, or "" for none: one plain line (note_clean) of at most SECRET_NOTE_MAX
+    characters, because an agent reads the note inside the hub's quotation marks, beside the hub's own words. A
+    ValueError says what is wrong with it."""
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("note is a string: one line about the secret, or \"\" for no note")
+    if len(value) > 8 * SECRET_NOTE_MAX:        # before any pass over it
+        raise ValueError(f"note is one line of at most {SECRET_NOTE_MAX} characters.")
+    note = note_clean(value)
+    if len(note) > SECRET_NOTE_MAX:
+        raise ValueError(f"note is one line of at most {SECRET_NOTE_MAX} characters: which account or key it is, and "
+                         f"when to use it. This one has {len(note)}.")
+    return note
+
+
+# What validate_team holds a stored note to: rules that no Unicode table changes, because a machine's own check of
+# team.json runs on that machine's Python, whose table can be older than the hub's. So no rule here asks what kind a
+# character is: the line breaks, the controls and the marks of ASCII, and the surrogates by their code points.
+NOTE_STORED_BAD = re.compile('[\x00-\x1f\x7f\x85\u2028\u2029\ud800-\udfff"`\\[\\]<>{}]')
+
+
+def note_stored(note):
+    """True for a note as team.json may hold it: a text of 1 to SECRET_NOTE_MAX characters with no blank at an end, no
+    backslash at its end and no character of NOTE_STORED_BAD. Each note that note_text gives passes."""
+    return isinstance(note, str) and 1 <= len(note) <= SECRET_NOTE_MAX and note == note.strip() and \
+        not note.endswith("\\") and not NOTE_STORED_BAD.search(note)
+
+
+def note_words(ref, team=None):
+    """The note of a secret after its name, where an agent reads it: who wrote it, and its words in quotation marks;
+    "" for a secret with none."""
+    entry = ((team or TEAM).get("logins") or {}).get(ref) or {}
+    if not entry.get("note"):
+        return ""
+    return f'; note of {"the owner" if entry.get("note_by") == "owner" else "an agent"}: "{entry["note"]}"'
+
+
+def save_secret_note(ref, note, by):
+    """The one write of a secret's note: `note` ("" takes it away) with `by`, "owner" or the name of the agent that
+    wrote it, in one commit of team.json whose message and the hub's log line name the writer. Gives (the entry's name,
+    whether it changed, the commit or None). A Refusal(404) for a reference that the catalog does not have. The caller
+    checked the words (note_text, and guard or secret_hit)."""
+    rev = kit_revision(fresh=True)
+    team, _, _ = team_view(rev)
+    catalog = dict(team.get("logins") or {})
+    entry = catalog.get(ref)
+    if entry is None:
+        raise Refusal(404, "no such secret")
+    name = entry.get("env") or entry["title"]
+    who = "owner" if by == "owner" else "agent"
+    if (entry.get("note") or "") == note and (not note or entry.get("note_by") == who):
+        return name, False, None
+    new = {k: v for k, v in entry.items() if k not in ("note", "note_by")}
+    if note:
+        new.update(note=note, note_by=who)
+    team["logins"] = dict(catalog, **{ref: new})
+    try:
+        validate_team(team)
+    except ValueError as e:
+        raise Refusal(400, str(e)) from None
+    data = (json.dumps(team, indent=2) + "\n").encode()
+    done = "wrote the note of" if note else "took away the note of"
+    commit = commit_kit_file("team.json", data, f"{by.capitalize()} {done} {name}")
+    apply_team(team)
+    log(by, f"{done} {name} ({ref}) in {commit[:12]}")
+    return name, True, commit
+
+
+def secret_words(agent, ref, note=False):
+    """One secret of an agent: its name in the catalog and its kind, whether the agent reads an API key in its
+    sessions, then the reference that the login tools take. A reference without a catalog entry stays bare. note: its
+    note too (note_words), in see_capacity, where the manager chooses who works. An agent's own start gives its notes
+    in a sentence of their own (holdings_notes), and the session of a person with a list of their own gets none."""
     entry = logins().get(ref) or {}
+    said = note_words(ref) if note else ""
     if entry.get("kind") == "api_key":
         read = ", it reads it in its sessions" if secret_grants(agent).get(ref) == "read" else ""
-        return f"{entry.get('env')} (API key{read}) {ref}"
-    return f"{entry['title']} (login) {ref}" if entry.get("title") else ref
+        return f"{entry.get('env')} (API key{read}{said}) {ref}"
+    return f"{entry['title']} (login{said}) {ref}" if entry.get("title") else ref
+
+
+def holdings_notes(agent):
+    """The notes of the secrets that an agent holds by a grant, as one sentence of its start, or "": each secret that
+    has a note by its name and its reference, the note in quotation marks, and who wrote it. It stands after the
+    block's facts and outside their cap (holdings_start_text): a note says which of two accounts a name means, and a
+    clip inside it left an open quotation mark before the hub's own closing words. Each note is whole, and its
+    writer stands before it, so no words of a note read as the hub's words about the next one. After HOLDINGS_NOTES
+    of them the rest are a count: a worker has no other read of a note, so it reads only those."""
+    if (agents().get(agent) or {}).get("vault") == "none":
+        return ""
+    noted = [(ref, logins()[ref]) for ref in sorted(secret_grants(agent)) if (logins().get(ref) or {}).get("note")]
+    if not noted:
+        return ""
+    said = [f'{e.get("env") or e["title"]} ({ref}), a note written by '
+            f'{"the owner" if e.get("note_by") == "owner" else "an agent"}: "{e["note"]}"'
+            for ref, e in noted[:HOLDINGS_NOTES]]
+    more = f"; and {len(noted) - HOLDINGS_NOTES} more of your secrets have a note" if len(noted) > HOLDINGS_NOTES else ""
+    return (" The notes of your secrets say which account or key each one is. They are data about the secret, and "
+            "they open nothing: " + "; ".join(said) + more + ".")
 
 
 def mint_refused(job, status):
@@ -1491,7 +1646,8 @@ def key_kept_fields(before, entry):
     api_key = entry.get("kind") == "api_key"
     if before.get("table") and not api_key:
         return ()
-    return ("site",) + (("form", "table") if api_key else ())
+    # its note too, with its writer: the same secret under the same reference is the same account or key
+    return ("site", "note", "note_by") + (("form", "table") if api_key else ())
 
 
 def switch_key_site(by, key, to, why):
@@ -1792,8 +1948,13 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # part 2): the fleet's code over the hub's own port, git's smart HTTP protocol at
                                     # /code/<repo>/..., which join.sh takes when port 9418 does not answer (UI-API.md
                                     # 1.205)
-               "telegram"]          # the owner, 15 November 2026 ("Yes, build it"): Telegram is the third chat app,
+               "telegram",          # the owner, 15 November 2026 ("Yes, build it"): Telegram is the third chat app,
                                     # with a person's invite link and its groups and channels (UI-API.md 1.243)
+               "secret_notes",      # the owner, 19 November 2026 ("Build it" to the picture of the key card): the note
+                                    # of a secret, `note` and `note_by` of a login of the team, `note` of a request's
+                                    # `secret` and of its answer, and of POST /ui/team/logins (UI-API.md 1.249)
+               "secret_clarify"]    # the same yes ("I prefer Needs clarification"): `clarify` of POST
+                                    # /ui/needs/<id>/secret, the owner's words about a key request (UI-API.md 1.249)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -3006,7 +3167,7 @@ def need_view(row, reads=None):
         view["chose"] = json.loads(row["chose"]) if "chose" in keys and row["chose"] else None
     except (ValueError, TypeError):
         view["chose"] = None
-    if view["secret"]:          # a login request's account and failed login are the hub's: its why names them
+    if view["secret"]:          # a login request's failed login is the hub's: its why names it
         view["secret"] = {k: v for k, v in view["secret"].items() if k not in SECRET_HUB_ONLY}
     view["talk"] = need_talk(row["id"]) if reads is None else reads[0].get(row["id"], [])
     if view.get("door_call"):                       # what a phone's statement names
@@ -5875,8 +6036,10 @@ def holdings_start_text(agent):
     calls = " " + words["fleet"][:1].upper() + words["fleet"][1:] + "." if words else ""
     # The words of the agent's keys that swap (key_words, the changed key swap, Part D) are advice too: they say what
     # to do with a placeholder, and they end their part of the facts, where a clip cuts first. So they raise the cap
-    # by their own length, by the rule of HOLDINGS_CHARS, and no fact that fit before is cut for them.
-    return "\n" + clip(said, max(120, HOLDINGS_CHARS + len(key_words(agent)) - len(closing))) + calls + closing + "\n"
+    # by their own length, by the rule of HOLDINGS_CHARS, and no fact that fit before is cut for them. The notes of the
+    # agent's secrets are no part of the facts: their sentence stands after the clipped facts, whole (holdings_notes).
+    return "\n" + clip(said, max(120, HOLDINGS_CHARS + len(key_words(agent)) - len(closing))) + holdings_notes(agent) + \
+        calls + closing + "\n"
 
 
 # No prompt named a colleague. A worker's start text said what it holds and then, for anything it does not hold,
@@ -11656,7 +11819,7 @@ def capacity_text(view, filters, needs, restricted=False, parent=None, caller=No
             facts.insert(0, "looks after: " + a["looks_after"])
         if a["knowledge_files"]:
             facts.append("knowledge: " + ", ".join(a["knowledge_files"]))
-        facts.append("secrets it may use here: " + (", ".join(secret_words(a["agent"], ref) for ref in a["logins"]["eligible"])
+        facts.append("secrets it may use here: " + (", ".join(secret_words(a["agent"], ref, note=True) for ref in a["logins"]["eligible"])
                                                      or "none"))
         repos = (agents().get(a["agent"]) or {}).get("repos") or {}       # owner feature integrations
         if repos:
@@ -14292,10 +14455,23 @@ SECRET_HOST_MAX = 80            # "Enter the API key " + 60 + " for " + 80 is un
 SECRET_SITE_MAX = 200
 SECRET_GIVE_MAX = 12
 SECRET_DECLINE_MAX = 300
+# Needs clarification (owner feature secret_clarify; the owner, 19 November 2026: "There should be a way to Reply or
+# comment to the card, to give more context or clarify something", then "Build it. I prefer Needs clarification" to the
+# picture of the card). A key card took no words at all, because a key typed there would be in the asker's
+# conversation. Its link in the app opens a field for words about the request: they close the item as the words of
+# every other item do, and go to the agent that asked with the hub's words after them. The guards of every owner text
+# stand: the app holds text that looks like a key, and command_run refuses a registered login. The board and the chat
+# apps still take no words for such an item (SECRET_NO_WORDS): they have no such guard before the send.
+SECRET_CLARIFY_MAX = 2000       # characters of the owner's words
+SECRET_CLARIFIED = ("\n(The hub: the owner saved nothing. The words before this line are theirs, about your request, "
+                    "and they hold no value. When they settle what to ask for, ask again with request_secret, once "
+                    "for each account or key that they name: with account for a login, and with note where a name "
+                    "does not say which one it is. A task session writes the note of a secret that the fleet holds "
+                    "already with note_secret. When their words ask you something, answer it where you answer the "
+                    "owner. Never ask for a value in words.)")
 SECRET_SITE = re.compile(r"https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:[/?#][^\s]*)?")
 SECRET_TODO = ("Open this request in Founderizer on your Mac and type it into its secure form: it goes straight into "
-               "the vault, and no agent sees it. The request takes no answer in words, so a key cannot land in a "
-               "chat by mistake.")
+               "the vault, and no agent sees it. Never type the key or the password in a message.")
 SECRET_NO_WORDS = ("N-{id} asks for a secret, so it takes no answer in words: a key typed here would be in the "
                    "conversation of the agent that asked before anything could mask it. Answer it in Founderizer on "
                    "the owner's Mac, whose secure form puts the value into the vault.")
@@ -14376,6 +14552,58 @@ def t_switch_key_site(agent, a):
                 f"session of an agent that reads it holds a placeholder for that site.")
     with transaction():
         keep_command(command, {"text": text}, now())
+    return text
+
+
+def t_note_secret(agent, a):
+    """note_secret (owner feature secret_notes; the owner, 19 November 2026: "Agents can modify the NOTES of the
+    secrets too"): the note of one secret, written or taken away, with no approval. A worker or a lead writes the note
+    of a secret that it holds; the manager, of each secret of the catalog. No session that a person's words drive
+    has it (tools_for), because each agent that holds the secret reads the note at its start."""
+    if contact_session(agent):
+        raise ToolError("You have no tool named note_secret.")
+    ref = str(a.get("secret") or "").strip().lower().removeprefix("secret:")
+    worker = role_of(agent) in ("worker", "lead")
+    if ref not in logins() or (worker and ref not in {r.lower() for r in granted_logins(agent)}):
+        raise ToolError("secret is the reference (bws://...) of a secret " +
+                        ("that a grant or your profile gives you." if worker else
+                         "of the catalog: see_capacity names each one that an agent holds."))
+    # Only "" takes a note away: a call that leaves note out, or gives null or blanks, changes nothing.
+    if not isinstance(a.get("note"), str) or (a["note"] and not a["note"].strip()):
+        raise ToolError('note is the note\'s words, or "" to take the note away.')
+    try:
+        note = note_text(a["note"])
+    except ValueError as e:
+        raise ToolError(str(e)) from None
+    if a["note"] and not note:
+        raise ToolError("note has no words that the hub keeps: write it in plain letters.")
+    guard(agent, note)
+    command, stored = agent_write(agent, "note_secret", a, {"secret": ref, "note": note})
+    if stored:
+        return stored["text"]
+    # Each call commits team.json, in the turn of the hub's writes, and each new note changes the start of every agent
+    # that holds the secret: a task of a worker or a lead writes a few (SECRET_NOTES_PER_TASK), as it asks the owner
+    # for a few secrets (SECRET_ASKS_PER_TASK). The manager's own writes of team.json have no such count.
+    # The count is the calling task's own: each kept call names its task in its receipt.
+    spot = str((getattr(CALL, "context", None) or ("", ""))[1])
+    tid = int(spot[2:]) if worker and re.fullmatch(r"T-[0-9]+", spot) else None
+    if tid is not None and q1("SELECT COUNT(*) n FROM tool_commands WHERE agent=? AND tool='note_secret' AND "
+                              "json_extract(receipt, '$.task')=?", (agent, tid))["n"] >= SECRET_NOTES_PER_TASK:
+        raise ToolError(f"This task wrote {SECRET_NOTES_PER_TASK} notes already: say in your result which note is "
+                        f"still to write.")
+    try:
+        name, changed, commit = save_secret_note(ref, note, agent)
+    except Refusal as e:
+        raise ToolError(str(e)) from None
+    if not changed:
+        text = f"The note of {name} was that already. Nothing changed."
+    elif note:
+        text = (f'The note of {name} is now "{note}" (revision {commit[:12]}). An agent that holds {name} by a grant '
+                f"reads it at the start of its next session, and the owner reads it in Founderizer.")
+    else:
+        text = f"{name} has no note now (revision {commit[:12]})."
+    with transaction():
+        keep_command(command, dict({"text": text}, **({"task": tid} if tid is not None else {})), now())
     return text
 
 
@@ -14721,9 +14949,11 @@ def secret_same(spec, kind, env, site, account="", failed=""):
 # logincredentials for websites, so the agent should be able to use these I already provided!"). request_secret looked
 # only at the asker's own logins; now it reads the whole catalog, by the site and the account, as it reads an API key
 # by its variable name. One site can have several accounts, so a request names the account that it means (account).
-# The owner's card shows neither the account nor a failed login (SECRET_HUB_ONLY): its why names them.
+# The owner's card shows no failed login (SECRET_HUB_ONLY): its why names it. Since owner API 1.249 the card gets the
+# account, as the start of its User name field (the owner, 19 November 2026, of a site with several accounts: one card
+# for each account); its why names it too, as before.
 SECRET_ACCOUNT_MAX = 100        # characters of an account's user name or email at its site, which why also holds
-SECRET_HUB_ONLY = ("account", "failed")         # the hub's own fields of a request, which need_view leaves out
+SECRET_HUB_ONLY = ("failed",)           # the hub's own fields of a request, which need_view leaves out
 LOGIN_ACCOUNT = ("For a login: the user name or email of the account at the site, which why names too, because the "
                  "owner reads why. A login that the fleet already holds for that account, or for any account when "
                  "you name none, is refused while an agent can give it, with how: name the account when the work "
@@ -14856,8 +15086,10 @@ def login_known(agent, site, account, worker, chat, tid):
                                     "or ") +
                 ("ask your requester which one with ask_my_requester." if tid else
                  "ask the manager which one with message_agent."))
+    # each one with its note, which says which account it is where its user name does not (note_words)
     held = (f"a login for {host}" + (f" as {given[0][1]}" if given[0][1] else "") + f", as {one}" if one else
-            f"logins for {host}: " + ", ".join(f"{r} ({u})" if u else r for r, u in given))
+            f"logins for {host}: " + ", ".join(
+                r + (f" ({(u + note_words(r)).removeprefix('; ')})" if u or note_words(r) else "") for r, u in given))
     route = (secret_route(one, holders.get(one, [])) if one else "give the one that the work needs: " +
              "; ".join(f"{r}: {secret_route(r, holders.get(r, []))}" for r, _ in given))
     return (f"The fleet already holds {held}, so there is nothing to type: {route}." + fails(one or "<its reference>")
@@ -15004,6 +15236,10 @@ def t_request_secret(agent, a):
     wrong = need_words("", why, details=details)
     if wrong:
         raise ToolError(wrong)
+    try:
+        note = note_text(a.get("note"))         # the secret's note, which the owner reads on the card and can change
+    except ValueError as e:
+        raise ToolError(str(e)) from None
     give = {"door": "use"} if door else {agent: "use"} if worker else a.get("give_to") or {}
     if not isinstance(give, dict) or len(give) > SECRET_GIVE_MAX:
         raise ToolError(f'give_to maps up to {SECRET_GIVE_MAX} agents to "use" or "read", for example '
@@ -15019,6 +15255,7 @@ def t_request_secret(agent, a):
                             f'it, or for an API key "read", which puts the key into its sessions as the variable.')
     spec = {"kind": kind, **({"env": env} if env else {}), **({"site": site} if site else {}),
             **({"account": account} if account else {}), **({"failed": failed} if failed else {}),
+            **({"note": note} if note else {}),
             **({"give": dict(sorted(give.items()))} if give else {}), **({"door": door} if door else {}),
             **({"door_user": door_user} if door and door_user else {}),     # the holder that the door uses it for
             **({"reply": reply["request_id"]} if chat else {}),         # the owner message it answers
@@ -15083,12 +15320,16 @@ def t_request_secret(agent, a):
                    (agent,)):
             old = need_secret(r)
             # a no to a login of any account holds each account: the request that the owner declined named none
-            if not secret_same(old, kind, env, site, account if old.get("account") else "", failed):
-                continue
+            if old.get("clarified") or not secret_same(old, kind, env, site, account if old.get("account") else "",
+                                                       failed):
+                continue                # (his Needs clarification is no decline, whatever its first words are)
             if not (q1("SELECT 1 FROM ui_requests WHERE recipient=? AND kind='message' AND created>? LIMIT 1",
                        (agent, r["answered"])) or
                     q1("SELECT 1 FROM events WHERE agent=? AND kind='say' AND json_extract(extra, '$.steer') IS NOT "
-                       "NULL AND created>? LIMIT 1", (agent, r["answered"]))):
+                       "NULL AND created>? LIMIT 1", (agent, r["answered"])) or
+                    # (his Needs clarification on a request of this agent's is his word to it too)
+                    q1("SELECT 1 FROM needs WHERE kind='secret' AND by=? AND answered>? AND "
+                       "json_extract(secret, '$.clarified') IS NOT NULL LIMIT 1", (agent, r["answered"]))):
                 raise ToolError(f"The owner declined N-{r['id']}: {r['answer']} " +
                                 ("Ask again only after they write to you again." if chat else
                                  "Go on without it, or deliver what you can; ask again only after they write to you "
@@ -15120,7 +15361,7 @@ def t_request_secret(agent, a):
                   "j.value=?", (tid,))["n"] >= SECRET_ASKS_PER_TASK:
         raise ToolError(f"This task has asked the owner for {SECRET_ASKS_PER_TASK} secrets already: deliver what you "
                         f"can, and say in the result what else it needs.")
-    guard(agent, why, details, site)
+    guard(agent, why, details, site, note)
     host = secret_site_host(site) if site else ""
     title = (f"Enter the API key {env}" + (f" for {host}" if host else "")) if kind == "api_key" else \
         f"Enter a login for {host}"
@@ -15414,6 +15655,58 @@ def secret_answer_text(ref, entry, spec, worker=False, task=False):
     return " ".join(words)
 
 
+def answer_note(ref, need, spec, body):
+    """The note of the secret that answers a request, written with the answer (owner feature secret_notes): the words
+    about it for the agent that asked, or "". It runs after the last step that can refuse the answer, so no note stays
+    of an answer that the hub refused, and its own fault refuses no answer: the secret is saved and given already.
+
+    - The card showed the request's note and let the owner change it, and the app sends what stood there at the save
+      (`note` of the body). Words that the owner changed are the owner's, and they go to the secret.
+    - The asker's own words go only to a secret with no note: they never take the place of a note that the secret has,
+      which the owner did not see on this card.
+    - With no `note` in the body (an app before owner API 1.249, or an answer with a secret of the list), the asker's
+      words go only to the secret that was asked for: a login of the request's site and of the account that it names,
+      by the host and the user name in its title (any login of the site when it names no account; the account of the
+      failed login when it asks for a new password); an API key of the request's own variable. The card offers each
+      login of the site, also of another account, and the note says what one account or key is.
+    - A new login for one whose password no longer works (`failed`) takes that login's note with its writer, when the
+      card showed no note and the new login is of the same site and account as the old one.
+    - Empty words take no note away, and words that hold a registered value write nothing: the asker's note was
+      checked when it asked, and a value can be registered after that. The card shows such a note with the hub's mask
+      in the value's place, and those words are not the owner's either."""
+    entry = logins().get(ref) or {}
+
+    def place(e):       # (the site, the account) of a login, by its title "host · user name", without case
+        host, _, name = str(e.get("title") or "").partition(" · ")
+        return login_host(host), name.strip().casefold()
+    asked, sent = spec.get("note") or "", "note" in body
+    old = logins().get(spec.get("failed") or "") or {}
+    noted = body["note"] if sent else asked
+    # The asker's own words: as they were asked, or as the card showed them when a value in them was registered since.
+    # The state masks such a text whole (scrubbed), and a mask of the value's own place is the other form of it.
+    masked = note_clean(mask_secrets(asked)) if asked and secret_hit(asked) else asked
+    own = bool(noted) and (noted in (asked, masked) or (masked != asked and noted == note_clean(MASK)))
+    if own:
+        account = str(spec.get("account") or "").casefold() or (place(old)[1] if old else "")
+        site = login_host(secret_site_host(spec.get("site") or ""))
+        fits = entry.get("env") == spec.get("env") if entry.get("kind") == "api_key" else \
+            place(entry)[0] == site and (not account or place(entry)[1] == account)
+        if entry.get("note") or masked != asked or (not sent and not fits):
+            noted = ""
+    writer = need["by"] if own else "owner"
+    carried = not noted and not sent and not entry.get("note") and bool(old.get("note")) and place(old) == place(entry)
+    if carried:
+        noted, writer = old["note"], "owner" if old.get("note_by") == "owner" else need["by"]
+    if not noted or noted == entry.get("note") or secret_hit(noted):
+        return ""
+    try:
+        save_secret_note(ref, noted, writer)
+    except Refusal as e:        # a KitFault too: the write of team.json failed
+        log("hub", f"the note of {ref} was not written with the answer of N-{need['id']}: {e}")
+        return " Its note was not written: a task session writes it with note_secret."
+    return f' The owner wrote its note: "{noted}".' if writer == "owner" and not carried else ""
+
+
 def answer_secret(body, request_id, client):
     """POST /ui/needs/<id>/secret: the answer of one secret request, with a secret of the catalog or with a decline.
     The value was saved, registered and granted by the app's own steps before this one; this one says so to the
@@ -15428,6 +15721,7 @@ def answer_secret(body, request_id, client):
     if q1("SELECT 1 FROM ui_requests WHERE request_id=?", (request_id,)):
         raise Refusal(409, code="command_reused_message")
     spec, ref = need_secret(need), body["login"]
+    clarify = body.get("clarify")
     # the tasks that wait on it, when a task session asked: his answer goes to them, not to a chat
     waiters = [t for t in spec.get("tasks") or [] if q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (t,))]
     gave = False
@@ -15468,6 +15762,11 @@ def answer_secret(body, request_id, client):
                       "no agent holds a server through the door") +
                      f": once one does, request_secret with door {spec['door']} and that agent's name in give_to "
                      f"gives it to that agent, with nothing to type."))
+        text += answer_note(ref, need, spec, body)      # after the last step that can refuse the answer
+    elif clarify is not None:
+        # Needs clarification on the card (owner feature secret_clarify): his own words are the item's answer, as on
+        # every other item, and the hub's words about them go only to the agent's session (SECRET_CLARIFIED)
+        text = clarify
     else:
         text = "Not given" + (f": {body['decline']}" if body["decline"] else ".") + \
             " Do not ask for it in words instead."
@@ -15477,9 +15776,9 @@ def answer_secret(body, request_id, client):
             # A save that gives the asker the secret wakes its tasks once their machine's vault has it (secret_wakes):
             # until then one quiet line, which wakes nobody. A decline, or a save that gives it nothing, goes on now.
             # the next step of a task that goes on without it, in its own events and never in his bubble
-            note = "" if gave or (ref is not None and spec.get("door")) else (
-                " Go on without it, or deliver what you can." if ref is None else
-                " The owner does not give it to you: go on without it, or deliver what you can.")
+            note = "" if gave or (ref is not None and spec.get("door")) else SECRET_CLARIFIED if clarify is not None \
+                else (" Go on without it, or deliver what you can." if ref is None else
+                      " The owner does not give it to you: go on without it, or deliver what you can.")
             event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0,
                                           task=waiters[0] if waiters else None, quiet=gave or not waiters, note=note)
             if ref is not None:
@@ -15492,9 +15791,12 @@ def answer_secret(body, request_id, client):
                 for tid in waiters:
                     secret_wait_moved(tid)
         else:
-            event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0)
+            event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0,
+                                          note=SECRET_CLARIFIED if clarify is not None else "")
             if ref is not None:
                 DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, saved=ref)), need["id"]))
+        if clarify is not None:         # no decline: the asker may ask again at once (t_request_secret)
+            DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, clarified=t0)), need["id"]))
     if gave and spec.get("tasks"):
         secret_wakes(t0)        # a vault that reads his project, or a delivery that finished before this answer
     return {"need": need["id"], "login": ref, "answer": text, "event_id": event_id}
@@ -17582,7 +17884,8 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
             DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} "
                        f"accepted as the answer of N-{need['id']} in C-{need['conversation']}"))
             return event_id
-        text = text.rstrip() + attachment_words(files) + (" It needs no reply." if secret_chat else "") + note
+        # (a note in a chat is the hub's words about his Needs clarification, which the agent acts on: SECRET_CLARIFIED)
+        text = text.rstrip() + attachment_words(files) + (" It needs no reply." if secret_chat and not note else "") + note
         asker = need_question_rows(need, value, t0)        # a question the manager took to him gets his words
         if asker:
             text += f" The hub gave it to {asker} as the answer to Q-{need['question']}: do not pass it on again."
@@ -39285,6 +39588,7 @@ TOOLS = [
                                                   "page (required for a login), or the API an agent calls with it"},
         "account": {"type": "string", "description": LOGIN_ACCOUNT},
         "failed": {"type": "string", "description": LOGIN_FAILED},
+        "note": {"type": "string", "description": SECRET_NOTE_FIELD},
         "why": {"type": "string", "description": f"What the work needs it for, in a sentence or two, at most "
                                                  f"{NEED_WHY_CHARS} characters: the owner reads it before they type "
                                                  f"the value"},
@@ -39327,6 +39631,7 @@ TOOLS = [
                                                   "page, or the API that your vault sends the key to (required)"},
         "account": {"type": "string", "description": LOGIN_ACCOUNT},
         "failed": {"type": "string", "description": LOGIN_FAILED_OWN},
+        "note": {"type": "string", "description": SECRET_NOTE_FIELD},
         "why": {"type": "string", "description": f"What the work needs it for, in a sentence or two, at most "
                                                  f"{NEED_WHY_CHARS} characters: the owner reads it before they type "
                                                  f"the value"},
@@ -39346,6 +39651,16 @@ TOOLS = [
                                                   "that holds servers through the door asks for one: the door knows "
                                                   "no other agent."}},
        ["why", "site"])),
+    # owner feature secret_notes: the note of a secret, which each agent that holds it reads beside its name
+    ("all", "note_secret", t_note_secret,
+     "Write the note of a secret that you hold (the manager: of any secret), or change it: which account or key "
+     "it is and when to use it, for each agent that holds it and for the owner. Only where the secret's name "
+     "does not say it: most secrets need no note. With no approval.",
+     S({"request_id": REQUEST_ID,
+        "secret": {"type": "string", "description": "Its reference (bws://...)"},
+        "note": {"type": "string", "description": f"One line of at most {SECRET_NOTE_MAX} characters, never a "
+                                                  f"value; \"\" takes the note away"}},
+       ["request_id", "secret", "note"])),
     # owner feature need_takeover: one step on the agent's own screen that only a person can do
     ("worker", "request_takeover", t_request_takeover,
      "In a browser or screen task, ask the owner to solve a CAPTCHA on your own screen: step \"captcha\", the only "
@@ -40757,6 +41072,8 @@ def tools_for(agent, context=None):
              not (role in ("worker", "lead") and name in WORKER_CHAT_ONLY) and name not in CONVERSATION_ONLY + CHAT_ONLY) and
             # owner feature secret_requests: a task that a conversation opened, or a part of one, asks him for none
             (name != "request_secret" or not contact_session(agent, context)) and
+            # owner feature secret_notes: nor writes a note that each holder of the secret reads at its start
+            (name != "note_secret" or not contact_session(agent, context)) and
             # owner feature need_takeover: nor a step on the agent's screen
             (name != "request_takeover" or not contact_session(agent, context)) and
             # nor reads the owner's files, as it never finds his chats (history_records): read_attachment. A task that
@@ -40907,7 +41224,7 @@ def stale_instructions(name, extra):
 # switch_key_site). A tool left out of it is refused while an owner's write runs its git (KIT_BUSY), and writes nothing;
 # test_every_writer_that_takes_the_lock_from_outside_takes_the_turn reads TOOLS for one.
 KIT_TOOLS = ("grant_access", "move_agent", "set_agent_model", "switch_key_site", "door_rollout", "door_hold",
-             "door_gitops", "door_fleet", "request_secret")
+             "door_gitops", "door_fleet", "request_secret", "note_secret")
 
 
 def tool_reads_ahead(name, args):
@@ -48520,13 +48837,19 @@ def validate_team(team, kept=None, shared_ok=None, browser_ok=None):
         raise ValueError(f"logins must map up to {CATALOG_MOST} bws://<uuid> references to {{title}}")
     for ref, entry in catalog.items():
         if not (isinstance(ref, str) and BWS_REF.fullmatch(ref) and ref == ref.lower()) or not isinstance(entry, dict) \
-                or "title" not in entry or set(entry) - {"title", "kind", "env", "site", "form", "table"} \
+                or "title" not in entry \
+                or set(entry) - {"title", "kind", "env", "site", "form", "table", "note", "note_by"} \
                 or not (isinstance(entry["title"], str) and "\n" not in entry["title"]
                         and 1 <= len(entry["title"].strip()) <= 60):
             raise ValueError(f"login {ref!r} needs a bws://<uuid> reference in lower case and a title of one line of "
                              f"1 to 60 characters")
         if "site" in entry and not login_site(entry["site"]):
             raise ValueError(f"login {ref!r}: site is the https address where it is used, with a host")
+        if ("note" in entry) != ("note_by" in entry) or ("note" in entry and (
+                not note_stored(entry["note"]) or entry["note_by"] not in SECRET_NOTE_BY)):
+            raise ValueError(f"login {ref!r}: note is one plain line of 1 to {SECRET_NOTE_MAX} characters, as the hub "
+                             f"writes it (no double quotation mark, bracket or control character), and note_by is "
+                             f"who wrote it: {' or '.join(SECRET_NOTE_BY)}")
         if "form" in entry and (entry["form"] not in lifecycle.KEY_FORMS or entry.get("kind") != "api_key"):
             raise ValueError(f"login {ref!r}: form is how an API key goes into the Authorization header, one of "
                              f"{', '.join(lifecycle.KEY_FORMS)}")
@@ -53083,6 +53406,14 @@ def save_login(body):
     for k in ("site", "form"):
         if entry is not None and body.get(k) == "":
             entry.pop(k, None)
+    if entry is not None and body.get("note") is not None:
+        # the owner's own words for the note, or "" to take it away; a save that sends the note as it stands leaves
+        # its writer as it is
+        if body["note"] != entry.get("note", ""):
+            entry.pop("note", None)
+            entry.pop("note_by", None)
+            if body["note"]:
+                entry.update(note=body["note"], note_by="owner")
     if entry is not None and any(body.get(k) is not None for k in ("site", "form")):
         # the owner's own site or form, also one that takes it away: the owner's lock, which no table and no tool of
         # an agent changes (the changed key swap, Part C), so the mark of a table-made site ends
@@ -64690,8 +65021,13 @@ class Handler(BaseHTTPRequestHandler):
             if data.get("form", "") != "" and data["form"] not in lifecycle.KEY_FORMS:   # the key swap (VAULT.md)
                 raise ValueError("form must be how the key goes into the Authorization header: " +
                                  ", ".join(lifecycle.KEY_FORMS) + ", or \"\" to take it away")
-            return dict({"title": title.strip()}, **{k: data[k] for k in ("site", "form") if k in data})
-        return self.team_entry("team/logins", "login", ("title", "site", "form"), check, save_login,
+            out = dict({"title": title.strip()}, **{k: data[k] for k in ("site", "form") if k in data})
+            if "note" in data:          # the owner's words for the secret's note, or "" to take it away; a note
+                if not isinstance(data["note"], str):       # that holds a registered login is command_run's refusal
+                    raise ValueError("note must be the note's words, or \"\" to take the note away")
+                out["note"] = note_text(data["note"])
+            return out
+        return self.team_entry("team/logins", "login", ("title", "site", "form", "note"), check, save_login,
                                ident=self.login_reference)
 
     @staticmethod
@@ -65569,19 +65905,43 @@ class Handler(BaseHTTPRequestHandler):
         """POST /ui/needs/<id>/secret (owner feature secret_requests): the answer of one request_secret, from the app's
         secure form once the value is in the vault and registered: login, the reference of the secret that answers
         it, or decline, with the owner's own words or none. No value comes in, and the words that reach the agent
-        are the hub's own (answer_secret)."""
+        are the hub's own (answer_secret). Owner feature secret_notes: with login, note is the secret's note as the
+        card shows it at the save. Owner feature secret_clarify: clarify, the owner's words about the request in place
+        of an answer, which close it and go to the agent that asked."""
         def read(data):
-            extra = sorted(set(data) - {"request_id", "db", "login", "decline"})
+            extra = sorted(set(data) - {"request_id", "db", "login", "decline", "clarify", "note"})
             if extra:
                 raise ValueError(f"unknown field {extra[0]}")
-            login, decline = data.get("login"), data.get("decline")
-            if (login is None) == (decline is None):
-                raise ValueError("send login, the reference of the secret that answers this request, or decline")
+            login, decline, clarify = data.get("login"), data.get("decline"), data.get("clarify")
+            if sum(x is not None for x in (login, decline, clarify)) != 1:
+                raise ValueError("send login, the reference of the secret that answers this request, or decline, or "
+                                 "clarify, the owner's words about the request")
             if decline is not None and not (isinstance(decline, str) and len(decline) <= SECRET_DECLINE_MAX
                                             and not any(c in decline for c in "\r\n")):
                 raise ValueError(f"decline is one line of at most {SECRET_DECLINE_MAX} characters, or empty")
-            return {"need": need_id, "login": self.login_reference(login) if login is not None else None,
+            if clarify is not None and not (isinstance(clarify, str) and 1 <= len(clarify.strip()) <= SECRET_CLARIFY_MAX):
+                raise ValueError(f"clarify is the owner's words about the request, 1 to {SECRET_CLARIFY_MAX} characters")
+            if "note" in data and (login is None or not isinstance(data["note"], str)):
+                raise ValueError("note is the note of the secret that answers the request, a string: it comes with "
+                                 "login")
+            if clarify is not None or "note" in data:
+                # The Mac's app and a PC's hold text that looks like a key before it goes; the iPhone's card has no
+                # field for a note or for words, so a phone's key sends neither (DEVICE_NEED gives it this route).
+                with LOCK:
+                    phone = owner_device_class(owner_device_at(self.client_address[0])) not in TEAM_PRESS_CLIENTS
+                if phone:
+                    raise ValueError("note and clarify come from Founderizer on the Mac or a PC")
+            body = {"need": need_id, "login": self.login_reference(login) if login is not None else None,
                     "decline": decline.strip() if decline is not None else None}
+            # The two fields of owner API 1.249 are in the body only when they came, so that the record of a command
+            # of an app before it stays as it was. A registered login in either one is command_run's refusal.
+            if clarify is not None:
+                body["clarify"] = clarify.strip()
+            if "note" in data:
+                # as the card showed it, made plain; one that is over the most then is cut, because the value is in
+                # the vault already and the note must refuse no answer (answer_note)
+                body["note"] = note_clean(note_clean(data["note"][:8 * SECRET_NOTE_MAX])[:SECRET_NOTE_MAX])
+            return body
 
         def act(body):
             return answer_secret(body, str(self.form()["request_id"]).lower(),

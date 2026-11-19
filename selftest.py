@@ -223,7 +223,9 @@ EVERY_AGENT = ["read_messages", "search_knowledge", "read_knowledge", "write_kno
                # CHAT-APPS.md 20: a file that a message carries to a person in a chat
                "attach_file",
                # the owner, 17 November 2026: the file that he sends with a message, in any session of the agent
-               "read_attachment"]
+               "read_attachment",
+               # the owner, 19 November 2026: the note of a secret, which an agent that holds the secret writes
+               "note_secret"]
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "see_team", "see_capacity", "see_goals",
                                "update_goal", "record_spend", "raise_needs_you", "withdraw_need", "request_secret",
