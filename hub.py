@@ -5646,6 +5646,8 @@ def t_read_messages(agent, a):
             # the agent's runtime is the reader's.
             reader = agents()[agent].get("runtime")
         first = [r["id"] for r in rows if r["read_at"] is None]
+        if chat_context(agent):             # a task result that this read gives waits for its message_owner
+            result_reads(agent, [r for r in rows if r["read_at"] is None])
         for r in rows:
             q("UPDATE events SET read_at=COALESCE(read_at,?) WHERE id=?", (now(), r["id"]))
             if reader:
@@ -18217,15 +18219,10 @@ def owner_route(agent):
     def serves(aid):
         acc = conf.get(aid)
         return bool(acc and chat_enabled(acc) and acc["agents"] == [agent])
-    row = q1("SELECT request_id, origin FROM ui_requests WHERE recipient=? AND kind='message' AND origin IS NOT NULL "
-             "ORDER BY created DESC, rowid DESC LIMIT 1", (agent,))
-    o = json.loads(row["origin"]) if row else None
-    if o and o.get("app") == "telegram" and not str(o.get("id") or "").startswith(
-            f"{telegram_bot_number(o.get('account')) or '-'}:"):
-        o = None            # 19.4: his newest message came through an earlier bot of the account: no way now
-    if o and serves(o["account"]) and conf[o["account"]]["app"] == o["app"] and origin_owned(o):
-        return {"app": o["app"], "account": o["account"], "chat": o["chat"], "recipient": None,
-                "request": row["request_id"]}
+    route = message_route(agent, q1("SELECT request_id, origin FROM ui_requests WHERE recipient=? AND kind='message' "
+                                    "AND origin IS NOT NULL ORDER BY created DESC, rowid DESC LIMIT 1", (agent,)))
+    if route:
+        return route
     for app in ("whatsapp", "discord", "telegram"):
         target = owner_target(app)
         aid = next((aid for aid in sorted(conf) if conf[aid]["app"] == app and serves(aid) and
@@ -18234,6 +18231,24 @@ def owner_route(agent):
             target = (owner_handle_through(aid, app), None)
         if target and aid:
             return {"app": app, "account": aid, "chat": target[0], "recipient": target[1], "request": None}
+    return None
+
+
+def message_route(agent, row):
+    """Rule 1 of owner_route for one message of the owner's, a ui_requests row with its request_id and origin: the
+    account and chat that it came from, while that account is enabled and this agent's alone, of the same app, its
+    sender is still an owner handle (origin_owned), and on Telegram it came through the bot of now; else None, also
+    for a message from the app (no origin) and for no row."""
+    o = json.loads(row["origin"]) if row and row["origin"] else None
+    if not o:
+        return None
+    if o.get("app") == "telegram" and not str(o.get("id") or "").startswith(
+            f"{telegram_bot_number(o.get('account')) or '-'}:"):
+        return None         # 19.4: the message came through an earlier bot of the account: no way now
+    acc = chat_apps().get(o.get("account"))
+    if acc and chat_enabled(acc) and acc["agents"] == [agent] and acc["app"] == o.get("app") and origin_owned(o):
+        return {"app": o["app"], "account": o["account"], "chat": o["chat"], "recipient": None,
+                "request": row["request_id"]}
     return None
 
 
@@ -18265,15 +18280,22 @@ def t_message_owner(agent, a):
     if chat_paused():
         raise ToolError("Refused: the owner turned on Pause all for chat apps. Nothing was sent.")
     t0 = now()
-    route = None if owner_wrote_last_in_app(agent) else owner_route(agent)
+    told = result_to_tell(agent) if chat_context(agent) else None
+    if told:        # it tells a task's result: it answers the owner's message that opened that task, where it came from
+        route = message_route(agent, told[1])
+    else:
+        route = None if owner_wrote_last_in_app(agent) else owner_route(agent)
+    reply_to = json.loads(told[1]["origin"]).get("id") if told and route else None
     rows = chat_files_rows(agent, ids, route["app"] if route else None, t0)
     with transaction():
         rid = DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to,pushed) "
                          "VALUES(?,'',?,?,NULL,1)", (text, t0, agent)).lastrowid
         files = chat_files_carry(rows, t0, report=rid)
         item = chat_queue("message", route["account"], t0, chat=route["chat"], recipient=route["recipient"],
-                          text=text, reply_to=None, report=rid, request_id=route["request"], files=files) \
+                          text=text, reply_to=reply_to, report=rid, request_id=route["request"], files=files) \
             if route else None
+        if told:
+            DB.execute("UPDATE events SET extra=json_set(extra, '$.told', ?) WHERE id=?", (rid, told[0]))
         answer = {"ok": True, "report": rid,
                   "via": {"app": route["app"], "account": route["account"]} if route else None}
         if queued_failure(item):            # in the app, and not sent: the agent is told why
@@ -21230,9 +21252,41 @@ def chat_result(task_id):
     said = (f"[hub] {tref(task_id)} ({clip(t['title'] or '', 120)}), which you opened from the owner's message "
             f"{source} in this chat, is {t['state']}: {clip(t['what'] or '', 3000)}"
             + (f" Where: {clip(t['where_'], 300)}" if t["where_"] else "") +
-            " Tell the owner in a few words what came of it, with message_owner. It needs no other reply.")
+            " Tell the owner in a few words what came of it, with message_owner: your next message_owner goes "
+            "where they wrote that message. It needs no other reply.")
     emit(t["owner"], "chat", said, extra={"generation": kv_get("db_id"), "task_result": task_id})
     log(t["owner"], f"the result of {tref(task_id)} went back into its owner chat")
+
+
+def result_reads(agent, new):
+    """Inside the lock of an owner chat's read_messages, with the events that this read gives for the first time: each
+    task result among them (chat_result) waits to be told (extra.told "waits"), and a read that gives nothing new ends
+    every wait (told 0), as the closing read of a turn does (unanswered). The ask for a new agent's first message has a
+    task_result that is no task (AGENT_FIRST_EXTRA), so it never waits."""
+    if not new:
+        q("UPDATE events SET extra=json_set(extra, '$.told', 0) WHERE agent=? AND kind='chat' AND "
+          "json_extract(extra, '$.told')='waits'", (agent,))
+    for r in new:
+        extra = json.loads(r["extra"] or "{}")
+        if isinstance(extra, dict) and type(extra.get("task_result")) is int:
+            q("UPDATE events SET extra=json_set(extra, '$.told', 'waits') WHERE id=?", (r["id"],))
+
+
+def result_to_tell(agent):
+    """The task result that this owner chat read and has not told yet, oldest first (result_reads): (its event id, the
+    ui_requests row of the owner's message that opened its task, or None). Its next message_owner is the answer to that
+    message, and goes where the message came from (message_route): a result of work that the owner asked for in the app
+    stays in the app, and one asked for in a chat app goes to that chat as a reply to the message. Before, it went
+    where the owner had last written from a chat app, which could be a chat where they had asked for nothing. None
+    when no result waits."""
+    row = q1("SELECT id, extra FROM events WHERE agent=? AND kind='chat' AND json_extract(extra, '$.told')='waits' "
+             "ORDER BY id LIMIT 1", (agent,))
+    if not row:
+        return None
+    t = q1("SELECT * FROM tasks WHERE id=?", (json.loads(row["extra"])["task_result"],))
+    source = start_task_source(t) if t else None
+    return row["id"], (q1("SELECT request_id, origin FROM ui_requests WHERE request_id=? AND kind='message'", (source,))
+                       if source else None)
 
 
 # The characters at which a line ends (str.splitlines) that JSON keeps as they are when a dump keeps a text's own
@@ -39611,8 +39665,9 @@ TOOLS = [
      "needed from them, never for progress, and never to correct a message that needed nothing from them: what can "
      "wait goes into the next message they need. Say it once, with the answer first, and short (RULES.md, \"Short, "
      "like a text to a friend\"). It goes where the owner last wrote to you (the app, or a chat app), else to your "
-     "own WhatsApp number, Discord bot or Telegram bot; without one it stays in the app. Answer an owner message with "
-     "tell_owner instead. One request_id is one message: the same request_id again sends nothing more. Never put a login in the text. Name a task or a duty "
+     "own WhatsApp number, Discord bot or Telegram bot; without one it stays in the app. The first one after a task's "
+     "result came back into your owner chat answers the owner's message that opened that task, where they wrote it. "
+     "Answer an owner message with tell_owner instead. One request_id is one message: the same request_id again sends nothing more. Never put a login in the text. Name a task or a duty "
      "by what it is about, never by its code (T-61, R-3), and an agent by its role.",
      S({"request_id": REQUEST_ID,
         "text": {"type": "string", "description": "The message in Markdown, 1 to 4,000 characters"},

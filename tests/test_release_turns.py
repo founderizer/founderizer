@@ -1161,7 +1161,8 @@ def later_data(t0=None):
           "'Say it',?,'manager',?,'Closed: Q-2 was answered by lead: Serif.',?,'Fleet')", (t0, answered, t0))
     hub.q("INSERT INTO events(agent,kind,text,created,extra,read_at) VALUES('vps','chat',?,?,?,?)",
           (f"[hub] T-{made['work']} (Fix the export), which you opened from the owner's message a-1 in this chat, is "
-           f"completed: fixed", t0, json.dumps({"generation": "test-generation", "task_result": made["work"]}), t0))
+           f"completed: fixed", t0, json.dumps({"generation": "test-generation", "task_result": made["work"],
+                                             "told": "waits"}), t0))     # result_reads: it waits for message_owner
     hub.q("INSERT INTO kv(k,v) VALUES(?,'1') ON CONFLICT(k) DO UPDATE SET v=excluded.v", ("lead_unread:stuck:1:1",))
     # and, from 12 November 2026, as hub.agent_first_message_sweep writes them: the ask for a new agent's first message
     # to the owner, which its chat read, and where that agent's first message stands
