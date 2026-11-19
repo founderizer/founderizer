@@ -533,6 +533,8 @@ class Devices(test_ui_api.OwnerAPI):
                                       "needs", "answered_needs", "tasks", "recent", "holds", "outcomes", "chat_apps",
                                       "counts", "ui_features", "token", "ended_mark", "asked"})
         self.assertEqual([n["id"] for n in state["needs"]], [need])     # the open item only
+        # owner API 1.244: an item that is no team card says so, so the phone draws each of its options to press
+        self.assertIs(state["needs"][0]["team"], False)
         self.assertEqual([(n["id"], n["answer"]) for n in state["answered_needs"]], [(answered, "yes")])
         # a head carries what the Mac's state word reads, so the phone's Tasks row can say "Stalled" as its page does
         self.assertLessEqual({"stalled_since", "nudge_level", "missing_since"}, set(state["tasks"][0]))

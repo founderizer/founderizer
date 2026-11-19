@@ -3403,6 +3403,32 @@ class Scripts(unittest.TestCase):
             self.assertIn(part, text)
         self.assertNotIn("Sandbox", text)       # no sandbox line of the main sshd: those kill sudo
 
+    def test_each_stop_line_of_install_has_its_own_words_in_the_owner_s_app(self):
+        """The owner's app sends the hub fixed words for an install that stopped, never a line of the server's output
+        (DoorHosts.installStops, 19 November 2026): a stop line that none of its patterns takes gives the manager the
+        general words. A clone with no app folder (the published hub) has nothing to compare."""
+        path = os.path.join("app", "Sources", "FleetCore", "DoorHosts.swift")
+        if not os.path.isfile(path):
+            self.skipTest("this clone has no app folder")
+        with open(path, encoding="utf-8") as f:
+            swift = f.read()
+        table = swift[swift.index("static let installStops"):]
+        patterns = [re.compile(p) for p in re.findall(r'\(#"(.+?)"#,', table[:table.index("\n    ]\n")])]
+        self.assertGreaterEqual(len(patterns), 8)
+        with open("host/install.sh") as f:
+            script = f.read()
+        self.assertIn('die() { echo "install.sh: $*" >&2; exit 1; }', script)     # the app takes them with status 1
+        dies = re.findall(r'\bdie "((?:[^"\\]|\\.)*)"', script)
+        self.assertGreaterEqual(len(dies), 15)
+        values = {"$1": "--verbose", "${PRETTY_NAME:-this system}": "Ubuntu 22.04.5 LTS",
+                  "$COVERED": "ubuntu:24.04 ubuntu:26.04", "$f": "inventory", "$PORT": "2244"}
+        for die in dies:
+            line = "install.sh: " + die
+            for name, value in values.items():
+                line = line.replace(name, value)
+            with self.subTest(line=line):
+                self.assertTrue(any(p.fullmatch(line) for p in patterns))
+
     def test_the_config_test_has_the_folder_that_sshd_needs(self):
         """On a host that Tailscale's own SSH serves, OpenSSH is masked and /run/sshd is not there, so `sshd -t`
         stopped the install with "Missing privilege separation directory: /run/sshd" (7 November 2026)."""

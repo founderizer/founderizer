@@ -2962,7 +2962,10 @@ def need_view(row, reads=None):
     it, the item reads its own."""
     view = dict(row, options=need_options(row), secret=need_secret(row))
     view.pop("approval", None)
-    view.pop("team_plan", None)         # owner API 1.214: the hub's own record of a team card's plan (Details show it)
+    # owner API 1.214: the hub's own record of a team card's plan (Details show it) stays here; owner API 1.244 says
+    # only that the item is a team card, whose yes options a phone cannot press (team_press), so that the iPhone draws
+    # one line to the Mac in their place (the lane "Give on the iPhone")
+    view["team"] = bool(view.pop("team_plan", None))
     # the lane "Give on a card": the grant that the item's first option makes, {agent, level, repos}, else null
     view["give"] = need_give_view(row)
     for kept in ("give_agent", "give_level", "give_repos"):

@@ -104,7 +104,8 @@ class TeamChanges(Remove):
 
     def test_only_a_press_of_its_yes_on_the_mac_or_a_pc_makes_the_plan(self):
         """Bug: typed words, a phone, a connected app or the hub's old board, none of which shows the Details, removes
-        an agent; or the phone rings for a card that it cannot press."""
+        an agent; or the phone rings for a card that it cannot press, or does not learn that it is one (owner API
+        1.244: the iPhone draws a line to the Mac in place of its yes)."""
         with patch.object(hub, "ping_need") as ring:
             said = self.plan([{"kind": "remove", "agent": "scout"}], title="Remove scout?")
         ring.assert_not_called()
@@ -112,6 +113,9 @@ class TeamChanges(Remove):
         options = json.loads(card["options"])
         self.assertEqual(options, ["Yes: remove scout and its service on box", "No"])
         self.assertIn(options[0], said)
+        phone = [n for n in hub.mobile_state(hub.kv_get("db_id"))["needs"] if n["id"] == card["id"]]
+        self.assertEqual([n["team"] for n in phone], [True])
+        self.assertNotIn("team_plan", phone[0])                  # the plan itself stays the hub's
         status, answer = self.owner(f"/ui/needs/{card['id']}", answer=options[0])
         self.assertEqual((status, answer.get("error")), (409, hub.TEAM_PRESS_WORDS))
         with self.from_device("iphone"):
