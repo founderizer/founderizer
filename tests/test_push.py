@@ -284,15 +284,18 @@ class Sender(PushCase):
         # as the apps write it (Swift's capitalized), not Python's capitalize() (review A9)
         self.assertEqual(self.opened(hub.ping_payload(dict(need, by="acme-dev"), "g", SEAL))["title"], "Acme-Dev")
 
-    def test_full_access_of_the_door_s_card_gets_no_button_and_the_others_keep_their_index(self):
-        """Owner API 1.245: the hub takes Full access only with the owner key on the Mac, so a button for it on the
-        phone could only be refused. Bug: the ping draws it, or a phone that skips it numbers No as Full access."""
+    def test_the_door_s_card_of_a_run_gets_no_button_and_a_tap_opens_its_script(self):
+        """Owner API 1.247: Run it once signs a root script that a ping does not show, and Full access counts only with
+        the owner key on the Mac, so the ping of the door's card of a run carries no buttons, also for a phone from
+        before. Bug: a press on the lock screen signs a script that the owner never saw."""
         card = {"id": 7, "title": "Run one root script on web-1?", "by": "atlas", "door_host": "web-1",
                 "options": json.dumps(["Run it once", "Full access on web-1", "No"])}
         said = self.opened(hub.ping_payload(card, "g", SEAL))
-        self.assertEqual((said["options"], said["no_button"]), (["Run it once", "Full access on web-1", "No"], [1]))
+        self.assertEqual((said["title"], said["body"]), ("Atlas", "Run one root script on web-1?"))
+        self.assertFalse({"options", "no_button"} & set(said))
         for other in (dict(card, door_host=None), {k: v for k, v in card.items() if k != "door_host"}):
-            self.assertNotIn("no_button", self.opened(hub.ping_payload(other, "g", SEAL)))
+            self.assertEqual(self.opened(hub.ping_payload(other, "g", SEAL))["options"],
+                             ["Run it once", "Full access on web-1", "No"])
 
     def test_an_option_that_does_not_fit_a_button_opens_the_app(self):
         self.give(self.enrolled(), seal=SEAL)

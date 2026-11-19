@@ -2474,15 +2474,14 @@ def ping_payload(need, generation, seal=None, badge=None):
         title = title[:PUSH_TEXT - 1].rstrip() + "…"
     said = {"need": need["id"], "db": generation, "title": shown_role(need["by"]) or PUSH_BANNER, "body": title}
     options = need_options(need)
-    # the lane "Give on a card": no buttons for an item that carries its grant, whose Give the phone does not press
+    # the lane "Give on a card": no buttons for an item that carries its grant, whose Give the phone does not press;
+    # the lane "Give on the iPhone" (owner API 1.247): none for the door's card of a run either, whose Run it once
+    # signs a root script that a ping does not show (the owner's "Show the script" of 19 November 2026) and whose Full
+    # access only the Mac signs: a tap opens the card, which shows the script. It replaces the `no_button` of 1.245.
+    door_run = "door_host" in need.keys() and need["door_host"]
     if 2 <= len(options) <= NEED_OPTIONS_MAX and all(len(o) <= PUSH_BUTTON for o in options) \
-            and scrub(options) == options and need_give_view(need) is None:
+            and scrub(options) == options and need_give_view(need) is None and not door_run:
         said["options"] = options         # the phone's notification content extension draws one button for each
-        # the lane "Give on the iPhone" (owner API 1.245): Full access, the door card's second answer, counts only with
-        # the owner key's signature on the Mac (phone_submit), so the phone draws no button for it, and the other
-        # buttons keep their own index, which their press sends
-        if "door_host" in need.keys() and need["door_host"]:
-            said["no_button"] = [1]
     sealed = push.seal(push.seal_key(seal), json.dumps(said, ensure_ascii=False, separators=(",", ":")).encode())
     payload["sealed"] = base64.b64encode(sealed).decode()
     payload["aps"]["mutable-content"] = 1
