@@ -366,12 +366,30 @@ class Updates(unittest.TestCase):
         self.assertEqual(database.read_bytes(), before)
 
     def test_a_release_whose_schema_check_says_nothing_is_not_taken(self):
+        """A check that cannot be read is not taken, and one that the system ends says so: in plain words, with the
+        word on memory for SIGKILL (what the kernel sends when memory runs out), and with the end of what it printed
+        on its standard output, where it stopped, not a warning of its error output (until 19 November 2026 the line
+        said only "no output", or the first words, so a small server that could not compile a release looked like any
+        other failure)."""
         def breaks_the_check(work):
             (work / "hub.py").write_text("raise SystemExit('this release cannot even be read')\n")
         answer = self.update(self.publish(breaks_the_check, "a release whose hub.py does not run"),
                              fleet_database(self.root / "fleet.db"))
         self.assertEqual((answer["state"], answer["step"]), (releases.ROLLED_BACK, "schema"))
         self.assertIn("could not read this fleet's database", answer["says"])
+        self.unchanged()
+
+        def is_killed(work):            # it prints a line for each of 200 checks, and the system ends it
+            (work / "hub.py").write_text("import os, signal, sys\nprint('a warning', file=sys.stderr, flush=True)\n"
+                                         "print('\\n'.join(f'PASS check {i}' for i in range(200)), flush=True)\n"
+                                         "os.kill(os.getpid(), signal.SIGKILL)\n")
+        answer = self.update(self.publish(is_killed, "a release whose check the system ends"),
+                             fleet_database(self.root / "killed.db"))
+        self.assertEqual((answer["state"], answer["step"]), (releases.ROLLED_BACK, "schema"))
+        self.assertIn("could not read this fleet's database: the system ended it, for example for lack of memory "
+                      "(SIGKILL); the end of what it printed:", answer["says"])
+        self.assertIn("PASS check 199. The fleet stays at", answer["says"])     # where it stopped, and the whole line
+        self.assertNotIn("PASS check 3 ", answer["says"])
         self.unchanged()
 
     def test_a_fleet_that_gives_no_database_is_updated_as_before(self):
@@ -1038,7 +1056,8 @@ class UnitFollowsCode(unittest.TestCase):
                             ((127, "", "sh: 1: exec: python3: not found"), "status 127"),
                             ((137, "", ""), "status 137"),
                             ((137, self.file + "\n", ""), "status 137"),        # the right words and a bad end
-                            ((-9, "", ""), "status -9"),
+                            ((-9, "", ""), "status -9: the system ended it, for example for lack of memory"),
+                            ((-15, "", ""), "status -15: the system ended it (SIGTERM)"),
                             (subprocess.TimeoutExpired(["systemd-run"], hub.START_CHECK_WAIT), "timed out"),
                             (FileNotFoundError(2, "No such file or directory", "systemd-run"), "No such file")):
             with self.subTest(proof=proof):

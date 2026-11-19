@@ -48,6 +48,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -476,6 +477,25 @@ def _line(text):
     return " ".join(str(text or "").split())[:400]
 
 
+def _ended(code, out, err):
+    """What a check of a release said, for the owner's line: its own words; and when the system ended it with a signal,
+    that first, in plain words, and then the end of what it printed on its standard output, where it stopped (a
+    self-test that is ended part way prints a line for each check that passed there; a warning on its error output
+    would hide that). Until 19 November 2026 such a line said only "no output". SIGKILL
+    is what the kernel sends when memory runs out: the case of a small server whose compile of a release takes more
+    memory than it has free."""
+    if not isinstance(code, int) or code >= 0:
+        return _line(err or out) or "no output"
+    try:
+        name = signal.Signals(-code).name
+    except ValueError:
+        name = f"signal {-code}"
+    ended = "the system ended it" + (", for example for lack of memory" if -code == signal.SIGKILL else "") + \
+        f" ({name})"
+    tail = " ".join(str(out or err or "").split())[-120:]   # its progress, not a warning; short: _said cuts at 400
+    return f"{ended}; the end of what it printed: {tail}" if tail else ended
+
+
 def _said(text):
     """One line the owner reads on the app's Updates page, so it starts with a capital (the owner, 19 October 2026).
     A line that starts with a name this fleet itself uses keeps it: a revision, a branch or a version."""
@@ -760,7 +780,7 @@ class Update:
         summary = schema_summary(out)
         if summary is None:
             return self.answer(ROLLED_BACK, "schema", f"release {version} could not read this fleet's database: "
-                                                      f"{_line(err or out) or 'no output'}. The fleet stays at "
+                                                      f"{_ended(code, out, err)}. The fleet stays at "
                                                       f"{pinned}.")
         refused, says = summary
         if refused:
@@ -786,7 +806,7 @@ class Update:
         summary = selftest_summary(out)
         if summary is None:
             return self.answer(ROLLED_BACK, "selftest", f"selftest.py did not answer for release {version}: "
-                                                        f"{_line(err or out) or 'no output'}. The fleet stays at "
+                                                        f"{_ended(code, out, err)}. The fleet stays at "
                                                         f"{pinned}.")
         passed, total, failed, new = summary
         if new:
@@ -812,7 +832,7 @@ class Update:
                    if one.get("state") == "fail" and one.get("check") not in OWNER_STEPS]
         except (ValueError, TypeError, KeyError):
             return self.answer(ROLLED_BACK, "verify", f"fleet.py verify did not answer for release {version}: "
-                                                      f"{_line(err or out) or 'no output'}. The fleet stays at "
+                                                      f"{_ended(code, out, err)}. The fleet stays at "
                                                       f"{pinned}.")
         if bad:
             return self.answer(ROLLED_BACK, "verify", f"release {version} is not healthy: verify failed "

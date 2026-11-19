@@ -1856,6 +1856,138 @@ class ShellOffRule(Base):
         self.assertIn("same question", self.ok("ask_team", self.context(cid), question=question))
         self.assertIn("Asked as", self.ok("ask_team", self.context(cid), question="And my invoice?"))
 
+    def test_a_colleague_s_question_waits_for_the_line_and_keeps_only_their_own_wish(self):
+        """The owner, 19 November 2026: a colleague asked an agent whose Shell box is off for links "for next time".
+        No session of it could keep that wish or wait for its line's answer, and its chat told the colleague that the
+        team had tried and kept it. The task that a colleague's question opens waits for an answer of its line, its
+        requester's too, and keeps and ends that colleague's own wish in their own words, and nothing else; a task of
+        the agent's own waits for nobody; the colleague's closed window starts with the items and is not told that
+        the colleague cannot give it work, a customer's window is; and the result tells the window what the task
+        already wrote to the colleague."""
+        pat = self.person("Pat", "peer", PAT)
+        hub.q("UPDATE people SET note='Runs the support desk.' WHERE id=?", (pat["id"],))
+        wish = "Please put the ticket links in your messages, for next time."
+        said = self.says(PAT, wish)
+        cid = said["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("ask_team", self.context(cid), question="Pat wants ticket links in my messages.",
+                messages=[hub.cm_ref(said["id"])])
+        work = hub.q1("SELECT * FROM tasks WHERE source_conversation=? AND source_message IS NULL", (cid,))
+        hub.q("UPDATE tasks SET state='working', started=? WHERE id=?", (hub.now(), work["id"]))
+        here = ("test-generation", hub.tref(work["id"]), "1")
+        self.assertLessEqual(set(hub.SHELL_OFF_ASKED_TOOLS), {t["name"] for t in hub.tools_for("studio", here)})
+        got = [e["text"] for e in hub.q("SELECT text FROM events WHERE agent='studio' AND task=? ORDER BY id",
+                                       (work["id"],))]
+        self.assertTrue(any(hub.json_one_line(wish) in text for text in got), got)       # their own words reach it
+        # the owner's note comes before the question, whose JSON string stays the last line
+        question = next(text for text in got if text.startswith("[hub] The question of Pat"))
+        self.assertIn("What the owner says about Pat: Runs the support desk.", question)
+        self.assertEqual(question.splitlines()[-1], hub.json_one_line("Pat wants ticket links in my messages."))
+
+        # it waits for its requester's answer, which only ask_my_requester gives a session with a shell
+        text, error = hub.call_tool("studio", "message_agent", {"agent": work["requester"], "waits": True,
+                                                                "text": "Which link format does the team use?",
+                                                                "request_id": str(uuid.uuid4())}, here)
+        self.assertFalse(error, text)
+        asked = hub.q1("SELECT * FROM agent_messages ORDER BY id DESC LIMIT 1")
+        self.assertEqual((asked["waits"], asked["sender_task"]), (1, work["id"]))
+        self.assertEqual(hub.waits_on_message(work["id"])["id"], asked["id"])
+        text, error = hub.call_tool(work["requester"], "message_agent", {
+            "agent": "studio", "text": "The tickets path and the ticket id.", "in_reply_to": f"AM-{asked['id']}",
+            "request_id": str(uuid.uuid4())})
+        self.assertFalse(error, text)
+        answer = hub.q1("SELECT * FROM agent_messages ORDER BY id DESC LIMIT 1")
+        self.assertEqual(hub.q1("SELECT task FROM events WHERE id=?", (answer["event_id"],))["task"], work["id"])
+        self.assertIsNone(hub.waits_on_message(work["id"]))
+        # a task of the agent's own waits for nobody, and keeps no wish
+        _, own = self.normal_task()
+        text, error = hub.call_tool("studio", "message_agent", {"agent": "manager", "text": "Which store?",
+                                                                "waits": True, "request_id": str(uuid.uuid4())}, own)
+        self.assertTrue(error, text)
+        self.assertIn("waits=true is for a task that a colleague's question opened", text)
+        self.assertFalse(set(hub.SHELL_OFF_ASKED_TOOLS) & {t["name"] for t in hub.tools_for("studio", own)})
+
+        # it keeps the colleague's own wish in their own words, for itself only, and never a wish of its own
+        source = hub.cm_ref(said["id"])
+        for args, refusal in (({"words": wish, "scope": "agent"}, "source names the message of Pat"),
+                              ({"words": wish, "scope": "agent", "source": "CM-999999"}, "source names the message"),
+                              ({"words": "Links in every message to everybody", "scope": "agent", "source": source},
+                               "not part of")):
+            with self.subTest(refusal):
+                text, error = hub.call_tool("studio", "keep_instruction", args, here)
+                self.assertTrue(error, text)
+                self.assertIn(refusal, text)
+        with patch.object(hub, "team_below", lambda agent: ["vps"] if agent == "studio" else []):
+            text, error = hub.call_tool("studio", "keep_instruction", {"words": wish, "scope": "team",
+                                                                   "source": source}, here)
+        self.assertTrue(error, text)
+        self.assertIn("a wish for the whole team goes to your lead", text)
+        self.ok("keep_instruction", here, words=wish, scope="agent", source=source)
+        item = hub.q1("SELECT * FROM standing ORDER BY id DESC LIMIT 1")
+        self.assertEqual((item["agent"], item["scope"], item["author"]), ("studio", "agent", f"P-{pat['id']}"))
+
+        # the colleague's closed window starts with it, a customer's window with none
+        def prompt(conversation, person_id):
+            return hub.conversation_prompt("studio", hub.q1("SELECT * FROM conversations WHERE id=?", (conversation,)),
+                                           hub.q1("SELECT * FROM people WHERE id=?", (person_id,)))
+        theirs = prompt(cid, pat["id"])
+        self.assertIn(f"{hub.iref(item['id'])} instruction, from Pat", theirs)
+        self.assertIn(hub.STANDING_PERSON, theirs)
+        self.assertNotIn("cannot give you work", theirs)
+        ana = self.person("Ana", "customer", ANA)
+        hello = self.says(ANA, "Hello")
+        outsider = prompt(hello["conversation"], ana["id"])
+        self.assertNotIn("STANDING ITEMS", outsider)
+        self.assertIn("cannot give you work", outsider)
+        text, error = hub.call_tool("studio", "ask_team", {"question": "And Ana?",
+                                                           "messages": [hub.cm_ref(hello["id"])]}, self.context(cid))
+        self.assertTrue(error, text)
+        self.assertIn("Each of messages must be one that Pat wrote in this conversation", text)
+        text, error = hub.call_tool("studio", "keep_instruction", {"words": "Hello", "scope": "agent",
+                                                                "source": hub.cm_ref(hello["id"])}, here)
+        self.assertTrue(error, text)
+        self.assertIn("source names the message of Pat", text)
+        hub.conversation_start("studio", hello["conversation"])
+        self.ok("read_messages", self.context(hello["conversation"]))
+        self.ok("ask_team", self.context(hello["conversation"]), question="Ana says hello.")
+        asks = hub.q1("SELECT id FROM tasks WHERE source_conversation=? AND source_message IS NULL",
+                      (hello["conversation"],))["id"]
+        hub.q("UPDATE tasks SET state='working', started=? WHERE id=?", (hub.now(), asks))
+        there = ("test-generation", hub.tref(asks), "1")
+        self.assertFalse(set(hub.SHELL_OFF_ASKED_TOOLS) & {t["name"] for t in hub.tools_for("studio", there)})
+        text, error = hub.call_tool("studio", "message_agent", {"agent": "manager", "text": "Who is she?",
+                                                                "waits": True, "request_id": str(uuid.uuid4())}, there)
+        self.assertTrue(error, text)
+        self.assertIn("a colleague's question opened", text)
+        # a colleague with a list reads no item and keeps none (person access plan, section 5)
+        hub.q("INSERT INTO person_scopes(person,agent,grants,updated) VALUES(?,'studio','{}',?)",
+              (pat["id"], hub.now()))
+        self.assertNotIn("STANDING ITEMS", prompt(cid, pat["id"]))
+        self.assertEqual(hub.staff_question(work["id"]), (None, None))
+        self.assertFalse(set(hub.SHELL_OFF_ASKED_TOOLS) & {t["name"] for t in hub.tools_for("studio", here)})
+        hub.q("DELETE FROM person_scopes WHERE person=?", (pat["id"],))
+
+        # it ends only that colleague's wish, on a message of theirs
+        hub.q("INSERT INTO standing(agent,scope,kind,words,author_kind,author,created) VALUES('studio','agent',"
+              "'instruction','Write in English.','owner','owner',?)", (hub.now(),))
+        owners = hub.q1("SELECT id FROM standing ORDER BY id DESC LIMIT 1")["id"]
+        stop = hub.cm_ref(self.says(PAT, "No more links, thanks.")["id"])
+        text, error = hub.call_tool("studio", "end_standing", {"id": hub.iref(owners), "why": "Pat asked.",
+                                                               "asked_by": stop}, here)
+        self.assertTrue(error, text)
+        self.assertIn("is not a wish of Pat's", text)
+        self.ok("end_standing", here, id=hub.iref(item["id"]), why="Pat asked for no more links.", asked_by=stop)
+        self.assertIsNotNone(hub.q1("SELECT ended FROM standing WHERE id=?", (item["id"],))["ended"])
+
+        # the result tells the window what the task already wrote to the colleague, so it does not say it twice
+        self.ok("message_contact", here, person=f"P-{pat['id']}", text="Fine, no more links.",
+                request_id=str(uuid.uuid4()))
+        self.ok("deliver_result", here, task_id=hub.tref(work["id"]), outcome="completed", values={"links": "ended"})
+        result = hub.q1("SELECT text FROM conversation_messages WHERE conversation=? AND who='action' ORDER BY id DESC "
+                        "LIMIT 1", (cid,))["text"]
+        self.assertIn("Its session already wrote to them (CM-", result)
+
     def shell_on(self):
         self.studio_can = ["shell"]         # a write of the settings keeps it (test_people.Roles.settings)
         hub.TEAM["agents"]["studio"]["can"] = ["shell"]

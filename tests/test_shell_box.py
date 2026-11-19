@@ -59,7 +59,8 @@ H1_CHAT = ["message_agent", "message_owner", "read_attachment", "read_messages",
            "tell_owner"]
 REVIEW_EXTRAS = ["remember", "write_notes"]
 # What no session of an agent whose Shell box is off holds; remember and write_notes only in a duty that names them,
-# and recall only in its owner chat
+# recall only in its owner chat, and keep_instruction only in a task that a colleague's question opened, for that
+# colleague's own wish (test_contacts_v2.ShellOffRule)
 FORBIDDEN = {"call_api", "report_up", "ask_my_requester", "ask_reporter", "keep_instruction",
              "write_skill",
              "write_knowledge", "recall", "search_history", "read_history", "see_earlier_work", "search_knowledge",
@@ -776,7 +777,8 @@ class Tools(Fleet):
         sent = hub.q1("SELECT COUNT(*) n FROM agent_messages")["n"]
         for to, words, more, refusal in (
                 ("cx", "Which store?", {}, "you write only to the agents of your reporting line: lead, manager, ops."),
-                ("manager", "Which store?", {"waits": True}, "message_agent does not take waits"),
+                ("manager", "Which store?", {"waits": True},
+                 "waits=true is for a task that a colleague's question opened"),
                 ("manager", "See https://crm.example/t/1", {}, "text holds an address")):
             with self.subTest(refusal):
                 text, error = send(to, words, **more)
