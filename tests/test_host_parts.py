@@ -3205,9 +3205,9 @@ class Health(HostCase):
             self.call("health", "node")
         with self.assertRaisesRegex(ROOT.Refused, "health takes nothing on stdin"):
             self.call("health", data=b"x")
-        d = door_targets.decide({"agents": {"theo": {"business": "amura", "servers": {"worker-7": "fix"}}},
-                                 "hosts": {"worker-7": {"business": "fleet", "mode": "rule-only", "kind": "fleet"}}},
-                                "theo", "worker-7", "health", [])
+        d = door_targets.decide({"agents": {"ops-one": {"business": "shop", "servers": {"web-1": "fix"}}},
+                                 "hosts": {"web-1": {"business": "fleet", "mode": "rule-only", "kind": "fleet"}}},
+                                "ops-one", "web-1", "health", [])
         self.assertEqual((d.kind, d.write, d.form), ("read", False, "health"))
 
     def test_it_says_what_the_host_s_memory_did_and_how_the_boot_before_ended(self):

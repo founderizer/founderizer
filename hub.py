@@ -54313,7 +54313,9 @@ def save_door_entry(body):
 
 
 # removed (version 1.122): the owner's Remove server took the door's parts off a server for apps, which leaves the list
-DOOR_HOST_STATES = ("installed", "passed", "failed", "removed")
+# unchecked (version 1.241): the door's check of the server made no step in three rounds in a row (no stop: the app
+# tries again each round, and the servers after it wait)
+DOOR_HOST_STATES = ("installed", "passed", "failed", "removed", "unchecked")
 DOOR_HOLDS = ("parts", "rule-only")    # N8 (b): what the manager's door_hold keeps from one server
 # rule-only had the name judged until 11 November 2026. team.json and the app's view keep that name, because an app
 # from before that day reads only it; an app from that day on reads both (DoorAccess.HubDoor.ruleOnlyHolds)
@@ -54342,10 +54344,11 @@ def door_waits_after():
 def door_host_report(body):
     """POST /ui/door/host (owner feature door_setup, new-projects plan N8 (b)): what the app's round did on one
     business server: the door's parts went on it (installed), the door's own check of its second sshd passed there
-    (passed: test 1, as code), or one of the two failed (failed), with its words. The hub keeps the last word of each
-    server and tells the manager of the first server that passed, which then waits for the Operator's normal work there
-    (test 6) and door_rollout, and of each failure, after which the app puts the parts on no other server until a new
-    release of the app or the door. Called with LOCK held."""
+    (passed: test 1, as code), or one of the two failed (failed), with its words, or the check made no step in three
+    rounds in a row (unchecked, version 1.241). The hub keeps the last word of each server and tells the manager of the
+    first server that passed, which then waits for the Operator's normal work there (test 6) and door_rollout, of each
+    failure, after which the app puts the parts on no other server until a new release of the app or the door, of each
+    unchecked word, and of a pass after unchecked or failed. Called with LOCK held."""
     host, state, said = body["host"], body["state"], body["said"]
     # A server that the owner added for apps in the app (version 1.122) is no canary: his add is the go-ahead, the app
     # puts its parts on at once, and a failure stops that server only. door_rollout stays for the servers that the app
@@ -54383,6 +54386,17 @@ def door_host_report(body):
     elif state == "failed":
         told = (f"[hub] The door's parts did not go on {host}, or the door's check of it failed: {said} The app puts "
                 f"the parts on no other server until a new release of the app or the door.")
+    elif state == "unchecked":
+        # version 1.241: the app's words only, one of its fixed causes (a server once waited 21 hours in silence)
+        told = (f"[hub] The door has not checked {host} yet: {said}. The app tries again each round, and the servers "
+                f"after it in the order wait. When the door cannot connect to its port 2244, the network's rules (the "
+                f"tailnet policy) must let the door reach that port. door_hold {host} with hold parts lets the other "
+                f"servers go on.")
+    elif state == "passed" and old.get("state") in ("unchecked", "failed"):
+        # version 1.241: the end of what the line above or the failed one started, so that a step taken for it ends
+        told = (f"[hub] The door's check of {host} passed, after it "
+                f"{'had made no step' if old['state'] == 'unchecked' else 'failed'}: its parts are in place, and the "
+                f"app goes on with the servers after it.")
     manager, t0 = manager_name(), now()
     task = filed_under(manager, "say", None)
     with transaction():     # the server's word and the manager's message, together or not at all

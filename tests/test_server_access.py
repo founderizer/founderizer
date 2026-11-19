@@ -938,6 +938,40 @@ class DoorCalls(Access):
         with self.assertRaisesRegex(ValueError, "door.holds maps"):
             hub.validate_door(team)
 
+    def test_a_check_with_no_step_tells_the_manager_once_for_each_cause_and_tells_its_end(self):
+        """API 1.241: the app's word unchecked (the door's check of a server made no step in three rounds in a row)
+        tells the manager what to do, once for each cause, and the pass after it tells the manager too, so that a step
+        taken for it (a policy line, a card) has its end. On 18 and 19 November 2026 a server waited 21 hours in
+        silence, and two servers behind it."""
+        def told(words):
+            return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND text LIKE ?",
+                                             (f"%{words}%",))]
+        hub.t_door_rollout("manager", {"request_id": "rollout-unchecked-1", "go": True, "why": "test 6 passed"})
+        cause = "the door's connection to port 2244 timed out"
+        for state, said in (("installed", ""), ("unchecked", cause)):
+            status, got = self.owner("/ui/door/host", host="web-9", state=state, said=said)
+            self.assertEqual((status, got["changed"]), (200, True), got)
+        line = told("has not checked web-9")
+        self.assertEqual(len(line), 1)
+        self.assertIn(f"[hub] The door has not checked web-9 yet: {cause}. The app tries again each round, and the "
+                      f"servers after it in the order wait.", line[0])
+        self.assertIn("the tailnet policy", line[0])
+        self.assertIn("door_hold web-9 with hold parts lets the other servers go on", line[0])
+        self.assertEqual(self.owner("/ui/door/host", host="web-9", state="unchecked", said=cause)[1]["changed"],
+                         False)
+        self.assertEqual(len(told("has not checked web-9")), 1)         # the same cause again: no second line
+        self.owner("/ui/door/host", host="web-9", state="unchecked",
+                   said="port 2244 of the host refused the door's connection")
+        self.assertEqual(len(told("has not checked web-9")), 2)         # a new cause: one more line
+        self.owner("/ui/door/host", host="web-9", state="passed", said="")
+        self.assertEqual(len(told("The door's check of web-9 passed, after it had made no step")), 1)
+        self.owner("/ui/door/host", host="web-8", state="failed", said="the door's check failed: no TTY")
+        self.owner("/ui/door/host", host="web-8", state="passed", said="")
+        self.assertEqual(len(told("The door's check of web-8 passed, after it failed")), 1)
+        self.owner("/ui/door/host", host="web-7", state="installed", said="")
+        self.owner("/ui/door/host", host="web-7", state="passed", said="")
+        self.assertEqual(told("check of web-7 passed"), [])                 # a plain pass, past the first server
+
     def test_a_key_for_an_app_s_setting_keeps_the_setting_s_name(self):
         """New-projects plan N4: a key card for app:<app>:<NAME> keeps NAME in its own case, because the app reads
         that name, and its answer says which door form puts it in the app's settings."""

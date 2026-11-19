@@ -2942,6 +2942,59 @@ def cmd_follow(args):
 
 
 PROBE_WAIT = 30         # seconds that one check of probe may take; a forward that the host took runs until then
+# Why check 1's connection failed (`probe --first`): (stopped, one whole line of ssh's own, fixed words or None for a
+# line that names no cause). The words are fixed because they reach the manager's [hub] line, and a host chooses some
+# of ssh's lines: its disconnect message is printed even at LogLevel=ERROR, with any line in it. So a cause is taken
+# only when every line is of ssh's own form and none carries the host's text (FIRST_PEER); ssh's text stays in the
+# check's third field, which the owner's app does not send. `connect`: the door did not reach the host's second sshd;
+# `login`: it reached it, and was not let in. Each word is of the app's alphabet (DoorHosts.causeWords: lower case).
+FIRST_LINES = tuple((stopped, re.compile(line), said) for stopped, line, said in (
+    ("connect", r"Connection timed out during banner exchange", "the host's second sshd sent no ssh banner in time"),
+    ("connect", r"ssh: connect to host \S+ port \d+: (?:Connection|Operation) timed out",
+     "the door's connection to port {port} timed out"),
+    ("connect", r"ssh: connect to host \S+ port \d+: Connection refused",
+     "port {port} of the host refused the door's connection"),
+    ("connect", r"ssh: connect to host \S+ port \d+: No route to host", "the door has no route to the host"),
+    ("connect", r"ssh: connect to host \S+ port \d+: Network is unreachable",
+     "the door's network does not reach the host"),
+    ("connect", r"ssh: connect to host \S+ port \d+: [A-Za-z' ]+", "the door could not connect to port {port}"),
+    ("login", r"\S+@\S+: Permission denied \([a-z,-]+\)\.", "the host's second sshd refused the door's key"),
+    ("login", r"kex_exchange_identification: (?:read: )?Connection (?:closed by remote host|reset by peer)",
+     "the host closed the door's connection"),
+    ("login", r"Connection (?:closed|reset) by \S+ port \d+", "the host closed the door's connection"),
+    (None, r"Connection to \S+ port \d+ timed out", None),
+    (None, r"Warning: Identity file \S+ not accessible: [A-Za-z ]+\.", None),
+))
+FIRST_PEER = re.compile(r"(?:Received disconnect from|Disconnected from|Bad remote protocol version)")
+FIRST_HOST_KEY = "the host's key is not the one that the door's file holds"
+FIRST_NO_WORDS = "the host closed the door's connection with no words"
+FIRST_SLOW = f"the host's second sshd gave no answer in {PROBE_WAIT} s"
+FIRST_OTHER = "the host's second sshd did not let the door in"
+
+
+def first_cause(status, out, port):
+    """(stopped, fixed words) for check 1's answer when it failed at all (status 255 of ssh, or 124 of run_program), or
+    None for a host that answered in another way, which gets the ten checks. A line of the host's own text, or of no
+    form that FIRST_LINES knows, gives the general words, so that no host chooses which cause the manager reads."""
+    if status == 124:
+        return "login", FIRST_SLOW
+    if status != 255:
+        return None
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    if not lines:
+        return "login", FIRST_NO_WORDS
+    if any(FIRST_PEER.match(line) for line in lines):     # the lines as split above, also at a lone \r
+        return "login", FIRST_OTHER
+    if lines[-1] == "Host key verification failed.":     # after ssh's own warning of a key that changed
+        return "login", FIRST_HOST_KEY
+    found = None
+    for line in lines:
+        known = next((rule for rule in FIRST_LINES if rule[1].fullmatch(line)), None)
+        if known is None:
+            return "login", FIRST_OTHER
+        if known[2] and found is None:
+            found = (known[0], known[2].format(port=port))
+    return found or ("login", FIRST_OTHER)
 
 
 def probe(host):
@@ -2950,6 +3003,14 @@ def probe(host):
     forward of both kinds, a Unix-socket forward and a form outside the list all fail, and a fixed read and a rule
     form through sudo ops-root work. It reads the host's key from the access file, into a known_hosts of its own. Gives
     [[name, ok, what it saw when not ok]]."""
+    return probe_checks(host)[0]
+
+
+def probe_checks(host, first=False):
+    """probe's checks, and where they stopped. With first (`probe --first`, which the owner's app passes when the door's
+    code has it, API 1.241), check 1's connection runs first, and when it fails at all (first_cause), the other checks
+    do not run: a host that the network does not let the door reach answers in about 15 s in place of about 150 s,
+    inside the 120 s that the app waits. Gives (checks, None), or ([check 1, failed], (stopped, fixed words))."""
     port, target = str(host.get("port", SSHD_PORT)), f"ops-agent@{host['address']}"
     checks = []
     with tempfile.TemporaryDirectory(prefix="door-probe-") as folder:
@@ -2968,8 +3029,16 @@ def probe(host):
             ok = bool(good(status, out))
             checks.append([name, ok, "" if ok else f"{status}: {out.strip()[-200:]}"])
         refused = re.compile(r"(?i)prohibited|open failed|forwarding failed")
-        check("a login with no request gets no shell", ssh + ["-T", target],
-              lambda status, out: status == 3 and "requests only" in out)
+        if first:       # check 1, from one connection: when it fails at all, the other checks do not run
+            status, out = run_program(ssh + ["-T", target], None, {}, timeout=PROBE_WAIT)
+            ok = status == 3 and "requests only" in out
+            checks.append(["a login with no request gets no shell", ok, "" if ok else f"{status}: {out.strip()[-200:]}"])
+            stopped = first_cause(status, out, port)
+            if stopped:
+                return checks, stopped
+        else:
+            check("a login with no request gets no shell", ssh + ["-T", target],
+                  lambda status, out: status == 3 and "requests only" in out)
         check("a shell command is refused", ssh + ["-T", target, "bash -i"], lambda status, out: status == 3)
         check("no TTY", ssh + ["-tt", target, req("uptime")], lambda status, out: "PTY allocation request failed" in out)
         check("no scp", ["scp", "-P", port, *opts, "/dev/null", f"{target}:/tmp/door-probe-scp"],
@@ -2987,19 +3056,23 @@ def probe(host):
               lambda status, out: status == 0 and "load average" in out)
         check("sudo ops-root runs a rule form", ssh + ["-T", target, req("daemon-reload")],
               lambda status, out: status == 0 and "systemd read its units again" in out)
-    return checks
+    return checks, None
 
 
 def cmd_probe(args):
     """The door's user, as the owner's app runs it over its own SSH after a host got its parts (N8 (b)): probe, as one
-    JSON line {host, passed, checks}. The status is 0 only when every check passed."""
+    JSON line {host, passed, checks}, and with --first, when check 1's connection failed, also {stopped, cause}
+    (probe_checks: `connect` or `login`, and fixed words). The status is 0 only when every check passed."""
     host = (read_json(ACCESS_FILE, {}).get("hosts") or {}).get(args.host)
     if not isinstance(host, dict) or not tailnet_address(host.get("address", "")) or \
             not HOST_KEY.fullmatch(host.get("host_key", "")):
         sys.exit(f"{args.host} is no host of the access file")
-    checks = probe(host)
+    checks, stopped = probe_checks(host, first=args.first)
     passed = all(ok for _, ok, _ in checks)
-    print(json.dumps({"host": args.host, "passed": passed, "checks": checks}))
+    line = {"host": args.host, "passed": passed, "checks": checks}
+    if stopped:
+        line["stopped"], line["cause"] = stopped
+    print(json.dumps(line))
     sys.exit(0 if passed else 1)
 
 
@@ -3030,6 +3103,7 @@ def main(argv=None):
     sub.add_parser("render-check").set_defaults(fn=cmd_render_check)
     probing = sub.add_parser("probe")
     probing.add_argument("host")
+    probing.add_argument("--first", action="store_true")    # the owner's app greps this line (DoorAccess.firstProbe)
     probing.set_defaults(fn=cmd_probe)
     args = p.parse_args(argv)
     args.fn(args)
