@@ -1399,6 +1399,22 @@ def stop_browser_units(run=None):
     return done_well
 
 
+def browser_units_ended(run=None):
+    """True where systemd says that each of this OS user's browser units (lifecycle.BROWSER_UNITS) has ended: inactive
+    or failed, as it says of a unit that it does not have. A stop that `--no-block` queued (stop_browser_units) may
+    still run, and Chrome writes its cookies as it ends; anything else, and a systemctl that did not answer, is not
+    ended."""
+    for unit in lifecycle.BROWSER_UNITS:
+        try:
+            done = (run or subprocess.run)(["systemctl", "--user", "is-active", unit], capture_output=True, text=True,
+                                           timeout=5)       # a systemd that hangs holds the helper's loop for little
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if (done.stdout or "").strip() not in ("inactive", "failed"):
+            return False
+    return True
+
+
 def task_work():
     """The folder of every task's own clones, WORK/.tasks: no GitHub owner's name starts with a dot."""
     return os.path.join(WORK, ".tasks")
@@ -5305,7 +5321,9 @@ class Helper:
         runs as its agent's own OS user (own_user). Nothing is decided before the first poll (False), on a list that a
         worker's hub does not give (None; a manager's hub names none, and a manager runs no browser task), or on a
         tmux that does not answer; a session or a tmux server that is not there is an answer: no window. A stop that
-        systemd did not take is tried again in a minute (stop_browser_units)."""
+        systemd did not take is tried again in a minute (stop_browser_units). Where the agent's Browser box is off, its
+        browser data goes (browser_data_gone) once systemd says that both units have ended (browser_units_ended); a
+        stop that still runs is looked at again a minute later."""
         if self.open_tasks is False or (self.open_tasks is None and self.worker) or sys.platform == "darwin" or \
                 (self.browser_at is not None and time.monotonic() - self.browser_at < PLACES_EVERY) or \
                 not self.own_user():
@@ -5320,6 +5338,49 @@ class Helper:
             return
         if not stop_browser_units(stop):
             self.browser_at -= PLACES_EVERY - 60
+        elif "browser" not in (self.conf.get("can") or []):     # its Browser box is off: its browser data goes once
+            if browser_units_ended(stop):                       # its units have ended, and Chrome writes no more
+                self.browser_data_gone()
+            else:
+                self.browser_at -= PLACES_EVERY - 60            # a stop that systemd still runs: again in a minute
+
+    def browser_data_gone(self, team=None):
+        """**An agent whose Browser box is off keeps no browser of its own** (the owner, 18 November 2026, to the
+        question whether an untick also deletes each agent's own browser data and tool: "Yes, delete them"). The box
+        is off after his untick, and after the hub's own take of a browser that it gave by default at a Shell box that
+        went off. Once no open task holds its units and systemd says that both have ended (sweep_browser),
+        this goes: its Chrome profile (browser_profile, in the helper's own folder: its cookies and the sign-ins of its
+        websites), the DevTools MCP package that only its browser runs, its browser and screen-sharing units, and the
+        helper's own lists of its browser (its clears and its fresh tasks). Only what the helper made goes: no folder
+        of the agent's home. The fleet's Node stays for the agent's other tools, and so does the package where an MCP
+        server of the owner's names the same package. A tick of the box later installs and starts all of it again, and
+        the vault signs in again. The server's own parts are the owner's Mac's (S1b). Nothing is said where nothing was
+        there."""
+        home, gone = os.path.expanduser("~"), []
+        profile = browser_profile()
+        if os.path.isdir(profile) and not os.path.islink(profile):
+            shutil.rmtree(profile, ignore_errors=True)
+            gone.append("its Chrome profile")
+        folder = package_folder(BROWSER_MCP_PACKAGE)
+        catalog = lifecycle.tool_catalog(checkout_team() if team is None else team)
+        if os.path.isdir(folder) and not any(isinstance(tool.get("package"), dict) and
+                                             package_folder(tool["package"]) == folder for tool in catalog.values()):
+            shutil.rmtree(folder, ignore_errors=True)
+            gone.append("its browser tool")
+        units = [os.path.join(home, ".config", "systemd", "user", unit) for unit in lifecycle.BROWSER_UNITS]
+        if any(os.path.exists(path) for path in units):
+            for path in units:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(path)
+            systemctl_user("daemon-reload", timeout=30)
+            gone.append("its browser units")
+        for path in (self.clears_file(), self.clears_file(done=True),
+                     os.path.join(HOME, f"browser-fresh-{self.agent}.json")):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path)
+        self.browser_fresh = set()
+        if gone:
+            self.say(f"its Browser box is off: {', '.join(gone)} went from this server")
 
     def browser_start(self, task, keep=False, closed=False, run=True):
         """**This agent's own browser, for a browser task on Linux** (build plan 04, S2): the catalog tool of its
@@ -9697,8 +9758,9 @@ def browser_folder():
 
 def browser_profile():
     """The agent's Chrome profile (D5): its cookies and the sign-ins of its websites, in the helper's own folder
-    (HOME), never in the agent's home, so that what the helper does to the profile (its mode, its session files and
-    its caches) never touches a folder of the agent's own work."""
+    (HOME), never in the agent's home, so that what the helper does to the profile (its mode, its session files, its
+    caches, and its deletion when the Browser box is off: Helper.browser_data_gone) never touches a folder of the
+    agent's own work."""
     return os.path.join(HOME, "browser")
 
 

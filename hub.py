@@ -3257,7 +3257,9 @@ BROWSER_CLOSED_TOLD = "browser_closed_told:"    # kv + agent: the manager knows 
 
 
 def browser_kv(k, v):
-    """kv_set of a key of this region, quiet: the hub's own rule reads them, and no app does."""
+    """kv_set of a key of this region, quiet: the hub's own rule reads them, and no app does. A place that a shortage
+    took (BROWSER_ROOM) reaches the owner's page only as an idle Browser box of a team read (owner_boxes), which his
+    page reads again by itself."""
     with area("quiet"):
         kv_set(k, v)
 
@@ -3657,7 +3659,8 @@ def browser_place_sweep(t0):
                 continue
             emit(requester, "say", f"[hub] A browser place is free on {server} now. If you still need the browser task "
                                    f"that the hub refused for want of one, create it again.", task=tid or None)
-    breaches = {name for kind, name in browser_breaches(TEAM) if kind == "closed"}
+    breaches = {name for kind, name in browser_breaches(TEAM) if kind == "closed"
+                and not kv_get(BROWSER_DEFAULT + name)}     # S3b: the default sweep takes a default browser away
     for name in sorted(breaches):
         if not kv_get(BROWSER_CLOSED_TOLD + name):
             browser_kv(BROWSER_CLOSED_TOLD + name, t0)
@@ -42319,6 +42322,12 @@ def save_agent_settings(agent, body):
                                    f"server first.")
             if new["screen"]["model"] or new["screen"]["effort"]:
                 offered(agent, new["screen"]["model"], new["screen"]["effort"], reading="screen_models")
+    # build plan 04 (D1, S3b): a Shell box that goes off under a browser that the Linux default gave is taken as he sent
+    # it (his app checks that the boxes it gets back are the ones that it sent), and D2 lets it pass for this write: the
+    # default sweep then takes that browser away in a commit of its own (take_default_browser), which keeps the
+    # default's mark and sets no removal mark of his, and the default gives it again with the Shell box
+    hub_removed = "can" in new and "shell" in old["can"] and "shell" not in new["can"] and "browser" in new["can"] \
+        and "browser" in old["can"] and bool(kv_get(BROWSER_DEFAULT + agent)) and linux_agent(agent, team)
     # An entry with no Tools list has the shell of its runtime (shell_off): a new list without it turns the shell off
     # too. Its `can` reads [] (ui_team), which every settings write sends back unchanged: that one changes nothing.
     if "can" in new and ("shell" in old["can"] or not isinstance(a.get("can"), list) and new["can"] != old["can"]) \
@@ -42387,15 +42396,21 @@ def save_agent_settings(agent, body):
             browser_box_refusal(team, agent, a.get("machine")):        # build plan 04 (D8), at his tick
         raise browser_box_refusal(team, agent, a.get("machine"))
     try:
-        validate_team(team)
+        validate_team(team, browser_ok=browser_breaches(TEAM) | ({("closed", agent)} if hub_removed else set()))
     except ValueError as e:
         raise Refusal(400, str(e), extra=getattr(e, "extra", None)) from None
     data = (json.dumps(team, indent=2) + "\n").encode()
     commit = commit_kit_file("team.json", data, f"Owner changed the settings of {agent}")
     apply_team(team)
     fields = {c["field"] for c in changed}
-    if {"browser", "screen"} & set(next((c["before"] or [] for c in changed if c["field"] == "can"), [])) - set(a.get("can") or []):
+    before_can = set(next((c["before"] or [] for c in changed if c["field"] == "can"), old["can"]))
+    if ({"browser", "screen"} & before_can) - set(a.get("can") or []) - ({"browser"} if hub_removed else set()):
         kv_set(f"default_desktop:{agent}", 2)   # his own removal: default_access_sweep gives it none of its Mac's again
+    if "browser" in before_can ^ set(a.get("can") or []) and not hub_removed:
+        kv_set(BROWSER_DEFAULT + agent, None)   # S3b: his tick or his untick: the browser is his own choice from now on
+    if hub_removed or ("shell" in set(a.get("can") or []) - before_can and
+                       str(kv_get(f"default_desktop:{agent}")) != "2"):
+        kv_set(f"default_desktop:{agent}", None)    # S3b: the Linux default reads it again (its Shell box came back)
     # Also the manager's helper (lifecycle arms its update too): until it loads them, its settings stay pending, which
     # holds its runtime switch. Its running standing session keeps the settings that it started with.
     updates = [agent] if fields & {"model", "effort", "can", "screen"} and \
@@ -47488,8 +47503,8 @@ def forget_removed_agents(names, t0):
         deleted = sum(DB.execute(f"DELETE FROM {table} WHERE {column}=?", (name,)).rowcount
                       for table, column in (("agent_keys", "agent"),) +
                       tuple(c for c, decision in AGENT_REMOVAL.items() if decision == "team"))
-        deleted += DB.execute("DELETE FROM kv WHERE k IN (?,?)",
-                              (f"default_vault:{name}", f"default_desktop:{name}")).rowcount
+        deleted += DB.execute("DELETE FROM kv WHERE k IN (?,?,?)",
+                              (f"default_vault:{name}", f"default_desktop:{name}", BROWSER_DEFAULT + name)).rowcount
         if deleted:
             forgot.append(name)
     return forgot
@@ -47923,24 +47938,147 @@ def save_vault(agent, body):
 # a "none" or a capability that he took away stays. A vault is given when vault_grant says it can be, the rule of his
 # own command: on a new machine that is after its broker first reports, and until then the agent holds none.
 DEFAULT_ACCESS_EVERY = 60       # seconds between two passes of default_access_sweep
+# The owner, 17 November 2026: "Every agent with shell" (build plan 04, D1, slice S3b): each worker and lead on a Linux
+# server gets a browser of its own by default, by a rule of its own beside the Mac's (desktop_defaults).
+BROWSER_DEFAULT = "default_browser:"    # kv + agent: the browser that the Linux default gave it (take_back_default_browsers)
+BROWSER_DONE_CLEARED = "default_browser_done_cleared"   # kv: the one-time clear of the old done marks of Linux agents
 DEFAULT_ACCESS = {"at": 0.0, "retry": {}}       # the last pass, and when an agent whose commit failed is tried again
+
+
+def linux_browser_default(team, name):
+    """What the Linux default of D1 does for this agent now (S3b): "give", "wait", or None, nothing to give (the done
+    mark). A worker or a lead on a Linux server that joined and is not the hub's own, with no browser yet and no host
+    list (a Browser box ends it), whose session gets a browser there (lifecycle.linux_browser_refusal: its runtime, its
+    Shell box, Codex's app-server start), that runs as an OS user of its own, on a system that runs one (D8), gets it
+    where its server has at least one place (D6, browser_places: the count needs no browser parts, which S1b then puts
+    there). While its server sends no reading of its parts or its users yet, or has no place, it waits, with no done
+    mark: a place can come; so does an agent in setup, whose activation would wait for those parts. The manager holds
+    no task of its own, so it runs no browser task and gets none."""
+    a = (team.get("agents") or {}).get(name) or {}
+    server = browser_server(name, team)
+    if a.get("role") not in ("worker", "lead") or not server or "browser" in (a.get("can") or []) or \
+            a.get(WEB_HOSTS) or lifecycle.linux_browser_refusal(a) or service_user_agents([name]):
+        return None
+    if a.get("active") is False:
+        return "wait"                   # in setup: its setup check would require a browser whose parts are not there
+    reading = server_reading(server, []) or {}
+    state = (reading.get("browser") or {}).get("state") if isinstance(reading.get("browser"), dict) else None
+    if state == "unsupported":
+        return None
+    user = ((reading.get("agents") or {}).get(name) or {}).get("user") if isinstance(reading.get("agents"), dict) \
+        else None
+    if user is not None and user == ((team.get("servers") or {}).get(server) or {}).get("user"):
+        return None                     # it runs as the server service's own user, which D11's proof refuses
+    if state is None or user is None or not browser_places(server, team):
+        return "wait"
+    return "give"
+
+
+def linux_browser_works(team, name):
+    """Whether a Browser box does something for this agent on its Linux server now (build plan 04): where the Linux
+    default of D1 would give it a browser if it had none, by that one rule (linux_browser_default, for an agent that is
+    not active too, whose other boxes read as before): a worker or a lead whose session gets a browser there (the
+    Shell box on, D2; an entry with no list reads as the default reads it), as an OS user of its own, on a joined
+    server that is not the hub's own, whose system runs one (D8) and that has a place for it (D6)."""
+    a = (team.get("agents") or {}).get(name)
+    if not isinstance(a, dict):
+        return False
+    probe = dict(a, can=[c for c in (a.get("can") or []) if c != "browser"])
+    probe.pop("active", None)
+    return linux_browser_default(dict(team, agents=dict(team["agents"], **{name: probe})), name) == "give"
+
+
+def browser_done_cleared():
+    """Once (a step of the release of S3b): the done mark default_desktop:<agent> that each pass wrote for every Linux
+    worker and lead, because the Mac's default gave it nothing, goes, so that the Linux default reads each of them;
+    each of the owner's own removals (2) stays."""
+    if kv_get(BROWSER_DONE_CLEARED):
+        return
+    for name in agents():
+        if linux_agent(name) and str(kv_get(f"default_desktop:{name}")) == "1":
+            kv_set(f"default_desktop:{name}", None)
+    kv_set(BROWSER_DONE_CLEARED, now())
+
+
+def take_default_browser(name):
+    """The hub's own removal of the browser that the Linux default gave an agent whose Shell box went off (D1, S3b):
+    one commit of its own, after the owner's write that turned the box off, which his app took back as he sent it. The
+    default's mark stays and no removal mark of his is set, so the default gives it again with the Shell box. The
+    manager is told, as it is of the default's give (give_defaults)."""
+    rev = kit_revision(fresh=True)
+    team, _, _ = team_view(rev)
+    a = team["agents"].get(name)
+    if not a or "browser" not in (a.get("can") or []) or "shell" in a["can"]:
+        return
+    a["can"] = [c for c in a["can"] if c != "browser"]
+    validate_team(team)
+    commit = commit_kit_file("team.json", (json.dumps(team, indent=2) + "\n").encode(),
+                             f"Fleet took back the browser that it gave {name} by default: its Shell box is off")
+    apply_team(team)
+    kv_set(f"default_desktop:{name}", None)
+    log("hub", f"took back {name}'s default browser in {commit[:12]}: its Shell box is off")
+    emit(manager_name(), "say", f"[hub] Fleet took back the browser that it gave {name} by default, because its Shell "
+                                f"box is off: it can now use {', '.join(a['can']) or 'nothing'}.")
+
+
+BROWSER_DEFAULT_PASS = 3        # S3b: Linux defaults given in one pass of the sweep, each a commit under LOCK
+
+
+def take_back_default_browsers(reason):
+    """The tested release step that takes back every browser that the Linux default gave, at once (build plan 04, D1):
+    one team.json commit takes `browser` from each agent with the default's mark (BROWSER_DEFAULT) and keeps each that
+    the owner ticked (a tick ends the mark); the owner's Mac then takes the parts away by itself where no agent wants
+    them (S1b). Only for the release that removes the default's rule, never while the rule is on, which gives each such
+    browser again. Returns the names, [] for none."""
+    rev = kit_revision(fresh=True)
+    team, _, _ = team_view(rev)
+    taken = [n for n, a in (team.get("agents") or {}).items()
+             if "browser" in (a.get("can") or []) and kv_get(BROWSER_DEFAULT + n) and linux_agent(n, team)]
+    for n in taken:
+        team["agents"][n]["can"] = [c for c in team["agents"][n]["can"] if c != "browser"]
+    if taken:
+        validate_team(team)
+        commit_kit_file("team.json", (json.dumps(team, indent=2) + "\n").encode(),
+                        f"Fleet takes back the browsers that it gave by default: {reason}")
+        apply_team(team)
+    for n in taken:
+        kv_set(BROWSER_DEFAULT + n, None)
+    log("hub", f"took back the default browser of {', '.join(taken) or 'no agent'}: {reason}")
+    return taken
 
 
 def default_access_sweep(t0):
     """Give each worker and lead the defaults it lacks (give_defaults). A vault that cannot serve the agent yet and a
-    machine of no known kind wait for a later pass; a default with nothing left to give ends for that agent. A pass
-    while an owner's write runs its git (kit_flying) waits for the next tick."""
+    machine of no known kind wait for a later pass; a default with nothing left to give ends for that agent. On a Linux
+    server the browser is the Linux default's (linux_browser_default), which also waits for its server. A pass while
+    an owner's write runs its git (kit_flying) waits for the next tick."""
     if t0 - DEFAULT_ACCESS["at"] < DEFAULT_ACCESS_EVERY or kit_flying():
         return
     DEFAULT_ACCESS["at"] = t0
+    browser_done_cleared()
+    linux_given = 0
     for name, a in list(agents().items()):
         if a.get("role") not in ("worker", "lead") or DEFAULT_ACCESS["retry"].get(name, 0) > t0:
+            continue
+        if linux_agent(name) and "browser" in (a.get("can") or []) and "shell" not in (a.get("can") or []) and \
+                kv_get(BROWSER_DEFAULT + name):
+            try:                        # S3b: its Shell box went off under the default's browser
+                take_default_browser(name)
+            except Exception as e:      # a commit that failed now: again in ten minutes
+                DEFAULT_ACCESS["retry"][name] = t0 + 600
+                log("hub", f"could not take back {name}'s default browser yet: {e}")
             continue
         vault, desktop = not kv_get(f"default_vault:{name}"), not kv_get(f"default_desktop:{name}")
         if vault and a.get("vault", "none") != "none":
             kv_set(f"default_vault:{name}", 1)          # it has a vault already
             vault = False
-        if desktop and server_kind_of(TEAM, a.get("machine")) is not None and \
+        if desktop and linux_agent(name):               # build plan 04 (S3b): the Linux default of D1
+            got = linux_browser_default(TEAM, name)
+            if got is None:
+                kv_set(f"default_desktop:{name}", 1)    # nothing to give: its browser is there, or it does not qualify
+            desktop = got == "give" and linux_given < BROWSER_DEFAULT_PASS     # "wait": no done mark; a later pass
+            linux_given += desktop                      # reads it again; a few in each pass: each is a commit
+        elif desktop and server_kind_of(TEAM, a.get("machine")) is not None and \
                 not with_desktop(json.loads(json.dumps(a)), TEAM):
             if not screen_waits(TEAM, a):
                 kv_set(f"default_desktop:{name}", 1)    # Linux, or it holds its Mac's desktop already
@@ -47976,16 +48114,31 @@ def give_defaults(name, vault, desktop):
     added = with_desktop(a, team) if desktop and not a.get(WEB_HOSTS) else []
     if added:
         given.append("the " + " and ".join(added) + " of its Mac")
+    second = linux_browser_default(team, name) if desktop and linux_agent(name, team) else None
+    linux = second == "give"
+    if linux:                           # build plan 04 (S3b): the Linux default of D1
+        a["can"] = list(a.get("can") or []) + ["browser"]
+        given.append(f"a browser of its own on {a['machine']}")
+    refused = False
     if given:
         try:
             validate_team(team)
         except ValueError as e:
             log("hub", f"gives {name} no default access: {e}")
-            given = []
+            given, refused = [], True
     if given:
         data = (json.dumps(team, indent=2) + "\n").encode()
-        commit = commit_kit_file("team.json", data, f"Fleet gave {name} by default: {'; '.join(given)}")
-        apply_team(team)
+        if linux:       # the default's own, before its commit: a Shell box that goes off, a move and the release step
+            kv_set(BROWSER_DEFAULT + name, now())       # that takes it back read it; a mark with no browser does nothing
+        committed = False
+        try:
+            commit = commit_kit_file("team.json", data, f"Fleet gave {name} by default: {'; '.join(given)}")
+            committed = True
+            apply_team(team)
+        except BaseException as e:      # a stop of the hub (not an Exception) reads nothing, and keeps the mark
+            if linux and not committed and isinstance(e, Exception) and not default_browser_landed(name):
+                kv_set(BROWSER_DEFAULT + name, None)    # no browser came: no mark of one
+            raise
         log("hub", f"gave {name} by default {'; '.join(given)} in {commit[:12]}")
         emit(manager_name(), "say", f"[hub] Fleet gave {name} by default {' and '.join(given)}: it can now use "
                                     f"{', '.join(a.get('can') or []) or 'nothing'}"
@@ -47995,8 +48148,23 @@ def give_defaults(name, vault, desktop):
     # validate_team refused ends both, and the log says why.
     if vault and a.get("vault", "none") != "none":
         kv_set(f"default_vault:{name}", 1)
-    if desktop and not screen_waits(team, a):
+    if desktop and not linux_agent(name, team) and not screen_waits(team, a):
         kv_set(f"default_desktop:{name}", 1)
+    if desktop and linux_agent(name, team) and (linux and (given or refused) or second is None):
+        kv_set(f"default_desktop:{name}", 1)        # given, refused (the log says why), or nothing to give; a wait
+                                                    # leaves it open
+
+
+def default_browser_landed(name):
+    """After a commit of the Linux default that raised: whether team.json at the hub's fresh revision gives the agent a
+    browser all the same (a push that landed before its error). One that cannot be read now counts as landed, so that
+    the default's mark stays: a mark with no browser does nothing, and a browser with no mark would be taken for the
+    owner's own."""
+    try:
+        team, _, _ = team_view(kit_revision(fresh=True))
+    except Exception:
+        return True
+    return "browser" in (((team.get("agents") or {}).get(name) or {}).get("can") or [])
 
 
 def save_vault_create(agent, body):
@@ -48258,32 +48426,46 @@ def desktop_defaults(team, machine, runtime):
             and (c != "screen" or mac_chatgpt(machine) is not False)]
 
 
-def owner_boxes(team, a):
+def owner_boxes(team, a, name=None):
     """The Tools boxes that the owner's app shows for an agent (owner API 1.216), in CAPABILITIES order. `on`: the boxes
     that it has in effect: its Tools list, or, for an entry with no list, the shell and the web of its runtime (shell_off
     reads such an entry as Shell on). `offered`: each box that does something for it, and each box that it has, so that
     the owner can always turn one off. A box does something when its runtime can use it (RUNTIME_CAN), the browser and
-    the screen only on a Mac (as desktop_defaults gives them, which also waits for the ChatGPT app's sign-in before it
+    the screen on a Mac (as desktop_defaults gives them, which also waits for the ChatGPT app's sign-in before it
     gives the screen), and the screen only with the Shell box on (fleet.closed_task_command refuses a screen task of a
     closed session); a Codex worker or lead on app-server runs browser tasks in its runner too (runtime_switch says so).
-    `idle`: the boxes of `offered` that do nothing for it now. `stays_on`: Shell, where no box turns
-    it off: for a runtime with no closed version, whose Shell off save_agent_settings refuses, and for the manager,
-    whose sessions have the shell and the web whatever its boxes say (the app shows no Capabilities for it)."""
+    On a Linux server the browser does something where the Linux default would give the agent one (build plan 04,
+    linux_browser_works), and a box that it lacks there shows once the default is done with it (his own removal, or
+    its done mark after the release's clear of the old ones): before that, the default gives the browser at its next
+    passes or waits for the agent's setup, so the box never shows off and then goes on by itself, and the box that he
+    took off stays on his page. `name`: the agent's name, found in `team` when it is not given. `idle`: the boxes of `offered` that do nothing for it now. `stays_on`: Shell, where no
+    box turns it off: for a runtime with no closed version, whose Shell off save_agent_settings refuses, and for the
+    manager, whose sessions have the shell and the web whatever its boxes say (the app shows no Capabilities for it)."""
     can, runtime = a.get("can"), a.get("runtime")
     runs = RUNTIME_CAN.get(runtime, set())
     on = list(can) if isinstance(can, list) else [c for c in ("shell", "web") if c in runs]
-    mac = server_kind_of(team, a.get("machine")) == "mac"
+    kind = server_kind_of(team, a.get("machine"))
+    mac = kind == "mac"
     closed = "shell" not in on
+    if name is None:
+        name = next((n for n, x in (team.get("agents") or {}).items() if x is a), None)
 
     def works(box):
+        if box == "browser" and kind == "linux":
+            return name is not None and linux_browser_works(team, name)
         runner = box == "browser" and app_server_task(a, "browser")
         return (box in runs or runner) and (mac or box in ("shell", "web")) and not (box == "screen" and closed)
-    offered = [c for c in CAPABILITIES if works(c) or c in on]
+    does = {c: works(c) for c in CAPABILITIES}        # once each: a Linux browser's reads run under LOCK
+    lacks = kind == "linux" and "browser" not in on and does["browser"]
+    mark = str(kv_get(f"default_desktop:{name}")) if lacks else ""
+    decided = mark == "2" or (mark == "1" and bool(kv_get(BROWSER_DONE_CLEARED)))
+    shows = dict(does, browser=does["browser"] and (not lacks or decided))
+    offered = [c for c in CAPABILITIES if shows[c] or c in on]
     worker = a.get("role") in ("worker", "lead")
     # A worker's list without the shell reads off, and goes on again; the manager's shell is on whatever it says.
     stays = "shell" in offered and ("shell" in on or not worker) and not (worker and closed_versions(runtime))
     return {"on": [c for c in CAPABILITIES if c in on], "offered": offered,
-            "idle": [c for c in offered if not works(c)], "stays_on": ["shell"] if stays else []}
+            "idle": [c for c in offered if not does[c]], "stays_on": ["shell"] if stays else []}
 
 
 def screen_waits(team, a):
@@ -50643,7 +50825,7 @@ AGENT_KV = ("tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "
             # results (lead_batch_rows) and the machine that it left in its newest move (MOVED): the review of 17
             # November 2026 found them where test_rename's scan of the kv keys did not look
             "memory_close:", "lead_batch:", "moved_from:",
-            "browser_closed_told:")     # build plan 04, S3: BROWSER_CLOSED_TOLD
+            "default_browser:", "browser_closed_told:")     # build plan 04: BROWSER_DEFAULT and BROWSER_CLOSED_TOLD
 # The same, with more after the name: `<prefix><agent>:<window, task or item>`.
 AGENT_KV_SCOPED = ("listed:", "untaken:", "chased:")
 # Keys that hold two agents' names, in their sorted order: `<prefix><one>:<two>` (agent_limit's talk guard).
@@ -50894,6 +51076,10 @@ def move_agent(agent, body, by="owner"):
     if a is None:
         raise Refusal(404, code="no_such_agent")
     placing = unplaced(agent, team)
+    if a.get("machine") != server and "browser" in (a.get("can") or []) and kv_get(BROWSER_DEFAULT + agent):
+        # build plan 04 (D1, S3b): a browser that the Linux default gave goes with the move, which keeps its mark, and
+        # the default gives it again on a server with room: a default browser never blocks a move that he did not block
+        a["can"] = [c for c in a["can"] if c != "browser"]
     runtime = body.get("runtime") or a["runtime"]
     if runtime != a["runtime"] and not placing:
         raise Refusal(409, f"A move keeps {shown_role(agent)}'s AI provider. Switch it with a command of its own.")
@@ -50970,6 +51156,10 @@ def move_agent(agent, body, by="owner"):
                 DB.execute(f"DELETE FROM {table} WHERE agent=?", (agent,))
             DB.execute("DELETE FROM kv WHERE k IN (?,?,?)", (f"default_vault:{agent}", SERVICE_USER + agent,
                                                               CALLER_USER + agent))
+            # build plan 04 (S3b): its new server's defaults are read again, as at a runtime switch; his removal stays
+            DB.execute("DELETE FROM kv WHERE k=? AND v<>'2'", (f"default_desktop:{agent}",))
+            if server_kind_of(team, server) != "linux":     # only the Mac's own default applies there
+                DB.execute("DELETE FROM kv WHERE k=?", (BROWSER_DEFAULT + agent,))
             os_user_drop(agent, old, left)  # it leaves any group of the old machine that readings made (os_user_kept)
         if old not in (None, server):       # an agent with no server left no machine whose calls get `moved`
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
@@ -63048,7 +63238,7 @@ class Handler(BaseHTTPRequestHandler):
                 line.update(active=a.get("active", True) is not False, model=a.get("model"), effort=a.get("effort"),
                             can=list(a.get("can") or []), settings_pending=settings_pending(line["agent"]),
                             web_hosts=list(a.get(WEB_HOSTS) or []),
-                            boxes=owner_boxes(team, a),                     # owner API 1.216
+                            boxes=owner_boxes(team, a, line["agent"]),      # owner API 1.216
                             reported_model=reported_model(line["agent"]),
                             screen=screen_settings(a), reported_screen_model=reported_model(line["agent"], screen=True),
                             title=a.get("title"), expertise=list(a.get("expertise") or []), account=a.get("account"),

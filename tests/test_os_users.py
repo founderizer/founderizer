@@ -359,6 +359,40 @@ class Moves(Servers):
         self.assertEqual(status, 409, answer)
         self.assertIn("A Mac runs one agent", answer["error"])
 
+    def test_a_move_takes_a_default_browser_with_it_and_reads_the_defaults_again(self):
+        """Build plan 04 (D1, S3b): a browser that the Linux default gave never blocks a move; the move keeps the
+        default's mark, so the default gives it again where there is room, and ends the done mark, but not his own
+        removal."""
+        self.write_can("scout", ["shell", "web", "browser"])
+        hub.kv_set(hub.BROWSER_DEFAULT + "scout", hub.now())
+        hub.kv_set("default_desktop:scout", 1)
+        self.joined("mac2", "mac", source=MAC2)
+        status, receipt = self.move("scout", "mac2")
+        self.assertEqual(status, 200, receipt)
+        self.assertNotIn("browser", self.origin_team()["agents"]["scout"]["can"])
+        # a Mac's own default applies there, so the Linux default's mark ends
+        self.assertEqual((hub.kv_get("default_desktop:scout"), hub.kv_get(hub.BROWSER_DEFAULT + "scout")), (None, None))
+        hub.kv_set("default_desktop:desk", 2)
+        self.joined("mac3", "mac", source="127.0.0.13")
+        status, receipt = self.move("desk", "mac3")
+        self.assertEqual((status, str(hub.kv_get("default_desktop:desk"))), (200, "2"), receipt)
+
+    def test_a_default_browser_comes_again_on_the_linux_server_that_its_agent_moves_to(self):
+        self.write_can("desk", ["shell", "web", "browser"], active=True)    # out of its setup: the default gives it one
+        hub.kv_set(hub.BROWSER_DEFAULT + "desk", hub.now())       # a browser that a default gave: its mark
+        status, receipt = self.move("desk", "box")
+        self.box_reads()
+        self.assertEqual(status, 200, receipt)
+        self.assertNotIn("browser", self.origin_team()["agents"]["desk"]["can"])
+        row = hub.q1("SELECT data FROM server_status WHERE server='box'")
+        data = dict(json.loads(row["data"]), agents={"desk": {"user": "fleet-desk", "uid": 1003},
+                                                      "scout": {"user": "fleet-scout", "uid": 1004}})
+        hub.q("UPDATE server_status SET data=? WHERE server='box'", (json.dumps(data),))
+        hub.TEAM = json.loads(json.dumps(self.origin_team()))
+        hub.DEFAULT_ACCESS.update(at=0.0, retry={})
+        hub.default_access_sweep(hub.now())
+        self.assertIn("browser", self.origin_team()["agents"]["desk"]["can"])
+
     def test_a_linux_agent_moves_to_an_empty_mac_and_keeps_no_user(self):
         self.write_can("scout", user="fleet-old")
         self.joined("mac2", "mac", source=MAC2)

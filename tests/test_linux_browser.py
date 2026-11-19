@@ -38,12 +38,15 @@ class SweepBrowser(unittest.TestCase):
     """S2a: a helper that started again, a task that ended while the helper did not run or under a release that took
     the browser back leaves no Chrome running for long; a browser that an open task holds stays."""
 
-    def sweep(self, open_tasks, windows=(), worker=True, at=None, platform="linux", own=True, answer=0, now=5000.0):
+    def sweep(self, open_tasks, windows=(), worker=True, at=None, platform="linux", own=True, answer=0, now=5000.0,
+              can=("shell", "browser"), gone=None, state=("inactive", "inactive")):
         """One call on a stand-in helper. `windows` are tmux's lines "<name>\\t<needs>", given only to the right
         list-windows; None is a tmux that does not answer, "gone" a session that is not there. `answer` is systemd's
-        exit code for each stop. Returns (the stops asked for, when the helper counts its last sweep)."""
+        exit code for each stop, and `state` what its is-active says of each unit. Returns (the stops asked for, when
+        the helper counts its last sweep)."""
         helper = types.SimpleNamespace(open_tasks=open_tasks, worker=worker, browser_at=at, session="fleet-ivy",
-                                       own_user=lambda: own)
+                                       own_user=lambda: own, conf={"can": list(can)},
+                                       browser_data_gone=lambda: (gone if gone is not None else []).append(1))
 
         def tmux(*args):
             if args != ("list-windows", "-t", "=fleet-ivy:", "-F", "#{window_name}\t#{@fleet_needs}"):
@@ -54,10 +57,16 @@ class SweepBrowser(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 1, "", "can't find session: fleet-ivy")
             return subprocess.CompletedProcess(args, 0, "".join(w + "\n" for w in windows), "")
         stops = []
+
+        def run(argv, **_):
+            if argv[:3] == ["systemctl", "--user", "is-active"]:
+                said = dict(zip(fleet.lifecycle.BROWSER_UNITS, state))[argv[3]]
+                return subprocess.CompletedProcess(argv, 0 if said == "active" else 3, said + "\n", "")
+            stops.append(argv)
+            return subprocess.CompletedProcess(argv, answer, "", "Failed to connect to bus")
         with patch.object(fleet, "tmux", tmux), patch.object(fleet.sys, "platform", platform), \
                 patch.object(fleet.time, "monotonic", lambda: now), contextlib.redirect_stdout(io.StringIO()):
-            fleet.Helper.sweep_browser(helper, stop=lambda argv, **_: stops.append(argv) or
-                                       subprocess.CompletedProcess(argv, answer, "", "Failed to connect to bus"))
+            fleet.Helper.sweep_browser(helper, stop=run)
         return stops, helper.browser_at
 
     def test_the_units_that_no_open_task_holds_stop(self):
@@ -100,6 +109,50 @@ class SweepBrowser(unittest.TestCase):
         self.assertEqual((stops, at), (STOPS, 5000.0 - fleet.PLACES_EVERY + 60))
         self.assertEqual(self.sweep(["T-1"], [], at=at, now=5059.0), ([], at))
         self.assertEqual(self.sweep(["T-1"], [], at=at, now=5060.0)[0], STOPS)
+
+    def test_an_untick_takes_the_agents_own_browser_data_away_once_its_units_ended(self):
+        """The owner, 18 November 2026: "Yes, delete them". An agent whose Browser box is off keeps no Chrome profile
+        (its cookies and sign-ins), no browser tool and no browser unit, once no open task holds its units and systemd
+        says that both have ended (Chrome writes its cookies as it ends); the fleet's Node stays, so does a package
+        that an MCP server of the owner's names too, and so does every folder of the agent's own home: a project of its
+        own called "browser" too. A stop that systemd did not take, an open browser task, and a Browser box that is on
+        delete nothing; a unit that has not ended yet deletes nothing until the sweep a minute later."""
+        for kwargs, deleted in ((dict(can=("shell",)), 1), (dict(can=("shell",), answer=1), 0),
+                                (dict(can=("shell",), windows=["T-1\tbrowser"]), 0), ({}, 0),
+                                (dict(can=("shell",), state=("failed", "inactive")), 1),
+                                (dict(can=("shell",), state=("inactive", "deactivating")), 0),
+                                (dict(can=("shell",), state=("active", "inactive")), 0)):
+            gone = []
+            self.sweep(["T-1"], gone=gone, **kwargs)
+            self.assertEqual(len(gone), deleted, kwargs)
+        self.assertEqual(self.sweep(["T-1"], can=("shell",), state=("deactivating", "inactive")),
+                         (STOPS, 5000.0 - fleet.PLACES_EVERY + 60))
+        h = helper(dict(CLAUDE, can=["shell"]))
+        home = os.path.expanduser("~")
+        made = [os.path.join(fleet.browser_profile(), "Default", "Cookies"),
+                os.path.join(fleet.package_folder(fleet.BROWSER_MCP_PACKAGE), "ready.json"),
+                os.path.join(fleet.programs_dir(), "node", "bin", "node"),
+                os.path.join(home, ".config", "systemd", "user", "fleet_browser.service"),
+                fleet.Helper.clears_file(h),
+                os.path.join(home, "browser", "Default", "Cookies")]          # the agent's own project
+        for path in made:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").close()
+        calls, call = systemd()
+        owners = {"devtools": {"package": dict(fleet.BROWSER_MCP_PACKAGE), "tools": ["take_snapshot"]}}
+        with patch.object(fleet, "systemctl_user", call), patch.object(fleet.lifecycle, "tool_catalog",
+                                                                       lambda team: owners):
+            fleet.Helper.browser_data_gone(h, team={"mcp": {}})     # the owner's own MCP server runs that package
+        self.assertEqual((os.path.exists(made[0]), os.path.exists(made[1])), (False, True))
+        h.said.clear()
+        with patch.object(fleet, "systemctl_user", call):
+            fleet.Helper.browser_data_gone(h, team={})
+        self.assertEqual([os.path.exists(p) for p in made], [False, False, True, False, False, True])
+        self.assertIn(("daemon-reload",), calls)
+        self.assertEqual(h.said, ["its Browser box is off: its browser tool went from this server"])
+        h.said.clear()
+        fleet.Helper.browser_data_gone(h, team={})                   # nothing there: nothing said
+        self.assertEqual(h.said, [])
 
     def test_nothing_is_decided_on_what_is_not_known(self):
         # Before the first poll, a worker's hub that names no open task, a tmux that does not answer, a Mac (whose
