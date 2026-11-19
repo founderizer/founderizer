@@ -551,7 +551,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=site.example.test -keyout /s
        "chown founderizer-egress: /var/lib/founderizer-egress/policy.json")
     check = sh(f"setpriv --reuid=founderizer-egress --regid=founderizer-egress --init-groups -- /usr/bin/python3 -I "
                f"{vault.EGRESS_SAFE} egress --config {vault.EGRESS_CONF} --check")
-    got["later policy: check"] = (check.returncode, (check.stdout + check.stderr).strip()[-300:])
+    # the message is 431 characters; a cut of 300 left out its start, which the test reads (seen 19 November 2026)
+    got["later policy: check"] = (check.returncode, (check.stdout + check.stderr).strip()[-1000:])
     sh("rm -f /var/lib/founderizer-egress/policy.json")
     got["listeners"] = sh("ss -Hltnu | awk '{print $5}' | sort -u").stdout.split()
     got["gate output"] = open("/tmp/gate.out").read()[-3000:]

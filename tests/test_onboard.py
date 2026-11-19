@@ -552,7 +552,9 @@ class PrepareRuntime(Base):
         self.assertEqual({k: onboard.kv(out)[k] for k in ("exe", "version", "rc", "logged_in")},
                          {"exe": str(local), "version": "9.9.9 (Tool)", "rc": "0", "logged_in": "yes"})
         self.assertNotIn("example.com", out)
-        for status, signed in (("Logged in using ChatGPT (owner@example.com)", "yes"), ("Not logged in", "no")):
+        # the third is the newer Codex's own word for a key (lifecycle.CODEX_KEEPS_SIGN_IN): it is a sign-in too
+        for status, signed in (("Logged in using ChatGPT (owner@example.com)", "yes"), ("Not logged in", "no"),
+                               ("API key configured - a-key-of***count (owner@example.com)", "yes")):
             tool(local, status)
             out = probe("codex")
             self.assertEqual(onboard.kv(out)["signed_in"], signed)

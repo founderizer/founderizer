@@ -2329,6 +2329,28 @@ def screen_codex(conf, name):
     return program if program and os.path.isfile(program) else None
 
 
+# What `codex login status` prints for a sign-in that the machine keeps. Measured on 19 November 2026 in homes with
+# made-up sign-ins: Codex 0.163.0 says "Logged in using ChatGPT" and "Logged in using an API key - ..."; the ChatGPT
+# app's own Codex 0.169.0-alpha.11.1 says "Logged in using ChatGPT" and, for a key, "API key configured - ..." with
+# a second line "Authentication is checked when you send a request." Both say "Not logged in" for none. Both end
+# with status 0 for a sign-in and 1 for none, which no reader here asks.
+CODEX_KEEPS_SIGN_IN = ("Logged in", "API key configured")
+
+
+def codex_keeps_sign_in(text):
+    """Whether these words of `codex login status` say that the machine keeps a sign-in of Codex: the ONE reading of
+    that command's words for the machine's reading (Lifecycle.runtime), the Mac's ChatGPT reading (Lifecycle.chatgpt)
+    and the health check (verify.py). onboard.CODEX_STATUS is the same rule in the shell of a machine that has no
+    code of ours yet, and the Mac installer has its own (MacSittingRead.chatGPTSignedIn in app/, which still takes
+    "Logged in" alone: with a key it asks for the ChatGPT app's own sign-in).
+
+    A key is a sign-in here, as it was while Codex called it "Logged in using an API key". While only "Logged in"
+    counted, an agent with a key read as signed out on a Codex that says "API key configured": the hub refused its
+    switch to Codex, and the hub holds the work of an agent that reads so. False for no words: each reader says what
+    a silence is for it."""
+    return any(word in text for word in CODEX_KEEPS_SIGN_IN) and "Not logged in" not in text
+
+
 # Where the helpers of one OS user leave the word of the newest account read of the screen runtime that gave an
 # answer (leave_screen_word), for the one reader that has no account read of its own: a Mac's server service,
 # whose reading says whether the ChatGPT app is signed in (Lifecycle.chatgpt). All agents of a Mac run as that
@@ -3527,7 +3549,7 @@ class Lifecycle:
             return False
         _, out, err = self.run([CHATGPT_CODEX, "login", "status"])
         text = out + err
-        return "Logged in" in text and "Not logged in" not in text and screen_word(self.home, self.clock()) is not True
+        return codex_keeps_sign_in(text) and screen_word(self.home, self.clock()) is not True
 
     def remember_browser(self, connected):
         """Leave the reading of Chrome where `fleet.py verify` reads it: over SSH it cannot read it, as a sign-in
@@ -3664,7 +3686,7 @@ class Lifecycle:
             code, out, err = self.run([asked, "login", "status"])
             text = out + err
             if text.strip():
-                result["signed_in"] = "Logged in" in text and "Not logged in" not in text
+                result["signed_in"] = codex_keeps_sign_in(text)
         elif name == "claude":
             code, out, _ = self.run([exe, "auth", "status"])
             try:

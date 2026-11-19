@@ -757,6 +757,7 @@ class Readings(unittest.TestCase):
         which test_usage holds to the collector's answers)."""
         signed_in = (0, "Logged in using ChatGPT\n", "")
         self.assertIs(self.chatgpt(True, signed_in), True)
+        self.assertIs(self.chatgpt(True, (0, "API key configured - a-key-of***count\n", "")), True)   # a newer Codex
         self.assertIs(self.chatgpt(True, (1, "Not logged in\n", "")), False)
         self.assertIs(self.chatgpt(False, (0, "", "")), False)        # no app
         self.assertIs(self.chatgpt(True, (1, "", "")), False)         # silence gives no agent a screen

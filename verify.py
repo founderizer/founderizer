@@ -44,8 +44,8 @@ import time
 import urllib.error
 import urllib.request
 
-from lifecycle import (CONFIG_BRANCH, checkout_branch, desktop_items, desktop_path, exe, runtime_fact, shown_name,
-                       signed_in_path)
+from lifecycle import (CONFIG_BRANCH, checkout_branch, codex_keeps_sign_in, desktop_items, desktop_path, exe,
+                       runtime_fact, shown_name, signed_in_path)
 
 # PRODUCT.md 4.1: these ids and nothing else. The order is the order of the readable lines.
 CHECKS = ("services", "hub_answers", "owner_claimed", "tailnet", "firewall", "clock", "disk",
@@ -818,7 +818,7 @@ class Verify:
             argv = self.as_user(user, [path, "login", "status"])
             _code, out, err = self.run(argv) if argv else (1, "", "")
             text = (out or "") + (err or "")
-            return "Logged in" in text and "Not logged in" not in text if text.strip() else None
+            return codex_keeps_sign_in(text) if text.strip() else None
         if runtime == "claude":
             argv = self.as_user(user, [path, "auth", "status"])
             _code, out, _err = self.run(argv) if argv else (1, "", "")

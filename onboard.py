@@ -423,8 +423,9 @@ echo fleet-claude-auth=1; echo rc=$rc; echo logged_in=$li"""
 # The PATH of every worker service (`fleet.py service`). With it, preparation finds the same runtime command as the
 # helper's status commands, which also try ~/.local/bin, the first folder here.
 SERVICE_PATH = "$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# The words are lifecycle.CODEX_KEEPS_SIGN_IN: a newer Codex says "API key configured" for a key, which is a sign-in.
 CODEX_STATUS = ('s=$("$exe" login status 2>&1 || true); case "$s" in *"Not logged in"*) echo signed_in=no;; '
-                '*"Logged in"*) echo signed_in=yes;; *) echo signed_in=unknown;; esac')
+                '*"Logged in"*|*"API key configured"*) echo signed_in=yes;; *) echo signed_in=unknown;; esac')
 
 
 def runtime_probe(rt):
