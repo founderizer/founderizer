@@ -15,6 +15,7 @@ In-process hub, no machine, no tmux, no provider and no AI call. The helper side
 the exact `claude` invocation and what it prints cannot be checked here, because checking them means signing in with a
 real credential. That is the operator's first live step, and `runtime_login_command` keeps it to one line.
 """
+import hashlib
 import http.client
 import json
 import os
@@ -258,7 +259,8 @@ class Signin(Machines):
         """The agents of one OS user keep one sign-in of each provider, as the agents of a Mac do, and each helper
         keeps its own word of the account read. After a sign-in from one agent's row, a second agent of that user
         read "signed out" for up to five minutes more, and a press of Sign in on its row started a second sign-in.
-        So each end "done" asks those agents for their status now, by either way that a sign-in ends."""
+        So each end "done" asks those agents for their status now, by each way that a sign-in ends: the machine's
+        status or its helper's report for a sign-in job, and a status or the service's report for a server job."""
         hub.TEAM["agents"].update(
             ivy={"role": "worker", "runtime": "claude", "machine": "box", "can": ["shell"]},
             nova={"role": "worker", "runtime": "codex", "machine": "box", "can": ["shell"]},
@@ -310,6 +312,21 @@ class Signin(Machines):
         says("solo", 501, codex=True)
         hub.end_signed_in_waits("solo")
         self.assertEqual((self.job(jid)["state"], asked()), ("done", ["ivy"]))
+        # the server's own service reports the job done, where no status came first: no reading finds that job open
+        # later, so its report asks each agent beside it of that OS user too. A job that fails asks only its own agent
+        hub.q("INSERT INTO server_keys(server,sha256,created) VALUES('box',?,0)",
+              (hashlib.sha256(b"key-of-box").hexdigest(),))
+
+        def service(jid, **fields):         # that server's own service: from its address, with its key
+            return self.request(f"/server/box/jobs/{jid}", fields, source="127.0.0.3", headers={
+                "Content-Type": "application/json", "X-Fleet-Client": "server-test",
+                "Authorization": "Bearer key-of-box"})
+
+        for state, detail, wanted in (("done", None, ["ivy", "solo"]), ("failed", "Codex printed no link.", ["solo"])):
+            hub.q("DELETE FROM events WHERE kind='status_now'")
+            jid = self.waiting_job(runtime="codex")
+            code, said = service(jid, state=state, step="sign_in", detail=detail)
+            self.assertEqual((code, self.job(jid)["state"], asked()), (200, state, wanted), said)
 
     def test_a_job_that_waits_at_its_sign_in_ends_with_it(self):
         """The sign-in is the last step of an install and of a preparation, so a job parked there is finished. Its
@@ -613,7 +630,6 @@ class NoCredentialKept(Machines):
 
     def test_the_records_table_holds_the_codes_fingerprint_and_not_the_code(self):
         """The owner-command record must still recognise a repeat of the same request_id, so it keeps the SHA-256."""
-        import hashlib
         self.open_one()
         body = self.command(code=CODE)
         self.assertEqual(self.request("/ui/machines/solo/signin/code", body)[0], 200)

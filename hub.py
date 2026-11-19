@@ -60524,6 +60524,11 @@ class Handler(BaseHTTPRequestHandler):
                 if row["kind"] in ("install", "prepare"):
                     status_now(row["agent"])
                     if update["state"] == "done" and update["step"] == "sign_in":
+                        # An install or a preparation always ends done at this step (server.py), with a sign-in that
+                        # its service made itself (Codex), with one that a sign-in job of the hub made, or with none.
+                        # This report closed the job, so no later reading finds it open (end_signed_in_waits): each
+                        # agent beside it of the same OS user is asked here.
+                        signed_in_beside(row["agent"])
                         # The report of the server's own service is an end of a sign-in too (Codex on a server
                         # has no sign-in job of the hub). It does not say whether a sign-in was made (sign_in_resumes).
                         sign_in_resumes(row["agent"], row["runtime"])
