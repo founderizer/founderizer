@@ -1112,7 +1112,12 @@ header carries Latin-1 only). `read_attachment` reads up to 25 MiB and `take_bac
 Mac app reads a copy. The program stops an answer at its limit while it arrives (a `Content-Length`
 above the limit ends it at its headers), so a hub that sends a body with no end cannot fill the
 Mac's memory; this server reads at most the limit and one byte. An answer that is not a success is
-words, never a file: both programs read at most 8 MiB of it, under the same total time. Both write
+words, never a file: both programs read at most 8 MiB of it, under the same total time. The whole
+snapshot (`GET /ui/state`), which a process reads before its first call for the hub's generation,
+has a limit of its own in both programs, 64 MiB (`STATE_MAX`, `Transfer.state`): it is an
+answer that holds a fleet's whole history, and on 19 November 2026 a fleet with about 1,400 tasks
+answered 57 KB more than the 8 MiB of a call, so that each tool refused with "The hub's answer is
+larger than this server reads." Every other answer that is no file keeps the 8 MiB. Both write
 at the path that the agent names: `~` is the home, the folders are made, and a folder takes the
 hub's name of the file. A path with a NUL is refused by each of the three, as the first check on the
 path, before `~` is expanded and before any request: "path cannot hold a NUL character: name a file

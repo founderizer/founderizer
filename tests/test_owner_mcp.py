@@ -4977,6 +4977,28 @@ class Table(unittest.TestCase):
                                            total=total)
                     self.assertEqual(str(caught.exception), lost.format(said), (said, opener.__name__, total))
 
+    def test_a_snapshot_larger_than_a_call_is_still_read(self):
+        """19 November 2026: a fleet's whole snapshot (/ui/state) passed READ_MAX, and each tool refused at its first
+        read, the one of the hub's generation: "The hub's answer is larger than this server reads." The snapshot is
+        an answer that holds a fleet's whole history, so it has a limit of its own; every other answer keeps
+        READ_MAX."""
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix="fleet-state-"))
+        self.addCleanup(shutil.rmtree, str(scratch), True)
+        big = json.dumps({"db": "g1", "pad": "a" * owner_mcp.READ_MAX}).encode()
+
+        class Body(io.BytesIO):
+            status, headers = 200, {"Content-Type": "application/json"}
+
+        def opened(request, timeout=None):
+            return Body(big)
+        with patch.object(owner_mcp.OPENER, "open", opened), patch.object(owner_mcp, "HOME", scratch), \
+                patch.object(owner_mcp, "CLIENT_FILE", scratch / "client"):
+            for path in ("/ui/state", "/ui/state?since=7"):
+                self.assertEqual(owner_mcp.call("GET", path, base="http://127.0.0.1:9").data["db"], "g1", path)
+            with self.assertRaises(owner_mcp.Refused) as caught:
+                owner_mcp.call("GET", "/ui/health", base="http://127.0.0.1:9")
+        self.assertEqual(str(caught.exception), "The hub's answer is larger than this server reads.")
+
     def test_a_file_from_the_hub_is_new_and_follows_no_link(self):
         """write_here with the agent's folder: an exclusive create, which leaves a file, a link and its target as they
         are; with the agent's own file path it replaces that file."""

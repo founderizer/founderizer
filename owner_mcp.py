@@ -77,6 +77,13 @@ OWNER_KEY_KEPT = "X-Fleet-Owner-Key"                # hubsetup.py: the claim's a
 PORT = 8765
 TIMEOUT = 30                            # seconds for one owner-API call
 READ_MAX = 8 * 1024 * 1024              # the largest answer this server reads from the hub
+# The whole snapshot (/ui/state) is an answer that holds a fleet's whole history, and a process of this server
+# reads it before its first call, for the hub's generation (a process of one call, as founderizer-cli call, each
+# time). On 19 November 2026 a fleet with about 1,400 tasks answered 8,445,765 bytes, 57 KB over READ_MAX, and from
+# that minute each tool answered "The hub's answer is larger than this server reads." So that route has a limit of
+# its own, and every other answer that is no file keeps READ_MAX.
+STATE_MAX = 64 * 1024 * 1024
+STATE_ROUTE = "/ui/state"
 BACKUP_MAX = 256 * 1024 * 1024          # hub.py BACKUP_MAX: the largest copy the hub serves
 ATTACH_MAX = 25 * 1024 * 1024           # hub.py ATTACH_MAX: the largest file the owner attaches
 # The three tools that move a file (attach_file, read_attachment, take_backup) read up to the hub's own limit of that
@@ -673,6 +680,8 @@ def _call(method, path, body, base, timeout, limit, mime, extra, total, key):
         headers["Content-Type"] = mime or "application/json"
         headers["X-Fleet-Client"] = client_label()
         headers.update(extra or {})
+    if limit == READ_MAX and path.split("?", 1)[0] == STATE_ROUTE:
+        limit = STATE_MAX           # the snapshot's own limit; a refusal's body below keeps READ_MAX
     request = urllib.request.Request(base + path, data=data, method=method, headers=headers)
     try:
         with OPENER.open(request, timeout=timeout) as answer:
