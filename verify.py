@@ -511,7 +511,7 @@ class Verify:
         if self.platform != "darwin" or not self.agents:
             return None
         tabs = any(runtime_fact(self.runtime_of(name), "browser_tabs") for name in self.agents)
-        items = desktop_items(self.run, self.home, self.me, tabs, self.helper_browser())
+        items = desktop_items(self.run, self.home, self.me, tabs, self.helper_browser(), self.helper_account())
         wanted = {c for name in self.agents for c in (self.conf["agents"][name].get("can") or [])}
         failed = [detail for kind, ref, state, detail in items
                   if state == "failed" and (kind != "capability" or ref in wanted)]      # as the hub's activation counts
@@ -788,6 +788,19 @@ class Verify:
             return state if isinstance(state, bool) and self.now() - float(said["at"]) <= HELPER_READING else None
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             return None
+
+    def helper_account(self):
+        """The account of Claude Code that this Mac's server service read with Chrome (lifecycle.claude_account), which
+        an extension that is not linked must use, or None when it has no such reading of the last HELPER_READING
+        seconds: the line of the helper's own setup check names it, and this one says the same."""
+        try:
+            with open(desktop_path(self.home)) as f:
+                said = json.load(f)
+            account = said.get("claude_account")
+            fresh = self.now() - float(said["at"]) <= HELPER_READING
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return None
+        return account if fresh and isinstance(account, dict) and isinstance(account.get("email"), str) else None
 
     def unread_signin(self, runtimes):
         """Why a sign-in reading of these runtimes was not taken here, and what takes it, as (the words after the

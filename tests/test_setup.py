@@ -549,6 +549,12 @@ class Helper(unittest.TestCase):
         self.connected = False          # on, and not signed in: the runtime's own list of browsers says so
         self.assertEqual(browser(life), ("failed", "Claude's extension is not signed in: sign in to Claude in Chrome on "
                                                    "this Mac, with this Mac's account."))
+        # With Claude Code's own account read, the line names the account and the organization to sign in with.
+        with patch.object(lifecycle, "claude_account", lambda run, exe: {"email": "agent@example.com",
+                                                                         "org": "Example Ventures SL"}):
+            self.assertEqual(browser(life), ("failed", "Claude's extension is not linked to Claude Code: in Chrome on "
+                                                       "this Mac, sign it in as agent@example.com, organization "
+                                                       "Example Ventures SL."))
         with open(os.path.join(self.tmp, "Library", "Application Support", "Google", "Chrome", "Profile 1",
                                "Secure Preferences"), "w") as f:
             f.write("not json")

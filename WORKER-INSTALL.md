@@ -64,7 +64,9 @@ A Mac's join also leaves the file that makes Chrome take Claude's extension from
 Web Store (`server.py join`), unless the owner chose ChatGPT alone for that Mac. Chrome fetches it at its next start and asks
 once, on that Mac's screen, to enable it. It asks on the page only on a profile that has
 started before the file arrived; on a newer one the question waits in no menu at all.
-Then sign the extension in, in that Chrome, to the Claude account of the Mac's agents.
+Then sign the extension in, in that Chrome, to the Claude account of the Mac's agents and its organization:
+the link needs both to be the same as Claude Code's. When the link fails, the manager's card names the account and
+the organization to use.
 Until a Chrome profile has it on and Chrome answers that account, the setup check fails
 the `browser` item of an agent on Claude. A Chrome profile that is removed takes the
 extension with it, and the next start of Chrome fetches it again.

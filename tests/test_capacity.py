@@ -438,7 +438,7 @@ class Capacity(OwnerAPI):
         self.assertEqual((groups[SHARED]["label"], groups[DEVA]["label"]), ("codex-main", "codex-main"))
         self.assertIn("also names", groups[SHARED]["mismatch"])                # counting follows the provider
 
-    def test_the_account_email_is_for_the_owner_and_never_decides_a_group(self):
+    def test_the_account_email_is_for_the_owner_and_the_manager_and_never_decides_a_group(self):
         later = self.baseline()
         mail = lambda reading, email: dict(reading, account_email=email)
         # big and seo's screen share one provider account. deva's other account gives the same email (for example
@@ -482,9 +482,17 @@ class Capacity(OwnerAPI):
                      mail(self.limits(SHARED, 40, later), "owner@example.com"))
         shared = {g["group"]: g for g in hub.capacity_view()["accounts"]}[SHARED]
         self.assertEqual((shared["emails"], len(shared["routes"])), (["owner@example.com", "second@example.com"], 2))
-        text, error = self.call("manager", "see_capacity", {})                   # no agent tool gives it
+        # The manager reads each route's email, which the owner's steps name (the owner, 19 November 2026: "the
+        # manager should know it"); a session that a contact drives never does, and no other agent text gives it.
+        text, error = self.call("manager", "see_capacity", {})
         self.assertFalse(error, text)
-        self.assertNotIn("@example.com", text + hub.overview_text())
+        self.assertIn("(claude@example.com): ", text)
+        self.assertIn("(second@example.com): ", text)
+        self.assertNotIn("@example.com", hub.overview_text())
+        with patch.object(hub, "contact_session", return_value=True):
+            text, error = self.call("manager", "see_capacity", {})
+        self.assertFalse(error, text)
+        self.assertNotIn("@example.com", text)
 
     def test_a_signed_out_route_is_not_available_through_another_routes_reading_of_the_same_account(self):
         later = self.baseline()

@@ -683,7 +683,8 @@ def safe_label(value, default):
 
 def safe_email(value):
     """The account email that the signed-in runtime gave, or None (unknown): at most 254 characters, one @, and no
-    whitespace or control character. It is for the owner only, and it never decides an account group."""
+    whitespace or control character. It is for the owner and the fleet manager (see_capacity, and the account that a
+    Mac's Claude extension needs), and it never decides an account group."""
     return value if isinstance(value, str) and len(value) <= 254 and EMAIL.fullmatch(value) else None
 
 

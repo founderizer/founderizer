@@ -83,6 +83,8 @@ from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, DEPLOY_APP_NOTE, GITHUB_T
 from lifecycle import SKILL_FILE, SKILL_NAME, SKILLS, skill_front, skill_rows, skills_text   # design v4 D: agents' skills
 from lifecycle import CONFIG_FILES, floor_path, keep_floor, may_take    # DevOps plan 0.1: the check of every move
 from lifecycle import KEY_SUFFIXES, SCREEN_COMMANDS, key_env, start_form    # DevOps plan 0.2: data stops being code
+from lifecycle import BRIDGE_HOST, ORG_NAME     # a Mac's Claude account for its extension's link (desktop_account)
+from usage import safe_email
 import lifecycle
 import acp_programs     # the AI providers build, D31: an ACP session's words for its tools (acp_tool_words)
 
@@ -11009,9 +11011,11 @@ def gb(size):
     return f"{size / 1024 ** 3:.1f}"
 
 
-def capacity_text(view, filters, needs, restricted=False, parent=None, caller=None):
+def capacity_text(view, filters, needs, restricted=False, parent=None, caller=None, emails=False):
     """see_capacity as text. restricted (a lead): only the task IDs of its own scope appear, in every line - its
-    session's task and that task's subtasks; the agent's other open work is a count."""
+    session's task and that task's subtasks; the agent's other open work is a count. emails: each route names the
+    email of its account, which the owner's steps need (the owner, 19 November 2026: "the manager should know it");
+    never in a session that a contact drives (t_see_capacity)."""
     t0 = view["time"]
 
     def visible(tid):
@@ -11029,7 +11033,8 @@ def capacity_text(view, filters, needs, restricted=False, parent=None, caller=No
                 (f"; the hub tries again at {clock(x['retry_at'])})" if x["retry_at"] else ")"))
 
     def route_text(r):
-        text = f"{r['route']} {r['runtime']}, account {short(r['group']) or 'none'}: {r['state']}"
+        email = f" ({r['account_email']})" if emails and r.get("account_email") else ""
+        text = f"{r['route']} {r['runtime']}, account {short(r['group']) or 'none'}{email}: {r['state']}"
         text += until(r) if r["state"] == "limited" else ""
         text += f". {r['reason']}" if r["reason"] else ""
         return text + (f" Reading {span(t0 - r['read_at'])} old (stale)." if r["stale"] and r["read_at"] else "")
@@ -11338,7 +11343,8 @@ def t_see_capacity(agent, a):
         names = [n for n in agents() if n != agent]
     filters = ", ".join(f"{k} {v}" for k, v in (("expertise", expertise), ("needs", needs), ("login", login)) if v)
     return capacity_text(capacity_view(names, expertise, needs, login), filters, needs,
-                         restricted=parent is not None, parent=parent, caller=agent)
+                         restricted=parent is not None, parent=parent, caller=agent,
+                         emails=not contact_session(agent))
 
 
 SEARCH_RESULTS = (5, 20)        # search_knowledge: the files of one result, by default and at most
@@ -44545,8 +44551,23 @@ def desktop_status(value):
         return None
     if not isinstance(value, dict):
         raise ValueError("desktop must be an object or null")
-    return {k: _optional(value.get(k), bool)
-            for k in ("locked", "setup", "chrome", "extension", "browser", "chatgpt", "chatgpt_app")}
+    return dict({k: _optional(value.get(k), bool)
+                 for k in ("locked", "setup", "chrome", "extension", "browser", "chatgpt", "chatgpt_app", "bridge")},
+                claude_account=desktop_account(value.get("claude_account")))
+
+
+def desktop_account(value):
+    """`claude_account` of a Mac's desktop reading (lifecycle.claude_account): {"email", "org"}, or None. Its words go
+    into the manager's message and the owner's steps (mac_desktop_sweep), so a value that is not an email and an
+    organization name of plain words is refused, as a wrong value of each other field of the reading is."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or safe_email(value.get("email")) is None:
+        raise ValueError("desktop claude_account must be an object with an email, or null")
+    org = value.get("org")
+    if org is not None and not (isinstance(org, str) and ORG_NAME.fullmatch(org)):
+        raise ValueError("desktop claude_account org must be an organization name or null")
+    return {"email": value["email"], "org": org}
 
 
 def macos_update_status(value):
@@ -47319,6 +47340,76 @@ CHATGPT_SIGN_IN = ("A new sign-in of Codex for an agent of that Mac puts this ri
 CHATGPT_INSTALL = "Founderizer's installer at that Mac brings the app, and it is the owner's own step at that Mac."
 CHATGPT_EITHER = ("With the ChatGPT app on that Mac, a new sign-in of Codex there puts this right, and it is the "
                   "owner's own step; a Mac without the app needs the app first, at that Mac.")
+# The words of mac_desktop_sweep for a Mac whose Chrome answers no Claude Code (`browser` false): they name the account
+# and the organization of Claude Code there, so that a change of that account is news again (lifecycle.claude_account).
+EXTENSION_UNLINKED = "Claude's extension in Chrome is not linked to Claude Code there"
+# mac_desktop_sweep's records of a Mac, by its name: a rename moves them, a removal deletes them. desktop_linked holds
+# the account that its extension last worked with, which a new Mac of the same name never had.
+DESKTOP_KV = ("desktop_seen:", "desktop_told:", "desktop_click:", "desktop_linked:")
+
+
+def account_words(account):
+    """An account of a Mac's desktop reading (desktop_account) as the manager and the owner read it."""
+    return account["email"] + (f", organization {account['org']}" if account.get("org") else "")
+
+
+def unlinked_words(account):
+    """The words of an extension that is not linked, with the account that Claude Code of that Mac is signed in to."""
+    return EXTENSION_UNLINKED + (f", which is signed in as {account_words(account)}" if account else "")
+
+
+def unlinked_steps(name, account, linked, blocked=False, sharers=()):
+    """What the manager hears after unlinked_words: the cause and the owner's exact steps with the account and the
+    organization to use. linked: the account that the extension last worked with, when Claude Code changed account
+    since; then signing Claude Code in again as that account is the other way, for when the new one is not meant for
+    this Mac. blocked: the Mac's last reading could not reach the link server (lifecycle.bridge_reachable). It is a
+    note after the steps and never in their place: a Mac behind a proxy reads it so while Chrome may reach the server,
+    and a reading that changes from one time to the next would hold back the message, which waits for the same words
+    twice. sharers: the agents on other machines with the same Claude account (account_sharers), whose sessions could
+    reach this Chrome, since the link goes by account (WORKER-INSTALL.md: a Claude account of its own for each Mac).
+
+    Why (19 November 2026): the hub said only "signed out", and the manager could not read the account (see_capacity
+    gave none then). Its five cards in 19 days named no account, and the last one blamed Claude Desktop and macOS's
+    Automation settings, which are no part of this link. Claude Code there had changed account meanwhile, to an
+    account that five agents shared."""
+    changed = bool(linked and account and linked != account)
+    before = (f"When the extension last worked there, Claude Code was signed in as {account_words(linked)}: the "
+              f"extension most likely still uses that account. If that is the account meant for this Mac, the other "
+              f"way is Use another account on the page of that Mac's agent in the app, signed in to claude.ai as "
+              f"{account_words(linked)}: then Chrome needs no step. " if changed else "")
+    shared = (f"{account['email']} is also the Claude account of {', '.join(shown_role(n) for n in sharers)} on "
+              f"other machines. The link "
+              f"goes by account, so their sessions could reach this Chrome and its signed-in sites, and the install "
+              f"guide asks for a Claude account of its own for each Mac: put that choice on the card too. "
+              if account and sharers else "")
+    want = account_words(account) if account else \
+        "the account and organization of Claude Code on that Mac (its agent's account email is in see_capacity)"
+    log_in = (f"Log in as {account['email']} and select the organization {account['org']}." if account and
+              account.get("org") else f"Log in as {account['email']} and select its organization." if account else
+              "Log in with that account and select that organization.")
+    return (f"{before}{shared}Its tasks in Chrome wait. The extension links to Claude Code only while it is signed in "
+            f"to the same claude.ai account and organization: it is signed out, uses another account or organization, "
+            f"or lost its link. Only hands at that Mac, or the app's Screen Sharing button, can put this right: raise "
+            f"it for the owner with raise_needs_you, with these steps. 1. In Chrome on {name}, open Claude's "
+            f"extension and read which account and organization it uses. 2. If it is signed in, but not as {want}, "
+            f"log out in the extension's settings. 3. {log_in} 4. If it already used that account and organization, "
+            f"quit Chrome and open it again. Claude Desktop and macOS's Automation settings are no part of this link: "
+            f"leave them out of the steps."
+            + (f" Also, the Mac's last reading could not reach {BRIDGE_HOST}, Anthropic's server that links the two, "
+               f"on port 443. If the steps do not put it right, the Mac's network, a firewall or a filter blocks that "
+               f"server, and the owner allows connections from {name} to it. Keep that address in the card's details "
+               f"and out of its steps: raise_needs_you refuses a sign-in beside a site that is no AI provider's."
+               if blocked else ""))
+
+
+def account_sharers(server, email):
+    """The agents on other machines whose Claude account reading names this email (usage_routes): Claude's extension
+    on this server links to every session of that account. An agent in setup counts too: its activation brings its
+    sessions on the same account."""
+    here, email = set(server_agents(server)), email.lower()
+    return sorted(n for n in agents() if n not in here and any(
+        runtime == "claude" and str((reading or {}).get("account_email") or "").lower() == email
+        for _route, runtime, reading in usage_routes(n)))
 
 
 def mac_desktop_sweep():
@@ -47326,7 +47417,10 @@ def mac_desktop_sweep():
     is reopening Chrome is no news. A Mac whose owner sits at it, and a Mac with no agent that works in its Chrome, are
     none either. macOS's setup screens go to the Mac's screen agent first (setup_click). A signed-out ChatGPT reaches
     the manager in the same way, with words of its own: the owner's sign-in of Codex puts it right where the Mac has
-    the ChatGPT app, and a Mac that says that it has no such app gets the words of that."""
+    the ChatGPT app, and a Mac that says that it has no such app gets the words of that. A Chrome that answers no
+    Claude Code reaches the manager with its cause, an extension that is not signed in to Claude Code's account and
+    organization, with that account, the owner's exact steps and a note when the Mac could not reach the link server
+    (unlinked_steps). Those words name the account, so a change of Claude Code's account is news again."""
     for name in server_names():
         st = q1("SELECT data, reported FROM server_status WHERE server=?", (name,))
         desktop = ((json.loads(st["data"]).get("security") or {}).get("desktop") or {}) if st else {}
@@ -47336,12 +47430,20 @@ def mac_desktop_sweep():
         screen = any("screen" in (agents()[a].get("can") or []) for a in active)
         if not desktop or not (browser or screen) or (setup and setup["state"] in ("add", "waiting")):
             continue
+        account = desktop.get("claude_account") if browser else None
+        if account and desktop.get("browser") is True:
+            # The account that the extension works with now: after a change of Claude Code's account, the manager
+            # hears which account the extension most likely still uses (unlinked_steps).
+            linked = json.dumps(account, sort_keys=True)
+            if kv_get(f"desktop_linked:{name}") != linked:
+                kv_set(f"desktop_linked:{name}", linked)
+        unlinked = browser and desktop.get("browser") is False
         words = ("the setup screens of macOS are open on its screen, as after a macOS update"
                  if desktop.get("setup") else
                  "its screen is locked" if desktop.get("locked") else
                  "Claude's extension is off in Chrome" if browser and desktop.get("extension") is False else
                  "Chrome does not run" if browser and desktop.get("extension") and desktop.get("chrome") is False else
-                 "Claude's extension in Chrome is signed out" if browser and desktop.get("browser") is False else
+                 unlinked_words(account) if unlinked else
                  CHATGPT_NO_APP if screen and desktop.get("chatgpt") is False and desktop.get("chatgpt_app") is False
                  else CHATGPT_SIGNED_OUT if screen and desktop.get("chatgpt") is False else None)
         if not desktop.get("setup") and kv_get(f"desktop_click:{name}"):
@@ -47373,9 +47475,14 @@ def mac_desktop_sweep():
             # which of the two it is, and a server service that does not say it yet gets the words of both.
             route = (CHATGPT_INSTALL if words == CHATGPT_NO_APP else
                      CHATGPT_SIGN_IN if desktop.get("chatgpt_app") is True else CHATGPT_EITHER)
+            linked = kv_get(f"desktop_linked:{name}")
             emit(manager_name(), "say", f"[hub] On the Mac {name}, {words}. Its tasks on its screen wait. {route} "
                                         f"Raise it for the owner with raise_needs_you."
                  if words in (CHATGPT_SIGNED_OUT, CHATGPT_NO_APP) else
+                 f"[hub] On the Mac {name}, {words}. "
+                 + unlinked_steps(name, account, json.loads(linked) if linked else None, desktop.get("bridge") is False,
+                                  account_sharers(name, account["email"]) if account else ())
+                 if words.startswith(EXTENSION_UNLINKED) else
                  f"[hub] On the Mac {name}, {words}{click}. Its tasks in Chrome and on its screen wait. Only hands at that "
                  f"Mac, or the app's Screen Sharing button, can put this right: raise it for the "
                  f"owner with raise_needs_you.")
@@ -48873,7 +48980,7 @@ def remove_server(server, body):
         DB.execute("DELETE FROM first_stores WHERE machine=?", (server,))      # C9: only this opens its keep again
         DB.execute("UPDATE server_jobs SET state='canceled', prompt=NULL, updated=? WHERE server=? AND state IN "
                    "('queued','running','needs_owner')", (t0, server))
-        for prefix in KEY_SWAP_KV:      # the key swap's records of the server, and an item that asks for its word
+        for prefix in KEY_SWAP_KV + DESKTOP_KV:     # the key swap's and the desktop sweep's records of the server
             DB.execute("DELETE FROM kv WHERE k=?", (prefix + server,))
         DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE key_swap_server=? AND answer IS NULL",
                    ("Closed by the hub: the server left the fleet", t0, "hub", server))
@@ -50130,8 +50237,9 @@ def rename_machine_rows(old, new):
         DB.execute(f"DELETE FROM {table} WHERE {column}=?", (new,))
     for table, column in MACHINE_COLUMNS:
         DB.execute(f"UPDATE {table} SET {column}=? WHERE {column}=?", (new, old))
-    # the key swap's records of the server: its reading, its asks, a press, and the item that asks for its word
-    for prefix in KEY_SWAP_KV:
+    # the key swap's records of the server: its reading, its asks, a press, and the item that asks for its word; and
+    # the desktop sweep's (DESKTOP_KV)
+    for prefix in KEY_SWAP_KV + DESKTOP_KV:
         DB.execute("DELETE FROM kv WHERE k=?", (prefix + new,))
         DB.execute("UPDATE kv SET k=? WHERE k=?", (prefix + new, prefix + old))
     DB.execute("UPDATE needs SET key_swap_server=? WHERE key_swap_server=?", (new, old))

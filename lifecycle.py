@@ -1624,6 +1624,52 @@ def browser_connected(exe):
                for b in browsers)
 
 
+# Anthropic's link server between Claude's extension in Chrome and Claude Code. The extension links to Claude Code
+# only through it, and only while it is signed in to the same claude.ai account and organization as Claude Code;
+# else Claude Code's browser tools say "Browser extension is not connected" (code.claude.com/docs/en/chrome, read on
+# 19 November 2026). Claude Desktop's own link program in Chrome is no part of it: on the owner's Mac Studio it ran
+# on 28 October 2026 too, the day a browser task worked there.
+BRIDGE_HOST = "bridge.claudeusercontent.com"
+# An organization's name as the manager reads it in the owner's steps (desktop_account): plain words, no markup. With
+# "@": claude.ai names a personal organization "<email>'s Organization", and an account in a team organization and in
+# its personal one is the case where the organization decides the link.
+ORG_NAME = re.compile(r"[\w .,&'()+@-]{1,120}")
+
+
+def claude_account(run, exe):
+    """The account and the organization that Claude Code is signed in to on this machine, from its own `auth status`
+    (no model turn): {"email", "org"}, or None when it is not signed in or names no valid email. Claude's extension
+    links to Claude Code only when it is signed in to this same account and organization, so these are the words of
+    the owner's step at the Mac (hub.mac_desktop_sweep). `org` is None for a name that is not plain words.
+
+    Why (19 November 2026): the extension on the owner's Mac Studio stayed unlinked for 19 days through five cards,
+    and no card named the account to sign in with. Meanwhile Claude Code there changed account, which leaves an
+    extension that worked on the old one."""
+    from usage import safe_email        # usage imports this module, so not at the top
+    code, out, _ = run([exe, "auth", "status"])
+    try:
+        said = json.loads(out) if code == 0 else None
+    except ValueError:
+        return None
+    if not isinstance(said, dict) or said.get("loggedIn") is not True or safe_email(said.get("email")) is None:
+        return None
+    org = said.get("orgName")
+    return {"email": said["email"], "org": org.strip() if isinstance(org, str) and ORG_NAME.fullmatch(org.strip())
+            else None}
+
+
+def bridge_reachable(connect=socket.create_connection):
+    """Whether this Mac reaches Anthropic's link server (BRIDGE_HOST) on port 443 directly: True or False. It is the one
+    cause of an unlinked extension that no sign-in puts right, so it is read only while no browser answers. A Mac whose
+    traffic goes through a proxy reads False while Chrome may reach it, so it is a note beside the sign-in steps, never
+    in their place (hub.unlinked_steps)."""
+    try:
+        connect((BRIDGE_HOST, 443), timeout=5).close()
+        return True
+    except OSError:
+        return False
+
+
 def console_session(run):
     """(who is at this Mac's console, whether its screen is locked), each None when it could not be read, and None
     for the whole reading when the console did not answer."""
@@ -1723,10 +1769,11 @@ def awake_item(run):
     return ("mac", "awake", "ok" if system == "never" else "not_verified" if system == "unknown" else "failed", words)
 
 
-def desktop_items(run, home, user, tabs, connected=None):
+def desktop_items(run, home, user, tabs, connected=None, account=None):
     """What a Mac's desktop can do now, as setup check items: the one reading of it, which the helper's setup check and
     `fleet.py verify` both give. tabs: the runtime works in tabs of Chrome through Claude's extension. connected: what
-    browser_connected read in the login session, None where nobody read it."""
+    browser_connected read in the login session, None where nobody read it. account: Claude Code's account there
+    (claude_account), which an extension that is not linked must use, None where nobody read it."""
     session = session_item(run, user)
     ready = session[2] == "ok"
     setup = session[3] if session[3] == SETUP_SCREENS else None         # the screens cover the session's own screen
@@ -1741,7 +1788,10 @@ def desktop_items(run, home, user, tabs, connected=None):
              "Claude's extension is off: press Enable Extension in Chrome on this Mac." if extension is False else
              "Claude's extension is not in Chrome on this Mac: restart Chrome, then press Enable Extension."
              if extension is None else
-             "Claude's extension is not signed in: sign in to Claude in Chrome on this Mac, with this Mac's account."),
+             "Claude's extension is not signed in: sign in to Claude in Chrome on this Mac, with this Mac's account."
+             if not account else
+             f"Claude's extension is not linked to Claude Code: in Chrome on this Mac, sign it in as {account['email']}"
+             + (f", organization {account['org']}." if account.get("org") else ".")),
             ("capability", "screen", "not_verified" if ready else "failed",
              "The session is ready, but Fleet cannot check the macOS screen recording and accessibility "
              "permissions that screen control needs." if ready else
@@ -3484,7 +3534,7 @@ class Lifecycle:
                 s["firewall"] = "active" if "enabled" in out.lower() else "inactive"
             if self.agent is None:      # one reading for each Mac: the server service's, and no agent's
                 s["desktop"] = self.desktop()
-                self.remember_browser(s["desktop"]["browser"])
+                self.remember_browser(s["desktop"]["browser"], s["desktop"]["claude_account"])
                 code, out, _ = self.run(["sw_vers", "-productVersion"])
                 s["macos_update"] = macos_update(out.strip() if code == 0 else None)
         else:
@@ -3524,14 +3574,22 @@ class Lifecycle:
         `chatgpt_app` says whether this Mac has the ChatGPT app with its copy of Codex at all: `chatgpt` is false
         without it and also for an app that is signed out, and only the first of the two needs the app's install at
         this Mac (Founderizer's installer); the second needs a sign-in of Codex, which the owner starts from
-        Founderizer on their own computer."""
+        Founderizer on their own computer.
+
+        `claude_account` is the account and the organization that the extension must be signed in to for Claude Code
+        of this Mac (claude_account), and `bridge` whether this Mac reaches the server that links the two, read only
+        while no browser answers (bridge_reachable): with them the manager names the cause and the owner's exact step,
+        where it guessed before."""
         console = console_session(self.run)
         code, _, _ = self.run(["pgrep", "-x", "Google Chrome"])
         extension = chrome_extension(self.home)
         # Its answer means something only for a runtime that is signed in: a signed-out one reads no browser at all.
         claude = self.exe("claude") if extension and self.runtime("claude")["signed_in"] else None
+        browser = browser_connected(claude) if claude else None
         return {"locked": console[1] if console else None, "setup": setup_screens(self.run), "chrome": code == 0,
-                "extension": extension, "browser": browser_connected(claude) if claude else None,
+                "extension": extension, "browser": browser,
+                "claude_account": claude_account(self.run, claude) if claude else None,
+                "bridge": bridge_reachable() if browser is False else None,
                 "chatgpt": self.chatgpt(), "chatgpt_app": os.path.exists(CHATGPT_CODEX)}
 
     def chatgpt(self):
@@ -3551,11 +3609,12 @@ class Lifecycle:
         text = out + err
         return codex_keeps_sign_in(text) and screen_word(self.home, self.clock()) is not True
 
-    def remember_browser(self, connected):
+    def remember_browser(self, connected, account=None):
         """Leave the reading of Chrome where `fleet.py verify` reads it: over SSH it cannot read it, as a sign-in
-        (remember_signed_in)."""
+        (remember_signed_in). account: Claude Code's account there (claude_account), which verify's line names as the
+        helper's own setup check does (desktop_items)."""
         try:
-            write_json(desktop_path(self.home), {"at": self.clock(), "browser": connected})
+            write_json(desktop_path(self.home), {"at": self.clock(), "browser": connected, "claude_account": account})
         except OSError:
             pass                # the next reading writes it again
 
@@ -3912,7 +3971,9 @@ class Lifecycle:
         if self.platform == "darwin":
             tabs = RUNTIMES.get(name, {}).get("browser_tabs")
             exe = self.exe(name) if tabs else None
-            for item in desktop_items(self.run, self.home, user, tabs, browser_connected(exe) if exe else None):
+            connected = browser_connected(exe) if exe else None
+            needed = claude_account(self.run, exe) if connected is False else None
+            for item in desktop_items(self.run, self.home, user, tabs, connected, needed):
                 add(*item)
         else:
             # build plan 04, S3: an agent's own Chrome on its Linux server, by its parts and its port's live proof

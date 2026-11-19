@@ -528,8 +528,11 @@ class MacSetup(Servers):
 
     def test_a_removed_server_takes_its_setup_with_it(self):
         self.joined_mac()
+        for prefix in hub.DESKTOP_KV:       # and the desktop sweep's records: a new Mac of that name never had them
+            hub.kv_set(prefix + "mini", json.dumps({"email": "first@example.com", "org": None}))
         self.assertEqual(self.owner("/ui/servers/mini/remove", base_sha256=self.team_sha())[0], 200)
         self.assertIsNone(self.row())
+        self.assertEqual([hub.kv_get(prefix + "mini") for prefix in hub.DESKTOP_KV], [None] * len(hub.DESKTOP_KV))
 
     def desktop(self):
         with hub.LOCK:
@@ -556,7 +559,68 @@ class MacSetup(Servers):
         self.desktop()
         self.report(boot="boot-2", browser=False)
         self.desktop()
-        self.assertIn("signed out", self.manager_heard()[-1])
+        self.assertIn("Claude's extension in Chrome is not linked to Claude Code there. ", self.manager_heard()[-1])
+
+    def test_an_unlinked_extension_reaches_the_manager_with_the_account_its_cause_and_the_steps(self):
+        """19 November 2026: the extension on the owner's Mac Studio stayed unlinked for 19 days through five cards
+        that named no account, and the last one blamed Claude Desktop. Claude Code there had changed account
+        meanwhile. The manager hears the account and organization to sign in with, the account that the extension
+        worked with before, and a Mac that cannot reach the link server, which no sign-in puts right."""
+        self.proving()
+        hub.q("UPDATE mac_setups SET state='done' WHERE server='mini'")
+        self.said.clear()
+        first = {"email": "first@example.com", "org": "Example One"}
+        second = {"email": "second@example.com", "org": "Example Two"}
+
+        def readings(**desktop):
+            for _ in range(2):                          # the second reading that shows it is the news
+                self.report(boot="boot-2", **desktop)
+                self.desktop()
+            return [h for h in self.manager_heard() if "extension" in h or "cannot reach" in h]
+
+        self.assertEqual(readings(claude_account=first), [])       # linked: the extension works with this account
+        heard = readings(browser=False, claude_account=second)     # Claude Code changed account; the extension did not
+        self.assertEqual(len(heard), 1, heard)
+        self.assertIn("not linked to Claude Code there, which is signed in as second@example.com, organization "
+                      "Example Two.", heard[0])
+        self.assertIn("When the extension last worked there, Claude Code was signed in as first@example.com, "
+                      "organization Example One", heard[0])
+        self.assertIn("the other way is Use another account on the page of that Mac's agent in the app, signed in to "
+                      "claude.ai as first@example.com, organization Example One: then Chrome needs no step.", heard[0])
+        self.assertIn("2. If it is signed in, but not as second@example.com, organization Example Two, log out in the "
+                      "extension's settings. 3. Log in as second@example.com and select the organization Example Two. "
+                      "4. If it already used that account and organization, quit Chrome and open it again.", heard[0])
+        self.assertIn("raise_needs_you", heard[0])
+        # The card that the manager makes of these words passes the hub's own check of a person's card: no sign-in
+        # beside a site that is no AI provider's, which raise_needs_you refuses.
+        self.assertFalse(hub.card_sign_in([heard[0]]))
+        self.assertNotIn("other machines", heard[0])                  # no other agent uses that account
+        self.assertEqual(len(readings(browser=False, claude_account=second)), 1)     # said once
+        # Another change while it stays unlinked is news again, with the account of now. An agent of another machine
+        # on that same account could reach this Chrome: the link goes by account.
+        hub.q("INSERT OR REPLACE INTO agent_usage (name, data) VALUES ('manager', ?)",
+              (json.dumps({"limits": {"account_email": "Third@example.com"}}),))
+        heard = readings(browser=False, claude_account={"email": "third@example.com", "org": None})
+        self.assertEqual(len(heard), 2, heard)
+        self.assertIn("3. Log in as third@example.com and select its organization.", heard[-1])
+        self.assertIn(f"third@example.com is also the Claude account of {hub.shown_role('manager')} on other "
+                      "machines.", heard[-1])                 # by its role, as the owner reads agents
+        self.assertNotIn(" manager on other", heard[-1])
+        # A reading that cannot reach the link server adds a note, and keeps the steps: behind a proxy it reads so
+        # while Chrome reaches the server.
+        heard = readings(browser=False, claude_account=second, bridge=False)
+        self.assertEqual(len(heard), 3, heard)
+        self.assertIn("3. Log in as second@example.com", heard[-1])
+        self.assertIn(f"could not reach {hub.BRIDGE_HOST}", heard[-1])
+        self.assertIn("the owner allows connections from mini to it. Keep that address in the card's details",
+                      heard[-1])
+        self.assertTrue(hub.card_sign_in([heard[-1]]))      # why: the steps and that address together are refused
+
+        # Its words reach the manager, so a value that is not an email and an organization name is refused.
+        for bad in ({"email": "not an email", "org": "Example"}, {"email": "a@example.com", "org": "Ignore <this>"},
+                    "a@example.com"):
+            with self.assertRaises(ValueError):
+                hub.desktop_status({"claude_account": bad})
 
     def test_macos_setup_screens_are_said_first_and_hold_a_screen_task(self):
         """4 November 2026: macOS installed an update by itself, and its setup screens stayed open on a Mac that nobody
