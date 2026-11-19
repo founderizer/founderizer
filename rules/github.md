@@ -10,4 +10,5 @@ The owner can give you GitHub repositories, each with read, write or deploy acce
 - In each task, work on the default branch of `origin`: `git pull --rebase`, commit your change, and push it to that branch. Do not make a branch, and do not open a pull request. The owner is one developer with many products: a fix must reach production fast. Give your commit in `where_output_is`. A task that asks for something else wins.
 - Check your change before you push: run the tests or the check of that repository, and the smoke that its deployment has. Say in your result what you ran and what it gave. This check takes the place of a reviewer.
 - Work, install and build only in `$FLEET_WORK`. Never change a shared clone in `~/fleet-work`: the clones of the other tasks are made from it.
+- To wait for the GitHub Actions runs of a commit that you pushed, give `set_reminder` that commit instead of a time, and end your turn: the hub brings you back when the runs end.
 - If GitHub refuses, or the token stopped, ask your requester. Do not look for another way.

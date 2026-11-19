@@ -23618,14 +23618,15 @@ def parse_profile(text):
 
 
 # The manager proposes changes to its own profile in a plan of team changes, which the owner's press makes (owner API
-# 1.214), so an owner's save keeps the opening that profiles/manager.md ships with instead of the workers' line.
+# 1.214), so an owner's save keeps the opening that a new fleet's manager profile ships with (publish/profiles/
+# manager.md, which holds these words) instead of the workers' line.
 MANAGER_OPENING = ("Written by the owner. The manager reads it at every start, and proposes changes to it in a plan "
                    "of team changes, which take effect on the owner's yes.\n\nThis file says what the manager is for "
                    "and what the owner does and does not let it do. How a tool is called is never here: a tool's own "
-                   "description is its current contract, and `RULES.md` says what each tool is for and when to reach "
-                   "for it. Those two travel with the hub and are always the hub's own; this file is the owner's and "
-                   "no update ever touches it, so anything in it that restated a tool would go stale here and nowhere "
-                   "else.")
+                   "description is its current contract and says what the tool is for and when to reach for it, and "
+                   "`RULES.md` says how the work goes. Those two travel with the hub and are always the hub's own; "
+                   "this file is the owner's and no update ever touches it, so anything in it that restated a tool "
+                   "would go stale here and nowhere else.")
 
 
 def render_profile(agent, sections):
@@ -38405,8 +38406,8 @@ TOOLS = [
      "earlier page of them), and search=\"<words>\" looks over all of it. Read "
      "it before you repeat anything that leaves the building (rule 9). mine=true reads your own finished tasks "
      "instead, newest first: how each one ended, whether its requester accepted it and why not, and what followed "
-     "it -- so you can see when the same work keeps coming back. Narrow that list with outcome= and search=. A lead "
-     "reads the same list for one of its own team with agent=.",
+     "it -- so you can see when the same work keeps coming back: one follow-up is a fix, three in a row is a loop. "
+     "Narrow that list with outcome= and search=. A lead reads the same list for one of its own team with agent=.",
      S({"task_id": TASK_ID, "task": {"type": "string", "description": "A task that this one follows, or one of your "
                                                                       "own, for example T-3"},
         "attempt": {"type": "integer", "description": "An earlier attempt of this task, for example 1"},
@@ -39628,7 +39629,8 @@ TOOLS = [
      "the task cannot get it later. The hub refuses one that you do not hold, and one while that desktop is busy "
      "with another such task. Its result comes back into this chat by itself when it ends: "
      "tell them then with message_owner. Give in_reply_to, the request UUID of the owner's message: one message is "
-     "one task, and a message from another agent starts nothing.",
+     "one task, and a message from another agent starts nothing. A lasting wish of the owner's goes into such a "
+     "task too, which keeps it with keep_instruction.",
      S({"title": STR, "done_when": {"type": "string", "description": "The line a stranger could test the result "
                                                                    "against"},
         "needs": {"type": "string", "enum": ["none", "browser", "screen"],
@@ -40490,8 +40492,8 @@ def stale_instructions(name, extra):
             f"{'These fields are' if len(extra) > 1 else 'This field is'} not part of it: the call was refused and "
             f"nothing happened. If you were told to pass {'them' if len(extra) > 1 else 'it'}, those instructions "
             f"are out of date -- a tool's contract changes with the hub, and a profile, a knowledge file or a note "
-            f"that restates it does not. This tool's own description is the current contract, and RULES.md says "
-            f"what the tool is for. Read the description, call it again with the fields it lists, and report that "
+            f"that restates it does not. This tool's own description is the current contract and says what the "
+            f"tool is for. Read the description, call it again with the fields it lists, and report that "
             f"the instructions you followed name a field that is gone.")
 
 
