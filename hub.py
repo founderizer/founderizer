@@ -53552,6 +53552,91 @@ def close_github_key_needs(owner, why):
                        (t0, "hub", f"closed N-{need['id']} {clip(need['title'] or '', 80)}: {why}"))
 
 
+def door_renew_todo(state):
+    """The what_to_do of the renewal's item for its step, in the words of each hub message that asks for that item."""
+    if state["step"] == "ask":
+        return (f"on {state['page']}, click \"Generate a private key\"; then in Founderizer on the owner's Mac, on the "
+                f"Apps page under GitHub, choose the file that GitHub downloaded next to Private key, and click Save. "
+                f"The form shows there while the item is open, with the App's ID in it.")
+    return (f"on {state['page']}, under Private keys, delete the key whose fingerprint is {state['fingerprint']}, "
+            f"exactly as the page shows it, and keep the other one.")
+
+
+def door_renew_again(state, t0, manager, refused=False):
+    """The renewal's step still waits on the owner, and no item asks for it: the hub tells the manager to raise it
+    again, and returns True when it did (the owner, 19 November 2026: "Yes, fix it"). An answer closes an item as every
+    answer does, also the Mac app's "Done" before the new key is saved and its "Not now", and the manager can withdraw
+    one. The form for the new key shows only while an item is open (GET /ui/team github.renew), and the hub's message
+    for each step comes once, so before this such an item never came back, and the old key stayed. refused: in the
+    step "ask", GitHub refuses the old key that the door still uses (the owner deleted it before the new key was
+    saved), so no token through the door works.
+
+    The hub tells the manager at the first look after an item of this step closed with the owner's answer or a
+    withdraw, and a day after the step began when no item of it closed so; then 1, 2, 4 and 7 days after its last word
+    and every 7 days (need_look_gap, as the looks at an open card), while no item is open. An item belongs to the step
+    in which it was raised, so an answer that lands while the look that ends its step runs is no answer of the next
+    step; an item that the hub closed was done, also one that the manager raised during that look. One mark in kv
+    (door_github_again): which step and item the words were about, how many went, when the last one went, and
+    whether one said that GitHub refuses the old key."""
+    owner = state["owner"]
+    if not manager or q1("SELECT 1 FROM needs WHERE github_key=? AND answer IS NULL", (owner,)):
+        return False
+    began = state["at"] - 1             # round() of the step's start, which can be half a second after it
+    closed = q1("SELECT id, title, answer, answered, answered_by FROM needs WHERE github_key=? AND answer IS NOT NULL "
+                "AND raised>=? AND COALESCE(answered_by, '')!='hub' ORDER BY answered DESC, id DESC LIMIT 1",
+                (owner, began))
+    about = f"{state['step']}:{closed['id'] if closed else 0}"
+    mark = {}
+    with contextlib.suppress(ValueError, TypeError):
+        mark = json.loads(kv_get("door_github_again") or "null") or {}
+    mark = mark if isinstance(mark, dict) and mark.get("about") == about else {}
+    asks, last, told = mark.get("asks"), mark.get("at"), mark.get("refused") is True
+    if not isinstance(asks, int) or isinstance(asks, bool) or asks < 0 or not isinstance(last, (int, float)):
+        asks, last = 0, None
+    news = refused and not told         # a refused old key starts the count again once: a 401 that comes and goes
+    if news:                            # (a key that GitHub takes again) starts nothing more
+        asks, last = 0, None
+    if asks:
+        due = last + need_look_gap(asks - 1)
+    else:
+        due = t0 if news else (closed["answered"] or 0) if closed else began + NEED_LOOK_FIRST
+    if t0 < due:
+        return False
+    if state["step"] == "ask":
+        status = ((f"GitHub refuses the old App key of {owner}, which the door still uses, so no GitHub token through "
+                   f"the door works until the new key is saved" if refused else
+                   f"the door still makes every GitHub token with the old App key of {owner}") +
+                  ", and the form for the new key shows on the owner's Apps page only while such an item is open")
+    else:
+        status = f"GitHub still takes the old App key of {owner} ({state['fingerprint']})"
+    guide = ""
+    if closed is None:
+        head = (f"No Needs-you item with github_key \"{owner}\" is open, {need_age(t0 - state['at'])} after the hub "
+                f"asked you for it, and its step is not done: {status}.")
+    else:
+        age = t0 - (closed["answered"] or t0)
+        when = f"{need_age(age)} ago" if age >= 3600 else "less than an hour ago"
+        how = (f"with the owner's answer \"{clip(closed['answer'] or '', 200)}\"" if closed["answered_by"] is None else
+               f"({clip(closed['answer'] or '', 200)})")
+        head = f"N-{closed['id']} ({clip(closed['title'] or '', 80)}) closed {when} {how}, and its step is not done: " \
+               f"{status}."
+        if closed["answered_by"] is None:
+            guide = (" When the owner's answer said that it was done, say in why that the hub does not see it yet; when "
+                     "it asked something, answer that in why or details; when it asked to wait, raise it when the "
+                     "wait is over.")
+    # the first word after an answer or a withdraw, and the first that the old key is refused, come at once; the
+    # others wait for the manager's next read, as need_look_sweep's looks do
+    emit(manager, "say", f"[hub] {head} Raise it again with raise_needs_you, github_key \"{owner}\" and no options. Its "
+                         f"what_to_do: {door_renew_todo(state)}{guide} The hub closes the item by itself when its "
+                         f"step is done, so do not withdraw it. While no such item is open, the hub tells you again "
+                         f"in {need_age(need_look_gap(asks))}.", extra=None if not asks and (closed or news) else LATER_SAY)
+    kv_set("door_github_again", json.dumps({"about": about, "asks": asks + 1, "at": t0, "refused": refused or told},
+                                           sort_keys=True))
+    log("hub", f"asked the manager again for the item of the GitHub App key of {owner} (step {state['step']}"
+               + (f", after N-{closed['id']})" if closed else ")"))
+    return True
+
+
 def door_renew(t0=None):
     """One look at the renewal, outside LOCK: the door says which key it uses for the hub's old App, that key's
     fingerprint as GitHub's page shows it, and whether GitHub still takes it (POST /github/key on the door)."""
@@ -53580,29 +53665,29 @@ def door_renew(t0=None):
                              f"every token with the App key that the hub held (App {app_id} of {state['owner']}), so "
                              f"that key gets a successor and then goes (DevOps plan 13, item 4). Raise one Needs-you "
                              f"item now with raise_needs_you, github_key \"{state['owner']}\" and no options. Its "
-                             f"what_to_do: on {state['page']}, click \"Generate a private key\"; then in Founderizer on "
-                             f"the owner's Mac, on the Apps page under GitHub, choose the file that GitHub downloaded "
-                             f"next to Private key, and click Save. The form shows there while the item is open, with "
-                             f"the App's ID in it. The hub closes the item by itself when the door makes tokens with "
-                             f"the new key, and then it tells you the second item, which deletes the old key.")
+                             f"what_to_do: {door_renew_todo(state)} The hub closes the item by itself when the door "
+                             f"makes tokens with the new key, and then it tells you the second item, which deletes the "
+                             f"old key.")
         log("hub", f"the App key that the hub held gets a successor: App {app_id} of {state['owner']}, "
                    f"{state['fingerprint']}")
         return state
     if state["step"] == "ask":
         if key.get("signs") is not True or state["old"] in (key.get("used") or [state["old"]]):
+            if isinstance(key.get("signs"), bool) and state["old"] in (key.get("used") or [state["old"]]):
+                door_renew_again(state, t0, manager, refused=key.get("signs") is False)     # the door uses the old key
             return None
         close_github_key_needs(state["owner"], "the door makes every GitHub token with the new App key now")
         state = dict(state, step="delete", at=round(t0))
         kv_set("door_github_renew", json.dumps(state, sort_keys=True))
         emit(manager, "say", f"[hub] The door makes every GitHub token with the new App key of {state['owner']}, and "
                              f"the hub closed the first item. Raise the second Needs-you item now with "
-                             f"raise_needs_you, github_key \"{state['owner']}\" and no options. Its what_to_do: on "
-                             f"{state['page']}, under Private keys, delete the key whose fingerprint is "
-                             f"{state['fingerprint']}, exactly as the page shows it, and keep the other one. The hub "
-                             f"closes the item by itself when GitHub refuses that key.")
+                             f"raise_needs_you, github_key \"{state['owner']}\" and no options. Its what_to_do: "
+                             f"{door_renew_todo(state)} The hub closes the item by itself when GitHub refuses that key.")
         log("hub", f"the door makes every GitHub token with the new App key of {state['owner']}")
         return state
     if key.get("signs") is not False:
+        if key.get("signs") is True:            # GitHub still takes the old key
+            door_renew_again(state, t0, manager)
         return None
     close_github_key_needs(state["owner"], "GitHub refuses the old App key now, so it is deleted")
     state = dict(state, step="done", at=round(t0))

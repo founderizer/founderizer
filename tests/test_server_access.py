@@ -342,7 +342,11 @@ class DoorTokens(Access):
         """Plan 13, item 4 (the coordinator's yes of 7 November 2026): nothing starts before the first task session's
         tokens through the door worked. Then the manager hears the first item, the GitHub App rows show their form
         while it is open, the hub closes it when the door makes tokens with a new key, the manager hears the second
-        item with the old key's fingerprint, and the hub closes that one when GitHub refuses the old key."""
+        item with the old key's fingerprint, and the hub closes that one when GitHub refuses the old key. An answer
+        closes an item before its step is done ("Done" before the key is saved, the owner's case of 19 November 2026),
+        and the form goes with it: the manager hears at the next look to raise it again, and a day after the hub's
+        word for a step whose item it never raised, also when the old key was deleted first; never while an item is
+        open. An item belongs to the step in which it was raised."""
         def told(words):
             return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND text LIKE ?",
                                              (f"%{words}%",))]
@@ -394,26 +398,69 @@ class DoorTokens(Access):
         self.assertIs(renew(), True)
         self.assertIsNone(hub.door_renew(t0 + 10))       # one look each DOOR_RENEW_EVERY
         self.assertIsNone(hub.door_renew(t0 + hub.DOOR_RENEW_EVERY))     # the door still uses the old key
+        self.assertEqual(self.owner(f"/ui/needs/{first}", answer="Done")[0], 200)
+        self.assertIs(renew(), False)                    # the answer closed the item, and the form went with it
+        self.assertIsNone(hub.door_renew(t0 + 2 * hub.DOOR_RENEW_EVERY))
+        again = told("Raise it again")
+        self.assertEqual(len(again), 1)
+        for words in (f"N-{first}", 'answer "Done"', 'github_key "acme"', "Generate a private key", "again in 1 day"):
+            self.assertIn(words, again[0])
+        t1 = t0 + 3 * hub.DOOR_RENEW_EVERY
+        self.assertIsNone(hub.door_renew(t1))
+        self.assertEqual(len(told("Raise it again")), 1)         # one word for that answer, then after a day
+        refused = (200, {"used": [old], "ref": old, "fingerprint": printed, "signs": False})
+        StubDoor.answers["/github/key"] = refused                # the old key deleted on GitHub, and no new one saved:
+        t1 += hub.DOOR_RENEW_EVERY                               # at once, not after the day
+        self.assertIsNone(hub.door_renew(t1))
+        for words in ("no GitHub token through the door works", "again in 1 day"):
+            self.assertIn(words, told("Raise it again")[1])
+        StubDoor.answers["/github/key"] = (200, {"used": [old], "ref": old, "fingerprint": printed, "signs": True,
+                                                 "owner": "acme", "page": page})
+        self.assertIsNone(hub.door_renew(t1 + hub.DOOR_RENEW_EVERY))
+        StubDoor.answers["/github/key"] = refused
+        self.assertIsNone(hub.door_renew(t1 + 2 * hub.DOOR_RENEW_EVERY))
+        self.assertEqual(len(told("Raise it again")), 2)         # a refusal that comes and goes starts it once
+        t1 += hub.NEED_LOOK_FIRST
+        self.assertIsNone(hub.door_renew(t1))
+        self.assertIn("again in 2 days", told("Raise it again")[2])
+        hub.t_raise_needs_you("manager", {"title": "A new key for your GitHub App", "why": "The hub does not see it "
+                                          "yet.", "what_to_do": f"On {page}, click Generate a private key",
+                                          "github_key": "acme"})
+        first = hub.q1("SELECT max(id) AS id FROM needs")["id"]
+        self.assertIs(renew(), True)
         StubDoor.answers["/github/key"] = (200, {"used": [new], "ref": new, "fingerprint": "SHA256:" + "B" * 43 + "=",
                                                  "signs": True, "owner": "acme", "page": page})
-        state = hub.door_renew(t0 + 2 * hub.DOOR_RENEW_EVERY)
+        with patch.object(hub, "now", lambda: t1 + hub.DOOR_RENEW_EVERY + 1):      # while the look that ends the step
+            self.assertEqual(self.owner(f"/ui/needs/{first}", answer="Done")[0], 200)       # runs: an answer, and
+            hub.t_raise_needs_you("manager", {"title": "A new key for your GitHub App", "why": "w",    # one more item
+                                              "what_to_do": f"On {page}, click Generate a private key",
+                                              "github_key": "acme"})
+        third = hub.q1("SELECT max(id) AS id FROM needs")["id"]
+        state = hub.door_renew(t1 + hub.DOOR_RENEW_EVERY)
         self.assertEqual(state["step"], "delete")
-        self.assertIn("Closed by the hub", hub.q1("SELECT answer FROM needs WHERE id=?", (first,))["answer"])
+        self.assertIn("Closed by the hub", hub.q1("SELECT answer FROM needs WHERE id=?", (third,))["answer"])
         self.assertIs(renew(), False)
         self.assertIn(printed, told("delete the key whose fingerprint is")[0])
+        self.assertIsNone(hub.door_renew(t1 + 2 * hub.DOOR_RENEW_EVERY))
+        self.assertEqual(len(told("Raise it again")), 3)         # both items belong to the step before
+        t2 = t1 + hub.DOOR_RENEW_EVERY + hub.NEED_LOOK_FIRST
+        self.assertIsNone(hub.door_renew(t2))                    # the manager raised no second item in a day
+        self.assertIn(printed, told("No Needs-you item with github_key")[0])
         hub.t_raise_needs_you("manager", {"title": "Delete the old key of your GitHub App", "why": "w",
                                           "what_to_do": f"On {page}, delete the key {printed}", "github_key": "acme"})
         second = hub.q1("SELECT max(id) AS id FROM needs")["id"]
         self.assertIs(renew(), False)                    # the form is for the first item only
         StubDoor.answers["/github/key"] = (200, {"used": [new], "ref": old, "fingerprint": printed, "signs": True,
                                                  "owner": "acme", "page": page})
-        self.assertIsNone(hub.door_renew(t0 + 3 * hub.DOOR_RENEW_EVERY))
+        t2 += hub.NEED_LOOK_MOST
+        self.assertIsNone(hub.door_renew(t2))
+        self.assertEqual(len(told("Raise it again")), 4)         # an open item: no word, also a week later
         self.assertEqual(StubDoor.calls[-1][3], {"app_id": "12345", "ref": old})
         StubDoor.answers["/github/key"] = (200, {"used": [new], "ref": old, "fingerprint": printed, "signs": False})
-        self.assertEqual(hub.door_renew(t0 + 4 * hub.DOOR_RENEW_EVERY)["step"], "done")
+        self.assertEqual(hub.door_renew(t2 + hub.DOOR_RENEW_EVERY)["step"], "done")
         self.assertIn("refuses the old App key", hub.q1("SELECT answer FROM needs WHERE id=?", (second,))["answer"])
         calls = len(StubDoor.calls)
-        self.assertIsNone(hub.door_renew(t0 + 5 * hub.DOOR_RENEW_EVERY))
+        self.assertIsNone(hub.door_renew(t2 + 2 * hub.DOOR_RENEW_EVERY))
         self.assertEqual(len(StubDoor.calls), calls)     # done: no more looks
         with self.assertRaisesRegex(hub.ToolError, "github_key is the GitHub account"):
             hub.t_raise_needs_you("manager", {"title": "t", "why": "w", "what_to_do": "d", "github_key": "acme"})
