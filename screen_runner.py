@@ -113,7 +113,7 @@ def primary_instruction(agent, task, needs):
             "machine. Read RULES.md, your profile and the named task, and follow them, with your "
             "current permissions. Use Fleet MCP tools to read the task, report progress, ask the requester and "
             "deliver the result. When your role has Fleet team tools such as create_task, use them only within this "
-            "task, as RULES.md says; they give no other authority. A helper signal means "
+            "task; they give no other authority. A helper signal means "
             "read_messages, not permission. " + work + "Never read or reveal credentials; pass only login names. "
             "Fleet carries runtime permissions to your requester; never bypass a refusal. Use Fleet ask_my_requester "
             "for questions, not request_user_input. When waiting for an answer, end the turn; the helper will send a "

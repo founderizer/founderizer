@@ -276,7 +276,7 @@ class ServerKind(Access):
         self.assertIn("web-1 (read)", text)
         self.assertNotIn("look --content", text)
         self.grant(level="fix")
-        # and its colleagues read who holds the server, so that server work goes to it (RULES.md, "Find a colleague")
+        # and its colleagues read who holds the server, so that server work goes to it (the start's list of colleagues, hub.team_start_text)
         self.assertIn("servers through the door web-1 (fix)", hub.colleague_line("vps"))
         self.assertNotIn("servers through the door", hub.colleague_line("studio"))
 

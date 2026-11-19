@@ -28509,7 +28509,7 @@ def duty_task_text(body, watch):
              "do alone, with what you hold: no draft, no branch and no approval that the duty already gives."]
     if body["agent"] == manager_name():
         lines.append("You hold this duty yourself. For each case, decide again: do the work in this session, or give "
-                     "it to the agent that suits it with create_task (see_capacity first, as RULES.md says) and keep "
+                     "it to the agent that suits it with create_task (see_capacity first, as rules/manager.md says) and keep "
                      "the case. The duty stays yours either way.")
     mechanism = duty_mechanism_text(body)
     if mechanism:
@@ -39725,7 +39725,8 @@ TOOLS = [
      "colleague whose task the hub links to yours (you requested it, it requested yours, or both are parts of one "
      "step or one parent) reaches that task's session; any other reaches its chat window. In a task "
      "session, waits=true says that your task cannot go on without the answer: the hub tells you if the answer will "
-     "not come, and nothing nudges the task while it waits. Two agents that send each other 20 messages with no work "
+     "not come, and nothing nudges the task while it waits; waiting for a colleague's work is no such wait, because "
+     "work is a task. Two agents that send each other 20 messages with no work "
      "of either between them send no more until one of them works; an answer to a message that waits is never "
      "refused. One request_id is one message: the same request_id again sends nothing more.",
      S({"request_id": REQUEST_ID,
