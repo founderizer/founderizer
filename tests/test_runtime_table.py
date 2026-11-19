@@ -150,7 +150,8 @@ MECHANICS = {
     # provider whose entry says it has no owner chat and cannot be the manager never reaches any of this.
     "fleet.py": {
         "session_command": "each terminal provider's own command line: the daemon flag, the MCP options, the "
-                           "session id or the prompt marker, an idle first turn, and how it resumes",
+                           "session id or the prompt marker, and how it resumes (an idle first turn is the "
+                           "fact starts_idle)",
         "chat_command": "the same, for an owner chat window",
         "chat_record_file": "the file name a Codex chat had before each runtime kept a record of its own",
         "manager_conversation": "a Codex record names a marker and a thread, a Claude record a session",

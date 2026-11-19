@@ -2475,8 +2475,9 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     # positional first prompt before it has connected the Fleet MCP server, and its own ToolSearch wait stops after
     # about 5 s. The first turn is the helper's first inbox signal for the unread task event, after the signal
     # throttle. A bounded mitigation, not MCP readiness: a slower server still gives a first turn without the Fleet
-    # tools, and the unread task event brings the signal again.
-    idle = task and conf.get("runtime") == "claude"
+    # tools, and the unread task event brings the signal again. The table's fact (starts_idle), which the hub reads too:
+    # it counts no turn of such a session that no line reached yet (hub.first_line_waits).
+    idle = task and runtime_fact(conf.get("runtime"), "starts_idle")
     # Each text of a start grows with the fleet: a standing session's first prompt is the hub's brief, and a task's
     # holds the list of its repositories (github_text). So no word of the command holds one: a first prompt comes
     # from its own file (file_prompt), and a Claude task's text from the file of its appended system prompt

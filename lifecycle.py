@@ -527,6 +527,10 @@ def web_hosts(value):
 #                     profile are its appended system prompt; "prompt", at the end of its first prompt, after its
 #                     parts of the rules and its profile, because it has RULES.md as its developer instructions
 #                     (fleet.codex_rules); None where Fleet starts none so
+#   starts_idle       its task session starts with no prompt and runs nothing until its helper types a first line
+#                     into its window (fleet.session_command), so the hub counts no turn of one that no line
+#                     reached yet (hub.first_line_waits); False where its first prompt begins its first turn, and
+#                     for an ACP program, whose runner holds its first prompt in its own way (acp_runner.py)
 #   token_weights     its list prices in dollars per million tokens, {model key: {input, cache_read, cache_write,
 #                     output}}, so that the cost of a session compares across providers (AUTONOMY.md P8, P10); on a
 #                     subscription account they are weights, not money spent. A session's model takes the entry
@@ -618,6 +622,7 @@ RUNTIMES = {
         "conversation_denied": None,
         "manager_denied": None,
         "task_opening": "prompt",
+        "starts_idle": False,
         # gpt-6.1-sol's list prices as public price pages gave them on 27 October 2026, NOT checked on OpenAI's own
         # pricing page: the owner sets the right ones with runtime_facts. OpenAI charges no more for a cache write
         # than for input.
@@ -700,6 +705,7 @@ RUNTIMES = {
         # the manager keeps Workflow, Skill and Artifact (his answer of 29 October 2026: Artifact stays with it)
         "manager_denied": ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"],
         "task_opening": "read",
+        "starts_idle": True,            # its task text is its appended system prompt (fleet.session_command)
         # Anthropic's list prices of 6 October 2026. Its sessions write one-hour caches, which cost twice the input.
         "token_weights": {"default": {"input": 4.0, "cache_read": 0.2, "cache_write": 8.0, "output": 20.0},
                           "fable": {"input": 10.0, "cache_read": 0.25, "cache_write": 20.0, "output": 50.0},
@@ -752,6 +758,7 @@ RUNTIMES = {
         "conversation_denied": None,
         "manager_denied": None,
         "task_opening": "system",       # its stable text is the session's system text, and its task the first prompt
+        "starts_idle": False,
         "token_weights": None,
         # Grok Build's memory and its automatic dreaming: off by default, and on with GROK_MEMORY=1, its config or a
         # managed remote setting. GROK_MEMORY=0 turns it off for the whole process, whatever the others say.
@@ -811,6 +818,7 @@ RUNTIMES = {
         "conversation_denied": None,
         "manager_denied": None,
         "task_opening": "system",
+        "starts_idle": False,
         "token_weights": None,
         "memory_off": {"env": {}},      # the program has no memory of its own to switch off
         "acp_auth": None,               # its one method, opencode-login, does nothing: the key is in its configuration
@@ -837,7 +845,7 @@ RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manage
                  "app_server", "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in",
                  "sign_out", "no_sign_in", "sandbox", "screen_counter", "browser_tabs", "cache_seconds",
                  "compact_tokens", "routine", "default_model", "task_denied", "task_allowed", "conversation_denied",
-                 "manager_denied", "task_opening", "token_weights", "memory_off",
+                 "manager_denied", "task_opening", "starts_idle", "token_weights", "memory_off",
                  "acp_auth", "acp_quiet", "acp_models", "acp_allowance", "key_env", "own_env", "pinned", "continues",
                  "acp_adapter", "own_hosts", "tool_pictures")
 

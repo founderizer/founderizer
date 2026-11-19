@@ -58939,24 +58939,25 @@ def turn_before(t):
 
 def first_line_waits(t):
     """True while the session of task row `t` stands at its empty prompt, for all that the hub can tell (plan P0): a
-    session that starts idle (a Claude task in a terminal, whose first turn is the first line that its helper types:
-    fleet.session_command), whose helper took the start of the current attempt (events.helper_ack, after the poll
-    answer that handed it out), which has not read that start, and into whose window no later poll answer can have had
-    its helper type a line (events.signalled). A helper types a line into a task window only for an event of the poll
-    answer that it handles (fleet.Helper.handle_events): that task's start again, which brings its first line, or a
-    message for that task. So while a hold of the poll keeps those events (a usage limit, a shared OS user, a sign-in,
-    a held task), such a session runs nothing, however long the hold lasts. A helper that says in its poll that it
-    typed no line into the window yet (`first`, fleet.Helper.first_lines) takes the mark back when that poll's answer
-    has it type none either: a hold that begins after the mark and before the first line keeps the session out too. A
-    session that starts with its prompt (Codex, a runner, an ACP program) runs from its start, so this is never true
-    for it. The runtime is the agent's now, and never one that its helper has not loaded yet (runtime_pending): while
-    a switch to Claude waits for the helper's update, a window of the previous runtime can run, and after a switch
-    away from Claude a session of before counts as before.
+    session that starts idle (the table's fact starts_idle, which fleet.session_command reads too: a Claude task in a
+    terminal, whose first turn is the first line that its helper types), whose helper took the start of the current
+    attempt (events.helper_ack, after the poll answer that handed it out), which has not read that start, and into
+    whose window no later poll answer can have had its helper type a line (events.signalled). A helper types a line
+    into a task window only for an event of the poll answer that it handles (fleet.Helper.handle_events): that task's
+    start again, which brings its first line, or a message for that task. So while a hold of the poll keeps those
+    events (a usage limit, a shared OS user, a sign-in, a held task), such a session runs nothing, however long the
+    hold lasts. A helper that says in its poll that it typed no line into the window yet (`first`,
+    fleet.Helper.first_lines) takes the mark back when that poll's answer has it type none either: a hold that begins
+    after the mark and before the first line keeps the session out too. A session that starts with its prompt (Codex,
+    a runner, an ACP program) runs from its start, so this is never true for it. The runtime is the agent's now, and
+    never one that its helper has not loaded yet (runtime_pending): while a switch to a runtime that starts idle waits
+    for the helper's update, a window of the previous runtime can run, and after a switch away from one a session of
+    before counts as before.
 
     Until 19 November 2026 running_turns counted such a session as its first turn for as long as the hold lasted: no
     release landed, and its helper's own update waited too (update_busy reads `turns`), for days at a weekly limit."""
     conf = agents().get(t["owner"]) or {}
-    if conf.get("runtime") != "claude" or app_server_task(conf, t["needs"]):
+    if not runtime_fact(conf.get("runtime"), "starts_idle") or app_server_task(conf, t["needs"]):
         return False
     start = q1("SELECT MAX(handed IS NOT NULL AND helper_ack IS NOT NULL) AS took, "
                "MAX(signalled IS NOT NULL OR read_at IS NOT NULL) AS moved FROM events WHERE task=? AND kind='task' AND "
