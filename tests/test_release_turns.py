@@ -593,6 +593,36 @@ class Turns(test_releases.HubUpdates):
         hub.kv_set("release_waits", None)
         self.assertEqual(sorted(self.delivered("task")), sorted([hub.tref(plain), hub.tref(case_task)]))
 
+    def test_a_session_that_started_gets_its_first_line_while_new_sessions_wait(self):
+        """19 November 2026, the owner's fleet. A Claude task session starts idle and works only once its helper types
+        its first line, which the helper does for the start event that a poll hands it. Two holds of new sessions held
+        that event too: the wait before a release (two sessions that started seconds before it stood at an empty
+        prompt for the whole hold, and their empty turn state, which counts as a first turn, kept the release waiting),
+        and an agent's new settings, which its helper loads at its update (that update waited for the session's empty
+        turn: the agent started no task for three hours, and no release landed). A start that its helper took passes
+        both, as it starts no second session (plan C6), and only the update run holds it."""
+        started, new = self.task_for(), self.task_for()
+        hub.q("UPDATE events SET helper_ack=? WHERE kind='task' AND task=?", (hub.now(), started))
+        windows("vps", hub.tref(started))
+
+        def starts():
+            code, data = self.request("/events/vps?delivery=1&after=0&wait=0", source=hub.address_of("vps"))
+            self.assertEqual(code, 200, data)
+            return [(e["task"], e.get("started")) for e in data["events"] if e["kind"] == "task"]
+        for hold in ("release", "settings"):
+            hub.kv_set("release_waits", json.dumps({"revision": "a" * 40, "since": hub.now()})
+                       if hold == "release" else None)
+            loaded = {"settings": {"model": None, "effort": None, "can": ["web"]}} if hold == "settings" else {}
+            helper_reports("vps", **loaded)
+            self.assertEqual((hub.release_holds_starts(), hub.settings_pending("vps")),
+                             (hold == "release", hold == "settings"))
+            self.assertEqual(starts(), [], hold)        # a helper that could start it twice waits, as before
+            helper_reports("vps", hub.START_ONCE, **loaded)
+            self.assertEqual(starts(), [(hub.tref(started), True)], hold)  # its first line goes, marked started,
+            #                                                                 and a new session waits
+        with patch.object(hub, "release_applying", return_value=True):
+            self.assertEqual(starts(), [])              # the update run holds both
+
     def test_a_release_the_run_would_refuse_does_not_wait(self):
         self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
         working = self.task_for()

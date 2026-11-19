@@ -65948,6 +65948,7 @@ class Handler(BaseHTTPRequestHandler):
                 pending = worker and settings_pending(agent)        # owner API 1.9: wait for the new settings
                 updating = release_applying()       # owner feature releases: an update run holds every new session
                 holding = release_holds_starts()    # plan P0: so does a release that waits for the running turns
+                once = START_ONCE in helper_features(agent)     # plan C6: a start that it took, it never makes again
                 # owner feature runtime_switch: an open chat window runs the old runtime, so a chat waits for the new one
                 chat_open = "owner-chat" in (query.get("alive") or "").split(",") and not (pending and runtime_pending(agent))
                 for r in rows:
@@ -65977,11 +65978,23 @@ class Handler(BaseHTTPRequestHandler):
                         continue        # a quiet message comes with the agent's next read; nothing is typed for it
                     if worker and r["kind"] in ("task", "say") and t and active_hold(t["id"]):
                         continue        # nothing is typed into a held session
-                    if pending and (r["kind"] == "task" or (r["kind"] == "chat" and not chat_open)):
-                        continue        # a new session waits until the helper has loaded the agent's new settings
-                    if r["kind"] == "task" and (updating or holding and not (t and t["duty_case"])):
+                    if pending and ((r["kind"] == "task" and not (once and r["helper_ack"])) or
+                                    (r["kind"] == "chat" and not chat_open)):
+                        continue        # a new session waits until the helper has loaded the agent's new settings,
+                                        # which it does at its update. A start whose session its helper started
+                                        # already passes, as it passes the wait before a release (below): held, a
+                                        # Claude session stood at an empty prompt, its empty turn state counted as a
+                                        # running turn, and the helper's update waited for that turn (19 November
+                                        # 2026: an agent started no task for three hours, and no release landed)
+                    if r["kind"] == "task" and (updating or holding and not (t and t["duty_case"]) and
+                                                not (once and r["helper_ack"])):
                         continue        # the hub restarts at the end of an update run, which would drop this session;
-                                        # a duty's case passes the wait before it (DevOps plan V1), not the run
+                                        # a duty's case passes the wait before it (DevOps plan V1), not the run. So
+                                        # does a start whose session its helper started already: it starts nothing new,
+                                        # and a Claude task session, which starts idle, waits for it to get its first
+                                        # line. Held, that session stood at an empty prompt for the whole wait, which
+                                        # counts as its first turn (running_turns), so the release waited for it
+                                        # (19 November 2026, 15 minutes)
                     if updating and worker and r["kind"] == "say" and t:
                         continue        # plan P0: a line would begin a turn of a session that waits between turns
                     if worker and r["kind"] == "say" and t and t["owner"] == agent and \
