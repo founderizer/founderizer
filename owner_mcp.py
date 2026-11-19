@@ -264,9 +264,9 @@ NOT_TOOLS = {
     "/ui/door/github-app": "the ID of a GitHub App that the app made with GitHub's manifest flow, whose key the door "
                            "holds",
     "/ui/door/host": "the app's own word about the door's parts on one server, which its round writes by itself",
-    "/ui/chat-apps/{}/token": "a Discord bot token; the app's program has save_bot_token, which takes the token "
-                              "from a file or a pipe on this Mac, or has the app read the clipboard, and never as a "
-                              "field",
+    "/ui/chat-apps/{}/token": "a Discord or Telegram bot token; the app's program has save_bot_token, which takes "
+                              "the token from a file or a pipe on this Mac, or has the app read the clipboard, and "
+                              "never as a field",
     "/ui/mcp/connect": "an MCP server's OAuth client, and a browser flow of the owner's own",
     "/ui/mcp/finish": "the authorization code of that flow",
     "/ui/secrets/add": "the value of a login; for a new login or API key the app's program has save_secret, which "
@@ -3079,10 +3079,13 @@ def tools():
         tool("remove_owner_handle", "Remove one of the owner's own chat handles.",
              {"app": S["text"], "id": S["text"], "delete": S["bool"], **rid}, ("app", "id"),
              plain("/ui/people/handles", ("app", "id", "delete"), "this owner handle")),
-        tool("person_code", "A one-time code that links the owner's own chat account on Discord or WhatsApp. The "
-                            "hub keeps no code: a repeat gives code null.",
-             {"app": S["text"], "purpose": S["text"], **rid}, ("app",),
-             plain("/ui/people/codes", ("app", "purpose"), "a link code")),
+        tool("person_code", "A one-time code that links the owner's own chat account on Discord, WhatsApp or "
+                            "Telegram (purpose owner), or a person's Telegram invite (purpose invite, app telegram, "
+                            "with person and agent): a link to that agent's bot for 7 days and one use, which binds "
+                            "the Telegram account that presses Start to that person. A new invite of a person "
+                            "replaces their open one. The hub keeps no code: a repeat gives code null.",
+             {"app": S["text"], "purpose": S["text"], "person": S["int"], "agent": S["text"], **rid}, ("app",),
+             plain("/ui/people/codes", ("app", "purpose", "person", "agent"), "a link code")),
         tool("control_conversation", "Pause one conversation with a person, or let it run again. A paused "
                                      "conversation keeps every message that arrives, and no agent answers it.",
              {"conversation": S["int"], "action": {"type": "string", "enum": ["pause", "resume"]}, **rid},

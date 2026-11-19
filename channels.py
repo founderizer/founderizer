@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Founderizer chat apps bridge (CHAT-APPS.md 15.11). Python standard library only.
 
-  channels.py run     keep the Discord and WhatsApp connections and carry text between them and the hub
+  channels.py run     keep the Discord, Telegram and WhatsApp connections and carry text between them and the hub
   channels.py unit    print the systemd user unit fleet-channels.service
 
-It runs on the hub machine. It keeps the Discord bot tokens, the inbound journal and one wa-link child process for
+It runs on the hub machine. It keeps the Discord and Telegram bot tokens, the inbound journal and one wa-link child
+process for
 each WhatsApp account, and it builds wa-link from the release's own source when it has none for it (wa_link_program).
 It decides nothing: the hub keeps every rule. It never logs message text or tokens.
 """
@@ -48,11 +49,25 @@ WA_CAPTION = 1024           # WhatsApp: a text this short is the caption of a me
 FILE_MOST = 25 << 20        # bytes of one file of a message: the hub's own limit (hub.CHAT_FILE_MAX)
 OUTBOX = "outbox"           # beside the sessions: the files of the messages that are being sent, mode 600
 REST_NOTE = "The rest is in Founderizer."
+# Telegram (CHAT-APPS.md 19.2). Facts read on core.telegram.org on 15 November 2026 (Bot API 10.4): every call is
+# <api>/bot<token>/<method>; sendMessage takes 1 to 4,096 characters after the entities; "typing" shows for 5 seconds;
+# at most one message a second in one chat; there is no idempotency key, so a lost answer can be a sent message.
+TELEGRAM_API = "https://api.telegram.org"
+TELEGRAM_LIMIT = 4000
+TELEGRAM_TOKEN = re.compile(r"^[0-9]{5,20}:[A-Za-z0-9_-]{30,80}$")
+TELEGRAM_CHAT = re.compile(r"^-?[1-9][0-9]{0,19}$")
+TELEGRAM_UPDATES = ["message", "my_chat_member"]
+TELEGRAM_STATUSES = ("creator", "administrator", "member", "restricted", "left", "kicked")
 
 # Timings in seconds. The tests make them short.
 OUT_WAIT = 25               # the /bridge/out long poll
 STATUS_EVERY = 60
 TYPING_EVERY = 8
+TELEGRAM_POLL = 25          # Telegram: seconds of one getUpdates long poll
+TELEGRAM_TYPING_EVERY = 4   # Telegram: "typing" lasts 5 seconds
+TELEGRAM_PART_GAP = 1.0     # Telegram: seconds between two parts to one chat
+TELEGRAM_TRIES = 3          # Telegram: tries of a request that did not reach it (nothing was sent)
+TELEGRAM_WAITS = 5          # Telegram: waits of retry_after for one part before it fails
 BACKOFF_FIRST, BACKOFF_MAX = 1.0, 60.0
 TOKEN_POLL = 5              # how often a Discord account looks for a new token file (16.4: it starts within 15 s)
 INVALID_WAIT = (1.0, 5.0)   # Discord: wait this long after INVALID_SESSION
@@ -192,6 +207,79 @@ def wa_format(text):
             line = " · ".join(c.strip() for c in line.strip().strip("|").split("|") if c.strip())
         out.append(_wa_inline(line))
     return "\n".join(out)
+
+
+def _tg_escape(text):
+    """Text as Telegram's HTML takes it: &, < and > as entities (CHAT-APPS.md 19.2)."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+TG_INLINE = re.compile(r"`([^`\n]+)`|\*\*(.+?)\*\*|\[([^\]\n]+)\]\(((?:https?|tg)://[^)\s]+)\)")
+
+
+def _tg_inline(line):
+    """One line of Markdown outside a code block as Telegram's HTML: `c` to <code>, **b** to <b>, [t](u) to a link of
+    http, https or tg. Everything between is escaped, so no text of the agent becomes a tag."""
+    out, at = [], 0
+    for m in TG_INLINE.finditer(line):
+        out.append(_tg_escape(line[at:m.start()]))
+        if m.group(1) is not None:
+            out.append("<code>" + _tg_escape(m.group(1)) + "</code>")
+        elif m.group(2) is not None:
+            out.append("<b>" + _tg_escape(m.group(2)) + "</b>")
+        else:
+            out.append('<a href="' + _tg_escape(m.group(4)).replace('"', "&quot;") + '">' + _tg_escape(m.group(3)) +
+                       "</a>")
+        at = m.end()
+    out.append(_tg_escape(line[at:]))
+    return "".join(out)
+
+
+def _tg_lines(text, inline, block):
+    """The lines of a Markdown text with a heading as a bold line and a table as one line for each row, as for
+    WhatsApp; inline(line) makes each line, block(lines) each code block, and a block that a part's end cut off is
+    closed."""
+    out, code = [], None
+    for line in text.split("\n"):
+        if line.lstrip().startswith("```"):
+            if code is None:
+                code = []
+            else:
+                if code:
+                    out.append(block(code))
+                code = None
+            continue
+        if code is not None:
+            code.append(line)
+            continue
+        heading = re.match(r"^\s{0,3}#{1,6}\s+(.*?)[\s#]*$", line)
+        if heading:
+            title = heading.group(1).replace("**", "").strip()
+            out.append(inline(f"**{title}**") if title else "")
+            continue
+        if re.match(r"^\s*\|.*\|\s*$", line):
+            if re.match(r"^\s*\|[\s:|-]*-[\s:|-]*\|\s*$", line):
+                continue                                    # the line under the header row
+            line = " · ".join(c.strip() for c in line.strip().strip("|").split("|") if c.strip())
+        out.append(inline(line))
+    if code:
+        out.append(block(code))
+    return "\n".join(out)
+
+
+def tg_format(text):
+    """Markdown to Telegram's HTML (parse_mode HTML, CHAT-APPS.md 19.2): bold, inline code, code blocks as <pre>,
+    links, a heading as a bold line, a table as one line for each row. One * or _ stays as it is, as for WhatsApp:
+    an agent's list marks are stars too."""
+    return _tg_lines(text, _tg_inline, lambda lines: "<pre>" + _tg_escape("\n".join(lines)) + "</pre>")
+
+
+def tg_plain(text):
+    """The same text with no markup, for a part whose HTML Telegram refused: **b** to b, [t](u) to t (u)."""
+    def inline(line):
+        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+        return re.sub(r"\[([^\]\n]+)\]\(([^)\s]+)\)", r"\1 (\2)", line)
+    return _tg_lines(text, inline, "\n".join)
 
 
 def wa_message_id(db, item_id, n):
@@ -528,9 +616,10 @@ class WebSocket:
 # ---------------------------------------------------------------- accounts
 
 class Typing:
-    """Repeat a typing signal for each chat until its time ends or a message for that chat goes out."""
-    def __init__(self, ping, off=None):
-        self.ping, self.off = ping, off
+    """Repeat a typing signal for each chat until its time ends or a message for that chat goes out. every: the
+    seconds between two signals, read at each signal (None: TYPING_EVERY)."""
+    def __init__(self, ping, off=None, every=None):
+        self.ping, self.off, self.every = ping, off, every
         self.chats = {}                     # chat -> [end, next signal] (monotonic)
         self.cond = threading.Condition()
         self.busy = threading.Lock()        # held while signals go out, so that end() waits for them
@@ -565,7 +654,7 @@ class Typing:
                         del self.chats[chat]
                         offs.append(chat)
                     elif now >= times[1]:
-                        times[1] = now + TYPING_EVERY
+                        times[1] = now + (self.every() if self.every else TYPING_EVERY)
                         pings.append(chat)
                 if not pings and not offs:
                     wake = min((min(t) for t in self.chats.values()), default=None)
@@ -588,6 +677,7 @@ class Account:
     # CHAT-APPS.md 20: an adapter that sends a message's files says so; any other one fails such a message, and never
     # sends its words alone with the report "sent" (a third app's adapter sets it once it sends files).
     sends_files = False
+    typing_every = None         # the seconds between two typing signals (Typing), when the app's own differ
 
     def __init__(self, bridge, conf):
         self.bridge, self.id = bridge, conf["id"]
@@ -597,7 +687,7 @@ class Account:
         self.stopping = threading.Event()
         self.outbox = queue.Queue()
         self.user = self.name = self.application_id = None
-        self.typing = Typing(self.typing_on, self.typing_off)
+        self.typing = Typing(self.typing_on, self.typing_off, self.typing_every)
 
     def start(self):
         threading.Thread(target=self.run, daemon=True).start()
@@ -1608,14 +1698,328 @@ class WhatsApp(Account):
         self.command({"op": "typing", "chat": chat, "on": False})
 
 
-APPS = {"discord": Discord, "whatsapp": WhatsApp}
+class TelegramPoll:
+    """The one getUpdates request that a Telegram account has open, so that its stop ends the long poll at once."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.conn = None
+
+    def set(self, conn):
+        with self.lock:
+            self.conn = conn
+
+    def close(self):
+        with self.lock:
+            conn = self.conn
+        sock = getattr(conn, "sock", None)
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+
+
+def telegram_call(base, token, method, body=None, timeout=20, poll=None):
+    """(status, answer, reached) of one Bot API call: <base>/bot<token>/<method>, a JSON body. status 0: no answer.
+    reached is False only when no connection was made, so that nothing can have reached Telegram: a send may then go
+    again. The token is in the path, so nothing here ever logs the address or an error's own words."""
+    url = urllib.parse.urlsplit(f"{base.rstrip('/')}/bot{token}/{method}")
+    cls = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+    conn = cls(url.hostname, url.port, timeout=timeout)
+    if poll:
+        poll.set(conn)
+    try:
+        try:
+            conn.connect()
+        except (OSError, http.client.HTTPException, ValueError):
+            return 0, {}, False
+        data = json.dumps(body or {}).encode()
+        try:
+            conn.request("POST", url.path, data, {"Content-Type": "application/json", "Accept": "application/json",
+                                                  "User-Agent": "Founderizer-channels"})
+            r = conn.getresponse()
+            status, raw = r.status, r.read()
+        except (OSError, http.client.HTTPException, ValueError):
+            return 0, {}, True
+    finally:
+        if poll:
+            poll.set(None)
+        conn.close()
+    try:
+        answer = json.loads(raw) if raw else {}
+    except ValueError:
+        answer = {}
+    return status, answer if isinstance(answer, dict) else {}, True
+
+
+class Telegram(Account):
+    """One bot (CHAT-APPS.md 19.2): a getUpdates long poll, and the Bot API's sends. Telegram keeps an update until a
+    later getUpdates confirms it with a higher offset, so each message is in the journal before the bridge asks for the
+    next ones: a stop or a crash in between gets the same update again, and the journal and the hub drop the copy."""
+    app = "telegram"
+    typing_every = staticmethod(lambda: TELEGRAM_TYPING_EVERY)
+
+    def __init__(self, bridge, conf):
+        super().__init__(bridge, conf)
+        self.token_path = os.path.join(bridge.folder, self.id + ".json")
+        self.api = bridge.telegram_api
+        self.offset = None          # the next update to ask for; None: the first one that Telegram keeps
+        self.bot = None             # the bot's number, from getMe: the first part of each message key
+        self.backoff = Backoff()
+        self.poll = TelegramPoll()
+
+    def token(self):
+        try:
+            with open(self.token_path, encoding="utf-8") as f:
+                token = json.load(f).get("token")
+        except (OSError, ValueError, AttributeError):
+            return None
+        token = token.strip() if isinstance(token, str) else ""
+        return token if TELEGRAM_TOKEN.match(token) else None
+
+    def halt(self):
+        self.poll.close()
+
+    def call(self, token, method, body=None, timeout=20, poll=False):
+        return telegram_call(self.api, token, method, body, timeout, self.poll if poll else None)
+
+    def run(self):
+        while not self.stopping.is_set():
+            token = self.token()
+            if not token:
+                self.set_state("missing_token")
+                self.stopping.wait(TOKEN_POLL)
+                continue
+            result = self.session(token)
+            if result == "fatal":       # a token that Telegram does not take: a new token file starts it again
+                while not self.stopping.wait(TOKEN_POLL) and self.token() == token:
+                    pass
+                continue
+            if result == "token":
+                continue
+            self.stopping.wait(self.backoff.next())
+
+    def session(self, token):
+        """getMe, then the long poll until a fault, a stop or a new token file."""
+        self.set_state("connecting")
+        status, me, _ = self.call(token, "getMe")
+        if status in (401, 404):
+            self.set_state("error", "Telegram does not take this token.")
+            return "fatal"
+        user = me.get("result") if me.get("ok") else None
+        if status != 200 or not isinstance(user, dict) or not isinstance(user.get("id"), int):
+            log(f"telegram {self.id}: getMe failed ({status or 'no answer'})")
+            return None
+        self.meet(str(user["id"]))
+        self.name = str(user.get("username") or "") or None
+        first = True
+        while not self.stopping.is_set():
+            if self.token() != token:
+                log(f"telegram {self.id}: the token file changed; connecting again")
+                return "token"
+            body = {"timeout": 0 if first else TELEGRAM_POLL, "allowed_updates": TELEGRAM_UPDATES}
+            if self.offset is not None:
+                body["offset"] = self.offset
+            status, answer, _ = self.call(token, "getUpdates", body, timeout=TELEGRAM_POLL + 15, poll=True)
+            if self.stopping.is_set():
+                return None
+            if status in (401, 404):
+                self.set_state("error", "Telegram does not take this token.")
+                return "fatal"
+            if status == 409:
+                self.set_state("error", "Another program reads this bot's updates (a webhook, or a second bridge).")
+                return None
+            if status == 429:
+                self.stopping.wait(min(number((answer.get("parameters") or {}).get("retry_after"), default=1), 60))
+                continue
+            updates = answer.get("result") if answer.get("ok") else None
+            if status != 200 or not isinstance(updates, list):
+                log(f"telegram {self.id}: getUpdates failed ({status or 'no answer'})")
+                return None
+            if first:
+                first = False
+                self.backoff.reset()
+                self.set_state("connected")
+            for update in updates:
+                uid = update.get("update_id") if isinstance(update, dict) else None
+                if not isinstance(uid, int) or isinstance(uid, bool):
+                    continue
+                if not self.on_update(update):
+                    return None         # not kept: the next getUpdates asks for it again
+                self.offset = uid + 1
+        return None
+
+    def meet(self, bot):
+        """The bot that this token is. Another bot than the last one starts from its own updates: an offset of the
+        bot before would confirm, and so lose, every update of the new one whose number is lower."""
+        if bot != self.bot:
+            self.offset = None
+        self.bot = self.user = bot
+
+    def on_update(self, update):
+        """True when the update is kept (or is one the bridge drops), so that the next getUpdates may confirm it."""
+        if isinstance(update.get("message"), dict):
+            return self.on_message(update["message"])
+        if isinstance(update.get("my_chat_member"), dict):
+            return self.on_member(update["my_chat_member"])
+        return True
+
+    def on_message(self, msg):
+        """A person's message in a private chat goes to the journal. A bot's, a group's and a channel's do not: in a
+        group, the bot only posts (19.5). A group that became a supergroup tells the hub its new number."""
+        chat, sender = msg.get("chat") or {}, msg.get("from") or {}
+        kind, cid, mid, uid = chat.get("type"), chat.get("id"), msg.get("message_id"), sender.get("id")
+        if not isinstance(cid, int):
+            return True
+        if kind in ("group", "supergroup"):
+            moved = msg.get("migrate_to_chat_id")
+            if isinstance(moved, int) and moved != cid:
+                return self.place({"account": self.id, "chat": str(cid), "moved_to": str(moved)})
+            return True
+        if kind != "private" or sender.get("is_bot") or not isinstance(uid, int) or not isinstance(mid, int):
+            return True
+        if msg.get("text"):
+            what = "text"
+        elif msg.get("photo"):
+            what = "image"
+        elif msg.get("voice") or msg.get("audio"):
+            what = "audio"
+        elif msg.get("document"):
+            what = "file"
+        else:
+            what = "other"
+        name = " ".join(str(x) for x in (sender.get("first_name"), sender.get("last_name")) if x) or \
+            str(sender.get("username") or "") or None
+        return self.bridge.inbound({"account": self.id, "id": f"{self.bot}:{cid}:{mid}", "chat": str(cid),
+                                    "group": False, "sender": str(uid), "sender_alt": None, "sender_name": name,
+                                    "bot": False, "from_me": False, "kind": what,
+                                    "text": str(msg.get("text") or "") if what == "text" else "",
+                                    "ts": number(msg.get("date"), default=time.time())})
+
+    def on_member(self, change):
+        """The bot's own status changed in a chat: in a group or a channel, the hub gets it, with who changed it
+        (19.5). A private chat's (a person stopped or started the bot) is dropped."""
+        chat, new = change.get("chat") or {}, change.get("new_chat_member") or {}
+        kind, cid, status = chat.get("type"), chat.get("id"), new.get("status")
+        if kind not in ("group", "supergroup", "channel") or not isinstance(cid, int) or status not in TELEGRAM_STATUSES:
+            return True
+        if kind == "channel":
+            can_post = status == "creator" or (status == "administrator" and new.get("can_post_messages") is True)
+        else:
+            can_post = status in ("creator", "administrator", "member") or \
+                (status == "restricted" and new.get("can_send_messages") is True)
+        by = (change.get("from") or {}).get("id")
+        title, username = chat.get("title"), chat.get("username")
+        return self.place({"account": self.id, "chat": str(cid), "kind": kind, "status": status, "can_post": can_post,
+                           "title": str(title)[:255] if title else None,
+                           "username": str(username) if username else None,
+                           "by": str(by) if isinstance(by, int) and by > 0 else None})
+
+    def place(self, body):
+        """POST /bridge/places until the hub answers. False when the bridge stops first: the update is asked for
+        again. A body that the hub refuses, or a hub with no such route, lets the update go."""
+        backoff = Backoff()
+        while not self.stopping.is_set():
+            code, _ = self.bridge.hub.call("POST", "/bridge/places", body)
+            if code == 200:
+                log(f"telegram {self.id}: a group or channel change went to the hub")
+                return True
+            if code in (400, 404, 409):
+                log(f"telegram {self.id}: the hub refused a group or channel change ({code}); let go")
+                return True
+            self.stopping.wait(backoff.next())
+        return False
+
+    def reply_id(self, reply_to, chat):
+        """Telegram's own number of the message that a reply answers, when it is in this chat of this bot."""
+        parts = str(reply_to or "").split(":")
+        if len(parts) == 3 and parts[0] == self.bot and parts[1] == chat and parts[2].isdigit():
+            return int(parts[2])
+        return None
+
+    def send(self, item, db):
+        token = self.token()
+        if not token:
+            return outcome("failed", [], "The bot has no token on the hub machine.")
+        chat = str(item.get("chat") or item.get("recipient") or "")
+        if not TELEGRAM_CHAT.match(chat):
+            return outcome("failed", [], "The chat is not a Telegram chat number.")
+        text = str(item.get("text") or "")
+        if item.get("prefix"):
+            text = f"**{item['prefix']}:** " + text
+        reply = self.reply_id(item.get("reply_to"), chat)
+        ids = []
+        for n, part in enumerate(split_parts(text, TELEGRAM_LIMIT), 1):
+            if n > 1:
+                time.sleep(TELEGRAM_PART_GAP)
+            body = {"chat_id": chat, "text": tg_format(part), "parse_mode": "HTML"}
+            if n == 1 and reply is not None:
+                body["reply_parameters"] = {"message_id": reply, "allow_sending_without_reply": True}
+            state, said = self.send_part(token, body, part, n, lambda: self.bridge.report_item(
+                item["id"], {"state": "sending", "parts": 0, "platform_ids": [], "error": None}))
+            if state != "sent":
+                return outcome(state, ids, said)
+            ids.append(said)
+        return outcome("sent", ids)
+
+    def send_part(self, token, body, part, n, begin=lambda: None):
+        """("sent", the part's message key) or (state, error). A request that reached no Telegram server, a 429 and a
+        refused HTML sent nothing, so they go again: the HTML as plain text. A lost answer is unknown, never a second
+        try: Telegram has no idempotency key, so a second try could be a second message (19.2). Before each wait of a
+        429, begin() tells the hub that the item begins again (CHAT-APPS.md 20): a wait can be longer than the hub's
+        window of a sending item, and an item that the hub made unknown meanwhile could be sent twice by Send again."""
+        tries = waits = 0
+        backoff = Backoff()
+        while True:
+            status, answer, reached = self.call(token, "sendMessage", body)
+            if status == 200 and answer.get("ok"):
+                mid = (answer.get("result") or {}).get("message_id")
+                return "sent", f"{self.bot}:{body['chat_id']}:{mid}"
+            if status == 0:
+                if reached:
+                    return "unknown", f"Telegram did not confirm part {n}."
+                tries += 1
+                if tries >= TELEGRAM_TRIES:
+                    return "failed", "The bridge could not reach Telegram."
+                time.sleep(backoff.next())
+                continue
+            params = answer.get("parameters") if isinstance(answer.get("parameters"), dict) else {}
+            said = str(answer.get("description") or "")[:200]
+            if status == 429 and waits < TELEGRAM_WAITS:
+                waits += 1
+                wait = number(params.get("retry_after"), default=1.0)
+                if wait > 60:
+                    return "failed", f"Telegram asks the bot to wait {int(wait)} seconds before it sends again."
+                begin()
+                time.sleep(wait)
+                continue
+            if status == 400 and "parse_mode" in body and "entit" in said.lower():
+                body = {k: v for k, v in body.items() if k != "parse_mode"}
+                body["text"] = tg_plain(part)
+                continue
+            moved = params.get("migrate_to_chat_id")
+            if isinstance(moved, int) and str(moved) != body["chat_id"]:
+                self.place({"account": self.id, "chat": body["chat_id"], "moved_to": str(moved)})
+                body = dict(body, chat_id=str(moved))
+                continue
+            if status >= 500:
+                return "unknown", f"Telegram answered HTTP {status} for part {n}."
+            return "failed", f"Telegram refused part {n}: HTTP {status}: {said}".strip()
+
+    def typing_on(self, chat):
+        token = self.token()
+        if token and TELEGRAM_CHAT.match(chat):
+            status, _, _ = self.call(token, "sendChatAction", {"chat_id": chat, "action": "typing"})
+            if status != 200:
+                log(f"telegram {self.id}: typing signal failed ({status or 'no answer'})")
+
+
+APPS = {"discord": Discord, "whatsapp": WhatsApp, "telegram": Telegram}
 
 
 # ---------------------------------------------------------------- the bridge
 
 class Bridge:
-    def __init__(self, folder, hub, gateway=GATEWAY, api=DISCORD_API):
-        self.folder, self.gateway, self.api = folder, gateway, api
+    def __init__(self, folder, hub, gateway=GATEWAY, api=DISCORD_API, telegram_api=TELEGRAM_API):
+        self.folder, self.gateway, self.api, self.telegram_api = folder, gateway, api, telegram_api
         os.makedirs(folder, mode=0o700, exist_ok=True)
         os.chmod(folder, 0o700)
         self.hub = Hub(hub, os.path.join(folder, "bridge.key"))
@@ -1844,7 +2248,7 @@ class Bridge:
 def unit_text():
     def quote(x):
         return json.dumps(x.replace("%", "%%"))
-    return ("[Unit]\nDescription=Founderizer chat apps bridge (Discord and WhatsApp)\n"
+    return ("[Unit]\nDescription=Founderizer chat apps bridge (Discord, Telegram and WhatsApp)\n"
             "After=network-online.target fleet-hub.service\nWants=network-online.target\n\n"
             "[Service]\nType=simple\nWorkingDirectory=" + KIT.replace("%", "%%").replace(" ", r"\x20") + "\n"
             "ExecStart=" + quote(sys.executable) + " " + quote(os.path.join(KIT, "channels.py")) + " run\n"

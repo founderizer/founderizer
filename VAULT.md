@@ -796,7 +796,7 @@ host.
     container on the Mac has the Mac's address and not that file, and the hub refuses it, unless the owner gives it
     the folder `~/.founderizer`.
 14. **The hub's own sign-ins.** The Google refresh tokens and their client secret, the GitHub App private key, the
-    credentials of the MCP servers and the Discord bot tokens are not in the vault. They are files of the hub's OS user
+    credentials of the MCP servers and the Discord and Telegram bot tokens are not in the vault. They are files of the hub's OS user
     on the hub's server, so a person who controls that user has them (`hub.py`, `channels.py`). The Google file is
     sealed with ChaCha20-Poly1305 under a key that the central vault keeps and gives to the hub's user, so a copy of
     the hub user's files does not open it (`hub.py`, `atrest.py`, `vault.py` `hub_key`). Until a central vault serves

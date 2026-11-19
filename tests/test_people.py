@@ -143,7 +143,7 @@ class People(test_chat_apps.ChatApps):
         self.assertEqual(self.handle(other["id"])[0], 409)                      # another person's handle
         self.own(app="whatsapp", ident="34600111000@s.whatsapp.net")
         self.assertEqual(self.handle(other["id"], handle="34600111000@s.whatsapp.net")[0], 409)
-        self.assertEqual(self.handle(other["id"], app="telegram")[0], 400)
+        self.assertEqual(self.handle(other["id"], app="signal")[0], 400)          # no chat app of this hub
         self.assertEqual(self.handle(other["id"], handle="with\nnewline")[0], 400)
         self.assertEqual(self.handle(999, handle=JORDI, app="discord")[0], 404)
         twice = dict(self.command(), name="Twice", role="customer", agents=[],

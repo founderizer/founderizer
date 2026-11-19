@@ -84,7 +84,8 @@ CLAIMED_NAMES = re.compile(r"claude|chatgpt", re.I)
 # part of the fleet: a device, a chat app, the owner, the hub, an agent's role, the product. Such a name shows as App.
 # "windows" and "pc" since an owner device can be a PC, whose messages say via=Windows (hub.OWNER_DEVICE_KINDS).
 RESERVED_NAMES = frozenset(("iphone", "ipad", "mac", "windows", "pc", "whatsapp", "discord", "owner", "hub", "manager",
-                            "founderizer", "fleet", "app"))
+                            "founderizer", "fleet", "app",
+                            "telegram"))        # the third chat app (CHAT-APPS.md 19)
 TAILNET = ipaddress.ip_network("100.64.0.0/10")
 NAT64 = ipaddress.ip_network("64:ff9b::/96")
 SITE_LOCAL = ipaddress.ip_network("fec0::/10")

@@ -93,6 +93,12 @@ OLD = {
                       "24.04 or 26.04 that is not the hub's own server runs one",
     "browser_no_room": "{server} has no room for the browser of {agent} beside its other agents: turn its Browser box "
                        "off first, or move it to a server with more memory",
+    "no_such_person": "no such person",
+    "person_blocked": "you blocked this person",
+    "person_handles_most": "a person has at most {most} handles",
+    "agent_no_telegram_bot": "{agent} has no Telegram bot",
+    "bot_name_unknown": "the bot has not said its name yet: try again when the bot is connected",
+    "token_bot_account": "a token is for a Discord or Telegram account",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
@@ -121,6 +127,9 @@ SITES = {
     'move_agent': {'agent_mid_turn': 1, 'agent_open_signin': 1, 'no_such_agent': 1, 'no_such_server': 1,
                    'server_no_service': 1, 'server_silent': 1, 'team_changed': 1},
     'need_give_press': {'request_answered': 1},  # the lane "Give on a card": a Give whose agent left the fleet
+    'new_invite_code': {'agent_no_telegram_bot': 1, 'bot_name_unknown': 1, 'no_such_person': 1, 'person_blocked': 1,
+                        'person_handles_most': 1},     # a person's Telegram invite
+    'person_remove': {'no_such_person': 1},
     'phone_chat': {'hub_changed': 1, 'no_such_agent': 1},
     'phone_ended': {'hub_changed': 1},
     'phone_knowledge': {'hub_changed': 1},
@@ -161,6 +170,7 @@ SITES = {
     'ui_capacity': {'hub_changed': 1},
     'ui_chat_apps': {'hub_changed': 1},
     'ui_chat_link_state': {'hub_changed': 1},
+    'ui_chat_token': {'token_bot_account': 1},
     'ui_checks': {'hub_changed': 1},
     'ui_connect': {'hub_changed': 1},
     'ui_conversation': {'hub_changed': 1},
@@ -188,6 +198,8 @@ SITES = {
     'ui_owner_devices': {'hub_changed': 1},
     'ui_owner_enroll': {'not_owner_device': 1},
     'ui_people': {'hub_changed': 1},
+    'ui_person': {'no_such_person': 1},
+    'ui_person_handles': {'no_such_person': 1, 'person_handles_most': 1},
     'ui_profile_save': {'no_such_agent': 1},
     'ui_profiles': {'hub_changed': 1},
     'ui_releases': {'hub_changed': 1},
@@ -440,7 +452,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 164)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 174)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

@@ -375,7 +375,8 @@ class ChatApps(OwnerAPI):
               "'connected','34911222333:4@s.whatsapp.net','+34 911 222 333',NULL,NULL,1)")
         _, wa = self.post("/ui/people/codes", purpose="owner", app="whatsapp")
         self.assertEqual(wa["targets"][0]["url"], f"https://wa.me/34911222333?text=link%20{wa['code']}")
-        for fields, words in (({"purpose": "invite", "app": "discord"}, "purpose"), ({"purpose": "owner", "app": "sms"},
+        for fields, words in (({"purpose": "invite", "app": "discord"}, "an invite is for Telegram"),
+                              ({"purpose": "other", "app": "discord"}, "purpose"), ({"purpose": "owner", "app": "sms"},
                               "app must be"), ({"purpose": "owner", "app": "discord", "x": 1}, "unknown field x")):
             code, data = self.post("/ui/people/codes", **fields)
             self.assertEqual(code, 400, data)
@@ -1215,7 +1216,7 @@ class ChatApps(OwnerAPI):
         self.assertFalse(os.path.exists(token))
         self.assertTrue(os.path.exists(kept), "only the removed account's file goes")
         self.assertIsNone(hub.q1("SELECT 1 FROM chat_status WHERE account='discord-studio'"))
-        self.assertIn("removed the Discord token file of discord-studio",
+        self.assertIn("removed the bot token file of discord-studio",
                       hub.q1("SELECT what FROM log WHERE what LIKE 'forgot the bridge%' ORDER BY id DESC LIMIT 1")["what"])
 
     def test_a_new_bot_under_a_removed_bots_id_does_not_catch_up_on_its_chats(self):
@@ -1272,7 +1273,9 @@ class ChatApps(OwnerAPI):
         self.assertEqual((wa["default"], wa["last_event"]), ("manager", None))
         self.assertEqual(set(discord), {"id", "app", "label", "agents", "default", "unknown", "enabled", "state", "user",
                                         "name", "error", "application_id", "invite_url", "status_at", "last_event",
-                                        "sent_today", "ignored_today", "link"})
+                                        "sent_today", "ignored_today", "link", "owner_wrote"})
+        # a message of the owner's came in through the Discord account only (CHAT-APPS.md 19.4)
+        self.assertEqual((discord["owner_wrote"], wa["owner_wrote"]), (True, False))
         # No console line in the API: the token is pasted into the app and POST /ui/chat-apps/<id>/token writes the
         # file. An API that carries a shell command invites an app to draw one.
         self.assertNotIn("setup", discord)

@@ -608,8 +608,9 @@ the app's own activate left Terminal in front 5 times of 5, and `open` from anot
 the app to the front 3 times of 3.
 
 **`save_bot_token`** (a write, so `founderizer-cli write` and the MCP form take it, and `call` does
-not): a Discord bot's token to the hub, as the app's own Discord page sends it, or its delete. Its
-fields are `account` (a Discord chat account that the fleet has already: the tool makes none),
+not): a Discord or Telegram bot's token to the hub, as the app's own Discord or Telegram page sends
+it, or its delete. Its fields are `account` (a Discord or Telegram chat account that the fleet has
+already: the tool makes none),
 `from` (`file` with `path`, `stdin`, or `clipboard`), `replace` and `delete`. A save for a bot that the
 bridge reports as connected now needs `replace` true; in every other state a save replaces what is
 there, and `replaced` says so. The token is never a field and never a word of
@@ -619,7 +620,8 @@ protocol), and sends it to the app as a value part after the request line, 64 Ki
 `path`. With `from` `clipboard` (with `write` and in the MCP form) the program reads nothing and
 sends only the fields: the app reads the clipboard itself, last, only for a call that passed every
 other check, and after a save that the hub confirmed clears it when nothing else changed it since
-the read. The app checks the token itself and sends it only while its reading of the fleet is current.
+the read. The app checks the token itself, of the account's app's form (each app's token goes only to a bot
+of that app), and sends it only while its reading of the fleet is current.
 It answers `account`, `set` and `replaced` (null when the hub does not say), and for the clipboard
 `clipboard` (`cleared` or `kept`), never the token. No command lock: the app does the
 write, as its page does. The value part and what any process of the owner's user can do with the
@@ -1481,7 +1483,7 @@ would read as an empty fleet instead of as a mistake.
 | `save_person` / `person_handle` | `/ui/people`, `/ui/people/<id>/handles` | The people who may write to an agent, and their chat handles. `scopes` gives a person All of an agent, or only some of its repositories and secrets (the person access plan). |
 | `save_role` | `/ui/roles` | The roles those people hold: a name, a prompt in the owner's words, tools on or off, a daily limit for a closed role. A held role is not deleted. |
 | `save_settings` | `/ui/settings` | The fleet's settings in `team.json`, such as `contacts.v2`, and the runtime facts the owner changes (`cache_seconds`, `compact_tokens`, `token_weights`, `routine`); null gives each its default. |
-| `person_code` / `remove_owner_handle` | `/ui/people/codes`, `/ui/people/handles` | Link the owner's own chat account; remove one of their handles. |
+| `person_code` / `remove_owner_handle` | `/ui/people/codes`, `/ui/people/handles` | Link the owner's own chat account, or make a person's Telegram invite; remove one of the owner's handles. |
 | `control_conversation` | `/ui/conversations/<id>` | Pause one conversation with a person, or let it run again. |
 | `save_chat_account` | `/ui/team/chat-apps` | One chat app account. The account, never its bot token. |
 | `pause_chat_apps` | `/ui/chat-apps/pause` | Pause all: every inbound message and every outbound item at once. |

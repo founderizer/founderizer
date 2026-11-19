@@ -111,6 +111,14 @@ WORDS = {
                       "24.04 or 26.04 that is not the hub's own server runs one",
     "browser_no_room": "{server} has no room for the browser of {agent} beside its other agents: turn its Browser box "
                        "off first, or move it to a server with more memory",
+    # a person and their handles: the people routes, and a person's Telegram invite (CHAT-APPS.md 19.4)
+    "no_such_person": "no such person",
+    "person_blocked": "you blocked this person",
+    "person_handles_most": "a person has at most {most} handles",
+    "agent_no_telegram_bot": "{agent} has no Telegram bot",
+    "bot_name_unknown": "the bot has not said its name yet: try again when the bot is connected",
+    # a bot's token (POST /ui/chat-apps/<account>/token)
+    "token_bot_account": "a token is for a Discord or Telegram account",
 }
 
 

@@ -1,6 +1,7 @@
 """Rules that send (WAKEUPS-INTERFACE.md section 8): a wake-up rule whose times send a ready text with no session, and
 a person's own reminders, through the real hub.Handler and the bridge routes, over a Discord account (no platform,
-no bridge process, no live hub, no ~/.fleet). Example names only."""
+no bridge process, no live hub, no ~/.fleet). Telegram's groups and channels as places of such a rule are
+test_telegram.py's. Example names only."""
 import datetime
 import json
 import re

@@ -968,12 +968,13 @@ TOOL_SPECS = (
                                                     "agent by its role."},
           "check": {"description": READ_WORDS},
           "send": {"type": "object",
-                   "description": "In place of task and check (WAKEUPS-INTERFACE.md 8): {\"to\": \"owner\", "
-                                  "\"text\": the message in Markdown}. At each time the hub sends the text word for "
-                                  "word, and no session starts, so it costs nothing; every sends at most once an "
-                                  "hour. Only the manager, or a task that the owner asked you for in your own chat, "
-                                  "saves or changes one to the owner. Write a rule with task instead when the text "
-                                  "must be written at the time from live data."},
+                   "description": "In place of task and check (WAKEUPS-INTERFACE.md 8): {\"to\": \"owner\" or one of "
+                                  "your Telegram groups or channels (its title, @username or number), \"text\": the "
+                                  "message in Markdown}. At each time the hub sends the text word for word, and no "
+                                  "session starts, so it costs nothing; every sends at most once an hour. Only the "
+                                  "manager, or a task that the owner asked you for in your own chat, saves or changes "
+                                  "one to the owner. Write a rule with task instead when the text must be written at "
+                                  "the time from live data."},
           "task_id": TASK_ID}, ["request_id"])),
     ("change_trigger",
      "Pause, resume or delete a wake-up rule that you may change, or run its check once now (check_now never starts "

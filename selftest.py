@@ -144,8 +144,9 @@ def free_port():
 # read. A fleet whose owner called his agents manager, vps or studio would otherwise be checked with his own entries,
 # and his studio without a browser fails checks that are about the hub's code (PRODUCT.md 4.1: a self-test that fails
 # for a reason that is not the code's keeps that machine on old code). These three carry no vault and no grant
-# either, so the tool sets below are the hub's own: test_create_login.py, test_call_api.py and test_google_api.py
-# check the tools a grant adds, and test_vault.py broker mode, which this file's file-mode login flow is not.
+# either, and no Telegram bot, so the tool sets below are the hub's own: test_create_login.py, test_call_api.py,
+# test_google_api.py and test_telegram.py (post_to_chat, CHAT-APPS.md 19.6) check the tools that a grant or a bot
+# adds, and test_vault.py broker mode, which this file's file-mode login flow is not.
 REFERENCE = {
     "manager": {"role": "manager", "machine": "hub", "runtime": "claude", "can": ["shell", "web"],
                 "start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}"},

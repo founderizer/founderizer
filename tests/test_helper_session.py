@@ -4,6 +4,7 @@ Real tmux on a socket of this test, a stand-in command (`sleep`) in every window
 call. The helper's conf is this file's own, so no agent of the live team.json is read.
 """
 import ast
+import glob
 import os
 import pwd
 import re
@@ -283,12 +284,12 @@ class OwnFolder(unittest.TestCase):
         self.assertTrue(self.without_a_folder(program + command))
         self.assertFalse(self.without_a_folder(program + "def setUpModule():\n    scratch_home()\n\n\n" + command))
         self.assertFalse(self.without_a_folder("class Helper(unittest.TestCase):\n    x = fleet.HelperState\n"))
-        here = TEST_DIR
         without, named = [], 0
-        for name in sorted(os.listdir(here)):
-            if not (name.startswith("test_") and name.endswith(".py")) or name in self.OWN_HOME:
+        # The pattern in quotes is what ship.py reads (`LISTING`): a change that adds a test file then runs this test.
+        for name in sorted(glob.glob("test_*.py", root_dir=TEST_DIR)):
+            if name in self.OWN_HOME:
                 continue
-            with open(os.path.join(here, name), encoding="utf-8") as f:
+            with open(os.path.join(TEST_DIR, name), encoding="utf-8") as f:
                 text = f.read()
             named += "fleet.Helper" in text
             if self.without_a_folder(text):

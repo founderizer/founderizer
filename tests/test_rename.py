@@ -430,6 +430,7 @@ class Columns(unittest.TestCase):
         ("attachments", "name"): "a file", ("calls", "name"): "a tool", ("chat_ignored", "sender"): "a chat handle",
         ("chat_ignored", "name"): "a person", ("chat_in", "sender"): "a chat handle", ("chat_out", "sender"): "a chat handle",
         ("chat_out", "recipient"): "a Discord user", ("chat_status", "name"): "a bot",
+        ("chat_places", "added_by"): "the Telegram user who put a bot in a group or a channel (CHAT-APPS.md 19.5)",
         ("conversation_messages", "who"): "person, agent, owner or action", ("conversations", "sender"): "a chat handle",
         ("deposits", "machine"): "a machine", ("deposits", "recipient"): "a vault key", ("jobs", "target"): "a site",
         ("join_codes", "name"): "a server", ("join_codes", "agent"): "a first agent that does not exist yet", ("link_failures", "sender"): "a chat handle", ("owner_handles", "name"): "the owner",
