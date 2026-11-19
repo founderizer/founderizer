@@ -1444,6 +1444,16 @@ RESTART_CONF_PLACES = ("/etc/systemd/system.conf", "/etc/systemd/system.conf.d",
 # The watchdog program itself (its file in /etc stays after an `apt remove`, so it says nothing): a server that has it
 # has a watchdog of its own, which would find the device held by systemd at its next boot.
 RESTART_DAEMON = "/usr/sbin/watchdog"
+# The link that enabling the unit makes: a unit with no such link loads no softdog at the next start, so a watchdog
+# that is active now is not in force by itself.
+RESTART_WANTS = "/etc/systemd/system/sysinit.target.wants/" + RESTART_UNIT_NAME
+# softdog now, as the unit loads it at each start. While systemd holds no watchdog device and the drop-in is in force, it
+# tries to open one at each reload and each time its own loop wakes, and systemd 259 at most once in five seconds: a
+# device that comes after a try waits for the next one, which on a quiet server can take minutes. So softdog loads
+# before the reload that reads the drop-in. Where the drop-in was in force before softdog loaded, a try in the five
+# seconds before that reload holds its try back, and one more reload RESTART_RETRY seconds later opens the device.
+RESTART_LOAD = "modprobe softdog"
+RESTART_RETRY = 6
 
 
 def swap_now(root=""):
@@ -1728,11 +1738,15 @@ def own_watchdog_settings(root=""):
 
 def harden_watchdog(check, run, root=""):
     """When systemd stops for ten minutes, the kernel's software watchdog restarts the server: RESTART_UNIT loads it at
-    each start, and RESTART_CONF has systemd ping it, which systemd takes at its reload. Each setting of the server's
-    own stays: a file of systemd's own configuration that sets RuntimeWatchdogSec (own_watchdog_settings), a link at
-    one of this step's files (a mask), the watchdog program (RESTART_DAEMON), and a watchdog that is active with
-    no file of this step's. Where systemd does not run the system (no /run/systemd/system, which is how systemd's own
-    sd_booted tells), and in a container, nothing is written. The words of what it did."""
+    each start, and RESTART_CONF has systemd ping it, which systemd takes at its reload. The unit is enabled first,
+    with no reload, so that an enable that fails leaves no device and the server's reading says so; then softdog loads
+    (RESTART_LOAD), then systemd reloads, and where no watchdog is active after that, it reloads once more
+    RESTART_RETRY seconds later. What the kernel says then decides the line, also where a reload's answer was lost.
+    Only a unit that is enabled (RESTART_WANTS) holds the watchdog over the next start. Each setting of
+    the server's own stays: a file of systemd's own configuration that sets RuntimeWatchdogSec
+    (own_watchdog_settings), a link at one of this step's files (a mask), the watchdog program (RESTART_DAEMON), and a
+    watchdog that is active with no file of this step's. Where systemd does not run the system (no /run/systemd/system,
+    which is how systemd's own sd_booted tells), and in a container, nothing is written. The words of what it did."""
     if lifecycle.in_container(root):
         return "the watchdog stays as it is: this system is a container, and its host restarts it"
     if not os.path.isdir(root + "/run/systemd/system"):
@@ -1763,7 +1777,8 @@ def harden_watchdog(check, run, root=""):
     active = lifecycle.watchdog_active(watchdogs)
     if active and texts[RESTART_CONF] is None:
         return "a watchdog of this server's own is active already"
-    if active and texts[RESTART_UNIT] == RESTART_UNIT_TEXT and texts[RESTART_CONF] == RESTART_CONF_TEXT:
+    if active and texts[RESTART_UNIT] == RESTART_UNIT_TEXT and texts[RESTART_CONF] == RESTART_CONF_TEXT \
+            and os.path.islink(root + RESTART_WANTS):
         return f"the watchdog restarts the server when systemd stops for {RESTART_WATCHDOG // 60} minutes already"
     if check:
         return f"would have the watchdog restart the server when systemd stops for {RESTART_WATCHDOG // 60} minutes"
@@ -1771,15 +1786,28 @@ def harden_watchdog(check, run, root=""):
         if texts[path] != text:
             os.makedirs(os.path.dirname(root + path), mode=0o755, exist_ok=True)
             put_file(root + path, text, 0o644, *((0, 0) if not root else ()))
-    for command in ("systemctl daemon-reload", f"systemctl enable {RESTART_UNIT_NAME}",
-                    f"systemctl start {RESTART_UNIT_NAME}"):
-        code, out, err = run(command)
-        if code != 0:
-            return ("the watchdog is written and not in force: a command of systemd failed, and the next run tries "
-                    f"again ({' '.join(command.split()[:2])}: {one_line(err) or one_line(out) or f'status {code}'})")
+
+    def failed(code, out, err, command):
+        return ("the watchdog is written and not in force: a command of systemd failed, and the next run tries "
+                f"again ({' '.join(command.split()[:2])}: {one_line(err) or one_line(out) or f'status {code}'})")
+    command = f"systemctl enable --no-reload {RESTART_UNIT_NAME}"
+    code, out, err = run(command)
+    if code != 0:
+        return failed(code, out, err, command)
+    code, out, err = run(RESTART_LOAD)
+    if code != 0:
+        return ("the watchdog is written and not in force: softdog did not load, and the next run tries again "
+                f"({one_line(err) or one_line(out) or f'status {code}'})")
+    code, out, err = run("systemctl daemon-reload")
     if not lifecycle.watchdog_active(watchdogs):
-        return "the watchdog is written and not in force yet: no watchdog device is active, softdog did not load"
-    return f"the watchdog restarts the server when systemd stops for {RESTART_WATCHDOG // 60} minutes"
+        run(f"sleep {RESTART_RETRY}")
+        code, out, err = run("systemctl daemon-reload")
+    if lifecycle.watchdog_active(watchdogs):
+        return f"the watchdog restarts the server when systemd stops for {RESTART_WATCHDOG // 60} minutes"
+    if code != 0:
+        return failed(code, out, err, "systemctl daemon-reload")
+    return ("the watchdog is written and not in force yet: systemd opened no watchdog device, and the next run tries "
+            "again")
 
 
 def harden_part(name, part, *args):

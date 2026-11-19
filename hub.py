@@ -3193,7 +3193,12 @@ def desktop_refusal(owner, needs, caller, keep=False):
 # task's Chrome (browser_waits, D10), and its end takes a free place again or waits for one.
 GIB = 1 << 30
 BROWSER_PLACE = 5 * GIB // 4        # D6: the unit's cap of 1 GiB, and the DevTools MCP server of its session
-BROWSER_NEED_SHELL = 3 * GIB // 2   # D6: an agent with a shell, the manager too: its sessions and one Node build
+# D6 after S4 (19 November 2026, the owner's "Follow the plan"): on worker-1 a lead's sessions and builds of its largest
+# Node repository, beside its browser tasks, filled user.slice to its limit and stalled it 9.1 s in 288 s (3.2 s in
+# 138 s with the builds alone); the lead's user held 2.4 GiB, page cache in it, and the slice 0.6 GiB more in swap.
+# Probe 2's 1.5 GiB (sessions of 0.6 GiB and one Node build) was too small. Whether one agent with a shell and one
+# browser fit a cx23 is the next live check (S4 on a server with one agent).
+BROWSER_NEED_SHELL = 11 * GIB // 4  # D6: an agent with a shell, the manager too: its sessions and its builds
 BROWSER_NEED_CLOSED = 3 * GIB // 5  # D6: an agent without one: its sessions
 BROWSER_MARGIN = GIB // 2           # D6: what stays free of the room
 BROWSER_STALL = 5_000_000           # D6: microseconds of `full` stall in 300 s of readings that is a real shortage

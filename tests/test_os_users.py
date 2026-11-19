@@ -302,7 +302,7 @@ class Moves(Servers):
         job = hub.q1("SELECT * FROM server_jobs WHERE id=?", (receipt["job"],))
         self.assertEqual((job["server"], job["kind"], job["agent"]), ("box", "install", "desk"))
 
-    def box_reads(self, browser="ready", memory=5000):
+    def box_reads(self, browser="ready", memory=7000):
         """box's service reads its browser parts and the room of its user.slice (build plan 04, S1b and D6)."""
         row = hub.q1("SELECT data FROM server_status WHERE server='box'")
         data = dict(json.loads(row["data"]), browser={"state": browser},
@@ -320,7 +320,7 @@ class Moves(Servers):
         status, answer = self.move("desk", "box")           # box has sent no room yet: no place
         self.assertEqual((status, answer.get("code"), answer.get("names")),
                          (409, "browser_no_room", {"server": "box", "agent": "Desk"}), answer)
-        self.box_reads(memory=2500)                         # no place with both agents there (D6)
+        self.box_reads(memory=5000)                         # one place for scout alone, none with both (D6)
         status, answer = self.move("desk", "box")
         self.assertEqual((status, answer.get("code")), (409, "browser_no_room"), answer)
         self.write_can("desk", ["web", "browser"])          # a closed agent hears its true reason first (D2), also

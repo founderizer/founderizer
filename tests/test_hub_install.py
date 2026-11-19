@@ -3310,20 +3310,44 @@ class HardenRestart(unittest.TestCase):
         self.panic.write_text("0\n")
         # Ubuntu's own file names the setting in a comment only.
         (self.root / "etc/systemd/system.conf").write_text("[Manager]\n#RuntimeWatchdogSec=off\n#RebootWatchdogSec=10min\n")
-        self.ran, self.fails, self.loads = [], {}, True
+        self.ran, self.fails, self.loads, self.opens, self.lost = [], {}, True, True, False
+        # The test's clock in seconds, which only `sleep` moves, and when systemd last tried to open the device.
+        self.clock, self.tried = 0, None
 
     def run_cmd(self, script, timeout=120):
-        """Each command as the real one leaves the server: sysctl takes the file's value, and the unit's start loads
-        softdog, which systemd holds open at once when its reload read the step's drop-in (measured on systemd 255)."""
+        """Each command as the real one leaves the server, as systemd 259 does it, which opens the device at fewer
+        moments than systemd 255 (its watchdog_open, read on 19 November 2026 after a server of Ubuntu 26.04 opened it
+        10 seconds late): sysctl takes the file's value; modprobe loads softdog, a device that nothing holds yet;
+        enabling the unit makes its link, and reloads systemd unless it says --no-reload; and once the
+        step's drop-in is there, systemd tries to open the device at each reload, at most once in five seconds of the
+        test's clock. With `lost`, systemd does a reload and its answer is lost."""
         self.ran.append(script)
         if script in self.fails:
             return self.fails[script]
+        unit = hubsetup.RESTART_UNIT_NAME
         if script == f"sysctl -q -p {hubsetup.RESTART_PANIC_FILE}":
             self.panic.write_text(f"{hubsetup.RESTART_PANIC}\n")
-        if script == f"systemctl start {hubsetup.RESTART_UNIT_NAME}" and self.loads:
+        if script == hubsetup.RESTART_LOAD:
+            if not self.loads:
+                return 1, "", "modprobe: FATAL: Module softdog not found in directory /lib/modules/6.8.0-149-generic\n"
             self.device.mkdir(exist_ok=True)
-            held = (self.root / hubsetup.RESTART_CONF.lstrip("/")).exists()
-            (self.device / "state").write_text("active\n" if held else "inactive\n")
+            if not (self.device / "state").exists():
+                (self.device / "state").write_text("inactive\n")
+        if script.startswith("sleep "):
+            self.clock += int(script.split()[1])
+        if script in (f"systemctl enable {unit}", f"systemctl enable --no-reload {unit}"):
+            wants = self.root / hubsetup.RESTART_WANTS.lstrip("/")
+            wants.parent.mkdir(parents=True, exist_ok=True)
+            if not os.path.lexists(wants):
+                os.symlink(hubsetup.RESTART_UNIT, wants)
+        if script in ("systemctl daemon-reload", f"systemctl enable {unit}") and self.opens \
+                and (self.root / hubsetup.RESTART_CONF.lstrip("/")).exists() \
+                and (self.tried is None or self.clock - self.tried >= 5):
+            self.tried = self.clock
+            if self.device.exists():
+                (self.device / "state").write_text("active\n")
+        if script == "systemctl daemon-reload" and self.lost:
+            return 1, "", "Failed to reload daemon: Connection timed out\n"
         return 0, "", ""
 
     def restart(self, check=False):
@@ -3345,8 +3369,11 @@ class HardenRestart(unittest.TestCase):
         self.assertIs(self.guard(), False)
         self.assertEqual(self.restart(), ["the server restarts 10 seconds after a kernel panic",
                                           "the watchdog restarts the server when systemd stops for 10 minutes"])
-        self.assertEqual(self.ran, ["sysctl -q -p /etc/sysctl.d/60-fleet-restart.conf", "systemctl daemon-reload",
-                                    "systemctl enable fleet-watchdog.service", "systemctl start fleet-watchdog.service"])
+        # the link with no reload, then softdog, then the reload that reads the drop-in and opens the device then: no
+        # wait on a new server
+        self.assertEqual(self.ran, ["sysctl -q -p /etc/sysctl.d/60-fleet-restart.conf",
+                                    "systemctl enable --no-reload fleet-watchdog.service", "modprobe softdog",
+                                    "systemctl daemon-reload"])
         for path, text in ((hubsetup.RESTART_PANIC_FILE, hubsetup.RESTART_PANIC_TEXT),
                            (hubsetup.RESTART_UNIT, hubsetup.RESTART_UNIT_TEXT),
                            (hubsetup.RESTART_CONF, hubsetup.RESTART_CONF_TEXT)):
@@ -3362,6 +3389,10 @@ class HardenRestart(unittest.TestCase):
         self.assertEqual(self.restart(), ["the server restarts 10 seconds after a kernel panic already",
                                           "the watchdog restarts the server when systemd stops for 10 minutes already"])
         self.assertEqual(self.ran, [])
+        # A unit that is not enabled loads no softdog at the next start, though systemd holds the device now.
+        (self.root / hubsetup.RESTART_WANTS.lstrip("/")).unlink()
+        self.assertEqual(self.restart()[1], "the watchdog restarts the server when systemd stops for 10 minutes")
+        self.assertTrue(os.path.islink(self.root / hubsetup.RESTART_WANTS.lstrip("/")))
 
     def test_a_server_keeps_its_own_files(self):
         """A sysctl file that sets kernel.panic (in a vendor's folder, or /etc/sysctl.conf) and systemd's own file or
@@ -3430,29 +3461,52 @@ class HardenRestart(unittest.TestCase):
         self.assertEqual((self.ran, self.written(), self.panic.read_text()), ([], [], "0\n"))
 
     def test_a_part_that_is_not_in_force_says_so_and_the_next_run_puts_it_in_force(self):
-        """A command that fails stops its part, so a unit that is not enabled, which no boot would start, is no
-        watchdog in force; and softdog that does not load is none either."""
+        """A command that fails stops its part, and the server's reading then says that it does not restart by itself,
+        so that the next run comes: softdog that does not load, an enable that fails (before softdog loads, so that no
+        device stays that no start would load again), a reload that fails, and a device that systemd does not open.
+        What the kernel says decides, also where a reload's answer was lost after systemd did it. Where the drop-in was
+        in force before softdog loaded, systemd may have tried the device in the five seconds before, and the run has
+        systemd read its files once more six seconds later."""
         self.fails[f"sysctl -q -p {hubsetup.RESTART_PANIC_FILE}"] = (
             255, "", 'sysctl: permission denied on key "kernel.panic"\n')
-        self.fails[f"systemctl enable {hubsetup.RESTART_UNIT_NAME}"] = (1, "", "Failed to enable unit: Access denied\n")
+        self.loads = False          # a kernel with no softdog
         self.assertEqual(self.restart(), [
             "the restart after a kernel panic is written and not in force yet: the kernel takes it at the next start "
             '(sysctl: permission denied on key "kernel.panic")',
-            "the watchdog is written and not in force: a command of systemd failed, and the next run tries again "
-            "(systemctl enable: Failed to enable unit: Access denied)"])
-        self.assertNotIn(f"systemctl start {hubsetup.RESTART_UNIT_NAME}", self.ran)
-        self.fails.clear()
-        self.loads = False          # a kernel with no softdog
-        self.assertEqual(self.restart()[1], "the watchdog is written and not in force yet: no watchdog device is "
-                                            "active, softdog did not load")
-        self.assertIs(self.guard(), False)
+            "the watchdog is written and not in force: softdog did not load, and the next run tries again "
+            "(modprobe: FATAL: Module softdog not found in directory /lib/modules/6.8.0-149-generic)"])
+        self.assertEqual(self.ran[-1], "modprobe softdog", "nothing of systemd's runs")
         self.loads = True
+        enable = f"systemctl enable --no-reload {hubsetup.RESTART_UNIT_NAME}"
+        self.fails = {enable: (1, "", "Failed to enable unit: Access denied\n")}
+        (self.root / hubsetup.RESTART_WANTS.lstrip("/")).unlink(missing_ok=True)
+        del self.ran[:]
+        self.assertEqual(self.restart()[1], "the watchdog is written and not in force: a command of systemd failed, and "
+                                            "the next run tries again (systemctl enable: Failed to enable unit: Access "
+                                            "denied)")
+        self.assertEqual((self.ran[-1], self.device.exists(), self.guard()), (enable, False, False),
+                         "no softdog, so nothing for systemd to open, and the reading asks again")
+        self.fails = {"systemctl daemon-reload": (1, "", "Failed to reload daemon: Access denied\n")}
+        self.assertEqual(self.restart()[1], "the watchdog is written and not in force: a command of systemd failed, and "
+                                            "the next run tries again (systemctl daemon-reload: Failed to reload daemon: "
+                                            "Access denied)")
+        self.assertIs(self.guard(), False)
+        self.fails.clear()
+        self.opens = False          # a systemd that does not take the drop-in at its reload
+        self.assertEqual(self.restart()[1], "the watchdog is written and not in force yet: systemd opened no watchdog "
+                                            "device, and the next run tries again")
+        self.assertIs(self.guard(), False)
+        self.opens, self.lost = True, True
+        self.assertEqual(self.restart()[1], "the watchdog restarts the server when systemd stops for 10 minutes")
+        self.assertIs(self.guard(), True)
+        # A boot that loaded no softdog, and systemd tried the device a moment before this run.
+        shutil.rmtree(self.device)
+        self.lost, self.tried = False, self.clock
         del self.ran[:]
         self.assertEqual(self.restart(), ["the server restarts 10 seconds after a kernel panic already",
                                           "the watchdog restarts the server when systemd stops for 10 minutes"])
-        self.assertEqual(self.ran, ["systemctl daemon-reload", "systemctl enable fleet-watchdog.service",
-                                    "systemctl start fleet-watchdog.service"])
-        self.assertIs(self.guard(), True)
+        self.assertEqual(self.ran, [enable, "modprobe softdog", "systemctl daemon-reload", "sleep 6",
+                                    "systemctl daemon-reload"])
 
 
 class HubTcp(unittest.TestCase):

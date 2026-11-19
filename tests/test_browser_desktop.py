@@ -127,6 +127,7 @@ class BrowserPublisher(unittest.TestCase):
 MIB = 1 << 20
 CX23 = {"memory_max": 3247 * MIB, "swap_max": None, "swap_total": 1910 * MIB, "swap_current": 0, "swap_peak": 0,
         "oom": 0, "swap_fail": 0, "full_us": 0}      # user.slice of a cx23 with part 1's limit and swap (probe 2)
+ONE_PLACE = dict(CX23, memory_max=5800 * MIB)      # a server whose room gives its two agents with a shell one place
 
 
 class LinuxPlaces(OwnerAPI):
@@ -144,7 +145,7 @@ class LinuxPlaces(OwnerAPI):
                                         "can": ["shell", "web", "browser"]}
             hub.know(name)
         hub.know("manager")
-        self.room(CX23)
+        self.room(ONE_PLACE)
 
     def room(self, room, boot="b1", state="ready"):
         """The server service's reading of box, with the room of its user.slice."""
@@ -178,33 +179,41 @@ class LinuxPlaces(OwnerAPI):
         return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent=? AND kind='say' ORDER BY id", (agent,))]
 
     def test_places_come_from_the_room_of_the_slice_and_every_agent_s_need(self):
-        """D6, with probe 2's cx23: 1 place with one agent with a shell (the formula gives 2), 1 with two, none with
-        three, none without the swap file, and none before part 1 put a limit on the slice."""
+        """D6, with probe 2's cx23: 1 place with one agent with a shell, none with two (S4 of 19 November 2026: a lead
+        and an agent without a shell stalled worker-1 beside a browser), none with three, none without the swap file,
+        and none before part 1 put a limit on the slice."""
+        self.room(CX23)
         team = json.loads(json.dumps(hub.TEAM))
-        self.assertEqual(hub.browser_places("box", team), 1)
+        self.assertEqual(hub.browser_places("box", team), 0)
         del team["agents"]["kai"]
         self.assertEqual(hub.browser_places("box", team), 1)
         team["agents"]["kai"] = dict(team["agents"]["ivy"])
         team["agents"]["lea"] = dict(team["agents"]["ivy"])
         self.assertEqual(hub.browser_places("box", team), 0)
         del team["agents"]["lea"]
-        team["agents"]["kai"]["can"] = ["web"]          # an agent without a shell needs less, and takes no browser
-        self.assertEqual(hub.browser_places("box", team), 1)
-        self.room(dict(CX23, swap_total=0))
+        team["agents"]["kai"]["can"] = ["web"]          # worker-1's team in S4: no place on a cx23
+        self.assertEqual(hub.browser_places("box", team), 0)
+        self.room(dict(CX23, memory_max=5000 * MIB))    # an agent without a shell needs less, and takes no browser:
+        self.assertEqual(hub.browser_places("box", team), 1)        # the formula gives 2, the cap 1
+        team["agents"]["kai"]["can"] = ["shell", "web"]
+        self.assertEqual(hub.browser_places("box", team), 0)
+        self.room(ONE_PLACE)                            # the two agents with a shell: 1 place, which needs its swap
+        self.assertEqual(hub.browser_places("box"), 1)
+        self.room(dict(ONE_PLACE, swap_total=0))
         self.assertEqual(hub.browser_places("box"), 0)
-        self.room(dict(CX23, memory_max=None))
+        self.room(dict(ONE_PLACE, memory_max=None))
         self.assertEqual(hub.browser_places("box"), 0)
-        self.room(dict(CX23, swap_max=0))               # a limit of the slice's swap counts before the swap file
+        self.room(dict(ONE_PLACE, swap_max=0))          # a limit of the slice's swap counts before the swap file
+        self.assertEqual(hub.browser_places("box"), 0)
+        self.room(dict(ONE_PLACE, swap_total=0, swap_max=1907 * MIB))  # and only the swap that exists counts
         self.assertEqual(hub.browser_places("box"), 0)
 
     def test_a_real_shortage_takes_a_place_until_the_next_boot_or_a_change_of_the_limits(self):
         """D6: a new oom of the slice, a new fail of its swap, or more than 5 s of full stall in 300 s takes one place
         for each reading that shows one; a reading of a new boot or of new limits starts again."""
-        hub.TEAM["agents"]["kai"]["can"] = ["web"]      # one agent with a shell: 1 place, as the formula gives 2
-        self.room(dict(CX23, memory_max=5000 * MIB))
         hub.TEAM["agents"]["kai"]["can"] = ["shell", "browser"]
         t0 = 1_000_000.0
-        reading = lambda **room: self.room(dict(dict(CX23, memory_max=5000 * MIB), **room))     # noqa: E731
+        reading = lambda **room: self.room(dict(dict(CX23, memory_max=7000 * MIB), **room))     # noqa: E731
         seen = lambda r, at: hub.browser_room_seen("box", r, at)        # noqa: E731
         seen(reading(), t0)
         self.assertEqual(hub.browser_places("box"), 2)
@@ -222,7 +231,7 @@ class LinuxPlaces(OwnerAPI):
         self.assertEqual(hub.browser_places("box"), 2)
         seen(dict(reading(oom=1), os={"boot": "b2"}), t0 + 2700)
         self.assertEqual(hub.browser_places("box"), 1)
-        seen(dict(reading(oom=1, memory_max=5100 * MIB), os={"boot": "b2"}), t0 + 3000)    # a new limit
+        seen(dict(reading(oom=1, memory_max=7100 * MIB), os={"boot": "b2"}), t0 + 3000)    # a new limit
         self.assertEqual(hub.browser_places("box"), 2)
 
     def test_a_browser_task_takes_its_place_and_the_next_one_hears_when_one_is_free(self):
@@ -369,7 +378,7 @@ class LinuxPlaces(OwnerAPI):
 
     def test_a_rename_keeps_each_place_and_the_room_s_counts(self):
         first = self.task("ivy")
-        hub.browser_room_seen("box", self.room(dict(CX23, oom=0)), 1000.0)
+        hub.browser_room_seen("box", self.room(dict(ONE_PLACE, oom=0)), 1000.0)
         with hub.transaction():
             hub.rename_machine_rows("box", "box9")
         self.assertEqual(hub.browser_holds()[first]["server"], "box9")
@@ -380,9 +389,9 @@ class LinuxPlaces(OwnerAPI):
         """The helper starts Chrome only where the parts are ready, for an agent that runs as its own OS user with a
         port of its own: a task admitted without them took a place, and its start was tried again for ever."""
         for room in (dict(state="missing"), dict(state="table_missing"), dict(state="unsupported")):
-            self.room(CX23, **room)
+            self.room(ONE_PLACE, **room)
             self.assertIn("ivy gets no browser on box:", self.task("ivy"), room)
-        data = self.room(CX23)
+        data = self.room(ONE_PLACE)
         for change, words in ((lambda d: d["browser"].update(proof_kept=False), "cannot keep the live proof"),
                               (lambda d: d["browser"].update(ports=d["browser"]["ports"][1:]), "has no browser port there"),
                               (lambda d: d["agents"]["ivy"].update(user="fleet"), "does not run as an OS user of its own")):
@@ -391,9 +400,9 @@ class LinuxPlaces(OwnerAPI):
             hub.q("UPDATE server_status SET data=? WHERE server='box'", (json.dumps(changed),))
             self.assertIn(words, self.task("ivy"), words)
             self.assertEqual(hub.browser_refusal("ivy", "manager"), "Ivy cannot run a browser task on box now.")
-        self.room(dict(CX23, memory_max=None))             # no place at all, and no task that holds one
+        self.room(dict(ONE_PLACE, memory_max=None))        # no place at all, and no task that holds one
         self.assertEqual(hub.browser_refusal("ivy", "manager"), "Ivy cannot run a browser task on box now.")
-        self.room(CX23)
+        self.room(ONE_PLACE)
         hub.kv_set(hub.SERVICE_USER + "ivy", "1")
         self.assertIn("does not run as an OS user of its own there yet", self.task("ivy"))
         self.assertEqual(hub.browser_holds(), {})
