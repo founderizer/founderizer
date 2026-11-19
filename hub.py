@@ -13475,6 +13475,33 @@ def t_switch_key_site(agent, a):
     return text
 
 
+# A change of the door (the manager's door_hold, door_fleet and door_gitops, and a key of the door from a key card)
+# reaches the door at the owner's Mac's next door round: the round writes it into the door's access file
+# (DoorSync.swift `tick`: at most every 300 s, then the round's own SSH steps), and the door acts as before until then.
+# Until 19 November 2026 these answers said that the change worked now ("gets ... through the door", "it now uses it
+# for", "within a few minutes", "This Mac's app writes the door's file", which the manager, on a server, cannot read as
+# the owner's Mac), and on 18 November the manager read the door's refusal of a new grant before that round as a defect
+# of Founderizer (door_round_errors). The words say when the Mac's last round started, so a reader sees a Mac that is
+# off. The agent that meets such a refusal often never reads the answer, so the manager says it in the task. Known and
+# written: a replay of the same request_id gives back the stored answer, with the time of its first call.
+DOOR_EARLY_REFUSAL = "A call that the door refuses before then is no defect."
+DOOR_EARLY_TASK = "Say so in a task that you give for it before then."
+
+
+def door_round_due(after=""):
+    """When the door gets a change that the owner's Mac writes into its access file, in words (door_round_seen)."""
+    return (f"the owner's Mac's next door round{after}, usually within 10 minutes while the Mac's app runs "
+            f"({door_round_seen()})")
+
+
+def door_round_tail(invites, tell=False):
+    """The last sentences of an answer about a change of the door's file. They are true also when the change was so
+    already: an earlier call made it, and the round after it may have passed. invites: the change gives an agent calls
+    that the door refuses until then. tell: the reader gives that work to another agent, which never reads this."""
+    return (f" The door acts on this from {door_round_due(' after the change')}; until then it acts as before." +
+            (f" {DOOR_EARLY_REFUSAL}" if invites else "") + (f" {DOOR_EARLY_TASK}" if invites and tell else ""))
+
+
 def t_door_hold(agent, a):
     """door_hold (the manager, new-projects plan N8 (b)): team.json door.holds[host]. parts: the app puts no door parts
     on the server, and nobody gets it through the door. rule-only: it gets its parts and its Operator, and the door's
@@ -13497,11 +13524,13 @@ def t_door_hold(agent, a):
         return stored["text"]
     if not isinstance(TEAM.get("door"), dict) or not TEAM["door"].get("address"):
         raise ToolError("This fleet has no door, so there is nothing to hold.")
+    was = {}            # the hold before this one, as change() read it: "parts", "rule-only" or None
 
     def change(team):
         door = team.get("door") or {}
         holds = dict(door.get("holds") or {})
-        if DOOR_HOLD_NAMES.get(holds.get(host), holds.get(host)) == (None if hold == "none" else hold):
+        was["hold"] = DOOR_HOLD_NAMES.get(holds.get(host), holds.get(host))
+        if was["hold"] == (None if hold == "none" else hold):
             return False
         if hold == "none":
             holds.pop(host, None)
@@ -13516,11 +13545,19 @@ def t_door_hold(agent, a):
         result = save_integration(None, change, f"the door holds {host}: {hold} ({why})", by=agent)
     except Refusal as e:
         raise ToolError(f"The hub refused it: {e}") from None
+    # A server that a parts hold kept may have no door parts: the app puts them there first, one step a round
+    # (DoorHosts.next: the install, then the door's check, in order, and past the first server only after door_rollout),
+    # and the door's file takes it only after that check. A wider hold gives calls that the door refuses until then.
+    opens = {"parts": 0, "rule-only": 1, "none": 2}
+    wider = opens[hold] > opens.get(was.get("hold") or "none", 2)
+    parts = (f" If its door parts are in place, the door takes {host} at {door_round_due(' after the change')}. If they "
+             f"are not, the app puts them there first, one step a round (their install, then the door's own check), "
+             f"and past the first server only after door_rollout. {DOOR_EARLY_REFUSAL} {DOOR_EARLY_TASK}")
     text = {"parts": f"{host} gets no door parts, and nobody gets it through the door, until you end the hold.",
             "rule-only": f"{host} gets its parts and its Operator, and only rule calls run there through the door "
                          f"until you end the hold.",
-            "none": f"{host} has no hold now."}[hold] + ("" if result["changed"] else " It was so already.") + \
-        " This Mac's app writes the door's file at its next round."
+            "none": f"{host} has no hold."}[hold] + ("" if result["changed"] else " It was so already.") + \
+        (parts if was.get("hold") == "parts" and wider else door_round_tail(invites=wider, tell=True))
     with transaction():
         keep_command(command, {"text": text}, now())
     return text
@@ -13576,8 +13613,7 @@ def t_door_fleet(agent, a):
             f"own there. Give it the work on such a server with create_task." if holder else
             "No agent is named for the fleet's own servers now: the owner's app gives them to the one DevOps agent of "
             "the fleet, or, where the fleet has none, to you when you run alone on a server that is not the hub's.") + \
-        ("" if result["changed"] else " It was so already.") + \
-        " The owner's app writes the door's file at its next round."
+        ("" if result["changed"] else " It was so already.") + door_round_tail(invites=True, tell=True)
     with transaction():
         keep_command(command, {"text": text}, now())
     return text
@@ -13639,8 +13675,8 @@ def t_door_gitops(agent, a):
         raise ToolError(f"The hub refused it: {e}") from None
     text = (f"{who} {'gets' if len(names) == 1 else 'get'} {repo} through the door: reads through its filter, commits "
             f"of the listed forms, rollbacks, and syncs through {sync}." if names else
-            f"Nobody gets {repo} through the door now.") + ("" if result["changed"] else " It was so already.") + \
-        " This Mac's app writes the door's file at its next round."
+            f"Nobody gets {repo} through the door.") + ("" if result["changed"] else " It was so already.") + \
+        door_round_tail(invites=bool(names), tell=True)
     with transaction():
         keep_command(command, {"text": text}, now())
     return text
@@ -13900,9 +13936,10 @@ def t_request_secret(agent, a):
         held = (TEAM["door"].get("credentials") or {}).get(door)
         if held:        # the door has this key already: nothing to type, and at most one name more in its rules
             users = held.get("agents") or []
-            if door_user in users:
+            if door_user in users:      # often asked right after the door refused a call of that agent
                 raise ToolError(f"The door already holds {door} for {'you' if door_user == agent else door_user}, so "
-                                f"there is nothing to type: `ops` takes it.")
+                                f"there is nothing to type: `ops` takes it." +
+                                door_round_tail(invites=True, tell=door_user != agent))
             if users:
                 raise ToolError(f"The door already holds {door}, for {', '.join(users)}: "
                                 f"{'ask your requester to give' if worker else 'give'} that part of the work to "
@@ -13918,9 +13955,10 @@ def t_request_secret(agent, a):
                 save_door_credential(door, held["secret"], door_user, named=True)
             except Refusal as e:
                 raise ToolError(f"The hub refused it: {e}") from None
-            return (f"The door already held {door}, for no agent: it now uses it for "
-                    f"{'you' if door_user == agent else door_user}, with nothing to type. The door's rules take it "
-                    f"when the app next writes them, within a few minutes; then `ops` takes it.")
+            return (f"The door already held {door}, for no agent: it uses it for "
+                    f"{'you' if door_user == agent else door_user} from {door_round_due()}, with nothing to type; "
+                    f"then `ops` takes it. {DOOR_EARLY_REFUSAL}" +
+                    ("" if door_user == agent else f" {DOOR_EARLY_TASK}"))
     env = str(a.get("env") or "").strip() or (door_env(door) if door else "")
     if kind == "api_key" and not env_name(env):
         if door:
@@ -14296,10 +14334,10 @@ def answer_secret(body, request_id, client):
             app_key = spec["door"].split(":") if spec["door"].startswith("app:") else None
             users = ((TEAM.get("door") or {}).get("credentials") or {}).get(spec["door"], {}).get("agents") or []
             text = (f"Saved for the door as {spec['door']} ({ref}): the door holds the key, and no agent holds it. " +
-                    (f"The door uses it for {', '.join(users)}. The door's rules take it when the app next writes "
-                     f"them, within a few minutes; then " +
+                    (f"The door uses it for {', '.join(users)} from {door_round_due()}; then " +
                      (f"`ops <host> env-new {app_key[1]} {app_key[2]} key` puts it in the app's settings."
-                      if app_key else f"`ops {spec['door']} <form>` works.") if users else
+                      if app_key else f"`ops {spec['door']} <form>` works.") + f" {DOOR_EARLY_REFUSAL}" +
+                     ("" if need["by"] in users else f" {DOOR_EARLY_TASK}") if users else
                      f"No agent uses it yet, because " +
                      ("several agents hold servers through the door" if door_holders() else
                       "no agent holds a server through the door") +
@@ -52655,9 +52693,10 @@ def door_holders(team=None):
 
 def save_door_credential(name, ref, asker, named=False):
     """A key that the owner saved from a key card for the door (DevOps plan 13, item 3): the door's rules name it
-    `name`, for the agent that asked. The app writes both into the door's access file at its next round. A key that
-    the manager asked for names no agent: the door uses it for the agent whose own card names it later. A key saved
-    again under the same name replaces the old one.
+    `name`, for the agent that asked. The owner's Mac writes both into the door's access file at its next door round,
+    and the door uses the key only from then: the answers that call this say so (door_round_due). A key that the
+    manager asked for names no agent: the door uses it for the agent whose own card names it later. A key saved again
+    under the same name replaces the old one.
 
     The door knows a caller by its address, and its file names only the agents that hold servers through it. So the
     key is for the asker when it holds a server, the manager too (API 1.122), and else for the one agent that holds
