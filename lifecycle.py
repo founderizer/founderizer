@@ -395,7 +395,10 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "acp_tasks", "model_accounts",
             # the host list: a closed task session takes its agent's host list from the hub's start, and its page
             # reads open only on those hosts (fleet.closed_task_command)
-            "web_hosts"]
+            "web_hosts",
+            # a removed person's windows close, and the runtime's own files of their sessions go (the event `forget`
+            # of the hub's person_remove: forget_valid, fleet.Helper.forget)
+            "forget_sessions"]
 # ---------------------------------------------------------------- the host list
 #
 # The host list of an agent whose Shell box is off and whose Web box is on (team.json "web_hosts"): the hosts on which
@@ -3394,6 +3397,46 @@ def browser_clear_valid(extra):
         clear["cookies"].append(dict({"name": name, "domain": domain}, **({"path": path} if path is not None else {}),
                                      **({"partitionKey": {"topLevelSite": key["topLevelSite"]}} if key else {})))
     return clear
+
+
+# The event `forget` of the hub's person_remove (the lane "What a removal still keeps", step 2; the owner's "Yes, as
+# recommended" of 19 November 2026): what a removed person left on one agent's machine. One rule for the hub, which
+# checks each event with it before it sends it, and for the helper, which acts only on what passes it.
+FORGET_MOST = 200       # the ids of one event; the hub sends more of them in more events
+# a session id, as helpers make them
+SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def forget_valid(extra):
+    """**What a removed person's event `forget` names**, or None where it is not such an event, and then nothing of it
+    is done (fleet.Helper.forget):
+    - `conversations`: [[id, since], ...]: each conversation of the person with this agent, whose window is C-<id>,
+      and the time when it began on the hub's clock: the transcripts of its closed sessions are the files of its
+      folder's project from then on, so a conversation with the same number in an older database keeps its own;
+    - `tasks`: the numbers of the person's tasks of this agent, whose windows are T-<id>;
+    - `sessions`: the ids of the runtime sessions of those tasks and windows (a UUID in lower case, as the helper
+      makes it at each start), whose files go.
+    A number is an int (no bool) from 1 to 12 digits, a time a number from 0, and no id comes twice; at most
+    FORGET_MOST ids in all. A key that is missing is an empty list, and another key is not read."""
+    if not isinstance(extra, dict):
+        return None
+    lists = [extra.get(key, []) for key in ("conversations", "tasks", "sessions")]
+    if not all(isinstance(one, list) for one in lists) or sum(map(len, lists)) > FORGET_MOST:
+        return None
+    pairs, tasks, sessions = lists
+
+    def number(value):
+        return isinstance(value, int) and not isinstance(value, bool) and 0 < value < 10 ** 12
+
+    if not (all(isinstance(p, list) and len(p) == 2 and number(p[0]) and isinstance(p[1], (int, float))
+                and not isinstance(p[1], bool) and 0 <= p[1] < float("inf") for p in pairs)
+            and all(number(t) for t in tasks)
+            and all(isinstance(s, str) and SESSION_ID.fullmatch(s) for s in sessions)):
+        return None
+    conversations = {p[0]: float(p[1]) for p in pairs}
+    if len(conversations) < len(pairs) or len(set(tasks)) < len(tasks) or len(set(sessions)) < len(sessions):
+        return None
+    return {"conversations": conversations, "tasks": list(tasks), "sessions": list(sessions)}
 
 
 def cpu_seconds(text):

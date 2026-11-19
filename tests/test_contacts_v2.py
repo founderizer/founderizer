@@ -953,6 +953,44 @@ class Conversations(Base):
         self.assertEqual(hub.q("SELECT * FROM conversation_messages WHERE conversation=? AND who<>'person'",
                                (said["conversation"],)), [])
 
+    def test_a_removal_asks_each_helper_that_forgets_to_delete_only_their_windows_and_sessions(self):
+        """Step 2 of the lane "What a removal still keeps": the runtime's own files of a removed person's sessions go
+        on each machine that ran one. Each helper's event names their conversation with its start, their task's
+        window and session, or the part's that a lead gave another agent, in events of at most FORGET_MOST ids, and
+        no session of another task; a helper without the feature gets none."""
+        ana = self.person("Ana", "customer", ANA)
+        cid = self.says(ANA, "What is the balance of my account?")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("ask_team", self.context(cid), question="What is the balance of my account?")
+        work = hub.q1("SELECT * FROM tasks WHERE source_conversation=? AND source_message IS NULL", (cid,))
+        with hub.LOCK, hub.transaction():       # a part of it, on the other agent's machine
+            part = hub.admit_task("studio", {"owner": "vps", "title": "Read the balance", "details": "",
+                                             "done_when": "done", "needs": "none", "goal": None, "goal_id": None,
+                                             "parent": work["id"], "follows": None, "case_id": None})
+        other, _ = self.normal_task(title="Plan the refunds")
+        theirs, at_vps, kept = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+        for tid, session in ((work["id"], theirs), (part, at_vps), (other, kept), (work["id"], "s")):
+            hub.ins("INSERT INTO thread_events(task,attempt,session,seq,ts,type,data,created) VALUES(?,1,?,1,?,"
+                    "'session','{}',?)", (tid, session, hub.now(), hub.now()))
+        began = hub.q1("SELECT created FROM conversations WHERE id=?", (cid,))["created"]
+        for agent in ("studio", "vps"):
+            helper_reports(agent, hub.CONVERSATION_TASKS, hub.FORGET_FEATURE)
+        with patch.object(lifecycle, "FORGET_MOST", 2):
+            self.assertEqual(self.change(ana["id"], delete=True)[0], 200)
+        self.assertEqual([(e["agent"], json.loads(e["extra"])) for e in hub.q("SELECT * FROM events WHERE "
+                                                                              "kind='forget' ORDER BY id")],
+                         [("studio", {"conversations": [[cid, began]], "tasks": [work["id"]], "sessions": []}),
+                          ("studio", {"conversations": [], "tasks": [], "sessions": [theirs]}),
+                          ("vps", {"conversations": [], "tasks": [part], "sessions": [at_vps]})])
+        # a helper from before the feature gets nothing: it would ack an event that it does not know
+        self.person("Bea", "customer", BEA)
+        bea = self.says(BEA, "Hello")
+        helper_reports("studio", hub.CONVERSATION_TASKS)
+        self.assertEqual(self.change(hub.q1("SELECT person FROM conversations WHERE id=?",
+                                            (bea["conversation"],))["person"], delete=True)[0], 200)
+        self.assertEqual(len(hub.q("SELECT * FROM events WHERE kind='forget'")), 3)
+
     def test_a_window_that_a_person_drives_reads_no_file_of_the_owners(self):
         """A reviewer of 18 November 2026: read_attachment worked in a conversation with tools, so a person could ask
         the agent for A-1, A-2 and so on and have the files that the owner sent it (the ids count up). A conversation

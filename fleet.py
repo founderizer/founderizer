@@ -66,7 +66,8 @@ import uuid
 import zipfile
 from http.client import HTTPException       # only the name: `http` is this module's own call to the hub
 
-from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript, text_of
+from threads import (MARKER, MAX_LINE, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript,
+                     text_of)
 from usage import Collector, local_model, timestamp
 import acp_programs
 import lifecycle
@@ -3398,6 +3399,149 @@ def conversation_folder(conversation):
     return folder
 
 
+FORGET_SKEW = 600       # seconds between the hub's clock and this machine's that a conversation's start may be off
+# Claude Code's own temporary folder of this user: <project>/<session>/ holds a session's scratchpad and the output of
+# its background commands (2.1.311 on the fleet's Linux machines and 2.1.312 on a Mac, 19 November 2026)
+CLAUDE_TMP = os.path.join("/tmp", f"claude-{os.getuid()}")
+
+
+def forget_path(root, *parts):
+    """Delete root/parts, a file or a folder with all that it holds, and say 1; 0 when it is not there. Nothing at or
+    through a symbolic link below root: such a path stays, and so does what the link points to (shutil.rmtree takes a
+    link inside a folder as a file of its own). Removed by its name, as Helper.forget's callers give it."""
+    path = root
+    for part in parts:
+        path = os.path.join(path, part)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return 0
+        if stat.S_ISLNK(info.st_mode):
+            return 0
+    if stat.S_ISDIR(info.st_mode):
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+    return 0 if os.path.lexists(path) else 1
+
+
+def forget_codex(sessions, cache):
+    """The Codex rollouts of these sessions, deleted (Helper.forget): the session's own, which the marker at the end
+    of its first prompt names (CodexFiles.find, in every folder and at any age), and each rollout that it started at
+    any depth, a subagent's or a fork's, whose first line names a thread of those as its session_id (Codex writes
+    the root's there), its parent_thread_id, its forked_from_id or the parent of its thread_spawn. A rollout's thread
+    is the id at the end of its file's name, as Codex names it. Only the files of CODEX_HOME's sessions. cache: what
+    was read before, {} at first, which a later pass of the same events reuses: a rollout never changes its first
+    lines, so each one's head is read once. Returns how many went."""
+    root = os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "sessions")
+    files = cache.setdefault("files", CodexFiles(os.path.expanduser("~")))
+    heads = cache.setdefault("heads", {})       # rollout -> (its thread, the threads that it names above it)
+    paths, threads = set(), set()
+    for session in sessions:
+        path = files.find(session, since=0)
+        found = THREAD_ID.search(os.path.basename(path or "")[-len(".jsonl") - 36:])
+        if path and found:
+            paths.add(path)
+            threads.add(found.group(0))
+    for path in glob.glob(os.path.join(root, "*", "*", "*", "rollout-*.jsonl")) if threads else []:
+        own = THREAD_ID.fullmatch(os.path.basename(path)[-len(".jsonl") - 36:-len(".jsonl")])
+        if path in heads or not own:
+            continue
+        try:
+            with open(path, "rb") as stream:
+                meta = json.loads(stream.readline(MAX_LINE))
+        except (OSError, ValueError):
+            continue
+        payload = meta.get("payload") if isinstance(meta, dict) and meta.get("type") == "session_meta" else None
+        if isinstance(payload, dict):
+            spawn = payload
+            for key in ("source", "subagent", "thread_spawn"):
+                spawn = spawn.get(key) if isinstance(spawn, dict) else None
+            above = [payload.get("session_id"), payload.get("parent_thread_id"), payload.get("forked_from_id"),
+                     spawn.get("parent_thread_id") if isinstance(spawn, dict) else None]
+            heads[path] = (own.group(0), {thread for thread in above if isinstance(thread, str)} - {own.group(0)})
+    while True:             # a subagent of a subagent joins after its parent
+        more = {own for own, above in heads.values() if own not in threads and above & threads}
+        if not more:
+            break
+        threads |= more
+    paths |= {path for path, (own, _) in heads.items() if own in threads}
+    return sum(forget_path(root, *os.path.relpath(path, root).split(os.sep)) for path in sorted(paths))
+
+
+def forget_files(agent, windows, sessions, conversations, cache):
+    """The files that a removed person's windows and sessions left on this machine, deleted (Helper.forget, when none
+    of those windows runs), by their exact names; returns how many went. Only these:
+    - Claude Code (CLAUDE_CONFIG_DIR, else ~/.claude): each session's transcript projects/*/<session>.jsonl, in every
+      project folder, its folder projects/*/<session>/ (its subagents, its tool results, its title), and its folders
+      file-history/<session>, session-env/<session> and tasks/<session> (as Claude Code 2.1.311 and 2.1.312 name
+      them on the fleet's machines); and its temporary folder CLAUDE_TMP/*/<session>/, when CLAUDE_TMP is a folder of
+      this user;
+    - a closed conversation's own sessions, which no record names: each transcript in the project of its folder
+      CHATS/<id> (only those sessions work there; the project's name is made from the real path of CHATS, so a link
+      at CHATS/<id> names no other project) that changed since the conversation began, less FORGET_SKEW, with the
+      session's other paths above; then that project folder and CHATS/<id> when they are empty;
+    - a screen task's record file, HOME/screen-<session>.jsonl, which the runner of an app-server task writes too;
+    - Codex's rollouts of the sessions (forget_codex, with `cache`);
+    - the helper's own files of the windows in SESSIONS (<agent>.<window>.<hex>.<ext>: a prompt, a credential). Those
+      of a conversation with the agent's tools are named for every such conversation (<agent>.conversation.*), and
+      sweep_sessions removes them a minute after their window ended.
+    Never a path at or through a symbolic link below those folders (forget_path; a link inside a session's folder goes
+    as a file, and what it points to stays), never a session or a window that the event does not name. An ACP
+    runner's own folder goes with its window (sweep_acp_folders), and its usage file holds only numbers. What the
+    runtime keeps elsewhere stays (UI-API.md 1.239)."""
+    claude = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    projects = os.path.join(claude, "projects")
+    found, gone, folders = set(sessions), 0, []
+    for cid, since in conversations.items():
+        folder = re.sub(r"[^A-Za-z0-9-]", "-", os.path.join(os.path.realpath(CHATS), str(cid)))
+        folders.append(folder)
+        try:
+            entries = list(os.scandir(os.path.join(projects, folder))) \
+                if not os.path.islink(os.path.join(projects, folder)) else []
+        except OSError:
+            entries = []
+        for entry in entries:
+            name = entry.name[:-len(".jsonl")] if entry.name.endswith(".jsonl") else ""
+            with contextlib.suppress(OSError):
+                if THREAD_ID.fullmatch(name) and entry.is_file(follow_symlinks=False) and \
+                        entry.stat(follow_symlinks=False).st_mtime >= since - FORGET_SKEW:
+                    found.add(name)
+    try:
+        project_names = os.listdir(projects) if not os.path.islink(projects) else []
+    except OSError:
+        project_names = []
+    try:
+        own = os.lstat(CLAUDE_TMP)
+        temporary = os.listdir(CLAUDE_TMP) if stat.S_ISDIR(own.st_mode) and own.st_uid == os.getuid() else []
+    except OSError:
+        temporary = []
+    for session in sorted(found):
+        for project in project_names:
+            gone += forget_path(projects, project, session + ".jsonl") + forget_path(projects, project, session)
+        for project in temporary:
+            gone += forget_path(CLAUDE_TMP, project, session)
+        for kind in ("file-history", "session-env", "tasks"):
+            gone += forget_path(claude, kind, session)
+        gone += forget_path(HOME, f"screen-{session}.jsonl")
+    gone += forget_codex(sorted(sessions), cache)
+    for cid, folder in zip(conversations, folders):
+        for empty in (os.path.join(projects, folder), os.path.join(CHATS, str(cid))):
+            with contextlib.suppress(OSError):
+                if not os.path.islink(empty):
+                    os.rmdir(empty)         # only an empty folder: what else is in it is not theirs to lose
+                    gone += 1
+    try:
+        names = os.listdir(SESSIONS)
+    except OSError:
+        names = []
+    for name in names:
+        if any(name.startswith(f"{agent}.{window}.") for window in windows):
+            gone += forget_path(SESSIONS, name)
+    return gone
+
+
 def conversation_command(agent, conf, generation, conversation, url, token, prompt, runtime=None, version=None,
                          mode=None):
     """The start of a locked conversation session with another person than the owner (CHAT-APPS.md 7.2): only the Fleet
@@ -5379,6 +5523,50 @@ class Helper:
         if systemctl_user("is-active", lifecycle.BROWSER_UNITS[0])[1].strip() == "active":
             self.browser_try("browser clears", lambda: self.browser_clears(browser_port()))
 
+    def forget(self, event, extra):
+        """**The owner removed a person** (the hub's event `forget`, by the rule lifecycle.forget_valid; the lane "What
+        a removal still keeps", step 2, the owner's "Yes, as recommended" of 19 November 2026). The runtime keeps each
+        session as a file (Claude Code for 30 days), and a later session of this agent with a shell could read the
+        person's words there. Each step waits on an event, never on a clock:
+        - Their windows end first: C-<id> of each of their conversations, T-<id> of each of their tasks, and each
+          window that runs one of the event's sessions, never another window. A conversation window closes here. A
+          task window closes at its task's stop, which the removal causes (the hub's tick), because the stop reads a
+          desktop task's processes before it closes the window: on a Mac a child of its window can be found only
+          then. While one is open, the event stays pending (Refused), and the helper keeps in memory the sessions
+          that those windows run, also one whose records had not reached the hub yet (a helper that starts again
+          meanwhile knows only the event's).
+        - Then forget_files deletes the runtime's own files of those sessions, and the event stays pending once more:
+          a program that its window's close ended can still write a last line, which makes a file again. The first
+          pass that finds nothing more to delete ends it, and handle sends the ack.
+        The log says only counts: no path, which could carry a word of theirs."""
+        wanted = lifecycle.forget_valid(extra)
+        if wanted is None:
+            self.say(f"forget {event}: not an event of the contract (lifecycle.forget_valid), so nothing is deleted")
+            return
+        learned = self.__dict__.setdefault("forget_learned", {})
+        sessions = set(wanted["sessions"]) | learned.get(event, set())
+        names = {f"C-{c}" for c in wanted["conversations"]} | {f"T-{t}" for t in wanted["tasks"]}
+        running = {w[0]: w[3] for w in self.task_windows()}
+        live = [w for w in self.look_sure() if w in names or running.get(w) in sessions]
+        if live:
+            learned[event] = sessions | {running[w] for w in live if w in running}
+            closed = [w for w in live if CONVERSATION_WINDOW.fullmatch(w)]
+            for window in closed:
+                tmux("kill-window", "-t", f"={self.session}:={window}", check=True)
+            raise Refused(f"forget {event}: {len(closed)} conversation window(s) closed and {len(live) - len(closed)} "
+                          f"task window(s) wait for their stop; the files go when none runs")
+        cache = self.__dict__.setdefault("forget_codex", {})
+        gone = forget_files(self.agent, sorted(names), sessions, wanted["conversations"], cache)
+        if gone:
+            learned[event] = sessions
+            self.say(f"forget {event}: {gone} file(s) and folder(s) of {len(sessions)} session(s) and "
+                     f"{len(wanted['conversations'])} conversation(s) deleted; the next poll looks once more")
+            raise Refused(f"forget {event}: the next poll looks once more")
+        learned.pop(event, None)
+        if not learned:
+            cache.clear()         # what forget_codex read stays only while an event needs it
+        self.say(f"forget {event}: nothing of those sessions is left")
+
     def browser_clears(self, port):
         """This agent's list of clears (browser_clear), done in its running Chrome through a blank page of its own.
         Each clear runs on its own, so one that fails does not stop the others; a lost connection (CdpLost) ends the
@@ -6678,6 +6866,8 @@ class Helper:
                     self.loop_wake.set()        # this round, not after the loop's pause
         elif kind == "browser_clear":   # build plan 04, S2: a site login's grant ended for this agent
             self.browser_clear(ev["id"], extra)
+        elif kind == "forget":          # the owner removed a person: their windows and their sessions' files go
+            self.forget(ev["id"], extra)
         elif kind == "update":
             if getattr(self, "lifecycle", None):
                 self.lifecycle.request(extra)

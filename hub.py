@@ -3825,7 +3825,7 @@ def questions_under(lead, task_id):
 
 def emit(agent, kind, text, task=None, extra=None):
     """Queue a message for one agent's helper. Kinds: task, say, chat, stop, control, signin, handover, create,
-    capture, request, deposit, withdraw, notify, mcp_program, manager_start, outputs."""
+    capture, request, deposit, withdraw, notify, mcp_program, manager_start, outputs, forget."""
     filed, about = filed_about(agent, kind, task)
     return ins(*event_row(agent, kind, filed, str(text), now(), json.dumps(extra or {}), about))
 
@@ -19660,8 +19660,16 @@ def person_remove(pid, t0):
     The owner's own words: the messages in the chats with the agents, and the answers to their Needs-you items
     (ui_requests.text). Until the sweep: the agent's files that went to them in a reply (names and bytes), and a file
     that a session of theirs sends up with an upload line from before the removal. Outside the records: the words of a
-    reply that the bridge sends at that moment, the bridge's log and the store of its WhatsApp library; the session
-    files of their windows and tasks on the agent's machine, and the task's folder there; the branch, the commits and
+    reply that the bridge sends at that moment, the bridge's log and the store of its WhatsApp library; on the agent's
+    machine the task's folder until the task's stop, and of the runtime's own files of their sessions, which the
+    helper deletes since 1.239 (removed_forget, fleet.Helper.forget), those that it cannot: on a machine whose helper
+    did not report FORGET_FEATURE at the removal (one that updates later gets no event; one rolled back after it
+    reported it acks the event and deletes nothing), on a machine that the agent was moved away from, of a session
+    whose window closed before any record of it reached the hub, at or behind a symbolic link, all of them when the
+    hub stopped between the removal's commit and its events, and what the runtime keeps beside them (Claude Code's
+    list of typed lines, which holds the helper's signals and no word of theirs, its plans, pastes and shell snapshots
+    and its file of each running program; Codex's history, its list of sessions, its SQLite files and its archived
+    sessions); the branch, the commits and
     the pull request of a conversation with a list of repositories, and what their sessions sent out; what the owner's
     devices hold; a copy of the records from before; the chat itself in the chat app. In the records' file: the
     write-ahead file until SQLite starts it again, and the history's search index (the words of a tool record for
@@ -19743,6 +19751,10 @@ def person_remove(pid, t0):
         DB.execute("DELETE FROM person_scopes WHERE person=?", (pid,))         # person access plan, section 2
         DB.execute("DELETE FROM people WHERE id=?", (pid,))
     ended = removed_conversation_tasks_end(list(linked) + part_rows, REMOVED_REASON)
+    try:        # the removal is done: what its helpers delete never makes it fail
+        removed_forget(rows, list(linked) + part_rows)      # their tasks' stops follow at the tick, and helpers wait
+    except Exception as e:
+        log("hub", f"the removal of P-{pid} sent no event forget to the helpers: {type(e).__name__}")
     log("owner", f"removed P-{pid}, with {len(convs)} conversation(s) and every message of them"
                  + (f"; {', '.join(tref(t) for t in ended)} ended with them" if ended else ""))
     return {"person": {"id": pid, "name": p["name"]}, "deleted": True, "conversations": len(convs)}
@@ -20246,6 +20258,53 @@ def removed_conversation_tasks_end(linked, reason):
         cancel_subtasks(t["id"], reason)
         ended.append(t["id"])
     return ended
+
+
+FORGET_FEATURE = "forget_sessions"      # a helper that deletes a removed person's session files (event forget)
+FORGET_TEXT = "Close the windows of a removed person's conversations and tasks, and delete their sessions' files."
+
+
+def removed_forget(conversations, tasks):
+    """After person_remove's commit (the lane "What a removal still keeps", step 2; the owner's "Yes, as recommended" of
+    19 November 2026): the event `forget` to the helper of each agent that held a
+    conversation of the removed person (`conversations`, their rows) or one of their tasks (`tasks`: the rows of the
+    cleared tasks, the parts among them, each on its owner's machine). It names the conversations, with the time when
+    each began, the windows T-<id> of the tasks (a conversation task runs in its conversation's window and has none),
+    and the sessions of those tasks' own records (thread_events.session: a task's session, or the session of a
+    conversation window with the agent's tools, whose records are its conversation tasks'). A
+    session id names one start of one window, so it is no other task's session. The helper closes the conversation
+    windows, waits for the task windows to close at their tasks' stops (the tick sends them), and then deletes the
+    runtime's own files of those sessions (fleet.Helper.forget). Only to a helper that reports FORGET_FEATURE, in
+    events of at most lifecycle.FORGET_MOST ids, each checked with lifecycle.forget_valid (one that breaks it is
+    logged and not sent): an older helper gets none, and its files stay (UI-API.md 1.239). The events name no word and
+    no person. Committing (emit). Returns {agent: the number of its events}."""
+    named = {}
+    for c in conversations:
+        named.setdefault(c["agent"], []).append(("conversations", [c["id"], c["created"]]))
+    owner = {t["id"]: t["owner"] for t in tasks}
+    for t in tasks:
+        named.setdefault(t["owner"], []).append(("tasks", t["id"]))
+    seen = set()
+    for some in id_lists(owner):
+        for r in q(f"SELECT DISTINCT task, session FROM thread_events WHERE task IN ({','.join('?' * len(some))}) "
+                   f"ORDER BY task, session", tuple(some)):
+            if lifecycle.SESSION_ID.fullmatch(r["session"]) and r["session"] not in seen:
+                seen.add(r["session"])
+                named.setdefault(owner[r["task"]], []).append(("sessions", r["session"]))
+    sent = {}
+    for agent, ids in named.items():
+        if FORGET_FEATURE not in helper_features(agent):
+            continue
+        for i in range(0, len(ids), lifecycle.FORGET_MOST):
+            extra = {"conversations": [], "tasks": [], "sessions": []}
+            for key, value in ids[i:i + lifecycle.FORGET_MOST]:
+                extra[key].append(value)
+            if lifecycle.forget_valid(extra) is None:
+                log("hub", f"an event forget for {agent} broke lifecycle.forget_valid and was not sent")
+                continue
+            emit(agent, "forget", FORGET_TEXT, extra=extra)
+            sent[agent] = sent.get(agent, 0) + 1
+    return sent
 
 
 def person_view(p, t0):
