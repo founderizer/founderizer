@@ -940,7 +940,8 @@ def kv_get(k, default=None):
 
 # Times the hub keeps for itself, which no screen of the owner's shows: their writes are quiet (live_changes).
 QUIET_KEYS = ("tick_ok", "releases_swept", "releases_found", "bridge_seen", "bridge_code",
-              "error_reports_tried", "error_reports_sent", "error_reports_hold", "error_reports_on_at", "door_grants")
+              "error_reports_tried", "error_reports_sent", "error_reports_hold", "error_reports_on_at", "door_grants",
+              "door_changes")
 
 
 def kv_set(k, v):
@@ -1022,6 +1023,7 @@ def manager_name():
 AGENT_NAME_FIELDS = {"create_task": ("owner",), "door_fleet": ("agent",), "door_gitops": ("agents",),
                      "grant_access": ("agent",),
                      "move_agent": ("agent",),
+                     "raise_needs_you": ("needs_agent",),       # the lane "Give on a card": who Give gives it to
                      "hand_over": ("to",), "message_agent": ("agent",), "report_up": ("about",),
                      "save_trigger": ("agent",), "search_history": ("person",), "see_earlier_work": ("agent",),
                      "see_history": ("agent",), "see_responsibilities": ("agent",), "set_agent_model": ("agent",),
@@ -1739,6 +1741,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # with one card for each job): tasks[].job, the task whose job a task joins,
                                     # tasks[].job_name, the name of a job on its first task, and tasks[].plain, a
                                     # result in plain words, of GET /ui/state
+               "need_give",         # the owner, 19 November 2026 (his picks of the mockup of a card for access): an
+                                    # item that carries its grant, needs[].give, whose first option, Give, makes it
+                                    # at his press (UI-API.md, "Give on a card")
                "code_over_hub_port"]    # the owner, 16 November 2026 ("Yes, build it" to the plan install-auto-repair,
                                     # part 2): the fleet's code over the hub's own port, git's smart HTTP protocol at
                                     # /code/<repo>/..., which join.sh takes when port 9418 does not answer (UI-API.md
@@ -2408,8 +2413,9 @@ def ping_payload(need, generation, seal=None, badge=None):
         title = title[:PUSH_TEXT - 1].rstrip() + "…"
     said = {"need": need["id"], "db": generation, "title": shown_role(need["by"]) or PUSH_BANNER, "body": title}
     options = need_options(need)
+    # the lane "Give on a card": no buttons for an item that carries its grant, whose Give the phone does not press
     if 2 <= len(options) <= NEED_OPTIONS_MAX and all(len(o) <= PUSH_BUTTON for o in options) \
-            and scrub(options) == options:
+            and scrub(options) == options and need_give_view(need) is None:
         said["options"] = options         # the phone's notification content extension draws one button for each
     sealed = push.seal(push.seal_key(seal), json.dumps(said, ensure_ascii=False, separators=(",", ":")).encode())
     payload["sealed"] = base64.b64encode(sealed).decode()
@@ -2910,6 +2916,10 @@ def need_view(row, reads=None):
     view = dict(row, options=need_options(row), secret=need_secret(row))
     view.pop("approval", None)
     view.pop("team_plan", None)         # owner API 1.214: the hub's own record of a team card's plan (Details show it)
+    # the lane "Give on a card": the grant that the item's first option makes, {agent, level, repos}, else null
+    view["give"] = need_give_view(row)
+    for kept in ("give_agent", "give_level", "give_repos"):
+        view.pop(kept, None)
     # owner feature need_talk: the long part behind Details, whether the options combine, the indexes he ticked, and
     # the record of his discussion of the item, which nothing adds to since Discuss left the apps (13 November 2026)
     keys = row.keys() if hasattr(row, "keys") else ()
@@ -5043,7 +5053,11 @@ def migrate():
                   "run_command": "TEXT", "run_on": "TEXT", "run_status": "INTEGER", "run_output": "TEXT",
                   # owner feature need_takeover (the owner's "Yes, as drawn", 16 November 2026): the browser or screen
                   # task whose session asked him for one step on its own screen, and which waits for his answer
-                  "takeover_task": "INTEGER"},
+                  "takeover_task": "INTEGER",
+                  # the lane "Give on a card" (the owner, 19 November 2026): the grant that an item for access carries,
+                  # which its first option, Give, makes at his press: the agent, the level, and the repositories as a
+                  # JSON list (need_give)
+                  "give_agent": "TEXT", "give_level": "TEXT", "give_repos": "TEXT"},
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0",      # chat apps round 2: message_owner
                           # 10 November 2026: the request id of the owner's message from the app whose turn this
@@ -8836,15 +8850,20 @@ def access_route(asker, rid, requester, want=None, restarts=None):
                  "Pass the question up with answer(..., pass_up=true). ") +
                 (f"team.json gives it at {mine} already: once the owner has done that, {restart}." if enough else
                  "Once the owner has done that, this question says how to give the access."))
+    # a hold that opened calls a short time ago: the door acts on the old one until its round, also for a restart
+    changed = door_hold_change_words(what) if kind == "server" else ""
     out = [f"ACCESS NEEDED: {asker} needs {resource_phrase(kind, what)} ({rid})" + (f" at {want}" if want else "") +
            ", and team.json gives it " +
-           (f"at {mine} already, so its next session has it: a running session keeps what it started with, so "
+           (f"at {mine} already." if enough and changed else
+            f"at {mine} already, so its next session has it: a running session keeps what it started with, so "
             f"{restart}." if enough else
             f"at {mine} only, which does not reach {want}." if mine else "none of it.")]
     if enough and kind == "repo" and door_lacks(asker, [what]):
         out.append(f"That grant is new: the door gets it at the owner's Mac's next door round, usually within 10 "
                    f"minutes while the Mac's app runs ({door_round_seen()}), and a restart waits for that round by "
                    f"itself. A session that started before it has no token for it, which is no defect.")
+    if changed:
+        out.append(f"{changed} {DOOR_HOLD_ANSWER if enough else DOOR_EARLY_TASK}")
     if hold_words:          # rule-only: the route below stands, and the hold says why an agent's own calls fail there
         out.append(hold_words)
     in_team = False
@@ -8865,11 +8884,15 @@ def access_route(asker, rid, requester, want=None, restarts=None):
                        ("raise a Needs-you item that says what the server needs and why." if manager else
                         "pass the question up with answer(..., pass_up=true)."))
         elif not others:
-            out.append(FLEET_SERVER_NOTE.format(server=what) if manager else
+            out.append(FLEET_SERVER_NOTE.format(server=what) + door_fleet_change_words() if manager else
                        "It is one of the fleet's own servers, which no agent holds yet: the manager names the agent "
                        "that holds them. Pass the question up with answer(..., pass_up=true).")
         elif not manager and not in_team:
             out.append(f"Pass the question up with answer(..., pass_up=true): once it is settled, {restart}.")
+        moved = door_fleet_change_words() if manager and others and \
+            (TEAM.get("door") or {}).get("fleet") not in {h["agent"] for h in others} else ""
+        if moved:           # the holder of the record gives the servers up at that round: "Held now by" says no more
+            out.append(moved.strip())
         return " ".join(out)
     if not enough and level and not refused:
         out.append((f'It is in the grantable pool, up to {top}: grant_access(agent="{asker}", resource="{rid}", '
@@ -12797,9 +12820,10 @@ def card_reason(a, title, why, todo, options):
         if a.get(field) not in (None, "") and reason != own:
             raise ToolError(f"{field} goes with reason {own}, and this item's reason is {reason}.")
     if reason == "access":
-        held = card_access(a.get("needs_access"), a.get("needs_level"))
-        if held:
-            raise ToolError(held)
+        for thing in need_give_things(a) or [a.get("needs_access")]:   # each repository that a Give gives
+            held = card_access(thing, a.get("needs_level"))
+            if held:
+                raise ToolError(held)
     elif reason == "decision":
         plain = card_plain(a.get("owner_words")).strip(" \"'.")
         if len(plain) < CARD_WORDS_MIN:
@@ -12818,19 +12842,257 @@ def card_reason(a, title, why, todo, options):
     return reason
 
 
+# ---------------------------------------------------------------- Give on a card (the lane "Give on a card")
+#
+# The owner, 19 November 2026, with a picture of an item for access whose steps sent him to the app's resources to give
+# an agent write on one repository by hand: "this is difficult to follow", "a button to grant it, right there"; then,
+# to its mockup, Give and No, One press for many, and Close by itself. An item for access that names the agent that
+# needs it (needs_agent) and one or more repositories (needs_access) carries its grant: the hub writes its first option,
+# Give <role> <level>, and its what_to_do, and the owner's press of Give gives that level on each repository in one
+# commit, through the path of the owner's own grants (save_integration), before his answer is written. A level that
+# the agent holds already is never lowered. An item whose agent holds the level on each repository, given another way,
+# closes by itself (need_look_sweep). A grant is the authorization (COORDINATION.md): the press is the owner's grant,
+# and nothing asks him a second time.
+NEED_GIVE_MOST = 50             # repositories that one Give gives: one decision, which Details still lists whole
+NEED_GIVE_WAIT = 120            # seconds that the agent holds what an open Give card gives before the hub closes the
+                                # card: a press of Give commits the grant a moment before its answer is written
+GIVE_TURN = threading.local()   # on: this thread's press of Give runs in its turn of the hub's writes (phone_submit)
+
+
+def need_give_things(a):
+    """The things of needs_access of a raise_needs_you that names needs_agent, split at commas and spaces, in lower
+    case; None when it names no agent, where needs_access is one thing or a few plain words."""
+    if not str(a.get("needs_agent") or "").strip():
+        return None
+    return [w for w in re.split(r"[\s,]+", str(a.get("needs_access") or "").strip().lower()) if w]
+
+
+def need_give(a):
+    """{agent, level, repos} of a raise_needs_you that names the agent that needs the access (needs_agent): the grant
+    that its first option gives. None when it names none. A ToolError for a grant that one press cannot give: an agent
+    that is not an active worker or lead (the manager holds no repository: validate_team), a level that a repository
+    does not take, a thing that is not a repository, or one of the product's own repositories, which the door refuses
+    in every fleet. card_reason checks each repository against the fleet's record after this (card_access): no agent
+    holds it at that level, and it is not in the pool that the manager grants from."""
+    things = need_give_things(a)
+    if things is None:
+        return None
+    agent = str(a.get("needs_agent")).strip()       # call_tool gave a role's agent by its name (AGENT_NAME_FIELDS)
+    if agent not in agents():
+        raise ToolError(f"needs_agent is the agent that needs the access, by its name or its role, and there is no "
+                        f"agent {agent}.")
+    if not agent_active(agent) or role_of(agent) not in ("worker", "lead"):
+        raise ToolError(f"needs_agent is a worker or a lead that is active, which holds repositories: {agent} is not "
+                        f"one now.")
+    if str(a.get("reason") or "").strip().lower() != "access":
+        raise ToolError("needs_agent goes with reason access, and needs_access names the repositories that it needs.")
+    level = str(a.get("needs_level") or "").strip().lower()
+    if level not in REPO_ACCESS:
+        raise ToolError(f"With needs_agent, needs_level is the level that Give gives on the repositories: "
+                        f"{', '.join(REPO_ACCESS)}.")
+    if not things or len(things) > NEED_GIVE_MOST or len(set(things)) != len(things):
+        raise ToolError(f"With needs_agent, needs_access names 1 to {NEED_GIVE_MOST} different repositories as "
+                        f"repo:<owner>/<name>, separated by commas.")
+    import door_targets
+    repos = []
+    for thing in things:
+        kind, what = resource_parts(thing)
+        if kind != "repo":
+            raise ToolError(f"With needs_agent, needs_access names repositories only (repo:<owner>/<name>), and {thing} "
+                            f"is not one. For another thing, leave needs_agent out and write the owner's steps in "
+                            f"what_to_do.")
+        if door_targets.vendor(what):
+            raise ToolError(f"The door refuses {what} in every fleet, so no grant of it works: leave it out.")
+        repos.append(what)
+    return {"agent": agent, "level": level, "repos": sorted(repos)}
+
+
+def need_give_words(give):
+    """The first option of an item that carries a grant, as the owner presses it: Give <role> <level>, with the count
+    of the repositories when it gives more than one."""
+    count = len(give["repos"])
+    return f"Give {shown_role(give['agent'])} {give['level']}" + (f" on {count} repositories" if count > 1 else "")
+
+
+def need_give_named(repo, title, why):
+    """True when the title or the why names this repository whole, owner/name in any case, between two word
+    boundaries: the card's own words say what Give gives, and "acme/web" is not "acme-ops/web"."""
+    return re.search(rf"(?<![\w./-]){re.escape(repo)}(?![\w-]|[./]\w)", f"{title}\n{why}", re.IGNORECASE) is not None
+
+
+def need_give_view(row):
+    """needs[].give: {agent, level, repos} of an item that carries a grant, else None."""
+    keys = row.keys() if hasattr(row, "keys") else ()
+    if "give_agent" not in keys or not row["give_agent"] or not row["give_level"]:
+        return None
+    try:
+        repos = json.loads(row["give_repos"] or "[]")
+    except (ValueError, TypeError):
+        repos = []
+    return {"agent": row["give_agent"], "level": row["give_level"],
+            "repos": [r for r in repos if isinstance(r, str)] if isinstance(repos, list) else []}
+
+
+def need_gives(need_id):
+    """True when open item `need_id` carries a grant: a press of its first option takes the turn of the hub's writes
+    (phone_submit)."""
+    return q1("SELECT 1 FROM needs WHERE id=? AND give_agent IS NOT NULL AND give_level IS NOT NULL AND answer IS NULL",
+              (need_id,)) is not None
+
+
+def need_give_gone(give):
+    """The words that close an item whose Give has nobody to give to any more: its agent left the fleet, or holds no
+    repositories now (it is no worker or lead); else None. An agent that is paused or in setup keeps its card: a grant
+    to it still works."""
+    agent = give["agent"]
+    if agent in agents() and role_of(agent) in ("worker", "lead"):
+        return None
+    return f"Closed by the hub: {shown_role(agent)} cannot take this access any more, so Give gives nothing."
+
+
+def need_give_close_rows(r, words, t0):
+    """Inside the caller's transaction, with DB.execute and read_row only: the hub closes open Give card row `r` with
+    `words`, and a question that the card carried gets those words as its answer, by the hub and not by the owner
+    (answer_rows with NEED_CLOSED_BY), so that the task that asked goes on. Returns (closed, the asker or None)."""
+    in_transaction("need_give_close_rows")
+    if not DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
+                      (words, t0, NEED_CLOSED_BY, r["id"])).rowcount:
+        return False, None
+    qid = r["question"] if "question" in r.keys() else None
+    qu = read_row("SELECT * FROM questions WHERE id=?", (qid,)) if qid else None
+    t = read_row("SELECT * FROM tasks WHERE id=?", (qu["task"],)) if qu else None
+    asker = qu["asker"] if qu and t and qu["answer"] is None and answer_rows(qu, t, words, NEED_CLOSED_BY, t0) \
+        else None
+    log_row("hub", f"closed N-{r['id']} {clip(r['title'] or '', 80)}: {clip(words, 200)}")
+    return True, asker
+
+
+def need_give_press(need_id, request_id, db, connection, address, signed):
+    """The owner's press of Give (phone_submit, in the turn of the hub's writes that it took for this press, before the
+    answer's own checks): the item's grant, made through the path of the owner's own grants before his answer is
+    written, so that the answer that the manager reads says what is true, and no other write comes between its read of
+    team.json and its commit. None when there is nothing to give here: an item with no grant or one that is answered, a
+    stale generation, a replay of this request, or a press with a signed statement, which the answer's own path refuses.
+    A (status, answer) refuses the press, and then no answer is written: from a client that shows no Details (a phone,
+    a connected app: the Mac and a PC show what Give gives), or an item whose agent is gone, which the hub closes. Else
+    {repos}: the repositories whose level the press raised, none when the agent held them already. Whatever the answer
+    does next, the manager hears the grant at once, as after every grant of the owner's (save_agent_repos)."""
+    need = q1("SELECT * FROM needs WHERE id=?", (need_id,))
+    give = need_give_view(need) if need else None
+    if give is None or need["answer"] is not None or db != kv_get("db_id") or signed or \
+            q1("SELECT 1 FROM ui_requests WHERE request_id=?", (request_id,)):
+        return None
+    if connection is not None or owner_device_class(owner_device_at(address) if address else None) \
+            not in TEAM_PRESS_CLIENTS:
+        return (409, {"error": TEAM_PRESS_WHERE})
+    gone = need_give_gone(give)
+    if gone:
+        t0 = now()
+        with transaction():
+            closed, asker = need_give_close_rows(need, gone, t0)
+        if closed:
+            why = gone.removeprefix("Closed by the hub: ")
+            emit(manager_name(), "say", f"[hub] The owner pressed Give on N-{need_id} ({need['title']}), but {why} The "
+                 f"hub closed the card." + (f" Q-{need['question']} of {asker} has its words as the answer."
+                                            if asker else ""))
+        return (409, refusal_words.answer("request_answered"))
+    agent, level, repos, raised = give["agent"], give["level"], give["repos"], []
+
+    def give_levels(team):
+        known_agents(team, [agent])
+        a = team["agents"][agent]
+        held = dict(a.get("repos") or {})
+        raised[:] = [r for r in repos if not level_at_least("repo", held.get(r), level)]
+        for repo in raised:
+            held[repo] = level
+        if raised:
+            a["repos"] = dict(sorted(held.items()))
+        return bool(raised)
+    what = repos[0] if len(repos) == 1 else f"{len(repos)} repositories"
+    try:
+        save_integration(None, give_levels, f"Owner gave {agent} {level} access to {what} with Give on N-{need_id}")
+    except Refusal as e:
+        return (e.status, refusal_body(e))
+    if raised:
+        pages = github_unreached(raised)
+        emit(manager_name(), "say", f"[hub] The owner pressed Give on N-{need_id} ({need['title']}): {agent} has "
+             f"{level} access to {', '.join(raised)} now. An agent gets the change in its next task session." +
+             (f" The fleet's GitHub App does not reach {', '.join(sorted(pages))} yet: tell the owner in one line "
+              f"that they add it at {pages[sorted(pages)[0]]}." if pages else "") +
+             door_round_next(door_lacks(agent, raised)))
+    return {"repos": list(raised)}
+
+
+def need_give_note(need, choice, gave):
+    """The hub's words after the owner's press of Give, for the manager's event (owner_message_rows note); "" for
+    every other answer. It reads nothing: the hub's line before the answer says what the press gave."""
+    if need is None or choice != 0 or not isinstance(gave, dict) or need_give_view(need) is None:
+        return ""
+    return (" The hub gave it at this press, as its line before this answer says: do nothing for it yourself."
+            if gave["repos"] else " The agent held that access already, so the press changed nothing: do nothing "
+                                  "for it yourself.")
+
+
+def need_give_closes(r):
+    """The words that close open card row `r` by itself, when it carries a grant and its agent holds that level on
+    each of its repositories now, given another way, or when its agent is gone (need_give_gone); else None.
+    team.json's grants only (agents())."""
+    give = need_give_view(r)
+    if give is None or not give["repos"]:
+        return None
+    gone = need_give_gone(give)
+    if gone:
+        return gone
+    held = (agents().get(give["agent"]) or {}).get("repos") or {}
+    if not all(level_at_least("repo", held.get(x), give["level"]) for x in give["repos"]):
+        return None
+    what = give["repos"][0] if len(give["repos"]) == 1 else f"the {len(give['repos'])} repositories"
+    return (f"Closed by the hub: {shown_role(give['agent'])} has {give['level']} access to {what} now, given another "
+            f"way.")
+
+
 def t_raise_needs_you(agent, a):
     title = str(a.get("title") or "").strip()
     why = str(a.get("why") or "").strip()
     todo = str(a.get("what_to_do") or "").strip()
-    if not title or not why or not todo:
+    give = need_give(a)         # the lane "Give on a card": the grant that the item's first option makes
+    if not title or not why or not (todo or give):
         raise ToolError("A Needs-you item needs a title, a why and what_to_do: the one thing that only the owner "
                         "can do or decide now. If there is no such thing, it is not a Needs-you item: news that the "
                         "owner must have now goes to message_owner, and the rest waits for the next message that they "
                         "need.")
-    options = check_need_options(a.get("options"))
     # owner feature need_talk: a short card, its long part behind Details, options that combine, and the item that
     # this one takes the place of
     details = str(a.get("details") or "").strip()
+    if give is None:
+        options = check_need_options(a.get("options"))
+    else:
+        # Give is the hub's first option, the manager's own options (its No) follow it, and the hub writes the step:
+        # the press is the step. The owner reads which repository it gives on the card: its title or its why names
+        # the one, and Details lists several.
+        given = a.get("options")
+        if given is not None and not isinstance(given, list):
+            check_need_options(given)       # its own refusal of options that are no list
+        if a.get("multi"):
+            raise ToolError("An item with needs_agent takes one press: leave multi out.")
+        if any(isinstance(o, str) and o.strip().casefold().startswith("give") for o in given or ()):
+            raise ToolError("With needs_agent, your options are only the no: the hub writes Give itself, and an option "
+                            "of yours that gives would give nothing.")
+        options = check_need_options([need_give_words(give)] + (list(given) if given else ["No"]))
+        repos, role = give["repos"], shown_role(give["agent"])
+        if len(repos) == 1 and not need_give_named(repos[0], title, why):
+            raise ToolError(f"The title or the why names the repository that Give gives as {repos[0]}, owner and "
+                            f"name, so that the owner reads what the press gives.")
+        if len(repos) > 1:
+            listed = f"Give gives {role} {give['level']} access to these repositories:\n" + \
+                "\n".join(f"- {repo}" for repo in repos)
+            if len(details) + len(listed) + 2 > NEED_DETAILS_CHARS:
+                raise ToolError(f"Details list the {len(repos)} repositories that Give gives, and with your details "
+                                f"they would be longer than {NEED_DETAILS_CHARS} characters: shorten your details, "
+                                f"or split the repositories into two items.")
+            details = (details + "\n\n" if details else "") + listed
+        todo = f"Press Give: it gives {role} {give['level']} access to " + \
+            (f"{repos[0]}." if len(repos) == 1 else f"the {len(repos)} repositories under Details.")
     multi = a.get("multi")
     if multi is not None and not isinstance(multi, bool):
         raise ToolError("multi is true when the owner may tick several of the options, and false or left out when "
@@ -12956,6 +13218,9 @@ def t_raise_needs_you(agent, a):
     # A card is the manager's last step: the hub's own kinds (the door's, an App's, a phone's, an App key's and a key
     # swap's) carry their reason, and every other item names its own, which the hub checks.
     fixed = any(x is not None for x in (door_call, door_host, github_app, add_device, github_key, key_swap_server))
+    if give and fixed:
+        raise ToolError("needs_agent goes on an item for access, with no door_call, door_host, github_app, add_device, "
+                        "github_key or key_swap_server.")
     listed = json.loads(options) if options else ()
     if door_call is None and door_host is None and card_route(title, why, todo, details, listed):
         raise ToolError(CARD_ROUTE_REFUSAL)     # the door's card shows the call that the owner's yes lets through
@@ -12970,11 +13235,13 @@ def t_raise_needs_you(agent, a):
         asking = door_asking_task(door_call, qu) if door_host else None
         door_task = door_task_words(asking["title"]) if asking else None
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,door_host,github_app,"
-                  "add_device,github_key,details,multi,door_script,door_task,door_task_id,key_swap_server) "
-                  "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "add_device,github_key,details,multi,door_script,door_task,door_task_id,key_swap_server,give_agent,"
+                  "give_level,give_repos) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call,
                    door_host, github_app, 1 if add_device else None, github_key, details or None,
-                   1 if multi else None, door_script, door_task, asking["id"] if asking else None, key_swap_server))
+                   1 if multi else None, door_script, door_task, asking["id"] if asking else None, key_swap_server,
+                   give["agent"] if give else None, give["level"] if give else None,
+                   json.dumps(give["repos"]) if give else None))
         # owner feature asks: the ask that the agent named, else the ask of the item that this one replaces, else the
         # ask of the task whose question it carries to the owner
         if not ask and old:
@@ -13026,6 +13293,11 @@ def t_raise_needs_you(agent, a):
                 f"{KEY_SWAP_CARD_ANSWERS[1]} sets the wish off. An answer in words sets no wish. The hub closes N-{nid} "
                 f"by itself when the wish is set another way or nothing on {key_swap_server} waits any more, so do not "
                 f"withdraw it.")
+    if give:
+        door = (f" Its first option is {json.loads(options)[0]}: the owner's press gives {give['agent']} "
+                f"{give['level']} access to {', '.join(give['repos'])} in one commit, and your answer says so; do not "
+                f"grant it or ask for it again. When {give['agent']} gets that access another way, the hub closes "
+                f"N-{nid} by itself.")
     later = "" if qu or github_key or key_swap_server else (" If nothing needs it any more before the owner answers, "
                                                             "close it at once with withdraw_need.")
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{later}{door}{picks}"
@@ -13300,7 +13572,7 @@ def need_look_sweep(t0):
     if 0 <= since < NEED_LOOK_EVERY:        # a clock that was set back runs the sweep at once, not hours later
         return
     kv_set("need_look_sweep_at", t0)
-    mgr, rows, closed = manager_name(), [], []
+    mgr, rows, closed, given = manager_name(), [], [], []
     held_before = kv_get("need_held")
     try:
         seen = json.loads(held_before or "{}")
@@ -13309,13 +13581,24 @@ def need_look_sweep(t0):
     seen, held = seen if isinstance(seen, dict) else {}, {}
     for r in q("SELECT * FROM needs WHERE answer IS NULL AND conversation IS NULL AND github_key IS NULL AND "
                "key_swap_server IS NULL AND COALESCE(add_device, 0)=0 ORDER BY id"):
-        ref = need_key_held(r)
+        # the lane "Give on a card" (the owner's Close by itself, 19 November 2026): a card whose agent holds what its
+        # Give gives closes too, NEED_GIVE_WAIT after the hub first saw it, which a press of Give answers well within
+        gives = need_give_closes(r)
+        ref = None if gives else need_key_held(r)
         first = seen.get(str(r["id"])) if isinstance(seen.get(str(r["id"])), (int, float)) else t0
         first = min(first, t0)          # a time kept while the clock ran fast does not lengthen the hour
-        if not ref or t0 - first < NEED_HELD_WAIT:
+        if not (gives or ref) or t0 - first < (NEED_GIVE_WAIT if gives else NEED_HELD_WAIT):
             rows.append(r)
-            if ref:
+            if gives or ref:
                 held[str(r["id"])] = first
+            continue
+        if gives:
+            # a question that the item took to the owner gets the hub's words as its answer, by the hub, so that the
+            # task that asked goes on (need_give_close_rows)
+            with transaction():
+                done, asker = need_give_close_rows(r, gives, t0)
+            if done:
+                given.append(f"N-{r['id']} ({clip(r['title'] or '', 80)}" + (f", for {asker}" if asker else "") + ")")
             continue
         with transaction():
             if DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
@@ -13327,6 +13610,10 @@ def need_look_sweep(t0):
         emit(mgr, "say", f"[hub] The hub closed {', '.join(closed)} on the owner's Needs you: the agent that asked "
                          f"holds it now, given another way. When that agent's chat waits on it to start its work, "
                          f"tell it with message_agent.", extra=LATER_SAY)
+    if given and mgr:       # the lane "Give on a card": a Give card whose grant came another way, or that has nobody
+        emit(mgr, "say", f"[hub] The hub closed {', '.join(given)} on the owner's Needs you: its answer says why (the "
+                         f"agent holds that access now, given another way, or cannot take it any more). "
+                         f"A question that it carried has that answer; do not raise it again.", extra=LATER_SAY)
     held_now = json.dumps(held, sort_keys=True) if held else None
     if held_now != held_before:
         kv_set("need_held", held_now)
@@ -13502,6 +13789,84 @@ def door_round_tail(invites, tell=False):
             (f" {DOOR_EARLY_REFUSAL}" if invites else "") + (f" {DOOR_EARLY_TASK}" if invites and tell else ""))
 
 
+# The answer of a change is read once, but a question about the server comes later, and access_route answers it from
+# team.json, which has the change at once: so the hub keeps the time of each change that moves or opens calls (a
+# door_fleet, a door_hold that opens calls) until the door's file holds it (door_rounded: the Mac's word that its file
+# holds a later view, as door_grants has for a grant), and access_route and grant_check say the round in that window
+# only. A sweep drops what a round gave the door, so a hub that starts again (and knows no word from before) reads
+# nothing old as new.
+DOOR_CHANGES = "door_changes"   # kv: {"fleet" | "hold:<host>": {"at": time, "parts": True when a parts hold ended}}
+
+
+def door_changes():
+    """The record DOOR_CHANGES, and {} for a value that is no such record. A read that commits nothing, so access_route
+    may run it inside a transaction."""
+    row = read_row("SELECT v FROM kv WHERE k=?", (DOOR_CHANGES,))
+    try:
+        kept = json.loads(row["v"] if row else "{}")
+    except ValueError:
+        return {}
+    return {k: v for k, v in kept.items() if isinstance(v, dict) and isinstance(v.get("at"), (int, float)) and
+            not isinstance(v["at"], bool)} if isinstance(kept, dict) else {}
+
+
+def door_change_keep(key, entry):
+    """t_door_hold, t_door_fleet: `entry` and the time now under `key`, or None: the key goes."""
+    with LOCK:              # one read and one write: two changes at once keep both
+        kept = door_changes()
+        if entry is None:
+            if key not in kept:
+                return
+            kept.pop(key)
+        else:
+            kept[key] = dict(entry, at=now())
+        kv_set(DOOR_CHANGES, json.dumps(kept, sort_keys=True) if kept else None)
+
+
+def door_change_pending(key):
+    """The record of a change that the door may not hold yet, or None."""
+    entry = door_changes().get(key)
+    return entry if entry and not door_rounded(entry["at"]) else None
+
+
+def door_changes_sweep(_t0):
+    """tick: a change that the owner's Mac's door rounds gave the door leaves the record."""
+    kept = door_changes()
+    left = {k: v for k, v in kept.items() if not door_rounded(v["at"])}
+    if left != kept:
+        kv_set(DOOR_CHANGES, json.dumps(left, sort_keys=True) if left else None)
+
+
+def door_hold_change_words(host):
+    """access_route: the words for a server whose hold opened calls a short time ago, or "" (also while a parts hold
+    stands now: its own words say that no agent gets the server)."""
+    entry = door_change_pending(f"hold:{host}")
+    if not entry or door_hold_of(host) == "parts":
+        return ""
+    ago, due = span(now() - entry["at"]), door_round_due(" after that")
+    return ((f"The hold of {host} changed from parts {ago} ago: if its door parts are in place, the door gets the new "
+             f"hold at {due}, and the hub records its holder then; if they are not, the app puts them there first, "
+             f"one step a round, and past the first server only after door_rollout." if entry.get("parts") else
+             f"The hold of {host} changed {ago} ago: the door gets the new hold at {due}.") +
+            f" Until then it acts on the old hold, also for a session that starts again before then. "
+            f"{DOOR_EARLY_REFUSAL}")
+
+
+def door_fleet_change_words():
+    """access_route and grant_check, for the manager: the words for a door_fleet a short time ago, or "". The holder
+    that the manager gives the work to meets the refusal, and never reads these words."""
+    entry = door_change_pending("fleet")
+    return (f" Who holds the fleet's own servers changed with door_fleet {span(now() - entry['at'])} ago: the door "
+            f"gets that at {door_round_due(' after that')}, and the hub records the holder then. "
+            f"{DOOR_EARLY_REFUSAL} {DOOR_EARLY_TASK}") if entry else ""
+
+
+# access_route, for a holder that a hold kept from its own calls: ops sends no credential, and the door knows an agent
+# by its address, so no restart is needed, and a restart before that round meets the old hold too
+DOOR_HOLD_ANSWER = ("So answer the question with that: once the door has it, the next call of the session that runs "
+                    "now works, with no restart, because the door knows an agent by its address.")
+
+
 def t_door_hold(agent, a):
     """door_hold (the manager, new-projects plan N8 (b)): team.json door.holds[host]. parts: the app puts no door parts
     on the server, and nobody gets it through the door. rule-only: it gets its parts and its Operator, and the door's
@@ -13550,6 +13915,8 @@ def t_door_hold(agent, a):
     # and the door's file takes it only after that check. A wider hold gives calls that the door refuses until then.
     opens = {"parts": 0, "rule-only": 1, "none": 2}
     wider = opens[hold] > opens.get(was.get("hold") or "none", 2)
+    # a parts hold that ended, also when another change came before a round gave the door the first one
+    from_parts = was.get("hold") == "parts" or bool((door_change_pending(f"hold:{host}") or {}).get("parts"))
     parts = (f" If its door parts are in place, the door takes {host} at {door_round_due(' after the change')}. If they "
              f"are not, the app puts them there first, one step a round (their install, then the door's own check), "
              f"and past the first server only after door_rollout. {DOOR_EARLY_REFUSAL} {DOOR_EARLY_TASK}")
@@ -13557,7 +13924,9 @@ def t_door_hold(agent, a):
             "rule-only": f"{host} gets its parts and its Operator, and only rule calls run there through the door "
                          f"until you end the hold.",
             "none": f"{host} has no hold."}[hold] + ("" if result["changed"] else " It was so already.") + \
-        (parts if was.get("hold") == "parts" and wider else door_round_tail(invites=wider, tell=True))
+        (parts if from_parts and wider else door_round_tail(invites=wider, tell=True))
+    if result["changed"]:       # a later question about the server, until the door has it (door_hold_change_words)
+        door_change_keep(f"hold:{host}", ({"parts": True} if from_parts else {}) if wider else None)
     with transaction():
         keep_command(command, {"text": text}, now())
     return text
@@ -13614,6 +13983,8 @@ def t_door_fleet(agent, a):
             "No agent is named for the fleet's own servers now: the owner's app gives them to the one DevOps agent of "
             "the fleet, or, where the fleet has none, to you when you run alone on a server that is not the hub's.") + \
         ("" if result["changed"] else " It was so already.") + door_round_tail(invites=True, tell=True)
+    if result["changed"]:       # a later question about such a server, until the door has it (door_fleet_change_words)
+        door_change_keep("fleet", {})
     with transaction():
         keep_command(command, {"text": text}, now())
     return text
@@ -32255,7 +32626,7 @@ def grant_check(agent, rid, level):
                         f"task sessions, so only a worker or a lead gets one. You never grant to yourself.")
     if kind == "server" and fleet_server(what):
         # the owner, 17 November 2026: a problem on one of the fleet's own servers is an agent's work, never his
-        return FLEET_SERVER_NOTE.format(server=what)
+        return FLEET_SERVER_NOTE.format(server=what) + door_fleet_change_words()
     if kind == "server":        # DevOps plan C4 and "Yes, by business": the owner's app gives it, by its tag
         return (f"A server is the owner's alone to give: their app gives each server that carries a business's Tailscale "
                 f"tag to that business's DevOps agent, by itself. Give the work on {what} to the agent that holds it, "
@@ -33473,7 +33844,7 @@ def t_grant_access(agent, a):
             f"{'Revision ' + result['revision'][:12] + '. ' if gave else ''}"
             f"It gets it in its next task session; a running session keeps what it started with. The grant is the "
             f"authorization: {target} does what this access allows and answers for it, and you answer for giving it. "
-            f"The owner reads who gave what to whom on the Access page of the app and takes it back there.")
+            f"The owner reads who gave what to whom in Settings › Apps of the app and takes it back there.")
     text += door_round_next(kind == "repo" and door_lacks(target, [what]))
     for row in q(f"SELECT t.id, t.attempt, t.requester, q.id qid, q.access_level want FROM questions q "
                  f"JOIN tasks t ON t.id=q.task WHERE q.access=? AND q.answer IS NULL AND t.owner=? AND "
@@ -36414,7 +36785,9 @@ TOOLS = [
      "the pool holds. reason says why only the owner can do it, and the hub checks what it can of it: money, for new "
      "money; access, "
      "for access that the fleet does not hold, named in needs_access (an agent that holds it does that part of the "
-     "work, and a thing in the grantable pool is yours to grant); decision, for a decision that the owner's own words "
+     "work, and a thing in the grantable pool is yours to grant; for repositories, name the agent that needs them in "
+     "needs_agent: the card's first option is then Give, which gives that level at the owner's press, the hub writes "
+     "what_to_do, and your options are only the no); decision, for a decision that the owner's own words "
      "keep for them, quoted word for word in owner_words from a policy file, a profile, a standing rule that they gave "
      "or their own message; or person, for a step that only a person can do: the owner's sign-in to an AI provider's "
      "own account or to an MCP server in their app, their phone, or a hand at a machine, to switch it on or to change a setting that it takes only "
@@ -36462,7 +36835,7 @@ TOOLS = [
                        "as the card shows it. For a choice: one short sentence. For a person's step: the exact steps "
                        "(each page as its full address, with what to click there; what the hand does at a machine; "
                        "a numbered list for more than one step), and never a command. If there is none, do not raise "
-                       "the item."},
+                       "the item. With needs_agent, leave it out: Give is the step, and the hub writes it."},
         "reason": {"type": "string", "enum": list(CARD_REASONS), "description": "Why only the owner can do it, for "
                    "every item but the door's, an App's, a phone's, an App key's and a key swap's: money, access "
                    "(with needs_access), decision (with owner_words) or person."},
@@ -36471,7 +36844,15 @@ TOOLS = [
                          "drive:a@b.com, tool:<MCP server>, server:<name>), or a few plain words when the fleet's "
                          "record does not name it (a role in a cloud account, a database login, a new agent). The hub "
                          "refuses it when an agent holds it or you can grant it, unless no holder can use it now (a "
-                         "Google account that its tools refuse, an MCP server whose access ended)."},
+                         "Google account that its tools refuse, an MCP server whose access ended). With needs_agent: "
+                         "one or more repositories, repo:<owner>/<name>, separated by commas."},
+        "needs_agent": {"type": "string", "description": "With reason access, for repositories: the agent that needs "
+                        "them, by its name or its role: an active worker or lead. The card then carries the grant: its "
+                        "first option is Give <role> <needs_level>, which gives that level on each repository at the "
+                        "owner's press in Founderizer on their Mac or a PC, in one commit, so do not grant it or ask "
+                        "for it again; the hub writes what_to_do, and your options are only the no (No when you give "
+                        "none). The title or the why names the one repository as owner/name; Details lists several. "
+                        "The card closes by itself when the agent gets that access another way."},
         "needs_level": {"type": "string", "description": "With needs_access: the level that the work needs, when an "
                         "agent holds the thing at a lower one (repo:acme/web at deploy where it holds write). For a "
                         "secret, value: its value itself, which only the owner gives (a new one when it is wrong or "
@@ -42741,6 +43122,7 @@ def tick():
         step(liveness, t0, restarts=True)
         step(restart_sweep, t0, restarts=True)
         step(door_grants_sweep, t0)         # a grant that the owner's Mac's door rounds gave the door holds no restart
+        step(door_changes_sweep, t0)        # and a hold or a fleet holder that they gave it gets no more words
         step(goal_sweep, t0)
         step(need_look_sweep, t0)           # the owner, 17 November 2026: a second look at the open cards
         step(duty_sweep, t0)                # owner API 1.13: the duties that are not in order
@@ -48797,7 +49179,8 @@ AGENT_COLUMNS = (
     ("history", "agent"), ("history", "person"),
     ("model_changes", "agent"), ("model_changes", "by"),       # AUTONOMY.md P8: whose model, and its one changer
     ("questions", "answered_by"),           # the agent that answered, or 'owner'
-    ("egress_hosts", "agent"), ("egress_names", "agent"))      # the outgoing gate's records of the agent's hosts
+    ("egress_hosts", "agent"), ("egress_names", "agent"),      # the outgoing gate's records of the agent's hosts
+    ("needs", "give_agent"))        # the lane "Give on a card": the agent that an item's Give gives access to
 # The tables with one row for each agent. A row under the new name is what an agent of that name left before it
 # was removed by hand, so it goes first, and the renamed agent's own row takes the name.
 AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent",
@@ -49258,7 +49641,8 @@ AGENT_REMOVAL = {
     ("memory_folds", "by"): "stays", ("resource_grants", "by"): "stays", ("deposits", "agent"): "stays",
     ("withdrawals", "agent"): "stays", ("placements", "agent"): "stays", ("standing", "author"): "stays",
     ("standing", "ended_by"): "stays", ("history", "person"): "stays", ("model_changes", "by"): "stays",
-    ("questions", "passed"): "stays"}
+    ("questions", "passed"): "stays",
+    ("needs", "give_agent"): "stays"}       # a Give card's record; an open one finds no agent at its press
 REMOVAL_WHERE = {
     ("triggers", "agent"): "state='deleted'",       # remove_rows has put each of its rules in that state
     # an item that a conversation raised is that conversation's, and a conversation with no message is no history
@@ -57652,7 +58036,9 @@ def need_words_note(need, choice, ticked):
     if need is None or choice is not None or ticked is not None or need["conversation"] or \
             need["by"] != manager_name():
         return ""
-    return (" The owner wrote this in their own words. If it asks you something back or does not settle the item, "
+    gives = (" Words give nothing on a card with Give: the access was not given. If their words ask for it, raise a "
+             "new card with needs_agent, and they press Give.") if need_give_view(need) is not None else ""
+    return gives + (" The owner wrote this in their own words. If it asks you something back or does not settle the item, "
             "reply with a new item (raise_needs_you) whose why answers what they asked. If it says that the item was "
             "not needed or went the wrong way, find the line that sent it (a policy, a profile, a standing item, your "
             "notes) and correct it before your next item: your notes and standing items at once, and a profile or an "
@@ -57763,6 +58149,23 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
             return (400, {"error": "replaces_request_id must be a UUID"})
     if need_id is not None and (replaces is not None or "recipient" in data):
         return (400, {"error": "owner answers use the request's own recipient and cannot correct another message"})
+    # the lane "Give on a card": a press of Give makes the item's grant and writes its answer in one turn of the hub's
+    # writes, under LOCK from its first read to its answer (kit_lock, as the manager's grant_access runs), so that no
+    # other write of team.json comes between the grant's read and its commit, and no other answer of the item between
+    # the grant and this one: its git cannot run without LOCK (kit_turn), because the press checked that the item is
+    # open. A grant that fails writes no answer, and the manager hears every grant
+    if need_id is not None and choice == 0 and not getattr(GIVE_TURN, "on", False) and need_gives(need_id):
+        GIVE_TURN.on = True
+        try:
+            with kit_lock():
+                return phone_submit(data, client, need_id, address, connection)
+        finally:
+            GIVE_TURN.on = False
+    gave = need_give_press(need_id, request_id, data.get("db"), connection, address,
+                           yes is not None or signed is not None) \
+        if need_id is not None and choice == 0 and getattr(GIVE_TURN, "on", False) else None
+    if isinstance(gave, tuple):
+        return gave
     with LOCK:
         if data.get("db") != kv_get("db_id"):
             return (409, refusal_words.answer("hub_changed_sending"))
@@ -57869,6 +58272,12 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
                 return (409, {"error": f"\"{unsigned[1]}\" needs the signature of the owner's key, and words carry "
                                        f"none. Press that answer in Founderizer"
                                        + (" on the Mac." if unsigned[0] == 1 else ".")})
+            # the lane "Give on a card": Give's own words give nothing, so they close nothing either
+            picks = need_options(need)
+            if picks and need_give_view(need) is not None and door_answer_words(value) == door_answer_words(picks[0]):
+                phone = connection is not None or owner_device_class(owner_device_at(address) if address else None) \
+                    not in TEAM_PRESS_CLIENTS
+                return (409, {"error": TEAM_PRESS_WHERE if phone else TEAM_PRESS_WORDS})
         # owner API 1.214: a team card's yes counts as a press on the Mac or a PC, after its plan's second check
         pressed = team_press(need, choice, value, address, connection) if need is not None else None
         if isinstance(pressed, tuple):
@@ -57903,6 +58312,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
         # device's key for this address, so the class comes from the request and not from the client's label:
         # the kind that the device's key was given to (owner API 1.149), "iPhone" or "Windows".
         device = owner_device_class(owner_device_at(address) if address else None)
+        given = need_give_note(need, choice, gave)      # its reads commit, so before the transaction
         # The event, receipt, optional answer and the links of the files commit together. No helper ack claims
         # delivery.
         with committed():
@@ -57918,7 +58328,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
                                               files=rows, chosen=None if ticked is not None else choice,
                                               device=device, connection=connection,
                                               note=need_run_note(need, ran["status"], ran_output) if ran is not None
-                                              else team_answer_note(need, choice) or
+                                              else team_answer_note(need, choice) or given or
                                               need_words_note(need, choice, ticked))
                 if isinstance(pressed, dict):       # owner API 1.214: kept for the plan's steps after this transaction
                     team_plan_pressed_rows(need, pressed, created)
@@ -57962,7 +58372,8 @@ CAPP_LOOPBACK_LINE = "Only approve if you started this on this computer."
 CAPP_PAGE_ERRORS = {"client": "This app cannot connect here.", "code": "That code is not valid."}
 # answer_need refuses an item that closes by its own route (need_replaced's list), and a signed yes of any kind
 CAPP_NEED_OWN_ROUTE = ("door_call", "github_app", "add_device", "github_key", "key_swap_server", "conversation",
-                       "team_plan")        # owner API 1.214: a team card is pressed where its Details show
+                       "team_plan",        # owner API 1.214: a team card is pressed where its Details show
+                       "give_agent")       # the lane "Give on a card": an item whose press of Give gives access
 
 
 def capp_task_arg(value):
@@ -64996,6 +65407,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif row and answer and row["answer"] is None and team_card(row) is not None:
                     # owner API 1.214: the board shows no Details, so a team card is answered in Founderizer (Mac, PC)
                     log("owner", f"REFUSED an answer on the board to the team card N-{nid}")
+                elif row and answer and row["answer"] is None and need_give_view(row) is not None and \
+                        door_answer_words(answer) == door_answer_words((need_options(row) or [""])[0]):
+                    # the lane "Give on a card": the board makes no grant, so Give is pressed in Founderizer (Mac, PC)
+                    log("owner", f"REFUSED Give on the board for N-{nid}: it is pressed in Founderizer")
                 elif row and answer and row["answer"] is None and row["conversation"] and \
                         q1("SELECT 1 FROM conversations WHERE id=?", (row["conversation"],)):
                     # A question of a person's conversation: the answer goes back there, as owner_message_rows sends it.

@@ -3,6 +3,7 @@ server kind, given only by the owner; the refusals of the plan's section 2; a hu
 and a hub with no door keeps its own key; the door's record each minute; and the door as one more holder of the
 central vault, whose sealed copies wait for the door at its own address."""
 import base64
+import contextlib
 import json
 import threading
 import time
@@ -660,6 +661,17 @@ class DoorCalls(Access):
         self.write_team(team)
         self.ref = "bws://00000001-0000-4000-8000-000000000000"
 
+    @staticmethod
+    def no_door_round(*started):
+        """In this block no door round of the owner's Mac gives the door a change, until the test sets the Mac's word
+        (DOOR_HELD); started: when the Mac's last rounds started (door_round_seen). The three are the hub's own lists,
+        which other tests' reads of GET /ui/door fill."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(hub, "DOOR_ROUNDS", list(started)))
+        stack.enter_context(patch.dict(hub.DOOR_HELD, {"at": None}))
+        stack.enter_context(patch.object(hub, "DOOR_OLD_READS", []))
+        return stack
+
     def test_the_owner_gives_the_door_a_secret_and_takes_it_back(self):
         status, receipt = self.owner("/ui/secrets/grant", login=self.ref, agent="door", grant="use")
         self.assertEqual((status, receipt.get("changed")), (200, True), receipt)
@@ -816,16 +828,35 @@ class DoorCalls(Access):
                                            "why": "2.14"})     # the old name, from a session of before
         self.assertIn("It was so already", said)
         hub.validate_door(json.loads(json.dumps(self.origin_team())))
-        said = hub.t_door_hold("manager", {"request_id": "hold-test-3", "host": "web-9", "hold": "none",
-                                           "why": "2.14 passed"})
+        self.grant(server="web-9", level="fix")             # vps holds web-9, as the app records its Operator
+        with self.no_door_round():                          # no door round gives the door the change
+            said = hub.t_door_hold("manager", {"request_id": "hold-test-3", "host": "web-9", "hold": "none",
+                                               "why": "2.14 passed"})
+            # a later question about web-9 is answered from team.json, which has no hold now, while the door keeps the
+            # old hold until its round: the line sent a restart, which met the same refusal, with no word of that round
+            line = hub.access_route("vps", "server:web-9", "manager", "fix")
+            self.assertIn("team.json gives it at fix already. The hold of web-9 changed ", line)
+            self.assertNotIn("restart_task", line)          # and no restart: ops sends no credential
+            self.assertNotIn("from parts", line)            # web-9 kept its parts
+            self.assertIn("Until then it acts on the old hold, also for a session that starts again before then. " +
+                          hub.DOOR_EARLY_REFUSAL + " " + hub.DOOR_HOLD_ANSWER, line)
         # the Operator's own calls there wait for the Mac's round, and its task says so; web-9 kept its parts
         self.assertIn(hub.DOOR_EARLY_REFUSAL + " " + hub.DOOR_EARLY_TASK, said)
         self.assertNotIn("door parts are in place", said)
         self.assertEqual(self.origin_team()["door"]["holds"], {"app-1": "parts"})
         # a parts hold kept the parts off, so the door takes the server only after the app put them there, one step a
         # round and past the first server only after door_rollout: "the next round" would make a later refusal a defect
-        said = hub.t_door_hold("manager", {"request_id": "hold-test-5", "host": "app-1", "hold": "rule-only",
-                                           "why": "plan 2.23 is done"})
+        with self.no_door_round():
+            said = hub.t_door_hold("manager", {"request_id": "hold-test-5", "host": "app-1", "hold": "rule-only",
+                                               "why": "plan 2.23 is done"})
+            line = hub.access_route("vps", "server:app-1", "manager", "fix")     # the same, for a later question
+            # and a second change before a round: the door may still have no parts there
+            again = hub.t_door_hold("manager", {"request_id": "hold-test-6", "host": "app-1", "hold": "none",
+                                                "why": "and its rule calls are done"})
+            self.assertIn("If they are not, the app puts them there first", again)
+            self.assertIn("The hold of app-1 changed from parts ", hub.access_route("vps", "server:app-1", "manager"))
+        self.assertIn("The hold of app-1 changed from parts ", line)
+        self.assertIn("and the hub records its holder then; if they are not, the app puts them there first", line)
         self.assertIn("If they are not, the app puts them there first, one step a round (their install, then the "
                       "door's own check), and past the first server only after door_rollout. " +
                       hub.DOOR_EARLY_REFUSAL + " " + hub.DOOR_EARLY_TASK, said)
@@ -1018,8 +1049,19 @@ class DoorCalls(Access):
         self.assertIn("door_fleet", [t["name"] for t in hub.tools_for("manager")])
         self.assertNotIn("door_fleet", [t["name"] for t in hub.tools_for("vps", ("vps", "T-1", "1"))])
         base = {"agent": "lead", "why": "the owner named it for the fleet's servers"}
-        with patch.object(hub, "DOOR_ROUNDS", [hub.now() - 180]):
+        with self.no_door_round(hub.now() - 180):
             said = hub.t_door_fleet("manager", dict(base, request_id="fleet-test-1"))
+            # until the Mac's round gives Lead the servers, the hub records no holder of them, and a blocked agent's
+            # question sent the work to Lead with no word of that round, while the door refuses Lead's calls
+            for line in (hub.access_route("studio", "server:vps", "manager", "patch"),
+                         hub.grant_check("studio", "server:vps", "patch")):
+                self.assertIn("Who holds the fleet's own servers changed with door_fleet", line)
+                self.assertIn("and the hub records the holder then. " + hub.DOOR_EARLY_REFUSAL + " " +
+                              hub.DOOR_EARLY_TASK, line)
+            hub.DOOR_HELD["at"] = hub.now() + 1             # the Mac's word: the door's file holds a later view
+            self.assertNotIn("changed with door_fleet", hub.access_route("studio", "server:vps", "manager", "patch"))
+            hub.door_changes_sweep(hub.now())
+            self.assertEqual(hub.door_changes(), {})        # so a hub that starts again reads nothing old as new
         self.assertIn("Lead holds the fleet's own servers through the door once the owner's app has put the door's "
                       "parts on them: fixed root forms and `ops <server> health`", said)
         # it invites a task at once, and the door takes Lead's calls only from the Mac's next round: the words say so,
@@ -1110,6 +1152,13 @@ class DoorCalls(Access):
         self.assertIn("at patch already", hub.access_route("lead", "server:vps", "manager", "patch"))
         # the manager's own grant tool says the same as the route
         self.assertIn("the agent that you name with door_fleet", hub.grant_check("studio", "server:vps", "patch"))
+        # door_fleet moves them to Vps: Lead stays in the record until the Mac's round, and the line that gave Lead the
+        # work said nothing of the move, which the door makes at that round, maybe in the middle of that task
+        with self.no_door_round():
+            hub.t_door_fleet("manager", {"request_id": "fleet-test-10", "agent": "vps", "why": "a test"})
+            line = hub.access_route("studio", "server:vps", "manager", "fix")
+        self.assertIn("Held now by lead (patch)", line)
+        self.assertIn("Who holds the fleet's own servers changed with door_fleet", line)
 
     def test_door_fleet_needs_a_door(self):
         team = self.origin_team()

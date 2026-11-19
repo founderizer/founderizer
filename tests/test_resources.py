@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 import uuid
+from unittest.mock import patch
 
 import hub
 from test_setup import git
@@ -531,3 +532,108 @@ class Resources(OwnerAPI):
         code, team = self.request("/ui/team?db=test-generation")
         self.assertEqual(code, 200, team)
         return team["logins"][ref]
+
+    # ---- Give on a card (the lane "Give on a card", 19 November 2026): an item for access carries its grant
+
+    def give_card(self, **fields):
+        """The manager's item for access that names the agent that needs it: its id, or the refusal's words."""
+        said, error = hub.call_tool("manager", "raise_needs_you", dict(
+            {"title": "Let Dev write to acme/web", "why": "Its fix needs a push to acme/web.", "reason": "access",
+             "needs_access": "repo:acme/web", "needs_level": "write", "needs_agent": "dev",
+             "options": ["No: keep it read-only"]}, **fields))
+        return said if error else int(said.split("N-")[1].split(".")[0])
+
+    def test_give_on_a_card_gives_its_repository_at_the_press_and_never_lowers_a_level(self):
+        """The owner's press of Give is the grant: one real commit of team.json before his answer, and the manager
+        reads what it gave. No gives nothing, a replay gives nothing twice, and a level that the agent holds already,
+        higher than the card's, stays."""
+        nid = self.give_card()
+        self.assertIsInstance(nid, int, nid)
+        need = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
+        self.assertEqual(need["options"], ["Give Dev write", "No: keep it read-only"])
+        self.assertEqual(need["give"], {"agent": "dev", "level": "write", "repos": ["acme/web"]})
+        self.assertEqual(need["todo"], "Press Give: it gives Dev write access to acme/web.")
+        self.assertNotIn("give_agent", need)
+        self.assertIn("need_give", self.request()[1]["ui_features"])
+        before = self.commits()
+        press = self.command(choice=0)
+        code, receipt = self.request(f"/ui/needs/{nid}", press)
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual(self.committed()["agents"]["dev"]["repos"], {"acme/web": "write"})
+        self.assertEqual(self.commits(), before + 1)
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"], "Give Dev write")
+        self.assertIn("The hub gave it at this press",
+                      hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"])
+        told = hub.q1("SELECT text FROM events WHERE agent='manager' AND text LIKE '[hub] The owner pressed Give%'")
+        self.assertIn(f"N-{nid} (Let Dev write to acme/web): dev has write access to acme/web now", told["text"])
+        code, again = self.request(f"/ui/needs/{nid}", press)
+        self.assertEqual((code, again["replayed"], self.commits()), (200, True, before + 1))
+        # No: nothing changes, and its words go to the manager as every answer's do
+        other = self.give_card(title="Let Lead write to acme/api", why="Its fix needs acme/api.",
+                               needs_access="repo:acme/api", needs_agent="lead")
+        self.assertEqual(self.request(f"/ui/needs/{other}", self.command(choice=1))[0], 200)
+        self.assertEqual((self.commits(), self.committed()["agents"]["lead"].get("repos")), (before + 1, None))
+        # deploy that came another way after the card stays deploy at the press of Give write
+        third = self.give_card(title="Let Lead write to acme/docs", why="Its fix needs acme/docs.",
+                               needs_access="repo:acme/docs", needs_agent="lead")
+        code, given = self.request("/ui/team/repos", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                      "base_sha256": self.pool()["sha256"], "repo": "acme/docs",
+                                                      "agent": "lead", "level": "deploy"})
+        self.assertEqual(code, 200, given)
+        self.assertEqual(self.request(f"/ui/needs/{third}", self.command(choice=0))[0], 200)
+        self.assertEqual(self.committed()["agents"]["lead"]["repos"], {"acme/docs": "deploy"})
+        # what one press cannot give is refused before it reaches the owner
+        for fields, words in ((dict(needs_access=f"secret:{KEY}"), "repositories only"),
+                              (dict(needs_agent="nobody"), "there is no agent nobody"),
+                              (dict(needs_agent="manager"), "manager is not one now"),
+                              (dict(needs_level="admin"), "the level that Give gives"),
+                              (dict(title="Let Dev push its fix", why="Its fix needs a push to acme-ops/web."),
+                               "names the repository that Give gives as acme/web"),
+                              (dict(options=["Give Dev read", "No"]), "your options are only the no"),
+                              (dict(multi=True), "leave multi out")):
+            with self.subTest(fields=fields):
+                said = self.give_card(**fields)
+                self.assertIsInstance(said, str)
+                self.assertIn(words, said)
+
+    def test_a_give_card_for_several_repositories_closes_by_itself_once_given_another_way(self):
+        nid = self.give_card(title="Let Lead read the shop's repositories", why="Its review reads them.",
+                             needs_access="repo:acme/api, repo:acme/docs", needs_level="read", needs_agent="lead",
+                             options=None)
+        need = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
+        self.assertEqual(need["options"], ["Give Lead read on 2 repositories", "No"])
+        self.assertIn("Give gives Lead read access to these repositories:\n- acme/api\n- acme/docs", need["details"])
+        code, given = self.request("/ui/team/repos", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                      "base_sha256": self.pool()["sha256"],
+                                                      "repo": ["acme/api", "acme/docs"], "agent": "lead",
+                                                      "level": "write"})
+        self.assertEqual(code, 200, given)
+        t0 = hub.now()
+        hub.need_look_sweep(t0)             # held now: the card waits a moment for a press that answers it
+        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"])
+        hub.need_look_sweep(t0 + hub.NEED_GIVE_WAIT + 1)
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"],
+                         "Closed by the hub: Lead has read access to the 2 repositories now, given another way.")
+        self.assertIn(f"N-{nid} (Let Lead read the shop's repositories)",
+                      hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC LIMIT 1")["text"])
+
+    def test_only_a_press_of_give_on_the_mac_or_a_pc_gives(self):
+        """A phone shows no Details, so its press gives nothing and answers nothing; Give's words typed give nothing
+        either; and a card whose agent left the fleet closes, at a press and by itself."""
+        nid, before = self.give_card(), self.commits()
+        with patch.object(hub, "owner_device_at", lambda address: "phone" if address == "100.64.0.9" else None), \
+                patch.object(hub, "owner_device_class", lambda device: "iPhone" if device == "phone" else None):
+            code, said = hub.phone_submit(self.command(choice=0), "a phone", nid, address="100.64.0.9")
+        self.assertEqual((code, said["error"]), (409, hub.TEAM_PRESS_WHERE))
+        code, said = self.request(f"/ui/needs/{nid}", self.command(answer="give dev write"))
+        self.assertEqual((code, said["error"]), (409, hub.TEAM_PRESS_WORDS))
+        self.assertEqual((self.commits(), hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"]),
+                         (before, None))
+        del hub.TEAM["agents"]["dev"]
+        self.assertEqual(self.request(f"/ui/needs/{nid}", self.command(choice=0))[0], 409)
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"],
+                         "Closed by the hub: Dev cannot take this access any more, so Give gives nothing.")
+        self.assertIn(f"N-{nid} (Let Dev write to acme/web), but Dev cannot take this access any more, so Give gives "
+                      f"nothing. The hub closed the card.",
+                      hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC LIMIT 1")["text"])
+        self.assertEqual(self.commits(), before)

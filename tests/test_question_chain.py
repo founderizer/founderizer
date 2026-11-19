@@ -333,6 +333,26 @@ class Access(Chain):
         self.assertIn(f"Q-{qid} of w on T-{self.t3}", hint)
         self.assertIn(f'restart_task(task_id="T-{self.t3}", expected_attempt=1, ...)', hint)
 
+    def test_a_give_card_that_closes_by_itself_answers_its_question_as_the_hub(self):
+        """The lane "Give on a card": a question for access comes up to the manager, whose Give card carries it; the
+        access comes another way, and the card closes by itself: the question has the hub's words as its answer, by
+        the hub and not by the owner, so the task that asked goes on and nobody asks the owner twice."""
+        qid = self.ask(question="May I push?", needs_access="repo:acme/web", needs_level="write")
+        self.pass_up("mid", qid, self.t2)
+        self.pass_up("top", qid, self.t1)
+        self.ok("manager", "raise_needs_you", {"title": "Let W push to acme/web", "why": "Its fix is a push to acme/web.",
+                                               "reason": "access", "needs_access": "repo:acme/web",
+                                               "needs_level": "write", "needs_agent": "w", "question_id": f"Q-{qid}"})
+        nid = hub.q1("SELECT MAX(id) id FROM needs")["id"]
+        hub.TEAM["agents"]["w"]["repos"] = {"acme/web": "write"}      # the grant, as team.json gives it now
+        t0 = hub.now()
+        hub.need_look_sweep(t0)
+        hub.need_look_sweep(t0 + hub.NEED_GIVE_WAIT + 1)
+        words = "Closed by the hub: W has write access to acme/web now, given another way."
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"], words)
+        self.assertEqual((self.question(qid)["answer"], self.question(qid)["answered_by"]), (words, hub.NEED_CLOSED_BY))
+        self.assertIn(words, self.said("w", self.t3)[-1])
+
 
 class ManagerActs(Chain):
     """The manager acts for a lead that cannot: its session's task ended, it lost its authority over the agent below

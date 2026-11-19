@@ -338,6 +338,18 @@ class Fixture:
                   "Stop the task and keep what it has written so far"])):
             hub.ins("INSERT INTO needs(title,why,todo,raised,by,options) VALUES(?,?,?,?,'manager',?)",
                     (title, why, todo, raised, json.dumps(options) if options else None))
+        # the lane "Give on a card": an item that carries its grant (its first option, Give, makes it), and a step on
+        # one page of the app, so the app can draw Give, the names as links and Open <page>
+        hub.ins("INSERT INTO needs(title,why,todo,raised,by,options,give_agent,give_level,give_repos) "
+                "VALUES(?,?,?,?,'manager',?,'vps','write',?)",
+                ("Let Vps write to acme/web", "Studio found the fix on mac-studio, and Vps holds acme/web read-only: "
+                 "it needs write to push it.", "Press Give: it gives Vps write access to acme/web.", now - 120,
+                 json.dumps(["Give Vps write", "No: keep it read-only"]), json.dumps(["acme/web"])))
+        hub.ins("INSERT INTO needs(title,why,todo,raised,by,options) VALUES(?,?,?,?,'manager',?)",
+                ("Make a new private key for the fleet's GitHub App", "GitHub refused the App's key, so no agent "
+                 "reaches GitHub now.", "1. On https://github.com/settings/apps, click **Generate a private key**.\n"
+                 "2. In Founderizer, on the Apps page under GitHub, choose the downloaded file and click **Save**.",
+                 now - 60, json.dumps(["Done", "Not now"])))
         hub.ins("INSERT INTO spends(goal,cents,currency,what,task,by,created) VALUES(?,?,?,?,?,?,?)",
                 (gid, 8500, "EUR", "Synthetic banner design", live, "manager", now - 900))
         hub.goal_history(gid, "owner", "created", "Publish the spring release")

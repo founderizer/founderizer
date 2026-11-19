@@ -301,6 +301,19 @@ class Board(NeedsCase):
         self.assertEqual(self.form("/needs/1", {"choice": "7"}), 303)
         self.assertIsNone(self.row()["answer"])
 
+    def test_give_is_pressed_in_founderizer_and_never_on_the_board(self):
+        """The lane "Give on a card": the board makes no grant, so its Give, pressed or written, closes nothing that
+        it did not give; No still answers."""
+        nid = hub.ins("INSERT INTO needs(title,why,todo,raised,by,options,give_agent,give_level,give_repos) "
+                      "VALUES(?,?,?,?,'manager',?,'dev','write',?)",
+                      ("Let Dev write to acme/web", "Its fix needs acme/web.", "Press Give.", hub.now(),
+                       json.dumps(["Give Dev write", "No"]), json.dumps(["acme/web"])))
+        self.assertEqual(self.form(f"/needs/{nid}", {"choice": "0"}), 303)
+        self.assertEqual(self.form(f"/needs/{nid}", {"answer": "Give Dev write"}), 303)
+        self.assertIsNone(self.row(nid)["answer"])
+        self.assertEqual(self.form(f"/needs/{nid}", {"choice": "1"}), 303)
+        self.assertEqual(self.row(nid)["answer"], "No")
+
     def test_an_item_without_options_draws_no_button(self):
         self.raise_item()
         page = self.page()
