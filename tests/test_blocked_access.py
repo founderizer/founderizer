@@ -450,17 +450,22 @@ class BlockedAccess(OwnerAPI):
             return 200, {"tokens": [{"token": "ghs_" + "a" * 36, "access": v, "repos": [r]} for r, v in given.items()],
                          "errors": errors}
         for patcher in [patch.object(hub, name, value) for name, value in (
-                ("door_call", answer), ("DOOR_ROUNDS", []), ("DOOR_SWEPT", {"round": None}))] + \
+                ("door_call", answer), ("DOOR_ROUNDS", []), ("DOOR_SWEPT", {"round": None}), ("DOOR_OLD_READS", []),
+                ("DOOR_MARKS", {}), ("DOOR_HELD", {"at": None}), ("DOOR_SPOKE", {"at": None}))] + \
                 [patch.dict(hub.DOOR_RENEW)]:        # a read with renew=form sets its time, and no later test sees it
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def door_round(self):
-        """A door round of the owner's Mac starts: it reads the hub's view (DoorSync), and the tick runs after it."""
-        self.assertEqual(self.request("/ui/door?db=test-generation&renew=form")[0], 200)
+    def door_round(self, held=None):
+        """A door round of the owner's Mac starts: it reads the hub's view (DoorSync), and the tick runs after it. held:
+        the mark of the view whose plan the door's file holds, as an app since owner API 1.234 says it ("" for none);
+        None for an app before that word. Gives the mark of the view that the read got."""
+        code, view = self.request("/ui/door?db=test-generation&renew=form" + ("" if held is None else f"&held={held}"))
+        self.assertEqual(code, 200, view)
         with hub.LOCK:
             hub.door_grants_sweep(hub.now())
             hub.restart_sweep(hub.now())
+        return view["mark"]
 
     def attempt(self, task):
         return hub.q1("SELECT attempt FROM tasks WHERE id=?", (task,))["attempt"]
@@ -476,7 +481,9 @@ class BlockedAccess(OwnerAPI):
         later, and the new session had no token, because a grant reaches the door only at the owner's Mac's next door
         round. The manager read the door's refusal as a defect, and the task waited a day. Now the restart stops the
         session at once and starts the new one after that round, with the token. A restart of an attempt that did not
-        ask for the new grant starts at once, as before: it may be for something else, such as a lost browser."""
+        ask for the new grant starts at once, as before: it may be for something else, such as a lost browser. Here the
+        Mac's app is one before owner API 1.234, whose reads say nothing of the door's file: for it two reads after the
+        grant stay the event."""
         file = {"dev": {}}
         self.linked_door(file)
         tid = self.task_for("dev")
@@ -506,6 +513,55 @@ class BlockedAccess(OwnerAPI):
         self.assertNotIn("door round", self.restart(tid, expected_attempt=2)[0])
         self.stop_confirmed(tid)
         self.assertEqual(self.attempt(tid), 3)
+
+    def test_only_the_macs_word_that_the_doors_file_holds_the_grant_ends_the_wait(self):
+        """The hole of the two reads (19 November 2026, release 2026.11.594): the hub saw only the start of each door
+        round, and took the second read after a grant for the end of the round that wrote it. A read that wrote nothing
+        (the GitHub App flow reads GET /ui/door too; a round stops after its read when its SSH fails or the app starts
+        again) so ended a restart's wait one round early, and the new session had no token. Since owner API 1.234 the
+        app's round says which view of the hub the door's file holds (held=<mark>): reads that name none, a view from
+        before the grant, or a mark that the hub never gave, hold the restart however many come, and once two rounds
+        went by its words say how old the door's file is, never while the rounds work; the word for a view after the
+        grant starts it at once, also for a view that the hub gives again after the grant was lowered and given back."""
+        file = {"dev": {}}
+        self.linked_door(file)
+        tid = self.task_for("dev")
+        self.ask("dev", tid, "The fix is written. May I push it?", needs_access=WEB)
+        for _ in range(2):
+            self.door_round(held="")            # an app that has just started names no view, and its rounds stop
+        before = self.door_round(held="")       # after their read: the hub cannot know what the door's file holds
+        self.assertIn("door's access file has not taken the hub's view since the hub started", hub.door_round_seen())
+        self.assertEqual(self.door_round(held=before), before)      # this round wrote the file from it, and says so
+        self.owner_gives("acme/web", "write")
+        self.restart(tid)
+        self.stop_confirmed(tid)
+        after = self.door_round(held=before)    # the round that reads the grant: the door's file holds the old view
+        self.assertNotEqual(after, before)
+        self.assertNotIn("door's access file", self.restart(tid)[0])        # while that round writes, nothing is wrong
+        for held in ("", "", before, "0" * 32):     # the GitHub App flow twice, a round that stopped after its read,
+            self.door_round(held=held)              # and a mark that the hub never gave
+        self.assertEqual(self.attempt(tid), 1)      # five reads after the grant, and none of them wrote it
+        self.assertIn("and the door's access file is as the hub had it", self.restart(tid)[0])
+        file["dev"]["acme/web"] = "write"           # a round wrote the view with the grant, and says so at its end
+        self.door_round(held=after)
+        self.assertEqual(self.attempt(tid), 2)
+        self.assertEqual(self.session_of("dev", "127.0.0.5")["errors"], [])
+        self.assertIsNone(hub.kv_get(hub.DOOR_GRANTS))      # a hub that starts again holds no restart for it
+
+        self.owner_gives("acme/web", "read")        # lowered and given back: a new grant, and the view of before
+        self.owner_gives("acme/web", "write")
+        self.ask("dev", tid, "My session has no token for acme/web.", needs_access=WEB)
+        self.restart(tid, expected_attempt=2)
+        self.stop_confirmed(tid)
+        self.assertEqual(self.attempt(tid), 2)
+        self.assertEqual(self.door_round(held=after), after)        # that view, given again, takes this read's time
+        self.assertEqual(self.attempt(tid), 3)
+        self.owner_gives("acme/billing", "read")    # a grant that a round reads,
+        read = self.door_round(held=after)
+        self.owner_gives("acme/billing", "write")   # another while that round writes,
+        self.door_round(held=read)                  # that round's end, which names the view that it read,
+        self.door_round(held=read)                  # and the next round's start: both rounds work, nothing is wrong
+        self.assertNotIn("door's access file", hub.door_round_seen())
 
     def test_a_session_that_starts_before_the_door_has_a_new_grant_says_why_and_that_it_is_no_defect(self):
         """The same morning the manager gave an agent write on a repository and made its task at once. The session had

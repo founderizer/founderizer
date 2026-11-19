@@ -52762,47 +52762,93 @@ def door_github_tokens(agent, repos):
 # Founderizer, and the task waited a day; the same happened that morning to two tasks made just after two grants. So
 # the hub keeps the time of each grant that rose until the Mac's rounds gave it to the door: a restart of a task that
 # asked for it waits for that (restart_continue), and a session that starts before it says why (door_round_errors).
-# The hub sees the start of each round (its read of GET /ui/door), not its end. The round that reads after the grant
-# writes it, and the next round starts only after that one ended (DoorSync's `working`): so two reads after the grant
-# are the event that ends the wait, and no clock. Only the owner's computer reads that route (ui_allowed), so a second
-# Mac runs no round. A Mac that is off or asleep, or whose app does not run, runs no round, and then the door cannot
-# have the grant either: the words name when its last round started (door_round_seen), so a reader sees that.
-# Known and written: a read that writes nothing can end a wait one round early (the GitHub App flow of
-# GitHubManifestFlow.swift reads the route too; a round can stop after its read, when its SSH fails or the app starts
-# again), and the session then shows the door's own refusal; a restart after the next round has the token. The
-# follow-up that closes it: the round says in its read whether the round before it wrote the door's file.
-DOOR_GRANTS = "door_grants"     # kv: {agent: {owner/name: when its grant rose}}, until two rounds read after it
-DOOR_ROUNDS = []                # when the owner's Mac's last two door rounds read GET /ui/door, since the hub started
-DOOR_SWEPT = {"round": None}    # the newest of those reads that door_grants_sweep has acted on
+# The event that ends the wait is the Mac's own word (owner API 1.234), and no clock: each view of GET /ui/door has its
+# mark (door_mark, the same while the view gives the same), and the round reads with held=<mark> once the door's file
+# holds what the view of that mark gives (the round wrote the file from it, or found it so). A grant is in the door's
+# file when such a word names a view that the hub gave after the grant. A read with held and no such mark ends no wait:
+# the GitHub App flow of GitHubManifestFlow.swift reads the route too, and a round can stop after its read (its SSH
+# fails, or the app starts again). Until that word the hub saw only the start of each round, and took two reads after
+# a grant for its end (the round that reads after the grant writes it, and the next round starts only after that one
+# ended: DoorSync's `working`), so such a read ended a wait one round early, and the new session had no token. An app
+# before the word reads with no held at all, and for it those two reads stay the event. Only the owner's computer reads
+# that route (ui_allowed), so a second Mac runs no round. A Mac that is off or asleep, or whose app does not run, runs
+# no round, and then the door cannot have the grant either: the words name when its last round started. A Mac whose
+# rounds run and cannot write the door's file (its SSH to the door fails, or the door refuses the file) holds such a
+# restart until one does, and the words then also say how old the door's file is (door_file_lags), so a reader sees it.
+DOOR_GRANTS = "door_grants"     # kv: {agent: {owner/name: when its grant rose}}, until the door's file holds it
+DOOR_ROUNDS = []                # when the owner's Mac's last three reads of GET /ui/door came, since the hub started
+DOOR_OLD_READS = []             # the same, of an app before the Mac's word (no held): two after a grant are its event
+DOOR_MARKS = {}                 # {mark: when the hub last gave a view of GET /ui/door with it}, the newest few
+DOOR_MARKS_KEPT = 16            # a word names the view of its own round, so a few are enough
+DOOR_HELD = {"at": None}        # the newest time that the hub gave a view that the door's file holds, by the Mac's word
+DOOR_SPOKE = {"at": None}       # when the Mac last read GET /ui/door with held, so an app that says the word
+DOOR_SWEPT = {"round": None}    # the newest reads that door_grants_sweep has acted on
 DOOR_FILE_WORDS = "door's access file"      # in both refusals of the door for a grant that its file does not hold
 DOOR_ROUND_WAIT = ("the door gets this new grant at the owner's Mac's next door round, usually within 10 minutes "
-                   "while the Mac's app runs ({seen}). This is no defect. If this task needs it, ask your requester to "
-                   "restart this task, with needs_access repo:{repo}: the restart waits for that round by itself, so "
-                   "that its new session has the token")
+                   "while the Mac's app runs ({seen}).{defect} If this task needs it, ask your requester to restart "
+                   "this task, with needs_access repo:{repo}: the restart waits for that round by itself, so that its "
+                   "new session has the token")
 DOOR_ROUND_NEXT = ("The door gets a new grant at the owner's Mac's next door round, usually within 10 minutes while "
                    "the Mac's app runs: a task session that starts before then has no token for it, and a restart_task "
                    "of a task that asked for it waits for that round by itself.")
 
 
-def door_round_read():
-    """GET /ui/door: the owner's Mac starts a door round, which writes into the door's file what the hub's view gives
-    now."""
-    DOOR_ROUNDS.append(now())
-    del DOOR_ROUNDS[:-2]
+def door_mark(view):
+    """The mark of a view of GET /ui/door, which the Mac's word names (owner API 1.234). It is the same for the same
+    view, so a hub that started again knows the word for the view that it gives now."""
+    return hashlib.sha256(json.dumps(view, sort_keys=True).encode()).hexdigest()[:32]
+
+
+def door_round_read(view, held):
+    """GET /ui/door, under LOCK and after door_view: the owner's Mac reads the view that its door round writes into the
+    door's file. held: the mark of the newest view whose plan the door's file holds, by the Mac's word (owner API
+    1.234); "" when it names none, and None from an app before that word. Gives the mark of this view."""
+    t0, mark = now(), door_mark(view)
+    DOOR_MARKS.pop(mark, None)  # a view that the hub gives again takes this time: a grant that rose since is in it
+    DOOR_MARKS[mark] = t0
+    for old in list(DOOR_MARKS)[:-DOOR_MARKS_KEPT]:
+        del DOOR_MARKS[old]
+    DOOR_ROUNDS.append(t0)
+    del DOOR_ROUNDS[:-3]
+    if held is None:            # an app before the word: two such reads after a grant are its event (door_rounded)
+        DOOR_OLD_READS.append(t0)
+        del DOOR_OLD_READS[:-2]
+        return mark
+    DOOR_SPOKE["at"] = t0
+    if held in DOOR_MARKS:      # the door's file holds what the hub gave then, and so each grant that rose before
+        DOOR_HELD["at"] = max(DOOR_HELD["at"] or 0, DOOR_MARKS[held])
+    return mark
 
 
 def door_rounded(at):
-    """True when a grant that rose at `at` is in the door's file: two door rounds of the owner's Mac read the hub's
-    view after it, so the first of them, which wrote it, has ended."""
-    return sum(1 for t in tuple(DOOR_ROUNDS) if t > at) >= 2        # a copy: GET /ui/door adds while this reads
+    """True when a grant that rose at `at` is in the door's file: the Mac's word names a view that the hub gave after
+    it, or, from an app before that word, two door rounds read the hub's view after it, so the first of them, which
+    wrote it, has ended."""
+    return (DOOR_HELD["at"] or 0) > at or sum(1 for t in tuple(DOOR_OLD_READS) if t > at) >= 2   # a copy: reads add
 
 
 def door_round_seen():
     """When the owner's Mac last started a door round, in words: a reader of a wait sees from it that no round runs
-    (the Mac is off or asleep, its app does not run, or its Tailscale shows no door), which no clock would say."""
+    (the Mac is off or asleep, its app does not run, or its Tailscale shows no door), which no clock would say, and
+    door_file_lags."""
     last = tuple(DOOR_ROUNDS)[-1:]
-    return (f"its last door round started {span(now() - last[0])} ago" if last else
+    return (f"its last door round started {span(now() - last[0])} ago{door_file_lags()}" if last else
             f"it has started no door round in the {span(now() - STARTED)} since the hub started")
+
+
+def door_file_lags():
+    """By the Mac's word (owner API 1.234), the words that say how old the door's file is, when the Mac read the hub's
+    view three times since the newest view that the door's file holds, or since the hub started when no word named
+    one; else "". A round that works reads twice (at its start, and at its end when it wrote a new view), and the view
+    can change between them, so this shows only once two rounds went by with no word for a newer view: while the Mac's
+    rounds run and cannot write the door's file (its SSH to the door fails, or the door refuses the file). Never for an
+    app before the word, whose last read said none."""
+    reads, held = tuple(DOOR_ROUNDS), DOOR_HELD["at"]
+    if len(reads) < 3 or DOOR_SPOKE["at"] != reads[-1] or (held is not None and held >= reads[0]):
+        return ""
+    return (f", and the door's access file is as the hub had it {span(now() - held)} ago" if held is not None else
+            f", and the door's access file has not taken the hub's view since the hub started "
+            f"{span(now() - STARTED)} ago")
 
 
 def door_grant_times():
@@ -52862,10 +52908,10 @@ def asked_repos(tid, attempt):
 
 
 def door_grants_sweep(_t0):
-    """tick: a grant that the Mac's rounds gave the door leaves the record, once after each new round, so that a hub
-    that starts again (and knows no round from before) holds no restart for it."""
-    newest = DOOR_ROUNDS[-1] if DOOR_ROUNDS else None
-    if newest is None or DOOR_SWEPT["round"] == newest:
+    """tick: a grant that the Mac's rounds gave the door leaves the record, once after each new round or word, so that
+    a hub that starts again (and knows no round from before) holds no restart for it."""
+    newest = (DOOR_OLD_READS[-1] if DOOR_OLD_READS else None, DOOR_HELD["at"])
+    if newest == (None, None) or DOOR_SWEPT["round"] == newest:
         return
     DOOR_SWEPT["round"] = newest
     kept = door_grant_times()
@@ -52891,7 +52937,8 @@ def door_round_errors(agent, errors):
         if rest or not waits:
             out.append(dict(e, repos=rest) if waits else e)
         if waits:
-            out.append({"repos": waits, "error": DOOR_ROUND_WAIT.format(repo=waits[0], seen=door_round_seen())})
+            out.append({"repos": waits, "error": DOOR_ROUND_WAIT.format(
+                repo=waits[0], seen=door_round_seen(), defect="" if door_file_lags() else " This is no defect.")})
     return out
 
 
@@ -62060,8 +62107,10 @@ class Handler(BaseHTTPRequestHandler):
             DOOR_RENEW["form"] = now()
         with LOCK:
             view = door_view()
-            door_round_read()               # after the view: the round that read it holds each grant that it gives
-        return self.json(200, dict(view, db=kv_get("db_id")), {"Cache-Control": "no-store"})
+            # after the view: the round that read it holds each grant that it gives; held is the Mac's word of what
+            # the door's file holds (owner API 1.234), and the answer gives this view's mark for it
+            mark = door_round_read(view, query.get("held"))
+        return self.json(200, dict(view, db=kv_get("db_id"), mark=mark), {"Cache-Control": "no-store"})
 
     def ui_door_save(self):
         """POST /ui/door (owner feature door_setup): the door's address and port, from the app's own Tailscale view
