@@ -69,6 +69,8 @@ FORBIDDEN = {"call_api", "report_up", "ask_my_requester", "ask_reporter", "keep_
              "set_duty", "change_duty", "save_trigger", "request_secret", "start_task", "open_work", "report_progress",
              "list_my_tasks", "set_reminder", "set_target", "sign_in", "create_login", "save_key", "hand_over",
              "attach_watch", "open_case", "see_notes", "forget", "see_team", "see_capacity"}
+# set_reminder: only a session that its duty's line watch started has it since 19 November 2026, as a time and no
+# words, so that nothing of the session comes back to a later one (Times); no other session of such an agent has it
 FEATURES = ("trigger_check", "trigger_code", "check_lines", "shell_box", "api_request", "task_outputs")
 
 
@@ -84,7 +86,7 @@ def setUpModule():
 def load_tests(loader, _tests, _pattern):
     """Only the cases that each class of this file defines itself: the hub classes get their server from OwnerAPI."""
     suite = unittest.TestSuite()
-    for cls in (Helper, Catalog, UrlLines, Lists, Tools, Cases, Reports, Questions):
+    for cls in (Helper, Catalog, UrlLines, Lists, Tools, Cases, Reports, Questions, Times):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -1702,8 +1704,8 @@ class Reports(Cases):
     def test_a_report_reaches_the_named_duty_as_a_task_of_ids_and_list_values(self):
         self.once(["T-81 message 10:00"])
         case_task = self.tasks()[0]
-        self.assertEqual(sorted(self.names("desk", self.ctx(case_task))),
-                         sorted(H1_TASK + H1_CONTACT + ["report_defect"]))
+        self.assertEqual(sorted(self.names("desk", self.ctx(case_task))),     # set_reminder: a time for its case
+                         sorted(H1_TASK + H1_CONTACT + ["report_defect", "set_reminder"]))
         request = str(uuid.uuid4())
         text, error = self.tool("desk", "report_defect", case_task, request_id=request, duty=f"R-{self.dev['id']}",
                                 symptom="wrong_price", component="price_update", supplier="8812", ids=["L-1"])
@@ -2371,7 +2373,7 @@ class Questions(Reports):
             f"[hub] ops works your report D-{self.rep['id']} of ticket T-81 and asks about it: \"Which field of the "
             f"listing is wrong?\" Answer once with answer_report"), session["details"][:200])
         self.assertTrue(hub.case_line_task(session))                    # the hub takes its result, as for a line
-        self.assertEqual(sorted(self.names("desk", self.ctx(session))),
+        self.assertEqual(sorted(self.names("desk", self.ctx(session))),      # and no time: the answer is all of it
                          sorted(H1_TASK + H1_CONTACT + ["report_defect", "answer_report"]))
         self.assertNotIn("answer_report", self.names("desk", self.ctx(self.case_task)))    # only that session
         got = self.read("desk", session)
@@ -2725,6 +2727,271 @@ class Questions(Reports):
             "request_id": str(uuid.uuid4())}, self.ctx(self.reader))
         self.assertTrue(error, text)
         self.assertIn("About a report of it, ask with ask_reporter, which starts a session of it that can answer.", text)
+
+
+class Times(Questions):
+    """A time for a case (19 November 2026): a session whose Shell box is off, which its duty's line watch started,
+    names a time and no words, and delivers as it always does. At that time the hub starts one new session for the
+    case's key, unless a session that a new event of the key started did the work by then. The fixture is one
+    ticket's session, T-81, that reported a defect."""
+
+    def remind(self, task=None, **fields):
+        return self.tool("desk", "set_reminder", task or self.case_task, **fields)
+
+    def times(self):
+        return hub.q("SELECT * FROM case_reminders ORDER BY id")
+
+    def sweep(self):
+        with hub.LOCK:
+            hub.case_reminder_notices(self.clock)                       # the tick's step
+
+    def started(self):
+        return hub.q("SELECT * FROM tasks WHERE why LIKE 'The time that a session set%' ORDER BY id")
+
+    def step(self, case_id):
+        return hub.q1("SELECT * FROM duty_steps WHERE duty_case=? AND key='comes_back'", (case_id,))
+
+    def test_a_time_of_a_case_starts_one_session_for_its_key_and_its_token_request_names_the_case(self):
+        """The owner, 19 November 2026, of a support agent that waits for the developer's answer: "if developer
+        needs more time than what we can afford, then support can write". No session of an agent whose Shell box
+        is off could come back by itself: the ticket waited until its customer wrote again."""
+        text, error = self.remind(minutes=60)
+        self.assertFalse(error, text)
+        case = hub.case_row(self.case_task["duty_case"])
+        self.assertIn(f"starts a new session for {hub.cref(case)} (T-81) at {hub.goal_time(self.clock + 3600)}", text)
+        [row] = self.times()
+        self.assertEqual((row["key"], row["task"], row["duty_case"], row["due"], row["done"]),
+                         ("T-81", self.case_task["id"], case["id"], self.clock + 3600, None))
+        self.assertEqual((self.step(case["id"])["text"], self.step(case["id"])["by"]),
+                         (f"at {hub.goal_time(self.clock + 3600)}", "desk"))
+        text, error = self.tool("desk", "record_step", self.case_task, step="comes_back", ids=["T-99"])
+        self.assertTrue(error, text)                                    # the hub's own line of the case
+        self.assertIn("comes_back is the hub's own step", text)
+        # the task is not parked: it holds no place of the watch's pool once its session ends
+        self.assertIsNone(hub.q1("SELECT 1 FROM reminders WHERE task=?", (self.case_task["id"],)))
+        self.clock += 3600
+        hub.tick()
+        self.assertEqual((self.started(), self.times()[0]["done"]), ([], None))  # its own session has not delivered
+        self.end(self.case_task)
+        hub.tick()                                                      # the hub's own tick starts it
+        [session] = self.started()
+        self.assertEqual((session["owner"], session["trigger_id"], session["duty_case"]),
+                         ("desk", self.t["id"], case["id"]))            # in the open case of its key
+        self.assertTrue(session["details"].startswith(                  # first: a start shows only the first part
+            f"[hub] The time came that a session of {hub.cref(case)} set for T-81 ({hub.goal_time(self.clock)}). "
+            f"Read the record of T-81 again with your own tools"), session["details"][:200])
+        self.assertIn("Answer each ticket of the CRM in its own session.", session["details"])     # the duty's words
+        self.assertTrue(hub.case_line_task(session))                    # the hub takes its result, as for a line
+        self.assertEqual((self.times()[0]["told_task"], self.times()[0]["done"]), (session["id"], self.clock))
+        self.assertEqual(self.step(case["id"])["text"],                 # the record says what came of the time
+                         f"came at {hub.goal_time(self.clock)}: {hub.tref(session['id'])}")
+        self.clock += 60
+        self.sweep()
+        self.assertEqual(len(self.started()), 1)                        # one time starts one session
+        hub.q("UPDATE responsibilities SET servers=? WHERE id=?", (json.dumps(["crm"]), self.r["id"]))
+        with patch.object(hub, "create_missing", lambda *a, **k: []):
+            code, answer = self.request("/helper/mint/desk", {"task": hub.tref(session["id"]), "attempt": 1,
+                                                              "tool": "crm"}, source=self.source("desk"))
+        self.assertEqual(code, 200, answer)
+        self.assertEqual(json.loads(hub.q1("SELECT body FROM jobs WHERE id=?", (answer["job"],))["body"]),
+                         {"ticketId": "T-81", "reminder": hub.cref(case)})       # its own event has ended
+
+    def test_a_later_session_of_the_key_that_did_the_work_takes_the_time_away(self):
+        """A customer who wrote again, or a developer whose case closed, started a session that answers: a second
+        session at the time would write a second reply. That session reads that a time waited, so that it sets one
+        again when the case still waits, and the record of the case does not say that a dropped time comes."""
+        self.assertFalse(self.remind(minutes=60)[1])
+        self.end(self.case_task)
+        self.once(["T-81 message 11:00"])                               # the same key writes again
+        again = self.tasks()[-1]
+        self.assertEqual(again["duty_case"], self.case_task["duty_case"])
+        self.assertTrue(again["details"].startswith(                    # first: a start shows only the first part
+            f"[hub] An earlier session of this case set a time for it: {hub.goal_time(self.times()[0]['due'])}. When "
+            f"your session does the work of the case, that time starts nothing"), again["details"][:200])
+        self.clock = self.times()[0]["due"]
+        hub.q("UPDATE tasks SET state='working', started=? WHERE id=?", (self.clock, again["id"]))
+        self.sweep()
+        self.assertEqual((self.started(), self.times()[0]["done"]), ([], None))  # it runs: it may still end with no work
+        self.end(again)
+        self.sweep()
+        self.assertEqual(self.started(), [])
+        self.assertEqual((self.times()[0]["told_task"], self.times()[0]["done"]), (None, self.clock))
+        self.assertEqual(self.step(again["duty_case"])["text"],
+                         f"no session at {hub.goal_time(self.clock)}: a later session of the case did the work")
+        self.once(["T-81 message 12:00"])
+        third = self.tasks()[-1]
+        self.assertNotIn("An earlier session of this case set a time", third["details"])      # that time is over
+        # one time for one key: the newer session sets its own, and the close of a covering case takes that away
+        self.assertFalse(self.remind(third, minutes=60)[1])
+        self.assertEqual([r["task"] for r in self.times() if r["done"] is None], [third["id"]])
+        self.end(third)
+        dev = self.open_dev_case(self.reader, "price-rules")
+        text, error = self.tool("ops", "join_report", self.reader, report=f"D-{self.rep['id']}", case=hub.cref(dev))
+        self.assertFalse(error, text)
+        self.assertFalse(self.close(self.reader, dev, covers=["T-81"], cause="ours", next_step="relist")[1])
+        self.end(self.task_of(self.reports()[0]["told_task"]))          # the session that tells the customer
+        self.clock += 3600
+        self.sweep()
+        self.assertEqual((self.started(), self.times()[1]["told_task"]), ([], None))
+
+    def test_a_later_session_that_did_no_work_or_that_only_answers_a_question_takes_no_time_away(self):
+        """A later session whose token its service refused worked nothing, and the session that answers a question
+        about a report does no other work on the ticket: with either one as "the session that has the case", the
+        time ended silently and nobody came back."""
+        self.assertFalse(self.remind(minutes=60)[1])
+        self.end(self.case_task)
+        self.once(["T-81 message 11:00"])
+        refused = self.tasks()[-1]
+        hub.q("UPDATE tasks SET state='failed', outcome='failed', started=? WHERE id=?", (hub.now(), refused["id"]))
+        self.clock = self.times()[0]["due"]                             # (as mint_refused ends it, after an attempt)
+        self.sweep()
+        [back] = self.started()
+        report = self.report(back, symptom="wrong_price", component="price_update", ids=["store-617375"])
+        self.assertFalse(report[1], report[0])
+        self.assertFalse(self.remind(back, minutes=60)[1])
+        self.end(back)
+        second = self.reports()[-1]
+        said, error = self.ask(task=self.task_of(second["task"]), report=f"D-{second['id']}")
+        self.assertFalse(error, said)
+        answering = self.task_of(self.questions()[-1]["task"])
+        self.assertGreater(answering["id"], back["id"])
+        self.end(answering)
+        self.clock += 3600
+        self.sweep()
+        self.assertEqual(len(self.started()), 2)
+
+    def test_a_time_takes_minutes_or_a_time_inside_its_limits_and_no_words(self):
+        """A session that reads strangers' text sets it: a time at once would start session after session, and a
+        word of its own would reach the next session as the hub's line."""
+        import datetime
+        iso = lambda seconds: datetime.datetime.fromtimestamp(self.clock + seconds, datetime.timezone.utc).isoformat()
+        for fields, said in (({}, "Give one of minutes"),
+                             ({"minutes": 60, "at": "2030-01-01T09:00"}, "Give one of minutes"),
+                             ({"minutes": 5}, "at least 15 minutes"), ({"minutes": -30}, "at least 15 minutes"),
+                             ({"minutes": "soon"}, "minutes must be a number"),
+                             ({"minutes": 31 * 24 * 60}, "within 30 days"), ({"at": "tomorrow"}, "ISO date"),
+                             ({"minutes": 60, "note": "Say that it is fixed."}, "set_reminder does not take note")):
+            text, error = self.remind(**fields)
+            self.assertTrue(error, fields)
+            self.assertIn(said, text)
+        self.assertEqual(self.times(), [])
+        request, at = str(uuid.uuid4()), iso(16 * 60)
+        text, error = self.remind(request_id=request, at=at)
+        self.assertFalse(error, text)
+        self.clock += 120                                               # the answer was lost, and the time is near now
+        self.assertEqual(self.remind(request_id=request, at=at), (text, False))    # a replay answers the same
+        self.assertEqual(len(self.times()), 1)
+        for _ in range(hub.CASE_REMINDERS + 1):                         # a moved time started no session: no limit
+            self.assertFalse(self.remind(at=iso(7200))[1])              # a second call moves the time
+        waiting = [r for r in self.times() if r["done"] is None]
+        self.assertEqual([(r["due"], r["told_task"]) for r in waiting], [(self.clock + 7200, None)])
+        self.assertEqual(self.step(self.case_task["duty_case"])["text"], f"at {hub.goal_time(self.clock + 7200)}")
+        self.end(self.case_task)
+        self.clock += 7199
+        self.sweep()
+        self.assertEqual(self.started(), [])                            # not before its time
+        self.clock += 1
+        self.sweep()
+        self.assertEqual(len(self.started()), 1)                        # the moved time, once
+        # the same request_id in the session that came back is another call: its minutes mean another time
+        text, error = self.remind(self.started()[0], request_id=request, at=at)
+        self.assertTrue(error, text)
+        self.assertIn("This request_id was already used for another call", text)
+
+    def test_the_times_of_one_key_start_four_sessions_in_thirty_days_and_no_more(self):
+        """The cost limit: a customer's text that tells each session to come back would start sessions with no end."""
+        task = self.case_task
+        for n in range(hub.CASE_REMINDERS):
+            self.assertFalse(self.remind(task, minutes=15)[1], n)
+            self.end(task)
+            self.clock += 900
+            self.sweep()
+            task = self.started()[-1]
+        self.assertEqual(len(self.started()), hub.CASE_REMINDERS)
+        text, error = self.remind(task, minutes=15)
+        self.assertTrue(error, text)
+        self.assertIn(f"No more: {hub.CASE_REMINDERS} sessions of this case started in 30 days", text)
+        self.assertEqual(len([r for r in self.times() if r["done"] is None]), 0)
+        self.clock += 31 * 86400
+        self.assertFalse(self.remind(task, minutes=15)[1])              # and it counts 30 days
+
+    def test_a_time_waits_for_a_place_and_for_a_paused_duty_or_watch_and_a_closed_case_gets_a_new_one(self):
+        """No clock ends a time: a full pool, a duty that the manager paused or a watch that the hub paused for an
+        hour would else end it for good, and nobody would come back to the case."""
+        self.assertFalse(self.remind(minutes=60)[1])
+        self.end(self.case_task)
+        hub.q("UPDATE duty_cases SET state='closed', closed=? WHERE id=?", (hub.now(), self.case_task["duty_case"]))
+        self.once(["T-82 message", "T-83 message", "T-84 message"])     # the watch's three places are taken
+        self.assertEqual(len([t for t in self.tasks() if t["state"] not in hub.TERMINAL]), hub.CASE_POOL)
+        self.clock += 7 * 24 * 3600                                     # a week later it still waits
+        self.sweep()
+        self.assertEqual((self.started(), self.times()[0]["done"]), ([], None))
+        self.end(self.tasks()[-1])
+        for table in ("responsibilities", "triggers"):
+            row = self.r["id"] if table == "responsibilities" else self.t["id"]
+            hub.q(f"UPDATE {table} SET state='paused' WHERE id=?", (row,))
+            self.sweep()
+            self.assertEqual((self.started(), self.times()[0]["done"]), ([], None), table)
+            hub.q(f"UPDATE {table} SET state='active' WHERE id=?", (row,))
+        self.sweep()                                                    # the tick, once a place is free
+        [session] = self.started()
+        fresh = hub.case_row(session["duty_case"])
+        self.assertNotEqual(fresh["id"], self.case_task["duty_case"])   # a new case of that key,
+        self.assertEqual((fresh["key"], fresh["state"], fresh["title"]), ("T-81", "open", session["title"]))
+        # a time that a session of a later case of the key replaces: the step of the earlier, closed case says so
+        self.assertFalse(self.remind(session, minutes=60)[1])
+        self.end(session)
+        hub.q("UPDATE duty_cases SET state='closed', closed=? WHERE id=?", (hub.now(), fresh["id"]))
+        self.once(["T-81 message 12:00"])
+        self.assertNotEqual(self.tasks()[-1]["duty_case"], fresh["id"])
+        self.assertFalse(self.remind(self.tasks()[-1], minutes=90)[1])
+        self.assertEqual(self.step(fresh["id"])["text"], "no session: a later session of the case set another time")
+
+    def test_the_new_session_starts_in_the_watch_of_the_session_that_set_the_time(self):
+        """A duty with two watches of lines, for example tickets and chats: the first watch's title, details and
+        pool belong to the other kind of work."""
+        first = dict(hub.q1("SELECT * FROM triggers WHERE id=?", (self.t["id"],)))
+        second = dict(first, request_id=str(uuid.uuid4()))
+        del second["id"]
+        chats = hub.ins(f"INSERT INTO triggers({','.join(second)}) VALUES({','.join('?' * len(second))})",
+                        tuple(second.values()))
+        hub.q("UPDATE tasks SET trigger_id=? WHERE id=?", (chats, self.case_task["id"]))
+        self.case_task = self.task_of(self.case_task["id"])
+        self.assertFalse(self.remind(minutes=60)[1])
+        self.end(self.case_task)
+        self.clock += 3600
+        self.sweep()
+        self.assertEqual([t["trigger_id"] for t in self.started()], [chats])
+
+    def test_only_a_session_of_a_line_watch_sets_a_time_and_a_duty_that_starts_no_session_ends_it(self):
+        """A task that its lead gave, and the session that answers a question about a report, have no time: of the
+        other tasks of such an agent only a colleague's question waits, so that no stranger's text holds a task open."""
+        plain, context = self.task("desk")
+        self.assertNotIn("set_reminder", self.names("desk", context))
+        text, error = hub.call_tool("desk", "set_reminder", {"minutes": 60, "request_id": str(uuid.uuid4()),
+                                                             "task_id": hub.tref(plain)}, context)
+        self.assertTrue(error, text)
+        said, error = self.ask()                                        # the session that only answers a question
+        self.assertFalse(error, said)
+        self.assertTrue(self.remind(self.task_of(self.questions()[0]["task"]), minutes=60)[1])
+        self.assertEqual((self.times(), hub.q("SELECT 1 FROM reminders")), ([], []))
+        # a duty that is retired takes no time, and ends one that waits; so does one with no watch of lines any more
+        hub.q("UPDATE responsibilities SET state='retired' WHERE id=?", (self.r["id"],))
+        text, error = self.remind(minutes=60)
+        self.assertTrue(error, text)
+        self.assertIn("is retired, so no session of it starts again", text)
+        for column, value, said in (("responsibilities", "retired", "its duty is retired"),
+                                    ("triggers", "deleted", "its duty has no watch of lines any more")):
+            hub.q("UPDATE responsibilities SET state='active' WHERE id=?", (self.r["id"],))
+            self.assertFalse(self.remind(minutes=60)[1])
+            row = self.r["id"] if column == "responsibilities" else self.t["id"]
+            hub.q(f"UPDATE {column} SET state=? WHERE id=?", (value, row))
+            self.clock += 3600
+            self.sweep()
+            last = self.times()[-1]
+            self.assertEqual((self.started(), last["told_task"], last["done"]), ([], None, self.clock), said)
+            self.assertEqual(self.step(self.case_task["duty_case"])["text"],
+                             f"no session at {hub.goal_time(self.clock)}: {said}")
 
 
 if __name__ == "__main__":

@@ -330,6 +330,16 @@ CREATE TABLE IF NOT EXISTS report_questions(message INTEGER PRIMARY KEY, report 
   created REAL NOT NULL, answer INTEGER, answered REAL, ids TEXT, seen_at TEXT, words TEXT, email TEXT);
 CREATE INDEX IF NOT EXISTS report_question_report ON report_questions(report);
 CREATE INDEX IF NOT EXISTS report_question_task ON report_questions(task);
+-- A time that a session whose Shell box is off set for the case of its task (set_reminder, typed: case_reminder).
+-- `task` is the session that set it and `duty_case` its case. At `due` the hub starts one new session for `key` in
+-- the duty's line watch, unless a session that a new event of the key started did the work by then: `told_task` is
+-- that new session, and `done` is when the time ended, with or without one (case_reminder_notices).
+CREATE TABLE IF NOT EXISTS case_reminders(id INTEGER PRIMARY KEY, responsibility INTEGER NOT NULL, key TEXT NOT NULL,
+  duty_case INTEGER NOT NULL, task INTEGER NOT NULL, due REAL NOT NULL, created REAL NOT NULL, done REAL,
+  told_task INTEGER);
+CREATE INDEX IF NOT EXISTS case_reminder_due ON case_reminders(due) WHERE done IS NULL;
+CREATE INDEX IF NOT EXISTS case_reminder_key ON case_reminders(responsibility, key);
+CREATE INDEX IF NOT EXISTS case_reminder_told ON case_reminders(told_task) WHERE told_task IS NOT NULL;
 CREATE TABLE IF NOT EXISTS agent_notes(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, text TEXT NOT NULL,
   revision INTEGER NOT NULL, created REAL NOT NULL, by TEXT NOT NULL, task INTEGER, duty_case INTEGER,
   why TEXT NOT NULL);
@@ -11105,6 +11115,8 @@ def t_set_reminder(agent, a):
     Two tools, two owners, two vocabularies, for one idea, and nothing at all for the agent that must wait four
     hours for a build. This is the one idea; the wake-up rules keep what this does not do, which is recurring work
     and a saved code check that costs no model turn."""
+    if shell_task(agent):       # a session whose Shell box is off: a time for its case, and no words
+        return case_reminder(agent, a)
     minutes, at, ci = a.get("minutes"), a.get("at"), a.get("ci")
     if sum(v not in (None, "") for v in (minutes, at, ci)) != 1:
         raise ToolError("Give one of minutes (a count from now), at (a time) or ci (a commit whose GitHub Actions runs "
@@ -30809,6 +30821,220 @@ def report_notices(t0):
                        (tid, *(x["id"] for x in reps)))
 
 
+# ---------------------------------------------------------------- a time for a case (set_reminder, typed)
+# A session whose Shell box is off works one event of a case and ends. No task of a line watch waits, because a wait
+# would hold a place of the watch's pool, and such a session keeps no wake-up. So "come back to this case at this
+# time" is a row of the hub's own: the session names a time and no words (SHELL_TYPED), delivers as it always does,
+# and at that time the hub starts one new session for the case's key in the duty's line watch, as report_notices
+# does for a covered ticket. A session that a new event of the key started after the call (a new line of the watch,
+# the close of a case that covers it, an earlier time) takes the time away when it completed, and is waited for
+# while it is open; one that failed worked nothing, and the session that answers a question about a report works
+# that question alone. Only a session that the duty's line watch started has this. Of the other tasks of such an
+# agent only a colleague's question waits, for an answer of its line (t_message_agent's waits): a stranger's text
+# would else hold a task open. The owner, 19 November 2026,
+# of a support agent that waits for a developer's answer before it writes to the customer: "if developer needs more
+# time than what we can afford, then support can write", and of this time: "make sure it is available to any
+# founderizer agent" (an agent with a shell has set_reminder for each task).
+CASE_REMINDER_MIN = 15 * 60         # seconds: the soonest time, because a session that comes back at once is a loop
+CASE_REMINDER_MAX = 30 * 86400      # seconds: the latest time
+CASE_REMINDERS = 4                  # the cost limit: the sessions that such times started for one key in 30 days
+CASE_REMINDER_DAYS = 30
+CASE_REMINDER_STEP = "comes_back"   # the step of the case that says the time, in the hub's words alone
+CASE_REMINDER_FAULTS = set()        # the times whose start raised in this run of the hub (case_reminder_notices)
+
+
+def case_reminder(agent, a):
+    """set_reminder of a session whose Shell box is off, which its duty's line watch started: a time inside
+    CASE_REMINDER_MIN and CASE_REMINDER_MAX, and no words. One time waits for one key, so a second call moves it. The
+    hub writes the step of the case that says the time. The task stays as it is: its session delivers as it always
+    does. Called with LOCK held."""
+    t = get_task(parse_task(a.get("task_id")), owner=agent)
+    if t["state"] in TERMINAL:
+        raise ToolError(f"{tref(t['id'])} is already {t['state']}; there is nothing to come back to.")
+    if not case_line_task(t):
+        raise ToolError("No time brings this task back: only a session that its duty's watch started for one line of "
+                        "its check sets one. Finish this task as usual.")
+    c = case_row(t["duty_case"])
+    r = duty_row(c["responsibility"])
+    if not r or r["state"] == "retired":
+        raise ToolError(f"{rref(c['responsibility'])} is retired, so no session of it starts again. Finish this task.")
+    minutes, at = a.get("minutes"), a.get("at")
+    if sum(v not in (None, "") for v in (minutes, at)) != 1:
+        raise ToolError("Give one of minutes (a count from now) or at (a time), and not both.")
+    # The task is part of the call, so the same request_id from the session that came back is another call: a count
+    # of minutes means another time there. And the receipt comes before the checks of the time, so a repeat of a call
+    # whose answer was lost gets that answer, also when its time is too near by then.
+    command, stored = agent_write(agent, "set_reminder", a, {"task": t["id"], "minutes": minutes, "at": at})
+    if stored:
+        return stored["text"]
+    t0 = now()
+    if at not in (None, ""):
+        due = parse_wake(at, "at", within=None)
+    else:
+        try:
+            due = t0 + float(minutes) * 60
+        except (TypeError, ValueError):
+            raise ToolError("minutes must be a number.") from None
+        if isinstance(minutes, bool) or not math.isfinite(due):
+            raise ToolError("minutes must be a number of minutes from now.")
+    if due - t0 < CASE_REMINDER_MIN:
+        raise ToolError(f"The time must be at least {CASE_REMINDER_MIN // 60} minutes from now: a session that comes "
+                        f"back at once reads what this one reads.")
+    if due - t0 > CASE_REMINDER_MAX:
+        raise ToolError(f"The time must be within {CASE_REMINDER_MAX // 86400} days from now.")
+    started = q1("SELECT COUNT(*) n FROM case_reminders WHERE responsibility=? AND key=? AND told_task IS NOT NULL "
+                 "AND done>?", (r["id"], c["key"], t0 - CASE_REMINDER_DAYS * 86400))["n"]
+    if started >= CASE_REMINDERS:
+        raise ToolError(f"No more: {started} sessions of this case started in {CASE_REMINDER_DAYS} days at a time "
+                        f"that a session of it set, and {CASE_REMINDERS} is the most. Say what the case still waits "
+                        f"for in the record that a person reads, so that the person can act.")
+    when = goal_time(due)
+    with transaction():
+        for old in DB.execute("SELECT * FROM case_reminders WHERE responsibility=? AND key=? AND done IS NULL",
+                              (r["id"], c["key"])).fetchall():
+            DB.execute("UPDATE case_reminders SET done=? WHERE id=?", (t0, old["id"]))
+            if old["duty_case"] != c["id"]:     # its step stands in an earlier case of the key
+                case_reminder_over(old, "no session: a later session of the case set another time", t0)
+        DB.execute("INSERT INTO case_reminders(responsibility,key,duty_case,task,due,created) VALUES(?,?,?,?,?,?)",
+                   (r["id"], c["key"], c["id"], t["id"], due, t0))
+        if c["state"] == "open":        # the hub writes the line: a time, and no word of the session
+            old = DB.execute("SELECT id FROM duty_steps WHERE duty_case=? AND key=?",
+                             (c["id"], CASE_REMINDER_STEP)).fetchone()
+            if old:
+                DB.execute("UPDATE duty_steps SET text=?, task=?, by=?, ts=? WHERE id=?",
+                           (f"at {when}", t["id"], agent, t0, old["id"]))
+            else:
+                DB.execute("INSERT INTO duty_steps(duty_case,key,text,task,by,ts) VALUES(?,?,?,?,?,?)",
+                           (c["id"], CASE_REMINDER_STEP, f"at {when}", t["id"], agent, t0))
+            if not c["first_step"]:
+                DB.execute("UPDATE duty_cases SET first_step=? WHERE id=?", (t0, c["id"]))
+        DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,'step',?)",
+                   (r["id"], t0, agent, f"{cref(c)} {CASE_REMINDER_STEP}: at {when}"))
+        text = (f"The hub starts a new session for {cref(c)} ({c['key']}) at {when}. That session reads the hub's "
+                f"own line and nothing of this session, so leave what it must know in the record of {c['key']} that "
+                f"it reads with its own tools. A session that a new event of the case starts before that time, and "
+                f"that does the work, takes this time away. Now deliver this task, and do not close the case while "
+                f"it waits: the session that comes back closes it.")
+        keep_command(command, {"task": t["id"], "text": text}, t0)
+    return text
+
+
+def case_reminding(tid):
+    """The case whose session set the time that started this task, as R-<n>/C-<n>, or None: its token request names
+    it, so that the service of the record can make a token for a record whose own event has already ended, as
+    report_covering does for a covered ticket."""
+    row = q1("SELECT duty_case FROM case_reminders WHERE told_task=? ORDER BY id LIMIT 1", (tid,))
+    c = case_row(row["duty_case"]) if row else None
+    return cref(c) if c else None
+
+
+def case_reminder_waits(duty_id, key):
+    """One line of the hub for a session that a new line of a watch starts for a key whose time still waits, or "":
+    when that session does the work, the time starts nothing, so it sets one again when the case still waits. Inside
+    the run's transaction (case_line_rows): a read of the connection, and no write."""
+    row = DB.execute("SELECT due FROM case_reminders WHERE responsibility=? AND key=? AND done IS NULL ORDER BY id "
+                     "DESC LIMIT 1", (duty_id, key)).fetchone()
+    return (f"[hub] An earlier session of this case set a time for it: {goal_time(row['due'])}. When your session "
+            f"does the work of the case, that time starts nothing: set a time again with set_reminder if the case "
+            f"still waits after your work.") if row else ""
+
+
+def case_reminder_over(rem, said, t0):
+    """Inside the caller's transaction: the hub's word for the end of one time, with the session that it started or
+    with none, in the step of its case while that step is still this time's, and in the duty's history: a time that
+    the hub dropped must not stand in the record as one that comes."""
+    in_transaction("case_reminder_over")
+    DB.execute("UPDATE duty_steps SET text=?, by='hub', ts=? WHERE duty_case=? AND key=? AND task=?",
+               (said, t0, rem["duty_case"], CASE_REMINDER_STEP, rem["task"]))
+    DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,'hub','step',?)",
+               (rem["responsibility"], t0, f"R-{rem['responsibility']}/C-{rem['duty_case']} {CASE_REMINDER_STEP}: "
+                                           f"{said}"))
+
+
+def case_reminder_notices(t0):
+    """One session for each time of a case that came (case_reminder): for the case's key, in its open case or in a
+    new case of that key, inside the pool of the duty's line watch, as report_notices starts the session of a covered
+    ticket. A time that finds no room, or whose duty or watch is paused or has no route or a usage limit now, waits
+    for the next tick, and so does one whose key has a later session that is still open: no clock ends it. A time
+    whose key got a later session that completed starts nothing, and neither does one of a duty that is retired or
+    has no watch of lines any more. A time whose start raises is logged and left for the next tick, so that it stops
+    no other time. Called with LOCK held."""
+    for rem in q("SELECT * FROM case_reminders WHERE done IS NULL AND due<=? ORDER BY due, id", (t0,)):
+        try:
+            case_reminder_start(rem, t0)
+        except Exception as e:      # noqa: BLE001 -- one time's fault is that time's
+            if rem["id"] not in CASE_REMINDER_FAULTS:       # said once for each run of the hub, with its trace
+                CASE_REMINDER_FAULTS.add(rem["id"])
+                print_fault()
+                log("hub", f"no session for the time of {rem['key']} (R-{rem['responsibility']}), and the tick "
+                           f"tries again: {type(e).__name__}")
+
+
+def case_reminder_start(rem, t0):
+    """The session of one time that came, when it can start now (case_reminder_notices)."""
+    duty = duty_row(rem["responsibility"])
+    live = bool(duty) and duty["state"] != "retired"
+    # The sessions that a new event of the key started after the call (a line of the watch, a covering close, an
+    # earlier time). One that answers a question about a report works that question alone (report_question_start).
+    # One that completed did the work of the case. One that is open may still do it, or end with none (a token that
+    # its service refused, a cancel, a failed result), so the time waits for it; and one that ended so worked nothing.
+    newer = q("SELECT t.state FROM tasks t JOIN duty_cases c ON c.id=t.duty_case WHERE c.responsibility=? AND c.key=? "
+              "AND t.id>? AND t.created>=? AND t.trigger_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "
+              "report_questions rq WHERE rq.task=t.id)",
+              (rem["responsibility"], rem["key"], rem["task"], rem["created"]))
+    lines = [w for w in duty_watches(duty["id"]) if w["check_spec"] and
+             case_line_watch(w, json.loads(w["check_spec"]))] if live else []      # the active and the paused ones
+    gone = ("its duty is retired" if not live else
+            "a later session of the case did the work" if any(x["state"] == "completed" for x in newer) else
+            "its duty has no watch of lines any more" if not lines else None)
+    if gone:
+        with transaction():
+            DB.execute("UPDATE case_reminders SET done=? WHERE id=?", (t0, rem["id"]))
+            case_reminder_over(rem, f"no session at {goal_time(rem['due'])}: {gone}", t0)
+        return
+    own = q1("SELECT state, trigger_id FROM tasks WHERE id=?", (rem["task"],))
+    # the session that set the time has not delivered yet (a turn that ended with the task open): a second session
+    # would work the same event beside it, so the time waits for it too
+    if any(x["state"] not in TERMINAL for x in newer) or (own and own["state"] not in TERMINAL) or \
+            duty["state"] != "active":
+        return
+    active = [w for w in lines if w["state"] == "active"]       # the watch of the session that set the time, first
+    watch = next((w for w in active if own and w["id"] == own["trigger_id"]), active[0] if active else None)
+    if not watch or q1(f"SELECT COUNT(*) n FROM tasks WHERE trigger_id=? AND {OPEN_TASK}",
+                       (watch["id"],))["n"] >= CASE_POOL:
+        return
+    route, _ = wakeups.wake_route(wake_org(), watch["agent"])
+    if route is None or route["kind"] != "task" or active_limit(watch["agent"]):
+        return
+    try:
+        admission = wake_admission(watch, route, json.loads(watch["task"]))
+    except ToolError:
+        return
+    set_in = case_row(rem["duty_case"])
+    said = (f"[hub] The time came that a session of {cref(set_in) if set_in else 'this case'} set for {rem['key']} "
+            f"({goal_time(rem['due'])}). Read the record of {rem['key']} again with your own tools: what that session "
+            f"waited for can be there now, or a later session can have done the work. If the case still waits, do "
+            f"what it needs at this time, as your duty and your profile say.")
+    task = json.loads(watch["task"])
+    with transaction():
+        case = DB.execute("SELECT id FROM duty_cases WHERE responsibility=? AND key=? AND state='open'",
+                          (duty["id"], rem["key"])).fetchone()
+        case_id = case["id"] if case else duty_new_case(
+            duty, rem["key"], case_title(task["title"], rem["key"]), "a time that its session set", "hub", t0,
+            repeats=False)
+        if not case:
+            DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,'hub','case_opened',?)",
+                       (duty["id"], t0, f"R-{duty['id']}/C-{case_id}: {rem['key']}"))
+        # the hub's line first, as for a covered ticket: a Shell-off session's start shows the first part of the details
+        details = "\n\n".join(x for x in (said, watch_details(watch, task), duty_case_line(duty, case_id)) if x)
+        child = dict(admission["child"], title=case_title(task["title"], rem["key"]),
+                     details=cut_whole(details, 8000), parent=None, responsibility=duty["id"], duty_case=case_id,
+                     why=f"The time that a session set for {rem['key']} came.")
+        tid = admit_task(route["requester"], child, trigger_id=watch["id"])
+        DB.execute("UPDATE case_reminders SET done=?, told_task=? WHERE id=?", (t0, tid, rem["id"]))
+        case_reminder_over(rem, f"came at {goal_time(t0)}: {tref(tid)}", t0)
+
+
 def lists_start_text(task_id):
     """Support plan F4 and K2, in the start of a Shell-off session: the values of its duty's lists, the duties that it
     may report a defect to, and the open cases that the reports of its duty joined, with their symptom, component and
@@ -39849,7 +40075,9 @@ CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "
 # duty or a wake-up, messages an agent outside its reporting line, asks a requester, calls an API with a key, or
 # reads memory, history, earlier work or knowledge. And record_step, close_case and deliver_result take typed fields
 # only (SHELL_TYPED): what such a session writes reaches a session with a shell as ids and short words of a-z 0-9 _,
-# never as its own text (H7). Its own words go to a person, with message_contact: a role with tools on, whose next
+# never as its own text (H7). The set_reminder of a session that its duty's line watch started is a time and no
+# words (case_reminder, 19 November 2026): the hub writes every word that comes back at that time, so it is no
+# wake-up that keeps the session's text. Its own words go to a person, with message_contact: a role with tools on, whose next
 # message comes back to it; and to the agents of its reporting line, with message_agent (shell_line), which get them
 # in quotation marks after the hub's label, as data (SHELL_LINE_FORM). The owner, 18 November 2026, of a support
 # agent: "Fix immediately, any agent can talk to the manager or its lead!", and "it can message the manager and other
@@ -39904,6 +40132,20 @@ SHELL_TYPED = {
         "it touched in ids. After this call the task is closed for good.",
         S({"task_id": TASK_ID, "outcome": {"type": "string", "enum": ["completed", "failed", "rejected"]},
            "values": TYPED_VALUES_FIELD, "ids": TYPED_IDS_FIELD}, ["task_id", "outcome"])),
+    # only in a session that its duty's line watch started (shell_tools): a time and no words (case_reminder)
+    "set_reminder": (
+        "Come back to this case at a time that you name: when it waits for an answer that no event of its own "
+        "brings, or when somebody must hear from you by a time. Give minutes or at, and no words. Then deliver this "
+        "task as usual, and do not close the case while it waits: at the time the hub starts a new session for the "
+        "case, which closes it. That session reads the hub's own line and nothing of this session, so leave what it "
+        "must know in the record that it reads with its own tools. A session that a new event of the case starts "
+        "before the time, and that does the work, takes the time away. Calling it again moves the time.",
+        S({"request_id": REQUEST_ID,
+           "minutes": {"type": "number", "description": f"A count of minutes from now, at least "
+                                                        f"{CASE_REMINDER_MIN // 60}"},
+           "at": {"type": "string", "description": "A time instead: an ISO date or date and time, for example "
+                  "2026-10-21T09:00. With no zone it is read in the fleet's own time zone."},
+           "task_id": TASK_ID}, ["request_id"])),
 }
 # message_agent in every session of an agent whose Shell box is off, a task's and its owner chat's: to the agents of
 # its reporting line alone (shell_line), with no wait, and its words made plain by report_words, as a report's summary
@@ -39967,7 +40209,7 @@ def shell_tools(agent, context=None):
         return None
     if chat_context(agent, context):
         return SHELL_OFF_CHAT
-    named, reports, asked, staff = None, False, False, False
+    named, reports, asked, staff, timed = None, False, False, False, False
     if context and len(context) == 3 and TASK_CONTEXT.fullmatch(str(context[1])):
         row = read_row("SELECT r.tools, r.report_to FROM tasks t JOIN responsibilities r ON r.id=t.responsibility "
                        "WHERE t.id=?", (int(str(context[1])[2:]),))
@@ -39977,7 +40219,13 @@ def shell_tools(agent, context=None):
         # a colleague's question keeps their own wish; one that reads a record holds a token, and keeps none
         staff = staff_question(int(str(context[1])[2:]))[1] is not None and \
             not question_record(int(str(context[1])[2:]))
+        # a time for its case (case_reminder): only a session that its duty's line watch started, which the hub can
+        # start again for that key, and never the session that only answers a question about a report. Of its
+        # other tasks only a colleague's question waits (t_message_agent's waits): no stranger's text holds a task open
+        own = read_row("SELECT trigger_id, duty_case FROM tasks WHERE id=?", (int(str(context[1])[2:]),))
+        timed = bool(own) and not asked and case_line_task(own)
     return SHELL_OFF_TOOLS + (("report_defect",) if reports else ()) + (("answer_report",) if asked else ()) + \
+        (("set_reminder",) if timed else ()) + \
         tuple(n for n in named or () if n in SHELL_OFF_DUTY_TOOLS) + (SHELL_OFF_ASKED_TOOLS if staff else ())
 
 
@@ -40435,6 +40683,8 @@ def typed_args(agent, name, a):
                     where_output_is="the case of this task and its records",
                     how_checked="typed fields of a session whose Shell box is off",
                     plain=None if plain and secret_hit(plain) else plain)
+    if name == "set_reminder":      # a time alone: the hub writes the line of the case's record (case_reminder)
+        return dict(out, request_id=a.get("request_id"), minutes=a.get("minutes"), at=a.get("at"))
     row = read_row("SELECT duty_case FROM tasks WHERE id=? AND owner=?", (parse_task(a.get("task_id")), agent))
     c = case_row(row["duty_case"]) if row and row["duty_case"] else None
     if not c:
@@ -40444,6 +40694,8 @@ def typed_args(agent, name, a):
         step = a.get("step")
         if not (isinstance(step, str) and TYPED_WORD.fullmatch(step)):
             raise ToolError("step must be one word of 1 to 40 characters a-z 0-9 _.")
+        if step == CASE_REMINDER_STEP:      # the hub's own line of a case: the time that set_reminder set
+            raise ToolError(f"{CASE_REMINDER_STEP} is the hub's own step, which set_reminder writes. Use another word.")
         return dict(out, step=step, text=typed_line({}, typed_list(a.get("ids"), "ids")))
     values = typed_values(a.get("values"))
     path = read_row("SELECT lists FROM responsibilities WHERE id=?", (c["responsibility"],))["lists"]
@@ -42669,7 +42921,10 @@ def case_line_rows(t, r, admission, starts, spec, t0, wakes=None):
             DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,'hub','case_opened',?)",
                        (duty["id"], t0, f"R-{duty['id']}/C-{case_id}: {key}"))
         said = mask_secrets(trigger_provenance(t, r["id"], r["due"], False, (spec, [line], None), t0=t0, wakes=wakes))
-        details = "\n\n".join(x for x in (watch_details(t, task), said, duty_case_line(duty, case_id)) if x)
+        # a time that an earlier session of the key set still waits (case_reminder): the hub's line of it first,
+        # because a start shows the first part of the details
+        details = "\n\n".join(x for x in (case_reminder_waits(duty["id"], key), watch_details(t, task), said,
+                                          duty_case_line(duty, case_id)) if x)
         child = dict(admission["child"], title=case_title(task["title"], key),
                      details=cut_whole(details, 8000), parent=None, responsibility=duty["id"], duty_case=case_id)
         tid = admit_task(admission["route"]["requester"], child, trigger_id=t["id"],
@@ -45443,6 +45698,7 @@ def tick():
         step(trigger_sweep, t0)
         step(report_notices, t0)            # support plan F4: the covered tickets that waited for a place
         step(report_question_sweep, t0)     # and the questions about a report that waited for one
+        step(case_reminder_notices, t0)     # and the times that a session whose Shell box is off set for its case
         step(manager_flag_update, t0)
         step(fault_flush, t0)               # the lane "Bug reports": what diagnostics.py counted in this pass
         step(error_report_sweep, t0)        # the lane "Error reports": the day's report, while the owner has it on
@@ -68909,6 +69165,9 @@ class Handler(BaseHTTPRequestHandler):
                 asking = report_asking(tid) if field and not covering else None
                 if asking:          # and a session that answers a question about a report of that ticket
                     body["asked_by"] = asking
+                reminding = case_reminding(tid) if field and not covering and not asking else None
+                if reminding:       # and a session that a time of the case started (case_reminder)
+                    body["reminder"] = reminding
             jid = ins("INSERT INTO jobs(agent,task,kind,login,target,created,request_id,attempt,method,path,body,auth,"
                       "headers,timeout) VALUES(?,?,'request',?,?,?,?,?,'POST',?,?,'bearer','{}',NULL)",
                       (agent, tid, ref, f"mint:{tool}", now(), str(uuid.uuid4()), t["attempt"], entry["mint"]["path"],
