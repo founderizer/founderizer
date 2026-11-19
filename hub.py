@@ -7355,11 +7355,12 @@ def outcome_text(task_id):
                      for o in q("SELECT * FROM outcomes WHERE task=? ORDER BY id", (task_id,)))
 
 
-def resume_plan(task_id, mode, by, via=None, note=""):
+def resume_plan(task_id, mode, by, via=None, note="", why=""):
     """Every check of a resume, and what it will write: {task, hold, by, mode, how, attempt, events}. It writes
     nothing. Unknown outcomes need a recorded check first, or an agent check (mode "check"). Only a confirmed stop is
     resumed, and a task of a paused goal (or held with its parent) only through the goal's (or the parent's) own
-    resume, which pass via="goal" or via="parent". note: more words for the session."""
+    resume, which pass via="goal" or via="parent". note: more words for the session. why: more words for the
+    requester, who hears of a resume that is not its own."""
     t = q1("SELECT * FROM tasks WHERE id=?", (task_id,))
     if not t:
         raise ToolError(f"There is no task {tref(task_id)}.")
@@ -7406,7 +7407,7 @@ def resume_plan(task_id, mode, by, via=None, note=""):
     if by != t["requester"]:
         events.append((t["requester"], "say", filed_under(t["requester"], "say", task_id),
                        f"[hub] The {by} resumed {tref(task_id)} ({t['title']}) with a {how}." +
-                       (f" Outcomes: {checked}." if checked else ""), None))
+                       (f" {why}" if why else "") + (f" Outcomes: {checked}." if checked else ""), None))
     return {"task": t, "hold": h, "by": by, "mode": mode if unknown else "resume", "how": how,
             "attempt": None if live else attempt_event(t, text), "events": events}
 
@@ -7422,9 +7423,9 @@ def resume_rows(plan, t0):
     event_rows(plan["events"], t0)
 
 
-def release_hold(task_id, mode, by, via=None, note=""):
+def release_hold(task_id, mode, by, via=None, note="", why=""):
     """Resume a held task once: resume_plan's checks, then all its writes together."""
-    plan = resume_plan(task_id, mode, by, via, note)
+    plan = resume_plan(task_id, mode, by, via, note, why)
     with transaction():
         resume_rows(plan, now())
     log(by, f"resumed {tref(task_id)} from H-{plan['hold']['id']} with a {plan['how']}")
@@ -7877,6 +7878,11 @@ def limit_reading(agent, reading, t0):
         log("hub", f"{agent}'s usage reading shows its windows open; its limit ends now")
 
 
+def session_failed_note(needs):
+    """The note of the pause that screen_failed makes, by which sign_in_resumes knows that hold again."""
+    return f"its {'screen session' if needs == 'screen' else 'session'} ended with an error"
+
+
 def screen_failed(key, seq, error):
     """A turn of a session in the runner failed (app_server_task: every screen task, and each task of a Codex agent
     with the app-server start policy): its records have a result with the stop reason "error" (a tool call that
@@ -7886,7 +7892,8 @@ def screen_failed(key, seq, error):
     limit is start_limit's. For every other error the runner starts no other turn, and a new session would fail in the
     same way. So the hub starts none and types nothing: the existing pause hold, in the requester's name, and one
     message to the requester. The helper's answer to the pause is the proof that nothing of the session runs. The
-    owner's Resume starts a new attempt, as from every hold."""
+    owner's Resume starts a new attempt, as from every hold, and so does the end of a sign-in of that runtime on the
+    agent's machine (sign_in_resumes)."""
     t = q1("SELECT * FROM tasks WHERE id=?", (key[0],))
     owner = agents().get(t["owner"]) or {}
     # The AI providers build (spec 3.11 item 7): a task of driver acp too. Its runner ends a failed prompt with the
@@ -7903,11 +7910,13 @@ def screen_failed(key, seq, error):
     said = " ".join(str(error.get("message") or "").split())
     why = cut_whole(said, 300) or ("..." if said else "The session gave no error text.")
     session = "screen session" if t["needs"] == "screen" else "session"
-    request_hold(t["id"], "pause", t["requester"], f"its {session} ended with an error")
+    request_hold(t["id"], "pause", t["requester"], session_failed_note(t["needs"]))
     emit(t["requester"], "say", f"[hub] The hub paused {tref(t['id'])} ({t['title']}, owner {t['owner']}): its {session} "
          f"ended with an error that a new session does not correct by itself. The error: {why} "
          f"{tref(t['id'])} starts no new session and gets no messages. Decide what to do: cancel it, or {PASS_UP}. "
-         f"The owner's Resume starts a new session when the cause is gone.", task=t["id"])
+         f"The owner's Resume starts a new session when the cause is gone" +
+         (", and so does the hub when a sign-in of that AI program ends on its server."
+          if session_runtime(owner, t["needs"]) in LOGIN_RUNTIMES else "."), task=t["id"])
     log("hub", f"{tref(t['id'])} on {t['owner']} is paused: its {session} failed ({error.get('code') or 'no error record'})")
 
 
@@ -55050,6 +55059,7 @@ def end_signed_in_waits(agent, t0=None):
         LIVE_LOGINS.pop(row["id"], None)        # the link and any code go, as on any other end of a sign-in
         log("hub", f"{agent}: sign-in L-{row['id']} ({row['runtime']}) done, as that machine reports it")
         signed_in_beside(agent)
+        sign_in_resumes(agent, row["runtime"])
     # The sign-in is the last step of both an install and a preparation, so a job that waits there is finished when
     # the machine is signed in. Its words go with its prompt: the app says what a finished job of that kind did.
     for row in q("SELECT * FROM server_jobs WHERE agent=? AND state='needs_owner' AND step='sign_in'", (agent,)):
@@ -55061,6 +55071,7 @@ def end_signed_in_waits(agent, t0=None):
         log("hub", f"server {row['server']}: job {row['id']} ({row['kind']} {agent}) done, as that machine reports "
                    f"{runtime_label(row['runtime'])} signed in")
         signed_in_beside(agent)             # that sign-in is also the one of each agent beside it
+        sign_in_resumes(agent, row["runtime"])
 
 
 def busy_words(busy):
@@ -55186,6 +55197,7 @@ def login_report(agent, lid, update):
         log("hub", f"{agent}: sign-in L-{lid} ({row['runtime']}) {state}")
     if state == "done":
         signed_in_beside(agent)
+        sign_in_resumes(agent, row["runtime"])
     return {"ok": True, "state": state}
 
 
@@ -55205,6 +55217,116 @@ def signed_in_beside(agent):
     for other in server_agents(machine):
         if other != agent and os_user_uid_own(other) == uid:
             status_now(other)
+
+
+def session_runtime(conf, needs):
+    """The runtime that the session of a task with these needs runs on, for an agent with this entry: a screen task on
+    the screen runtime (own_runtime_task), every other task on the agent's own."""
+    return APP_SERVER_RUNTIME if needs == "screen" else conf.get("runtime")
+
+
+def turn_worked_since(names, runtime, since):
+    """True when the hub stored, after `since`, the end of a turn that a session on `runtime` of one of these agents
+    ended by itself: not with an error, and not because it was stopped (`cancelled` proves nothing of the runtime).
+    Then that runtime worked there after that moment. Only the tasks that moved since are read (last_activity, which
+    the records of an open task's current attempt move), and of each one only its results since: no chat, and no
+    conversation."""
+    for name in names:
+        conf = agents().get(name) or {}
+        for t in q("SELECT id, needs FROM tasks WHERE owner=? AND last_activity>?", (name, since)):
+            if session_runtime(conf, t["needs"]) == runtime and read_row(
+                    "SELECT 1 FROM thread_events WHERE task=? AND type='result' AND created>? AND "
+                    "json_extract(data, '$.stop_reason') NOT IN ('error','cancelled') LIMIT 1", (t["id"], since)):
+                return True
+    return False
+
+
+def other_hold_around(t):
+    """Why task row `t` does not go on by a resume of its own hold alone, or None. The owner holds a task above it:
+    the owner's Pause of a parent that comes after the hub's pause of this task leaves this hold as it is, with no row
+    of parent_holds (request_hold, hold_subtasks), so resume_plan does not see it. Only the owner's hold holds what is
+    under it (hold_subtasks has no other caller): under a task that its requester or the hub paused, a subtask ran
+    before this rule and goes on now (a wake-up, a case or a review of a lead's worker is a subtask of the lead's one
+    task). Or tasks under it are held with it (parent_holds), which only a Resume of this task by the owner releases
+    (release_subtasks).
+
+    Known: a Pause of a task that is paused already changes nothing (request_hold answers `changed` false), so the
+    owner's Pause, through the API or the owner tools, of this task or of a task above it that is paused already is
+    not seen here: the hold stays its first holder's, and the hub's own pause is resumed. The apps show no Pause on a
+    held task, and the owner's Stop is kept (it changes the hold's kind)."""
+    above, seen = t["parent"], set()
+    while above and above not in seen:
+        seen.add(above)
+        if (active_hold(above) or {"by": None})["by"] == "owner":
+            return f"the owner holds {tref(above)} above it"
+        row = q1("SELECT parent FROM tasks WHERE id=?", (above,))
+        above = row["parent"] if row else None
+    if q1("SELECT 1 FROM parent_holds ph JOIN holds h ON h.id=ph.hold WHERE ph.parent=? AND h.state<>'released' LIMIT 1",
+          (t["id"],)):
+        return "its subtasks are held with it, and the owner's Resume releases them together"
+    return None
+
+
+def sign_in_resumes(agent, runtime):
+    """A sign-in of `runtime` on this agent's machine ended done, so each task there that the hub paused itself
+    because its session on that runtime ended with an error (screen_failed) is resumed, with nobody's press on Resume.
+    The tasks of this agent, and of each agent beside it that runs as the same OS user, whose sign-in it is too
+    (signed_in_beside). The ends of a sign-in: a sign-in job that its helper reports done (login_report) or that the
+    machine's reading ends (end_signed_in_waits), and an install or a preparation that ends at its sign-in step, by
+    that reading or by the report of its server's own service (Handler.server_job). Only for a runtime that has a
+    sign-in (LOGIN_RUNTIMES): an install reports that step done also when it had none to make, as for an agent on a
+    key. Known, as finished_sign_in has it: that report does not say whether a sign-in of Claude Code or Codex was
+    made (a step that finds the runtime signed in makes none), so the install of an agent that moved to another server
+    resumes its paused task there.
+
+    Why (the owner, 19 November 2026, in the live check of the app's row "Codex is signed out on <server>", after
+    a sign-in from that row's "Sign in again"): "I signed in but that task still shows an orange error label,
+    probably not updated". The task stayed paused, and nothing said that Resume was the next step. What can run by
+    itself runs with no control for it. A sign-in job starts only while the hub's reading does not say that the
+    runtime is signed in, or for another account (start_machine_login), so its end is news of that runtime there.
+
+    What that sign-in may have put right, and no more. The hub reads no cause from the error: it resumes its own
+    pause (the hold's note is session_failed_note's, and its kind is still pause: the owner's Stop on it stays a
+    stop) of a task whose session runs on that runtime, when no turn of that runtime ended there by itself since the
+    pause (turn_worked_since). A task that failed while that runtime still worked for another task failed for another
+    reason, and it waits for its requester or the owner as before. A task that fails again is paused again, and each
+    later end of a sign-in resumes it once more: two ends can come close together (a sign-in job that found a sign-in
+    that works ends done with nothing started, fleet.Helper.sign_in_works), and no end comes without the owner.
+
+    Every check of a resume stands (resume_plan): a task whose stop is not confirmed stays paused, and so does one
+    with an unknown outcome, because nobody checked what its stopped attempt did (rule 9), and a task of a paused
+    goal. So does a task with another hold around it (other_hold_around). The log says why, and the requester hears
+    of each resume with its reason. Answers the tasks that went on, in the order of their ids."""
+    if runtime not in LOGIN_RUNTIMES:
+        return []
+    conf = agents().get(agent) or {}
+    machine, uid = conf.get("machine"), os_user_uid_own(agent)
+    names = [agent] + [other for other in (server_agents(machine) if machine and uid is not None else [])
+                       if other != agent and os_user_uid_own(other) == uid]
+    label, went = runtime_label(runtime), []
+    marks = ",".join("?" * len(names))
+    for t in q(f"SELECT * FROM tasks WHERE owner IN ({marks}) AND {OPEN_TASK} ORDER BY id", tuple(names)):
+        h = active_hold(t["id"])
+        if not h or h["kind"] != "pause" or h["note"] != session_failed_note(t["needs"]) or \
+                session_runtime(agents().get(t["owner"]) or {}, t["needs"]) != runtime:
+            continue
+        if turn_worked_since(names, runtime, h["created"]):
+            continue
+        why_not = other_hold_around(t)
+        if not why_not:
+            try:
+                release_hold(t["id"], "resume", "hub",
+                             note=f"The hub resumed it because a sign-in of {label} ended on your server after your "
+                                  f"session ended with an error.",
+                             why=f"A sign-in of {label} ended on its server, and no turn of {label} had ended there "
+                                 f"by itself since its session ended with an error.")
+            except ToolError as e:
+                why_not = str(e)
+        if why_not:
+            log("hub", f"{tref(t['id'])} stays paused after the sign-in of {label}: {why_not}")
+        else:
+            went.append(t["id"])
+    return went
 
 
 def login_input(data):
@@ -60386,6 +60508,10 @@ class Handler(BaseHTTPRequestHandler):
                 team_plan_job(job, update["state"], update.get("detail"))     # owner API 1.214: a plan's job
                 if row["kind"] in ("install", "prepare"):
                     status_now(row["agent"])
+                    if update["state"] == "done" and update["step"] == "sign_in":
+                        # The report of the server's own service is an end of a sign-in too (Codex on a server
+                        # has no sign-in job of the hub). It does not say whether a sign-in was made (sign_in_resumes).
+                        sign_in_resumes(row["agent"], row["runtime"])
                 if row["kind"] == "remove" and update["state"] == "done":
                     with transaction():
                         free_name(row["agent"])     # agent_remove: nothing of it is left on its server

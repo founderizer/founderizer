@@ -222,6 +222,7 @@ class ScreenFailure(unittest.TestCase):
         (hold,) = self.holds(tid)
         self.assertEqual((hold["kind"], hold["by"], hold["state"]), ("pause", "manager", "requested"))
         self.assertIn("The error: The model `synthetic-old` is not supported.", self.said("manager")[0])
+        self.assertIn("when a sign-in of that AI program ends on its server", self.said("manager")[0])
         # The same batch again, and a second failed turn of a runner that still ran: one hold and one message.
         self.records(tid, [result(2)])
         self.records(tid, [error(3), result(4)])
@@ -272,6 +273,95 @@ class ScreenFailure(unittest.TestCase):
         self.records(tid, [result(6)])
         (hold,) = self.holds(tid)
         self.assertIn("The error: The session gave no error text.", self.said("manager")[0])
+
+    def paused(self, confirmed=True, owner="dana"):
+        """A screen task whose session ended with an error, so the hub paused it; its stop confirmed or not."""
+        tid = self.task(owner=owner)
+        self.records(tid, [error(1, "http_connection_failed", "unexpected status 401 Unauthorized"), result(2)],
+                     session=str(uuid.uuid4()), agent=owner)
+        if confirmed:
+            hub.settle_hold(hub.active_hold(tid), True, "no session was running")
+        return tid
+
+    def sign_in(self, runtime, end="report", agent="dana"):
+        """A sign-in of that runtime on the agent's machine ends done: its helper reports the job's end ("report"), or
+        the machine's next reading says signed in while the job ("reading") or a preparation at its sign-in step
+        ("step") still waits for the owner."""
+        before = hub.now() - 10
+        if end == "step":
+            hub.ins("INSERT INTO server_jobs(server,kind,agent,runtime,state,step,created,updated) "
+                    "VALUES('dana-mac','prepare',?,?,'needs_owner','sign_in',?,?)", (agent, runtime, before, before))
+        else:
+            job = hub.ins("INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES(?,?,'needs_owner',?,?)",
+                          (agent, runtime, before, before))
+        if end == "report":
+            return hub.login_report(agent, job, hub.login_input({"state": "done"}))
+        hub.q("INSERT OR REPLACE INTO machine_status(agent,data,reported) VALUES(?,?,?)",
+              (agent, json.dumps({"runtimes": {runtime: {"signed_in": True}}}), hub.now()))
+        return hub.end_signed_in_waits(agent)
+
+    def test_a_sign_in_that_ends_resumes_the_task_that_the_hub_paused_for_its_failed_session(self):
+        """The owner signed in from a paused task's error row and the task stayed paused (19 November 2026): each end
+        of a sign-in of the session's runtime resumes the task, and its requester hears why. A turn that was stopped
+        there since the pause is no proof that the runtime worked."""
+        for end in ("report", "reading", "step"):
+            tid = self.paused()
+            self.records(self.task(), [result(1, "cancelled")], session=str(uuid.uuid4()))
+            self.sign_in("claude", end)             # the sign-in of another runtime than the screen session's
+            self.assertEqual(self.holds(tid)[0]["state"], "stopped", end)
+            self.sign_in("codex", end)
+            (hold,) = self.holds(tid)
+            self.assertEqual((hold["state"], hold["released_by"], hold["resume_mode"]), ("released", "hub", "resume"), end)
+            self.assertEqual(hub.q1("SELECT attempt FROM tasks WHERE id=?", (tid,))["attempt"], 2, end)
+            self.assertIn("A sign-in of Codex ended on its server", self.said("manager")[-1], end)
+
+    def test_a_sign_in_of_one_agent_resumes_the_task_of_the_agent_beside_it_of_the_same_os_user(self):
+        """The agents of one OS user keep one sign-in of each provider, and the owner can start it from the row of
+        either: the paused task of the other one goes on too. An agent of another OS user keeps its own sign-in."""
+        hub.TEAM["agents"].update(erin=dict(DANA), finn=dict(DANA))
+        for name, uid in (("dana", 501), ("erin", 501), ("finn", 502)):
+            hub.q("INSERT OR REPLACE INTO machine_status(agent,data,reported) VALUES(?,?,?)",
+                  (name, json.dumps({"access": {"uid": uid}}), hub.now()))
+        beside, other = self.paused(owner="erin"), self.paused(owner="finn")
+        self.sign_in("codex")
+        self.assertEqual([self.holds(t)[0]["state"] for t in (beside, other)], ["released", "stopped"])
+
+    def test_a_sign_in_resumes_only_what_it_can_have_put_right(self):
+        """A task stays as it is when it failed while the runtime still worked there, when the pause is its
+        requester's own, when nobody confirmed its stop, when the owner turned the pause into a stop, when an action
+        of its stopped attempt has an unknown result (rule 9), when the owner holds the task above it, and when its
+        subtasks are held with it. None of them stops the report of the sign-in's end, and a task above that its
+        requester paused holds no subtask: a worker's task under a lead's paused task goes on."""
+        before = self.paused()
+        self.records(self.task(), [result(1, "end_turn")], session=str(uuid.uuid4()))   # the runtime works after it
+        own = self.task()
+        hub.request_hold(own, "pause", "manager", "wait for my word")
+        hub.settle_hold(hub.active_hold(own), True, "no session was running")
+        open_stop = self.paused(confirmed=False)
+        stop = self.paused()
+        hub.request_hold(stop, "stop", "owner")
+        hub.settle_hold(hub.active_hold(stop), True, "no session was running")
+        unknown = self.task()
+        self.records(unknown, [error(1), result(2)], session=str(uuid.uuid4()))
+        hub.settle_hold(hub.active_hold(unknown), True, "interrupted and closed", ended=1)
+        # The owner pauses a task whose subtask the hub paused before: the subtask's hold stays the hub's.
+        above, under = self.task(), self.paused()
+        hub.q("UPDATE tasks SET parent=? WHERE id=?", (above, under))
+        hub.request_hold(above, "pause", "owner")
+        hub.hold_subtasks(above, "pause")
+        # The owner pauses a task that the hub paused before: its hold stays the hub's, and its subtask is held with it.
+        over = self.paused()
+        hub.q("UPDATE tasks SET parent=? WHERE id=?", (over, self.task()))
+        hub.request_hold(over, "pause", "owner")
+        hub.hold_subtasks(over, "pause")
+        after = self.paused()
+        hub.q("UPDATE tasks SET parent=? WHERE id=?", (own, after))      # under a task that its requester paused
+        self.assertEqual(self.sign_in("codex"), {"ok": True, "state": "done"})
+        self.assertEqual({name: self.holds(t)[-1]["state"] for name, t in (
+            ("before", before), ("own", own), ("open stop", open_stop), ("stop", stop), ("unknown", unknown),
+            ("under", under), ("over", over), ("after", after))},
+            {"before": "stopped", "own": "stopped", "open stop": "requested", "stop": "stopped", "unknown": "stopped",
+             "under": "stopped", "over": "stopped", "after": "released"})
 
     def test_only_the_current_attempt_of_an_open_screen_task_is_paused(self):
         browser = self.task(owner="studio", needs="browser")

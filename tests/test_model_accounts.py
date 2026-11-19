@@ -1021,10 +1021,16 @@ class ModelAccounts(OwnerAPI):
                 if "paused" in r["text"]]
         self.assertEqual(len(told), 1)
         self.assertIn("The error: The key was refused.", told[0])
+        self.assertNotIn("sign-in", told[0])        # its runtime has no sign-in that could end
         records({"seq": 5, "ts": time.time(), "type": "error", "code": "no_credit", "message": "No credit.",
                  "retryable": False, "resets_at": None}, {"seq": 6, "ts": time.time(), "type": "result",
                                                           "stop_reason": "error"})
         self.assertEqual(len(hub.q("SELECT * FROM holds WHERE task=?", (tid,))), 1)
+        # An install reports its sign-in step done also for a runtime with no sign-in (an agent that moved to another
+        # server): that is no end of a sign-in, and the task stays paused.
+        hub.settle_hold(hub.active_hold(tid), True, "no session was running")
+        self.assertEqual(hub.sign_in_resumes("gem-1", hub.agents()["gem-1"]["runtime"]), [])
+        self.assertEqual(hub.active_hold(tid)["state"], "stopped")
 
     # ---- the model of an ACP agent (spec 5.2 items 7 and 9)
     def test_the_owner_sets_a_model_and_an_effort_of_an_acp_agent_against_its_own_reading(self):

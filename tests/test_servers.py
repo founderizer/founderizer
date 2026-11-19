@@ -1066,6 +1066,25 @@ class Servers(OwnerAPI):
         job = self.add_agent(runtime=runtime)[1]["job"]
         self.assertEqual(self.service(f"/server/mini/jobs/{job}", {"state": "done", "step": "sign_in"})[0], 200)
 
+    def test_a_preparation_that_its_server_signed_in_resumes_the_task_paused_for_a_failed_session(self):
+        """A server's own service signs Codex in for a preparation and reports `done` at the sign-in step, with no
+        sign-in job of the hub: that end of a sign-in too resumes the screen task that the hub paused because its
+        session ended with an error (the owner, 19 November 2026: a task stayed paused after the sign-in)."""
+        self.installed()
+        tid = hub.ins("INSERT INTO tasks(title,done_when,needs,owner,requester,state,created,started,last_activity) "
+                      "VALUES('Read the page on the screen','read','screen','scout','manager','working',?,?,?)",
+                      (hub.now(),) * 3)
+        hub.request_hold(tid, "pause", "manager", hub.session_failed_note("screen"))
+        hub.settle_hold(hub.active_hold(tid), True, "no session was running")
+        job = self.prepare()[1]["job"]
+        self.assertEqual(self.service(f"/server/mini/jobs/{job}", {"state": "failed", "step": "sign_in",
+                                                                   "detail": "No sign-in."})[0], 200)
+        self.assertEqual(hub.q1("SELECT state FROM holds WHERE task=?", (tid,))["state"], "stopped")    # no sign-in ended
+        job = self.prepare()[1]["job"]
+        self.assertEqual(self.service(f"/server/mini/jobs/{job}", {"state": "done", "step": "sign_in"})[0], 200)
+        self.assertEqual(dict(hub.q1("SELECT state, released_by FROM holds WHERE task=?", (tid,))),
+                         {"state": "released", "released_by": "hub"})
+
     def test_prepare_gives_the_server_a_job_and_changes_no_agent(self):
         self.installed()
         before = git("--git-dir", str(self.root / "origin.git"), "rev-parse", "main")
