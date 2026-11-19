@@ -10,9 +10,12 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import types
 import unittest
+from unittest.mock import patch
 import uuid
 
+import door
 import hub
 from test_setup import git
 from test_ui_api import OwnerAPI
@@ -416,6 +419,119 @@ class BlockedAccess(OwnerAPI):
         self.assertIn("which dev holds at read now",
                       hub.q1("SELECT text FROM events WHERE agent='dev' AND kind='task' ORDER BY id DESC LIMIT 1")["text"])
         self.assertEqual(hub.q1("SELECT attempt FROM tasks WHERE id=?", (tid,))["attempt"], 2)
+
+    # ---- a new grant reaches the door at the owner's Mac's next door round
+
+    def linked_door(self, file):
+        """This hub gets every GitHub token from its door (DevOps plan 13, item 4), whose access file gives `file`,
+        {agent: {owner/name: level}}: the door's own code refuses what the file does not hold, in its own words
+        (door.Door.github_tokens), and a grant of the file gets a token, as GitHub gives it. A door round of the owner's
+        Mac is this test's read of GET /ui/door, and the test writes the file as such a round would."""
+        code, got = self.request("/ui/door", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                              "address": "100.64.0.9", "port": 8766})
+        self.assertEqual(code, 200, got)
+        (self.root / "door.json").write_text(json.dumps({"token": "token-secret", "record": "record-secret"}))
+        hub.CFG["door_secrets"] = str(self.root / "door.json")
+        self.addCleanup(hub.CFG.pop, "door_secrets", None)
+        real = door.Door.__new__(door.Door)
+        real.access = lambda: {"agents": {a: {"github": dict(g)} for a, g in file.items()}}
+        real.record = types.SimpleNamespace(add=lambda **_: None)
+        levels = list(door.GITHUB_ACCESS)
+
+        def answer(_conf, _method, path, _secret, body=None):
+            if path != "/github/token":
+                return 404, {"error": "no such route"}
+            held = file.get(body["agent"], {})
+            given = {r: v for r, v in body["repos"].items() if r in held and levels.index(held[r]) >= levels.index(v)}
+            try:
+                _, errors = real.github_tokens(body["agent"], {r: v for r, v in body["repos"].items() if r not in given})
+            except door.Refused as e:
+                return 403, {"error": str(e)}
+            return 200, {"tokens": [{"token": "ghs_" + "a" * 36, "access": v, "repos": [r]} for r, v in given.items()],
+                         "errors": errors}
+        for patcher in [patch.object(hub, name, value) for name, value in (
+                ("door_call", answer), ("DOOR_ROUNDS", []), ("DOOR_SWEPT", {"round": None}))] + \
+                [patch.dict(hub.DOOR_RENEW)]:        # a read with renew=form sets its time, and no later test sees it
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def door_round(self):
+        """A door round of the owner's Mac starts: it reads the hub's view (DoorSync), and the tick runs after it."""
+        self.assertEqual(self.request("/ui/door?db=test-generation&renew=form")[0], 200)
+        with hub.LOCK:
+            hub.door_grants_sweep(hub.now())
+            hub.restart_sweep(hub.now())
+
+    def attempt(self, task):
+        return hub.q1("SELECT attempt FROM tasks WHERE id=?", (task,))["attempt"]
+
+    def owner_gives(self, repo, level):
+        code, got = self.request("/ui/team/repos", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                    "base_sha256": self.request("/ui/team?db=test-generation")[1]["sha256"],
+                                                    "repo": repo, "agent": "dev", "level": level})
+        self.assertEqual(code, 200, got)
+
+    def test_a_restart_right_after_a_grant_starts_its_session_once_the_door_has_the_grant(self):
+        """18 November 2026: the owner gave an agent write on a repository, the manager restarted its task 9 seconds
+        later, and the new session had no token, because a grant reaches the door only at the owner's Mac's next door
+        round. The manager read the door's refusal as a defect, and the task waited a day. Now the restart stops the
+        session at once and starts the new one after that round, with the token. A restart of an attempt that did not
+        ask for the new grant starts at once, as before: it may be for something else, such as a lost browser."""
+        file = {"dev": {}}
+        self.linked_door(file)
+        tid = self.task_for("dev")
+        self.ask("dev", tid, "The fix is written. May I push it?", needs_access=WEB)
+        self.door_round()                       # a round that read the hub's view before the grant cannot write it
+        self.owner_gives("acme/web", "write")
+        self.assertIn("[hub] The owner gave dev write access to the GitHub repository acme/web. An agent gets the "
+                      "change in its next task session. The door gets a new grant at the owner's Mac's next door round",
+                      self.said_to("manager"))
+        refused = self.session_of("dev", "127.0.0.5")["errors"]       # the door's refusal of one repository
+        self.assertEqual([e["repos"] for e in refused], [["acme/web"]])
+        self.assertIn("This is no defect. If this task needs it, ask your requester", refused[0]["error"])
+        self.assertIn("When dev's helper confirms the stop and the owner's Mac's next door round has given the door "
+                      "dev's new grant of acme/web", self.restart(tid)[0])
+        self.stop_confirmed(tid)
+        self.assertEqual(self.attempt(tid), 1)          # stopped, and no new session that would have no token
+        self.assertIn("already waits for the owner's Mac's next door round", self.restart(tid)[0])
+        self.door_round()                       # this round holds the grant and writes it into the door's file
+        file["dev"]["acme/web"] = "write"
+        self.assertEqual(self.attempt(tid), 1)          # the hub sees a round start, not its end
+        self.door_round()                       # and the app starts the next round only after that one ended
+        self.assertEqual(self.attempt(tid), 2)
+        self.assertEqual(self.session_of("dev", "127.0.0.5")["errors"], [])
+        self.assertIsNone(hub.kv_get(hub.DOOR_GRANTS))      # a hub that starts again holds no restart for it
+
+        self.owner_gives("acme/web", "deploy")      # a new grant of the same repository, which attempt 2 never asked for
+        self.assertNotIn("door round", self.restart(tid, expected_attempt=2)[0])
+        self.stop_confirmed(tid)
+        self.assertEqual(self.attempt(tid), 3)
+
+    def test_a_session_that_starts_before_the_door_has_a_new_grant_says_why_and_that_it_is_no_defect(self):
+        """The same morning the manager gave an agent write on a repository and made its task at once. The session had
+        no token, and its start gave only the door's refusal, which the manager read as a defect. Now the start text
+        and the manager's lines say that the door gets the grant at the owner's Mac's next door round, and how the
+        task gets it. A grant that the door still refuses after that round keeps the door's own words: a fault."""
+        self.linked_door({})                    # the agent's first grant: the door's file has no entry for it yet
+        self.stand(WEB, {"max": "write"})
+        self.assertIn("The door gets a new grant at the owner's Mac's next door round, usually within 10 minutes",
+                      self.grant("dev", WEB, "write"))
+        tid = self.task_for("dev")
+        refused = self.session_of("dev", "127.0.0.5")["errors"]
+        self.assertEqual([e["repos"] for e in refused], [["acme/web"]])
+        self.assertTrue(refused[0]["error"].startswith("the door gets this new grant at the owner's Mac's next door "
+                                                       "round, usually within 10 minutes while the Mac's app runs (it "
+                                                       "has started no door round in the "), refused)
+        self.assertIn("This is no defect. If this task needs it, ask your requester to restart this task, with "
+                      "needs_access repo:acme/web", refused[0]["error"])        # and no round is a Mac that is off
+        self.ask("dev", tid, "My session has no token for acme/web.", needs_access=WEB)
+        self.assertIn("That grant is new: the door gets it at the owner's Mac's next door round",
+                      self.said_to("manager"))
+        self.door_round()                       # two rounds that did not write the file: the door is at fault now
+        self.door_round()
+        self.assertEqual(self.session_of("dev", "127.0.0.5")["errors"],
+                         [{"repos": ["acme/web"], "error": "the door gave no GitHub token: dev is not in the door's "
+                                                           "access file"}])
 
     # ---- the sentence that says what an agent looks after
 

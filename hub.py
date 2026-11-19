@@ -940,7 +940,7 @@ def kv_get(k, default=None):
 
 # Times the hub keeps for itself, which no screen of the owner's shows: their writes are quiet (live_changes).
 QUIET_KEYS = ("tick_ok", "releases_swept", "releases_found", "bridge_seen", "bridge_code",
-              "error_reports_tried", "error_reports_sent", "error_reports_hold", "error_reports_on_at")
+              "error_reports_tried", "error_reports_sent", "error_reports_hold", "error_reports_on_at", "door_grants")
 
 
 def kv_set(k, v):
@@ -7542,7 +7542,11 @@ def t_restart_task(agent, a):
     h = active_hold(tid)
     own = h is not None and h["by"] == agent    # only a restart makes a hold of an open task in its requester's name
     if own and q1("SELECT 1 FROM restart_holds WHERE hold=? AND state='pending'", (h["id"],)):
-        raise ToolError(f"A restart of {tref(tid)} already waits for its stop (H-{h['id']}).")
+        lacking = door_lacks(t["owner"], asked_repos(tid, t["attempt"])) if h["state"] == "stopped" else []
+        raise ToolError(f"A restart of {tref(tid)} already waits for the owner's Mac's next door round, which gives the "
+                        f"door {t['owner']}'s new grant of {named_few(lacking)} (H-{h['id']}; the Mac's app runs that "
+                        f"round, and {door_round_seen()}): it starts by itself then."
+                        if lacking else f"A restart of {tref(tid)} already waits for its stop (H-{h['id']}).")
     if h and not own:
         raise ToolError(f"{tref(tid)} is {held_word(h)}. Only the {h['by']} resumes it.")
     waiting = q1("SELECT id FROM prompts WHERE task=? AND decision IS NULL AND kind<>'code' ORDER BY id", (tid,))
@@ -7560,6 +7564,7 @@ def t_restart_task(agent, a):
         raise ToolError(f"{t['owner']} {os_user_hold_reason(t['owner'])}, so the hub holds its work. "
                         f"{tref(tid)} continues by itself once it runs in a user account of its own, so it is not "
                         f"restarted now.")
+    waits = door_lacks(t["owner"], asked_repos(tid, t["attempt"]))     # restart_continue holds the new session then
     kv_set(f"lost:{tid}", None)         # the requester acted: the losses since then count again from nothing
     # A count never refuses it, and it starts the count again. A task whose start failed goes the same way: its helper
     # confirms that no session runs, and only a confirmed stop starts the next attempt (plan C6).
@@ -7581,10 +7586,15 @@ def t_restart_task(agent, a):
                    (hid, agent, reason, t0))
         after = (f"{tref(tid)} starts once more in a new session, as attempt {t['attempt'] + 1}, and its owner first "
                  f"checks what its last actions did.")
+        door = (f"the owner's Mac's next door round has given the door {t['owner']}'s new grant of {named_few(waits)} "
+                f"(usually within 10 minutes while the Mac's app runs; {door_round_seen()})")
         text = (f"The stop of {tref(tid)} is already confirmed (H-{hid}), so its restart continues now: {after} If it "
-                f"cannot start, you get a message." if confirmed else
+                f"cannot start, you get a message." if confirmed and not waits else
+                f"The stop of {tref(tid)} is already confirmed (H-{hid}). Its restart waits: when {door}, {after} A "
+                f"session that started before that round would have no GitHub token for it." if confirmed else
                 f"The restart of {tref(tid)} is requested (H-{hid}). The hub stops its session now. When {t['owner']}'s "
-                f"helper confirms the stop, {after} Without a confirmed stop it stays held, and you get a message.")
+                f"helper confirms the stop" + (f" and {door}" if waits else "") + f", {after} Without a confirmed stop "
+                f"it stays held, and you get a message.")
         keep_command(command, {"text": text}, t0)
     log(agent, f"restart of {tref(tid)} requested as H-{hid}")
     restart_continue(hid)
@@ -7637,6 +7647,8 @@ def restart_continue(hold_id):
         return held(f"{t['owner']} reached its usage limit, which resets at {clock(lim['until'])}.")
     if os_user_held(t["owner"]):
         return held(f"{t['owner']} {os_user_hold_reason(t['owner'])}, so the hub holds its work.")
+    if door_lacks(t["owner"], asked_repos(tid, t["attempt"])):
+        return          # its new session would have no token for that grant yet: restart_sweep brings it back here
     # The records of the stop once more: a hub that stopped in the middle of the helper's report kept only a part of
     # them. Each of these is safe to repeat. Then one more unknown outcome for the attempt: a failed connection, and a
     # session that was interrupted at any other point, can have cut an action whose result never came back, so the new
@@ -8815,6 +8827,10 @@ def access_route(asker, rid, requester, want=None, restarts=None):
            (f"at {mine} already, so its next session has it: a running session keeps what it started with, so "
             f"{restart}." if enough else
             f"at {mine} only, which does not reach {want}." if mine else "none of it.")]
+    if enough and kind == "repo" and door_lacks(asker, [what]):
+        out.append(f"That grant is new: the door gets it at the owner's Mac's next door round, usually within 10 "
+                   f"minutes while the Mac's app runs ({door_round_seen()}), and a restart waits for that round by "
+                   f"itself. A session that started before it has no token for it, which is no defect.")
     if hold_words:          # rule-only: the route below stands, and the hold says why an agent's own calls fail there
         out.append(hold_words)
     in_team = False
@@ -33406,6 +33422,7 @@ def t_grant_access(agent, a):
             f"It gets it in its next task session; a running session keeps what it started with. The grant is the "
             f"authorization: {target} does what this access allows and answers for it, and you answer for giving it. "
             f"The owner reads who gave what to whom on the Access page of the app and takes it back there.")
+    text += door_round_next(kind == "repo" and door_lacks(target, [what]))
     for row in q(f"SELECT t.id, t.attempt, t.requester, q.id qid, q.access_level want FROM questions q "
                  f"JOIN tasks t ON t.id=q.task WHERE q.access=? AND q.answer IS NULL AND t.owner=? AND "
                  f"t.{OPEN_TASK} ORDER BY t.id", (rid, target)):
@@ -42622,6 +42639,7 @@ def tick():
         step(turn_end_sweep, t0)
         step(liveness, t0, restarts=True)
         step(restart_sweep, t0, restarts=True)
+        step(door_grants_sweep, t0)         # a grant that the owner's Mac's door rounds gave the door holds no restart
         step(goal_sweep, t0)
         step(need_look_sweep, t0)           # the owner, 17 November 2026: a second look at the open cards
         step(duty_sweep, t0)                # owner API 1.13: the duties that are not in order
@@ -45648,6 +45666,7 @@ def apply_team(new, left=()):
     of another revision of team.json) ends no phone's link and deletes no token."""
     was_v2 = contacts_v2()
     gone = [name for name in agents() if name not in new["agents"]]
+    before = {name: dict(a.get("repos") or {}) for name, a in agents().items()}    # for door_grants_note
     left = sorted(set(left))
     # Under LOCK, with which the bridge reads its configuration: it never reads an account gone without the hub's word
     # that it left. A fault of the forgetting does not stop the rest: the team is applied in any case.
@@ -45665,6 +45684,10 @@ def apply_team(new, left=()):
                 left = []
     CFG["team_problem"] = team_problem(TEAM)    # a write that validates takes the startup reading off the board
     os_user_refresh()                           # the hold follows the new team at once (os_user_held)
+    try:            # after TEAM has them: a door round that reads GET /ui/door from now on holds each new grant
+        door_grants_note(before, new)
+    except Exception as e:      # the record holds a restart and words a refusal, and never stops the team change
+        log("hub", f"kept no time of the new repository grants ({type(e).__name__})")
     for name in new["agents"]:
         know(name)
     if gone:
@@ -51744,10 +51767,11 @@ def save_repo(body):
     result = save_integration(body["base_sha256"], change, f"Owner changed the access to {what}")
     if result["changed"]:
         words = ", ".join(f"{n} {v}" for n, v in sorted(access.items())) or "no agent"
-        emit(manager_name(), "say", (f"[hub] The owner changed who may use the GitHub repository {repo}: {words}. An "
-                                     f"agent gets it in its next task session.") if not isinstance(repo, list) else
-             (f"[hub] The owner changed who may use {len(names)} GitHub repositories ({named_few(names)}): {words}. "
-              f"An agent gets them in its next task session."))
+        emit(manager_name(), "say", ((f"[hub] The owner changed who may use the GitHub repository {repo}: {words}. An "
+                                      f"agent gets it in its next task session.") if not isinstance(repo, list) else
+                                     (f"[hub] The owner changed who may use {len(names)} GitHub repositories "
+                                      f"({named_few(names)}): {words}. An agent gets them in its next task session."))
+             + door_round_next(any(door_lacks(name, names) for name in access)))
     return dict(result, repo=repo, access=access)
 
 
@@ -51780,7 +51804,7 @@ def save_agent_repos(body):
         count = f"{len(names)} " if isinstance(repo, list) else ""
         emit(manager_name(), "say", "[hub] The owner " + (f"gave {agent} {level} access to {count}{held}" if level else
                                                            f"took {count}{held} away from {agent}") +
-             ". An agent gets the change in its next task session.")
+             ". An agent gets the change in its next task session." + door_round_next(door_lacks(agent, names)))
     return dict(result, repo=repo, agent=agent, level=level)
 
 
@@ -52661,6 +52685,146 @@ def door_github_tokens(agent, repos):
     tokens = [t for t in answer.get("tokens") or [] if isinstance(t, dict) and isinstance(t.get("token"), str)
               and GITHUB_TOKEN.fullmatch(t["token"])]
     return tokens, [e for e in answer.get("errors") or [] if isinstance(e, dict)]
+
+
+# A new grant reaches the door at the owner's Mac's next door round (DoorSync.swift: about every five minutes the round
+# reads GET /ui/door and writes each agent's grants into the door's access file), and a task session's tokens are fixed
+# at its start. So a session that starts between the grant and that round has no token for it. On 18 November 2026 the
+# manager restarted a task 9 seconds after the owner's grant, read the door's refusal in the new session as a defect of
+# Founderizer, and the task waited a day; the same happened that morning to two tasks made just after two grants. So
+# the hub keeps the time of each grant that rose until the Mac's rounds gave it to the door: a restart of a task that
+# asked for it waits for that (restart_continue), and a session that starts before it says why (door_round_errors).
+# The hub sees the start of each round (its read of GET /ui/door), not its end. The round that reads after the grant
+# writes it, and the next round starts only after that one ended (DoorSync's `working`): so two reads after the grant
+# are the event that ends the wait, and no clock. Only the owner's computer reads that route (ui_allowed), so a second
+# Mac runs no round. A Mac that is off or asleep, or whose app does not run, runs no round, and then the door cannot
+# have the grant either: the words name when its last round started (door_round_seen), so a reader sees that.
+# Known and written: a read that writes nothing can end a wait one round early (the GitHub App flow of
+# GitHubManifestFlow.swift reads the route too; a round can stop after its read, when its SSH fails or the app starts
+# again), and the session then shows the door's own refusal; a restart after the next round has the token. The
+# follow-up that closes it: the round says in its read whether the round before it wrote the door's file.
+DOOR_GRANTS = "door_grants"     # kv: {agent: {owner/name: when its grant rose}}, until two rounds read after it
+DOOR_ROUNDS = []                # when the owner's Mac's last two door rounds read GET /ui/door, since the hub started
+DOOR_SWEPT = {"round": None}    # the newest of those reads that door_grants_sweep has acted on
+DOOR_FILE_WORDS = "door's access file"      # in both refusals of the door for a grant that its file does not hold
+DOOR_ROUND_WAIT = ("the door gets this new grant at the owner's Mac's next door round, usually within 10 minutes "
+                   "while the Mac's app runs ({seen}). This is no defect. If this task needs it, ask your requester to "
+                   "restart this task, with needs_access repo:{repo}: the restart waits for that round by itself, so "
+                   "that its new session has the token")
+DOOR_ROUND_NEXT = ("The door gets a new grant at the owner's Mac's next door round, usually within 10 minutes while "
+                   "the Mac's app runs: a task session that starts before then has no token for it, and a restart_task "
+                   "of a task that asked for it waits for that round by itself.")
+
+
+def door_round_read():
+    """GET /ui/door: the owner's Mac starts a door round, which writes into the door's file what the hub's view gives
+    now."""
+    DOOR_ROUNDS.append(now())
+    del DOOR_ROUNDS[:-2]
+
+
+def door_rounded(at):
+    """True when a grant that rose at `at` is in the door's file: two door rounds of the owner's Mac read the hub's
+    view after it, so the first of them, which wrote it, has ended."""
+    return sum(1 for t in tuple(DOOR_ROUNDS) if t > at) >= 2        # a copy: GET /ui/door adds while this reads
+
+
+def door_round_seen():
+    """When the owner's Mac last started a door round, in words: a reader of a wait sees from it that no round runs
+    (the Mac is off or asleep, its app does not run, or its Tailscale shows no door), which no clock would say."""
+    last = tuple(DOOR_ROUNDS)[-1:]
+    return (f"its last door round started {span(now() - last[0])} ago" if last else
+            f"it has started no door round in the {span(now() - STARTED)} since the hub started")
+
+
+def door_grant_times():
+    """The record DOOR_GRANTS: {agent: {owner/name: time}}, and {} for a value that is no such record. A read that
+    commits nothing, so access_route may still run inside a transaction."""
+    row = read_row("SELECT v FROM kv WHERE k=?", (DOOR_GRANTS,))
+    try:
+        kept = json.loads(row["v"] if row else "{}")
+    except ValueError:
+        return {}
+    if not isinstance(kept, dict):
+        return {}
+    return {a: {r: t for r, t in repos.items() if isinstance(t, (int, float)) and not isinstance(t, bool)}
+            for a, repos in kept.items() if isinstance(repos, dict)}
+
+
+def door_grants_note(before, team):
+    """apply_team: the time of each repository grant that rose (a new one, or a higher level), in a hub that gets its
+    tokens from the door. before: {agent: {owner/name: level}} of the team that ran until now."""
+    if door_conf() is None:
+        return
+    t0, rose = now(), {}
+    for name, a in (team.get("agents") or {}).items():
+        was = before.get(name) or {}
+        for repo, level in (a.get("repos") or {}).items():
+            if level in REPO_ACCESS and (was.get(repo) not in REPO_ACCESS or
+                                         REPO_ACCESS.index(level) > REPO_ACCESS.index(was[repo])):
+                rose.setdefault(name, {})[repo] = t0
+    if rose:
+        with LOCK:              # one read and one write: two team changes at once keep both of their grants
+            kept = door_grant_times()
+            for name, repos in rose.items():
+                kept.setdefault(name, {}).update(repos)
+            kv_set(DOOR_GRANTS, json.dumps(kept, sort_keys=True))
+
+
+def door_lacks(agent, repos):
+    """The repositories of `repos` that `agent` holds now and that the door may not hold yet: their grant rose, and no
+    door round of the owner's Mac has given it to the door since. Empty in a hub that makes its own tokens. The door
+    refuses the product's own repositories in every fleet (door_targets.vendor), so no round brings them."""
+    if not repos or door_conf() is None:
+        return []
+    import door_targets
+    held, rose = (agents().get(agent) or {}).get("repos") or {}, door_grant_times().get(agent) or {}
+    return sorted({r for r in repos if r in held and r in rose and not door_rounded(rose[r]) and
+                   not door_targets.vendor(r)})
+
+
+def asked_repos(tid, attempt):
+    """The repositories that the questions of attempt `attempt` of task `tid` named in needs_access, answered or not:
+    the restart that stops that attempt after their grant is for them. What an earlier attempt asked for holds no
+    restart, which may be for something else (a browser that lost its connection)."""
+    since = read_row("SELECT created FROM attempts WHERE task=? AND attempt=?", (tid, attempt))
+    return [resource_parts(r["access"])[1] for r in read_rows(
+        "SELECT DISTINCT access FROM questions WHERE task=? AND access LIKE 'repo:%' AND asked>=?",
+        (tid, (since["created"] if since else None) or 0))]
+
+
+def door_grants_sweep(_t0):
+    """tick: a grant that the Mac's rounds gave the door leaves the record, once after each new round, so that a hub
+    that starts again (and knows no round from before) holds no restart for it."""
+    newest = DOOR_ROUNDS[-1] if DOOR_ROUNDS else None
+    if newest is None or DOOR_SWEPT["round"] == newest:
+        return
+    DOOR_SWEPT["round"] = newest
+    kept = door_grant_times()
+    left = {a: {r: t for r, t in repos.items() if not door_rounded(t)} for a, repos in kept.items()}
+    left = {a: repos for a, repos in left.items() if repos}
+    if left != kept:
+        kv_set(DOOR_GRANTS, json.dumps(left, sort_keys=True) if left else None)
+
+
+def door_round_next(lacking):
+    """The sentence for a grant's message to the manager when the door lacks it yet (door_lacks); else none."""
+    return f" {DOOR_ROUND_NEXT}" if lacking else ""
+
+
+def door_round_errors(agent, errors):
+    """helper_integrations: the door's refusal of a grant that its file does not hold yet, in words that say why. The
+    door's own words read like a broken grant, and the manager took them for a defect twice on 18 November 2026."""
+    out = []
+    for e in errors:
+        repos = [r for r in e.get("repos") or [] if isinstance(r, str)]
+        waits = door_lacks(agent, repos) if DOOR_FILE_WORDS in str(e.get("error")) else []
+        rest = [r for r in repos if r not in waits]
+        if rest or not waits:
+            out.append(dict(e, repos=rest) if waits else e)
+        if waits:
+            out.append({"repos": waits, "error": DOOR_ROUND_WAIT.format(repo=waits[0], seen=door_round_seen())})
+    return out
 
 
 # Plan 13, item 4 (the coordinator's yes of 7 November 2026): the door makes every GitHub token with the App key that
@@ -61706,6 +61870,7 @@ class Handler(BaseHTTPRequestHandler):
             DOOR_RENEW["form"] = now()
         with LOCK:
             view = door_view()
+            door_round_read()               # after the view: the round that read it holds each grant that it gives
         return self.json(200, dict(view, db=kv_get("db_id")), {"Cache-Control": "no-store"})
 
     def ui_door_save(self):
@@ -65021,6 +65186,7 @@ class Handler(BaseHTTPRequestHandler):
                 tokens, errors = github_tokens(repos, agent)
             except GitHubError as e:
                 errors = [{"repos": sorted(repos), "error": str(e)}]
+            errors = door_round_errors(agent, errors)       # a grant that the door gets at the Mac's next round
             log(agent, "GitHub tokens for a task session: " + ("; ".join(
                 f"{t['access']} {', '.join(t['repos'])}" for t in tokens) or "none") +
                 "".join(f"; refused for {', '.join(e['repos'])}: {e['error']}" for e in errors))
