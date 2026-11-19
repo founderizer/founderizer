@@ -51700,6 +51700,7 @@ def move_agent(agent, body, by="owner"):
         commit = commit_kit_file("team.json", data, f"Owner gave agent {agent} its server {server}, with {runtime}"
                                  if placing else f"{actor} moved agent {agent} from {old} to server {server}")
         digest = hashlib.sha256(data).hexdigest()
+    linux = server_kind_of(team, server) == "linux"     # read before the transaction: server_reading's q1 commits
     with transaction():
         if old != server:
             left = os_user_uid(agent, old)      # before its reading goes: the uid that its siblings were compared with
@@ -51711,7 +51712,7 @@ def move_agent(agent, body, by="owner"):
                                                               CALLER_USER + agent))
             # build plan 04 (S3b): its new server's defaults are read again, as at a runtime switch; his removal stays
             DB.execute("DELETE FROM kv WHERE k=? AND v<>'2'", (f"default_desktop:{agent}",))
-            if server_kind_of(team, server) != "linux":     # only the Mac's own default applies there
+            if not linux:                       # only the Mac's own default applies there
                 DB.execute("DELETE FROM kv WHERE k=?", (BROWSER_DEFAULT + agent,))
             os_user_drop(agent, old, left)  # it leaves any group of the old machine that readings made (os_user_kept)
         if old not in (None, server):       # an agent with no server left no machine whose calls get `moved`
