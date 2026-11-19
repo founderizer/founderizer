@@ -496,12 +496,17 @@ class SameBytes(StateCase):
                          [(True, None, 1), (False, None, 2), (True, None, 3), (False, None, None)])
         # the hub's own turn stays its own; the apps' turn is turn_word, which these reports have not (owner API 1.190)
         # The five tables have no twin of before: their rows, in their order and with the logins masked, are the
-        # database's own. A task has one value more that is no column: from_conversation (owner API 1.231), false
-        # here, where no conversation opened a task.
+        # database's own. A task has values more that are no column: from_conversation (owner API 1.231), false
+        # here, where no conversation opened a task, and on an open task since when it is in its state (since, owner
+        # API 1.237), the hub's own answer.
+        with hub.LOCK:
+            since = hub.task_since(hub.parked_until())
+        self.assertTrue(since)
         for table, key in FIVE:
             rows = hub.scrub([dict(r) for r in hub.q(f"SELECT * FROM {table} ORDER BY id")])
             if key == "tasks":
-                rows = [dict(r, from_conversation=False) for r in rows]
+                rows = [dict(r, **({"since": since[r["id"]]} if r["id"] in since else {}), from_conversation=False)
+                        for r in rows]
             self.assertEqual(state[key], rows, key)
 
     def test_the_five_tables_keep_their_place_in_the_answer(self):
@@ -638,10 +643,11 @@ class Reads(StateCase):
                                     for t in tables}
         self.assertEqual(count(seen), dict.fromkeys(tables, 1))
         # Before, for the 8 agents: usage and turn end of each; an open limit of each, and again for the 2 with a turn
-        # end; the machine reading of the 7 that have no local model, and again for the 6 that can have an owner chat;
+        # end, and the limits once for the times of the open tasks (task_since, owner API 1.237); the machine reading
+        # of the 7 that have no local model, and again for the 6 that can have an owner chat;
         # the two kinds of sign-in of those 7; the key of the 4 whose helper starts its chat; the chat of the 2 with a
         # key whose chat window runs.
-        self.assertEqual(count(before), {"agent_usage": 8, "agent_limits": 8 + 2, "machine_status": 7 + 6,
+        self.assertEqual(count(before), {"agent_usage": 8, "agent_limits": 8 + 2 + 1, "machine_status": 7 + 6,
                                          "server_jobs": 7, "signin_jobs": 7, "agent_keys": 4,
                                          "session_credentials": 2, "kv WHERE k%turn_ended": 8})
 

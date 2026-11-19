@@ -473,6 +473,14 @@ class Jobs(Asks):
             self.assertIn(why, self.refused("manager", "create_task", dict(fields, **more)))
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM tasks")["n"], 0)
         self.create(title="x" * hub.TITLE_CHARS, job_name="y" * hub.TITLE_CHARS)      # the longest that the hub takes
+        # Each tool that asks an agent for such a title says the number that the hub refuses over: when the number
+        # went from 80 to 50 (19 November 2026), two descriptions held 80 as a literal, and an agent that followed
+        # them would have been refused.
+        import wakeups
+        words = {name: json.dumps([text, schema]) for _role, name, _fn, text, schema in hub.TOOLS}
+        words["save_trigger"] = json.dumps(dict((n, (d, s)) for n, d, s in wakeups.TOOL_SPECS)["save_trigger"])
+        for name in ("create_task", "open_case", "set_duty", "save_trigger"):
+            self.assertIn(f"at most {hub.TITLE_CHARS} characters", words[name], name)
         # The task of a wake-up rule has the rule's own title, saved before: a refusal there would stop each run of
         # the rule. Its admission is check_task, which takes the title as it is.
         long = "R-7: the vulnerability cases that need me, with every open advisory of the week in one run"

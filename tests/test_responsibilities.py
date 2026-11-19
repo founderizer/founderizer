@@ -579,7 +579,7 @@ class Cases(Base):
         self.fire(rule["id"])
         mine = hub.tref(self.first_case_task()["id"])
         for title, said in (("Sort out T-12 for the shop", "Say T-12 in plain words in title"),
-                            ("x" * 81, "title is at most 80 characters")):
+                            ("x" * (hub.TITLE_CHARS + 1), f"title is at most {hub.TITLE_CHARS} characters")):
             text, error = self.tool("vps", "open_case", request_id=str(uuid.uuid4()), responsibility="R-1", key="k/1",
                                     title=title, task_id=mine)
             self.assertTrue(error, text)

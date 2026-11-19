@@ -6439,6 +6439,115 @@ def parked_until():
     return out
 
 
+# What a task's waiting_on names, and the record whose time says when that wait began: a question that it asked
+# (ask_my_requester), the owner's request that it waits on (secret_parked), a person's answer (message_contact with a
+# wait), a permission prompt.
+WAIT_REF = re.compile(r"^(Q|N|CM|P)-(\d+)$")
+WAIT_BEGAN = {"Q": ("questions", "asked"), "N": ("needs", "raised"), "CM": ("conversation_messages", "created"),
+              "P": ("prompts", "created")}
+
+
+LIMIT_READ = ("SELECT * FROM agent_limits WHERE ended IS NULL OR id IN (SELECT MAX(id) FROM agent_limits WHERE "
+              "ended IS NOT NULL GROUP BY agent) ORDER BY id DESC")
+
+
+def limit_reads(read):
+    """({agent: its newest open limit}, {agent: when its newest limit that ended ended}) in one read of agent_limits
+    (LIMIT_READ), with `read` (q, or read_rows outside the lock): the agents' views and task_since take both from the
+    one read of the state (AgentReads)."""
+    limits, ends = {}, {}
+    for r in read(LIMIT_READ):
+        if r["ended"] is None:
+            limits.setdefault(r["agent"], r)
+        else:
+            ends[r["agent"]] = max(ends.get(r["agent"], r["ended"]), r["ended"])
+    return limits, ends
+
+
+def task_since(parks, reads=None):
+    """Owner API 1.237: by task, since when each open task is in the state that the owner's apps show for it, in the
+    order of the mark that the Mac app draws on its row: a hold that is not released, since it was set; a usage limit
+    of its agent, since it began (or since the task was made, when that was later); a stall, since it began, or
+    since the hub nudged the task; a lost session, since it was lost; the start of what it waits on (waiting_on:
+    WAIT_BEGAN); for a task that its agent parked (parks, as parked_until gives them), the time that its reminder
+    was set; for one that no session took yet, its creation; else the time that it came back to work: the later of
+    the start of its attempt and the last end of a wait of it. A wait can end in the session that waited, with no new
+    attempt, so each kind of end counts: a question answered (not one answered after the task went on with its
+    default), a prompt decided, the owner's answer to a request that the task waited on, a person's answer that the
+    hub gave to the task, a reminder fired or a park that a turn ended, a hold released, and the end of a usage limit
+    of its agent. The apps say it on a task's row in the card of its job ("2 h ago"; the owner, 19 November 2026:
+    "show its name too and the time it's been in that state"). reads: the state's AgentReads, whose one read of
+    agent_limits gives the limits (limit_reads), else None for a read of its own. read_rows: it is read inside the
+    state's own hold of the lock."""
+    rows = read_rows(f"SELECT id, owner, state, created, started, waiting_on, stalled_since, nudge_level, nudged_at, "
+                     f"missing_since FROM tasks WHERE {OPEN_TASK}")
+    if not rows:
+        return {}
+    waits = {}
+    for r in rows:
+        ref = WAIT_REF.match(r["waiting_on"] or "")
+        if ref:
+            waits.setdefault(ref.group(1), set()).add(int(ref.group(2)))
+    began = {}
+    for kind, numbers in waits.items():
+        table, column = WAIT_BEGAN[kind]
+        for w in read_rows(f"SELECT id, {column} AS t FROM {table} WHERE id IN ({','.join('?' * len(numbers))})",
+                           tuple(numbers)):
+            began[f"{kind}-{w['id']}"] = w["t"]
+    ids = tuple(r["id"] for r in rows)
+    marks = ",".join("?" * len(ids))
+    held = {h["task"]: h["t"] for h in read_rows(f"SELECT task, MAX(created) AS t FROM holds WHERE state<>'released' "
+                                                 f"AND task IN ({marks}) GROUP BY task", ids)}
+    open_limits, unlimited = (reads.limits, reads.limit_ends) if reads is not None else limit_reads(read_rows)
+    limited = {agent: lim["since"] for agent, lim in open_limits.items()}
+    ended, parked_at = {}, {}
+    for sql in (f"SELECT task, MAX(answered) AS t FROM questions WHERE assumed IS NULL AND task IN ({marks}) "
+                f"GROUP BY task",
+                f"SELECT task, MAX(decided) AS t FROM prompts WHERE task IN ({marks}) GROUP BY task",
+                f"SELECT task, MAX(fired) AS t FROM reminders WHERE task IN ({marks}) GROUP BY task",
+                f"SELECT r.task, MAX(CAST(k.v AS REAL)) AS t FROM reminders r JOIN kv k ON k.k='park_ended:' || r.id "
+                f"WHERE r.task IN ({marks}) GROUP BY r.task",
+                f"SELECT task, MAX(released) AS t FROM holds WHERE task IN ({marks}) GROUP BY task",
+                f"SELECT CAST(j.value AS INTEGER) AS task, "
+                f"MAX(COALESCE(json_extract(n.secret, '$.woken'), n.answered)) AS t FROM needs n, "
+                f"json_each(n.secret, '$.tasks') j WHERE n.secret IS NOT NULL AND json_valid(n.secret) "
+                f"AND CAST(j.value AS INTEGER) IN ({marks}) GROUP BY CAST(j.value AS INTEGER)",
+                f"SELECT takeover_task AS task, MAX(answered) AS t FROM needs WHERE takeover_task IN ({marks}) "
+                f"GROUP BY takeover_task",
+                f"SELECT task, MAX(created) AS t FROM conversation_messages WHERE who='person' AND task IN ({marks}) "
+                f"GROUP BY task"):
+        for e in read_rows(sql, ids):
+            if e["t"] is not None:
+                ended[e["task"]] = max(ended.get(e["task"], e["t"]), e["t"])
+    if parks:
+        inside = tuple(parks)
+        for p in read_rows(f"SELECT task, MAX(created) AS t FROM reminders WHERE done=0 AND task IN "
+                           f"({','.join('?' * len(inside))}) GROUP BY task", inside):
+            parked_at[p["task"]] = p["t"]
+    out = {}
+    for r in rows:
+        stall = r["stalled_since"] if r["stalled_since"] is not None else \
+            r["nudged_at"] if (r["nudge_level"] or 0) > 0 else None
+        if held.get(r["id"]) is not None:
+            out[r["id"]] = held[r["id"]]
+        elif limited.get(r["owner"]) is not None:
+            out[r["id"]] = max(limited[r["owner"]], r["created"] or limited[r["owner"]])
+        elif stall is not None:
+            out[r["id"]] = stall
+        elif r["missing_since"] is not None:
+            out[r["id"]] = r["missing_since"]
+        elif began.get(r["waiting_on"]) is not None:
+            out[r["id"]] = began[r["waiting_on"]]
+        elif parked_at.get(r["id"]) is not None:
+            out[r["id"]] = parked_at[r["id"]]
+        elif r["state"] == "submitted" or r["started"] is None:
+            out[r["id"]] = r["created"]
+        else:
+            out[r["id"]] = max([r["started"]] + [t for t in (ended.get(r["id"]), unlimited.get(r["owner"]))
+                                                 if t is not None])
+    return out
+
+
 DOING_TEXT = 120                # characters of what a session does now, for the owner's apps
 # The fleet's own tools in plain words, as the owner reads them in his apps ("you" is the owner). A tool that is not
 # here reads as its name with spaces ("See goals").
@@ -6635,6 +6744,7 @@ class AgentReads:
     rows: {agent: its AGENT_SEEN values}.
     usage: {agent: its stored usage}.
     limits: {agent: its newest open limit}.
+    limit_ends: {agent: when its newest limit that ended ended}, in the same read (task_since).
     status: {agent: its machine_status row}. data(agent) is that row's data, read from JSON once.
     jobs and logins: {(agent, runtime): the time of its newest done sign-in}, as finished_sign_in reads them.
     keys: the agents with a key.
@@ -6646,9 +6756,8 @@ class AgentReads:
         self.rows = {r["name"]: {k: r[k] for k in AGENT_SEEN}
                      for r in q(f"SELECT name,{','.join(AGENT_SEEN)} FROM agents")}
         self.usage = {r["name"]: r["data"] for r in q("SELECT name, data FROM agent_usage")}
-        self.limits, self.chats, self.parsed = {}, None, {}
-        for r in q("SELECT * FROM agent_limits WHERE ended IS NULL ORDER BY id DESC"):
-            self.limits.setdefault(r["agent"], r)
+        self.chats, self.parsed = None, {}
+        self.limits, self.limit_ends = limit_reads(q)
         self.status = {r["agent"]: r for r in q("SELECT agent, data, reported FROM machine_status")}
         self.jobs = {(r["agent"], r["runtime"]): r["t"] for r in q(
             "SELECT agent, runtime, MAX(updated) t FROM server_jobs WHERE state='done' AND step='sign_in' AND "
@@ -9737,8 +9846,10 @@ def ask_missed(agent, tid):
 # conversation work of a whole team under the lead's one task for its team's results (lead_batch_rows), and those are
 # not one piece of work. A task is in one job, so `job` goes with no `ask` and no `case_id` of the task's own, and
 # the task takes the ask of its job before the ask of the task that it follows.
-TITLE_CHARS = 80                # characters of a title that an agent gives a task: one line of a card of that page,
-#                                 with room for a language whose words are longer than the English ones
+TITLE_CHARS = 50                # characters of a title that an agent gives a task, a job, a case or a rule's task:
+#                                 the name of a card of that page. It was 80, and the owner, 19 November 2026, of
+#                                 cards of 90 characters: "some card titles are still too long, this board needs to
+#                                 be simple!", and the owner's pick of 50; the name of what the owner asked for takes 40
 PLAIN_CHARS = 280               # characters of a result in plain words: three lines of a card of that page
 
 
@@ -36564,7 +36675,10 @@ TOOLS = [
        ["person", "text", "request_id"])),
     ("manager", "create_task", t_create_task,
      "Give one agent a task. needs is none, browser or screen; the hub refuses an agent that lacks it. "
-     "Use follows to point at an earlier task whose result this one builds on or fixes. "
+     "Use follows to point at an earlier task whose result this one builds on or fixes, and, with no job, at the "
+     "task that failed or was not accepted when this one takes its work over (its card stays red until a task "
+     "follows it), unless this one is the task for the cause of a circle of follow-ups or the fix that follows "
+     "that task; name in details any other task whose output this one needs. "
      "THE OWNER READS THE TITLE on their Tasks page: say the work in a few plain words that a person outside it "
      f"understands, at most {TITLE_CHARS} characters, with no code; each exact name, version and step goes in "
      "details. Every task is part of one job, which the owner reads as one card with its tasks inside. A task with "
@@ -37117,9 +37231,9 @@ TOOLS = [
         "responsibility": {"type": "string", "description": "Responsibility id, for example R-1"},
         "key": {"type": "string", "description": "The name of the event, which makes it one thing: a thread, an "
                                                  "alert fingerprint, an order number"},
-        "title": {"type": "string", "description": "What happened, in one line of plain words, at most 80 "
-                                                   "characters, with no code: the owner reads it as the name of this "
-                                                   "work on their Tasks page"},
+        "title": {"type": "string", "description": "What happened, in one line of plain words, at most "
+                                                   f"{TITLE_CHARS} characters, with no code: the owner reads it as the "
+                                                   "name of this work on their Tasks page"},
         "repeat": {"type": "boolean", "description": "True only when the event itself came back after its case "
                                                      "closed: the new case is marked a repeat"}, "task_id": TASK_ID},
        ["request_id", "responsibility", "key", "title"])),
@@ -37390,8 +37504,8 @@ TOOLS = [
                   "clock, check: a file of checks/ with commit and sha256, schedule, title, done_when, needs, "
                   "trigger}. The whole list replaces the watches of the duty. The owner reads a watch's title on "
                   "a card of their Tasks page at each event, before the event's key: a few plain words, at most "
-                  "80 characters, with no code, and an agent by its role. A watch that names its trigger and no "
-                  "title keeps the title that it has."},
+                  f"{TITLE_CHARS} characters, with no code, and an agent by its role. A watch that names its "
+                  "trigger and no title keeps the title that it has."},
         "tools": {"type": "array", "items": {"type": "string"}, "description": "Only for a holder whose Shell box "
                   "is off: the optional tools of the sessions of its cases, which replace the Web box's "
                   "WebSearch: any of WebSearch, remember and write_notes. Leave it out for the defaults. A session "
@@ -42637,7 +42751,8 @@ def liveness(t0):
         elif not t["stall_told"]:
             # plan C10: told at the label flip, once. The manager's own notice of the machine names its tasks
             # (offline_sweep), so a task it requested gets none of its own.
-            q("UPDATE tasks SET stall_told=1, nudge_level=2 WHERE id=?", (tid,))
+            # nudged_at: when the hub nudged it, which the apps say on its row while nudge_level stays (task_since)
+            q("UPDATE tasks SET stall_told=1, nudge_level=2, nudged_at=? WHERE id=?", (now(), tid))
             if t["requester"] != manager_name():
                 stuck_told(tid, emit(t["requester"], "say", f"[hub] {tref(tid)} ({t['title']}, owner {owner}) has no "
                                      f"live path: {reason}. It is still {t['state']}. Decide what to do: wait, cancel "
@@ -60647,6 +60762,7 @@ class Handler(BaseHTTPRequestHandler):
             result["steers"] = None     # its place: views made after the lock, with the files of `files`
             result["secrets"] = [dict(r) for r in q("SELECT id,COALESCE(label,'Registered login') AS label FROM secrets ORDER BY id")]
             parks = parked_until()
+            since = task_since(parks, agents_read)
             turns = task_turns()
         # A row holds its own values, so this needs no lock. On the first fleet the tasks were 977 KB of the state's
         # 1.70 MB, and in a copy of its database making their rows into dicts took 2.1 ms of each read's hold of the
@@ -60656,6 +60772,8 @@ class Handler(BaseHTTPRequestHandler):
         for task in result["tasks"]:            # owner API 1.117: until when its agent parked it, on that task only
             if task["id"] in parks:
                 task["parked_until"] = parks[task["id"]]
+            if since.get(task["id"]) is not None:    # owner API 1.237: since when it is in its state
+                task["since"] = since[task["id"]]
             if task["id"] in turns:             # owner API 1.147, 1.148: whether its session works on it now, and
                 task["works"] = turns[task["id"]]["works"]      # what its running turn does
                 if turns[task["id"]]["doing"]:
@@ -67071,8 +67189,9 @@ class Handler(BaseHTTPRequestHandler):
             if attempt == t["attempt"] and started:
                 q("UPDATE tasks SET nudge_level=0 WHERE id=? AND nudge_level=2", (tid,))     # plan C9: a new turn
                 for r in q("SELECT id, created FROM reminders WHERE task=? AND done=0", (tid,)):
-                    if (before or {}).get("at") and before["at"] > r["created"]:
-                        kv_set(f"park_ended:{r['id']}", now())      # a turn after the one that set it: awake
+                    if (before or {}).get("at") and before["at"] > r["created"] and \
+                            kv_get(f"park_ended:{r['id']}") is None:
+                        kv_set(f"park_ended:{r['id']}", now())      # a turn after the one that set it: awake, once
             if attempt == t["attempt"] and state["turns"] > ((before or {}).get("turns", 0)
                                                              if (before or {}).get("session") == session else 0):
                 unanswered(agent, now(), tid)       # plan C8: a turn of the task's session ended

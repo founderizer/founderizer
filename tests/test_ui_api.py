@@ -703,6 +703,90 @@ class OwnerAPI(unittest.TestCase):
         hub.q("UPDATE reminders SET done=1 WHERE task=?", (parked,))
         self.assertNotIn("parked_until", {t["id"]: t for t in self.request()[1]["tasks"]}[parked])
 
+    def test_state_says_since_when_an_open_task_is_in_its_state(self):
+        """Owner API 1.237: `since` on an open task is when it came into the state that the apps show (the owner, 19
+        November 2026, of a job's task rows: "show its name too and the time it's been in that state"). A wait began
+        with its own record, whatever attempt came after it: on the owner's fleet that day a restart gave 15 open
+        tasks a new start at one minute, among them one that had waited on its question for two days. A task back
+        at work came back with the last end of its wait, also one that ended in the session that waited (a person's
+        or the owner's answer, a park that a turn ended), with no new attempt."""
+        t0 = hub.now() - 7200
+
+        def task(state, waiting_on=None, live_path="live session", owner="vps"):
+            return hub.ins("INSERT INTO tasks(title,owner,requester,state,waiting_on,live_path,created,started) "
+                           "VALUES('Work',?,'manager',?,?,?,?,?)", (owner, state, waiting_on, live_path, t0,
+                                                                    None if state == "submitted" else t0 + 3000))
+        asked = task("input-required")
+        qid = hub.ins("INSERT INTO questions(task,asker,requester,text,asked) VALUES(?,'vps','manager','Which?',?)",
+                      (asked, t0 + 600))
+        hub.q("UPDATE tasks SET waiting_on=? WHERE id=?", (f"Q-{qid}", asked))
+        person = task("input-required")
+        cm = hub.ins("INSERT INTO conversation_messages(conversation,who,text,created) VALUES(1,'vps','Is it paid?',?)",
+                     (t0 + 700,))
+        hub.q("UPDATE tasks SET waiting_on=? WHERE id=?", (hub.cm_ref(cm), person))
+        owner = task("input-required")
+        nid = hub.ins("INSERT INTO needs(title,why,todo,raised,by) VALUES('Enter a key','','',?,'vps')", (t0 + 800,))
+        hub.q("UPDATE tasks SET waiting_on=? WHERE id=?", (f"N-{nid}", owner))
+        prompt = task("input-required")
+        pid = hub.ins("INSERT INTO prompts(task,agent,tool,input,key,created) VALUES(?,'vps','Bash','ls','k',?)",
+                      (prompt, t0 + 900))
+        hub.q("UPDATE tasks SET waiting_on=? WHERE id=?", (f"P-{pid}", prompt))
+        parked = task("working", live_path=hub.PARKED_PATH + "10:00 UTC, as vps asked (R-1)")
+        hub.ins("INSERT INTO reminders(due,note,agent,task,created) VALUES(?,?,?,?,?)",
+                (hub.now() + 3600, "later", "vps", parked, t0 + 1000))
+        queued = task("submitted")
+        answered = task("working")
+        hub.ins("INSERT INTO questions(task,asker,requester,text,asked,answer,answered) "
+                "VALUES(?,'vps','manager','Which?',?,'This one',?)", (answered, t0 + 3100, t0 + 3200))
+        restarted = task("working")         # its answer came before its attempt began
+        hub.ins("INSERT INTO questions(task,asker,requester,text,asked,answer,answered) "
+                "VALUES(?,'vps','manager','Which?',?,'This one',?)", (restarted, t0 + 100, t0 + 200))
+        paused = task("input-required")     # the owner's hold comes first, as in the mark that the apps draw
+        hub.q("UPDATE tasks SET waiting_on=? WHERE id=?", (f"Q-{qid}", paused))
+        hub.ins("INSERT INTO holds(task,kind,by,state,created,attempt) VALUES(?,'pause','owner','paused',?,1)",
+                (paused, t0 + 1100))
+        stalled = task("working")
+        hub.q("UPDATE tasks SET stalled_since=? WHERE id=?", (t0 + 1200, stalled))
+        nudged = task("working")
+        hub.q("UPDATE tasks SET nudge_level=2, nudged_at=? WHERE id=?", (t0 + 1300, nudged))
+        limited = task("working", owner="studio")
+        hub.ins("INSERT INTO agent_limits(agent,since,until,reset_known) VALUES('studio',?,?,1)",
+                (t0 + 1400, t0 + 9000))
+        # back at work in the session that waited: each end of a wait counts, and a question that the task went on
+        # from with its default ended no wait
+        told = task("working")
+        hub.ins("INSERT INTO conversation_messages(conversation,who,text,created,task) VALUES(1,'person','Yes',?,?)",
+                (t0 + 3300, told))
+        given = task("working")
+        hub.ins("INSERT INTO needs(title,why,todo,raised,by,answer,answered,secret) VALUES('Enter a key','','',?,"
+                "'vps','saved',?,?)", (t0 + 900, t0 + 3400, json.dumps({"tasks": [given]})))
+        resumed = task("working")
+        hub.ins("INSERT INTO holds(task,kind,by,state,created,attempt,released) "
+                "VALUES(?,'pause','owner','released',?,1,?)", (resumed, t0 + 1000, t0 + 3500))
+        woken = task("working")
+        rid = hub.ins("INSERT INTO reminders(due,note,agent,task,created) VALUES(?,?,?,?,?)",
+                      (hub.now() + 3600, "later", "vps", woken, t0 + 3050))
+        hub.kv_set(f"park_ended:{rid}", t0 + 3600)
+        unheld = task("working", owner="ops")          # its agent's usage limit ended after its attempt began
+        hub.ins("INSERT INTO agent_limits(agent,since,until,reset_known,ended) VALUES('ops',?,?,1,?)",
+                (t0 + 3100, t0 + 3800, t0 + 3800))
+        taken = task("working")                           # the owner did the step on its screen that it asked for
+        hub.ins("INSERT INTO needs(title,why,todo,raised,by,answer,answered,takeover_task) VALUES('Sign in','','',?,"
+                "'vps','done',?,?)", (t0 + 900, t0 + 3900, taken))
+        assumed = task("working")
+        hub.ins("INSERT INTO questions(task,asker,requester,text,asked,assumed,answer,answered) "
+                "VALUES(?,'vps','manager','Which?',?,'The first','This one',?)", (assumed, t0 + 3100, t0 + 3700))
+        ended = task("completed")
+        rows = {t["id"]: t for t in self.request()[1]["tasks"]}
+        self.assertEqual({k: rows[k].get("since") for k in (asked, person, owner, prompt, parked, queued, answered,
+                                                             restarted, paused, stalled, nudged, limited, told, given,
+                                                             resumed, woken, unheld, taken, assumed, ended)},
+                         {asked: t0 + 600, person: t0 + 700, owner: t0 + 800, prompt: t0 + 900, parked: t0 + 1000,
+                          queued: t0, answered: t0 + 3200, restarted: t0 + 3000, paused: t0 + 1100,
+                          stalled: t0 + 1200, nudged: t0 + 1300, limited: t0 + 1400, told: t0 + 3300,
+                          given: t0 + 3400, resumed: t0 + 3500, woken: t0 + 3600, unheld: t0 + 3800,
+                          taken: t0 + 3900, assumed: t0 + 3000, ended: None})
+
     def test_state_says_whether_a_working_tasks_session_works_now(self):
         """Owner API 1.147: `works` is on the row of a task in state working whose current attempt has a turn record:
         true while a turn runs or a background call is open, false when its last turn ended and nothing of it runs.
