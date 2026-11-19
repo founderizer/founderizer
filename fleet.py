@@ -6429,6 +6429,15 @@ class Helper:
             self.ready_base.pop(window)
         return due
 
+    def first_lines(self, names):
+        """The poll's `first` (plan P0): the task windows of `names` (look_known) that this helper started and typed no
+        line into yet, which first_line_due keeps in ready_base until their first line goes. A session that starts
+        idle runs nothing before that line, so the hub counts no turn of it while a hold of its poll keeps the line
+        (hub.first_line_waits); the answer to this poll comes before any line of its round. "" when there is none, and
+        when tmux gave no list."""
+        waiting = sorted(w for w in list(self.ready_base) if re.fullmatch(r"T-\d+", w) and w in (names or ()))
+        return f"&first={','.join(waiting)}" if waiting else ""
+
     def idle_since(self, window, at):
         """True when the window reached an idle point after `at`: its screen showed its empty input line (the screen
         watch), or, for a runtime whose idle screen the helper cannot read, RESIGNAL_FIRST seconds passed."""
@@ -10514,7 +10523,8 @@ def cmd_run(args):
             checks = ",".join(str(r) for r in list(h.check_runs) if isinstance(r, int))  # C12: its check runs
             asked = time.monotonic()
             code, data = http("GET", f"/events/{agent}?delivery=1&after=0&wait=8&{listed}&jobs={held}&checks={checks}"
-                                     f"{h.browser_closed()}")       # S3, D10: a wait's place, once Chrome is closed
+                                     f"{h.browser_closed()}"        # S3, D10: a wait's place, once Chrome is closed
+                                     f"{h.first_lines(names)}")     # plan P0: windows still at their empty prompt
             polled = time.monotonic() - asked
             if code == 403 and data.get("auth") == "moved":
                 h.moved_away()          # agent_move: the owner moved this agent to another server

@@ -623,6 +623,73 @@ class Turns(test_releases.HubUpdates):
         with patch.object(hub, "release_applying", return_value=True):
             self.assertEqual(starts(), [])              # the update run holds both
 
+    def test_a_session_that_a_hold_keeps_from_its_first_line_runs_no_turn(self):
+        """A Claude task session starts idle, and only a line that its helper types begins its first turn: the helper
+        types one for an event that a poll answer hands it, its start again or a message. A hold of the poll that
+        begins after the helper started the session (a usage limit here; a shared OS user, a sign-in and a held task
+        hold the same events) keeps that line, so the session stands at its empty prompt for as long as the hold lasts.
+        Until 19 November 2026 it counted as a first turn all that time: no release landed, and its helper's own update
+        waited too, for days at a weekly limit. It counts from the answer that can have the helper type into it, also
+        when the helper's ack of its start comes late, and no longer once its helper says that it typed nothing into it
+        yet and the answer has it type nothing either. A fresh attempt goes by its own start. A Codex session runs from
+        its start, and so can a window while a switch to Claude waits for the helper. A release that waits passes a
+        start that its helper took only to a helper with start_once, both ways."""
+        hub.TEAM["agents"]["vps"]["runtime"] = "claude"
+        helper_reports("vps", hub.UPDATE_BETWEEN_TURNS, hub.START_ONCE)
+        task = self.task_for()
+        window, first = hub.tref(task), f"&first={hub.tref(task)}"
+
+        def poll(alive=window, first=""):
+            """One poll of vps's helper: the turns that its answer reads, and the tasks of the events it hands out."""
+            code, data = self.request(f"/events/vps?delivery=1&after=0&wait=0&alive={alive}{first}",
+                                      source=hub.address_of("vps"))
+            self.assertEqual(code, 200, data)
+            return data["turns"], [e["task"] for e in data["events"] if e["kind"] in ("task", "say")]
+
+        def limit():
+            hub.ins("INSERT INTO agent_limits(agent,since,until,reset_known) VALUES('vps',?,?,1)",
+                    (hub.now(), hub.now() + 4 * 86400))     # a weekly limit, four days before its reset
+        self.assertEqual(poll(alive=""), ([], [window]))        # its start goes out
+        hub.q("UPDATE events SET helper_ack=? WHERE kind='task' AND task=?", (hub.now(), task))   # it started
+        windows("vps", window)
+        limit()
+        self.assertEqual(hub.fleet_idle(), (True, []))
+        self.assertEqual(poll(), ([], []))                      # so its helper may take its own update
+        hub.q("DELETE FROM agent_limits WHERE agent='vps'")      # the reset: its first line goes
+        self.assertEqual(poll(), ([window], [window]))
+        limit()                                                  # again, and the line may have gone in
+        self.assertEqual(poll(), ([window], []))
+        self.assertEqual(poll(first=first), ([], []))           # its helper typed none into it yet
+        hub.TEAM["agents"]["vps"]["runtime"] = "codex"
+        self.assertEqual(hub.fleet_idle(), (False, [task]))     # a Codex session ran from its start
+        hub.TEAM["agents"]["vps"]["runtime"] = "claude"
+        helper_reports("vps", hub.UPDATE_BETWEEN_TURNS, hub.START_ONCE, runtime={"name": "codex"})
+        self.assertEqual(hub.fleet_idle(), (False, [task]))     # so can one while its helper has not loaded Claude
+        helper_reports("vps", hub.UPDATE_BETWEEN_TURNS, hub.START_ONCE)
+        # The hub's own word on the limit passes it, and the helper types it into the window: a turn begins.
+        hub.emit("vps", "say", "[hub] You reached your usage limit.", task=task, extra=hub.LIMIT_SAY)
+        self.assertEqual(poll(first=first), ([window], [window]))
+        # It read both, and after the reset a fresh attempt starts, whose ack comes in after the next answer.
+        hub.q("UPDATE events SET read_at=? WHERE task=?", (hub.now(), task))
+        hub.q("DELETE FROM agent_limits WHERE agent='vps'")
+        row = hub.q1("SELECT * FROM tasks WHERE id=?", (task,))
+        start = hub.attempt_event(row, "Its cache is cold.")
+        with hub.transaction():
+            hub.attempt_rows(row, "fresh", start, hub.now())
+        self.assertEqual(poll(alive=""), ([], [window]))
+        windows("vps", window)
+        self.assertEqual(poll(), ([window], [window]))          # its helper finds the window, and may type into it
+        hub.q("UPDATE events SET helper_ack=? WHERE kind='task' AND task=? AND helper_ack IS NULL", (hub.now(), task))
+        limit()
+        self.assertEqual(hub.fleet_idle(), (False, [task]))     # the mark of that answer, from before the ack
+        self.assertEqual(poll(first=first), ([], []))           # the read start of attempt 1 does not make it count
+        hub.q("DELETE FROM agent_limits WHERE agent='vps'")
+        hub.kv_set("release_waits", json.dumps({"revision": "a" * 40, "since": hub.now()}))
+        helper_reports("vps", hub.UPDATE_BETWEEN_TURNS)
+        self.assertEqual(poll(), ([], []))                      # the wait holds the start of a helper with no start_once
+        helper_reports("vps", hub.UPDATE_BETWEEN_TURNS, hub.START_ONCE)
+        self.assertEqual(poll(first=first), ([window], [window]))
+
     def test_a_release_the_run_would_refuse_does_not_wait(self):
         self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
         working = self.task_for()
@@ -781,6 +848,18 @@ class HelperUpdate(unittest.TestCase):
         self.helper.hub_turns = (set(), time.monotonic() + 1)
         self.assertFalse(self.helper.update_busy())
 
+    def test_the_poll_names_a_task_window_until_its_first_line_goes(self):
+        """The hub counts no turn of a session that starts idle while its helper says that it typed no line into its
+        window yet (hub.first_line_waits). A window that the helper still named after its first line went would read
+        as idle while its first turn runs, and a release would cut that turn."""
+        helper = fleet.Helper("vps", {"role": "worker", "runtime": "claude", "machine": "vps", "can": ["shell"]})
+        helper.ready_base.update({"T-1": 0, "T-2": 0, "owner-chat": 0})     # as Helper.start leaves a new window
+        self.assertEqual(helper.first_lines(["home", "owner-chat", "T-1", "T-2"]), "&first=T-1,T-2")
+        self.assertEqual((helper.first_lines(["T-2"]), helper.first_lines(None)), ("&first=T-2", ""))
+        helper.listed["T-1"], helper.screens["T-1"] = 1, {"idle_run": 1}    # its tools listed, its input line shows
+        self.assertTrue(helper.first_line_due("T-1"))
+        self.assertEqual(helper.first_lines(["T-1", "T-2"]), "&first=T-2")
+
 
 # ---- the rollback reads: what the later lanes of AUTONOMY.md write (section 6.1), as they would write it
 
@@ -792,6 +871,7 @@ LATER_COLUMNS = (("tasks", "source_conversation", "INTEGER"), ("tasks", "source_
                  ("trigger_history", "saved_by_task", "INTEGER"), ("trigger_history", "outside_reads", "INTEGER"),
                  ("trigger_runs", "lines", "TEXT"), ("trigger_runs", "runs", "INTEGER"),
                  ("events", "handed", "REAL"),          # plan P0: the poll answer that handed out a signal
+                 ("events", "signalled", "REAL"),       # and the one that had a session's first line typed in
                  # questions up the line (29 October 2026): who passed a question up, who answered it, and the
                  # Needs-you item that took it to the owner
                  ("questions", "passed", "TEXT"), ("questions", "answered_by", "TEXT"), ("needs", "question", "INTEGER"),
@@ -1035,6 +1115,11 @@ def later_data(t0=None):
                        "opening": "read", "rules": ["logins"]})))
     hub.q("INSERT INTO notes(task,agent,ts,text) VALUES(?,'vps',?,'the last note, kept by deliver_result')",
           (made["task"], t0))
+    # plan P0: the start of a session that starts idle, which a poll handed out, its helper took, and a later answer
+    # had that helper type the session's first line for (Handler.events: events.handed, helper_ack, signalled)
+    hub.q("INSERT INTO events(agent,kind,task,text,created,extra,handed,helper_ack,signalled) "
+          "VALUES('vps','task',?,'Fix the export.',?,?,?,?,?)",
+          (made["work"], t0, json.dumps({"needs": "none", "attempt": 1, "generation": "test-generation"}), t0, t0, t0))
     # owner feature secret_requests (28 October 2026), as hub.t_request_secret and hub.owner_message_rows write them: a
     # worker's request in its owner chat, which names the owner message it answers, and his answer, which that chat
     # has read once (a chat event that waits for no reply)
@@ -1208,9 +1293,12 @@ def helper_calls():
                            fleet.screen_report("limit", 1), fleet.screen_report("gone", 1),
                            fleet.screen_report("frozen", 1), fleet.screen_report("moving", 1)],
                   "manager": [fleet.screen_report("limit"), fleet.screen_report("closed")]}
+        # plan P0: the poll's word on a task window that the helper typed no line into yet (fleet.Helper.first_lines)
+        poller = fleet.Helper("vps", {"role": "worker", "runtime": "claude", "machine": "vps", "can": ["shell"]})
+        poller.ready_base["T-7"] = 0
         return {"status": {"vps": status("vps", "worker"), "manager": status("manager", "manager")},
                 "usage": {"plain": usage.plain_sessions(report), "kinds": usage.kinds_sessions(report),
-                          "models": report}, "dialog": dialog}
+                          "models": report}, "dialog": dialog, "poll": poller.first_lines(["T-7"])}
     finally:
         shutil.rmtree(home, ignore_errors=True)
 
@@ -1423,6 +1511,8 @@ class RollbackReads(HubFixture):
         if answer.get("session_models") is True:        # and the models to one that said it takes those too
             code, answer = self.request("/helper/usage/vps", calls["usage"]["models"], source="127.0.0.3")
             self.assertEqual(code, 200, answer)
+        code, answer = self.request(f"/events/vps?delivery=1&after=0&wait=0{calls['poll']}", source="127.0.0.3")
+        self.assertEqual(code, 200, answer)             # plan P0: a release that does not know `first` ignores it
 
 
 # ---- the feature-flag convention (COORDINATION.md, "Autonomous teams")

@@ -204,7 +204,7 @@ CREATE TABLE IF NOT EXISTS needs(id INTEGER PRIMARY KEY, title TEXT, why TEXT, t
 CREATE TABLE IF NOT EXISTS need_talk(id INTEGER PRIMARY KEY, need INTEGER NOT NULL, ts REAL NOT NULL,
   who TEXT NOT NULL, text TEXT NOT NULL, request_id TEXT UNIQUE);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, agent TEXT, kind TEXT, task INTEGER, text TEXT,
-  created REAL, extra TEXT, read_at REAL, helper_ack REAL, handed REAL);
+  created REAL, extra TEXT, read_at REAL, helper_ack REAL, handed REAL, signalled REAL);
 -- "Come back to this at this time", for any agent. agent is who set it and who the hub brings it back to;
 -- task is the work it brings back, and while it waits that task is parked: no nudge and no new session.
 CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY, due REAL, note TEXT, done INTEGER DEFAULT 0,
@@ -1284,6 +1284,9 @@ def mint_refused(job, status):
     if not t or t["state"] in TERMINAL or t["attempt"] != job["attempt"]:
         return
     what = f"failed: mint=refused, server={job['target'][5:]}, status={status}"
+    if question_record(t["id"]):      # the chat of a colleague's question tells them why, in their words
+        what += (". The service knows no such record" if status == 404 else
+                 ". This question has no access to that record")
     taken = case_line_task(t)
     q("UPDATE tasks SET state='failed', outcome='failed', what=?, delivered=?, waiting_on=NULL, accepted=?, "
       "checked_at=? WHERE id=?", (what, now(), 1 if taken else None, now() if taken else None, t["id"]))
@@ -5168,6 +5171,10 @@ def migrate():
         "events": {"read_at": "REAL", "helper_ack": "REAL",
                    "handed": "REAL",            # plan P0: the first poll answer that carried a conversation's signal
                    #                              or, since 19 November 2026, a task's start (attempt_began)
+                   # plan P0 (19 November 2026): the first poll answer after a task start's first one that can have had
+                   # its helper type a line into the session's window (first_line_waits); NULL again when the helper
+                   # said that it typed none into that window yet
+                   "signalled": "REAL",
                    # the task that a message is about when it is filed under another one (filed_about: a lead reads
                    # its team's news in its own task), so that person_remove finds a lead's line about a person's task
                    "about": "INTEGER"},
@@ -6211,9 +6218,9 @@ SHELL_OFF_RULE = (" Your Shell box is off: no shell, no file tool and no key rea
                   "risk, or something that this task does not cover. Say such a thing with message_agent to an agent "
                   "of YOUR LINE: the agents above you, your peers and the team that you lead. They get your words in "
                   "quotation marks, as data. So say what you saw and what you ask, name a record by its id, and give "
-                  "no address. The message pauses nothing, except in a task that a colleague's question opened: there "
-                  "waits=true holds the task until the answer comes, and the answer comes to this task. Go on inside "
-                  "your duty's words. When you cannot do what was asked, deliver failed with a typed reason, never "
+                  "no address. The message pauses nothing, except in a task that a colleague's question opened and "
+                  "that reads no record: there waits=true holds the task until the answer comes, and the answer "
+                  "comes to this task. Go on inside your duty's words. When you cannot do what was asked, deliver failed with a typed reason, never "
                   "completed.")
 RULE_FOUR = (" Never contact the owner from here: if you are blocked, use ask_my_requester, and your line takes the "
              "question up as far as it must go, the owner last. If you are only UNSURE and not "
@@ -7433,7 +7440,8 @@ def attempt_event(t, note="", resume=True):
     return (t["owner"], "task", t["id"],
             start_text(t["owner"], t["id"], resume=resume, note=note, row=t, opening=opening),
             dict({"needs": t["needs"], "resume": True, "attempt": t["attempt"] + 1, "generation": kv_get("db_id")},
-                 **stable_extra(t["owner"], opening), **closed_extra(t["owner"], t["responsibility"])))
+                 **stable_extra(t["owner"], opening),
+                 **closed_extra(t["owner"], t["responsibility"], (question_record(t["id"]) or {}).get("record"))))
 
 
 def stable_extra(agent, opening):
@@ -10596,7 +10604,7 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
                 json.dumps(dict({"needs": f["needs"], "resume": False, "attempt": 1,
                                  "generation": generation[0] if generation else None},
                                 **stable_extra(f["owner"], opening),
-                                **closed_extra(f["owner"], f.get("responsibility"))))))
+                                **closed_extra(f["owner"], f.get("responsibility"), f.get("question_record"))))))
     if f["needs"] == "browser":
         browser_admit_rows(tid, f["owner"], t0)     # build plan 04 (D6): its place, before its helper reads it
     memory_shown_rows(f["owner"], tid, 1, t0)
@@ -18484,12 +18492,14 @@ def t_message_agent(agent, a):
             fence(agent, tid)
         if waits and not tid:
             raise ToolError("waits=true is for a task session whose task cannot go on without the answer.")
-        if waits and line is not None and staff_question(tid)[0] is None:
+        if waits and line is not None and (staff_question(tid)[0] is None or question_record(tid)):
             # of an agent whose Shell box is off only a colleague's question waits: a task of a duty would hold a
             # place of the duty's watch (CASE_POOL), and a customer's question one session for each question, at
             # the word of a stranger's text (19 November 2026)
-            raise ToolError("waits=true is for a task that a colleague's question opened. A task of your duty waits "
-                            "for nobody: go on inside its words, or deliver failed with a typed reason.")
+            # (and a task that reads a record holds a token for an hour: it waits for nobody either)
+            raise ToolError("waits=true is for a task that a colleague's question opened and that reads no record. A "
+                            "task of your duty waits for nobody: go on inside its words, or deliver failed with a "
+                            "typed reason.")
         # A session whose Shell box is off has no ask_my_requester, so it waits for its requester's answer here.
         if waits and line is None and q1("SELECT 1 FROM tasks WHERE id=? AND requester=?", (tid, to)):
             raise ToolError(f"{to} gave you {tref(tid)}: to wait for its answer, use ask_my_requester, which pauses "
@@ -19728,8 +19738,10 @@ def conversation_closed_rules(agent, person):
         "- You have no shell, no files, no browser, no logins and no keys in this window, and you cannot do work "
         "here. Promise no date, no price and no result.",
         (f"- Work goes to your team with ask_team, as {person['name']}'s own words, with the ids of their messages in "
-         f"messages, and you tell them that you asked." +
-         (f" A lasting wish of theirs (\"from now on\", \"for next time\") goes the same way, so that it is kept."
+         f"messages, and you tell them that you asked. A question about one record goes with that record's id in "
+         f"record, as a message of theirs or yours here names it, one record for each ask." +
+         (f" A lasting wish of theirs (\"from now on\", \"for next time\") goes in an ask of its own, with no "
+          f"record, so that it is kept."
           if person_scope(person["id"], agent) is None else "") if staff else
          f"- What you cannot answer here goes to your team with ask_team, as {person['name']}'s own words, and you "
          f"tell them that you asked.") +
@@ -21519,7 +21531,7 @@ def open_work_pass(agent, a):
             f"words as a message.")
 
 
-def conversation_line_task(agent, conv, person, title, details, record, why, follows=None):
+def conversation_line_task(agent, conv, person, title, details, record, why, follows=None, question=None):
     """Inside the lock: one task on this agent from conversation `conv`, on the agent's wake-up route
     (wakeups.wake_route): the fleet manager as its requester, or its lead, in whose one task for its team's results
     (lead_batch_rows, plan P9.11) it is a subtask, as a wake is. Only this task carries the conversation: its result
@@ -21535,8 +21547,11 @@ def conversation_line_task(agent, conv, person, title, details, record, why, fol
             common["parent"] = lead_batch_rows(route["requester"], t0)
         tid = admit_task(route["requester"], dict(common, owner=agent, title=title, details=details,
                                                   done_when="The work is done and its result says what came of it.",
-                                                  why=why))
+                                                  why=why, question_record=(question or {}).get("record")))
         DB.execute("UPDATE tasks SET source_conversation=? WHERE id=?", (conv["id"], tid))
+        if question:        # a colleague's question about one record (question_record)
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       (f"question_record:{tid}", json.dumps(question)))
         DB.execute("INSERT INTO conversation_messages(id,conversation,who,text,created,task) VALUES(?,?,?,?,?,?)",
                    (unused_id("conversation_messages"), conv["id"], "action", f"{record} ({tref(tid)})", t0, tid))
         DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
@@ -21554,17 +21569,30 @@ def t_ask_team(agent, a):
         raise ToolError(f"A question is 1 to {CONVERSATION_ASK_MAX} characters.")
     refs = a.get("messages") or []          # as open_work's: the person's own words reach the task
     if not isinstance(refs, list) or len(refs) > 20 or not all(CM_REF.match(str(r)) for r in refs):
-        raise ToolError("messages is a list of up to 20 of this person's messages, each as CM-<number>.")
+        raise ToolError("messages is a list of up to 20 messages of this conversation, each as CM-<number>.")
     ids = sorted({int(CM_REF.match(str(r)).group(1)) for r in refs})
+    record = str(a.get("record") or "").strip() or None
+    if record and not TYPED_ID.fullmatch(record):
+        raise ToolError("record is the id of one record, as the person wrote it: a letter or a digit and then up to "
+                        "63 of A-Z a-z 0-9 _ -")
     guard(agent, question)
     with LOCK:
         conv, person = conversation_fence(agent)
         if not contacts_v2() or conversation_works(person, agent):
             raise ToolError("ask_team is for a closed conversation.")
-        rows = q(f"SELECT * FROM conversation_messages WHERE conversation=? AND who='person' AND id IN "
-                 f"({','.join('?' * len(ids))}) ORDER BY id", (conv["id"], *ids)) if ids else []
-        if len(rows) != len(ids):
-            raise ToolError(f"Each of messages must be one that {person['name']} wrote in this conversation.")
+        named = q(f"SELECT * FROM conversation_messages WHERE conversation=? AND who IN ('person','agent') AND id "
+                  f"IN ({','.join('?' * len(ids))}) ORDER BY id", (conv["id"], *ids)) if ids else []
+        if len(named) != len(ids):
+            raise ToolError(f"Each of messages must be one that {person['name']} or you wrote in this conversation.")
+        rows = [r for r in named if r["who"] == "person"]         # their words reach the task; yours stay here
+        if record:      # one record for a colleague's question: a read-only token for it (question_record)
+            if not (shell_off(agent) and person_access(person)["tools"] and
+                    person_scope(person["id"], agent) is None):
+                raise ToolError("record is for a colleague's question to an agent whose Shell box is off.")
+            whole = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(record)}(?![A-Za-z0-9_-])")   # never a part of an id
+            if not rows or not any(whole.search(r["text"] or "") for r in named):
+                raise ToolError(f"record must be written in one of messages, and messages must hold the message of "
+                                f"{person['name']} that asks about it.")
         # The person's words go into the details only, as one JSON string on a line of its own: never into the title,
         # which every reader takes as the task's own words, and never between marks that their own text could close.
         title = f"A question of {person['name']} ({person['role']})"     # the conversation is in the details
@@ -21580,7 +21608,10 @@ def t_ask_team(agent, a):
                    f"What you do for {person['role']}: {access['prompt']} Do what that allows for {person['name']}, "
                    f"with your own tools, and nothing outside it. Your result goes back into C-{conv['id']}, and that "
                    f"conversation tells {person['name']}: write the result as what they may read." +
-                   (f"\n\nWhen you cannot go on without an answer of your line, ask with message_agent and waits=true: "
+                   (f"\n\nThe question is about the record {record}. Your MCP server that reads records holds a "
+                    f"read-only token for that one record in this session: read it there, and answer from it, with "
+                    f"its link when it gives one. This task keeps no wish and waits for nobody." if record else
+                    f"\n\nWhen you cannot go on without an answer of your line, ask with message_agent and waits=true: "
                     f"this task waits, and the answer comes to it. A lasting wish of {person['name']}'s about your "
                     f"work for them, in a message of theirs that this task got, you keep with keep_instruction: that "
                     f"message as source, its own words, scope agent; and you end one with end_standing, with the "
@@ -21591,7 +21622,8 @@ def t_ask_team(agent, a):
         if same:
             return f"{tref(same['id'])} with the same question is already open. Nothing was asked twice."
         tid, _ = conversation_line_task(agent, conv, person, title, details, f"Asked the team: {question}",
-                                        f"{person['name']} asked in C-{conv['id']}.")
+                                        f"{person['name']} asked in C-{conv['id']}.",
+                                        question={"record": record, "message": rows[-1]["id"]} if record else None)
         if closed:          # read by this task's own session alone: no requester reads a message of its task
             note = f" What the owner says about {person['name']}: {mask_secrets(person['note'])}" \
                 if person["note"] else ""         # their domain, which a manager's wish is judged in
@@ -36365,9 +36397,9 @@ def standing_asked(agent, a, field):
     task = int(str(context[1])[2:]) if context and len(context) == 3 and TASK_CONTEXT.fullmatch(str(context[1])) \
         else None
     conv, person = staff_question(task)
-    if conv is None:
-        raise ToolError("Your Shell box is off: only a task that a colleague's question opened keeps or ends a "
-                        "lasting wish, and only that colleague's own.")
+    if conv is None or question_record(task):      # a task that reads a record keeps no wish (shell_tools)
+        raise ToolError("Your Shell box is off: only a task that a colleague's question opened, and that reads no "
+                        "record, keeps or ends a lasting wish, and only that colleague's own.")
     m = SOURCE_REF.match(str(a.get(field) or ""))
     if not m or m.group(1).upper() != "CM" or not q1(
             "SELECT 1 FROM conversation_messages WHERE id=? AND conversation=? AND who='person'",
@@ -38450,7 +38482,11 @@ TOOLS = [
      S({"question": {"type": "string", "description": "What the person needs, in their own words"},
         "messages": {"type": "array", "items": {"type": "string"},
                      "description": "The person's messages that the question comes from, each as CM-<number>: their "
-                                    "own words reach the task, which keeps a lasting wish of theirs in those words"}},
+                                    "own words reach the task, which keeps a lasting wish of theirs in those words. "
+                                    "With record, also your own message here that names the record"},
+        "record": {"type": "string", "description": "A colleague's question about one record: its id, as a "
+                                                   "message of messages writes it. The task reads that record, "
+                                                   "read only, and keeps no wish"}},
        ["question"])),
     ("worker", "open_work", t_open_work,
      "Open larger work from this conversation as a task of your own, with your own line as its requester. It runs in "
@@ -39858,7 +39894,9 @@ def shell_tools(agent, context=None):
         named = duty_tools(row["tools"]) if row else None
         reports = bool(row and duty_ids(row["report_to"]))     # support plan F4: H1's report_defect, once it has a reader
         asked = bool(report_question_of(int(str(context[1])[2:])))      # a session that answers a report's reader
-        staff = staff_question(int(str(context[1])[2:]))[1] is not None     # a colleague's question: their own wish
+        # a colleague's question keeps their own wish; one that reads a record holds a token, and keeps none
+        staff = staff_question(int(str(context[1])[2:]))[1] is not None and \
+            not question_record(int(str(context[1])[2:]))
     return SHELL_OFF_TOOLS + (("report_defect",) if reports else ()) + (("answer_report",) if asked else ()) + \
         tuple(n for n in named or () if n in SHELL_OFF_DUTY_TOOLS) + (SHELL_OFF_ASKED_TOOLS if staff else ())
 
@@ -39871,11 +39909,35 @@ def question_task(task_id):
                     "t.source_message IS NULL", (task_id,)) if task_id else None
 
 
+def question_record(task_id):
+    """{"record", "message"} of a colleague's question about one record (ask_team's record), else None: the record
+    as the person's message names it, and that message's id. Its task gets a read-only token for that record from
+    each server of question_servers, keeps no wish and waits for nobody. None too when the task is no colleague's
+    question any more (staff_question): a person who lost their tools or got a list. read_row only."""
+    if not task_id or staff_question(task_id)[1] is None:
+        return None
+    row = read_row("SELECT v FROM kv WHERE k=?", (f"question_record:{task_id}",))
+    try:
+        found = json.loads(row["v"]) if row else None
+    except (TypeError, ValueError):
+        return None
+    return found if isinstance(found, dict) and found.get("record") and found.get("message") else None
+
+
+def question_servers(agent):
+    """The agent's MCP servers that mint a token for one case (auth "mint" with a field), which a colleague's
+    question about one record gets, with that record as the case. A server that mints with no case, as a review's,
+    is never one of them."""
+    catalog = tool_catalog(TEAM)
+    return [t for t in (agents().get(agent) or {}).get("tools") or []
+            if ((catalog.get(t) or {}).get("mint") or {}).get("field")]
+
+
 def staff_question(task_id):
     """(conversation, person) of task `task_id` when a person whose role has its tools on opened it with a question
     (question_task), else (None, None). Such a task of an agent whose Shell box is off keeps and ends that person's
     own lasting wish (SHELL_OFF_ASKED_TOOLS), in the person's own words (standing_asked), and it may wait for an
-    answer of its line (message_agent waits): it has no case, so no token
+    answer of its line (message_agent waits), unless it reads a record (question_record): it has no case, so no token
     of a mint server (fleet.mint_tokens) and no stranger's text reach it to steer what it keeps. A task that ever gets
     such a token must not get these tools. read_row only: tools_for runs inside the transactions of a call."""
     conv = question_task(task_id)
@@ -39921,11 +39983,13 @@ def duty_tools(value):
     return [n for n in found if isinstance(n, str)] if isinstance(found, list) else None
 
 
-def closed_extra(owner, responsibility=None):
+def closed_extra(owner, responsibility=None, record=None):
     """What the start event of a task of an agent whose Shell box is off says to its helper (support plan F1): the
     runtime and the version of closed sessions, and the built-in tools of this task, the Web box's unless its duty
-    names fewer, and the MCP servers that its duty names (None: no server whose token is made for a session). {} for
-    every other agent. read_row only: admit_task writes the event in a transaction."""
+    names fewer, and the MCP servers that its duty names (None: no server whose token is made for a session). A
+    colleague's question about one record (`record`, question_record) names the agent's servers that mint a token
+    for one case (question_servers). {} for every other agent. read_row only: admit_task writes the event in a
+    transaction."""
     if not shell_off(owner):
         return {}
     row = read_row("SELECT tools, servers FROM responsibilities WHERE id=?", (responsibility,)) if responsibility \
@@ -39934,7 +39998,7 @@ def closed_extra(owner, responsibility=None):
     allowed = SHELL_OFF_BUILT_INS if "web" in (agents()[owner].get("can") or []) else ()
     out = {"runtime": setting("conversations.closed_runtime"), "version": setting("conversations.closed_version"),
            "built_ins": [n for n in allowed if named is None or n in named],
-           "servers": duty_tools(row["servers"]) if row else None}
+           "servers": duty_tools(row["servers"]) if row else (question_servers(owner) if record else None)}
     hosts = agents()[owner].get("web_hosts")
     if hosts and WEB_SEARCH in out["built_ins"]:        # the host list: page reads go with web search, on its hosts
         out.update(built_ins=out["built_ins"] + [WEB_PAGES], web_hosts=list(hosts), version=host_list_version())
@@ -58622,10 +58686,12 @@ def running_turns(owner=None, t0=None):
     sessions do not reach the hub, so a restart cuts nothing of theirs, and they never keep a release waiting, and
     neither does a session that stands at a question on its own screen with nothing moving (screen_stuck). An attempt
     whose start waits in the hub (attempt_began) runs nothing: the window T-<id> that its helper may still list is an
-    earlier attempt's, which counts only while that attempt's own turn state says that a turn runs (turn_before)."""
+    earlier attempt's, which counts only while that attempt's own turn state says that a turn runs (turn_before).
+    Nor does a session that starts idle and that no line reached yet (first_line_waits): from its start until a poll
+    answer brings that line, which a hold of the poll can keep, for days at a weekly limit."""
     t0 = t0 or now()
-    rows = q(f"SELECT id, owner, attempt, state, source_conversation, source_message, scope_person FROM tasks WHERE "
-             f"{OPEN_TASK}" +
+    rows = q(f"SELECT id, owner, attempt, state, needs, source_conversation, source_message, scope_person FROM tasks "
+             f"WHERE {OPEN_TASK}" +
              (" AND owner=?" if owner else "") + " ORDER BY id", (owner,) if owner else ())
     helpers, busy = {}, []
     for t in rows:
@@ -58653,6 +58719,9 @@ def running_turns(owner=None, t0=None):
                     (not listed(row) or conversation_window(t) in (row["alive"] or "").split(",")):
                 busy.append(t["id"])
             continue
+        if state is None and not is_conversation_task(t) and first_line_waits(t):
+            continue                        # it stands at its empty prompt: the hub holds the line that begins its
+            #                                 first turn, for days at a weekly limit
         if listed(row):
             # Starting: the helper's step names it, or it took the session's credential after its last window list,
             # which therefore cannot show the window yet. A list taken after that credential is the fact. A
@@ -58706,6 +58775,33 @@ def turn_before(t):
     row = q1("SELECT MAX(attempt) AS attempt FROM attempts WHERE task=? AND attempt<? AND turn IS NOT NULL",
              (t["id"], t["attempt"]))
     return turn_state(t["id"], row["attempt"]) if row and row["attempt"] is not None else None
+
+
+def first_line_waits(t):
+    """True while the session of task row `t` stands at its empty prompt, for all that the hub can tell (plan P0): a
+    session that starts idle (a Claude task in a terminal, whose first turn is the first line that its helper types:
+    fleet.session_command), whose helper took the start of the current attempt (events.helper_ack, after the poll
+    answer that handed it out), which has not read that start, and into whose window no later poll answer can have had
+    its helper type a line (events.signalled). A helper types a line into a task window only for an event of the poll
+    answer that it handles (fleet.Helper.handle_events): that task's start again, which brings its first line, or a
+    message for that task. So while a hold of the poll keeps those events (a usage limit, a shared OS user, a sign-in,
+    a held task), such a session runs nothing, however long the hold lasts. A helper that says in its poll that it
+    typed no line into the window yet (`first`, fleet.Helper.first_lines) takes the mark back when that poll's answer
+    has it type none either: a hold that begins after the mark and before the first line keeps the session out too. A
+    session that starts with its prompt (Codex, a runner, an ACP program) runs from its start, so this is never true
+    for it. The runtime is the agent's now, and never one that its helper has not loaded yet (runtime_pending): while
+    a switch to Claude waits for the helper's update, a window of the previous runtime can run, and after a switch
+    away from Claude a session of before counts as before.
+
+    Until 19 November 2026 running_turns counted such a session as its first turn for as long as the hold lasted: no
+    release landed, and its helper's own update waited too (update_busy reads `turns`), for days at a weekly limit."""
+    conf = agents().get(t["owner"]) or {}
+    if conf.get("runtime") != "claude" or app_server_task(conf, t["needs"]):
+        return False
+    start = q1("SELECT MAX(handed IS NOT NULL AND helper_ack IS NOT NULL) AS took, "
+               "MAX(signalled IS NOT NULL OR read_at IS NOT NULL) AS moved FROM events WHERE task=? AND kind='task' AND "
+               "agent=? AND COALESCE(json_extract(extra, '$.attempt'), 1)=?", (t["id"], t["owner"], t["attempt"]))
+    return bool(start["took"]) and not start["moved"] and not runtime_pending(t["owner"])
 
 
 def conversation_signalled(t):
@@ -67363,6 +67459,12 @@ class Handler(BaseHTTPRequestHandler):
             signed_out = runtime_signed_out(agent)
             waits = {}          # task id: its refused session waits for the machine's word or its fresh start
             began = {}          # (task id, attempt): whether the start of that attempt left the hub (attempt_began)
+            # plan P0: the tasks whose window T-<id> the helper started and typed no line into yet, by its own word
+            # (fleet.Helper.first_lines), which it sent after it handled every answer that the hub marked before
+            # `polled_at`; the line of this poll's answer comes after that word (first_line_waits)
+            first = {int(w[2:]) for w in str(query.get("first") or "").split(",")
+                     if re.fullmatch(r"T-[1-9][0-9]{0,17}", w)}
+            polled_at = now()
 
             def sign_in_holds(r, t, conf):
                 """True when the sign-in holds this event (needs_sign_in): a session of the runtime that is signed out,
@@ -67525,15 +67627,47 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(0.5)
             if agent not in agents():       # it left inside the last round: nothing is handed to a name that is gone
                 return self.json(404, {"error": "unknown agent"})
-            # plan P0: this answer hands out these conversation signals, so a turn of their task may begin now
-            # (conversation_signalled). The helper sends no ack of one: it types it, or starts the window, at once.
-            # So does a task's start, whose ack comes only once its session runs: from here its helper closes the
-            # window of the attempt before and starts this one (attempt_began).
-            handed = [r["id"] for r in rows if r["kind"] in ("conversation", "task") and r["handed"] is None]
-            if handed:
+            with LOCK:
+                # plan P0: an update run that began after this round's filter read `updating` holds from here what it
+                # holds there. start_release_work marks the run under LOCK before the run checks the turns, under
+                # LOCK too, so no start or line of this answer goes out that the run's check did not see.
+                if not updating and release_applying():
+                    rows = [r for r in rows if not (r["kind"] in ("task", "conversation") or
+                                                    worker and r["kind"] == "say" and r["task"])]
+                # plan P0: this answer hands out these conversation signals, so a turn of their task may begin now
+                # (conversation_signalled). The helper sends no ack of one: it types it, or starts the window, at
+                # once. So does a task's start, whose ack comes only once its session runs: from here its helper
+                # closes the window of the attempt before and starts this one (attempt_began).
+                handed = [r["id"] for r in rows if r["kind"] in ("conversation", "task") and r["handed"] is None]
+                if handed:
+                    with area("quiet"):
+                        q(f"UPDATE events SET handed=? WHERE handed IS NULL AND id IN ({','.join('?' * len(handed))})",
+                          (now(), *handed))
+                # plan P0: the task windows that this answer can have the helper type a line into (Helper.handle): a
+                # start that went out before comes again, and the helper types its session's first line where its
+                # window stands, also when the helper's ack of it is not in yet; and a worker's or a lead's message
+                # for its task goes into that task's window (one filed under no task reaches no worker: the filter
+                # above), which can take a line only once its start went out in an earlier answer or its ack is in: a
+                # start's first answer, and a message that goes with it, find no window that can take one yet. Before
+                # such an answer a session that starts idle runs nothing (first_line_waits), so this marks its start,
+                # once. A window that the helper says it typed no line into yet, and that this answer types none into
+                # either, stands at its empty prompt after this answer too: its mark goes, unless an answer that the
+                # helper had not handled then set it.
+                again = [r for r in rows if r["kind"] == "task" and (r["handed"] is not None or r["helper_ack"])]
+                told = {r["task"] for r in rows if r["kind"] == "say" and worker and r["task"] and not event_window(r)}
+                untyped = first - told - {r["task"] for r in again}
                 with area("quiet"):
-                    q(f"UPDATE events SET handed=? WHERE handed IS NULL AND id IN ({','.join('?' * len(handed))})",
-                      (now(), *handed))
+                    if again:
+                        q(f"UPDATE events SET signalled=? WHERE signalled IS NULL AND read_at IS NULL AND id IN "
+                          f"({','.join('?' * len(again))})", (now(), *(r["id"] for r in again)))
+                    if told:
+                        q(f"UPDATE events SET signalled=? WHERE agent=? AND kind='task' AND signalled IS NULL AND "
+                          f"(helper_ack IS NOT NULL OR handed<?) AND read_at IS NULL AND task IN "
+                          f"({','.join('?' * len(told))})", (now(), agent, polled_at, *told))
+                    if untyped:
+                        q(f"UPDATE events SET signalled=NULL WHERE agent=? AND kind='task' AND signalled<? AND "
+                          f"helper_ack IS NOT NULL AND read_at IS NULL AND task IN ({','.join('?' * len(untyped))})",
+                          (agent, polled_at, *untyped))
             return self.json(200, {"db": kv_get("db_id"), "last": newest, "chat": chat,
                 "listed": listed_windows(agent, query.get("alive")),
                 # owner API 1.12: the standing session and the owner chat whose credential a key change revoked; the
@@ -68589,23 +68723,30 @@ class Handler(BaseHTTPRequestHandler):
             t = q1("SELECT * FROM tasks WHERE id=? AND owner=?", (tid, agent))
             if not t or t["state"] in TERMINAL or str(t["attempt"]) != str(attempt):
                 return self.json(409, {"error": "no such open task attempt of this agent"})
-            if shell_off(agent):
-                duty = read_row("SELECT servers FROM responsibilities WHERE id=?", (t["responsibility"],)) \
-                    if t["responsibility"] else None
-                if tool not in ((duty_tools(duty["servers"]) if duty else None) or []):
-                    log(agent, f"REFUSED a token request of {tool} for {tref(tid)}: its duty names no such server")
-                    return self.json(409, {"error": f"the duty of {tref(tid)} names no MCP server {tool}"})
-            c = case_row(t["duty_case"]) if t["duty_case"] else None
-            field = entry["mint"]["field"]
-            if field and not c:
-                return self.json(200, {"job": None})
-            body = {field: c["key"]} if field else {}
-            covering = report_covering(tid) if field else None
-            if covering:        # support plan F4: a covered ticket's session, whose own event has already ended
-                body["covered_by"] = covering
-            asking = report_asking(tid) if field and not covering else None
-            if asking:          # and a session that answers a question about a report of that ticket
-                body["asked_by"] = asking
+            asked = question_record(tid) if shell_off(agent) and not t["responsibility"] else None
+            if asked and tool in question_servers(agent):
+                # a colleague's question about one record (ask_team's record): a read-only token for that record,
+                # named by the person and the message of theirs that asks, which the service counts and limits
+                c, person = None, staff_question(tid)[1]
+                body = {entry["mint"]["field"]: asked["record"], "asked_by": f"P-{person['id']}/CM-{asked['message']}"}
+            else:
+                if shell_off(agent):
+                    duty = read_row("SELECT servers FROM responsibilities WHERE id=?", (t["responsibility"],)) \
+                        if t["responsibility"] else None
+                    if tool not in ((duty_tools(duty["servers"]) if duty else None) or []):
+                        log(agent, f"REFUSED a token request of {tool} for {tref(tid)}: its duty names no such server")
+                        return self.json(409, {"error": f"the duty of {tref(tid)} names no MCP server {tool}"})
+                c = case_row(t["duty_case"]) if t["duty_case"] else None
+                field = entry["mint"]["field"]
+                if field and not c:
+                    return self.json(200, {"job": None})
+                body = {field: c["key"]} if field else {}
+                covering = report_covering(tid) if field else None
+                if covering:        # support plan F4: a covered ticket's session, whose own event has already ended
+                    body["covered_by"] = covering
+                asking = report_asking(tid) if field and not covering else None
+                if asking:          # and a session that answers a question about a report of that ticket
+                    body["asked_by"] = asking
             jid = ins("INSERT INTO jobs(agent,task,kind,login,target,created,request_id,attempt,method,path,body,auth,"
                       "headers,timeout) VALUES(?,?,'request',?,?,?,?,?,'POST',?,?,'bearer','{}',NULL)",
                       (agent, tid, ref, f"mint:{tool}", now(), str(uuid.uuid4()), t["attempt"], entry["mint"]["path"],

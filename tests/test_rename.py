@@ -474,6 +474,7 @@ class Columns(unittest.TestCase):
         "lost:": "a task", "mcp_renew:": "an MCP server: the manager's notice that its access ended or ends soon",
         "name_told:": "a machine", "owner_pin:": "a machine", "park_ended:": "a reminder",
         "row_floor:": "a table", "screen_frozen:": "a task", "screen_limit:": "a task", "screen_question:": "a task",
+        "question_record:": "a task",
         "screen_restart:": "a task", "standing_told:": "a conversation", "start_failed:": "a task",
         "stuck_notice:": "a task", "team_plan:": "a team card (a Needs-you item)", "team_plan_job:": "a server job",
         "turn_ack:": "a task", "turn_checked:": "a task", "turn_empty:": "a task"}

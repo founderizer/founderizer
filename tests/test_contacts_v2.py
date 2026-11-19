@@ -1943,7 +1943,7 @@ class ShellOffRule(Base):
         text, error = hub.call_tool("studio", "ask_team", {"question": "And Ana?",
                                                            "messages": [hub.cm_ref(hello["id"])]}, self.context(cid))
         self.assertTrue(error, text)
-        self.assertIn("Each of messages must be one that Pat wrote in this conversation", text)
+        self.assertIn("Each of messages must be one that Pat or you wrote in this conversation", text)
         text, error = hub.call_tool("studio", "keep_instruction", {"words": "Hello", "scope": "agent",
                                                                 "source": hub.cm_ref(hello["id"])}, here)
         self.assertTrue(error, text)

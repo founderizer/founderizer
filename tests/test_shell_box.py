@@ -1171,6 +1171,82 @@ class Tools(Fleet):
                 hub.duty_fields({"servers": bad}, False)
 
 
+    def test_a_colleague_s_question_about_one_record_gets_a_read_only_token_for_that_record(self):
+        """The owner, 19 November 2026 ("Yes, build it" to item C of the review of a support agent's chat with a
+        colleague): the task of a colleague's question about one record gets a token for that record only, named by
+        the person and the message that asks, and its first start already names the server; it keeps no wish and
+        waits for nobody; a refused token tells the chat why; an id that no message of the ask writes, and a
+        customer's question, get no record."""
+        t0 = hub.now()
+
+        def chat(name, role, said):
+            pid = hub.ins("INSERT INTO people(name,role,added) VALUES(?,?,?)", (name, role, t0))
+            hub.q("INSERT INTO person_agents(person,agent,added) VALUES(?,'desk',?)", (pid, t0))
+            cid = hub.ins("INSERT INTO conversations(person,agent,account,chat,state,created,last) VALUES(?,'desk',"
+                          "'x',?,'open',?,?)", (pid, name, t0, t0))
+            ids = [hub.ins("INSERT INTO conversation_messages(conversation,who,text,created,read_at) VALUES(?,?,?,?,?)",
+                           (cid, who, text, t0, t0)) for who, text in said]
+            return pid, cid, ids
+
+        pat, cid, (mine, asks) = chat("Pat", "peer", [("agent", "TCK-20261119-000004 (a partner offer): a note is on "
+                                                                 "the ticket."),
+                                                        ("person", "could you share the ticket links? for next time")])
+        here = (hub.kv_get("db_id"), "conversation", cid)
+
+        def ask(where=here, **args):
+            return hub.call_tool("desk", "ask_team", dict({"question": "Pat wants the ticket's link."}, **args), where)
+
+        for args, refusal in (({"record": "TCK-1", "messages": [f"CM-{asks}"]}, "record must be written"),
+                              ({"record": "TCK-2026", "messages": [f"CM-{mine}", f"CM-{asks}"]},
+                               "record must be written"),         # a part of an id is no record
+                              ({"record": "TCK-20261119-000004", "messages": [f"CM-{mine}"]}, "record must be written"),
+                              ({"record": "a b", "messages": [f"CM-{asks}"]}, "record is the id of one record")):
+            with self.subTest(refusal):
+                text, error = ask(**args)
+                self.assertTrue(error, text)
+                self.assertIn(refusal, text)
+        text, error = ask(record="TCK-20261119-000004", messages=[f"CM-{mine}", f"CM-{asks}"])
+        self.assertFalse(error, text)
+        tid = hub.q1("SELECT id FROM tasks WHERE source_conversation=? AND source_message IS NULL", (cid,))["id"]
+        context = (hub.kv_get("db_id"), hub.tref(tid), 1)
+        # the first attempt's start event already names the server that reads records, and never the review's
+        event = json.loads(hub.q1("SELECT extra FROM events WHERE kind='task' AND task=? ORDER BY id", (tid,))["extra"])
+        self.assertEqual(event["shell_off"]["servers"], ["crm"])
+        again = hub.attempt_event(hub.q1("SELECT * FROM tasks WHERE id=?", (tid,)))[4]      # and a later attempt's
+        self.assertEqual(again["shell_off"]["servers"], ["crm"])
+        with patch.object(hub, "create_missing", lambda *a, **k: []):
+            code, answer = self.request("/helper/mint/desk", {"task": context[1], "attempt": 1, "tool": "crm"},
+                                        source=self.source("desk"))
+            self.assertEqual(code, 200, answer)
+            job = hub.q1("SELECT * FROM jobs WHERE id=?", (answer["job"],))
+            self.assertEqual(json.loads(job["body"]), {"ticketId": "TCK-20261119-000004",
+                                                       "asked_by": f"P-{pat}/CM-{asks}"})
+            code, answer = self.request("/helper/mint/desk", {"task": context[1], "attempt": 1, "tool": "crm-review"},
+                                        source=self.source("desk"))
+            self.assertEqual(code, 409, answer)
+        # it keeps no wish and waits for nobody: a stranger's text in the record steers neither
+        self.assertFalse(set(hub.SHELL_OFF_ASKED_TOOLS) & set(self.names("desk", context)))
+        text, error = hub.call_tool("desk", "message_agent", {"agent": "lead", "text": "Which store is it?",
+                                                              "waits": True, "request_id": str(uuid.uuid4())}, context)
+        self.assertTrue(error, text)
+        self.assertIn("reads no record", text)
+        # a refused token tells the chat why, in plain words
+        with hub.LOCK:
+            hub.mint_refused(job, 409)
+        self.assertIn("This question has no access to that record", hub.q1("SELECT what FROM tasks WHERE id=?",
+                                                                            (tid,))["what"])
+        # a customer's question, and a colleague's who has a list, name no record
+        _, other, (said,) = chat("Ana", "customer", [("person", "Where is TCK-20261119-000004?")])
+        listed, kept, (theirs,) = chat("Kim", "peer", [("person", "And TCK-20261119-000004?")])
+        hub.q("INSERT INTO person_scopes(person,agent,grants,updated) VALUES(?,'desk','{}',?)", (listed, t0))
+        for where, message, refusal in ((other, said, "record is for a colleague's question"),
+                                        (kept, theirs, "no tool named ask_team")):     # a list holds none
+            text, error = ask((hub.kv_get("db_id"), "conversation", where), record="TCK-20261119-000004",
+                              messages=[f"CM-{message}"])
+            self.assertTrue(error, text)
+            self.assertIn(refusal, text)
+            self.assertIsNone(hub.q1("SELECT id FROM tasks WHERE source_conversation=?", (where,)))
+
 class Cases(Fleet):
     """F2 and F5: a duty's pinned line check, one case and one session for each line."""
 
