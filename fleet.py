@@ -4740,6 +4740,9 @@ OUTPUT_DEPTH = 6                        # names below outputs/T-<id>/, the file'
 # give each later session there an instruction. A folder of that name is left out too: the rule is one for each name.
 OUTPUT_NAME = re.compile(r"(?!(?i:agents\.md)\Z)[A-Za-z0-9_][A-Za-z0-9._+-]{0,119}")
 OUTPUT_CAPTURES = "computer-use"
+# Python's cache, at any depth. Python writes it again at each import, so a copy on the configuration ref would be a
+# tracked file that changes in each checkout, and a checkout with a change stops the update at a task's start.
+OUTPUT_CACHE = "__pycache__"
 # Its last part ("or is AGENTS.md") is proposed, not approved: the result of a delivery names each file left out
 OUTPUT_BAD_NAME = ("its name has a character other than letters, digits and . _ + -, starts with one of . -, or is "
                    "AGENTS.md")
@@ -4747,8 +4750,8 @@ OUTPUT_BAD_NAME = ("its name has a character other than letters, digits and . _ 
 
 def collect_outputs(kit, ref):
     """([{path, data}], [{path, why}]) of outputs/<ref>/ in this checkout: its regular files in name order, each in
-    base64, inside the hub's limits. A name that starts with a dot (.DS_Store) is left out without a word; each other
-    file that is not sent is listed with why, and the result of the delivery says it."""
+    base64, inside the hub's limits. A name that starts with a dot (.DS_Store) and Python's cache folder are left out
+    without a word; each other file that is not sent is listed with why, and the result of the delivery says it."""
     root = os.path.join(kit, "outputs", ref)
     files, skipped, total = [], [], 0
     if os.path.islink(root) or not os.path.isdir(root):
@@ -4759,7 +4762,7 @@ def collect_outputs(kit, ref):
         keep = []
         for name in sorted(dirs):
             path = f"{rel}/{name}/"
-            if name.startswith(".") or (here == root and name == OUTPUT_CAPTURES):
+            if name.startswith(".") or name == OUTPUT_CACHE or (here == root and name == OUTPUT_CAPTURES):
                 continue
             why = ("a symbolic link" if os.path.islink(os.path.join(here, name)) else
                    OUTPUT_BAD_NAME if not OUTPUT_NAME.fullmatch(name) else

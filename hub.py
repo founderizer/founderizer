@@ -9485,6 +9485,8 @@ OUTPUTS_AGENTS_MD = re.compile(r"(?i)(?<=/)agents\.md(?=/|\Z)")
 # release before that rule, which still sends such a file.
 OUTPUTS_BAD_NAME = ("its name has a character other than letters, digits and . _ + -, starts with one of . -, or is "
                     "AGENTS.md")
+# Python's cache folder, at any depth: fleet.OUTPUT_CACHE, which a helper leaves out; this one is for an older helper.
+OUTPUTS_CACHE = "__pycache__"
 # Only in the hub's memory, as the MCP program checks are: each delivery that waits for its files. A restart ends the
 # call that waited, and the agent's deliver_result, which then failed, sends its files again.
 OUTPUTS = {}
@@ -24204,6 +24206,9 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
     default — an agent's knowledge write passes KNOWLEDGE_WRITE, which is knowledge/ without the owner's own files.
     check: called with the revision the commit is made on, once that revision is final; it raises to refuse the write
     (seen_check). The push is a fast-forward of that revision, so nothing can land between the check and the commit.
+    Each file goes in also when a .gitignore names it (git add -f): `allow` is the rule for the paths of a write, and
+    the published .gitignore is for the files that a running checkout makes. Without -f, git refused such a file and
+    the whole write with it: a task's output run.log, a skill's sample log, every try again the same.
 
     The hub writes the configuration ref and nothing else writes it, so a developer's push to the code branch cannot
     put origin ahead of the hub: that is what made every owner write answer 409 three times on 2026-10-16. Commits
@@ -24298,7 +24303,7 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
                                    text=True, timeout=60, stdin=subprocess.DEVNULL)
                 if r.returncode != 0 or tgit("checkout", "-q", rev)[0] != 0:
                     raise Refusal(500, "the hub could not prepare the change")
-                staged = True
+                staged, failed = True, None
                 for one, content in [(path, data), *(more or {}).items()]:
                     if content is None:
                         staged = staged and tgit("rm", "-q", "--", one)[0] == 0
@@ -24306,13 +24311,14 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
                         os.makedirs(os.path.dirname(os.path.join(tmp, "kit", one)), exist_ok=True)
                         with open(os.path.join(tmp, "kit", one), "wb") as f:
                             f.write(content)
-                        staged = staged and tgit("add", one)[0] == 0
+                        staged = staged and tgit("add", "-f", one)[0] == 0
+                    failed = failed or (None if staged else one)    # the refusal names the file that git refused
                 # The revision holds these bytes already: a push of this write that landed with no answer (a time
                 # limit), taken in above. No commit, so its next try after a KitFault ends well.
                 same = staged and tgit("diff", "--cached", "--quiet")[0] == 0
                 if not same:
                     if not staged or tgit("commit", "-q", "-m", message)[0] != 0:
-                        raise Refusal(500, f"the hub could not commit {path}")
+                        raise Refusal(500, f"the hub could not commit {failed or path}")
                     commit = tgit("rev-parse", "HEAD")[1]
                     if fleet:           # before the push: one that lands with no answer is the hub's own all the same
                         with area("quiet"):
@@ -69021,6 +69027,8 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             if not isinstance(path, str) or len(path) > 400 or not allow.match(path):
                 return self.json(400, {"error": f"{str(path)[:200]} is not a file of outputs/{ref}/"})
+            if OUTPUTS_CACHE in path.split("/")[2:-1]:
+                continue                    # Python's cache, from a helper of a release before it left it out
             if path.lower() in seen:        # two names that differ only in case are one file on a Mac
                 skipped.append({"path": path, "why": "another file has this name in other letter case"})
                 continue

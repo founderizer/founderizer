@@ -78,9 +78,13 @@ class HelperFiles(unittest.TestCase):
         self.assertEqual(base64.b64decode(files[1]["data"]), b"\x89PNG\r\n\x1a\nxx")
         self.assertEqual(skipped, [])
 
-    def test_the_screen_captures_and_dot_files_stay_without_a_word(self):
+    def test_the_screen_captures_dot_files_and_pythons_cache_stay_without_a_word(self):
+        """Python's cache at any depth: on the configuration ref it would be a tracked file that Python writes again
+        in each checkout, and a checkout with a change stops the update at a task's start."""
         write(self.kit, {"outputs/T-7/computer-use/capture-1.png": b"x", "outputs/T-7/.DS_Store": b"x",
-                         "outputs/T-7/.hidden/x.md": "x", "outputs/T-7/sub/computer-use/kept.md": "x"})
+                         "outputs/T-7/.hidden/x.md": "x", "outputs/T-7/sub/computer-use/kept.md": "x",
+                         "outputs/T-7/__pycache__/tool.cpython-312.pyc": b"\x00",
+                         "outputs/T-7/sub/__pycache__/a.pyc": b"\x00"})
         # only the folder of the task itself is Fleet's: one deeper down is the agent's own
         self.assertEqual(self.collect(), (["outputs/T-7/sub/computer-use/kept.md"], {}))
 
@@ -205,7 +209,8 @@ class Delivery(OwnerAPI):
         super().setUp()
         hub.TEAM = json.loads(json.dumps(TEAM))
         self.root = Path(tempfile.mkdtemp(prefix="fleet-outputs-"))
-        self.kit = repository(self.root, {"team.json": json.dumps(TEAM, indent=2) + "\n", "RULES.md": "# Rules\n",
+        self.kit = repository(self.root, {".gitignore": "*.log\n__pycache__/\n",    # as the published one
+                                          "team.json": json.dumps(TEAM, indent=2) + "\n", "RULES.md": "# Rules\n",
                                           "hub.py": "# the hub\n"})
         hub.CFG["team_path"] = str(self.kit / "team.json")
         hub._revision_cache.update(at=0.0, value=None)
@@ -259,22 +264,25 @@ class Delivery(OwnerAPI):
         return git(*args, cwd=self.root / "origin.git")
 
     def test_the_files_are_committed_by_the_agent_before_the_task_closes(self):
-        write(self.checkout, {f"outputs/{self.ref}/report.md": "# Report\n",
+        """Also a file that .gitignore names (run.log): before, git refused it, and the whole delivery with it."""
+        write(self.checkout, {f"outputs/{self.ref}/report.md": "# Report\n", f"outputs/{self.ref}/run.log": "ok\n",
                               f"outputs/{self.ref}/computer-use/capture-1.png": b"x", "RULES.md": "changed"})
         self.helper()
         text, error = self.deliver()
         self.assertFalse(error, text)
         commit = self.origin("rev-parse", hub.CONFIG_BRANCH)
+        files = f"outputs/{self.ref}/report.md, outputs/{self.ref}/run.log"
         self.assertEqual(text, f"Delivered. {self.ref} is completed. Its files are on the configuration ref as "
-                               f"{commit[:12]}: outputs/{self.ref}/report.md. You are done with it: stop now and end your turn; your session closes when it ends.")
+                               f"{commit[:12]}: {files}. You are done with it: stop now and end your turn; your session closes when it ends.")
         self.assertEqual(self.origin("ls-tree", "-r", "--name-only", hub.CONFIG_BRANCH).split(),
-                         ["RULES.md", "hub.py", f"outputs/{self.ref}/report.md", "team.json"])
+                         [".gitignore", "RULES.md", "hub.py", f"outputs/{self.ref}/report.md",
+                          f"outputs/{self.ref}/run.log", "team.json"])
         self.assertEqual(self.origin("show", f"{hub.CONFIG_BRANCH}:outputs/{self.ref}/report.md"), "# Report")
         self.assertEqual(self.origin("log", "-1", "--format=%an", hub.CONFIG_BRANCH), "Fleet agent vps")
         self.assertEqual(git("rev-parse", "HEAD", cwd=self.kit), commit)        # the hub checkout took it in
         said = hub.q1("SELECT text FROM events WHERE agent='manager' AND kind='say' ORDER BY id DESC LIMIT 1")["text"]
         self.assertIn(f"Output: outputs/{self.ref}/report.md. Its files are on the configuration ref as "
-                      f"{commit[:12]}: outputs/{self.ref}/report.md. Checked: Read it back.", said)
+                      f"{commit[:12]}: {files}. Checked: Read it back.", said)
         self.assertEqual(hub.q1("SELECT state FROM tasks WHERE id=?", (self.task,))["state"], "completed")
         self.assertEqual(self.answers, [(200, {"taken": True})])
 
@@ -412,12 +420,14 @@ class Delivery(OwnerAPI):
     def test_an_older_helpers_agents_md_stays_out_with_its_reason(self):
         """The AI providers build (spec 3.11 item 9; the wave 1 review, R3): the hub takes no file or folder AGENTS.md
         of an output, in any case of its letters, also from a helper of a release before its own rule. Such a file
-        stays out with the helper's own reason, and the other files of the delivery go in."""
+        stays out with the helper's own reason, and the other files of the delivery go in. Python's cache folder, at
+        any depth, stays out without a word, as a helper of this release leaves it out."""
         token = "t" * 22
         hub.OUTPUTS[token] = {"agent": "vps", "task": self.task, "answer": None, "gave_up": False, "late": False}
         self.addCleanup(hub.OUTPUTS.pop, token, None)
         names = [f"outputs/{self.ref}/{name}" for name in ("AGENTS.md", "notes/agents.md", "Agents.MD/plan.md",
-                                                            "report.md", "agents.md.txt")]
+                                                            "report.md", "agents.md.txt", "__pycache__/a.pyc",
+                                                            "sub/__pycache__/b.pyc")]
         code, data = self.request("/helper/outputs/vps", {"outputs": token, "task": self.ref,
                                                           "files": [{"path": n, "data": "eA=="} for n in names]},
                                   source=VPS)
@@ -426,7 +436,7 @@ class Delivery(OwnerAPI):
         self.assertEqual(sorted(answer["files"]), [f"outputs/{self.ref}/agents.md.txt", f"outputs/{self.ref}/report.md"])
         self.assertEqual(answer["skipped"], [{"path": n, "why": fleet.OUTPUT_BAD_NAME} for n in names[:3]])
         allow = hub.outputs_allow(self.ref)
-        self.assertEqual([bool(allow.match(n)) for n in names], [False, False, False, True, True])
+        self.assertEqual([bool(allow.match(n)) for n in names], [False, False, False, True, True, True, True])
         hub.OUTPUTS[token].update(answer=None)
         code, data = self.request("/helper/outputs/vps", {"outputs": token, "task": self.ref,
                                                           "files": [{"path": f"outputs/{self.ref}/../AGENTS.md",

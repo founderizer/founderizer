@@ -1976,8 +1976,10 @@ def give_way_to(kit, target, run=None):
     """Make room for a fast-forward to `target`: a file of outputs/ that this checkout holds untracked and that
     `target` adds with the same bytes is removed, and the merge brings it back tracked. It is one that the hub took
     in from here, a task's output that this helper sent when its agent delivered (helper feature task_outputs). A
-    file with other bytes stays, and the merge then says why it cannot. Every fast-forward of a checkout that
-    delivers goes through this: the task-start sync (follow_config_ref) and the Fleet update (Lifecycle.apply)."""
+    file with other bytes stays, and the merge then says why it cannot; but a name that .gitignore names (run.log)
+    is one that git writes over without a word, so the delivered bytes take its place. Every fast-forward of a
+    checkout that delivers goes through this: the task-start sync (follow_config_ref) and the Fleet update
+    (Lifecycle.apply)."""
     run = run or _run
 
     def git(*args):
