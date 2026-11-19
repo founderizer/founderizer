@@ -539,7 +539,7 @@ host.
   A second run changes nothing. `--egress off` takes the table first, then the rules file, the gate, its units, the
   drop-ins and the closures.
 - **A gate that does not run.** The table stays (`agent-outgoing-connections-proposal.md`, section 5.4): an agent's DNS
-  and TCP fail at once, and the hub still answers. Nothing falls back to a direct connection, because a gap with no
+  and TCP fail at once, and the hub and each other Tailscale machine still answer. Nothing falls back to a direct connection, because a gap with no
   table would let an agent open a connection that it keeps after the gate is back. The unit starts the gate again in 2
   seconds; a new program comes by the hand-over with no cut, and one that does not start is not taken; at a cold start
   the launcher runs the installed program, or the safe copy when that program fails its start check. The unit's
@@ -568,7 +568,11 @@ host.
   and so does the swap proxy on `127.0.0.1:876`, and an agent's connection to its own browser's DevTools port on the
   loopback address (`/etc/fleet-browser/ports`): the browsers' own table lets that port reach only its own agent's
   user, by that user's UID, which a connection through the gate would not keep; another agent's connection to it goes
-  through the gate, which records it. Each DNS
+  through the gate, which records it. A TCP connection to another Tailscale machine goes direct too, and the gate
+  does not record it: Tailscale's own rule drops each packet from its IPv4 range that does not come in on
+  `tailscale0`, which each answer of the gate to an agent did (19 November 2026: until this line, no agent reached
+  the door). This machine's own Tailscale address, tailscaled's own address `100.100.100.100` and Tailscale's IPv6
+  range, which has no such rule, stay with the gate. Each DNS
   question, to any name server, goes to the gate's resolver; each other TCP connection goes to the gate; every other
   packet of an agent user is refused (UDP other than DNS, ICMP). Each packet of a sub-uid of an agent user
   (`/etc/subuid`) is refused: `newuidmap` can give a process of the agent such a UID in a user namespace of its own,

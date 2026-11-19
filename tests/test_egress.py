@@ -499,6 +499,22 @@ class Texts(unittest.TestCase):
         # A packet that no user's socket makes (the kernel's own) meets no rule of a user: no "!=" test of a set,
         # which would not match it and would send it on to a refusal
         self.assertNotIn("!= @", text)
+        # A TCP connection to another Tailscale machine goes direct, because Tailscale's own rule drops each answer of
+        # the gate from its IPv4 range (19 November 2026: no agent reached the door): after the redirect of DNS, so
+        # that each question still reaches the gate's resolver; only by Tailscale's interface, so that this
+        # machine's own address keeps the gate's local port and a cloud's own service in that range keeps the gate;
+        # never to tailscaled's own address; and the kernel lets it through. Tailscale has no such rule for its IPv6
+        # range, which stays with the gate.
+        nat = text[text.index("chain agent_nat"):text.index("chain filter_out")]
+        out = text[text.index("chain agent_out"):text.index("chain sub_out")]
+        direct = 'ip daddr 100.64.0.0/10 ip daddr != 100.100.100.100 oifname "tailscale0" meta l4proto tcp'
+        self.assertIn(f"{direct} return", nat)
+        self.assertIn(f"{direct} accept", out)
+        self.assertEqual((nat.count("100.64.0.0/10"), out.count("100.64.0.0/10")), (1, 1))
+        self.assertLess(nat.index("th dport 53 redirect"), nat.index(direct))
+        self.assertLess(nat.index(direct), nat.index("redirect to :877"))
+        self.assertLess(out.index(direct), out.index("meta l4proto tcp reject with tcp reset"))
+        self.assertNotIn("fd7a:115c:a1e0", text)
 
     def test_a_load_is_the_whole_table_with_the_elements_of_its_sets(self):
         folder = tempfile.mkdtemp(prefix="egress-elements-")
@@ -788,7 +804,7 @@ class ConfigureEgress(unittest.TestCase):
         self.program = os.path.join(folder, "vault.py")
         Path(self.program).write_text("# the installed program\n")
 
-    def test_on_starts_the_gate_before_the_table_and_a_second_run_changes_nothing(self):
+    def test_on_starts_the_gate_first_a_second_run_changes_nothing_and_a_new_text_loads_with_no_restart(self):
         machine = Machine()
         (changes, answer), loads = self.step(machine)
         self.assertEqual(changes, ["the gate's user", "the gate's files", "the gate", "the kernel rules",
@@ -804,6 +820,21 @@ class ConfigureEgress(unittest.TestCase):
         self.assertIn(vault.EGRESS_SAFE, machine.files)
         (changes, answer), loads = self.step(machine)
         self.assertEqual((changes, answer["egress_state"], loads), ([], "there", []))
+        # A later program's new table text of the same version (19 November 2026: the Tailscale range), on a machine
+        # whose gate and swap proxy run: the step finds it by its file's hash and says so, then writes and loads it,
+        # and restarts neither the gate nor the swap proxy, whose restart would cut each open tunnel
+        machine.files[vault.EGRESS_RULES] = "0" * 64
+        machine.state.update(eswap="active", eswap_at="100", eprogram_at="200")
+        (changes, answer), loads = self.step(machine, check=True)
+        self.assertEqual((changes, answer["egress_state"], loads),
+                         (["the gate's files", "the kernel rules"], "would make", []))
+        before = len(machine.ran)
+        (changes, answer), loads = self.step(machine)
+        self.assertEqual((changes, answer["egress_state"], len(loads)),
+                         (["the gate's files", "the kernel rules"], "made", 1))
+        later = "\n".join(machine.ran[before:])
+        self.assertIn(f"mv -f {vault.EGRESS_RULES}.new {vault.EGRESS_RULES}\n", later)
+        self.assertNotIn("systemctl restart", later)
 
     def test_a_gate_that_does_not_start_leaves_no_table_no_rules_file_and_no_rules_unit(self):
         machine = Machine()

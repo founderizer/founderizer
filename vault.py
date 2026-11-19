@@ -4159,7 +4159,11 @@ WantedBy=multi-user.target
 # the proposal's section 8.
 
 EGRESS_KEY = 1                              # the format of EGRESS_CONF
-EGRESS_TABLE = 1                            # the version of the table's text that this program writes and reads
+EGRESS_TABLE = 1                            # the version of the table's text that this program writes and reads: a
+# new version when the gate must serve a table in a new way. The direct lines of the Tailscale range (19 November
+# 2026) changed no port and no set of the gate, so they kept version 1: the root step finds the new text by its
+# file's hash, and a version 2 would also have made it restart a swap proxy that started before its program changed
+# (swap_again), which cuts that proxy's tunnels.
 EGRESS_POLICY = 1                           # the version of the policy that this program takes
 EGRESS_LIB = "/usr/local/lib/founderizer-egress"
 EGRESS_SAFE = EGRESS_LIB + "/vault.py"      # this program as it was at the last root step: what the launcher runs
@@ -4258,6 +4262,9 @@ EGRESS_DAEMONS = ("/run/docker.sock", "/var/snap/lxd/common/lxd/unix.socket", "/
 # a process of an agent user that still has the group (its user manager, a tmux) loses it only at its next login, so
 # a named user's entry with no right on the socket ends its use at once (a named user's entry decides before a
 # group's)
+# Tailscale's interface, its IPv4 range, and its own address on this machine (tailscaled's resolver and web
+# interface), for the one direct line of the Tailscale range (egress_table)
+EGRESS_TAILSCALE = {"interface": "tailscale0", "range": "100.64.0.0/10", "own": "100.100.100.100"}
 EGRESS_CLASSES = (                          # for the records: the kinds of address that are never the open internet
     ("metadata", ("169.254.169.254/32", "fd00:ec2::254/128")),
     ("link-local", ("169.254.0.0/16", "fe80::/10")),
@@ -4311,10 +4318,10 @@ def egress_table(conf=None):
       or to its own browser's DevTools port on the loopback address (the set browser, of each agent user and its port:
       the browsers' own table lets that port reach only its own agent's user, so the connection must keep that user's
       UID, and another agent's connection to it goes through the gate, which records it) goes on as it is; each DNS
-      question (UDP or TCP to port 53, to any name server) goes to the gate's resolver; each TCP connection to an
-      address of this machine goes to the gate's local port, and every other one to its port. The chain's priority is
-      one before dstnat, so that a NAT rule of another table (Docker's published ports) does not take an agent's
-      connection first.
+      question (UDP or TCP to port 53, to any name server) goes to the gate's resolver; a TCP connection to another
+      Tailscale machine goes on as it is (below); each TCP connection to an address of this machine goes to the
+      gate's local port, and every other one to its port. The chain's priority is one before dstnat, so that a NAT
+      rule of another table (Docker's published ports) does not take an agent's connection first.
     - agent_out: a flow that is open goes on (the first install cuts nothing, and an agent's listener answers).
       Every other first packet of an agent user is refused, but those that the kernel sent to the gate and those that
       go direct: so UDP other than DNS, ICMP and each other protocol are refused, with words that the program sees.
@@ -4325,8 +4332,27 @@ def egress_table(conf=None):
 
     Two limits for each agent user, in the kernel, so that one agent's flood of new connections or DNS questions
     never reaches the gate as more than its share: past them a new TCP connection gets a reset and a question is
-    dropped (EGRESS_NEW_RATE, EGRESS_DNS_RATE)."""
+    dropped (EGRESS_NEW_RATE, EGRESS_DNS_RATE).
+
+    A TCP connection to another Tailscale machine goes direct (EGRESS_TAILSCALE), because the gate cannot answer for
+    it. Tailscale's own rule (its chain ts-input, at the input hook) drops each packet from its IPv4 range that does
+    not come in on tailscale0, but this machine's own address on the loopback interface; and the kernel gives an
+    agent each packet of the gate from the address that the agent asked for, on the loopback interface. So an
+    agent's connection to another Tailscale machine did not open: each answer of the gate was dropped, and the
+    program waited until its own time limit (19 November 2026: from the first table on, no agent reached the door,
+    and the counter of that rule rose with each try). The line takes only an address of that range whose route
+    leaves through tailscale0: not this machine's own address (its route is the loopback interface, and the gate's
+    local port keeps it), not an address of that range on another network (a cloud's own services), and not
+    tailscaled's own IPv4 address, whose services are tailscaled's as its socket is (the closures): a connection
+    there still goes to the gate, and waits until the program's own time limit, as the door's did. The gate does not
+    record a direct connection. A DNS question to a name server in that range still goes to the gate's resolver, whose
+    answer that rule drops: so a machine whose resolv.conf names one (tailscaled's 100.100.100.100, or a cloud's)
+    loses its agents' DNS, an open hole that the proposal's section 16.9 names; a server that asks 127.0.0.53 does
+    not. Tailscale 1.104 has no such rule for IPv6, so the gate records an agent's connections to Tailscale's IPv6
+    range as to any other host."""
     p = EGRESS_PORTS
+    ts = EGRESS_TAILSCALE
+    tailscale = f'ip daddr {ts["range"]} ip daddr != {ts["own"]} oifname "{ts["interface"]}"'
     return f"""# founderizer-egress table {EGRESS_TABLE}
 # The outgoing gate's kernel rules (vault.py, "the outgoing gate"). Root's: `vault.py configure --egress on` writes
 # this file, and the unit {EGRESS_RULES_SERVICE} loads it with the elements of its sets. Do not edit it.
@@ -4353,6 +4379,7 @@ table inet founderizer_egress {{
     ip daddr 127.0.0.1 meta skuid . tcp dport @browser return
     ip6 daddr ::1 meta skuid . tcp dport @browser return
     meta l4proto {{ udp, tcp }} th dport 53 redirect to :{p["dns"]}
+    {tailscale} meta l4proto tcp return
     fib daddr type local meta l4proto tcp redirect to :{p["local"]}
     meta l4proto tcp redirect to :{p["out"]}
   }}
@@ -4372,6 +4399,7 @@ table inet founderizer_egress {{
     ip daddr 127.0.0.1 tcp dport {SWAP_PORT} accept
     ip daddr 127.0.0.1 meta skuid . tcp dport @browser accept
     ip6 daddr ::1 meta skuid . tcp dport @browser accept
+    {tailscale} meta l4proto tcp accept
     ct status dnat ip daddr 127.0.0.1 meta l4proto {{ tcp, udp }} th dport {{ {p["out"]}, {p["local"]}, {p["dns"]} }} accept
     ct status dnat ip6 daddr ::1 meta l4proto {{ tcp, udp }} th dport {{ {p["out"]}, {p["local"]}, {p["dns"]} }} accept
     meta l4proto tcp reject with tcp reset
@@ -6856,7 +6884,8 @@ def configure_egress(egress, check, run, broker, settle, rules=None, close=None)
         int(before.get("eswap_at") or 0) < int(before.get("eprogram_at") or 0)
     changes = [name for name, needed in (("the gate's user", before.get("euser") != "yes"),
                                          ("the gate's files", bool(new_files)), ("the gate", gate_again),
-                                         ("the kernel rules", table_new), ("the rules' unit", path_again),
+                                         ("the kernel rules", table_new or EGRESS_RULES in new_files),
+                                         ("the rules' unit", path_again),
                                          ("the swap proxy", swap_again)) if needed]
     if check or not changes:
         return changes, dict(state, egress_state="would make" if changes else "there")

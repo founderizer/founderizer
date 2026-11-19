@@ -7,7 +7,8 @@ starts a container and installs packages, and no ordinary test run does that.
 Inside the container, as on a server: the real table from `vault.py egress-rules` (root, from the safe copy), the real
 gate (`vault.py egress`) as founderizer-egress with the right to its low ports, an agent user (fleet-alpha), another
 user (other), the service user (fleet) and the swap proxy's user (founderizer-swap). A network namespace "world"
-behind a veth pair plays the internet: a site, another host, a stand-in hub, a name server and an IPv6 host. It
+behind a veth pair plays the internet: a site, another host, a stand-in hub, a name server and an IPv6 host; a
+second veth pair, named tailscale0 on this side, plays another Tailscale machine with a stand-in door. It
 proves, in the order of the probe of 13 November 2026 (P1 to P12) and of the proposal's section 10:
 
   a user that is no agent is not touched, and the gate counts nothing of it;
@@ -17,6 +18,10 @@ proves, in the order of the probe of 13 November 2026 (P1 to P12) and of the pro
   UDP other than DNS and ping of an agent are refused by the kernel, the same of another user pass;
   the hub's address and port go direct, also while the gate is down, and the agent's other connections then fail
   at once;
+  an agent's TCP connection to another Tailscale machine (the door) goes direct over IPv4, because Tailscale's own
+  rule (played here, as Tailscale 1.104 writes it) drops each answer of the gate from its IPv4 range, while this
+  machine's own Tailscale address still goes through the gate's local port, and Tailscale's IPv6 range, which has
+  no such rule, through the gate with its record;
   an agent's connection to its own browser's DevTools port goes direct, with its own UID, which the browsers' table
   reads; and a process with a sub-uid of the agent, as newuidmap gives one in a user namespace, is refused;
   the relay port takes the swap proxy's CONNECT with the agent's UID and nobody else's, and the kernel refuses the
@@ -27,10 +32,12 @@ proves, in the order of the probe of 13 November 2026 (P1 to P12) and of the pro
   ends of a program that nobody asked for (the unit's ExecStopPost, played here), the launcher runs the safe copy
   too.
 
-All names and addresses are made up (the documentation ranges). Nothing is written outside the container, which is
-removed at the end."""
+All names and addresses are made up (the documentation ranges, and Tailscale's own ranges for its part). Nothing is
+written outside the container, which is removed at the end."""
+import ipaddress
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -120,6 +127,18 @@ class Kernel(unittest.TestCase):
         self.assertEqual(self.got["P11 hub, gate down"], "the page of hub")
         self.assertTrue(self.got["P11 site fails at once, gate down"])
         self.assertEqual(self.got["P12 cgroup"], "0::/")
+
+    def test_an_agent_reaches_another_tailscale_machine_whose_answers_tailscales_own_rule_would_drop(self):
+        """An agent reaches another Tailscale machine over IPv4 (19 November 2026: through the gate, no agent reached
+        the door, as Tailscale's rule dropped each answer of the gate), and that rule drops nothing of it; the gate
+        has no row of that connection, and keeps its rows of this machine's own Tailscale address (its local port)
+        and of Tailscale's IPv6 range, where Tailscale has no such rule."""
+        self.assertEqual(self.got["tailnet: the door"], "the page of door", self.log)
+        self.assertEqual(self.got["tailnet: drops of Tailscale's rule"], [0], self.log)
+        self.assertEqual(self.got["tailnet: the door over IPv6"], "the page of door", self.log)
+        self.assertEqual(self.got["tailnet: this machine's own address"], "other's server", self.log)
+        self.assertEqual(self.got["tailnet rows"],
+                         [["100.64.0.1", 9003, "local"], ["fd7a:115c:a1e0::7", 8766, "fleet"]])
 
     def test_the_table_loads_before_the_gate_serves_and_root_s_file_names_it(self):
         self.assertEqual(self.got["rules"], "loaded", self.log)
@@ -252,6 +271,16 @@ def table_of(text):
         return text.strip()[-300:]
 
 
+def tailnet(host):
+    """True for an address in Tailscale's ranges; a row's host is a name or an address."""
+    try:
+        a = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(a in net for net in map(ipaddress.ip_network, ("100.64.0.0/10", "fd7a:115c:a1e0::/48"))
+               if net.version == a.version)
+
+
 def inside():
     sys.path.insert(0, "/kit")
     import vault
@@ -277,7 +306,26 @@ ip netns exec world sh -c 'ip addr add 10.99.0.2/24 dev v1; ip link set v1 up; i
 ip route add 198.51.100.0/24 via 10.99.0.2
 ip -6 addr add 2001:db8:99::1/64 dev v0 nodad
 ip netns exec world ip -6 addr add 2001:db8:99::2/64 dev v1 nodad
-for n in site other hub six; do mkdir -p /srv/$n; echo "the page of $n" > /srv/$n/index.html; done
+# Tailscale's interface, and its rule as Tailscale 1.104 writes it (its chain ts-input): a packet from its IPv4 range
+# that does not come in on tailscale0 is dropped, but this machine's own address on the loopback interface. It has
+# no such rule for IPv6.
+ip link add tailscale0 type veth peer name t1
+ip link set t1 netns world
+ip addr add 100.64.0.1/24 dev tailscale0 && ip -6 addr add fd7a:115c:a1e0::1/64 dev tailscale0 nodad
+ip link set tailscale0 up
+ip netns exec world sh -c 'set -e; ip addr add 100.64.0.7/24 dev t1; ip -6 addr add fd7a:115c:a1e0::7/64 dev t1 nodad
+  ip link set t1 up'
+nft -f - <<'EOF'
+table ip tailscale_rule {
+  chain input {
+    type filter hook input priority 0; policy accept;
+    ip saddr 100.64.0.1 iifname "lo" accept
+    iifname "tailscale0" accept
+    ip saddr 100.64.0.0/10 iifname != "tailscale0" counter drop
+  }
+}
+EOF
+for n in site other hub six door; do mkdir -p /srv/$n; echo "the page of $n" > /srv/$n/index.html; done
 head -c 40000000 /dev/zero > /srv/site/big
 mkdir -p /srv/a /srv/o /srv/b /etc/fleet-browser; echo "alpha's own server" > /srv/a/index.html
 echo "other's server" > /srv/o/index.html; echo "alpha's browser" > /srv/b/index.html
@@ -299,6 +347,11 @@ openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=site.example.test -keyout /s
         f"{world} -m http.server 8765 --bind 198.51.100.9 --directory /srv/hub",
         f"{world} -m http.server 80 --bind 2001:db8:99::2 --directory /srv/six",
         f"ip netns exec world {program(WORLD_DNS)}",
+        # the door on another Tailscale machine; another user's server on this machine's own Tailscale address
+        f"{world} -m http.server 8766 --bind 100.64.0.7 --directory /srv/door",
+        f"{world} -m http.server 8766 --bind fd7a:115c:a1e0::7 --directory /srv/door",
+        "setpriv --reuid=2500 --regid=2500 --clear-groups python3 -m http.server 9003 --bind 100.64.0.1 --directory "
+        "/srv/o",
         f"{world} -c \"import http.server, ssl; s = http.server.ThreadingHTTPServer(('198.51.100.7', 443), "
         f"lambda *a: http.server.SimpleHTTPRequestHandler(*a, directory='/srv/site')); c = ssl.SSLContext("
         f"ssl.PROTOCOL_TLS_SERVER); c.load_cert_chain('/srv/cert.pem', '/srv/key.pem'); "
@@ -430,6 +483,12 @@ openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=site.example.test -keyout /s
     got["P10 other direct"] = as_user("other", "curl -sS -m 5 -g 'http://[2001:db8:99::2]/' 2>&1").stdout.strip()
     got["P10 ipv6 through the gate, loopback"] = out("fleet-alpha", f"{curl} -g 'http://[::1]:9002/'")
     got["P11 hub up"] = out("fleet-alpha", f"{curl} http://198.51.100.9:8765/")
+    # another Tailscale machine: direct, because Tailscale's own rule drops each answer of the gate from its IPv4 range
+    got["tailnet: the door"] = out("fleet-alpha", f"{curl} http://100.64.0.7:8766/")
+    got["tailnet: the door over IPv6"] = out("fleet-alpha", f"{curl} -g 'http://[fd7a:115c:a1e0::7]:8766/'")
+    got["tailnet: this machine's own address"] = out("fleet-alpha", f"{curl} http://100.64.0.1:9003/")
+    got["tailnet: drops of Tailscale's rule"] = [int(n) for n in re.findall(
+        r"packets (\d+)", sh("nft list table ip tailscale_rule").stdout)]
     got["P14 alpha's own browser"] = out("fleet-alpha", f"{curl} http://127.0.0.1:9301/")
     got["P14 browser set"] = sh("nft list set inet founderizer_egress browser").stdout
     for uid, key in ((600007, "P15 a sub-uid of alpha"), (900007, "P15 the same with another uid")):
@@ -474,6 +533,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=site.example.test -keyout /s
     got["P1 rows of other"] = sum(1 for r in rows if r["uid"] == 2500)
     got["rows of alpha"] = sorted({(r["host"], r["port"], r["how"]) for r in rows if r["uid"] == 2001})
     got["local rows"] = sorted({(r["host"], r["port"], r["cls"]) for r in rows if r["cls"] == "local"})
+    got["tailnet rows"] = sorted({(r["host"], r["port"], r["cls"]) for r in rows if tailnet(r["host"])})
     got["bytes down of the http row"] = sum(r["down"] for r in rows if r["port"] == 80 and r["how"] == "host")
     # a hand-over during a download: the installed program changes, the service user's word, the new process
     pid_before = gate.pid
