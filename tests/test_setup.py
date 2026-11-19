@@ -537,6 +537,26 @@ class Helper(unittest.TestCase):
         life = self.life(conf={"runtime": "claude"})
         self.assertEqual(browser(life), ("failed", "Claude's extension is not in Chrome on this Mac: restart Chrome, "
                                                    "then press Enable Extension."))
+        self.connected = True           # a Mac that reads no extension stays failed: that Chrome may be another Mac's
+        self.assertEqual(browser(life)[0], "failed")
+        # macOS 27 refuses a list of Chrome's folder, so the extension is not known: a Chrome that answers Claude
+        # Code's account is the extension at work, and one that does not gets the account to sign in with.
+        with patch.object(lifecycle, "chrome_hidden", lambda home: True):
+            self.assertEqual(browser(life), ("ok", "Google Chrome is installed, and the session is ready."))
+            self.connected = None           # nobody read the link here
+            self.assertEqual(browser(life), ("failed", "macOS does not let Fleet read Chrome's folder on this Mac, and "
+                                                       "no reading of Claude Code's browser link was made here."))
+            self.connected = False
+            self.assertEqual(browser(life), ("failed", "Claude's extension is not signed in: sign in to Claude in "
+                                                       "Chrome on this Mac, with this Mac's account. If Chrome has no "
+                                                       "Claude extension, add it from the Chrome Web Store first."))
+            with patch.object(lifecycle, "claude_account", lambda run, exe: {"email": "agent@example.com",
+                                                                             "org": None}):
+                self.assertEqual(browser(life), ("failed", "Claude's extension is not linked to Claude Code: in Chrome "
+                                                           "on this Mac, sign it in as agent@example.com. If Chrome has "
+                                                           "no Claude extension, add it from the Chrome Web Store "
+                                                           "first."))
+        self.connected = None
         profile(None)
         self.assertEqual(browser(life)[0], "failed")
         profile({"disable_reasons": [8192]})    # what Chrome 156 wrote for an extension that waits for its first press

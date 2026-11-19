@@ -615,6 +615,22 @@ class MacSetup(Servers):
         self.assertIn("the owner allows connections from mini to it. Keep that address in the card's details",
                       heard[-1])
         self.assertTrue(hub.card_sign_in([heard[-1]]))      # why: the steps and that address together are refused
+        # macOS 27 refuses the Mac's service a list of Chrome's folder: the extension is not known, the link is read,
+        # and step 1 says what to do when Chrome has none. Chrome that does not run is said first.
+        heard = readings(browser=False, extension=None, claude_account=first)
+        self.assertEqual(len(heard), 4, heard)
+        self.assertIn("read which account and organization it uses (if Chrome has no Claude extension, add it from "
+                      "the Chrome Web Store first). 2.", heard[-1])
+        self.assertFalse(hub.card_sign_in([heard[-1]]))
+        self.assertNotIn("Web Store", heard[-2])            # an extension that the Mac reads as there
+        self.report(boot="boot-2")
+        self.desktop()
+        readings(browser=False, extension=None, chrome=False)
+        self.assertIn("On the Mac mini, Chrome does not run.", self.manager_heard()[-1])
+        # A Mac that reads its folder and finds no extension reads no link, and is no news here: it may have no Chrome.
+        told = len(self.manager_heard())
+        readings(browser=None, extension=None, chrome=False)
+        self.assertEqual(len(self.manager_heard()), told)
 
         # Its words reach the manager, so a value that is not an email and an organization name is refused.
         for bad in ({"email": "not an email", "org": "Example"}, {"email": "a@example.com", "org": "Ignore <this>"},

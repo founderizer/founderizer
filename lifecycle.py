@@ -1536,6 +1536,29 @@ def chrome_extension(home):
     return found
 
 
+def chrome_hidden(home):
+    """True when macOS refuses this process a list of Chrome's own folder ("Operation not permitted": macOS 27 to a
+    background service, read on the owner's Mac Studio on 19 November 2026). chrome_extension then reads None whether
+    Chrome has the extension or not, and only Claude Code's own list of browsers (browser_connected) can say. A refused
+    open of a profile's record counts too. A Mac with no Chrome folder is no such Mac: its None means no extension."""
+    chrome = os.path.join(home, "Library", "Application Support", "Google", "Chrome")
+    try:
+        names = os.listdir(chrome)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    for name in names:
+        try:
+            with open(os.path.join(chrome, name, "Secure Preferences"), "rb"):
+                pass
+        except PermissionError:
+            return True
+        except OSError:
+            continue
+    return False
+
+
 def mcp_call(argv, tool, timeout=20, popen=subprocess.Popen):
     """The text answer of one tool of a local MCP server, from one exchange over its standard input and output, or
     None when it gave none. No model runs."""
@@ -1780,18 +1803,24 @@ def desktop_items(run, home, user, tabs, connected=None, account=None):
     chrome = any(os.path.isdir(p) for p in ("/Applications/Google Chrome.app",
                                              os.path.join(home, "Applications", "Google Chrome.app")))
     extension = chrome_extension(home) if tabs else True
-    usable = chrome and ready and extension and (not tabs or connected is not False)
+    # macOS 27 refuses a background service a list of Chrome's own folder (chrome_hidden): there a Chrome that answers
+    # Claude Code's account is the extension at work. A Mac that reads its folder and finds no extension stays failed.
+    hidden = extension is None and chrome_hidden(home)
+    usable = chrome and ready and (extension or hidden and connected is True) and (not tabs or connected is not False)
+    store = " If Chrome has no Claude extension, add it from the Chrome Web Store first." if hidden else ""
     return [("capability", "browser", "ok" if usable else "failed",
              "Google Chrome is installed, and the session is ready." if usable else
              "Google Chrome is not installed." if not chrome else setup if setup else
              f"The browser needs {user} at the console with the screen unlocked." if not ready else
              "Claude's extension is off: press Enable Extension in Chrome on this Mac." if extension is False else
              "Claude's extension is not in Chrome on this Mac: restart Chrome, then press Enable Extension."
-             if extension is None else
+             if extension is None and not hidden else
+             "macOS does not let Fleet read Chrome's folder on this Mac, and no reading of Claude Code's browser link "
+             "was made here." if connected is None else
              "Claude's extension is not signed in: sign in to Claude in Chrome on this Mac, with this Mac's account."
-             if not account else
+             + store if not account else
              f"Claude's extension is not linked to Claude Code: in Chrome on this Mac, sign it in as {account['email']}"
-             + (f", organization {account['org']}." if account.get("org") else ".")),
+             + (f", organization {account['org']}." if account.get("org") else ".") + store),
             ("capability", "screen", "not_verified" if ready else "failed",
              "The session is ready, but Fleet cannot check the macOS screen recording and accessibility "
              "permissions that screen control needs." if ready else
@@ -3584,7 +3613,11 @@ class Lifecycle:
         code, _, _ = self.run(["pgrep", "-x", "Google Chrome"])
         extension = chrome_extension(self.home)
         # Its answer means something only for a runtime that is signed in: a signed-out one reads no browser at all.
-        claude = self.exe("claude") if extension and self.runtime("claude")["signed_in"] else None
+        # An extension that macOS hides is read too (chrome_hidden): `extension` is None there, and until 19 November
+        # 2026 the link was never read, so the manager never heard of an extension that was not linked. The hub tells
+        # such a Mac by a None `extension` beside a `browser` that is not None.
+        hidden = extension is None and chrome_hidden(self.home)
+        claude = self.exe("claude") if (extension or hidden) and self.runtime("claude")["signed_in"] else None
         browser = browser_connected(claude) if claude else None
         return {"locked": console[1] if console else None, "setup": setup_screens(self.run), "chrome": code == 0,
                 "extension": extension, "browser": browser,

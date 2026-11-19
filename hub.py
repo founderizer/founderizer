@@ -47358,7 +47358,7 @@ def unlinked_words(account):
     return EXTENSION_UNLINKED + (f", which is signed in as {account_words(account)}" if account else "")
 
 
-def unlinked_steps(name, account, linked, blocked=False, sharers=()):
+def unlinked_steps(name, account, linked, blocked=False, sharers=(), unknown=False):
     """What the manager hears after unlinked_words: the cause and the owner's exact steps with the account and the
     organization to use. linked: the account that the extension last worked with, when Claude Code changed account
     since; then signing Claude Code in again as that account is the other way, for when the new one is not meant for
@@ -47367,6 +47367,8 @@ def unlinked_steps(name, account, linked, blocked=False, sharers=()):
     and a reading that changes from one time to the next would hold back the message, which waits for the same words
     twice. sharers: the agents on other machines with the same Claude account (account_sharers), whose sessions could
     reach this Chrome, since the link goes by account (WORKER-INSTALL.md: a Claude account of its own for each Mac).
+    unknown: the Mac could not read whether Chrome has the extension (macOS 27 refuses its service a list of Chrome's
+    own folder), so step 1 says what to do when Chrome has none.
 
     Why (19 November 2026): the hub said only "signed out", and the manager could not read the account (see_capacity
     gave none then). Its five cards in 19 days named no account, and the last one blamed Claude Desktop and macOS's
@@ -47391,7 +47393,9 @@ def unlinked_steps(name, account, linked, blocked=False, sharers=()):
             f"to the same claude.ai account and organization: it is signed out, uses another account or organization, "
             f"or lost its link. Only hands at that Mac, or the app's Screen Sharing button, can put this right: raise "
             f"it for the owner with raise_needs_you, with these steps. 1. In Chrome on {name}, open Claude's "
-            f"extension and read which account and organization it uses. 2. If it is signed in, but not as {want}, "
+            f"extension and read which account and organization it uses"
+            + (" (if Chrome has no Claude extension, add it from the Chrome Web Store first)" if unknown else "")
+            + f". 2. If it is signed in, but not as {want}, "
             f"log out in the extension's settings. 3. {log_in} 4. If it already used that account and organization, "
             f"quit Chrome and open it again. Claude Desktop and macOS's Automation settings are no part of this link: "
             f"leave them out of the steps."
@@ -47438,11 +47442,15 @@ def mac_desktop_sweep():
             if kv_get(f"desktop_linked:{name}") != linked:
                 kv_set(f"desktop_linked:{name}", linked)
         unlinked = browser and desktop.get("browser") is False
+        # macOS hides Chrome's folder from the Mac's service (lifecycle.chrome_hidden): its extension is not known, and
+        # it reads the link all the same, which a Mac that finds no extension does not.
+        hidden = desktop.get("extension") is None and desktop.get("browser") is not None
         words = ("the setup screens of macOS are open on its screen, as after a macOS update"
                  if desktop.get("setup") else
                  "its screen is locked" if desktop.get("locked") else
                  "Claude's extension is off in Chrome" if browser and desktop.get("extension") is False else
-                 "Chrome does not run" if browser and desktop.get("extension") and desktop.get("chrome") is False else
+                 "Chrome does not run" if browser and (desktop.get("extension") or hidden) and
+                 desktop.get("chrome") is False else
                  unlinked_words(account) if unlinked else
                  CHATGPT_NO_APP if screen and desktop.get("chatgpt") is False and desktop.get("chatgpt_app") is False
                  else CHATGPT_SIGNED_OUT if screen and desktop.get("chatgpt") is False else None)
@@ -47481,7 +47489,7 @@ def mac_desktop_sweep():
                  if words in (CHATGPT_SIGNED_OUT, CHATGPT_NO_APP) else
                  f"[hub] On the Mac {name}, {words}. "
                  + unlinked_steps(name, account, json.loads(linked) if linked else None, desktop.get("bridge") is False,
-                                  account_sharers(name, account["email"]) if account else ())
+                                  account_sharers(name, account["email"]) if account else (), hidden)
                  if words.startswith(EXTENSION_UNLINKED) else
                  f"[hub] On the Mac {name}, {words}{click}. Its tasks in Chrome and on its screen wait. Only hands at that "
                  f"Mac, or the app's Screen Sharing button, can put this right: raise it for the "
