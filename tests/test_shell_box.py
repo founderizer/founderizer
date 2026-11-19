@@ -43,6 +43,8 @@ CRM = {"title": "CRM", "url": "https://crm.example/api/agent-mcp", "auth": "mint
 # the review's own server: its token reads every customer's drafts, so it is never a ticket session's (review, item 1)
 CRM_REVIEW = {"title": "CRM review", "url": "https://crm.example/api/agent-mcp", "auth": "mint", "key": "CRM_POLL_KEY",
               "mint": "/api/agent-case/review-tokens", "mint_field": ""}
+# a server with no token of a session: a start whose duty names no server loads it, and a duty's own list drops it
+HELPDESK = {"title": "Helpdesk", "url": "https://helpdesk.example/mcp", "auth": "none"}
 LINE_CHECK = {"path": "checks/url_lines.py", "commit": "a" * 40, "sha256": "b" * 64, "form": "lines",
               "args": {"url": "https://crm.example/api/agent-case/events", "key": "CRM_POLL_KEY"}}
 EVERY = {"kind": "every", "minutes": 1}
@@ -267,6 +269,44 @@ class Helper(unittest.TestCase):
                              {"crm-review": "tok_review_1.abcdefgh"})
             self.assertEqual(fleet.mint_tokens("desk", "T-6", 1, env, closed={}), {})       # no duty list: no mint
         self.assertEqual(posted, ["crm-review"])
+
+    def test_the_hub_names_the_servers_that_the_helper_loads_from_the_same_start(self):
+        """create_task tells the giver of a Shell-off agent's task which MCP servers its session loads
+        (hub.closed_servers). That is the helper's own reading of the same start, or the giver plans work on a
+        server that the session does not have: one of another runtime, one that needs a key, which no session of
+        such an agent gets, one that its duty's list leaves out."""
+        mcp = {"crm": CRM, "crm-review": CRM_REVIEW, "helpdesk": HELPDESK,
+               "other": dict(HELPDESK, title="Other", runtimes=["codex"]),
+               "kb": {"title": "KB", "url": "https://kb.example/mcp", "auth": "key", "key": "KB_API_KEY"},
+               "docs": {"title": "Docs", "url": "https://docs.example/mcp", "auth": "oauth"}}
+        desk = dict(DESK, tools=list(mcp) + ["github", "of-a-newer-catalog"])
+        team = {"agents": {"desk": desk}, "mcp": mcp}
+        answer = {"repos": {}, "tools": desk["tools"], "mcp": {"FLEET_MCP_DOCS": "tok_docs_1.abcdefgh"},
+                  "mcp_problems": [], "tokens": [], "errors": []}
+        with patch.object(fleet, "team_catalog", lambda: lifecycle.tool_catalog(team)), \
+                patch.object(hub, "TEAM", team), \
+                patch.object(hub, "mcp_state", lambda team: {"docs": {"connected": True, "ended": False}}), \
+                patch.object(fleet, "read_env", side_effect=AssertionError("no key for a Shell-off session")), \
+                patch.object(fleet, "checkout_conf", lambda agent: desk), \
+                patch.object(fleet, "http", lambda *a, **k: (200, answer)), \
+                patch.object(fleet, "prepare_repos", lambda repos, values, place=None: {}):
+            env = fleet.session_env("desk", desk, "task")       # the helper's own choice of this session's servers
+            catalog = lifecycle.tool_catalog(team)
+            for servers, loads in ((["crm"], ["crm"]), (["crm-review", "helpdesk"], ["crm-review", "helpdesk"]),
+                                   (["other"], []), (["kb", "docs", "github"], ["docs"]), ([], []),
+                                   (None, ["helpdesk", "docs"])):
+                with self.subTest(servers=servers):
+                    start = {"built_ins": [], "servers": servers}
+                    said = hub.closed_servers("desk", start)
+                    self.assertEqual(said, loads)
+                    minted = {t: "tok_case_1.abcdefgh" for t in said if catalog[t].get("mint")}
+                    option = self.parts(self.build(conf=desk, env=env, minted=minted, closed=start))[2]
+                    self.assertEqual(sorted(self.private(option("--mcp-config"))["mcpServers"]),
+                                     sorted(["fleet"] + said))
+            for gone in ({"connected": True, "ended": True}, {"connected": False, "ended": False}, None):
+                with self.subTest(docs=gone), patch.object(hub, "mcp_state", lambda team: {"docs": gone}):
+                    # an access that ended, or a server that the owner did not connect: the helper gets no variable
+                    self.assertEqual(hub.closed_servers("desk", {"servers": None}), ["helpdesk"])
 
     def test_a_shell_on_claude_task_takes_a_minted_token_in_its_mcp_file_only(self):
         conf = dict(DESK, can=["shell", "web"])
@@ -1597,6 +1637,67 @@ class Reports(Cases):
             fields.setdefault("for_customer", FOR_CUSTOMER)
         return self.tool("ops", "close_case", task, case=hub.cref(case), outcome="handled",
                          note="Fixed the price rules.", **fields)
+
+    def test_the_giver_of_a_task_reads_what_a_shell_off_session_holds(self):
+        """The giver of a task reads in create_task's answer what the session of an agent whose Shell box is off
+        holds, and what a session of a case of each of its duties holds in its place. On one fleet, 11 tasks of a
+        week failed only because their plain session had no server or tool that the work needed, and the giver
+        learned it from the failed result. A peer, which gives no task of a case, reads who gives such work."""
+        hub.TEAM["mcp"]["helpdesk"] = HELPDESK
+        hub.TEAM["agents"]["desk"]["tools"].append("helpdesk")
+        clock = [{"kind": "clock", "schedule": EVERY}]
+        ticket = self.duty(watch=clock, tools=["WebSearch"], servers=["crm"])
+        review = self.duty(watch=clock, tools=["remember", "write_notes"], servers=["crm-review"])
+        same = self.duty(watch=clock)               # it names nothing: a session of its case is the plain session
+        _, at_work = Fleet.task(self, "lead")       # desk and ops report to the lead: its task gives them theirs
+        _, beside = Fleet.task(self, "ops")         # and ops, desk's peer, gives it a part of its own task
+
+        def give(giver, context, owner="desk", **more):
+            """create_task's answer, and of the new task the tools of its session and the start that its helper reads."""
+            text, error = hub.call_tool(giver, "create_task", dict(
+                {"owner": owner, "title": "Read one ticket", "done_when": "The ticket is read."}, **more), context)
+            self.assertFalse(error, text)
+            tid = hub.q1("SELECT MAX(id) m FROM tasks")["m"]
+            start = json.loads(hub.q1("SELECT extra FROM events WHERE kind='task' AND task=?", (tid,))["extra"])
+            return text, self.names(owner, (hub.kv_get("db_id"), hub.tref(tid), 1)), start.get("shell_off")
+
+        def words(tools, start, base=()):
+            """What the note says of a session with these tools and this start: (servers, web tools, the tools besides)."""
+            return (", ".join(start["servers"] if start["servers"] is not None else ["helpdesk"]),
+                    "web search" if start["built_ins"] == ["WebSearch"] else "none",
+                    ", ".join(sorted(n for n in tools if n not in base)))
+
+        plain, plain_tools, start = give("lead", at_work)
+        self.assertIsNone(start["servers"])         # no duty: each server that needs no token of a session
+        self.assertIn(f"Its Fleet tools: {', '.join(plain_tools)}.", plain)
+        self.assertIn("Its MCP servers: helpdesk. Its web tools: web search.", plain)
+        self.assertNotIn(f"R-{same['id']}:", plain)
+        # what the plain note says of each duty is what a real task of a case of that duty then holds
+        for r in (self.r, ticket, review):
+            with self.subTest(duty=r["id"]):
+                with hub.transaction():
+                    case = hub.duty_new_case(r, f"T-8{r['id']}", "A case", "test", "hub", hub.now())
+                text, tools, start = give("lead", at_work, case_id=f"R-{r['id']}/C-{case}")
+                servers, web, also = words(tools, start, plain_tools)
+                self.assertIn(f"R-{r['id']}: MCP servers {servers}; web tools {web}" +
+                              (f"; also the Fleet tools {also}." if also else "."), plain)
+                self.assertIn(f"Its Fleet tools: {', '.join(tools)}.", text)
+                self.assertIn(f"Its MCP servers: {servers}. Its web tools: {web}.", text)
+                self.assertNotIn(f"R-{r['id']}:", text)                 # its own duty is not another duty
+        self.assertIn(f"R-{self.r['id']}: MCP servers helpdesk; web tools web search; also the Fleet tools "
+                      f"report_defect.", plain)                         # the duty with a reader of its reports
+        self.assertIn(f"R-{review['id']}: MCP servers crm-review; web tools none; also the Fleet tools remember, "
+                      f"write_notes.", plain)                           # a duty's own list drops helpdesk and the web
+        for word in ("cancel_task", "case_id", "open_case", "For crm, the service"):
+            self.assertIn(word, plain)              # crm: the one whose token is made for the key of a case
+        text, _, _ = give("ops", beside)            # a peer reads no duty of desk, and the hub refuses its case_id
+        self.assertIn("Its MCP servers: helpdesk.", text)
+        self.assertIn("lead gives such work", text)
+        for word in ("case_id", f"R-{ticket['id']}", f"R-{review['id']}", "crm"):
+            self.assertNotIn(word, text)
+        text, _, start = give("lead", at_work, owner="ops")     # the Shell box on: the agent's own access
+        self.assertIsNone(start)
+        self.assertNotIn("Shell box", text)
 
     def test_a_report_reaches_the_named_duty_as_a_task_of_ids_and_list_values(self):
         self.once(["T-81 message 10:00"])

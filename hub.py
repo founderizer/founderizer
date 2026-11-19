@@ -10639,6 +10639,7 @@ def t_create_task(agent, a):
     if runtime_signed_out(owner) and own_runtime_task(agents()[owner], f["needs"]):
         late += (f" Note: {owner} is not signed in to {runtime_label(agents()[owner].get('runtime'))}, so no session "
                  f"of it can work; the task waits until the owner signs it in.")
+    late += shell_off_note(owner, tid, agent)   # a Shell-off agent: what this task's session holds
     lim = active_limit(owner)
     if lim:
         source = limit_source(lim)      # account_limits: an allowance another agent spent is not this one's limit
@@ -40020,6 +40021,87 @@ def closed_extra(owner, responsibility=None, record=None):
     if hosts and WEB_SEARCH in out["built_ins"]:        # the host list: page reads go with web search, on its hosts
         out.update(built_ins=out["built_ins"] + [WEB_PAGES], web_hosts=list(hosts), version=host_list_version())
     return {"shell_off": out}
+
+
+def closed_servers(owner, start):
+    """The MCP servers that a start of closed_extra lets a session of `owner` load, as its helper reads that start
+    (fleet.integration_env, fleet.closed_task_command). Of the agent's servers that its runtime runs: the ones that
+    the task's duty names, or with no such list each one that needs no token of a session. And of those only a
+    server that needs no variable of the session: a session of an agent whose Shell box is off gets no key and no
+    GitHub token (fleet.session_env), so the one variable that reaches it is the access of an oauth server whose
+    connection stands. The helper also leaves out a server whose program its machine lacks and a server whose token
+    it did not get, which the hub does not see here."""
+    conf, catalog, named, state, out = agents()[owner], tool_catalog(TEAM), start.get("servers"), None, []
+    for t in conf.get("tools") or []:
+        tool = catalog.get(t) if isinstance(t, str) else None       # a name of a newer catalog is no server here
+        if not tool or conf.get("runtime") not in tool["runtimes"] or \
+                not (t in named if isinstance(named, list) else not tool.get("mint")):
+            continue
+        if [v for v in tool_needs(tool) if v != mcp_variable(t)]:
+            continue
+        if tool.get("auth") == "oauth":
+            state = mcp_state(TEAM) if state is None else state
+            if not (state.get(t) or {}).get("connected") or (state.get(t) or {}).get("ended"):
+                continue
+        out.append(t)
+    return out
+
+
+def shell_off_note(owner, task_id, giver):
+    """In create_task's answer, for a task of an agent whose Shell box is off: what the session of this task holds,
+    from the readings that start it (tools_for, closed_extra, closed_servers), and what a session of a case of each
+    other duty of that agent holds in its place: a duty that names servers or tools gives its cases those and no
+    others. The duties are the ones that can still have a task of a case: each active or paused one, and one with an
+    open case. A giver that reads those duties (the manager, the agent's lead) gets them by name, with the way to
+    give the work again; a peer, which reads none of them and gives no task with case_id, gets the agent that gives
+    such work, or reads that only the duty's watch starts it when that agent's own Shell box is off. So the giver
+    reads it here and not in a failed result: on one fleet, 12 to 19 November 2026, 11 of 26 failed tasks were work
+    that such a session could not do. "" for every other agent. No transaction is open: tools_for reads."""
+    if not shell_off(owner):
+        return ""
+    extra = SHELL_OFF_DUTY_TOOLS + ("report_defect",)
+
+    def web(start):
+        built = start["built_ins"]
+        return "none" if WEB_SEARCH not in built else \
+            "web search and page reads on its host list" if WEB_PAGES in built else "web search"
+    row = q1("SELECT responsibility, needs FROM tasks WHERE id=?", (task_id,))
+    duty = row["responsibility"] if row else None
+    held = [t["name"] for t in tools_for(owner, (None, tref(task_id), "1"))]
+    here = closed_extra(owner, duty, question_record(task_id))["shell_off"]
+    mine = (closed_servers(owner, here), web(here), sorted(n for n in held if n in extra))
+    catalog, keyed, lines, unread = tool_catalog(TEAM), set(mine[0]), [], False
+    for r in q("SELECT * FROM responsibilities r WHERE agent=? AND id IS NOT ? AND (state IN ('active', 'paused') OR "
+               "EXISTS (SELECT 1 FROM duty_cases c WHERE c.responsibility=r.id AND c.state='open')) ORDER BY id",
+               (owner, duty)):
+        start = closed_extra(owner, r["id"])["shell_off"]
+        # the Fleet tools that a duty adds to its own cases, as shell_tools reads them
+        theirs = (closed_servers(owner, start), web(start),
+                  sorted([n for n in duty_tools(r["tools"]) or () if n in SHELL_OFF_DUTY_TOOLS] +
+                         (["report_defect"] if duty_ids(r["report_to"]) else [])))
+        if theirs == mine:
+            continue
+        if not duty_read_allowed(giver, r):         # a peer: it reads no duty of this agent, and gives no case's task
+            unread = True
+            continue
+        keyed |= set(theirs[0])
+        lines.append(f"{rref(r['id'])}: MCP servers {', '.join(theirs[0]) or 'none'}; web tools {theirs[1]}" +
+                     (f"; also the Fleet tools {', '.join(theirs[2])}" if theirs[2] else ""))
+    keyed = sorted(t for t in keyed if ((catalog.get(t) or {}).get("mint") or {}).get("field"))
+    boss = reports_to(owner)
+    return (f" Note: {owner}'s Shell box is off, so this task's session has no shell, no file tool and no API key. "
+            f"Its Fleet tools: {', '.join(held)}. Its MCP servers: {', '.join(mine[0]) or 'none'}. Its web tools: "
+            f"{mine[1]}." +
+            (" It is a browser task, so it has Chrome's tools too." if row and row["needs"] == "browser" else "") +
+            (f" A task of an open case of another duty of {owner} holds other things. {'. '.join(lines)}. If this "
+             f"work needs them, cancel this task with cancel_task and give the work with case_id, in an open case of "
+             f"that duty (open_case opens one in an active duty)." if lines else "") +
+            (f" A task of a case of one of {owner}'s duties holds other servers and tools: " +
+             ("only the watch of that duty starts such work." if shell_off(boss) else f"{boss} gives such work.")
+             if unread and not lines else "") +
+            (f" For {', '.join(keyed)}, the service makes a session's token for the key of its case: a key that the "
+             f"service refuses ends the task." if keyed else "") +
+            " Work that needs a shell, a file or an API key is for an agent whose Shell box is on.")
 
 
 # ---------------------------------------------------------------- the host list (UI-API.md, "the host list")
