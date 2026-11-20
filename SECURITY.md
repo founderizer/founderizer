@@ -109,14 +109,48 @@ and the app keeps it nowhere. The helper refuses while a page of that browser is
 What this does not protect: `x11vnc` runs as the agent's own user, so those settings hold for an agent that does not
 interfere. An agent that turns against the owner (a page that took over its session, for example) can replace that
 server with a program of its own on the same port, and then it decides what the owner sees, and it reads what the
-owner's viewer sends: what the owner types, and the clipboard of the owner's Mac where Screen Sharing sends it to such
-a server (not yet measured). The address of that screen names a user of its own (`takeover-<agent>`), so that Screen
-Sharing should not take the sign-in that it keeps for 127.0.0.1, which can be another Mac's, when such a server asks
-for an Apple sign-in (not yet measured either: the live check of the take-over measures it). On a Mac the other end is
-Apple's own server, but its shared clipboard reaches the agent's Mac too (an open point of the take-over). So a
-take-over is for a CAPTCHA only: the owner types nothing there that they would not type into the agent's own browser,
-and copies no password before it. The agent's session gets the owner's answer only after the sharing has stopped,
-which holds for an agent that reads its messages with `read_messages`.
+owner types and clicks. A live check on 19 and 20 November 2026 measured two more things on one Mac (macOS 27.0.1,
+Screen Sharing 7.0): the clipboard, and a sign-in that Screen Sharing keeps for 127.0.0.1 (another Mac's). It opened
+the take-over's address as the app does, against a stand-in for such a program on 127.0.0.1, at port 5901, where that
+kept sign-in has the same server, port and protocol (not the same user: the address names `takeover-<agent>`).
+
+- A program that answers as `x11vnc` does (the viewer then speaks RFB 3.3, with VNC's own password) gets only an
+  answer made from the address's one-time password, and the owner's clipboard does not reach it: Screen Sharing makes
+  Use Shared Clipboard, Get Clipboard and Send Clipboard unavailable for such a server, and the stand-in got no
+  clipboard text at the open, after a click into the window, or after the clipboard changed.
+- A program that offers only Apple's older sign-in (the one of macOS 10.12 and earlier) in Apple's protocol makes
+  Screen Sharing warn first ("could not verify the authenticity of 127.0.0.1:<port>", with Cancel and Continue).
+  After Continue it got the address's user and one-time password and never the kept sign-in: 9 sign-ins on the
+  connections after two presses of Continue, with no new warning. What such a program gets after that sign-in was
+  not measured. Offered in RFB 3.3, that sign-in gets nothing: Screen Sharing closes the connection. In Apple's
+  protocol, a program that offers only VNC's own password gets no answer, and one that offers no sign-in gets "the
+  viewer and server are incompatible".
+- When the program refused the first sign-in, in both ways, that sign-in carried only the address's credentials, and
+  Screen Sharing tried no other sign-in and asked for none (the stand-in listened on for 16 and 55 seconds).
+- None of the nine test passwords was in Recent Items > Servers, Screen Sharing's files, the names of the login
+  Keychain's items, or the default, error and fault lines of the system log of the minutes of the runs, as the log
+  stores them. Screen Sharing keeps the address with its user and no password
+  (`vnc://takeover-<agent>@127.0.0.1:<port>`).
+- Not measured: Apple's newer sign-ins, and an offer of more than one sign-in; Screen Sharing's own later choice of
+  VNC's password in Apple's protocol; a server in RFB 3.3 that offers no sign-in; a program that answers as `x11vnc`
+  does and changes later in the session; text that a server puts into the owner's clipboard; Apple's protocol after
+  the sign-in; macOS 15 and 26; a fault in Screen Sharing itself that a server's data could use.
+
+So at a take-over of an agent on a Linux server, Screen Sharing opens the agent's screen with no question. If it shows
+a warning, a question or a sign-in window there, the owner presses Cancel (or OK where that is the only button) and
+types nothing in it. The warning that
+it could not verify the authenticity, or a sign-in window, means that the program on that port is not the one that
+the helper started: the owner then answers the card in words (not with "Done"), does not press Take over again, stops
+that agent, and treats the logins of its browser as exposed (the site's "sign out everywhere" or a new password, as
+above). At every take-over, a Mac's too, the owner presses Cancel at the warning that Screen Sharing could not verify
+the authenticity and then takes the same steps (on a Mac it means that Apple's server does not hold the port), never
+types a password, a key, a card number or a one-time code on the agent's screen, never uses a
+passkey or signs in there, and copies no password, key or other secret before or during it. An agent asks the owner
+for a CAPTCHA only (`TAKEOVER_TITLES` in `hub.py`). On a Mac the other end is Apple's own server, while it holds that
+Mac's Screen Sharing port: Screen Sharing can ask for the sign-in of that Mac's account, which goes to that server and
+not to the agent's screen, and its shared clipboard reaches the agent's Mac too (an open point of the take-over). The
+agent's session gets the owner's answer only after the sharing has stopped, which holds for an agent that reads its
+messages with `read_messages`.
 
 ## What an agent's read of a server shows, and what it does not
 

@@ -235,6 +235,11 @@ GITHUB_ACCESS = {"read": {"contents": "read", "pull_requests": "read", "metadata
                  "write": {"contents": "write", "pull_requests": "write", "metadata": "read"},
                  "deploy": {"contents": "write", "pull_requests": "write", "metadata": "read",
                             "workflows": "write", "actions": "write"}}
+# The words of a token that the door refuses for one of the product's own repositories (door_targets.vendor): no grant
+# and no pool opens one in any fleet. Until 20 November 2026 it got the words of a missing grant, so an agent that held
+# the grant asked its manager for it, and the manager answered that it held it already.
+VENDOR_TOKEN_WORDS = ("it is one of the product's own repositories, and the door makes no token for those in any "
+                      "fleet: no grant of it works, so do not ask for its access")
 NAME = re.compile(r"[a-z][a-z0-9-]{1,30}")
 HOST = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}")
 REF = re.compile(r"bws://[0-9a-f-]{36}", re.I)
@@ -1601,7 +1606,8 @@ class Door:
         """The hub asks for one agent's tokens, and names each grant: the door makes one for a repository that the
         access file gives that agent, or one in its business's pool, because the manager hands out what the pool
         holds, at no more than the level there. One installation token for each owner and level, from the door's App
-        of that owner (credentials github:<owner>)."""
+        of that owner (credentials github:<owner>). One of the product's own repositories gets none, whatever the file
+        gives, and its error says that no grant works (VENDOR_TOKEN_WORDS)."""
         access = self.access()
         me = (access.get("agents") or {}).get(agent)
         if me is None:
@@ -1609,11 +1615,14 @@ class Door:
         granted = me.get("github") or {}
         pool = (access.get("pools") or {}).get(me.get("business")) or {}
         levels = list(GITHUB_ACCESS)
-        groups, refused = {}, []
+        groups, refused, vendors = {}, [], []
         operator, kept = bool(me.get("servers") or me.get("business")), []
         for repo, level in sorted((repos or {}).items()):
+            if door_targets.vendor(repo):
+                vendors.append(repo)
+                continue
             tops = [levels.index(x) for x in (granted.get(repo), pool.get(repo)) if x in GITHUB_ACCESS]
-            if door_targets.vendor(repo) or level not in GITHUB_ACCESS or not tops or levels.index(level) > max(tops):
+            if level not in GITHUB_ACCESS or not tops or levels.index(level) > max(tops):
                 refused.append(repo)
                 continue
             # new-projects plan N3: no deploy token on a repository that the door made, and no write token on it for
@@ -1624,6 +1633,7 @@ class Door:
             groups.setdefault((repo.split("/")[0], level), []).append(repo)
         tokens, errors = [], [{"repos": [r], "error": "neither the door's access file nor the business's pool gives "
                                                       "this agent that level"} for r in refused]
+        errors += [{"repos": [r], "error": VENDOR_TOKEN_WORDS} for r in vendors]
         errors += [{"repos": [r], "error": "the door made this repository: it makes no deploy token on it, and no write "
                                           "token for an Operator, whose workflow files there go through the door"}
                    for r in kept]

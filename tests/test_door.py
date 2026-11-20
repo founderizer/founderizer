@@ -1882,13 +1882,21 @@ class HubRights(Served):
             return e.code, json.loads(e.read())
 
     def test_a_token_only_for_a_grant_of_the_access_file(self):
+        """A token only for a grant of the access file, and none for one of the product's own repositories even where
+        the file grants it, with words that say that no grant works: on 20 November 2026 the words of a missing grant
+        made an agent ask its manager for a grant that it held already."""
+        data = json.loads(json.dumps(ACCESS))
+        data["agents"]["ops-one"]["github"]["founderizer/founderizer-apps"] = "read"
+        self.write_access(data)
         status, got = self.post("/github/token", {"agent": "ops-one", "repos": {
             "one-org/shop": "write", "one-org/ops": "write", "one-org/other": "read",
             "founderizer/founderizer-apps": "read"}}, self.secrets["token"])
         self.assertEqual(status, 200, got)
         self.assertEqual([(t["access"], t["repos"]) for t in got["tokens"]], [("write", ["one-org/shop"])])
-        self.assertEqual(sorted(r for e in got["errors"] for r in e["repos"]),
-                         ["founderizer/founderizer-apps", "one-org/ops", "one-org/other"])
+        words = {r: e["error"] for e in got["errors"] for r in e["repos"]}
+        self.assertEqual(sorted(words), ["founderizer/founderizer-apps", "one-org/ops", "one-org/other"])
+        self.assertEqual(words["founderizer/founderizer-apps"], door.VENDOR_TOKEN_WORDS)
+        self.assertNotIn("access file", words["founderizer/founderizer-apps"])
         asked = json.loads(next(d for m, u, d in self.github if u.endswith("/access_tokens")))
         self.assertEqual(asked, {"repositories": ["shop"], "permissions": door.GITHUB_ACCESS["write"]})
 
