@@ -6074,8 +6074,11 @@ class Helper:
     def sync_checkout(self):
         """Before a task session starts, the helper brings this folder onto the configuration ref and up to date with
         it (fast-forward only), so that the agent reads the current RULES.md, its profile, the owner's knowledge and
-        team.json without pulling, and a read-only task changes no file itself. A failure is only logged."""
-        problem = follow_config_ref(KIT, floor=os.path.join(HOME, FLOOR_FILE))     # DevOps plan 0.1: may_take
+        team.json without pulling, and a read-only task changes no file itself. A release that does not start on this
+        machine as a helper is not taken (lifecycle.take, `starts`), and the session starts on the tree the machine
+        has. A failure is only logged."""
+        problem = follow_config_ref(KIT, floor=os.path.join(HOME, FLOOR_FILE),     # DevOps plan 0.1: may_take
+                                    starts="helper")
         if problem:
             self.say("checkout not brought up to date before the task: " + problem)
 

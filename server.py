@@ -1654,17 +1654,24 @@ class Service:
         checkout and a new start of this process. The revision is a commit of the fleet's configuration ref, so the
         checkout follows that ref first (lifecycle.follow_config_ref: it moves a checkout that still stands on the
         code branch, and leaves an origin from before the split as it was). A revision that does not fast-forward
-        gets no second try."""
+        gets no second try. Before each move the release's own start check runs on this machine (lifecycle.take,
+        `starts`): a release that does not start here moves nothing and starts nothing, and the line on standard
+        error says which release and why; a later revision of the same release is refused at once."""
         desired = self.desired
         if not desired or desired in (self.loaded, self.stuck):
             return
         if self.run(["git", "-C", self.kit, "fetch", "-q", "origin"], timeout=120)[0] != 0:
             return                      # no network: this revision keeps its try for the next round
         code, out, _ = self.run(["git", "-C", self.kit, "diff", "--name-only", self.loaded or "HEAD", desired])
-        # Every move under the one check (lifecycle.may_take): onto the ref, and onto the hub's revision.
+        # Every move under the one check (lifecycle.may_take), and the release's start check on this machine: onto
+        # the ref, and onto the hub's revision.
         problem = "git diff failed" if code != 0 else \
-            lifecycle.follow_config_ref(self.kit, self.run, self.floor) or \
-            lifecycle.take(self.kit, desired, self.run, self.floor)
+            lifecycle.follow_config_ref(self.kit, self.run, self.floor, starts="server") or \
+            lifecycle.take(self.kit, desired, self.run, self.floor, starts="server")
+        if isinstance(problem, lifecycle.Refused):
+            self.stuck = desired
+            print(problem, file=sys.stderr, flush=True)
+            return
         if problem:
             self.stuck = desired
             print(f"Fleet could not fast-forward {lifecycle.checkout_branch(self.kit, self.run) or 'this checkout'} "

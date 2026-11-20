@@ -2256,7 +2256,9 @@ def may_take(kit, target, run=None, floor=None, head="HEAD"):
     floor, and the others take theirs after it. They stayed where they were for every release after that (3 November
     2026: the Mac Studio's server service and a support agent on worker-1, at the revisions of that morning). Every
     mover of a checkout calls this first: the helper's update and task-start sync, the server service, the hub, both
-    installers and the owner's MCP server (the shell ones as `lifecycle.py may-take`)."""
+    installers and the owner's MCP server (the shell ones as `lifecycle.py may-take`). The helper's two movers and the
+    server service's then check that the release starts on their machine, and only after this passed (take,
+    `starts`): no code of a tree runs before its signature passed."""
     import releases                     # here and not at the top: releases imports this module
     old, new = _commit(kit, run, head), _commit(kit, run, target)
     if not old or not new:
@@ -2306,16 +2308,21 @@ def may_take(kit, target, run=None, floor=None, head="HEAD"):
     return None
 
 
-def take(kit, target, run=None, floor=None, room=False):
+def take(kit, target, run=None, floor=None, room=False, starts=None):
     """Move this checkout onto `target` when may_take lets it: a fast-forward, and the floor raised to the release it
     then runs. `target` is read once, as one commit, and that commit is the one checked and the one taken, so a fetch
     in between moves nothing unchecked. room: first remove the outputs that it brings back tracked (give_way_to).
-    None, or the reason why the checkout stays where it is."""
+    starts: the role of the program that runs from this checkout (START_PROGRAMS: the helper's update and task-start
+    sync, the server service's update), or None for a mover that starts nothing from it (the hub's own update, which
+    has its larger check, the installers, the owner's MCP server, a new agent's checkout). With a role, a move that
+    brings code runs the release's own start check after may_take and before the move (start_problem), and a release
+    that does not start on this machine moves nothing and raises no floor; a check that cannot run here stops nothing.
+    None, or the reason why the checkout stays where it is: a Refused for a release that did not start here."""
     keep_floor(kit, floor, run)
     commit = _commit(kit, run, target)
     if not commit:
         return f"{target} is not a commit of this checkout"
-    problem = may_take(kit, commit, run, floor)
+    problem = may_take(kit, commit, run, floor) or (start_problem(kit, commit, starts, run) if starts else None)
     if problem:
         return problem
     if room:
@@ -2327,13 +2334,15 @@ def take(kit, target, run=None, floor=None, room=False):
     return None
 
 
-def follow_config_ref(kit, run=None, floor=None):
+def follow_config_ref(kit, run=None, floor=None, starts=None):
     """Bring this checkout onto the configuration ref and up to date with it, fast-forward only, and only where
     may_take lets it. The hub commits the owner's team.json, profiles and knowledge there, so an agent reads the
     current RULES.md, its profile and the owner's knowledge, while code reaches this machine only with a signed
     release. Returns None when the checkout follows the ref, else the one reason why it stays as it is: a checkout
     with its own changes is never touched. An origin without the ref is a Fleet before the split of 2026-10-17, and
-    is brought up to date as it was before, under the same check."""
+    is brought up to date as it was before, under the same check. starts: as take's, for each move that this makes,
+    the one onto the ref's branch too. A checkout that keeps its revision for a release that did not start here also
+    takes no later data of the ref, until a release that starts here."""
     run = run or _run
 
     def git(*args, timeout=60):
@@ -2346,7 +2355,7 @@ def follow_config_ref(kit, run=None, floor=None):
     if git("status", "--porcelain", "--untracked-files=no")[1]:
         return "the checkout has its own changes, so it stays where it is"
     if git("rev-parse", "--verify", "--quiet", "refs/remotes/origin/" + CONFIG_BRANCH)[0] != 0:
-        return take(kit, "@{upstream}", run, floor)
+        return take(kit, "@{upstream}", run, floor, starts=starts)
     if checkout_branch(kit, run) != CONFIG_BRANCH:
         here = git("rev-parse", "--verify", "--quiet", "refs/heads/" + CONFIG_BRANCH)[0] == 0
         keep_floor(kit, floor, run)
@@ -2355,13 +2364,189 @@ def follow_config_ref(kit, run=None, floor=None):
         problem = may_take(kit, commit, run, floor) if commit else "the ref is not a commit of this checkout"
         if problem:
             return f"the checkout did not move onto {CONFIG_BRANCH}: {problem}"
+        problem = start_problem(kit, commit, starts, run) if starts else None
+        if problem:
+            return problem
         code, out, err = git("checkout", "-q", CONFIG_BRANCH) if here else \
             git("checkout", "-q", "-b", CONFIG_BRANCH, commit)
         if code == 0 and not here:
             code, out, err = git("branch", "-q", "--set-upstream-to=origin/" + CONFIG_BRANCH, CONFIG_BRANCH)
         if code != 0:
             return f"the checkout did not move onto {CONFIG_BRANCH}: " + (err or out)[-200:]
-    return take(kit, "origin/" + CONFIG_BRANCH, run, floor, room=True)
+    return take(kit, "origin/" + CONFIG_BRANCH, run, floor, room=True, starts=starts)
+
+
+# ---------------------------------------------------------------- a release starts here before a checkout moves onto it
+#
+# Only the hub checked a release before it ran it (releases.Update.checks). Each other program of a machine moved its
+# checkout onto the release and started itself again on the new code, and a unit with Restart=always then started a
+# release that did not start on that machine again and again, until a person installed it again. So the program that
+# runs from a checkout checks a release on its machine before the checkout moves (take, `starts`): from a temporary
+# copy of the target tree, with that tree's own command, `lifecycle.py start-check <role>`, so a later release can add
+# to its own check with no change of the code that runs it. A release that does not start here leaves the checkout,
+# the floor and the running program as they are, and the machine says why. A check that cannot run here stops nothing:
+# it guards that a release starts, not that it is trusted (may_take passed already), so a fault of the checker is
+# never worse than no checker.
+START_CHECK_WAIT = 420      # seconds for a release's own start check: the hub's wait for fleet.py verify (releases)
+START_PROGRAMS = {"helper": "fleet.py", "server": "server.py"}     # each role's program, from which its check loads
+# hub.py is not loaded: verify.py imports it for one rule, it is the hub's own program, it costs seconds and more than
+# 100 MB, and the hub's own check of a release loads it (releases.Update.checks).
+START_LEFT_OUT = ("hub",)
+_REFUSED = {}               # {a checkout's real path: (the revision of the last release that did not start, the words)}
+
+
+class Refused(str):
+    """take()'s reason for a release that did not start on this machine (start_problem): the words that the owner
+    reads, which name the release and say why. A caller that starts again after a move tells it apart from any other
+    reason."""
+
+
+def start_problem(kit, commit, role, run=None, head="HEAD"):
+    """None when the move of checkout `kit` from `head` onto `commit` brings data only (data_path), when the tree of
+    `commit` starts on this machine as `role`, or when its check cannot run here; else a Refused, the words of why the
+    checkout stays. Called only after may_take passed on `commit`. It never raises.
+
+    Only the release's own answer refuses: its command ended with a status that is not 0, or its wait ran out. That
+    refusal is kept in this process: a later target that carries the same release (the revision of its release.json)
+    is refused with the same words and no new copy, and a target of another release is checked. A new process checks
+    once more, because an update of the system can have removed the cause. Anything that goes wrong in this code before
+    that answer (no room for the copy, a git step that fails) is a fault of the checker and not of the release: the
+    move goes on as it did before this check, one line on standard error says so, and nothing is kept."""
+    name = commit[:12]
+    try:
+        old = _commit(kit, run, head)
+        if old == commit:
+            return None
+        changed = changed_paths(kit, run, old, commit) if old else None
+        if changed is not None and all(data_path(path) for path, _ in changed):
+            return None
+        text = _blob(kit, run, commit, RELEASE_FILE)
+        revision, version = released(text) if text is not None else (None, None)
+        name, key = version or name, os.path.realpath(kit)
+        kept = _REFUSED.get(key)
+        if revision and kept and kept[0] == revision:
+            return kept[1]
+        passed, reason = start_check(kit, commit, role, run)
+    except Exception as e:      # the checker's own fault, never the release's
+        passed, reason = None, _fault(e)
+    if passed:
+        return None
+    if passed is None:
+        with contextlib.suppress(OSError, ValueError):      # a standard error that is gone stops nothing either
+            print(f"Release {name} is taken without its start check, which could not run on this server: {reason}",
+                  file=sys.stderr, flush=True)
+        return None
+    words = Refused(f"Release {name} did not start on this server, so the server keeps the version that it runs: "
+                    f"{reason}"[:300])
+    if revision:
+        _REFUSED[key] = (revision, words)
+    return words
+
+
+def _fault(e):
+    """An exception of this code as one short line: its type and the first line of its message."""
+    said = str(e).strip().splitlines()
+    return f"{type(e).__name__}: {said[0] if said else ''}".strip()[:300]
+
+
+def start_check(kit, commit, role, run=None):
+    """Whether the tree of `commit` starts on this machine as `role`: (True, None); (False, the reason), which is the
+    last line that is not empty of what the tree's own `lifecycle.py start-check <role>` printed (its standard
+    output, else its standard error), or the end of its wait; or (None, the reason) when anything of this code went
+    wrong before that command answered, the copy most of all. It never raises. The copy is made as the hub makes its
+    own (releases.Update.in_clone), in a new temporary folder that goes in every case, and the command runs in it,
+    with no compiled file written (-B), through `run`, as every git step of take."""
+    run, folder = run or _run, None
+    try:
+        folder = tempfile.mkdtemp(prefix="fleet-start-check-")
+        copy = os.path.join(folder, "kit")
+        code, out, err = run(["git", "clone", "-q", "--shared", kit, copy], timeout=120)
+        if code == 0:
+            code, out, err = run(["git", "-C", copy, "checkout", "-q", commit], timeout=120)
+        if code != 0:
+            said = (err or out or "").strip().splitlines()
+            return None, (said[-1] if said else "git made no copy")[:300]
+        began = time.monotonic()
+        code, out, err = run([sys.executable, "-B", os.path.join(copy, "lifecycle.py"), "start-check", role],
+                             timeout=START_CHECK_WAIT, cwd=copy)
+        if code == 0:
+            return True, None
+        if time.monotonic() - began >= START_CHECK_WAIT:
+            return False, f"its start check did not end within {START_CHECK_WAIT} seconds"
+        said = [line.strip() for line in (out or "").splitlines() if line.strip()] or \
+            [line.strip() for line in (err or "").splitlines() if line.strip()]
+        return False, (said[-1] if said else f"its start check ended with {code} and said nothing")[:300]
+    except Exception as e:      # before the release's command answered: the checker's fault
+        return None, _fault(e)
+    finally:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+def program_modules(top, program):
+    """The modules of folder `top` that the program in its file `program` can load, the program first: each name of
+    an `import` or `from ... import` statement in any scope (an import inside a function counts) that is a .py file
+    of `top`, and on from those files, read with ast. START_LEFT_OUT is not followed. A file that cannot be read or
+    parsed is not followed either: its import says why."""
+    import ast
+    found, todo = [], [program[:-len(".py")]]
+    while todo:
+        name = todo.pop(0)
+        if name in found or name in START_LEFT_OUT:
+            continue
+        found.append(name)
+        try:
+            with open(os.path.join(top, name + ".py"), encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            names = [one.name for one in node.names] if isinstance(node, ast.Import) else \
+                [node.module] if isinstance(node, ast.ImportFrom) and not node.level and node.module else []
+            names = [each.split(".")[0] for each in names]
+            todo += [one for one in names if os.path.isfile(os.path.join(top, one + ".py"))]
+    return found
+
+
+def start_readings(role, top, platform_name=sys.platform):
+    """The readings that the program of `role` takes of its machine through this module, each of which changes
+    nothing, sends nothing and needs no root: the system, the security facts and the ways in, for both; the load, the
+    room and the browser parts for the server service (server.Service.reading); the agent's own use and Tailscale's
+    word for a helper (Lifecycle.collect and leaving). Left out: the runtimes and their model lists, which start the
+    vendors' programs, and those can reach the network; a Mac server's desktop, which writes a file and starts Claude
+    Code; the live proof of the browser ports, which can stop an agent's browser, and the agents' users, which only
+    the server's own process reads; the vault, the windows and the switch, which only the helper's process can say."""
+    life = Lifecycle(top, role, {}, None, lambda: False, platform_name=platform_name)   # a name: no desktop reading
+    taken = {"os": life.os_info(), "security": life.security(), "access": life.access()}
+    if role == "server":
+        taken.update(load=machine_load(platform_name), room=room_reading(platform_name),
+                     browser=browser_reading(platform_name))
+    else:
+        taken.update(use=agent_use(role)[0], tailscale=life.private_network())
+    return taken
+
+
+def start_check_here(role, platform_name=sys.platform):
+    """`lifecycle.py start-check <role>`, in the tree under test: (its exit status, its one line). Each module that
+    the program of `role` can load (program_modules) loads, dependencies first, so a line names the module that does
+    not load; and the readings of the machine end with no exception (start_readings). What a reading says does not
+    count: a full disk or a firewall that is off never refuses a release. It is the seam of the later parts of the
+    check, not a second `verify`."""
+    import importlib
+    sys.dont_write_bytecode = True      # no compiled file in the tree, as -B
+    top = os.path.dirname(os.path.abspath(__file__))       # the folder of the tree, which is first on sys.path
+    for name in reversed(program_modules(top, START_PROGRAMS[role])):
+        try:
+            importlib.import_module(name)
+        except (Exception, SystemExit) as e:        # a module that ends the process at its load does not load either
+            said = str(e).strip().splitlines()
+            return 1, f"start-check: {name} does not load: {type(e).__name__}: {said[0] if said else ''}".strip()
+    try:
+        start_readings(role, top, platform_name)
+    except Exception as e:
+        said = str(e).strip().splitlines()
+        return 1, f"start-check: the reading of this machine failed: {type(e).__name__}: {said[0] if said else ''}"
+    return 0, f"start-check: this release starts here as {role}"
 
 
 # ---------------------------------------------------------------- data stops being code (DevOps plan v44, step 0.2)
@@ -4463,7 +4648,9 @@ class Lifecycle:
             self.run(["git", "-C", self.kit, "merge-base", "--is-ancestor", "HEAD", self.upstream()], timeout=30)[0] == 0
 
     def apply(self, desired):
-        """Runs with the gate held. True when the restart was asked for: this process ends soon."""
+        """Runs with the gate held. True when the restart was asked for: this process ends soon. A release that does
+        not start on this machine (take, `starts`) is a failed update with its own words, and no restart: this process
+        keeps the code it runs, and so does its checkout."""
         self.set("updating", "Updating Fleet while idle.")
         with self.account_lock:         # a check's account item that began after the idle test ends first (Y10)
             while self.account_runs:
@@ -4476,8 +4663,11 @@ class Lifecycle:
             code, out, err = self.run(["git", "-C", self.kit, "fetch", "-q", "origin"], timeout=120)
             if code != 0:
                 return self.fail("The checkout could not fetch: " + (err or out).strip()[-300:])
-            # The one check of every move (may_take), and the files of a task that this machine delivered.
-            problem = take(self.kit, target, self.run, self.floor, room=True)
+            # The one check of every move (may_take), the release's own start check on this machine, and the files of
+            # a task that this machine delivered.
+            problem = take(self.kit, target, self.run, self.floor, room=True, starts="helper")
+            if isinstance(problem, Refused):
+                return self.fail(str(problem))
             if problem:
                 return self.fail("The checkout did not move: " + problem[-300:])
         if desired and not (self.revision() or "").startswith(desired) and not self.has(desired):
@@ -4752,7 +4942,10 @@ def main(argv=None):
     error. The caller makes the move itself, with `git merge --ff-only TARGET`.
 
     `python3 -E -s lifecycle.py mcp-start --keep NAME[=SOURCE] ... --path PATH --folder FOLDER -- PROGRAM ARGS`: the
-    start of one program server (mcp_start)."""
+    start of one program server (mcp_start).
+
+    `python3 -B lifecycle.py start-check ROLE`, in a copy of a release's tree: does this release start on this
+    machine as that program (start_check_here)? One line, and 0 or 1."""
     import argparse
     parser = argparse.ArgumentParser(prog="lifecycle.py", description="The one check of every move of a checkout")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -4761,6 +4954,8 @@ def main(argv=None):
                        help="this user's release floor (default ~/.fleet/release-floor)")
     check.add_argument("kit", help="the checkout")
     check.add_argument("target", help="the commit it would move onto")
+    starts = sub.add_parser("start-check", help="does this tree start on this machine as that program?")
+    starts.add_argument("role", choices=sorted(START_PROGRAMS), help="the program that runs from the checkout")
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["mcp-start"]:       # its program's own arguments follow "--", and argparse reads none of them
         rest = argv.index("--") if "--" in argv else len(argv)
@@ -4776,6 +4971,10 @@ def main(argv=None):
             return 2
         return 0
     args = parser.parse_args(argv)
+    if args.cmd == "start-check":
+        code, line = start_check_here(args.role)
+        print(line, flush=True)
+        return code
     kit = os.path.abspath(args.kit)
     keep_floor(kit, args.floor)
     problem = may_take(kit, args.target, floor=args.floor)

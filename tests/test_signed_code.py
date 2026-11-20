@@ -13,6 +13,8 @@ every test has its own HOME, so no floor of this computer's own is read or writt
 """
 import atexit
 import base64
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -35,7 +37,7 @@ import vault
 from test_hub_install import run_shell, shell_function
 from test_ui_api import OwnerAPI
 from test_vault import AGENT_KEY, OWNER, REF, STUDIO_KEY, VaultBroker, owner_pin
-from leftovers import ROOT
+from leftovers import ROOT, scratch_home
 
 KIT = Path(ROOT)
 SEED = bytes(range(160, 192))           # this file's release key: the real one lives only on the website host
@@ -48,14 +50,22 @@ TEAM = {"hub": {"machine": "hub", "port": 8765},
         "agents": {"manager": {"role": "manager", "runtime": "claude", "machine": "hub", "can": []},
                    "vps": {"role": "worker", "runtime": "codex", "machine": "vps", "can": ["shell"]}}}
 PROFILE = "# Profile: vps\n\n**Character.** Careful.\n"
+STARTS = "import lifecycle\n"            # the program of a release that starts: it loads lifecycle, as both programs do
+# A release whose helper does not start on a machine: a module that its program loads raises as it loads.
+NO_START = {"fleet.py": STARTS + "import broken\n", "broken.py": "raise RuntimeError('no such setting here')\n"}
+
+
+def setUpModule():
+    scratch_home()      # the start check runs the helper's own program in a child, which reads the home folder
 
 
 def load_tests(loader, _tests, _pattern):
     """Only the tests of this file: the hub fixture it borrows carries its own, and a mover's class takes the shared
     cases of Mover."""
     suite = unittest.TestSuite()
-    for cls in (Check, Floor, Command, TakeOnce, HelperUpdate, TaskStartSync, ServerUpdate, ServerNewCheckout,
-                HubMovers, JoinScript, HubScript, OwnerMCP, ConfigRef, HandoverRecipients):
+    for cls in (Check, Floor, Command, TakeOnce, StartCheck, StartCheckCommand, HelperUpdate, TaskStartSync,
+                ServerUpdate, ServerNewCheckout, HubMovers, JoinScript, HubScript, OwnerMCP, ConfigRef,
+                HandoverRecipients):
         names = cls.__dict__ if issubclass(cls, OwnerAPI) else dir(cls)
         suite.addTests(cls(name) for name in names if name.startswith("test_"))
     return suite
@@ -90,8 +100,9 @@ def checks_pass(argv, timeout=None, cwd=None, input=None):
 
 
 def machine_run(argv, timeout=20, cwd=None):
-    """A machine's commands: git for real, and nothing else of this computer."""
-    if argv[0] == "git":
+    """A machine's commands: git for real, a release's own start check for real (it reads this computer and changes
+    nothing), and nothing else of this computer."""
+    if argv[0] == "git" or argv[-2:-1] == ["start-check"]:
         return lifecycle._run(argv, timeout=timeout, cwd=cwd)
     return 1, "", "not in this test"
 
@@ -100,7 +111,9 @@ class Fleet:
     """A fleet in the shape it runs, in a temporary folder: the published repository (`upstream`), the hub's bare
     repository (`origin`) with its configuration ref, and the checkout that takes releases with `releases.Update`, as
     the hub's does. The ref starts as every fleet's did before track 0, with code and data and no release.json. The
-    code is this checkout's own lifecycle.py, onboard.py and releases.py, so a shell mover runs the real check."""
+    code is this checkout's own lifecycle.py, onboard.py and releases.py, so a shell mover runs the real check, and
+    fleet.py and server.py stand in for the two programs that run from a checkout: each loads lifecycle, so a
+    release's own start check (`lifecycle.py start-check`) runs for real on this tree and passes."""
 
     def __init__(self, root, team=None):
         self.root, self.made = Path(root), 0
@@ -109,6 +122,8 @@ class Fleet:
         for name in CODE:
             shutil.copy(KIT / name, pub / name)
         (pub / "hub.py").write_text("VERSION = 1\n")
+        for name in lifecycle.START_PROGRAMS.values():
+            (pub / name).write_text(STARTS)
         (pub / "join.sh").write_text("#!/bin/sh\n")
         (pub / lifecycle.RELEASE_KEYS).write_text(base64.b64encode(KEY).decode() + "\n")
         (pub / "team.json").write_text('{"agents": {}}\n')         # the published seed, which no fleet takes
@@ -152,11 +167,14 @@ class Fleet:
         git("clone", "-q", "-b", lifecycle.CONFIG_BRANCH, self.origin, str(folder))
         return folder
 
-    def release(self, version, seed=SEED, keys=KEY):
+    def release(self, version, seed=SEED, keys=KEY, files=None):
         """Release `version` on the configuration ref, put there by releases.Update, as the hub takes one. `keys` are
-        what the hub checks the channel's manifest with."""
+        what the hub checks the channel's manifest with; `files` ({path: text}) are written into the release too."""
         (self.pub / "hub.py").write_text(f"VERSION = {version}\n")
-        git("commit", "-q", "-am", f"release {version}", cwd=self.pub)
+        for path, text in (files or {}).items():
+            (self.pub / path).write_text(text)
+        git("add", "-A", cwd=self.pub)
+        git("commit", "-q", "-m", f"release {version}", cwd=self.pub)
         git("push", "-q", self.upstream, "HEAD:main", cwd=self.pub)
         revision = git("rev-parse", "HEAD", cwd=self.pub)
         git("fetch", "-q", "origin", cwd=self.releaser)
@@ -428,6 +446,139 @@ class TakeOnce(Repositories):
         self.assertEqual(self.head(), four)
 
 
+class StartCheck(Repositories):
+    """The release's own start check, for a mover that starts a program from its checkout (lifecycle.take with
+    `starts`): the checkout moves onto a release only after its tree started on this machine from a copy, checked
+    after may_take and before the move. Git and the check run for real, and each command is recorded."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+
+    def commands(self, argv, timeout=20, cwd=None):
+        self.calls.append(list(argv))
+        return lifecycle._run(argv, timeout=timeout, cwd=cwd)
+
+    def copies(self):
+        return [argv for argv in self.calls if argv[:2] == ["git", "clone"]]
+
+    def checks(self):
+        return [argv for argv in self.calls if argv[-2:-1] == ["start-check"]]
+
+    def take(self, target, starts="helper", run=None):
+        git("fetch", "-q", "origin", cwd=self.kit)
+        return lifecycle.take(str(self.kit), target, run or self.commands, str(self.floor), starts=starts)
+
+    def released(self, commit):
+        return json.loads(git("show", f"{commit}:{lifecycle.RELEASE_FILE}", cwd=self.kit))["revision"]
+
+    def data(self):
+        """A later commit of the hub on the ref: the owner's own file, and no release."""
+        return self.fleet.commit(lambda work: (work / "profiles/vps.md").write_text(PROFILE + "Quick.\n"), "Profile")
+
+    def test_a_release_that_does_not_start_here_moves_nothing_raises_no_floor_and_says_why(self):
+        four = self.fleet.release(4, files=NO_START)
+        said = self.take(four)
+        self.assertIsInstance(said, lifecycle.Refused)
+        self.assertEqual(said, "Release 2026.11.4 did not start on this server, so the server keeps the version that "
+                               "it runs: start-check: broken does not load: RuntimeError: no such setting here")
+        self.assertEqual(self.head(), self.three)
+        self.assertEqual(lifecycle.read_floor(str(self.floor)), (self.released(self.three), None))
+
+    def test_a_release_that_starts_here_moves_as_before_after_one_check(self):
+        four = self.fleet.release(4)
+        self.assertIsNone(self.take(four))
+        self.assertEqual((self.head(), len(self.copies()), len(self.checks())), (four, 1, 1))
+        self.assertEqual(lifecycle.read_floor(str(self.floor)), (self.released(four), None))
+
+    def test_a_move_of_data_only_makes_no_copy(self):
+        """Each task start syncs the checkout: a change of the owner's files alone pays for no clone."""
+        data = self.data()
+        self.assertIsNone(self.take(data))
+        self.assertEqual((self.head(), self.copies(), self.checks()), (data, [], []))
+
+    def test_a_commit_that_may_take_refuses_is_never_copied_or_run(self):
+        """No code of a tree runs before its signature passed."""
+        forged = self.fleet.forged("fleet.py", STARTS + "VERSION = 'forged'\n")
+        self.assertIn("is not release 2026.11.3: it differs in fleet.py", self.take(forged))
+        self.assertEqual((self.head(), self.copies(), self.checks()), (self.three, [], []))
+
+    def test_a_release_that_did_not_start_is_not_copied_again_and_another_release_is_checked(self):
+        """The hub asks again at each change of the owner's files, which are later commits of the same release: they
+        are refused with the same words and no new copy. A new release is checked, and moves when it starts."""
+        refused = self.take(self.fleet.release(4, files=NO_START))
+        self.assertEqual(self.take(self.data()), refused)
+        self.assertEqual((self.head(), len(self.copies())), (self.three, 1))
+        five = self.fleet.release(5, files={"fleet.py": STARTS})
+        self.assertIsNone(self.take(five))
+        self.assertEqual((self.head(), len(self.copies())), (five, 2))
+
+    def test_a_check_that_cannot_run_moves_as_before_says_so_and_keeps_nothing(self):
+        """A full disk is a fault of the checker, not of the release that may_take let through: the move goes on as it
+        did before this check, a line on standard error says so, and a later release that does not start is still
+        refused."""
+        four = self.fleet.release(4, files=NO_START)
+
+        def full(argv, timeout=20, cwd=None):
+            if argv[:2] == ["git", "clone"]:
+                return 128, "", "fatal: could not create work tree dir: No space left on device"
+            return self.commands(argv, timeout, cwd)
+        with contextlib.redirect_stderr(io.StringIO()) as said:
+            self.assertIsNone(self.take(four, run=full))
+        self.assertEqual(self.head(), four)
+        self.assertEqual(said.getvalue(), "Release 2026.11.4 is taken without its start check, which could not run on "
+                                          "this server: fatal: could not create work tree dir: No space left on "
+                                          "device\n")
+        self.assertIsInstance(self.take(self.fleet.release(5)), lifecycle.Refused)
+        self.assertEqual(self.head(), four)
+
+    def test_no_temporary_folder_moves_as_before_and_raises_nothing(self):
+        """A machine with no room for a temporary folder: the server's service and a task's start, which catch
+        nothing, go on, and so does the move."""
+        four = self.fleet.release(4)
+        with patch.object(lifecycle.tempfile, "mkdtemp", side_effect=OSError(28, "No space left on device")), \
+                contextlib.redirect_stderr(io.StringIO()) as said:
+            self.assertIsNone(self.take(four))
+        self.assertEqual(self.head(), four)
+        self.assertEqual(said.getvalue(), "Release 2026.11.4 is taken without its start check, which could not run on "
+                                          "this server: OSError: [Errno 28] No space left on device\n")
+
+    def test_a_mover_with_no_role_makes_no_copy_and_runs_no_check(self):
+        """The hub's own update (it has its larger check), the installers and the owner's MCP server move as before."""
+        four = self.fleet.release(4, files=NO_START)
+        self.assertIsNone(self.take(four, starts=None))
+        self.assertEqual((self.head(), self.copies(), self.checks()), (four, [], []))
+
+
+class StartCheckCommand(unittest.TestCase):
+    """`lifecycle.py start-check helper` in a tree of its own, run as a machine runs it: by its path, with -B."""
+
+    def setUp(self):
+        self.tree = Path(tempfile.mkdtemp(prefix="fleet-start-tree-"))
+        self.addCleanup(shutil.rmtree, str(self.tree), True)
+        for name in ("lifecycle.py", "onboard.py"):
+            shutil.copy(KIT / name, self.tree / name)
+
+    def check(self, files):
+        for name, text in files.items():
+            (self.tree / name).write_text(text)
+        done = subprocess.run([sys.executable, "-B", str(self.tree / "lifecycle.py"), "start-check", "helper"],
+                              cwd=self.tree, capture_output=True, text=True, timeout=120)
+        return done.returncode, done.stdout.strip()
+
+    def test_it_names_the_module_that_does_not_load_finds_one_that_a_function_imports_and_never_loads_hub(self):
+        program = STARTS + "import early\n\n\ndef later():\n    import late\n    import hub\n"
+        self.assertEqual(self.check({"fleet.py": program, "early.py": "", "late.py": "",
+                                     "hub.py": "raise RuntimeError('the hub was loaded')\n"}),
+                         (0, "start-check: this release starts here as helper"))
+        code, line = self.check({"late.py": "def later(:\n"})
+        self.assertEqual(code, 1)
+        self.assertTrue(line.startswith("start-check: late does not load: SyntaxError: "), line)
+        self.assertEqual(self.check({"late.py": "", "early.py": "raise ValueError('no such setting here')\n"}),
+                         (1, "start-check: early does not load: ValueError: no such setting here"))
+        self.assertEqual(list(self.tree.rglob("*.pyc")), [])
+
+
 # ---------------------------------------------------------------- every mover
 
 class Mover(Repositories):
@@ -457,17 +608,25 @@ class HelperUpdate(Mover):
         life = lifecycle.Lifecycle(str(self.kit), "vps", {"role": "worker", "runtime": "codex"}, None, lambda: False,
                                    restart=lambda: True, run=machine_run, home=str(self.home), floor=str(self.floor))
         life.report = lambda *a, **k: None
-        self.restarted = life.apply(target)
+        self.restarted, self.life = life.apply(target), life
 
     def test_a_refused_move_is_a_failed_update_and_no_restart(self):
         self.move(self.fleet.forged())
         self.assertFalse(self.restarted)
 
+    def test_a_release_that_does_not_start_here_is_a_failed_update_in_its_own_words_and_no_restart(self):
+        self.move(self.fleet.release(4, files=NO_START))
+        self.assertEqual((self.restarted, self.life.state, self.head()), (False, "failed", self.three))
+        self.assertEqual(self.life.detail, "Release 2026.11.4 did not start on this server, so the server keeps the "
+                                           "version that it runs: start-check: broken does not load: RuntimeError: no "
+                                           "such setting here")
+
 
 class TaskStartSync(Mover):
-    """The helper brings the checkout up to date before a task session (lifecycle.follow_config_ref)."""
+    """The helper brings the checkout up to date before a task session (lifecycle.follow_config_ref, as
+    fleet.Helper.sync_checkout calls it)."""
     def move(self, target):
-        self.said = lifecycle.follow_config_ref(str(self.kit), floor=str(self.floor))
+        self.said = lifecycle.follow_config_ref(str(self.kit), floor=str(self.floor), starts="helper")
 
 
 class ServerUpdate(Mover):
@@ -475,9 +634,21 @@ class ServerUpdate(Mover):
     def move(self, target):
         service = server.Service({"name": "worker-9", "repo": self.fleet.origin}, None, kit=str(self.kit),
                                  home=str(self.home), floor=str(self.floor))
-        service.restart = lambda: None
+        self.restarts, self.service, said = [], service, io.StringIO()
+        service.restart = lambda: self.restarts.append(target)
         service.desired = target
-        service.update()
+        with contextlib.redirect_stderr(said):
+            service.update()
+        self.said = said.getvalue()
+
+    def test_a_release_that_does_not_start_here_starts_nothing_and_gets_no_second_try(self):
+        four = self.fleet.release(4, files={"server.py": NO_START["fleet.py"], "broken.py": NO_START["broken.py"]})
+        self.move(four)
+        self.assertEqual((self.restarts, self.service.loaded, self.service.stuck, self.head()),
+                         ([], self.three, four, self.three))
+        self.assertEqual(self.said, "Release 2026.11.4 did not start on this server, so the server keeps the version "
+                                    "that it runs: start-check: broken does not load: RuntimeError: no such setting "
+                                    "here\n")
 
 
 class ServerNewCheckout(Mover):
