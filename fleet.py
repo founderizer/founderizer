@@ -1232,6 +1232,23 @@ NO_TIMERS = "CLAUDE_CODE_DISABLE_CRON=1"
 # "refuse" drops each such message. It also drops what a session's own hook or command writes into its own inbox,
 # which Fleet does not use; the end notice of a session's own Workflow still arrives (test_efficiency.LiveAskingUp).
 NO_PEER_MESSAGES = {"crossSessionInbound": "refuse"}
+# Its Remote Control: a session that starts it registers with the claude.ai account that it is signed in with, and a
+# person can then read it and type into it from claude.ai or the Claude app, which the hub cannot see either. The
+# program starts it at a session's start when remoteControlAtStartup is true. It takes that value from the policy,
+# then from --settings, then from the user's own ~/.claude/settings.json (read directly, whatever --setting-sources
+# says), then from ~/.claude.json; with none of them, from an org policy or a flag of the vendor, which is off today
+# (read in 2.1.312). So every Claude session that a helper starts for an agent's work names it off in its own
+# settings, which the program reads before the user's files, and the vendor's later default changes none of them. The
+# window of a sign-in or a sign-out has no settings of its own, as above.
+NO_REMOTE_CONTROL = {"remoteControlAtStartup": False}
+# Remote Control's commands of cloud sessions: a person's claude.ai cloud session runs commands on this computer, also
+# with no question once the computer's user allowed it ("Allow them in /config in claude, or in the Claude desktop app
+# under Remote Control", the program's words). The program serves them only while its own switch is not 0 and its other
+# conditions hold (a flag of the account, a saved sign-in, the user's consent), and a start's --settings cannot turn
+# them off: the program ignores that setting there (read in 2.1.312). Whether a session in a helper's window would serve
+# them is not measured. Each one starts with the switch off, as one of its env words, which its settings give again
+# (start_env), so that the user's own env map cannot turn it on. The model's own tools stay the same.
+NO_REMOTE_TOOLS = "CLAUDE_CODE_REMOTE_TOOLS_SERVE=0"
 # Its agent teams: with this variable on, in the machine's environment today and maybe by default in a later version,
 # Claude Code's documents say that a subagent that the model gives a name starts as a teammate, and that nobody is
 # asked. Measured here: the model is then offered other tools. The helper's reader of a session's records
@@ -1393,6 +1410,7 @@ def settings_arg(agent, conf, task, tools=(), needs="none", browser=False, words
     settings["prefersReducedMotion"] = False        # the screen watch reads its counters (MOTION)
     settings.update(NO_SUGGESTION)
     settings.update(NO_PEER_MESSAGES)               # a message reaches a session through the hub only
+    settings.update(NO_REMOTE_CONTROL)              # and no person reaches it from claude.ai
     # AUTONOMY.md decision 41: what an agent learns is the fleet's (its notes and its memory, which the owner reads),
     # never a memory folder of Claude Code's own that a later session would load unseen
     settings.update(CLAUDE_NO_MEMORY)
@@ -2589,7 +2607,7 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     words = f"FLEET_ATTEMPT={attempt} FLEET_GENERATION={shlex.quote(generation)} FLEET_HUB={shlex.quote(HUB)} " \
             f"FLEET_AGENT={shlex.quote(agent)} FLEET_TASK={shlex.quote(task or '')}"
     if conf.get("runtime") == "claude":
-        words += f" {NO_TIMERS} {NO_TEAMS} {NO_FILE_MENTIONS} {MOTION}" + \
+        words += f" {NO_TIMERS} {NO_TEAMS} {NO_FILE_MENTIONS} {MOTION} {NO_REMOTE_TOOLS}" + \
             (f" {TODO_TOOLS} {OWN_TASK_LIST}" if task else "")
     if conf.get("runtime") == "claude":     # a task session too, since the owner's answer of 19 November 2026
         words += f" CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"
@@ -2758,7 +2776,7 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
         allow.append(CHROME_TOOLS)
         deny += CLOSED_CHROME_DENY
     hook = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.join(KIT, 'fleet.py'))} hook"
-    settings = dict({**CLAUDE_NO_MEMORY, **NO_PEER_MESSAGES, "prefersReducedMotion": False,
+    settings = dict({**CLAUDE_NO_MEMORY, **NO_PEER_MESSAGES, **NO_REMOTE_CONTROL, "prefersReducedMotion": False,
                      # its mode here too: no question of the program about the user's own mode (CLOSED_MODE)
                      "permissions": {"allow": allow, "deny": deny, "defaultMode": CLOSED_MODE},
                      # the activity of its tool calls for the hub's views, as every task session sends it (C7)
@@ -2782,7 +2800,7 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
     first = ["--append-system-prompt-file", session_file(agent, task, "md", text + github_text(values, tools))]
     words = ["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}",
              f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", NO_TIMERS, NO_TEAMS, NO_FILE_MENTIONS, MOTION,
-             OWN_TASK_LIST, CLOSED_NO_UPDATES] + \
+             NO_REMOTE_TOOLS, OWN_TASK_LIST, CLOSED_NO_UPDATES] + \
         [f"{name}={values[name]}" for name in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW",) if name in values]   # a window
     settings["env"] = start_env(words[1:])      # its words again, after the user's own env map (CLOSED_MODE)
     # Its settings from a file too, as its MCP configuration: they hold one rule for each listed host and for each of
@@ -3181,7 +3199,7 @@ def chat_words(agent, generation, claude):
     """The env words of an owner chat's start (after the word "env"), with Claude Code's own when claude, which a
     Claude chat's settings give again (start_env), so that the machine user's ~/.claude.json changes none of them."""
     return ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK="] + \
-        ([NO_TIMERS, NO_TEAMS, NO_FILE_MENTIONS, f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"]
+        ([NO_TIMERS, NO_TEAMS, NO_FILE_MENTIONS, NO_REMOTE_TOOLS, f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"]
          if claude else [])
 
 
@@ -3242,7 +3260,7 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
         # machine user's settings (kept_user_settings). Its mode in its settings too: with another defaultMode in the
         # user's own ~/.claude/settings.json and none in a source of the start, Claude Code asks at the start whether
         # auto mode is to be the default, and the helper's next Enter answers yes (as in a closed start, CLOSED_MODE)
-        settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION, **NO_PEER_MESSAGES,
+        settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION, **NO_PEER_MESSAGES, **NO_REMOTE_CONTROL,
                          "permissions": {"allow": [f"mcp__fleet__{t}" for t in CHAT_TOOLS], "deny": DENY,
                                          "defaultMode": CHAT_MODE}},
                         **kept_user_settings())
@@ -3762,12 +3780,12 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
     # mode "narrowed" (the person access plan): the same lock, with the narrowed tools as the allow list
     allowed = NARROWED_TOOLS if narrowed_mode(mode) else CONVERSATION_TOOLS
     words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK=", NO_TIMERS,
-             NO_TEAMS, NO_FILE_MENTIONS,
+             NO_TEAMS, NO_FILE_MENTIONS, NO_REMOTE_TOOLS,
              f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"]     # a window that stays open: a bounded context
     if runtime is not None:
         words.append(CLOSED_NO_UPDATES)         # the pinned version stays the version that runs
     # its mode, and its words again after the user's own env map, with what it keeps of their env (CLOSED_MODE)
-    settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION, **NO_PEER_MESSAGES,
+    settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION, **NO_PEER_MESSAGES, **NO_REMOTE_CONTROL,
                      "permissions": {"allow": [f"mcp__fleet__{t}" for t in allowed], "deny": DENY,
                                      "defaultMode": CLOSED_MODE}}, **kept)
     settings["env"] = dict(kept.get("env") or {}, **start_env(words[1:]))

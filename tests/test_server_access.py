@@ -601,8 +601,18 @@ class DoorTokens(Access):
             team = self.origin_team()
             change(team)
             self.assertIn(why, hub.door_key_kept(team, old, rev)[1])
-        with patch.object(hub, "profile_logins", lambda name, rev=None: {old} if name == "lead" else set()):
+        with patch.object(hub, "profile_logins",
+                          lambda name, rev=None, strict=False: {old} if name == "lead" else set()):
             self.assertIn("lead still holds it", hub.door_key_kept(self.origin_team(), old, rev)[1])
+        # a profile that git does not give now may list it: the entry stays until a later round, never as one that no
+        # profile lists (a finding of the area "Hub core", 20 November 2026)
+        def unread(name, rev=None, strict=False):
+            if name == "lead" and strict:
+                raise hub.KitUnread("profiles/lead.md")
+            return set()
+        with patch.object(hub, "profile_logins", unread):
+            self.assertEqual(hub.door_key_kept(self.origin_team(), old, rev),
+                             ("write", "the hub cannot read the profile of lead now"))
         self.assertIsNone(hub.door_key_kept(self.origin_team(), old, rev))
         team = self.origin_team()                        # an entry that is no GitHub App key stays for good
         team["logins"][old]["env"] = "CLOUDFLARE_API_TOKEN"

@@ -137,6 +137,7 @@ SITES = {
     'grant_server': {'no_such_agent': 1},
     'join_server': {'server_name_kept': 1},       # a server named door (C49)
     'key_swap_entry': {'no_such_server': 1},      # Part B of the key swap: the 404 of both of its routes
+    'key_hold_index': {'profile_unread': 1},       # a key's table site (save_secret, save_secrets)
     'knowledge_add': {'revision_unreadable': 1},
     'knowledge_content': {'login_as_text': 1},
     'knowledge_delete': {'profile_unread': 1, 'revision_unreadable': 1},
@@ -178,6 +179,7 @@ SITES = {
     'save_grant': {'no_such_agent': 1},
     'save_integration': {'team_changed': 1},
     'save_lines': {'team_changed_lines': 1},
+    'save_login': {'profile_unread': 1},           # the delete guard: a profile that git does not give now
     'save_profile': {'profile_unread': 1, 'revision_unreadable': 1},
     'save_resource': {'repo_vendor': 1},
     'save_runtime': {'no_such_agent': 1, 'team_changed': 1},
@@ -483,7 +485,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 198)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 200)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

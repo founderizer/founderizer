@@ -211,7 +211,8 @@ class Catalog(test_grants.Grants):
 
     def test_a_key_that_something_holds_gets_no_site(self):
         ref = self.ref(1)
-        with patch.object(hub, "profile_logins", lambda agent: {ref} if agent == "alpha" else set()):
+        with patch.object(hub, "profile_logins",
+                          lambda agent, rev=None, strict=False: {ref} if agent == "alpha" else set()):
             self.born(1, "PROFILED_KEY", "https://api.openai.com")             # a profile lists it
         self.assertNotIn("site", self.entry(ref))
         now = hub.now()
@@ -236,6 +237,16 @@ class Catalog(test_grants.Grants):
                 self.assertEqual(hub.key_table_site(held, new, "HELD_KEY", "openai", hub.key_hold_index(held)), {})
         self.assertEqual(hub.key_table_site(team, new, "HELD_KEY", "openai", hub.key_hold_index(team))["site"], OPENAI)
         self.assertEqual(hub.key_table_site(team, new, "HELD_KEY", "gone", hub.key_hold_index(team)), {})     # no such row now
+        # a profile that git does not give now may list the key: no index, so no site, never a profile that lists none
+        # (a finding of the area "Hub core", 20 November 2026)
+        def unread(agent, rev=None, strict=False):
+            if agent == "alpha" and strict:
+                raise hub.KitUnread("profiles/alpha.md")
+            return set()
+        with patch.object(hub, "profile_logins", unread), self.assertRaises(hub.Refusal) as got:
+            hub.key_hold_index(team)
+        self.assertEqual((got.exception.status, got.exception.extra["code"], got.exception.extra["names"]),
+                         (503, "profile_unread", {"agent": "alpha"}))
 
     def test_an_import_gives_each_row_its_site_by_the_same_conditions_in_one_commit(self):
         before = self.commits()

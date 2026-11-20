@@ -1650,10 +1650,16 @@ def key_hold_index(team):
     """What holds the catalog's keys, read once for a write of many entries: (the references that a grant of an agent
     at any level, a profile or an account names, the variables that an MCP server or a saved check names). A "use"
     grant counts, because a site limits where the vault sends the key (vault.py swap_call). A saved check is a wake-up
-    rule or a duty's watch, whose arguments name a variable (as checks/url_lines.py's args.key does)."""
-    refs, envs = set(), set()
+    rule or a duty's watch, whose arguments name a variable (as checks/url_lines.py's args.key does). A profile that git
+    does not give now may name a key: 503 profile_unread, never a profile that names none, so that the table gives no
+    site to a key that a profile holds (a finding of the area "Hub core", 20 November 2026)."""
+    refs, envs, rev = set(), set(), kit_revision(fresh=True)
     for name, a in (team.get("agents") or {}).items():
-        refs |= set((a.get("secrets") or {}) if isinstance(a, dict) else {}) | profile_logins(name)
+        try:
+            listed = profile_logins(name, rev, strict=True)
+        except KitUnread:
+            raise Refusal(503, code="profile_unread", names={"agent": name}) from None
+        refs |= set((a.get("secrets") or {}) if isinstance(a, dict) else {}) | listed
     refs |= {x.get("secret") for x in (team.get("accounts") or {}).values() if isinstance(x, dict)}
     for server in (team.get("mcp") or {}).values():
         if isinstance(server, dict):
@@ -18111,7 +18117,10 @@ def key_table_count():
         if kv_get(KEY_TABLE_PASS):
             return
         team = team_read()
-        refs, envs = key_hold_index(team)
+        try:
+            refs, envs = key_hold_index(team)
+        except Refusal:
+            return                      # a profile that git does not give now: a later tick counts the list
         catalog = team.get("logins") or {}
         would = {name: 0 for name in lifecycle.KEY_TABLE}
         left = {"with a site": 0, "with a mark": 0, "held": 0, "of a row that is gone": 0}
@@ -57009,9 +57018,17 @@ def save_team_entry(body, key, what, entry, busy):
 def save_login(body):
     """An owner label of one login reference (owner feature secrets). It never holds a value and gives no access. A
     label stays while a profile or a grant lists the reference. Once it is gone, the central vault's reconciler takes
-    the value out of the central vault too, after no machine's vault holds a copy (central_removals)."""
+    the value out of the central vault too, after no machine's vault holds a copy (central_removals). A profile that git
+    does not give now may list the reference, so the removal waits for it (503 profile_unread), and is never taken as a
+    profile that lists no login (a finding of the area "Hub core", 20 November 2026)."""
     def busy(ref):
-        users = sorted(n for n in agents() if ref in granted_logins(n))
+        users = []
+        for n in sorted(agents()):
+            try:
+                if ref in granted_logins(n, strict=True):
+                    users.append(n)
+            except KitUnread:
+                raise Refusal(503, code="profile_unread", names={"agent": n}) from None
         if users:
             raise Conflict(f"{ref} is still listed (profiles and grants: {', '.join(users)}); remove it there first",
                            agents=users)
@@ -57110,7 +57127,9 @@ def save_secrets(body):
     command), a new API key whose variable name the catalog has, or an entry before it that the hub took (409,
     key_named), and an entry that the catalog has no room for (400). An entry is registered as save_secret registers
     one: its fingerprints first, so a commit that fails leaves them, and the same step again finds them. Only a refusal
-    of team.json itself (validate_team) refuses the whole list, with 400. No value comes in."""
+    of team.json itself (validate_team) refuses the whole list, with 400, and a profile that git does not give now while
+    an entry has a row of the table (key_hold_index), with 503 profile_unread, before anything is written. No value
+    comes in."""
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     logins = dict(team.get("logins") or {})
@@ -60466,7 +60485,14 @@ def door_key_kept(team, ref, rev):
     if entry is not None and (entry.get("kind") != "api_key" or
                               not GITHUB_APP_KEY_NAME.fullmatch(str(entry.get("env")))):
         return "name", "the entry is not a GitHub App key by its kind and its name, and the hub removes no other entry"
-    users = sorted(n for n in team.get("agents") or {} if ref in profile_logins(n, rev) | set(secret_grants(n, team)))
+    users = []
+    for n in sorted(team.get("agents") or {}):
+        try:                # a profile that git does not give now may list it: never a profile that lists no login
+            listed = profile_logins(n, rev, strict=True)
+        except KitUnread:   # door_key_retire's quiet reason of a read that failed: one log line, tried again later
+            return "write", f"the hub cannot read the profile of {n} now"
+        if ref in listed | set(secret_grants(n, team)):
+            users.append(n)
     if users:
         return (f"held {', '.join(users)}",
                 f"{', '.join(users)} still {'holds' if len(users) == 1 else 'hold'} it, by a grant or a profile")

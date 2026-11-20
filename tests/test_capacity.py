@@ -482,6 +482,15 @@ class Capacity(OwnerAPI):
         code, data = self.request("/ui/team/logins", dict(request_id=str(uuid.uuid4()), db="test-generation",
                                                           base_sha256=self.sha(), login=loud, delete=True))
         self.assertEqual((code, data["agents"]), (409, ["seo"]), data)
+        # While git gives no answer for seo's profile, which lists it, the removal waits: never a profile with no login
+        # (git_blob gives None for a read that failed as for no file; a finding of the area "Hub core", 20 Nov 2026)
+        path, blob, batch = "profiles/seo.md", hub.git_blob, hub.kit_batch
+        with patch.multiple(hub, git_blob=lambda rev, p: None if p == path else blob(rev, p),
+                            kit_batch=lambda folder, rev, paths: {} if path in paths else batch(folder, rev, paths),
+                            KIT_PATHS=hub.collections.OrderedDict()):
+            code, data = label(LOGIN_B, delete=True)
+        self.assertEqual((code, data.get("code"), data.get("names")), (503, "profile_unread", {"agent": "seo"}), data)
+        self.assertIn(LOGIN_B, self.request("/ui/team?db=test-generation")[1]["logins"])
         code, data = label(fresh, delete=True)
         self.assertEqual((code, data["deleted"]), (200, True), data)
         self.assertEqual(set(self.request("/ui/team?db=test-generation")[1]["logins"]), {LOGIN_A, LOGIN_B})

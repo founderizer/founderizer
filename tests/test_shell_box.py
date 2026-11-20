@@ -151,6 +151,7 @@ class Helper(unittest.TestCase):
         self.assertIn(fleet.CLOSED_NO_UPDATES, env)
         self.assertIn(fleet.NO_TEAMS, env)
         self.assertIn(fleet.NO_FILE_MENTIONS, env)      # the program reads no file that a prompt names
+        self.assertIn(fleet.NO_REMOTE_TOOLS, env)       # and serves no command of a cloud session
         self.assertTrue(all(w.startswith(("FLEET_", "CLAUDE_", "DISABLE_")) for w in env[1:]), env)
         self.assertEqual((option("--setting-sources"), option("--permission-mode"), option("--tools")),
                          ("", "dontAsk", "WebSearch"))
@@ -166,6 +167,7 @@ class Helper(unittest.TestCase):
                                                    "deny": fleet.DENY, "defaultMode": "dontAsk"})
         self.assertFalse(settings["autoMemoryEnabled"])
         self.assertEqual(settings["crossSessionInbound"], "refuse")       # no message of another Claude session
+        self.assertIs(settings["remoteControlAtStartup"], False)          # and no Remote Control from claude.ai
         self.assertNotIn("enableWorkflows", settings)
         self.assertEqual(list(settings["hooks"]), ["PostToolUse", "PostToolUseFailure"])
         self.assertNotIn(TOKEN, self.build())
