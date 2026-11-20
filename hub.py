@@ -54638,16 +54638,17 @@ def account_sharers(server, email):
 # What stops Fleet Vault on a Mac whose agent works in Chrome, in the words of the vault's own refusals (VaultFailure's
 # chromeJavaScriptOff and chromeRefused, app/Sources/FleetVaultCore/VaultProtocol.swift). The words say no "sign in"
 # beside a site: the manager's card of them passes card_sign_in.
-VAULT_JAVASCRIPT_OFF = ("Chrome's menu item View, Developer, Allow JavaScript from Apple Events has no tick, so Fleet Vault "
-                        "fills no password there")
+VAULT_JAVASCRIPT_OFF = ("Chrome's menu item View, Developer, Allow JavaScript from Apple Events has no tick in a profile "
+                        "that has a window, so Fleet Vault fills no password there")
 VAULT_REFUSED = "macOS does not let Fleet Vault control Chrome, so it fills no password there"
 VAULT_NOT_ASKED = ("macOS has not yet asked if Fleet Vault may control Chrome, so it fills no password there: the vault's "
                    "next job there makes macOS ask, and a person at that Mac clicks Allow")
 VAULT_WORDS = (VAULT_JAVASCRIPT_OFF, VAULT_REFUSED, VAULT_NOT_ASKED)
 # Chrome takes that menu item only from the Mac's own keyboard, mouse or trackpad (Chromium's browser_commands_mac.mm
 # refuses an event of another process), and per profile: Screen Sharing cannot tick it.
-VAULT_HANDS_ONLY = ("Only a person at that Mac itself, with its own keyboard or mouse, can tick it, in a Chrome window of "
-                    "the agent's profile: Chrome ignores that menu item through Screen Sharing")
+VAULT_HANDS_ONLY = ("Only a person at that Mac itself, with its own keyboard or mouse, can tick it, in a window of each "
+                    "Chrome profile that has one: the tick belongs to a profile, and Chrome ignores that menu item through "
+                    "Screen Sharing")
 
 
 def mac_desktop_sweep():

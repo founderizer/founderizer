@@ -56,11 +56,18 @@ INBOX = "inbox"             # beside the sessions: the files that wa-link downlo
 # 20 November 2026, and the owner's words of that day: "does it accept multiple files, images etc? it should"): the
 # bridge uploads each file of a message, of any type, to POST /bridge/files before the message's own POST
 # /bridge/inbound. A file that does not come up is one code of the message's `missed`: size (more than FILE_MOST, or
-# than Telegram gives a bot), download, refused (by the hub, also for bytes that are not of their type, and after
-# FILE_TRIES attempts that it did not answer) or many (past FILES_IN).
+# than Telegram gives a bot), download, refused (by the hub, also for bytes that are not of their type; after
+# FILE_TRIES attempts that the hub, up, answered with no answer that the interface names; and after FILE_DOWN_MOST
+# uploads of the file that took the hub away) or many (past FILES_IN).
 FILES_IN = 10               # Discord's own most for one message
 MISSED_MOST = 20            # codes of one message's `missed` that the hub takes
-FILE_TRIES = 3              # attempts that a message's files keep it, in all, after no answer or a 5xx: then `refused`
+FILE_TRIES = 3              # attempts that a message's files keep it, in all, after the hub, up, gave its question or
+                            # an upload no answer, a 5xx, or for an upload an answer that the interface does not name
+                            # (files_up): then `refused`
+FILE_NOT_SENT = ("ConnectionRefusedError", "OSError", "gaierror", "no bridge key")   # an upload that never left
+FILE_DOWN_MOST = 3          # uploads of a message's files after which the hub, which had just said yes, answered
+                            # nothing at all: then the file and the ones after it are `refused` and never sent again
+                            # (files that bring the hub down at each upload)
 # The types whose bytes the hub checks (hub.ATTACH_TYPES and hub.ATTACH_OFFICE), with their extensions. A file whose
 # chat app gives no valid type is of its name's extension: these first, so that the hub reads a Markdown or an Office
 # file as one, then Python's own table (never the system's, so that each machine says the same), else
@@ -363,8 +370,10 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect
 
 
 def request(url, method="GET", data=None, headers=None, timeout=30, raw=None):
-    """(status, headers, parsed JSON or None). Status 0: no answer (refused, reset or timed out). raw: (bytes, content
-    type) of a body that is not JSON, such as a Discord message with files."""
+    """(status, headers, parsed JSON or None). Status 0: no answer (refused, reset or timed out), with the fault's class
+    as `error` and, for urllib's URLError, the class of its reason as `cause` (ConnectionRefusedError: the connection
+    never opened, so the far end got no request; TimeoutError). raw: (bytes, content type) of a body that is not JSON,
+    such as a Discord message with files."""
     body = None if data is None else json.dumps(data).encode()
     sent = {"Accept": "application/json", **(headers or {})}
     if raw is not None:
@@ -379,7 +388,9 @@ def request(url, method="GET", data=None, headers=None, timeout=30, raw=None):
         except urllib.error.HTTPError as e:
             status, got, raw = e.code, e.headers, e.read()
     except (OSError, http.client.HTTPException, ValueError) as e:
-        return 0, {}, {"error": type(e).__name__}
+        reason = getattr(e, "reason", None) if isinstance(e, urllib.error.URLError) else None
+        return 0, {}, {"error": type(e).__name__,
+                       **({"cause": type(reason).__name__} if isinstance(reason, BaseException) else {})}
     try:
         return status, got, json.loads(raw) if raw else None
     except ValueError:
@@ -2561,7 +2572,9 @@ class Bridge:
         does not name (for FILE_TRIES attempts of the entry in all, whatever its number of files: then its files that
         are left are `refused` with no fetch and the message goes on; if the hub takes no message either, the next
         attempt asks again, and a hub that comes back gets the files), or the bridge has not read its accounts yet (at
-        a start, the journal replays first)."""
+        a start, the journal replays first). An attempt in which the hub answers nothing at all (answered) counts for
+        none of those tries, and the entry waits for the hub, as its post would get no answer either; only an upload
+        that the hub had just said yes to, after which it answers nothing, counts, for that file (FILE_DOWN_MOST)."""
         files, more = event.get("media"), event.get("media_more")
         files = [f if isinstance(f, dict) else {} for f in files] if isinstance(files, list) else []
         more = more if isinstance(more, int) and not isinstance(more, bool) and more > 0 else 0
@@ -2572,15 +2585,33 @@ class Bridge:
         if account is None and not configured:
             log(f"inbound {where}: the bridge does not run its account yet; kept")
             return None
-        seen = self.files_seen.setdefault(path, {"up": {}, "kept": 0})
+        seen = self.files_seen.setdefault(path, {"up": {}, "kept": 0, "down": 0, "gone": set()})
         done = seen["up"]
 
         def kept():
-            """Whether the entry waits for the next attempt after one more that got no answer, of the hub's question or
-            of an upload: FILE_TRIES of them for the whole entry, whatever its number of files. Past them, the files
-            that are left are `refused` with no fetch, and the message goes on."""
+            """Whether the entry waits for the next attempt after one more in which the hub, up, gave its question or an
+            upload no answer (none in its time, or none to the same request once more), a 5xx, or for an upload an
+            answer that the interface does not name: FILE_TRIES of them for the whole entry, whatever its number of
+            files. Past them, the files that are left are `refused` with no fetch, and the message goes on."""
             seen["kept"] += 1
             return seen["kept"] < FILE_TRIES
+
+        def answered(code, answer, send, upload=False):
+            """The answer to a question or an upload that got none (0): None when the hub answers nothing at all, as a
+            read of the bridge's configuration gets no answer either, in the post's own time. It is away (stopped, or
+            a process that holds its socket and answers nothing, as a restart in place or a hung hub does), its post
+            would get no answer either, so the attempt counts no try: counted, a hub that came back between an
+            attempt's question and its post past FILE_TRIES stored the message without its files (a whole-module run
+            of the tests under load, 20 November 2026). When the hub answers, the same request goes once more now,
+            which a hub that has just come back answers. Not an upload after a timeout: its bytes, up to FILE_MOST,
+            would only wait as long again for a stuck route, and the first answer counts; a question has no body."""
+            if code != 0:
+                return code, answer
+            if self.hub.call("GET", "/bridge/config")[0] == 0:
+                return None, answer
+            if upload and "TimeoutError" in (answer.get("error"), answer.get("cause")):
+                return code, answer
+            return send()
 
         missed, up, asked, refused_all = [], 0, False, False
         for n, f in enumerate(files[:FILES_IN], 1):
@@ -2594,34 +2625,67 @@ class Bridge:
                 data, self.file_held = held[2], None
             try:
                 mime, size = file_type(f.get("mime"), f.get("name")), f.get("size")
+                if data is None and isinstance(size, int) and not isinstance(size, bool) and size > FILE_MOST:
+                    raise Missed("size")
+                if n in seen["gone"]:   # it took the hub away at each of FILE_DOWN_MOST uploads
+                    raise Missed("refused")
+                if refused_all:         # the hub refused this message's sender or account: it refuses each file
+                    raise Missed("refused")
+                if data is None and account is None:
+                    raise Missed("download", "the bridge does not run its account")
+                if not asked:           # at each attempt, before a fetch and before held bytes go again
+                    asked = refused_all = True      # until the hub says yes: a fault here refuses them all
+                    question = upload_path(event, n, f, mime, check=True)
+                    code, answer = answered(*self.hub.upload(question, b""), lambda: self.hub.upload(question, b""))
+                    if code is None or code == 0 or code >= 500:
+                        if data is not None:
+                            self.file_held = (path, n, data)       # they go again with no new fetch
+                        if code is None:    # away: a question has no body, so no question takes the hub away
+                            log(f"inbound {where}: the hub answers nothing ({answer.get('error') or 'no answer'}); "
+                                f"kept")
+                            return None
+                        if kept():
+                            log(f"inbound {where}: the hub did not say whether it takes the files "
+                                f"({code or answer.get('error') or 'no answer'}); kept")
+                            return None
+                        raise Missed("refused", f"no answer of the hub in {FILE_TRIES} attempts")
+                    # only the hub's yes lets a byte of the chat app be fetched: any other answer is no (a hub of an
+                    # older release answers 404, which let a stranger's file be fetched)
+                    if code != 200:
+                        raise Missed("refused", f"the hub answered {code}")
+                    refused_all = False
                 if data is None:
-                    if isinstance(size, int) and not isinstance(size, bool) and size > FILE_MOST:
-                        raise Missed("size")
-                    if refused_all:     # the hub refused this message's sender or account: it refuses each file
-                        raise Missed("refused")
-                    if account is None:
-                        raise Missed("download", "the bridge does not run its account")
-                    if not asked:       # at each attempt: a hub that is down costs no download
-                        asked = refused_all = True      # until the hub says yes: a fault here refuses them all
-                        code, _ = self.hub.upload(upload_path(event, n, f, mime, check=True), b"")
-                        if code == 0 or code >= 500:
-                            if kept():
-                                log(f"inbound {where}: the hub did not say whether it takes the files "
-                                    f"({code or 'no answer'}); kept")
-                                return None
-                            raise Missed("refused", f"no answer of the hub in {FILE_TRIES} attempts")
-                        # only the hub's yes lets a byte of the chat app be fetched: any other answer is no (a
-                        # hub of an older release answers 404, which let a stranger's file be fetched)
-                        if code != 200:
-                            raise Missed("refused", f"the hub answered {code}")
-                        refused_all = False
                     try:
                         data = account.fetch_media(f, FILE_FETCH_TIMEOUT)
                     except Missed:
                         raise
                     except Exception as e:      # a fault of one fetch must not stop the journal
                         raise Missed("download", type(e).__name__) from None
-                code, _ = self.hub.upload(upload_path(event, n, f, mime), data)
+
+                def send(n=n, f=f, mime=mime, data=data):
+                    return self.hub.upload(upload_path(event, n, f, mime), data)
+                # once more after no answer: a write that the hub took and whose answer was lost comes back with that
+                # same row (bridge_file_key)
+                code, answer = answered(*send(), send, upload=True)
+                if code is None:
+                    # the hub went away during an upload that it had just said yes to: it waits with its bytes. An
+                    # upload that never reached the hub (a refused connection, an unreachable network, no key file)
+                    # took nothing away; the others count for the whole entry, as FILE_TRIES do, also a timeout,
+                    # which a hub that the upload hangs gives too, and at FILE_DOWN_MOST every file of it that is not
+                    # up yet is `refused` and never sent again: a message whose files take the hub away cannot hold
+                    # the journal, and costs the hub at most that many stops
+                    self.file_held = (path, n, data)
+                    why = answer.get("cause") or answer.get("error") or "no answer"
+                    if why not in FILE_NOT_SENT:
+                        seen["down"] += 1
+                    if seen["down"] < FILE_DOWN_MOST:
+                        log(f"inbound {where}: the hub answers nothing after file {n} ({why}); kept")
+                        return None
+                    # one that went up stays out: its bytes passed the hub's check once, and after FILE_UP_FOR it
+                    # goes again for its message
+                    seen["gone"].update(m for m in range(1, FILES_IN + 1) if m not in done)
+                    self.file_held = None
+                    raise Missed("refused", f"the hub went away at {FILE_DOWN_MOST} uploads of the message's files")
                 if code == 200:
                     done[n] = time.monotonic()
                     up += 1
@@ -2636,7 +2700,7 @@ class Bridge:
                     refused_all = refused_all or code in (403, 409)
                     raise Missed("refused", f"the hub answered {code}")
                 # these bytes go again at the next attempt, with no new fetch; past FILE_TRIES too, when the hub then
-                # takes no message either (it is down): a hub that comes back gets the file
+                # takes no message either: a hub that comes back gets the file
                 self.file_held = (path, n, data)
                 if not kept():
                     refused_all = True          # the files after it go with this one: no fetch, no upload

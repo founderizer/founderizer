@@ -1080,8 +1080,9 @@ class DiscordTests(Base):
     def test_an_attempt_after_no_answer_sends_only_what_did_not_come_up(self):
         """No change of the journal (the interface of version 2), and no download for nothing: a 503 to the hub's
         question keeps the message; a file that the hub took does not go again, though its address ended meanwhile;
-        the bytes of a file whose upload got no answer go again with no new fetch; the message goes after its files,
-        and nothing of it stays in the bridge's memory once it left the journal."""
+        the bytes of a file whose upload got no answer go again with no new fetch, after the hub's yes to that
+        attempt's question (files_up): no bytes go to a hub that is away; the message goes after its files, and
+        nothing of it stays in the bridge's memory once it left the journal."""
         self.ready()
         first, second = b"\x89PNG\r\n\x1a\n first", b"\x89PNG\r\n\x1a\n second"
         self.hub.check_answers = [(503, {"error": "hub error"})]
@@ -1094,7 +1095,8 @@ class DiscordTests(Base):
         self.assertEqual([(f["n"], data) for f, data, _ in self.hub.uploads],
                          [("1", first), ("2", second), ("2", second)])
         self.assertEqual(self.cdn.fetched(), ["/attachments/700/41/first.png", "/attachments/700/42/second.png"])
-        self.assertEqual(self.order(), ["/bridge/files?check"] * 2 + ["/bridge/files"] * 3 + ["/bridge/inbound"] * 2)
+        self.assertEqual(self.order(), ["/bridge/files?check"] * 2 + ["/bridge/files"] * 2 +
+                         ["/bridge/files?check", "/bridge/files"] + ["/bridge/inbound"] * 2)
         self.assertEqual([e.get("missed") for e in self.hub.posted], [None, None])
         self.assertEqual((self.bridge.files_seen, self.bridge.file_held), ({}, None))
         self.assertIn("inbound discord-studio 1641: the hub did not take file 2 (503); kept", self.log.getvalue())
@@ -1113,6 +1115,96 @@ class DiscordTests(Base):
         self.assertEqual((self.hub.inbound[0].get("missed"), len(self.hub.posted)), (["refused"] * 3, 1))
         self.assertEqual([data for _, data, _ in self.hub.uploads], [pngs[0]] * 3)
         self.assertEqual(len(self.cdn.requests), 1)
+        # the same when the hub, up, gives its question no answer (a stuck files route): each attempt asks once more,
+        # and counts; a wait with no count, as for a hub that is away, held the journal of every account for ever. An
+        # upload that timed out is not sent again: its bytes would only wait as long again
+        asked, real = [], self.bridge.hub.upload
+
+        def upload(path, data, timeout=None):
+            if "check=1" in path and "message=1644" in path:
+                asked.append(path)
+                return 0, {"error": "ConnectionResetError"}
+            if "check=1" not in path and "message=1647" in path:
+                asked.append(path)                      # a stuck upload route: each upload times out
+                return 0, {"error": "TimeoutError"}
+            return real(path, data, timeout)
+        patched = patch.object(self.bridge.hub, "upload", upload)
+        patched.start()
+        self.addCleanup(patched.stop)
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1644, "", attachments=[
+            self.attachment("44", "stuck.png", b"\x89PNG\r\n\x1a\n stuck")]))
+        self.wait_for(lambda: len(self.hub.inbound) == 2 and not self.journal_files(), "the second message")
+        self.assertEqual((self.hub.inbound[1].get("missed"), len(asked), len(self.cdn.requests)),
+                         (["refused"], 2 * channels.FILE_TRIES, 1))
+        self.assertEqual(self.log.getvalue().count("inbound discord-studio 1644: the hub did not say whether it takes "
+                                                   "the files (ConnectionResetError); kept"), channels.FILE_TRIES - 1)
+        self.assertNotIn("1644: the hub answers nothing", self.log.getvalue())
+        # a question that times out while the hub answers nothing at all (it holds its socket, as a restart in place
+        # or a hung process does) counts no try either: the read after it finds the hub away, and its files go once
+        # it answers again
+        frozen, real_call = {"left": 2 * channels.FILE_TRIES + 1}, self.bridge.hub.call
+
+        def upload_frozen(path, data, timeout=None):
+            if "check=1" in path and "message=1648" in path and frozen["left"]:
+                return 0, {"error": "TimeoutError"}
+            return upload(path, data, timeout)
+
+        def call(method, path, data=None, timeout=30):
+            if (method, path) == ("GET", "/bridge/config") and frozen["left"]:
+                frozen["left"] -= 1
+                if frozen["left"]:
+                    return 0, {"error": "TimeoutError"}
+                # the hub comes back while this read waits: it answers, and the question goes once more
+            return real_call(method, path, data, timeout)
+        for name, stand_in in (("upload", upload_frozen), ("call", call)):
+            patched = patch.object(self.bridge.hub, name, stand_in)
+            patched.start()
+            self.addCleanup(patched.stop)
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1648, "", attachments=[
+            self.attachment("48", "frozen.png", b"\x89PNG\r\n\x1a\n frozen")]))
+        self.wait_for(lambda: len(self.hub.inbound) == 3 and not self.journal_files(), "the message after the freeze")
+        self.assertEqual(self.hub.inbound[2].get("missed"), None)
+        self.assertNotIn("1648: the hub did not say whether", self.log.getvalue())
+        asked.clear()
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1647, "", attachments=[
+            self.attachment("47", "slow.png", b"\x89PNG\r\n\x1a\n slow")]))
+        self.wait_for(lambda: len(self.hub.inbound) == 4 and not self.journal_files(), "the fourth message")
+        self.assertEqual((self.hub.inbound[3].get("missed"), len(asked)), (["refused"], channels.FILE_TRIES))
+
+    def test_a_file_whose_upload_takes_the_hub_away_each_time_is_given_up(self):
+        """No message's files hold the journal, whose later entries wait behind it, for ever: an upload that the hub had
+        just said yes to, after which it answers nothing at all, counts, for the whole entry, and after FILE_DOWN_MOST
+        of them that file and the ones after it are `refused` and their bytes never go again, so that the message goes
+        on and its files stop the hub that many times at most. An upload that never reached the hub (a refused
+        connection, an unreachable network) counts nothing. Before, the held bytes went at each attempt and could stop
+        the hub each time."""
+        self.ready()
+        uploads, real_call = [], self.bridge.hub.call
+
+        def upload(path, data, timeout=None):
+            if "check=1" in path:
+                return 200, {"welcome": True}
+            uploads.append(data)
+            if len(uploads) <= 2:                       # the upload never reached the hub
+                return 0, {"error": "URLError", "cause": "ConnectionRefusedError" if len(uploads) == 1 else "OSError"}
+            return 0, {"error": "RemoteDisconnected"}   # it went down during the upload
+
+        def call(method, path, data=None, timeout=30):
+            if (method, path) == ("GET", "/bridge/config"):
+                return 0, {"error": "URLError"}         # and answers nothing just after it
+            return real_call(method, path, data, timeout)
+        for name, stand_in in (("upload", upload), ("call", call)):
+            patched = patch.object(self.bridge.hub, name, stand_in)
+            patched.start()
+            self.addCleanup(patched.stop)
+        pngs = [b"\x89PNG\r\n\x1a\n down at each upload " + bytes([n]) for n in range(2)]
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1646, "", attachments=[
+            self.attachment(f"6{n}", f"down{n}.png", png) for n, png in enumerate(pngs)]))
+        self.wait_for(lambda: self.hub.inbound and not self.journal_files(), "the message without its files")
+        self.assertEqual((self.hub.inbound[0].get("missed"), len(self.cdn.requests)), (["refused"] * 2, 1))
+        self.assertEqual(uploads, [pngs[0]] * (2 + channels.FILE_DOWN_MOST))
+        self.assertIn(f"1646: file 1 refused (the hub went away at {channels.FILE_DOWN_MOST} uploads of the message's "
+                      f"files)", self.log.getvalue())
 
     def test_a_file_that_went_up_goes_again_after_half_the_hubs_hour(self):
         """The hub keeps a file that no message took for an hour (hub.ATTACH_WAIT): a message that still waits
@@ -1177,8 +1269,8 @@ class DiscordTests(Base):
         self.wait_for(lambda: peer.pongs == [b"hi"], "the pong")
 
     def test_hub_down_then_up_loses_nothing(self):
-        """Neither a message nor its file (a release restarts the hub): past FILE_TRIES, a file whose message the hub
-        takes no more than the file goes again with its bytes, fetched once, so that the hub that comes back gets it."""
+        """Neither a message nor its file (a release restarts the hub): while the hub answers nothing, its attempts
+        count no try (files_up's away), and the hub that comes back gets both messages and the file, fetched once."""
         self.ready()
         self.private += ["while the hub is down 1", "while the hub is down 2"]
         png = b"\x89PNG\r\n\x1a\n while the hub is down"
@@ -1200,18 +1292,97 @@ class DiscordTests(Base):
     def test_a_hub_that_is_down_costs_no_download(self):
         """The bridge asks the hub at each attempt before it fetches a file (check=1): while the hub is down, no file of
         the chat app is fetched, also past FILE_TRIES, and a hub that comes back gets each file, fetched once. Before,
-        each attempt past the question's tries fetched the message's files again (up to 250 MB a minute for ten)."""
+        each attempt past the question's tries fetched the message's files again (up to 250 MB a minute for ten).
+
+        Here the hub comes back right after a question that got no answer, before the message's post, five times
+        FILE_TRIES attempts on: an attempt in which the hub answers nothing at all counts for no try, however many there
+        are (a question has no body, so no question takes the hub away), and the attempt in which it comes back asks
+        once more and counts none either. Counted, a whole-module run under load once had the hub take the message
+        without them."""
         self.ready()
         pngs = [b"\x89PNG\r\n\x1a\n down " + bytes([n]) for n in range(2)]
+        asked, back, real = [], [], self.bridge.hub.upload
+
+        def upload(path, data, timeout=None):
+            if "check=1" in path and not back:          # the hub is down: no answer
+                asked.append(len(self.cdn.requests))
+                if len(asked) == 5 * channels.FILE_TRIES:
+                    self.hub.up()                       # back, right after this question
+                    back.append(True)
+                return 0, {"error": "URLError"}
+            return real(path, data, timeout)
+        patched = patch.object(self.bridge.hub, "upload", upload)
+        patched.start()
+        self.addCleanup(patched.stop)
         self.hub.down()
         self.gw.latest().dispatch("MESSAGE_CREATE", dm(1303, "", attachments=[
             self.attachment(f"3{n}", f"down{n}.png", png) for n, png in enumerate(pngs)]))
-        self.wait_for(lambda: len(self.journal_files()) == 1, "the event in the journal")
-        time.sleep(0.6)                 # twice FILE_TRIES attempts and more, with the tests' backoff
-        self.assertEqual(len(self.cdn.requests), 0)
-        self.hub.up()
         self.wait_for(lambda: self.hub.inbound and not self.journal_files(), "the message once the hub is back")
+        self.assertEqual(set(asked), {0})               # no download while the hub was down
         self.assertEqual((self.hub.inbound[0].get("missed"), len(self.cdn.requests)), (None, 2))
+        self.assertNotIn("1303: the hub did not say whether", self.log.getvalue())         # no try counted
+        self.assertIn("1303: the hub answers nothing", self.log.getvalue())
+        # and right after a read of /bridge/config that got no answer, before the message's post: the attempt in which
+        # the hub is away waits, however many there were, so no post goes without the files
+        probes, real_call = {"after": False, "n": 0}, self.bridge.hub.call
+
+        def upload_after(path, data, timeout=None):
+            code, answer = real(path, data, timeout)
+            if "check=1" in path and "message=1305" in path and code == 0:
+                probes["after"] = True                  # the next read of /bridge/config is files_up's
+            return code, answer
+
+        def call(method, path, data=None, timeout=30):
+            if (method, path) == ("GET", "/bridge/config") and probes["after"]:
+                probes["after"] = False
+                probes["n"] += 1
+                if probes["n"] == 5 * channels.FILE_TRIES:
+                    self.hub.up()                       # back, right after this read
+                return 0, {"error": "URLError"}
+            return real_call(method, path, data, timeout)
+        for name, stand_in in (("upload", upload_after), ("call", call)):
+            patched = patch.object(self.bridge.hub, name, stand_in)
+            patched.start()
+            self.addCleanup(patched.stop)
+        self.hub.down()
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1305, "", attachments=[
+            self.attachment("35", "down-again.png", b"\x89PNG\r\n\x1a\n down again")]))
+        self.wait_for(lambda: len(self.hub.inbound) == 2 and not self.journal_files(), "the second message")
+        self.assertEqual((self.hub.inbound[1].get("missed"), probes["n"]), (None, 5 * channels.FILE_TRIES))
+        self.assertNotIn("1305: the hub did not say whether", self.log.getvalue())
+
+    def test_an_upload_that_a_restart_cuts_goes_again_when_the_hub_is_back(self):
+        """The hub says yes to the question and goes down during the upload (a restart): the file waits with its bytes,
+        and each later attempt asks the question first, so that the hub's being away costs no try and its bytes go
+        only to a hub that said yes again. The hub comes back right after a question that got no answer; the file goes
+        up, fetched once, and the message is not posted without it."""
+        self.ready()
+        png = b"\x89PNG\r\n\x1a\n cut by a restart"
+        state, real = {"cut": False, "asked": 0, "back": False}, self.bridge.hub.upload
+
+        def upload(path, data, timeout=None):
+            if "check=1" not in path and not state["cut"]:      # its first upload: the hub goes down during it
+                state["cut"] = True
+                self.hub.down()
+                return 0, {"error": "RemoteDisconnected"}
+            if "check=1" in path and state["cut"] and not state["back"]:
+                state["asked"] += 1
+                if state["asked"] == 2 * channels.FILE_TRIES + 1:
+                    self.hub.up()                       # back, right after this question
+                    state["back"] = True
+                    return 0, {"error": "URLError"}
+            return real(path, data, timeout)
+        patched = patch.object(self.bridge.hub, "upload", upload)
+        patched.start()
+        self.addCleanup(patched.stop)
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1304, "", attachments=[
+            self.attachment("34", "cut.png", png)]))
+        self.wait_for(lambda: self.hub.inbound and not self.journal_files(), "the message once the hub is back")
+        self.assertEqual((self.hub.inbound[0].get("missed"), len(self.cdn.requests)), (None, 1))
+        self.assertEqual([data for _, data, _ in self.hub.uploads], [png])
+        log = self.log.getvalue()
+        self.assertEqual(log.count("1304: the hub answers nothing after file 1 (RemoteDisconnected); kept"), 1)
+        self.assertNotIn("1304: the hub did not", log)                       # no try counted
 
     def test_the_journal_replays_at_start_and_a_duplicate_is_removed(self):
         journal = channels.Journal(self.journal)
