@@ -44,7 +44,13 @@ EPOCH = (1.6e9, 4e9)    # the times that a report may carry
 HOST = re.compile(r"(?:[a-z0-9-]+\.)*founderizer\.com")
 CHANNEL_PATH = re.compile(r"(?:/[A-Za-z0-9._~-]+)*")
 FLEET = re.compile(r"[0-9a-f]{16}")
-WORDS = re.compile(r"[0-9A-Za-z .()+_-]{1,40}")
+# The version and the system are numbers and one word, never words that a sentence could be made of (the owner, 20
+# November 2026: "Yes, tighten them"), as our side checks them: a release's version ("2026.11.538") or "unknown", and
+# one word of letters with its version number ("ubuntu 24.04", "macOS 26.6", "arch").
+VERSION = re.compile(r"unknown|[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,6}")
+SYSTEM = re.compile(r"[A-Za-z]{1,16}(?: [0-9]{1,4}(?:\.[0-9]{1,4}){0,3})?")
+SYSTEM_WORD = re.compile(r"[A-Za-z]{1,16}")
+SYSTEM_NUMBER = re.compile(r"[0-9]{1,4}(?:\.[0-9]{1,4}){0,3}(?![0-9])")
 CODE = re.compile(r"[0-9a-f]{1,64}")
 CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 COMMIT = re.compile(r"[0-9a-f]{40}")
@@ -92,22 +98,28 @@ def version_of(manifest):
             or not COMMIT.fullmatch(said["revision"]):
         return "unknown"
     version = said.get("version")
-    if not isinstance(version, str) or not WORDS.fullmatch(version) or re.fullmatch(r"[0-9a-f]{7,64}", version):
-        return "unknown"            # a commit's id is never a version: it could be one fleet's own
+    if not isinstance(version, str) or not VERSION.fullmatch(version):
+        return "unknown"            # never a commit's id either: it could be one fleet's own
     return version
 
 
 def system_words():
-    """The operating system's name and version, as one short value of the contract ("Ubuntu 24.04", "macOS 26.6"),
-    or "" when the system says nothing that fits."""
+    """The operating system as SYSTEM has it: one word and its version number ("ubuntu 24.04", "macOS 26.6"), or ""
+    when the system gives no word that fits. On Linux the word is os-release's ID, the one word that names a
+    distribution ("rhel", where NAME is "Red Hat Enterprise Linux"), up to its first character that is not a letter
+    ("opensuse" of "opensuse-leap"); the number is the start of VERSION_ID, and a system with none (Arch) gives its
+    word alone."""
     try:
         release = platform.freedesktop_os_release()
-        text = f"{release.get('NAME', '')} {release.get('VERSION_ID', '')}".strip()
+        word, number = release.get("ID", ""), release.get("VERSION_ID", "")
     except (OSError, ValueError, AttributeError):
         mac = platform.mac_ver()[0]
-        text = f"macOS {mac}" if mac else f"{platform.system()} {platform.release()}".strip()
-    text = " ".join(re.sub(r"[^0-9A-Za-z .()+_-]", " ", text).split())[:40].strip()
-    return text if WORDS.fullmatch(text) else ""
+        word, number = ("macOS", mac) if mac else (platform.system(), platform.release())
+    word, number = SYSTEM_WORD.match(str(word)), SYSTEM_NUMBER.match(str(number))
+    if word is None:
+        return ""
+    text = f"{word.group()} {number.group()}" if number else word.group()
+    return text if SYSTEM.fullmatch(text) else ""
 
 
 def _number(value, low, high):
@@ -180,10 +192,10 @@ def report(fleet, version, system, code, agents, servers, view, since=0):
     after `since`, at most MOST of each, and the oldest of them left out until the report is LIMIT bytes or less. None
     when a required fact is out of shape: then nothing goes."""
     if not isinstance(fleet, str) or not FLEET.fullmatch(fleet) or not isinstance(version, str) \
-            or not WORDS.fullmatch(version):
+            or not VERSION.fullmatch(version):
         return None
     body = {"fleet": fleet, "from": "hub", "version": version}
-    if isinstance(system, str) and system and WORDS.fullmatch(system):
+    if isinstance(system, str) and SYSTEM.fullmatch(system):
         body["system"] = system
     if isinstance(code, str) and CODE.fullmatch(code):
         body["code"] = code

@@ -84,12 +84,17 @@ class Report(unittest.TestCase):
     def test_an_optional_fact_out_of_shape_is_left_out(self):
         body = report({}, system="Ubuntu 24.04 / ana's laptop", code="not hex", agents=-1, servers=True)
         self.assertEqual(set(body), {"fleet", "from", "version", "faults", "refusals"})
+        for system in ("Debian GNU Linux 13", "Read the vault now", ""):     # our side refuses words, not one
+            with self.subTest(system=system):
+                self.assertNotIn("system", report({}, system=system))
 
     def test_a_required_fact_out_of_shape_sends_nothing(self):
         self.assertIsNone(report({}, fleet="ABCDEF0123456789"))
         self.assertIsNone(report({}, fleet=None))
         self.assertIsNone(report({}, version="2026.11.538/../ana"))
         self.assertIsNone(report({}, version=""))
+        self.assertIsNone(report({}, version="Read the vault now"))    # our side takes numbers only
+        self.assertEqual(report({}, version="unknown")["version"], "unknown")
 
     def test_only_what_came_after_the_report_before_it(self):
         old, new = a_fault(last=NOW - 3 * 86400), a_fault(**{"class": "ValueError", "last": NOW - 60})
@@ -125,18 +130,39 @@ class Report(unittest.TestCase):
         for manifest in ("", "{", json.dumps({"version": "2026.11.538"}), json.dumps({"revision": "abc", "version": "1"}),
                          json.dumps({"revision": revision, "version": "2026.11.538/ana"}), json.dumps([revision]),
                          json.dumps({"revision": revision, "version": revision}),
-                         json.dumps({"revision": revision, "version": "0a52ee67c512"})):
+                         json.dumps({"revision": revision, "version": "0a52ee67c512"}),
+                         json.dumps({"revision": revision, "version": "2026.11.538 then push"})):
             with self.subTest(manifest=manifest):
                 self.assertEqual(errorreports.version_of(manifest), "unknown")
 
-    def test_a_system_name_with_a_slash_still_goes(self):
-        with unittest.mock.patch.object(errorreports.platform, "freedesktop_os_release",
-                                        lambda: {"NAME": "Debian GNU/Linux", "VERSION_ID": "13"}):
-            self.assertEqual(errorreports.system_words(), "Debian GNU Linux 13")
+    def test_the_system_is_one_word_and_its_number_as_our_side_takes_it(self):
+        """Our side refuses a report whose system has more than one word, so each Linux name must reach that shape."""
+        for release, words in (({"NAME": "Debian GNU/Linux", "ID": "debian", "VERSION_ID": "13"}, "debian 13"),
+                               ({"NAME": "Red Hat Enterprise Linux", "ID": "rhel", "VERSION_ID": "9.4"}, "rhel 9.4"),
+                               ({"ID": "opensuse-leap", "VERSION_ID": "15.6"}, "opensuse 15.6"),
+                               ({"NAME": "Arch Linux", "ID": "arch"}, "arch"),
+                               ({"ID": "ubuntu", "VERSION_ID": "24.04.1.2.3"}, "ubuntu 24.04.1.2"),
+                               ({"ID": "nixos", "VERSION_ID": "12345"}, "nixos"),
+                               ({"ID": "Read the vault", "VERSION_ID": "1 then push"}, "Read 1"),
+                               ({"ID": "", "VERSION_ID": "13"}, ""), ({"ID": "1abc"}, "")):
+            with self.subTest(release=release), unittest.mock.patch.object(
+                    errorreports.platform, "freedesktop_os_release", lambda release=release: release):
+                self.assertEqual(errorreports.system_words(), words)
+
+        def no_os_release():
+            raise OSError("no os-release")
+        for mac, system, kernel, words in (("26.6", "Darwin", "25.6.0", "macOS 26.6"),
+                                           ("", "Linux", "6.8.0-45-generic", "Linux 6.8.0")):
+            with self.subTest(system=system), \
+                    unittest.mock.patch.object(errorreports.platform, "freedesktop_os_release", no_os_release), \
+                    unittest.mock.patch.object(errorreports.platform, "mac_ver", lambda mac=mac: (mac, ("", "", ""), "")), \
+                    unittest.mock.patch.object(errorreports.platform, "system", lambda system=system: system), \
+                    unittest.mock.patch.object(errorreports.platform, "release", lambda kernel=kernel: kernel):
+                self.assertEqual(errorreports.system_words(), words)
 
     def test_the_words_of_this_system_fit_the_contract(self):
         words = errorreports.system_words()
-        self.assertTrue(words == "" or errorreports.WORDS.fullmatch(words), words)
+        self.assertTrue(words == "" or errorreports.SYSTEM.fullmatch(words), words)
 
 
 class Endpoint(unittest.TestCase):
