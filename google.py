@@ -277,6 +277,49 @@ def drive_search(access, words=None, folder=None, page=None):
     return {"files": [_file(f) for f in found.get("files") or []], "next": found.get("nextPageToken") or None}
 
 
+def _in_parents(parents):
+    return "(" + " or ".join(f"{_quoted(p)} in parents" for p in parents) + ")"
+
+
+def _place(drive_id):
+    """The corpus of a search inside some folders: the shared drive that holds them, else every drive of the account
+    (a folder of My Drive or one shared with the account)."""
+    return {"corpora": "drive", "driveId": drive_id} if drive_id else {"corpora": "allDrives"}
+
+
+def drive_search_in(access, parents, words, drive_id=None, page=None):
+    """Files whose words match, among the children of these folders (one group, all in one drive): {"files", "next",
+    "incomplete"}. incomplete: Google says that it did not search every place (incompleteSearch)."""
+    q = f"fullText contains {_quoted(words)} and {_in_parents(parents)} and trashed = false"
+    found = _drive(access, "GET", "", dict(_place(drive_id), **{
+        "q": q, "pageSize": 20, "pageToken": page, "includeItemsFromAllDrives": "true", "supportsAllDrives": "true",
+        "fields": f"nextPageToken,incompleteSearch,files({FIELDS})"}))
+    return {"files": [_file(f) for f in found.get("files") or []], "next": found.get("nextPageToken") or None,
+            "incomplete": bool(found.get("incompleteSearch"))}
+
+
+def drive_folders_in(access, parents, drive_id=None):
+    """The ids of the folders whose parent is one of these folders (one group, all in one drive), every page of
+    them."""
+    q, ids, page = f"mimeType = '{FOLDER}' and {_in_parents(parents)} and trashed = false", [], None
+    while True:
+        found = _drive(access, "GET", "", dict(_place(drive_id), **{
+            "q": q, "pageSize": 1000, "pageToken": page, "includeItemsFromAllDrives": "true",
+            "supportsAllDrives": "true", "fields": "nextPageToken,files(id)"}))
+        ids += [f["id"] for f in found.get("files") or [] if isinstance(f, dict) and isinstance(f.get("id"), str)]
+        page = found.get("nextPageToken")
+        if not page:
+            return ids
+
+
+def shared_drive(access, drive_id):
+    """A shared drive as a folder FILE (its root), for a link to a whole shared drive: {"id", "name", "mime": FOLDER,
+    "drive_id", "shared": True, "parents": []}."""
+    d = _call("GET", _url("drive", "/drive/v3/drives/" + _q(drive_id), {"fields": "id,name"}), access)
+    return {"id": d.get("id"), "name": d.get("name"), "mime": FOLDER, "modified": None, "size": None, "owner": None,
+            "shared": True, "drive_id": d.get("id"), "parents": [], "link": None, "trashed": False}
+
+
 def drive_file(access, file_id):
     return _file(_drive(access, "GET", "/" + _q(file_id), {"fields": FIELDS, "supportsAllDrives": "true"}))
 

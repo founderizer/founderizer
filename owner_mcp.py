@@ -1270,6 +1270,8 @@ def grant_access(args):
                       " — for example repo:acme/web, secret:bws://<uuid>, gmail:a@b.com or tool:github.")
     if not isinstance(agent, str) or not agent:
         raise Refused("agent must be the name of the agent that holds this resource.")
+    if args.get("folder") is not None:
+        return grant_folder(what, kind, agent, level, args)
     if kind == "secret":
         if level is not None and not secret_reaches(what, agent, level):
             raise Refused(GRANT_NOT_SIGNED)
@@ -1294,6 +1296,36 @@ def grant_access(args):
             access[line["agent"]] = service["level"]
     return _one_moved(access, agent, level, "/ui/team/google", {"account": what, "service": kind}, "access",
                       what_for, args)
+
+
+# A folder's ID in a link of it, as hub.py DRIVE_FOLDER_IN reads it: …/folders/<id>, …/drives/<id> or ?id=<id>.
+DRIVE_FOLDER_IN = re.compile(r"(?:/folders/|/drives/|[?&]id=)([A-Za-z0-9_-]{10,200})")
+FOLDER_KIND = "folder goes with drive:<email> only: the link or the ID of one folder of that Drive."
+
+
+def grant_folder(what, kind, agent, level, args):
+    """One agent's hold of one folder of a Drive account (owner API 1.255, `drive_folders`): `folder` is its link or
+    its ID, which the hub reads with the account. The folder's other agents come from `GET /ui/resources` first, so
+    only the named agent moves; a folder that no agent holds yet has none."""
+    folder = args.get("folder")
+    if kind != "drive" or not isinstance(folder, str) or not folder.strip():
+        raise Refused(FOLDER_KIND)
+    folder = folder.strip()
+    found = DRIVE_FOLDER_IN.search(folder)
+    folder_id, account = found.group(1) if found else folder, lower_reference("drive:" + what)
+    page = get("/ui/resources", "a read of the resources").data
+    held = {}
+    for item in (page.get("resources") if isinstance(page, dict) else None) or []:
+        if isinstance(item, dict) and lower_reference(str(item.get("id"))) == account:
+            for f in item.get("folders") or []:
+                if isinstance(f, dict) and f.get("id") == folder_id:
+                    held = {h.get("agent"): h.get("level") for h in f.get("holders") or [] if isinstance(h, dict)}
+    # The base is the version of team.json that this page read, not of a second read: an agent given the folder in
+    # between would lose it with no word.
+    body = {"account": what, "service": "drive", "folder": folder, "access": _one_moved_map(held, agent, level),
+            "base_sha256": page.get("sha256") if isinstance(page, dict) else None}
+    return command("/ui/team/google", body, f"the grant of the Drive folder {folder} to {agent}",
+                   args.get("request_id"))
 
 
 # The words when GET /ui/team does not have the shape that grant_access reads. Nothing is sent then: before
@@ -2946,7 +2978,9 @@ def tools():
         tool("grant_access", "Give one agent a resource the fleet already holds, or end that hold with level null: "
                              "repo:<owner/name> read|write|deploy (deploy also runs its workflows), "
                              "secret:bws://<uuid> use|read, drive:<email> "
-                             "read|write|write_shared, gmail:<email> read|write|send, tool:<name> use. The grant is "
+                             "read|write|write_shared, gmail:<email> read|write|send, tool:<name> use. With folder "
+                             "(the link or the ID of one folder of that Drive), drive:<email> gives that folder and "
+                             "everything under it alone, and the agent's whole Drive stays as it is. The grant is "
                              "the authorization: the agent then does what that access allows, and the hub records "
                              "who gave what to whom. A repository that the hub's GitHub App does not reach comes back "
                              "with unreached: the GitHub page where the owner adds it to the App. On a fleet with a "
@@ -2963,7 +2997,7 @@ def tools():
                              "tag to that business's DevOps agent (or the manager while it has none), and each "
                              "Linux server of the fleet itself at patch (its fixed root forms only) to one agent, "
                              "which the manager can name with door_fleet.",
-             {"resource": S["text"], "agent": S["text"], "level": S["level"], **rid},
+             {"resource": S["text"], "agent": S["text"], "level": S["level"], "folder": S["text"], **rid},
              ("resource", "agent", "level"), grant_access),
         tool("share_resource", "The owner's standing for one resource in the grantable pool: the manager may hand it "
                                "out itself up to max. Leave max out to take the entry back, so the owner alone gives "

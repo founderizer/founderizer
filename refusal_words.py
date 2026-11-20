@@ -84,6 +84,13 @@ WORDS = {
     "google_refused": "Google refused: {reason}. Start Connect again.",
     "google_revoked_during": "A Disconnect of this account came during this Connect, so nothing was connected. Start "
                              "Connect again.",
+    # a Drive folder of one account for some agents (POST /ui/team/google with folder)
+    "drive_folder_link": "That is not the link of a Drive folder.",
+    "drive_folder_account": "{account} is not connected for Google Drive now. Connect it again.",
+    "drive_folder_unseen": "{account} cannot open this folder. Share it with {account}, or connect the account that "
+                           "has it.",
+    "drive_folder_file": "That is the link of a file, not of a folder.",
+    "drive_folder_google": "Google did not answer about this folder: {reason}. Try again.",
     # the package of a program server, as its registry gives it (POST /ui/mcp/package, UI-API.md 1.187)
     "package_unknown": "{registry} has no package {name}",
     "package_unread": "{registry} did not give the record of {name} ({http_status})",

@@ -69,6 +69,13 @@ OLD = {
     "google_refused": "Google refused: {reason}. Start Connect again.",
     "google_revoked_during": "A Disconnect of this account came during this Connect, so nothing was connected. Start "
                              "Connect again.",
+    # the lane "Drive folders" (POST /ui/team/google with folder)
+    "drive_folder_link": "That is not the link of a Drive folder.",
+    "drive_folder_account": "{account} is not connected for Google Drive now. Connect it again.",
+    "drive_folder_unseen": "{account} cannot open this folder. Share it with {account}, or connect the account that "
+                           "has it.",
+    "drive_folder_file": "That is the link of a file, not of a folder.",
+    "drive_folder_google": "Google did not answer about this folder: {reason}. Try again.",
     # the lane "Any MCP server: install and sign-in" (UI-API.md 1.187)
     "package_unknown": "{registry} has no package {name}",
     "package_unread": "{registry} did not give the record of {name} ({http_status})",
@@ -120,6 +127,9 @@ SITES = {
     'enroll_new_device': {'not_owner_device_no_code': 1},
     'google_file_refusal': {'google_file_key': 1, 'google_file_lost': 1, 'google_file_mode': 1,
                             'google_file_unreadable': 1},
+    'google_folder_found': {'drive_folder_account': 1, 'drive_folder_file': 1, 'drive_folder_google': 1,
+                            'drive_folder_unseen': 1},
+    'google_folder_id': {'drive_folder_link': 1},
     'grant_server': {'no_such_agent': 1},
     'join_server': {'server_name_kept': 1},       # a server named door (C49)
     'key_swap_entry': {'no_such_server': 1},      # Part B of the key swap: the 404 of both of its routes
@@ -463,7 +473,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 182)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 187)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

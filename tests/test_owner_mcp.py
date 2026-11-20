@@ -53,7 +53,8 @@ def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Admin, Boundary, FromNothing, McpServers, Refusals,
                                                     Install, Progress, RootThroughSudo, NoSecret, Shape, Table,
                                                     Parity, SecretGive, ShareStanding, ShareStandingNoWorker,
-                                                    SignedGrantWords, SignedPoolWords, VaultReading, GoogleConnect)
+                                                    SignedGrantWords, SignedPoolWords, VaultReading, GoogleConnect,
+                                                    FolderGrant)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -4224,6 +4225,14 @@ def parity_cases():
                        ("the agent's own request id", {"resource": "repo:acme/web", "agent": "worker-1",
                                                        "level": "read", "request_id": PARITY_RID})):
         case(f"grant_access: {name}", "grant_access", args)
+    folders = {"sha256": "x", "resources": [{"id": "drive:ada@example.com", "kind": "drive", "folders": [
+        {"id": "Abc-Folder_01", "holders": [{"agent": "worker-2", "level": "read"}]}]}]}
+    case("grant_access: a folder of a Drive account", "grant_access",
+         {"resource": "drive:Ada@example.com", "agent": "worker-1", "level": "write",
+          "folder": "https://drive.google.com/drive/folders/Abc-Folder_01?usp=sharing"},
+         lambda s, r: parity_json(200, folders) if r["path"] == "/ui/resources" else None)
+    case("grant_access: a folder with another kind", "grant_access",
+         {"resource": "gmail:ada@example.com", "agent": "worker-1", "level": "read", "folder": "Abc-Folder_01"})
     case("grant_access: a team read with no lines", "grant_access",
          {"resource": "repo:acme/web", "agent": "worker-1", "level": "read"},
          lambda s, r: parity_json(200, {"sha256": "x"}) if r["path"] == "/ui/team" else None)
@@ -5156,6 +5165,36 @@ class Table(unittest.TestCase):
         what = owner_mcp.PAGES["devices"][1]
         self.assertNotIn("their open enrollment codes", what)
         self.assertIn("never a code", what)
+
+
+class FolderGrant(unittest.TestCase):
+    """grant_access with a folder (owner API 1.255, the owner's "Yes, as drawn" of 20 November 2026 to Drive access to
+    some folders only): the owner's own MCP gives one folder of a Drive account, as his app does."""
+
+    def test_a_folder_grant_moves_only_the_named_agent_of_that_folder(self):
+        """Bug: the folder's other agents lose it, another folder's agents are read for it, the grant writes the
+        account's whole Drive in place of the folder, or its base is a second read of the team, so an agent given the
+        folder between the two reads loses it."""
+        page = {"sha256": "page-sha", "resources": [{"id": "drive:ada@example.com", "folders": [
+            {"id": "Abc-Folder_01", "holders": [{"agent": "ops", "level": "read"}]},
+            {"id": "Other-Fold-02", "holders": [{"agent": "boss", "level": "write"}]}]}]}
+        sent, link = [], "https://drive.google.com/drive/folders/Abc-Folder_01?usp=sharing"
+        with patch.object(owner_mcp, "get", lambda route, what, *a, **q: types.SimpleNamespace(data=page)), \
+                patch.object(owner_mcp, "team", lambda: {"sha256": "a second read, which the grant must not take"}), \
+                patch.object(owner_mcp, "command",
+                                  lambda route, body, what, request_id=None, **k: sent.append((route, body)) or {}):
+            owner_mcp.grant_access({"resource": "drive:Ada@example.com", "agent": "dev", "level": "write",
+                                    "folder": f" {link} "})
+            owner_mcp.grant_access({"resource": "drive:ada@example.com", "agent": "ops", "level": None,
+                                    "folder": "Abc-Folder_01"})
+        self.assertEqual(sent, [
+            ("/ui/team/google", {"account": "Ada@example.com", "service": "drive", "folder": link,
+                                 "access": {"ops": "read", "dev": "write"}, "base_sha256": "page-sha"}),
+            ("/ui/team/google", {"account": "ada@example.com", "service": "drive", "folder": "Abc-Folder_01",
+                                 "access": {}, "base_sha256": "page-sha"})])
+        for rid, folder in (("gmail:ada@example.com", "Abc-Folder_01"), ("drive:ada@example.com", " ")):
+            with self.assertRaisesRegex(owner_mcp.Refused, "folder goes with drive:<email> only"):
+                owner_mcp.grant_access({"resource": rid, "agent": "dev", "level": "read", "folder": folder})
 
 
 class GoogleConnect(unittest.TestCase):

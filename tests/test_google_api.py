@@ -357,6 +357,39 @@ class GoogleApiTest(unittest.TestCase):
         self.assertEqual(query["q"], "fullText contains 'costs' and trashed = false")
         self.assertNotIn("orderBy", query)
 
+    def test_a_search_inside_some_folders_keeps_their_or_in_brackets(self):
+        """drive_search_in and drive_folders_in (Drive access to some folders only): the "in parents" parts stand in
+        one bracket, so that Google reads "words and (A or B)" and never "words and A or B", which matches every child
+        of B; trashed items stay out, and a folder of a shared drive searches that drive alone."""
+        self.g.on("GET", "/drive/v3/files", {"files": [DOC_ITEM], "incompleteSearch": True})
+        got = google.drive_search_in(ACCESS, ["fA", "fB"], "it's", drive_id="0Adrive", page="P2")
+        self.assertEqual(got, {"files": [DOC_FILE], "next": None, "incomplete": True})
+        query = args(self.g.requests[-1])
+        self.assertEqual({k: query[k] for k in ("q", "corpora", "driveId", "pageToken", "includeItemsFromAllDrives",
+                                                "supportsAllDrives")}, {
+            "q": r"fullText contains 'it\'s' and ('fA' in parents or 'fB' in parents) and trashed = false",
+            "corpora": "drive", "driveId": "0Adrive", "pageToken": "P2", "includeItemsFromAllDrives": "true",
+            "supportsAllDrives": "true"})     # Google refuses corpora=drive without the two
+        self.assertIn("incompleteSearch", query["fields"])
+        google.drive_search_in(ACCESS, ["fA"], "x")
+        self.assertEqual((args(self.g.requests[-1])["corpora"], "driveId" in args(self.g.requests[-1])),
+                         ("allDrives", False))
+        pages = iter([{"files": [{"id": "s1"}], "nextPageToken": "N"}, {"files": [{"id": "s2"}, {"name": "no id"}]}])
+
+        def paged(handler, _request):
+            data = json.dumps(next(pages)).encode()
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json; charset=UTF-8")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.end_headers()
+            handler.wfile.write(data)
+        self.g.on("GET", "/drive/v3/files", paged)
+        self.assertEqual(google.drive_folders_in(ACCESS, ["fA", "fB"]), ["s1", "s2"])
+        first, second = (args(r) for r in self.g.requests[-2:])
+        self.assertEqual(first["q"], f"mimeType = '{google.FOLDER}' and ('fA' in parents or 'fB' in parents) and "
+                                     f"trashed = false")
+        self.assertEqual((first.get("pageToken"), second["pageToken"]), (None, "N"))
+
     def test_drive_file(self):
         self.g.on("GET", "/drive/v3/files/p1", PDF_ITEM)
         self.assertEqual(google.drive_file(ACCESS, "p1"), PDF_FILE)

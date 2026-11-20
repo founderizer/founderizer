@@ -52,6 +52,7 @@ ACCESS = "ya29.accesstoken-"
 REDIRECT = "http://127.0.0.1:53111/"
 EMAIL = "owner@example.com"
 EMAIL2 = "dev.agent@example.com"
+REPLIES = "replies-Fold-01"     # a folder ID as Drive gives it: its case is kept
 SCOPES = list(google.SCOPES)
 STAND_IN = "Zq8wK2vLp9xR4tY7"          # a registered login for the guard tests
 DRIVE_TOOLS = {"read": {"drive_search", "drive_read"},
@@ -159,7 +160,19 @@ class FakeGoogle:
             drive("txt1", "notes.txt", "text/plain"), drive("form1", "Survey", "application/vnd.google-apps.form"),
             drive("shared1", "Team plan", hub.DRIVE_DOC, shared=True, size=None),
             drive("drive1", "Drive doc", hub.DRIVE_DOC, drive_id="0AsharedDrive", size=None),
-            drive("sfolder", "Shared work", hub.DRIVE_FOLDER, shared=True, size=None))}
+            drive("sfolder", "Shared work", hub.DRIVE_FOLDER, shared=True, size=None),
+            # a tree for Drive access to some folders only: Replies holds Inner, which holds a doc; outside1 is not in it
+            drive("root-id", "My Drive", hub.DRIVE_FOLDER, parents=(), size=None),
+            drive(REPLIES, "Support replies", hub.DRIVE_FOLDER, size=None),
+            drive("inner-folder-1", "Inner", hub.DRIVE_FOLDER, parents=(REPLIES,), size=None),
+            drive("deep-doc-0001", "Reply draft", hub.DRIVE_DOC, parents=("inner-folder-1",), size=None),
+            drive("deep-sheet-01", "Reply costs", hub.DRIVE_SHEET, parents=("inner-folder-1",), size=None),
+            drive("deep-pdf-0001", "reply.pdf", parents=("inner-folder-1",)),
+            drive("team-reply-01", "Team reply", hub.DRIVE_DOC, shared=True, parents=(REPLIES,), size=None),
+            drive("deeper-folder1", "Deeper", hub.DRIVE_FOLDER, parents=("inner-folder-1",), size=None),
+            drive("deepest-doc-01", "Reply deepest", hub.DRIVE_DOC, parents=("deeper-folder1",), size=None),
+            drive("outside-doc-1", "Reply outside", hub.DRIVE_DOC, size=None))}
+        self.stray = []         # what drive_search_in gives beside the children of its folders
         self.texts = {"doc1": "# Plan\nStep one.", "sheet1": "a,b\n1,2", "txt1": "plain notes"}
         self.search_files = [self.files["doc1"], self.files["pdf1"]]
 
@@ -208,8 +221,23 @@ class FakeGoogle:
         self.note("drive_search", access, words, folder, page)
         return {"files": list(self.search_files), "next": "page-2"}
 
+    def drive_search_in(self, access, parents, words, drive_id=None, page=None):
+        self.note("drive_search_in", access, tuple(parents), words, drive_id, page)
+        hits = [dict(f) for f in self.files.values() if set(f["parents"]) & set(parents)
+                and words.lower() in f["name"].lower()]
+        return {"files": hits + [dict(f) for f in self.stray], "next": None, "incomplete": False}
+
+    def drive_folders_in(self, access, parents, drive_id=None):
+        self.note("drive_folders_in", access, tuple(parents), drive_id)
+        return [f["id"] for f in self.files.values() if f["mime"] == hub.DRIVE_FOLDER and set(f["parents"]) & set(parents)]
+
+    def shared_drive(self, access, drive_id):
+        self.note("shared_drive", access, drive_id)
+        raise Err("Google answered 404: notFound", 404, "notFound")
+
     def drive_file(self, access, file_id):
         self.note("drive_file", access, file_id)
+        file_id = "root-id" if file_id == "root" else file_id      # Drive's alias of the root of My Drive
         if file_id not in self.files:
             raise Err("Google answered 404: notFound", 404, "notFound")
         return dict(self.files[file_id])
@@ -288,7 +316,7 @@ class FakeGoogle:
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite([case(name) for case in (GoogleHub, ConnectThroughTheStandIn, SealAtStart)
+    return unittest.TestSuite([case(name) for case in (GoogleHub, DriveFolders, ConnectThroughTheStandIn, SealAtStart)
                                for name in case.__dict__ if name.startswith("test_")])
 
 
@@ -2818,6 +2846,239 @@ class GoogleHub(OwnerAPI):
             self.assertNotIn(value, stored, value)
             self.assertNotIn(value, said, value)
         self.assertIn(EMAIL, stored)                        # the emails may be shown
+
+
+class DriveFolders(GoogleHub):
+    """Drive access to some folders only (the owner's "Yes, as drawn" of 20 November 2026): an agent that holds
+    folders of an account, and not its whole Drive, reaches only the files under them. Each test names the bug that
+    would let a file outside the folders through."""
+
+    def folders(self, agent="dev", account=EMAIL, whole=None, **levels):
+        """drive_folders in the hub's team at once (a running hub after a save): {folder id: level}, and the whole
+        Drive's level when given."""
+        a = hub.TEAM["agents"][agent]
+        if whole:
+            a["google"] = {"drive": {"account": account, "level": whole}}
+        else:
+            a.pop("google", None)
+        folders = levels.pop("of", {})
+        if folders:
+            a["drive_folders"] = {"account": account, "folders": folders}
+        else:
+            a.pop("drive_folders", None)
+
+    def setUp(self):
+        super().setUp()
+        names = patch.dict(hub.DRIVE_NAMES, clear=True)        # never a name of another test, nor a thread for one
+        names.start()
+        self.addCleanup(names.stop)
+        self.connected()
+        self.work = self.task()
+
+    def test_a_folder_holder_reads_under_its_folder_and_nothing_outside(self):
+        """Bug: only the file's direct parent is checked, or nothing is; or the words of a refusal tell that a file
+        outside exists (Google's notFound for one, a refusal for the other)."""
+        self.folders(of={REPLIES: "read"})
+        self.assertIn("Name: Reply draft", self.ok("drive_read", {"file_id": "deep-doc-0001"}))   # two folders down
+        self.assertIn("This is a folder.", self.ok("drive_read", {"file_id": REPLIES}))
+        for outside in ("outside-doc-1", "no-such-file", "root", "doc1"):
+            self.assertEqual(self.refused("drive_read", {"file_id": outside}), hub.DRIVE_NOT_HELD, outside)
+        self.assertNotIn("drive_text", [c[0] for c in self.fake.calls if c[1][1:2] == ("outside-doc-1",)])
+        self.assertEqual(sorted(t["name"] for t in hub.tools_for("dev") if t["name"] in hub.GOOGLE_TOOLS),
+                         ["drive_read", "drive_search"])
+        self.assertIn(f"Drive of {EMAIL}: only these folders and what they hold: "
+                      f"https://drive.google.com/drive/folders/{REPLIES} (read) (drive_search, drive_read)",
+                      hub.google_clauses("dev"))
+        self.assertNotIn("Support replies", " ".join(hub.google_clauses("dev")))       # a name is Google's text
+        self.folders()
+        self.assertTrue(self.refused("drive_read", {"file_id": "deep-doc-0001"}))
+
+    def test_a_search_with_words_stays_inside_the_folders(self):
+        """Bug: the search runs over the whole Drive, keeps a result that Google gives outside the folders, or takes
+        a page token of a wider search, or root as its folder."""
+        self.folders(of={REPLIES: "read"})
+        self.fake.stray = [self.fake.files["outside-doc-1"]]
+        text = self.ok("drive_search", {"words": "reply"})
+        self.assertIn("deep-doc-0001 | Reply draft", text)
+        self.assertIn("team-reply-01 | Team reply", text)
+        self.assertIn("deepest-doc-01 | Reply deepest", text)          # three folders down
+        self.assertNotIn("outside-doc-1", text)
+        self.assertNotIn("drive_search", self.fake.names())
+        self.assertEqual({c[1][1] for c in self.fake.calls if c[0] == "drive_search_in"},
+                         {tuple(sorted([REPLIES, "inner-folder-1", "deeper-folder1"]))})    # every level
+        self.assertEqual(self.refused("drive_search", {"words": "reply", "folder_id": "root"}), hub.DRIVE_NOT_HELD)
+        self.assertEqual(self.refused("drive_search", {"folder_id": "folder1"}), hub.DRIVE_NOT_HELD)
+        self.assertIn("deep-pdf-0001", self.ok("drive_search", {"folder_id": "inner-folder-1", "words": "reply"}))
+        self.assertTrue(self.refused("drive_search", {"words": "reply", "page": "page-2"}).startswith("page must be"))
+        hub.DRIVE_GROUP, old = 1, hub.DRIVE_GROUP       # one folder for each query: the next page is the next group
+        self.addCleanup(setattr, hub, "DRIVE_GROUP", old)
+        self.fake.stray = []
+        first = self.ok("drive_search", {"words": "reply"})
+        token = re.search(r"More: page=(\S+)", first).group(1)
+        self.folders("ops", of={REPLIES: "read"})
+        ops = self.task("ops")
+        self.assertTrue(self.refused("drive_search", {"words": "reply", "page": token}, task=ops, agent="ops")
+                        .startswith("page must be"))                    # a token is its agent's own
+        self.assertNotIn("More:", self.ok("drive_search", {"words": "reply", "page": token}).split("\n")[1])
+        pages, args = [], {"words": "reply"}
+        while True:                     # one group of one folder on each page, to the end
+            page = self.ok("drive_search", args)
+            pages.append(re.findall(r"^(\S+) \| ", page, re.M))
+            more = re.search(r"More: page=(\S+)", page)
+            if not more:
+                break
+            args = {"words": "reply", "page": more.group(1)}
+        self.assertEqual(len(pages), 3)
+        self.assertEqual(sorted(i for p in pages for i in p), sorted(
+            ["deepest-doc-01", "deep-doc-0001", "deep-sheet-01", "deep-pdf-0001", "team-reply-01"]))
+        self.assertTrue(self.refused("drive_search", args))      # a token is used once
+        self.folders(whole="read", of={REPLIES: "write"})
+        self.ok("drive_search", {"words": "plan"})
+        self.assertEqual(self.fake.names()[-1], "drive_search")       # the whole Drive searches as before
+
+    def test_a_new_item_or_a_move_never_leaves_the_folders(self):
+        """Bug: a new item lands in My Drive with no folder_id or with root, or a move takes a file out."""
+        self.folders(of={REPLIES: "write"})
+        new = {"kind": "doc", "name": "Answer", "text": "# Hi"}
+        for where in ({}, {"folder_id": "root"}):
+            words = self.refused("drive_write", dict(new, request_id=str(uuid.uuid4()), **where))
+            self.assertEqual(words, hub.DRIVE_NO_ROOT.format(
+                email=EMAIL, links=f"https://drive.google.com/drive/folders/{REPLIES} (write)"))
+        self.assertEqual(self.refused("drive_write", dict(new, request_id=str(uuid.uuid4()), folder_id="folder1")),
+                         hub.DRIVE_NOT_HELD)
+        self.ok("drive_write", dict(new, request_id=str(uuid.uuid4()), folder_id="inner-folder-1"))
+        self.assertEqual(self.fake.calls[-1][1][1:4], ("doc", "Answer", "inner-folder-1"))
+        move = {"file_id": "deep-pdf-0001"}
+        for to in ("folder1", "root"):
+            self.assertTrue(self.refused("drive_move", dict(move, request_id=str(uuid.uuid4()), folder_id=to)), to)
+        self.assertNotIn("drive_patch", self.fake.names())
+        self.ok("drive_move", dict(move, request_id=str(uuid.uuid4()), folder_id=REPLIES))
+        self.assertEqual(self.fake.calls[-1], ("drive_patch", (ACCESS + "1", "deep-pdf-0001", None, REPLIES, None)))
+        self.assertEqual(self.refused("drive_move", {"request_id": str(uuid.uuid4()), "file_id": "outside-doc-1",
+                                                     "folder_id": REPLIES}), hub.DRIVE_NOT_HELD)
+
+    def test_the_level_that_counts_is_the_highest_grant_that_holds_the_file(self):
+        """Bug: the agent's highest level is used for every file, so a folder at write makes the whole Drive
+        writable; or a shared file in a folder at write is written without write_shared."""
+        self.folders(whole="read", of={REPLIES: "write"})
+        sheet = {"range": "A1", "rows": [["x"]]}
+        self.ok("drive_sheet", dict(sheet, request_id=str(uuid.uuid4()), file_id="deep-sheet-01"))
+        self.assertEqual(self.refused("drive_sheet", dict(sheet, request_id=str(uuid.uuid4()), file_id="sheet1")),
+                         "Your Drive level does not allow this now. Ask your requester.")
+        self.assertIn("Name: Plan", self.ok("drive_read", {"file_id": "doc1"}))      # the whole Drive still reads
+        self.assertEqual(self.refused("drive_write", {"request_id": str(uuid.uuid4()), "file_id": "team-reply-01",
+                                                      "text": "x"}), hub.GOOGLE_SHARED)
+        self.folders(whole="read", of={REPLIES: "write_shared"})
+        self.ok("drive_write", {"request_id": str(uuid.uuid4()), "file_id": "team-reply-01", "text": "x"})
+        self.folders(of={"inner-folder-1": "write", REPLIES: "read"})
+        self.assertEqual(self.refused("drive_write", {"request_id": str(uuid.uuid4()), "file_id": "team-reply-01",
+                                                      "text": "x"}), hub.DRIVE_ONLY_READ)
+        self.ok("drive_write", {"request_id": str(uuid.uuid4()), "file_id": "deep-doc-0001", "text": "x"})
+        formula = [["=IMPORTRANGE(\"outside-sheet\", \"A1:Z9\")"]]
+        self.assertEqual(self.refused("drive_sheet", {"request_id": str(uuid.uuid4()), "file_id": "deep-sheet-01",
+                                                      "range": "A1", "rows": formula}), hub.DRIVE_IMPORTS)
+        self.assertEqual(self.refused("drive_write", {"request_id": str(uuid.uuid4()), "kind": "sheet", "name": "S",
+                                                      "folder_id": "inner-folder-1", "text": "a\n=importrange(1,2)"}),
+                         hub.DRIVE_IMPORTS)
+        self.folders(whole="read", of={REPLIES: "write"})
+        self.ok("drive_sheet", {"request_id": str(uuid.uuid4()), "file_id": "deep-sheet-01", "range": "A1",
+                                "rows": formula})       # it reads the whole Drive already
+
+    def test_a_link_checks_the_folder_again_when_it_is_used(self):
+        """Bug: a one-time link keeps the grant that the agent had when the tool made it."""
+        self.folders(of={REPLIES: "write"})
+        download = self.token(self.ok("drive_read", {"file_id": "deep-pdf-0001"}))
+        upload = self.token(self.ok("drive_write", {"request_id": str(uuid.uuid4()), "kind": "file", "name": "a.bin",
+                                                    "folder_id": REPLIES, "upload": True}))
+        self.folders(of={"inner-folder-1": "read"})         # the folder of the upload is no longer held at write
+        status, _, body = self.link(download)
+        self.assertEqual(status, 200, body)                 # the pdf is under inner-folder-1, which it still reads
+        status, _, body = self.link(upload, data=b"bytes", method="POST")
+        self.assertEqual(status, 403, body)
+        self.assertNotIn("drive_create", self.fake.names())
+        self.folders(of={REPLIES: "write"})
+        change = self.token(self.ok("drive_write", {"request_id": str(uuid.uuid4()), "file_id": "deep-pdf-0001",
+                                                    "upload": True}))
+        self.folders(of={REPLIES: "read"})
+        status, _, body = self.link(change, data=b"bytes", method="POST")
+        self.assertEqual(status, 403, body)
+        self.assertNotIn("drive_update", self.fake.names())
+        download = self.token(self.ok("drive_read", {"file_id": "deep-pdf-0001"}))
+        self.folders(of={REPLIES + "x": "read"})
+        status, _, body = self.link(download)
+        self.assertEqual((status, body), (403, f"Not downloaded: {hub.DRIVE_NOT_HELD}\n".encode()))
+
+    def test_the_owner_gives_a_folder_by_its_link(self):
+        """Bug: the folder ID loses its case or keeps the owner's word for an alias; a folder of another account or
+        one under the whole Drive's level is kept; the page names no folder."""
+        link = f"https://drive.google.com/drive/folders/{REPLIES}?usp=sharing"
+        data = self.levels(service="drive", folder=link, access={"dev": "write", "ops": "read"})
+        self.assertEqual((data["folder"], data["name"], data["took_place_of"], data["changed"]),
+                         (REPLIES, "Support replies", {}, True))
+        team = json.loads((self.root / "kit" / "team.json").read_text())
+        self.assertEqual(team["agents"]["dev"]["drive_folders"], {"account": EMAIL, "folders": {REPLIES: "write"}})
+        self.assertNotIn("google", team["agents"]["dev"])
+        said = hub.q1("SELECT text FROM events WHERE agent='manager' AND kind='say' ORDER BY id DESC")["text"]
+        self.assertEqual(said, f"[hub] The owner changed who has the Drive folder https://drive.google.com/drive/"
+                               f"folders/{REPLIES} of {EMAIL}: dev write, ops read.")
+        page = self.request("/ui/resources?db=test-generation")[1]
+        item = next(r for r in page["resources"] if r["id"] == f"drive:{EMAIL}")
+        self.assertEqual(item["holders"], [])
+        folder = item["folders"][0]
+        self.assertEqual({k: folder[k] for k in ("id", "name", "shared", "gone", "holders")},
+                         {"id": REPLIES, "name": "Support replies", "shared": False, "gone": False,
+                          "holders": [{"agent": "dev", "level": "write"}, {"agent": "ops", "level": "read"}]})
+        self.assertEqual([(h["agent"], h["level"], h["by"]) for h in folder["history"]],
+                         [("ops", "read", "owner"), ("dev", "write", "owner")])
+        self.assertNotIn("Support replies", item["title"])
+        self.levels(service="drive", folder=REPLIES, access={"dev": "write"})       # ops is not named: it loses it
+        team = json.loads((self.root / "kit" / "team.json").read_text())
+        self.assertNotIn("drive_folders", team["agents"]["ops"])
+        self.levels(service="drive", folder=REPLIES, access={"dev": "write", "ops": "read"})
+        self.levels(service="drive", access={"dev": "write"})        # the whole Drive reaches the folder's level
+        team = json.loads((self.root / "kit" / "team.json").read_text())
+        self.assertNotIn("drive_folders", team["agents"]["dev"])
+        self.assertIn("drive_folders", team["agents"]["ops"])
+        self.connected(email=EMAIL2, refresh=REFRESH2)
+        data = self.levels(account=EMAIL2, service="drive", folder=REPLIES, access={"ops": "write"})
+        self.assertEqual(data["took_place_of"], {"ops": EMAIL})
+        team = json.loads((self.root / "kit" / "team.json").read_text())
+        self.assertEqual(team["agents"]["ops"]["drive_folders"], {"account": EMAIL2, "folders": {REPLIES: "write"}})
+        for value, code, status in (("https://example.com/x", "drive_folder_link", 400),
+                                    ("no-such-folder-1", "drive_folder_unseen", 404),
+                                    ("deep-doc-0001", "drive_folder_file", 422)):
+            got, body = self.owner("/ui/team/google", base_sha256=self.sha(), account=EMAIL, service="drive",
+                                   folder=value, access={"dev": "write"})
+            self.assertEqual((got, body.get("code")), (status, code), body)
+        code, gone = self.owner("/ui/google/disconnect", account=EMAIL2)
+        self.assertEqual(code, 200, gone)
+        self.levels(account=EMAIL2, service="drive", folder=REPLIES, access={})     # with no token: no read of Google
+        self.assertNotIn("drive_folders", json.loads((self.root / "kit" / "team.json").read_text())["agents"]["ops"])
+        bad = json.loads(json.dumps(team))
+        bad["agents"]["ops"]["google"] = {"drive": {"account": EMAIL2, "level": "write"}}
+        with self.assertRaisesRegex(ValueError, "higher than the whole Drive"):
+            hub.validate_team(bad)
+        bad["agents"]["ops"]["drive_folders"]["folders"] = {"root": "write_shared"}
+        with self.assertRaisesRegex(ValueError, "drive_folders"):
+            hub.validate_team(bad)
+
+    def test_the_manager_does_not_widen_a_folder_holder_to_the_whole_drive(self):
+        """Bug: grant_access, or the advice of an access question, gives the whole Drive to an agent whose folders
+        the owner chose."""
+        hub.TEAM["resources"] = {f"drive:{EMAIL}": {"max": "write", "to": hub.RESOURCE_AUDIENCE}}
+        self.folders(of={REPLIES: "read"})
+        refused = hub.grant_check("dev", f"drive:{EMAIL}", "read")
+        self.assertIn("uses only some folders of the Drive of owner@example.com", refused)
+        self.assertIsNone(hub.grant_check("ops", f"drive:{EMAIL}", "read"))
+        pool = next(p for p in hub.grant_pool(["dev", "ops"]) if p["resource"] == f"drive:{EMAIL}")
+        self.assertEqual(pool["eligible"], ["ops"])          # see_capacity offers what grant_access gives
+        with patch.object(hub, "agent_active", lambda name: True):
+            # An item about this Drive can be about the folder holder, by its role: neither the item's check nor the
+            # Needs-you check calls it the manager's to give.
+            self.assertIsNone(hub.card_access(f"drive:{EMAIL}", "read"))
+            self.assertIsNone(hub.need_is_yours("manager", f"Customer Support needs drive:{EMAIL} at read"))
+            self.folders()
+            self.assertIn("yours to give", hub.card_access(f"drive:{EMAIL}", "read"))
 
 
 class ConnectThroughTheStandIn(GoogleHub):

@@ -1859,6 +1859,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # 1.223), and each task of GET /ui/state says from_conversation (UI-API.md 1.231)
                "office_files",      # the owner, 20 November 2026 ("Yes, fix both"): POST /ui/attachments takes Word,
                                     # Excel and PowerPoint files too (ATTACH_OFFICE, owner API 1.251)
+               "drive_folders",     # the owner, 20 November 2026 ("Yes, as drawn"): Drive access to some folders only
+                                    # (POST /ui/team/google with folder, a Drive resource's folders; owner API 1.255)
                "mobile_ended",      # owner API 1.166: GET /ui/mobile/ended and the ended_mark of GET /ui/mobile
                "older_tasks",       # owner API 1.254: GET /ui/state takes tasks=window, and GET /ui/tasks/older has
                                     # the ended tasks that the window leaves out. A reader goes by `older_tasks` of
@@ -6272,8 +6274,14 @@ def google_clauses(agent):
     google = (agents().get(agent) or {}).get("google") or {}
     out = []
     for service in ("gmail", "drive"):
-        if google.get(service):
-            gave = [t for t in GOOGLE_TOOLS if GOOGLE_TOOLS[t][0] == service and google_allowed(agent, t)]
+        gave = [t for t in GOOGLE_TOOLS if GOOGLE_TOOLS[t][0] == service and google_allowed(agent, t)]
+        account, _, folders = drive_grant(agent) if service == "drive" else (None, -1, {})
+        if folders:
+            # By link, never by name: a folder's name is Google's text, which a stranger who shares a folder chooses.
+            whole = (f" at the level {google[service]['level']}, and in" if google.get(service) else ": only") + \
+                " these folders and what they hold:"
+            out.append(f"{GOOGLE_NAMES[service]} of {account}{whole} {drive_links(folders)} ({', '.join(gave)})")
+        elif google.get(service):
             out.append(f"{GOOGLE_NAMES[service]} of {google[service]['account']} at the level "
                        f"{google[service]['level']} ({', '.join(gave)})")
     return out
@@ -6405,6 +6413,9 @@ def colleague_facts(name):
     for service in ("gmail", "drive"):
         if google.get(service):
             out.append(f"{GOOGLE_NAMES[service]} at the level {google[service]['level']}")
+    words = drive_folder_words(name)
+    if words:
+        out.append(f"Drive {words}")
     if a.get("tools"):
         out.append("MCP servers " + named_few(sorted(a["tools"]), TEAM_ITEMS))
     if a.get("servers"):        # who to give server work to: the door takes a server's calls from its holder only
@@ -12237,8 +12248,11 @@ def capacity_view(names=None, expertise=None, needs=None, login=None):
                                 "marker": d["marker_kind"]}
                                for d in q("SELECT id, text, state, marker_kind FROM responsibilities WHERE agent=? "
                                           "AND state!='retired' ORDER BY id", (name,))],
-                    "google": {s: (a.get("google") or {}).get(s, {}).get("level")
-                               for s in ("gmail", "drive") if (a.get("google") or {}).get(s)},
+                    "google": dict({s: (a.get("google") or {}).get(s, {}).get("level")
+                                    for s in ("gmail", "drive") if (a.get("google") or {}).get(s)},
+                                   **({"drive": " ".join(filter(None, [(a.get("google") or {}).get("drive", {})
+                                                                       .get("level"), drive_folder_words(name)]))}
+                                      if drive_folder_words(name) else {})),
                     "logins": {"eligible": allowed, "probe": probe}, "seen_at": seen, "hold": hold, "routes": routes,
                     "workload": {"open": len(tasks), "by_state": states, "tasks": [t["id"] for t in tasks]},
                     "eligible": not why_not, "why_not": why_not})
@@ -13682,6 +13696,10 @@ def need_is_yours(agent, *texts):
             if kind not in allowed or other not in allowed and (f"{other}:{what}" in blob or
                                                                 re.search(rf"\b{other}\b", words)):
                 continue
+            if kind == "drive" and drive_folders_held(what, active=True):
+                # Agents hold some folders of this Drive, which the owner chose: an item about this Drive can be about
+                # one of them, by name or by role, and grant_check refuses the whole Drive to it. The owner decides.
+                continue
         who = [n for n in agents() if grant_fits(n, entry) and agent_active(n)]
         if not who:
             continue
@@ -14069,6 +14087,8 @@ def card_access(words, level):
                 f"{resource_phrase(kind, what)} ({rid}) already. Give that part of the work to it with create_task: "
                 f"the owner is not needed. If the work needs more than that level, give needs_level.{value}")
     top = (resource_pool().get(rid) or {}).get("max")
+    if kind == "drive" and drive_folders_held(what, active=True):
+        return None         # the item can be about an agent whose folders the owner chose: only the owner widens them
     for name in sorted(agents()):
         if not (agent_active(name) and role_of(name) in ("worker", "lead")):
             continue
@@ -25430,6 +25450,27 @@ DRIVE_TYPES = {DRIVE_FOLDER: "folder", DRIVE_DOC: "Google Doc", DRIVE_SHEET: "Go
                DRIVE_SLIDES: "Google Slides", DRIVE_DRAWING: "Google Drawing"}
 DRIVE_EXPORTS = {DRIVE_DOC: ".md", DRIVE_SHEET: ".xlsx", DRIVE_SLIDES: ".pdf", DRIVE_DRAWING: ".png"}
 DRIVE_KINDS = {"doc": "Google Doc", "sheet": "Google Sheet", "folder": "folder", "file": "file"}
+# Drive access to some folders only (the owner's "Yes, as drawn" of 20 November 2026 to
+# ~/dev/founderizer-plans/drive-folder-access-design.md, version 2). team.json agents.<a>.drive_folders =
+# {"account", "folders": {<folder id>: <level>}}: each folder and everything under it, beside the whole-Drive grant of
+# agents.<a>.google.drive, which stays as it was. drive_get is the one door of the tools and links to a file.
+DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{10,200}")       # a folder id as Google gives it: never an alias such as root
+DRIVE_FOLDERS_MOST = 500                # folders of one agent
+DRIVE_GROUP = 40                        # folders in one "in parents" query: Google publishes no limit for q
+DRIVE_PAGE_LIFE = 3600                  # seconds that the hub keeps the next page of a search inside some folders
+DRIVE_PAGES = {}                        # the hub's own page tokens of those searches: token -> what the next page needs
+DRIVE_NAMES = {}                        # (account, folder id) -> {"name", "shared", "at"}: for the owner's page only
+DRIVE_NAME_LIFE = 600                   # seconds that DRIVE_NAMES keeps a name before it is read again
+DRIVE_NAMES_BUSY = threading.Event()    # set while a thread reads the names of DRIVE_NAMES
+DRIVE_FOLDER_LINK = "https://drive.google.com/drive/folders/{}"
+DRIVE_FOLDER_IN = re.compile(r"(?:/folders/|/drives/|[?&]id=)([A-Za-z0-9_-]{10,200})")
+DRIVE_NOT_HELD = "No file with this id is in the Drive folders that you may use. Ask your requester."
+DRIVE_ONLY_READ = "In this folder you may only read. Ask your requester."
+DRIVE_NO_ROOT = ("You may use only some folders of the Drive of {email}: give folder_id, one of these folders or a "
+                 "folder inside one: {links}.")
+DRIVE_IMPORT = re.compile(r"importrange\s*\(", re.I)
+DRIVE_IMPORTS = ("A formula with IMPORTRANGE reads another sheet, and you may use only some folders of this Drive: "
+                 "write the values themselves.")
 GOOGLE_PROBLEM = "Google refused the saved access. Connect again."
 GOOGLE_TESTING = ("Google refused the saved access. If your Google Cloud client is in Testing, publish it, because "
                   "Google ends its sign-ins after 7 days. Then connect again.")
@@ -26206,7 +26247,8 @@ def google_view(team):
             google_key_read()
         except OSError:
             bad = refusal_words.words("google_file_key")
-    named = {g.get("account") for a in team["agents"].values() for g in (a.get("google") or {}).values()}
+    named = {g.get("account") for a in team["agents"].values() for g in (a.get("google") or {}).values()} | \
+        {a["drive_folders"].get("account") for a in team["agents"].values() if isinstance(a.get("drive_folders"), dict)}
     with GOOGLE_LOCK:
         problems, made = dict(GOOGLE["problems"]), dict(GOOGLE["problem_for"])
     accounts = []
@@ -26223,34 +26265,143 @@ def google_view(team):
             "accounts": accounts, "levels": {s: list(v) for s, v in GOOGLE_LEVELS.items()}}
 
 
-def save_google(body):
+def save_google(body, found=None):
     """Who has one service of one account, at which level: {agent: level}. A named agent gets the service from this
-    account (in place of another account); an agent that is not named and has it from this account loses it."""
+    account (in place of another account); an agent that is not named and has it from this account loses it.
+
+    found: the folder of body["folder"] as the account reads it (google_folder_found, outside LOCK), for a grant of
+    that folder alone: a named agent gets it at that level, an agent that is not named loses it, and the whole Drive
+    and the other folders stay. Either way the rules of drive_grant hold after the write (drive_folders_fit): one
+    account for each agent, and a folder only at a level higher than the agent's whole Drive."""
     account, service, access = body["account"], body["service"], body["access"]
+    folder = found["id"] if found else None
+    replaced, moved = {}, {}
 
     def change(team):
         known_agents(team, access)
         changed = False
         for name, a in team["agents"].items():
-            levels = dict(a.get("google") or {})
+            levels, before_folders = dict(a.get("google") or {}), a.get("drive_folders")
             before = levels.get(service)
-            if name in access:
+            if folder:
+                df = before_folders if (before_folders or {}).get("account") == account else None
+                held = dict((df or {}).get("folders") or {})
+                if name in access:
+                    held[folder] = access[name]
+                    if (before or {}).get("account") not in (None, account):
+                        replaced[name] = before["account"]
+                        del levels[service]
+                    elif (before_folders or {}).get("account") not in (None, account):
+                        replaced[name] = before_folders["account"]
+                else:
+                    held.pop(folder, None)
+                if name in access or df:
+                    a["drive_folders"] = {"account": account, "folders": dict(sorted(held.items()))}
+            elif name in access:
                 levels[service] = {"account": account, "level": access[name]}
+                if (before or {}).get("account") not in (None, account):
+                    replaced[name] = before["account"]
             elif (before or {}).get("account") == account:
                 del levels[service]
-            if levels.get(service) != before:
+            put_google(a, levels)
+            if service == "drive":
+                drive_folders_fit(a, replaced, name)
+            if levels.get(service) != before or a.get("drive_folders") != before_folders:
                 changed = True
-                if levels:
-                    a["google"] = dict(sorted(levels.items()))
-                else:
-                    a.pop("google", None)
+            if folder:
+                now_held = ((a.get("drive_folders") or {}).get("folders") or {}).get(folder)
+                if now_held != (((before_folders or {}).get("folders") or {}).get(folder)
+                                if (before_folders or {}).get("account") == account else None):
+                    moved[name] = now_held
         return changed
     word = GOOGLE_NAMES[service]
-    result = save_integration(body["base_sha256"], change, f"Owner changed who has Google {word} of {account}")
+    what = f"the Drive folder {DRIVE_FOLDER_LINK.format(folder)}" if folder else f"Google {word}"
+    result = save_integration(body["base_sha256"], change, f"Owner changed who has {what} of {account}")
     if result["changed"]:
         words = ", ".join(f"{n} {v}" for n, v in sorted(access.items())) or "no agent"
-        emit(manager_name(), "say", f"[hub] The owner changed who has Google {word} of {account}: {words}.")
-    return dict(result, account=account, service=service, access=access)
+        emit(manager_name(), "say", f"[hub] The owner changed who has {what} of {account}: {words}.")
+        if moved:       # a folder's own record, for its card: "drive:<account>/<folder id>", never a resource id
+            rid = f"drive:{account}/{folder}"
+            with transaction():
+                for name, level in sorted(moved.items()):
+                    resource_record(rid, name, level, "owner", result["revision"])
+    # took_place_of, not "replaced": an app reads the "replaced" of a Connect's finish as a bool from this same reader
+    return dict(result, account=account, service=service, access=access, took_place_of=replaced,
+                **({"folder": folder, "name": found.get("name"), "shared": found.get("shared")} if folder else {}))
+
+
+def put_google(a, levels):
+    """An agent's google field, or none: team.json stores no empty object."""
+    if levels:
+        a["google"] = dict(sorted(levels.items()))
+    else:
+        a.pop("google", None)
+
+
+def drive_folders_fit(a, replaced=None, name=None):
+    """Inside a change of team.json: the agent's drive_folders after a change of its Drive, so that drive_grant's rules
+    hold. Folders of another account than its whole Drive's go (an agent has the Drive of one account: replaced names
+    that account), and so does a folder whose level the whole Drive reaches, which then adds nothing. No folder left
+    is no field."""
+    df, whole = a.get("drive_folders"), (a.get("google") or {}).get("drive")
+    if not isinstance(df, dict):
+        return
+    levels, held = GOOGLE_LEVELS["drive"], dict(df.get("folders") or {})
+    if whole and whole.get("account") != df.get("account"):
+        if replaced is not None and name is not None:
+            replaced.setdefault(name, df.get("account"))
+        held = {}
+    elif whole:
+        held = {i: v for i, v in held.items() if levels.index(v) > levels.index(whole["level"])}
+    if held:
+        a["drive_folders"] = {"account": df["account"], "folders": dict(sorted(held.items()))}
+    else:
+        a.pop("drive_folders", None)
+
+
+def google_folder_id(value):
+    """A Drive folder's ID from a link of it (…/folders/<id>, …/drives/<id>, ?id=<id>) or the ID itself; ValueError
+    with a code otherwise (the app shows it)."""
+    text = str(value or "").strip()
+    if DRIVE_ID.fullmatch(text):
+        return text
+    m = DRIVE_FOLDER_IN.search(text) if len(text) <= 2000 else None
+    if not m:
+        raise refusal_words.Coded("drive_folder_link")
+    return m.group(1)
+
+
+def google_folder_found(body):
+    """POST /ui/team/google with a folder, outside LOCK (ui_command's outside): the folder as the account reads it,
+    {"id", "name", "shared", "drive_id"}, with the ID that Google gives, or None for a write with no folder. A Refusal
+    with a code that the app shows: the account is not connected, it cannot open the folder, it is no folder, or
+    Google did not answer."""
+    if not body.get("folder"):
+        return None
+    account = body["account"]
+    if body["folder"] in drive_folders_held(account):
+        # A folder that agents of this account hold was read when it was first given: one more agent, a take-back
+        # or the clean-up after a Disconnect (when the account has no token) needs no read of Google.
+        with GOOGLE_LOCK:
+            kept = dict(DRIVE_NAMES.get((account, body["folder"])) or {})
+        return {"id": body["folder"], "name": kept.get("name"), "shared": kept.get("shared"), "drive_id": None}
+    try:
+        access = google_access(account, "drive")
+    except ToolError:
+        raise Refusal(409, code="drive_folder_account", names={"account": account}) from None
+    try:            # a link to a whole shared drive reads as its root folder
+        f = drive_folder_read(access, body["folder"])
+    except google.GoogleError as e:
+        if e.status not in (403, 404) or e.unknown:
+            raise Refusal(502, code="drive_folder_google", names={"reason": google_why(e)}) from None
+        raise Refusal(404, code="drive_folder_unseen", names={"account": account}) from None
+    if f.get("mime") != DRIVE_FOLDER or not DRIVE_ID.fullmatch(str(f.get("id") or "")):
+        raise Refusal(422, code="drive_folder_file")
+    shown = {"id": f["id"], "name": f.get("name"), "shared": bool(f.get("shared") or f.get("drive_id")),
+             "drive_id": f.get("drive_id")}
+    with GOOGLE_LOCK:
+        DRIVE_NAMES[(account, f["id"])] = dict(name=shown["name"], shared=shown["shared"], gone=False, at=now())
+    return shown
 
 
 def google_why(e):
@@ -26280,9 +26431,16 @@ def google_level(agent, service):
 
 
 def google_allowed(agent, tool):
+    """A Google tool for this agent now: a worker or a lead whose level of the tool's service reaches the tool's. For
+    Drive, the highest of the whole Drive's level and its folders' (drive_grant): drive_get checks each file."""
     service, need = GOOGLE_TOOLS[tool]
-    return (agents().get(agent) or {}).get("role") in ("worker", "lead") and \
-        google_level(agent, service) >= GOOGLE_LEVELS[service].index(need)
+    if (agents().get(agent) or {}).get("role") not in ("worker", "lead"):
+        return False
+    have = google_level(agent, service)
+    if service == "drive":
+        _, whole, folders = drive_grant(agent)
+        have = max([whole, *folders.values()])
+    return have >= GOOGLE_LEVELS[service].index(need)
 
 
 def google_revokes(saved):
@@ -26574,7 +26732,8 @@ def google_task(agent, a, tool):
     if t["state"] in TERMINAL:
         raise ToolError(f"{tref(tid)} is already {t['state']}.")
     activity(tid, tool)
-    return t, google_grant(agent, GOOGLE_TOOLS[tool][0])[0]
+    service = GOOGLE_TOOLS[tool][0]
+    return t, drive_grant(agent)[0] if service == "drive" else google_grant(agent, service)[0]
 
 
 def google_safe_name(name, ext=""):
@@ -26611,15 +26770,6 @@ def google_link_alive(agent, rid):
     with GOOGLE_LOCK:
         return any(v["kind"] == "upload" and v["command"][:2] == (agent, rid) and v["ends"] >= now()
                    for v in GOOGLE["links"].values())
-
-
-def google_shared(agent, *files):
-    """The shared check before each Drive write: a shared file or folder, or one in a shared drive, needs write_shared.
-    The root of My Drive (None) is not shared. Returns whether one is shared."""
-    shared = any(f and (f.get("shared") or f.get("drive_id")) for f in files)
-    if shared and google_level(agent, "drive") < GOOGLE_LEVELS["drive"].index("write_shared"):
-        raise ToolError(GOOGLE_SHARED)
-    return shared
 
 
 def google_begin(agent, tool, a, fields, receipt=None, before=None):
@@ -26686,14 +26836,154 @@ def drive_named(f, email):
     return f"'{g_line(f.get('name'))}' (ID {f.get('id')}) in the Drive of {email}: {f.get('link')}"
 
 
-def drive_folder(access, folder):
-    """The folder of a new item or a move, read for the shared check; None for the root of My Drive."""
+def drive_grant(agent, team=None):
+    """(account, whole, folders) of the agent's Drive now: the account, the place in GOOGLE_LEVELS["drive"] of its
+    whole-Drive level (-1 for none), and {folder id: place of its level} of drive_folders. One account for each agent:
+    folders of another account than the whole Drive's give nothing (validate_team refuses them). (None, -1, {})."""
+    a = ((team.get("agents") or {}).get(agent) if team is not None else agents().get(agent)) or {}
+    levels, g, df = GOOGLE_LEVELS["drive"], (a.get("google") or {}).get("drive"), a.get("drive_folders")
+    account = g.get("account") if isinstance(g, dict) else None
+    whole = levels.index(g["level"]) if isinstance(g, dict) and g.get("level") in levels else -1
+    folders = {}
+    if isinstance(df, dict) and isinstance(df.get("folders"), dict) and account in (None, df.get("account")):
+        account = df.get("account")
+        folders = {i: levels.index(v) for i, v in df["folders"].items() if v in levels}
+    return account, whole, folders
+
+
+def drive_folder_words(agent, team=None):
+    """The agent's folder grants in a few words for the facts that other agents and the manager read ("in 2 folders,
+    up to write"), or "" when it has none. No link and no name: those are for the agent itself (google_clauses)."""
+    _, _, folders = drive_grant(agent, team)
+    if not folders:
+        return ""
+    top = GOOGLE_LEVELS["drive"][max(folders.values())]
+    return f"in {len(folders)} folder{'s' if len(folders) > 1 else ''}, up to {top}"
+
+
+def drive_folders_held(account, active=False):
+    """{folder id: [agents]} of the folders of one Drive account that agents hold now (drive_folders); only the agents
+    in work when active."""
+    held = {}
+    for name, a in sorted(agents().items()):
+        df = a.get("drive_folders")
+        if isinstance(df, dict) and df.get("account") == account and (not active or agent_active(name)):
+            for i in df.get("folders") or {}:
+                held.setdefault(i, []).append(name)
+    return held
+
+
+def drive_links(folders, least=None):
+    """The agent's folders as links, each with its level, for a refusal and the start text: those at `least` or
+    higher when given."""
+    levels = GOOGLE_LEVELS["drive"]
+    return ", ".join(f"{DRIVE_FOLDER_LINK.format(i)} ({levels[v]})" for i, v in sorted(folders.items())
+                     if least is None or v >= levels.index(least)) or "none"
+
+
+def drive_need(f, need):
+    """The level that a step on this file needs: a write to a shared file, or to one in a shared drive, reaches other
+    people, so it needs write_shared (drive_shared)."""
+    return "write_shared" if need == "write" and f and (f.get("shared") or f.get("drive_id")) else need
+
+
+def drive_cover(access, f, folders):
+    """The place of the highest level of the granted folders that hold this file (the file itself, or a folder above
+    it), or -1. It reads the file's parents up to the root, one read for each, and compares the ids that Google gives,
+    never an agent's word. A parent that the account cannot open ends that path as not held. Google gives an item one
+    parent since September 2020 ("A file can only have one parent folder"); an older item with more is held where any
+    path meets a granted folder, because Drive shows it in each. It stops at the highest level that a folder gives."""
+    best, top, seen, todo = -1, max(folders.values(), default=-1), set(), [f]
+    while todo and best < top:
+        node = todo.pop()
+        if node.get("id") in seen:
+            continue
+        seen.add(node.get("id"))
+        best = max(best, folders.get(node.get("id"), -1))
+        for p in node.get("parents") or []:
+            best = max(best, folders.get(p, -1))
+            if best >= top or p in seen:
+                continue
+            try:
+                todo.append(google.drive_file(access, p))
+            except google.GoogleError as e:
+                if e.status not in (403, 404):
+                    raise ToolError(f"Not done: {google_why(e)}.") from None
+    return best
+
+
+def drive_get(agent, email, access, file_id, need, shared=True):
+    """The one door of the Drive tools and links to a file: the file (FILE) once the check says that the agent may take
+    a step that needs `need` (read or write; a write to a shared file needs write_shared, drive_need) on it.
+
+    An agent with no folder grant is checked as before: the whole Drive's level. One with folders reads the file
+    first, and its whole-Drive level settles it when it is enough; else the folders above the file do (drive_cover).
+    Such an agent gets one refusal for a file outside its folders and for an id that Google does not know, and the
+    check comes before any word that depends on the file's type, so its answers tell nothing of files outside its
+    folders. file_id is the agent's own word: an alias such as root is read, and only the id that Google gives
+    counts.
+
+    shared False: the rule of a shared file waits for drive_shared, which the tool calls after its checks of the
+    file's type, so that those keep their order of before. The file then carries "held", the place of the level that
+    holds it."""
+    levels = GOOGLE_LEVELS["drive"]
+    _, whole, folders = drive_grant(agent)
+    if not folders:
+        f = google_call(google.drive_file, access, file_id)
+        f["held"] = whole
+        if whole < levels.index(drive_need(f, need) if shared else need):
+            raise ToolError(GOOGLE_SHARED if need == "write" and whole >= levels.index("write") else
+                            "Your Drive level does not allow this now. Ask your requester.")
+        return f
+    try:            # a granted folder can be a whole shared drive, whose id files.get does not take
+        f = drive_folder_read(access, file_id) if file_id in folders else google.drive_file(access, file_id)
+    except google.GoogleError as e:
+        if e.status in (403, 404):
+            raise ToolError(DRIVE_NOT_HELD) from None
+        raise ToolError(f"Not done: {google_why(e)}.") from None
+    want = levels.index(drive_need(f, need) if shared else need)
+    f["held"] = whole
+    if whole >= want and (shared or whole >= levels.index(drive_need(f, need))):
+        return f
+    cover = drive_cover(access, f, folders)
+    have = f["held"] = max(whole, cover)
+    if have < levels.index("read"):
+        raise ToolError(DRIVE_NOT_HELD)
+    if have < want:
+        raise ToolError(GOOGLE_SHARED if have >= levels.index("write") else DRIVE_ONLY_READ if cover >= 0 else
+                        "Your Drive level does not allow this now. Ask your requester.")
+    return f
+
+
+def drive_shared(*files):
+    """The rule of a shared file after a tool's own checks (drive_get with shared False): a write to a shared file or
+    folder, or to one in a shared drive, needs the level write_shared where the file is held."""
+    if any(f and drive_need(f, "write") == "write_shared" and f.get("held", -1) < GOOGLE_LEVELS["drive"].index(
+            "write_shared") for f in files):
+        raise ToolError(GOOGLE_SHARED)
+
+
+def drive_target(agent, email, access, folder):
+    """The folder of a new item or of a move, through drive_get at write; None for the root of My Drive, which only the
+    whole Drive at write reaches (an agent with no folder grant has it, or it would not have the tool)."""
+    _, whole, folders = drive_grant(agent)
     if not folder or folder == "root":
+        if whole < GOOGLE_LEVELS["drive"].index("write"):
+            raise ToolError(DRIVE_NO_ROOT.format(email=email, links=drive_links(folders, "write")) if folders else
+                            "Your Drive level does not allow this now. Ask your requester.")
         return None
-    f = google_call(google.drive_file, access, folder)
+    f = drive_get(agent, email, access, folder, "write", shared=False)
     if f.get("mime") != DRIVE_FOLDER:
         raise ToolError("folder_id is not a folder.")
     return f
+
+
+def drive_imports(agent, *texts):
+    """An agent that holds only some folders writes no IMPORTRANGE formula: sheet_write takes USER_ENTERED values, so
+    such a formula could read a sheet outside its folders that the account allowed before."""
+    if drive_grant(agent)[1] < GOOGLE_LEVELS["drive"].index("read") and any(
+            isinstance(t, str) and DRIVE_IMPORT.search(t) for t in texts):
+        raise ToolError(DRIVE_IMPORTS)
 
 
 def t_drive_search(agent, a):
@@ -26702,13 +26992,105 @@ def t_drive_search(agent, a):
     if not words and not folder:
         raise ToolError("Give words, folder_id, or both.")
     _, email = google_task(agent, a, "drive_search")
-    r = google_call(google.drive_search, google_access(email, "drive"), words=words, folder=folder, page=page)
+    access = google_access(email, "drive")
+    _, whole, folders = drive_grant(agent)
+    if whole >= GOOGLE_LEVELS["drive"].index("read"):
+        r = google_call(google.drive_search, access, words=words, folder=folder, page=page)
+    else:
+        r = drive_search_folders(agent, email, access, words, folder, page, folders)
     lines = [" | ".join(g_line(x) for x in (f.get("id"), f.get("name"), drive_type(f), f.get("modified"), f.get("owner"),
                                             drive_shared_word(f), f.get("link"))) for f in r.get("files") or []] \
         or ["No files found."]
+    if r.get("incomplete"):
+        lines.append("Google says that this search did not reach every place: some files can be missing.")
     if r.get("next"):
         lines.append(f"More: page={r['next']}")
     return google_data("drive", email, google_cut("\n".join(lines))[0])
+
+
+def drive_search_folders(agent, email, access, words, folder, page, folders):
+    """drive_search for an agent that holds only some folders: {"files", "next", "incomplete"}, with the hub's own page
+    token, so that a token of a wider search leads nowhere.
+
+    With folder_id: that folder, once drive_get says that the agent holds it, and only the files whose parent it is.
+    With words alone: the hub lists the folders under each granted folder, level by level, then asks Google in groups
+    of DRIVE_GROUP folders of one drive, and keeps only a file whose parent is one of the folders of this call's list
+    (parents is in the answer, so that costs no call). A page goes on in the group where the last one stopped."""
+    t0 = now()
+    if page is not None:
+        with GOOGLE_LOCK:
+            for old in [k for k, v in DRIVE_PAGES.items() if v["ends"] < t0]:
+                del DRIVE_PAGES[old]
+            kept = DRIVE_PAGES.get(page)
+            if kept and (kept["agent"], kept["words"], kept["folder"]) == (agent, words, folder):
+                del DRIVE_PAGES[page]       # used once, and only by its own agent's same search
+            else:
+                kept = None
+        if not kept:
+            raise ToolError("page must be the token after More: page= in the last result of the same search.")
+        group, token = kept["group"], kept["token"]
+    else:
+        group, token = 0, None
+    if folder:
+        f = drive_get(agent, email, access, folder, "read")
+        if f.get("mime") != DRIVE_FOLDER:
+            raise ToolError("folder_id is not a folder.")
+        groups = [((f.get("drive_id"),), [f["id"]])]
+        if words:
+            found = google_call(google.drive_search_in, access, [f["id"]], words, f.get("drive_id"), token)
+        else:
+            found = google_call(google.drive_search, access, folder=f["id"], page=token)
+    else:
+        groups = drive_groups(access, folders)
+        if not words:
+            raise ToolError("Give words, folder_id, or both.")
+        found = {"files": [], "next": None}
+        while group < len(groups):
+            (drive_id,), ids = groups[group]
+            found = google_call(google.drive_search_in, access, ids, words, drive_id, token)
+            if found.get("files") or found.get("next"):
+                break
+            group, token = group + 1, None
+    listed = {i for _, ids in groups for i in ids}
+    files = [f for f in found.get("files") or [] if set(f.get("parents") or []) & listed]
+    nxt = None
+    if found.get("next") or (not folder and group + 1 < len(groups)):
+        nxt = secrets.token_urlsafe(24)
+        step = (group, found["next"]) if found.get("next") else (group + 1, None)
+        with GOOGLE_LOCK:
+            for old in [k for k, v in DRIVE_PAGES.items() if v["ends"] < t0]:
+                del DRIVE_PAGES[old]
+            DRIVE_PAGES[nxt] = {"agent": agent, "words": words, "folder": folder, "group": step[0], "token": step[1],
+                                "ends": t0 + DRIVE_PAGE_LIFE}
+    return {"files": files, "next": nxt, "incomplete": bool(found.get("incomplete"))}
+
+
+def drive_groups(access, folders):
+    """The granted folders and every folder under them, as groups of at most DRIVE_GROUP ids of one drive:
+    [((drive id or None,), [ids])], in a fixed order. Each granted folder is read once for its drive; a folder that the
+    account can no longer open is left out."""
+    by_drive = {}
+    for i in sorted(folders):
+        try:
+            f = drive_folder_read(access, i)
+        except google.GoogleError as e:
+            if e.status in (403, 404):
+                continue
+            raise ToolError(f"Not done: {google_why(e)}.") from None
+        if f.get("mime") == DRIVE_FOLDER:
+            by_drive.setdefault(f.get("drive_id"), set()).add(f["id"])
+    groups = []
+    for drive_id in sorted(by_drive, key=lambda d: d or ""):
+        seen, level = set(by_drive[drive_id]), sorted(by_drive[drive_id])
+        while level:
+            below = []
+            for n in range(0, len(level), DRIVE_GROUP):
+                below += google_call(google.drive_folders_in, access, level[n:n + DRIVE_GROUP], drive_id)
+            level = sorted(set(below) - seen)
+            seen |= set(level)
+        ids = sorted(seen)
+        groups += [((drive_id,), ids[n:n + DRIVE_GROUP]) for n in range(0, len(ids), DRIVE_GROUP)]
+    return groups
 
 
 def t_drive_read(agent, a):
@@ -26716,7 +27098,7 @@ def t_drive_read(agent, a):
     file_id, rng = g_id(a, "file_id"), g_text(a, "range", 200, need=False)
     t, email = google_task(agent, a, "drive_read")
     access = google_access(email, "drive")
-    f = google_call(google.drive_file, access, file_id)
+    f = drive_get(agent, email, access, file_id, "read")
     mime = f.get("mime") or ""
     if rng and mime != DRIVE_SHEET:
         raise ToolError("range is for a Google Sheet only.")
@@ -26776,7 +27158,7 @@ def t_drive_write(agent, a):
     access = google_access(email, "drive")
     target, parent, mime = None, None, None
     if file_id:
-        target = google_call(google.drive_file, access, file_id)
+        target = drive_get(agent, email, access, file_id, "write", shared=False)
         mime = target.get("mime") or ""
         if mime == DRIVE_FOLDER:
             raise ToolError("This is a folder: it has no content to change.")
@@ -26791,8 +27173,12 @@ def t_drive_write(agent, a):
         elif text is not None and not mime.startswith("text/"):
             raise ToolError("This file is not text. Send its new content with upload: true.")
     else:
-        parent = drive_folder(access, folder)
-    shared = google_shared(agent, target, parent)
+        parent = drive_target(agent, email, access, folder)
+        folder = parent["id"] if parent else folder
+        if kind == "sheet":
+            drive_imports(agent, text)
+    drive_shared(target, parent)
+    shared = bool(drive_need(target or parent, "write") == "write_shared")
     if upload:
         token = google_new_link(agent, t, "upload", command=command, account=email, file=target, name=name,
                                 folder=folder, shared=shared)
@@ -26839,15 +27225,16 @@ def t_drive_sheet(agent, a):
     if old:
         return google_receipt(agent, "drive_sheet", a, old, t)
     access = google_access(email, "drive")
-    f = google_call(google.drive_file, access, file_id)
+    f = drive_get(agent, email, access, file_id, "write", shared=False)
     if f.get("mime") != DRIVE_SHEET:
         raise ToolError("drive_sheet changes the cells of a Google Sheet only.")
-    google_shared(agent, f)
+    drive_shared(f)
+    drive_imports(agent, *cells)
     command, old = google_begin(agent, "drive_sheet", a, fields)
     if old:
         return google_receipt(agent, "drive_sheet", a, old, t)
     try:
-        r = google.sheet_write(access, file_id, rng, rows, append=append)
+        r = google.sheet_write(access, f["id"], rng, rows, append=append)
     except google.GoogleError as e:
         google_failed(command, e)
     return google_end(command, {"state": "done", "text": f"{'Added' if append else 'Wrote'} {r.get('cells')} cells in "
@@ -26869,8 +27256,10 @@ def t_drive_move(agent, a):
     if old:
         return google_receipt(agent, "drive_move", a, old, t)
     access = google_access(email, "drive")
-    f = google_call(google.drive_file, access, file_id)
-    google_shared(agent, f, drive_folder(access, folder))
+    f = drive_get(agent, email, access, file_id, "write", shared=False)
+    target = drive_target(agent, email, access, folder) if folder is not None else None
+    drive_shared(f, target)
+    folder = target["id"] if target else folder
     command, old = google_begin(agent, "drive_move", a, fields)
     if old:
         return google_receipt(agent, "drive_move", a, old, t)
@@ -35905,11 +36294,76 @@ def resource_view(rid, team, accounts):
     entry = (team.get("resources") or {}).get(rid) or {}
     uses, credential = resource_uses(kind, what, team)
     ready = True if kind not in ("drive", "gmail") else kind in accounts.get(what, ())
-    return {"id": rid, "kind": kind, "what": what, "title": resource_title(kind, what, team),
-            "needs": RESOURCE_NEEDS[kind], "levels": list(RESOURCE_LEVELS[kind]), "uses": uses,
-            "credential": credential, "connected": ready,
-            "grant": {"max": entry["max"], "to": entry.get("to", RESOURCE_AUDIENCE)} if entry.get("max") else None,
-            "holders": resource_holders(kind, what, team), "history": resource_history(rid)}
+    return dict({"id": rid, "kind": kind, "what": what, "title": resource_title(kind, what, team),
+                 "needs": RESOURCE_NEEDS[kind], "levels": list(RESOURCE_LEVELS[kind]), "uses": uses,
+                 "credential": credential, "connected": ready,
+                 "grant": {"max": entry["max"], "to": entry.get("to", RESOURCE_AUDIENCE)} if entry.get("max") else None,
+                 "holders": resource_holders(kind, what, team), "history": resource_history(rid)},
+                **({"folders": drive_folders_view(what, team, ready)} if kind == "drive" else {}))
+
+
+def drive_folders_view(account, team, connected=True):
+    """The folders of one Drive account that agents hold (drive_folders), for GET /ui/resources and the owner's page
+    alone: [{"id", "link", "name", "shared", "gone", "holders", "history"}], each folder once. name and shared are
+    Google's, from DRIVE_NAMES, which google_folder_found and drive_names_fill keep: None while the hub has not read
+    them. gone: the account could not open the folder at the last read. They are never in resource_title or
+    resource_phrase, which reach agents through the manager's pool: a folder's name is a stranger's text when a
+    stranger shares the folder. history: the folder's own records, "drive:<account>/<id>"."""
+    held = {}
+    for name, a in sorted((team.get("agents") or {}).items()):
+        df = a.get("drive_folders")
+        if isinstance(df, dict) and df.get("account") == account:
+            for i, level in sorted((df.get("folders") or {}).items()):
+                held.setdefault(i, []).append({"agent": name, "level": level})
+    with GOOGLE_LOCK:
+        names = {i: dict(DRIVE_NAMES.get((account, i)) or {}) for i in held}
+    old = [i for i in held if now() - names[i].get("at", 0) > DRIVE_NAME_LIFE]
+    if old and connected:
+        drive_names_fill(account, old)
+    return [{"id": i, "link": DRIVE_FOLDER_LINK.format(i), "name": names[i].get("name"),
+             "shared": names[i].get("shared"), "gone": bool(names[i].get("gone")), "holders": holders,
+             "history": resource_history(f"drive:{account}/{i}")} for i, holders in held.items()]
+
+
+def drive_folder_read(access, folder):
+    """One folder as the account reads it: its FILE, a shared drive's root for a link to a whole shared drive, or a
+    GoogleError (Google's 404 when neither is there)."""
+    try:
+        return google.drive_file(access, folder)
+    except google.GoogleError as e:
+        if e.status != 404:
+            raise
+        try:
+            return google.shared_drive(access, folder)
+        except google.GoogleError:
+            raise e from None
+
+
+def drive_names_fill(account, ids):
+    """Read the names of these folders of one account in a thread of its own, into DRIVE_NAMES, so that the owner's
+    page never waits for Google: the next reading of the page shows them. One such thread at a time."""
+    if DRIVE_NAMES_BUSY.is_set():
+        return
+    DRIVE_NAMES_BUSY.set()
+
+    def run():
+        try:
+            access = google_access(account, "drive")
+            for i in ids:
+                try:
+                    f = drive_folder_read(access, i)
+                    entry = {"name": f.get("name"), "shared": bool(f.get("shared") or f.get("drive_id")), "gone": False}
+                except google.GoogleError as e:
+                    if e.status not in (403, 404):
+                        continue
+                    entry = {"name": None, "shared": None, "gone": True}
+                with GOOGLE_LOCK:
+                    DRIVE_NAMES[(account, i)] = dict(entry, at=now())
+        except ToolError:
+            pass                # the account is not connected now: the page says so on its account
+        finally:
+            DRIVE_NAMES_BUSY.clear()
+    threading.Thread(target=run, name="drive-names", daemon=True).start()
 
 
 def resource_ids(team, accounts):
@@ -35925,6 +36379,8 @@ def resource_ids(team, accounts):
         ids |= {f"repo:{repo}" for repo in (a.get("repos") or {})}
         ids |= {f"{service}:{got['account']}" for service, got in (a.get("google") or {}).items()
                 if isinstance(got, dict) and got.get("account")}
+        if isinstance(a.get("drive_folders"), dict) and a["drive_folders"].get("account"):
+            ids.add(f"drive:{a['drive_folders']['account']}")      # an account whose agents hold folders of it only
     ids |= {rid for rid in (team.get("resources") or {}) if resource_parts(rid)[0]}
     return sorted(ids, key=lambda rid: (list(RESOURCE_LEVELS).index(resource_parts(rid)[0]), rid))
 
@@ -36021,7 +36477,8 @@ def grant_pool(names, team=None):
         pool.append({"resource": rid, "kind": kind, "title": resource_title(kind, what, team),
                      "max": entry["max"], "to": entry.get("to", RESOURCE_AUDIENCE),
                      "levels": list(RESOURCE_LEVELS[kind]),
-                     "eligible": [n for n in names if grant_fits(n, entry, team)],
+                     "eligible": [n for n in names if grant_fits(n, entry, team) and
+                                  not (kind == "drive" and drive_grant(n, team)[2])],
                      "held_by": {h["agent"]: h["level"] for h in resource_holders(kind, what, team)}})
     return pool
 
@@ -36076,6 +36533,11 @@ def grant_check(agent, rid, level):
                 f"the owner with raise_needs_you to make it grantable, or to grant it once.")
     if not resource_known(kind, what, TEAM):
         return f"The fleet does not hold {resource_phrase(kind, what)} any more. Tell the owner."
+    if kind == "drive" and level and drive_grant(agent)[2]:
+        # Drive access to some folders only: the owner chose those folders for this agent, so a grant of a whole Drive,
+        # which would widen them or take their place, is the owner's to give.
+        return (f"{shown_role(agent)} uses only some folders of the Drive of {drive_grant(agent)[0]}, which the owner "
+                f"chose. A whole Drive is the owner's to give: ask with raise_needs_you, and say what the work needs.")
     why = google_refusal(what, kind) if kind in ("drive", "gmail") else None
     if why:
         # A Connect asks Google for one service (owner API 1.185): an account connected for Gmail is no Drive account.
@@ -36144,6 +36606,8 @@ def grant_resource(by, rid, agent, level, phrase):
             else:
                 del levels[kind]
             put(a, "google", dict(sorted(levels.items())))
+            if kind == "drive":
+                drive_folders_fit(a)
             return True
         done = f"gave {agent} {phrase} ({level})" if level else f"took {phrase} back from {agent}"
         result = save_integration(None, change, f"{by.capitalize()} {done}", by=by)
@@ -36547,7 +37011,8 @@ def team_remove(ctx, c):
                       if isinstance(acc, dict) and acc.get("agents") == [n])
     held = ([f"GitHub {r} ({v})" for r, v in sorted((a.get("repos") or {}).items())] +
             [f"{GOOGLE_NAMES.get(s, s)} ({x.get('level')})" for s, x in sorted((a.get("google") or {}).items())
-             if isinstance(x, dict)] + [f"the MCP server {t}" for t in sorted(a.get("tools") or [])])
+             if isinstance(x, dict)] + ([f"Drive {drive_folder_words(n, team)}"] if drive_folder_words(n, team) else
+                                        []) + [f"the MCP server {t}" for t in sorted(a.get("tools") or [])])
     door = team.get("door") if isinstance(team.get("door"), dict) else {}
     keys = sorted(k for k, x in (door.get("credentials") or {}).items()
                   if isinstance(x, dict) and n in (x.get("agents") or []))
@@ -42044,7 +42509,8 @@ def google_described(agent, name, desc):
     if name not in GOOGLE_TOOLS:
         return desc
     service = GOOGLE_TOOLS[name][0]
-    return f"{desc} It uses the Google {GOOGLE_NAMES[service]} of {google_grant(agent, service)[0]}."
+    account = drive_grant(agent)[0] if service == "drive" else google_grant(agent, service)[0]
+    return f"{desc} It uses the Google {GOOGLE_NAMES[service]} of {account}."
 
 
 def gate(agent, task_id, name, args):
@@ -49858,6 +50324,24 @@ def validate_team(team, kept=None, shared_ok=None, browser_ok=None):
             raise ValueError(f"agent {name}: google is for a worker or a lead, and maps drive and gmail to {{account, "
                              f"level}}: an email in lower case, and a level (drive read, write or write_shared; gmail "
                              f"read, write or send); an empty object is not stored")
+        if "drive_folders" in a:            # Drive access to some folders only (drive_grant)
+            df, levels = a["drive_folders"], GOOGLE_LEVELS["drive"]
+            whole = ((grants or {}).get("drive") or {}) if isinstance(grants, dict) else {}
+            if a["role"] not in ("worker", "lead") or not isinstance(df, dict) or set(df) != {"account", "folders"} or \
+                    not google_account(df["account"]) or not isinstance(df["folders"], dict) or \
+                    not 1 <= len(df["folders"]) <= DRIVE_FOLDERS_MOST or not all(
+                        isinstance(i, str) and DRIVE_ID.fullmatch(i) and v in levels for i, v in df["folders"].items()):
+                raise ValueError(f"agent {name}: drive_folders is for a worker or a lead: {{account, folders}}, an email "
+                                 f"in lower case and 1 to {DRIVE_FOLDERS_MOST} Drive folder IDs, each with a level "
+                                 f"(read, write or write_shared)")
+            if whole and whole.get("account") != df["account"]:
+                raise ValueError(f"agent {name}: drive_folders must be of the account of its whole Drive, "
+                                 f"{whole.get('account')}: an agent has the Drive of one account")
+            low = sorted(i for i, v in df["folders"].items()
+                         if whole and levels.index(v) <= levels.index(whole.get("level")))
+            if low:
+                raise ValueError(f"agent {name}: a folder's level must be higher than the whole Drive's "
+                                 f"({whole.get('level')}), which already gives {', '.join(low)}")
         if "user" in a and not (isinstance(a["user"], str) and AGENT_OS_USER.fullmatch(a["user"])
                                 and a["role"] in ("worker", "lead")):
             raise ValueError(f"agent {name}: user is the OS user a worker or a lead keeps after a rename, fleet-<the "
@@ -66537,7 +67021,7 @@ class Handler(BaseHTTPRequestHandler):
     def ui_team_google(self):
         """POST /ui/team/google (owner feature google): the agents' levels of Google Drive or Gmail of one account."""
         def read(data):
-            base = self.integration_base(data, ("account", "service", "access"))
+            base = self.integration_base(data, ("account", "service", "access", "folder"))
             account, service, access = self.google_account_field(data.get("account")), data.get("service"), \
                 data.get("access")
             if not isinstance(service, str) or service not in GOOGLE_LEVELS:
@@ -66546,8 +67030,13 @@ class Handler(BaseHTTPRequestHandler):
                                                        v in GOOGLE_LEVELS[service] for n, v in access.items()):
                 raise ValueError(f"access must map agent names to {', '.join(GOOGLE_LEVELS[service])}; {{}} removes "
                                  f"{service} of this account from every agent")
-            return {"base_sha256": base, "account": account, "service": service, "access": dict(sorted(access.items()))}
-        return self.ui_command("team/google", read, save_google, kit=True)
+            body = {"base_sha256": base, "account": account, "service": service, "access": dict(sorted(access.items()))}
+            if data.get("folder") is not None:      # one folder of the account (drive_folders): a link or its ID
+                if service != "drive":
+                    raise ValueError('folder is for the service "drive"')
+                body["folder"] = google_folder_id(data["folder"])
+            return body
+        return self.ui_command("team/google", read, save_google, kit=True, outside=google_folder_found)
 
     def ui_team_access(self):
         """POST /ui/team/access (owner feature machine_access): how the fleet reaches one machine -- its SSH user,
@@ -67138,7 +67627,15 @@ class Handler(BaseHTTPRequestHandler):
                                                link["attachment_id"])
                 response, ctype = None, "application/octet-stream"
             else:
-                response, ctype, _ = google.drive_download(google_access(account, "drive"), link["file"])
+                if drive_grant(link["agent"])[0] != account:        # changed meanwhile
+                    return self.send(403, "Your Drive account does not allow this download now. Ask your "
+                                          "requester.\n", plain)
+                access = google_access(account, "drive")
+                try:        # the same check as the tool's, at the use of the link: the grant can have changed
+                    f = drive_get(link["agent"], account, access, link["file"]["id"], "read")
+                except ToolError as e:
+                    return self.send(403, f"Not downloaded: {e}\n", plain)
+                response, ctype, _ = google.drive_download(access, f)
         except ToolError as e:
             return self.send(502, f"Not downloaded: {e}\n", plain)
         except google.GoogleError as e:
@@ -67174,8 +67671,7 @@ class Handler(BaseHTTPRequestHandler):
             log(agent, f"BLOCKED an upload for {tref(link['task'])} that held a login")
             google_end(command, {"state": "failed", "text": GOOGLE_SECRET_FILE})
             return self.send(422, GOOGLE_SECRET_FILE + "\n", plain)
-        need = GOOGLE_LEVELS["drive"].index("write_shared" if link["shared"] else "write")
-        if google_grant(agent, "drive")[0] != account or google_level(agent, "drive") < need:      # changed meanwhile
+        if drive_grant(agent)[0] != account:      # changed meanwhile
             text = google_end(command, {"state": "failed", "text": "Your Drive account or level does not allow this "
                                                                    "write now. Ask your requester."})
             return self.send(403, text + "\n", plain)
@@ -67183,6 +67679,14 @@ class Handler(BaseHTTPRequestHandler):
             access = google_access(account, "drive")
         except ToolError as e:
             return self.send(502, google_end(command, {"state": "failed", "text": f"Not saved: {e}"}) + "\n", plain)
+        try:        # the tool's check again at the use of the link (drive_get): the grant can have changed meanwhile
+            if link["file"]:
+                drive_get(agent, account, access, link["file"]["id"], "write")
+            else:
+                drive_shared(drive_target(agent, account, access, link["folder"]))
+        except ToolError as e:
+            text = google_end(command, {"state": "failed", "text": f"Not saved: {e}"})
+            return self.send(403, text + "\n", plain)
         google_end(command, {"state": "started"})
         try:
             if link["file"]:
