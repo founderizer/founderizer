@@ -1471,7 +1471,11 @@ and its own refusals:
   refusal often carries what is still missing, and that is the part the agent must act on.
 
 This file validates nothing the hub validates. It passes the fields through and gives the hub's
-own words back, so the two cannot drift apart. It validates only what no hub sees: the SSH host
+own words back, so the two cannot drift apart. A null goes through only for a field whose schema
+takes null (the table's `nulls`): there it is a value of the hub's, such as an agent's model that
+follows the default again, a chat app account removed or a role with no daily limit. Every other
+null is left out, and a field left out stays as it is. Until 20 November 2026 every null was left
+out, and none of those reached the hub. This file validates only what no hub sees: the SSH host
 and user it puts in a command line, and the mode of the auth key file.
 
 `fleet_read` is the reads. Each of its pages is one `GET` route, and

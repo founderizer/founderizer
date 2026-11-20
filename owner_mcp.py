@@ -1092,13 +1092,24 @@ def table_tool(run, kind, route, fields, what, revision_page=None, rid_from_args
     run.kind, run.route, run.fields, run.what = kind, route, tuple(fields), what
     # For `with_base`: the fields that replace a whole value, which go only with the base of the client's own read.
     run.revision_page, run.rid_from_args, run.whole = revision_page, rid_from_args, tuple(whole)
+    run.nulls = ()          # the fields whose null is a value (`sent`); `tool` sets them from the schema
     return run
+
+
+def sent(run, fields, args):
+    """The body of a table tool: each field that the arguments give, as it is. A null is left out, but for a field
+    whose schema takes null (`run.nulls`, which `tool` reads from the schema), where null is a value of the hub's:
+    an agent's model or effort that follows the default again, a title or an account label taken away, a chat app
+    account removed, a person's or a role's own daily limit. Before 20 November 2026 each null was left out, so none of
+    those reached the hub (the reviews of that day)."""
+    return {name: args[name] for name in fields
+            if args.get(name) is not None or (name in args and name in getattr(run, "nulls", ()))}
 
 
 def plain(route, fields, what, rid_from_args=True):
     """A tool that passes its fields to one command route as they are. The hub checks each one."""
     def run(args):
-        body = {name: args[name] for name in fields if args.get(name) is not None}
+        body = sent(run, fields, args)
         return command(route_for(route, args), body, what, args.get("request_id") if rid_from_args else None)
     return table_tool(run, "plain", route, fields, what, rid_from_args=rid_from_args)
 
@@ -1127,7 +1138,7 @@ def with_base(route, fields, what, whole=()):
     nothing. With no base of the client's, the base is `GET /ui/team` read immediately before the command, and a
     change that arrived meanwhile is the hub's own 409."""
     def run(args):
-        body = {name: args[name] for name in fields if args.get(name) is not None}
+        body = sent(run, fields, args)
         if args.get("base_sha256") is not None:
             body["base_sha256"] = args["base_sha256"]
         else:
@@ -1284,7 +1295,7 @@ def with_revision(route, read, fields, what):
         number = whole_number(args, "id")
         page = read_page({"page": read, "id": number})
         thing = page.get({"goal": "goal", "responsibility": "responsibility", "trigger": "trigger"}[read])
-        body = {name: args[name] for name in fields if args.get(name) is not None}
+        body = sent(run, fields, args)
         body["base_revision"] = (thing or {}).get("revision")
         if not isinstance(body["base_revision"], int):
             raise Refused(f"the hub gave no revision for {read} {number}, so this change cannot be bound to it.")
@@ -2704,6 +2715,9 @@ READ_ONLY = ("fleet_overview", "fleet_read", "search_history", "see_costs", "whi
 
 
 def tool(name, about, properties, required, run):
+    if getattr(run, "kind", None):          # a table tool: the fields whose schema takes null (`sent`)
+        run.nulls = tuple(field for field in run.fields if isinstance((properties.get(field) or {}).get("type"), list)
+                          and "null" in properties[field]["type"])
     return {"name": name, "description": about, "run": run, "annotations": {"readOnlyHint": name in READ_ONLY},
             "inputSchema": {"type": "object", "properties": properties, "required": list(required),
                             "additionalProperties": False}}
@@ -2913,15 +2927,16 @@ def tools():
                                "host list. can, expertise, screen and web_hosts each replace a whole value: with one "
                                "of them, send base_sha256 from your fleet_read(page=\"team\"). "
                                "A null model or effort follows the fleet's default_model of its runtime "
-                               "(save_settings), else the runtime's own. Each of vault, runtime and vault_create is a "
+                               "(save_settings), else the runtime's own. "
+                               "A field left out stays as it is. Each of vault, runtime and vault_create is a "
                                "command of its own, and has a tool of its own here: vault_access, switch_runtime and "
                                "login_creation.",
              {"agent": S["text"], "model": {"type": ["string", "null"]}, "effort": {"type": ["string", "null"]},
               "can": {"type": "array", "items": {"type": "string",
                                                  "enum": list(FROM_THE_HUB["hub.CAPABILITIES"])}},
-              "title": {"type": ["string", "null"]},
+              "title": {"type": ["string", "null"], "description": "Null takes the title away."},
               "expertise": {"type": "array", "items": {"type": "string"}},
-              "account": {"type": ["string", "null"]},
+              "account": {"type": ["string", "null"], "description": "Null takes the account label away."},
               "screen": {"type": "object", "description": "The model of this agent's screen work: both keys, and "
                                                            "null in either for the fleet's Codex default_model, else "
                                                            "the screen runtime's own default.",
@@ -3169,14 +3184,16 @@ def tools():
         tool("save_person", "The people who may write to an agent from Discord or WhatsApp: add one, change one, or "
                             "remove one with delete true and its id. role is one of the roles that "
                             "fleet_read(page=\"people\") lists; agents are the agents they may reach; daily is their "
-                            "own message limit, or null for the role's own. scopes, for a person who is there "
+                            "own message limit, or null for the role's own; a field left out stays as it is. "
+                            "scopes, for a person who is there "
                             "already, maps an agent of their list to null (All: whatever that agent holds) or to a "
                             "list {\"repo:<owner/name>\": \"read\" or \"write\", \"secret:bws://<uuid>\": \"use\" or "
                             "\"read\"} of what that agent holds: their conversation with it then runs locked, and "
                             "the hub makes each repository call for it. This route is the only writer of the "
                             "people tables, so nothing a person says can widen their own access.",
              {"id": S["int"], "name": S["text"], "role": S["text"], "agents": {"type": "array", "items": S["text"]},
-              "note": {"type": ["string", "null"]}, "daily": {"type": ["integer", "null"]}, "blocked": S["bool"],
+              "note": {"type": ["string", "null"], "description": "Null takes the note away."},
+              "daily": {"type": ["integer", "null"]}, "blocked": S["bool"],
               "handles": {"type": "array", "items": {"type": "object"}}, "delete": S["bool"],
               "scopes": {"type": "object", "additionalProperties": {"type": ["object", "null"]}}, **rid}, (),
              plain("/ui/people", ("id", "name", "role", "agents", "note", "daily", "blocked", "handles", "delete",
@@ -3412,11 +3429,11 @@ def dump_tools(listed=None):
     gives, so that it cannot drift from them: every tool with its name, words, input schema and annotations, and its
     kind. A tool that `plain`, `with_base` or `with_revision` builds carries its route, its fields, its words for a
     refusal, whether the request id comes from the arguments, the page of its revision (`with_revision`), the fields
-    that replace a whole value and need the client's own base (`whole`, of `with_base`) and the hub's feature that
-    gates it. Each other tool is `swift` or `absent`, and a tool of none of these kinds stops
-    the dump: somebody decides which it is. Beside the tools: the facts that the program's own reads take from this
-    file, its first words to a client, and a `version`, a SHA-256 of all the rest (this file does not know the
-    repository's revision)."""
+    that replace a whole value and need the client's own base (`whole`, of `with_base`), the fields whose null goes to
+    the hub (`nulls`) and the hub's feature that gates it. Each other tool is `swift` or `absent`, and a tool of none of
+    these kinds stops the dump: somebody decides which it is. Beside the tools: the facts that the program's own reads
+    take from this file, its first words to a client, and a `version`, a SHA-256 of all the rest (this file does not
+    know the repository's revision)."""
     entries = []
     for t in listed if listed is not None else tools():
         run, name = t["run"], t["name"]
@@ -3425,7 +3442,7 @@ def dump_tools(listed=None):
         if kind:
             entry.update(kind=kind, route=run.route, fields=list(run.fields), what=run.what,
                          revision_page=run.revision_page, request_id_from_args=run.rid_from_args,
-                         feature=FEATURES.get(name), whole=list(run.whole))
+                         feature=FEATURES.get(name), whole=list(run.whole), nulls=list(run.nulls))
         elif name in SWIFT_READS or name in SWIFT_WRITES:
             entry["kind"] = "swift"
         elif name in ABSENT:

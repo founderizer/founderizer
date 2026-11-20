@@ -3027,6 +3027,21 @@ class Admin(WithServer):
         self.assertEqual(self.team_file()["agents"]["vps"]["reports_to"], "lead")
         self.assertEqual(self.team_file()["agents"]["lead"]["role"], "lead")
 
+    def test_a_null_that_the_hub_takes_reaches_it(self):
+        """A field whose schema takes null sends its null (the tool's `nulls`): a chat app account is removed with
+        account null, and an agent's title is taken away with title null. Until 20 November 2026 the tools left every
+        null out, so the hub refused the removal (account absent) and kept the title."""
+        client = self.started()
+        account = {"app": "discord", "label": "The bot", "agents": ["vps"], "unknown": "ignore", "enabled": True}
+        client.call("save_chat_account", id="discord-vps", account=account)
+        self.assertIn("discord-vps", self.team_file().get("chat_apps") or {})
+        client.call("save_chat_account", id="discord-vps", account=None)
+        self.assertNotIn("discord-vps", self.team_file().get("chat_apps") or {})
+        client.call("agent_settings", agent="vps", title="Night shift")
+        self.assertEqual(self.team_file()["agents"]["vps"].get("title"), "Night shift")
+        client.call("agent_settings", agent="vps", title=None)
+        self.assertIsNone(self.team_file()["agents"]["vps"].get("title"))
+
     def test_a_whole_value_made_from_an_older_read_of_the_team_is_the_hubs_refusal_and_the_change_stays(self):
         """with_base's `whole` (the review of 20 November 2026): the reporting lines and an agent's lists go with the
         base of the client's own read, so lines or boxes made from a read before somebody else's change are the hub's
@@ -3121,6 +3136,8 @@ class Admin(WithServer):
         self.assertEqual(list(roles), ["customer", "peer", "manager"])
         made = client.call("save_role", name="supplier", prompt="A supplier of the shop.", tools=False, daily=10)
         self.assertEqual((made["role"]["tools"], made["role"]["daily"], "changed" in made), (False, 10, False))
+        # null is the hub's "no limit", so it goes and is not left out (the reviews of 20 November 2026)
+        self.assertEqual(client.call("save_role", name="supplier", daily=None)["role"]["daily"], None)
         self.assertEqual(client.call("save_role", name="supplier", tools=True)["role"]["daily"], None)
         with self.assertRaises(Refused) as caught:
             client.call("save_role", name="supplier", daily=5)
@@ -4218,6 +4235,16 @@ def parity_cases():
     case("with_base: the client's base and a part that is two dots", "rename_agent",
          {"agent": "..", "name": "new-name", "base_sha256": "team-sha-0"})
     case("with_base: a new record with no base", "save_mcp_server", {"name": "crm", "server": {"title": "CRM"}})
+    # A null that the hub takes goes as null; a null of a field whose schema takes none is left out.
+    case("nulls: an agent's model and title back to the default", "agent_settings",
+         {"agent": "worker-1", "model": None, "effort": None, "title": None, "account": None})
+    case("nulls: a chat app account removed", "save_chat_account", {"id": "discord-worker-1", "account": None})
+    case("nulls: a role with no daily limit", "save_role", {"name": "supplier", "daily": None})
+    case("nulls: a person's own note and limit taken away", "save_person", {"id": 3, "note": None, "daily": None})
+    case("nulls: an agent that reports to the manager", "add_agent",
+         {"server": "server-1", "agent": "scout", "runtime": "claude", "role": "worker", "reports_to": None})
+    case("nulls: a null of a field that takes none is left out", "save_person",
+         {"id": 3, "name": None, "blocked": None})
     # A request id that is not a UUID is refused before any request where owner_mcp.py makes none before its command.
     case("plain: a request id that is no UUID, on a tool with a feature", "check_releases", {"request_id": "not-one"})
     case("with_base: the client's base and a request id that is no UUID", "rename_agent",
@@ -5010,6 +5037,10 @@ class Table(unittest.TestCase):
                     self.assertEqual(entry["whole"], lists, t["name"])
                 takes = entry["kind"] == "with_base" and (entry["whole"] or t["name"] in self.RECORDS)
                 self.assertEqual("base_sha256" in entry["inputSchema"]["properties"], bool(takes), t["name"])
+                # `nulls`, which the program inside the app reads too: the fields whose schema takes null, whose
+                # null goes to the hub as a value of its own.
+                self.assertEqual(entry["nulls"], [name for name in entry["fields"] if "null" in kinds.get(name, ())],
+                                 t["name"])
             else:
                 self.assertFalse(hasattr(run, "kind"), t["name"])
                 self.assertNotIn("route", entry, t["name"])
