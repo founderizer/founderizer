@@ -57409,11 +57409,13 @@ def close_github_key_needs(owner, why):
 def door_renew_todo(state):
     """The what_to_do of the renewal's item for its step, in the words of each hub message that asks for that item."""
     if state["step"] == "ask":
-        return (f"on {state['page']}, click \"Generate a private key\"; then in Founderizer on the owner's Mac, on the "
-                f"Apps page under GitHub, choose the file that GitHub downloaded next to Private key, and click Save. "
-                f"The form shows there while the item is open, with the App's ID in it.")
-    return (f"on {state['page']}, under Private keys, delete the key whose fingerprint is {state['fingerprint']}, "
-            f"exactly as the page shows it, and keep the other one.")
+        return (f"on {state['page']}, click \"Credentials\" in the left menu, open the tab \"Key pairs\" and click "
+                f"\"New key\": GitHub downloads one .pem file. Then in Founderizer on the owner's Mac, on the Apps "
+                f"page under GitHub, click \"Choose file\" beside \"Private key\", choose that file, and click "
+                f"\"Replace\". The form shows there while the item is open, with the App's ID in it.")
+    return (f"on {state['page']}, click \"Credentials\" in the left menu and open the tab \"Key pairs\". Keep each "
+            f"other key there: click \"Delete\" only beside the key whose fingerprint is {state['fingerprint']}, "
+            f"exactly as the page shows it, and click \"Delete\" again to confirm.")
 
 
 def door_renew_again(state, t0, manager, refused=False):
@@ -58311,9 +58313,9 @@ def hub_only_notes(found):
         steps.append(
             "**Put a GitHub App key back.** This one first: it is a single file and it unblocks every task that "
             "touches code. GitHub never gives a key out twice, so make a new one — github.com/settings/apps, "
-            "your App, Private keys, Generate a private key — and paste it with the App ID into the app, which "
-            "writes the file. Then delete the old key on that same page. `config/team.json` in this copy names "
-            "your repositories, so the App you want is the one installed on them.")
+            "your App, Credentials in the left menu, the tab Key pairs, New key — and paste it with the App ID "
+            "into the app, which writes the file. Then delete the old key on that same tab. `config/team.json` "
+            "in this copy names your repositories, so the App you want is the one installed on them.")
     else:
         had_none.append("GitHub App")
     n = google.get("accounts")

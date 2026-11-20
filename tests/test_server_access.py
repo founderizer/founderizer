@@ -382,7 +382,10 @@ class DoorTokens(Access):
         state = hub.door_renew(t0)
         self.assertEqual((state["step"], state["old"], state["page"]), ("ask", old, page))
         self.assertEqual(StubDoor.calls[-1][1:], ("/github/key", "Bearer token-secret", {"app_id": "12345"}))
-        self.assertIn(f'github_key "acme"', told("Generate a private key")[0])
+        asked = told('click "New key"')[0]              # the clicks of GitHub's page, read on 20 November 2026
+        self.assertIn('github_key "acme"', asked)
+        self.assertIn(f'on {page}, click "Credentials" in the left menu, open the tab "Key pairs"', asked)
+        self.assertIn('click "Replace"', asked)         # the form's button while the hub has an App through the door
         self.assertIs(renew(), False)                    # no item yet, so no form
         with self.assertRaisesRegex(hub.ToolError, "no options"):
             hub.t_raise_needs_you("manager", {"title": "A new key", "why": "w", "what_to_do": "d",
@@ -391,7 +394,7 @@ class DoorTokens(Access):
             hub.t_raise_needs_you("manager", {"title": "A new key", "why": "w", "what_to_do": "d",
                                               "github_key": "other"})
         said = hub.t_raise_needs_you("manager", {"title": "A new key for your GitHub App", "why": "The hub held the "
-                                                 "old one.", "what_to_do": f"On {page}, click Generate a private key",
+                                                 "old one.", "what_to_do": f"On {page}, click New key",
                                                  "github_key": "acme"})
         self.assertIn("closes", said)
         first = hub.q1("SELECT max(id) AS id FROM needs")["id"]
@@ -403,7 +406,7 @@ class DoorTokens(Access):
         self.assertIsNone(hub.door_renew(t0 + 2 * hub.DOOR_RENEW_EVERY))
         again = told("Raise it again")
         self.assertEqual(len(again), 1)
-        for words in (f"N-{first}", 'answer "Done"', 'github_key "acme"', "Generate a private key", "again in 1 day"):
+        for words in (f"N-{first}", 'answer "Done"', 'github_key "acme"', 'click "New key"', "again in 1 day"):
             self.assertIn(words, again[0])
         t1 = t0 + 3 * hub.DOOR_RENEW_EVERY
         self.assertIsNone(hub.door_renew(t1))
@@ -424,7 +427,7 @@ class DoorTokens(Access):
         self.assertIsNone(hub.door_renew(t1))
         self.assertIn("again in 2 days", told("Raise it again")[2])
         hub.t_raise_needs_you("manager", {"title": "A new key for your GitHub App", "why": "The hub does not see it "
-                                          "yet.", "what_to_do": f"On {page}, click Generate a private key",
+                                          "yet.", "what_to_do": f"On {page}, click New key",
                                           "github_key": "acme"})
         first = hub.q1("SELECT max(id) AS id FROM needs")["id"]
         self.assertIs(renew(), True)
@@ -433,14 +436,15 @@ class DoorTokens(Access):
         with patch.object(hub, "now", lambda: t1 + hub.DOOR_RENEW_EVERY + 1):      # while the look that ends the step
             self.assertEqual(self.owner(f"/ui/needs/{first}", answer="Done")[0], 200)       # runs: an answer, and
             hub.t_raise_needs_you("manager", {"title": "A new key for your GitHub App", "why": "w",    # one more item
-                                              "what_to_do": f"On {page}, click Generate a private key",
+                                              "what_to_do": f"On {page}, click New key",
                                               "github_key": "acme"})
         third = hub.q1("SELECT max(id) AS id FROM needs")["id"]
         state = hub.door_renew(t1 + hub.DOOR_RENEW_EVERY)
         self.assertEqual(state["step"], "delete")
         self.assertIn("Closed by the hub", hub.q1("SELECT answer FROM needs WHERE id=?", (third,))["answer"])
         self.assertIs(renew(), False)
-        self.assertIn(printed, told("delete the key whose fingerprint is")[0])
+        for words in (printed, f'on {page}, click "Credentials" in the left menu and open the tab "Key pairs"'):
+            self.assertIn(words, told('click "Delete" only beside the key whose fingerprint is')[0])
         self.assertIsNone(hub.door_renew(t1 + 2 * hub.DOOR_RENEW_EVERY))
         self.assertEqual(len(told("Raise it again")), 3)         # both items belong to the step before
         t2 = t1 + hub.DOOR_RENEW_EVERY + hub.NEED_LOOK_FIRST

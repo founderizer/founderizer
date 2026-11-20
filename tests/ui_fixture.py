@@ -347,7 +347,8 @@ class Fixture:
                  json.dumps(["Give Vps write", "No: keep it read-only"]), json.dumps(["acme/web"])))
         hub.ins("INSERT INTO needs(title,why,todo,raised,by,options) VALUES(?,?,?,?,'manager',?)",
                 ("Make a new private key for the fleet's GitHub App", "GitHub refused the App's key, so no agent "
-                 "reaches GitHub now.", "1. On https://github.com/settings/apps, click **Generate a private key**.\n"
+                 "reaches GitHub now.", "1. On https://github.com/settings/apps/fleet-app, click **Credentials** in "
+                 "the left menu, open the tab **Key pairs**, and click **New key**.\n"
                  "2. In Founderizer, on the Apps page under GitHub, choose the downloaded file and click **Save**.",
                  now - 60, json.dumps(["Done", "Not now"])))
         hub.ins("INSERT INTO spends(goal,cents,currency,what,task,by,created) VALUES(?,?,?,?,?,?,?)",
