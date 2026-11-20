@@ -354,9 +354,10 @@ class Attachments(test_ui_api.OwnerAPI):
         for aid, name in ((two["id"], "brief.pdf"), (wide["id"], "wide.png"), (three["id"], "more.png")):
             self.assertIn(f"A-{aid} {name}", start)
         self.assertNotIn(f"A-{two['id']}", t["details"])
-        # none in a session that has no read_attachment: one whose Shell box is off (closed), and one that a person's
-        # conversation opened, which never reads the owner's chats or files (contact_session)
-        self.assertNotIn("The owner attached", hub.task_itself(t["id"], closed=True))
+        # a session whose Shell box is off (closed) reads them too since 20 November 2026: the files of the message
+        # that its own task comes from. None in a session that a person's conversation opened, which never reads the
+        # owner's chats or files (contact_session)
+        self.assertIn("The owner attached 3 files", hub.task_itself(t["id"], closed=True))
         theirs = hub.ins("INSERT INTO tasks(title,owner,state,attempt,created,ask,source_conversation) "
                          "VALUES(?,?,?,?,?,?,?)", ("Read the brief", "worker", "working", 1, hub.now(),
                                                    sent["request_id"], 1))
@@ -460,9 +461,10 @@ class Attachments(test_ui_api.OwnerAPI):
             self.assertIn(f"A-{three['id']} brief.pdf", hub.task_itself(tid))
             text, failed = self.line("worker", ctx, f"A-{three['id']}", tid)
             self.assertIn("/attachment/file/", text)
-        with patch.dict(hub.TEAM["agents"]["worker"], {"can": []}):     # Shell off: a steer's file only (1.223)
-            text, failed = self.line("worker", ctx, f"A-{three['id']}", tid)
-            self.assertIn("opens only the files of the owner's steers", text)
+        with patch.dict(hub.TEAM["agents"]["worker"], {"can": []}):     # Shell off: the file of its own task's message
+            text, failed = self.line("worker", ctx, f"A-{three['id']}", tid)    # too (20 November 2026), and a file
+            self.assertIn("cannot be opened in this session, which has no shell", text)     # that no answer carries
+            self.assertIn("Go on with what the owner's words say", text)                    # is said in plain words
         text, failed = self.line("worker", context, f"A-{three['id']}", task)
         self.assertTrue(failed, text)
         # An ask that a task took another way (from the task that follows names, or from a Needs-you item) gives no
@@ -523,7 +525,7 @@ class Attachments(test_ui_api.OwnerAPI):
             self.assertTrue(failed, text)
             self.assertIn("end the task with deliver_result, outcome failed", text)
             text, failed = self.line("worker", context, f"A-{note['id']}", task)
-            self.assertIn("opens only the files of the owner's steers", text)
+            self.assertIn("that this task does not come from", text)    # another message of the owner's to its agent
         # the fleet manager: in the session of its own task, and not in its standing session, which has none
         mine, mine_context = self.task("manager")
         hub.q("UPDATE tasks SET requester='worker' WHERE id=?", (mine,))

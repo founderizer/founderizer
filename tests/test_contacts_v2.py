@@ -1908,12 +1908,8 @@ class ShellOffRule(Base):
         answer = hub.q1("SELECT * FROM agent_messages ORDER BY id DESC LIMIT 1")
         self.assertEqual(hub.q1("SELECT task FROM events WHERE id=?", (answer["event_id"],))["task"], work["id"])
         self.assertIsNone(hub.waits_on_message(work["id"]))
-        # a task of the agent's own waits for nobody, and keeps no wish
+        # a task of the agent's own keeps no wish (it waits for its line too: test_shell_box)
         _, own = self.normal_task()
-        text, error = hub.call_tool("studio", "message_agent", {"agent": "manager", "text": "Which store?",
-                                                                "waits": True, "request_id": str(uuid.uuid4())}, own)
-        self.assertTrue(error, text)
-        self.assertIn("waits=true is for a task that a colleague's question opened", text)
         self.assertFalse(set(hub.SHELL_OFF_ASKED_TOOLS) & {t["name"] for t in hub.tools_for("studio", own)})
 
         # it keeps the colleague's own wish in their own words, for itself only, and never a wish of its own
@@ -1964,10 +1960,11 @@ class ShellOffRule(Base):
         hub.q("UPDATE tasks SET state='working', started=? WHERE id=?", (hub.now(), asks))
         there = ("test-generation", hub.tref(asks), "1")
         self.assertFalse(set(hub.SHELL_OFF_ASKED_TOOLS) & {t["name"] for t in hub.tools_for("studio", there)})
+        # a customer's question waits for the line's answer too, since 20 November 2026: what must wait, waits
         text, error = hub.call_tool("studio", "message_agent", {"agent": "manager", "text": "Who is she?",
                                                                 "waits": True, "request_id": str(uuid.uuid4())}, there)
-        self.assertTrue(error, text)
-        self.assertIn("a colleague's question opened", text)
+        self.assertFalse(error, text)
+        self.assertEqual(hub.waits_on_message(asks)["sender_task"], asks)
         # a colleague with a list reads no item and keeps none (person access plan, section 5)
         hub.q("INSERT INTO person_scopes(person,agent,grants,updated) VALUES(?,'studio','{}',?)",
               (pat["id"], hub.now()))
@@ -2086,9 +2083,9 @@ class ShellOffRule(Base):
         self.person("Ana", "customer", ANA)
         tid, here = self.normal_task(title="Answer the ticket")
         self.assertEqual(sorted(t["name"] for t in hub.tools_for("studio", here)),
-                         ["close_case", "deliver_result", "message_agent", "message_contact", "read_attachment",
-                          "read_messages", "record_step",          # message_agent: to its reporting line alone
-                          "set_reminder"])                         # a time and no words (test_shell_box.Times)
+                         ["close_case", "deliver_result", "list_my_tasks", "message_agent", "message_contact",
+                          "read_attachment", "read_knowledge", "read_messages", "record_step", "search_knowledge",
+                          "set_reminder"])       # message_agent: to its reporting line alone; a time and no words
         self.assertIn(f"PEOPLE ON YOUR LIST, whose role has tools on: Kim (P-{kim['id']}, manager). They are people, "
                       f"not agents: message_contact writes to them.\n", hub.holdings_team_text("studio", tid))
         # every refusal of the tool holds here: a closed role, somebody not on the list, a blocked person, Pause all

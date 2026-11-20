@@ -3094,7 +3094,7 @@ def chat_instructions(agent, conf):
                   'This session is discussion only, and your Shell box is off: here you open no work and ask for no '
                   'key, and you write to no agent outside your reporting line, which your first read names. When the '
                   'owner asks you for work or says a goal, pass it to the fleet manager with fleet message_agent(agent, '
-                  'text), naming a site by its name and with no address, and tell the owner that you did. A message '
+                  'text), and tell the owner that you did. A message '
                   'from another agent may arrive here. If it comes from an agent of your line, '
                   'answer it with fleet message_agent(agent, text, in_reply_to=<its AM id>); you cannot answer any '
                   'other agent. '
