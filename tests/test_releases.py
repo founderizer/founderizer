@@ -500,8 +500,10 @@ class Repositories(unittest.TestCase):
     def runner(self, selftest=None, verify=None, schema=None):
         """Git for real; the three checks from a table, because `selftest.py` and `fleet.py verify` take minutes
         and read the machine they run on, and the schema check needs a real `hub.py` in the clone, which this
-        fixture's two-line stand-in is not (`test_schema_guard.py` runs that one for real). Everything else is a
-        mistake in the code under test."""
+        fixture's two-line stand-in is not (`test_schema_guard.py` runs that one for real). The writer of the clone's
+        compiled hub.py (hubpieces.py) fails, as in a clone of a release from before it: so each release of these
+        tests also proves that a writer that fails stops nothing. Everything else is a mistake in the code under
+        test."""
         selftest = selftest if selftest is not None else (0, WHOLE_OUT, "")
         verify = verify if verify is not None else (0, HEALTHY_VERIFY, "")
         schema = schema if schema is not None else (0, WHOLE_SCHEMA, "")
@@ -517,6 +519,8 @@ class Repositories(unittest.TestCase):
                 return verify
             if "--check-schema" in argv:
                 return schema
+            if argv[1:] == ["-B", "-m", "hubpieces"]:
+                return 1, "", "No module named hubpieces"
             raise AssertionError("the update ran something unexpected: " + " ".join(argv))
         return run
 

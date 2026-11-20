@@ -77,6 +77,7 @@ CHANNEL_TIMEOUT = 10        # seconds for GET /releases/latest: a channel that d
 SELFTEST_WAIT = 300         # seconds for selftest.py, as verify.py gives it
 VERIFY_WAIT = 420           # seconds for fleet.py verify; the run's own selftest.py comes before it, and it runs none
 SCHEMA_WAIT = 120           # seconds for the released code's schema against a copy of this fleet's database
+PIECES_WAIT = 120           # seconds for the clone's hubpieces.py, which compiles hub.py in pieces in about a second
 GIT_WAIT = 300              # seconds for one git step; a fetch of the whole repository is the slow one
 PUSH_TRIES = 4              # the push of the configuration ref, and three more when the hub moved the ref under it
 
@@ -748,6 +749,16 @@ class Update:
                                                     f"stays at {self.pinned[:12]}.")
         return None
 
+    def pieces(self):
+        """The clone's compiled hub.py, compiled in pieces (hubpieces.py), before the first check that imports hub:
+        the schema check, the hubs of selftest.py and fleet.py verify then read that file, where the first of them
+        would otherwise compile the whole file, about 270 MB for a moment on a server with 1 GB, against about 85 MB
+        in pieces (measured on 20 November 2026). It runs the clone's own hubpieces.py, so each release brings the
+        writer of its own hub.py, with -B, so that Python writes no compiled file of the writer itself. Its answer is
+        not read, and it stops nothing: when it writes no file (a clone of a release from before it, a process that
+        the system ended), the first check compiles the whole file, as before."""
+        self.run([self.python, "-B", "-m", "hubpieces"], timeout=PIECES_WAIT, cwd=self.clone)
+
     def schema_check(self):
         """The released code's own schema against a copy of this fleet's database, in the clone.
 
@@ -762,10 +773,11 @@ class Update:
         folder `apply()` deletes, so the released code can only ever open a file this run wrote. That costs the
         database's size in the tempdir for the length of the run, which is the right price for the invariant.
 
-        The released hub runs as a module from the clone (`python3 -m hub`), not by its path. Python then keeps what
-        it compiled in the clone's __pycache__, and the hubs that selftest.py starts next in that clone, also as a
-        module, read it there: the compile of hub.py, about 190 MB for a moment, is paid one time in a run, here,
-        where nothing else of the run holds memory, and not again beside the self-test and its hubs."""
+        The released hub runs as a module from the clone (`python3 -m hub`), not by its path. Python then reads the
+        compiled hub.py that `pieces` wrote in the clone just before (or, when it wrote none, compiles the whole file
+        here and keeps it in the clone's __pycache__), and the hubs that selftest.py starts next in that clone, also
+        as a module, read the same file: hub.py is compiled one time in a run, before the first check that imports
+        it, and not again beside the self-test and its hubs."""
         if not self.database:
             return None
         version, pinned = self.manifest["version"], self.pinned[:12]
@@ -797,6 +809,7 @@ class Update:
         in the clone, so they read the released code and not this hub's. Any one failing keeps the fleet where it
         is. The schema goes first because it takes a second and selftest.py about a minute."""
         from verify import OWNER_STEPS
+        self.pieces()
         answer = self.schema_check()
         if answer:
             return answer

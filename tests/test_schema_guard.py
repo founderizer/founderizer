@@ -24,6 +24,7 @@ import contextlib
 import inspect
 import io
 import json
+import marshal
 import os
 import pwd
 import shlex
@@ -42,6 +43,7 @@ from unittest.mock import patch
 
 import fleet
 import hub
+import hubpieces
 import lifecycle
 import releases
 from test_ui_api import parent_pipe
@@ -292,18 +294,36 @@ class Updates(unittest.TestCase):
         return write
 
     def runner(self):
-        """Git and the schema check for real; `selftest.py` and `fleet.py verify` from a table."""
+        """Git, the writer of the clone's compiled hub.py (hubpieces.py) and the schema check for real; `selftest.py`
+        and `fleet.py verify` from a table. The writer and the schema check run in an environment of their own in
+        which Python writes its compiled files, into a folder of this test's own: as on a fleet's server, also in a
+        ship run, whose PYTHONDONTWRITEBYTECODE would write none."""
         self.ran = []
+        prefix = str(self.root / "compiled")
+        compiling = {k: v for k, v in os.environ.items() if k not in ("PYTHONDONTWRITEBYTECODE", "PYTHONOPTIMIZE")}
+        compiling["PYTHONPYCACHEPREFIX"] = prefix
 
         def run(argv, timeout=None, cwd=None, input=None):
             self.ran.append(argv)
             if "--check-schema" in argv:
                 self.schema_in = cwd
-            if argv[0] == "git" or "--check-schema" in argv:
+            if argv[1:] == ["-B", "-m", "hubpieces"]:
+                self.pieces_in = cwd
+            if "--check-schema" in argv or argv[1:] == ["-B", "-m", "hubpieces"]:
+                done = subprocess.run(argv, cwd=cwd, env=compiling, capture_output=True, text=True,
+                                      timeout=timeout or releases.GIT_WAIT, stdin=subprocess.DEVNULL)
+                return done.returncode, done.stdout.strip(), done.stderr.strip()
+            if argv[0] == "git":
                 return releases._run(argv, timeout=timeout or releases.GIT_WAIT, cwd=cwd, input=input)
             if argv[-1].endswith("selftest.py"):
-                kept = os.path.join(os.path.dirname(argv[-1]), "__pycache__")       # what the schema check left
-                self.compiled = sorted(os.listdir(kept)) if os.path.isdir(kept) else []
+                # The compiled hub.py that the self-test's hubs will read, where Python reads it: the file in pieces?
+                kept = os.path.join(prefix, os.path.realpath(os.path.dirname(argv[-1])).lstrip(os.sep),
+                                    f"hub.{sys.implementation.cache_tag}.pyc")
+                try:
+                    with open(kept, "rb") as f:
+                        self.compiled = hubpieces.in_pieces(marshal.loads(f.read()[16:]))
+                except (OSError, EOFError, ValueError):
+                    self.compiled = None
                 return HEALTHY_SELFTEST
             if argv[-3:] == ["verify", "--no-selftest", "--json"]:
                 return HEALTHY_VERIFY
@@ -337,25 +357,27 @@ class Updates(unittest.TestCase):
 
     def test_the_same_release_is_taken_by_a_fleet_whose_records_fit_it(self):
         """And its schema check runs the released hub as a module in the clone, `python3 -m hub --check-schema`,
-        not `python3 <clone>/hub.py`: Python keeps what it compiled only for a module, in the clone's __pycache__,
-        and the hubs that selftest.py starts next, as a module in the same clone, read it there. The compile of
-        hub.py takes about 190 MB for a moment: by its path it was paid here and again by the self-test's first
-        hub, beside the fleet's own hub, on a server that may have 1 GB."""
+        not `python3 <clone>/hub.py`: Python reads a compiled file only for a module, and the hubs that selftest.py
+        starts next, as a module in the same clone, read the same one. Before that check the clone's own
+        hubpieces.py writes that file, compiled in pieces: a compile of the whole hub.py takes about 270 MB for a
+        moment, by its path here and again by the self-test's first hub, beside the fleet's own hub, on a server
+        that may have 1 GB; in pieces about 85 MB."""
         database = fleet_database(self.root / "fleet.db", notes=1)      # one note: the new index holds
         answer = self.update(self.publish(self.adds_index(), "a release with a new unique index"), database)
         self.assertEqual((answer["state"], answer["step"]), (releases.DONE, "follow"), answer["says"])
         self.assertEqual(git("rev-parse", "HEAD", cwd=self.kit), answer["reached"])
         self.assertEqual(git("rev-parse", hub.CONFIG_BRANCH, cwd=self.origin), answer["reached"])
         self.assertIn(NEW_INDEX, (self.kit / "hub.py").read_text())
-        check = next(argv for argv in self.ran if "--check-schema" in argv)
-        self.assertEqual(check[:4], [sys.executable, "-m", "hub", "--check-schema"])
+        check = next(i for i, argv in enumerate(self.ran) if "--check-schema" in argv)
+        self.assertEqual(self.ran[check][:4], [sys.executable, "-m", "hub", "--check-schema"])
+        self.assertIn([sys.executable, "-B", "-m", "hubpieces"], self.ran[:check],
+                      "hub.py was not compiled in pieces before the first check that imports it")
         selftest = next(argv for argv in self.ran if argv[-1].endswith("selftest.py"))
         self.assertEqual(os.path.realpath(self.schema_in), os.path.realpath(os.path.dirname(selftest[-1])),
                          "the schema check ran in the clone, where the self-test starts its hubs")
-        if not (os.environ.get("PYTHONDONTWRITEBYTECODE") or os.environ.get("PYTHONPYCACHEPREFIX")
-                or sys.flags.optimize):
-            self.assertTrue([one for one in self.compiled if one.startswith("hub.") and one.endswith(".pyc")],
-                            f"the clone held no compiled hub when the self-test began: {self.compiled}")
+        self.assertEqual(os.path.realpath(self.pieces_in), os.path.realpath(self.schema_in))
+        self.assertTrue(self.compiled, "when the self-test began, the clone's compiled hub.py was not the file in "
+                                       "pieces")
 
     def test_the_live_database_is_never_opened_by_the_release(self):
         """The hub hands over a copy. A release that changed the schema must not be able to change the records of

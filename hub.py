@@ -61388,6 +61388,31 @@ def rules_news(old, new):
             "a profile.")
 
 
+PIECES_WAIT = 120       # seconds for hubpieces.py, which compiles hub.py in pieces in about a second
+
+
+def pieces_written(folder=None, run=None):
+    """Before the hub's restart onto new code: the compiled file of the new hub.py, compiled in pieces (hubpieces.py
+    of the new code, in the code's folder, with this Python and -B), which the start after the restart reads:
+    `python3 -m hub` in that folder, again by restart_in_place or by the unit. Without it that start compiles the whole file in
+    the hub's own process, about 270 MB for a moment on a server with 1 GB, against about 85 MB in pieces (measured
+    on 20 November 2026). A writer that fails says so in the hub's output, and the restart goes on: its start then
+    compiles the whole file, as before. Returns what it said, or None."""
+    folder = folder or os.path.dirname(os.path.abspath(__file__))
+    try:
+        done = (run or subprocess.run)([sys.executable, "-B", "-m", "hubpieces"], cwd=folder, capture_output=True,
+                                       text=True, errors="replace", timeout=PIECES_WAIT, stdin=subprocess.DEVNULL)
+        if done.returncode == 0:
+            return None
+        says = (done.stdout or done.stderr or "").strip() or f"status {done.returncode}"    # its one line first
+    except (OSError, subprocess.SubprocessError) as e:
+        says = str(e)
+    says = releases._line(says)
+    print(f"WARNING: hub.py was not compiled in pieces before the restart ({says}). The start after it compiles the "
+          f"whole file.", flush=True)
+    return says
+
+
 def restart_hub_soon(pinned, reached, always=False):
     """The last step of an update: this hub runs the new code.
 
@@ -61403,7 +61428,9 @@ def restart_hub_soon(pinned, reached, always=False):
     `always` is the restore's restart: there is no revision to compare, and the records only change at a start.
 
     The restart of the hub's own service (HUB_RESTART) runs in this process where it can (restart_in_place), so
-    that the port stays open; else, and for a fleet's own restart command, it runs the command as before."""
+    that the port stays open; else, and for a fleet's own restart command, it runs the command as before. Before the
+    restart of the hub's own service onto new code, the new hub.py is compiled in pieces (pieces_written), so that its
+    start reads that file and does not compile the whole file in this server's memory."""
     if not always and same_code(pinned, reached):
         return None
     argv = CFG.get("hub_restart", HUB_RESTART)
@@ -61415,6 +61442,11 @@ def restart_hub_soon(pinned, reached, always=False):
     old_bridge = argv == HUB_RESTART and not kv_get("bridge_code")
 
     def run():
+        if argv == HUB_RESTART and not always:
+            try:
+                pieces_written()        # the new hub.py's compiled file, in pieces, before the start that reads it
+            except Exception:           # this step never stops the restart onto the new code
+                print_fault()
         time.sleep(RESTART_DELAY)        # this run's row and the owner's answer are written before the process goes
         if old_bridge:
             with contextlib.suppress(OSError, subprocess.SubprocessError):

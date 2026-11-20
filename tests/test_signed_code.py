@@ -76,9 +76,12 @@ def signed(revision, version, seed=SEED, hold=False):
 
 
 def checks_pass(argv, timeout=None, cwd=None, input=None):
-    """Git for real, and the release's own checks answered as passed: they take minutes and read the machine."""
+    """Git for real, and the release's own checks answered as passed: they take minutes and read the machine. The
+    writer of the clone's compiled hub.py fails, as in a clone of a release from before it, which stops nothing."""
     if argv[0] == "git":
         return releases._run(argv, timeout=timeout or releases.GIT_WAIT, cwd=cwd, input=input)
+    if argv[1:] == ["-B", "-m", "hubpieces"]:
+        return 1, "", "No module named hubpieces"
     if argv[-1].endswith("selftest.py"):
         return 0, "1 of 1 checks passed.", ""
     if argv[-3:] == ["verify", "--no-selftest", "--json"]:

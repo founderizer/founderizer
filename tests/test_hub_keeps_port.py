@@ -378,27 +378,52 @@ class Pieces(unittest.TestCase):
         self.assertNotIn(hub.CHILDREN, seen["environ"])     # no list of before goes on to a later exec
 
     def test_the_release_restarts_the_hub_in_place_and_its_service_only_when_it_cannot(self):
-        ran = []
+        """And a restart of the hub's own service onto new code first compiles the new hub.py in pieces
+        (hubpieces.py, in the code's folder), so that the start after it reads that file and does not compile the
+        whole file in the server's memory; a writer that fails stops no restart. The restore's restart (always)
+        changes no code, and a fleet's own command gets no writer."""
+        ran, writer, folders = [], {"status": 0}, set()
+        pieces = [sys.executable, "-B", "-m", "hubpieces"]
 
         def run(argv, *args, **how):
             ran.append(argv)
+            if argv == pieces:
+                folders.add(how.get("cwd"))
+                if writer.get("raises"):
+                    raise writer["raises"]
+                return subprocess.CompletedProcess(argv, writer["status"], "", "No module named hubpieces")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
-        def restart(in_place):
+        def restart(in_place, always=True):
             ran.clear()
             with patch.object(hub, "restart_in_place", return_value=in_place) as asked:
-                hub.restart_hub_soon(None, None, always=True)
+                hub.restart_hub_soon(None, None, always=always)
                 for thread in threading.enumerate():
                     if thread.name == "release-restart":
                         thread.join(5)
             return list(ran), asked.call_count
         with patch.object(hub, "RESTART_DELAY", 0), patch.object(hub.subprocess, "run", run), \
-                patch.object(hub, "kv_get", return_value="c0de" * 16), patch.dict(hub.CFG, clear=False):
+                patch.object(hub, "kv_get", return_value="c0de" * 16), patch.dict(hub.CFG, clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as said:
             hub.CFG.pop("hub_restart", None)
             self.assertEqual(restart(True), ([], 1))
             self.assertEqual(restart(False), ([hub.HUB_RESTART], 1))
+            self.assertEqual(restart(True, always=False), ([pieces], 1))
+            self.assertEqual(restart(False, always=False), ([pieces, hub.HUB_RESTART], 1))
+            self.assertNotIn("not compiled in pieces", said.getvalue())
+            writer["status"] = 1                            # a release's code from before hubpieces.py
+            self.assertEqual(restart(False, always=False), ([pieces, hub.HUB_RESTART], 1))
+            self.assertIn("not compiled in pieces before the restart (No module named hubpieces)", said.getvalue())
+            with patch.object(hub, "print_fault") as fault:
+                for raised in (subprocess.TimeoutExpired(pieces, 120), OSError("no such file"), ValueError("a fault")):
+                    writer["raises"] = raised
+                    self.assertEqual(restart(False, always=False), ([pieces, hub.HUB_RESTART], 1), raised)
+            self.assertEqual(fault.call_count, 1, "only the error that pieces_written does not expect is a fault")
+            writer.pop("raises")
             hub.CFG["hub_restart"] = ["true"]               # a fleet's own command: as before, never in place
             self.assertEqual(restart(True), ([["true"]], 0))
+            self.assertEqual(restart(True, always=False), ([["true"]], 0))
+        self.assertEqual(folders, {os.path.dirname(os.path.abspath(hub.__file__))}, "the writer ran in another folder")
 
     def test_the_child_processes_of_the_code_before_are_waited_for_and_no_other(self):
         sleeper = os.posix_spawn("/bin/sleep", ["sleep", "0.3"], dict(os.environ))
