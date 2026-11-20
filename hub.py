@@ -6800,7 +6800,8 @@ def start_text(agent, task_id, resume=False, note="", row=None, opening=None, fi
 
 # The rules split by role (AUTONOMY.md P9.3): RULES.md is the core that every agent reads, and each part of
 # rules/<part>.md loads only for the agents it is about, in this order.
-RULES_PARTS = ("lead", "manager", "conversations", "logins", "github", "servers", "duty")
+RULES_PARTS = ("lead", "manager", "conversations", "logins", "github", "servers", "duty", "shell-off",
+               "wishes")
 
 
 def rules_parts(agent):
@@ -6812,16 +6813,21 @@ def rules_parts(agent):
     for the manager, which may hold one and whose standing conversation keeps the parts that it began with (since 20
     November 2026, lanes/agent-context-size.md: what a duty is, and how its holder keeps it and builds its watch, which
     RULES.md said to every agent; the chain of a case stays in RULES.md for each agent that works a case, its holder or
-    not). A worker's or a lead's first duty reaches the part at its next task session. Reads only: start_text runs
-    inside admit_task's transaction."""
+    not). A worker's or a lead's first duty reaches the part at its next task session. And the part of a session whose
+    Shell box is off, for such an agent (shell_off): what its own sessions have and where their words go, which
+    RULES.md said to every agent too. And the part of wishes, for an agent with people on its list and for a lead and
+    the manager, which get what such an agent passes up: a person's wish for others, and how a step that a person keeps
+    becomes the agent's by its record (the sentence table's N6: one part for both states, so that the manager reads it
+    once). Reads only: start_text runs inside admit_task's transaction."""
     a, role = agents().get(agent) or {}, role_of(agent)
+    people = bool(read_row("SELECT 1 FROM person_agents WHERE agent=? LIMIT 1", (agent,)))
     wanted = {"lead": role in ("lead", "manager"), "manager": role == "manager",
-              "conversations": role == "manager" or bool(read_row("SELECT 1 FROM person_agents WHERE agent=? LIMIT 1",
-                                                                  (agent,))),
+              "conversations": role == "manager" or people,
               "logins": bool(granted_logins(agent) or a.get("vault_create") is True or a.get("vault") == "broker"),
               "github": bool(a.get("repos")), "servers": bool(a.get("servers")),
               "duty": role == "manager" or bool(read_row("SELECT 1 FROM responsibilities WHERE agent=? AND "
-                                                         "state!='retired' LIMIT 1", (agent,)))}
+                                                         "state!='retired' LIMIT 1", (agent,))),
+              "shell-off": shell_off(agent), "wishes": people or role in ("lead", "manager")}
     return [part for part in RULES_PARTS if wanted[part]]
 
 
