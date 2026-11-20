@@ -3063,12 +3063,20 @@ class DriveFolders(GoogleHub):
             hub.validate_team(bad)
 
     def test_the_manager_does_not_widen_a_folder_holder_to_the_whole_drive(self):
-        """Bug: grant_access, or the advice of an access question, gives the whole Drive to an agent whose folders
-        the owner chose."""
+        """Bug: grant_access, or the advice of an access question, gives the whole Drive to an agent that holds
+        folders, also as My Drive's root given as one folder; or the advice does not name the folder grant."""
         hub.TEAM["resources"] = {f"drive:{EMAIL}": {"max": "write", "to": hub.RESOURCE_AUDIENCE}}
         self.folders(of={REPLIES: "read"})
         refused = hub.grant_check("dev", f"drive:{EMAIL}", "read")
         self.assertIn("uses only some folders of the Drive of owner@example.com", refused)
+        self.fake.files["my-drive-root"] = drive("my-drive-root", "My Drive", hub.DRIVE_FOLDER, parents=(), size=None)
+        read = self.fake.drive_file
+        with patch.object(self.fake, "drive_file", lambda access, i: read(access, "my-drive-root" if i == "root"
+                                                                          else i)):
+            said, refused = self.grant(folder="my-drive-root", level="read")
+        self.assertEqual(said, hub.DRIVE_FOLDER_ROOT.format(account=EMAIL))
+        advice = hub.access_route("dev", f"drive:{EMAIL}", "manager", "read")
+        self.assertIn(f'grant_access(agent="dev", resource="drive:{EMAIL}", level="read", folder=', advice)
         self.assertIsNone(hub.grant_check("ops", f"drive:{EMAIL}", "read"))
         pool = next(p for p in hub.grant_pool(["dev", "ops"]) if p["resource"] == f"drive:{EMAIL}")
         self.assertEqual(pool["eligible"], ["ops"])          # see_capacity offers what grant_access gives
@@ -3079,6 +3087,123 @@ class DriveFolders(GoogleHub):
             self.assertIsNone(hub.need_is_yours("manager", f"Customer Support needs drive:{EMAIL} at read"))
             self.folders()
             self.assertIn("yours to give", hub.card_access(f"drive:{EMAIL}", "read"))
+
+    # ---- the manager's grant_access with a folder (design section 7)
+    def pool(self, top="write", account=EMAIL):
+        """The owner's standing of one Drive account, committed: the manager may give it, and its folders, up to top."""
+        code, data = self.owner("/ui/resources", base_sha256=self.sha(), resource=f"drive:{account}",
+                                policy={"max": top, "to": hub.RESOURCE_AUDIENCE})
+        self.assertEqual(code, 200, data)
+
+    def grant(self, account=EMAIL, **fields):
+        """The manager's grant_access with a folder, as its session calls it: (its words, refused)."""
+        return hub.call_tool("manager", "grant_access", dict(
+            {"request_id": str(uuid.uuid4()), "resource": f"drive:{account}", "agent": "dev"}, **fields))
+
+    def team(self):
+        return json.loads((self.root / "kit" / "team.json").read_text())
+
+    def test_the_manager_gives_a_folder_only_of_an_account_of_its_pool(self):
+        """Bug: a folder is given although its account has no standing in the pool, or the hub asks Google about a
+        folder of an account that the manager may not give."""
+        said, refused = self.grant(folder=REPLIES, level="read")
+        self.assertTrue(refused, said)
+        self.assertIn("is not in the grantable pool", said)
+        self.assertNotIn("drive_file", self.fake.names())           # no read of Google for it
+        self.pool()
+        self.connected(email=EMAIL2, refresh=REFRESH2)
+        said, refused = self.grant(account=EMAIL2, folder=REPLIES, level="read")
+        self.assertIn("is not in the grantable pool", said)
+        said, refused = self.grant(account="", folder=REPLIES, level="read")
+        self.assertTrue(refused, said)
+        self.assertNotIn("drive_file", self.fake.names())
+        said, refused = self.grant(folder="no-such-folder-1", level="read")
+        self.assertEqual(said, hub.DRIVE_FOLDER_GRANT_WORDS["drive_folder_unseen"].format(account=EMAIL))
+        self.assertNotIn("drive_folders", self.team()["agents"]["dev"])
+        q = hub.ins("INSERT INTO questions(task,asker,requester,text,asked,access,access_level) VALUES(?,?,?,?,?,?,?)",
+                    (self.work, "dev", "manager", "I need the replies folder.", hub.now(), f"drive:{EMAIL}", "read"))
+        said, refused = self.grant(folder=REPLIES, level="read")
+        self.assertFalse(refused, said)
+        self.assertIn(f"T-{self.work} waits at Q-{q} for Google Drive of {EMAIL}: if this folder is what its work "
+                      f"needs, its session cannot use the grant", said)        # a folder grant still names it
+        self.assertEqual(self.team()["agents"]["dev"]["drive_folders"], {"account": EMAIL, "folders": {REPLIES: "read"}})
+        self.assertNotIn("google", self.team()["agents"]["dev"])
+
+    def test_the_manager_gives_a_folder_up_to_the_accounts_level_only(self):
+        """Bug: a folder's level is checked against nothing, so the manager gives a folder above the account's
+        standing; or a level that the agent's whole Drive reaches is kept, or write on a shared folder."""
+        self.pool("read")
+        said, refused = self.grant(folder=REPLIES, level="write")
+        self.assertIn("The owner allows at most read", said)
+        self.pool("write")
+        said, refused = self.grant(folder=REPLIES, level="write_shared")
+        self.assertIn("The owner allows at most write", said)
+        self.assertNotIn("drive_folders", self.team()["agents"]["dev"])
+        self.fake.files["shared-fold-01"] = drive("shared-fold-01", "Shared work", hub.DRIVE_FOLDER, shared=True,
+                                                  size=None)
+        said, refused = self.grant(folder="shared-fold-01", level="write")
+        self.assertIn("is shared", said)
+        self.levels(service="drive", folder="shared-fold-01", access={"ops": "read"})
+        hub.DRIVE_NAMES.clear()                 # a restart: the hub keeps no name nor sharing of a folder
+        said, refused = self.grant(folder="shared-fold-01", level="write")
+        self.assertIn("is shared", said)
+        self.levels(service="drive", access={"dev": "read"})
+        said, refused = self.grant(folder=REPLIES, level="read")
+        self.assertIn("has the whole Drive of owner@example.com at read", said)
+        said, refused = self.grant(folder=REPLIES, level="write")
+        self.assertFalse(refused, said)
+        self.assertEqual({k: self.team()["agents"]["dev"][k] for k in ("google", "drive_folders")},
+                         {"google": {"drive": {"account": EMAIL, "level": "read"}},
+                          "drive_folders": {"account": EMAIL, "folders": {REPLIES: "write"}}})
+
+    def test_the_owners_line_names_a_folder_by_its_link(self):
+        """Bug: the line in the owner's chat, or the row of the Access given card, names the folder by the name that
+        Google gives it, which whoever shares a folder chooses; or a folder grant draws no row."""
+        self.pool()
+        link = f"https://drive.google.com/drive/folders/{REPLIES}"
+        said, refused = self.grant(folder=link + "?usp=sharing", level="write", why="It drafts the replies.")
+        self.assertFalse(refused, said)
+        self.assertNotIn("Support replies", said)
+        row = hub.q1("SELECT * FROM owner_reports ORDER BY id DESC LIMIT 1")
+        self.assertEqual((row["text"], row["about"]),
+                         (f"I gave {hub.shown_role('dev')} the Google Drive folder {link} of {EMAIL} (write): It "
+                          f"drafts the replies.", f"grant drive:{EMAIL}/{REPLIES} to dev"))
+        parts = hub.report_grants(hub.q("SELECT * FROM owner_reports"), hub.q("SELECT * FROM resource_grants"))
+        self.assertEqual(parts[row["id"]], {"agent": "dev", "resource": f"drive:{EMAIL}/{REPLIES}", "kind": "drive",
+                                            "word": "Google Drive folder", "title": link, "level": "write",
+                                            "words": "write"})
+        page = self.request("/ui/resources?db=test-generation")[1]
+        folder = next(r for r in page["resources"] if r["id"] == f"drive:{EMAIL}")["folders"][0]
+        self.assertEqual([(h["agent"], h["level"], h["by"]) for h in folder["history"]], [("dev", "write", "manager")])
+        said, refused = self.grant(folder=REPLIES, level="write")
+        self.assertTrue(said.startswith("dev already had the Google Drive folder"), said)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM owner_reports")["n"], 1)
+
+    def test_a_folder_grant_keeps_the_other_grants_of_that_folder_and_of_the_agent(self):
+        """Bug: the manager's folder grant writes the folder's holders as the owner's card does (an agent that is not
+        named loses it), so giving it to one agent takes it from the others; or it drops the agent's other folders,
+        or takes the place of folders of another account that the owner chose."""
+        self.pool()
+        self.levels(service="drive", folder=REPLIES, access={"ops": "read"})
+        self.levels(service="drive", folder="deeper-folder1", access={"dev": "read"})
+        said, refused = self.grant(folder=REPLIES, level="write")
+        self.assertFalse(refused, said)
+        team = self.team()["agents"]
+        self.assertEqual(team["ops"]["drive_folders"], {"account": EMAIL, "folders": {REPLIES: "read"}})
+        self.assertEqual(team["dev"]["drive_folders"],
+                         {"account": EMAIL, "folders": {"deeper-folder1": "read", REPLIES: "write"}})
+        self.connected(email=EMAIL2, refresh=REFRESH2)
+        self.pool(account=EMAIL2)
+        said, refused = self.grant(account=EMAIL2, folder=REPLIES, level="read")
+        self.assertIn("or a folder of another account, which would take their place, is the owner's to give", said)
+        self.assertEqual(self.team()["agents"]["dev"]["drive_folders"], team["dev"]["drive_folders"])
+        self.levels(account=EMAIL2, service="drive", access={"ops": "read"})      # the owner: the Drive of EMAIL2
+        said, refused = self.grant(agent="ops", folder=REPLIES, level="read")
+        self.assertIn(f"{hub.shown_role('ops')} no longer has the Drive of {EMAIL2}", said)
+        self.assertEqual({k: v for k, v in self.team()["agents"]["ops"].items() if k in ("google", "drive_folders")},
+                         {"drive_folders": {"account": EMAIL, "folders": {REPLIES: "read"}}})
+        self.assertEqual(tuple(hub.q1("SELECT agent, level, by FROM resource_grants WHERE resource=? ORDER BY id "
+                                      "DESC", (f"drive:{EMAIL2}",))), ("ops", None, "manager"))   # its own record
 
 
 class ConnectThroughTheStandIn(GoogleHub):

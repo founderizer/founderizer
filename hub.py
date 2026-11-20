@@ -141,10 +141,12 @@ class TeamLock:
 
 
 class Call(threading.local):
-    """What a thread knows of the request that it serves now: the session of a tool call (context), and the agent
-    that the request works for (agent, see TeamLock). None for a thread that serves no such request."""
+    """What a thread knows of the request that it serves now: the session of a tool call (context), the agent that the
+    request works for (agent, see TeamLock), and the Drive folder that a grant_access call gives, as its account read
+    it before LOCK (folder, see grant_folder_ahead). None for a thread that serves no such request."""
     context = None
     agent = None
+    folder = None
 
 
 CALL = Call()
@@ -10023,6 +10025,11 @@ def access_route(asker, rid, requester, want=None, restarts=None):
                    f"It is in the grantable pool, up to {top}, and only the manager gives it.")
     elif not enough and refused:
         out.append(refused if manager else f"The manager cannot settle it either: {refused[0].lower()}{refused[1:]}")
+        if manager and kind == "drive" and drive_grant(asker)[2] and drive_grant(asker)[0] == what and \
+                grant_check(asker, rid, level, folder=True) is None:
+            # design section 5: the advice for a folder holder names the folder grant, never the whole account
+            out.append(f'One more folder of it is yours to give, up to {top}: grant_access(agent="{asker}", '
+                       f'resource="{rid}", level="{level}", folder="<the folder\'s link>"), and then {restart}.')
     elif not enough and not others:
         out.append("The owner set no standing for it and no agent holds it, so the manager cannot give it" +
                    (": raise a Needs-you item and say what the work needs it for." if manager else "."))
@@ -13710,8 +13717,8 @@ def need_is_yours(agent, *texts):
                                                                 re.search(rf"\b{other}\b", words)):
                 continue
             if kind == "drive" and drive_folders_held(what, active=True):
-                # Agents hold some folders of this Drive, which the owner chose: an item about this Drive can be about
-                # one of them, by name or by role, and grant_check refuses the whole Drive to it. The owner decides.
+                # Agents hold some folders of this Drive: an item about this Drive can be about one of them, by name or
+                # by role, and grant_check refuses the whole Drive to it. The owner decides.
                 continue
         who = [n for n in agents() if grant_fits(n, entry) and agent_active(n)]
         if not who:
@@ -14101,7 +14108,7 @@ def card_access(words, level):
                 f"the owner is not needed. If the work needs more than that level, give needs_level.{value}")
     top = (resource_pool().get(rid) or {}).get("max")
     if kind == "drive" and drive_folders_held(what, active=True):
-        return None         # the item can be about an agent whose folders the owner chose: only the owner widens them
+        return None         # the item can be about an agent that holds folders of it: only the owner widens them
     for name in sorted(agents()):
         if not (agent_active(name) and role_of(name) in ("worker", "lead")):
             continue
@@ -25476,6 +25483,7 @@ DRIVE_NAMES = {}                        # (account, folder id) -> {"name", "shar
 DRIVE_NAME_LIFE = 600                   # seconds that DRIVE_NAMES keeps a name before it is read again
 DRIVE_NAMES_BUSY = threading.Event()    # set while a thread reads the names of DRIVE_NAMES
 DRIVE_FOLDER_LINK = "https://drive.google.com/drive/folders/{}"
+DRIVE_FOLDER_WORD = "Google Drive folder"       # a folder grant in the owner's chat: this word, then its link, never its name
 DRIVE_FOLDER_IN = re.compile(r"(?:/folders/|/drives/|[?&]id=)([A-Za-z0-9_-]{10,200})")
 DRIVE_NOT_HELD = "No file with this id is in the Drive folders that you may use. Ask your requester."
 DRIVE_ONLY_READ = "In this folder you may only read. Ask your requester."
@@ -26297,29 +26305,18 @@ def save_google(body, found=None):
             levels, before_folders = dict(a.get("google") or {}), a.get("drive_folders")
             before = levels.get(service)
             if folder:
-                df = before_folders if (before_folders or {}).get("account") == account else None
-                held = dict((df or {}).get("folders") or {})
+                drive_folder_put(a, name, account, folder, access.get(name), replaced)
+            else:
                 if name in access:
-                    held[folder] = access[name]
+                    levels[service] = {"account": account, "level": access[name]}
                     if (before or {}).get("account") not in (None, account):
                         replaced[name] = before["account"]
-                        del levels[service]
-                    elif (before_folders or {}).get("account") not in (None, account):
-                        replaced[name] = before_folders["account"]
-                else:
-                    held.pop(folder, None)
-                if name in access or df:
-                    a["drive_folders"] = {"account": account, "folders": dict(sorted(held.items()))}
-            elif name in access:
-                levels[service] = {"account": account, "level": access[name]}
-                if (before or {}).get("account") not in (None, account):
-                    replaced[name] = before["account"]
-            elif (before or {}).get("account") == account:
-                del levels[service]
-            put_google(a, levels)
-            if service == "drive":
-                drive_folders_fit(a, replaced, name)
-            if levels.get(service) != before or a.get("drive_folders") != before_folders:
+                elif (before or {}).get("account") == account:
+                    del levels[service]
+                put_google(a, levels)
+                if service == "drive":
+                    drive_folders_fit(a, replaced, name)
+            if (a.get("google") or {}).get(service) != before or a.get("drive_folders") != before_folders:
                 changed = True
             if folder:
                 now_held = ((a.get("drive_folders") or {}).get("folders") or {}).get(folder)
@@ -26341,6 +26338,30 @@ def save_google(body, found=None):
     # took_place_of, not "replaced": an app reads the "replaced" of a Connect's finish as a bool from this same reader
     return dict(result, account=account, service=service, access=access, took_place_of=replaced,
                 **({"folder": folder, "name": found.get("name"), "shared": found.get("shared")} if folder else {}))
+
+
+def drive_folder_put(a, name, account, folder, level, replaced):
+    """Inside a change of team.json: agent `name`'s level of one folder of a Drive account, or none (level None), as
+    save_google's folder grant and the manager's grant_access with a folder write it. Its other folders of that account
+    stay, and so does its whole Drive of it; its Drive of another account goes (one account for each agent: replaced
+    names that account). drive_folders_fit then keeps the rules of drive_grant."""
+    levels, before_folders = dict(a.get("google") or {}), a.get("drive_folders")
+    before = levels.get("drive")
+    df = before_folders if (before_folders or {}).get("account") == account else None
+    held = dict((df or {}).get("folders") or {})
+    if level:
+        held[folder] = level
+        if (before or {}).get("account") not in (None, account):
+            replaced[name] = before["account"]
+            del levels["drive"]
+        elif (before_folders or {}).get("account") not in (None, account):
+            replaced[name] = before_folders["account"]
+    else:
+        held.pop(folder, None)
+    if level or df:
+        a["drive_folders"] = {"account": account, "folders": dict(sorted(held.items()))}
+    put_google(a, levels)
+    drive_folders_fit(a, replaced, name)
 
 
 def put_google(a, levels):
@@ -26384,15 +26405,16 @@ def google_folder_id(value):
     return m.group(1)
 
 
-def google_folder_found(body):
+def google_folder_found(body, fresh=False):
     """POST /ui/team/google with a folder, outside LOCK (ui_command's outside): the folder as the account reads it,
     {"id", "name", "shared", "drive_id"}, with the ID that Google gives, or None for a write with no folder. A Refusal
     with a code that the app shows: the account is not connected, it cannot open the folder, it is no folder, or
-    Google did not answer."""
+    Google did not answer. fresh: read Google even for a folder that agents hold (the manager's grant_access, whose
+    checks need `shared` and a folder that the account can still open, and DRIVE_NAMES is empty after a restart)."""
     if not body.get("folder"):
         return None
     account = body["account"]
-    if body["folder"] in drive_folders_held(account):
+    if not fresh and body["folder"] in drive_folders_held(account):
         # A folder that agents of this account hold was read when it was first given: one more agent, a take-back
         # or the clean-up after a Disconnect (when the account has no token) needs no read of Google.
         with GOOGLE_LOCK:
@@ -36496,10 +36518,16 @@ def grant_pool(names, team=None):
     return pool
 
 
-def grant_check(agent, rid, level):
+def grant_check(agent, rid, level, folder=False):
     """The reason the manager may not give this agent this resource at this level, or None when it may. The pool
     decides, then the audience, then the level. A refusal says what the owner would have to do, so the manager asks
-    for the one thing that is missing instead of a list of grants."""
+    for the one thing that is missing instead of a list of grants.
+
+    folder: the grant is of one folder of the Drive account `rid` (grant_access with a folder). The account's standing
+    covers each of its folders, up to its max (design section 7 of Drive access to some folders only). The grant sets
+    the agent's level of that folder, higher or lower, as every grant sets its level, and keeps its other folders and
+    its whole Drive of that account; it takes the place of a whole Drive of another account, as a whole-Drive grant
+    does, and never of folders."""
     kind, what = resource_parts(rid)
     if not kind:
         raise ToolError(f"resource must be <kind>:<what>, with a kind of {', '.join(sorted(RESOURCE_LEVELS))}, for "
@@ -36546,11 +36574,13 @@ def grant_check(agent, rid, level):
                 f"the owner with raise_needs_you to make it grantable, or to grant it once.")
     if not resource_known(kind, what, TEAM):
         return f"The fleet does not hold {resource_phrase(kind, what)} any more. Tell the owner."
-    if kind == "drive" and level and drive_grant(agent)[2]:
-        # Drive access to some folders only: the owner chose those folders for this agent, so a grant of a whole Drive,
-        # which would widen them or take their place, is the owner's to give.
-        return (f"{shown_role(agent)} uses only some folders of the Drive of {drive_grant(agent)[0]}, which the owner "
-                f"chose. A whole Drive is the owner's to give: ask with raise_needs_you, and say what the work needs.")
+    if kind == "drive" and level and drive_grant(agent)[2] and not (folder and drive_grant(agent)[0] == what):
+        # Drive access to some folders only: this agent was narrowed to some folders, so a grant of a whole Drive,
+        # which would widen them, is the owner's to give, and so is a folder of another account, which would take
+        # their place (one account for each agent). A folder of the same account adds one.
+        return (f"{shown_role(agent)} uses only some folders of the Drive of {drive_grant(agent)[0]}. A whole Drive, "
+                f"which would widen them, or a folder of another account, which would take their place, is the "
+                f"owner's to give: ask with raise_needs_you, and say what the work needs.")
     why = google_refusal(what, kind) if kind in ("drive", "gmail") else None
     if why:
         # A Connect asks Google for one service (owner API 1.185): an account connected for Gmail is no Drive account.
@@ -36562,6 +36592,11 @@ def grant_check(agent, rid, level):
     if levels.index(level) > levels.index(entry["max"]):
         return (f"The owner allows at most {entry['max']} of {resource_phrase(kind, what)}, and you asked for {level}. "
                 f"Give {entry['max']}, or ask the owner for {level}.")
+    account, whole, _ = drive_grant(agent) if folder else (None, -1, {})
+    if folder and account == what and whole >= levels.index(level):
+        # drive_folders_fit drops a folder whose level the whole Drive reaches: it would add nothing
+        return (f"{shown_role(agent)} has the whole Drive of {what} at {levels[whole]}, which holds each of its "
+                f"folders: a folder adds something only at a higher level.")
     return None
 
 
@@ -36571,11 +36606,15 @@ def door_made(repo):
                           "outcome='done' LIMIT 1", (repo,)))
 
 
-def grant_resource(by, rid, agent, level, phrase):
+def grant_resource(by, rid, agent, level, phrase, folder=None):
     """Give or take back one agent's hold of one resource, through the path that the owner's own grant routes use: one
     commit of the hub's checkout, checked by validate_team and applied at once. level None takes the hold back. So
     every change is a commit in git, a record the owner reads and a line of the log, and the owner takes any of it
     back in one step. Nothing about a value changes: the vault stays as it is.
+
+    folder: the ID of one folder of the Drive account `rid`, as Google gives it: the agent's level of that folder alone
+    (drive_folder_put), and no other agent's. The result's took_place_of names the account whose Drive the agent had
+    before, when the folder took its place.
 
     The caller writes the resource_grants row, in the transaction that keeps its own receipt: a commit of team.json
     cannot join a database transaction, so the record, the receipt and the owner's line are at least one write among
@@ -36594,6 +36633,10 @@ def grant_resource(by, rid, agent, level, phrase):
         def change(team):
             known_agents(team, [agent])
             a = team["agents"][agent]
+            if kind == "drive" and folder:
+                before = json.dumps([a.get("google"), a.get("drive_folders")], sort_keys=True)
+                drive_folder_put(a, agent, what, folder, level, replaced)
+                return json.dumps([a.get("google"), a.get("drive_folders")], sort_keys=True) != before
             if kind in ("repo", "server"):
                 field = "repos" if kind == "repo" else "servers"
                 held = dict(a.get(field) or {})
@@ -36622,8 +36665,11 @@ def grant_resource(by, rid, agent, level, phrase):
             if kind == "drive":
                 drive_folders_fit(a)
             return True
+        replaced = {}
         done = f"gave {agent} {phrase} ({level})" if level else f"took {phrase} back from {agent}"
         result = save_integration(None, change, f"{by.capitalize()} {done}", by=by)
+        if folder:
+            result = dict(result, took_place_of=replaced.get(agent))
     return result
 
 
@@ -37708,38 +37754,112 @@ def team_plan_sweep(t0):
             team_plan_close(now_open, reason)
 
 
+# What the manager reads when the folder of its grant_access cannot be given, by the code of google_folder_found's
+# refusal: the owner's own words say "Connect it again", which is no step of the manager's.
+DRIVE_FOLDER_GRANT_WORDS = {
+    "drive_folder_account": "{account} is not connected for Google Drive now. Ask the owner with raise_needs_you to "
+                            "connect it again, and say what the work needs.",
+    "drive_folder_unseen": "{account} cannot open this folder, so it is no folder of that Drive. Give a folder that "
+                           "{account} has, or ask the owner with raise_needs_you to share it with {account}.",
+    "drive_folder_file": "That is the link of a file, not of a folder: give the folder's link."}
+DRIVE_FOLDER_ROOT = ("That is the root of My Drive of {account}, which holds all of it, so it is no folder grant: give "
+                     "a folder in it, or the whole Drive by its own rules (drive:{account} without folder).")
+
+
+def grant_folder_id(a):
+    """The ID of the folder that a grant_access call names (google_folder_id), or None when it names none. A
+    ToolError for a folder beside another resource than a Drive account, or for words that are no folder's link."""
+    if a.get("folder") in (None, ""):
+        return None
+    if resource_parts(str(a.get("resource") or "").strip().lower())[0] != "drive":
+        raise ToolError("folder is one folder of a Drive account: give it with resource drive:<email>.")
+    try:
+        return google_folder_id(a["folder"] if isinstance(a["folder"], str) else "")
+    except ValueError:
+        raise ToolError(f"folder is the link of a Drive folder, {DRIVE_FOLDER_LINK.format('<id>')}, or its "
+                        f"ID.") from None
+
+
+def grant_folder_ahead(a):
+    """call_tool, before the LOCK of grant_access: (resource, folder ID, the folder as its account reads it or the
+    words of why it cannot be given) for a call with a folder, else None. google_folder_found waits for Google, so it
+    never runs under LOCK; t_grant_access takes its answer under LOCK only for the same resource and folder, after
+    grant_check passed there. When grant_check refuses the call now, nothing asks Google: a manager learns nothing of
+    a folder of an account that it may not give."""
+    rid = str(a.get("resource") or "").strip().lower()
+    try:
+        folder = grant_folder_id(a)
+        if folder is None or grant_check(str(a.get("agent") or "").strip(), rid, str(a.get("level") or "").strip()
+                                         .lower(), folder=True) is not None:
+            return None
+    except ToolError:
+        return None                     # t_grant_access says it, under LOCK
+    account = resource_parts(rid)[1]
+    try:
+        found = google_folder_found({"account": account, "folder": folder}, fresh=True)
+        # My Drive's root is a folder to Google, and it holds all of My Drive: grant_check's rules of a whole Drive
+        # decide it, so that no folder holder gets it as "one folder"
+        if found["id"] == (google.drive_file(google_access(account, "drive"), "root") or {}).get("id"):
+            return rid, folder, DRIVE_FOLDER_ROOT.format(account=account)
+        return rid, folder, found
+    except Refusal as e:
+        code = (getattr(e, "extra", None) or {}).get("code")
+        return rid, folder, DRIVE_FOLDER_GRANT_WORDS[code].format(account=account) if code in \
+            DRIVE_FOLDER_GRANT_WORDS else str(e)
+    except ToolError:
+        return rid, folder, DRIVE_FOLDER_GRANT_WORDS["drive_folder_account"].format(account=account)
+    except google.GoogleError as e:
+        return rid, folder, refusal_words.words("drive_folder_google", {"reason": google_why(e)})
+
+
 def t_grant_access(agent, a):
-    """The manager gives one agent one resource of the grantable pool, at a level that the owner's policy allows."""
+    """The manager gives one agent one resource of the grantable pool, at a level that the owner's policy allows; with
+    a folder, one folder of a Drive account of the pool, up to the account's standing."""
     rid = str(a.get("resource") or "").strip().lower()
     target, level = str(a.get("agent") or "").strip(), str(a.get("level") or "").strip().lower()
     why = str(a.get("why") or "").strip()
-    refused = grant_check(target, rid, level)
+    given = grant_folder_id(a)
+    refused = grant_check(target, rid, level, folder=given is not None)
     kind, what = resource_parts(rid)
     if refused:
         raise ToolError(refused)
     if len(why) > GRANT_WHY_MAX:
         raise ToolError(f"why is at most {GRANT_WHY_MAX} characters: the one line the owner reads about this grant.")
     guard(agent, why)
-    phrase = resource_phrase(kind, what)
-    command, stored = agent_write(agent, "grant_access", a,
-                                  {"agent": target, "resource": rid, "level": level, "why": why})
-    if stored:
+    command, stored = agent_write(agent, "grant_access", a, dict(
+        {"agent": target, "resource": rid, "level": level, "why": why}, **({"folder": given} if given else {})))
+    if stored:          # before the read of the folder: a repeat gets its first answer, whatever Google says now
         return stored["text"]
+    phrase, folder, record = resource_phrase(kind, what), None, rid
+    if given is not None:
+        ahead = CALL.folder
+        if not ahead or ahead[:2] != (rid, given):
+            raise ToolError("The hub could not read the folder in this call. Call grant_access again.")
+        if isinstance(ahead[2], str):
+            raise ToolError(ahead[2])
+        folder, link = ahead[2]["id"], DRIVE_FOLDER_LINK.format(ahead[2]["id"])
+        if level == "write" and ahead[2].get("shared"):
+            raise ToolError(f"The folder {link} is shared, so each file in it is shared, and write lets "
+                            f"{shown_role(target)} write none of them: give write_shared, or read.")
+        # The record of a folder is the folder's own, as the owner's grant writes it (save_google), never a resource id
+        phrase, record = f"the {DRIVE_FOLDER_WORD} {link} of {what}", f"drive:{what}/{folder}"
     try:
-        result = grant_resource(agent, rid, target, level, phrase)
+        result = grant_resource(agent, rid, target, level, phrase, folder=folder)
     except Refusal as e:
         raise ToolError(f"The hub refused the grant: {e}") from None
     # The commit of team.json is in force now and cannot join the transaction below, so a hub that dies here leaves
     # the hold given with nothing the owner can read about it. `gave` is therefore the answer of the call that got
     # the hold in force and not of the commit alone: a repeat of the same request_id whose first attempt reached the
     # commit and no further finds no record of it, writes that record, and answers what the first attempt would have.
-    gave = result["changed"] or resource_recorded(rid, target) != level
+    gave = result["changed"] or resource_recorded(record, target) != level
     text = (f"{target} {'now has' if gave else 'already had'} {phrase} at level {level}. "
             f"{'Revision ' + result['revision'][:12] + '. ' if gave else ''}"
             f"It gets it in its next task session; a running session keeps what it started with. The grant is the "
             f"authorization: {target} does what this access allows and answers for it, and you answer for giving it. "
             f"The owner reads who gave what to whom in Settings › Apps of the app and takes it back there.")
-    text += door_round_next(kind == "repo" and door_lacks(target, [what]))
+    moved = f" {shown_role(target)} no longer has the Drive of {result['took_place_of']}: an agent has the Drive of " \
+        f"one account." if result.get("took_place_of") else ""
+    text += moved + door_round_next(kind == "repo" and door_lacks(target, [what]))
     for row in q(f"SELECT t.id, t.attempt, t.requester, q.id qid, q.access_level want FROM questions q "
                  f"JOIN tasks t ON t.id=q.task WHERE q.access=? AND q.answer IS NULL AND t.owner=? AND "
                  f"t.{OPEN_TASK} ORDER BY t.id", (rid, target)):
@@ -37748,7 +37868,10 @@ def t_grant_access(agent, a):
             text += (f" {tref(row['id'])} waits at Q-{row['qid']} for it at {row['want']}, which this grant does not "
                      f"reach: it stays blocked until it holds {row['want']}.")
             continue
-        text += (f" {tref(row['id'])} waits at Q-{row['qid']} for it, and its session cannot use the grant: " +
+        # a question names a Drive account, never a folder of it: the folder may be what its work needs, or not
+        text += (f" {tref(row['id'])} waits at Q-{row['qid']} for {resource_phrase(kind, what)}: if this folder is "
+                 f"what its work needs, its session cannot use the grant: " if folder else
+                 f" {tref(row['id'])} waits at Q-{row['qid']} for it, and its session cannot use the grant: ") + (
                  (f"restart_task(task_id=\"{tref(row['id'])}\", expected_attempt={row['attempt']}, ...) starts it "
                   f"once more in a session that has it." if row["requester"] == agent else
                   f"its requester {row['requester']} restarts it with restart_task, so tell {row['requester']} that "
@@ -37767,18 +37890,20 @@ def t_grant_access(agent, a):
     # (the owner, 17 November 2026: "Manager should be capital M - like any other agent name/role", "quieter,
     # clearer, simpler and direct to the point. Dont spam with messages!").
     said = f"I gave {shown_role(target)} {phrase} ({GRANT_LEVEL_WORDS.get(level, level.replace('_', ' '))})" + \
-        (f": {full_stop(why)}" if why else ".")
+        (f": {full_stop(why)}" if why else ".") + moved
     if kind == "repo" and level == "deploy":
         said += (" GitHub refuses its deploy token until the hub's GitHub App carries the Workflows and Actions "
                  "permissions and you accept them on the App's installation page.")
     t0 = now()
     with transaction():
         if gave:
-            resource_record(rid, target, level, agent, result["revision"], t0)
+            resource_record(record, target, level, agent, result["revision"], t0)
+            if result.get("took_place_of"):     # the Drive of the other account ended: its own record says so
+                resource_record(f"drive:{result['took_place_of']}", target, None, agent, result["revision"], t0)
         keep_command(command, {"text": text}, t0)
         if gave:
             DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to) VALUES(?,?,?,?,NULL)",
-                       (said, f"grant {rid} to {target}", t0, agent))
+                       (said, f"grant {record} to {target}", t0, agent))
     return text
 
 
@@ -37800,7 +37925,9 @@ def report_grants(reports, records, team=None):
 
     `title` is the resource in the owner's words (resource_title), `word` what kind of thing it is as the line says
     it (RESOURCE_WORDS: a mail account and a Drive account of one address have one title), and `words` the level as
-    the line says it (GRANT_LEVEL_WORDS). `reports`: rows of owner_reports; `records`: rows of resource_grants; `team`: the team of
+    the line says it (GRANT_LEVEL_WORDS). A folder of a Drive account (its record is drive:<account>/<folder id>, as
+    t_grant_access writes it with a folder) has the folder's link as its title and DRIVE_FOLDER_WORD as its word,
+    never its name: Google gives the name, and whoever shares a folder chooses it. `reports`: rows of owner_reports; `records`: rows of resource_grants; `team`: the team of
     the read's moment. It reads no row itself."""
     by_time = {}
     for record in records:
@@ -37815,17 +37942,20 @@ def report_grants(reports, records, team=None):
             rid, level = record["resource"], record["level"]
             if record["by"] != report["agent"] or not about.startswith(f"grant {rid} to "):
                 continue
-            if rid not in named:                # each resource's kind and title once for a read
+            if rid not in named:                # each resource's kind, title and word once for a read
                 kind, what = resource_parts(rid)
                 if kind == "tool":              # one build of the MCP catalog for a read, not one for each line
                     if not catalog:
                         catalog.append(tool_catalog(team or TEAM))
-                    named[rid] = (kind, (catalog[0].get(what) or {}).get("title") or what)
+                    named[rid] = (kind, (catalog[0].get(what) or {}).get("title") or what, RESOURCE_WORDS[kind])
+                elif kind == "drive" and "/" in what and DRIVE_ID.fullmatch(what.rpartition("/")[2]):
+                    # a folder's ID has no @: the last part of an address with a / in its local part is no folder
+                    named[rid] = (kind, DRIVE_FOLDER_LINK.format(what.rpartition("/")[2]), DRIVE_FOLDER_WORD)
                 else:
-                    named[rid] = (kind, resource_title(kind, what, team) if kind else rid)
+                    named[rid] = (kind, resource_title(kind, what, team) if kind else rid, RESOURCE_WORDS.get(kind))
             parts[report["id"]] = {
                 "agent": record["agent"], "resource": rid, "kind": named[rid][0],
-                "word": RESOURCE_WORDS.get(named[rid][0]), "title": named[rid][1],
+                "word": named[rid][2], "title": named[rid][1],
                 "level": level, "words": GRANT_LEVEL_WORDS.get(level, level.replace("_", " "))}
             break
     return parts
@@ -41412,7 +41542,8 @@ TOOLS = [
      "set, never above the level the owner allows, and never for a resource that the owner keeps (money, a production "
      "deployment, customer mail). The grant is a commit of team.json, so the owner sees it and can take it back. "
      "Bringing a new credential into the fleet stays the owner's: for a key or a login the fleet does not hold, "
-     "request_secret; for anything else, raise_needs_you. The agent gets it in its "
+     "request_secret; for anything else, raise_needs_you. A Drive account of the pool also gives one folder of it "
+     "alone (folder), up to the account's level. The agent gets it in its "
      "next task session. Each grant is written into the owner's chat with you, with your own why, because you answer "
      "for giving it.",
      S({"request_id": REQUEST_ID,
@@ -41423,6 +41554,9 @@ TOOLS = [
                   "deployment (its workflow files and the start of its GitHub Actions runs; every level reads the "
                   "runs where the App has the Actions permission). secret: use, or read for an API key. "
                   "drive: read, write or write_shared. gmail: read or write. tool: use."},
+        "folder": {"type": "string", "description": "Only with drive:<email>: one folder of that Drive, by its link "
+                   "or ID. The agent gets it and all under it, and keeps its other Drive grants of that account. A "
+                   "level that its whole Drive reaches adds nothing; a shared folder takes read or write_shared."},
         "why": {"type": "string", "description": "The one line the owner reads about this grant: what the work needs "
                 "it for, in plain words, with no code (T-12, C-3)"},
         "task_id": TASK_ID}, ["request_id", "agent", "resource", "level"])),
@@ -42748,6 +42882,7 @@ def call_tool(agent, name, args, context=None):
                     text = fn(agent, args)
                 else:
                     tool_reads_ahead(name, args)        # its git reads, before LOCK
+                    CALL.folder = grant_folder_ahead(args) if name == "grant_access" else None    # Google, before LOCK
                     # A tool that commits team.json takes the turn of the hub's writes first (KIT_TOOLS), so that it
                     # waits for an owner's write that runs its git now instead of being refused (kit_flying).
                     with kit_lock() if name in KIT_TOOLS else LOCK:
@@ -42792,7 +42927,7 @@ def call_tool(agent, name, args, context=None):
                     "[blocked]" if secret_hit(json.dumps(args)) else call_record_args(name, args), said, window, own)
         return said, True
     finally:
-        CALL.context = None
+        CALL.context = CALL.folder = None
 
 
 # ---------------------------------------------------------------- overview and board
