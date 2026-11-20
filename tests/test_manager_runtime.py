@@ -52,6 +52,14 @@ def first_prompt(words):
     return Path(shlex.split(read.group(1))[0]).read_text()
 
 
+def env_words(command):
+    """The program's words that a window's env file gives where its command names "$@" (fleet.env_prefix): a Codex
+    session's developer instructions (fleet.codex_rules) come first."""
+    words = shlex.split(command)
+    lines = [line for line in Path(words[1]).read_text().splitlines() if line.startswith("set -- ")]
+    return shlex.split(lines[0][len("set -- "):]) if lines else []
+
+
 def setUpModule():
     scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
@@ -144,16 +152,30 @@ class Records(Base):
         return fleet.launch_words(command), session, record, note
 
     def test_a_codex_manager_continues_its_thread_with_the_options_of_a_new_start(self):
-        new, marker, record, _ = self.words(CODEX)
+        """...and with its rules: the parts that the hub named for its start (here the lead's and the manager's) are
+        its developer instructions with RULES.md, which Codex builds again at a compaction, and its record keeps them,
+        so that a continued thread gets the same (fleet.codex_rules). Until 20 November 2026 they were in its first
+        prompt, which a compaction summarizes: a Codex manager lost rules/manager.md there."""
+        parts = ["lead", "manager"]
+        with patch.object(fleet, "http", return_value=(200, {"rules": parts})):
+            command = fleet.manager_start("manager", CODEX, "g1", TOKEN)
+        new, marker, record = fleet.launch_words(command[0]), command[1], command[2]
+        self.assertEqual(record["rules"], parts)
+        self.assertEqual(env_words(command[0])[:2], fleet.codex_rules(parts))
         self.assertIn(APPROVE, new)                                     # its Fleet tools need no machine configuration
-        self.assertEqual(first_prompt(new), PROMPT + "\n\n" + fleet.MARKER.format(marker))
+        prompt = first_prompt(new)                                      # its profile first, then its own words
+        self.assertTrue(prompt.endswith("\n" + PROMPT + "\n\n" + fleet.MARKER.format(marker)), prompt[-300:])
+        with open(os.path.join(fleet.KIT, "rules", "manager.md"), encoding="utf-8") as f:
+            self.assertNotIn(f.read().strip()[:200], prompt)            # in its developer instructions instead
         self.assertEqual((record["marker"], record["session"]), (marker, None))
         fleet.save_chat_record("manager", record, "codex", "manager")
         self.codex_rollout(marker=marker)
-        again, window, found, note = self.words(CODEX)
+        command = fleet.manager_start("manager", CODEX, "g1", TOKEN)
+        again, window, found, note = fleet.launch_words(command[0]), command[1], command[2], command[3]
         self.assertEqual((again[:2], again[-1], window, note),
                          (["codex", "resume"], THREAD, marker, "it continues its recorded conversation"))
         self.assertEqual(again[2:-1], new[1:-1])                        # every option of a new start, and no prompt
+        self.assertEqual(env_words(command[0])[:2], fleet.codex_rules(parts))     # and the same rules
         self.assertEqual(found, dict(record, session=THREAD))           # saved when its window runs
         saved = self.save("codex", marker=marker, session=THREAD)
         third, window, kept, _ = self.words(CODEX)

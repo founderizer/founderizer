@@ -341,9 +341,12 @@ class Runner:
             )
             if self.needs != "screen":      # a primary task: its own instruction, not the screen task's limits
                 instruction = primary_instruction(self.agent, self.task, self.needs)
-            # The rules first, whole, as every Codex session of the fleet has them (fleet.codex_rules): until 17
-            # November 2026 the thread read them as the folder's AGENTS.md, which Codex cut at 32 KiB. The words after
-            # them still say to read RULES.md, which a thread without them does.
+            # RULES.md first, whole, as every Codex session of the fleet has it (fleet.codex_rules): until 17 November
+            # 2026 the thread read it as the folder's AGENTS.md, which Codex cut at 32 KiB. The words after it still
+            # say to read RULES.md, which a thread without it does. Its parts of rules/ are not here, as they are in a
+            # terminal session's developer instructions: the hub names no parts for a runner's start (hub.stable_extra),
+            # so the thread reads them as the files that its task's start names, and a compaction loses them (an open
+            # gap, lanes/agent-context-size.md).
             rules = fleet.rules_text()
             instruction = rules + "\n\n" + RULES_ABOVE + "\n\n" + instruction if rules else instruction
             # The owner's direction excludes full Chrome DevTools Protocol access for the browser tools. No AGENTS.md

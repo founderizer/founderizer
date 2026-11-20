@@ -847,18 +847,38 @@ def rules_text():
         return ""
 
 
-def codex_rules():
-    """The words that give a Codex session RULES.md as its developer instructions, or none when this checkout has no
-    RULES.md. Codex 0.163 puts that text first in the first message of a thread, before the environment with its date
-    and before the first prompt, where the folder's AGENTS.md was until 17 November 2026 (the same start, `codex debug
-    prompt-input`), and builds it again with the rest of its instructions when it compacts a thread. The value is a
-    TOML string, which is how Codex reads a -c value: JSON writes each character that TOML must have escaped, but the
-    one control character that it leaves as it is (U+007F). The words are one argument of the program, about 36 KB
-    with the RULES.md of that day, so a session takes them from its env file (env_prefix) and never from its window's
-    command, which tmux takes up to about 16 KiB."""
+def part_texts(parts):
+    """The parts of the rules in `parts` (the list that the hub named for a session, hub.rules_parts), in RULES_PARTS
+    order, each as a session holds it. A part that this checkout lacks or cannot read is left out, as a start whose
+    stable text a missing file stops (stable_text) has the files that are there. No list (an older hub) gives none."""
+    texts = []
+    for part in RULES_PARTS if isinstance(parts, (list, tuple)) else ():
+        if part in parts:
+            try:
+                with open(os.path.join(KIT, "rules", f"{part}.md"), encoding="utf-8") as f:
+                    texts.append(f.read().strip())
+            except (OSError, UnicodeDecodeError):
+                pass
+    return [text for text in texts if text]
+
+
+def codex_rules(parts=None):
+    """The words that give a Codex session RULES.md, and after it the parts of the rules that the hub named for it
+    (parts, part_texts), as its developer instructions, or none when this checkout has no RULES.md. Codex 0.163 puts
+    that text first in the first message of a thread, before the environment with its date and before the first
+    prompt, where the folder's AGENTS.md was until 17 November 2026 (the same start, `codex debug prompt-input`), and
+    builds it again with the rest of its instructions when it compacts a thread, while it summarizes the first prompt.
+    So the parts are here and not in the first prompt (20 November 2026, lanes/agent-context-size.md): until then a
+    Codex session lost them at its first compaction, a Codex manager all of rules/manager.md. The value is a TOML
+    string, which is how Codex reads a -c value: JSON writes each character that TOML must have escaped, but the one
+    control character that it leaves as it is (U+007F). The words are one argument of the program, about 92 KB for a
+    manager with every part on 20 November 2026, and Linux takes one of at most 128 KiB (test_window_size); so a session
+    takes them from its env file (env_prefix) and never from its window's command, which tmux takes up to about 16
+    KiB. The profile stays in the first prompt: it is the owner's file, with no ceiling (test_context_size)."""
     text = rules_text()
     if not text:
         return []
+    text = "\n\n".join([text] + part_texts(parts))
     return ["-c", "developer_instructions=" + json.dumps(text, ensure_ascii=False).replace("\x7f", "\\u007f")]
 
 
@@ -2086,8 +2106,9 @@ def codex_server(name, catalog=None):
 # text is the fleet's rules (RULES.md, and the parts of rules/ that hub.rules_parts names for this agent) and the
 # agent's profile, all from this checkout, which the helper brought up to date just before the start. Claude reads it
 # as its appended system prompt, from a file, and takes no CLAUDE.md of the folder (--setting-sources ''); its task
-# is the first answer of read_messages. Codex gets RULES.md as its developer instructions (codex_rules) and reads no
-# AGENTS.md of the folder (CODEX_NO_FOLDER_RULES), and the parts, its profile and then its task as its first prompt.
+# is the first answer of read_messages. Codex gets RULES.md and its parts as its developer instructions (codex_rules),
+# which a compaction keeps, and reads no AGENTS.md of the folder (CODEX_NO_FOLDER_RULES), and its profile and then its
+# task as its first prompt.
 RULES_PARTS = ("lead", "manager", "conversations", "logins", "github", "servers")  # hub.RULES_PARTS, in that order
 STABLE_TASK = ('You are agent "{agent}" in Founderizer, in a session for one task of yours. {where} Your helper '
                'brought this folder up to date just before this session; do not pull at the start. ')
@@ -2095,8 +2116,8 @@ STABLE_RULES = "{rules} are in your context, so do not read them again."
 STABLE_WHERE = {"read": ("The task is the first answer of read_messages.",
                          "The fleet's rules for you (RULES.md and your parts of rules/) and your profile follow: they"),
                 "prompt": ("The task is at the end of this text.",
-                           "RULES.md is your developer instructions, and your parts of rules/ and your profile follow: "
-                           "they"),
+                           "RULES.md and your parts of rules/ are your developer instructions, and your profile "
+                           "follows: they"),
                 # An ACP program (the AI providers spec, 3.5.1): the stable text is its session's system text, and
                 # its task is the first prompt. No ACP program reads RULES.md as its folder's AGENTS.md.
                 "system": ("The task is your first message.",
@@ -2142,8 +2163,9 @@ def knowledge_texts(agent):
 
 def stable_text(agent, opening, parts, head=None, skills=True, knowledge=False):
     """The stable start of a session of `agent` whose runtime reads its rules by `opening` (plan P9.2), or None when
-    this checkout cannot give it: a file is missing. With the opening "prompt" (Codex) RULES.md is not in it, because
-    the session gets RULES.md as its developer instructions (codex_rules), but this checkout must have it all the same.
+    this checkout cannot give it: a file is missing. With the opening "prompt" (Codex) RULES.md and the parts are not
+    in it, because the session gets them as its developer instructions (codex_rules), but this checkout must have them
+    all the same.
     head: what comes first, a task session's line by default, the owner chat's instructions, or ""
     for the standing manager session, whose first prompt says who it is. The same files give the same bytes.
     skills: the list of the agent's own skills comes last (design v4 D3, helper feature stable_skills), so a new
@@ -2154,9 +2176,8 @@ def stable_text(agent, opening, parts, head=None, skills=True, knowledge=False):
         with open(os.path.join(KIT, name), encoding="utf-8") as f:
             return f.read().strip()
     try:
-        core = read("RULES.md")
-        texts = ([core] if opening in ("read", "system") else []) + \
-            [read(f"rules/{part}.md") for part in RULES_PARTS if part in parts] + [read(f"profiles/{agent}.md")]
+        rules = [read("RULES.md")] + [read(f"rules/{part}.md") for part in RULES_PARTS if part in parts]
+        texts = (rules if opening in ("read", "system") else []) + [read(f"profiles/{agent}.md")]
     except OSError:
         return None
     texts += knowledge_texts(agent) if knowledge else []
@@ -2445,8 +2466,9 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     # A Codex session's catalog servers are -c options, which grow with the owner's servers: a program server's
     # settings and arguments alone can be thousands of characters (lifecycle.MCP_SETTINGS_MOST). They come from its
     # env file, and the command gives them to Codex where it names ARGS (env_prefix). Its rules come from there too, as
-    # its developer instructions (codex_rules), in each Codex start: with its stable text or without, new or resumed.
-    served = codex_rules() + [w for t in tools for w in shlex.split(codex_server(t, catalog))] \
+    # its developer instructions (codex_rules), in each Codex start: with its stable text or without, new or resumed,
+    # with the parts that the hub named (rules; a continued conversation's are those that it began with).
+    served = codex_rules(rules) + [w for t in tools for w in shlex.split(codex_server(t, catalog))] \
         if runtime == "codex" else []
     if browser and runtime == "codex":
         served += shlex.split(codex_server(BROWSER_SERVER, {BROWSER_SERVER: browser}))
@@ -2518,7 +2540,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         elif resume:
             first = shlex.quote(session)                    # its thread
         else:
-            # Codex has RULES.md as its developer instructions (served), and the rest of its stable text first here.
+            # Codex has RULES.md and its parts as its developer instructions (served), and the rest of its stable
+            # text first here.
             first = file_prompt(agent, window, prompt, first=stable + "\n")
     elif conf.get("runtime") == "claude" and not idle:
         core = rules_file()                                 # the folder's CLAUDE.md loads no more
@@ -3120,8 +3143,9 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     prompt = head + said            # the recap last: what a Codex chat's first prompt cuts first (file_prompt)
     url = f"{HUB}/mcp/{agent}/{generation}/owner-chat/1"
     # A Codex chat's rules are its developer instructions (codex_rules), with its stable text or without, new or
-    # resumed: they come from its env file, as the program's words where its command names ARGS, before its thread.
-    developer = codex_rules() if conf.get("runtime") == "codex" else []
+    # resumed, with its parts: they come from its env file, as the program's words where its command names ARGS,
+    # before its thread.
+    developer = codex_rules(rules) if conf.get("runtime") == "codex" else []
     tail = []
     if conf.get("runtime") == "codex":
         if resume is not None and not THREAD_ID.fullmatch(str(resume)):
@@ -3806,10 +3830,12 @@ def cmd_chat_session(args):
         die(f"the hub gave no generation ({code})")
     # The owner names this conversation as the one to continue, so its record takes the start text of now as the one
     # that it began with (standing_text): the helper leaves a record without one. Its tools are not known here, and
-    # the helper compares none for a record that names none (Helper.chat_changed).
-    began = standing_text(agent, None, chat_instructions(agent, dict(conf, runtime=runtime)))
+    # the helper compares none for a record that names none (Helper.chat_changed). Its parts of the rules are the ones
+    # that the hub names now: a continued Codex chat takes them again as its developer instructions (codex_rules).
+    rules = opening_rules(data)
+    began = standing_text(agent, rules, chat_instructions(agent, dict(conf, runtime=runtime)))
     save_chat_record(agent, {"generation": data["db"], "marker": None, "session": args.session, "started": time.time(),
-                             "text": began, "rules": None}, runtime)
+                             "text": began, "rules": rules}, runtime)
     print(f"recorded: the next owner chat of {agent} in generation {data['db']} continues conversation {args.session}, "
           f"while its rules, its instructions and its profile stay as they are now")
 
@@ -4054,9 +4080,11 @@ def manager_start(agent, conf, generation, token, fresh=False):
             else:
                 keep = dict(record, session=found) if record.get("session") != found else None
             # A continued conversation gets no first prompt, so it needs no brief either: that session has what it
-            # worked out. The brief is for the one that starts cold.
+            # worked out. The brief is for the one that starts cold. A Codex thread takes its rules again with each
+            # start, as its developer instructions: the parts that it began with, from its record (codex_rules).
             return (session_command(agent, conf, MANAGER_START.format(agent=agent, resume=""), session=found,
-                                    token=token, resume=True, env=env), window, keep,
+                                    token=token, resume=True, env=env,
+                                    rules=opening_rules(record) if runtime == "codex" else None), window, keep,
                     "it continues its recorded conversation")
         note = "a new conversation: the recorded start never began one"
     session, new = str(uuid.uuid4()), None
@@ -6140,6 +6168,15 @@ class Helper:
         if runtime_fact(self.conf.get("runtime"), "driver") == "acp":
             sweep_acp_folders(self.conf.get("runtime"))     # and the own folders of sessions whose windows ended
 
+    def chat_record_rules(self, runtime):
+        """The parts of the rules that this agent's recorded owner chat began with (its record's rules), or None: a
+        continued Codex chat takes them again as its developer instructions (codex_rules). A record that cannot be read
+        gives none, as chat_resume, which read it just before, would have started a new chat."""
+        try:
+            return opening_rules(load_chat_record(self.agent, runtime) or {})
+        except Refused:
+            return None
+
     def chat_resume(self, generation):
         """The conversation to continue when the owner chat of this generation starts again (a Codex thread or a
         Claude session), or None for a new one: no record, another generation's chat (its route is closed), a runtime
@@ -6761,6 +6798,8 @@ class Helper:
         # for the parts of the rules that it starts with (plan P9.2).
         data = {} if resume else hub_opening(self.agent)
         recap, rules = "" if resume else chat_recap(self.agent, data), opening_rules(data)
+        if resume and runtime == "codex":   # its developer instructions again, with the parts that it began with
+            rules = self.chat_record_rules(runtime)
         self.start(window, chat_command(self.agent, self.run_conf(), generation, token=token, marker=marker, resume=resume,
                                         recap=recap, env=session_env(self.agent, self.conf, "chat"), rules=rules),
                    1, generation)

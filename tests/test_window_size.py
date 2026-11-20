@@ -204,12 +204,14 @@ class Sizes(unittest.TestCase):
         self.assertFalse([f for f in files if f.exists()])         # both read and removed before Codex ran
 
     def test_a_codex_session_s_rules_fit_in_one_argument_on_linux(self):
-        """A Codex session's developer instructions are all of this checkout's RULES.md in one argument of the program
-        (fleet.codex_rules), and Linux takes one of at most 131,071 bytes with pages of 4 KiB: a RULES.md that grew
-        past it would end every Codex start on Linux with "Argument list too long", in a pane that closes."""
+        """A Codex session's developer instructions are all of this checkout's RULES.md and of its parts of rules/ in
+        one argument of the program (fleet.codex_rules), and Linux takes one of at most 131,071 bytes with pages of 4
+        KiB: rules that grew past it would end every Codex start on Linux with "Argument list too long", in a pane that
+        closes. A manager that holds every part has the most (about 92 KB on 20 November 2026)."""
         with patch.object(fleet, "KIT", ROOT):
-            words = fleet.codex_rules()
+            core, words = fleet.codex_rules(), fleet.codex_rules(list(fleet.RULES_PARTS))
         self.assertEqual(words[0], "-c")
+        self.assertGreater(len(words[1]), len(core[1]))                 # each part is in this checkout
         self.assertLess(len(words[1].encode("utf-8")), 32 * 4096 - 1)
 
     def test_a_runner_task_reads_its_prompt_from_a_file_that_it_removes(self):
