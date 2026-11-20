@@ -148,6 +148,15 @@ class Rename(Servers):
                                           "unknown": "ignore", "enabled": True}}
         self.write_team(json.loads(json.dumps(team)))           # the hub's own copy, which the rename changes
         before, profile = self.head(), self.show("profiles/scout.md")
+        # While git gives no answer for its profile, or for one at the new name, the rename waits and commits nothing:
+        # git_blob gives None for a read that failed as for no file, so team.json took the new name and the profile
+        # stayed at the old one, or went over the profile at the new one (a finding of the area "Hub core", 20 Nov 2026)
+        for unread, shown in (("scout", hub.shown_role("scout")), ("nova", hub.shown_name("nova"))):
+            with self.not_given(f"profiles/{unread}.md"):
+                status, answer = self.rename()
+            self.assertEqual((status, answer.get("code"), answer.get("names")), (503, "profile_unread",
+                                                                                 {"agent": shown}), answer)
+        self.assertEqual(self.head(), before)
         status, receipt = self.rename()
         self.assertEqual(status, 200, receipt)
         self.assertEqual({k: receipt[k] for k in ("agent", "was", "server", "replayed")},
@@ -173,6 +182,15 @@ class Rename(Servers):
         hub.commit_kit_file("skills/scout/deploy/SKILL.md", (skill + "\n").encode(), "scout wrote the skill deploy",
                             more={"skills/scout/deploy/scripts/check.sh": b"npm run smoke\n"}, author="scout")
         before = self.head()
+        # A skill, or a list of them, that git does not give now waits too: the skill came to the new name empty, or
+        # stayed at the old one, for a later agent of that name
+        kit = hub.git_kit
+        no_list = patch.object(hub, "git_kit", lambda *a, **k: (128, "", "") if a[0] == "ls-tree" else kit(*a, **k))
+        for unread in (self.not_given("skills/scout/deploy/scripts/check.sh"), no_list):
+            with unread:
+                status, answer = self.rename()
+            self.assertEqual((status, answer.get("code")), (503, "revision_unreadable"), answer)
+        self.assertEqual(self.head(), before)
         status, receipt = self.rename()
         self.assertEqual(status, 200, receipt)
         self.assertEqual(git("--git-dir", str(self.root / "origin.git"), "rev-list", "--count", f"{before}..main"), "1")

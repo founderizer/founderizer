@@ -59,9 +59,11 @@ func run(dbPath string) error {
 		return err
 	}
 	link := NewLink(w, os.Stdout, log.Sub("Link"))
-	// The bridge writes the file of a send here, beside the database, and a send takes a file from here only.
+	// The bridge writes the file of a send here, beside the database, and a send takes a file from here only; a
+	// download writes into inbox beside it, which the bridge reads and empties.
 	if abs, err := filepath.Abs(dbPath); err == nil {
 		link.outbox = filepath.Join(filepath.Dir(abs), "outbox")
+		link.inbox = filepath.Join(filepath.Dir(abs), "inbox")
 	}
 	w.handler = link.HandleEvent
 	link.Run(ctx, os.Stdin)
@@ -89,7 +91,9 @@ func openStore(ctx context.Context, path string, log waLog.Logger) (*sqlstore.Co
 }
 
 // logger writes INFO and higher to standard error. whatsmeow logs IDs and
-// JIDs at these levels, never message text.
+// JIDs at these levels, never message text. A web address in a line becomes
+// <address>: whatsmeow's warning of a failed media request holds its URL,
+// with the media's direct path and hash.
 type logger struct {
 	mu  *sync.Mutex
 	w   io.Writer
@@ -103,7 +107,7 @@ func newLogger(w io.Writer, mod string) waLog.Logger {
 func (l *logger) printf(level, msg string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	fmt.Fprintf(l.w, "%s %s [%s] %s\n", time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), level, l.mod, fmt.Sprintf(msg, args...))
+	fmt.Fprintf(l.w, "%s %s [%s] %s\n", time.Now().UTC().Format("2006-01-02T15:04:05.000Z"), level, l.mod, withoutAddresses(fmt.Sprintf(msg, args...)))
 }
 
 func (l *logger) Errorf(msg string, args ...any) { l.printf("ERROR", msg, args...) }

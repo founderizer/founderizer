@@ -38533,7 +38533,11 @@ def team_remove(ctx, c):
     duties = [duty_name(r["text"]) for r in read_rows("SELECT text FROM responsibilities WHERE agent=? AND "
                                                       "state!='retired' ORDER BY id", (n,))]
     ctx["team"] = removed_team(team, n)
-    ctx["files"].update(removed_files(rev, n))
+    try:
+        ctx["files"].update(removed_files(rev, n))
+    except Refusal:     # its profile or its skills, which git does not give now (removed_files): the card stays
+        raise TeamPassing("The hub cannot read its configuration now. Try again in a minute.",
+                          "the hub cannot read its configuration now") from None
     ctx["job"] = {"kind": "remove", "server": server, "agent": n} if serviced else None
     ctx["after"].update(removed={"agent": n, "entry": a, "server": server, "serviced": serviced}, profiles=True,
                         left=accounts)
@@ -55509,8 +55513,13 @@ def add_server_agent(server, body):
         except ValueError as e:
             raise Refusal(400, str(e)) from None
         data = (json.dumps(team, indent=2) + "\n").encode()
-        profile = None if git_blob(rev, f"profiles/{agent}.md") is not None else \
-            (SERVER_PROFILE % {"name": agent}).encode()
+        # A profile that git does not give now is never one that is not there (kit_file): the add waits, and never
+        # writes the server's default profile over the owner's words.
+        try:
+            held = kit_file(rev, f"profiles/{agent}.md") is not None
+        except KitUnread:
+            raise Refusal(503, code="profile_unread", names={"agent": shown_name(agent)}) from None
+        profile = None if held else (SERVER_PROFILE % {"name": agent}).encode()
         commit = commit_kit_file("team.json", data, f"Owner added agent {agent} on server {server}",
                                  more={f"profiles/{agent}.md": profile} if profile else None)
         apply_team(team)
@@ -56218,8 +56227,18 @@ def rename_agent(agent, body):
             raise Refusal(409, code="agent_open_signin", names={"agent": shown_role(agent)})
         st = q1("SELECT data FROM server_status WHERE server=?", (server,))
         key_moves = KEY_FEATURE in (json.loads(st["data"]).get("features") or [])
-    profile = git_blob(rev, f"profiles/{agent}.md")
-    if git_blob(rev, f"profiles/{new}.md") is not None:
+    # **A file that git does not give now is never a file that is not there** (kit_file; a finding of the area "Hub
+    # core", 20 November 2026): with git_blob's None, a rename left the profile at the old name and moved team.json,
+    # so the agent ran with no profile, and it could write over a profile that was there at the new name.
+    try:
+        profile = kit_file(rev, f"profiles/{agent}.md")
+    except KitUnread:
+        raise Refusal(503, code="profile_unread", names={"agent": shown_role(agent)}) from None
+    try:
+        taken = kit_file(rev, f"profiles/{new}.md") is not None
+    except KitUnread:
+        raise Refusal(503, code="profile_unread", names={"agent": shown_name(new)}) from None
+    if taken:
         raise Refusal(409, f"A profile for {new} is in the fleet already. Choose another name.")
     renamed = renamed_team(team, agent, new)
     try:
@@ -56231,10 +56250,17 @@ def rename_agent(agent, body):
     more = None if profile is None else {f"profiles/{agent}.md": None,
                                          f"profiles/{new}.md": renamed_profile(profile, agent, new)}
     # its skills move with it, byte for byte (design v4 D1): skills/<agent>/ is its own folder, as its profile is
+    # A list or a skill file that git does not give now is no skill that is not there either: it would stay at the old
+    # name, or come to the new one empty.
     code, out, _ = git_kit("ls-tree", "-r", "-z", "--name-only", rev, "--", f"{SKILLS}/{agent}/")
-    for path in (p for p in out.split("\0") if p.startswith(f"{SKILLS}/{agent}/")) if code == 0 else ():
-        more = dict(more or {}, **{path: None, f"{SKILLS}/{new}/" + path[len(f"{SKILLS}/{agent}/"):]:
-                                   git_blob(rev, path)})
+    if code != 0:
+        raise Refusal(503, code="revision_unreadable")
+    for path in (p for p in out.split("\0") if p.startswith(f"{SKILLS}/{agent}/")):
+        try:
+            moved = kit_file(rev, path)
+        except KitUnread:
+            raise Refusal(503, code="revision_unreadable") from None
+        more = dict(more or {}, **{path: None, f"{SKILLS}/{new}/" + path[len(f"{SKILLS}/{agent}/"):]: moved})
     commit = commit_kit_file("team.json", data, f"Owner renamed agent {agent} to {new}", more=more)
     manager = next(n for n, x in renamed["agents"].items() if x.get("role") == "manager")
     with transaction():
@@ -56742,10 +56768,18 @@ def removal_server(team, agent):
 
 def removed_files(rev, agent):
     """{path: None} of the files that an agent's removal deletes in its commit: its profile, and its skills, which are
-    its own folder as its profile is its own file."""
-    more = {f"profiles/{agent}.md": None} if git_blob(rev, f"profiles/{agent}.md") is not None else {}
+    its own folder as its profile is its own file. A profile or a list of skills that git does not give now is never
+    one that is not there (kit_file): the removal waits (503), or a later agent of the same name would take the old
+    profile, with its "Logins it may use", and the old skills."""
+    try:
+        held = kit_file(rev, f"profiles/{agent}.md") is not None
+    except KitUnread:
+        raise Refusal(503, code="profile_unread", names={"agent": shown_role(agent)}) from None
+    more = {f"profiles/{agent}.md": None} if held else {}
     code, out, _ = git_kit("ls-tree", "-r", "-z", "--name-only", rev, "--", f"{SKILLS}/{agent}/")
-    for path in (p for p in out.split("\0") if p.startswith(f"{SKILLS}/{agent}/")) if code == 0 else ():
+    if code != 0:
+        raise Refusal(503, code="revision_unreadable")
+    for path in (p for p in out.split("\0") if p.startswith(f"{SKILLS}/{agent}/")):
         more[path] = None
     return more
 

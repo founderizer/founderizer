@@ -145,6 +145,12 @@ func (w *waClient) Upload(ctx context.Context, data []byte, kind whatsmeow.Media
 	return w.client().Upload(ctx, data, kind)
 }
 
+// Download fetches a message's media from WhatsApp's media servers into file: whatsmeow checks the encrypted file's
+// hash and HMAC, decrypts it in place and checks the plain hash.
+func (w *waClient) Download(ctx context.Context, msg whatsmeow.DownloadableMessage, file whatsmeow.File) error {
+	return w.client().DownloadToFile(ctx, msg, file)
+}
+
 func (w *waClient) MarkRead(ctx context.Context, chat, sender types.JID, ids []types.MessageID) error {
 	return w.client().MarkRead(ctx, ids, time.Now(), chat, sender)
 }

@@ -123,7 +123,7 @@ OLD = {
 # (an `ast` search of every route of the owner API) and the seven reads of the phone that it did not list. A place
 # keeps its code: a place that moves to another code, or loses it, fails here. A lane may add codes to these functions.
 SITES = {
-    'add_server_agent': {'team_changed': 1},
+    'add_server_agent': {'profile_unread': 1, 'team_changed': 1},
     'add_server_refusal': {'no_such_server': 1, 'server_no_service': 1, 'server_silent': 1},
     'answer_secret': {'command_reused_message': 1, 'request_answered': 1, 'request_unknown_ended': 1},
     'attachment_check': {'login_as_file': 1},
@@ -167,7 +167,9 @@ SITES = {
     'refresh_page': {'knowledge_unread': 1},
     'remove_agent': {'no_such_agent': 1, 'team_changed': 1},
     'remove_server': {'no_such_server': 1, 'team_changed': 1},
-    'rename_agent': {'agent_open_signin': 1, 'no_such_agent': 1, 'server_silent': 1, 'team_changed': 1},
+    'removed_files': {'profile_unread': 1, 'revision_unreadable': 1},     # a removal waits for its files' read
+    'rename_agent': {'agent_open_signin': 1, 'no_such_agent': 1, 'profile_unread': 2, 'revision_unreadable': 2,
+                     'server_silent': 1, 'team_changed': 1},
     'save_access': {'team_changed': 1},
     'save_agent_settings': {'no_such_agent': 1, 'team_changed': 1},
     # build plan 04, S3 (UI-API.md 1.218)
@@ -485,7 +487,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 200)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 207)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

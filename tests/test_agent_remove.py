@@ -110,6 +110,17 @@ class Remove(Servers):
             return {a: hub.q1("SELECT COUNT(*) c FROM history WHERE agent=?", (a,))["c"] for a in ("scout", "vps")}
         self.assertEqual(copies(), {"scout": 3, "vps": 3})
         before = self.head()
+        # While git gives no answer for its profile, or for the list of its skills, the delete waits and commits
+        # nothing: git_blob gave None for a read that failed as for no file, so the profile, with its "Logins it may
+        # use", and the skills stayed for a later agent of the same name (a finding of the area "Hub core", 20 Nov 2026)
+        kit = hub.git_kit
+        no_list = patch.object(hub, "git_kit", lambda *a, **k: (128, "", "") if a[0] == "ls-tree" else kit(*a, **k))
+        for unread, code, names in ((self.not_given("profiles/scout.md"), "profile_unread",
+                                     {"agent": hub.shown_role("scout")}), (no_list, "revision_unreadable", None)):
+            with unread:
+                status, answer = self.remove()
+            self.assertEqual((status, answer.get("code"), answer.get("names")), (503, code, names), answer)
+        self.assertEqual(self.head(), before)
         status, receipt = self.remove()
         self.assertEqual(status, 200, receipt)
         self.assertEqual({k: receipt[k] for k in ("agent", "server")}, {"agent": "scout", "server": "box"})

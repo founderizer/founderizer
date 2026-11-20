@@ -202,6 +202,12 @@ class TeamChanges(Remove):
         self.assertIn("cannot make this change now: scout has open tasks now", answer["error"])
         self.assertIsNone(self.card()["answer"])
         hub.q("UPDATE tasks SET state='completed' WHERE id=?", (task,))
+        # a profile that git does not give now passes too (removed_files' 503): the press keeps the card
+        with self.not_given("profiles/scout.md"):
+            status, answer = self.press(0)
+        self.assertEqual(status, 409, answer)
+        self.assertIn("cannot make this change now: the hub cannot read its configuration now", answer["error"])
+        self.assertIsNone(self.card()["answer"])
         self.link_person("scout")
         hub.kv_set(hub.TEAM_PLAN_SWEEP, None)
         hub.team_plan_sweep(hub.now())

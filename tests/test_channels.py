@@ -549,10 +549,21 @@ def record(obj):
 
 record({"op": "start", "db": db})
 if not os.environ.get("WA_STUB_OLD"):           # a wa-link of today says what it can do first; an older one says nothing
-    emit({"ev": "hello", "features": ["file"]})
+    emit({"ev": "hello", "features": ["file"] if os.environ.get("WA_STUB_NO_DOWNLOAD") else ["file", "download"]})
 emit({"ev": "state", "state": "connecting", "jid": None, "error": None})
-if os.path.exists(db):
+linked = threading.Event()      # a download needs WhatsApp's media servers: before the link it fails, as whatsmeow's
+
+def link(delay):
+    time.sleep(delay)
+    linked.set()
     emit({"ev": "state", "state": "linked", "jid": JID, "error": None})
+
+if os.path.exists(db):
+    delay = float(os.environ.get("WA_STUB_LINK_DELAY") or 0)        # a number that takes a while to link, while the
+    if delay:                                                       # commands come
+        threading.Thread(target=link, args=(delay,), daemon=True).start()
+    else:
+        link(0)
 else:
     emit({"ev": "state", "state": "logged_out", "jid": None, "error": None})
 
@@ -572,6 +583,37 @@ def inject():
         time.sleep(0.01)
 
 threading.Thread(target=inject, daemon=True).start()
+
+def download(cmd):
+    """A download into the inbox beside the database, of the bytes of media/<the direct path's last part>; some
+    parts act: fail, large, silent (no answer), slow (an answer after 1.5 s), crash-once (wa-link stops, once)."""
+    spec = cmd.get("media") or {}
+    name = str(spec.get("direct_path") or "").split("?")[0].rsplit("/", 1)[-1]
+    if not linked.is_set():
+        return emit({"ev": "downloaded", "id": cmd["id"], "ok": False, "size": None, "too_large": False,
+                     "error": "wa-link is not connected to WhatsApp"})
+    if name == "silent":
+        return
+    if name == "crash-once":
+        mark = os.path.join(ctl, "crashed")
+        if not os.path.exists(mark):
+            open(mark, "w").close()
+            os._exit(4)
+    if name in ("slow", "slow-crash"):
+        time.sleep(1.5)
+    if name in ("fail", "large"):
+        return emit({"ev": "downloaded", "id": cmd["id"], "ok": False, "size": None, "too_large": name == "large",
+                     "error": "STUB-WORDS of https://mmg.whatsapp.net/v/t62/x?hash=STUB"})
+    with open(os.path.join(ctl, "media", name), "rb") as f:
+        data = f.read()
+    target = os.path.join(os.path.dirname(db), "inbox", cmd["id"])
+    with os.fdopen(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as out:
+        out.write(data)
+    record({"op": "wrote", "id": cmd["id"]})
+    if name == "slow-crash":    # it stops before its answer
+        os._exit(5)
+    emit({"ev": "downloaded", "id": cmd["id"], "ok": True, "size": len(data), "too_large": False, "error": None})
+
 for line in sys.stdin:
     cmd = json.loads(line)
     op = cmd.get("op")
@@ -588,23 +630,28 @@ for line in sys.stdin:
         if not os.path.exists(db):
             emit({"ev": "qr", "code": "QR-CODE-1", "timeout": 20})
             open(db, "w").close()
+        linked.set()
         emit({"ev": "state", "state": "linked", "jid": JID, "error": None})
     elif op == "send":
         if "NOREPLY" in cmd["text"]:
             continue
         refuse = "REFUSE" in cmd["text"] or "REFUSE" in (cmd.get("file") or {}).get("name", "")
-        ok = not refuse and "LOST" not in cmd["text"]
-        error = None if ok else "refused by the stand-in" if refuse else "unknown: connection lost"
+        ok = not refuse and "LOST" not in cmd["text"] and "URLERR" not in cmd["text"]
+        error = None if ok else "refused by the stand-in" if refuse else "unknown: connection lost" \
+            if "LOST" in cmd["text"] else 'not sent: Post "https://mmg.whatsapp.net/mms/document/x?auth=AUTH-VALUE": EOF'
         emit({"ev": "sent", "id": cmd["id"], "ok": ok, "error": error})
     elif op == "logout":
         os.unlink(db)
         emit({"ev": "state", "state": "logged_out", "jid": None, "error": None})
+    elif op == "download":
+        threading.Thread(target=download, args=(cmd,), daemon=True).start()
 '''
 
 
 def make_wa_link(folder, journal):
     """The wa-link stand-in in folder, and the environment that makes the bridge start it."""
     os.makedirs(os.path.join(folder, "inject"))
+    os.makedirs(os.path.join(folder, "media"))
     script = os.path.join(folder, "stub.py")
     with open(script, "w") as f:
         f.write(STUB)
@@ -619,6 +666,11 @@ class WaLinkControl:
     """Events into the wa-link stand-in, and the commands that it got."""
     def __init__(self, folder):
         self.folder, self.injected = folder, 0
+
+    def media(self, part, data):
+        """The bytes that the stand-in downloads for a direct path whose last part is `part`."""
+        with open(os.path.join(self.folder, "media", part), "wb") as f:
+            f.write(data)
 
     def inject(self, obj):
         self.injected += 1
@@ -991,16 +1043,18 @@ class DiscordTests(Base):
             self.assertLess(self.cdn.sent["/attachments/700/71/big.pdf"], 64, "the bridge read the file to its end")
 
     def test_the_hubs_refusals_give_their_codes_and_cost_no_fetch(self):
-        """The hub's answers (the interface of version 2): to its question, a 409 (no such account) or a 403 (a sender
-        whose files it does not take, as a stranger's) makes each file of the message `refused` with no fetch, and the
-        message's own post settles the rest; to an upload, 413 is `size`, and 415 (bytes that are not of their type,
-        now that any type goes up), 403, 422 and 400 are `refused`, and a 403 is the answer for the message's other
-        files too, with no fetch. No refusal of a file holds its message back."""
+        """The hub's answers (the interface of version 2): to its question, a 409 (no such account), a 403 (a sender
+        whose files it does not take, as a stranger's) or any other answer but its 200 (a 404 of a hub of an older
+        release) makes each file of the message `refused` with no fetch, and the message's own post settles the rest;
+        to an upload, 413 is `size`, and 415 (bytes that are not of their type, now that any type goes up), 403, 422
+        and 400 are `refused`, and a 403 is the answer for the message's other files too, with no fetch. No refusal of
+        a file holds its message back."""
         self.ready()
         png = b"\x89PNG\r\n\x1a\n"
         self.hub.forced = [(409, {"error": "unknown chat app account"})]
         self.hub.check_answers = [(409, {"error": "unknown chat app account"}),
-                                  (403, {"code": "not_welcome", "error": "not taken"})]
+                                  (403, {"code": "not_welcome", "error": "not taken"})] + [None] * 5 + \
+            [(404, {"error": "no such route"})]
         self.hub.upload_answers = [(415, {"error": "the bytes are not of the type that the request names"}),
                                    (422, {"error": "a registered login", "code": "login_as_file"}),
                                    (403, {"code": "not_welcome"}), (413, {"error": "an attachment is at most 25 MiB"}),
@@ -1013,14 +1067,15 @@ class DiscordTests(Base):
         for mid in range(1633, 1638):
             second = [self.attachment(f"{mid}b", "e.png", png)] if mid == 1635 else []     # after the upload's 403
             peer.dispatch("MESSAGE_CREATE", dm(mid, "", attachments=[self.attachment(str(mid), "d.png", png)] + second))
-        self.wait_for(lambda: len(self.hub.posted) == 7 and not self.journal_files(), "seven messages", timeout=10)
+        peer.dispatch("MESSAGE_CREATE", dm(1638, "", attachments=[self.attachment("1638", "f.png", png)]))
+        self.wait_for(lambda: len(self.hub.posted) == 8 and not self.journal_files(), "eight messages", timeout=10)
         self.assertEqual([e.get("missed") for e in self.hub.posted], [["refused", "refused"], ["refused"], ["refused"],
                                                                       ["refused"], ["refused", "refused"], ["size"],
-                                                                      ["refused"]])
+                                                                      ["refused"], ["refused"]])
         self.assertEqual(len(self.hub.uploads), 5)
         self.assertEqual(self.cdn.fetched(), [f"/attachments/700/{mid}/d.png" for mid in range(1633, 1638)],
                          "no fetch of a file that the hub does not take")
-        self.assertEqual([e["id"] for e in self.hub.inbound], [str(mid) for mid in range(1632, 1638)])
+        self.assertEqual([e["id"] for e in self.hub.inbound], [str(mid) for mid in range(1632, 1639)])
 
     def test_an_attempt_after_no_answer_sends_only_what_did_not_come_up(self):
         """No change of the journal (the interface of version 2), and no download for nothing: a 503 to the hub's
@@ -1565,13 +1620,223 @@ class WhatsAppTests(Base):
                                                "error": "The bridge sends no file to WhatsApp yet."})
         self.assertEqual(self.commands("send"), [])
 
-    def test_the_bridge_empties_the_outbox_that_a_stop_left(self):
-        outbox = os.path.join(self.folder, "outbox")
-        os.makedirs(outbox)
-        with open(os.path.join(outbox, "9-1"), "wb") as f:
-            f.write(b"left from a stop")
+    def test_the_bridge_empties_the_outbox_and_the_inbox_that_a_stop_left(self):
+        """A file stays in either folder only while its message is on its way: what a stop left goes at the start."""
+        outbox, inbox = os.path.join(self.folder, "outbox"), os.path.join(self.folder, "inbox")
+        for folder in (outbox, inbox):
+            os.makedirs(folder)
+            with open(os.path.join(folder, "9-1"), "wb") as f:
+                f.write(b"left from a stop")
         self.start()
-        self.assertEqual(os.listdir(outbox), [])
+        self.assertEqual((os.listdir(outbox), os.listdir(inbox)), ([], []))
+        self.assertEqual(stat.S_IMODE(os.stat(inbox).st_mode), 0o700)
+
+    # the media of a person's or the owner's message (CHAT-APPS.md 8.1)
+
+    def wa_media(self, part, kind, mime, size, name=""):
+        """A media description as wa-link's message event gives it; the stand-in downloads media/<part>. Its direct
+        path and its key are what no log line may hold."""
+        key = base64.b64encode(bytes([1]) * 32).decode()
+        path = f"/v/t62.7118-24/{part}?ccb=11-4&oh=01_Q5AaIX&oe=6812ABCD"
+        self.private += [path, key]
+        return {"kind": kind, "mime": mime, "size": size, "name": name, "direct_path": path, "media_key": key,
+                "file_sha256": base64.b64encode(bytes([2]) * 32).decode(),
+                "file_enc_sha256": base64.b64encode(bytes([3]) * 32).decode()}
+
+    def message(self, mid, kind, text="", spec=None, **extra):
+        """A message event of wa-link from WA_CHAT, with its media."""
+        event = {"ev": "message", "id": mid, "chat": WA_CHAT, "sender": WA_CHAT, "sender_alt": "123@lid",
+                 "push_name": "Alex", "group": False, "from_me": False, "kind": kind, "text": text,
+                 "ts": 1792134000.5}
+        if spec:
+            event["media"] = spec
+        event.update(extra)
+        return event
+
+    def calls_in_order(self):
+        with self.hub.lock:
+            return [path for _, path in self.hub.calls if path in ("/bridge/files?check", "/bridge/files",
+                                                                    "/bridge/inbound")]
+
+    def test_a_picture_with_words_a_voice_note_a_document_and_a_video_go_up_before_their_messages(self):
+        """The owner, 20 November 2026: "pictures and files sohuld be allowed!". A WhatsApp message brings one file:
+        the bridge asks the hub first (check=1), and only after its yes asks wa-link to download the media into the
+        inbox beside the sessions (its own description back, with the time that is left), uploads the bytes with the
+        name and type that the rules give, and then posts the message with no `media`. The direct path and the keys
+        stay on the hub machine, and no log line names the file or holds its words."""
+        self.linked()
+        jpeg, ogg = b"\xff\xd8\xff\xe0 a screenshot", b"OggS\x00\x02 a voice note"
+        pdf, mp4 = b"%PDF-1.4 an invoice", b"\x00\x00\x00\x18ftypmp42 a video"
+        for part, data in (("pic.enc", jpeg), ("voice.enc", ogg), ("doc.enc", pdf), ("clip.enc", mp4)):
+            self.wa.media(part, data)
+        specs = [self.wa_media("pic.enc", "image", "image/jpeg", len(jpeg)),
+                 self.wa_media("voice.enc", "voice", "audio/ogg; codecs=opus", len(ogg)),
+                 self.wa_media("doc.enc", "document", "application/pdf", len(pdf), "Invoice-October.pdf"),
+                 self.wa_media("clip.enc", "video", "video/mp4", len(mp4))]
+        kinds = ("image", "audio", "file", "other")
+        words = ("What does this error say? wa21", "", "Here is the invoice wa23", "Look at this wa24")
+        self.private += [w for w in words if w] + ["Invoice-October.pdf"]
+        for n, (kind, text, spec) in enumerate(zip(kinds, words, specs), 1):
+            self.inject(self.message(f"WAPIC{n}", kind, text, spec))
+        self.wait_for(lambda: len(self.hub.inbound) == 4 and not self.journal_files(), "the four messages")
+        fields = {"account": "whatsapp-main", "n": "1", "sender": WA_CHAT, "sender_alt": "123@lid"}
+        want = [(dict(fields, message="WAPIC1", name="photo.jpg", mime="image/jpeg"), jpeg),
+                (dict(fields, message="WAPIC2", name="voice.ogg", mime="audio/ogg"), ogg),
+                (dict(fields, message="WAPIC3", name="Invoice-October.pdf", mime="application/pdf"), pdf),
+                (dict(fields, message="WAPIC4", name="video.mp4", mime="video/mp4"), mp4)]
+        self.assertEqual([(f, data) for f, data, _ in self.hub.uploads], want)
+        self.assertEqual([f for f, _, _ in self.hub.checks], [f for f, _ in want])
+        self.assertEqual(self.calls_in_order(), ["/bridge/files?check", "/bridge/files", "/bridge/inbound"] * 4)
+        self.assertEqual([(e["id"], e["kind"], e["text"]) for e in self.hub.inbound],
+                         [(f"WAPIC{n}", k, t) for n, (k, t) in enumerate(zip(kinds, words), 1)])
+        self.assertEqual([sorted(set(e) & {"media", "media_more", "missed"}) for e in self.hub.posted], [[]] * 4)
+        downloads = self.commands("download")
+        self.assertEqual([d["media"] for d in downloads], specs, "wa-link gets its own description back")
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{32}", d["id"]) and 0 < d["seconds"] <= 60 for d in downloads))
+        self.assertEqual(os.listdir(os.path.join(self.folder, "inbox")), [])
+        self.assertEqual((self.bridge.files_seen, self.bridge.file_held), ({}, None))
+
+    def test_a_groups_an_own_and_a_strangers_media_is_never_downloaded(self):
+        """The rule of the design: no byte of a sender whose message the hub would not store is fetched. A group's
+        message and the number's own bring no `media` into the journal, so the hub is not even asked, and a stranger's
+        gets the hub's 403 to its question: wa-link downloads nothing. Each message still goes on."""
+        self.linked()
+        self.wa.media("pic.enc", b"\xff\xd8\xff")
+        spec = self.wa_media("pic.enc", "image", "image/jpeg", 3)
+        self.hub.check_answers = [(403, {"code": "not_welcome", "error": "not taken"})]
+        stranger = "34600000777@s.whatsapp.net"
+        self.inject(self.message("WAGRP1", "image", "", spec, group=True, chat="120363000000000000@g.us"))
+        self.inject(self.message("WAMINE1", "image", "", spec, from_me=True))
+        self.inject(self.message("WASTR1", "image", "", spec, chat=stranger, sender=stranger, sender_alt=None))
+        self.wait_for(lambda: len(self.hub.posted) == 3 and not self.journal_files(), "the three messages")
+        self.assertEqual([(e["id"], e.get("missed")) for e in self.hub.posted],
+                         [("WAGRP1", None), ("WAMINE1", None), ("WASTR1", ["refused"])])
+        self.assertEqual([f["message"] for f, _, _ in self.hub.checks], ["WASTR1"])
+        self.assertEqual((self.commands("download"), self.hub.uploads), ([], []))
+
+    def an_older_wa_link_misses(self, env):
+        """A message with a picture to a wa-link of an older source, which ignores the download command."""
+        with patch.dict(os.environ, env):
+            self.linked()
+            self.wa.media("pic.enc", b"\xff\xd8\xff")
+            at = time.monotonic()
+            self.inject(self.message("WAOLD1", "image", "", self.wa_media("pic.enc", "image", "image/jpeg", 3)))
+            event = self.wait_for(lambda: self.hub.inbound, "the message")[0]
+        self.assertEqual(event.get("missed"), ["download"])
+        self.assertLess(time.monotonic() - at, 3, "a wa-link that cannot download held the message")
+        self.assertEqual((self.commands("download"), self.hub.uploads), ([], []))
+
+    def test_a_wa_link_whose_hello_lacks_download_gets_no_command(self):
+        """A wa-link of an older source runs when a build of this one fails: its hello says "file" and not
+        "download", so each file of its messages is `download` at once, with no command and no wait."""
+        self.an_older_wa_link_misses({"WA_STUB_NO_DOWNLOAD": "1"})
+
+    def test_a_wa_link_that_says_no_hello_gets_no_command(self):
+        """A wa-link from before hello: its first line is a state, and it gets no download command either."""
+        self.an_older_wa_link_misses({"WA_STUB_OLD": "1"})
+
+    def test_a_download_that_fails_is_too_large_or_late_is_missed_and_leaves_no_file(self):
+        """wa-link's answers: a failure is `download`, a file above 25 MiB `size`; a size above 25 MiB that the
+        message gives is `size` with no question and no download; no answer in the file's time is `download`, and a
+        file that wa-link wrote after it goes. The bridge logs none of wa-link's words, which can hold an address."""
+        limits = patch.multiple(channels, FILE_FETCH_TIMEOUT=0.5, WA_ANSWER_SLACK=0.2)
+        limits.start()
+        self.addCleanup(limits.stop)
+        self.linked()
+        self.wa.media("slow", b"\xff\xd8\xff late")
+        self.private += ["STUB-WORDS", "mmg.whatsapp.net"]
+        for mid, part, size in (("WAF1", "fail", 10), ("WAF2", "large", 10), ("WAF3", "big", channels.FILE_MOST + 1),
+                                ("WAF4", "silent", 10), ("WAF5", "slow", 10)):
+            self.inject(self.message(mid, "image", "", self.wa_media(part, "image", "image/jpeg", size)))
+        self.wait_for(lambda: len(self.hub.inbound) == 5, "five messages", timeout=10)
+        self.assertEqual([e.get("missed") for e in self.hub.inbound],
+                         [["download"], ["size"], ["size"], ["download"], ["download"]])
+        self.assertEqual([f["message"] for f, _, _ in self.hub.checks], ["WAF1", "WAF2", "WAF4", "WAF5"])
+        self.assertEqual((len(self.commands("download")), self.hub.uploads), (4, []))
+        late = self.commands("download")[-1]["id"]
+        self.wait_for(lambda: [c for c in self.commands("wrote") if c["id"] == late], "the late file", timeout=5)
+        inbox = os.path.join(self.folder, "inbox")
+        self.wait_for(lambda: not os.listdir(inbox), "an inbox without the late file")
+
+    def test_a_file_that_a_restart_left_waits_for_wa_link_to_link(self):
+        """At a start the journal replays before wa-link said its first line and before the number is linked: the
+        file waits for both, in its time, and is not missed."""
+        jpeg = b"\xff\xd8\xff\xe0 left by a restart"
+        self.wa.media("left.enc", jpeg)
+        spec = self.wa_media("left.enc", "image", "image/jpeg", len(jpeg))
+        event = self.message("WALEFT1", "image", "", spec)
+        del event["ev"], event["push_name"], event["media"]
+        channels.Journal(self.journal).write(dict(event, account="whatsapp-main", sender_name="Alex", bot=False,
+                                                  media=[{"wa": spec, "name": "photo.jpg", "mime": "image/jpeg",
+                                                          "size": len(jpeg)}]))
+        with patch.dict(os.environ, {"WA_STUB_LINK_DELAY": "0.5"}):
+            self.link_db()
+            self.start()
+            got = self.wait_for(lambda: self.hub.inbound, "the message")[0]
+        self.assertEqual((got["id"], got.get("missed")), ("WALEFT1", None))
+        self.assertEqual([data for _, data, _ in self.hub.uploads], [jpeg])
+
+    def test_a_wa_link_that_stops_during_a_download_gets_one_more_try(self):
+        """A wa-link that stops in the middle of a download starts again: the file gets one more try in its time."""
+        self.linked()
+        jpeg = b"\xff\xd8\xff\xe0 after a crash"
+        self.wa.media("crash-once", jpeg)
+        self.inject(self.message("WACRASH1", "image", "", self.wa_media("crash-once", "image", "image/jpeg", 9)))
+        got = self.wait_for(lambda: self.hub.inbound, "the message", timeout=10)[0]
+        self.assertEqual((got.get("missed"), [data for _, data, _ in self.hub.uploads]), (None, [jpeg]))
+        self.assertEqual(len(self.commands("download")), 2)
+
+    def test_a_wa_link_that_does_not_link_holds_the_journal_once_and_not_for_each_file(self):
+        """A number that does not link (WhatsApp is down for it, or its wa-link is still being built): the first file
+        waits WA_READY_GRACE since the number was last linked, and each file after it is `download` at once, so the
+        messages behind them wait once and not a minute for each file."""
+        grace = patch.object(channels, "WA_READY_GRACE", 0.5)
+        grace.start()
+        self.addCleanup(grace.stop)
+        with patch.dict(os.environ, {"WA_STUB_LINK_DELAY": "30"}):
+            self.link_db()
+            self.start()
+            self.wait_for(lambda: self.commands("start"), "wa-link")
+            self.wa.media("pic.enc", b"\xff\xd8\xff")
+            at = time.monotonic()
+            for mid in ("WAWAIT1", "WAWAIT2", "WAWAIT3"):
+                self.inject(self.message(mid, "image", "", self.wa_media("pic.enc", "image", "image/jpeg", 3)))
+            self.wait_for(lambda: len(self.hub.inbound) == 3, "the three messages", timeout=10)
+        self.assertLess(time.monotonic() - at, 4, "each file waited for the link")
+        self.assertEqual([e.get("missed") for e in self.hub.inbound], [["download"]] * 3)
+        self.assertEqual(self.commands("download"), [])
+
+    def test_a_file_that_wa_link_writes_after_the_bridge_stopped_waiting_goes_when_it_stops(self):
+        """A download that ends after the bridge stopped waiting for it, by a wa-link that then stops before it
+        answers: its file goes when wa-link stops, and does not wait in the inbox for the bridge's next start."""
+        limits = patch.multiple(channels, FILE_FETCH_TIMEOUT=0.5, WA_ANSWER_SLACK=0.2)
+        limits.start()
+        self.addCleanup(limits.stop)
+        self.linked()
+        self.wa.media("slow-crash", b"\xff\xd8\xff written late")
+        self.inject(self.message("WALATE1", "image", "", self.wa_media("slow-crash", "image", "image/jpeg", 20)))
+        got = self.wait_for(lambda: self.hub.inbound, "the message")[0]
+        self.assertEqual(got.get("missed"), ["download"])
+        rid = self.commands("download")[0]["id"]
+        self.wait_for(lambda: [c for c in self.commands("wrote") if c["id"] == rid], "the late file", timeout=5)
+        inbox = os.path.join(self.folder, "inbox")
+        self.wait_for(lambda: not os.listdir(inbox), "an inbox without the late file")
+
+    def test_wa_links_words_reach_the_hub_with_no_address(self):
+        """A wa-link of an older source (it runs when a build fails) put the URL of a media request into an upload's
+        error, with the media connection's auth: the bridge passes no web address of wa-link's words to the hub, which
+        shows them in the owner's apps, neither a send's error nor a state's."""
+        self.linked()
+        self.private.append("AUTH-VALUE")
+        self.hub.queue({"id": 45, "kind": "message", "account": "whatsapp-main", "chat": WA_CHAT, "text": "URLERR",
+                        "reply_to": None, "prefix": None})
+        self.assertEqual(self.result(45), {"state": "failed", "parts": 0, "platform_ids": [],
+                                           "error": 'not sent: Post "<address> EOF'})
+        self.inject({"ev": "state", "state": "error", "jid": WA_JID,
+                     "error": "connect failure 403 https://www.whatsapp.com/x?token=AUTH-VALUE"})
+        state = self.wait_for(lambda: [s for s in self.states("whatsapp-main") if s["state"] == "error"], "the error")
+        link = self.wait_for(lambda: [k for k in self.hub.links if k["state"] == "error"], "the link's error")
+        self.assertEqual((state[-1]["error"], link[-1]["error"]), ("connect failure 403 <address>",) * 2)
 
     def test_read_typing_and_unlink_items(self):
         self.linked()
@@ -1860,7 +2125,7 @@ class RealHub(test_ui_api.OwnerAPI):
         super().tearDown()
         logs = self.log.getvalue()
         for text in (TOKEN, "How is the scrape going? rh1", "On it, rh2", "LINK-CODE", "What does this error say? rh3",
-                     "screenshot.png", "/attachments/700/"):
+                     "screenshot.png", "/attachments/700/", "What does this error say? rh5", "/v/t62.7118-24/"):
             self.assertNotIn(text, logs)
         self.assertNotIn(read(os.path.join(self.folder, "bridge.key")).strip(), logs)
 
@@ -1968,6 +2233,41 @@ class RealHub(test_ui_api.OwnerAPI):
         self.assertEqual((fleet_hub.attachment_bytes(row), row["message"]), (png, req["request_id"]))
         self.assertEqual([path.partition("?")[0] for path, _, _ in cdn.requests],
                          ["/attachments/700/21/screenshot.png"])
+
+    def test_a_whatsapp_picture_reaches_the_agent_and_a_strangers_is_never_fetched(self):
+        """CHAT-APPS.md 8.1 against the real hub: the owner's WhatsApp picture with words goes up after the hub's yes
+        to the bridge's question, and the agent's event names it as A-<id>, whose bytes on the hub are the picture's;
+        a stranger's picture gets the hub's no, and wa-link downloads nothing of it."""
+        wait_for(self, lambda: self.accounts()["whatsapp-main"]["state"] == "connected", "WhatsApp connected")
+        fleet_hub.q("INSERT INTO owner_handles(app,id,alias,name,linked) VALUES('whatsapp',?,NULL,'owner',?)",
+                    (WA_CHAT, fleet_hub.now()))
+        jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + bytes(range(64))
+        with open(os.path.join(self.wa.folder, "media", "rh.enc"), "wb") as f:
+            f.write(jpeg)
+        spec = {"kind": "image", "mime": "image/jpeg", "size": len(jpeg), "name": "",
+                "direct_path": "/v/t62.7118-24/rh.enc?ccb=11-4", "media_key": base64.b64encode(bytes(32)).decode(),
+                "file_sha256": base64.b64encode(bytes(32)).decode(),
+                "file_enc_sha256": base64.b64encode(bytes(32)).decode()}
+        # WhatsApp's own shape: the sender by its hidden ID, the owner's handle by the phone number, its other ID
+        for mid, sender, alt in (("WARH1", "123456789012345@lid", WA_CHAT),
+                                 ("WARH2", "987654321098765@lid", "34600000777@s.whatsapp.net")):
+            self.wa.inject({"ev": "message", "id": mid, "chat": sender, "sender": sender, "sender_alt": alt,
+                            "push_name": "Alex", "group": False, "from_me": False, "kind": "image",
+                            "text": "What does this error say? rh5", "ts": time.time(), "media": spec})
+        req = wait_for(self, lambda: fleet_hub.q1("SELECT * FROM ui_requests WHERE client=? AND origin LIKE ?",
+                                                  ("fleet-channels/1/whatsapp-main", '%"WARH1"%')),
+                       "the owner's message at the hub")
+        wait_for(self, lambda: fleet_hub.q1("SELECT 1 FROM chat_in WHERE account='whatsapp-main' AND msg_id='WARH2'"),
+                 "the stranger's message at the hub")
+        text, error = fleet_hub.call_tool("manager", "read_messages", {}, CHAT_CONTEXT)
+        self.assertFalse(error, text)
+        self.assertIn("What does this error say? rh5", text)
+        aid = int(re.search(r"A-(\d+) photo\.jpg \(image/jpeg", text).group(1))
+        row = fleet_hub.q1("SELECT * FROM attachments WHERE id=?", (aid,))
+        self.assertEqual((fleet_hub.attachment_bytes(row), row["message"]), (jpeg, req["request_id"]))
+        self.assertEqual(len(self.wa.commands("download")), 1, "a download of the stranger's picture")
+        self.assertEqual(fleet_hub.q1("SELECT COUNT(*) AS n FROM attachments WHERE client=?",
+                                      ("fleet-channels/1/whatsapp-main",))["n"], 1)
 
     def test_an_agents_file_goes_through_the_hubs_queue_and_the_bridge(self):
         """CHAT-APPS.md 20, the done-when of the owner's yes of 15 November 2026: the manager sends a PDF up with

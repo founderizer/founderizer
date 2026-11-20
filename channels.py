@@ -24,6 +24,7 @@ import shutil
 import signal
 import socket
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -34,6 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 KIT = os.path.dirname(os.path.abspath(__file__))
 CHAT_DIR = os.path.expanduser("~/.fleet/chat-apps")
@@ -49,6 +51,7 @@ DISCORD_LIMIT, WHATSAPP_LIMIT, MOST_PARTS = 2000, 4000, 4
 WA_CAPTION = 1024           # WhatsApp: a text this short is the caption of a message's first file (CHAT-APPS.md 20)
 FILE_MOST = 25 << 20        # bytes of one file of a message: the hub's own limit (hub.CHAT_FILE_MAX)
 OUTBOX = "outbox"           # beside the sessions: the files of the messages that are being sent, mode 600
+INBOX = "inbox"             # beside the sessions: the files that wa-link downloaded for the bridge, mode 600
 # The files that a person's or the owner's message brings (the design "Files from chat apps to agents", version 2, of
 # 20 November 2026, and the owner's words of that day: "does it accept multiple files, images etc? it should"): the
 # bridge uploads each file of a message, of any type, to POST /bridge/files before the message's own POST
@@ -98,6 +101,13 @@ TELEGRAM_FILES = (("animation", "animation.mp4"), ("video", "video.mp4"), ("vide
 MEDIA_EXTENSIONS = {".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg", ".mp3": "audio/mpeg",
                     ".m4a": "audio/mp4", ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
                     ".tgs": "application/x-tgsticker", ".heic": "image/heic"}
+MEDIA_TYPES = {}            # the extension of each of those types: its first one
+for _ext, _mime in MEDIA_EXTENSIONS.items():
+    MEDIA_TYPES.setdefault(_mime, _ext)
+# WhatsApp (CHAT-APPS.md 8.1): the name of a file that comes with none, by the kind that wa-link gives its media, before
+# the extension of its type. A document has its own name.
+WA_NAMES = {"image": "photo", "voice": "voice", "audio": "audio", "video": "video", "sticker": "sticker",
+            "document": "file"}
 
 # Timings in seconds. The tests make them short.
 OUT_WAIT = 25               # the /bridge/out long poll
@@ -116,6 +126,9 @@ WA_SEND_TIMEOUT = 25        # WhatsApp: wait this long for wa-link's "sent" even
 WA_STABLE = 60              # a wa-link that ran this long starts its backoff again
 WA_LOGOUT_WAIT = 5          # WhatsApp: wait this long for wa-link to end the phone's link of a number that left the fleet
 WA_FILE_TIMEOUT = 120       # WhatsApp: wait this long for wa-link's "sent" of a file part (its upload and its send)
+WA_READY_GRACE = 60         # WhatsApp: a file waits for a wa-link that starts at most this long after the number was
+                            # last linked, so that a wa-link that is built holds the journal once and not for each file
+WA_ANSWER_SLACK = 5         # WhatsApp: a download's answer may come this long after the time that its command gave
 CODE_CHECK = 60             # how often the bridge looks whether a release changed its own code
 FILE_FETCH_TIMEOUT = 60     # seconds of one file's download from its chat app, in all: no account waits long behind it
 FILE_UPLOAD_TIMEOUT = 120   # seconds of one file's upload to the hub, which checks its bytes before it answers
@@ -530,6 +543,25 @@ def with_media(event, files):
         if len(files) > FILES_IN:
             event["media_more"] = len(files) - FILES_IN
     return event
+
+
+WEB_ADDRESS = re.compile(r"(?i)\b(?:https?|wss?)://\S*")
+
+
+def wa_words(text):
+    """wa-link's words (an error of a send, of a state, of a link) as they go to the hub and the owner's apps: each web
+    address replaced by <address>. A wa-link of this source does it itself; one of an older source, which runs when a
+    build fails, put the URL of a media request into an upload's error, with the media connection's auth."""
+    return WEB_ADDRESS.sub("<address>", str(text))
+
+
+def wa_file_name(kind, mime):
+    """The name of a WhatsApp file that comes with none (all but a document): its kind's word (WA_NAMES) and the
+    extension of its type, the hub's own first (FILE_TYPES), then the bridge's table, then Python's own."""
+    mime = str(mime or "").split(";", 1)[0].strip().lower()
+    ext = FILE_TYPES.get(mime) or MEDIA_TYPES.get(mime) or \
+        (PYTHON_TYPES.guess_extension(mime) if MIME_TOKEN.fullmatch(mime) else None) or ""
+    return WA_NAMES.get(kind, "file") + ext
 
 
 class Hub:
@@ -1635,7 +1667,13 @@ class WhatsApp(Account):
         self.waiting = {}           # message ID -> [Event, the "sent" event or None]
         self.wa_state = None
         self.link_state = None
-        self.features = set()       # what the running wa-link said it can do (its hello): "file" for a file
+        # what the running wa-link said it can do (its hello): "file" for a file of a send, "download" for a file of a
+        # message; None until its first line, and an empty set for one of an older source, which says no hello
+        self.features = None
+        self.fetching = {}          # download ID -> [Event, the "downloaded" event or None]
+        self.abandoned = set()      # download IDs whose answer the bridge stopped waiting for: their file goes later
+        self.start_failed = False   # the last try to start wa-link failed (no program, a build, the start): no wait
+        self.unready_since = time.monotonic()   # since when the number is not linked; None while it is
         # A link request while no wa-link runs (it is built, or it starts again): the pair goes at wa-link's first
         # state, and the next try to start it does not wait. Both under plock.
         self.pair_wanted = False
@@ -1702,6 +1740,7 @@ class WhatsApp(Account):
 
     def cannot_start(self, reason):
         """No wa-link runs: the account's error, and the link request's too, when one waits."""
+        self.start_failed = True
         self.set_state("error", reason)
         with self.plock:
             wanted, self.pair_wanted = self.pair_wanted, False
@@ -1740,7 +1779,8 @@ class WhatsApp(Account):
                 continue
             with self.plock:
                 self.proc = proc
-                self.features = set()           # until its hello: a wa-link of an older source says none
+                self.features = None            # until its first line: a hello, or none from an older source
+                self.start_failed = False
             if self.stopping.is_set():
                 self.halt()
             log(f"whatsapp {self.id}: wa-link started (pid {proc.pid})")
@@ -1765,8 +1805,14 @@ class WhatsApp(Account):
                 except OSError:
                     pass
             self.wa_state = None
-            for waiter in list(self.waiting.values()):      # its sends have no confirmation now
+            if self.unready_since is None:
+                self.unready_since = time.monotonic()
+            for waiter in list(self.waiting.values()) + list(self.fetching.values()):   # no answer comes now
                 waiter[0].set()
+            for rid in list(self.abandoned):    # a file that it wrote after the bridge stopped waiting, and no answer
+                self.abandoned.discard(rid)
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(self.bridge.inbox_dir, rid))
             if self.stopping.is_set():
                 return
             log(f"whatsapp {self.id}: wa-link stopped (exit {code})")
@@ -1803,13 +1849,26 @@ class WhatsApp(Account):
         kind = event.get("ev")
         if kind == "hello":
             self.features = {str(f) for f in event.get("features") or [] if isinstance(f, str)}
-        elif kind == "message":
+            return
+        if self.features is None:       # the first line of a wa-link that says no hello: an older one, which can do neither
+            self.features = set()
+        if kind == "message":
             self.on_message(event)
         elif kind == "sent":
             waiter = self.waiting.get(str(event.get("id") or ""))
             if waiter:
                 waiter[1] = event
                 waiter[0].set()
+        elif kind == "downloaded":
+            rid = str(event.get("id") or "")
+            waiter = self.fetching.get(rid)
+            if waiter:
+                waiter[1] = event
+                waiter[0].set()
+            elif re.fullmatch(r"[0-9a-f]{32}", rid):    # it came after the bridge stopped waiting: its file goes
+                self.abandoned.discard(rid)
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(self.bridge.inbox_dir, rid))
         elif kind == "state":
             self.on_state(event)
         elif kind == "qr":
@@ -1824,7 +1883,12 @@ class WhatsApp(Account):
 
     def on_state(self, event):
         state, jid, error = event.get("state"), event.get("jid") or None, event.get("error") or None
+        error = wa_words(error) if error else None
         self.wa_state = state
+        if state == "linked":
+            self.unready_since = None
+        elif self.unready_since is None:
+            self.unready_since = time.monotonic()
         if jid:
             self.user = str(jid)
             self.name = re.split(r"[:@.]", self.user)[0] or None
@@ -1846,18 +1910,104 @@ class WhatsApp(Account):
                                             "error": error[:300] if error else None})
 
     def on_message(self, event):
+        """A message goes to the journal, and its ack to wa-link after the write. The media of a direct message from
+        another person (a picture, a voice note, a sound, a video, a document or a sticker: WhatsApp brings one a
+        message) goes as `media`: its name (a document's own, else wa_file_name's), type and size, and `wa`, wa-link's
+        own description of it (its direct path, key and hashes), which only wa-link reads, when the bridge asks it for
+        the file after the hub's welcome (fetch_media). The post to the hub carries none of it. A group's message and
+        the number's own get no `media`: the hub takes no file of them, and its question cannot tell a group's sender."""
         mid = str(event.get("id") or "")
         if not mid:
             return
-        ok = self.bridge.inbound({"account": self.id, "id": mid, "chat": str(event.get("chat") or ""),
-                                  "group": bool(event.get("group")), "sender": str(event.get("sender") or ""),
-                                  "sender_alt": event.get("sender_alt") or None,
-                                  "sender_name": event.get("push_name") or None, "bot": False,
-                                  "from_me": bool(event.get("from_me")), "kind": event.get("kind") or "other",
-                                  "text": str(event.get("text") or ""), "ts": number(event.get("ts"),
-                                                                                       default=time.time())})
+        group, mine, spec = bool(event.get("group")), bool(event.get("from_me")), event.get("media")
+        files = [media(spec.get("name") or wa_file_name(spec.get("kind"), spec.get("mime")), spec.get("mime"),
+                       spec.get("size"), wa=spec)] if isinstance(spec, dict) and not group and not mine else []
+        ok = self.bridge.inbound(with_media({
+            "account": self.id, "id": mid, "chat": str(event.get("chat") or ""), "group": group,
+            "sender": str(event.get("sender") or ""), "sender_alt": event.get("sender_alt") or None,
+            "sender_name": event.get("push_name") or None, "bot": False, "from_me": mine,
+            "kind": event.get("kind") or "other", "text": str(event.get("text") or ""),
+            "ts": number(event.get("ts"), default=time.time())}, files))
         if ok:      # the ack goes only after the journal write: then whatsmeow confirms the message to WhatsApp
             self.command({"op": "ack", "id": mid})
+
+    def fetch_media(self, f, timeout):
+        """The bytes of a file of a WhatsApp message (CHAT-APPS.md 8.1), which files_up asks for only after the hub
+        took the message's sender: wa-link downloads it into the inbox folder on a command (its media's description,
+        `wa`, and the time that is left), and the bridge reads it from there and removes it. A file that is larger than
+        25 MiB is `size`, any other failure `download`. The file's `timeout` covers the wait for a wa-link that starts
+        (ready_to_fetch); a wa-link that stops during a download gets one more try in the time that is left. No log
+        line holds wa-link's words: a program that FLEET_WA_LINK names could write anything there."""
+        spec = f.get("wa")
+        if not isinstance(spec, dict):
+            raise Missed("download", "no description of the media")
+        end = time.monotonic() + timeout
+        for _ in range(2):
+            self.ready_to_fetch(end)
+            rid = uuid.uuid4().hex
+            path = os.path.join(self.bridge.inbox_dir, rid)
+            waiter = self.fetching[rid] = [threading.Event(), None]
+            try:
+                if self.command({"op": "download", "id": rid, "media": spec,
+                                 "seconds": max(1.0, round(end - time.monotonic(), 1))}):
+                    while not waiter[0].wait(0.05):
+                        if self.stopping.is_set():
+                            raise Missed("download", "the account stops")
+                        if time.monotonic() > end + WA_ANSWER_SLACK:
+                            self.abandoned.add(rid)     # its file, if it comes, goes at its answer or at the exit
+                            raise Missed("download", f"wa-link did not answer in {timeout:g} s")
+                answer = waiter[1]
+                if answer is None:      # wa-link stopped: the next try waits for it to start again
+                    continue
+                if not answer.get("ok"):
+                    raise Missed("size" if answer.get("too_large") is True else "download", "wa-link did not fetch it")
+                return self.inbox_file(path, answer.get("size"))
+            finally:
+                self.fetching.pop(rid, None)
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+        raise Missed("download", "wa-link stopped during the download")
+
+    def ready_to_fetch(self, end):
+        """Waits until wa-link can download a file: it runs, its first line came, and the number is linked. Raises
+        Missed (`download`) at once when it cannot (its hello lacks "download", or it said none; the number is logged
+        out; its last start failed), and when the wait passes `end`, or WA_READY_GRACE after the number was last
+        linked: so a wa-link that is built, or that cannot connect, holds the journal once, and not for each file."""
+        while True:
+            if self.stopping.is_set():
+                raise Missed("download", "the account stops")
+            with self.plock:
+                running = self.proc is not None and self.proc.poll() is None
+            features = self.features
+            if running and features is not None:
+                if "download" not in features:
+                    raise Missed("download", "the wa-link on the hub machine is too old to fetch a file")
+                if self.wa_state == "linked":
+                    return
+                if self.wa_state == "logged_out":
+                    raise Missed("download", "the number is not linked")
+            elif not running and self.start_failed:
+                raise Missed("download", "wa-link does not run")
+            now, since = time.monotonic(), self.unready_since
+            if now >= end or (since is not None and now - since >= WA_READY_GRACE):
+                raise Missed("download", "wa-link was not ready in time")
+            self.stopping.wait(0.05)
+
+    def inbox_file(self, path, size):
+        """The bytes of a download that wa-link said came: a regular file, never through a link, of the size that it
+        said, of at most FILE_MOST bytes."""
+        if not isinstance(size, int) or isinstance(size, bool) or not 0 <= size <= FILE_MOST:
+            raise Missed("download", "wa-link gave no size")
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as e:
+            raise Missed("download", type(e).__name__) from None
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            data = fh.read(FILE_MOST + 1) if stat.S_ISREG(st.st_mode) and st.st_size == size else None
+        if data is None or len(data) != size:
+            raise Missed("download", "the file in the inbox is not the one that wa-link said")
+        return data
 
     def send(self, item, db):
         if self.wa_state != "linked":
@@ -1866,7 +2016,7 @@ class WhatsApp(Account):
         if item.get("prefix"):
             text = f"*{item['prefix']}:* " + text
         files, paths = item.get("files") or [], []
-        if files and "file" not in self.features:
+        if files and "file" not in (self.features or ()):
             # a wa-link of an older source (its build failed, or FLEET_WA_LINK names one) would send the words alone
             return outcome("failed", [], "The wa-link on the hub machine is too old to send files.")
         try:
@@ -1898,7 +2048,7 @@ class WhatsApp(Account):
                 if not waiter[0].wait(WA_FILE_TIMEOUT if "file" in part else WA_SEND_TIMEOUT) or waiter[1] is None:
                     return outcome("unknown", ids, f"wa-link did not confirm part {n}.")
                 if not waiter[1].get("ok"):
-                    error = str(waiter[1].get("error") or "WhatsApp refused the message.")
+                    error = wa_words(waiter[1].get("error") or "WhatsApp refused the message.")
                     # wa-link: an error that starts with "unknown: " means that the message can have arrived.
                     return outcome("unknown" if error.startswith("unknown: ") else "failed", ids, error)
                 ids.append(mid)
@@ -2309,6 +2459,14 @@ class Bridge:
         for name in os.listdir(self.outbox_dir):
             with contextlib.suppress(OSError):
                 os.remove(os.path.join(self.outbox_dir, name))
+        # CHAT-APPS.md 8.1: the files that wa-link downloads for the bridge, each only after the hub took its sender. A
+        # file stays only until the bridge read it, so what a stop left goes now; inbox beside the sessions is wa-link's.
+        self.inbox_dir = os.path.abspath(os.path.join(folder, INBOX))
+        os.makedirs(self.inbox_dir, mode=0o700, exist_ok=True)
+        os.chmod(self.inbox_dir, 0o700)
+        for name in os.listdir(self.inbox_dir):
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(self.inbox_dir, name))
         self.stopping = threading.Event()
         self.lock = threading.Lock()
         self.accounts = {}
@@ -2452,9 +2610,11 @@ class Bridge:
                                     f"({code or 'no answer'}); kept")
                                 return None
                             raise Missed("refused", f"no answer of the hub in {FILE_TRIES} attempts")
-                        if code in (400, 403, 409):
+                        # only the hub's yes lets a byte of the chat app be fetched: any other answer is no (a
+                        # hub of an older release answers 404, which let a stranger's file be fetched)
+                        if code != 200:
                             raise Missed("refused", f"the hub answered {code}")
-                        refused_all = False     # a yes, or an answer that only the upload's own answer settles
+                        refused_all = False
                     try:
                         data = account.fetch_media(f, FILE_FETCH_TIMEOUT)
                     except Missed:

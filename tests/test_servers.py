@@ -271,6 +271,16 @@ class Servers(OwnerAPI):
         return self.owner(f"/ui/servers/{server}/agents", base_sha256=base or self.team_sha(), agent=agent,
                           runtime=runtime, role=role, reports_to=reports_to)
 
+    @staticmethod
+    def not_given(path):
+        """A patch under which git gives no answer for one file of the configuration ref: git_blob gives None for it,
+        as it does for a read that failed, and kit_batch no answer at all, so that kit_file raises KitUnread. KIT_PATHS
+        starts empty, as on a commit that no batch answered yet, so that no blob of an earlier read stands in."""
+        blob, batch = hub.git_blob, hub.kit_batch
+        return patch.multiple(hub, git_blob=lambda rev, p: None if p == path else blob(rev, p),
+                              kit_batch=lambda folder, rev, paths: {} if path in paths else batch(folder, rev, paths),
+                              KIT_PATHS=hub.collections.OrderedDict())
+
     def helper_reports(self, agent="scout", seen=0.0):
         """That agent's own helper has reached the hub. On a real machine the service step started it one step before
         the sign-in, and it is the process that runs the provider's flow in that agent's own home."""
@@ -827,6 +837,34 @@ class Servers(OwnerAPI):
         self.assertEqual((mini["agents"], mini["available"], mini["why"]),
                          (["scout"], False, ["one_per_mac", "has_agent", "busy"]))
         self.assertEqual(mini["job"]["state"], "queued")
+
+    def test_add_agent_keeps_the_owners_profile_and_waits_while_git_gives_no_answer_for_it(self):
+        """The owner's words for a name stay: Add agent writes the server's default profile only where the
+        configuration ref holds none. While git gives no answer for that profile, the add waits (503 profile_unread)
+        and commits nothing: git_blob gives None for a read that failed as for no file, so the default profile went
+        over the owner's (a finding of the area "Hub core", 20 November 2026)."""
+        self.joined()
+        words = "# Profile: scout\n\nThe owner's own words for scout."
+        (self.kit / "profiles").mkdir(exist_ok=True)
+        (self.kit / "profiles" / "scout.md").write_text(words + "\n")
+        git("add", "profiles/scout.md", cwd=self.kit)
+        git("commit", "-q", "-m", "the owner wrote scout's profile", cwd=self.kit)
+        git("push", "-q", "origin", "HEAD", cwd=self.kit)
+        hub._revision_cache.update(at=0.0, value=None)
+        before = git("--git-dir", str(self.root / "origin.git"), "rev-parse", "main")
+        jobs = [r["id"] for r in hub.q("SELECT id FROM server_jobs")]
+        with self.not_given("profiles/scout.md"):
+            status, answer = self.add_agent()
+        self.assertEqual((status, answer.get("code"), answer.get("names")),
+                         (503, "profile_unread", {"agent": hub.shown_name("scout")}), answer)
+        self.assertEqual(git("--git-dir", str(self.root / "origin.git"), "rev-parse", "main"), before)
+        self.assertEqual(("scout" in hub.agents(), [r["id"] for r in hub.q("SELECT id FROM server_jobs")]),
+                         (False, jobs))
+        status, receipt = self.add_agent()
+        self.assertEqual(status, 200, receipt)
+        files = git("--git-dir", str(self.root / "origin.git"), "diff", "--name-only", before, "main").split()
+        self.assertEqual(files, ["team.json"])
+        self.assertEqual(git("--git-dir", str(self.root / "origin.git"), "show", "main:profiles/scout.md"), words)
 
     def test_the_start_settings_come_from_a_server_of_the_same_kind(self):
         """A fleet that has a worker keeps copying it, with its allow list, from a server of the same kind first (the
