@@ -20,6 +20,7 @@ file holds:
 """
 import http.client
 import json
+import re
 import sqlite3
 import unittest
 from unittest.mock import patch
@@ -250,6 +251,25 @@ class Bound(test_state_read.StateCase):
             self.assertTrue(hub.STATE_KEEP <= len(kept) <= most, len(kept))
         self.assertEqual(json.loads(many)["older_tasks"]["before"], 500)
         self.assertEqual(len(json.loads(whole_many)["tasks"]), 650)
+
+    def test_the_head_of_the_state_holds_the_generation_and_reads_no_list(self):
+        """Owner API 1.256: a program that needs the hub's generation or its features asks for the head of the state
+        (the owner's tools, before their first call). Its answer holds those and none of the state's lists, and the
+        hub reads no row of a list for it: a head that reads the tasks and leaves them out costs each call of the
+        tools the fleet's history again, as the whole read did. Another value of `head` is no such read."""
+        self.fill()
+        lists = re.compile(r"\b(?:FROM|JOIN)\s+(?:tasks|notes|prompts|holds|outcomes|steers|needs|ui_requests|"
+                           r"owner_reports|goals|responsibilities)\b", re.I)
+        whole, read = self.traced(lambda: json.loads(self.body("/ui/state")))
+        self.assertTrue([sql for sql in read if lists.search(sql)], "the trace sees the reads of the lists")
+        for path in ("/ui/state?head=1", "/ui/state?head=1&tasks=window"):
+            head, read = self.traced(lambda: json.loads(self.body(path)))
+            self.assertEqual(sorted(head), ["db", "head", "repository", "schema_version", "time", "token",
+                                            "ui_features"], path)
+            self.assertEqual([head[key] for key in ("db", "ui_features", "repository", "schema_version", "head")],
+                             [whole[key] for key in ("db", "ui_features", "repository", "schema_version")] + [True], path)
+            self.assertEqual([sql for sql in read if lists.search(sql)], [], path)
+        self.assertIn("tasks", json.loads(self.body("/ui/state?head=0")))
 
     def test_a_reader_that_does_not_ask_reads_the_whole_state(self):
         """An app from before this change sends no `tasks`, and a reader may send words that the hub does not know:

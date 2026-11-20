@@ -127,7 +127,7 @@ class FakeSystem:
         if method != "GET":
             self.writes.append((method, url, body))
             return 404, {"error": "unknown"}
-        if url.endswith("/ui/state"):
+        if url.endswith("/ui/state?head=1"):        # the head: the step reads no task for these two values
             return 200, {"db": "g1", "ui_features": self.features}
         if "/ui/team?db=" in url:
             if not url.endswith("?db=g1"):

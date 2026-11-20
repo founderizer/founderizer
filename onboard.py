@@ -640,7 +640,9 @@ class Onboarding:
 
     # ---- hub
     def hub_state(self):
-        code, data = self.sys.http("GET", self.hub + "/ui/state")
+        # the head of the state (owner API 1.256): the generation and the features, and no task; a hub from before
+        # it answers the state, which holds both
+        code, data = self.sys.http("GET", self.hub + "/ui/state?head=1")
         if code != 200:
             raise StepFailed("The hub did not answer /ui/state (%s): %s" % (code, data.get("error", "")))
         return data

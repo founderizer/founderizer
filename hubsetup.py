@@ -3719,9 +3719,9 @@ fi
 i=0
 while [ "$i" -lt 60 ]; do
     if [ -n "$key" ]; then
-        printf 'header = "Authorization: Bearer %s"\\n' "$key" | curl -fsS -m 5 -o /dev/null -K - "{base}/ui/state" && ok=1 || ok=0
+        printf 'header = "Authorization: Bearer %s"\\n' "$key" | curl -fsS -m 5 -o /dev/null -K - "{base}/ui/state?head=1" && ok=1 || ok=0
     else
-        curl -fsS -m 5 -o /dev/null "{base}/ui/state" && ok=1 || ok=0
+        curl -fsS -m 5 -o /dev/null "{base}/ui/state?head=1" && ok=1 || ok=0
     fi
     if [ "$ok" = 1 ]; then
         echo "Founderizer: this Mac reads the hub. Paste this address in Founderizer: {base}"

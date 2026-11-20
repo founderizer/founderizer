@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Founderizer hub.
 
-One small file: tasks, questions, decisions, timers, a board and a practice
-site. Python standard library only. A throwaway test kit, not the product.
+The center of a Founderizer fleet: the fleet's records, the owner's API that the apps read, and
+the agents' tools. It needs only Python's standard library and the other files of this repository.
 
-Run it on the always-on machine:
+Run it on the always-on machine as a module, as its service does:
 
-    python3 hub.py
+    python3 -m hub
 
 It listens on the hub machine's address from team.json ("addresses"). A name is
 accepted only from that agent's own machine, and a name whose machine has no
@@ -63043,6 +63043,18 @@ def save_connect(on):
 # arguments.
 
 
+def state_head(repository):
+    """GET /ui/state?head=1 (owner API 1.256): the head of the state and none of its lists: the generation (`db`), the
+    hub's time, the change token, the features and the repository's address, with `head` true. A program that needs
+    the generation or the features reads this, and no task: the owner's tools read the whole state before their first
+    call for those two values, 8.9 MB on the first fleet on 20 November 2026. The values are of one moment, as the
+    state's are (state_moment), and `repository` is read before it, as there (Handler.ui_state). A hub from before
+    this version reads no such word and gives the state, which holds the same keys: one read serves both."""
+    with state_moment() as (token, at):
+        return {"schema_version": 1, "db": kv_get("db_id"), "time": at, "token": token, "ui_features": ui_features(),
+                "repository": repository, "head": True}
+
+
 def phone_mobile(query):
     """GET /ui/mobile after ui_allowed: (status, answer, headers). The answer carries the change token (live_changes)
     of the moment that its rows are of, for the phone's GET /ui/wait; the ETag in the headers leaves it out, and the
@@ -65585,6 +65597,8 @@ class Handler(BaseHTTPRequestHandler):
         # newest ids, with the rows of the five tables of those tasks, and `older_tasks`, which says where the others
         # are (older_read). Without it, or on a hub whose marks are not in place, every task is in this answer.
         window = OLDER["on"] and self.route()[1].get("tasks") == "window"
+        if self.route()[1].get("head") == "1":      # owner API 1.256: the head alone, and no list (state_head)
+            return self.json(200, scrub(state_head(repository)))
         with state_moment() as (token, at):
             # The rows, the token and the team of one moment (state_moment): LOCK is held for that moment only. A write
             # after it is not in this answer, and it moves the token past this answer's (live_changes).

@@ -84,13 +84,19 @@ READ_MAX = 8 * 1024 * 1024              # the largest answer this server reads f
 # its own, and every other answer that is no file keeps READ_MAX.
 STATE_MAX = 64 * 1024 * 1024
 STATE_ROUTE = "/ui/state"
-# The read of the state that this server makes for itself (the generation, the features, fleet_overview, a claim's
-# end check): with the window of the tasks (owner API 1.254), so that it does not grow with the fleet's history. The
+# The read of the state that this server makes for itself where it reads the state's lists (fleet_overview, and
+# use_hub for the agents' names): with the window of the tasks (owner API 1.254), so that it does not grow with the
+# fleet's history. The read for the generation alone is STATE_HEAD, below. The
 # answer holds the tasks that have not ended and the ended ones of the newest ids, and `older_tasks` says how many
 # more ended. A hub from before 1.254 reads no such word and gives the whole answer. `fleet_read` with the page
 # `state` stays the whole snapshot: it is what the owner's agent asks for by that name.
 STATE_READ = STATE_ROUTE + "?tasks=window"
 OLDER_MOST = 10 ** 9            # a count of older tasks above this, or below 0, is no count: fleet_overview adds 0
+# The read for the hub's generation alone, and for a proof that the hub answers this computer (owner API 1.256): the
+# head of the state, which holds `db`, `ui_features` and no list, so a process of one call reads no task before that
+# call. A hub from before 1.256 does not know `head` and answers the state: with the window of STATE_READ from 1.254
+# on, and whole before. Each of those answers holds `db` too, so the one read serves every hub.
+STATE_HEAD = STATE_ROUTE + "?head=1&tasks=window"
 BACKUP_MAX = 256 * 1024 * 1024          # hub.py BACKUP_MAX: the largest copy the hub serves
 ATTACH_MAX = 25 * 1024 * 1024           # hub.py ATTACH_MAX: the largest file the owner attaches
 # The three tools that move a file (attach_file, read_attachment, take_backup) read up to the hub's own limit of that
@@ -781,7 +787,7 @@ def generation(fresh=False):
     """The hub's generation (`db`), which every read and every command is bound to. A hub that restarted with a new
     database answers 409 to the old one, and this server reads it again once, as the app does on that refusal."""
     if fresh or not GENERATION["db"]:
-        answer = call("GET", STATE_READ)
+        answer = call("GET", STATE_HEAD)
         if answer.status != 200 or not isinstance(answer.data, dict) or not answer.data.get("db"):
             raise refusal(answer, "a read of the fleet")
         GENERATION["db"] = answer.data["db"]
@@ -2272,7 +2278,7 @@ def claim_hub(args):
     waited, reads = time.monotonic() + 300, None
     while time.monotonic() < waited:
         try:
-            reads = call("GET", STATE_READ, base=base, timeout=10)
+            reads = call("GET", STATE_HEAD, base=base, timeout=10)
         except Refused:
             reads = None
         if reads is not None and reads.status == 200:
@@ -2368,7 +2374,7 @@ def which_hub(_args):
     reads = False
     if base:
         try:
-            reads = call("GET", STATE_READ, base=base).status == 200
+            reads = call("GET", STATE_HEAD, base=base).status == 200
         except Refused:
             reads = False
     return {"hub": base, "where": str(HUB_FILE), "client": client_label(), "reads_owner_api": reads,

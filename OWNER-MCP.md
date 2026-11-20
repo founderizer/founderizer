@@ -1123,7 +1123,12 @@ API 1.254 that read, and the one of `fleet_overview`, ask for the window of the 
 and the ended ones of the newest ids, so the answer does not grow with the fleet's history, and
 `fleet_overview` adds the older ended tasks to its count from the answer's `older_tasks`. A hub
 from before 1.254 gives the whole answer. `fleet_read` with the page `state` is still the whole
-snapshot. Both write
+snapshot. Since owner API 1.256 the read of the generation asks for the head of the state
+(`GET /ui/state?head=1&tasks=window`; `STATE_HEAD`, `Transfer.stateHead`), which holds `db`,
+`ui_features` and no list: a process of one call, as `founderizer-cli call`, reads no task before
+that call. A hub from before 1.256 does not know `head` and answers the state, with the window
+from 1.254 on, and each program takes what it keeps from that answer as well: the generation, and
+in the program the features. Both write
 at the path that the agent names: `~` is the home, the folders are made, and a folder takes the
 hub's name of the file. A path with a NUL is refused by each of the three, as the first check on the
 path, before `~` is expanded and before any request: "path cannot hold a NUL character: name a file
@@ -1337,7 +1342,11 @@ spaces that `int()` takes, and the routes and fields that the hub does not know.
 requests, the result or the refusal's words, every file and folder after the call, the setup's too
 (only the lock and each program's label file in `~/.founderizer` are left out, by their names), and
 how many times the sentence of a hub older than the app must stand (the read of the vault's page
-before a give of a secret does not count: a hub with no such page is no refusal there). A
+before a give of a secret does not count: a hub with no such page is no refusal there). In one
+place the two programs read the hub differently, and the script says so (`app_lists`): before an
+answer with a choice of 0 or 1 the program reads the item of the state, to see whether it is a door
+card, where this server reads only the head of the state for the generation (owner API 1.256);
+the fixture of those cases holds the program's read. A
 placeholder stands for each
 local folder and for the hub's address; both programs run on one fixed clock (the fixture's `now`,
 which the Swift test gives to `OwnerContext.now`), so a fallback name of a copy is compared whole.

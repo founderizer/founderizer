@@ -4060,6 +4060,10 @@ def parity_answer(state, req):
         if path == "/ui/backups/confirm":
             return parity_json(200, {"ok": True, "backup": {"sha256": body.get("sha256"), "bytes": body.get("bytes")}})
         return parity_json(200, {"ok": True, "route": path})
+    if path == "/ui/state" and query.get("head") == ["1"]:
+        # Owner API 1.256: the read of the generation and the features asks for the head, which holds no list.
+        head = parity_state(db)
+        return parity_json(200, {"db": db, "time": head["time"], "ui_features": head["ui_features"], "head": True})
     if path == "/ui/state":
         # Owner API 1.254: a read that asks for the window of the tasks gets the ended tasks that it leaves out as a
         # number, which fleet_overview adds to its finished tasks; the whole snapshot (fleet_read state) has none.
@@ -4122,9 +4126,16 @@ def parity_cases():
     shared part and the nine writes. `answer(state, request)` answers a request before the stand-in hub's own."""
     cases = []
 
-    def case(name, tool, arguments=None, answer=None, files=None, folders=(), links=None):
-        """`links`: a symbolic link of the work folder, by its path there, to a path there (made absolute)."""
+    def case(name, tool, arguments=None, answer=None, files=None, folders=(), links=None, app_lists=False):
+        """`links`: a symbolic link of the work folder, by its path there, to a path there (made absolute).
+        `app_lists`: the one place where the two programs read the hub differently. Before an answer with a choice
+        of 0 or 1 the program inside the app reads the item of the state, to see whether it is a door card
+        (`AnswerDoor.press`), and that read gives it the generation too; this server, which hands no press to the
+        app, reads only the head of the state for the generation (owner API 1.256). The fixture of such a case holds
+        the app's read, the state with its lists, and the stand-in hub's answer to it (parity_fixture). Only for a
+        case with no answer of its own: the stand-in's answer to that read is then the same at any moment."""
         cases.append({"name": name, "tool": tool, "arguments": arguments or {}, "answer": answer,
+                      "app_lists": app_lists,
                       "setup": {"files": files or {}, "folders": list(folders), "links": links or {}}})
 
     for t in owner_mcp.dump_tools()["tools"]:
@@ -4176,7 +4187,7 @@ def parity_cases():
          lambda s, r: (502, {"Content-Type": "text/html"}, b"<html>Bad gateway</html>")
          if r["method"] == "POST" else None)
     case("send_message: no text", "send_message", {})
-    case("answer_needs_you: a choice", "answer_needs_you", {"need": 4, "choice": 1})
+    case("answer_needs_you: a choice", "answer_needs_you", {"need": 4, "choice": 1}, app_lists=True)
     case("answer_needs_you: choices", "answer_needs_you", {"need": 4.0, "choices": [0, 2]})
     case("answer_needs_you: words", "answer_needs_you", {"need": "5", "answer": "Yes, but later."})
     # Files go with words or alone, as in the app; beside a choice or choices they are refused before any request, and
@@ -4188,7 +4199,7 @@ def parity_cases():
     case("answer_needs_you: choices with a file", "answer_needs_you",
          {"need": 4, "choices": [0, 2], "attachments": [11]})
     case("answer_needs_you: a choice with an empty list", "answer_needs_you",
-         {"need": 4, "choice": 1, "attachments": []})
+         {"need": 4, "choice": 1, "attachments": []}, app_lists=True)
     # A file id that is no list is a file too (truth, not form), a choice of null is no choice, and the refusal of a
     # file beside a choice comes before the refusal of a need that is no number.
     case("answer_needs_you: a choice with a file id that is no list", "answer_needs_you",
@@ -4801,6 +4812,17 @@ def parity_fixture():
                         patch.object(owner_mcp.time, "time", lambda: float(PARITY_NOW)):
                     text, bad = owner_mcp.call_tool(c["tool"], args)
                 owner_mcp.GENERATION["db"] = None
+                if c["app_lists"]:
+                    # the app's read in place of this server's read of the head, with the hub's answer to it (case())
+                    assert c["answer"] is None, c["name"]
+                    first = hub_.requests[0]
+                    words = first["query"].split("&")
+                    assert first["path"] == owner_mcp.STATE_ROUTE and "head=1" in words, (c["name"], first["query"])
+                    first["query"] = "&".join(word for word in words if word != "head=1")
+                    assert first["path"] + "?" + first["query"] == owner_mcp.STATE_READ, first["query"]
+                    status, headers, data = hub_.answer(0, first)
+                    first["answer"] = (status, {k: v.encode("utf-8").decode("latin-1") for k, v in headers.items()},
+                                       data)
                 answers = []
                 for req in hub_.requests:
                     status, headers, data = req["answer"]
@@ -4823,8 +4845,10 @@ def parity_fixture():
         hub_.close()
     return {"about": "The parity check of owner_mcp.py and the program inside the Founderizer app (OWNER-MCP.md, "
                      "\"The program inside the app\"): each case's arguments, the stand-in hub's answers in order, "
-                     "the requests that owner_mcp.py made and its outcome. The Swift test OwnerParityTests replays "
-                     "it. Remake it with: " + PARITY_REMAKE,
+                     "the requests that owner_mcp.py made and its outcome. In the two cases of an answer with a "
+                     "choice of 0 or 1 the first request is the app's program's read of the state with its lists, "
+                     "where owner_mcp.py reads the head. The Swift test OwnerParityTests replays it. Remake it "
+                     "with: " + PARITY_REMAKE,
             "now": PARITY_NOW, "cases": out}
 
 
@@ -5006,7 +5030,7 @@ class Table(unittest.TestCase):
             return Body(big)
         with patch.object(owner_mcp.OPENER, "open", opened), patch.object(owner_mcp, "HOME", scratch), \
                 patch.object(owner_mcp, "CLIENT_FILE", scratch / "client"):
-            for path in ("/ui/state", "/ui/state?since=7", owner_mcp.STATE_READ):
+            for path in ("/ui/state", "/ui/state?since=7", owner_mcp.STATE_READ, owner_mcp.STATE_HEAD):
                 self.assertEqual(owner_mcp.call("GET", path, base="http://127.0.0.1:9").data["db"], "g1", path)
             with self.assertRaises(owner_mcp.Refused) as caught:
                 owner_mcp.call("GET", "/ui/health", base="http://127.0.0.1:9")
@@ -5085,7 +5109,7 @@ class Table(unittest.TestCase):
 
         def call(method, path, body=None, **_kw):
             held.append((method, (home / "lock").exists() and taken()))
-            data = {"db": "g1"} if path == owner_mcp.STATE_READ else {"ok": True}
+            data = {"db": "g1"} if path == owner_mcp.STATE_HEAD else {"ok": True}
             return owner_mcp.Answer(200, data, b"", {})
         owner_mcp.GENERATION["db"] = None
         with patch.object(owner_mcp, "call", call), patch.object(owner_mcp, "HOME", home):
@@ -5105,7 +5129,7 @@ class Table(unittest.TestCase):
 
         def call(method, path, body=None, **_kw):
             sent.append(method)
-            return owner_mcp.Answer(200, {"db": "g1"} if path == owner_mcp.STATE_READ else {"ok": True}, b"", {})
+            return owner_mcp.Answer(200, {"db": "g1"} if path == owner_mcp.STATE_HEAD else {"ok": True}, b"", {})
         owner_mcp.GENERATION["db"] = None
         with patch.object(owner_mcp, "call", call), patch.object(owner_mcp, "HOME", scratch / ".founderizer"), \
                 patch.object(owner_mcp.fcntl, "flock", flock):
@@ -5130,7 +5154,7 @@ class Table(unittest.TestCase):
                     except BlockingIOError:
                         locked = True
             held.append((method, path.split("?")[0], locked))
-            return owner_mcp.Answer(200, {"db": "g1"} if path == owner_mcp.STATE_READ else {"attachment": 1}, b"", {})
+            return owner_mcp.Answer(200, {"db": "g1"} if path == owner_mcp.STATE_HEAD else {"attachment": 1}, b"", {})
         owner_mcp.GENERATION["db"] = None
         with patch.object(owner_mcp, "call", call), patch.object(owner_mcp, "HOME", home):
             owner_mcp.attach_file({"path": str(scratch / "note.txt")})
@@ -5279,7 +5303,7 @@ class GoogleConnect(unittest.TestCase):
 
         def call(method, path, body=None, timeout=owner_mcp.TIMEOUT, **_kw):
             waits[path], sent[path] = timeout, body
-            if path == owner_mcp.STATE_READ:
+            if path == owner_mcp.STATE_HEAD:
                 return owner_mcp.Answer(200, {"db": "g1"}, b"", {})
             if path == "/ui/google/connect":
                 return owner_mcp.Answer(200, {"url": self.URL, "state": self.STATE, "expires_at": 1,
