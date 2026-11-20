@@ -49337,10 +49337,11 @@ def knowledge_entries():
     apps do not get it (knowledge_public).
 
     A read that fails (git, or its 5 seconds) gives an UnreadCatalog: empty, as before, for each caller to which a
-    failed read and no file are the same (a look that tries again, the app's list), and told apart where an empty list
-    would tell an agent that the file it needs is not there (knowledge_usable, the room check of t_write_knowledge,
-    t_summarize_knowledge). The hub's output names the fault, with no path or words of git's: a read that keeps
-    failing is seen there, and no agent is told that the fleet has no file."""
+    failed read and no file are the same (a look that tries again), and told apart where an empty list would tell an
+    agent or the owner that the file it needs is not there (knowledge_usable, the room check of t_write_knowledge,
+    t_summarize_knowledge, the owner's list and read: knowledge_shown, phone_knowledge). The hub's output names the
+    fault, with no path or words of git's: a read that keeps failing is seen there, and no agent is told that the fleet
+    has no file."""
     global KNOWLEDGE_CACHE
     repo = CFG.get("artifact_repo", os.path.dirname(os.path.abspath(__file__)))
     def git(*args):
@@ -49357,7 +49358,10 @@ def knowledge_entries():
                 continue
             meta, path_bytes = item.split(b"\t", 1)
             mode, kind, oid, size = meta.decode("ascii").split()
-            path = path_bytes.decode("utf-8")
+            try:
+                path = path_bytes.decode("utf-8")
+            except UnicodeError:            # a name that no hub write makes: only this one stays out, as for text
+                continue
             if mode not in ("100644", "100755") or kind != "blob" or not path.endswith(".md") or not path.startswith("knowledge/"):
                 continue
             if CONTROL.search(path) or any(part in ("", ".", "..") for part in path.split("/")):
@@ -49420,6 +49424,18 @@ class KnowledgeUnread(ToolError):
 def knowledge_public(entry):
     """One catalog entry as the owner API gives it: {path, title, scope, bytes, source, commit}, without its blob."""
     return {k: v for k, v in entry.items() if k != "blob"}
+
+
+def knowledge_shown():
+    """The catalog that the owner's apps list (GET /ui/state `knowledge`): knowledge_entries, or, while its read fails
+    (an UnreadCatalog), the catalog that this hub read last, so that the Knowledge page keeps the owner's files and
+    never says that there is none; None when the hub has read none since its start, and the state then has no
+    `knowledge`. A file of that list that cannot be read now is phone_knowledge's 503."""
+    catalog = knowledge_entries()
+    if not isinstance(catalog, UnreadCatalog):
+        return catalog
+    key, last = KNOWLEDGE_CACHE         # one read: another reader can store its own meanwhile
+    return last if key and key[0] == CFG.get("artifact_repo", os.path.dirname(os.path.abspath(__file__))) else None
 
 
 def knowledge_text(entry):
@@ -64833,12 +64849,17 @@ def phone_task(task_id, query):
 
 def phone_knowledge(query):
     """GET /ui/knowledge after ui_allowed: one owner knowledge file with its text (owner feature owner_knowledge).
-    Internal files stay internal."""
+    Internal files stay internal. A read that fails, of the catalog (an UnreadCatalog) or of a listed file's text, is
+    503 knowledge_unread and never the 404 of a file that is not there: the app's list keeps the file while the reads
+    fail (knowledge_shown)."""
     generation = kv_get("db_id")
     if query.get("db") != generation:
         return 409, refusal_words.answer("hub_changed"), None
-    entry = next((k for k in knowledge_entries() if k["path"] == query.get("path") and k["scope"] == "owner"), None)
+    catalog = knowledge_entries()
+    entry = next((k for k in catalog if k["path"] == query.get("path") and k["scope"] == "owner"), None)
     text = knowledge_text(entry) if entry else None
+    if isinstance(catalog, UnreadCatalog) or entry and text is None:
+        return 503, refusal_words.answer("knowledge_unread"), None
     if text is None:
         return 404, {"error": "no such owner knowledge file"}, None
     return 200, dict(scrub(knowledge_public(entry)), db=generation, text=mask_secrets(text)), \
@@ -67423,7 +67444,9 @@ class Handler(BaseHTTPRequestHandler):
             result["older_rows"] = {name: rows_head(name, befores[name], counted[name],
                                                     rows_team(name, team_reads[name], conf, grant_team))
                                     for name in ROW_LISTS}
-        result["knowledge"] = [knowledge_public(k) for k in knowledge_entries()]
+        catalog = knowledge_shown()             # a read that fails lists the catalog that the hub read last
+        if catalog is not None:
+            result["knowledge"] = [knowledge_public(k) for k in catalog]
         # Keys, ciphertext, helper jobs, raw worker queues and runtime configuration are excluded.
         # Also mask old text if a login was registered after that text was stored. scrub makes each dict and list of
         # the answer new, so it can be written in parts (InParts).

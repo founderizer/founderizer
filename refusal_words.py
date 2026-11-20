@@ -56,6 +56,7 @@ WORDS = {
                            "was about, and send the command again with a new request_id if it did not take effect",
     # the hub's own checkout
     "revision_unreadable": "the hub cannot read its own revision",
+    "knowledge_unread": "the knowledge files cannot be read now; try again in a moment",
     # a server and its service
     "server_silent": "{server} sent no reading in the last 10 minutes: check that it is on",
     "server_no_service": "{server} has no server service: it did not join with a join code",

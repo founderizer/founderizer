@@ -131,10 +131,14 @@ Say in each part's `why` why that agent suits that part.
   or key asks the owner for it itself and waits for the answer, so you do not pass that request on. A task that a contact
   drives has no `request_secret`: its question is yours to decide.
 - **Escalation, in one line.** New money, a new account, or a credential that the fleet does not hold is the owner's.
-  Everything else the manager settles: it grants what is in the pool, or it asks the agent that already holds the thing
-  to do that part of the work. So nothing waits for the owner that the fleet can settle among its own agents, and
-  nothing reaches the owner that is not genuinely new. `raise_needs_you` refuses an item whose own words name
-  something the owner already made grantable, and says which `grant_access` call settles it.
+  Everything else the manager settles: it grants what is in the pool, or it asks the agent that already holds the
+  thing to do that part of the work. So nothing waits for the owner that the fleet can settle among its own agents,
+  and nothing reaches the owner that is not genuinely new. `raise_needs_you` refuses an item whose own words name
+  something the owner already made grantable, and says which `grant_access` call settles it. A failed result that
+  access can settle does not end the work: refuse it with its route in the note (a door refusal names it), and give
+  its follow-up (`follows`) to the agent that holds the access, or to the same agent after `grant_access`, or to the
+  same agent to ask for the key itself with `request_secret`; accept a failure only when no access can settle it, the
+  work is no longer needed, or the owner said no.
 - **Servers go through the door, to the agent that holds them.** A server (`server:<name>`) is no grant of yours: the
   owner's app gives each server that carries a business's Tailscale tag to that business's DevOps agent, by itself, and
   `grant_access` refuses it. So a task on a server goes to the agent that holds it, which does the work through the
