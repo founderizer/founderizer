@@ -479,6 +479,30 @@ class Unit(unittest.TestCase):
         self.assertEqual(lifecycle.hub_start("python3"), ["python3", "-m", "hub"])
         self.assertNotIn("hub.py", self.unit())
 
+    def test_a_hub_that_runs_as_a_module_holds_one_copy_of_itself_and_of_hubsetup(self):
+        """The service runs `python3 -m hub`, where hub.py is `__main__`, and hubsetup.py imports `hub` at its top:
+        with no `hub` of its own in sys.modules that import loaded hub.py a second time, with its own TEAM, DB and
+        LOCK, at hubsetup's first import, which could come after a release had moved the kit (the finding of the area
+        "Door and security", 20 November 2026). Now hubsetup comes at the hub's start from the same folder, and its
+        `hub` is the module that runs. `--start-check` runs main() and stops before the hub serves."""
+        script = ("import runpy, sys\n"
+                  "sys.argv = ['hub', '--start-check']\n"
+                  "try:\n"
+                  "    runpy.run_module('hub', run_name='__main__', alter_sys=True)\n"
+                  "except SystemExit:\n"
+                  "    pass\n"
+                  "loaded = 'hubsetup' in sys.modules\n"
+                  "import hubsetup\n"
+                  "print(sys.modules['hub'].__name__, hubsetup.hub is sys.modules['hub'], loaded)\n")
+        done = subprocess.run([sys.executable, "-c", script], cwd=str(ROOT), capture_output=True, text=True,
+                              timeout=180)
+        self.assertEqual(done.stdout.split()[-3:], ["__main__", "True", "True"], done.stdout + done.stderr)
+        # A runner that keeps its own module as `__main__` (a profiler, a tracer: runpy with no alter_sys) still
+        # starts the hub: the name `hub` goes only to the module whose globals hub.py's code has.
+        done = subprocess.run([sys.executable, "-c", script.replace(", alter_sys=True", "")], cwd=str(ROOT),
+                              capture_output=True, text=True, timeout=180)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
     def test_the_hub_keeps_running_when_the_system_ends_one_of_its_processes(self):
         """OOMPolicy=continue, in [Service], for the hub alone: by systemd's default (stop) the whole service stops
         when the system ends one process of it for lack of memory, and the checks of a release are such processes."""

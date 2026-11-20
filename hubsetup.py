@@ -115,10 +115,16 @@ import urllib.error
 import urllib.request
 import zoneinfo
 
-import hub
-import lifecycle
-import onboard
-import releases
+# One copy of this file in a process: hub.py imports this module at its end, and while this file runs as a program
+# (`python3 hubsetup.py ...`, where it is `__main__`) that import gets it under this name, as hub.py does for itself.
+_running = sys.modules.get(__name__)
+if _running is not None and vars(_running) is globals():
+    sys.modules.setdefault("hubsetup", _running)
+
+import hub  # noqa: E402
+import lifecycle  # noqa: E402
+import onboard  # noqa: E402
+import releases  # noqa: E402
 
 KIT = os.path.dirname(os.path.abspath(__file__))
 CODE_LENGTH = 12                # hub.LINK_ALPHABET: 12 characters, 60 bits, as a join code

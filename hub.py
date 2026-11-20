@@ -60,6 +60,15 @@ import uuid
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# **One copy of this file in a process** (the finding of the area "Door and security", 20 November 2026): the hub's
+# service runs it as `python3 -m hub`, where it is `__main__`, and a module that it loads and that imports `hub`
+# (hubsetup) loaded this file a second time as `hub`, with its own TEAM, DB and LOCK, and from a kit that a release
+# had moved meanwhile. Under this name every such import gets this module: the one whose globals these are, which a
+# runner that keeps its own module under the name (runpy with no alter_sys) does not give.
+_running = sys.modules.get(__name__)
+if _running is not None and vars(_running) is globals():
+    sys.modules.setdefault("hub", _running)
+
 from usage import IDENTITY_CHANGED, IDENTITY_ERRORS, READING_AHEAD, SCREEN_RUNTIME, SIGN_IN_REQUIRED, local_model, \
     validate_usage
 from lifecycle import EDITABLE_FACTS, TOKEN_KINDS, facts_now, token_price     # AUTONOMY.md P8, P10: lane L7
@@ -55331,9 +55340,7 @@ def server_agent_entry(team, agent, server, runtime, role, parent, account=None)
         # The first worker of a fleet, where there is nothing to copy: the installer's first team.json holds one
         # manager and nothing else, so without this no customer could ever add their first agent. It takes the
         # installer's own worker line, Fleet's full-access worker form (plan C15: workers act without asking), never
-        # the manager's, which runs bypassPermissions with no Fleet deny list. The import is here because hubsetup
-        # imports this module.
-        import hubsetup
+        # the manager's, which runs bypassPermissions with no Fleet deny list.
         start = hubsetup.WORKER_STARTS.get(runtime)
         if not start:
             raise Refusal(409, f"No worker runs {runtime_label(runtime)} yet, so Founderizer has no settings to copy "
@@ -66691,7 +66698,6 @@ def capp_serve_status():
     """`tailscale serve status --json` of the hub's machine (hubsetup.tailscale_argv), parsed: a dict, or OSError /
     ValueError when the command is absent, fails, takes more than 5 seconds or prints no object. Never under LOCK."""
     import shutil
-    import hubsetup         # here, because hubsetup imports this module; only while the feature would open the socket
     argv = hubsetup.tailscale_argv("serve-status")
     app = TAILSCALE_APP if os.path.exists(TAILSCALE_APP) else argv[0]
     try:
@@ -66713,7 +66719,6 @@ def capp_funnel_ok(name):
     socket stays closed. tailscaled can point Funnel at any target, a Unix socket too, so the socket opens only while
     Funnel publishes the gate and nothing else. The hub's own port has its own guard, 6(a): the header rule of Handler
     (funnel_refused)."""
-    import hubsetup
     try:
         conf = capp_serve_status()
     except (OSError, ValueError) as e:
@@ -66766,7 +66771,6 @@ def capp_close():
 def capp_gate_address():
     """Where the gate listens on this machine, as (host, port): hubsetup.CONNECT_TARGET, the one target that Funnel
     publishes."""
-    import hubsetup
     target = urllib.parse.urlsplit(hubsetup.CONNECT_TARGET)
     return target.hostname, target.port
 
@@ -75507,6 +75511,14 @@ def main():
         print("\nstopped")
         return
     after_serving(server)       # the new code in this process, or the end of it (stop_serving)
+
+
+# **hubsetup from this code's own folder, at the hub's start** (the same finding): a release moves the kit before the
+# hub starts again (lifecycle.take), and a first import of hubsetup in that time read the new hubsetup.py beside this
+# old hub.py. hubsetup imports this module at its top and reads its names there, so its import stands after the last
+# of them. Its `hub` is now this hub that runs: the hub uses only hubsetup's constants and pure functions, never an
+# installer step that changes `hub`'s own state (keep_fleet_id swaps hub.DB for its own connection).
+import hubsetup  # noqa: E402
 
 
 if __name__ == "__main__":
