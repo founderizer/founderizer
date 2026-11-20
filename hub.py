@@ -5654,8 +5654,10 @@ def migrate():
         # account_limits: a hold belongs to one agent, an allowance to one account. `cause` is the id of the row
         # whose session reported the limit (null when this agent reported it itself), so one episode of one account
         # is one row for each agent it holds and one message for the manager. `route` is the route of this agent
-        # that spends from that account, which a derived row cannot read from a task of its own.
-        "agent_limits": {"cause": "INTEGER", "route": "TEXT"},
+        # that spends from that account, which a derived row cannot read from a task of its own. `account` is the key
+        # of the account that reached the limit (route_account), so a reading that names another one ends this
+        # agent's hold (limit_account); null where nothing named it then.
+        "agent_limits": {"cause": "INTEGER", "route": "TEXT", "account": "TEXT"},
         # plan C1: the attempt's turn state, as JSON (turn_state), kept from every record the helper sends
         "attempts": {"turn": "TEXT"},
         # plan C8: the sender's task waits for the answer, and why that wait ended
@@ -8731,8 +8733,11 @@ def spread_limit(agent, route, cause, until, known, t0):
     for name, r in others:
         if active_limit(name):
             continue            # already held, by its own report or by an earlier one of this account
-        ins("INSERT INTO agent_limits(agent,since,until,reset_known,cause,route) VALUES(?,?,?,?,?,?)",
-            (name, t0, until, known, cause, r))
+        if (route_reading(name, r) or {}).get("error") == IDENTITY_CHANGED and route_account(name, r) is None:
+            continue            # its own runtime named another account since: account_groups still files that
+                                # reading under the key of the account it left, which is not the agent's now
+        ins("INSERT INTO agent_limits(agent,since,until,reset_known,cause,route,account) VALUES(?,?,?,?,?,?,?)",
+            (name, t0, until, known, cause, r, g["key"]))
         held.append(name)
         for t in q("SELECT id FROM tasks WHERE owner=? AND state='working' ORDER BY id", (name,)):
             if not session_alive(name, t["id"]):
@@ -8765,8 +8770,8 @@ def start_limit(agent, resets_at, task_id=None):
         return
     route = task_route(task_id)
     q("UPDATE agent_limits SET resumed=? WHERE agent=? AND resumed IS NULL", (t0, agent))     # a new hold replaces the old resume
-    cause = ins("INSERT INTO agent_limits(agent,since,until,reset_known,task,route) VALUES(?,?,?,?,?,?)",
-                (agent, t0, until, known, task_id, route))
+    cause = ins("INSERT INTO agent_limits(agent,since,until,reset_known,task,route,account) VALUES(?,?,?,?,?,?,?)",
+                (agent, t0, until, known, task_id, route, route_account(agent, route)))
     if task_id:
         # The session that reported it, while it probably still has one turn. Until now only the manager was told,
         # so an agent never learned that it had been limited: the next session was told only that the limit had
@@ -8833,6 +8838,67 @@ def limit_reading(agent, reading, t0):
         log("hub", f"{agent}'s usage reading shows its windows open; its limit ends now")
 
 
+def limit_account(agent, t0):
+    """**A hold is the allowance of one account, and an agent that now uses another account leaves it.** The usual
+    reason to change an agent's account is that its allowance is spent, and the hub's own advice says so ("Sign the
+    manager in to another account"). Before this, nothing ended a hold before the reset of the account that reached
+    the limit: a reading that gave a reset time made limit_reading pass by, and a finished sign-in ended no hold. So
+    the agent's work waited for a reset of an account it no longer used, days away for a weekly window.
+
+    The event is the agent's own usage reading (POST /helper/usage): when it names another account than the one the
+    hold recorded (`account`, route_account), the hold of this agent ends at once (leave_limit). An owner's change of
+    an agent's account with a kind is no such event: account_change_refusal refuses it before it is saved. Every way of changing the account counts: Use another account,
+    a sign-in typed by hand on its server, and a sign-in of another agent of the same OS user, which keeps one sign-in
+    for all of them. A reading that says signed out, or that its identity is changing, names no account and ends
+    nothing; the finished sign-in alone does not either, because it does not say which account it was.
+
+    A row with no account is one from before this release, or one whose reading named none at its start: it takes
+    the account that the reading names now, unless a sign-in of that route's runtime ended on its machine since the
+    hold began, which made that account a new one. A new account whose allowance is spent too is not predicted: its
+    first turn reports it, and start_limit holds the agent again, on that account."""
+    lim = active_limit(agent)
+    if not lim:
+        return
+    route = limit_route(lim)
+    key = route_account(agent, route)
+    if key is None or key == lim["account"]:
+        return
+    if lim["account"] is None:
+        runtime = next((r[1] for r in usage_routes(agent) if r[0] == route), None)
+        if not any((finished_sign_in(n, runtime) or 0) > lim["since"] for n in sign_in_agents(agent)):
+            q("UPDATE agent_limits SET account=? WHERE id=?", (key, lim["id"]))
+            return
+    leave_limit(lim, t0)
+
+
+def limit_left_text(t):
+    return (f"The usage limit that held your work no longer applies: you now use another provider account. "
+            f"Continue {tref(t['id'])}. First check what was already done (rule 9): never repeat an outside action "
+            f"that already happened.")
+
+
+def leave_limit(lim, t0):
+    """This agent's hold ends before the reset, because it now uses another account (limit_account). Only its own row:
+    the other agents of the episode still spend the account that reached the limit, and their rows keep their reset
+    and their cause. `until` stays as it was, because helper_limit knows an episode that it already held by its reset.
+    Its held work resumes one time, each task in a new session where its session may go (resume_held `fresh`), and
+    the manager reads one message."""
+    agent = lim["agent"]
+    q("UPDATE agent_limits SET ended=? WHERE id=?", (t0, lim["id"]))
+    done = resume_held(lim, t0, text=limit_left_text, fresh=True) if agent != manager_name() else []
+    q("UPDATE agent_limits SET resumed=? WHERE id=?", (t0, lim["id"]))
+    root = lim["cause"] or lim["id"]
+    stay = [r["agent"] for r in q("SELECT agent FROM agent_limits WHERE ended IS NULL AND (id=? OR cause=?) ORDER BY id",
+                                  (root, root)) if r["agent"] != manager_name()]
+    if agent != manager_name():
+        emit(manager_name(), "say", f"[hub] {agent} now uses another provider account, so the hold of its usage limit "
+             f"ended before the reset. The hub resumed its held work one time: {', '.join(done) or 'nothing was waiting'}."
+             + (f" {' and '.join(stay)} {'spend' if len(stay) > 1 else 'spends'} the account that reached the limit, so "
+                f"the hub holds {'their' if len(stay) > 1 else 'its'} work until {clock(lim['until'])}, as long as "
+                f"{'they use' if len(stay) > 1 else 'it uses'} that account." if stay else ""), extra=QUIET_SAY)
+    log("hub", f"{agent}'s usage limit ended: its account changed; resumed {len(done)} task(s)")
+
+
 def session_failed_note(needs):
     """The note of the pause that screen_failed makes, by which sign_in_resumes knows that hold again."""
     return f"its {'screen session' if needs == 'screen' else 'session'} ended with an error"
@@ -8875,20 +8941,27 @@ def screen_failed(key, seq, error):
     log("hub", f"{tref(t['id'])} on {t['owner']} is paused: its {session} failed ({error.get('code') or 'no error record'})")
 
 
-def resume_held(lim, t0):
+def resume_held(lim, t0, text=None, fresh=False):
     """One held agent's working tasks, each resumed one time: a message when its session still runs, a new attempt
     when it does not, or when its window still shows its runtime's usage-limit menu, where no line can be typed
-    (runtime gaps C1). The new attempt is not counted, so a reset never spends one of the three session restarts."""
+    (runtime gaps C1). The new attempt is not counted, so a reset never spends one of the three session restarts.
+    `text(t)`: the words of each resume, the reset's by default. `fresh`: after a change of account (leave_limit), a
+    new attempt also where the session still runs, because a session that started on the old account keeps what its
+    runtime read at its start. Only for a task of the route that the hold was on, and only where fresh_refusal lets its
+    session go: one with a command in the background, a job or a permission prompt open keeps its session and gets
+    the message, as at a reset."""
     done = []
     for t in q("SELECT * FROM tasks WHERE owner=? AND state='working' ORDER BY id", (lim["agent"],)):
         if active_hold(t["id"]) or parked(t["id"]) or (turn_state(t["id"], t["attempt"]) or {}).get("running"):
             continue            # a parked task comes back at its own time (reminder_sweep); a running turn needs nothing
-        text = limit_reset_text(t)
-        if session_alive(lim["agent"], t["id"]) and kv_get(f"screen_limit:{t['id']}") != str(t["attempt"]):
-            emit(lim["agent"], "say", "[hub] " + text, task=t["id"])
+        text_t = (text or limit_reset_text)(t)
+        again = fresh and ("screen" if t["needs"] == "screen" else "primary") == limit_route(lim) and \
+            fresh_refusal(t, t["attempt"]) is None
+        if not again and session_alive(lim["agent"], t["id"]) and kv_get(f"screen_limit:{t['id']}") != str(t["attempt"]):
+            emit(lim["agent"], "say", "[hub] " + text_t, task=t["id"])
             done.append(f"{tref(t['id'])} (message)")
         else:
-            new_attempt(t, LIMIT_RESET, text)
+            new_attempt(t, LIMIT_RESET, text_t)
             done.append(f"{tref(t['id'])} (new session)")
     return done
 
@@ -8920,14 +8993,19 @@ def end_limits(t0):
     # The reported row of each episode, and a derived row whose reported row is already resumed: a second report by
     # the agent that caused this one closes its own rows and leaves that one behind, and the work it holds still has
     # to resume exactly once. So does a derived row whose reported row is gone: the owner deleted the agent that
-    # reported it (REMOVED_OWN), and a row that is gone never resumes. Each such row resumes alone, so the manager
-    # reads one message for each held agent of that episode, in the pass that ends it or, after a fault in that
-    # pass, in the next.
+    # reported it (REMOVED_OWN), and a row that is gone never resumes. So does a derived row whose reported row left
+    # the episode before the reset (leave_limit: that agent uses another account now). The derived rows of one cause
+    # resume together, so the manager reads one message for the rest of that episode, in the pass that ends it or,
+    # after a fault in that pass, in the next.
+    taken = set()
     for lim in q("SELECT l.* FROM agent_limits l LEFT JOIN agent_limits c ON c.id=l.cause "
                  "WHERE l.ended IS NOT NULL AND l.resumed IS NULL AND l.until<=? "
                  "AND (l.cause IS NULL OR c.id IS NULL OR c.resumed IS NOT NULL) ORDER BY l.id", (t0,)):
-        episode = [lim] + q("SELECT * FROM agent_limits WHERE cause=? AND resumed IS NULL AND ended IS NOT NULL "
-                            "ORDER BY id", (lim["id"],))
+        if lim["id"] in taken:
+            continue            # it resumed in this pass with the first row of its cause
+        episode = [lim] + [r for r in q("SELECT * FROM agent_limits WHERE cause=? AND resumed IS NULL AND ended IS NOT "
+                                        "NULL ORDER BY id", (lim["cause"] or lim["id"],)) if r["id"] != lim["id"]]
+        taken.update(r["id"] for r in episode)
         told = []
         for r in episode:
             if r["agent"] != manager_name():
@@ -11977,6 +12055,19 @@ def account_group(agent, route="primary", groups=None):
     key = (model_group(agent) if route == "primary" else None) or ((want[2] or {}).get("account_key") if want else None)
     g = (groups if groups is not None else account_groups()).get(key) if key else None
     return dict(g, runtime=want[1], sharers=[n for n in g["agents"] if n != agent]) if g else None
+
+
+def route_reading(agent, route):
+    """The newest usage reading of one route of one agent, as the hub keeps it, or None."""
+    return next((r[2] for r in usage_routes(agent) if r[0] == route), None)
+
+
+def route_account(agent, route="primary"):
+    """The key of the provider account that this route of this agent spends from NOW, or None while nothing says: its
+    account with a kind (model_group), else the account that its own newest reading names as its runtime's own
+    (reading_account: none while it is signed out or its identity is changing). account_group files a reading under
+    its key whatever its error says; this is the stricter word, for a usage-limit hold (limit_account)."""
+    return (model_group(agent) if route == "primary" else None) or reading_account(route_reading(agent, route))
 
 
 def allowance_ahead(agent, route="primary"):
@@ -60112,16 +60203,29 @@ def end_signed_in_waits(agent, t0=None):
         sign_in_resumes(agent, row["runtime"])
 
 
+def sign_out_busy(name):
+    """What a sign-out would stop of this agent, or None: switch_busy's facts, but for an agent that a usage limit
+    holds, its owner messages that wait for a reply do not count. They wait for the end of that hold, and changing the
+    account is how the owner ends it (limit_account): with them, the one agent that needed another account could
+    not get one."""
+    busy = switch_busy(name)
+    if busy and busy["chats_waiting"] and active_limit(name):
+        busy = dict(busy, chats_waiting=0)
+        if not any(busy.values()):
+            return None
+    return busy
+
+
 def busy_words(busy):
     """What keeps an agent occupied, in the owner's own words. The same facts `switch_busy` gives a switch, because
     a sign-out stops the agent exactly as a switch does."""
     parts = []
-    if busy.get("open_tasks"):
-        parts.append(", ".join(busy["open_tasks"]))
+    if busy.get("open_tasks"):      # the owner reads words, never a task's code (a turn runs in each one)
+        parts.append("%d task%s running" % (len(busy["open_tasks"]), "" if len(busy["open_tasks"]) == 1 else "s"))
     if busy.get("chats_waiting"):
-        parts.append("%d chat waiting" % busy["chats_waiting"])
+        parts.append("%d chat%s waiting" % (busy["chats_waiting"], "" if busy["chats_waiting"] == 1 else "s"))
     if busy.get("desktop"):
-        parts.append("desktop %s open" % busy["desktop"])
+        parts.append("a browser or screen task open")
     if busy.get("checks"):
         parts.append("%d check running" % len(busy["checks"]))
     if busy.get("jobs"):
@@ -60151,7 +60255,8 @@ def start_machine_login(agent, runtime, replace=False):
     open_one = open_login(agent)
     if open_one:
         return {"agent": agent, "login": login_view(open_one, live=False), "changed": False}
-    signed_in = signed_in_now(agent, runtime) is True
+    said = signed_in_now(agent, runtime)
+    signed_in = said is True
     if signed_in and not replace:
         raise Refusal(409, f"{runtime_label(runtime)} is signed in on this server. Use another account signs it "
                            f"out first.")
@@ -60160,10 +60265,18 @@ def start_machine_login(agent, runtime, replace=False):
                            f"account on this server. Sign out there yourself, then sign in.")
     if not q1("SELECT last_seen FROM agents WHERE name=? AND last_seen>?", (agent, now() - MACHINE_STALE)):
         raise Refusal(409, f"{shown_role(agent)} is not answering. Check that its server is on.")
-    busy = switch_busy(agent) if signed_in else None
-    if busy:
-        raise Refusal(409, f"{shown_role(agent)} has {busy_words(busy)}. A sign-out stops it, so finish or stop "
-                           f"that first.")
+    # **A sign-out stops every agent that keeps this sign-in**, not only the one whose row the owner pressed: the agents
+    # of one OS user keep one sign-in of each provider (sign_in_agents), so a switch from one agent's row signed the
+    # others out in the middle of a running turn. And a replace while no recent reading says (None) can meet a
+    # sign-in that is there, which the provider's own new sign-in can remove at its start (fleet.Helper, `another`).
+    for name in ([agent] + sign_in_shared(agent).get(runtime, []) if signed_in or (replace and said is None) else []):
+        busy = sign_out_busy(name)
+        if busy and name == agent:
+            raise Refusal(409, f"{shown_role(agent)} has {busy_words(busy)}. A sign-out stops it, so finish or stop "
+                               f"that first.")
+        if busy:
+            raise Refusal(409, f"{shown_role(name)} uses the same {runtime_label(runtime)} sign-in on this server and "
+                               f"has {busy_words(busy)}. A sign-out stops it too, so finish or stop that first.")
     t0, state = now(), "signing_out" if signed_in else "starting"
     lid = ins("INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES(?,?,?,?,?)",
               (agent, runtime, state, t0, t0))
@@ -60239,6 +60352,36 @@ def login_report(agent, lid, update):
     return {"ok": True, "state": state}
 
 
+def sign_in_agents(agent, strict=True):
+    """[agent] and each other agent of its machine that keeps the same sign-in of each provider: the agents of one OS
+    user (a Mac's agents all run as its desktop account), by each helper's own uid (os_user_uid_own). strict=False also
+    counts an agent whose uid no reading gives yet, or every agent of the machine while this one's own is not known:
+    for a step that signs a runtime OUT, where a wrong guess must cost a refusal, never a sign-out under running work.
+    Not on a Linux server, where each agent has an OS user of its own and one with no reading yet is one in setup."""
+    machine, uid = (agents().get(agent) or {}).get("machine"), os_user_uid_own(agent)
+    if not machine or (uid is None and strict):
+        return [agent]
+
+    def shares(other):
+        theirs = os_user_uid_own(other)
+        if theirs is not None and theirs == uid:
+            return True
+        return not strict and (uid is None or theirs is None) and not linux_agent(other)
+    return [agent] + [other for other in server_agents(machine) if other != agent and shares(other)]
+
+
+def sign_in_shared(agent):
+    """{runtime: [the other agents that a sign-out of that runtime on this agent's machine stops]}: each other agent of
+    the same sign-in (sign_in_agents, strict=False) that runs a session on that runtime, its own or its screen tasks'.
+    The refusal of a sign-out under running work reads it (start_machine_login), and so does the app's line of what a
+    change of account stops (`/ui/machines` `sign_in_shared`). Empty where this agent's sign-in is its own."""
+    out = {}
+    for other in sign_in_agents(agent, strict=False)[1:]:
+        for runtime in sorted({r[1] for r in usage_routes(other)} & set(LOGIN_RUNTIMES)):
+            out.setdefault(runtime, []).append(other)
+    return out
+
+
 def signed_in_beside(agent):
     """A sign-in on this agent's machine ended done (a sign-in job, or an install or a preparation at its sign-in
     step), so each other agent there that runs as the same OS user is asked for its status now (status_now). The
@@ -60249,12 +60392,8 @@ def signed_in_beside(agent):
     (usage.Collector.sign_in_ended), and the read's new word sends the reading that says signed in. The uid is each
     helper's own (os_user_uid_own): an agent whose reading names none, or another one, keeps its own sign-in and is
     not asked."""
-    machine, uid = (agents().get(agent) or {}).get("machine"), os_user_uid_own(agent)
-    if not machine or uid is None:
-        return
-    for other in server_agents(machine):
-        if other != agent and os_user_uid_own(other) == uid:
-            status_now(other)
+    for other in sign_in_agents(agent)[1:]:
+        status_now(other)
 
 
 def session_runtime(conf, needs):
@@ -60337,10 +60476,7 @@ def sign_in_resumes(agent, runtime):
     of each resume with its reason. Answers the tasks that went on, in the order of their ids."""
     if runtime not in LOGIN_RUNTIMES:
         return []
-    conf = agents().get(agent) or {}
-    machine, uid = conf.get("machine"), os_user_uid_own(agent)
-    names = [agent] + [other for other in (server_agents(machine) if machine and uid is not None else [])
-                       if other != agent and os_user_uid_own(other) == uid]
+    names = sign_in_agents(agent)
     label, went = runtime_label(runtime), []
     marks = ",".join("?" * len(names))
     for t in q(f"SELECT * FROM tasks WHERE owner IN ({marks}) AND {OPEN_TASK} ORDER BY id", tuple(names)):
@@ -60473,6 +60609,7 @@ def machine_rows():
                      "owner_chat_bound": data.get("owner_chat_bound"), "manager_bound": data.get("manager_bound"),
                      "use": data.get("use"),          # what its own processes use (lifecycle.agent_use)
                      "login": login_view(last_login(name)),       # owner feature machine_signin
+                     "sign_in_shared": sign_in_shared(name),      # whom a change of its account stops too
                      "reported_at": st["reported"] if st else None,
                      "stale": (st is None) or t0 - st["reported"] > MACHINE_STALE})
     return desired, rows
@@ -69856,6 +69993,7 @@ class Handler(BaseHTTPRequestHandler):
                     q("INSERT INTO agent_usage(name,data) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET data=excluded.data",
                       (agent, json.dumps(data)))
                 limit_reading(agent, data.get("limits"), now())
+                limit_account(agent, now())     # a reading that names another account ends this agent's hold
             # helper features session_kinds and session_models: this hub takes each session's four kinds, and its
             # tokens by model (usage.Collector.send)
             return self.json(200, {"ok": True, "session_kinds": True, "session_models": True})

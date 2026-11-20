@@ -564,16 +564,77 @@ class AnotherAccount(Machines):
         self.assertEqual(code, 409, answer)
         self.assertEqual(self.view()["url"], CLAUDE_URL)
 
-    def test_a_sign_out_is_refused_while_the_agent_has_work_open(self):
-        """It stops the agent, so nothing is signed out from under a running task. The same facts a switch reads."""
-        self.signed_in()
-        hub.q("INSERT INTO tasks(id,owner,requester,title,done_when,state,created) "
-              "VALUES(7,'solo','manager','A task','It is done','working',?)", (hub.now(),))
+    def beside(self, stale=()):
+        """ivy shares solo's OS user on solo's machine, and so its one sign-in of each provider; nova has a user of its
+        own there, and far is on another machine with a user of the same number. All are signed in to Claude Code."""
+        hub.TEAM["agents"].update(
+            ivy={"role": "worker", "runtime": "claude", "machine": "box", "can": ["shell"], "title": "Research"},
+            nova={"role": "worker", "runtime": "claude", "machine": "box", "can": ["shell"]},
+            far={"role": "worker", "runtime": "claude", "machine": "hub", "can": ["shell"]})
+        for agent, uid in (("solo", 501), ("ivy", 501), ("nova", 1002), ("far", 501)):
+            hub.q("INSERT OR REPLACE INTO agents(name,last_seen) VALUES(?,?)", (agent, hub.now()))
+            hub.q("INSERT OR REPLACE INTO machine_status(agent,data,reported) VALUES(?,?,?)", (agent, json.dumps(
+                {"runtimes": {"claude": {"version": "2.1.287", "signed_in": True}}, "access": {"user": "desk", "uid": uid}}),
+                hub.now() - (hub.MACHINE_STALE + 60 if agent in stale else 0)))
+
+    def working(self, *owners):
+        hub.q("DELETE FROM tasks")
+        for tid, owner in enumerate(owners, 7):
+            hub.q("INSERT INTO tasks(id,owner,requester,title,done_when,state,created) "
+                  "VALUES(?,?,'manager','A task','It is done','working',?)", (tid, owner, hub.now()))
+
+    def test_a_sign_out_is_refused_while_an_agent_of_that_sign_in_has_work_open(self):
+        """It stops every agent that keeps that sign-in, so nothing is signed out from under a running task: the agent
+        whose row the owner pressed, and each agent of the same OS user on its machine, which keeps the same one.
+        Before 20 November 2026 only the first was read, and a switch from one agent's row signed the others out in
+        the middle of a turn. An agent of another user, or of another machine, keeps its own and is not read. The
+        words are the owner's: a role, and no task code."""
+        self.beside()
+        self.working("solo")
         code, answer = self.start(replace=True)
         self.assertEqual(code, 409, answer)
-        self.assertIn("T-7", answer["error"])
+        self.assertIn("has 1 task running", answer["error"])
+        self.assertNotIn("T-7", answer["error"])
         self.assertIn("stops it", answer["error"])
+        self.working("ivy")
+        code, answer = self.start(replace=True)
+        self.assertEqual(code, 409, answer)
+        self.assertIn("uses the same Claude Code sign-in", answer["error"])
+        self.assertIn(hub.shown_role("ivy"), answer["error"])
         self.assertEqual(self.count("signin_jobs"), 0)
+        rows = self.request("/ui/machines?db=test-generation")[1]["machines"]
+        self.assertEqual(next(m for m in rows if m["agent"] == "solo")["sign_in_shared"], {"claude": ["ivy"]})
+        # An older helper's reading names no uid, so ivy may share solo's user and is read too; not on a Linux server,
+        # where each agent has an OS user of its own and one with no reading is still in setup.
+        hub.q("UPDATE machine_status SET data=? WHERE agent='ivy'",
+              (json.dumps({"runtimes": {"claude": {"version": "2.1.287", "signed_in": True}}}),))
+        self.assertEqual(self.start(replace=True)[0], 409)
+        hub.TEAM["servers"] = {"box": {"kind": "linux"}}
+        self.assertEqual(self.start(replace=True)[0], 200)
+        hub.q("DELETE FROM signin_jobs")
+        del hub.TEAM["servers"]
+        self.working("nova", "far")
+        self.assertEqual(self.start(replace=True)[0], 200)
+
+    def test_a_change_of_account_with_no_recent_reading_is_refused_under_running_work_too(self):
+        """With no reading of the last ten minutes the hub cannot say whether the runtime is signed in, and the
+        provider's own new sign-in can remove a sign-in that is there at its start: so it is read as one."""
+        self.beside(stale=("solo",))
+        self.working("ivy")
+        code, answer = self.start(replace=True)
+        self.assertEqual(code, 409, answer)
+        self.assertIn(hub.shown_role("ivy"), answer["error"])
+
+    def test_a_limited_agent_changes_its_account_while_its_owner_message_waits(self):
+        """A message to an agent that a usage limit holds waits for the end of that hold, and a change of account is
+        how the owner ends it. Counted as work open, it refused the one switch that the agent needed."""
+        self.signed_in()
+        hub.q("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,recipient) "
+              "VALUES('r1','message','Where are we?',1,?,'owner','solo')", (hub.now(),))
+        self.assertEqual(self.start(replace=True)[0], 409)
+        hub.q("INSERT INTO agent_limits(agent,since,until,reset_known) VALUES('solo',?,?,1)",
+              (hub.now() - 60, hub.now() + 86400))
+        self.assertEqual(self.start(replace=True)[0], 200)
 
     def test_a_runtime_fleet_drives_no_sign_out_for_says_so(self):
         self.reports("solo", codex=True)

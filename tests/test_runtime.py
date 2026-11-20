@@ -193,6 +193,10 @@ class Runtime(unittest.TestCase):
         self.assertEqual((code, body["until"]), (200, None))
         code, body = self.call("POST", "/helper/limit/manager", {"resets_at": reset + 60, "runtime": "claude"}, client=None)
         self.assertEqual((code, body["until"]), (200, reset + 60))           # a new reset is a new episode
+        # So does a hold that ended because the manager now uses another account: leave_limit keeps its reset.
+        hub.leave_limit(hub.active_limit("manager"), hub.now())
+        code, body = self.call("POST", "/helper/limit/manager", {"resets_at": reset + 60, "runtime": "claude"}, client=None)
+        self.assertEqual((code, body["until"]), (200, None))
 
     def test_records_count_as_activity(self):
         tid = self.task()
@@ -559,6 +563,72 @@ class Runtime(unittest.TestCase):
         hub.tick()
         hub.tick()
         self.assertEqual((len(self.said("vps")), len(self.said("manager"))), before)  # resumed one time only
+
+    def test_an_agent_that_now_uses_another_account_leaves_its_hold_at_once(self):
+        """The owner's reason to change an agent's account is most often that its allowance is spent (20 November
+        2026), and the hub's own advice says so. Before this, nothing ended the hold before the reset of the account
+        that reached the limit: the agent's work waited, days for a weekly window, for an account it no longer used.
+        A reading that names another account ends that agent's hold at once, and only its own: the agent that still
+        spends the old account stays held. A session of the agent's that holds a command in the background is not cut
+        off: it gets the message. vps and w3 still spend the old account: at its reset they resume once each, in one
+        message for the rest of the episode, which does not name studio."""
+        later, mine, theirs = self.shared()
+        old, new = "openai:" + "a" * 32, "openai:" + "b" * 32
+        hub.TEAM["agents"]["w3"] = {"role": "worker", "runtime": "codex", "machine": "w3", "can": ["shell"]}
+        self.reading("w3", old, 40, later)
+        third = self.task(owner="w3")
+        deploy = self.task()                            # its session's command still runs in the background
+        hub.q("INSERT OR REPLACE INTO attempts(task,attempt,created,reason,turn) VALUES(?,1,?,'created',?)",
+              (deploy, hub.now(), json.dumps({"running": False, "turns": 1, "calls": {"c1": ["deploy", 5.0, True]}})))
+        self.alive("studio", f"T-{mine}", f"T-{deploy}")
+        self.hit(mine, later)
+        self.assertEqual(hub.active_limit("studio")["account"], old)
+
+        def reports(key, error="No account limits were reported."):
+            limits = {"collected_at": hub.now(), "source": usage.LIMIT_SOURCES[hub.agents()["studio"]["runtime"]],
+                      "plan": "pro", "account_key": key, "windows": [], "error": error}
+            self.assertEqual(self.call("POST", "/helper/usage/studio", {"tokens": None, "limits": limits},
+                                       client=None)[0], 200)
+        reports(old, usage.SIGN_IN_REQUIRED)            # signed out of the old one: no account yet, and no end
+        reports(new, usage.IDENTITY_CHANGED)            # an identity that is changing names none either
+        self.assertIsNotNone(hub.active_limit("studio"))
+        reports(new)                                    # signed in to another account
+        self.assertIsNone(hub.active_limit("studio"))
+        t = hub.q1("SELECT attempt, restarts FROM tasks WHERE id=?", (mine,))
+        self.assertEqual((t["attempt"], t["restarts"]), (2, 0))      # a new session, which starts on that account
+        self.assertEqual(hub.q1("SELECT attempt FROM tasks WHERE id=?", (deploy,))["attempt"], 1)   # not cut off
+        self.assertIsNotNone(hub.active_limit("vps"))   # it still spends the account that reached the limit
+        left = [x for x in self.said("manager") if "now uses another provider account" in x]
+        self.assertEqual(len(left), 1)
+        self.assertIn(f"T-{mine} (new session)", left[0])
+        self.assertIn(f"T-{deploy} (message)", left[0])
+        self.assertIn("vps and w3 spend the account that reached the limit", left[0])
+        hub.q("UPDATE agents SET alive=NULL, alive_ts=NULL WHERE name='vps'")
+        hub.q("UPDATE tasks SET last_activity=0 WHERE id IN (?,?)", (theirs, third))
+        hub.q("UPDATE agent_limits SET until=? WHERE ended IS NULL", (hub.now() - 1,))
+        hub.tick()
+        self.assertIsNone(hub.active_limit("vps"))
+        resets = [x for x in self.said("manager") if "has reset" in x]
+        self.assertEqual(len(resets), 1)                # one message, and studio is not resumed a second time
+        self.assertIn(f"the provider account that vps and w3 share has reset", resets[0])
+        self.assertNotIn("studio", resets[0])
+        self.assertEqual([hub.q1("SELECT attempt FROM tasks WHERE id=?", (t,))["attempt"] for t in (theirs, third)],
+                         [2, 2])                        # each resumed one time
+
+    def test_a_hold_that_recorded_no_account_leaves_only_after_a_sign_in(self):
+        """A hold of a release before this one recorded no account. Its agent's next reading names one: with no
+        sign-in on its machine since the hold began, that is the account that reached the limit, and the hold stays;
+        after a sign-in, the account is a new one, and the hold of the owner's change of account ends."""
+        later, mine, _ = self.shared()
+        self.hit(mine, later)
+        hub.q("UPDATE agent_limits SET account=NULL")
+        hub.limit_account("studio", hub.now())
+        self.assertEqual(hub.active_limit("studio")["account"], "openai:" + "a" * 32)
+        hub.q("UPDATE agent_limits SET account=NULL")
+        hub.q("INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES('studio',?,'done',?,?)",
+              (hub.agents()["studio"]["runtime"], hub.now(), hub.now()))
+        hub.limit_account("studio", hub.now())
+        self.assertIsNone(hub.active_limit("studio"))
 
     def test_a_better_reset_time_moves_every_agent_of_the_episode(self):
         """The rows of one episode carry one reset, so a later and better one moves all of them -- whichever of the
