@@ -91,6 +91,9 @@ WORDS = {
                            "has it.",
     "drive_folder_file": "That is the link of a file, not of a folder.",
     "drive_folder_google": "Google did not answer about this folder: {reason}. Try again.",
+    # a grant of one of the product's own repositories, which the door refuses in every fleet (POST /ui/team/repos,
+    # POST /ui/resources, and the same words for the manager's grant_access and the Give card of a Needs-you item)
+    "repo_vendor": "The door refuses {repo} in every fleet, so no grant of it works: leave it out.",
     # the package of a program server, as its registry gives it (POST /ui/mcp/package, UI-API.md 1.187)
     "package_unknown": "{registry} has no package {name}",
     "package_unread": "{registry} did not give the record of {name} ({http_status})",

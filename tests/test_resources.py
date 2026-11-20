@@ -528,6 +528,87 @@ class Resources(OwnerAPI):
                                                         "resource": "repo:acme/web", "policy": None})[0], 409)
         self.assertEqual(self.committed()["resources"], {"repo:acme/web": {"max": "read", "to": "workers"}})
 
+    def test_no_grant_of_the_products_own_repositories_is_kept_because_the_door_refuses_them(self):
+        """The door refuses a token for the product's own repositories in every fleet (door_targets.VENDOR_REPOS), so a
+        grant of one was kept with no word and never worked: the agent's clone failed (20 November 2026). Every way
+        to give one refuses a new hold or a new level with the same words, the line of an access question sends
+        nobody to a grant, a holder or the owner, and a grant from before still leaves: a take-back, and a write that
+        names another holder as it is (the owner MCP's grant_access), pass."""
+        import door_targets
+
+        def repos(**fields):
+            return self.request("/ui/team/repos", dict({"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                        "base_sha256": self.pool()["sha256"]}, **fields))
+        words = "The door refuses acme/web in every fleet, so no grant of it works: leave it out."
+        plain = {"title": "Let Dev read acme/web", "why": "Its work reads acme/web.", "reason": "access",
+                 "needs_access": "repo:acme/web", "what_to_do": "Give Dev read access to acme/web."}
+        # before acme/web is one of them: a Give card for it, lead holds it beside shopper, and the pool may give it
+        nid = self.give_card()
+        self.assertIsInstance(nid, int, nid)
+        self.assertEqual(repos(repo="acme/web", agent="lead", level="write")[0], 200)
+        self.assertEqual(repos(repo="acme/storefront", agent="lead", level="read")[0], 200)
+        self.assertEqual(self.stand("repo:acme/web", {"max": "write"})[0], 200)
+        with patch.object(door_targets, "VENDOR_REPOS", door_targets.VENDOR_REPOS + ("acme/web", "acme/storefront")):
+            before = self.commits()
+            # a word that is only the short name of one that lead holds is no item about it: the old hint stays
+            said, error = hub.call_tool("manager", "raise_needs_you", dict(plain, needs_access="the storefront's "
+                                                                                                "database login"))
+            self.assertTrue(error, said)
+            self.assertIn("Give it as repo:acme/storefront", said)
+            self.assertNotIn("The door refuses", said)
+            code, said = self.request(f"/ui/needs/{nid}", self.command(choice=0))      # the card closes, and gives none
+            self.assertEqual((code, said.get("code")), (409, "request_answered"), said)
+            self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"],
+                             "Closed by the hub: the door refuses acme/web in every fleet, so Give gives nothing.")
+            line = hub.access_route("dev", "repo:acme/web", "manager")
+            self.assertIn(words, line)
+            self.assertNotIn("create_task", line)           # lead and shopper hold it, and their clones fail too
+            said, error = hub.call_tool("manager", "raise_needs_you", plain)
+            self.assertTrue(error, said)
+            self.assertIn(words, said)                      # no holder to give the work to, and no owner's grant
+            for fields in (dict(agent="dev", level="read"), dict(agent="shopper", level="write"),
+                           dict(access={"shopper": "read", "lead": "write", "dev": "read"}),
+                           dict(repo=["acme/api", "acme/web"], agent="dev", level="read")):
+                with self.subTest(fields=fields):
+                    code, said = repos(**dict({"repo": "acme/web"}, **fields))
+                    self.assertEqual((code, said.get("code"), said.get("names"), said.get("error")),
+                                     (400, "repo_vendor", {"repo": "acme/web"}, words))
+            self.assertEqual(self.commits(), before)
+            code, said = self.stand("repo:acme/web", {"max": "read"})
+            self.assertEqual((code, said.get("code")), (400, "repo_vendor"))
+            self.assertNotIn("repo:acme/web", [p["resource"] for p in hub.capacity_view()["resources"]])
+            text, _ = self.call("manager", "see_capacity", {})      # a hold from before is no capability
+            self.assertIn("acme/web (read; the door refuses it in every fleet, so this agent cannot use it)",
+                          self.agent_line(text, "shopper"))
+            page = "https://github.com/apps/fleet/installations/new"      # and no GitHub step makes it one
+            with patch.object(hub, "github_reach", return_value={"pages": {}, "all": set(), "repos": set(),
+                                                                 "install": page}):
+                self.assertEqual(hub.github_unreached(["acme/web", "acme/api"]), {"acme/api": page})
+            self.assertIn(words, self.refused("dev", "repo:acme/web", "read"))
+            self.assertIn(words, self.give_card(needs_access="repo:acme/web"))
+            self.assertEqual(self.commits(), before)
+            # what was given before leaves: lead by a write that keeps shopper as it is, then shopper, then the pool
+            self.assertEqual(repos(repo="acme/web", access={"shopper": "read"})[0], 200)
+            self.assertEqual(repos(repo="acme/web", agent="shopper", level=None)[0], 200)
+            self.assertEqual(repos(repo="acme/storefront", agent="lead", level=None)[0], 200)
+            self.assertEqual(self.stand("repo:acme/web", None)[0], 200)
+            self.assertEqual([a.get("repos") for a in self.committed()["agents"].values()], [None] * 4)
+            self.assertNotIn("resources", self.committed())
+            # with no standing and no holder, still no route to the owner for it
+            self.assertIn(words, self.refused("dev", "repo:acme/web", "read"))
+            line = hub.access_route("dev", "repo:acme/web", "manager")
+            self.assertIn(words, line)
+            self.assertNotIn("Needs-you", line)
+            for thing in ("repo:acme/web", "acme/web", "https://github.com/acme/web", "acme/web.git"):   # also in
+                # plain words, held by nobody, as a link or as a clone's error writes it
+                said, error = hub.call_tool("manager", "raise_needs_you", dict(plain, needs_access=thing))
+                self.assertTrue(error, said)
+                self.assertIn(words, said)
+        # the real list, in any case
+        code, said = repos(repo="Founderizer/Founderizer-Apps", agent="dev", level="read")
+        self.assertEqual((code, said.get("code"), said.get("names")),
+                         (400, "repo_vendor", {"repo": "founderizer/founderizer-apps"}))
+
     def team_login(self, ref):
         code, team = self.request("/ui/team?db=test-generation")
         self.assertEqual(code, 200, team)

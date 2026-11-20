@@ -76,6 +76,8 @@ OLD = {
                            "has it.",
     "drive_folder_file": "That is the link of a file, not of a folder.",
     "drive_folder_google": "Google did not answer about this folder: {reason}. Try again.",
+    # a grant of one of the product's own repositories (the area "Vault, keys and access", 20 November 2026)
+    "repo_vendor": "The door refuses {repo} in every fleet, so no grant of it works: leave it out.",
     # the lane "Any MCP server: install and sign-in" (UI-API.md 1.187)
     "package_unknown": "{registry} has no package {name}",
     "package_unread": "{registry} did not give the record of {name} ({http_status})",
@@ -171,6 +173,7 @@ SITES = {
     'save_integration': {'team_changed': 1},
     'save_lines': {'team_changed_lines': 1},
     'save_profile': {'revision_unreadable': 1},
+    'save_resource': {'repo_vendor': 1},
     'save_runtime': {'no_such_agent': 1, 'team_changed': 1},
     'save_team_entry': {'team_changed': 1},
     'save_vault': {'no_such_agent': 1, 'team_changed': 1},
@@ -240,6 +243,7 @@ SITES = {
     'ui_triggers': {'hub_changed': 1},
     'ui_vault': {'hub_changed': 1},
     'ui_wait': {'hub_changed': 1},
+    'vendor_repo_check': {'repo_vendor': 1},
 }
 # The one place that writes a sentence of the table and has no code yet: a registered login that a batch of the secrets
 # import refuses, which is an entry's `error` in an answer that succeeded, and no refusal of the whole command.
@@ -473,7 +477,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 187)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 189)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

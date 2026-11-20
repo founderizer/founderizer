@@ -9,7 +9,8 @@ so its tests need no hub:
 - authority: the hub's one authority function, authority(actor, target, action), decides every rule write, every
   read and every wake, and every task that a wake starts;
 - the route of a wake-up: one inbox message for the fleet manager, or a task whose requester can see its result: the
-  fleet manager directly, or a lead through a parent task in its own task session;
+  fleet manager directly, or a lead through a parent task in its own task session (for the team of a lead whose
+  Shell box is off, the nearest agent above that lead that can act);
 - saved check code: an agent writes a check as text; the hub keeps each version by its SHA-256 and never changes it,
   without a repository commit or an owner pin for each change;
 - where saved code runs (plan P4): only on its own agent's machine, as that agent's user and with that agent's read
@@ -71,12 +72,13 @@ class Refused(Exception):
 
 class Org:
     """What the module reads from the hub: the fleet manager's name, the team.json agents, the hub's one authority
-    function, authority(actor, target, action) -> (allowed, reason), and the features
-    that each helper reports. The module never decides authority itself: it asks this function, so the rules of the
-    module and of the hub cannot drift apart."""
+    function, authority(actor, target, action) -> (allowed, reason), the features that each helper reports, and
+    giver(name), the agent that gives an agent its tasks (hub.task_giver; the team.json reporting line when it is
+    None). The module never decides authority itself: it asks this function, so the rules of the module and of the hub
+    cannot drift apart."""
 
-    def __init__(self, manager, agents, authority, features=None):
-        self.manager, self.agents, self.authority = manager, agents, authority
+    def __init__(self, manager, agents, authority, features=None, giver=None):
+        self.manager, self.agents, self.authority, self.giver = manager, agents, authority, giver
         self.features = features or (lambda agent: ())     # hub.helper_features: what an agent's helper reports
 
 
@@ -87,7 +89,8 @@ def number_text(x):
 
 
 def team_authority(manager, agents):
-    """A stand-in with the rules of hub.authority, for the tests of this module."""
+    """A stand-in with the rules of hub.authority, for the tests of this module (not task_giver's team of a lead whose
+    Shell box is off: the hub's own tests cover that)."""
     def authority(actor, target, action):
         if actor not in agents:
             return False, f"{actor} is not an agent of this team."
@@ -115,8 +118,11 @@ def level(org, caller, target):
 
 
 def boss(org, name):
-    """The agent that gives `name` its tasks in the reporting lines: its lead, or the fleet manager. None for the
-    fleet manager. As hub.reports_to."""
+    """The agent that gives `name` its tasks: its lead or the fleet manager, and for the team of a lead whose Shell box
+    is off the nearest agent above that lead that can act (Org.giver, hub.task_giver). None for the fleet manager. Without a giver, the
+    team.json reporting line, as hub.reports_to."""
+    if org.giver is not None:
+        return org.giver(name)
     conf = org.agents.get(name) or {}
     if name == org.manager or conf.get("role") == "manager":
         return None
@@ -190,8 +196,9 @@ def check_set(org, caller, target):
 
 def wake_route(org, target):
     """(route, None), or (None, why) when a match cannot start anything that someone can follow. A wake-up of the
-    fleet manager is one inbox message. Otherwise it is a task for the target, whose requester is the target's boss in
-    the reporting lines:
+    fleet manager is one inbox message. Otherwise it is a task for the target, whose requester is the agent that gives
+    the target its tasks (boss): its lead, or the fleet manager for an agent with no lead, and for the team of a lead
+    whose Shell box is off, which has no tool to check a result, the nearest agent above that lead that can act:
 
     {"kind": "message", "to": <fleet manager>}
     {"kind": "task", "owner": <target>, "requester": <fleet manager>, "parent": None}
@@ -199,7 +206,7 @@ def wake_route(org, target):
 
     A requester other than the fleet manager reads results only in its own task sessions, so the hub starts a parent
     task for it in the same transaction, and the target's task is its subtask. That requester must be a lead (it needs
-    the team tools) that reports to the fleet manager. Every task of the route must pass the one authority function
+    the team tools) that gets its tasks from the fleet manager (boss). Every task of the route must pass the one authority function
     (action "task"), so a wake never starts a task that its requester could not give."""
     if target == org.manager:
         return {"kind": "message", "to": target}, None
@@ -211,8 +218,8 @@ def wake_route(org, target):
             return None, (f"{requester} would receive {target}'s result, but it is not a lead, so it has no tools to "
                           f"check results. The owner can make it a lead.")
         if boss(org, requester) != org.manager:
-            return None, (f"{requester} would receive {target}'s result, but it reports to {boss(org, requester)}, "
-                          f"not to the manager. A wake-up can go through one lead only.")
+            return None, (f"{requester} would receive {target}'s result, but it gets its tasks from "
+                          f"{boss(org, requester)}, not from the manager. A wake-up can go through one lead only.")
         parent = {"owner": requester, "requester": org.manager}
         allowed, why = org.authority(org.manager, requester, "task")
         if not allowed:

@@ -324,11 +324,17 @@ class HubSide(OwnerAPI):
         self.assertIn("repo_picker", hub.ui_features())
 
     def test_the_door_s_list_keeps_only_each_account_s_own_repositories(self):
+        """The list to choose from has no product repository either (door_targets.VENDOR_REPOS), which no grant gives
+        (20 November 2026), and no account that has only those: the owner never picks a grant that is refused."""
+        import door_targets
         door = {"address": "100.64.0.9", "port": 8766, "token": "t" * 43}
-        answer = {"accounts": {"one-org": {"name": "One-Org", "repos": ["one-org/shop", "Other/stray", "bad name"]},
+        answer = {"accounts": {"one-org": {"name": "One-Org", "repos": ["one-org/shop", "Other/stray", "bad name",
+                                                                         "One-Org/Core"]},
+                               "two-org": {"name": "Two-Org", "repos": ["two-org/core"]},
                                "x y": {"name": "x", "repos": ["x/y"]}}}
         with patch.object(hub, "github_app", return_value=None), patch.object(hub, "door_conf", return_value=door), \
-                patch.object(hub, "door_call", return_value=(200, answer)) as call:
+                patch.object(hub, "door_call", return_value=(200, answer)) as call, \
+                patch.object(door_targets, "VENDOR_REPOS", ("one-org/core", "two-org/core")):
             self.assertEqual(hub.github_repos_read(), ({"one-org": {"name": "One-Org", "repos": ["one-org/shop"]}}, []))
         self.assertEqual(call.call_args.args[1:4], ("GET", "/github/repos", "t" * 43))
         with patch.object(hub, "github_app", return_value=None), patch.object(hub, "door_conf", return_value=door), \

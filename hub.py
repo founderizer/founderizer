@@ -6988,8 +6988,8 @@ def team_start_text(agent):
     rev, duties = kit_revision(), {}
     for r in read_rows("SELECT agent, text FROM responsibilities WHERE state!='retired' ORDER BY id"):
         duties.setdefault(r["agent"], []).append(duty_name(r["text"]))
-    requester, mine = reports_to(agent), \
-        [n for n in agents() if reports_to(n) == agent] if role_of(agent) in ("lead", "manager") else []
+    requester, mine = task_giver(agent), \
+        [n for n in agents() if task_giver(n) == agent] if role_of(agent) in ("lead", "manager") else []
     # peer tasks: an equal on the line, which this agent may give a part of a task of its own (the start of a task
     # says how)
     peer = [n for n in agents() if gives_subtasks(agent) and peers(agent, n)[0]]
@@ -7450,9 +7450,9 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
                  f'questions, reports and permission prompts arrive in this session: check the result with '
                  f'check_result, answer with answer, decide prompts with decide_permission and reports with '
                  f'decide_report, and deliver {tref(task_id)} only when it is finished; see_team shows each part and what '
-                 f'waits on you. {reports_to(agent)} is told, and may cancel it.')
+                 f'waits on you. {peer_canceler(agent)} is told, and may cancel it.')
     if role_of(agent) == "lead" and not closed:      # F1: a closed session gives out no part
-        team = ", ".join(n for n in agents() if reports_to(n) == agent) or "nobody yet"
+        team = ", ".join(n for n in agents() if task_giver(n) == agent) or "nobody yet"
         said += (f' You lead {team}. Give parts of {tref(task_id)} to them with create_task: each becomes a subtask of '
                  f'{tref(task_id)}. Their results, questions and permission prompts arrive in this session: check each '
                  f'result with check_result, answer with answer, and decide prompts with decide_permission. A question '
@@ -7462,7 +7462,7 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
                  f'{manager_name()} stays the authority over every duty of the fleet, so it reads what you write and '
                  f'it writes a duty outside your team.' +
                  (f' Your peers report to {reports_to(agent)} as you do: {", ".join(mates)}. You may give one of them a '
-                  f'part of {tref(task_id)} the same way, and {reports_to(agent)} is told.' if mates else ''))
+                  f'part of {tref(task_id)} the same way, and {peer_canceler(agent)} is told.' if mates else ''))
     if resume:
         t = row or read_row("SELECT * FROM tasks WHERE id=?", (task_id,))
         said += ((" " + mask_secrets(note) if note else "") + unknown_start_text(task_id, closed, note) +
@@ -9140,8 +9140,13 @@ def t_restart_task(agent, a):
 
 def restart_authority(agent, t):
     """(allowed, why) of a restart of task row `t` by `agent`: the one authority rule over its owner, or the manager
-    acting for a lead that cannot (lead_left), because the manager is the authority over the whole fleet."""
+    for a task that it requested or for a lead that cannot (lead_left), because the manager is the authority over the
+    whole fleet: a task of its own stays its own after the owner's line changed (a lead's Shell box back on)."""
+    if not agent_active(t["owner"]):        # the true reason for every caller, before the manager's two branches
+        return False, f"{t['owner']} is in setup. The owner activates it in Fleet."
     if agent != t["requester"] and acts_for(agent, t):
+        return True, None
+    if agent == t["requester"] == manager_name():
         return True, None
     allowed, reason = authority(agent, t["owner"], "task")
     return (True, None) if allowed or (agent == t["requester"] and t["peer"] and peers(agent, t["owner"])[0]) \
@@ -10242,7 +10247,7 @@ def mine_text(agent, who, want, find, count):
         if role_of(agent) != "lead":
             raise ToolError("agent= is for a lead reading the finished work of its own team. Leave it out to read "
                             "your own.")
-        team = [n for n in agents() if reports_to(n) == agent and authority(agent, n, "task")[0]]
+        team = [n for n in agents() if task_giver(n) == agent and authority(agent, n, "task")[0]]
         if who not in team:
             raise ToolError(f"{who} is not on your team, so its finished work is not yours to read. Your team: "
                             f"{', '.join(team) or 'nobody'}.")
@@ -10472,6 +10477,15 @@ def access_route(asker, rid, requester, want=None, restarts=None):
         # A question outlives its asker and its kind: a line that is shown long after the ask never raises.
         return f"ACCESS NEEDED: {rid[:200]}, which the hub cannot read any more: team.json has no such asker or kind."
     want = want if want in RESOURCE_LEVELS[kind] else None
+    if kind == "repo":
+        import door_targets
+        if door_targets.vendor(what):
+            # One of the product's own repositories: the door makes no token for it in any fleet, so no grant, no
+            # restart and no agent that holds it gets the work through, and no owner's step either (vendor_repo_check)
+            return (f"ACCESS NEEDED: {asker} needs {resource_phrase(kind, what)} ({rid})" +
+                    (f" at {want}" if want else "") + f". {refusal_words.words('repo_vendor', {'repo': what})} No "
+                    f"restart and no agent that holds it gets this work through either: answer the question, and say "
+                    f"that no agent can use {what}, so that the work goes on without it.")
     hold_words = door_hold_note(what) if kind == "server" else ""
     if hold_words and door_hold_of(what) == "parts":
         # the owner, 17 November 2026: a card asked him for a tag that the server carried, while the manager's hold
@@ -11065,7 +11079,8 @@ def lead_left(lead, t):
     """True when `lead`, the requester of task row `t` or the holder of a question about it, can no longer act on it,
     so that the manager acts for it (the owner, 29 October 2026; report_for_manager's rule since 22 October): it is
     no lead any more, the task of its session above `t` has ended, or it lost its authority over the agent below it on
-    that chain. Never for the manager, which acts for itself. read_row only."""
+    that chain (also when its Shell box went off: task_giver). Never for the manager, which acts for itself. read_row
+    only."""
     if not lead or lead == manager_name():
         return False
     link = chain_link(lead, t) if t is not None else None
@@ -11150,7 +11165,7 @@ LEAD_LOOK_ROWS = 12
 
 
 def lead_overview(agent, parent):
-    team = [n for n in agents() if reports_to(n) == agent]
+    team = [n for n in agents() if task_giver(n) == agent]
     # a worker reads the parts that it gave its peers (peer tasks), and has no team of its own
     out = [f"YOUR TEAM ({agent})"] if role_of(agent) != "worker" else [f"WHAT YOU GAVE YOUR PEERS ({agent})"]
     for name in team:
@@ -11225,8 +11240,9 @@ AUTHORITY_ACTIONS = ("task", "rule")
 def authority(actor, target, action):
     """(allowed, reason): the one authority rule. May `actor` give `target` a task ("task"), or set and change the
     wake-up rules that wake `target` ("rule")? create_task, the lead team tools, trigger runs and the wake-up rules all
-    ask it. A task follows the reporting line, and only the agent itself or the fleet manager sets its rules. reason is
-    None when allowed."""
+    ask it. A task follows the reporting line (task_giver: the team of a lead whose Shell box is off gets its tasks
+    from the nearest agent above that lead that can act), and only the agent itself or the fleet manager sets its
+    rules. reason is None when allowed."""
     if action not in AUTHORITY_ACTIONS:
         raise ValueError(f"unknown authority action {action!r}")
     team, manager = agents(), manager_name()
@@ -11238,9 +11254,11 @@ def authority(actor, target, action):
         if actor in (manager, target):
             return True, None
         return False, f"Only {target} itself or {manager} sets {target}'s rules."
-    workers = [n for n, x in team.items() if x.get("role") in ("worker", "lead") and reports_to(n) == actor]
+    workers = [n for n, x in team.items() if x.get("role") in ("worker", "lead") and task_giver(n) == actor]
     if target not in workers:
-        boss = reports_to(target) if target in team else None
+        boss, giver = (reports_to(target), task_giver(target)) if target in team else (None, None)
+        if giver != boss:
+            return False, f"{boss}'s Shell box is off, so {giver} gives {target} its tasks."
         return False, (f"{target} reports to {boss}: only {boss} gives it tasks." if boss and boss != actor else
                        f"'{target}' does not report to you. Your team: {', '.join(workers) or 'nobody'}.")
     if not agent_active(target):
@@ -11282,6 +11300,13 @@ def peers(actor, target):
     if not agent_active(target):
         return False, f"{target} is in setup. The owner activates it in Fleet."
     return True, None
+
+
+def peer_canceler(agent):
+    """The agent that may cancel a task that `agent` gives its peer, beside the giver: the agent above both, or the
+    fleet manager when that is an agent whose Shell box is off, which has no cancel_task (peer_told tells both)."""
+    boss = reports_to(agent)
+    return manager_name() if boss and shell_off(boss) else boss
 
 
 def may_give(actor, target):
@@ -11897,7 +11922,7 @@ def t_create_task(agent, a):
         said += (f" {owner} is your peer: the task is a part of {tref(f['parent'])}, its result, questions, "
                  f"reports and permission prompts come to this session, and you check its result with "
                  f"check_result. "
-                 f"{reports_to(agent)} is told, and may cancel it.")
+                 f"{peer_canceler(agent)} is told, and may cancel it.")
     if f.get("duty_case"):
         said += f" It is work of {cref(case_row(f['duty_case']))}, and close_case ends that case."
     if f.get("step") is not None:
@@ -11925,7 +11950,8 @@ def t_cancel_task(agent, a):
     # it acts from any session of its own, but never from one that a person's conversation drives (peer_task_refusal)
     boss = bool(t["peer"]) and t["requester"] not in (agent, t["owner"]) and \
         (agent == manager_name() or (reports_to(t["owner"]) == agent and reports_to(t["requester"]) == agent))
-    if t["requester"] != agent and not boss:
+    acting = not boss and t["requester"] != agent and acts_for(agent, t)    # the manager, for a lead that cannot
+    if t["requester"] != agent and not boss and not acting:
         raise ToolError(f"{tref(tid)} was not requested by you.")
     if boss and contact_session(agent):
         raise ToolError(f"A person's conversation drives this session, and their words cancel no task that "
@@ -11940,12 +11966,15 @@ def t_cancel_task(agent, a):
     unfile_notices(tid)
     end_waits(tid)
     by = (f"{agent}, which you and {t['requester']} report to" if reports_to(t["owner"]) == agent else agent) \
-        if boss else "your requester"
+        if boss else f"{agent}, in place of your requester {t['requester']}" if acting else "your requester"
     emit(t["owner"], "say", f"[hub] {tref(tid)} was canceled by {by}: {full_stop(reason)} Stop working on it "
                             f"now.", task=tid)
     if boss:
         emit(t["requester"], "say", f"[hub] {agent} canceled {tref(tid)}, which you gave your peer {t['owner']}: "
                                     f"{full_stop(reason)}", task=tid)
+    elif acting:            # a lead that can no longer act on it still reads its news, with its next read
+        emit(t["requester"], "say", f"[hub] {agent} canceled {tref(tid)}, which you requested and can no longer act "
+                                    f"on: {full_stop(reason)}", task=tid, extra=QUIET_SAY)
     cancel_subtasks(tid, reason)
     left = case_left_open(case_id=t["duty_case"]) if t["duty_case"] else None
     return f"{tref(tid)} is canceled." + (" " + case_left_open_text(left) if left else "")
@@ -12904,7 +12933,10 @@ def capacity_text(view, filters, needs, restricted=False, parent=None, caller=No
                                                      or "none"))
         repos = (agents().get(a["agent"]) or {}).get("repos") or {}       # owner feature integrations
         if repos:
-            facts.append("GitHub repositories: " + ", ".join(f"{r} ({v})" for r, v in sorted(repos.items())))
+            import door_targets         # a hold from before of one of the product's own: no work on it can go there
+            facts.append("GitHub repositories: " + ", ".join(
+                f"{r} ({v}" + ("; the door refuses it in every fleet, so this agent cannot use it"
+                               if door_targets.vendor(r) else "") + ")" for r, v in sorted(repos.items())))
         if a["google"]:             # owner feature google: a duty that writes to customers needs Gmail send
             facts.append("Google: " + ", ".join(f"{GOOGLE_NAMES[s]} {lvl}" for s, lvl in sorted(a["google"].items())))
         if a["duties"]:             # owner API 1.13: what it answers for already
@@ -13192,7 +13224,7 @@ def t_see_capacity(agent, a):
         raise ToolError("needs must be none, browser or screen.")
     parent = lead_task(agent)
     if parent is not None:
-        names = [n for n in agents() if reports_to(n) == agent and authority(agent, n, "task")[0]]
+        names = [n for n in agents() if task_giver(n) == agent and authority(agent, n, "task")[0]]
     else:
         names = [n for n in agents() if n != agent]
     filters = ", ".join(f"{k} {v}" for k, v in (("expertise", expertise), ("needs", needs), ("login", login)) if v)
@@ -14253,12 +14285,15 @@ def need_is_yours(agent, *texts):
     """The refusal of a Needs-you item that asks the owner for something this manager may already give, or None. The
     owner's own rule is that a grant is the authorization and the manager answers for giving it; that rule only works
     if the owner is never asked for what he has already delegated."""
+    import door_targets
     blob = " ".join(t for t in texts if t).lower()
     words, services = re.sub(r"\S+@\S+", " ", blob), None      # its words without addresses: x@gmail.com is no Gmail
     for rid, entry in sorted(resource_pool().items()):
         kind, what = resource_parts(rid)
         if not kind or not entry.get("max") or not resource_known(kind, what, TEAM):
             continue
+        if kind == "repo" and door_targets.vendor(what):
+            continue        # a standing from before: grant_check refuses each grant of it (vendor_repo_check)
         if rid not in blob and not (len(what) >= 4 and what in blob):
             continue
         if kind in ("drive", "gmail"):
@@ -14598,6 +14633,18 @@ def card_dead(kind, what):
     return False
 
 
+def vendor_in_words(low):
+    """The first of the product's own repositories (door_targets.VENDOR_REPOS) that words in lower case name by its
+    whole name, or None: owner/name, also in a github.com link or with .git, as a clone's error shows it. Never by its
+    short name, which an unrelated word can be ("agents")."""
+    import door_targets
+    for name in door_targets.VENDOR_REPOS:
+        name = name.lower()
+        if re.search(rf"(?:(?<![\w/.@-])|(?<=github\.com/)){re.escape(name)}(?:\.git)?(?![\w@-]|\.\w)", low):
+            return name
+    return None
+
+
 def card_named(text):
     """(kind, what) of a thing of the fleet's record that plain words name, or None: a repository or a server of an
     agent, a Google account of an agent, a secret by its title or its variable, or an MCP server by its name."""
@@ -14615,6 +14662,9 @@ def card_named(text):
         for kind, got in sorted((a.get("google") or {}).items()):
             if isinstance(got, dict) and says(str(got.get("account") or "").lower()):
                 return kind, str(got["account"]).lower()
+    vendor = vendor_in_words(low)       # the product's own repositories by their whole name, held or not
+    if vendor:
+        return "repo", vendor
     for ref, entry in sorted((TEAM.get("logins") or {}).items()):
         if any(says(str(entry.get(k) or "").lower()) for k in ("env", "title")):
             return "secret", ref
@@ -14634,13 +14684,21 @@ def card_access(words, level):
                         "does not name, such as a role in a cloud account, a database login or a new agent.")
     if len(text) > 200:
         raise ToolError("needs_access is at most 200 characters: the thing itself, not its story.")
+    import door_targets
     kind, what = resource_parts(text.lower())
     if not kind:
         if str(level or "").strip():
             raise ToolError("needs_level is the level of a thing that the fleet's record names (<kind>:<what>).")
         named = card_named(text)
-        return (f"needs_access names {named[0]}:{named[1]} in words. Give it as {named[0]}:{named[1]}, with needs_level "
-                f"for the level that the work needs, so that the hub can tell who holds it.") if named else None
+        if not (named and named[0] == "repo" and named[1] == vendor_in_words(text.lower())):
+            return (f"needs_access names {named[0]}:{named[1]} in words. Give it as {named[0]}:{named[1]}, with "
+                    f"needs_level for the level that the work needs, so that the hub can tell who holds it.") \
+                if named else None
+        kind, what = named          # one of the product's own repositories named whole: refused below, in one step
+    if kind == "repo" and door_targets.vendor(what):
+        # one of the product's own repositories: no grant of the owner's works either (vendor_repo_check), and an
+        # agent that holds it from before cannot use it, so the item has nobody to send the work to
+        return refusal_words.words("repo_vendor", {"repo": what})
     if not resource_known(kind, what, TEAM):
         return (f"needs_access {text} is not one thing that the fleet's record names. Give <kind>:<what> exactly as "
                 f"grant_access takes it (repo:acme/web), or a few plain words for what the record does not name. A key "
@@ -14768,8 +14826,8 @@ def need_give(a):
             raise ToolError(f"With needs_agent, needs_access names repositories only (repo:<owner>/<name>), and {thing} "
                             f"is not one. For another thing, leave needs_agent out and write the owner's steps in "
                             f"what_to_do.")
-        if door_targets.vendor(what):
-            raise ToolError(f"The door refuses {what} in every fleet, so no grant of it works: leave it out.")
+        if door_targets.vendor(what):       # the words of every grant of one (vendor_repo_check, grant_check)
+            raise ToolError(refusal_words.words("repo_vendor", {"repo": what}))
         repos.append(what)
     return {"agent": agent, "level": level, "repos": sorted(repos)}
 
@@ -14809,9 +14867,14 @@ def need_gives(need_id):
 
 def need_give_gone(give):
     """The words that close an item whose Give has nobody to give to any more: its agent left the fleet, or holds no
-    repositories now (it is no worker or lead); else None. An agent that is paused or in setup keeps its card: a grant
-    to it still works."""
+    repositories now (it is no worker or lead), or the item names one of the product's own repositories, which no grant
+    gives (a card from before it was one: need_give refuses a new one); else None. An agent that is paused or in setup
+    keeps its card: a grant to it still works."""
+    import door_targets
     agent = give["agent"]
+    vendor = [r for r in give["repos"] if door_targets.vendor(r)]
+    if vendor:
+        return f"Closed by the hub: the door refuses {vendor[0]} in every fleet, so Give gives nothing."
     if agent in agents() and role_of(agent) in ("worker", "lead"):
         return None
     return f"Closed by the hub: {shown_role(agent)} cannot take this access any more, so Give gives nothing."
@@ -22700,7 +22763,7 @@ def conversation_task_rows(conv, person, cm, t0):
             (unused_id("tasks"), f"Answer {person['name']}",       # on a card: its conversation is in the details
              f"A conversation task: {cm_ref(cm)} of C-{conv['id']}, with {person['name']} ({person['role']}). It runs "
              f"in that conversation's own session, and the reply ends it.",
-             f"{agent_display(agent)} answered {person['name']} with reply.", "none", agent, reports_to(agent),
+             f"{agent_display(agent)} answered {person['name']} with reply.", "none", agent, task_giver(agent),
              "submitted", t0, t0, conv["id"], cm, f"{person['name']} wrote in C-{conv['id']}.",
              person["id"] if narrowed else None)).lastrowid
         DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,1,?,'created')", (tid, t0))
@@ -31427,10 +31490,12 @@ def duty_state_change(r, action, by, note="", command=None, receipt=None):
 
 
 def duty_read_allowed(actor, r):
-    """Who sees a duty: its holder, the fleet manager, and the lead of the agent that holds it. Reading follows
-    writing: a lead writes the duties of its own team (duty_write_allowed), and a duty it may write but not read
-    would be a duty it could only overwrite blind."""
-    return actor in (r["agent"], manager_name()) or duty_write_allowed(actor, r["agent"])[0]
+    """Who sees a duty: its holder, the fleet manager, the lead of the agent that holds it, and the agent that gives
+    the holder its tasks (task_giver). Reading follows writing: a lead writes the duties of the agents that it gives
+    tasks to (duty_write_allowed), and a duty it may write but not read would be a duty it could only overwrite blind.
+    A lead whose Shell box is off writes none, and still reads its own team's."""
+    return actor in (r["agent"], manager_name()) or duty_write_allowed(actor, r["agent"])[0] or \
+        (role_of(actor) == "lead" and reports_to(r["agent"]) == actor)
 
 
 def duty_write_allowed(actor, target):
@@ -31460,7 +31525,7 @@ def duty_write_allowed(actor, target):
         if authority(actor, target, "task")[0]:                  # its own team, by the one authority rule
             return True, None
         team = ", ".join(n for n, x in agents().items()
-                         if x.get("role") in ("worker", "lead") and reports_to(n) == actor) or "nobody"
+                         if x.get("role") in ("worker", "lead") and task_giver(n) == actor) or "nobody"
         return False, (f"{target} does not report to you, so its duty is not yours to write. Your team: {team}. "
                        f"{manager} writes the duties of every other agent: ask it with message_agent.")
     return False, (f"Only {manager} writes a duty of {target}: you write duties for yourself only. Propose it to "
@@ -37177,8 +37242,12 @@ def resources_view(team):
 
 def save_resource(body):
     """One owner change of team.json "resources": the standing of one resource, or None, which takes the entry out.
-    The owner's own grants do not change with it; only who may hand this resource out."""
+    The owner's own grants do not change with it; only who may hand this resource out. A new standing of one of the
+    product's own repositories is refused, as grant_check would refuse each grant from it; one from before can be
+    taken out, and validate_team keeps it."""
+    import door_targets
     rid, policy = body["resource"], body["policy"]
+    kind, what = resource_parts(rid)
 
     def change(team):
         pool = dict(team.get("resources") or {})
@@ -37188,6 +37257,8 @@ def save_resource(body):
             raise Refusal(400, str(e)) from None
         if pool.get(rid) == entry or (entry is None and rid not in pool):
             return False
+        if entry is not None and kind == "repo" and door_targets.vendor(what):
+            raise Refusal(400, code="repo_vendor", names={"repo": what})
         if entry is None:
             pool.pop(rid, None)
         else:
@@ -37197,7 +37268,6 @@ def save_resource(body):
         else:
             team.pop("resources", None)
         return True
-    kind, what = resource_parts(rid)
     result = save_integration(body["base_sha256"], change, f"Owner changed the standing of {rid}")
     entry = resource_pool().get(rid)
     if result["changed"]:
@@ -37245,11 +37315,14 @@ def grant_pool(names, team=None):
     """What the manager may hand out now, for see_capacity: each resource of the pool with its level, its audience, the
     agents of this view that could be given it, and who holds it today. The pool is the authority — grant_access
     refuses everything outside it — so the manager reads it here instead of waiting for a message about it."""
+    import door_targets
     pool, services = [], None
     for rid, entry in sorted((((team or TEAM).get("resources")) or {}).items()):
         kind, what = resource_parts(rid)
         if not kind or not entry.get("max"):
             continue
+        if kind == "repo" and door_targets.vendor(what):
+            continue        # grant_check refuses it: the door refuses the product's own repositories in every fleet
         if kind in ("drive", "gmail"):
             services = google_services_now()[0] if services is None else services      # one read for the pool
             if kind not in services.get(what, ()):
@@ -37283,6 +37356,12 @@ def grant_check(agent, rid, level, folder=False):
     if a.get("role") not in ("worker", "lead"):
         raise ToolError(f"{agent} is the {a.get('role')}: a repository, a tool, a Google service and a secret reach "
                         f"task sessions, so only a worker or a lead gets one. You never grant to yourself.")
+    if kind == "repo":
+        import door_targets
+        if door_targets.vendor(what):
+            # the door refuses the product's own repositories in every fleet, so a grant of one would be taken and
+            # never work, also from the pool: the words of the owner's grant routes (vendor_repo_check)
+            return refusal_words.words("repo_vendor", {"repo": what})
     if kind == "server" and fleet_server(what):
         # the owner, 17 November 2026: a problem on one of the fleet's own servers is an agent's work, never his
         return FLEET_SERVER_NOTE.format(server=what) + door_fleet_change_words()
@@ -40641,16 +40720,19 @@ MODEL_WHY_MAX = 300     # characters of the reason for one model change
 
 
 def t_set_agent_model(agent, a):
-    """AUTONOMY.md P8: an agent's one changer -- its lead, or the fleet manager for an agent with no lead -- sets its
-    model and effort inside the account it has, while the setting model_changes is on: only what its runtime offers
-    on its machine now (offered), written as the owner's settings write them, and recorded in model_changes."""
+    """AUTONOMY.md P8: an agent's one changer -- the agent that gives it its tasks (task_giver): its lead, or the fleet
+    manager for an agent with no lead -- sets its model and effort inside the account it has, while the setting
+    model_changes is on: only what its runtime offers on its machine now (offered), written as the owner's settings
+    write them, and recorded in model_changes."""
     target = str(a.get("agent") or "").strip()
     if target not in agents():
         raise ToolError(f"There is no agent {target} in the team.")
-    if reports_to(target) != agent:
-        raise ToolError(f"{target}'s model is the owner's to change." if not reports_to(target) else
-                        f"{target} reports to {reports_to(target)}, which is the one that changes its model and "
-                        f"effort.")
+    giver = task_giver(target)
+    if giver != agent:
+        raise ToolError(f"{target}'s model is the owner's to change." if not giver else
+                        f"{reports_to(target)}'s Shell box is off, so {giver} changes {target}'s model and effort."
+                        if giver != reports_to(target) else
+                        f"{target} reports to {giver}, which is the one that changes its model and effort.")
     if not setting("model_changes"):
         raise ToolError("The owner turned model changes off (the setting model_changes). The model stays as it is.")
     new = {k: None if str(a.get(k) or "").strip().lower() in ("", "default") else str(a[k]).strip()
@@ -41468,8 +41550,8 @@ TOOLS = [
         "files": CHAT_FILES_FIELD},
        ["person", "text", "request_id"])),
     ("manager", "create_task", t_create_task,
-     "Give one agent a task: one that reports to you, or, from the session of a task of yours and with your Shell box "
-     "on, a peer, which reports to the same agent as you; a peer's task is a part of yours, its result comes to this "
+     "Give one agent a task: one that reports to you, or to a lead under you whose Shell box is off, or, from the "
+     "session of a task of yours and with your Shell box on, a peer, which reports to the same agent as you; a peer's task is a part of yours, its result comes to this "
      "session, and the agent above you both is told and may cancel it. A task that a peer gave you goes to no other "
      "peer, and a session that a person's conversation drives gives none. needs is none, browser or screen; the hub "
      "refuses an agent that lacks it. "
@@ -41532,7 +41614,8 @@ TOOLS = [
        ["owner", "title", "done_when"])),
     ("manager", "cancel_task", t_cancel_task,
      "Cancel a task that you requested and that is not finished yet, or one that an agent of yours gave its peer (the "
-     "hub told you of it; the fleet manager cancels any such task).",
+     "hub told you of it; the fleet manager cancels any such task). The fleet manager also cancels a task whose lead "
+     "can no longer act on it.",
      S({"task_id": TASK_ID, "reason": STR}, ["task_id", "reason"])),
     ("manager", "restart_task", t_restart_task,
      "Start a task that you requested once more in a new session, whenever you judge that a new session helps: its "
@@ -41614,9 +41697,8 @@ TOOLS = [
         "window": {"type": "integer", "description": f"Days. Default {HISTORY_WINDOW}, at most {HISTORY_WINDOW_MAX}."},
         "agent": {"type": "string", "description": "One agent of your team only"}})),
     ("manager", "set_agent_model", t_set_agent_model,
-     "Change the model and the effort of an agent you give work to (a lead's own team; the fleet manager's agents "
-     "with no lead), inside its own runtime and account: only a model and an effort that its runtime offers on its "
-     "machine now. Its next sessions start with them. Change one thing at a time, say why, and keep or undo it by "
+     "Change the model and the effort of an agent you give work to, inside its own runtime and account: only a model "
+     "and an effort that its runtime offers on its machine now. Its next sessions start with them. Change one thing at a time, say why, and keep or undo it by "
      "the next period's costs. \"default\" is the owner's default for its runtime, else the runtime's own. A new "
      "account, provider or money is the owner's.",
      S({"agent": {"type": "string", "description": "The agent whose model and effort change"},
@@ -42589,8 +42671,9 @@ TOOLS = [
      "your own. First tell the owner what you will do, with tell_owner(text, in_reply_to, before_task=true) and one "
      "sentence that does not say that a task is open: call only tell_owner in that step, and call this when it "
      "returns, with the same in_reply_to. The owner then reads your sentence while you write this call, and this call "
-     "makes it the reply to their message. It runs in its own task session, with your line as its requester (the "
-     "manager, or your lead), which checks the result. That session has no browser and no screen unless you give "
+     "makes it the reply to their message. It runs in its own task session, with the agent that gives you your tasks "
+     "as its requester (your lead or the manager), which checks the result. That session has no browser and no "
+     "screen unless you give "
      "needs: browser for work that must click, type or sign in on a web page, screen for work in an app on your "
      "machine's own screen. Give one only when the work cannot be done without it or the owner's words ask for it: "
      "a browser or screen task holds the desktop of your machine while it is open. Give it in this call, because "
@@ -43080,7 +43163,7 @@ def shell_off_note(owner, task_id, giver):
         lines.append(f"{rref(r['id'])}: MCP servers {', '.join(theirs[0]) or 'none'}; web tools {theirs[1]}" +
                      (f"; also the Fleet tools {', '.join(theirs[2])}" if theirs[2] else ""))
     keyed = sorted(t for t in keyed if ((catalog.get(t) or {}).get("mint") or {}).get("field"))
-    boss = reports_to(owner)
+    boss = task_giver(owner)
     return (f" Note: {owner}'s Shell box is off, so this task's session has no shell, no file tool and no API key. "
             f"Its Fleet tools: {', '.join(held)}. Its MCP servers: {', '.join(mine[0]) or 'none'}. Its web tools: "
             f"{mine[1]}." +
@@ -44472,7 +44555,7 @@ def trigger_decision(t, manual, due, t0):
     agent, task = t["agent"], json.loads(t["task"])
     if agent not in agents():
         return "not_started", f"{agent} is no longer in the team, so the hub paused this trigger."
-    if role_of(agent) not in ("worker", "lead") or reports_to(agent) != manager_name():
+    if role_of(agent) not in ("worker", "lead") or task_giver(agent) != manager_name():
         return "not_started", f"{agent} does not report to the manager."
     if task["needs"] != "none" and task["needs"] not in (agents()[agent].get("can") or []):
         return "not_started", f"{agent} has no {task['needs']}."
@@ -44773,8 +44856,8 @@ def agent_rule(t):
 
 def wake_org():
     """The facts that the wake-up module reads (WAKEUPS-INTERFACE.md): the fleet manager, the team, the one authority
-    function and the features that each helper reports."""
-    return wakeups.Org(manager_name(), agents(), authority, features=helper_features)
+    function, the features that each helper reports and the agent that gives each agent its tasks (task_giver)."""
+    return wakeups.Org(manager_name(), agents(), authority, features=helper_features, giver=task_giver)
 
 
 def wake_when(t):
@@ -44948,13 +45031,13 @@ def checks_start_text(agent, task_id):
     since = read_row("SELECT MAX(a.created) at FROM attempts a JOIN tasks t ON t.id=a.task WHERE t.owner=? AND "
                      "(a.task<>? OR a.attempt<(SELECT MAX(attempt) FROM attempts WHERE task=?))",
                      (agent, task_id, task_id))["at"]
-    team = [n for n in agents() if reports_to(n) == agent] if role_of(agent) == "lead" else []
+    team = [n for n in agents() if task_giver(n) == agent] if role_of(agent) == "lead" else []
     return checks_block(agent, since, team, "YOUR TEAM since your last session")
 
 
 def manager_checks_text(t0):
     """The checks block of the fleet manager's brief (plan P4): its own checks, and the new or changed checks of the
-    agents that report to it with no lead between, since its last brief (kv checks_brief, which this moves to t0). A
+    agents that it gives tasks to (task_giver: no lead between, or a lead whose Shell box is off), since its last brief (kv checks_brief, which this moves to t0). A
     lead reads its own team's in its sessions' starts. Outside every transaction: the standing session's start asks
     for the brief."""
     manager = manager_name()
@@ -44963,8 +45046,8 @@ def manager_checks_text(t0):
         since = float(last) if last else None
     except ValueError:
         since = None
-    team = [n for n in agents() if n != manager and reports_to(n) == manager]
-    text = checks_block(manager, since, team, "THE AGENTS THAT REPORT TO YOU since your last brief")
+    team = [n for n in agents() if n != manager and task_giver(n) == manager]
+    text = checks_block(manager, since, team, "THE AGENTS THAT YOU GIVE TASKS TO since your last brief")
     kv_set(f"checks_brief:{manager}", str(t0))
     return text
 
@@ -45039,7 +45122,7 @@ def check_decision(t, r, value, t0):
     agent, task = t["agent"], json.loads(t["task"])
     if agent not in agents():
         return "not_started", f"{agent} is no longer in the team, so the hub paused this trigger.", None
-    if role_of(agent) not in ("worker", "lead") or reports_to(agent) != manager_name():
+    if role_of(agent) not in ("worker", "lead") or task_giver(agent) != manager_name():
         return "waiting", f"{agent} does not report to the manager.", None
     if task["needs"] != "none" and task["needs"] not in (agents()[agent].get("can") or []):
         return "waiting", f"{agent} has no {task['needs']}.", None
@@ -50205,8 +50288,9 @@ def name_check(value):
 # and reads it with setting(key). A key that is not here is a later release's (plan P0): validate_team checks none of
 # those, and every write keeps them as they are.
 SETTINGS = {
-    "model_changes": (True, setting_bool, "An agent's lead, or the fleet manager for an agent with no lead, changes "
-                                          "its model and effort inside the account it has (AUTONOMY.md P8)."),
+    "model_changes": (True, setting_bool, "The agent that gives an agent its tasks (its lead, or the fleet manager for "
+                                          "an agent with no lead) changes its model and effort inside the account it "
+                                          "has (AUTONOMY.md P8)."),
     "contacts.v2": (False, setting_bool, "Roles are prompts and conversations act (AUTONOMY.md P1, P2): one switch "
                                          "for the fleet. Turning it on gives employees and supervisors the role "
                                          "peer and deputies the role manager, one time."),
@@ -51521,12 +51605,30 @@ def check_lines(lines):
 
 
 def reports_to(name):
-    """The agent that gives this agent its tasks: its lead, or the manager."""
+    """The agent that this agent reports to in the reporting lines: its lead, or the manager. The agent that gives it
+    its tasks is task_giver's, which differs only for the team of a lead whose Shell box is off."""
     a = agents().get(name) or {}
     if a.get("role") == "manager":
         return None
     up = a.get("reports_to")
     return up if up in agents() else manager_name()
+
+
+def task_giver(name):
+    """The agent that gives this agent its tasks, checks their results and changes its model: the agent that it reports
+    to, or, when that is a lead whose Shell box is off (its sessions have no tool to give, check or change work:
+    SHELL_OFF_TOOLS), the nearest agent above it that can: a lead whose Shell box is on, or the fleet manager. So
+    nobody skips a level that can act. None for the manager. The one authority rule (authority) and the route of a
+    wake-up (wakeups.wake_route, through wake_org) follow it, so no task of such a lead's team waits for a check that
+    nobody can make, and the manager acts for that lead on the work that it requested before (lead_left). The finding
+    of the KPI spec, 20 November 2026: wake_route read the lead's role and not its Shell box."""
+    up, seen = reports_to(name), {name}
+    while up and role_of(up) == "lead" and shell_off(up):
+        if up in seen:              # check_lines refuses a loop in the reporting lines; this ends one all the same
+            return manager_name()
+        seen.add(up)
+        up = reports_to(up)
+    return up
 
 
 def reload_team(revision):
@@ -51734,7 +51836,8 @@ def save_lines(base, lines):
     words = "; ".join(f"{c['agent']} is now a {c['after']['role']} reporting to {c['after']['reports_to']}"
                       for c in changed)
     emit(manager, "say", f"[hub] The owner changed the reporting lines: {words}. Give tasks only to the agents that "
-         f"report to you; a lead gives tasks to its own team.")
+         f"report to you, and to the team of a lead under you whose Shell box is off; a lead does the same for its "
+         f"own team.")
     updates = [n for n in moved if request_update(n, commit) == "requested"]
     log("owner", f"changed the reporting lines in {commit[:12]}: {words}")
     return {"revision": commit, "sha256": hashlib.sha256(data).hexdigest(), "changed": changed,
@@ -57265,12 +57368,18 @@ GITHUB_REPOS_LOCK = threading.Lock()
 def github_repos_read():
     """({account: {"name": the account as GitHub writes it, "repos": [owner/name in lower case]}}, problems): the
     repositories of every installation of the hub's own App and of the door's Apps, archived ones and suspended
-    installations left out. A source that cannot be read is a problem, and the other still counts."""
+    installations left out. A source that cannot be read is a problem, and the other still counts. The product's own
+    repositories are left out too, which no grant gives (vendor_repo_check), and an account that has only those."""
+    import door_targets
     found, problems = {}, []
 
     def keep(login, name, repos):
+        mine = {r for r in repos if REPO_NAME.fullmatch(r) and r.split("/")[0] == login.lower()}
+        own = {r for r in mine if not door_targets.vendor(r)}
+        if mine and not own:
+            return
         entry = found.setdefault(login.lower(), {"name": name, "repos": set()})
-        entry["repos"] |= {r for r in repos if REPO_NAME.fullmatch(r) and r.split("/")[0] == login.lower()}
+        entry["repos"] |= own
     app = github_app()
     if app is not None:
         try:
@@ -57399,8 +57508,10 @@ def github_reach_refresh():
 
 def github_unreached(repos):
     """{owner/name: the GitHub page where the owner adds it} of each of these repositories that the hub's GitHub App
-    does not reach, from the newest reading (github_reach); {} without one."""
-    repos = sorted(set(repos))
+    does not reach, from the newest reading (github_reach); {} without one. No page for one of the product's own
+    repositories, an old hold or standing of one: adding it to the App would not make it work (vendor_repo_check)."""
+    import door_targets
+    repos = sorted({r for r in repos if not door_targets.vendor(r)})
     reach = github_reach() if repos else None
     if not reach:
         return {}
@@ -58207,6 +58318,20 @@ def known_agents(team, names):
         raise Refusal(400, "no such agent: " + ", ".join(unknown))
 
 
+def vendor_repo_check(team, names, levels):
+    """POST /ui/team/repos: refused (400, repo_vendor) when the change gives an agent of `levels` ({agent: level, or
+    None for a take-back}) one of the product's own repositories of `names` at a level that it does not hold now. The
+    door refuses them in every fleet (door_targets.vendor), so such a grant would be taken and never work: the agent's
+    clone fails. A take-back passes, and so does a hold that stays as it is, so a grant from before (validate_team
+    keeps it) leaves by a write that names the other agents as they are, as the owner MCP's grant_access sends one."""
+    import door_targets
+    for one in names:
+        if door_targets.vendor(one) and any(
+                level and ((team["agents"][name].get("repos") or {}).get(one) != level)
+                for name, level in levels.items()):
+            raise Refusal(400, code="repo_vendor", names={"repo": one})
+
+
 def save_repo(body):
     """Who may use one GitHub repository, and how: {agent: read | write | deploy}. An agent that is not named loses
     it; {} removes the repository from every agent. repo may be a list: each of them gets this access, in one change.
@@ -58219,6 +58344,7 @@ def save_repo(body):
 
     def change(team):
         known_agents(team, access)
+        vendor_repo_check(team, names, access)
         changed = False
         for name, a in team["agents"].items():
             repos = dict(a.get("repos") or {})
@@ -58254,6 +58380,7 @@ def save_agent_repos(body):
 
     def change(team):
         known_agents(team, {agent: level or "read"})
+        vendor_repo_check(team, names, {agent: level})
         a = team["agents"][agent]
         repos = dict(a.get("repos") or {})
         before = dict(repos)

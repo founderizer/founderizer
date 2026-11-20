@@ -1063,6 +1063,23 @@ class Cases(Base):
         self.assertFalse(allowed)
         self.assertIn("only lead gives it tasks", why)
         self.assertEqual(hub.AUTHORITY_ACTIONS, ("task", "rule"))
+        # A lead whose Shell box is off has no tool to check that result (SHELL_OFF_TOOLS), so its team is the fleet
+        # manager's (task_giver): a wake of vps goes to the manager with no parent task, and the manager acts for the
+        # lead on the case that is open (lead_left). The KPI spec's finding of 20 November 2026: wake_route read the
+        # lead's role and not its Shell box.
+        hub.TEAM["agents"]["lead"]["can"] = []
+        self.assertEqual(hub.wakeups.wake_route(hub.wake_org(), "vps")[0],
+                         {"kind": "task", "owner": "vps", "requester": "manager", "parent": None})
+        self.assertEqual(hub.authority("manager", "vps", "task"), (True, None))
+        self.assertIn("lead's Shell box is off, so manager gives vps its tasks", hub.authority("lead", "vps", "task")[1])
+        self.assertTrue(hub.lead_left("lead", case))
+        self.assertTrue(hub.duty_read_allowed("lead", hub.duty_row(1)))     # it still reads its own team's duties
+        # and a task that the manager requested stays its own to restart when the lead's box is on again
+        own = hub.ins("INSERT INTO tasks(title,details,done_when,needs,owner,requester,state,created,attempt) "
+                      "VALUES(?,?,?,?,?,?,?,?,?)", ("Its own", "x", "y", "none", "vps", "manager", "working",
+                                                    hub.now(), 1))
+        hub.TEAM["agents"]["lead"]["can"] = ["shell"]
+        self.assertEqual(hub.restart_authority("manager", hub.get_task(own)), (True, None))
 
     def test_a_key_that_another_duty_has_open_joins_that_case_and_keeps_no_copy(self):
         """Live, 3 November 2026: a lead's duty copied each of a DevOps agent's cases into a case of its

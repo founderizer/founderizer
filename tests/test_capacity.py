@@ -239,8 +239,8 @@ class Capacity(OwnerAPI):
 
     def test_the_agent_above_two_peers_may_cancel_the_task_that_one_gave_the_other(self):
         """Told, not asked, and still in charge: the manager cancels pma's task for big, and both hear of it; another
-        agent of the same line may not, nor may the manager cancel a task between them that is no peer task, or act
-        on a person's words in a conversation. A lead above two peers cancels too, the manager cancels any peer task,
+        agent of the same line may not, nor may the manager cancel a task that is no peer task while its lead can act
+        on it, or act on a person's words in a conversation. A lead above two peers cancels too, the manager cancels any peer task,
         and the line about a peer task reaches a session that reads it. The bugs: a boss told of work that it cannot
         stop, a boss's cancel that reaches more than peer tasks, and a line filed where no session reads it."""
         lead = self.create("manager", "pma")
@@ -248,10 +248,6 @@ class Capacity(OwnerAPI):
         other = self.create("manager", "pmb")
         self.assertIn("was not requested by you", self.refused("pmb", "cancel_task", {
             "task_id": f"T-{part}", "reason": "Mine now."}, other))
-        old = hub.ins("INSERT INTO tasks(title,details,done_when,needs,owner,requester,state,created,attempt) "
-                      "VALUES(?,?,?,?,?,?,?,?,?)", ("Old work", "x", "y", "none", "big", "pma", "working", hub.now(), 1))
-        self.assertIn("was not requested by you", self.refused("manager", "cancel_task", {   # no peer task
-            "task_id": f"T-{old}", "reason": "Mine now."}))
         with patch.object(hub, "contact_session", lambda agent, context=None: True):
             self.assertIn("conversation drives", self.refused("manager", "cancel_task", {
                 "task_id": f"T-{part}", "reason": "A customer asked."}))
@@ -261,6 +257,8 @@ class Capacity(OwnerAPI):
         self.assertIn("canceled by manager, which you and pma report to", said("big"))
         self.assertIn(f"manager canceled T-{part}, which you gave your peer big", said("pma"))
         mine = self.create("pma", "seo", lead)
+        self.assertIn("was not requested by you", self.refused("manager", "cancel_task", {   # no peer task, and its
+            "task_id": f"T-{mine}", "reason": "Mine now."}))                                 # lead can act on it
         state = lambda tid: hub.q1("SELECT state FROM tasks WHERE id=?", (tid,))["state"]
         stop = lambda agent, tid, task=None: self.call(agent, "cancel_task", {"task_id": f"T-{tid}", "reason": "No."}, task)
         self.assertFalse(stop("pma", self.create("seo", "deva", mine), lead)[1])        # the lead above both

@@ -573,6 +573,15 @@ class WarmStart(Capacity):
         self.assertIn("message_agent: a message between linked tasks reaches the colleague's task, and any other its "
                       "chat, which can talk and not act", said)       # plan C11
         self.assertIn("None of this gives you their access", said)
+        # Its lead's Shell box is off: that lead gives and checks no work (SHELL_OFF_TOOLS), so the directory names the
+        # agent above that lead as the one that gives seo its tasks (task_giver): the fleet manager, or a lead above it
+        # whose Shell box is on, so that nobody skips a level that can act
+        hub.TEAM["agents"]["pma"]["can"] = []
+        said = hub.team_start_text("seo")
+        self.assertIn("manager [manager, Claude Code] -- it gives you your tasks:", said)
+        self.assertNotIn("pma [lead, Codex] -- it gives you your tasks", said)
+        hub.TEAM["agents"]["pma"]["reports_to"] = "pmb"
+        self.assertIn("pmb [lead, Codex] -- it gives you your tasks:", hub.team_start_text("seo"))
 
     def test_the_team_block_says_what_a_colleague_holds_and_nothing_it_is_spending(self):
         """What a colleague holds is a fact about the team. Its allowance, its workload, its accounts, its logins

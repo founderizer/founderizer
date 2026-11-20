@@ -173,7 +173,7 @@ class Routes(unittest.TestCase):
         self.assertIn("dev would receive deeper's result, but it is not a lead", why)
         agents = dict(AGENTS, **{"dev": dict(AGENTS["dev"], role="lead")})
         route, why = w.wake_route(org(agents=agents), "deeper")
-        self.assertIn("reports to lead-a, not to the manager. A wake-up can go through one lead only", why)
+        self.assertIn("gets its tasks from lead-a, not from the manager. A wake-up can go through one lead only", why)
 
 class Grants(unittest.TestCase):
     def test_the_execution_grant_is_the_same_rule_for_every_runtime(self):

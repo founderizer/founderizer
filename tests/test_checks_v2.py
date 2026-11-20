@@ -564,7 +564,7 @@ class Lines(OwnerAPI):
         brief = hub.manager_resume_text()
         self.assertIn("YOUR CHECKS", brief)
         self.assertIn(f"- Trigger {own['id']} (NEW", brief)
-        self.assertIn("NEW OR CHANGED CHECKS OF THE AGENTS THAT REPORT TO YOU since your last brief", brief)
+        self.assertIn("NEW OR CHANGED CHECKS OF THE AGENTS THAT YOU GIVE TASKS TO since your last brief", brief)
         self.assertIn(f"- Trigger {vps['id']} of vps (NEW, by vps in {self.sessions['vps'][1]})", brief)
         self.assertNotIn(f"Trigger {seo['id']} of seo", brief)
         self.assertLess(brief.index("YOUR CHECKS"), brief.index("Then call read_messages"))     # before the receipt

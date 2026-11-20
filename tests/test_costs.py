@@ -755,6 +755,12 @@ class ModelChanges(Base):
                                                             model="gpt-6.1-sol", effort="low", why="x"))
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM model_changes")["n"], 0)
         self.assertNotIn("model", self.origin_team()["agents"]["solo"])
+        # A lead whose Shell box is off changes no model (SHELL_OFF_TOOLS), so the fleet manager is its team's one
+        # changer (task_giver; the KPI spec's finding of 20 November 2026), or nobody but the owner could be
+        hub.TEAM["agents"]["lead"]["can"] = []
+        self.ok("manager", "set_agent_model", agent="hand", model="claude-sonnet-5-5", effort="low",
+                why="its lead changes no model")
+        self.assertEqual(hub.q1("SELECT by FROM model_changes WHERE agent='hand'")["by"], "manager")
 
     def test_the_setting_turns_model_changes_off(self):
         hub.TEAM["settings"] = {"model_changes": False}

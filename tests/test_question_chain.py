@@ -371,16 +371,19 @@ class ManagerActs(Chain):
         hub.TEAM["agents"]["mid"]["role"] = "worker"
         self.assertTrue(hub.lead_left("mid", t3))
 
-    def test_the_manager_answers_decides_checks_and_restarts_for_a_lead_that_cannot(self):
+    def test_the_manager_answers_decides_checks_restarts_and_cancels_for_a_lead_that_cannot(self):
         qid = self.ask()
         prompt = hub.ins("INSERT INTO prompts(task,agent,tool,input,key,created) VALUES(?,?,?,?,?,?)",
                          (self.t3, "w", "Bash", "make deploy", "k1", hub.now()))
+        spare = self.create("mid", "w", self.t2)
         # while mid can act, nobody skips it
         self.assertIn("was not asked of you", self.answer("manager", qid, "Blue.")[0])
         self.assertIn("is for mid to decide", self.refused("manager", "decide_permission",
                                                            {"prompt_id": f"P-{prompt}", "decision": "allow"}))
         self.assertIn("was not requested by you", self.refused("manager", "restart_task", {
             "task_id": f"T-{self.t3}", "request_id": str(uuid.uuid4()), "expected_attempt": 1, "reason": "x"}))
+        self.assertIn("was not requested by you", self.refused("manager", "cancel_task", {"task_id": f"T-{spare}",
+                                                                                          "reason": "x"}))
         hub.TEAM["agents"]["w"]["reports_to"] = "top"           # mid lost its authority over w
         team = self.ok("manager", "see_team", {})
         self.assertIn("with mid, which cannot act on it any more: you answer it", team)
@@ -393,6 +396,9 @@ class ManagerActs(Chain):
         self.assertIn("The restart of", self.ok("manager", "restart_task", {
             "task_id": f"T-{self.t3}", "request_id": str(uuid.uuid4()), "expected_attempt": 1,
             "reason": "its lead lost it"}))
+        self.assertIn("is canceled", self.ok("manager", "cancel_task", {"task_id": f"T-{spare}",
+                                                                        "reason": "its lead lost it"}))
+        self.assertIn("canceled by manager, in place of your requester mid", self.said("w", spare)[-1])
         # and its result, which the manager's see_team lists with its own
         hub.q("UPDATE tasks SET state='completed', outcome='completed', what='Painted it.', delivered=? WHERE id=?",
               (hub.now(), self.t3))

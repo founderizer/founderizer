@@ -432,7 +432,8 @@ class Conversations(Base):
     def test_work_and_questions_under_a_lead_join_the_leads_one_task_with_no_limit(self):
         """Plan P9.11: as a wake, a case and a review do, the work of a conversation is a subtask of the lead's one
         task for its team's results; and no number of open ones of a conversation is refused."""
-        hub.TEAM["agents"]["boss"] = {"role": "lead", "runtime": "claude", "machine": "studio-host", "can": []}
+        # a lead with its Shell box on: one with it off checks no result, and its team's work is the manager's
+        hub.TEAM["agents"]["boss"] = {"role": "lead", "runtime": "claude", "machine": "studio-host", "can": ["shell"]}
         hub.TEAM["agents"]["studio"]["reports_to"] = "boss"
         cid = self.says(PAT, "Please rebuild the export.")["conversation"]
         self.ok("read_messages", self.context(cid))
