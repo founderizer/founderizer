@@ -261,7 +261,7 @@ class SecondOpinion(unittest.TestCase):
     """OpenSSL's ECDSA beside ours (the owner's "OpenSSL as a second check", 20 November 2026): an owner statement
     counts only when both take its signature, wherever the machine has an OpenSSL that passes the probe, for the
     central vault and for a machine broker's handover pin alike (both take it through owner_statement, which calls
-    owner_signed_twice). owner_signed, the door's and the hub's, stays our ECDSA alone."""
+    owner_signed_twice). owner_signed stays our ECDSA alone; the door and the hub take owner_signed_twice too."""
 
     owners = {"owner_keys": [OWNER_A, OWNER_B]}
 
@@ -334,8 +334,8 @@ class SecondOpinion(unittest.TestCase):
         in the log, with one run also where the owner's key is listed twice (one call stays within the hub's wait for
         the vault, under its one request lock). The program stays kept, so the next check asks it again and opens no
         probe that one failure could end: a forged statement that our ECDSA takes is still refused when OpenSSL then
-        fails once on the probe's good signature. owner_signed, which the door and the hub call under their locks, runs
-        no OpenSSL."""
+        fails once on the probe's good signature. owner_signed runs no OpenSSL; the door and the hub take
+        owner_signed_twice, and keep each statement's answer, so that OpenSSL runs once for each."""
         program = self.openssl()
         calls = []
         twice = {"owner_keys": [OWNER_A, OWNER_A, OWNER_B]}

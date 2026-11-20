@@ -72,7 +72,7 @@ if _running is not None and vars(_running) is globals():
 from usage import IDENTITY_CHANGED, IDENTITY_ERRORS, READING_AHEAD, SCREEN_RUNTIME, SIGN_IN_REQUIRED, local_model, \
     validate_usage
 from lifecycle import EDITABLE_FACTS, TOKEN_KINDS, facts_now, token_price     # AUTONOMY.md P8, P10: lane L7
-from vault import owner_signed      # owner feature door_calls: a phone's yes, with the central vault's own check
+from vault import owner_signed_twice      # owner feature door_calls: a phone's yes, as the door checks it
 import wakeups
 from desktop import Frames
 import atrest       # the cipher that seals the hub's Google file at rest (UI-API.md 1.202)
@@ -2243,12 +2243,36 @@ def certify_device(device, statement, signature):
     return {"device": device, "certified": True}
 
 
-def phone_signed(device, statement, signature):
-    """True when this phone's own signing key signed the statement and the owner's Mac certified that key (owner
-    feature door_calls). The door counts a phone's yes only through that certificate, so the hub records no other:
-    a key that the Mac has not certified yet, or one that the phone replaced, would let nothing through."""
+# The owner's "OpenSSL as a second check" (20 November 2026; the central vault since a7ff7da18, the door since
+# c7ca3a0e2): a phone's yes counts here only when our own ECDSA and this machine's OpenSSL both take its signature, as
+# the door that it lets through checks it (vault.owner_signed_twice); with our ECDSA alone the hub could record a yes
+# that the door then refuses, and close the owner's item for nothing. OpenSSL takes about 15 ms, and a phone's answer
+# is written under LOCK, so phone_submit asks first, before it takes LOCK, and each answer is kept for this process by
+# the hash of the key, the statement and the signature. Under LOCK OpenSSL never runs (an OpenSSL that hangs waits
+# seconds): the check there reads the kept answer, and with none (OpenSSL could not be asked, or the key changed
+# meanwhile) the yes does not count this time (503 signature_unchecked), and the next press asks again.
+PHONE_SIGNED, PHONE_SIGNED_MOST = {}, 4096
+
+
+def phone_signed(device, statement, signature, ask=True):
+    """True when this phone's own signing key, which the owner's Mac certified (owner feature door_calls), signed the
+    statement, by both checks; False when not; None when OpenSSL could not be asked this time. The door counts a
+    phone's yes only through that certificate, so the hub records no other: a key that the Mac has not certified yet,
+    or one that the phone replaced, would let nothing through. The hub keeps the certificate as the Mac sent it: its
+    signature is the door's to check, as the Mac's own yes is. ask=False, under LOCK: the answer that a check before
+    it kept, and None for none, with no run of OpenSSL."""
     row = q1("SELECT key FROM owner_device_signing WHERE device=? AND statement IS NOT NULL", (device,))
-    return bool(row) and owner_signed({"owner_keys": [row["key"]]}, statement, signature)
+    if not row or not isinstance(statement, str) or not isinstance(signature, str):
+        return False
+    key = hashlib.sha256(json.dumps([row["key"], statement, signature]).encode()).hexdigest()
+    said = PHONE_SIGNED.get(key)
+    if said is None and ask:
+        said = owner_signed_twice({"owner_keys": [row["key"]]}, statement, signature)
+        if said is not None:
+            if len(PHONE_SIGNED) >= PHONE_SIGNED_MOST:
+                PHONE_SIGNED.clear()
+            PHONE_SIGNED[key] = said
+    return said
 
 
 def enroll_device(device, code, signing=None, kind="iphone"):
@@ -6586,6 +6610,9 @@ def migrate():
         "CREATE INDEX IF NOT EXISTS event_agent ON events(agent, id, kind, read_at, helper_ack)",
         # The request of one event: the same poll asks for it at each owner chat message, to find the reply.
         "CREATE INDEX IF NOT EXISTS ui_request_event ON ui_requests(event_id)",
+        # an agent's owner messages, newest last: the timer's chat_late (every 5 seconds under LOCK, for each worker
+        # and lead) and turn_ended_after read them; with no index each read went through every message of the fleet
+        "CREATE INDEX IF NOT EXISTS ui_request_recipient ON ui_requests(recipient, created)",
         # The tasks of one wake-up rule, which GET /ui/triggers reads several times for each rule (trigger_view).
         "CREATE INDEX IF NOT EXISTS task_trigger ON tasks(trigger_id) WHERE trigger_id IS NOT NULL",
         # The notes of one task: the board's newest note of each open task, task_in_full and the phone's task page.
@@ -11715,7 +11742,9 @@ def ask_missed(agent, tid):
     (kv ask_missed), and no time and no other task decides it. The tasks that the hub makes with the manager as their
     requester (a wake-up's run, a worker's start_task) are many on a busy fleet, so they are no measure of it."""
     told = int(kv_get("ask_missed") or 0)
-    m = q1("SELECT u.event_id, u.text FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.recipient=? AND "
+    # +u.recipient: the newest messages by their event, stopping at the first that fits, as ui_request_event gives
+    # them; with the recipient's index (ui_request_recipient) SQLite would sort all of the agent's messages each time
+    m = q1("SELECT u.event_id, u.text FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE +u.recipient=? AND "
            "u.kind='message' AND u.asked IS NULL AND e.read_at IS NOT NULL AND u.event_id>? "
            "ORDER BY u.event_id DESC LIMIT 1", (agent, told))
     if not m:
@@ -26856,7 +26885,7 @@ def save_profile(agent, base, sections):
     try:                                    # null is the base of an agent with no profile, never of a failed read
         old = kit_file(rev, path)
     except KitUnread:
-        raise Refusal(503, code="profile_unread", names={"agent": agent}) from None
+        raise Refusal(503, code="profile_unread", names={"agent": shown_role(agent)}) from None
     current = hashlib.sha256(old).hexdigest() if old is not None else None
     if base != current:
         raise Conflict("the profile changed meanwhile; reload it", sha256=current)
@@ -50395,7 +50424,7 @@ def knowledge_delete(path):
             if path in profile_knowledge_files(name, rev, strict=True):
                 users.append(name)
         except KitUnread:
-            raise Refusal(503, code="profile_unread", names={"agent": name}) from None
+            raise Refusal(503, code="profile_unread", names={"agent": shown_role(name)}) from None
     if users:
         raise Refusal(409, f"the Knowledge files of {', '.join(users)} list {path}. Remove it there first.")
     commit = commit_kit_file(path, None, f"Owner deleted {path}")
@@ -65937,6 +65966,13 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
     # other write of team.json comes between the grant's read and its commit, and no other answer of the item between
     # the grant and this one: its git cannot run without LOCK (kit_turn), because the press checked that the item is
     # open. A grant that fails writes no answer, and the manager hears every grant
+    ahead = None                        # the phone whose yes was checked before LOCK
+    if yes is not None and address and not getattr(GIVE_TURN, "on", False):
+        # its signature's two checks run here, before LOCK (OpenSSL takes about 15 ms), and their answer is kept for
+        # the check under LOCK below (phone_signed)
+        ahead = owner_device_at(address)
+        if ahead is not None:
+            phone_signed(ahead, yes, signed)
     if need_id is not None and choice == 0 and not getattr(GIVE_TURN, "on", False) and need_gives(need_id):
         GIVE_TURN.on = True
         try:
@@ -65999,10 +66035,15 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
                                            f"the hub cannot tell what its yes would let through. "
                                            f"Answer No, and ask {shown_role(need['by'])} for a new "
                                            f"card."})
-            if choice == 0 and ("door_call" in need.keys() and need["door_call"]) and \
-                    (yes is None or phone is not None and not phone_signed(phone, yes, signed)):
+            door_yes = choice == 0 and ("door_call" in need.keys() and need["door_call"])
+            by_phone = phone_signed(phone, yes, signed, ask=False) \
+                if door_yes and yes is not None and phone is not None else True     # kept by the check before LOCK
+            if by_phone is None:        # OpenSSL could not be asked this time: not recorded, and the next press asks
+                return (503, refusal_words.answer("signature_unchecked"))
+            if door_yes and (yes is None or not by_phone or ahead is not None and phone != ahead):
                 # a yes that lets a door call through counts only when the owner key signed it, or a phone's own
-                # key that the Mac certified (phone_signed): otherwise it is not recorded, and the item stays open
+                # key that the Mac certified (phone_signed): otherwise it is not recorded, and the item stays open.
+                # So is the yes of a phone that the owner removed after its check: it is never the Mac's yes
                 return (409, {"error": "This yes lets a door call through, so it needs the signature of "
                                        "the owner key on the Mac. Answer it in Founderizer on the Mac."})
             if choice == 1 and host and (yes is None or phone is not None):
@@ -70755,7 +70796,7 @@ class Handler(BaseHTTPRequestHandler):
         if not rev:
             return self.json(503, refusal_words.answer("revision_unreadable"))
         if unread is not None:
-            return self.json(503, refusal_words.answer("profile_unread", agent=unread))
+            return self.json(503, refusal_words.answer("profile_unread", agent=shown_role(unread)))
         return self.json(200, scrub(dict(db=generation, revision=rev, profiles=profiles)), {"Cache-Control": "no-store"})
 
     def ui_github_repos(self, query):

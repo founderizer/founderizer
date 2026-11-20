@@ -2538,9 +2538,11 @@ def owner_key(text):
 # handover pin) counts only when our ECDSA above and this machine's OpenSSL both take its signature
 # (owner_signed_twice), wherever the machine has an OpenSSL that passes the probe: RFC 6979 A.2.5's signature of
 # "sample", and the same signature with one bit changed. Every supported Linux
-# system has OpenSSL (its ca-certificates depends on it). owner_signed, which the door (door.py) and the hub
-# (hub.phone_signed) call, stays our ECDSA alone: a run of OpenSSL there needs a design of its own, because the door
-# checks each of the owner's yeses again at each fetch, and the hub checks a phone's yes under its one lock.
+# system has OpenSSL (its ca-certificates depends on it). The door (door.owner_signed, since c7ca3a0e2) and the hub
+# (hub.phone_signed, since 20 November 2026) take owner_signed_twice too, and each keeps a statement's answer for
+# its process, because the door checks each of the owner's yeses again at each fetch, and the hub asks before it
+# takes its one lock for a phone's yes; owner_signed alone is our ECDSA, which the apps' test vectors and the tests
+# call.
 # releases.py makes a second check of the same kind for each release; this file stands alone, so it has its own, made
 # for a check that must end within its caller's wait.
 # Our own code decides alone where no OpenSSL place holds a program that passes the probe: no program there, one that
@@ -2720,7 +2722,7 @@ def owner_signer(conf, statement, signature):
 
 def owner_signed(conf, statement, signature):
     """True when one of the owner's keys signed exactly these statement bytes, by our own ECDSA alone (owner_signer):
-    the check of the owner's statements in the door and in the hub."""
+    the first of owner_signed_twice's two checks, which the door and the hub take since 20 November 2026."""
     return owner_signer(conf, statement, signature) is not None
 
 

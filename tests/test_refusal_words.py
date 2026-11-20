@@ -50,6 +50,7 @@ OLD = {
     "revision_unreadable": "the hub cannot read its own revision",
     "knowledge_unread": "the knowledge files cannot be read now; try again in a moment",
     "profile_unread": "{agent}'s profile cannot be read now; try again in a moment",
+    "signature_unchecked": "the hub could not check the signature of this yes now; answer it again",
     "server_silent": "{server} sent no reading in the last 10 minutes: check that it is on",
     "server_no_service": "{server} has no server service: it did not join with a join code",
     "request_answered": "owner request is already answered",
@@ -161,7 +162,7 @@ SITES = {
     'phone_knowledge': {'hub_changed': 1, 'knowledge_unread': 1},
     'phone_mobile': {'hub_changed': 1},
     'phone_submit': {'command_reused_content': 2, 'hub_changed_sending': 1, 'login_as_text': 3, 'request_answered': 1,
-                     'request_unknown': 1},
+                     'request_unknown': 1, 'signature_unchecked': 1},
     'phone_task': {'hub_changed': 1, 'no_such_task': 1},
     'prepare_server_agent': {'no_such_agent': 1, 'no_such_server': 1, 'server_no_service': 1, 'server_silent': 1},
     'profile_unknown_file': {'knowledge_unread': 1},
@@ -488,7 +489,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 209)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 210)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

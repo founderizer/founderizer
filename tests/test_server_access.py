@@ -2660,8 +2660,12 @@ class PhoneYes(Devices):
         self.assertEqual(self.call("/door/approvals", source=DOOR)[1]["devices"], [])
 
     def test_a_phones_yes_counts_only_when_its_own_certified_key_signed_it(self):
-        """A yes that the door would refuse is never recorded: it gets the unsigned yes's 409, and the item stays open,
-        so that a yes from the phone never closes an item that lets nothing through."""
+        """A yes that the phone's certified key did not sign is never recorded: it gets the unsigned yes's 409, and the
+        item stays open, so that a yes from the phone never closes an item that lets nothing through. Since the owner's
+        "OpenSSL as a second check" (20 November 2026) the hub checks that signature as the door does, by our ECDSA and
+        by OpenSSL, and before the hub's lock: a yes that OpenSSL refuses gets the 409, one that OpenSSL could not check
+        is not recorded (503), and an answer kept before the lock counts only for the key and the certificate that the
+        lock finds. The certificate's own signature is the door's to check, as the Mac's yes is."""
         from test_vault_central import owner_point, owner_sign
         secret = 0x1D0C0FFEE0B1A5ED5EED0F7E57C0DE0123456789ABCDEF0123456789ABCDEF01
         key = owner_point(secret)
@@ -2677,8 +2681,8 @@ class PhoneYes(Devices):
         yes = json.dumps({"v": 1, "kind": "door-call", "fleet": self.fleet, "need": nid, "call": call, "at": 1},
                          sort_keys=True, separators=(",", ":"))
 
-        def answer(signature):
-            return self.call(f"/ui/needs/{nid}", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+        def answer(signature, db="test-generation"):
+            return self.call(f"/ui/needs/{nid}", {"request_id": str(uuid.uuid4()), "db": db,
                                                   "choice": 0, "statement": yes, "signature": signature},
                              source=PHONE, token=got["key"])
         status, said = answer(owner_sign(yes, secret))
@@ -2686,6 +2690,33 @@ class PhoneYes(Devices):
         self.assertIn("owner key on the Mac", said["error"])
         self.assertEqual(self.certify(self.certificate(key=key))[0], 200)
         self.assertEqual(answer(owner_sign(yes))[0], 409)               # another key signed it
+        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"])
+        import vault
+        ran = []
+
+        def openssl(said):                              # this machine's OpenSSL, the second check
+            def takes(point, message, signature):
+                ran.append(hub.LOCK._is_owned())
+                return said
+            return patch.object(vault, "openssl_takes", takes)
+        with openssl(False):                            # OpenSSL refuses what our ECDSA takes
+            self.assertEqual(answer(owner_sign(yes, secret))[0], 409)
+        with openssl(None):                             # OpenSSL could not be asked this time
+            status, said = answer(owner_sign(yes, secret))
+        self.assertEqual((status, said.get("code")), (503, "signature_unchecked"), said)
+        self.assertEqual(ran, [False, False])           # each check ran once, and before the hub's lock
+        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"])
+        good = owner_sign(yes, secret)                  # kept as True before the lock, which then finds another hub
+        with openssl(True):
+            self.assertEqual(answer(good, db="another-generation")[0], 409)
+        row = hub.q1("SELECT key, statement FROM owner_device_signing")
+        for column, value in (("statement", None), ("key", owner_point(secret + 1))):  # no certificate, a new key
+            hub.q(f"UPDATE owner_device_signing SET {column}=?", (value,))
+            self.assertEqual(answer(good)[0], 409, column)
+            hub.q(f"UPDATE owner_device_signing SET {column}=?", (row[column],))
+        real = hub.owner_device_at                      # the owner removes the phone between the check and the lock
+        with patch.object(hub, "owner_device_at", lambda address: None if hub.LOCK._is_owned() else real(address)):
+            self.assertEqual(answer(owner_sign(yes, secret))[0], 409)
         self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"])
         status, said = answer(owner_sign(yes, secret))
         self.assertEqual(status, 200, said)

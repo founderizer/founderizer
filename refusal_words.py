@@ -58,6 +58,7 @@ WORDS = {
     "revision_unreadable": "the hub cannot read its own revision",
     "knowledge_unread": "the knowledge files cannot be read now; try again in a moment",
     "profile_unread": "{agent}'s profile cannot be read now; try again in a moment",
+    "signature_unchecked": "the hub could not check the signature of this yes now; answer it again",
     # a server and its service
     "server_silent": "{server} sent no reading in the last 10 minutes: check that it is on",
     "server_no_service": "{server} has no server service: it did not join with a join code",
