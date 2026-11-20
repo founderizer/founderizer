@@ -497,6 +497,30 @@ def validate_access(data):
     return data
 
 
+# The owner's "OpenSSL as a second check" (20 November 2026; the central vault since a7ff7da18): a statement of his
+# counts at the door only when our own ECDSA and this machine's OpenSSL both take its signature
+# (vault.owner_signed_twice). The door checks the same statements again at each fetch (fetch_approvals), at each call
+# (approved, under the door's lock; full_access), so each one's answer is kept for this process, by the hash of the
+# keys, the statement and the signature, and OpenSSL runs once for each. An answer that OpenSSL could not give is
+# kept for none: the statement does not count this time, and the next fetch or call asks again.
+SIGNED, SIGNED_MOST = {}, 4096
+
+
+def owner_signed(keys, statement, signature):
+    """True when one of these keys signed the statement, by our own ECDSA and by this machine's OpenSSL."""
+    if not keys or not isinstance(statement, str) or not isinstance(signature, str):
+        return False
+    key = hashlib.sha256(json.dumps([sorted(keys), statement, signature]).encode()).hexdigest()
+    said = SIGNED.get(key)
+    if said is None:
+        said = vault.owner_signed_twice({"owner_keys": list(keys)}, statement, signature)
+        if said is not None:
+            if len(SIGNED) >= SIGNED_MOST:
+                SIGNED.clear()
+            SIGNED[key] = said
+    return said is True
+
+
 def device_keys(access, items):
     """{device: key} of the owner's phones whose signing key his owner key certified: {v: 1, kind: "owner-device",
     fleet, device, key, at} in its canonical form, signed by one of the owner keys of the access file. The hub serves
@@ -517,7 +541,7 @@ def device_keys(access, items):
             vault.owner_key(said["key"])
         except ValueError:
             continue
-        if vault.owner_signed({"owner_keys": keys}, statement, item.get("signature")):
+        if owner_signed(keys, statement, item.get("signature")):
             out[said["device"]] = said["key"]
     return out
 
@@ -543,8 +567,8 @@ def approval(access, statement, signature, devices=None):
             said["need"] < 1 or type(said["at"]) is not int or \
             not now() - APPROVAL_DAYS * 86400 <= said["at"] <= now() + 300:
         return None
-    if not vault.owner_signed({"owner_keys": keys}, statement, signature) and \
-            not (devices and vault.owner_signed({"owner_keys": sorted(devices.values())}, statement, signature)):
+    if not owner_signed(keys, statement, signature) and \
+            not (devices and owner_signed(sorted(devices.values()), statement, signature)):
         return None
     return said["call"], said["need"]
 
@@ -680,7 +704,7 @@ def mode_statement(access, statement, signature):
     if not keys or not isinstance(signature, str):
         return None
     found = mode_form(access, statement)
-    if found is None or not vault.owner_signed({"owner_keys": keys}, statement, signature):
+    if found is None or not owner_signed(keys, statement, signature):
         return None
     return found
 

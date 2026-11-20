@@ -2927,6 +2927,52 @@ class OwnerYes(DoorCase):
         self.assertEqual(self.delete()["kind"], "refused")             # once: the hub still serves it, and it is used
         self.assertEqual(len(self.deleted()), 1)
 
+    def test_a_yes_counts_only_when_this_machine_s_openssl_takes_its_signature_too(self):
+        """The owner's "OpenSSL as a second check" (20 November 2026; the central vault since a7ff7da18), also at the
+        door, where his yes lets a call run: our own ECDSA and this machine's OpenSSL must both take the signature. The
+        door checks each yes again at each fetch and at each call, so OpenSSL is asked once for each statement in its
+        process; an answer that OpenSSL could not give is kept for none, and the next fetch asks again."""
+        door.SIGNED.clear()
+        self.addCleanup(door.SIGNED.clear)
+        call, asked, says = self.refused_once(), [], []
+
+        def openssl(point, message, signature):
+            asked.append(message.decode())
+            return says.pop(0)
+
+        def offer(need):
+            said = self.statement(call, need=need)
+            self.answers = [{"need": need, "statement": said, "signature": self.sign(said)}]
+            return said
+        with patch.object(vault, "openssl_takes", openssl):
+            refused = offer(7)
+            says.append(False)                                  # our ECDSA takes it, OpenSSL does not
+            self.assertEqual(door.fetch_approvals(self.door), 0)
+            self.assertEqual(self.delete()["kind"], "refused")
+            said = offer(8)
+            says.extend([None, True])                           # not asked this time, then a yes
+            self.assertEqual(door.fetch_approvals(self.door), 0)
+            self.assertEqual(door.fetch_approvals(self.door), 1)
+            self.assertEqual(door.fetch_approvals(self.door), 1)          # kept: OpenSSL is not asked again
+            got = self.delete()
+            self.assertEqual((got["ok"], got["kind"]), (True, "approved"), got)
+            self.assertEqual(asked, [refused, said, said])
+            # the same for a server's mode, which lets every root script there through, and a phone's certificate
+            from test_vault_central import owner_point
+            access, t = door.read_json(door.ACCESS_FILE, {}), round(time.time()) - 10
+            for at, openssl_says, want in ((t, False, None), (t + 1, True, ("web-1", "full", t + 1))):
+                mode = vault.canonical({"v": 1, "kind": "door-mode", "fleet": "fleet-1", "host": "web-1",
+                                        "mode": "full", "at": at})
+                says.append(openssl_says)
+                self.assertEqual(door.mode_statement(access, mode, self.sign(mode)), want)
+            phone = 0x0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+            cert = vault.canonical({"v": 1, "kind": "owner-device", "fleet": "fleet-1", "device": "iphone",
+                                    "key": owner_point(phone), "at": t})
+            says.append(False)
+            self.assertEqual(door.device_keys(access, [{"statement": cert, "signature": self.sign(cert)}]), {})
+            self.assertEqual(says, [])
+        self.assertEqual(len(self.deleted()), 1)
+
     def test_a_yes_of_another_call_fleet_key_or_age_or_not_canonical_lets_nothing_through(self):
         from test_vault_central import owner_point, owner_sign
         call = self.refused_once()
