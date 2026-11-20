@@ -1408,6 +1408,22 @@ check("the board counts the calls the machine rule refused, and nothing else",
       b3[-900:])
 proc3.terminate()
 
+# ---------------------------------------------------------------- the check of a release, on this machine
+# A fleet takes a release only when releases.signed_by_any says yes, which asks this machine's OpenSSL too where it has
+# one that verifies Ed25519 (releases.openssl_agrees). The hub runs this file on the code of a release before it takes
+# it, so a release whose check would refuse every good signature on the hub's machine, or take a forged one, fails here
+# and is not taken: the hub stays on the code that it runs.
+release_check_problem = None
+try:
+    import releases
+    refused = releases.self_check()
+    check("this machine takes a release that a trusted key signed, and not one whose signature was changed",
+          refused is None, str(refused))
+except Exception as e:      # the check itself must not end the run
+    release_check_problem = e
+if release_check_problem is not None:
+    check("the check of a release can be run on this machine", False, repr(release_check_problem))
+
 finish()
 print(f"{count[0] - len(fails)} of {count[0]} checks passed." + ("" if not fails else f" FAILED: {fails}"))
 sys.exit(1 if fails else 0)

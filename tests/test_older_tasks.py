@@ -466,7 +466,9 @@ class Marks(OlderCase):
 
 class Schema(OlderCase):
     def triggers(self):
-        return {r["name"]: r["sql"] for r in hub.q("SELECT name, sql FROM sqlite_master WHERE type='trigger'")}
+        """The tasks' triggers: the marks of the older rows have their own (row_block_*, test_older_rows)."""
+        return {r["name"]: r["sql"] for r in hub.q("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND name "
+                                                   "LIKE 'task\\_block\\_%' ESCAPE '\\'")}
 
     def test_a_start_that_changes_nothing_makes_no_trigger_and_moves_no_mark(self):
         """Each start of the hub runs the schema again. A start must leave the marks as they are: else each release
@@ -525,6 +527,24 @@ class Schema(OlderCase):
         marked, _ = self.marks()
         self.assertTrue(all(marked[b] != marks[b] for b in marks))
         self.assertEqual(len(self.triggers()), 3 + 4 * len(hub.OLDER_TABLES) + 4 + 3 + 3)
+
+    def test_a_release_that_changes_how_a_block_looks_counts_every_block_once(self):
+        """Owner API 1.258: a block that a reader kept stays with it until its mark moves, also on its disk. A release
+        that changes a view of a block's rows in code (a steer's files, from_conversation, scrub) changes the answers
+        with no write: its first start counts every block once. A hub that kept no shape yet (the first start with the
+        shape) keeps this one and counts nothing, so that release makes no reader read every block again."""
+        for _ in range(3 * self.BLOCK):
+            self.task()
+        marks, _ = self.marks()
+        hub.kv_set("older_shape", None)
+        self.assertEqual(hub.migrate(), [])
+        self.assertEqual((self.marks()[0], hub.kv_get("older_shape")), (marks, hub.older_shape()))
+        with patch.object(hub, "OLDER_SHAPE", hub.OLDER_SHAPE + 1):
+            self.assertEqual(hub.migrate(), [])
+            marked, _ = self.marks()
+            self.assertTrue(all(marked[b] != marks[b] for b in marks), (marks, marked))
+            self.assertEqual(hub.migrate(), [])
+            self.assertEqual(self.marks()[0], marked, "a start of the same release counts nothing")
 
     def test_a_hub_whose_marks_are_not_in_place_serves_the_whole_state(self):
         """Without one of its triggers a block could change under a mark that stands. So a hub that could not make

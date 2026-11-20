@@ -7,8 +7,10 @@ same cipher.
 
 A text is sealed with a key of 32 random bytes and a nonce of 12 random bytes, which each sealing draws again. The
 caller's file is written seldom (a Connect, a Disconnect, a new secret of Founderizer's Google app), so random nonces
-stay far below the limit of RFC 8439 section 4 for one key. The tag is checked before any byte is decrypted, and with
-a comparison in constant time.
+stay far below the limit of RFC 8439 section 4 for one key. push.py seals the sealed part of each ping to the
+owner's phone with this cipher too, with the phone's own key and no additional data: many seals for one key, and
+random 96-bit nonces stay far below that limit at any count of pings that a fleet makes. The tag is checked before any
+byte is decrypted, and with a comparison in constant time.
 
 Python's integers are not constant time, so this code does not hide its timing from a process on the same machine.
 Such a process can read the file and the key anyway, when it runs as the hub's user, and cannot read either when it

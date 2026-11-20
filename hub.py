@@ -1877,6 +1877,11 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # the ended tasks that the window leaves out. A reader goes by `older_tasks` of
                                     # the answer, not by this name: a hub whose marks are not in place (older_schema)
                                     # gives the whole state to a reader that asks for the window
+               "older_rows",        # owner API 1.258: GET /ui/state takes rest=window, and GET /ui/older has the
+                                    # Needs-you items, reports and messages that it leaves out; a reader goes by
+                                    # `older_rows` of the answer, as by `older_tasks`
+               "ended_asks",        # owner API 1.258: GET /ui/mobile/ended takes chat and from: the ended heads of
+                                    # what the owner asked for in one chat, from a time on
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
@@ -3348,10 +3353,36 @@ def phone_ended(query):
     """GET /ui/mobile/ended after ui_allowed (owner API 1.166): the head of every ended task, by id, with the schedule
     it ran for, and the mark of GET /ui/mobile that it is of. A device reads it when that mark changes, and its Tasks
     board counts and opens the ended tasks of each period from it, as the Mac does from GET /ui/state, which has every
-    task. GET /ui/mobile keeps its 20 newest in `recent`, so it does not grow with them."""
+    task. GET /ui/mobile keeps its 20 newest in `recent`, so it does not grow with them.
+
+    Owner API 1.258 (owner feature ended_asks): with `chat`, an agent's name, and `from`, a time, only the ended tasks
+    of what the owner asked for in that chat (their `ask`) in a message of it from that time on, or in a message that
+    such a message corrects (ChatAskPlaces: a correction stands for the message that it replaced). The iPhone reads its
+    rows of a chat's asks so, from the oldest line that it holds of the chat that is open: the answer grows with what
+    the phone holds, and not with the fleet's history (on the first fleet, on 20 November 2026, every ended head was
+    839,613 bytes, and the phone kept 177 of the 1,615). The Windows app's Ended lane reads every head, as before."""
     generation = kv_get("db_id")
     if query.get("db") != generation:               # a read of a generation that the client holds (its mark)
         return 409, refusal_words.answer("hub_changed"), None
+    chat = query.get("chat")
+    if chat is not None:
+        try:
+            start = float(query.get("from") or 0)
+        except (TypeError, ValueError):
+            start = math.nan
+        if not math.isfinite(start):
+            return 400, {"error": "from is a time: the oldest line of the chat that the device holds"}, None
+        asked_here = ("SELECT lower(request_id) FROM ui_requests WHERE recipient=? AND created>=? UNION SELECT "
+                      "lower(replaces_request_id) FROM ui_requests WHERE recipient=? AND created>=? AND "
+                      "replaces_request_id IS NOT NULL")
+        with LOCK:
+            tasks = [{k: r[k] for k in MOBILE_HEAD + ("trigger_id",)}
+                     for r in q(f"SELECT * FROM tasks WHERE state IN {ENDED_STATES} AND ask IS NOT NULL AND lower(ask) "
+                                f"IN ({asked_here}) ORDER BY id", (chat, start, chat, start))]
+            mark = ended_mark()
+            asked = ask_names(tasks)
+        return 200, scrub({"db": generation, "mark": mark, "tasks": tasks, "asked": asked, "chat": chat,
+                           "from": start}), {"Cache-Control": "no-store"}
     with LOCK:
         tasks = [{k: r[k] for k in MOBILE_HEAD + ("trigger_id",)}
                  for r in q(f"SELECT * FROM tasks WHERE state IN {ENDED_STATES} ORDER BY id")]
@@ -3385,7 +3416,7 @@ def phone_ended(query):
 # moves no count either.
 #
 # A later change that drops a column of tasks, notes, prompts, holds, outcomes, steers, attachments or secrets drops
-# the task_block_* triggers of that table first (older_unwatch): SQLite refuses to drop a column that a trigger names
+# the triggers first (older_unwatch, every trigger of the marks): SQLite refuses to drop a column that a trigger names
 # ("error in trigger task_block_... after drop column"), and older_schema makes the triggers again at the same start.
 STATE_KEEP = 100                # the newest task ids whose ended tasks a window read of the state holds, at the least
 TASK_BLOCK = 100                # the task ids of one block of the older tasks
@@ -3396,6 +3427,9 @@ OLDER_TABLES = (("notes", "notes", "SELECT t.* FROM notes t"),
                 ("outcomes", "outcomes", "SELECT t.* FROM outcomes t"),
                 ("steers", "steers", "SELECT t.*, e.read_at FROM steers t JOIN events e ON e.id=t.event_id"))
 OLDER = {"on": False}           # the marks' table and triggers are in place (older_schema): the hub serves the window
+# Bump it when what a row of a block of older tasks says changes in code that older_shape does not read (owner API 1.258,
+# the lane "A bound for the rest of the state page"): each reader then reads every block again once.
+OLDER_SHAPE = 1
 OLDER_OPEN = f"state NOT IN {ENDED_STATES}"     # the words of the index task_open, so that SQLite uses it
 # Every other task is a block's: one that ended, and a row with no state, which the line above does not take either
 # (no writer of this file makes one). So the window and the blocks together are every row of the table.
@@ -3503,12 +3537,14 @@ def older_triggers():
 
 
 def older_unwatch(table):
-    """Drops the task_block_* triggers of one table, so that a column of it can be dropped: an UPDATE trigger of the
-    marks names each column of its table, and SQLite refuses the drop of a column that a trigger names. For a step of
-    migrate() and for a test that makes the records of an earlier release. older_schema, at the end of migrate(),
-    makes the triggers again and counts every block once, for the writes that no trigger saw meanwhile."""
-    for r in q("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=? AND name LIKE 'task\\_block\\_%' "
-               "ESCAPE '\\'", (table,)):
+    """Drops every trigger of the marks, task_block_* and row_block_* (owner API 1.258: a trigger of one table names
+    columns of others, as the steers' keys in the triggers of the events and the files), so that a column of `table`
+    can be dropped: an UPDATE trigger of the marks names each column of its table, and SQLite refuses the drop of a
+    column that a trigger names. For a step of migrate() and for a test that makes the records of
+    an earlier release. older_schema and row_schema, at the end of migrate(), make the triggers again and count every
+    block once, for the writes that no trigger saw meanwhile."""
+    for r in q("SELECT name FROM sqlite_master WHERE type='trigger' AND (name LIKE 'task\\_block\\_%' ESCAPE '\\' OR "
+               "name LIKE 'row\\_block\\_%' ESCAPE '\\')"):
         q(f"DROP TRIGGER IF EXISTS {r['name']}")
 
 
@@ -3540,13 +3576,30 @@ def older_schema(problems):
                 sql_step(f"DROP TRIGGER IF EXISTS {name}", problems)
             sql_step(statement, problems)
             made = True
+    # The views of a block's rows that no trigger sees (owner API 1.258): a release that changes one counts every block
+    # once. A hub that kept no shape yet keeps this one, and counts nothing for it.
+    try:
+        shape = older_shape()
+    except (OSError, TypeError) as e:
+        problems.append(f"the shape of the older tasks: {e}")
+        shape = None
+    made = made or (shape is not None and kv_get("older_shape") not in (None, shape))
     sql_step(f"INSERT OR IGNORE INTO task_blocks(block, rev, tasks) SELECT id / {TASK_BLOCK}, 1, COUNT(*) FROM tasks "
              f"WHERE {OLDER_REST} GROUP BY id / {TASK_BLOCK}", problems)
     if made:
         sql_step(f"UPDATE task_blocks SET rev = rev + 1, tasks = (SELECT COUNT(*) FROM tasks WHERE id >= block * "
                  f"{TASK_BLOCK} AND id < (block + 1) * {TASK_BLOCK} AND {OLDER_REST})", problems)
     OLDER["on"] = bool(want) and len(problems) == refused
+    if OLDER["on"]:
+        kv_set("older_shape", shape)
     return problems
+
+
+def older_shape():
+    """The code that builds a block of older tasks, as one digest (owner API 1.258, code_digest of older_read: its reads,
+    a steer's and a file's view, from_conversation, scrub). A new column of the six tables makes its trigger again
+    (older_triggers), and that counts every block already."""
+    return rows_digest([OLDER_SHAPE, code_digest(("older_read",))])
 
 
 def older_before():
@@ -3653,6 +3706,464 @@ def older_read(query):
     for _, key, _ in OLDER_TABLES:
         answer[key] = [steer_view(r, attached.get(r["request_id"], [])) for r in parts[key]] if key == "steers" \
             else [dict(r) for r in parts[key]]
+    return 200, scrub(answer), {"Cache-Control": "no-store"}
+
+
+# ---------------------------------------------------------------- the lane "A bound for the rest of the state page" (owner API 1.258)
+#
+# The window of the tasks (owner API 1.254) left three lists of GET /ui/state that keep every row, and the steps of the
+# duties' cases. On the first fleet, on 20 November 2026 at 12:00 UTC, a window read was 2.63 MB: the Needs-you items
+# 463 KB (203 of 209 answered), the messages 414 KB, the reports 372 KB, and 138 KB of steps of open cases. The three
+# lists grew by about 0.15 MB a day: the Mac app's 16,000,000 bytes were about 90 days away.
+#
+# A reader that asks with `rest=window` gets the items that are open, and the items, the reports and the messages of the
+# newest keys (ROWS_KEEP keys at the least). It reads the older ones in blocks of ROWS_BLOCK keys from GET /ui/older, as
+# it reads the older tasks: once, and again only when the mark of a block moved. The key of an item and of a report is
+# its id. A message has no number of its own, so its key is its rowid, which no answer gives: a reader joins the
+# messages by their request_id. The duties of that answer carry their cases without `steps`: no reader of the window
+# reads them (the Mac app decodes the heads of the cases, the owner's tools a duty's counts; the steps of a case are on
+# the duty's page, GET /ui/responsibilities/<id>, which is bounded). A reader that does not ask gets every row.
+#
+# A mark is the block's size and its count, which SQL triggers move (row_triggers), as the tasks' marks: each write to a
+# row of the block, and to a row that its answer shows (an item's discussion; a report's delivery, files and grant
+# record; a message's event, which holds its read time, and its files), and every block at a change of the registered
+# logins, by the rules of the tasks' marks. These triggers count each write and compare few values, so that they name
+# few columns: an older row is written seldom, and a write that changes no value makes a reader read one block again,
+# which is no harm. Two values of an answer come from team.json and not from the records, where no trigger sees them:
+# the titles of the resources of the reports' grant lines (report_grants) and the labels of the chat apps' accounts on
+# the messages (their origin). Each mark of those two lists ends with one digest of all of them (rows_team): a new title
+# or label is seldom, and then each reader reads that list's blocks again. And a release that changes how a row of
+# these lists looks in an answer (its columns, its view, scrub) counts every block once at its first start
+# (rows_shape), so that no reader keeps a block of the old look.
+#
+# A later step that drops a column of needs, need_talk, owner_reports, chat_out, attachments, resource_grants,
+# ui_requests, events or secrets calls older_unwatch(<table>) first: it drops every one of these triggers, because a
+# trigger of one table names columns of others, and row_schema makes them again at the same start. The indexes
+# need_open (needs.answer) and attachment_report (attachments.report) name a column too: a step that drops one of those
+# two columns drops its index first.
+ROWS_KEEP = {"needs": 50, "reports": 100, "messages": 100}     # the newest keys of each list that a window holds
+ROWS_BLOCK = {"needs": 50, "reports": 100, "messages": 100}    # the keys of one block of each list
+ROWS = {"on": False}            # the marks' table and triggers are in place (row_schema): the hub serves the window
+# (the table, the key of its rows, which rows of the table are a block's: `{t}` stands for the table in a read). An item
+# that is open is in every window; a message is in an answer only with its event, which holds its read time.
+ROW_LISTS = {"needs": ("needs", "id", "{t}.answer IS NOT NULL"),
+             "reports": ("owner_reports", "id", "1"),
+             "messages": ("ui_requests", "rowid", "EXISTS (SELECT 1 FROM events e WHERE e.id = {t}.event_id)")}
+ROWS_MESSAGES = "SELECT u.*, e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id"
+# Bump it when what a row of these lists says in an answer changes in code that rows_shape does not read (a helper of a
+# view): each reader then reads every block again once.
+ROWS_SHAPE = 1
+ROWS_OUT = "SELECT * FROM chat_out WHERE id IN (SELECT MAX(id) FROM chat_out WHERE kind='message' AND report IS NOT NULL"
+
+
+def row_triggers():
+    """{name: the CREATE TRIGGER statement} of the triggers that move the marks of the blocks of older rows (the
+    comment above says what counts). The count of a block begins with its first write, and each count of a block also
+    counts its rows again (`rows`), for the number that the state says. The block's row is added with no OR IGNORE, as
+    the tasks' (older_triggers): inside a trigger SQLite takes the conflict rule of the statement that fired it. Each
+    trigger asks first for the key that it counts: a block of no number would refuse the write that fired it."""
+    def recount(name, block):
+        table, key, rest = ROW_LISTS[name]
+        size = ROWS_BLOCK[name]
+        return (f"(SELECT COUNT(*) FROM {table} r WHERE r.{key} >= {block} * {size} AND r.{key} < ({block} + 1) * "
+                f"{size} AND {rest.format(t='r')})")
+
+    def counts(name, key):          # the block of one row, by its key
+        block = f"(CAST({key} AS INTEGER) / {ROWS_BLOCK[name]})"
+        return (f"INSERT INTO row_blocks(list, block, rev, rows) SELECT '{name}', {block}, 0, 0 WHERE NOT EXISTS "
+                f"(SELECT 1 FROM row_blocks WHERE list = '{name}' AND block = {block}); "
+                f"UPDATE row_blocks SET rev = rev + 1, rows = {recount(name, block)} WHERE list = '{name}' AND "
+                f"block = {block};")
+
+    def counts_where(name, match):  # the block of each row of the list that `match` names: `t` is that row
+        table, key, _ = ROW_LISTS[name]
+        block = f"CAST(t.{key} AS INTEGER) / {ROWS_BLOCK[name]}"
+        rows = f"FROM {table} t WHERE {match}"
+        return (f"INSERT INTO row_blocks(list, block, rev, rows) SELECT DISTINCT '{name}', {block}, 0, 0 {rows} AND "
+                f"NOT EXISTS (SELECT 1 FROM row_blocks b WHERE b.list = '{name}' AND b.block = {block}); "
+                f"UPDATE row_blocks SET rev = rev + 1, rows = {recount(name, 'row_blocks.block')} WHERE list = "
+                f"'{name}' AND block IN (SELECT {block} {rows});")
+
+    def four(prefix, table, when_new, when_old, name, key, moved_of, moved):
+        """The triggers of the rows of `table` that count the block of the row at `key`: a row that comes, a row that
+        is written, a row that moves to another key (its old block), and a row that leaves."""
+        new, old = key.format(row="NEW"), key.format(row="OLD")
+        return {f"{prefix}_insert": f"AFTER INSERT ON {table} WHEN {when_new} BEGIN {counts(name, new)} END",
+                f"{prefix}_update": f"AFTER UPDATE ON {table} WHEN {when_new} BEGIN {counts(name, new)} END",
+                f"{prefix}_moved": f"AFTER UPDATE OF {moved_of} ON {table} WHEN {when_old} AND ({moved}) "
+                                   f"BEGIN {counts(name, old)} END",
+                f"{prefix}_delete": f"AFTER DELETE ON {table} WHEN {when_old} BEGIN {counts(name, old)} END"}
+
+    made = {}
+    # the items: an answered item is a block's, an open one is in every window; an item that is answered or opened
+    # again moves between the two, and its block counts. Its discussion is part of its row (need_view).
+    made.update(four("row_block_needs", "needs", "NEW.answer IS NOT NULL", "OLD.answer IS NOT NULL", "needs",
+                     "{row}.id", "id", "OLD.id IS NOT NEW.id"))
+    made["row_block_needs_update"] = "AFTER UPDATE ON needs WHEN NEW.answer IS NOT NULL OR OLD.answer IS NOT NULL " \
+                                     f"BEGIN {counts('needs', 'NEW.id')} END"
+    talk = "EXISTS (SELECT 1 FROM needs WHERE id = {row}.need AND answer IS NOT NULL)"
+    made.update(four("row_block_talk", "need_talk", talk.format(row="NEW"), talk.format(row="OLD"), "needs",
+                     "{row}.need", "need", "OLD.need IS NOT NEW.need"))
+    # the reports, each of them, and the parts of a report's row: its delivery (the newest chat_out row of kind message
+    # of it), its files, and the record of a grant that makes it a grant line (report_grants)
+    made.update(four("row_block_reports", "owner_reports", "1", "1", "reports", "{row}.id", "id",
+                     "OLD.id IS NOT NEW.id"))
+    out = "{row}.kind = 'message' AND {row}.report IS NOT NULL"
+    made.update(four("row_block_out", "chat_out", out.format(row="NEW"), out.format(row="OLD"), "reports",
+                     "{row}.report", "kind, report", "OLD.report IS NOT NEW.report OR OLD.kind IS NOT NEW.kind"))
+    made.update(four("row_block_rfile", "attachments", "NEW.report IS NOT NULL", "OLD.report IS NOT NULL", "reports",
+                     "{row}.report", "report", "OLD.report IS NOT NEW.report"))
+
+    def granted(row):
+        said = f"'grant ' || {row}.resource || ' to '"
+        return f"t.created = {row}.ts AND t.agent = {row}.by AND substr(t.about, 1, length({said})) = {said}"
+
+    made["row_block_grant_insert"] = f"AFTER INSERT ON resource_grants WHEN NEW.level IS NOT NULL BEGIN " \
+                                     f"{counts_where('reports', granted('NEW'))} END"
+    made["row_block_grant_update"] = f"AFTER UPDATE ON resource_grants WHEN OLD.level IS NOT NULL OR NEW.level IS NOT " \
+                                     f"NULL BEGIN {counts_where('reports', granted('OLD'))} " \
+                                     f"{counts_where('reports', granted('NEW'))} END"
+    made["row_block_grant_delete"] = f"AFTER DELETE ON resource_grants WHEN OLD.level IS NOT NULL BEGIN " \
+                                     f"{counts_where('reports', granted('OLD'))} END"
+    # the messages, each of them, their events (a message is in an answer only with its event, whose read time it
+    # shows; an event's number can come again, as older_triggers says) and their files
+    made["row_block_messages_insert"] = f"AFTER INSERT ON ui_requests BEGIN {counts('messages', 'NEW.rowid')} END"
+    made["row_block_messages_update"] = f"AFTER UPDATE ON ui_requests BEGIN {counts('messages', 'NEW.rowid')} END"
+    made["row_block_messages_delete"] = f"AFTER DELETE ON ui_requests BEGIN {counts('messages', 'OLD.rowid')} END"
+    said = "EXISTS (SELECT 1 FROM ui_requests WHERE event_id = {row}.id)"
+    made["row_block_event_read"] = f"AFTER UPDATE OF read_at ON events WHEN OLD.read_at IS NOT NEW.read_at AND " \
+                                   f"{said.format(row='NEW')} BEGIN {counts_where('messages', 't.event_id = NEW.id')} END"
+    made["row_block_event_delete"] = f"AFTER DELETE ON events WHEN {said.format(row='OLD')} BEGIN " \
+                                     f"{counts_where('messages', 't.event_id = OLD.id')} END"
+    made["row_block_event_insert"] = f"AFTER INSERT ON events WHEN {said.format(row='NEW')} BEGIN " \
+                                     f"{counts_where('messages', 't.event_id = NEW.id')} END"
+    filed = "{row}.message IS NOT NULL AND EXISTS (SELECT 1 FROM ui_requests WHERE request_id = {row}.message)"
+    new, old = counts_where("messages", "t.request_id = NEW.message"), counts_where("messages", "t.request_id = OLD.message")
+    made["row_block_mfile_insert"] = f"AFTER INSERT ON attachments WHEN {filed.format(row='NEW')} BEGIN {new} END"
+    made["row_block_mfile_update"] = f"AFTER UPDATE ON attachments WHEN {filed.format(row='NEW')} BEGIN {new} END"
+    made["row_block_mfile_moved"] = f"AFTER UPDATE OF message ON attachments WHEN OLD.message IS NOT NEW.message AND " \
+                                    f"{filed.format(row='OLD')} BEGIN {old} END"
+    made["row_block_mfile_delete"] = f"AFTER DELETE ON attachments WHEN {filed.format(row='OLD')} BEGIN {old} END"
+    # the registered logins: every block counts, by the rules of the tasks' marks (older_triggers says why three kinds
+    # of write count in none)
+    every = "BEGIN UPDATE row_blocks SET rev = rev + 1; END"
+
+    def new_mask(row, other):
+        label = f"COALESCE({row}.label, '')"
+        made_now = f"({label} = '{SITE_KEY}' OR {label} LIKE 'mcp token %' OR {label} LIKE 'google refresh-token %')"
+        return (f"NOT {made_now} AND NOT EXISTS (SELECT 1 FROM secrets WHERE {other}salt IS {row}.salt AND "
+                f"hash IS {row}.hash AND len IS {row}.len)")
+
+    made["row_block_login_insert"] = f"AFTER INSERT ON secrets WHEN {new_mask('NEW', 'id <> NEW.id AND ')} {every}"
+    made["row_block_login_update"] = f"AFTER UPDATE ON secrets WHEN OLD.salt IS NOT NEW.salt OR OLD.hash IS NOT " \
+                                     f"NEW.hash OR OLD.len IS NOT NEW.len {every}"
+    made["row_block_login_delete"] = f"AFTER DELETE ON secrets WHEN {new_mask('OLD', '')} {every}"
+    return {name: f"CREATE TRIGGER {name} {body}" for name, body in made.items()}
+
+
+def row_schema(problems):
+    """The marks of the blocks of older rows, at the end of migrate(), as older_schema makes the tasks' marks: their
+    table, the triggers (made again when their words differ from row_triggers, never at a start that changes nothing),
+    the index of the open items, and a mark for each block that holds a row of a list and has none (the rows of before
+    this change). A start that made a trigger counts every block once and counts its rows again: a write could have
+    come while that trigger was not there. So does a start whose rows look otherwise than the rows of the start before
+    (rows_shape, kept in kv). The hub serves the window only when no step was refused (ROWS)."""
+    refused, made = len(problems), False
+    sql_step("CREATE TABLE IF NOT EXISTS row_blocks(list TEXT NOT NULL, block INTEGER NOT NULL, rev INTEGER NOT NULL, "
+             "rows INTEGER NOT NULL, PRIMARY KEY(list, block))", problems)
+    sql_step("CREATE INDEX IF NOT EXISTS need_open ON needs(id) WHERE answer IS NULL", problems)
+    # the files of the reports of a window or a block, without a read of every file (a window read and the whole one)
+    sql_step("CREATE INDEX IF NOT EXISTS attachment_report ON attachments(report) WHERE report IS NOT NULL", problems)
+    try:
+        have = {r["name"]: r["sql"] for r in q("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND "
+                                               "name LIKE 'row\\_block\\_%' ESCAPE '\\'")}
+        want = row_triggers()
+    except sqlite3.Error as e:
+        problems.append(f"the triggers of the older rows: {e}")
+        have, want = {}, {}
+    for name in sorted(set(have) - set(want)):
+        sql_step(f"DROP TRIGGER IF EXISTS {name}", problems)
+    for name, statement in want.items():
+        if have.get(name) != statement:
+            if name in have:
+                sql_step(f"DROP TRIGGER IF EXISTS {name}", problems)
+            sql_step(statement, problems)
+            made = True
+    try:
+        shape = rows_shape()
+    except (sqlite3.Error, OSError, TypeError) as e:
+        problems.append(f"the shape of the older rows: {e}")
+        shape = None
+    made = made or (shape is not None and kv_get("rows_shape") != shape)
+    for name, (table, key, rest) in ROW_LISTS.items():
+        size = ROWS_BLOCK[name]
+        sql_step(f"INSERT OR IGNORE INTO row_blocks(list, block, rev, rows) SELECT '{name}', CAST(t.{key} AS INTEGER) "
+                 f"/ {size}, 1, COUNT(*) FROM {table} t WHERE t.{key} >= 0 AND {rest.format(t='t')} "
+                 f"GROUP BY CAST(t.{key} AS INTEGER) / {size}", problems)
+        if made:
+            sql_step(f"UPDATE row_blocks SET rev = rev + 1, rows = (SELECT COUNT(*) FROM {table} r WHERE r.{key} >= "
+                     f"row_blocks.block * {size} AND r.{key} < (row_blocks.block + 1) * {size} AND "
+                     f"{rest.format(t='r')}) WHERE list = '{name}'", problems)
+    ROWS["on"] = bool(want) and len(problems) == refused
+    if ROWS["on"]:
+        kv_set("rows_shape", shape)
+    return problems
+
+
+def rows_before(name):
+    """The key below which a row of one list is an older row: no part of a window read of the state (an open item is),
+    and part of its block. A multiple of the list's block, with the ROWS_KEEP newest keys at or above it."""
+    table, key, _ = ROW_LISTS[name]
+    size = ROWS_BLOCK[name]
+    top = q1(f"SELECT MAX({key}) AS top FROM {table}")["top"] or 0
+    return max(0, (int(top) - ROWS_KEEP[name] + 1) // size * size)
+
+
+def rows_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:12]
+
+
+ROWS_CODE = {}          # the digest of the code of each kind of block, made once in a process (code_digest)
+# What decides no look of a row: the reads and the writes of the records, the clock, the team's own values (which
+# rows_team digests where a row shows one) and the catalog that names a resource (its names are in rows_team too).
+SHAPE_PLUMBING = frozenset({"q", "q1", "commit", "read_rows", "state_moment", "now", "kv_get", "counted", "held",
+                            "changed", "no_commit_inside", "in_transaction", "team_read", "chat_apps", "log",
+                            "tool_catalog", "resource_title", "resource_parts"})
+SHAPE_STATE = frozenset({"ROWS", "OLDER", "TEAM", "CHANGE", "SCRUB", "SNAP", "READERS", "ROWS_CODE", "CFG", "LOCK"})
+SHAPE_MODULES = frozenset({"hidden"})       # a module of this repository whose code a view reaches (scrub's skeleton)
+
+
+def shape_code(fn):
+    """code_text of a function with no docstring: what it does, and not its words or its lines."""
+    code = fn.__code__
+    if code.co_consts and fn.__doc__ is not None and code.co_consts[0] == fn.__doc__:
+        code = code.replace(co_consts=(None,) + code.co_consts[1:])
+    return code_text(code) + code_text((fn.__defaults__, fn.__kwdefaults__))
+
+
+def stable_text(value):
+    """A value as text that is the same in each process: a set's members and a dict's keys in one order (a string's
+    hash, and so a set's order, changes from one process to the next), a pattern by its words."""
+    if isinstance(value, dict):
+        return "{" + ",".join(sorted(f"{stable_text(k)}:{stable_text(v)}" for k, v in value.items())) + "}"
+    if isinstance(value, (set, frozenset)):
+        return "{" + ",".join(sorted(stable_text(v) for v in value)) + "}"
+    if isinstance(value, (list, tuple)):
+        return "(" + ",".join(stable_text(v) for v in value) + ")"
+    if isinstance(value, re.Pattern):
+        return f"re({value.pattern!r},{value.flags})"
+    return repr(value)
+
+
+def code_names(code):
+    """The names that a code object reads, with those of the code objects inside it."""
+    names = set(code.co_names)
+    for value in code.co_consts:
+        if isinstance(value, type(code)):
+            names |= code_names(value)
+    return names
+
+
+def code_digest(roots):
+    """A digest of the code that builds a block's rows, made once in a process (a test that later stands in for a
+    function does not change it): these functions of this file and every function of it that they reach, also through
+    a cache that wraps one (spans_of's), as code (shape_code); the constants that they read; the code and the values of
+    the module hidden; and the search of scrub (search_version). Not SHAPE_PLUMBING, and no value that the hub changes
+    as it runs."""
+    key = tuple(roots)
+    if key in ROWS_CODE:
+        return ROWS_CODE[key]
+    module, parts, seen, todo = sys.modules[__name__], [], set(), list(roots)
+    while todo:
+        name = todo.pop()
+        if name in seen or name in SHAPE_PLUMBING or name in SHAPE_STATE:
+            continue
+        seen.add(name)
+        value = getattr(module, name, None)
+        try:
+            found = inspect.unwrap(value)
+        except ValueError:          # a loop of __wrapped__
+            found = value
+        if inspect.isfunction(found) and found.__module__ == __name__:
+            parts.append(name.encode() + b"\0" + shape_code(found))
+            todo.extend(code_names(found.__code__))
+        elif inspect.ismodule(value) and name in SHAPE_MODULES:
+            for item, member in sorted(vars(value).items()):
+                if inspect.isfunction(member) and member.__module__ == value.__name__:
+                    parts.append(f"{name}.{item}".encode() + b"\0" + shape_code(member))
+                elif not item.startswith("__") and not callable(member) and not inspect.ismodule(member):
+                    parts.append(f"{name}.{item}={stable_text(member)}".encode())
+        elif name.isupper() and isinstance(value, (str, bytes, int, float, tuple, frozenset, set, dict, re.Pattern)):
+            parts.append(f"{name}={stable_text(value)}".encode())
+    digest = hashlib.sha256(b"\1".join(sorted(parts) + [search_version().encode()])).hexdigest()[:12]
+    ROWS_CODE[key] = digest
+    return digest
+
+
+def rows_shape():
+    """What decides how a row of these lists looks in a block, as one digest: the block sizes, the columns of the tables
+    whose rows the views take whole or in part, and the code that builds a block (code_digest of rows_read: the views,
+    their helpers and scrub). row_schema counts every block once when it differs from the start before."""
+    columns = {table: [r["name"] for r in q(f"PRAGMA table_info({table})")]
+               for table in ("needs", "need_talk", "owner_reports", "ui_requests", "attachments", "chat_out",
+                             "resource_grants")}
+    return rows_digest([ROWS_SHAPE, ROWS_BLOCK, columns, code_digest(("rows_read",))])
+
+
+def rows_team_reads(name):
+    """The rows that rows_team needs, read in the moment of the rows: the resources that a grant line can name."""
+    if name == "reports":
+        return [r["resource"] for r in q("SELECT DISTINCT resource FROM resource_grants WHERE level IS NOT NULL "
+                                         "ORDER BY resource")]
+    return []
+
+
+def rows_team(name, resources, conf, team):
+    """One digest of every value of team.json that a row of this list can show, or None for a list that shows none:
+    the label of each chat app account (a message's origin), and the kind and title of each resource that a grant
+    line can name (report_grants, grant_names). conf and team are chat_apps() and team_read() of the moment of the
+    rows. It reads no row, so it runs after the moment."""
+    if name == "messages":
+        return rows_digest(sorted([str(account), (value or {}).get("label", account)] for account, value in conf.items()))
+    if name == "reports":
+        return rows_digest(sorted([rid, list(named)] for rid, named in grant_names(resources, team).items()))
+    return None
+
+
+def row_block_mark(name, rev, team):
+    """The mark of one block: its list's block size, its count, and the digest of rows_team. The size is in it, so that
+    a block that a reader kept from a release with another size is never taken for the block of the same first key."""
+    return f"{ROWS_BLOCK[name]}.{rev}" + (f".{team}" if team else "")
+
+
+def rows_counted(name, before):
+    """The sum of the counts of the blocks of one list below `before`, and of their rows (rows_head)."""
+    return q1("SELECT COALESCE(SUM(rev), 0) AS n, COALESCE(SUM(rows), 0) AS rows FROM row_blocks WHERE list = ? AND "
+              "block >= 0 AND block < ?", (name, before // ROWS_BLOCK[name]))
+
+
+def rows_head(name, before, counted, team):
+    """One list of `older_rows` of a window read of the state, and the head of the list of GET /ui/older: {before,
+    block, mark, rows}. mark changes when a block below `before` changes, or `before` does: the block size, the key,
+    the sum of those blocks' counts (rows_counted), and the digest of rows_team. rows is the number of the rows in those
+    blocks: with the rows of the window, every row of the list."""
+    mark = f"{ROWS_BLOCK[name]}.{before}.{counted['n']}" + (f".{team}" if team else "")
+    return {"before": before, "block": ROWS_BLOCK[name], "mark": mark, "rows": counted["rows"]}
+
+
+def rows_window(name, before):
+    """The rows of one list in a window read of the state, in the order of the whole state: each row at or above
+    `before` (and one of a key below 0, which no block has), and each open item below it. Every other row is in the
+    block of its key (rows_read), so the window and the blocks together are the whole list."""
+    if name == "needs":
+        return sorted(q("SELECT * FROM needs WHERE id >= ? OR id < 0", (before,))
+                      + q("SELECT * FROM needs WHERE id >= 0 AND id < ? AND answer IS NULL", (before,)),
+                      key=lambda r: r["id"])
+    if name == "reports":
+        return q("SELECT * FROM owner_reports WHERE id >= ? OR id < 0 ORDER BY id", (before,))
+    return q(f"{ROWS_MESSAGES} WHERE u.rowid >= ? OR u.rowid < 0 ORDER BY u.created,u.request_id", (before,))
+
+
+def message_views(rows, attached, conf):
+    """The messages of GET /ui/state and of a block of them, from their rows (u.* with the read time of their event):
+    attached is {request_id: [the views of its files]}, conf the chat apps of the moment (chat_apps)."""
+    # ui_requests.connection is the hub's own record of a connected app's message: the apps do not read it
+    views = [{k: r[k] for k in r.keys() if k != "connection"} for r in rows]
+    for m in views:                         # owner feature chat_apps: the chat app of a message, without its IDs
+        o = json.loads(m["origin"]) if m.get("origin") else None
+        m["origin"] = {"app": o["app"], "account": o["account"],
+                       "label": (conf.get(o["account"]) or {}).get("label", o["account"])} if o else None
+        # edit_in_place: when he last changed its words, and not every text it has had
+        m["edited"] = message_edited(m)
+        m.pop("edits", None)
+    for m in views:                         # owner feature attachments: the files of each message
+        m["attachments"] = attached.get(m["request_id"], [])
+    return views
+
+
+def report_views(rows, files, outbound, granted):
+    """The reports of GET /ui/state and of a block of them, from their rows: files are the rows of their files,
+    outbound the newest chat_out row of kind message of each of them, granted report_grants of them."""
+    delivery = {r["report"]: {"app": r["app"], "account": r["account"], "state": r["state"], "at": r["updated"],
+                              "error": r["error"], "outbound": r["id"]} for r in outbound}
+    reported = {}                           # CHAT-APPS.md 20: the files that an agent's report carries
+    for r in files:
+        reported.setdefault(r["report"], []).append(attachment_view(r))
+    # turn (owner API 1.190): the owner's message whose turn the report took in the runtime turn that read it
+    # (turn_word), which is no link and never in_reply_to: the apps place the row of what the owner asked for under
+    # it (ChatAskPlaces), and nothing else. The hub's own turn stays its own (t_tell_owner).
+    # grant (owner API 1.236): the parts of a line that says a grant, so an app shows a run of them as one record
+    return [dict({k: r[k] for k in r.keys() if k not in ("turn", "turn_word")}, pushed=bool(r["pushed"]),
+                 delivery=delivery.get(r["id"]), turn=r["turn_word"],
+                 attachments=reported.get(r["id"], []), grant=granted.get(r["id"]))
+            for r in rows]
+
+
+def rows_read(query):
+    """GET /ui/older after ui_allowed (owner API 1.258). `list` is needs, reports or messages. Without `from`: the
+    blocks of that list below the window of the state, each with its mark and the number of its rows, and the head of
+    them all, which a window read of the state gives too (`older_rows`, rows_head).
+    With `from`, the first key of a block: the older rows of that block as GET /ui/state gives them (an answered item, a
+    report, a message with its event), under the list's own name, and the block's mark of the same moment. A reader
+    keeps a block until its mark differs. A block at or above the window is none: 404, and the reader reads the list
+    again."""
+    generation = kv_get("db_id")
+    if query.get("db") != generation:               # a read of a generation that the client holds (its marks)
+        return 409, refusal_words.answer("hub_changed"), None
+    name = query.get("list")
+    if name not in ROW_LISTS:
+        return 400, {"error": "list is needs, reports or messages"}, None
+    if not ROWS["on"]:
+        return 404, {"error": "this hub keeps no blocks of older rows"}, None
+    size, start = ROWS_BLOCK[name], query.get("from")
+    if start is None:
+        with state_moment():
+            before = rows_before(name)
+            counted, resources = rows_counted(name, before), rows_team_reads(name)
+            counts = {r["block"]: r for r in q("SELECT block, rev, rows FROM row_blocks WHERE list = ? AND block >= 0 "
+                                               "AND block < ?", (name, before // size))}
+            conf, team = chat_apps(), team_read()
+        shown = rows_team(name, resources, conf, team)
+        nothing = {"rev": 0, "rows": 0}         # a block that never held a row
+        return 200, dict(rows_head(name, before, counted, shown), db=generation, list=name,
+                         blocks=[{"from": block * size, "mark": row_block_mark(name, counts.get(block, nothing)["rev"], shown),
+                                  "rows": counts.get(block, nothing)["rows"]}
+                                 for block in range(before // size)]), {"Cache-Control": "no-store"}
+    if not (start.isascii() and start.isdigit() and len(start) <= 18) or int(start) % size:
+        return 400, {"error": f"from is the first key of a block: a multiple of {size}"}, None
+    start = int(start)
+    end = start + size
+    with state_moment():
+        if start >= rows_before(name):
+            return 404, {"error": "no such block of older rows"}, None
+        counted = q1("SELECT rev FROM row_blocks WHERE list = ? AND block = ?", (name, start // size))
+        resources = rows_team_reads(name)
+        if name == "needs":
+            rows = q("SELECT * FROM needs WHERE id >= ? AND id < ? AND answer IS NOT NULL ORDER BY id", (start, end))
+            reads = need_reads() if rows else None
+        elif name == "reports":
+            rows = q("SELECT * FROM owner_reports WHERE id >= ? AND id < ? ORDER BY id", (start, end))
+            files = q("SELECT * FROM attachments WHERE report >= ? AND report < ? ORDER BY id", (start, end))
+            outbound = q(f"{ROWS_OUT} AND report >= ? AND report < ? GROUP BY report)", (start, end))
+            records = q("SELECT ts, resource, agent, level, by FROM resource_grants")
+        else:
+            rows = q(f"{ROWS_MESSAGES} WHERE u.rowid >= ? AND u.rowid < ? ORDER BY u.created,u.request_id", (start, end))
+            files = q("SELECT * FROM attachments WHERE message IN (SELECT request_id FROM ui_requests WHERE rowid >= ? "
+                      "AND rowid < ?) ORDER BY id", (start, end))
+        conf, team = chat_apps(), team_read()       # a grant line's title and a message's label are of the moment
+    # The views from the rows read in the moment, after it, as Handler.ui_state makes its views: they read nothing.
+    if name == "needs":
+        views = [need_view(r, reads) for r in rows]
+    elif name == "reports":
+        views = report_views(rows, files, outbound, report_grants(rows, records, team))
+    else:
+        attached = {}
+        for r in files:
+            attached.setdefault(r["message"], []).append(attachment_view(r))
+        views = message_views(rows, attached, conf)
+    answer = {"db": generation, "list": name, "from": start,
+              "mark": row_block_mark(name, counted["rev"] if counted else 0, rows_team(name, resources, conf, team)),
+              name: views}
     return 200, scrub(answer), {"Cache-Control": "no-store"}
 
 
@@ -6008,6 +6519,7 @@ def migrate():
     memory_search_probe()
     history_search_probe()
     older_schema(problems)      # the lane "A bound for the state page": last, after every column of its six tables
+    row_schema(problems)        # the lane "A bound for the rest of the state page": after every column of its tables
     return problems
 
 
@@ -38176,22 +38688,34 @@ def report_grants(reports, records, team=None):
             if record["by"] != report["agent"] or not about.startswith(f"grant {rid} to "):
                 continue
             if rid not in named:                # each resource's kind, title and word once for a read
-                kind, what = resource_parts(rid)
-                if kind == "tool":              # one build of the MCP catalog for a read, not one for each line
-                    if not catalog:
-                        catalog.append(tool_catalog(team or TEAM))
-                    named[rid] = (kind, (catalog[0].get(what) or {}).get("title") or what, RESOURCE_WORDS[kind])
-                elif kind == "drive" and "/" in what and DRIVE_ID.fullmatch(what.rpartition("/")[2]):
-                    # a folder's ID has no @: the last part of an address with a / in its local part is no folder
-                    named[rid] = (kind, DRIVE_FOLDER_LINK.format(what.rpartition("/")[2]), DRIVE_FOLDER_WORD)
-                else:
-                    named[rid] = (kind, resource_title(kind, what, team) if kind else rid, RESOURCE_WORDS.get(kind))
+                named.update(grant_names([rid], team, catalog))
             parts[report["id"]] = {
                 "agent": record["agent"], "resource": rid, "kind": named[rid][0],
                 "word": named[rid][2], "title": named[rid][1],
                 "level": level, "words": GRANT_LEVEL_WORDS.get(level, level.replace("_", " "))}
             break
     return parts
+
+
+def grant_names(rids, team=None, catalog=None):
+    """{resource id: (kind, title, word)} of these resources as a grant line names them (report_grants): what kind of
+    thing it is, its title in the owner's words, of `team` (the team of the read's moment), and its word: a folder of a
+    Drive account has its link as its title and DRIVE_FOLDER_WORD as its word. `catalog`: a list that holds the MCP
+    catalog once it was built, so that a read builds it once and not once for each line. The digest of the reports'
+    older blocks takes these names too (rows_team, owner API 1.258)."""
+    named, catalog = {}, [] if catalog is None else catalog
+    for rid in rids:
+        kind, what = resource_parts(rid)
+        if kind == "tool":              # one build of the MCP catalog for a read, not one for each line
+            if not catalog:
+                catalog.append(tool_catalog(team or TEAM))
+            named[rid] = (kind, (catalog[0].get(what) or {}).get("title") or what, RESOURCE_WORDS[kind])
+        elif kind == "drive" and "/" in what and DRIVE_ID.fullmatch(what.rpartition("/")[2]):
+            # a folder's ID has no @: the last part of an address with a / in its local part is no folder
+            named[rid] = (kind, DRIVE_FOLDER_LINK.format(what.rpartition("/")[2]), DRIVE_FOLDER_WORD)
+        else:
+            named[rid] = (kind, resource_title(kind, what, team) if kind else rid, RESOURCE_WORDS.get(kind))
+    return named
 
 
 # ---------------------------------------------------------------- standing items (AUTONOMY.md P3)
@@ -66398,6 +66922,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         return self.json(*older_read(query))
 
+    def ui_older(self, query):
+        """GET /ui/older: the blocks of the Needs-you items, the reports or the messages that a window read of the state
+        leaves out, or one of them (rows_read; owner API 1.258)."""
+        if not self.ui_allowed():
+            return
+        return self.json(*rows_read(query))
+
     def ui_state(self):
         if not self.ui_allowed():
             return
@@ -66407,6 +66938,10 @@ class Handler(BaseHTTPRequestHandler):
         # newest ids, with the rows of the five tables of those tasks, and `older_tasks`, which says where the others
         # are (older_read). Without it, or on a hub whose marks are not in place, every task is in this answer.
         window = OLDER["on"] and self.route()[1].get("tasks") == "window"
+        # Owner API 1.258: with rest=window the answer holds the Needs-you items that are open and the items, reports
+        # and messages of the newest keys, and `older_rows`, which says where the others are (rows_read); its duties
+        # carry their cases without their steps. Without it, or on a hub whose marks are not in place, every row.
+        rest = ROWS["on"] and self.route()[1].get("rest") == "window"
         if self.route()[1].get("head") == "1":      # owner API 1.256: the head alone, and no list (state_head)
             return self.json(200, scrub(state_head(repository)))
         with state_moment() as (token, at):
@@ -66427,19 +66962,30 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     plain_rows[key] = window_rows(reads[table], before)
                 result[key] = None          # its place in the answer: its rows become dicts after the lock
-            needs = q("SELECT * FROM needs ORDER BY id")
+            befores = {name: rows_before(name) for name in ROW_LISTS} if rest else {}
+            needs = rows_window("needs", befores["needs"]) if rest else q("SELECT * FROM needs ORDER BY id")
             needs_read = need_reads() if needs else None    # with no item it reads nothing more, as before
             result["needs"] = None          # its place: a view of rows read here, made after the lock
             agents_read = agent_reads()     # each table once for all the agents
             result["agents"] = [agent_view(name, config, agents_read) for name, config in agents().items()]
             conf = chat_apps()
-            messages = q("SELECT u.*,e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id "
-                         "ORDER BY u.created,u.request_id")
-            files = q("SELECT * FROM attachments WHERE message IS NOT NULL ORDER BY id")
-            report_files = q("SELECT * FROM attachments WHERE report IS NOT NULL ORDER BY id")    # CHAT-APPS.md 20
-            outbound = q("SELECT * FROM chat_out WHERE id IN (SELECT MAX(id) FROM chat_out WHERE kind='message' "
-                         "AND report IS NOT NULL GROUP BY report)")
-            reports = q("SELECT * FROM owner_reports ORDER BY id")
+            if rest:
+                # the files of those messages here, and the files of the guidance of the answer once its rows are read
+                messages = rows_window("messages", befores["messages"])
+                files = q("SELECT * FROM attachments WHERE message IN (SELECT request_id FROM ui_requests WHERE "
+                          "rowid >= ? OR rowid < 0) ORDER BY id", (befores["messages"],))
+                report_files = q("SELECT * FROM attachments WHERE report >= ? OR report < 0 ORDER BY id",
+                                 (befores["reports"],))
+                outbound = q(f"{ROWS_OUT} AND (report >= ? OR report < 0) GROUP BY report)", (befores["reports"],))
+                reports = rows_window("reports", befores["reports"])
+            else:
+                messages = q("SELECT u.*,e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id "
+                             "ORDER BY u.created,u.request_id")
+                files = q("SELECT * FROM attachments WHERE message IS NOT NULL ORDER BY id")
+                report_files = q("SELECT * FROM attachments WHERE report IS NOT NULL ORDER BY id")    # CHAT-APPS.md 20
+                outbound = q("SELECT * FROM chat_out WHERE id IN (SELECT MAX(id) FROM chat_out WHERE kind='message' "
+                             "AND report IS NOT NULL GROUP BY report)")
+                reports = q("SELECT * FROM owner_reports ORDER BY id")
             grant_records = q("SELECT ts, resource, agent, level, by FROM resource_grants")      # owner API 1.236
             grant_team = team_read()            # the team of this moment, for the titles of those records' resources
             result["messages"] = result["reports"] = None      # their places: they are made after the lock
@@ -66452,6 +66998,11 @@ class Handler(BaseHTTPRequestHandler):
             result["responsibilities"] = None   # its place: views of rows read here, made after the lock
             steers = window_rows(reads["steers"], before) if window else \
                 q("SELECT s.*, e.read_at FROM steers s JOIN events e ON e.id=s.event_id ORDER BY s.id")
+            if rest:                    # the files of that guidance, which the whole state reads with `files`
+                steered = sorted({r["request_id"] for r in steers})
+                for chunk in (steered[i:i + 500] for i in range(0, len(steered), 500)):
+                    files += q(f"SELECT * FROM attachments WHERE message IN ({','.join('?' * len(chunk))})", chunk)
+                files = sorted({r["id"]: r for r in files}.values(), key=lambda r: r["id"])
             result["steers"] = None     # its place: views made after the lock, with the files of `files`
             result["secrets"] = [dict(r) for r in q("SELECT id,COALESCE(label,'Registered login') AS label FROM secrets ORDER BY id")]
             parks = parked_until()
@@ -66461,6 +67012,10 @@ class Handler(BaseHTTPRequestHandler):
             above = tasks_above(plain_rows["tasks"]) if window else {}
             if window:
                 result["older_tasks"] = older_head(before)
+            if rest:                    # its place: made after the lock, with the values of the team
+                result["older_rows"] = None
+                counted = {name: rows_counted(name, befores[name]) for name in ROW_LISTS}
+                team_reads = {name: rows_team_reads(name) for name in ROW_LISTS}
         # A row holds its own values, so this needs no lock. On the first fleet the tasks were 977 KB of the state's
         # 1.70 MB, and in a copy of its database making their rows into dicts took 2.1 ms of each read's hold of the
         # lock (10 November 2026).
@@ -66487,36 +67042,21 @@ class Handler(BaseHTTPRequestHandler):
         # rows that they were given, these views read nothing themselves (11 November 2026).
         result["needs"] = [need_view(r, needs_read) for r in needs]
         result["responsibilities"] = [duty_view(r, reads=duties_read) for r in duties]
-        # ui_requests.connection is the hub's own record of a connected app's message: the apps do not read it
-        result["messages"] = [{k: r[k] for k in r.keys() if k != "connection"} for r in messages]
-        for m in result["messages"]:            # owner feature chat_apps: the chat app of a message, without its IDs
-            o = json.loads(m["origin"]) if m.get("origin") else None
-            m["origin"] = {"app": o["app"], "account": o["account"],
-                           "label": (conf.get(o["account"]) or {}).get("label", o["account"])} if o else None
-            # edit_in_place: when he last changed its words, and not every text it has had
-            m["edited"] = message_edited(m)
-            m.pop("edits", None)
+        if rest:                                # owner API 1.258: no reader of the window reads a case's steps
+            for duty in result["responsibilities"]:
+                for case in duty["cases"] + duty["joined"] + [duty["last_case"] or {}]:
+                    case.pop("steps", None)
         attached = {}                           # owner feature attachments: the files of each message
         for r in files:
             attached.setdefault(r["message"], []).append(attachment_view(r))
-        for m in result["messages"]:
-            m["attachments"] = attached.get(m["request_id"], [])
+        result["messages"] = message_views(messages, attached, conf)
         # owner API 1.223: a steer's files are linked by its request_id as a message's are, so `files` has them too
         result["steers"] = [steer_view(r, attached.get(r["request_id"], [])) for r in steers]
-        delivery = {r["report"]: {"app": r["app"], "account": r["account"], "state": r["state"], "at": r["updated"],
-                                  "error": r["error"], "outbound": r["id"]} for r in outbound}
-        reported = {}                           # CHAT-APPS.md 20: the files that an agent's report carries
-        for r in report_files:
-            reported.setdefault(r["report"], []).append(attachment_view(r))
-        # turn (owner API 1.190): the owner's message whose turn the report took in the runtime turn that read it
-        # (turn_word), which is no link and never in_reply_to: the apps place the row of what the owner asked for under
-        # it (ChatAskPlaces), and nothing else. The hub's own turn stays its own (t_tell_owner).
-        # grant (owner API 1.236): the parts of a line that says a grant, so an app shows a run of them as one record
-        granted = report_grants(reports, grant_records, grant_team)
-        result["reports"] = [dict({k: r[k] for k in r.keys() if k not in ("turn", "turn_word")}, pushed=bool(r["pushed"]),
-                                  delivery=delivery.get(r["id"]), turn=r["turn_word"],
-                                  attachments=reported.get(r["id"], []), grant=granted.get(r["id"]))
-                             for r in reports]
+        result["reports"] = report_views(reports, report_files, outbound, report_grants(reports, grant_records, grant_team))
+        if rest:
+            result["older_rows"] = {name: rows_head(name, befores[name], counted[name],
+                                                    rows_team(name, team_reads[name], conf, grant_team))
+                                    for name in ROW_LISTS}
         result["knowledge"] = [knowledge_public(k) for k in knowledge_entries()]
         # Keys, ciphertext, helper jobs, raw worker queues and runtime configuration are excluded.
         # Also mask old text if a login was registered after that text was stored. scrub makes each dict and list of
@@ -70701,6 +71241,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_state()
         if parts == ["ui", "tasks", "older"]:           # owner API 1.254
             return self.ui_tasks_older(query)
+        if parts == ["ui", "older"]:                    # owner API 1.258
+            return self.ui_older(query)
         if parts == ["ui", "wait"]:                     # owner feature live_changes
             return self.ui_wait(query)
         if len(parts) == 3 and parts[:2] == ["ui", "attachments"]:

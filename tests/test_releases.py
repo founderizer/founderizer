@@ -161,6 +161,117 @@ class Signature(unittest.TestCase):
             self.assertIs(releases.verify_signature(b"\x00" * 32, message, b"\x00" * 64), False, message)
 
 
+class SecondOpinion(unittest.TestCase):
+    """OpenSSL's Ed25519 beside ours (the owner's "OpenSSL as a second check", 20 November 2026): a release is taken
+    only when both say yes, wherever the machine has an OpenSSL that verifies Ed25519."""
+
+    def setUp(self):
+        releases._openssl.clear()
+        self.addCleanup(releases._openssl.clear)
+        self.folder = Path(tempfile.mkdtemp(prefix="fleet-openssl-"))
+        self.addCleanup(shutil.rmtree, str(self.folder), True)
+
+    def program(self, name, says, status):
+        """A stand-in openssl that prints `says` and ends with `status` whatever it is asked."""
+        path = self.folder / name
+        path.write_text(f"#!/bin/sh\nprintf '%s\\n' '{says}'\nexit {status}\n")
+        path.chmod(0o755)
+        return str(path)
+
+    def openssl3(self):
+        """The first OpenSSL 3 or later at an OpenSSL place, found without the probe, which must take it: a fault of ours that
+        makes the probe refuse every program (a wrong key head, swapped files, a wrong line) fails these tests, where
+        a skip would hide it and the second check would be gone in every fleet with no sign."""
+        for program in releases.OPENSSL_PLACES:
+            try:
+                said = subprocess.run([program, "version"], capture_output=True, text=True, timeout=30).stdout
+            except (OSError, subprocess.SubprocessError):
+                continue
+            major = re.match(r"OpenSSL (\d+)\.", said)
+            if major and int(major.group(1)) >= 3:      # OpenSSL 3 and every later one verifies Ed25519
+                self.assertEqual(releases.openssl_verifier(), program)
+                return program
+        self.skipTest("this machine has no OpenSSL 3 or later")
+
+    def test_a_forged_release_is_refused_even_where_our_own_check_would_take_it(self):
+        """The point of the second check: a fault of our Ed25519 that takes a bad signature lets no forged release
+        into a fleet whose machine has OpenSSL."""
+        self.openssl3()
+        good = releases.sign(SEED, b"a release")
+        forged = bytes([good[0] ^ 1]) + good[1:]
+        with patch.object(releases, "verify_signature", lambda *_: True):
+            self.assertFalse(releases.signed_by_any([KEY], b"a release", forged))
+            self.assertFalse(releases.signed_by_any([KEY], b"another release", good))
+            self.assertTrue(releases.signed_by_any([KEY], b"a release", good))
+
+    def test_openssl_reads_the_key_message_and_signature_as_ours_does(self):
+        """The key goes to OpenSSL as an RFC 8410 public key, with the message and the signature as they are."""
+        program = self.openssl3()
+        for seed, public, message, signature in Signature.VECTORS[1:]:      # OpenSSL reads no empty message
+            public, message, signature = (binascii.unhexlify(x) for x in (public, message, signature))
+            self.assertTrue(releases.openssl_verify(program, public, message, signature))
+            self.assertFalse(releases.openssl_verify(program, public, message + b"!", signature))
+            self.assertFalse(releases.openssl_verify(program, KEY, message, signature))
+        self.assertTrue(releases.signed_by_any([KEY], b"a release", releases.sign(SEED, b"a release")))
+
+    def test_a_probe_that_failed_once_is_tried_again_at_the_next_check(self):
+        """A short fault of the first probe (a time-out under load, a full /tmp) does not turn the second check off
+        for the life of a long-lived hub."""
+        program = self.openssl3()
+        releases._openssl.clear()
+        real, calls = releases.openssl_verify, []
+
+        def faulty_once(*args):
+            calls.append(args)
+            return False if len(calls) == 1 else real(*args)
+        with patch.object(releases, "openssl_verify", faulty_once), patch.object(releases, "OPENSSL_PLACES", (program,)):
+            self.assertIsNone(releases.openssl_verifier())
+            self.assertEqual(releases.openssl_verifier(), program)
+
+    def test_a_program_that_stops_working_after_its_probe_refuses_nothing_by_itself(self):
+        """An OpenSSL that passed its probe and later cannot run does not refuse every release until a restart: a
+        new probe finds none, and our own Ed25519 decides, as on a machine with none."""
+        self.openssl3()
+        good = releases.sign(SEED, b"a release")
+        with patch.object(releases, "openssl_verify", lambda *_: False):
+            self.assertTrue(releases.signed_by_any([KEY], b"a release", good))
+            self.assertFalse(releases.signed_by_any([KEY], b"a release", bytes([good[0] ^ 1]) + good[1:]))
+
+    def test_the_self_check_finds_a_check_that_refuses_everything_or_takes_a_forgery(self):
+        """What selftest.py runs on the hub before the hub takes a release: a check that would strand the hub (it
+        refuses every release) or open it (it takes a changed signature) is named."""
+        self.assertIsNone(releases.self_check())
+        with patch.object(releases, "openssl_agrees", lambda *_: False):
+            self.assertIn("refuses a release that a trusted key signed", releases.self_check())
+        with patch.object(releases, "verify_signature", lambda *_: True), \
+                patch.object(releases, "openssl_agrees", lambda *_: True):
+            self.assertIn("takes a release whose signature was changed", releases.self_check())
+
+    def test_a_refusal_that_only_openssl_gives_says_so(self):
+        """The line that the owner reads tells a forged signature from one that our code takes and OpenSSL
+        refuses."""
+        manifest = dict(revision="a" * 40, version="2026.11.1", notes=None, minimum=None, hold=False)
+        manifest["signature"] = base64.b64encode(releases.sign(SEED, releases.signed_text(manifest))).decode()
+        with patch.object(releases, "openssl_agrees", lambda *_: False):
+            with self.assertRaisesRegex(releases.Untrusted, "this machine's OpenSSL refuses it"):
+                releases.check(manifest, [KEY])
+        with self.assertRaisesRegex(releases.Untrusted, "not a signature of it by a release key"):
+            releases.check(manifest, [releases.public_key(OTHER_SEED)])
+
+    def test_a_program_that_takes_everything_or_nothing_is_not_asked_and_ours_decides(self):
+        """A program at an OpenSSL place that says yes to everything, or no to everything, or is not there, is no
+        second opinion: the machine checks with our Ed25519 alone, as before."""
+        good = releases.sign(SEED, b"a release")
+        forged = bytes([good[0] ^ 1]) + good[1:]
+        places = (str(self.folder / "absent"), self.program("yes", releases.OPENSSL_SAYS, 0),
+                  self.program("no", "Signature Verification Failure", 1),
+                  self.program("lies", releases.OPENSSL_SAYS, 1))
+        with patch.object(releases, "OPENSSL_PLACES", places):
+            self.assertIsNone(releases.openssl_verifier())
+            self.assertTrue(releases.signed_by_any([KEY], b"a release", good))
+            self.assertFalse(releases.signed_by_any([KEY], b"a release", forged))
+
+
 # ---------------------------------------------------------------- the manifest and the key file
 
 class Manifest(unittest.TestCase):

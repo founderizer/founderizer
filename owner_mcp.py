@@ -84,9 +84,9 @@ READ_MAX = 8 * 1024 * 1024              # the largest answer this server reads f
 # its own, and every other answer that is no file keeps READ_MAX.
 STATE_MAX = 64 * 1024 * 1024
 STATE_ROUTE = "/ui/state"
-# The read of the state that this server makes for itself where it reads the state's lists (fleet_overview, and
-# use_hub for the agents' names): with the window of the tasks (owner API 1.254), so that it does not grow with the
-# fleet's history. The read for the generation alone is STATE_HEAD, below. The
+# The read of the state that this server makes for itself where it reads the state's lists (use_hub for the agents'
+# names; fleet_overview reads the window of the rest too, owner API 1.258): with the window of the tasks (owner API
+# 1.254), so that it does not grow with the fleet's history. The read for the generation alone is STATE_HEAD, below. The
 # answer holds the tasks that have not ended and the ended ones of the newest ids, and `older_tasks` says how many
 # more ended. A hub from before 1.254 reads no such word and gives the whole answer. `fleet_read` with the page
 # `state` stays the whole snapshot: it is what the owner's agent asks for by that name.
@@ -965,7 +965,9 @@ COSTS_WORDS = ("from", "to", "agent", "minimum", "by")
 
 def overview(_args):
     """What is my fleet doing: the one read that answers it, from the routes the app's own screens read."""
-    state = get("/ui/state", "a read of the fleet", tasks="window").data
+    # the windows of the tasks (owner API 1.254) and of the rest (1.258): this reads the open items, the duties' counts
+    # and the five newest reports, which the window holds; an item that is answered can be in a block of GET /ui/older
+    state = get("/ui/state", "a read of the fleet", tasks="window", rest="window").data
     found = {"hub": hub_base(), "generation": state.get("db"), "time": state.get("time"),
              "features": state.get("ui_features"), "manager_warning": state.get("manager_warning")}
     found["agents"] = [{k: a.get(k) for k in ("name", "role", "runtime", "active", "reports_to",

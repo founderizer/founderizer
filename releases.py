@@ -40,7 +40,9 @@ what comes back. Nothing here refuses work when it expires. A hub with none asks
 the channel answers every fleet (the website's docs/CONTRACTS.md, "A call with no token").
 
 No dependency: a hub is a bare Ubuntu server with python3, git and curl (hub.sh PACKAGES), so the Ed25519
-verification below is the reference implementation of RFC 8032 and nothing else.
+verification below is the reference implementation of RFC 8032. Where the machine has an OpenSSL that verifies Ed25519
+(every supported Linux system has one), that proven implementation checks each signature too, and a release is taken
+only when both say yes (openssl_agrees).
 """
 import base64
 import hashlib
@@ -229,6 +231,81 @@ def verify_signature(public, message, signature):
         return False
 
 
+# ---------------------------------------------------------------- a second opinion: OpenSSL's Ed25519
+#
+# Since 20 November 2026 a release is taken only when this machine's OpenSSL says yes too, where the machine has one
+# that verifies Ed25519 (the owner's "OpenSSL as a second check": ~/dev/founderizer-plans/dependency-reduction.md,
+# item D). So one wrong line of our own code above cannot let a forged release into a fleet, and a machine with no
+# such OpenSSL checks as before. No package comes in: every supported Linux system has OpenSSL 3, because its
+# ca-certificates depends on it, and a Mac's Homebrew Python brings Homebrew's; macOS's own /usr/bin/openssl
+# (LibreSSL 3.3) has no Ed25519, and the probe below passes it over. A program is looked for only at these places,
+# never on the PATH, and is used only once it took RFC 8032's test vector and refused it with one bit changed.
+OPENSSL_PLACES = ("/usr/bin/openssl", "/opt/homebrew/opt/openssl@3/bin/openssl",
+                  "/usr/local/opt/openssl@3/bin/openssl")
+OPENSSL_WAIT = 30                   # seconds for one check by OpenSSL
+OPENSSL_SAYS = "Signature Verified Successfully"    # pkeyutl's line for a good signature, beside its status 0
+_ED25519_HEAD = bytes.fromhex("302a300506032b6570032100")      # the DER head of an Ed25519 public key (RFC 8410)
+# RFC 8032's TEST 2 (section 7.1): OpenSSL's pkeyutl reads no message of zero bytes, so not TEST 1. No manifest is
+# empty, and a message of zero bytes is refused wherever OpenSSL checks.
+_PROBE = (bytes.fromhex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"), b"\x72",
+          bytes.fromhex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+                        "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"))
+_openssl = []                       # [the program] once one is found in this process; empty before, or with none
+
+
+def openssl_verify(program, public, message, signature):
+    """True when the OpenSSL program at this path says that `signature` is the Ed25519 signature of `message` by the
+    32-byte key `public`: both its status 0 and its line. Every failure to ask it is False."""
+    folder = None
+    try:
+        folder = tempfile.mkdtemp(prefix="fleet-ed25519-")
+        names = ("key.pem", "message", "signature")
+        pem = (b"-----BEGIN PUBLIC KEY-----\n" + base64.b64encode(_ED25519_HEAD + bytes(public))
+               + b"\n-----END PUBLIC KEY-----\n")
+        for name, data in zip(names, (pem, bytes(message), bytes(signature))):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(data)
+        key, text, sig = (os.path.join(folder, name) for name in names)
+        done = subprocess.run([program, "pkeyutl", "-verify", "-pubin", "-inkey", key, "-rawin", "-in", text,
+                               "-sigfile", sig], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=OPENSSL_WAIT)
+        return done.returncode == 0 and done.stdout.decode("utf-8", "replace").strip() == OPENSSL_SAYS
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        return False
+    finally:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+def openssl_verifier(again=False):
+    """The first OpenSSL of OPENSSL_PLACES that takes RFC 8032's test vector and refuses it with one bit changed, or
+    None: then our own Ed25519 decides alone. A program that it found is kept for the process; when it found none, it
+    looks again at the next check, so a short fault of a probe (a time-out under load, a full /tmp) does not turn the
+    second check off for the life of a hub. `again` probes anew in any case."""
+    if _openssl and not again:
+        return _openssl[0]
+    public, message, signature = _PROBE
+    forged = bytes([signature[0] ^ 1]) + signature[1:]
+    found = next((program for program in OPENSSL_PLACES
+                  if os.path.isfile(program) and os.access(program, os.X_OK)
+                  and openssl_verify(program, public, message, signature)
+                  and not openssl_verify(program, public, message, forged)), None)
+    _openssl[:] = [found] if found else []
+    return found
+
+
+def openssl_agrees(public, message, signature):
+    """True when this machine has no OpenSSL that verifies Ed25519, or when its OpenSSL takes this signature too.
+    OpenSSL's no is asked once more after a new probe: a program that stopped working since its probe then refuses
+    nothing by itself, and our own Ed25519 decides, as on a machine with none, while an OpenSSL that works refuses a
+    forged signature both times."""
+    program = openssl_verifier()
+    if program is None or openssl_verify(program, public, message, signature):
+        return True
+    program = openssl_verifier(again=True)
+    return program is None or openssl_verify(program, public, message, signature)
+
+
 # ---------------------------------------------------------------- the public keys, shipped in the repository
 
 MAX_KEYS = 4            # how many keys one file may hold: two while a key is being replaced, and room for a mistake
@@ -288,9 +365,30 @@ def trusted(keys):
 
 
 def signed_by_any(keys, message, signature):
-    """True when one of these keys signed `message`. Every key the checkout carries is trusted, so the fleet that
-    is a release behind and the fleet that is up to date check the same release, each with a key it has."""
-    return any(verify_signature(key, message, signature) for key in trusted(keys))
+    """True when one of these keys signed `message`: our own Ed25519 says so, and so does this machine's OpenSSL
+    where it has one that verifies Ed25519 (openssl_agrees). Every key the checkout carries is trusted, so the fleet
+    that is a release behind and the fleet that is up to date check the same release, each with a key it has."""
+    return any(verify_signature(key, message, signature) and openssl_agrees(key, message, signature)
+               for key in trusted(keys))
+
+
+def self_check():
+    """None when this machine checks a release as it must: a manifest that a test key signed passes signed_by_any,
+    and the same manifest with one bit of its signature changed does not. Else the one line that says which. The hub
+    runs it through selftest.py on the code of a release before it takes it, so a release whose check would refuse
+    every later release on the hub's machine is not taken there. A helper, the door and a root copy of this file run
+    no selftest.py: each one asks the probe in each process, and with no OpenSSL that passes it, our own Ed25519
+    decides, as before."""
+    seed = hashlib.sha256(b"Founderizer: the self-check of a release").digest()
+    key = public_key(seed)
+    text = signed_text({"revision": "0123456789abcdef" * 2 + "01234567", "version": "2026.11.1",
+                        "notes": DEFAULT_CHANNEL + "/notes", "minimum": "", "hold": False})
+    good = sign(seed, text)
+    if not signed_by_any([key], text, good):
+        return "this machine's check refuses a release that a trusted key signed"
+    if signed_by_any([key], text, bytes([good[0] ^ 1]) + good[1:]):
+        return "this machine's check takes a release whose signature was changed"
+    return None
 
 
 # ---------------------------------------------------------------- the manifest
@@ -351,6 +449,9 @@ def check(raw, keys):
     except (ValueError, TypeError):
         raise Untrusted("the manifest's signature is not base64") from None
     if not signed_by_any(keys, signed_text(manifest), signature):
+        if any(verify_signature(key, signed_text(manifest), signature) for key in keys):
+            raise Untrusted("the manifest's signature passes this checkout's own check, and this machine's OpenSSL "
+                            "refuses it")
         raise Untrusted("the manifest's signature is not a signature of it by a release key this checkout carries")
     return manifest
 

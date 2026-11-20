@@ -9,15 +9,16 @@ Authorization header, and a fleet that holds one still sends it as the bearer, w
 
 What a ping says goes sealed. The phone gives the hub a key of its own with its push token, and the hub seals the
 agent's name, the item's title and its options with it (ChaCha20-Poly1305, RFC 8439, which the phone opens with
-CryptoKit). Our side and Apple carry the item's number and the sealed bytes, and never a word of the item.
+CryptoKit). Our side and Apple carry the item's number and the sealed bytes, and never a word of the item. The cipher
+is atrest.py's, the one copy of it in the hub (its own copy here went on 20 November 2026).
 """
 import base64
 import json
-import os
 import re
-import struct
 import urllib.error
 import urllib.request
+
+import atrest
 
 ENVIRONMENTS = ("production", "development")    # the app's own build: production from TestFlight, development from Xcode
 DEVICE_TOKEN = re.compile(r"[0-9a-f]{64,200}")
@@ -54,79 +55,24 @@ def _retry_after(headers):
     return min(max(seconds, 1), RETRY_MOST)
 
 
-# ---------------------------------------------------------------- the seal (RFC 8439)
-
-def _rotl(v, c):
-    return ((v << c) & 0xffffffff) | (v >> (32 - c))
-
-
-def _quarter(s, a, b, c, d):
-    s[a] = (s[a] + s[b]) & 0xffffffff
-    s[d] = _rotl(s[d] ^ s[a], 16)
-    s[c] = (s[c] + s[d]) & 0xffffffff
-    s[b] = _rotl(s[b] ^ s[c], 12)
-    s[a] = (s[a] + s[b]) & 0xffffffff
-    s[d] = _rotl(s[d] ^ s[a], 8)
-    s[c] = (s[c] + s[d]) & 0xffffffff
-    s[b] = _rotl(s[b] ^ s[c], 7)
-
-
-def _block(key, counter, nonce):
-    state = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574, *struct.unpack("<8L", key), counter,
-             *struct.unpack("<3L", nonce)]
-    work = state[:]
-    for _ in range(10):
-        _quarter(work, 0, 4, 8, 12)
-        _quarter(work, 1, 5, 9, 13)
-        _quarter(work, 2, 6, 10, 14)
-        _quarter(work, 3, 7, 11, 15)
-        _quarter(work, 0, 5, 10, 15)
-        _quarter(work, 1, 6, 11, 12)
-        _quarter(work, 2, 7, 8, 13)
-        _quarter(work, 3, 4, 9, 14)
-    return struct.pack("<16L", *((w + s) & 0xffffffff for w, s in zip(work, state)))
-
-
-def _chacha20(key, nonce, data):
-    out = bytearray()
-    for at in range(0, len(data), 64):
-        out += bytes(x ^ y for x, y in zip(data[at:at + 64], _block(key, 1 + at // 64, nonce)))
-    return bytes(out)
-
-
-def _tag(key, nonce, sealed):
-    """The Poly1305 tag over the sealed bytes, with no additional data (RFC 8439 2.8)."""
-    one_time = _block(key, 0, nonce)[:32]
-    r = int.from_bytes(one_time[:16], "little") & 0x0ffffffc0ffffffc0ffffffc0fffffff
-    s = int.from_bytes(one_time[16:], "little")
-    data = sealed + b"\0" * (-len(sealed) % 16) + struct.pack("<QQ", 0, len(sealed))
-    p, acc = (1 << 130) - 5, 0
-    for at in range(0, len(data), 16):
-        acc = (acc + int.from_bytes(data[at:at + 16] + b"\x01", "little")) * r % p
-    return ((acc + s) & ((1 << 128) - 1)).to_bytes(16, "little")
-
+# ---------------------------------------------------------------- the seal (RFC 8439, atrest.py's cipher)
 
 def seal(key, plaintext, nonce=None):
-    """The nonce, the sealed bytes and the tag in one, as CryptoKit's `ChaChaPoly.SealedBox(combined:)` reads them."""
+    """The nonce, the sealed bytes and the tag in one, as CryptoKit's `ChaChaPoly.SealedBox(combined:)` reads them:
+    AEAD_CHACHA20_POLY1305 with no additional data, and a new random nonce for each seal unless a test gives one."""
     if len(key) != 32:
         raise ValueError("a seal key is 32 bytes")
-    nonce = nonce or os.urandom(12)
-    sealed = _chacha20(key, nonce, plaintext)
-    return nonce + sealed + _tag(key, nonce, sealed)
+    return atrest.encrypt(key, plaintext, b"", nonce)
 
 
 def open_sealed(key, combined):
     """The other half of seal, for the tests: the plaintext, or ValueError when the tag does not stand."""
     if len(key) != 32 or len(combined) < 28:
         raise ValueError("not a sealed ping")
-    nonce, sealed, tag = combined[:12], combined[12:-16], combined[-16:]
-    if not _equal(_tag(key, nonce, sealed), tag):
-        raise ValueError("the tag does not stand")
-    return _chacha20(key, nonce, sealed)
-
-
-def _equal(a, b):
-    return len(a) == len(b) and not sum(x ^ y for x, y in zip(a, b))
+    try:
+        return atrest.decrypt(key, combined, b"")
+    except atrest.Unopened:
+        raise ValueError("the tag does not stand") from None
 
 
 def seal_key(text):
