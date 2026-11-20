@@ -17,8 +17,8 @@ recorded and not applied. The private keys live only on the owner's Mac and in t
 can be replaced without stranding a fleet that skipped the release which brought the new one (4.3, "How a signing
 key is replaced").
 
-**Two tracks.** A fleet takes from the channel only a release that a key of KEY_FILE signed, which the owner signs
-with Touch ID, unless the fleet takes releases early (the hub's setting `releases.early`, the owner's own fleet):
+**Two tracks.** A fleet takes from the channel only a release that a key of KEY_FILE signed, which the owner's Mac
+signs once the owner's own fleet runs that release, unless the fleet takes releases early (the hub's setting `releases.early`, the owner's own fleet):
 then it asks the channel for the early track and trusts the keys of EARLY_KEY_FILE too, which sign each release as
 it is published. A release that a fleet already took is checked against both files (every_key).
 

@@ -2,7 +2,7 @@
 #
 # The early key signs every release as it is published, with nobody pressing anything, for the fleets that take
 # each release first: the owner's own fleet, whose setting `releases.early` is on. Every other fleet takes a
-# release only once the approve key of release-key.pub signed it, which needs the owner's Touch ID. So only a fleet
+# release only once the approve key of release-key.pub signed it, after the owner's own fleet ran it. So only a fleet
 # with that setting asks the channel for early releases and trusts this file there; what a fleet already took is
 # checked against both files everywhere (lifecycle.may_take, the vault program, the door and ops-root).
 #

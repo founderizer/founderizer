@@ -1,8 +1,8 @@
 # The Founderizer release public keys (PRODUCT.md 4.2 and 4.3): the keys that sign a release for every fleet.
 #
 # One base64 line for each 32-byte Ed25519 public key, and lines that start with # are for the reader. No private
-# half is on any server or hub: the approve key is in the Secure Enclave of the owner's Mac and signs only after the
-# owner's Touch ID, and the spare is in the owner's own password manager. A fleet can check a release and can never
+# half is on any server or hub: the approve key is in the Secure Enclave of the owner's Mac and signs what the owner's
+# own fleet and Mac run, and the spare is in the owner's own password manager. A fleet can check a release and can never
 # make one. A fleet that takes each release early trusts the keys of early-key.pub as well.
 #
 # **This file holds a set, and every key in it is trusted.** That is what makes a key replaceable: the release
