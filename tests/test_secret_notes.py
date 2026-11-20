@@ -236,11 +236,6 @@ class Notes(test_grants.Grants):
         self.assertEqual((code, refused["code"]), (422, "login_as_text"), refused)
         self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"])
         self.assertNotIn(VALUE, json.dumps([dict(r) for r in hub.q("SELECT * FROM events")]))
-        # a phone sends neither words nor a note: its card has no field for them, and no guard before the send
-        with patch.object(hub, "owner_device_class", return_value="iPhone"):
-            self.assertEqual(self.answer(nid, clarify="Which account?")[0], 400)
-            self.assertEqual(self.answer(nid, login=SECOND, note="A note")[0], 400)
-        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"])
         # a note of the request that holds a value which was registered after the request never reaches team.json
         hub.q("UPDATE needs SET secret=json_set(secret, '$.note', ?) WHERE id=?", (f"Its key is {VALUE}", nid))
         self.saved(THIRD, "second@example.com")

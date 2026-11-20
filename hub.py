@@ -1955,8 +1955,11 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "secret_notes",      # the owner, 19 November 2026 ("Build it" to the picture of the key card): the note
                                     # of a secret, `note` and `note_by` of a login of the team, `note` of a request's
                                     # `secret` and of its answer, and of POST /ui/team/logins (UI-API.md 1.249)
-               "secret_clarify"]    # the same yes ("I prefer Needs clarification"): `clarify` of POST
+               "secret_clarify",    # the same yes ("I prefer Needs clarification"): `clarify` of POST
                                     # /ui/needs/<id>/secret, the owner's words about a key request (UI-API.md 1.249)
+               "secret_clarify_phone"]      # the owner, 20 November 2026 ("Yes, build it" to the picture of the
+                                    # iPhone's key card): the hub takes `clarify` from a phone's key too, and its
+                                    # receipt has `created`, as the receipt of an answer has (UI-API.md 1.252)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -14526,7 +14529,9 @@ SECRET_DECLINE_MAX = 300
 # conversation. Its link in the app opens a field for words about the request: they close the item as the words of
 # every other item do, and go to the agent that asked with the hub's words after them. The guards of every owner text
 # stand: the app holds text that looks like a key, and command_run refuses a registered login. The board and the chat
-# apps still take no words for such an item (SECRET_NO_WORDS): they have no such guard before the send.
+# apps still take no words for such an item (SECRET_NO_WORDS): they have no such guard before the send. The iPhone's
+# card has the link since owner API 1.252 (the owner's "Yes, build it" of 20 November 2026 to its picture), with the
+# same guard.
 SECRET_CLARIFY_MAX = 2000       # characters of the owner's words
 SECRET_CLARIFIED = ("\n(The hub: the owner saved nothing. The words before this line are theirs, about your request, "
                     "and they hold no value. When they settle what to ask for, ask again with request_secret, once "
@@ -15864,7 +15869,8 @@ def answer_secret(body, request_id, client):
             DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, clarified=t0)), need["id"]))
     if gave and spec.get("tasks"):
         secret_wakes(t0)        # a vault that reads his project, or a delivery that finished before this answer
-    return {"need": need["id"], "login": ref, "answer": text, "event_id": event_id}
+    # created: the time of the answer, as the receipt of every answer has it (the phone reads one shape of receipt)
+    return {"need": need["id"], "login": ref, "answer": text, "event_id": event_id, "created": t0}
 
 
 # ---------------------------------------------------------------- a task that waits on the owner's secret
@@ -66488,13 +66494,14 @@ class Handler(BaseHTTPRequestHandler):
             if "note" in data and (login is None or not isinstance(data["note"], str)):
                 raise ValueError("note is the note of the secret that answers the request, a string: it comes with "
                                  "login")
-            if clarify is not None or "note" in data:
-                # The Mac's app and a PC's hold text that looks like a key before it goes; the iPhone's card has no
-                # field for a note or for words, so a phone's key sends neither (DEVICE_NEED gives it this route).
+            if "note" in data:
+                # A phone saves no secret, so its card has no note: a phone's key sends none (DEVICE_NEED gives it this
+                # route). Its words about a request come from here since owner API 1.252 (secret_clarify_phone): the
+                # iPhone's card has the link too, and holds text that looks like a key before it goes, as the Mac's.
                 with LOCK:
                     phone = owner_device_class(owner_device_at(self.client_address[0])) not in TEAM_PRESS_CLIENTS
                 if phone:
-                    raise ValueError("note and clarify come from Founderizer on the Mac or a PC")
+                    raise ValueError("note comes from Founderizer on the Mac or a PC")
             body = {"need": need_id, "login": self.login_reference(login) if login is not None else None,
                     "decline": decline.strip() if decline is not None else None}
             # The two fields of owner API 1.249 are in the body only when they came, so that the record of a command

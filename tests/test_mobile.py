@@ -150,6 +150,31 @@ class Devices(test_ui_api.OwnerAPI):
         self.assertEqual(hub.q1("SELECT sha256 FROM owner_devices WHERE device='iphone'")["sha256"],
                          hub.hashlib.sha256(key.encode()).hexdigest())
 
+    def test_a_phone_sends_words_about_a_key_request_and_no_note(self):
+        """Owner API 1.252 (Needs clarification from the iPhone): an enrolled phone's key sends `clarify` for a request
+        for a key or a login, the hub closes the item with those words, and the receipt has each field that the phone
+        reads of the receipt of an answer, also when the same request comes again. The phone saves no secret, so
+        `note` from it is refused. A hub that refused a phone's words, or a receipt with a field missing, leaves the
+        phone's saved request with no way out."""
+        key = self.enrolled()
+        spec = {"kind": "login", "site": "https://shop.example/login", "give": {}}
+        nid = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?)",
+                      ("Enter a login for shop.example", "The orders.", hub.SECRET_TODO, hub.now(), "manager", "secret",
+                       json.dumps(spec)))
+        self.assertIn("secret_clarify_phone", self.call("/ui/mobile", source=PHONE, token=key)[1]["ui_features"])
+        body = {"request_id": str(uuid.uuid4()), "db": "test-generation"}
+        path = f"/ui/needs/{nid}/secret"
+        status, refused = self.call(path, dict(body, login="bws://11111111-2222-4333-8444-555555555555", note="A note"),
+                                    source=PHONE, token=key)
+        self.assertEqual(status, 400, refused)
+        status, receipt = self.call(path, dict(body, clarify="Which account?"), source=PHONE, token=key)
+        self.assertEqual(status, 200, receipt)
+        self.assertEqual({k: type(receipt.get(k)) for k in ("ok", "request_id", "client", "event_id", "created", "replayed")},
+                         {"ok": bool, "request_id": str, "client": str, "event_id": int, "created": float, "replayed": bool})
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"], "Which account?")
+        again = self.call(path, dict(body, clarify="Which account?"), source=PHONE, token=key)[1]
+        self.assertEqual((again["replayed"], again["created"], again["event_id"]), (True, receipt["created"], receipt["event_id"]))
+
     def test_a_code_works_once_and_only_from_its_device(self):
         status, made = self.code()
         self.assertEqual(status, 200)
