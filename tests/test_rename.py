@@ -441,6 +441,7 @@ class Columns(unittest.TestCase):
         ("placements", "machine"): "a machine", ("withdrawals", "machine"): "a machine",
         ("faults", "name"): "an exception class, or a tool of the hub's list (diagnostics.py)",
         ("first_stores", "machine"): "a machine",
+        ("token_slots", "machine"): "a machine (UI-API.md 1.260)",
         ("egress_names", "name"): "a host's full name in the outgoing gate's records (UI-API.md 1.220)",
         ("home_items", "name"): "a file, process or port in an agent's home reading (UI-API.md 1.253)",
         ("door_record", "target"): "a host or a provider account of the door (DevOps plan C4)",

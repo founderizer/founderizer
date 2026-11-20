@@ -278,6 +278,15 @@ CREATE TABLE IF NOT EXISTS machine_checks(id INTEGER PRIMARY KEY, agent TEXT NOT
   state TEXT NOT NULL, completed REAL, detail TEXT);
 CREATE TABLE IF NOT EXISTS session_tokens(agent TEXT NOT NULL, session_id TEXT NOT NULL, total INTEGER NOT NULL,
   last_activity REAL, reported REAL NOT NULL, PRIMARY KEY(agent, session_id));
+-- The lane "Tokens by day and model" (owner API 1.260): what each session spent and when. Each usage report's increase
+-- of a session's totals, for each model, in the slot of the session's newest call: the start of its 15 minutes, in
+-- seconds since 1970 (SLOT_SECONDS), so that the slots of one day add up in every time zone. model '' is a model that
+-- the report did not name; machine is the agent's machine at the report, NULL for an agent with no machine in
+-- team.json and in what a start puts in (slot_fill).
+CREATE TABLE IF NOT EXISTS token_slots(agent TEXT NOT NULL, session_id TEXT NOT NULL, slot INTEGER NOT NULL,
+  model TEXT NOT NULL, input INTEGER NOT NULL, cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL,
+  output INTEGER NOT NULL, calls INTEGER NOT NULL, machine TEXT, PRIMARY KEY(agent, session_id, slot, model));
+CREATE INDEX IF NOT EXISTS token_slot_time ON token_slots(slot);
 CREATE TABLE IF NOT EXISTS model_changes(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, by TEXT NOT NULL, "from" TEXT,
   "to" TEXT, why TEXT, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS steers(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, attempt INTEGER NOT NULL,
@@ -1874,6 +1883,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "signed_grants", "agent_rename", "agent_memory", "live_changes",
                "kept_pins",         # GET /ui/vault names when each machine's kept pin was signed (kept_pin_at)
                "settings", "standing", "history", "costs",
+               "costs_by",          # owner API 1.260: GET /ui/costs by= gives the tokens by day, agent, model, kind
+                                    # or machine (token_slots)
                "server_names",      # the owner, 30 October 2026: a server's name is its name in Tailscale
                "mac_setup",         # the owner, 31 October 2026: one sitting at a new Mac
                "agent_move",        # DevOps plan C7, 2 November 2026: an agent moves to an empty server
@@ -5984,6 +5995,14 @@ def migrate():
                 DB.execute("INSERT OR IGNORE INTO kv(k,v) VALUES(?,?)", (MEMORY_COUNT_FROM, str(now())))
     except sqlite3.Error as e:
         problems.append(f"the start of the lesson count: {e}")
+    # The lane "Tokens by day and model": what the token slots of each session lack against its totals (slot_fill),
+    # and, at the first start that keeps them, that time, in one transaction.
+    try:
+        with transaction():
+            slot_fill()
+            DB.execute("INSERT OR IGNORE INTO kv(k,v) VALUES(?,?)", (TOKEN_SLOTS_FROM, str(now())))
+    except Exception as e:      # build_schema raises nothing; slot_fill passes over each row that is not counts
+        problems.append(f"the token slots: {e}")
     # Not through sql_step and not in SCHEMA: a machine without FTS5 searches with a scan, and must not have that
     # recorded as a refused step, which is what a release reads (memory_search_probe, history_search_probe).
     memory_search_probe()
@@ -23949,7 +23968,10 @@ def record_session_tokens(agent, rows, runtime=None, reading=None):
     its tokens by model; an older row leaves them as they are. The hub adds the session's runtime (the report's), its
     account (the report's reading, while the session spends), its kind and task kind (session_kind), and its points of
     that account's main usage window. A task's thread records can arrive after a usage report, so a standing session
-    that spent within KIND_AGAIN is matched again."""
+    that spent within KIND_AGAIN is matched again.
+
+    The lane "Tokens by day and model": what each session's totals grew by since its stored row goes into token_slots,
+    in the same write (slot_rows)."""
     if not rows:
         return
     t0 = now()
@@ -23957,8 +23979,10 @@ def record_session_tokens(agent, rows, runtime=None, reading=None):
     with area("activity"), LOCK:
         ids = [r["session_id"] for r in rows]
         known = {r["session_id"]: r for at in range(0, len(ids), 500) for r in read_rows(
-            f"SELECT session_id, total, kind FROM session_tokens WHERE agent=? AND session_id IN "
+            f"SELECT session_id, total, kind, input, cache_read, cache_write, output, calls, model, models "
+            f"FROM session_tokens WHERE agent=? AND session_id IN "
             f"({','.join('?' * len(ids[at:at + 500]))})", (agent, *ids[at:at + 500]))}
+        slots = slot_rows(agent, rows, known, t0)
         values = []
         for r in rows:
             old = known.get(r["session_id"])
@@ -23987,6 +24011,7 @@ def record_session_tokens(agent, rows, runtime=None, reading=None):
             "ELSE account END, "
             "task_kind=CASE WHEN excluded.kind IS NULL THEN task_kind ELSE excluded.task_kind END, "
             "kind=COALESCE(excluded.kind,kind)", values)
+        slot_write(slots)
         if account:
             window_shares(agent, account, reading, t0)
         commit()
@@ -24087,6 +24112,192 @@ def session_models(r):
     if models and all(sum(tokens[k] for _, tokens in models) == r[k] for k in TOKEN_KINDS):
         return models
     return [(r["model"], {k: r[k] for k in TOKEN_KINDS})]
+
+
+# ---- the lane "Tokens by day and model" (owner API 1.260): what each session spent, and when
+#
+# A helper reports each session's running totals every 30 seconds, and session_tokens keeps only the newest ones. So
+# the hub keeps what each report added to them, in 15-minute slots (token_slots): each model of the session apart, in
+# the slot of the session's newest call, which is within one report of the time that the tokens were spent. Each start
+# of the hub puts in what the slots lack against the totals (slot_fill): the sessions from before the slots, and what a
+# release without them recorded. A session's totals go down when one of its records goes away (Claude Code removes old
+# ones, and the helper then counts without it, usage.read_files): the slots keep what was spent, and what the totals
+# grow by after that counts, so the slots of a session add up to its totals, or to more after such a drop. No helper
+# sends totals that went down and then come back, which would count twice. GET /ui/costs with by= reads the slots
+# (costs_series).
+
+SLOT_SECONDS = 900                  # 15 minutes: every time zone's day starts on a quarter hour
+SLOT_FIELDS = ("input", "cache_read", "cache_write", "output", "calls")     # usage.MODEL_FIELDS, in its order
+SLOT_SUMS = ", ".join(f"SUM({k}) {k}" for k in SLOT_FIELDS)
+TOKEN_SLOTS_FROM = "token_slots_from"   # kv: the first start that kept the slots; before it each session is in one
+
+
+def slot_of(ts):
+    """The slot of a time: the start of its 15 minutes, in whole seconds since 1970."""
+    return int(ts // SLOT_SECONDS) * SLOT_SECONDS
+
+
+def slot_count(value):
+    """A count of tokens or calls as a helper reports it (usage.number): a whole number from 0 to 2**53 - 1, and None
+    as 0. Anything else, which no code of the hub writes, is a ValueError."""
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 2**53 - 1 or value % 1:
+        raise ValueError("not a count")
+    return int(value)
+
+
+def slot_models(text):
+    """The models that session_tokens keeps for a session, as the list that its helper sent, or None."""
+    try:
+        models = json.loads(text) if text else None
+    except ValueError:
+        return None
+    return models if isinstance(models, list) else None
+
+
+def slot_split(totals, models, model):
+    """{model: [its SLOT_FIELDS]} of one session's totals (a row or a dict with SLOT_FIELDS): its models as its helper
+    reported them, while they add up to the totals; else all of it at the session's own model. A model that is not
+    named is ''. None for totals that are not counts."""
+    try:
+        want = [slot_count(totals[k]) for k in SLOT_FIELDS]
+    except (KeyError, IndexError, ValueError):
+        return None
+    split = {}
+    try:
+        for entry in models or ():
+            values = [slot_count(v) for v in entry[1:]]
+            if len(values) != len(SLOT_FIELDS):
+                raise ValueError("not a model's row")
+            name = str(entry[0] or "")
+            split[name] = [a + b for a, b in zip(split.get(name, [0] * len(SLOT_FIELDS)), values)]
+    except (TypeError, ValueError, IndexError, KeyError):
+        split = {}
+    if split and [sum(v[i] for v in split.values()) for i in range(len(SLOT_FIELDS))] == want:
+        return split
+    return {str(model or ""): want}
+
+
+def slot_growth(have, after, grow, model):
+    """{model: [growth of each of SLOT_FIELDS]}: what the session's split `after` stands above what each model's slots
+    hold (`have`), when that is at least `grow`, what the session's totals grew by, in each field (more is what the
+    slots lacked: a report that a stored row passed over); else `grow`, all of it at the session's newest model. So
+    the growth after a report without the split, after a split that moved between models (past usage.MODELS_MAX a
+    helper folds the smallest into one of no name), or after totals that went down, still gives each token once. Each
+    model gets its own share again at the first report whose split stands at or above what its slots hold; after the
+    session's totals went down its slots stay above them, so its growth goes to its newest model from then on."""
+    zero = [0] * len(SLOT_FIELDS)
+    above = {m: [a - b for a, b in zip(after.get(m, zero), have.get(m, zero))] for m in {*after, *have}}
+    if all(v >= 0 for values in above.values() for v in values) and \
+            all(sum(values[i] for values in above.values()) >= grow[i] for i in range(len(SLOT_FIELDS))):
+        grew = above
+    else:
+        grew = {str(model or ""): grow}
+    return {m: values for m, values in grew.items() if any(values)}
+
+
+def slot_rows(agent, rows, known, t0):
+    """The token_slots rows of one usage report: what each session with its four kinds grew by since its stored row
+    (`known`, read before the report's write), given to its models by slot_growth, in the slot of its newest call, and
+    never in one after the hub's own clock (the helper's machine has its own). A session that the hub did not know, or
+    knew without its kinds, grew by all of it. A session that a report names twice counts once, at its last row, as
+    session_tokens keeps it. A stored row that is not counts (no code of the hub writes one) gives that session no
+    slot, and never stops the report."""
+    machine = (agents().get(agent) or {}).get("machine")
+    grown = []
+    for r in {r["session_id"]: r for r in rows}.values():
+        old = known.get(r["session_id"])
+        if r.get("input") is None:      # a row of an older helper: the stored kinds stay as they are, and so do these
+            continue
+        fresh = old is None or old["input"] is None
+        try:
+            if not fresh and all(old[k] == r[k] for k in SLOT_FIELDS):
+                continue                # reported again with nothing new, as most sessions of each report are
+            after = slot_split(r, r.get("models"), r.get("model"))
+            before = [0] * len(SLOT_FIELDS) if fresh else [slot_count(old[k]) for k in SLOT_FIELDS]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if after is not None:
+            grow = [max(0, sum(v[i] for v in after.values()) - before[i]) for i in range(len(SLOT_FIELDS))]
+            if any(grow):
+                grown.append((r, after, grow, r.get("model") or (old["model"] if old is not None else None)))
+    have, ids = {}, [r["session_id"] for r, *_ in grown]
+    for at in range(0, len(ids), 500):
+        for h in read_rows(f"SELECT session_id, model, {SLOT_SUMS} FROM token_slots WHERE agent=? AND session_id IN "
+                           f"({','.join('?' * len(ids[at:at + 500]))}) GROUP BY session_id, model",
+                           (agent, *ids[at:at + 500])):
+            have.setdefault(h["session_id"], {})[h["model"]] = [h[k] for k in SLOT_FIELDS]
+    out = []
+    for r, after, grow, model in grown:
+        last = r.get("last_activity")
+        slot = slot_of(min(t0, last) if last is not None else t0)
+        out += [(agent, r["session_id"], slot, m, *values, machine)
+                for m, values in slot_growth(have.get(r["session_id"], {}), after, grow, model).items()]
+    return out
+
+
+def slot_write(slots):
+    """slot_rows' rows into token_slots, inside record_session_tokens' write: a slot that has a row of the session and
+    model adds to it."""
+    held("slot_write")
+    DB.executemany(
+        "INSERT INTO token_slots(agent,session_id,slot,model,input,cache_read,cache_write,output,calls,machine) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,session_id,slot,model) DO UPDATE SET "
+        "input=input+excluded.input, cache_read=cache_read+excluded.cache_read, "
+        "cache_write=cache_write+excluded.cache_write, output=output+excluded.output, calls=calls+excluded.calls, "
+        "machine=COALESCE(excluded.machine,machine)", slots)
+
+
+def slot_fill():
+    """Inside migrate's transaction, at each start: what the slots of each session with its four kinds lack against
+    its totals goes into the slot of its last activity, where the costs reading counts the whole session, and never
+    into one after its last report (`reported`, the hub's own clock). At the first start that is each session from
+    before the slots; later it is what a release without them recorded (a rollback). SQL finds those sessions, so a
+    start reads only them in Python. Their machine is not known.
+
+    A release without the slots also renames and deletes agents without them. So first the slots of a session that no
+    row of session_tokens holds under their agent go to the one agent whose row holds a session of that id, and the
+    fill does not count that session again."""
+    in_transaction("slot_fill")
+    lost = read_rows("SELECT o.agent, o.session_id FROM (SELECT agent, session_id FROM token_slots GROUP BY agent, "
+                     "session_id) o WHERE NOT EXISTS (SELECT 1 FROM session_tokens st WHERE st.agent=o.agent AND "
+                     "st.session_id=o.session_id)")
+    if lost:
+        ids, holders = sorted({r["session_id"] for r in lost}), {}
+        for at in range(0, len(ids), 500):
+            for r in read_rows(f"SELECT agent, session_id FROM session_tokens WHERE session_id IN "
+                               f"({','.join('?' * len(ids[at:at + 500]))})", tuple(ids[at:at + 500])):
+                holders.setdefault(r["session_id"], []).append(r["agent"])
+        DB.executemany("UPDATE OR IGNORE token_slots SET agent=? WHERE agent=? AND session_id=?",
+                       [(holders[r["session_id"]][0], r["agent"], r["session_id"]) for r in lost
+                        if len(holders.get(r["session_id"], ())) == 1])
+    out = []
+    for r in read_rows(f"SELECT st.*, s.agent AS slotted FROM session_tokens st LEFT JOIN (SELECT agent, session_id, "
+                       f"{SLOT_SUMS} FROM token_slots GROUP BY agent, session_id) s ON s.agent=st.agent AND "
+                       f"s.session_id=st.session_id WHERE st.input IS NOT NULL AND (s.agent IS NULL OR " +
+                       " OR ".join(f"COALESCE(st.{k},0)>s.{k}" for k in SLOT_FIELDS) + ")"):
+        try:
+            after = slot_split(r, slot_models(r["models"]), r["model"])
+            if after is None:
+                continue
+            have = {} if r["slotted"] is None else {
+                h["model"]: [h[k] for k in SLOT_FIELDS] for h in read_rows(
+                    f"SELECT model, {SLOT_SUMS} FROM token_slots WHERE agent=? AND session_id=? GROUP BY model",
+                    (r["agent"], r["session_id"]))}
+            kept = [sum(v[i] for v in have.values()) for i in range(len(SLOT_FIELDS))]
+            grow = [max(0, sum(v[i] for v in after.values()) - kept[i]) for i in range(len(SLOT_FIELDS))]
+            slot = slot_count(slot_of(min(t for t in (r["last_activity"], r["reported"]) if t is not None)))
+        except (TypeError, ValueError, OverflowError):
+            continue                    # a row that no code of the hub wrote: that session gets no slot
+        out += [(r["agent"], r["session_id"], slot, m, *values, None)
+                for m, values in slot_growth(have, after, grow, r["model"]).items()]
+    DB.executemany(
+        "INSERT INTO token_slots(agent,session_id,slot,model,input,cache_read,cache_write,output,calls,machine) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,session_id,slot,model) DO UPDATE SET "
+        "input=input+excluded.input, cache_read=cache_read+excluded.cache_read, "
+        "cache_write=cache_write+excluded.cache_write, output=output+excluded.output, calls=calls+excluded.calls",
+        out)
 
 
 def goal_tokens(goal_id):
@@ -39707,6 +39918,74 @@ def costs_view(names, start, end, minimum=COSTS_MINIMUM):
     return out
 
 
+COSTS_BY = ("day", "agent", "model", "kind", "machine")     # GET /ui/costs by=: the parts of a token series
+
+
+def costs_by(value):
+    """The parts that GET /ui/costs by= names, in its own order, or None when it names none."""
+    if value is None or not str(value).strip():
+        return None
+    parts = [p.strip().lower() for p in str(value).split(",")]
+    if any(p not in COSTS_BY for p in parts) or len(set(parts)) != len(parts):
+        raise ToolError("by is one or more of day, agent, model, kind and machine, with commas between them.")
+    return parts
+
+
+def costs_series(names, start, end, by, everyone=False):
+    """The tokens of these agents' sessions in [start, end), by the parts that `by` names (the lane "Tokens by day and
+    model", owner API 1.260): from token_slots, each slot in the period of its start; a day in the fleet's own time
+    zone; a kind of work as session_kind gave it to the session (standing when none did, as costs_kinds counts it);
+    and the list dollars of the rows that have a price, at the runtime facts' prices of now, each model at its own, as
+    session_cost prices a session. everyone: a reading of the whole fleet, which has the agents that the owner deleted
+    too, each with the time of its delete, as costs_view has them. SQL adds up each group of the parts that it needs,
+    each model with its runtime for its prices, so Python reads one row for each group; Handler.ui_costs reads it in a
+    moment of its own (state_moment), with no lock held."""
+    import datetime
+    zone, book, team = goal_settings()[2], price_book(), list(agents())
+    columns = [f"{column} AS {name}" for part, column, name in (
+        ("day", "ts.slot", "slot"), ("agent", "ts.agent", "agent"), ("kind", "st.kind", "kind"),
+        ("machine", "ts.machine", "machine")) if part in by] + ["ts.model AS model", "st.runtime AS runtime"]
+    names_in = "" if everyone else f" AND ts.agent IN ({','.join('?' * len(names))})"
+    sql = (f"SELECT {', '.join(columns)}, " + ", ".join(f"SUM(ts.{k}) {k}" for k in SLOT_FIELDS) +
+           " FROM token_slots ts LEFT JOIN session_tokens st ON st.agent=ts.agent AND st.session_id=ts.session_id "
+           f"WHERE ts.slot>=? AND ts.slot<?{names_in} GROUP BY " + ", ".join(c.split(" AS ")[0] for c in columns))
+    days, groups = {}, {}
+    for r in read_rows(sql, (start, end, *([] if everyone else names))):
+        parts = {"model": r["model"] or None}
+        if "day" in by:
+            if r["slot"] not in days:
+                days[r["slot"]] = datetime.datetime.fromtimestamp(r["slot"], zone).date().isoformat()
+            parts["day"] = days[r["slot"]]
+        if "agent" in by:
+            parts["agent"] = r["agent"]
+        if "kind" in by:
+            parts["kind"] = r["kind"] or "standing"
+        if "machine" in by:
+            parts["machine"] = r["machine"]
+        g = groups.setdefault(tuple(parts[p] for p in by), {**dict.fromkeys(SLOT_FIELDS, 0), "cost": None})
+        for k in SLOT_FIELDS:
+            g[k] += r[k]
+        price = token_price(book.get(r["runtime"]), r["model"] or None)
+        if price:
+            g["cost"] = (g["cost"] or 0) + sum(r[k] * price[k] for k in TOKEN_KINDS) / 1e6
+    rows, total = [], {**dict.fromkeys(SLOT_FIELDS, 0), "cost": None}
+    for key, g in sorted(groups.items(), key=lambda item: [(v is None, str(v)) for v in item[0]]):
+        row = dict(zip(by, key))
+        if "agent" in row and row["agent"] not in team:
+            name, _, at = row["agent"].partition(":deleted:")
+            row.update(agent=name, deleted=float(at) if at else deleted_at(name))
+        for k in SLOT_FIELDS:
+            total[k] += g[k]
+        if g["cost"] is not None:
+            total["cost"] = (total["cost"] or 0) + g["cost"]
+        rows.append(dict(row, **{k: g[k] for k in SLOT_FIELDS},
+                         cost=None if g["cost"] is None else round(g["cost"], 4)))
+    since = kv_get(TOKEN_SLOTS_FROM)
+    return {"from": start, "to": end, "by": by, "unit": "list dollars", "zone": zone.key, "slot_seconds": SLOT_SECONDS,
+            "exact_from": float(since) if since else None, "rows": rows,
+            "total": dict(total, cost=None if total["cost"] is None else round(total["cost"], 4))}
+
+
 def costs_money(value):
     return "not measured" if value is None else f"${value:,.2f}" if value >= 0.1 else f"${value:.3f}"
 
@@ -54273,6 +54552,7 @@ AGENT_COLUMNS = (
     ("holds", "by"), ("holds", "released_by"), ("outcomes", "by"), ("agent_limits", "agent"),
     ("machine_status", "agent"), ("machine_updates", "agent"), ("goals", "paused_by"), ("goal_history", "by"),
     ("spends", "by"), ("restart_holds", "by"), ("machine_checks", "agent"), ("session_tokens", "agent"),
+    ("token_slots", "agent"),           # the lane "Tokens by day and model": its sessions' slots, as its sessions
     ("triggers", "agent"), ("triggers", "paused_by"), ("triggers", "created_by"), ("trigger_code", "by"),
     ("trigger_history", "by"), ("session_credentials", "agent"), ("responsibilities", "agent"),
     ("responsibilities", "created_by"), ("duty_cases", "by"), ("duty_cases", "closed_by"), ("duty_steps", "by"),
@@ -54745,6 +55025,7 @@ AGENT_REMOVAL = {
     ("resource_grants", "agent"): "delete", ("person_agents", "agent"): "delete", ("person_scopes", "agent"): "delete",
     ("sealed", "recipient"): "delete",
     ("session_tokens", "agent"): "spent", ("model_changes", "agent"): "spent", ("triggers", "agent"): "spent",
+    ("token_slots", "agent"): "spent",      # the lane "Tokens by day and model": its sessions' slots, with them
     ("calls", "agent"): "spent", ("server_jobs", "agent"): "spent", ("attachments", "agent"): "spent",
     ("jobs", "agent"): "spent", ("tool_commands", "agent"): "spent",
     ("egress_hosts", "agent"): "spent", ("egress_names", "agent"): "spent",     # the outgoing gate's records
@@ -55194,7 +55475,8 @@ MACHINE_COLUMNS = (("server_keys", "server"), ("server_status", "server"), ("ser
                    ("deposits", "machine"), ("withdrawals", "machine"), ("placements", "machine"),
                    ("place_codes", "machine"), ("place_hosts", "machine"), ("mac_setups", "server"),
                    ("first_stores", "machine"), ("egress_servers", "server"), ("egress_hosts", "server"),
-                   ("home_items", "server"), ("home_readings", "server"))      # the home reading's rows
+                   ("home_items", "server"), ("home_readings", "server"),      # the home reading's rows
+                   ("token_slots", "machine"))     # the machine that a session's agent ran on at a usage report
 MACHINE_ROWS = (("server_status", "server"), ("place_hosts", "machine"),    # a key of their own: an old row goes
                 ("first_stores", "machine"), ("egress_servers", "server"))
 MACHINE_MAPS = ("addresses", "servers", "access", "vault_stores")      # the team.json maps keyed by a machine
@@ -68778,7 +69060,9 @@ class Handler(BaseHTTPRequestHandler):
     def ui_costs(self, query):
         """GET /ui/costs (owner feature costs, AUTONOMY.md P8): what the work of every agent cost from `from` to `to`
         (the last HISTORY_WINDOW days by default), each number with the period of the same length before it; agent=
-        narrows it to one agent and minimum= is the results a kind of work needs in each period to be compared."""
+        narrows it to one agent and minimum= is the results a kind of work needs in each period to be compared. With
+        by= (owner feature costs_by, owner API 1.260) the answer is the tokens of that period by day, agent, model, kind
+        or machine alone (costs_series)."""
         if not self.ui_allowed():
             return
         generation = kv_get("db_id")
@@ -68795,12 +69079,18 @@ class Handler(BaseHTTPRequestHandler):
             minimum = int(query.get("minimum") or COSTS_MINIMUM)
             if not 1 <= minimum <= 1000:
                 raise ToolError("minimum is a whole number from 1 to 1000.")
+            by = costs_by(query.get("by"))
         except ValueError:
             return self.json(400, {"error": "minimum is a whole number from 1 to 1000."})
         except ToolError as e:
             return self.json(400, refusal_body(e))
-        with LOCK:
-            result = costs_view([who] if who else list(agents()), start, end, minimum)
+        names = [who] if who else list(agents())
+        if by:
+            with state_moment():        # a moment of the records: a year of slots holds no writer back
+                result = costs_series(names, start, end, by, everyone=not who)
+        else:
+            with LOCK:
+                result = costs_view(names, start, end, minimum)
         return self.json(200, scrub(dict(result, db=generation)), {"Cache-Control": "no-store"})
 
     def ui_responsibilities(self, query):

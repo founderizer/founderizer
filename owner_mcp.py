@@ -960,7 +960,7 @@ def costs(args):
     return get("/ui/costs", "the costs", **{k: args.get(k) for k in COSTS_WORDS}).data
 
 
-COSTS_WORDS = ("from", "to", "agent", "minimum")
+COSTS_WORDS = ("from", "to", "agent", "minimum", "by")
 
 
 def overview(_args):
@@ -2731,8 +2731,11 @@ def tools():
                           "share, for each kind of work the results without rework and the cost of each, each "
                           "check's quiet runs against its wakes, each account's windows with each agent's points "
                           "of the main one and what is left, and the model changes. agent narrows it to one agent; "
-                          "minimum is the results a kind needs in each period to be compared (3).",
-             {"from": S["text"], "to": S["text"], "agent": S["text"], "minimum": S["int"]}, (), costs),
+                          "minimum is the results a kind needs in each period to be compared (3). by gives only the "
+                          "tokens of the period, from 15-minute slots: the four kinds, calls and list dollars by one "
+                          "or more of day, agent, model, kind and machine, with commas (for example day,model).",
+             {"from": S["text"], "to": S["text"], "agent": S["text"], "minimum": S["int"], "by": S["text"]}, (),
+             costs),
         tool("which_hub", "Which hub this server reads, and on what authority.", {}, (), which_hub),
         tool("use_hub", "Point this server at a hub that runs already. It proves the address by reading the owner "
                         "API from this Mac, and stores nothing but the address.",

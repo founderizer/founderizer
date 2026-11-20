@@ -1,7 +1,8 @@
 """What the work costs (AUTONOMY.md P8, lane L7): each session's four kinds of tokens apart, its kind, model,
 runtime, account and window share; the token weights of the runtime facts, which the owner changes through the
 settings route; see_history what="costs" for every agent in its own scope; GET /ui/costs and the admin MCP's
-see_costs; set_agent_model and model_changes. An in-process hub with a temporary database and git checkout, on the
+see_costs; set_agent_model and model_changes; what each session spent in each 15-minute slot (token_slots) and
+GET /ui/costs by=. An in-process hub with a temporary database and git checkout, on the
 Claude and the Codex runtime forms; no helper and no AI call.
 
     python3 -m unittest -v test_costs
@@ -64,7 +65,7 @@ def report(rows, runtime="claude", key=CLAUDE, used=40.0, at=None, windows=None)
 def load_tests(loader, _tests, _pattern):
     """Only this file's cases, not the inherited OwnerAPI ones."""
     suite = unittest.TestSuite()
-    for cls in (Helper, Storing, Weights, Costs, Scope, ModelChanges):
+    for cls in (Helper, Storing, Weights, Costs, Scope, ModelChanges, Slots):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -522,8 +523,9 @@ class Weights(Base):
         asked = []
         with patch.object(owner_mcp, "get", lambda route, what, **query: asked.append((route, query)) or
                           type("A", (), {"data": {}})()):
-            owner_mcp.costs({"from": "2026-10-01", "agent": "hand"})
-        self.assertEqual(asked, [("/ui/costs", {"from": "2026-10-01", "to": None, "agent": "hand", "minimum": None})])
+            owner_mcp.costs({"from": "2026-10-01", "agent": "hand", "by": "day,model"})
+        self.assertEqual(asked, [("/ui/costs", {"from": "2026-10-01", "to": None, "agent": "hand", "minimum": None,
+                                                "by": "day,model"})])
 
 
 class Costs(Base):
@@ -760,6 +762,207 @@ class ModelChanges(Base):
                                                                model="gpt-6.1-sol", effort="low", why="x"))
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM model_changes")["n"], 0)
 
+
+
+class Slots(Base):
+    """The lane "Tokens by day and model" (owner API 1.260): what each session spent, and when, in 15-minute slots,
+    and GET /ui/costs by= over them."""
+
+    def slots(self, agent):
+        """{(session, slot, model): [its SLOT_FIELDS, machine]} of the agent's token slots."""
+        return {(r["session_id"], r["slot"], r["model"]): [r[k] for k in hub.SLOT_FIELDS] + [r["machine"]]
+                for r in hub.q("SELECT * FROM token_slots WHERE agent=?", (agent,))}
+
+    def sums(self, agent, sid):
+        """What the slots of one session add up to."""
+        r = hub.q1("SELECT " + ", ".join(f"SUM({k}) {k}" for k in hub.SLOT_FIELDS) +
+                   " FROM token_slots WHERE agent=? AND session_id=?", (agent, sid))
+        return [r[k] for k in hub.SLOT_FIELDS]
+
+    def totals(self, agent, sid):
+        row = self.stored(agent, sid)
+        return [row[k] for k in hub.SLOT_FIELDS]
+
+    def test_a_report_adds_what_a_session_grew_by_in_the_slot_of_its_newest_call(self):
+        """A helper sends each session's running totals every 30 seconds. Each report adds only what they grew by, in
+        the slot of the session's newest call: a report that names it again with nothing new adds nothing, and the
+        slots add up to the totals."""
+        first, later = self.t0 - 3 * 3600, self.t0 - 600
+        for _ in range(2):
+            self.usage("hand", [session("s1", first, input=100, cache_read=900, cache_write=10, output=50, calls=4)])
+        self.assertEqual(self.slots("hand"),
+                         {("s1", hub.slot_of(first), "claude-opus-5-5"): [100, 900, 10, 50, 4, "hand-box"]})
+        self.usage("hand", [session("s1", later, input=160, cache_read=1900, cache_write=10, output=80, calls=7)])
+        self.assertEqual(self.slots("hand")[("s1", hub.slot_of(later), "claude-opus-5-5")], [60, 1000, 0, 30, 3,
+                                                                                                "hand-box"])
+        self.assertEqual(self.sums("hand", "s1"), self.totals("hand", "s1"))
+        # the helper's machine has a clock of its own: a time ahead of the hub's puts nothing in a later slot
+        self.usage("hand", [session("s2", self.t0 + 7200)])
+        self.assertEqual([k[1] <= time.time() for k in self.slots("hand") if k[0] == "s2"], [True])
+        # a stored row that is not counts (no code of the hub writes one) gives its session no slot and never stops the
+        # report; the next start puts in what that session's slots lack
+        hub.q("UPDATE session_tokens SET input='x' WHERE agent='hand' AND session_id='s1'")
+        self.usage("hand", [session("s1", later, input=200, cache_read=1900, cache_write=10, output=80, calls=8),
+                            session("s3", later, input=5, cache_read=0, output=1, calls=1)])
+        self.assertEqual((self.sums("hand", "s3"), self.sums("hand", "s1")),
+                         (self.totals("hand", "s3"), [160, 1900, 10, 80, 7]))
+        self.assertEqual(hub.migrate(), [])
+        self.assertEqual(self.sums("hand", "s1"), self.totals("hand", "s1"))
+        # without a start, the session's next report puts in what its slots lack
+        hub.q("UPDATE session_tokens SET input='x' WHERE agent='hand' AND session_id='s1'")
+        self.usage("hand", [session("s1", later, input=230, cache_read=1900, cache_write=10, output=80, calls=9)])
+        self.usage("hand", [session("s1", later, input=250, cache_read=1900, cache_write=10, output=90, calls=10)])
+        self.assertEqual(self.sums("hand", "s1"), [250, 1900, 10, 90, 10])
+
+    def test_each_model_gets_its_own_growth_also_after_a_report_without_the_split(self):
+        """A workflow agent often runs another model than its session, so each model grows apart. A report without the
+        split (one that it would take past the hub's size limit), or a split that moved, gives the session's growth
+        at its own model; the next report with a split gives each model its own share again, and no token is lost or
+        counted twice."""
+        at, slot = self.t0 - 600, hub.slot_of(self.t0 - 600)
+
+        def mixed(opus, haiku):
+            totals = dict(zip(hub.SLOT_FIELDS, (a + b for a, b in zip(opus, haiku))))
+            return dict(session("m1", at, **totals), models=[["claude-opus-5-5", *opus], ["claude-haiku-5-5", *haiku]])
+
+        def held():
+            got = self.slots("hand")
+            return got[("m1", slot, "claude-opus-5-5")][:5], got[("m1", slot, "claude-haiku-5-5")][:5]
+        self.usage("hand", [mixed([100, 0, 0, 10, 1], [50, 0, 0, 5, 2])])
+        self.usage("hand", [mixed([300, 0, 0, 30, 2], [60, 0, 0, 6, 3])])
+        self.assertEqual(held(), ([300, 0, 0, 30, 2], [60, 0, 0, 6, 3]))
+        self.usage("hand", [session("m1", at, **dict(zip(hub.SLOT_FIELDS, [500, 0, 0, 50, 6])))])
+        self.assertEqual(held(), ([440, 0, 0, 44, 3], [60, 0, 0, 6, 3]))
+        # the stored split is stale now: what each model's slots hold gives each model its own share again
+        self.usage("hand", [mixed([600, 0, 0, 60, 4], [90, 0, 0, 9, 4])])
+        self.assertEqual(held(), ([600, 0, 0, 60, 4], [90, 0, 0, 9, 4]))
+        # a split that moved (haiku's part folded into another): the growth goes to the session's model
+        self.usage("hand", [mixed([650, 0, 0, 65, 5], [80, 0, 0, 8, 4])])
+        self.assertEqual(held(), ([640, 0, 0, 64, 5], [90, 0, 0, 9, 4]))
+        self.assertEqual(self.sums("hand", "m1"), self.totals("hand", "m1"))
+
+    def test_a_reading_that_goes_down_takes_nothing_away(self):
+        """A record that the helper reads no more makes a session's totals smaller: what was spent stays in the slots,
+        and what the session spends after it adds to them."""
+        at = self.t0 - 600
+        self.usage("hand", [session("d1", at, input=1000, cache_read=0, output=100, calls=5)])
+        self.usage("hand", [session("d1", at, input=400, cache_read=0, output=40, calls=2)])
+        self.assertEqual(self.sums("hand", "d1"), [1000, 0, 0, 100, 5])
+        self.usage("hand", [session("d1", at, input=500, cache_read=0, output=50, calls=3)])
+        self.assertEqual(self.sums("hand", "d1"), [1100, 0, 0, 110, 6])
+        # what it grows by past what the slots hold is new spending too, not only the part above them
+        self.usage("hand", [session("d1", at, input=1300, cache_read=0, output=130, calls=7)])
+        self.assertEqual(self.sums("hand", "d1"), [1900, 0, 0, 190, 10])
+
+    def test_each_start_puts_in_what_the_slots_lack_and_nothing_twice(self):
+        """The sessions from before the slots, and what a release without them recorded (a rollback), go into the slot
+        of each session's last activity at the next start of the hub, and never into one after its last report; a
+        start after it adds nothing, and a session that such a release gave to another agent takes its slots along."""
+        old_at, new_at = self.t0 - 5 * DAY, self.t0 - DAY
+        split = [["claude-opus-5-5", 60, 900, 0, 60, 1], ["claude-haiku-5-5", 40, 0, 0, 40, 3]]
+        cols = "agent,session_id,total,last_activity,reported,input,cache_read,cache_write,output,calls,model"
+        hub.q(f"INSERT INTO session_tokens({cols},models,runtime) VALUES('hand','old',1100,?,?,100,900,0,100,4,"
+              "'claude-opus-5-5',?,'claude')", (old_at, old_at, json.dumps(split)))
+        hub.q("INSERT INTO session_tokens(agent,session_id,total,last_activity,reported) VALUES('hand','plain',50,?,?)",
+              (old_at, old_at))                     # a session from before the four kinds has nothing to split
+        hub.q(f"INSERT INTO session_tokens({cols}) VALUES('hand','ahead',10,?,?,10,0,0,0,1,'claude-opus-5-5')",
+              (self.t0 + 5 * 3600, self.t0 - 60))   # its helper's clock was ahead of the hub's
+        for sid, kinds, last in (("odd", "'x',0,0,0,1", old_at), ("odd-time", "10,0,0,0,1", "x"),
+                                 ("odd-past", "10,0,0,0,1", -1e19)):
+            hub.q(f"INSERT INTO session_tokens({cols}) VALUES('hand',?,10,?,?,{kinds},'claude-opus-5-5')",
+                  (sid, last, old_at))      # no code of the hub writes these: they get no slot, and stop nothing
+        self.assertEqual(hub.migrate(), [])
+        got = self.slots("hand")
+        self.assertEqual({k: v for k, v in got.items() if k[0] == "old"},
+                         {("old", hub.slot_of(old_at), "claude-opus-5-5"): [60, 900, 0, 60, 1, None],
+                          ("old", hub.slot_of(old_at), "claude-haiku-5-5"): [40, 0, 0, 40, 3, None]})
+        self.assertEqual(sorted((k[0], k[1]) for k in got if k[0] != "old"), [("ahead", hub.slot_of(self.t0 - 60))])
+        since = hub.kv_get(hub.TOKEN_SLOTS_FROM)
+        self.assertIsNotNone(since)
+        self.assertEqual(hub.migrate(), [])
+        self.assertEqual(self.sums("hand", "old"), [100, 900, 0, 100, 4])
+        # a release without the slots recorded more of the session: the next start puts in what they lack
+        hub.q("UPDATE session_tokens SET input=130, output=110, calls=5, total=1140, last_activity=?, reported=?, "
+              "models=NULL WHERE session_id='old'", (new_at, new_at))
+        self.assertEqual(hub.migrate(), [])
+        self.assertEqual(self.slots("hand")[("old", hub.slot_of(new_at), "claude-opus-5-5")], [30, 0, 0, 10, 1, None])
+        # and it renamed the agent, or deleted it: the session's slots go with the session, and nothing counts twice
+        hub.q("UPDATE session_tokens SET agent='lead' WHERE session_id='old'")
+        self.assertEqual(hub.migrate(), [])
+        self.assertEqual(([k for k in self.slots("hand") if k[0] == "old"], self.sums("lead", "old")),
+                         ([], [130, 900, 0, 110, 5]))
+        self.assertEqual(hub.kv_get(hub.TOKEN_SLOTS_FROM), since)
+
+    def test_the_owner_reads_the_tokens_by_day_agent_model_kind_and_machine(self):
+        """GET /ui/costs by=: the tokens of the period by the parts that it names, a day in the fleet's own time zone
+        (00:20 in Madrid is the day before in UTC), each model at its own list prices, a deleted agent under its name
+        with the time of its delete, and each slot in the period of its start."""
+        import datetime
+        import zoneinfo
+        hub.TEAM["goals"] = {"timezone": "Europe/Madrid"}
+        zone = zoneinfo.ZoneInfo("Europe/Madrid")
+        day = (datetime.datetime.now(zone) - datetime.timedelta(days=1)).date()
+        midnight = datetime.datetime.combine(day, datetime.time(0, 0), zone).timestamp()
+        next_midnight = datetime.datetime.combine(day + datetime.timedelta(days=1), datetime.time(0, 0),
+                                                  zone).timestamp()
+        early, noon = midnight + 20 * 60, midnight + 12 * 3600
+        self.link(self.new_task("hand"), "h1")
+        self.usage("hand", [session("h1", early, input=1_000_000, cache_read=0, output=0, calls=2),
+                            dict(session("h2", noon, input=500_000, cache_read=0, output=0, calls=3),
+                                 models=[["claude-opus-5-5", 300_000, 0, 0, 0, 1],
+                                         ["claude-haiku-5-5", 200_000, 0, 0, 0, 2]])])
+        self.usage("solo", [session("c1", noon, input=100_000, cache_read=0, output=0, calls=1, model="gpt-6.1-sol")],
+                   key=OPENAI)
+
+        def read(query):
+            code, page = self.request(f"/ui/costs?db=test-generation&{query}")
+            self.assertEqual(code, 200, page)
+            return page, [{k: v for k, v in r.items() if k not in ("cache_read", "cache_write", "output")}
+                          for r in page["rows"]]
+        book = hub.price_book()
+        price = {m: hub.token_price(book[r], m)["input"] for m, r in (("claude-opus-5-5", "claude"),
+                                                                       ("claude-haiku-5-5", "claude"),
+                                                                       ("gpt-6.1-sol", "codex"))}
+        page, rows = read(f"by=day,agent&from={day}&to={day}")
+        self.assertEqual([{k: v for k, v in r.items() if k != "cost"} for r in rows],
+                         [dict(day=day.isoformat(), agent="hand", input=1_500_000, calls=5),
+                          dict(day=day.isoformat(), agent="solo", input=100_000, calls=1)])
+        # a group of several models: each model at its own price
+        self.assertAlmostEqual(rows[0]["cost"], price["claude-opus-5-5"] * 1.3 + price["claude-haiku-5-5"] * 0.2,
+                               places=4)
+        self.assertAlmostEqual(rows[1]["cost"], price["gpt-6.1-sol"] * 0.1, places=4)
+        self.assertEqual((page["zone"], page["unit"], page["by"], page["total"]["input"]),
+                         ("Europe/Madrid", "list dollars", ["day", "agent"], 1_600_000))
+        self.assertIsNotNone(page["exact_from"])
+        _, rows = read("by=model")
+        self.assertEqual([(r["model"], r["input"]) for r in rows],
+                         [("claude-haiku-5-5", 200_000), ("claude-opus-5-5", 1_300_000), ("gpt-6.1-sol", 100_000)])
+        for r in rows:
+            self.assertAlmostEqual(r["cost"], price[r["model"]] * r["input"] / 1e6, places=4)
+        self.assertEqual([(r["kind"], r["input"]) for r in read("by=kind")[1]],
+                         [("standing", 600_000), ("task", 1_000_000)])
+        self.assertEqual([(r["machine"], r["input"]) for r in read("by=machine")[1]],
+                         [("hand-box", 1_500_000), ("solo-box", 100_000)])
+        self.assertEqual([r["agent"] for r in read("by=agent&agent=solo")[1]], ["solo"])
+        self.assertIn("costs_by", self.request()[1]["ui_features"])
+        for query in ("by=week", "by=day,day", "by=day;agent"):
+            self.assertEqual(self.request(f"/ui/costs?db=test-generation&{query}")[0], 400, query)
+        # an agent that the owner deleted, whose name went free: its slots stay, under its name and its delete's time
+        gone = hub.spent_name("gone", 1_700_000_000.0)
+        hub.q("INSERT INTO session_tokens(agent,session_id,total,last_activity,reported,input,cache_read,cache_write,"
+              "output,calls,model,runtime,kind) VALUES(?,'g1',10,?,?,10,0,0,0,1,'claude-opus-5-5','claude','task')",
+              (gone, noon, noon))
+        hub.q("INSERT INTO token_slots(agent,session_id,slot,model,input,cache_read,cache_write,output,calls) "
+              "VALUES(?,'g1',?,'claude-opus-5-5',10,0,0,0,1)", (gone, hub.slot_of(noon)))
+        self.assertEqual([(r["agent"], r.get("deleted"), r["input"]) for r in read("by=agent")[1]],
+                         [("gone", 1_700_000_000.0, 10), ("hand", None, 1_500_000), ("solo", None, 100_000)])
+        # the period: a slot counts in the period of its start, and a date's period ends at the next midnight
+        self.usage("hand", [session("h0", midnight - 2 * DAY + 12 * 3600, input=7_000, cache_read=0, output=0),
+                            session("h9", next_midnight + 300, input=3_000, cache_read=0, output=0)])
+        self.assertEqual([(r["day"], r["input"]) for r in read(f"by=day&from={day}&to={day}")[1]],
+                         [(day.isoformat(), 1_600_010)])
+        by_day = {r["day"]: r["input"] for r in read("by=day")[1]}
+        self.assertEqual(by_day[(day - datetime.timedelta(days=2)).isoformat()], 7_000)
 
 if __name__ == "__main__":
     unittest.main()
