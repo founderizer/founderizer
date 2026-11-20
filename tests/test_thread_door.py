@@ -1,14 +1,19 @@
 """Tests of thread_door.py: the repository calls of a narrowed conversation, against a GitHub that lives in memory.
 No network and no hub: the fake `req` serves one repository and records every request, so each test reads what the
-door asked GitHub and what it told the thread."""
+door asked GitHub and what it told the thread. HubStart alone imports hub.py, in a process of its own."""
 import base64
 import hashlib
 import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
 import unittest
 import urllib.parse
 
 import door_targets
+from leftovers import ROOT
 import thread_door as td
 
 REPO, CID, MINE = "acme/web", 7, "fleet/c7/fix"
@@ -611,6 +616,25 @@ class Shape(unittest.TestCase):
             ".gitmodules", ".gitattributes", ".git/**", ".windsurf/**", ".windsurfrules", ".clinerules",
             ".clinerules/**", ".roo*", ".continue/**", ".aider*", ".zed/**", ".idea/**", "mise.toml", ".mise.toml",
             ".pre-commit-config.yaml", "lefthook*", ".lefthook*", ".npmrc", "CODEOWNERS"])
+
+
+class HubStart(unittest.TestCase):
+    """The hub reads thread_door once, with hub.py, as it reads door_targets (test_door.HubStart). A release moves the
+    hub's kit before the hub runs the new code, and a restart that fails leaves the hub on the old code: a first import
+    of thread_door in that time read the new thread_door.py beside the old hub.py (a review of the area "Release, ship
+    and tests", 20 November 2026), so a narrowed conversation's repository call raised there, or read wrongly."""
+
+    def test_an_import_after_a_release_moved_the_calls_gives_the_calls_that_the_hub_started_with(self):
+        with tempfile.TemporaryDirectory() as moved:
+            with open(os.path.join(moved, "thread_door.py"), "w") as f:
+                f.write("raise SystemExit('the hub read the thread_door.py that came after its start')\n")
+            code = ("import sys\nsys.path.insert(0, sys.argv[1])\nimport hub\nsys.path.insert(0, sys.argv[2])\n"
+                    "import thread_door\nprint(thread_door.__file__)\n")
+            done = subprocess.run([sys.executable, "-c", code, ROOT, moved], capture_output=True, text=True,
+                                  timeout=300)
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertEqual(os.path.realpath(done.stdout.strip().splitlines()[-1]),
+                         os.path.realpath(os.path.join(ROOT, "thread_door.py")))
 
 
 if __name__ == "__main__":

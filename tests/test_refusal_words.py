@@ -150,6 +150,8 @@ SITES = {
     'new_invite_code': {'agent_no_telegram_bot': 1, 'bot_name_unknown': 1, 'no_such_person': 1, 'person_blocked': 1,
                         'person_handles_most': 1},     # a person's Telegram invite
     'older_read': {'hub_changed': 1},              # GET /ui/tasks/older (owner API 1.254)
+    'owner_catalog': {'knowledge_unread': 1},
+    'owner_file_unread': {'knowledge_unread': 1},
     'person_remove': {'no_such_person': 1},
     'phone_chat': {'hub_changed': 1, 'no_such_agent': 1},
     'phone_ended': {'hub_changed': 1},
@@ -159,6 +161,8 @@ SITES = {
                      'request_unknown': 1},
     'phone_task': {'hub_changed': 1, 'no_such_task': 1},
     'prepare_server_agent': {'no_such_agent': 1, 'no_such_server': 1, 'server_no_service': 1, 'server_silent': 1},
+    'profile_unknown_file': {'knowledge_unread': 1},
+    'refresh_page': {'knowledge_unread': 1},
     'remove_agent': {'no_such_agent': 1, 'team_changed': 1},
     'remove_server': {'no_such_server': 1, 'team_changed': 1},
     'rename_agent': {'agent_open_signin': 1, 'no_such_agent': 1, 'server_silent': 1, 'team_changed': 1},
@@ -478,7 +482,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 190)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 194)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

@@ -7,6 +7,7 @@ import base64
 import contextlib
 import fcntl
 import hashlib
+import http.server
 import io
 import json
 import os
@@ -37,8 +38,8 @@ def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite(cls(name) for cls in (Files, ModeAndLock, ScriptForms, Runners, PristineRunners,
                                                      Accounts, SshdFolder, SshdCalls, SelfUpdate,
                                                      Reader, Scripts, NewApp, AppUnitAndSettings, AppRunner, AppVhost,
-                                                     ReleaseHelper, Look, LookBoxLive, FleetMachine, Health,
-                                                     HealthLive)
+                                                     ReleaseHelper, ReleaseHealth, Look, LookBoxLive, FleetMachine,
+                                                     Health, HealthLive)
                                for name in cls.__dict__ if name.startswith("test_"))
     # The release helper again where tarfile has no data filter, as on Debian 12
     suite.addTests(ReleaseHelperWithoutFilter(name) for name in ReleaseHelper.__dict__ if name.startswith("test_"))
@@ -4303,8 +4304,13 @@ class ReleaseHelper(unittest.TestCase):
     def test_a_failed_health_check_puts_the_previous_release_back(self):
         first, second = "a" * 40, "b" * 40
         self.deploy(first)
-        self.healthy = lambda sha: sha == first
-        with self.assertRaisesRegex(REL.Failed, f"{first} runs again"):
+
+        def answers(sha):           # as healthy() leaves it: why the last answer was not a healthy one
+            REL.LAST["why"] = None if sha == first else "HTTP 503"
+            return sha == first
+        self.healthy = answers
+        with self.assertRaisesRegex(REL.Failed, rf"^{second} did not answer its health check \(its last answer: HTTP "
+                                                rf"503\): {first} runs again$"):
             self.deploy(second)
         self.assertEqual(os.readlink(self.tmp + "/var/www/shop/current"), f"/var/www/shop/releases/{first}")
         self.healthy = lambda sha: True
@@ -4451,4 +4457,105 @@ class ReleaseHelperWithoutFilter(ReleaseHelper):
             change.__enter__()
             self.addCleanup(change.__exit__, None, None, None)
         warnings.simplefilter("ignore", DeprecationWarning)     # Python 3.12 and 3.13 ask for a filter
+
+
+class ReleaseHealth(unittest.TestCase):
+    """The release helper's health check, which root makes as root: the release's own code answers it, and that code
+    can be anybody's. A redirect is an unhealthy answer, and root asks no other address: it could send root's request
+    to any host, or to this host's own loopback services, past the outgoing rules of the app's own user (a review of
+    20 November 2026). An answer that HTTP cannot read is an unhealthy one, so the deploy goes on to its rollback. Its
+    body is read one buffer at a time, up to 64 KiB, whatever chunk sizes it gives. And one answer that comes slowly
+    ends at its own time."""
+
+    def serve(self, answer):
+        """A server on a loopback port that answers each request with answer(handler); its port and the paths asked.
+        An answer that waits ends at self.stop, which the test's end sets, before the server joins its threads."""
+        asked = []
+        self.stop = getattr(self, "stop", None) or threading.Event()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                asked.append(self.path)
+                with contextlib.suppress(OSError):         # the check that ended does not read the rest
+                    answer(self)
+
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = False                       # so server_close joins each handler's thread
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(self.stop.set)
+        return server.server_address[1], asked
+
+    def test_a_redirect_is_an_unhealthy_answer_and_root_asks_no_other_address(self):
+        sha = "a" * 40
+
+        def release(handler):
+            body = json.dumps({"sha": sha}).encode()
+            handler.send_response(200)
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        elsewhere, seen = self.serve(release)
+        for code in (301, 302, 303, 307, 308):
+            def moved(handler, code=code):
+                handler.send_response(code)
+                handler.send_header("Location", f"http://127.0.0.1:{elsewhere}/?data=from-the-host")
+                handler.send_header("Content-Length", "0")
+                handler.end_headers()
+            port, asked = self.serve(moved)
+            with self.subTest(code=code):
+                self.assertFalse(REL.healthy(port, "/api/health", sha, wait=0))
+                self.assertEqual((asked, seen), (["/api/health"], []))
+                self.assertEqual(REL.last_answer(),       # what the app's owner reads in the deploy's failure
+                                 f" (its last answer: a redirect, HTTP {code}, which the check never follows)")
+        self.assertTrue(REL.healthy(elsewhere, "/api/health", sha, wait=0))     # that answer on the app's own port
+        self.assertEqual(REL.last_answer(), "")
+
+    def test_an_answer_that_http_cannot_read_is_an_unhealthy_one(self):
+        """A status line that is not HTTP, and a chunk size of -2**64, which raised OverflowError past the rollback (a
+        review of 20 November 2026)."""
+        for answer, words in ((b"NOT HTTP\r\n\r\n", "an answer that is not HTTP"),
+                              (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n-10000000000000000\r\n",
+                               "an answer that the check cannot read")):
+            port, asked = self.serve(lambda handler, answer=answer: handler.wfile.write(answer))
+            with self.subTest(answer=answer):
+                self.assertFalse(REL.healthy(port, "/api/health", "a" * 40, wait=0))
+                self.assertEqual(asked, ["/api/health"])
+                self.assertEqual(REL.last_answer(), f" (its last answer: {words})")
+
+    def test_a_chunk_of_any_size_reads_no_more_than_the_first_bytes(self):
+        """read() takes a chunk's size as the answer gives it, and a size of -1 read to the end of the answer, in
+        root's memory (a review of 20 November 2026: 256 MiB in a tenth of a second). The check reads one buffer at a
+        time, up to HEALTH_MAX, so the sha after them is not read, and an answer that stays open holds nothing."""
+        def endless(handler):
+            handler.wfile.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n-1\r\n" + b"x" * (72 * 1024) +
+                                b"a" * 40)
+            handler.wfile.flush()
+            self.stop.wait(30)
+        port, _ = self.serve(endless)
+        with patch.object(REL, "HEALTH_TRY", 3):
+            self.assertFalse(REL.healthy(port, "/api/health", "a" * 40, wait=0))
+        self.assertEqual(REL.last_answer(),
+                         " (its last answer: HTTP 200 without the release's sha in its first 64 KiB)")
+
+    def test_one_slow_answer_ends_at_its_own_time(self):
+        """A byte now and then never meets the socket's timeout of one read, so only the request's own time ends it."""
+        def slow(handler):
+            handler.send_response(200)
+            handler.send_header("Content-Length", "100000")
+            handler.end_headers()
+            for _ in range(40):
+                handler.wfile.write(b"x")
+                handler.wfile.flush()
+                if self.stop.wait(0.5):
+                    return
+        port, _ = self.serve(slow)
+        started = time.monotonic()
+        with patch.object(REL, "HEALTH_TRY", 1):
+            self.assertFalse(REL.healthy(port, "/api/health", "a" * 40, wait=0))
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertEqual(REL.last_answer(), " (its last answer: no whole answer within 1 seconds)")
 

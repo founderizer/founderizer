@@ -2223,7 +2223,7 @@ def swap_install(check=False, run=None):
     else:
         say(f"this machine's key swap is on: {SWAP_USER} runs the vault's proxy on 127.0.0.1:{SWAP_PORT}. A key that "
             f"an agent reads and that has a site now reaches a session as a placeholder, and the proxy puts the key "
-            f"into the Authorization header of a request to that site only")
+            f"into a request to that site only, in the key's own form")
     return state
 
 

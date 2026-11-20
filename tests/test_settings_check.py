@@ -382,8 +382,8 @@ class Finding(Base):
         self.assertIn("now: a use grant and the key swap need the https site of the key on its login, and this", linux)
 
     SWAP = ("Switch the key swap on for its server box-1 (WORKER-INSTALL.md says how): the vault then keeps {} out "
-            "of its sessions, and it puts the key into the Authorization header of an HTTPS request to the key's "
-            "site. Cost: a program that uses the key in another way fails. To undo: switch it off again.")
+            "of its sessions, and it puts the key into an HTTPS request to the key's site, in the key's own form. "
+            "Cost: a program that uses the key in another way fails. To undo: switch it off again.")
 
     def test_the_key_swap_is_an_option_for_a_key_that_can_swap_on_a_linux_server_that_does_not_swap_yet(self):
         """The key swap lane's rule (hub.key_swap) says which key can swap, and the owner's command takes the word
@@ -415,7 +415,8 @@ class Finding(Base):
         agent there, swaps then. The cost says how many keys of how many other agents that is, and nothing where no
         key of another agent swaps."""
         both, linux = {KEY_A: "read", KEY_B: "read"}, {"box-1": {"kind": "linux"}}
-        cost = "HTTPS request to the key's site. Cost: {}a program that uses the key in another way fails. To undo: "
+        cost = ("HTTPS request to the key's site, in the key's own form. Cost: {}a program that uses the key in another "
+                "way fails. To undo: ")
         self.assertIn(cost.format(""), self.words(both, servers=linux))    # alone on its server
         self.agent("writer")["machine"] = "box-1"               # it reads ACME_API_KEY, which has a site
         self.assertIn(cost.format("it also swaps 1 key of another agent of that server, and "), self.words(both))

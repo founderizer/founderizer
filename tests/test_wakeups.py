@@ -166,14 +166,22 @@ class Routes(unittest.TestCase):
         self.assertIn(("manager", "lead-a", "task"), asked)                    # the parent task
         self.assertIn(("lead-a", "dev", "task"), asked)                        # the target's task
 
-    def test_a_route_needs_a_lead_that_reports_to_the_manager(self):
+    def test_a_route_goes_through_each_lead_up_to_the_manager(self):
+        """Each agent on the way up must be a lead, which holds the task for its team's results (hub.lead_batch_rows):
+        a worker above has no tools to check them. A route under two leads was refused until 20 November 2026. The
+        bugs: a team under a middle lead that gets no wake-up at all, or one whose result reaches nobody."""
         o = org()
         route, why = w.wake_route(o, "deeper")                           # deeper reports to dev, a worker
         self.assertIsNone(route)
         self.assertIn("dev would receive deeper's result, but it is not a lead", why)
         agents = dict(AGENTS, **{"dev": dict(AGENTS["dev"], role="lead")})
+        self.assertEqual(w.wake_route(org(agents=agents), "deeper")[0],    # dev, a lead under the lead lead-a
+                         {"kind": "task", "owner": "deeper", "requester": "dev",
+                          "parent": {"owner": "dev", "requester": "lead-a"}})
+        agents["lead-a"] = dict(AGENTS["lead-a"], reports_to="seo")       # a worker above the two leads
         route, why = w.wake_route(org(agents=agents), "deeper")
-        self.assertIn("gets its tasks from lead-a, not from the manager. A wake-up can go through one lead only", why)
+        self.assertIsNone(route)
+        self.assertIn("seo would receive lead-a's result, but it is not a lead", why)
 
 class Grants(unittest.TestCase):
     def test_the_execution_grant_is_the_same_rule_for_every_runtime(self):

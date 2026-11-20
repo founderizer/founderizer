@@ -47,7 +47,8 @@ owner's vault delivered it, never a login that the owner saved there himself or 
 With the part "swap" in its configuration, which only a root step writes, a Linux broker also keeps such a key out
 of the sessions (the key swap): the session start gets a placeholder, and a second process of this program, the swap
 proxy (`vault.py swap`), which runs as a user of its own that cannot read the store, puts the real key into the
-Authorization header of an HTTPS request to that key's own site. The broker gives the proxy one value for one
+Authorization header, or into the one header that the key's form names, of an HTTPS request to that key's own site.
+The broker gives the proxy one value for one
 placeholder, one OS user and one host, after the hub said that the grant is live now.
 
 A broker writes no key into another host: place, which wrote one into an application's .env file or a Kubernetes
@@ -774,7 +775,7 @@ def read(conf, purpose=None, uid=None):
             # this machine swaps keys, and the hub names this key's site: a placeholder, or nothing
             named.add(ref.lower())
             site, token, form = swap_site(x.get("site")), x.get("swap"), x.get("form", SWAP_FORMS[0])
-            if conf.get("_swaps") is None or type(uid) is not int or not site or form not in SWAP_FORMS \
+            if conf.get("_swaps") is None or type(uid) is not int or not site or not swap_form(form, full=True) \
                     or not (isinstance(token, str) and SWAP_TOKEN.fullmatch(token)):
                 missing.append(name)
                 continue
@@ -3610,7 +3611,8 @@ class Broker:
 #                                        HTTPS_PROXY names it. It passes a connection to any other host as it is,
 #                                        unread. For a key's site it ends TLS with a certificate of a CA of its own
 #                                        that is limited to that host name, reads the head of one request, replaces
-#                                        the placeholders in its Authorization header, and sends it on a TLS
+#                                        the placeholder in its Authorization header or in the one header that the
+#                                        key's form names, and sends it on a TLS
 #                                        connection of its own to the site.
 #
 # Root switches it on for a machine with one part of the broker's own configuration, "swap" (SWAP_KEYS,
@@ -3634,14 +3636,23 @@ SWAPS = "swaps.json"                        # the broker's list of placeholders,
 PLACEHOLDER = re.compile(r"vaultswap_[0-9a-f]{40}")
 PLACEHOLDER_BYTES = re.compile(rb"vaultswap_[0-9a-f]{40}")
 SWAP_TOKEN = re.compile(r"[0-9a-f]{64}")    # the hub's token of one agent and key: it asks "is this grant live?" only
-# The one form in which a key goes into the Authorization header, which the key's catalog entry names (the hub
-# gives it with the site): the key is the whole credential, and never text beside other text of the agent's choice.
-SWAP_FORMS = ("bearer", "token", "basic-user", "basic-password")
+# The one form in which a key goes into a request, which the key's catalog entry names (the hub gives it with the
+# site): the key is the whole credential, and never text beside other text of the agent's choice. These are forms of
+# the Authorization header (key: `Key <key>`); header:<name> is the whole value of the one request header of that
+# name. The same rule as lifecycle.key_form, in this program's own code (it stands alone as a root-owned program);
+# test_key_swap holds the two equal.
+SWAP_FORMS = ("bearer", "token", "basic-user", "basic-password", "key")
+SWAP_HEADER_FORM = "header:"
+SWAP_HEADER_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+SWAP_FORM_WORD = re.compile(r"[a-z][a-z0-9-]{0,39}")       # the shape of a word form, also of a later release's
+SWAP_HEADER_WORDS = ("key", "token", "secret", "auth")
+SWAP_HEADER_NEVER = ("authorization", "proxy-authorization", "connection", "proxy-connection", "keep-alive", "upgrade")
+SWAP_HEADER_NEVER_PARTS = ("idempoten", "csrf", "xsrf", "authenticat")
 # A site's host: a DNS name of small letters, digits, dots and hyphens, at most 240 characters and never an IP
 # address, so that it is safe in a file name and in openssl's files, and so that its CA has one kind of limit.
 SWAP_HOST = re.compile(r"(?=.{1,240}$)(?![0-9.]+$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
                        r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
-SWAP_BEARER = re.compile(rb"((?i:bearer|token)) (vaultswap_[0-9a-f]{40})")
+SWAP_BEARER = re.compile(rb"((?i:bearer|token|key)) (vaultswap_[0-9a-f]{40})")
 SWAP_BASIC = re.compile(rb"(?:([^:]*):(vaultswap_[0-9a-f]{40})|(vaultswap_[0-9a-f]{40}):(.*))", re.S)
 SWAP_LOW_PORTS = "/proc/sys/net/ipv4/ip_unprivileged_port_start"    # the first port that each user can listen on
 SWAP_HEAD = 65536                           # bytes of one request head
@@ -3675,18 +3686,20 @@ SWAP_UNREACHABLE = "The vault's proxy could not reach this host."
 SWAP_BAD_SITE = ("The vault's proxy could not reach this key's site with a certificate that is the site's own. "
                  "Nothing was sent.")
 SWAP_BAD_HEAD = "The vault's proxy does not pass this request to a key's site: {why}. Nothing was sent."
-SWAP_PLACE = ("The vault puts a key only into the Authorization header of a request to the key's own site, as the "
-              "whole credential and in the one form of that key: `Bearer <placeholder>`, `token <placeholder>`, or "
-              "Basic with the placeholder as the user name or as the password. This request has a placeholder in "
-              "another place or form. Nothing was sent.")
+SWAP_PLACE = ("The vault puts a key only into a request to the key's own site, as the whole credential and in the one "
+              "form of that key: in the Authorization header as `Bearer <placeholder>`, `token <placeholder>`, "
+              "`Key <placeholder>`, or Basic with the placeholder as the user name or as the password, or as the whole "
+              "value of the one header that the key's form names, in one header of that name. This request has a "
+              "placeholder in another place or form. Nothing was sent.")
 SWAP_REFUSED = ("The vault did not put the key into this request: this placeholder is not a key that this agent holds "
-                "for this host now. Nothing was sent. If the work needs the key, ask your requester.")
+                "for this host now, or this is not the key's own form. Nothing was sent. If the work needs the key, "
+                "ask your requester.")
 SWAP_NO_HUB = ("The vault did not put the key into this request: the hub did not confirm the grant now. Nothing was "
                "sent. Try again.")
 SWAP_NO_VAULT = "The vault's proxy got no answer from this machine's vault. Nothing was sent. Try again."
 SWAP_BUSY = "The vault's proxy has too many connections of this user. Close some, and try again."
-SWAP_CALL = ("On this machine the vault sends this key only to the key's own site, in the Authorization header and in "
-             "the key's own form, as its proxy does. Nothing was sent.")
+SWAP_CALL = ("On this machine the vault sends this key only to the key's own site, in the key's own form, as its proxy "
+             "does. Nothing was sent.")
 SWAP_ROOM = 256                             # questions of the proxy that the broker answers at one time
 SWAP_KEPT = 60                              # seconds: the hub's yes to a use of a placeholder counts while the hub
                                             # does not answer, from the moment that its question left (Swaps.said)
@@ -3737,6 +3750,24 @@ def swap_site(value):
         return None
     host = host[:-1] if host.endswith(".") else host
     return (host, port or 443) if SWAP_HOST.fullmatch(host) else None
+
+
+def swap_form(form, full=False):
+    """True for a form of a key (SWAP_FORMS, or header:<name>), for any value and with no exception: lifecycle.key_form
+    in this program's own code. full: the whole rule, which the read of a session's keys and the proxy keep (a header's
+    name holds a word of SWAP_HEADER_WORDS, and is no name of SWAP_HEADER_NEVER, no sec-* name and holds no part of
+    SWAP_HEADER_NEVER_PARTS). Without full, its shape only, which the load of the list of placeholders keeps
+    (Swaps.load), so that a later release that refuses one more name, or that adds a word of the Authorization header
+    (any plain word is a shape), never makes a broker refuse its whole list."""
+    if not isinstance(form, str):
+        return False
+    if form in SWAP_FORMS or not full and SWAP_FORM_WORD.fullmatch(form):
+        return True
+    name = form[len(SWAP_HEADER_FORM):] if form.startswith(SWAP_HEADER_FORM) else None
+    if name is None or not SWAP_HEADER_NAME.fullmatch(name):
+        return False
+    return not full or (any(w in name for w in SWAP_HEADER_WORDS) and name not in SWAP_HEADER_NEVER and
+                        not name.startswith("sec-") and not any(p in name for p in SWAP_HEADER_NEVER_PARTS))
 
 
 def swap_origin(host, port):
@@ -3804,7 +3835,7 @@ class Swaps:
                 and isinstance(e["agent"], str) and AGENT_NAME.fullmatch(e["agent"])
                 and isinstance(e["login"], str) and SECRET_REF.fullmatch(e["login"]) and isinstance(e["host"], str)
                 and SWAP_HOST.fullmatch(e["host"]) and type(e["port"]) is int and 0 < e["port"] < 65536
-                and e["form"] in SWAP_FORMS and isinstance(e["token"], str) and SWAP_TOKEN.fullmatch(e["token"])
+                and swap_form(e["form"]) and isinstance(e["token"], str) and SWAP_TOKEN.fullmatch(e["token"])
                 for p, e in entries.items()):
             raise ValueError()
         return entries
@@ -4079,16 +4110,23 @@ def swap_value(conf, uid, host, port, name, form):
 
 def swap_call(conf, confirmed, call, login):
     """May this broker send this call_api request with this key? On a machine that swaps keys, a key that the hub
-    names with a site goes into a request only as the proxy puts it there: to that site, in the Authorization header,
-    and in the key's own form. So call_api is no second road with looser rules (a header of the agent's choice, the
-    address of the saved item). `bearer` is call_api's bearer, and `basic-password` its basic, whose user name is the
-    saved item's own. A key of another form goes through the proxy only. True on a machine that does not swap, and for
-    a key that the hub names no site for: as before."""
+    names with a site goes into a request only as the proxy puts it there: to that site, and in the key's own form. So
+    call_api is no second road with looser rules (a header of the agent's choice, the address of the saved item).
+    `bearer` is call_api's bearer, `basic-password` its basic, whose user name is the saved item's own, and a header
+    form its `header:<Name>` of the same name in any case (the form's name has no `_`, so `xi_api_key` is not
+    `header:xi-api-key`), by the whole rule as the read and the proxy keep it (a stored form that only its shape lets
+    through goes nowhere), and with no header of the agent's that a site reads as the key's own (`_` read as `-`), which
+    it could join to the key. A key of another form goes through the proxy only. True on a machine that does not swap,
+    and for a key that the hub names no site for: as before."""
     if "_swap" not in conf or confirmed.get("site") is None:
         return True
     site, where = swap_site(confirmed.get("site")), origin(login.get("url") or "")
-    return bool(site and where and where[2] == "https://" + swap_origin(*site)
-                and {"bearer": "bearer", "basic-password": "basic"}.get(confirmed.get("form")) == call["auth"])
+    form, auth = confirmed.get("form"), call["auth"]
+    named = form[len(SWAP_HEADER_FORM):] if isinstance(form, str) and form.startswith(SWAP_HEADER_FORM) else None
+    fits = ({"bearer": "bearer", "basic-password": "basic"}.get(form) == auth or
+            named is not None and swap_form(form, full=True) and isinstance(auth, str) and auth.lower() == form and
+            not any(str(n).lower().replace("_", "-") == named for n in (call.get("headers") or {})))
+    return bool(site and where and where[2] == "https://" + swap_origin(*site) and fits)
 
 
 def swap_handle(conf, line):
@@ -4205,18 +4243,33 @@ def swap_basic(value):
 
 def swap_found(target, headers):
     """(the placeholder that this request head asks a key for, or None; the form in which it stands, one of
-    SWAP_FORMS; True when the head has a placeholder in a place or a form where no key goes). A key goes into the one
-    Authorization header only, and as the whole credential: `Bearer <placeholder>`, `token <placeholder>`, or Basic
-    credentials that are exactly `<placeholder>:<text>` (basic-user) or `<text>:<placeholder>` (basic-password). The
-    broker gives the value only for the one form of that key (swap_value): with other text beside the placeholder, or
-    with the key on the wrong side of a Basic credential, an agent could make the key a refused credential on purpose,
-    and a site that writes one into its error would give it back. The request line, each other header, a header name
-    and a second Authorization header are no place for one."""
+    SWAP_FORMS or header:<name>; True when the head has a placeholder in a place or a form where no key goes). A key
+    goes in as the whole credential only: in the one Authorization header as `Bearer <placeholder>`,
+    `token <placeholder>`, `Key <placeholder>`, or Basic credentials that are exactly `<placeholder>:<text>`
+    (basic-user) or `<text>:<placeholder>` (basic-password); or as the whole value of one other header whose name a
+    header form can have (swap_form, full), in the one header of that name. The broker gives the value only for the one
+    form of that key (swap_value): with other text beside the placeholder, or with the key on the wrong side of a Basic
+    credential, an agent could make the key a refused credential on purpose, and a site that writes one into its error
+    would give it back. The request line, a header name, any other header, a second header of a named header's name
+    with any value (also one with _ for -, which CGI and WSGI sites read as the same header, and which a site can join
+    to the first), a second Authorization header, and two placeholders that each could be a key are no place for one
+    (design key-swap-two-more-forms.md, version 2)."""
     grants = [v for n, v in headers if n.lower() == b"authorization"]
-    elsewhere = bool(PLACEHOLDER_BYTES.search(target)) or any(
-        PLACEHOLDER_BYTES.search(n) or (n.lower() != b"authorization" and PLACEHOLDER_BYTES.search(v))
-        for n, v in headers)
+    elsewhere = bool(PLACEHOLDER_BYTES.search(target)) or any(PLACEHOLDER_BYTES.search(n) for n, _v in headers)
+    same = {}               # each header's name as a site may read it: in small letters, with _ as -
+    for n, _v in headers:
+        read_as = n.lower().replace(b"_", b"-")
+        same[read_as] = same.get(read_as, 0) + 1
     found = []
+    for n, v in headers:
+        low = n.lower()
+        if low == b"authorization" or not PLACEHOLDER_BYTES.search(v):
+            continue
+        form = SWAP_HEADER_FORM + low.decode("ascii")       # SWAP_HEADER takes only ASCII token characters
+        if PLACEHOLDER_BYTES.fullmatch(v) and swap_form(form, full=True) and same[low] == 1:
+            found.append((v.decode(), form))
+        else:
+            elsewhere = True
     for value in grants:
         plain = swap_basic(value)
         word = SWAP_BEARER.fullmatch(value)
@@ -4228,21 +4281,26 @@ def swap_found(target, headers):
                          (basic.group(2).decode(), "basic-password"))
         elif PLACEHOLDER_BYTES.search(value) or (plain is not None and PLACEHOLDER_BYTES.search(plain)):
             elsewhere = True
-    if (found or elsewhere) and len(grants) > 1:
+    if (found or elsewhere) and len(grants) > 1 or len(found) > 1:
         elsewhere = True
     name, form = found[0] if len(found) == 1 else (None, None)
     return name, form, elsewhere
 
 
-def swap_put(headers, name, value):
-    """The headers with the placeholder `name` of the Authorization header replaced by `value`, in the form that
-    swap_found accepted."""
+def swap_put(headers, name, value, form=None):
+    """The headers with the placeholder `name` replaced by `value` in the one place of the form that swap_found
+    accepted: the Authorization header for a form of SWAP_FORMS (form None is one of them), else the whole value of
+    the one header that the form header:<name> names, and no other header."""
     old, new = name.encode(), value.encode()
+    named = form[len(SWAP_HEADER_FORM):].encode() if isinstance(form, str) and form.startswith(SWAP_HEADER_FORM) \
+        else None
     out = []
     for header, text in headers:
-        if header.lower() == b"authorization":
+        if named is None and header.lower() == b"authorization":
             plain = swap_basic(text)
             text = b"Basic " + base64.b64encode(plain.replace(old, new)) if plain is not None else text.replace(old, new)
+        elif named is not None and header.lower() == named and text == old:
+            text = new
         out.append((header, text))
     return out
 
@@ -4738,7 +4796,8 @@ class SwapProxy:
 
     def opened(self, conn, uid, host, port):
         """A connection to a key's site: TLS ends here, the head of one request is read, and the placeholder of its
-        Authorization header is replaced. The request goes to the site on a TLS connection that checks the site's
+        Authorization header, or of the one header that the key's form names, is replaced. The request goes to the
+        site on a TLS connection that checks the site's
         own certificate. A connection that ends before its TLS (a session's start asks for the site's CA in this way)
         ends here with no line in the log."""
         context = self.authority.context(host)          # the CA's public certificate is in place before the answer
@@ -4790,7 +4849,7 @@ class SwapProxy:
                     if code == "refused":
                         return swap_say(client, "403 Forbidden", SWAP_REFUSED)
                     return swap_say(client, "503 Service Unavailable", SWAP_NO_HUB if code == "hub" else SWAP_NO_VAULT)
-                kept = swap_put(kept, name, value)
+                kept = swap_put(kept, name, value, form)
                 del value, said
             out = method + b" " + target + b" HTTP/1.1\r\n" + b"".join(n + b": " + v + b"\r\n" for n, v in kept) + b"\r\n"
             del kept

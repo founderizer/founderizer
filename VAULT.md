@@ -498,11 +498,17 @@ server that joined before, it is off until root switches it on.
   adds only the CAs of an agent's own keys' sites to the lists of CAs that the agent's sessions use, and each of
   these CAs is limited to one host name (`fleet.py`, `vault.py`).
 - **A key's site.** For a connection to a key's site, the proxy reads the head of one HTTP request. It puts the
-  key in the place of the placeholder only in the `Authorization` header, only as the whole credential, and only
-  in the one form of that key: `Bearer`, `token`, or the user name or the password of `Basic`. The form is
-  `Bearer` when the key's catalog entry names no other (`vault.py`, `lifecycle.py`). The proxy refuses a request
-  whose head has a placeholder in another place or in another form, and a `TRACE` request with a placeholder,
-  because a server sends such a request back. It sends the request on a TLS connection of its own, which checks
+  key in the place of the placeholder only as the whole credential, and only in the one form of that key: in the
+  `Authorization` header as `Bearer`, `token`, `Key` (as FAL takes a key), or the user name or the password of
+  `Basic`; or, for the form `header:<name>`, as the whole value of the one request header of that name (as
+  ElevenLabs takes a key in `xi-api-key`). The form is `Bearer` when the key's catalog entry names no other
+  (`vault.py`, `lifecycle.py`). A header form's name is 1 to 64 small letters, digits and `-`, holds `key`, `token`,
+  `secret` or `auth` (a site sends many other request headers back, so a list of refused names alone would not do),
+  and is not `authorization`, `proxy-authorization`, a header that the proxy does not pass, a `sec-*` name, or a
+  name that holds `idempoten`, `csrf`, `xsrf` or `authenticat`. The proxy refuses a request whose head has a
+  placeholder in another place or in another form, a second header of a header form's name with any value (also
+  one with `_` for `-`, which some sites read as the same header and can join to the first), two placeholders that
+  each could be a key, and a `TRACE` request with a placeholder, because a server sends such a request back. It sends the request on a TLS connection of its own, which checks
   the site's certificate against the system's list of CAs (`vault.py`). It reads no byte of a request after its
   head, and no byte of an answer.
 - **One CA for each site.** The proxy makes one CA for each site. X.509 name constraints limit it to that one host
@@ -522,9 +528,20 @@ server that joined before, it is off until root switches it on.
   not look at the agent's Shell box: a session that started before that box went off still gets the key in its
   requests while the grant holds (`hub.py`).
 - **`call_api` on such a server.** The broker can also send a request itself (`call_api`). On a server that swaps
-  keys, it sends a key that the hub names with a site only as the proxy does: to that site, in the `Authorization`
-  header, and in the key's own form. A key whose form is `token` or the user name of `Basic` goes through the
-  proxy only (`vault.py`, `hub.py`).
+  keys, it sends a key that the hub names with a site only as the proxy does: to that site, and in the key's own
+  form (`bearer` as `call_api`'s bearer, the password of `Basic` as its basic, and a header form as its
+  `header:<Name>` of the same name in any case). A key whose form is `token`, `Key` or the user name of `Basic` goes
+  through the proxy only (`vault.py`, `hub.py`).
+- **Older programs.** A broker of a release from before the forms `key` and `header:<name>` leaves a key of such a
+  form out of a session (neither the key nor a placeholder) until its program is updated, and it refuses its whole
+  list of placeholders when one entry has such a form, so a vault program that is put back to such a release swaps
+  no key on that server. An older proxy refuses a request with `Key <placeholder>` or a header form (400) until the
+  new broker's first answer starts its hand-over (`vault.py`). A hub of such a release does not load a `team.json`
+  with such a form (its `validate_team` refuses the form), and then refuses each write of `team.json`. So before a
+  hub is put back to such a release, the owner takes each such form away (`save_login` with `form` `""`, or with an
+  older form); each of these writes is still taken by this release. From this release on, a later release's new
+  form of the Authorization header (any plain word) or a later refused header name keeps a `team.json` loadable
+  (`lifecycle.key_form`, the shape only).
 - **The model's own calls.** The variable `NO_PROXY` names the hosts of the provider of the agent's own program,
   the hub and the machine itself, so the calls to them do not go through the proxy (`lifecycle.py`, `fleet.py`).
   For a check, it names only the hub and the machine itself (`fleet.py`).
@@ -683,13 +700,16 @@ host.
      region's host, for example `eu.api.openai.com`; an account in Cloudflare's FedRAMP uses
      `api.fed.cloudflare.com`), and an agent whose program's own provider has that host (an OpenAI key stays a value
      for an agent of Codex) (`lifecycle.py`).
-   - A site that sends the key back gives it to the session: an answer that repeats the `Authorization` header.
-     The proxy does not look for the key in an answer (`vault.py`).
-   - The key goes only in the `Authorization` header, as `Bearer`, `token` or `Basic`. A program that needs the
-     key in another place gets no key. When the placeholder is in another header or in the address of a request to
-     the key's site, the proxy refuses the request. When a program puts the placeholder in a body, makes a
-     signature from it, sends it to another host, or does not use HTTPS, the placeholder goes out as it is
-     (`vault.py`).
+   - A site that sends the key back gives it to the session: an answer that repeats the `Authorization` header, or
+     the header of a key's header form. The proxy does not look for the key in an answer (`vault.py`).
+   - The key goes only in its own form: in the `Authorization` header as `Bearer`, `token`, `Key` or `Basic`, or as
+     the whole value of the one header that a header form names. A program that needs the key in another place gets
+     no key. When the placeholder is in another header or in the address of a request to the key's site, the proxy
+     refuses the request. When a program puts the placeholder in a body, makes a signature from it, sends it to
+     another host, or does not use HTTPS, the placeholder goes out as it is (`vault.py`).
+   - A key's site is one host. A service that takes one key at two hosts (FAL's `fal.run` and `queue.fal.run`) gets
+     the key at the site's host only. The proxy passes no `Upgrade` to a key's site, so no websocket to a key's site
+     opens through it at all (ElevenLabs' streaming over a websocket does not work there) (`vault.py`).
    - A person who breaks into the swap proxy can get the keys that swap on that server, of each agent user, and can
      read the traffic to those keys' sites. That person also sees the names of the other hosts to which the
      sessions connect through the proxy. That person does not get the store, a login's password, or a key that

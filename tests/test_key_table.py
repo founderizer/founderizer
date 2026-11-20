@@ -74,7 +74,7 @@ class Rule(unittest.TestCase):
             with self.subTest(row=name):
                 self.assertRegex(name, r"^[a-z][a-z0-9-]{0,39}$")
                 self.assertEqual(lifecycle.key_site(row["site"]), row["site"])
-                self.assertIn(row["form"], lifecycle.KEY_FORMS)
+                self.assertTrue(lifecycle.key_form(row["form"], full=True), row["form"])
                 self.assertEqual(row["hosts"], (row["site"].split("://", 1)[1],))      # its one API host
                 places += list(row["hosts"]) + list(row["pages"])
         self.assertEqual(len(places), len(set(places)))
@@ -383,7 +383,7 @@ class Catalog(test_grants.Grants):
                          "as the password of Basic, OPENAI_A_KEY for api.openai.com as Bearer)")
         self.assertEqual(self.says("box", True)[0], 200)
         shared = (": the variable holds a placeholder, which begins with vaultswap_, and not the key, and this machine's "
-                  "vault puts the key in its place only in the Authorization header of an HTTPS request to that host, "
+                  "vault puts the key in its place only in an HTTPS request to that host, "
                   "in that form, and nowhere else; a request with the placeholder in another form or another place "
                   "gets a refusal; never write a placeholder into a file or into an application's configuration, on a "
                   "server or in a repository: it works only in this session's own requests; when a program needs the "
@@ -425,7 +425,8 @@ class Catalog(test_grants.Grants):
         # each form in its words, as the proxy takes it (vault.swap_found)
         self.assertEqual(set(hub.KEY_FORM_WORDS), set(lifecycle.KEY_FORMS))
         for form, said in (("bearer", "as Bearer"), ("token", "as token"), ("basic-user", "as the user name of Basic"),
-                           ("basic-password", "as the password of Basic")):
+                           ("basic-password", "as the password of Basic"), ("key", "as Key"),
+                           ("header:xi-api-key", "as the whole value of the header xi-api-key")):
             with self.subTest(form=form):
                 self.assertEqual(self.label(test_grants.KEY, "OPENAI_API_KEY", site="https://api.example.com",
                                             form=form)[0], 200)

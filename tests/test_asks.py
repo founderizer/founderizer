@@ -431,6 +431,9 @@ class Jobs(Asks):
             results = hub.lead_batch_rows("lead", hub.now())
         loose, _ = self.create("lead", "w", task=results, title="Check the disk")
         self.assertEqual((loose["parent"], loose["job"]), (results, None))
+        hub.kv_set("lead_batch:lead", "0")         # a newer one took its place (a move of the line): still no job
+        stale, _ = self.create("lead", "w", task=results, title="Check the logs")
+        self.assertEqual((stale["parent"], stale["job"]), (results, None))
         # a subtask with an ask of its own is in that ask's job: the hub writes no second link beside it
         message = self.says("lead", text="Move the logos too.")
         hub.q("UPDATE tasks SET state='working' WHERE id=?", (own["id"],))

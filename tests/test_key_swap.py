@@ -109,6 +109,7 @@ class Reading(unittest.TestCase):
     def test_a_key_goes_into_the_authorization_header_only_and_as_the_whole_credential(self):
         for value, form in (("Bearer " + PLACE, "bearer"), ("bearer " + PLACE, "bearer"), ("BEARER " + PLACE, "bearer"),
                             ("token " + PLACE, "token"), ("Token " + PLACE, "token"),
+                            ("Key " + PLACE, "key"), ("key " + PLACE, "key"),
                             (basic(PLACE + ":"), "basic-user"), (basic(PLACE + ":x:y"), "basic-user"),
                             (basic("user:" + PLACE), "basic-password"), (basic(":" + PLACE), "basic-password")):
             with self.subTest(value=value):
@@ -116,11 +117,36 @@ class Reading(unittest.TestCase):
         self.assertEqual(self.found(("Host", HOST), ("Authorization", "Bearer some-other-token")), (None, None, False))
         self.assertEqual(self.found(("Host", HOST)), (None, None, False))
 
+    def test_a_key_goes_as_the_whole_value_of_the_one_header_that_a_header_form_names(self):
+        """The form header:<name> (ElevenLabs takes its key in xi-api-key): the whole value of one header whose name
+        holds a credential's word, in any case and with the spaces around a value that the head's reader takes off."""
+        for name, form in (("xi-api-key", "header:xi-api-key"), ("XI-API-KEY", "header:xi-api-key"),
+                           ("X-Api-Key", "header:x-api-key"), ("x-auth-token", "header:x-auth-token")):
+            with self.subTest(name=name):
+                self.assertEqual(self.found(("Host", HOST), (name, PLACE), ("Accept", "*/*")), (PLACE, form, False))
+        read = vault.swap_request(head("GET /v1/models HTTP/1.1", "Host: " + HOST, "xi-api-key: \t " + PLACE + "  "),
+                                  HOST, 443)
+        self.assertEqual(vault.swap_found(read[1], read[2]), (PLACE, "header:xi-api-key", False))
+
     def test_a_placeholder_in_each_other_place_or_form_is_no_place_for_a_key(self):
         other = "vaultswap_" + "b2" * 20
         for why, headers, target in (
-                ("another header", [("X-Api-Key", PLACE)], b"/"),
+                ("a header with no word of a credential", [("X-Debug", PLACE)], b"/"),
                 ("a header that a site gives back", [("Idempotency-Key", PLACE)], b"/"),
+                ("a request's id", [("X-Request-Id", PLACE)], b"/"),
+                ("a header of CSRF", [("X-CSRF-Token", PLACE)], b"/"),
+                ("a header of XSRF", [("X-XSRF-TOKEN", PLACE)], b"/"),
+                ("a header of the browser", [("Sec-Api-Key", PLACE)], b"/"),
+                ("a header that names who is signed in", [("X-Authenticated-Key", PLACE)], b"/"),
+                ("the proxy's own header", [("Proxy-Authorization", PLACE)], b"/"),
+                ("a header name with _", [("xi_api_key", PLACE)], b"/"),
+                ("text beside it in a header", [("xi-api-key", PLACE + "x")], b"/"),
+                ("a second header of its name", [("xi-api-key", PLACE), ("Xi-Api-Key", "x")], b"/"),
+                ("a second header of its name with _", [("xi-api-key", PLACE), ("xi_api_key", "x")], b"/"),
+                ("two named headers that each could be a key", [("xi-api-key", PLACE), ("x-api-key", other)], b"/"),
+                ("a named header and Authorization", [("xi-api-key", PLACE), ("Authorization", "Bearer " + other)],
+                 b"/"),
+                ("Key with no space", [("Authorization", "Key" + PLACE)], b"/"),
                 ("a header name", [(PLACE, "1")], b"/"),
                 ("the request line", [("Authorization", "Bearer x")], ("/?key=" + PLACE).encode()),
                 ("text after it", [("Authorization", "Bearer " + PLACE + "x")], b"/"),
@@ -144,8 +170,14 @@ class Reading(unittest.TestCase):
         put = lambda value: dict(vault.swap_put([(b"Authorization", value.encode()), (b"X-A", b"1")], PLACE, KEY))
         self.assertEqual(put("Bearer " + PLACE), {b"Authorization": ("Bearer " + KEY).encode(), b"X-A": b"1"})
         self.assertEqual(put("token " + PLACE)[b"Authorization"], ("token " + KEY).encode())
+        self.assertEqual(put("Key " + PLACE)[b"Authorization"], ("Key " + KEY).encode())
         self.assertEqual(put(basic(PLACE + ":"))[b"Authorization"], basic(KEY + ":").encode())
         self.assertEqual(put(basic("user:" + PLACE))[b"Authorization"], basic("user:" + KEY).encode())
+        # a header form: that one header's whole value, and no other header, Authorization included
+        named = vault.swap_put([(b"Authorization", ("Bearer " + PLACE).encode()), (b"Xi-Api-Key", PLACE.encode()),
+                                (b"X-A", PLACE.encode())], PLACE, KEY, "header:xi-api-key")
+        self.assertEqual(named, [(b"Authorization", ("Bearer " + PLACE).encode()), (b"Xi-Api-Key", KEY.encode()),
+                                 (b"X-A", PLACE.encode())])
 
     def test_a_site_is_an_https_address_with_a_dns_name(self):
         self.assertEqual(vault.swap_site("https://API.Example.com/v1/x"), (HOST, 443))
@@ -160,6 +192,30 @@ class Reading(unittest.TestCase):
         self.assertEqual(lifecycle.key_site("https://api.example.com:8443"), f"https://{HOST}:8443")
         self.assertEqual(vault.swap_site(lifecycle.key_site("https://api.example.com:8443/x")), (HOST, 8443))
         self.assertEqual(lifecycle.KEY_FORMS, vault.SWAP_FORMS)
+
+    def test_the_hub_and_the_vault_take_the_same_forms_by_the_whole_rule_and_by_the_shape(self):
+        """One rule in two programs (vault.py stands alone): what the owner's route takes, the broker's read takes, and
+        a stored form that a later release refuses keeps its shape, so a team.json and a broker's list still load."""
+        whole = ("bearer", "token", "basic-user", "basic-password", "key", "header:xi-api-key", "header:x-api-key",
+                 "header:api-key", "header:apikey", "header:x-auth-token", "header:ocp-apim-subscription-key",
+                 "header:x-goog-api-key", "header:client-secret", "header:private-token", "header:x-auth")
+        # a later release's word of the Authorization header, and a name that a later release refuses: shapes
+        shape = ("header:authorization", "header:proxy-authorization", "header:upgrade", "header:idempotency-key",
+                 "header:x-csrf-token", "header:x-xsrf-token", "header:sec-api-key", "header:x-authenticated-key",
+                 "header:x-request-id", "header:accept", "header:a", "splunk", "header", "a" * 40)
+        neither = ("Bearer", "KEY", "header:", "header:Xi-Api-Key", "header:xi_api_key", "header:-key",
+                   "header:" + "k" * 65, "header:x key", "headers:x-api-key", "a" * 41, "1key", "bearer token", "",
+                   None, 7, ["key"], {"form": "key"})
+        for form in whole + shape + neither:
+            with self.subTest(form=form):
+                self.assertEqual((lifecycle.key_form(form, full=True), lifecycle.key_form(form)),
+                                 (form in whole, form in whole + shape))
+                self.assertEqual((vault.swap_form(form, full=True), vault.swap_form(form)),
+                                 (form in whole, form in whole + shape))
+        self.assertEqual((lifecycle.KEY_HEADER_WORDS, lifecycle.KEY_HEADER_NEVER, lifecycle.KEY_HEADER_NEVER_PARTS),
+                         (vault.SWAP_HEADER_WORDS, vault.SWAP_HEADER_NEVER, vault.SWAP_HEADER_NEVER_PARTS))
+        self.assertEqual(lifecycle.KEY_HEADER_NAME.pattern, vault.SWAP_HEADER_NAME.pattern)
+        self.assertTrue(set(lifecycle.KEY_HEADER_NEVER) >= {n.decode() for n in vault.SWAP_NOT_PASSED})
 
     def test_the_user_of_a_connection_is_the_row_with_exactly_its_addresses_and_ports(self):
         """The kernel's table of sockets: only the row of this connection's other end names its user."""
@@ -206,12 +262,24 @@ class Reading(unittest.TestCase):
         item = {"url": "https://api.example.com/v1", "password": KEY, "username": "AC123"}
         named = {"site": "https://" + HOST, "form": "bearer"}
 
-        def may(conf, confirmed, auth, login=item):
-            return vault.swap_call(conf, confirmed, {"auth": auth}, login)
+        def may(conf, confirmed, auth, login=item, headers=None):
+            return vault.swap_call(conf, confirmed, {"auth": auth, "headers": headers or {}}, login)
         self.assertTrue(may(swaps, named, "bearer"))
         self.assertTrue(may(swaps, dict(named, form="basic-password"), "basic"))
+        voice = dict(named, form="header:xi-api-key")              # call_api's own header auth, of the form's header
+        self.assertTrue(may(swaps, voice, "header:xi-api-key"))
+        self.assertTrue(may(swaps, voice, "header:Xi-Api-Key", headers={"Accept": "audio/mpeg"}))
+        # a header of the agent's that a site reads as the key's own, which it could join to the key
+        self.assertFalse(may(swaps, voice, "header:xi-api-key", headers={"xi_api_key": "x"}))
+        # a stored form that only its shape lets through (a later release refuses the name): the read and the proxy
+        # refuse it, and so does call_api
+        self.assertFalse(may(swaps, dict(named, form="header:x-request-id"), "header:X-Request-Id"))
         for why, confirmed, auth, login in (
                 ("a header of the agent's choice", named, "header:X-Request-Id", item),
+                ("another header for a header form", voice, "header:X-Api-Key", item),
+                ("a header with _ for a header form", voice, "header:xi_api_key", item),
+                ("bearer for a header form", voice, "bearer", item),
+                ("a form that only the proxy sends", dict(named, form="key"), "bearer", item),
                 ("basic for a bearer key", named, "basic", item),
                 ("bearer for a basic key", dict(named, form="basic-password"), "bearer", item),
                 ("a form that only the proxy sends", dict(named, form="token"), "bearer", item),
@@ -353,7 +421,7 @@ class Rule(unittest.TestCase):
                 ("an http site", self.team(logins__REF__site="http://api.example.com")),
                 ("a site that is an IP address", self.team(logins__REF__site="https://203.0.113.7")),
                 ("a login", self.team(logins__REF__kind="login")),
-                ("a form that is none", self.team(logins__REF__form="header")),
+                ("a form that is none", self.team(logins__REF__form="header:")),
                 ("a program that nobody proved", self.team(**{"agents__dev-lead__runtime": "grok"})),
                 ("a program of the ACP runner", self.team(**{"agents__dev-lead__runtime": "opencode"})),
                 ("no program", self.team(**{"agents__dev-lead__runtime": None})),
@@ -370,6 +438,10 @@ class Rule(unittest.TestCase):
         self.assertIsNone(lifecycle.key_swap(self.team(), "another", self.REF))
         self.assertIsNone(lifecycle.key_swap({}, "dev-lead", self.REF))
         self.assertIsNone(lifecycle.key_swap(None, "dev-lead", self.REF))
+        # a later release's word, by its shape: the hub names the site, and the broker's read (the whole rule) gives the
+        # session nothing, never the key as a value
+        self.assertEqual(lifecycle.key_swap(self.team(logins__REF__form="splunk"), "dev-lead", self.REF),
+                         ("https://api.example.com", "splunk"))
 
     def test_a_site_that_only_looks_like_the_providers_host_swaps(self):
         for site in ("https://api.openai.com", "https://notanthropic.com", "https://anthropic.com.example.com"):
@@ -563,7 +635,7 @@ class Proxy(unittest.TestCase):
         self.assertTrue(any("the key of one placeholder" in line for line in self.logged))
 
     def test_each_form_of_a_key_is_named_to_the_broker_and_put_back_in_that_form(self):
-        for value, form, wanted in (("token " + PLACE, "token", "token " + KEY),
+        for value, form, wanted in (("token " + PLACE, "token", "token " + KEY), ("Key " + PLACE, "key", "Key " + KEY),
                                     (basic(PLACE + ":"), "basic-user", basic(KEY + ":")),
                                     (basic("AC123:" + PLACE), "basic-password", basic("AC123:" + KEY))):
             with self.subTest(form=form):
@@ -571,6 +643,12 @@ class Proxy(unittest.TestCase):
                 self.assertEqual(self.get("Authorization: " + value)[0], "HTTP/1.1 200 OK")
                 self.assertEqual(self.swaps()[0]["form"], form)
                 self.assertEqual(self.site.got[-1]["headers"]["Authorization"], wanted)
+        # a header form: the key is that header's whole value, and the request gets no Authorization header
+        self.asked.clear()
+        self.assertEqual(self.get("Xi-Api-Key: " + PLACE, "Accept: audio/mpeg")[0], "HTTP/1.1 200 OK")
+        self.assertEqual(self.swaps()[0]["form"], "header:xi-api-key")
+        got = self.site.got[-1]["headers"]
+        self.assertEqual((got["Xi-Api-Key"], got["Accept"], "Authorization" in got), (KEY, "audio/mpeg", False))
 
     def test_without_a_context_of_its_own_the_proxy_checks_the_site_against_the_systems_cas(self):
         """The site of these tests has a certificate that no CA of this machine signed: it gets no key."""
@@ -616,7 +694,8 @@ class Proxy(unittest.TestCase):
         self.assertEqual(self.logged, [])                                              # and no line about a tunnel
 
     def test_a_placeholder_where_no_key_goes_is_refused_and_nothing_is_sent(self):
-        for why, headers, target in (("another header", ["X-Api-Key: " + PLACE], "/"),
+        for why, headers, target in (("a header with no word of a credential", ["X-Debug: " + PLACE], "/"),
+                                     ("a second header of its name", ["Xi-Api-Key: " + PLACE, "xi_api_key: x"], "/"),
                                      ("text beside it", ["Authorization: Bearer " + PLACE + "-x"], "/"),
                                      ("the address", ["Authorization: Bearer x"], "/?key=" + PLACE),
                                      ("two Authorization headers", ["Authorization: Bearer " + PLACE,
@@ -1509,6 +1588,22 @@ class BrokerPart(test_vault.VaultBroker):
         return self.proxy_asks(**dict({"op": "swap", "uid": os.getuid(), "host": HOST, "port": 443, "name": placeholder,
                                        "form": "bearer"}, **changes))
 
+    def test_a_key_of_a_header_form_is_given_for_that_header_only_and_a_refused_name_gives_nothing(self):
+        """Design key-swap-two-more-forms.md, version 2: the proxy gets the value of a header form's placeholder only
+        for that one header's form, and the broker's read keeps the whole rule, so a stored name that only the shape
+        lets through (a later release refuses it) gives the session neither the key nor a placeholder."""
+        self.started()
+        hub.TEAM["logins"][test_vault.REF]["form"] = "header:xi-api-key"
+        name = fleet.vault_call({"op": "read"})["env"]["SHOP_API_KEY"]
+        self.assertTrue(vault.PLACEHOLDER.fullmatch(name), name)
+        self.assertEqual(self.swap(name, form="header:xi-api-key"), {"ok": True, "value": self.VALUE})
+        for other in ("bearer", "key", "header:x-api-key", "header:xi_api_key"):
+            with self.subTest(other=other):
+                self.assertEqual(self.swap(name, form=other), {"ok": False, "code": "refused"})
+        hub.TEAM["logins"][test_vault.REF]["form"] = "header:x-request-id"
+        raw = fleet.vault_call({"op": "read"})
+        self.assertEqual((raw["env"], raw["missing"]), ({}, ["SHOP_API_KEY"]))
+
     def test_a_broker_without_the_part_gives_the_key_as_before_and_opens_nothing(self):
         raw = fleet.vault_call({"op": "read"})
         self.assertEqual(raw, {"ok": True, "v": 2, "env": {"SHOP_API_KEY": self.VALUE}, "missing": []})
@@ -2079,6 +2174,13 @@ class BrokerPart(test_vault.VaultBroker):
                 kept.write_text(json.dumps({name: bad}))
                 with self.assertRaises(vault.Refused):
                     vault.Swaps(str(kept))
+        # a stored header form that a later release refuses still loads (its shape only), so the other keys still swap;
+        # a form of no shape does not
+        kept.write_text(json.dumps({name: dict(entries[name], form="header:x-request-id")}))
+        self.assertEqual(vault.Swaps(str(kept)).entries[name]["form"], "header:x-request-id")
+        kept.write_text(json.dumps({name: dict(entries[name], form="header:Xi_Key")}))
+        with self.assertRaises(vault.Refused):
+            vault.Swaps(str(kept))
 
     def test_a_key_with_a_colon_is_not_the_user_name_of_basic(self):
         value = "id-part:secret-part-0123456789"
@@ -2263,7 +2365,20 @@ class HubRoutes(test_grants.Grants):
         code, receipt = self.label(site="https://203.0.113.7")              # a site of the catalog that cannot swap
         self.assertEqual((code, receipt["swap_site"]), (200, None), receipt)
         self.assertEqual(self.label(site="")[0], 200)
-        for bad in (dict(form="header"), dict(form="Bearer"), dict(site="http://api.example.com"), dict(site="api.example.com")):
+        for good in ("key", "header:xi-api-key"):                           # the forms of FAL and ElevenLabs
+            with self.subTest(good=good):
+                self.assertEqual(self.label(site=self.SITE, form=good)[0], 200)
+                self.assertEqual(self.committed()["logins"][test_grants.KEY]["form"], good)
+        self.assertEqual(self.label(site="", form="")[0], 200)
+        team = self.committed()             # a stored form that a later release refuses: team.json loads, by its shape
+        team["logins"][test_grants.KEY].update(site=self.SITE, form="header:x-request-id")
+        hub.validate_team(team)
+        team["logins"][test_grants.KEY]["form"] = "header:Xi-Api-Key"
+        with self.assertRaises(ValueError):
+            hub.validate_team(team)
+        for bad in (dict(form="header"), dict(form="Bearer"), dict(site="http://api.example.com"), dict(site="api.example.com"),
+                    dict(form="header:x-request-id"), dict(form="header:Xi-Api-Key"), dict(form="header:xi_api_key"),
+                    dict(form="header:x-csrf-token")):
             with self.subTest(bad=bad):
                 self.assertEqual(self.label(**bad)[0], 400)
         code, answer = self.request("/ui/team/logins", dict(request_id=str(uuid.uuid4()), db="test-generation",
@@ -2515,7 +2630,7 @@ class Fact(test_grants.Grants):
         # with no owner's word, the words of before, with the key's form beside its host (Part D, the manager's point 6)
         self.assertEqual(words[0], " (OPENAI_API_KEY is for api.example.com only, as Bearer: when its value begins "
                                    "with vaultswap_, it is a placeholder, and this machine's vault puts the key into "
-                                   "the Authorization header of an HTTPS request to that host, and nowhere else; a "
+                                   "an HTTPS request to that host, in that form, and nowhere else; a "
                                    "program that needs the key itself does not work with a placeholder, so ask your "
                                    "requester then, and do not look for the key)")
         self.assertEqual(words[1], " (a placeholder when its value begins with vaultswap_: OPENAI_API_KEY for "
@@ -2526,7 +2641,7 @@ class Fact(test_grants.Grants):
         self.assertEqual(hub.key_words("alpha"),
                          " (OPENAI_API_KEY is for api.example.com only, as Bearer: the variable holds a placeholder, "
                          "which begins with vaultswap_, and not the key, and this machine's vault puts the key in its "
-                         "place only in the Authorization header of an HTTPS request to that host, in that form, and "
+                         "place only in an HTTPS request to that host, in that form, and "
                          "nowhere else; a request with the placeholder in another form or another place gets a "
                          "refusal; never write a placeholder into a file or into an application's configuration, on a "
                          "server or in a repository: it works only in this session's own requests; when a program "

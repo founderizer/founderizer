@@ -1036,8 +1036,8 @@ class Cases(Base):
         to report to the MANAGER, because a duty's watch starts a case task and somebody has to read its result --
         so every duty a lead could write for its own team was refused, which is why cd0b3cd took both tools away.
         The rule it was standing in for is wake_route's, and that one already handles a lead's worker: the case task
-        is the lead's subtask under a parent task the manager requests, so the lead reads its team's case results in
-        a session the hub starts for it."""
+        is the lead's subtask under the lead's team-results task, which the agent above the lead requests, so the lead
+        reads its team's case results in a session the hub starts for it."""
         tid = self.with_a_lead()
         text, error = self.tool("lead", "set_duty", task_id=hub.tref(tid), request_id=str(uuid.uuid4()),
                                 agent="vps", text="Watch the shop's order queue. When an order sticks, find out "
@@ -1084,6 +1084,31 @@ class Cases(Base):
         hub.TEAM["agents"]["lead"]["active"] = False
         self.assertIn("lead is in setup, so manager gives vps its tasks", hub.authority("lead", "vps", "task")[1])
         self.assertEqual(hub.peer_canceler("vps"), "manager")
+        # A lead under another lead: its team-results task is a subtask of the same task of the lead above it, up to
+        # the manager, so each result reaches a session that checks it (nested leads, 20 November 2026)
+        hub.TEAM["agents"]["lead"]["active"] = True
+        hub.TEAM["agents"]["top"] = {"role": "lead", "runtime": "claude", "machine": "vps", "can": ["shell"]}
+        hub.TEAM["agents"]["lead"]["reports_to"] = "top"
+        self.assertEqual(hub.wakeups.wake_route(hub.wake_org(), "vps")[0],
+                         {"kind": "task", "owner": "vps", "requester": "lead",
+                          "parent": {"owner": "lead", "requester": "top"}})
+        with hub.LOCK, hub.transaction():           # its open one, which the manager requested, takes no more
+            batch = hub.lead_batch_rows("lead", hub.now())
+        batch = hub.get_task(batch)                 # a read outside the transaction (q commits)
+        self.assertNotEqual(batch["id"], parent["id"])
+        self.assertNotIn(hub.get_task(parent["id"])["state"], hub.TERMINAL)    # it ends with its own subtasks
+        above = hub.get_task(batch["parent"])
+        self.assertEqual((batch["owner"], batch["requester"], above["owner"], above["requester"], above["parent"]),
+                         ("lead", "top", "top", "manager", None))
+        # and when the lead above moves, the next work follows the whole line of now, not only its first level
+        hub.TEAM["agents"]["upper"] = {"role": "lead", "runtime": "claude", "machine": "vps", "can": ["shell"]}
+        hub.TEAM["agents"]["top"]["reports_to"] = "upper"
+        with hub.LOCK, hub.transaction():
+            again = hub.lead_batch_rows("lead", hub.now())
+        again = hub.get_task(again)
+        higher = hub.get_task(again["parent"])
+        self.assertNotEqual(again["id"], batch["id"])
+        self.assertEqual((again["requester"], higher["owner"], higher["requester"]), ("top", "top", "upper"))
 
     def test_a_key_that_another_duty_has_open_joins_that_case_and_keeps_no_copy(self):
         """Live, 3 November 2026: a lead's duty copied each of a DevOps agent's cases into a case of its

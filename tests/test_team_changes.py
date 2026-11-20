@@ -473,6 +473,22 @@ class TeamChanges(Remove):
             self.assertEqual(isinstance(refused.exception, hub.TeamPassing), passing, refused.exception)
             if not passing:
                 self.assertEqual(str(refused.exception), "There is no owner file knowledge/owner/brand.md.")
+        # the catalog stops being readable after the plan's own read: the 503 of the room check in knowledge_replaced
+        # passes by itself too, and closes no card (lanes/knowledge-list-on-a-failed-read.md)
+        before = "# Brand\n\nSource: brand.pdf · added 2026-10-01\n\nBlue.\n".encode()
+        reads = iter([listed, hub.UnreadCatalog()])
+        with patch.object(hub, "knowledge_entries", lambda: next(reads)), \
+                patch.object(hub, "git_blob", lambda rev, path: before), self.assertRaises(hub.TeamPassing):
+            hub.team_owner_file({"rev": "r" * 40, "team": hub.TEAM},
+                                dict(step, base_sha256=hub.hashlib.sha256(before).hexdigest()))
+        # every other refusal of knowledge_replaced still ends the plan: here the file has this text already (409)
+        same = "# Brand\n\nSource: brand.pdf · added 2026-10-01\n\n# Brand\n\nGreen.\n".encode()
+        with patch.object(hub, "knowledge_entries", lambda: listed), \
+                patch.object(hub, "git_blob", lambda rev, path: same), self.assertRaises(hub.ToolError) as refused:
+            hub.team_owner_file({"rev": "r" * 40, "team": hub.TEAM},
+                                dict(step, base_sha256=hub.hashlib.sha256(same).hexdigest()))
+        self.assertNotIsInstance(refused.exception, hub.TeamPassing)
+        self.assertEqual(str(refused.exception), "knowledge/owner/brand.md has this text already.")
 
     def test_a_plan_changes_each_thing_once(self):
         """Bug: the card shows two changes of one profile, and the press makes only the last."""

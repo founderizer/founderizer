@@ -2786,15 +2786,47 @@ def key_env(name):
 # ---------------------------------------------------------------- the key swap (VAULT.md, "The key swap")
 #
 # An API key that an agent reads can stay out of its sessions: the session holds a placeholder, and the vault of the
-# agent's machine puts the key into the Authorization header of an HTTPS request to the key's own site (vault.py).
-# Here is what the hub and the helper share: which key can swap, and the variables of a session that holds one.
+# agent's machine puts the key into the Authorization header, or into the one header that its form names, of an HTTPS
+# request to the key's own site (vault.py). Here is what the hub and the helper share: which key can swap, and the
+# variables of a session that holds one.
 
-# The one form in which a key goes into the Authorization header: its catalog entry names it (`form`), and the first
-# one holds for an entry that names none. basic-user: the key is the user name of Basic credentials; basic-password:
-# it is the password.
-KEY_FORMS = ("bearer", "token", "basic-user", "basic-password")
+# The one form in which a key goes into a request: its catalog entry names it (`form`), and the first one holds for an
+# entry that names none. Each of these is a word of the Authorization header with the key as the whole credential:
+# bearer, token and key (`Key <key>`, as FAL takes it); basic-user: the key is the user name of Basic credentials;
+# basic-password: it is the password. The other form is `header:<name>`: the key is the whole value of the one request
+# header of that name (`header:xi-api-key`, as ElevenLabs takes it; design key-swap-two-more-forms.md, version 2).
+KEY_FORMS = ("bearer", "token", "basic-user", "basic-password", "key")
+KEY_HEADER_FORM = "header:"
+KEY_HEADER_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+KEY_FORM_WORD = re.compile(r"[a-z][a-z0-9-]{0,39}")        # the shape of a word form, also of a later release's
+# A header form's name holds one of these words, so that it is a credential's header: a deny list alone fails open
+# (a site sends back many request headers, CORS's Access-Control-Request-Headers among them)
+KEY_HEADER_WORDS = ("key", "token", "secret", "auth")
+# Never a header form's name, though it can hold such a word: the scheme forms' own header, the proxy's dropped
+# headers (vault.py SWAP_NOT_PASSED), and names that hold no credential
+KEY_HEADER_NEVER = ("authorization", "proxy-authorization", "connection", "proxy-connection", "keep-alive", "upgrade")
+KEY_HEADER_NEVER_PARTS = ("idempoten", "csrf", "xsrf", "authenticat")
 KEY_SITE_HOST = re.compile(r"(?=.{1,240}$)(?![0-9.]+$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
                            r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+
+
+def key_form(form, full=False):
+    """True for a form of a key (KEY_FORMS, or header:<name>), for any value and with no exception. full: the whole
+    rule, which a write of a form and the vault's use keep (POST /ui/team/logins, the broker's read, the proxy): a
+    header's name holds a word of KEY_HEADER_WORDS and is no name of KEY_HEADER_NEVER, no sec-* name and holds no part
+    of KEY_HEADER_NEVER_PARTS. Without full, its shape only, which a read of stored data keeps (validate_team,
+    key_swap), so a later release that refuses one more name, or that adds a word of the Authorization header (any
+    plain word is a shape), never makes a stored team.json fail to load when this release runs it again. vault.py
+    swap_form keeps the same rule in its own code."""
+    if not isinstance(form, str):
+        return False
+    if form in KEY_FORMS or not full and KEY_FORM_WORD.fullmatch(form):
+        return True
+    name = form[len(KEY_HEADER_FORM):] if form.startswith(KEY_HEADER_FORM) else None
+    if name is None or not KEY_HEADER_NAME.fullmatch(name):
+        return False
+    return not full or (any(w in name for w in KEY_HEADER_WORDS) and name not in KEY_HEADER_NEVER and
+                        not name.startswith("sec-") and not any(p in name for p in KEY_HEADER_NEVER_PARTS))
 
 
 def key_site(value):
@@ -2896,7 +2928,7 @@ def key_swap(team, agent, ref):
         return None
     site, form = key_site(entry.get("site")), entry.get("form", KEY_FORMS[0])
     own = runtime_fact(conf.get("runtime"), "own_hosts")
-    if not site or form not in KEY_FORMS or not own:
+    if not site or not key_form(form) or not own:      # its shape only: the broker's read keeps the whole rule
         return None
     host = site.split("://", 1)[1].split(":")[0]
     if any(host == name or host.endswith("." + name) for name in own):

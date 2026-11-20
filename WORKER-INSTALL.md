@@ -495,7 +495,7 @@ of `hubsetup.py vault` adds the key again.
 
 An API key that an agent reads is a variable in its sessions. With the key swap, a key
 that has a site stays out of them: the session holds a placeholder, and the vault's
-swap proxy puts the key into the `Authorization` header of an HTTPS request to that
+swap proxy puts the key, in the key's own form, into an HTTPS request to that
 site only (VAULT.md, "The key swap"). **A new Linux server's install switches it on**
 (`join.sh`; `hub.sh` only where the owner chose one server for all,
 `FLEET_HUB_SERVER=shared`). On a server that joined before, the owner's Mac app
@@ -541,10 +541,11 @@ has mode 751, `vault.sock` 660 and `swap.sock` 666 (the broker answers on `swap.
 only the proxy's user, which it reads from the kernel).
 
 After the step, a key swaps when the owner gave it a site (`POST /ui/team/logins` with
-`site`, and `form` when the key does not go as `Bearer`), an agent of this machine
-reads it, and the agent's program is Claude Code or Codex. Its next session then gets
-the placeholder. On such a machine the vault also sends that key in a `call_api`
-request only to that site, in the `Authorization` header and in the key's own form.
+`site`, and `form` when the key does not go as `Bearer`: `token`, `key`, `basic-user`,
+`basic-password` or `header:<name>`), an agent of this machine reads it, and the agent's
+program is Claude Code or Codex. Its next session then gets the placeholder. On such a
+machine the vault also sends that key in a `call_api` request only to that site, and in
+the key's own form.
 
 The hub reads no report of a machine for the key swap. The owner's Mac app reads each
 joined Linux server of the fleet but the hub's own machine: it runs the vault's own step there

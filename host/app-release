@@ -24,6 +24,8 @@ deploy user could change meanwhile. The release is root:root, folders
 0555, files 0444, or 0555 for a file that was executable. It writes .release.env with APP_RELEASE_SHA, the name of
 both procedures, points `previous` at the release that ran and `current` at the new one, each in one rename, restarts
 only the app's unit, and waits for the health path on the app's loopback port to answer 200 with the sha in its body.
+The release's own code answers there, so root follows no redirect of it: a 3xx is an unhealthy answer (unhealthy),
+and a failure's words say what the last answer was.
 When that fails, `current` and `previous` go back, the unit restarts, and that release must answer too. After a
 healthy release, the oldest releases and artifacts go, five of each stay, and a pruning error is a warning that never
 undoes a good release.
@@ -33,11 +35,13 @@ Standard library only. Exit status: 0 done, 3 refused (the one line says why), 1
 import contextlib
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import pwd
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -52,6 +56,8 @@ APPS = "/etc/ops-root/apps"
 KEEP = 5                    # releases and artifacts that a prune keeps, beside `current` and `previous`
 ARTIFACT_MAX = 2 * 1024 ** 3
 HEALTH_WAIT = 90            # seconds that a release has to answer its health path
+HEALTH_TRY = 10             # seconds for one request of the health path, its whole answer included
+HEALTH_MAX = 65536          # bytes of that answer that the check reads
 APP = re.compile(r"[a-z][a-z0-9-]{0,23}")
 SHA = re.compile(r"[0-9a-f]{40}")
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
@@ -262,18 +268,91 @@ def restart(app):
     return status == 0
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None             # the app's own answer: one that sends root's request elsewhere is an unhealthy one
+
+
+class Slow(Exception):
+    pass
+
+
+LAST = {"why": None}        # why the last answer of a health check was not a healthy one (unhealthy), or None
+
+
+def unhealthy(port, health, sha):
+    """None when one request of the health path on the app's loopback port gets 200 with the release's sha in the
+    first HEALTH_MAX bytes, all within HEALTH_TRY seconds; else why not, in a few words. A release's code answers it,
+    and that code can be anybody's: root follows no redirect, which could send its request to any host or to this
+    host's own loopback services, past the outgoing rules of the app's own user; it takes no proxy; and a socket's
+    timeout bounds each read but not their sum, so the whole request has its own time. The body is read with read1,
+    one buffer at most each time: read() takes a chunk's size as the answer gives it, and a size of -1 read to the end
+    of the answer, in root's memory. Any answer that the check cannot read is an unhealthy one too, so the deploy goes
+    on to its rollback."""
+    def late(signum, frame):
+        raise Slow()
+    try:
+        before, armed = signal.signal(signal.SIGALRM, late), True
+    except ValueError:          # not the program's main thread (a test's): no timer, so an endless answer holds it
+        before, armed = None, False
+    try:
+        try:
+            if armed:
+                signal.setitimer(signal.ITIMER_REAL, HEALTH_TRY)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+            with opener.open(f"http://127.0.0.1:{port}{health}", timeout=5) as r:
+                if r.status != 200:
+                    return f"HTTP {r.status}"
+                body = b""
+                while len(body) < HEALTH_MAX:
+                    piece = r.read1(HEALTH_MAX - len(body))
+                    if not piece:
+                        break
+                    body += piece
+                if sha not in body[:HEALTH_MAX].decode("utf-8", "replace"):
+                    return f"HTTP 200 without the release's sha in its first {HEALTH_MAX // 1024} KiB"
+                return None
+        finally:
+            if armed:
+                signal.setitimer(signal.ITIMER_REAL, 0)     # an alarm that comes before this line is caught below
+    except urllib.error.HTTPError as e:
+        with contextlib.suppress(Exception):
+            e.close()
+        return f"a redirect, HTTP {e.code}, which the check never follows" if 300 <= e.code < 400 else \
+            f"HTTP {e.code}"
+    except Slow:
+        return f"no whole answer within {HEALTH_TRY:g} seconds"
+    except (urllib.error.URLError, OSError, ValueError):
+        return "no answer"
+    except http.client.HTTPException:
+        return "an answer that is not HTTP"
+    except Exception:           # an answer that breaks the reader otherwise, as a chunk size of -2**64 does
+        return "an answer that the check cannot read"
+    finally:
+        if armed:
+            signal.signal(signal.SIGALRM, signal.SIG_DFL if before is None else before)
+
+
 def healthy(port, health, sha, wait=HEALTH_WAIT):
-    """True when the app answers its health path on its loopback port with 200 and the release's sha."""
+    """True when the app answers its health path on its loopback port with 200 and the release's sha (unhealthy); else
+    False, and LAST says why its last answer was not a healthy one."""
     end = time.monotonic() + wait
     while True:
-        with contextlib.suppress(urllib.error.URLError, OSError, ValueError):
-            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
-                    f"http://127.0.0.1:{port}{health}", timeout=5) as r:
-                if r.status == 200 and sha in r.read(65536).decode("utf-8", "replace"):
-                    return True
+        try:
+            LAST["why"] = unhealthy(port, health, sha)
+        except Slow:            # an alarm that came as unhealthy() stopped its timer: the same answer
+            LAST["why"] = f"no whole answer within {HEALTH_TRY:g} seconds"
+        if LAST["why"] is None:
+            return True
         if time.monotonic() >= end:
             return False
         time.sleep(2)
+
+
+def last_answer():
+    """Why the last health check failed, for the words of a failure: "" when none failed in this run."""
+    why, LAST["why"] = LAST["why"], None
+    return f" (its last answer: {why})" if why else ""
 
 
 @contextlib.contextmanager
@@ -329,6 +408,7 @@ def deploy(app, artifact, checksum, sha):
         if restart(app) and healthy(port, health, sha):
             prune(tree)
             return f"{app} runs {sha}"
+        said = last_answer()                    # the new release's, before the check of the release that ran
         if old and old != release:
             point(f"{tree}/current", old)       # both links as they were: a rollback then leaves the release that runs
             if before:
@@ -336,8 +416,8 @@ def deploy(app, artifact, checksum, sha):
             else:
                 os.remove(P(f"{tree}/previous"))
             if restart(app) and healthy(port, health, os.path.basename(old)):
-                raise Failed(f"{sha} did not answer its health check: {os.path.basename(old)} runs again")
-        raise Failed(f"{sha} did not answer its health check, and no earlier release answers either")
+                raise Failed(f"{sha} did not answer its health check{said}: {os.path.basename(old)} runs again")
+        raise Failed(f"{sha} did not answer its health check{said}, and no earlier release answers either")
 
 
 def rollback(app):
@@ -352,7 +432,7 @@ def rollback(app):
             point(f"{tree}/previous", now_running)
         if restart(app) and healthy(port, health, os.path.basename(before)):
             return f"{app} runs {os.path.basename(before)} again"
-        raise Failed(f"{os.path.basename(before)} did not answer its health check")
+        raise Failed(f"{os.path.basename(before)} did not answer its health check{last_answer()}")
 
 
 def prune(tree):

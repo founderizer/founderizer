@@ -3133,11 +3133,13 @@ def tools():
         tool("save_login", "The owner's own title for one login of the vault, by its bws://<uuid> reference, or "
                            "delete true to take it out of the catalog. This is the label only: no value of a login "
                            "passes here, and the vault is not touched. For an API key also: site, the https address "
-                           "of the service that the key is for, and form, how the key goes into the Authorization "
-                           "header there: bearer (when none is given), token, basic-user (the key is the user name "
-                           "of Basic) or basic-password. On a server whose vault swaps keys, an agent that reads a "
-                           "key with a site holds a placeholder in its sessions, and the vault puts the key into "
-                           "requests to that site only. An empty site or form takes it away.",
+                           "of the service that the key is for, and form, how the key goes into a request there: in "
+                           "the Authorization header as bearer (when none is given), token, key (Key <key>), "
+                           "basic-user (the key is the user name of Basic) or basic-password, or header:<name>, the "
+                           "whole value of that one header (header:xi-api-key; the name holds key, token, secret or "
+                           "auth). On a server whose vault swaps keys, an agent that reads a key with a site holds a "
+                           "placeholder in its sessions, and the vault puts the key into requests to that site only, "
+                           "in that form. An empty site or form takes it away.",
              {"login": S["text"], "title": S["text"], "site": S["text"], "form": S["text"], "delete": S["bool"],
               "base_sha256": S["record_base"], **rid},
              ("login",),

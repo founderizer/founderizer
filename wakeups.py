@@ -203,28 +203,34 @@ def wake_route(org, target):
 
     {"kind": "message", "to": <fleet manager>}
     {"kind": "task", "owner": <target>, "requester": <fleet manager>, "parent": None}
-    {"kind": "task", "owner": <target>, "requester": <R>, "parent": {"owner": <R>, "requester": <fleet manager>}}
+    {"kind": "task", "owner": <target>, "requester": <R>, "parent": {"owner": <R>, "requester": <R's boss>}}
 
     A requester other than the fleet manager reads results only in its own task sessions, so the hub starts a parent
-    task for it in the same transaction, and the target's task is its subtask. That requester must be a lead (it needs
-    the team tools) that gets its tasks from the fleet manager (boss). Every task of the route must pass the one authority function
-    (action "task"), so a wake never starts a task that its requester could not give."""
+    task for it in the same transaction (hub.lead_batch_rows), and the target's task is its subtask. That requester
+    must be a lead (it needs the team tools), and so must each agent above it up to the fleet manager: each such lead
+    holds the same task for its team's results, a subtask of the one of the lead above it, so each result reaches a
+    session that can check it (the owner, 20 November 2026: "yes we need that, definitely", of nested leads, which
+    this refused before). Every task of the route must pass the one authority function (action "task"), so a wake
+    never starts a task that its requester could not give."""
     if target == org.manager:
         return {"kind": "message", "to": target}, None
     requester = boss(org, target)
     parent = None
     if requester != org.manager:
-        conf = org.agents.get(requester) or {}
-        if conf.get("role") != "lead":
-            return None, (f"{requester} would receive {target}'s result, but it is not a lead, so it has no tools to "
-                          f"check results. The owner can make it a lead.")
-        if boss(org, requester) != org.manager:
-            return None, (f"{requester} would receive {target}'s result, but it gets its tasks from "
-                          f"{boss(org, requester)}, not from the manager. A wake-up can go through one lead only.")
-        parent = {"owner": requester, "requester": org.manager}
-        allowed, why = org.authority(org.manager, requester, "task")
-        if not allowed:
-            return None, why
+        below, lead, seen = target, requester, {target}
+        while lead != org.manager:          # each lead up to the fleet manager, with the task that it requests
+            if (org.agents.get(lead) or {}).get("role") != "lead":
+                return None, (f"{lead} would receive {below}'s result, but it is not a lead, so it has no tools to "
+                              f"check results. The owner can make it a lead.")
+            if lead in seen:                # hub.check_lines refuses a loop in the reporting lines
+                return None, f"The reporting lines above {target} go round in a loop."
+            seen.add(lead)
+            above = boss(org, lead)
+            allowed, why = org.authority(above, lead, "task")
+            if not allowed:
+                return None, why
+            below, lead = lead, above
+        parent = {"owner": requester, "requester": boss(org, requester)}
     allowed, why = org.authority(requester, target, "task")
     if not allowed:
         return None, why
@@ -701,7 +707,9 @@ def batch_fields(lead):
                         "they open from conversations, are subtasks of this task, and more join it while it is "
                         "open. Their results, questions and permission prompts arrive in this session. Check each "
                         "result with check_result: closely where an agent's record is weak, by sample where it is "
-                        "good; you decide. Answer with answer. Deliver this task when no subtask is open."),
+                        "good; you decide. Answer with answer. The same task of each lead under you is a subtask "
+                        "too: check its result when that lead delivers it. Deliver this task when no subtask is "
+                        "open."),
             "done_when": "Every subtask has ended and you have checked its result.", "needs": "none"}
 
 

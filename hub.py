@@ -73,6 +73,10 @@ try:
     import door_targets  # the door's rules of this code, never the ones that a release puts beside it before the restart
 except FileNotFoundError:   # a copy of the kit's top files with no host/ folder (a test's seed): it loads them later
     pass
+try:
+    import thread_door  # the repository calls of a narrowed conversation, of this code too (it imports door_targets)
+except FileNotFoundError:   # the same copy: thread_door imports door_targets, which reads host/
+    pass
 import diagnostics  # the lane "Bug reports": the hub's own faults and refused calls, with no words
 import errorreports  # the lane "Error reports": the day's report of them, while the owner has turned it on
 import mcp
@@ -1572,8 +1576,9 @@ def read_twice(team, agent, ref):
 # ---------------------------------------------------------------- the key swap (VAULT.md, "The key swap")
 #
 # An API key that an agent reads can stay out of its sessions. On a machine whose vault swaps keys, the session holds
-# a placeholder, and the vault's proxy puts the key into the Authorization header of an HTTPS request to the key's own
-# site (vault.py). The hub's part: it names the site and the form of each key that can swap in its answer to the
+# a placeholder, and the vault's proxy puts the key into the Authorization header, or the one header that its form
+# names, of an HTTPS request to the key's own site (vault.py). The hub's part: it names the site and the form of each
+# key that can swap in its answer to the
 # vault's read, and it answers the vault's question at each use, "does this agent still read this key at this site?".
 # Whether a machine swaps is its vault's own root-owned setting, and no report of an agent's side: the hub does not
 # ask it, and its answers to a vault do not decide by it. What the hub SAYS about an agent's keys (the settings check,
@@ -1625,7 +1630,7 @@ def key_table_mark_ok(entry):
             or not isinstance(mark["on"], bool):
         return False
     if mark["on"]:
-        return bool(lifecycle.key_site(entry.get("site"))) and entry.get("form") in lifecycle.KEY_FORMS
+        return bool(lifecycle.key_site(entry.get("site"))) and lifecycle.key_form(entry.get("form"))
     return "site" not in entry and "form" not in entry
 
 
@@ -1718,7 +1723,17 @@ def switch_key_site(by, key, to, why):
 # The form of a key's placeholder in a request (lifecycle.KEY_FORMS), in the words of a start text: the proxy puts the
 # key in only in that form (vault.py swap_found), so the words name it beside the host (the changed key swap, Part D)
 KEY_FORM_WORDS = {"bearer": "as Bearer", "token": "as token", "basic-user": "as the user name of Basic",
-                  "basic-password": "as the password of Basic"}
+                  "basic-password": "as the password of Basic", "key": "as Key"}
+
+
+def key_form_said(form):
+    """A key's form in the words of a start text: KEY_FORM_WORDS, a header form's own words, or the form by its name
+    (a later release's form)."""
+    if form in KEY_FORM_WORDS:
+        return KEY_FORM_WORDS[form]
+    if isinstance(form, str) and form.startswith(lifecycle.KEY_HEADER_FORM):
+        return f"as the whole value of the header {form[len(lifecycle.KEY_HEADER_FORM):]}"
+    return f"in the form {form}"
 
 
 def key_names(names):
@@ -1758,7 +1773,7 @@ def key_words(agent, short=False):
             held.append((name, found[0].split("://", 1)[1], found[1], isinstance(mark, dict) and mark.get("on") is True))
     if not held:
         return ""
-    said = lambda form: KEY_FORM_WORDS.get(form, f"in the form {form}")    # a later release's form: by its name
+    said = key_form_said
     sure = not shell_off(agent) and (agents().get(agent) or {}).get("vault") == "broker" \
         and any(key_swaps(agent, ref) for ref, _name in read_secrets(agent))    # one server, so each of them or none
     if not sure:                # the words of before Part D with each key's form, and no new clause (its section 4)
@@ -1767,7 +1782,7 @@ def key_words(agent, short=False):
                 + ", ".join(f"{name} for {host} {said(form)}" for name, host, form, _made in held) + ")"
         return (" (" + ", ".join(f"{name} is for {host} only, {said(form)}" for name, host, form, _made in held)
                 + ": when its value begins with vaultswap_, it is a placeholder, and this machine's vault puts the key "
-                "into the Authorization header of an HTTPS request to that host, and nowhere else; a program that needs "
+                "into an HTTPS request to that host, in that form, and nowhere else; a program that needs "
                 "the key itself does not work with a placeholder, so ask your requester then, and do not look for the "
                 "key)")
     manager = role_of(agent) == "manager"
@@ -1787,7 +1802,7 @@ def key_words(agent, short=False):
                 + ")")
     return (" (" + ", ".join(f"{name} is for {host} only, {said(form)}" for name, host, form, _made in held)
             + ": the variable holds a placeholder, which begins with vaultswap_, and not the key, and this machine's "
-            "vault puts the key in its place only in the Authorization header of an HTTPS request to that host, in "
+            "vault puts the key in its place only in an HTTPS request to that host, in "
             "that form, and nowhere else; a request with the placeholder in another form or another place gets a "
             "refusal; never write a placeholder into a file or into an application's configuration, on a server or "
             "in a repository: it works only in this session's own requests; when a program needs the key itself, "
@@ -10935,10 +10950,17 @@ def deliver_result(agent, a, files_said=None):
     t = get_task(tid, owner=agent)
     if t["state"] in TERMINAL:
         raise ToolError(f"{tref(tid)} is already {t['state']}. A finished task is never reopened.")
-    left = q(f"SELECT id FROM tasks WHERE parent=? AND {OPEN_TASK} ORDER BY id", (tid,))
+    left = q(f"SELECT id, owner, title FROM tasks WHERE parent=? AND {OPEN_TASK} ORDER BY id", (tid,))
     if left:
-        raise ToolError(f"{tref(tid)} still has open subtasks: {', '.join(tref(r['id']) for r in left)}. "
-                        f"Check or cancel them first.")
+        # the team-results task of a lead under this one (lead_batch_rows) ends when that lead delivers it: a cancel
+        # would end the work of that lead's whole team (cancel_subtasks), which is not this lead's to give
+        teams = [r for r in left if team_results_task(r)]
+        rest = [r for r in left if r not in teams]
+        raise ToolError(f"{tref(tid)} still has open subtasks: {', '.join(tref(r['id']) for r in left)}. " +
+                        ("Check or cancel them first." if not teams else
+                         (f"Check or cancel {', '.join(tref(r['id']) for r in rest)} first. " if rest else "") +
+                         f"{', '.join(tref(r['id']) for r in teams)}: the results of a team under you, which its "
+                         f"lead delivers when they are done. Wait for each, and cancel none of them."))
     # Rule 3 and check_result's text: whoever gave a task checks its result. check_result reaches a subtask only from this session, so a
     # result left unchecked here could never be checked by anybody again.
     unchecked = [r for r in q("SELECT id, owner, peer FROM tasks WHERE parent=? AND state IN ('completed','failed',"
@@ -11712,7 +11734,8 @@ def task_job(agent, a, follows, parent, step, case_id):
     if step is not None:
         first = q1("SELECT id FROM tasks WHERE step=? AND state<>'canceled' ORDER BY id LIMIT 1", (step,))
         return (first["id"] if first else None), False
-    if parent is not None and kv_get(f"lead_batch:{agent}") != str(parent):
+    if parent is not None and kv_get(f"lead_batch:{agent}") != str(parent) and \
+            not team_results_task(q1("SELECT owner, title FROM tasks WHERE id=?", (parent,))):
         return parent, False
     return None, False
 
@@ -23393,7 +23416,7 @@ def t_ask_team(agent, a):
         if len(named) != len(ids):
             raise ToolError(f"Each of messages must be one that {person['name']} or you wrote in this conversation.")
         rows = [r for r in named if r["who"] == "person"]         # their words reach the task; yours stay here
-        if record:      # one record for a colleague's question: a read-only token for it (question_record)
+        if record:      # one record for a colleague's question: a token for that one record (question_record)
             if not (shell_off(agent) and person_access(person)["tools"] and
                     person_scope(person["id"], agent) is None):
                 raise ToolError("record is for a colleague's question to an agent whose Shell box is off.")
@@ -23417,8 +23440,9 @@ def t_ask_team(agent, a):
                    f"with your own tools, and nothing outside it. Your result goes back into C-{conv['id']}, and that "
                    f"conversation tells {person['name']}: write the result as what they may read." +
                    (f"\n\nThe question is about the record {record}. Your MCP server that reads records holds a "
-                    f"read-only token for that one record in this session: read it there, and answer from it, with "
-                    f"its link when it gives one. This task keeps no wish and waits for nobody." if record else
+                    f"token for that one record in this session: read it there, do there what its tools allow, and "
+                    f"answer from it, with its link when it gives one. This task keeps no wish and waits for nobody."
+                    if record else
                     f"\n\nWhen you cannot go on without an answer of your line, ask with message_agent and waits=true: "
                     f"this task waits, and the answer comes to it. A lasting wish of {person['name']}'s about your "
                     f"work for them, in a message of theirs that this task got, you keep with keep_instruction: that "
@@ -30988,8 +31012,8 @@ def duty_target(body, old=None):
     That last one used to be spelled "a worker or a lead that reports to the manager", which refused every duty a
     lead could write for its own team -- the reason cd0b3cd took both duty tools off a lead. The rule it was
     standing in for is wake_route's, and that one already handles a lead's worker: the case task becomes the lead's
-    subtask, under a parent task the manager requests, so the lead reads its team's case results in a session the
-    hub starts for it. One rule, in the place that already had it."""
+    subtask, under the lead's team-results task, which the agent above the lead requests, so the lead reads its
+    team's case results in a session the hub starts for it. One rule, in the place that already had it."""
     agent = body["agent"]
     if agent not in agents():
         raise Refusal(400, f"there is no agent {agent} in the team")
@@ -37884,12 +37908,14 @@ def profile_unknown_file(sections, plan=False):
     """The first path of these sections' Knowledge files that is not in the knowledge catalog, or None: the owner's
     own profile save refuses it (ui_profile_save), and so does a team plan. plan: a team plan's check, which raises
     TeamPassing when the catalog cannot be read now and the sections list a file, so that its card stays and a pressed
-    plan tries again, and never says that a file is not there (lanes/a-knowledge-read-that-fails.md; the owner's
-    save keeps its own answer)."""
+    plan tries again, and never says that a file is not there (lanes/a-knowledge-read-that-fails.md); the owner's
+    save then answers 503 knowledge_unread (lanes/knowledge-list-on-a-failed-read.md)."""
     listed = next((knowledge_list(x["text"]) for x in sections if x["key"] == "knowledge_files"), [])
     entries = knowledge_entries()
-    if plan and listed and isinstance(entries, UnreadCatalog):
-        raise TeamPassing(KNOWLEDGE_PASSING, KNOWLEDGE_PASSING_OWNER)
+    if listed and isinstance(entries, UnreadCatalog):
+        if plan:
+            raise TeamPassing(KNOWLEDGE_PASSING, KNOWLEDGE_PASSING_OWNER)
+        raise Refusal(503, code="knowledge_unread")
     catalog = {k["path"] for k in entries}
     return next((p for p in listed if p not in catalog), None)
 
@@ -38324,9 +38350,10 @@ def team_owner_file(ctx, c):
     path, text = c.get("path"), c.get("text")
     if not isinstance(path, str) or knowledge_scope(path) != "owner" or not path.endswith(".md"):
         raise ToolError("path is an owner file: knowledge/owner/<name>.md.")
-    # The catalog first: while it cannot be read, knowledge_replaced would find room in no file, and a file that it
-    # lists but git does not give now is a read that failed, not a file that is gone. A plain ToolError would close
-    # the owner's card at the press and at the sweep; TeamPassing keeps it.
+    # The catalog first: while it cannot be read, knowledge_replaced refuses with 503 knowledge_unread, and a file that
+    # it lists but git does not give now is a read that failed, not a file that is gone. A plain ToolError would close
+    # the owner's card at the press and at the sweep; TeamPassing keeps it, also for that 503 when the catalog stops
+    # being readable between this read and knowledge_replaced's (lanes/knowledge-list-on-a-failed-read.md).
     catalog = knowledge_entries()
     if isinstance(catalog, UnreadCatalog):
         raise TeamPassing(KNOWLEDGE_PASSING, KNOWLEDGE_PASSING_OWNER)
@@ -38343,6 +38370,8 @@ def team_owner_file(ctx, c):
     try:
         content = knowledge_replaced(path, before, text)
     except Refusal as e:
+        if getattr(e, "extra", {}).get("code") == "knowledge_unread":
+            raise TeamPassing(KNOWLEDGE_PASSING, KNOWLEDGE_PASSING_OWNER) from None
         raise ToolError(str(e)) from None
     ctx["files"][path] = content
     readers = sorted(knowledge_readers(path, rev))
@@ -40210,8 +40239,8 @@ def settings_words(agent, keys, boxes):
             target = each if len(swaps) == len(keys) else those if swaps == calls else \
                 named_few(swaps, SETTINGS_FIT_NAMED) if names else f"{len(swaps)} of these keys"
             options.append(f"Switch the key swap on for its server {a.get('machine')} (WORKER-INSTALL.md says how): "
-                           f"the vault then keeps {target} out of its sessions, and it puts the key into the "
-                           f"Authorization header of an HTTPS request to the key's site. Cost: "
+                           f"the vault then keeps {target} out of its sessions, and it puts the key into an HTTPS "
+                           f"request to the key's site, in the key's own form. Cost: "
                            + (f"it also swaps {also} key{'s' if also > 1 else ''} of "
                               f"{'another agent' if len(others) == 1 else f'{len(others)} other agents'} of that "
                               f"server, and " if others else "")
@@ -43191,8 +43220,9 @@ def question_task(task_id):
 
 def question_record(task_id):
     """{"record", "message"} of a colleague's question about one record (ask_team's record), else None: the record
-    as the person's message names it, and that message's id. Its task gets a read-only token for that record from
-    each server of question_servers, keeps no wish and waits for nobody. None too when the task is no colleague's
+    as the person's message names it, and that message's id. Its task gets a token for that record from each server of
+    question_servers, whose own tools decide what the token can do (a read; a CRM's draft or note that a person then
+    sends), keeps no wish and waits for nobody. None too when the task is no colleague's
     question any more (staff_question): a person who lost their tools or got a list. read_row only."""
     if not task_id or staff_question(task_id)[1] is None:
         return None
@@ -45187,23 +45217,41 @@ def admit_wake(t, run, admission, line, t0):
     return tid, None, parent
 
 
+def team_results_task(row):
+    """True for task row `row` (its owner and title) when it is a lead's task for its team's results (lead_batch_rows),
+    also an older one that takes no more work: the hub gives each the same title (wakeups.batch_fields)."""
+    return bool(row) and row["title"] == wakeups.batch_fields(row["owner"])["title"]
+
+
 def lead_batch_rows(lead, t0):
     """Inside the caller's transaction: the lead's one open task for its team's waiting results (plan P9.11), made
     when it has none. A wake-up, a case, a duty review or the work from a conversation (conversation_line_task) of an
     agent under the lead becomes a subtask of it, so the lead checks those results together, in one session, instead
     of one task and one session for each. A task that the lead has delivered (deliver_result refuses while a subtask
-    is open or unchecked) is replaced by a new one."""
+    is open or unchecked) is replaced by a new one. A lead that gets its tasks from a lead above it (task_giver) has
+    its task requested by that lead, as a subtask of the same task of that lead, and so on up to the fleet manager:
+    each result reaches a session that can check it (wakeups.wake_route checks each level's authority first). An
+    open task whose requester is no longer the lead's giver (the owner moved the lead, or a lead above it went into
+    setup or got its Shell box off), or whose parent is no longer the current task of the lead above, takes nothing
+    more: a new one follows the line of now, and the old one ends with
+    its own subtasks, so new work never skips a level."""
     in_transaction("lead_batch_rows")
+    up = task_giver(lead)
+    nested = bool(up) and up != manager_name() and role_of(up) == "lead"
+    requester = up if nested else manager_name()
+    # the whole line of now, from the top down: the task above first, so that a move of a lead further up also
+    # makes a new task here (an open task above stays open while this one is open, so a current line makes none)
+    parent = lead_batch_rows(up, t0) if nested else None
     key = f"lead_batch:{lead}"
     row = DB.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
     if row and str(row[0]).isdigit():
-        open_task = DB.execute(f"SELECT id FROM tasks WHERE id=? AND owner=? AND {OPEN_TASK}",
-                               (int(row[0]), lead)).fetchone()
+        open_task = DB.execute(f"SELECT id FROM tasks WHERE id=? AND owner=? AND requester=? AND parent IS ? AND "
+                               f"{OPEN_TASK}", (int(row[0]), lead, requester, parent)).fetchone()
         if open_task:
             return open_task[0]
     fields = wakeups.batch_fields(lead)
-    tid = admit_task(manager_name(), dict(fields, goal=None, goal_id=None, parent=None, follows=None, case_id=None,
-                                          why="The results of the agents that it leads arrive in this task."))
+    tid = admit_task(requester, dict(fields, goal=None, goal_id=None, parent=parent, follows=None, case_id=None,
+                                     why="The results of the agents that it leads arrive in this task."))
     DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, str(tid)))
     return tid
 
@@ -46222,9 +46270,14 @@ def start_sandbox(conf):
 def verify_merge(agent, items, status):
     """A setup check: the helper's items, and the hub's own (knowledge files, sandbox, vault, logins not probed)."""
     rev = kit_revision(fresh=True)
-    catalog = {k["path"] for k in knowledge_entries()}
+    entries = knowledge_entries()
+    catalog = {k["path"] for k in entries}
     out = [i for i in items if not (i["kind"] == "access" and i["ref"] in ("sandbox", "vault"))]
     for path in profile_knowledge_files(agent, rev):
+        if isinstance(entries, UnreadCatalog):          # not a file that failed: a check that waits for a read
+            out.append({"kind": "knowledge", "ref": path, "state": "not_verified",
+                        "detail": "The hub cannot read its knowledge catalog now."})
+            continue
         out.append({"kind": "knowledge", "ref": path, "state": "ok" if path in catalog else "failed",
                     "detail": (f"In the catalog at {rev[:7]}." if path in catalog else
                                f"Not in the hub's knowledge catalog at {rev[:7]}.")})
@@ -49438,6 +49491,24 @@ def knowledge_shown():
     return last if key and key[0] == CFG.get("artifact_repo", os.path.dirname(os.path.abspath(__file__))) else None
 
 
+def owner_catalog():
+    """The owner's files of the knowledge catalog, for an owner's write that checks its room or a file's name against
+    them: 503 knowledge_unread while the catalog cannot be read now (an UnreadCatalog), so that no room check passes
+    against no file."""
+    catalog = knowledge_entries()
+    if isinstance(catalog, UnreadCatalog):
+        raise Refusal(503, code="knowledge_unread")
+    return [k for k in catalog if k["scope"] == "owner"]
+
+
+def owner_file_unread(path):
+    """For an owner's write to an owner file whose bytes git_blob did not give, which it gives for a read that failed as
+    for no file: 503 knowledge_unread while the catalog cannot be read now or lists the file, as team_owner_file tells
+    the two apart. The caller's own answer follows for a file that the catalog, read now, does not have."""
+    if any(k["path"] == path for k in owner_catalog()):
+        raise Refusal(503, code="knowledge_unread")
+
+
 def knowledge_text(entry):
     """The text of one catalog file, from the commit of its catalog entry, or None."""
     repo = CFG.get("artifact_repo", os.path.dirname(os.path.abspath(__file__)))
@@ -49708,8 +49779,9 @@ def knowledge_add(path, content, attachment=None):
         raise Refusal(503, code="revision_unreadable")
     if git_blob(rev, path) is not None:
         raise Refusal(409, f"{path} exists already. Delete it first.")
+    owner_file_unread(path)             # a file of this name that git did not give now is never written over
     files, _, in_all = KNOWLEDGE_LIMITS["owner"]
-    owner = [k for k in knowledge_entries() if k["scope"] == "owner"]
+    owner = owner_catalog()
     if len(owner) >= files or sum(k["bytes"] for k in owner) + len(content) > in_all:
         raise Refusal(413, f"the owner's knowledge has room for {files} files and {in_all // MIB} MiB")
     said = f"Owner added {path}" + (f" from the file they attached (A-{attachment})" if attachment else "")
@@ -49728,6 +49800,7 @@ def knowledge_delete(path):
     if not rev:
         raise Refusal(503, code="revision_unreadable")
     if git_blob(rev, path) is None:
+        owner_file_unread(path)
         raise Refusal(404, f"{path} is not in the repository")
     users = [name for name in agents() if path in profile_knowledge_files(name, rev)]
     if users:
@@ -49752,7 +49825,7 @@ def knowledge_replaced(path, before, text):
     if content.split(b"\n\n", 2)[2] == before.split(b"\n\n", 2)[2]:
         raise Refusal(409, f"{path} has this text already.")
     in_all = KNOWLEDGE_LIMITS["owner"][2]
-    if sum(k["bytes"] for k in knowledge_entries() if k["scope"] == "owner") - len(before) + len(content) > in_all:
+    if sum(k["bytes"] for k in owner_catalog()) - len(before) + len(content) > in_all:
         raise Refusal(413, f"the owner's knowledge has room for {in_all // MIB} MiB")
     return content
 
@@ -49767,6 +49840,7 @@ def knowledge_replace(path, text):
         raise Refusal(503, code="revision_unreadable")
     before = git_blob(rev, path)
     if before is None:
+        owner_file_unread(path)
         raise Refusal(404, f"{path} is not in the repository")
     content = knowledge_replaced(path, before, text)
     commit = commit_kit_file(path, content, f"Owner changed {path}")
@@ -49785,9 +49859,12 @@ def refresh_page(entry):
     """Read the page of one owner knowledge file (Add URL) again. When its text changed, commit the new text in the
     same file, under its own title, with today's date. Returns the commit, or None for the same text and for a file
     that did not come from a page. The page is read outside the lock, as for Add URL. Raises Refusal or ValueError
-    when the page or the file cannot change now."""
+    when the page or the file cannot change now: 503 knowledge_unread for a text that git does not give now, so that
+    the next look reads it again and not the next day (refresh_knowledge)."""
     old = knowledge_text(entry)
-    parts = (old or "").split("\n\n", 2)
+    if old is None:                     # a file of the catalog, which git read as text: a read that failed
+        raise Refusal(503, code="knowledge_unread")
+    parts = old.split("\n\n", 2)
     found = PAGE_SOURCE.fullmatch(parts[1]) if len(parts) == 3 else None
     if not found:
         return None
@@ -49800,9 +49877,10 @@ def refresh_page(entry):
         rev = kit_revision(fresh=True)
         before = git_blob(rev, entry["path"]) if rev else None
         if before is None:
+            owner_file_unread(entry["path"])
             raise Refusal(404, f"{entry['path']} is not in the repository")     # the owner deleted it meanwhile
         in_all = KNOWLEDGE_LIMITS["owner"][2]
-        if sum(k["bytes"] for k in knowledge_entries() if k["scope"] == "owner") - len(before) + len(content) > in_all:
+        if sum(k["bytes"] for k in owner_catalog()) - len(before) + len(content) > in_all:
             raise Refusal(413, f"the owner's knowledge has room for {in_all // MIB} MiB")
         commit = commit_kit_file(entry["path"], content, f"Hub refreshed {entry['path']} from its page")
         log("hub", f"refreshed {entry['path']} from its page in {commit[:12]}")
@@ -51728,9 +51806,11 @@ def validate_team(team, kept=None, shared_ok=None, browser_ok=None):
             raise ValueError(f"login {ref!r}: note is one plain line of 1 to {SECRET_NOTE_MAX} characters, as the hub "
                              f"writes it (no double quotation mark, bracket or control character), and note_by is "
                              f"who wrote it: {' or '.join(SECRET_NOTE_BY)}")
-        if "form" in entry and (entry["form"] not in lifecycle.KEY_FORMS or entry.get("kind") != "api_key"):
-            raise ValueError(f"login {ref!r}: form is how an API key goes into the Authorization header, one of "
-                             f"{', '.join(lifecycle.KEY_FORMS)}")
+        if "form" in entry and (not lifecycle.key_form(entry["form"]) or entry.get("kind") != "api_key"):
+            # the form's shape only (key_form): a later release that refuses one more header name never makes a
+            # stored team.json fail to load; POST /ui/team/logins keeps the whole rule
+            raise ValueError(f"login {ref!r}: form is how an API key goes into a request, one of "
+                             f"{', '.join(lifecycle.KEY_FORMS)}, or header:<name>")
         if "table" in entry and not key_table_mark_ok(entry):
             raise ValueError(f"login {ref!r}: table is the mark of a site that the table of well-known services made, "
                              f"{{row, on}}, for an API key: on true with a site that can swap and a form, on false with "
@@ -55337,7 +55417,7 @@ def key_swap_card_details(server, team=None):
             f"again.\n\n"
             f"The keys with a site on {server}:\n{lines}\n\n"
             f"What can stop: a program that does not send its request through the vault's proxy, or that sends the "
-            f"key in another place than the Authorization header, gets the placeholder, and the site refuses it. A "
+            f"key in another place or form than the key's own, gets the placeholder, and the site refuses it. A "
             f"check of these agents can stop in this way: after the switch, the fleet manager has each one run once. "
             f"You can change your answer later: tell your own AI to set the key swap of {server}.")
 
@@ -68707,9 +68787,13 @@ class Handler(BaseHTTPRequestHandler):
             if data.get("site", "") != "" and not login_site(data["site"]):
                 raise ValueError("site must be the https address where the login is used, with a host, or \"\" to "
                                  "take it away")
-            if data.get("form", "") != "" and data["form"] not in lifecycle.KEY_FORMS:   # the key swap (VAULT.md)
-                raise ValueError("form must be how the key goes into the Authorization header: " +
-                                 ", ".join(lifecycle.KEY_FORMS) + ", or \"\" to take it away")
+            if data.get("form", "") != "" and not lifecycle.key_form(data["form"], full=True):   # the key swap
+                raise ValueError("form must be how the key goes into a request: " + ", ".join(lifecycle.KEY_FORMS) +
+                                 " (words of the Authorization header), or header:<name> (the whole value of that "
+                                 "one header), where <name> is 1 to 64 small letters, digits and -, holds key, token, "
+                                 "secret or auth, and is no " + ", ".join(lifecycle.KEY_HEADER_NEVER) + " and no "
+                                 "sec-* name, and holds no " + ", ".join(lifecycle.KEY_HEADER_NEVER_PARTS) +
+                                 "; or \"\" to take it away")
             out = dict({"title": title.strip()}, **{k: data[k] for k in ("site", "form") if k in data})
             if "note" in data:          # the owner's words for the secret's note, or "" to take it away; a note
                 if not isinstance(data["note"], str):       # that holds a registered login is command_run's refusal
@@ -73234,8 +73318,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(409, {"error": "no such open task attempt of this agent"})
             asked = question_record(tid) if shell_off(agent) and not t["responsibility"] else None
             if asked and tool in question_servers(agent):
-                # a colleague's question about one record (ask_team's record): a read-only token for that record,
-                # named by the person and the message of theirs that asks, which the service counts and limits
+                # a colleague's question about one record (ask_team's record): a token for that record, named by the
+                # person and the message of theirs that asks, which the service counts and limits, and whose tools
+                # the service decides
                 c, person = None, staff_question(tid)[1]
                 body = {entry["mint"]["field"]: asked["record"], "asked_by": f"P-{person['id']}/CM-{asked['message']}"}
             else:
