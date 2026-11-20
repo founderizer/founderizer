@@ -61225,8 +61225,11 @@ def door_sealed(src):
 
 def door_call_statement(need, statement):
     """Why the owner's signed yes does not fit this Needs-you item, or None. It is {v: 1, kind: "door-call", fleet,
-    need, call, at} in its canonical form (vault.canonical), for this item and its door call. The door checks the
-    signature against the owner keys of its own access file, so the hub can hold a yes back and forge none."""
+    need, call, at} in its canonical form (vault.canonical), for this item and its door call, of this fleet, with
+    whole numbers, and with a time that the door takes (door.approval: not more than DOOR_MODE_AHEAD ahead, nor older
+    than DOOR_APPROVAL_DAYS): a yes that the door would refuse must not close the item (a review of 20 November 2026:
+    a Mac whose clock is six minutes fast). The door checks the signature against the owner keys of its own access
+    file, so the hub can hold a yes back and forge none."""
     call = need["door_call"] if "door_call" in need.keys() else None
     if not call:
         return "this Needs-you item names no door call"
@@ -61239,6 +61242,14 @@ def door_call_statement(need, statement):
         return "the statement is not a door-call statement in its canonical form"
     if said["v"] != 1 or said["kind"] != "door-call" or said["need"] != need["id"] or said["call"] != call:
         return "the statement is not the yes to this item's door call"
+    if any(type(said[k]) is not int for k in ("v", "need", "at")):
+        return "the statement is not a door-call statement in its canonical form"
+    if said["fleet"] != fleet_id():
+        return "the statement is not of this fleet"
+    if said["at"] > now() + DOOR_MODE_AHEAD:
+        return "the statement's time is in the future by the hub's clock: check this Mac's clock, and answer again"
+    if said["at"] < now() - DOOR_APPROVAL_DAYS * 86400:
+        return "the statement's time is older than the door takes: check this Mac's clock, and answer again"
     return None
 
 

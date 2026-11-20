@@ -1625,10 +1625,22 @@ class DoorCalls(Access):
         item = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
         self.assertEqual(item["door_call"], call)
         self.assertNotIn("approval", item)
-        yes = json.dumps({"v": 1, "kind": "door-call", "fleet": "f", "need": nid, "call": call, "at": 1},
-                         sort_keys=True, separators=(",", ":"))
+        fleet, at = hub.fleet_id(), round(hub.now())
+
+        def door_call(**more):
+            return json.dumps(dict({"v": 1, "kind": "door-call", "fleet": fleet, "need": nid, "call": call, "at": at},
+                                   **more), sort_keys=True, separators=(",", ":"))
+        yes = door_call()
+        # and what the door would refuse (door.approval), which would close the item with no yes at the door (a
+        # review of 20 November 2026: a Mac whose clock is six minutes fast)
         for wrong, choice, why in ((yes.replace(call, "d" * 64), 0, "this item's door call"),
-                                   (yes + " ", 0, "canonical form"), (yes, 1, "only the first option")):
+                                   (yes + " ", 0, "canonical form"), (yes, 1, "only the first option"),
+                                   (door_call(fleet="another-fleet"), 0, "not of this fleet"),
+                                   (door_call(at=at + 360), 0, "in the future by the hub's clock"),
+                                   (door_call(at=at - hub.DOOR_APPROVAL_DAYS * 86400 - 60), 0, "older than the door"),
+                                   (door_call(v=True), 0, "canonical form"), (door_call(need=float(nid)), 0,
+                                                                              "canonical form"),
+                                   (door_call(at=float(at)), 0, "canonical form")):
             status, answer = self.owner(f"/ui/needs/{nid}", choice=choice, statement=wrong, signature="c2ln")
             self.assertEqual(status, 400, answer)
             self.assertIn(why, answer["error"])
@@ -1676,8 +1688,8 @@ class DoorCalls(Access):
                            "'Has the owner answered?',?)", (task, hub.now()))
 
         def run_once(nid, call):
-            yes = json.dumps({"v": 1, "kind": "door-call", "fleet": "f", "need": nid, "call": call, "at": 1},
-                             sort_keys=True, separators=(",", ":"))
+            yes = json.dumps({"v": 1, "kind": "door-call", "fleet": hub.fleet_id(), "need": nid, "call": call,
+                              "at": round(hub.now())}, sort_keys=True, separators=(",", ":"))
             self.assertEqual(self.owner(f"/ui/needs/{nid}", choice=0, statement=yes, signature="c2ln")[0], 200)
         once, nid, call, title = card("logrotate -f /etc/logrotate.conf\n")
         asked = question(once)
@@ -2087,8 +2099,8 @@ class DoorCalls(Access):
         fleet = hub.fleet_id()
         mode = json.dumps({"v": 1, "kind": "door-mode", "fleet": fleet, "host": "web-1", "mode": "full", "at": 5},
                           sort_keys=True, separators=(",", ":"))
-        yes = json.dumps({"v": 1, "kind": "door-call", "fleet": "f", "need": nid, "call": call, "at": 1},
-                         sort_keys=True, separators=(",", ":"))
+        yes = json.dumps({"v": 1, "kind": "door-call", "fleet": fleet, "need": nid, "call": call,
+                          "at": round(hub.now())}, sort_keys=True, separators=(",", ":"))
         for wrong, choice, why in ((mode.replace("web-1", "web-2"), 1, "Full access on this item's server"),
                                    (mode.replace('"full"', '"auto"'), 1, "Full access on this item's server"),
                                    (mode + " ", 1, "canonical form"), (mode, 0, "not a door-call statement"),
@@ -2125,8 +2137,8 @@ class DoorCalls(Access):
         once_card = run_card(script="uptime\n")
         once = hub.t_raise_needs_you("manager", once_card)
         once_id = int(once.split("N-")[1].split(".")[0])
-        yes = json.dumps({"v": 1, "kind": "door-call", "fleet": "f", "need": once_id, "call": once_card["door_call"],
-                          "at": 1},
+        yes = json.dumps({"v": 1, "kind": "door-call", "fleet": hub.fleet_id(), "need": once_id,
+                          "call": once_card["door_call"], "at": round(hub.now())},
                          sort_keys=True, separators=(",", ":"))
         self.assertEqual(self.owner(f"/ui/needs/{once_id}", choice=0, statement=yes, signature="c2ln")[0], 200)
         answer = self.request("/door/approvals", source=DOOR)[1]
@@ -2405,7 +2417,8 @@ class DoorCalls(Access):
               "'Run one root script on web-1?','It lists a folder.','Answer',1,'manager',?,?,'web-1','ls -la /srv/app')",
               (json.dumps(["Run it once", "Full access on web-1", "No"]), run))
         for nid in (900, 901):
-            yes = json.dumps({"v": 1, "kind": "door-call", "fleet": hub.fleet_id(), "need": nid, "call": run, "at": 1},
+            yes = json.dumps({"v": 1, "kind": "door-call", "fleet": hub.fleet_id(), "need": nid, "call": run,
+                              "at": round(hub.now())},
                              sort_keys=True, separators=(",", ":"))
             for more in ({}, {"statement": yes, "signature": "c2ln"}):
                 status, answer = self.owner(f"/ui/needs/{nid}", choice=0, **more)
@@ -2416,7 +2429,8 @@ class DoorCalls(Access):
         # an older item whose hash the record does not hold: the hub cannot tell what its yes lets through
         hub.q("INSERT INTO needs(id,title,why,todo,raised,by,options,door_call) VALUES(902,'Delete the old test volume?',"
               "'It costs money.','Answer yes',1,'manager',?,?)", (json.dumps(["Yes, delete it", "No"]), "9" * 64))
-        yes = json.dumps({"v": 1, "kind": "door-call", "fleet": hub.fleet_id(), "need": 902, "call": "9" * 64, "at": 1},
+        yes = json.dumps({"v": 1, "kind": "door-call", "fleet": hub.fleet_id(), "need": 902, "call": "9" * 64,
+                          "at": round(hub.now())},
                          sort_keys=True, separators=(",", ":"))
         status, answer = self.owner("/ui/needs/902", choice=0, statement=yes, signature="c2ln")
         self.assertEqual(status, 409, answer)
@@ -2678,7 +2692,8 @@ class PhoneYes(Devices):
         nid = int(hub.t_raise_needs_you("manager", {"title": "Start the runner", "why": "It adds cost",
                                                     "what_to_do": "Answer yes", "door_call": call,
                                                     "options": ["Yes, run it once", "No"]}).split("N-")[1].split(".")[0])
-        yes = json.dumps({"v": 1, "kind": "door-call", "fleet": self.fleet, "need": nid, "call": call, "at": 1},
+        yes = json.dumps({"v": 1, "kind": "door-call", "fleet": self.fleet, "need": nid, "call": call,
+                          "at": round(hub.now())},
                          sort_keys=True, separators=(",", ":"))
 
         def answer(signature, db="test-generation"):
