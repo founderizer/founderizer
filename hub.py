@@ -1294,10 +1294,13 @@ def secret_grants(agent, team=None):
     return dict(((team or TEAM)["agents"].get(agent) or {}).get("secrets") or {})
 
 
-def granted_logins(agent, rev=None):
+def granted_logins(agent, rev=None, strict=False):
     """The bws:// logins that the owner gives this agent: its grants, and the references in its profile section
-    "Logins it may use" (at this revision of the owner's files, else at the hub's fresh one)."""
-    return profile_logins(agent, rev) | set(secret_grants(agent))
+    "Logins it may use" (at this revision of the owner's files, else at the hub's fresh one). strict: KitUnread for a
+    profile that git does not give now (profile_logins). A call without it keeps its two arguments, which tests stand
+    in for."""
+    return (profile_logins(agent, rev, strict=True) if strict else profile_logins(agent, rev)) | \
+        set(secret_grants(agent))
 
 
 # A secret's note (the owner, 19 November 2026, of several accounts of one site: "the need of adding notes/context to
@@ -25985,6 +25988,31 @@ def git_blob(rev, path):
     return r.stdout if r.returncode == 0 else None
 
 
+class KitUnread(Exception):
+    """git gave no answer now for a file of the configuration ref (kit_file): a read that failed, not a missing file."""
+
+
+def kit_file(rev, path):
+    """A committed file's exact bytes at commit `rev`, or None when the commit holds no file at `path`. git_blob gives
+    None for a read that failed as for no file; for its None this asks git once more with kit_batch, which tells a
+    missing path from no answer, and raises KitUnread for no answer (also for no `rev`), so that a write, or a check
+    that refuses one or holds an activation, never takes a failed read for no file."""
+    data = git_blob(rev, path) if rev else None
+    if data is not None:
+        return data
+    if rev:
+        with KIT_FILES_LOCK:            # a batch of this commit answered "missing" (kit_files): so it stays, no git
+            if KIT_PATHS.get((kit_dir(), rev, path), KIT_UNSEEN) is None:
+                return None
+    read = kit_batch(kit_dir(), rev, [path]) if rev else {}
+    if not read:
+        raise KitUnread(path)
+    return read.get(path, (None, None))[1]
+
+
+KIT_UNSEEN = object()       # a path that KIT_PATHS does not hold (kit_file)
+
+
 # The files of the configuration ref by commit (kit_files). A commit id names its tree for ever, so what a commit holds
 # at a path never changes, and nothing here is ever read again from git. KIT_PATHS: (checkout, commit, path) -> the
 # file's blob id, or None for a path that the commit does not hold as a file. KIT_OBJECTS: blob id -> its bytes, so a
@@ -26106,17 +26134,22 @@ def profile_paths():
     return [f"profiles/{name}.md" for name in agents()]
 
 
-def profile_logins(agent, rev=None):
+def profile_logins(agent, rev=None, strict=False):
     """The bws:// logins in the owner's profile section "Logins it may use", from the hub checkout's commit (or from
-    the revision that the caller read once for many agents)."""
+    the revision that the caller read once for many agents). strict: KitUnread for a profile that git does not give
+    now (profile_view), in place of a profile that lists no login."""
     rev = rev or kit_revision(fresh=True)        # an owner who removes a login is obeyed at once
-    text = next((x["text"] for x in profile_view(agent, rev)["sections"] if x["key"] == "logins"), "") if rev else ""
+    view = (profile_view(agent, rev, strict=True) if strict else profile_view(agent, rev)) if rev or strict else None
+    text = next((x["text"] for x in view["sections"] if x["key"] == "logins"), "") if view else ""
     return {m.lower() for m in re.findall(r"bws://[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", text)}
 
 
-def profile_view(agent, rev):
+def profile_view(agent, rev, strict=False):
+    """The agent's profile at commit `rev`: its path, its SHA-256 (None for no file), its sections and its text.
+    strict: KitUnread for a profile that git does not give now (kit_file), for a reader that writes, refuses a write or
+    holds an activation; without it a read that failed is a profile with no text, as before."""
     path = f"profiles/{agent}.md"
-    data = git_blob(rev, path) if rev else None
+    data = kit_file(rev, path) if strict else git_blob(rev, path) if rev else None
     text = data.decode("utf-8", "replace") if data is not None else ""
     return {"agent": agent, "path": path, "sha256": hashlib.sha256(data).hexdigest() if data is not None else None,
             "sections": parse_profile(text), "text": text}
@@ -26645,7 +26678,10 @@ def save_profile(agent, base, sections):
     if not rev:
         raise Refusal(503, code="revision_unreadable")
     path = f"profiles/{agent}.md"
-    old = git_blob(rev, path)
+    try:                                    # null is the base of an agent with no profile, never of a failed read
+        old = kit_file(rev, path)
+    except KitUnread:
+        raise Refusal(503, code="profile_unread", names={"agent": agent}) from None
     current = hashlib.sha256(old).hexdigest() if old is not None else None
     if base != current:
         raise Conflict("the profile changed meanwhile; reload it", sha256=current)
@@ -46582,8 +46618,12 @@ def knowledge_list(text):
     return paths
 
 
-def profile_knowledge_files(agent, rev):
-    text = next((x["text"] for x in profile_view(agent, rev)["sections"] if x["key"] == "knowledge_files"), "") if rev else ""
+def profile_knowledge_files(agent, rev, strict=False):
+    """The paths that the profile's Knowledge files list, [] for none. strict: KitUnread for a profile that git does
+    not give now (profile_view), in place of a profile that lists no file. A call without it keeps the two arguments
+    of profile_view, which tests stand in for."""
+    view = (profile_view(agent, rev, strict=True) if strict else profile_view(agent, rev)) if rev or strict else None
+    text = next((x["text"] for x in view["sections"] if x["key"] == "knowledge_files"), "") if view else ""
     try:
         return knowledge_list(text) if text else []
     except ValueError:
@@ -46608,7 +46648,13 @@ def verify_merge(agent, items, status):
     entries = knowledge_entries()
     catalog = {k["path"] for k in entries}
     out = [i for i in items if not (i["kind"] == "access" and i["ref"] in ("sandbox", "vault"))]
-    for path in profile_knowledge_files(agent, rev):
+    try:                                    # its files and its logins, at the one revision of this check
+        listed, logins = profile_knowledge_files(agent, rev, strict=True), granted_logins(agent, rev, strict=True)
+    except KitUnread:                       # not a profile that lists no file: a check that waits for a read
+        listed, logins = [], set(secret_grants(agent))
+        out.append({"kind": "knowledge", "ref": f"profiles/{agent}.md", "state": "not_verified",
+                    "detail": "The hub cannot read the agent's profile now."})
+    for path in listed:
         if isinstance(entries, UnreadCatalog):          # not a file that failed: a check that waits for a read
             out.append({"kind": "knowledge", "ref": path, "state": "not_verified",
                         "detail": "The hub cannot read its knowledge catalog now."})
@@ -46617,7 +46663,7 @@ def verify_merge(agent, items, status):
                     "detail": (f"In the catalog at {rev[:7]}." if path in catalog else
                                f"Not in the hub's knowledge catalog at {rev[:7]}.")})
     probed = {i["ref"] for i in items if i["kind"] == "login"}
-    for login in sorted(granted_logins(agent) - probed):
+    for login in sorted(logins - probed):
         out.append({"kind": "login", "ref": login, "state": "not_verified", "detail": "not probed"})
     vault = (status.get("security") or {}).get("vault") or {}
     # The AI providers build: the check of an account with a kind is the helper's (Lifecycle.verify). A helper that
@@ -50137,7 +50183,13 @@ def knowledge_delete(path):
     if git_blob(rev, path) is None:
         owner_file_unread(path)
         raise Refusal(404, f"{path} is not in the repository")
-    users = [name for name in agents() if path in profile_knowledge_files(name, rev)]
+    users = []
+    for name in agents():                   # a profile that git does not give now may list the file
+        try:
+            if path in profile_knowledge_files(name, rev, strict=True):
+                users.append(name)
+        except KitUnread:
+            raise Refusal(503, code="profile_unread", names={"agent": name}) from None
     if users:
         raise Refusal(409, f"the Knowledge files of {', '.join(users)} list {path}. Remove it there first.")
     commit = commit_kit_file(path, None, f"Owner deleted {path}")
@@ -70416,9 +70468,19 @@ class Handler(BaseHTTPRequestHandler):
         if query.get("db") != generation:
             return self.json(409, refusal_words.answer("hub_changed"))
         kit_reads_ahead(profile_paths())       # git outside LOCK
+        unread, profiles = None, []
         with LOCK:
             rev = kit_revision(fresh=True)
-            profiles = [profile_view(name, rev) for name in agents()]
+            for name in agents() if rev else ():
+                try:                # a profile that git gives no answer for is never one with sha256 null, which
+                    profiles.append(profile_view(name, rev, strict=True))      # is the base of no profile yet
+                except KitUnread:
+                    unread = name
+                    break
+        if not rev:
+            return self.json(503, refusal_words.answer("revision_unreadable"))
+        if unread is not None:
+            return self.json(503, refusal_words.answer("profile_unread", agent=unread))
         return self.json(200, scrub(dict(db=generation, revision=rev, profiles=profiles)), {"Cache-Control": "no-store"})
 
     def ui_github_repos(self, query):

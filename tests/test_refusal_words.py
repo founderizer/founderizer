@@ -49,6 +49,7 @@ OLD = {
                            "was about, and send the command again with a new request_id if it did not take effect",
     "revision_unreadable": "the hub cannot read its own revision",
     "knowledge_unread": "the knowledge files cannot be read now; try again in a moment",
+    "profile_unread": "{agent}'s profile cannot be read now; try again in a moment",
     "server_silent": "{server} sent no reading in the last 10 minutes: check that it is on",
     "server_no_service": "{server} has no server service: it did not join with a join code",
     "request_answered": "owner request is already answered",
@@ -138,7 +139,7 @@ SITES = {
     'key_swap_entry': {'no_such_server': 1},      # Part B of the key swap: the 404 of both of its routes
     'knowledge_add': {'revision_unreadable': 1},
     'knowledge_content': {'login_as_text': 1},
-    'knowledge_delete': {'revision_unreadable': 1},
+    'knowledge_delete': {'profile_unread': 1, 'revision_unreadable': 1},
     'knowledge_replace': {'revision_unreadable': 1},
     'mcp_package_lookup': {'package_no_record': 1, 'package_no_version': 1, 'package_none_old': 1,
                            'package_record_large': 1, 'package_registry_away': 1, 'package_too_new': 1,
@@ -177,7 +178,7 @@ SITES = {
     'save_grant': {'no_such_agent': 1},
     'save_integration': {'team_changed': 1},
     'save_lines': {'team_changed_lines': 1},
-    'save_profile': {'revision_unreadable': 1},
+    'save_profile': {'profile_unread': 1, 'revision_unreadable': 1},
     'save_resource': {'repo_vendor': 1},
     'save_runtime': {'no_such_agent': 1, 'team_changed': 1},
     'save_team_entry': {'team_changed': 1},
@@ -230,7 +231,7 @@ SITES = {
     'ui_person': {'no_such_person': 1},
     'ui_person_handles': {'no_such_person': 1, 'person_handles_most': 1},
     'ui_profile_save': {'no_such_agent': 1},
-    'ui_profiles': {'hub_changed': 1},
+    'ui_profiles': {'hub_changed': 1, 'profile_unread': 1, 'revision_unreadable': 1},
     'ui_releases': {'hub_changed': 1},
     'ui_resources': {'hub_changed': 1},
     'ui_responsibilities': {'hub_changed': 1},
@@ -482,7 +483,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 194)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 198)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

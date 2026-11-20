@@ -625,8 +625,9 @@ class Service:
         return {**({"start_check": checked} if checked else {}),
                 **({"updating": self.updating} if self.updating else {}),     # in the middle of a move (update)
                 # the hub's revision that it knew as it read: a report before the answer that names a release has not
-                # heard of it yet (autopublish.fleet_took)
-                **({"heard": self.desired} if self.desired else {}),
+                # heard of it yet (autopublish.fleet_took); a new process knows none yet, and names its own revision,
+                # which does not have a release that it has not taken
+                **({"heard": self.desired or self.loaded} if self.desired or self.loaded else {}),
                 "revision": self.loaded, "os": life.os_info(), "security": life.security(),
                 "runtimes": self.runtimes(), "load": lifecycle.machine_load(self.platform),
                 "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name, uid=os.getuid()),

@@ -1444,10 +1444,13 @@ class ServerService(Servers):
         it refused the release that the hub runs, and it runs other code). A record of another shape is dropped and
         never refuses the reading. The reading says too the revision that the service moves to while it is in the
         middle of an update (`updating`), and the hub's revision that it knew as it read (`heard`: the answer of its
-        report before), which the approval of a release reads, each a whole commit id or nothing."""
+        report before), which the approval of a release reads, each a whole commit id or nothing. The first reading of
+        a new process, which knows no hub revision yet, names its own as `heard`."""
         life = self.mod.lifecycle
         self.join_by_script(self.code()["code"])
-        svc = self.service()
+        svc = self.service(report=False)
+        self.assertEqual(svc.report(), 200)
+        self.assertEqual(self.servers()[1]["mini"]["reading"]["heard"], svc.loaded)
         self.assertIsNone(self.servers()[1]["mini"]["reading"]["start_check"])        # a service with no floor
         svc.floor = str(self.home / ".fleet" / life.FLOOR_FILE)
         life.keep_start_check(svc.floor, "server", "refused", "2026.11.677", "7" * 40, "2026.11.676",
