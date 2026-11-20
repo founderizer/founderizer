@@ -41557,7 +41557,9 @@ def duty_tools(value):
 def closed_extra(owner, responsibility=None, record=None):
     """What the start event of a task of an agent whose Shell box is off says to its helper (support plan F1): the
     runtime and the version of closed sessions, and the built-in tools of this task, the Web box's unless its duty
-    names fewer, and the MCP servers that its duty names (None: no server whose token is made for a session). A
+    names fewer (its helper adds the runtime's task list by itself, at a version at which the live test passed
+    with it: fleet.CLOSED_PLAN_TOOLS), and the MCP servers that its duty names (None: no server whose token is made
+    for a session). A
     colleague's question about one record (`record`, question_record) names the agent's servers that mint a token
     for one case (question_servers). {} for every other agent. read_row only: admit_task writes the event in a
     transaction."""

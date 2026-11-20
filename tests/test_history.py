@@ -710,15 +710,22 @@ class ToolRecords(Base):
             call(11, "c5", "Edit hub.py", "edit", changes=[{"path": "/srv/app/hub.py", "action": "modify"}]),
             {"seq": 12, "type": "agent_message", "text": "Migrations applied; the gnu table is next"},
             {"seq": 13, "type": "error", "code": "api_error", "message": "the quokka API refused"},
-            call(14, "c6", "acme-crm: list_tickets", "other", "acme-crm"), done(15, "c6", "ticket 7 from the wombat")])
+            call(14, "c6", "acme-crm: list_tickets", "other", "acme-crm"), done(15, "c6", "ticket 7 from the wombat"),
+            # a step of the session's plan, which the owner's app shows and no agent reads: a session whose Shell box
+            # is off keeps a plan too, in its own words (fleet.CLOSED_PLAN_TOOLS)
+            {"seq": 16, "type": "plan", "entries": [{"content": "Ask the okapi about its invoice",
+                                                     "status": "in_progress"}]}])
         for words, ref in (("zebra", "TR-4"), ("migrate", "TR-3"), ("config.yaml", "TR-5"), ("hub.py", "TR-11"),
                            ("gnu", "TR-12"), ("quokka", "TR-13"), ("wombat", "TR-15")):
             self.assertIn(ref, self.refs(self.search("vps", query=words)), words)
-        for words in ("alpaca", "flamingo", "koala"):
+        for words in ("alpaca", "flamingo", "koala", "okapi"):
             self.assertIn("Nothing", self.search("vps", query=words), words)
         self.assertIn("Bash: ./migrate.sh --apply → applied 12 migrations to zebra", self.read("vps", "TR-4"))
         self.assertIn("is not in your history", self.read("vps", "TR-1"))      # what was typed into the session
         self.assertIn("is not in your history", self.read("vps", "TR-8"))      # a fleet tool's answer
+        self.assertIn("is not in your history", self.read("vps", "TR-16"))     # a step of its plan
+        # the record itself is kept, for the owner's app
+        self.assertIn("okapi", hub.q1("SELECT data FROM thread_events WHERE type='plan'")["data"])
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM history WHERE kind='tool' AND text IS NOT NULL")["n"], 0)
 
     def test_an_update_far_from_its_call_finds_it(self):

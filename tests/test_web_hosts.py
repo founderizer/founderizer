@@ -179,7 +179,9 @@ class Start(test_shell_box.Helper):
     def test_a_start_with_a_host_list_reads_pages_only_on_its_hosts(self):
         words, option, settings = self.start()
         self.assertIn(str(self.proved), words)
-        self.assertEqual(option("--tools"), "WebSearch,WebFetch")
+        # its web tools, and the runtime's task list when this version is in that list too (fleet.CLOSED_PLAN_TOOLS)
+        plan = fleet.CLOSED_PLAN_TOOLS if PROVED in lifecycle.PLAN_LIST_VERSIONS else ()
+        self.assertEqual(option("--tools"), ",".join(("WebSearch", "WebFetch") + plan))
         self.assertEqual(option("--permission-mode"), "dontAsk")        # what no rule names is refused
         allow = settings["permissions"]["allow"]
         self.assertEqual([rule for rule in allow if "WebFetch" in rule], RULES)

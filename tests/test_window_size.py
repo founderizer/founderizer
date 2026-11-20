@@ -286,8 +286,10 @@ class Sizes(unittest.TestCase):
         for host in hosts:
             self.assertNotIn(host, command)
         settings = json.loads(self.private(words[words.index("--settings") + 1]))
-        self.assertEqual(settings["permissions"]["allow"],
-                         ["mcp__fleet__*"] + [f"mcp__{t}__*" for t in SERVERS] + ["WebSearch"] + fleet.host_rules(hosts))
+        # its servers, its web search, the runtime's task list at a version that has it, and the rules of its hosts
+        plan = list(fleet.CLOSED_PLAN_TOOLS) if closed["version"] in lifecycle.PLAN_LIST_VERSIONS else []
+        self.assertEqual(settings["permissions"]["allow"], ["mcp__fleet__*"] + [f"mcp__{t}__*" for t in SERVERS] +
+                         ["WebSearch"] + plan + fleet.host_rules(hosts))
         self.assertEqual(settings["hooks"]["PreToolUse"], [fleet.hosts_hook(hosts)])
         given = self.run_window(command)
         self.assertEqual(given["argv"], words[words.index(str(self.root / "kept" / "claude-2.1.312")) + 1:])

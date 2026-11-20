@@ -206,13 +206,17 @@ class WarmStart(Capacity):
                     output="[owner] words of the owner")
         self.record(self.first, 1, 8, "tool_call_update", tool_call_id="c9", status="completed",
                     output="a result whose call is not known")
+        self.record(self.first, 1, 9, "plan", entries=[{"content": "A STEP OF ITS PLAN", "status": "in_progress"}])
         text = self.lost(self.first)
         block = text.split("THE RECORD OF ATTEMPT 1'S SESSION")[1]
         self.assertIn("not the state now", block)
         self.assertIn("It said: I will time the page first.", block)
         self.assertIn("Result of Bash: node time.js: Loaded in 4.2 seconds.", block)
-        for absent in ("SECRET_FILE_TEXT", "words of the owner", "whose call is not known", "Older records"):
+        # a step of the session's plan is the owner's app's alone: no start and no read of an agent carries it
+        for absent in ("SECRET_FILE_TEXT", "words of the owner", "whose call is not known", "Older records",
+                       "A STEP OF ITS PLAN"):
             self.assertNotIn(absent, block)
+        self.assertNotIn("A STEP OF ITS PLAN", text + self.see(self.first, attempt=1))
         self.assertLess(block.index("It said:"), block.index("Result of"))          # oldest first
 
     def test_the_records_block_keeps_the_newest_inside_its_cap_and_names_what_it_left_out(self):

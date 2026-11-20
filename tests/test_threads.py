@@ -171,7 +171,9 @@ class Translation(unittest.TestCase):
     def test_claude_task_tools_are_its_plan(self):
         """Claude Code 2.1.3xx keeps its plan with TaskCreate and TaskUpdate, and offers TodoWrite only with its tasks
         off: each change of its list is one plan record, an update finds its task by the id that the creating call's
-        result gave (its text, else toolUseResult), and none of the four tools shows as a call."""
+        result gave (its text, else toolUseResult), and none of the four tools shows as a call. A TodoWrite that the
+        program refuses, as it does beside the task tools and in a closed session, was no plan: the plan before it
+        stands again, so the owner's app does not show a list that the session never had."""
         def use(call, name, **args):
             return {"type": "assistant", "sessionId": SESSION, "message": {"content": [
                 {"type": "tool_use", "id": call, "name": name, "input": args}]}}
@@ -193,9 +195,17 @@ class Translation(unittest.TestCase):
                 use("t9", "TaskUpdate", taskId="2", description="New words"),  # no change that the plan shows
                 use("t10", "TaskCreate", subject="Refused", description="x"), result("t10", "Invalid input", error=True),
                 use("t11", "TaskCreate", subject="Spare", description="x"), result("t11", "", made="3"),
-                use("t12", "TaskUpdate", taskId="3", status="deleted")]
+                use("t12", "TaskUpdate", taskId="3", status="deleted"),
+                use("t13", "TodoWrite", todos=[{"content": "A list of the other tool", "status": "pending"}]),
+                result("t13", "No such tool available: TodoWrite", error=True),
+                # two refused lists and a new step in one message: the plan is the task list with that step
+                use("t14", "TodoWrite", todos=[{"content": "One", "status": "pending"}]),
+                use("t15", "TodoWrite", todos=[{"content": "Two", "status": "pending"}]),
+                use("t16", "TaskCreate", subject="Check the apps", description="x"),
+                result("t14", "No such tool available: TodoWrite", error=True),
+                result("t15", "No such tool available: TodoWrite", error=True), result("t16", "", made="4")]
         out, _ = translate("claude", rows)
-        self.assertEqual([r["type"] for r in out], ["session"] + ["plan"] * 9)
+        self.assertEqual([r["type"] for r in out], ["session"] + ["plan"] * 16)
         plans = [[(e["content"], e["status"]) for e in r["entries"]] for r in out[1:]]
         done, doing = ("Read the advisories", "completed"), ("Upgrade the seven apps", "in_progress")
         self.assertEqual(plans[:3], [[("Read the advisories", "pending")],
@@ -203,7 +213,16 @@ class Translation(unittest.TestCase):
                                      [("Read the advisories", "in_progress"), ("Upgrade the apps", "pending")]])
         self.assertEqual(plans[3:], [[done, ("Upgrade the apps", "pending")], [done, doing],
                                      [done, doing, ("Refused", "pending")], [done, doing],
-                                     [done, doing, ("Spare", "pending")], [done, doing]])
+                                     [done, doing, ("Spare", "pending")], [done, doing],
+                                     [("A list of the other tool", "pending")], [done, doing],
+                                     [("One", "pending")], [("Two", "pending")]] +
+                         [[done, doing, ("Check the apps", "pending")]] * 3)
+        # a session with no task tool: a refused list gives the newest one that the program took
+        rows = [use("w1", "TodoWrite", todos=[{"content": "Kept", "status": "pending"}]), result("w1", "Todos updated"),
+                use("w2", "TodoWrite", todos=[{"content": "Refused", "status": "pending"}]),
+                result("w2", "Invalid input", error=True)]
+        out, _ = translate("claude", rows)
+        self.assertEqual([[e["content"] for e in r["entries"]] for r in out[1:]], [["Kept"], ["Refused"], ["Kept"]])
 
     def turns(self, rows, idle=False):
         """The records of rows, and the result records' stop reasons; idle: a read that finds no new line after them."""

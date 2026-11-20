@@ -381,7 +381,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             # and each scan reads only what the transcripts gained (plan P8, decision 41)
             "session_models",
             # support plan F1: a task session of an agent whose Shell box is off starts closed (fleet.shell_off): the
-            # pinned Claude Code, the built-in tools that the hub names, its own MCP servers only, and no key; and
+            # pinned Claude Code, the built-in tools that the hub names (and, since 20 November 2026, the runtime's
+            # task list at a version of PLAN_LIST_VERSIONS), its own MCP servers only, and no key; and
             # F3: an MCP server of auth "mint" gets a token for that one session through the vault (mint_tokens)
             "shell_box",
             "signin_relink",    # its sign-in waits out a hub that is away and sends its link again (send_link)
@@ -423,6 +424,15 @@ WEB_HOSTS_FORM = (f"a list of 1 to {WEB_HOSTS_MOST} different hosts, each a host
 # these, else at the first of these (hub.closed_extra), and a helper starts none at another (closed_task_command).
 # A version joins only in a release whose live test passed at it. 2.1.308 was not on that Mac, so it is not here.
 HOST_LIST_VERSIONS = ("2.1.312", "2.1.311")
+# The versions of Claude Code at which a closed task session with the runtime's task list passed its live test
+# (test_conversation_lockdown.ClosedTask, with FLEET_LIVE_LOCKDOWN=1; fleet.CLOSED_PLAN_TOOLS): on the owner's Mac,
+# 20 November 2026, the model was offered the four task tools beside the tools of the session's list and nothing
+# else (but the program's own fleet.CLAUDE_BUILT_INS), the four worked, and a shell, a file tool and a sub-agent
+# did not exist. A helper names the task
+# tools in a closed start only at one of these versions (fleet.closed_task_command); at another version the session
+# starts as before, with no plan list. A version joins only in a release whose live test passed at it. 2.1.308 was
+# not on that Mac, so it is not here.
+PLAN_LIST_VERSIONS = ("2.1.311", "2.1.312")
 
 
 def web_hosts(value):

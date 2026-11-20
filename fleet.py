@@ -66,8 +66,8 @@ import uuid
 import zipfile
 from http.client import HTTPException       # only the name: `http` is this module's own call to the hub
 
-from threads import (MARKER, MAX_LINE, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript,
-                     text_of)
+from threads import (CLAUDE_TASK_TOOLS, MARKER, MAX_LINE, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows,
+                     manager_transcript, text_of)
 from usage import Collector, local_model, timestamp
 import acp_programs
 import lifecycle
@@ -1256,9 +1256,19 @@ NO_FILE_MENTIONS = "CLAUDE_CODE_DISABLE_FILE_MENTIONS=1"
 # machine's own axScreenReader, and settings_arg's --settings over its own prefersReducedMotion.
 MOTION = "CLAUDE_AX_SCREEN_READER=0"
 # Claude Code offers its task list (TaskCreate, TaskUpdate, TaskList, TaskGet) to the models of its own list only, the
-# Claude 3 and 4 models up to Opus 4.7, and to a newer model only with this variable (2.1.312, 4 November 2026). A
+# Claude 3 and 4 models up to Opus 4.7, and to a newer model only with this variable (2.1.312, 4 November 2026) or
+# when --tools names the four (a closed task session: CLOSED_PLAN_TOOLS). A
 # task session keeps its plan there (RULES.md), which the owner's app shows while the task runs (threads.py).
 TODO_TOOLS = "CLAUDE_CODE_ENABLE_TODO_TOOLS=1"
+# That list is a folder of the session's own id under ~/.claude/tasks, unless this variable of the program names
+# another one: then every session that starts with the same value keeps and reads one list, and the program itself
+# gives a session the entries of that list, with no call of its model. A machine's environment could hold the
+# variable, and then a session's plan would be text that other sessions of the machine read as their own, and that
+# stays for later ones. So each task session, an open one and a closed one, starts with it empty, which the program
+# reads as not set (read in the program's code at 2.1.311 and 2.1.312, and proved in a real closed start:
+# test_conversation_lockdown.ClosedTask). One way past it stays, as past each word of a start: an `env` map in the
+# user's ~/.claude.json, which the program puts into the session's environment after them.
+OWN_TASK_LIST = "CLAUDE_CODE_TASK_LIST_ID="
 PRESENCE = 30           # seconds between two presence pings while the main loop is inside one step (Helper.presence)
 # Owner-contact plan B3 (6 November 2026): the failed starts of the standing manager session in a row after which its
 # helper tells the hub, whose flag then rings the owner (Helper.manager_start_failed). One failure is the helper's own
@@ -2585,7 +2595,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         cmd = cmd.replace("codex ", "codex resume ", 1)     # last, so that it comes first: codex resume [options] <thread>
     env = f"FLEET_ATTEMPT={attempt} FLEET_GENERATION={shlex.quote(generation)} FLEET_HUB={shlex.quote(HUB)} FLEET_AGENT={shlex.quote(agent)} FLEET_TASK={shlex.quote(task or '')}"
     if conf.get("runtime") == "claude":
-        env += f" {NO_TIMERS} {NO_TEAMS} {NO_FILE_MENTIONS} {MOTION}" + (f" {TODO_TOOLS}" if task else "")
+        env += f" {NO_TIMERS} {NO_TEAMS} {NO_FILE_MENTIONS} {MOTION}" + \
+            (f" {TODO_TOOLS} {OWN_TASK_LIST}" if task else "")
     if conf.get("runtime") == "claude":     # a task session too, since the owner's answer of 19 November 2026
         env += f" CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"
     # Its env file last, with its credential, its keys and its catalog servers' options: a start that fails above (a
@@ -2594,11 +2605,29 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
 
 
 # Support plan F1: the built-in tools that a closed task session can have, by the Tools box that allows each. Every
-# other built-in tool -- a shell, a file tool, an agent, a plan, a question, a timer -- is outside its --tools. The Web
+# other built-in tool -- a shell, a file tool, an agent, plan mode, a question, a timer -- is outside its --tools, but
+# two that come by rules of their own: the page fetch of a host list (CLOSED_PAGE_TOOL) and its task list
+# (CLOSED_PLAN_TOOLS). The Web
 # box gives web search and never a page fetch: an address that the model writes can carry data to any site's log
 # (support plan H4), so a closed session reads pages only through a server of its own, or on the hosts of its agent's
 # host list (CLOSED_PAGE_TOOL).
 CLOSED_BUILT_INS = {"web": ("WebSearch",)}
+# The runtime's own task list, in which a task session keeps its plan (RULES.md, "While a task runs") and which the
+# owner's app shows while the task runs: the four tools that threads.py reads as the plan (TaskCreate, TaskUpdate,
+# TaskList and TaskGet; the descriptions of the first two tell the model to call the other two).
+# A closed task session has them whatever its boxes and its duty are, at a version of Claude Code at which the live
+# test passed with them (lifecycle.PLAN_LIST_VERSIONS), and at no other. Their names in --tools are enough: no
+# environment switch (TODO_TOOLS alone gives a closed session none). The live test (20 November 2026,
+# test_conversation_lockdown.ClosedTask, real closed starts against stand-ins) shows: the model gets these four
+# beside the tools of its list, and nothing else but the program's own CLAUDE_BUILT_INS; the four work in dontAsk; a
+# call of a tool of the test's list of other built-in tools is refused; a task id that is a path finds no task; and
+# the list is a folder of the session's own id under ~/.claude/tasks, also when the machine's environment names
+# another list (OWN_TASK_LIST). Measured apart, with a deliberate break of this start: the four work also without
+# their names in the allow list, which names them as it names each built-in tool of the start but the page fetch.
+# Of each entry only its subject and its state reach the hub, as a plan record (threads.claude_task), which the hub
+# gives to the owner's apps and to the owner's own AI client, as each record of the session, and to no agent of the
+# fleet; the activity hook sends the name of the tool, as for each call.
+CLOSED_PLAN_TOOLS = CLAUDE_TASK_TOOLS
 # The host list (team.json "web_hosts"): the page fetch of a closed task session whose Web box is on, only when the
 # hub's start names the hosts of its agent's list and this tool. Three parts hold it to those hosts, and
 # test_web_hosts.Live proves them in a real session. Its rules, WebFetch(domain:<host>), open the listed hosts, and
@@ -2636,10 +2665,12 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
     """The start of a task session of an agent whose Shell box is off (support plan F1, H1), as a closed conversation
     starts: the Claude Code version of closed sessions, which passed the lockdown test, with its updater off; no
     setting source of this machine; --tools with only the built-in tools that the hub names and the boxes allow (the
-    Web box: web search, unless the task's duty names none); only Fleet's MCP server, whose tools the
+    Web box: web search, unless the task's duty names none) and, at a version that passed the live test with them,
+    the runtime's task list (CLOSED_PLAN_TOOLS); only Fleet's MCP server, whose tools the
     hub fixes (hub.shell_tools), and the agent's own catalog servers (--strict-mcp-config); no key, no GitHub token and
     nothing of the session's own in its environment, so the values that its servers need are in its mode-600 MCP file
-    only; in dontAsk, which refuses whatever its allow list does not name. closed: {runtime, version, built_ins} from
+    only; in dontAsk, which refuses each call that needs a permission and that its allow list does not name (the
+    task tools need none). closed: {runtime, version, built_ins} from
     the hub's start event (hub.closed_extra); without it, the first tested version and the Web box's tools. With
     web_hosts in it, the hosts of the agent's host list, and WebFetch among its built_ins: page reads on those hosts
     only (CLOSED_PAGE_TOOL), at a version that passed the host list's live test, and at no other. Codex and
@@ -2676,6 +2707,8 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
     paged = bool(hosts) and "web" in (conf.get("can") or []) and isinstance(named, list) and CLOSED_PAGE_TOOL in named
     if paged:
         built_ins.append(CLOSED_PAGE_TOOL)
+    if version in lifecycle.PLAN_LIST_VERSIONS:     # its plan, which no box and no duty takes away
+        built_ins += CLOSED_PLAN_TOOLS
     values, minted = dict(env or {}), dict(minted or {})
     catalog = team_catalog()
     values.update({catalog[t]["bearer"]: v for t, v in minted.items() if t in catalog})
@@ -2724,7 +2757,7 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
         (["--chrome"] if needs == "browser" else []) + first + shlex.split(model_flags(conf))
     words = ["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}",
              f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", NO_TIMERS, NO_TEAMS, NO_FILE_MENTIONS, MOTION,
-             CLOSED_NO_UPDATES] + \
+             OWN_TASK_LIST, CLOSED_NO_UPDATES] + \
         [f"{name}={values[name]}" for name in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW",) if name in values]   # a window
     return shlex.join(words + args)
 

@@ -381,6 +381,9 @@ class Translator:
         self.open = set()       # tool calls with no finish yet
         self.silent = set()     # tool calls shown as a plan, not as a call
         self.tasks = []         # Claude: its own task list (TaskCreate, TaskUpdate) in order, which is its plan
+        self.todos = {}         # Claude: TodoWrite call -> its entries, until its result
+        self.kept = []          # Claude: the entries of the newest TodoWrite that the program took
+        self.tasked = False     # Claude: the session used its task tools, so its task list is its plan
         self.limit = False      # Codex: inside a stretch where a limit is reached
         self.reset = None       # Codex: the latest reset time in its rate-limit records
         self.commands = {}      # Codex: exec call -> the commands it started, in order
@@ -712,7 +715,8 @@ class Translator:
         args = block.get("input") if isinstance(block.get("input"), dict) else {}
         if name == "TodoWrite" and isinstance(args.get("todos"), list):
             self.silent.add(call)
-            return [{"type": "plan", "entries": plan_entries(args["todos"], "content")}]
+            self.todos[call] = plan_entries(args["todos"], "content")
+            return [{"type": "plan", "entries": self.todos[call]}]
         if name in CLAUDE_TASK_TOOLS:
             self.silent.add(call)
             return self.claude_task(call, name, args)
@@ -760,7 +764,7 @@ class Translator:
     def claude_task(self, call, name, args):
         """A plan record when a call changes the session's task list. A new task gets its id from its call's result
         (claude_task_made), and an update names that id; a deleted task leaves the plan."""
-        before = plan_entries(self.tasks, "content")
+        before, self.tasked = plan_entries(self.tasks, "content"), True
         if name == "TaskCreate" and str(args.get("subject") or "").strip():
             self.tasks.append({"id": None, "call": call, "content": args["subject"], "status": "pending"})
         elif name == "TaskUpdate":
@@ -776,7 +780,16 @@ class Translator:
         return [{"type": "plan", "entries": after}] if after != before else []
 
     def claude_task_made(self, call, block, row):
-        """A TaskCreate's result: the id that later updates name, or, when it was refused, the plan without it."""
+        """A TaskCreate's result: the id that later updates name, or, when it was refused, the plan without it. And
+        the result of a TodoWrite. One that the program refused, as it does while its task tools are on and in a
+        closed session, was no plan: the plan is then the session's task list as it stands now, or with no task
+        tool the newest list that the program took."""
+        if call in self.todos:
+            entries = self.todos.pop(call)
+            if not block.get("is_error"):
+                self.kept = entries
+                return []
+            return [{"type": "plan", "entries": plan_entries(self.tasks, "content") if self.tasked else self.kept}]
         task = next((t for t in self.tasks if t["call"] == call and t["id"] is None), None)
         if task is None:
             return []
