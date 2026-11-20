@@ -72,8 +72,11 @@ The vault protects the value of each secret. The design gives these results:
   holds a value, of the catalog or of the same import, is refused before the hub keeps the command (`hub.py`).
 - The catalog takes no second API key with the variable name of another one, also not from one import (`hub.py`).
   The successor of a GitHub App's key on a fleet with a door is no replace: it stands beside the old key under a
-  reference and a name of its own, the first that the catalog does not have (`GITHUB_APP_<OWNER>_2_KEY`), and the
-  old key's entry stays after GitHub refuses that key (`Sources/FleetCore/GitHubAppKey.swift`).
+  reference and a name of its own, the first that the catalog does not have (`GITHUB_APP_<OWNER>_2_KEY`)
+  (`Sources/FleetCore/GitHubAppKey.swift`). When GitHub refuses the old key, the hub takes it back from the door and
+  removes its entry from the catalog by itself (`hub.py` `door_key_retire`; `UI-API.md`, version 1.103, says
+  when); the owner's signed grant of it to the door stays in the central vault, and nothing ends that grant today
+  (limit 25).
   When the owner saves a key under a variable name that one key of the catalog has, the app replaces the value of
   that key: the new value goes
   under the same reference, with a `replace` statement that the owner key signs about that one sealed copy (see "The

@@ -55381,7 +55381,8 @@ def save_secret(body):
     secret_replace). The successor of a GitHub App's key on a fleet with a door is no replace: it stands beside the
     old key under a reference of its own, with which the door shows that GitHub refuses the old key (door_renew), so
     the Mac app gives it a name of its own, the first that the list does not have: GITHUB_APP_<OWNER>_2_KEY
-    (GitHubAppKey.place). The old key's entry stays after that."""
+    (GitHubAppKey.place). The old key's entry leaves by itself once GitHub refuses that key (door_key_retire;
+    UI-API.md, version 1.103, says when)."""
     ref = body["login"]
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
@@ -58312,8 +58313,9 @@ def save_door_credential(name, ref, asker, named=False):
     return save_integration(None, change, f"the door uses {ref} as {name}")
 
 
-def door_call(conf, method, path, secret, body=None):
-    """One call to the door with one of the hub's two secrets: (status, answer). Never under LOCK."""
+def door_call(conf, method, path, secret, body=None, clock=None):
+    """One call to the door with one of the hub's two secrets: (status, answer). Never under LOCK. clock: a dict that
+    gets `skew`, the door's clock minus the hub's in seconds, from the Date of the door's answer (door_skew)."""
     if LOCK._is_owned():
         raise RuntimeError("the door is asked while LOCK is held: ask it before or after, never under it")
     host = conf["address"] if ":" not in conf["address"] else f"[{conf['address']}]"
@@ -58322,6 +58324,8 @@ def door_call(conf, method, path, secret, body=None):
                                  headers={"Authorization": "Bearer " + secret, "Content-Type": "application/json"})
     try:
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=DOOR_WAIT) as r:
+            if clock is not None:
+                clock["skew"] = door_skew(r.headers.get("Date"))
             return r.status, json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         try:
@@ -58330,6 +58334,16 @@ def door_call(conf, method, path, secret, body=None):
             return e.code, {}
     except (urllib.error.URLError, OSError, ValueError):
         return None, {"error": "the door does not answer"}
+
+
+def door_skew(date):
+    """The door's clock minus the hub's, in seconds, from the Date header of the door's answer (the door's HTTP server
+    writes it from its own clock, to the second), or None when there is no such date."""
+    import email.utils
+    try:
+        return email.utils.parsedate_to_datetime(date).timestamp() - now()
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
 
 
 def door_github_tokens(agent, repos):
@@ -58547,7 +58561,10 @@ GITHUB_APP_PAGE = re.compile(r"https://github\.com/(?:organizations/[A-Za-z0-9][
 
 
 def door_renewal():
-    """The renewal of the App key that the hub held: {owner, app_id, old, fingerprint, page, step, at}, or None."""
+    """The renewal of the App key that the hub held: {owner, app_id, old, fingerprint, page, step, at}, or None. Also
+    `looks`, the looks in a row that showed that GitHub refuses the old key alone (door_looks); `back`, after a "done"
+    that was not true; after the step "done", `retired` once the step that takes the old key out of the door and the
+    list is over, and until then `kept`, the reason for which the key stays (door_key_retire)."""
     with contextlib.suppress(ValueError, TypeError):
         found = json.loads(kv_get("door_github_renew") or "null")
         return found if isinstance(found, dict) else None
@@ -58652,22 +58669,292 @@ def door_renew_again(state, t0, manager, refused=False):
     return True
 
 
+# The old App key leaves the door and the list by itself (20 November 2026, the second part of the lane "App key
+# successor"). After the renewal the old key's entry stayed in the list of secrets and its copy in the door, and the
+# owner could not remove it: the list's own remove refuses an entry that the door holds (validate_door), and no screen
+# takes a key back from the door. So once GitHub refuses the old key, the hub takes it back from the door and removes
+# its entry, in one commit of team.json and with nothing on a screen (door_key_retire). The door then removes its copy
+# at its next fetch, while the hub has a reading of the central vault (door_sealed `keep`). The hub signs nothing: the
+# owner's signed grant of that key to the door stays in the central vault, marked not held (central_standing), and
+# with it the value there (central_removals) and in each backup. Nothing ends that grant today (VAULT.md, limit 25).
+# GitHub refuses that value, so it opens nothing.
+#
+# The door reads each 401 of GitHub as "this key does not sign" (door.py github_key). A door whose clock is wrong or
+# an App that is suspended gets a 401 for every key, and a door whose clock is about 60 seconds ahead makes each token
+# at the edge of GitHub's time rule, so that GitHub refuses some of its requests and takes others. So a look counts
+# only when GitHub refuses the old key, the key in use signs, and the door's clock is near the hub's (door_old_key_look).
+# That check sees nothing on a door that runs on the hub's own server, or with two clocks that drift together: there,
+# the take-back rests on its count alone.
+# The hub closes the second item at the second such look in a row (DOOR_RENEW_LOOKS), which a later look that sees
+# GitHub take the old key undoes; it takes the key out of the door and the list, which nothing undoes, only at the
+# twelfth (DOOR_RETIRE_LOOKS). These are counts of looks, never a time.
+GITHUB_APP_KEY_NAME = re.compile(r"GITHUB_APP_[A-Z0-9_]{1,45}_KEY")     # the Mac app's GitHubAppKey.variable
+DOOR_RENEW_LOOKS = 2            # looks in a row that show that GitHub refuses the old key alone, before "done"
+DOOR_RETIRE_LOOKS = 12          # looks in a row, those two included, before the hub takes the old key out
+DOOR_CLOCK_MOST = 30            # seconds that the door's clock may be off the hub's for a look to count
+DOOR_LOOK_WORDS = {             # why a look after "done" does not count, in a sentence for the manager
+    "other key": "the key that the door holds under its reference does not have that fingerprint, so the hub cannot "
+                 "see whether GitHub refuses the old key.",
+    "in use": "the door does not show that it makes its tokens with another key that GitHub takes now.",
+    "clock": f"the door's clock is more than {DOOR_CLOCK_MOST} seconds off the hub's, so the hub does not take "
+             f"GitHub's refusal of the old key as true."}
+
+
+def door_looks(state):
+    """The looks in a row, up to now, that showed that GitHub refuses the old key alone (the renewal's `looks`)."""
+    looks = state.get("looks")
+    return looks if isinstance(looks, int) and not isinstance(looks, bool) and looks > 0 else 0
+
+
+def door_renew_keep(state):
+    """The renewal's state, written as a quiet change: it is on no screen, and a write of the count must not wake the
+    owner's apps at each look."""
+    with area("quiet"):
+        kv_set("door_github_renew", json.dumps(state, sort_keys=True))
+
+
+def door_key_in_use(state, key):
+    """Whether this answer of the door (POST /github/key with no reference) shows that the door makes its tokens with
+    another key than the old one, and that GitHub takes that key now: the door's file names no key of the App under
+    the old reference, and the key that the answer is about, one that the file names, signs and has a fingerprint
+    that is not the old key's."""
+    used = key.get("used") if isinstance(key, dict) else None
+    if not isinstance(used, list) or not used or not all(isinstance(ref, str) for ref in used):
+        return False
+    return str(state.get("old")).lower() not in {ref.lower() for ref in used} and key.get("ref") in used and \
+        key.get("signs") is True and bool(GITHUB_KEY_PRINT.fullmatch(str(key.get("fingerprint")))) and \
+        key["fingerprint"] != state.get("fingerprint")
+
+
+def door_old_key_look(state, conf, app_id, first=None):
+    """One look at the old key and at the key in use, for the end of the step "delete" and for the step after it.
+    "refused": GitHub refuses the key under the old reference, which has the old key's fingerprint; the door's answer
+    about the key in use shows that it signs (door_key_in_use); and the Date of that answer is within DOOR_CLOCK_MOST
+    of the hub's clock. "taken": GitHub takes the old key. "other key": the key under the old reference does not have
+    the old key's fingerprint. "in use": the answer about the key in use does not show that it signs. "clock": the
+    door's clock is off. None: the door did not answer, or its App is not the one whose key this renewal is about.
+    first: the door's answer about the old reference, when the caller has it from this look."""
+    if str(state.get("app_id")) != str(app_id):
+        return None
+
+    def ask(ref=None, clock=None):
+        status, key = door_call(conf, "POST", "/github/key", conf["token"],
+                                {"app_id": app_id, **({"ref": ref} if ref else {})}, clock=clock)
+        return key if status == 200 and isinstance(key, dict) else None
+    old = first if first is not None else ask(state["old"])
+    if old is None or not isinstance(old.get("signs"), bool):
+        return None
+    if old.get("fingerprint") != state.get("fingerprint"):
+        return "other key"
+    if old["signs"]:
+        return "taken"
+    clock = {}
+    used = ask(clock=clock)
+    if used is None or clock.get("skew") is None:
+        return None
+    if abs(clock["skew"]) > DOOR_CLOCK_MOST:
+        return "clock"
+    return "refused" if door_key_in_use(state, used) else "in use"
+
+
+def door_key_kept(team, ref, rev):
+    """Why the old App key's entry stays in this team.json, as (a short name of the reason, the reason in words for
+    the manager), or None when the hub may take it out. The entry is an API key with a name of the GitHub App keys:
+    the reference came from the door's answer, and the hub removes nothing else on its word. No agent holds it, by a
+    grant or by its profile, as the list's own remove asks (save_login). The grantable pool does not name it. No rule
+    of the door names it: save_door_grant drops such a credential with no word, and this step drops none."""
+    entry = (team.get("logins") or {}).get(ref)
+    if entry is not None and (entry.get("kind") != "api_key" or
+                              not GITHUB_APP_KEY_NAME.fullmatch(str(entry.get("env")))):
+        return "name", "the entry is not a GitHub App key by its kind and its name, and the hub removes no other entry"
+    users = sorted(n for n in team.get("agents") or {} if ref in profile_logins(n, rev) | set(secret_grants(n, team)))
+    if users:
+        return (f"held {', '.join(users)}",
+                f"{', '.join(users)} still {'holds' if len(users) == 1 else 'hold'} it, by a grant or a profile")
+    if f"secret:{ref}" in (team.get("resources") or {}):
+        return "pool", "the owner's standing lets the manager give it (the grantable pool names it)"
+    door = team.get("door") if isinstance(team.get("door"), dict) else {}
+    named = sorted(n for n, c in (door.get("credentials") or {}).items()
+                   if isinstance(c, dict) and c.get("secret") == ref)
+    if named:
+        return f"rule {', '.join(named)}", f"the door's rules use it as {', '.join(named)}"
+    return None
+
+
+def door_key_out(ref):
+    """The old App key leaves team.json: out of door.secrets and out of the catalog in one commit, so that no half
+    stays. It runs in the turn of the hub's writes (kit_lock), on the team.json of the hub's fresh revision, so no
+    other write comes between its read and its commit. Returns (reason, detail, name): ("out", the commit, the
+    entry's name for the manager); ("absent", whether the list still has the entry, None) when the door of that
+    team.json does not hold the key, so there is nothing to take back, which is also this step a second time after
+    its commit landed; (a reason of door_key_kept, its words, None); ("invalid" or "write", the words, None) when
+    team.json does not pass its check after the change, or the hub could not read or write its files now.
+
+    A fault after the commit landed is the caller's to raise: the key is out then, and the next look finds it so. That
+    look cannot tell which commit took it out, so the record of the take-back and the message of this look are lost."""
+    with kit_lock():
+        try:
+            rev = kit_revision(fresh=True)
+            team, _, _ = team_view(rev)
+        except Refusal as e:
+            return "write", f"the hub could not read its files now ({clip(str(e), 200)})", None
+        catalog, door = dict(team.get("logins") or {}), team.get("door")
+        if not isinstance(door, dict) or ref not in (door.get("secrets") or []):
+            if ref in ((TEAM.get("door") or {}).get("secrets") or []):
+                # the hub's own commit landed, and the team that it runs is from before it (its apply failed): the
+                # checked team of its checkout, as a start of the hub runs it
+                with contextlib.suppress(ValueError, TypeError):
+                    apply_team(validate_team(team))
+            return "absent", ref in catalog, None
+        kept = door_key_kept(team, ref, rev)
+        if kept:
+            return kept[0], kept[1], None
+        entry = catalog.pop(ref, None) or {}
+        name = entry.get("env") or entry.get("title") or ref
+        # a fleet that renewed before the list took no second key of one name (13 November 2026) can have both keys
+        # under one name: the words say which one went
+        said = name + (" (the old one: the other key of that name stays)" if entry.get("env") and
+                       key_named(team, entry["env"], ref) else "")
+        door["secrets"] = [r for r in door["secrets"] if r != ref]
+        if not door["secrets"]:
+            del door["secrets"]
+        if catalog:
+            team["logins"] = catalog
+        else:
+            team.pop("logins", None)
+        try:
+            validate_team(team)
+        except ValueError as e:
+            return "invalid", f"the hub's team file does not pass its check after the change ({clip(str(e), 200)})", \
+                None
+        data = (json.dumps(team, indent=2) + "\n").encode()
+        try:
+            commit = commit_kit_file("team.json", data, f"Hub took the GitHub App key {name} back from the door and "
+                                                        f"out of the list: GitHub refuses it")
+        except Exception as e:      # a write that failed now (a release on its way, a git that did not answer)
+            return "write", f"the hub could not save the change of its files now ({clip(str(e), 200)})", None
+        apply_team(team)
+        with transaction():     # each copy of it that waited for the door goes too, as at the end of a grant
+            DB.execute("DELETE FROM door_copies WHERE login=?", (ref,))
+            resource_record(f"secret:{ref}", "door", None, "hub", commit)
+        central_due()
+        log("hub", f"took {name} ({ref}) back from the door and out of the catalog in {commit[:12]}: GitHub refuses "
+                   f"that App key")
+        return "out", commit, said
+
+
+def door_key_retire(state, conf, app_id):
+    """One look after the step "done": the old App key leaves the door and the list of secrets at the
+    DOOR_RETIRE_LOOKS-th look in a row that shows that GitHub refuses it alone (door_old_key_look), the looks before
+    "done" included. Returns (state, reason, words): the renewal's state as it is written now; a short name of what
+    this look came to; and what the hub did, or why the key stays, in sentences for the manager (None when there is
+    nothing to say). The state gets `retired` when the step is over: the commit that took the key out, "absent" when
+    the door no longer holds it, or "left" for an entry that is not a GitHub App key, which the hub never removes.
+    Else it gets `kept`, the reason, so that the caller says a reason only when it is not the last one said. A state
+    with no `retired` gets this step again at the next look: after a commit that failed, after an entry that was
+    held, and in a fleet whose renewal was "done" before the hub had this step. The count stops at
+    DOOR_RETIRE_LOOKS, so a look that changes nothing writes nothing. The reason "taken" (GitHub takes the old key)
+    writes nothing: the caller puts the renewal back into the step "delete"."""
+    ref = str(state.get("old") or "").lower()
+    stays = "That key's entry stays in the list of secrets, and its copy in the door"
+    again = f"every {DOOR_RENEW_EVERY // 60} minutes"
+
+    def write(new, reason=None, words=None, mark=None):
+        new = dict(new, **({"retired": mark} if mark else {"kept": reason} if reason else {}))
+        if new != state:
+            door_renew_keep(new)
+        return new, reason, words
+
+    def absent(new, listed):
+        return write(new, "absent", "The door no longer holds that key" + (
+            ", and its entry is still in the list of secrets." if listed else
+            ", and the list of secrets has no entry of it."), "absent")
+    if ref not in ((TEAM.get("door") or {}).get("secrets") or []):
+        return absent(state, ref in logins())
+    look = door_old_key_look(state, conf, app_id)
+    state_now = dict(state, looks=min(door_looks(state) + 1, DOOR_RETIRE_LOOKS) if look == "refused" else 0)
+    if look == "taken":
+        return state_now, look, None
+    if look in DOOR_LOOK_WORDS:
+        return write(state_now, look, f"{stays}: {DOOR_LOOK_WORDS[look]} The hub looks again {again}.")
+    if look is None or state_now["looks"] < DOOR_RETIRE_LOOKS:
+        return write(state_now)
+    reason, detail, name = door_key_out(ref)
+    if reason == "out":
+        return write(state_now, reason, f"The hub took that key back from the door and removed its entry, {name}, "
+                                        f"from the list of secrets.", detail)
+    if reason == "absent":
+        return absent(state_now, detail)
+    if reason == "name":
+        return write(state_now, reason, f"The hub leaves that key's entry in the list of secrets and its copy in the "
+                                        f"door: {detail}. It looks no more.", "left")
+    if reason in ("invalid", "write"):
+        if state.get("kept") != reason:
+            log("hub", f"did not take the old App key {ref} out of the door and the list: {detail}")
+        return write(state_now, reason, f"{stays} for now: {detail}. The hub tries again {again}.")
+    return write(state_now, reason, f"{stays} while {detail}: the hub takes both out by itself after that.")
+
+
 def door_renew(t0=None):
     """One look at the renewal, outside LOCK: the door says which key it uses for the hub's old App, that key's
-    fingerprint as GitHub's page shows it, and whether GitHub still takes it (POST /github/key on the door)."""
+    fingerprint as GitHub's page shows it, and whether GitHub still takes it (POST /github/key on the door). After
+    the step "done", the look is the one that takes the old key out of the door and the list (door_key_retire),
+    until that step is over."""
     t0 = t0 or now()
     conf, app_id = door_conf(), door_app_id()
     state = door_renewal() or {}
-    if conf is None or app_id is None or state.get("step") == "done" or t0 - DOOR_RENEW["at"] < DOOR_RENEW_EVERY:
+    if conf is None or app_id is None or t0 - DOOR_RENEW["at"] < DOOR_RENEW_EVERY or \
+            (state.get("step") == "done" and state.get("retired")):
         return None
     if not state and (not kv_get("door_first_token") or t0 - DOOR_RENEW["form"] > DOOR_RENEW_FORM):
         return None             # the first item waits for a token through the door and for an app that shows the form
     DOOR_RENEW["at"] = t0
+    manager = manager_name()
+    if state.get("step") == "done":     # after a commit that failed, an entry that was held, or a "done" from before
+        said = state.get("kept")
+        state, reason, words = door_key_retire(state, conf, app_id)
+        if reason == "taken":
+            # GitHub takes the old key, so the "done" was written on a refusal that was not about that key (before
+            # 20 November 2026 one 401 of any cause wrote it): the step "delete" is not done, and its item comes back.
+            # Unless the door still makes its tokens with that very key (a "new" key that was the old one, saved
+            # again before the guard of the step "ask"): words to delete it would end every token, so the renewal
+            # goes back to its first step, which asks for a new key. A door that does not say which key it uses
+            # gets no way back at this look, and the count starts again, as after every look that does not count.
+            status, used = door_call(conf, "POST", "/github/key", conf["token"], {"app_id": app_id})
+            if status != 200 or not isinstance(used, dict):
+                door_renew_keep(state)
+                return None
+            first = state["old"] in (used.get("used") or [state["old"]]) or \
+                used.get("fingerprint") == state["fingerprint"]
+            state = {k: v for k, v in dict(state, step="ask" if first else "delete", at=round(t0), looks=0,
+                                           back=True).items() if k != "kept"}
+            door_renew_keep(state)
+            kv_set("door_github_again", None)
+            emit(manager, "say", f"[hub] GitHub takes the App key that the hub held ({state['fingerprint']}), so the "
+                                 f"owner has not deleted it: the refusal on which the hub closed the second item was "
+                                 f"not about that key. "
+                                 + ("The door also still makes its tokens with that key, so the renewal is back at its "
+                                    "first item, which asks for a new key. Raise it "
+                                    if first else "Raise the second Needs-you item ")
+                                 + f"again now with raise_needs_you, github_key \"{state['owner']}\" and no options. "
+                                   f"Its what_to_do: {door_renew_todo(state)} The hub closes the item by itself when "
+                                 + ("the door makes tokens with a new key." if first else
+                                    "GitHub has refused that key for about an hour."))
+            log("hub", f"GitHub takes the App key that the hub held again ({state['fingerprint']}): the renewal is "
+                       f"back in its step {state['step']}")
+            return state
+        if words and (state.get("retired") or reason != said):
+            emit(manager, "say", f"[hub] This is about the old App key of {state['owner']} ({state['fingerprint']}), "
+                                 f"after the hub closed its second item. {words}"
+                                 + (" Nothing is needed for it." if reason == "out" else ""),
+                 extra=QUIET_SAY)
+        return state if state.get("retired") else None
     asked = {"app_id": app_id, **({"ref": state["old"]} if state.get("step") == "delete" else {})}
     status, key = door_call(conf, "POST", "/github/key", conf["token"], asked)
     if status != 200 or not isinstance(key, dict):
+        if door_looks(state):   # in a row: a look with no answer starts the count again
+            door_renew_keep(dict(state, looks=0))
         return None             # the next look asks again; door_sweep tells the manager of a door that does not answer
-    manager = manager_name()
     if not state:
         if key.get("signs") is not True or not GITHUB_KEY_PRINT.fullmatch(str(key.get("fingerprint"))) or \
                 not GITHUB_APP_PAGE.fullmatch(str(key.get("page"))) or not GITHUB_LOGIN.fullmatch(str(key.get("owner"))) \
@@ -58701,18 +58988,31 @@ def door_renew(t0=None):
         emit(manager, "say", f"[hub] The door makes every GitHub token with the new App key of {state['owner']}, and "
                              f"the hub closed the first item. Raise the second Needs-you item now with "
                              f"raise_needs_you, github_key \"{state['owner']}\" and no options. Its what_to_do: "
-                             f"{door_renew_todo(state)} The hub closes the item by itself when GitHub refuses that key.")
+                             f"{door_renew_todo(state)} The hub closes the item by itself when GitHub refuses that key"
+                             + (" for about an hour." if state.get("back") else "."))
         log("hub", f"the door makes every GitHub token with the new App key of {state['owner']}")
         return state
-    if key.get("signs") is not False:
-        if key.get("signs") is True:            # GitHub still takes the old key
+    # The step "delete" ends when GitHub refuses the old key, and that key alone: the look of door_old_key_look, two
+    # times in a row. Before 20 November 2026 one 401 for the key under the old reference ended it, also a 401 of a
+    # door whose clock was wrong. The key leaves the door and the list later, at the DOOR_RETIRE_LOOKS-th such look.
+    # A renewal that came back from a "done" that was not true (`back`) waits for that longer count here too: a key
+    # that GitHub takes now and then must not close and open the owner's item again and again.
+    refused = door_old_key_look(state, conf, app_id, first=key) == "refused"
+    looks = min(door_looks(state) + 1, DOOR_RETIRE_LOOKS) if refused else 0
+    if looks < (DOOR_RETIRE_LOOKS if state.get("back") else DOOR_RENEW_LOOKS):
+        if looks != door_looks(state):
+            door_renew_keep(dict(state, looks=looks))
+        if key.get("signs") is True:            # GitHub still takes the key under the old reference
             door_renew_again(state, t0, manager)
         return None
     close_github_key_needs(state["owner"], "GitHub refuses the old App key now, so it is deleted")
-    state = dict(state, step="done", at=round(t0))
+    state = dict(state, step="done", at=round(t0), looks=looks)
     kv_set("door_github_renew", json.dumps(state, sort_keys=True))
+    when = "at its next look" if looks >= DOOR_RETIRE_LOOKS else "in about an hour"
     emit(manager, "say", f"[hub] GitHub refuses the App key that the hub held ({state['fingerprint']}): the owner "
-                         f"deleted it, and the hub closed the second item. Nothing more is needed for it.")
+                         f"deleted it, and the hub closed the second item. Nothing is needed for it: unless something "
+                         f"else holds that key, which the hub then says, it takes the key back from the door and out "
+                         f"of the list of secrets by itself {when}, while GitHub goes on refusing it.")
     log("hub", f"GitHub refuses the App key that the hub held: {state['fingerprint']}")
     return state
 

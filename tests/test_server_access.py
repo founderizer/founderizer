@@ -283,17 +283,22 @@ class ServerKind(Access):
 
 
 class StubDoor(BaseHTTPRequestHandler):
-    """A door on this machine: what the hub sends, and the answers of the test."""
-    calls, answers = [], {}
+    """A door on this machine: what the hub sends, and the answers of the test. skew: the seconds by which its clock is
+    ahead of the hub's, in the Date of its answers."""
+    calls, answers, skew = [], {}, 0
 
     def log_message(self, *a):
         pass
+
+    def date_time_string(self, timestamp=None):         # skew None: a Date that says no time
+        return "no time" if StubDoor.skew is None else super().date_time_string(time.time() + StubDoor.skew)
 
     def reply(self):
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n)) if n else None
         StubDoor.calls.append((self.command, self.path, self.headers.get("Authorization"), body))
-        status, answer = StubDoor.answers.get(self.path.split("?")[0], (404, {}))
+        found = StubDoor.answers.get(self.path.split("?")[0], (404, {}))
+        status, answer = found(body) if callable(found) else found      # an answer by what the hub asks about
         raw = json.dumps(answer).encode()
         self.send_response(status)
         self.send_header("Content-Length", str(len(raw)))
@@ -312,7 +317,7 @@ class DoorTokens(Access):
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.addCleanup(self.httpd.server_close)
         self.addCleanup(self.httpd.shutdown)
-        StubDoor.calls, StubDoor.answers = [], {}
+        StubDoor.calls, StubDoor.answers, StubDoor.skew = [], {}, 0
         secrets = self.root / "door.json"
         secrets.write_text(json.dumps({"token": "token-secret", "record": "record-secret"}))
         hub.CFG["door_secrets"] = str(secrets)
@@ -322,11 +327,52 @@ class DoorTokens(Access):
         self.write_team(team)
         real = hub.door_call
 
-        def to_stub(conf, method, path, secret, body=None):
-            return real(dict(conf, address="127.0.0.1", port=self.httpd.server_port), method, path, secret, body)
+        def to_stub(conf, method, path, secret, body=None, **more):
+            return real(dict(conf, address="127.0.0.1", port=self.httpd.server_port), method, path, secret, body,
+                        **more)
         patcher = patch.object(hub, "door_call", to_stub)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    OLD, NEW = "bws://00000001-0000-4000-8000-000000000000", "bws://00000002-0000-4000-8000-000000000000"
+    PAGE, PRINTED = "https://github.com/settings/apps/fleet-app", "SHA256:" + "A" * 43 + "="
+
+    def two_keys(self):
+        """The two App keys as the Mac app registers them (GitHubAppKey.place): the old one under the owner's plain
+        name and its successor under a name of its own, each through Add secret's hub step, and both held by the door.
+        A rule of the hub for a key's name that refuses the successor's name fails here. The central vault answers,
+        and the owner signed both grants for the door."""
+        central = patch.dict(hub.CENTRAL, dict(hub.CENTRAL_START, read_at=hub.now(), status={
+            "recovery": "age1" + "e" * 58,
+            "grants": [{"login": ref, "agent": "door", "machine": "door"} for ref in (self.OLD, self.NEW)]}),
+            clear=True)
+        central.start()
+        self.addCleanup(central.stop)
+        for ref, name in ((self.OLD, "GITHUB_APP_ACME_KEY"), (self.NEW, "GITHUB_APP_ACME_2_KEY")):
+            status, said = self.owner("/ui/secrets/add", login=ref, title=name, kind="api_key", env=name,
+                                      fingerprints=[])
+            self.assertEqual((status, said.get("changed")), (200, True), said)
+            self.assertEqual(self.owner("/ui/secrets/grant", login=ref, agent="door", grant="use")[0], 200)
+
+    def keys(self, old_signs=None, new_signs=True, skew=0, in_use=None, in_use_status=200, **old):
+        """The door's answer to each POST /github/key from now on, by the reference that the hub asks about: the old
+        key, or with no reference the key in use, which is the one that the door's file names. old: other fields of
+        the answer about the old key, and in_use of the answer about the key in use. skew: the seconds by which the
+        door's clock is ahead. old_signs None: the door does not answer, as when GitHub does not say; in_use_status:
+        the status of the answer about the key in use alone."""
+        StubDoor.skew = skew
+        if old_signs is None:
+            StubDoor.answers["/github/key"] = (502, {"error": "GitHub did not say whether it takes the App key (500)"})
+            return
+
+        def answer(body):
+            ref = body.get("ref") or self.NEW
+            found = {"used": [self.NEW], "ref": ref, "signs": old_signs if ref == self.OLD else new_signs,
+                     "fingerprint": self.PRINTED if ref == self.OLD else "SHA256:" + "B" * 43 + "="}
+            found.update(old if ref == self.OLD else in_use or {})
+            return (200 if ref == self.OLD else in_use_status), \
+                dict(found, owner="acme", page=self.PAGE) if found["signs"] else found
+        StubDoor.answers["/github/key"] = answer
 
     def test_a_task_session_s_tokens_come_from_the_door(self):
         StubDoor.answers["/github/token"] = (200, {"tokens": [{"token": "ghs_" + "a" * 36, "expires_at": "x",
@@ -347,7 +393,10 @@ class DoorTokens(Access):
         closes an item before its step is done ("Done" before the key is saved, the owner's case of 19 November 2026),
         and the form goes with it: the manager hears at the next look to raise it again, and a day after the hub's
         word for a step whose item it never raised, also when the old key was deleted first; never while an item is
-        open. An item belongs to the step in which it was raised."""
+        open. An item belongs to the step in which it was raised. A 401 for the old key closes the second item only
+        at the second look in a row in which the key in use signs, the key under the old reference is the old one and
+        the door's clock is near the hub's; at the twelfth such look in a row the hub takes the old key back from the
+        door and out of the list of secrets, in one commit, and the successor stays."""
         def told(words):
             return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND text LIKE ?",
                                              (f"%{words}%",))]
@@ -359,8 +408,7 @@ class DoorTokens(Access):
         self.addCleanup(patcher.stop)
         (self.root / "door.json").write_text(json.dumps({"token": "token-secret", "record": "record-secret",
                                                          "app_id": "12345"}))
-        old, new = "bws://00000001-0000-4000-8000-000000000000", "bws://00000002-0000-4000-8000-000000000000"
-        page, printed = "https://github.com/settings/apps/fleet-app", "SHA256:" + "A" * 43 + "="
+        old, new, page, printed = self.OLD, self.NEW, self.PAGE, self.PRINTED
         StubDoor.answers["/github/key"] = (200, {"used": [old], "ref": old, "fingerprint": printed, "signs": True,
                                                  "owner": "acme", "page": page})
         t0 = hub.now()
@@ -466,14 +514,189 @@ class DoorTokens(Access):
         self.assertIsNone(hub.door_renew(t2))
         self.assertEqual(len(told("Raise it again")), 4)         # an open item: no word, also a week later
         self.assertEqual(StubDoor.calls[-1][3], {"app_id": "12345", "ref": old})
-        StubDoor.answers["/github/key"] = (200, {"used": [new], "ref": old, "fingerprint": printed, "signs": False})
-        self.assertEqual(hub.door_renew(t2 + hub.DOOR_RENEW_EVERY)["step"], "done")
+        self.two_keys()
+        hub.q("INSERT INTO door_copies(login,sealed,sha256,created) VALUES(?,?,?,?)", (old, "sealed", "0" * 64, t2))
+        refused = dict(old_signs=False)
+        for answers in (dict(old_signs=False, new_signs=False),      # a 401 for every key: the door's clock, the App
+                        dict(old_signs=False, new_signs=False),      # and no second look of that kind counts
+                        dict(old_signs=False, fingerprint="SHA256:" + "C" * 43 + "="),      # not the old key there
+                        refused,                         # the first look that shows it, and each look between two
+                        dict(old_signs=False, new_signs=False), refused,         # of them starts the count again:
+                        dict(old_signs=False, skew=45), refused,                 # a clock 45 s ahead,
+                        dict(old_signs=False, skew=None), refused,               # a Date that says no time,
+                        dict(), refused,                                         # a look with no answer,
+                        dict(old_signs=True), refused):                          # GitHub takes the old key
+            self.keys(**answers)
+            t2 += hub.DOOR_RENEW_EVERY
+            self.assertIsNone(hub.door_renew(t2), answers)
+        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (second,))["answer"])
+        self.assertEqual((hub.door_renewal()["step"], set(self.origin_team()["logins"])), ("delete", {old, new}))
+        commits, hub.CENTRAL["due"] = int(git("rev-list", "--count", "HEAD", cwd=self.kit)), False
+        t2 += hub.DOOR_RENEW_EVERY
+        state = hub.door_renew(t2)                       # the second look in a row closes the item
+        self.assertEqual(state["step"], "done")
         self.assertIn("refuses the old App key", hub.q1("SELECT answer FROM needs WHERE id=?", (second,))["answer"])
+        self.assertIn("by itself in about an hour", told("the hub closed the second item")[0])
+        changes = hub.CHANGE["state"]
+        for _ in range(9):                               # the looks 3 to 11 in a row: the take-back, which nothing
+            t2 += hub.DOOR_RENEW_EVERY                   # undoes, has a longer count than the closing of the item
+            self.assertIsNone(hub.door_renew(t2))
+        self.assertEqual(hub.CHANGE["state"], changes)   # the count is on no screen: its writes wake no app
+        self.assertEqual((set(self.origin_team()["logins"]), int(git("rev-list", "--count", "HEAD", cwd=self.kit))),
+                         ({old, new}, commits))          # nothing is taken out before the twelfth look in a row
+        t2 += hub.DOOR_RENEW_EVERY
+        state = hub.door_renew(t2)
+        team = self.origin_team()        # the old key is out of the door and of the list, and its successor stays
+        self.assertEqual((set(team["logins"]), team["door"]["secrets"]), ({new}, [new]))
+        self.assertEqual((int(git("rev-list", "--count", "HEAD", cwd=self.kit)), state["retired"]),
+                         (commits + 1, git("rev-parse", "HEAD", cwd=self.kit)))
+        text = told("removed its entry, GITHUB_APP_ACME_KEY, from the list")[0]
+        self.assertIn("Nothing is needed for it.", text)
+        self.assertEqual(hub.door_sealed(DOOR)["keep"], [new])           # the door removes its copy at its next fetch,
+        self.assertIsNone(hub.q1("SELECT 1 FROM door_copies WHERE login=?", (old,)))     # and no copy waits for it
+        self.assertEqual(dict(hub.q1("SELECT agent, level, by, revision FROM resource_grants WHERE resource=? ORDER BY "
+                                     "id DESC", (f"secret:{old}",))), {"agent": "door", "level": None, "by": "hub",
+                                                                       "revision": state["retired"]})
+        self.assertIs(hub.CENTRAL["due"], True)          # the hub's next pass reads the central vault again
         calls = len(StubDoor.calls)
-        self.assertIsNone(hub.door_renew(t2 + 2 * hub.DOOR_RENEW_EVERY))
-        self.assertEqual(len(StubDoor.calls), calls)     # done: no more looks
+        self.assertIsNone(hub.door_renew(t2 + hub.DOOR_RENEW_EVERY))
+        self.assertEqual(len(StubDoor.calls), calls)     # done, and the old key is out: no more looks
         with self.assertRaisesRegex(hub.ToolError, "github_key is the GitHub account"):
             hub.t_raise_needs_you("manager", {"title": "t", "why": "w", "what_to_do": "d", "github_key": "acme"})
+
+    def test_the_old_app_key_stays_while_something_holds_it_and_the_step_runs_again(self):
+        """The hub takes the old App key out of the door and the list only when nothing else holds its entry and the
+        entry is a GitHub App key, and only at the twelfth look in a row in which GitHub refuses that key alone. Each
+        later look tries again: after an entry that was held, after a commit that failed, and so also in a fleet whose
+        renewal was "done" before the hub had this step. The manager reads a reason for which the entry stays when it
+        is not the last one said, and then, with no wake-up, that the key went; a look that changes nothing writes
+        nothing. A "done" that was not true goes back to the step "delete": GitHub takes the old key."""
+        def told(words):
+            return [(r["text"], json.loads(r["extra"] or "{}")) for r in hub.q(
+                "SELECT text, extra FROM events WHERE agent='manager' AND text LIKE ?", (f"%{words}%",))]
+
+        def look(**answers):
+            self.keys(**answers)
+            self.at += hub.DOOR_RENEW_EVERY
+            return hub.door_renew(self.at)
+
+        def done(**more):
+            hub.kv_set("door_github_renew", json.dumps(dict(
+                {"owner": "acme", "app_id": "12345", "old": old, "page": self.PAGE, "fingerprint": self.PRINTED,
+                 "step": "done", "at": 1, "looks": hub.DOOR_RETIRE_LOOKS - 1}, **more)))
+        patcher = patch.dict(hub.DOOR_RENEW, {"at": 0.0, "form": 0.0})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        (self.root / "door.json").write_text(json.dumps({"token": "token-secret", "record": "record-secret",
+                                                         "app_id": "12345"}))
+        self.two_keys()
+        old, new, rev, self.at = self.OLD, self.NEW, hub.kit_revision(fresh=True), hub.now()
+        for change, why in (
+                (lambda t: t["logins"][old].update(env="CLOUDFLARE_API_TOKEN"), "not a GitHub App key"),
+                (lambda t: t["agents"]["studio"].update(secrets={old: "read"}), "studio still holds it"),
+                (lambda t: t.update(resources={f"secret:{old}": {"max": "use", "to": "workers"}}), "grantable pool"),
+                (lambda t: t["door"].update(credentials={"cloudflare:acme": {"secret": old}}),
+                 "the door's rules use it as cloudflare:acme")):
+            team = self.origin_team()
+            change(team)
+            self.assertIn(why, hub.door_key_kept(team, old, rev)[1])
+        with patch.object(hub, "profile_logins", lambda name, rev=None: {old} if name == "lead" else set()):
+            self.assertIn("lead still holds it", hub.door_key_kept(self.origin_team(), old, rev)[1])
+        self.assertIsNone(hub.door_key_kept(self.origin_team(), old, rev))
+        team = self.origin_team()                        # an entry that is no GitHub App key stays for good
+        team["logins"][old]["env"] = "CLOUDFLARE_API_TOKEN"
+        self.write_team(team)
+        done()
+        self.assertEqual(look(old_signs=False)["retired"], "left")
+        self.assertEqual([extra.get("quiet") for _, extra in told("It looks no more")], [True])
+        calls = len(StubDoor.calls)
+        self.assertIsNone(look(old_signs=False))
+        self.assertEqual(len(StubDoor.calls), calls)
+        team["logins"][old]["env"] = "GITHUB_APP_ACME_KEY"
+        team["agents"]["vps"]["secrets"] = {old: "use"}
+        self.write_team(team)
+        del hub.TEAM["agents"]["vps"]["secrets"]         # the hub reads team.json again for its write, not its memory
+        done()
+        self.assertIsNone(look(old_signs=False))
+        state = hub.door_renewal()
+        self.assertEqual((state["step"], state.get("retired"), state["kept"]), ("done", None, "held vps"))
+        self.assertEqual([extra.get("quiet") for _, extra in told("while vps still holds it")], [True])
+        kept, changes = hub.kv_get("door_github_renew"), hub.CHANGE["state"]
+        self.assertIsNone(look(old_signs=False))         # the same reason again: no second word, and no write
+        self.assertEqual((len(told("vps still holds it")), hub.kv_get("door_github_renew"), hub.CHANGE["state"]),
+                         (1, kept, changes))
+        in_use = {"used": [new], "ref": new, "signs": True, "fingerprint": "SHA256:" + "B" * 43 + "="}
+        self.assertTrue(hub.door_key_in_use(state, in_use))
+        for other in ({"signs": False}, {"used": [new, old.upper()]}, {"fingerprint": self.PRINTED}, {"used": []},
+                      {"ref": old}, {"fingerprint": None}):
+            self.assertFalse(hub.door_key_in_use(state, dict(in_use, **other)), other)
+        calls = len(StubDoor.calls)                      # the door's App is not the one of this renewal: no look
+        self.assertIsNone(hub.door_old_key_look(dict(state, app_id="999"), hub.door_conf(), "12345"))
+        self.assertEqual(len(StubDoor.calls), calls)
+        team = self.origin_team()
+        del team["agents"]["vps"]["secrets"]
+        self.write_team(team)
+        for answers, words in ((dict(old_signs=False, new_signs=False), "does not show that it makes its tokens"),
+                               (dict(old_signs=False, fingerprint="SHA256:" + "C" * 43 + "="),
+                                "does not have that fingerprint"),
+                               (dict(old_signs=False, skew=-45), "more than 30 seconds off the hub's")):
+            hub.kv_set("door_github_renew", json.dumps(dict(hub.door_renewal(), looks=hub.DOOR_RETIRE_LOOKS - 1)))
+            self.assertIsNone(look(**answers))           # a 401 for every key, not the old key, a door's clock behind:
+            self.assertIsNone(look(old_signs=False))     # each one starts the count again, so this look takes nothing
+            self.assertEqual([extra.get("quiet") for _, extra in told(words)], [True])
+        for _ in range(6):                               # the count starts again from each of those looks, and from a
+            self.assertIsNone(look(old_signs=False))     # look with no answer
+        self.assertIsNone(look())
+        for _ in range(hub.DOOR_RETIRE_LOOKS - 1):
+            self.assertIsNone(look(old_signs=False))
+        self.assertEqual(set(self.origin_team()["logins"]), {old, new})
+        state = look(old_signs=True, in_use={"fingerprint": self.PRINTED})       # and the door uses that very key:
+        self.assertEqual(state["step"], "ask")           # no words to delete it, the renewal asks for a new key again
+        text, extra = told("the renewal is back at its first item")[0]
+        self.assertEqual(('click "New key"' in text, "Delete" in text, extra.get("quiet")), (True, False, None))
+        done()                                           # the same when the door's file still names the old reference
+        self.assertEqual(look(old_signs=True, in_use={"used": [old, new]})["step"], "ask")
+        done()
+        self.assertIsNone(look(old_signs=True, in_use_status=502))       # the door does not say which key it uses:
+        self.assertEqual((hub.door_renewal()["step"], hub.door_renewal()["looks"]), ("done", 0))   # no way back, and
+        self.assertIsNone(look(old_signs=False))         # the count starts again, so this look takes nothing out
+        state = look(old_signs=True, skew=45)            # GitHub takes the old key, also with a door's clock that is
+        self.assertEqual(state["step"], "delete")        # off: the "done" was not true
+        self.assertEqual((state["looks"], "kept" in state, state["back"]), (0, False, True))
+        text, extra = told("Raise the second Needs-you item again")[0]
+        self.assertEqual(('github_key "acme"' in text, extra.get("quiet")), (True, None))       # it wakes the manager
+        for _ in range(hub.DOOR_RETIRE_LOOKS - 1):       # after a way back, the item closes only at the twelfth look
+            self.assertIsNone(look(old_signs=False))     # in a row: a key that GitHub takes now and then does not open
+        self.assertEqual(look(old_signs=False)["step"], "done")          # and close it again and again
+        self.assertIn("by itself at its next look", told("deleted it, and the hub closed the second item")[0][0])
+        held = []
+
+        def fails(*args, **more):
+            held.append((hub.KIT._is_owned(), hub.LOCK._is_owned()))
+            raise hub.Refusal(409, "the hub checkout has local changes")
+        asked, said = len(StubDoor.calls), len(told(""))
+        with patch.object(hub, "commit_kit_file", fails):
+            self.assertIsNone(look(old_signs=False))     # the next look, and the write fails
+        self.assertEqual((hub.door_renewal().get("retired"), hub.door_renewal()["kept"], held),
+                         (None, "write", [(True, True)]))
+        self.assertEqual((len(StubDoor.calls), len(told(""))), (asked + 2, said + 1))  # one look, one quiet word
+        text, extra = told("could not save the change of its files")[0]
+        self.assertEqual((extra.get("quiet"), "The hub tries again every 5 minutes." in text), (True, True))
+        self.assertTrue(hub.q1("SELECT 1 FROM log WHERE what LIKE ?", ("%did not take the old App key%",)))
+        self.assertEqual(set(self.origin_team()["logins"]), {old, new})
+        state = look(old_signs=False)                    # the same step again, as for a "done" from before this step
+        team = self.origin_team()
+        self.assertEqual((set(team["logins"]), team["door"]["secrets"], state["retired"]),
+                         ({new}, [new], git("rev-parse", "HEAD", cwd=self.kit)))
+        text, extra = told("removed its entry, GITHUB_APP_ACME_KEY, from the list")[0]
+        self.assertEqual((extra.get("quiet"), "Nothing is needed for it." in text), (True, True))
+        hub.kv_set("door_github_renew", json.dumps({k: v for k, v in state.items() if k != "retired"}))
+        calls = len(StubDoor.calls)      # a hub that stopped after the commit and before its mark asks the door nothing
+        self.assertEqual((look(old_signs=False)["retired"], len(StubDoor.calls)), ("absent", calls))
+        hub.kv_set("door_github_renew", json.dumps({k: v for k, v in state.items() if k != "retired"}))
+        hub.TEAM["door"]["secrets"] = [new, old]         # a team in memory from before the hub's own commit
+        self.assertEqual(look(old_signs=False)["retired"], "absent")
+        self.assertEqual(hub.TEAM["door"]["secrets"], [new])     # the hub runs its own commit now
 
     def test_the_app_links_the_hub_to_the_door_only_when_the_door_mints_for_every_owner(self):
         """DevOps plan 13, item 4: the app makes the hub's two door secrets on the door and gives them to the hub. The
