@@ -3085,12 +3085,25 @@ def need_run_note(need, status, output):
 # What the tool tells an agent that asks for the key of a Cloudflare account of the door (the owner, 12 November 2026,
 # to a card that listed seven rights: "why do I have to do that?"): one key that only makes tokens, given one time,
 # from which the door makes each narrow key (door_providers.cloudflare_work_key). The agent writes the card in its own
-# words: the owner chose no fixed words for it.
+# words: the owner chose no fixed words for it. Since 20 November 2026 the words give the address of Cloudflare's own
+# form for that key (the owner, of such a card that named the menus and no address: "also when possible these tasks
+# should include specific links"): the template link of "API token template URLs" in Cloudflare's documentation, with
+# the key's two permissions and a name. That day, in a signed-in dashboard, it opened "Create a token" in the account
+# that the dashboard showed, with the name, Account API Tokens: Edit and Account Settings: Read filled in and "No
+# expiration" chosen; it asked for no account. :account stays in it, because the hub knows no account id to put there
+# (team.json names a door account by a name of the owner's, as cloudflare:acme), so the owner checks the account.
+CLOUDFLARE_KEY_FORM = ("https://dash.cloudflare.com/?to=/:account/api-tokens&permissionGroupKeys=%5B%7B%22key%22%3A"
+                       "%22account_api_tokens%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings"
+                       "%22%2C%22type%22%3A%22read%22%7D%5D&name=Founderizer%20door%20key%20maker")
 DOOR_CLOUDFLARE_KEY = (
-    "A cloudflare key is one that only makes tokens. The owner makes it one time for that account, in Cloudflare "
-    "under Manage Account, then Account API Tokens: an account-owned token with two permissions, Account API Tokens: "
-    "Edit and Account Settings: Read, and with no end date. Write those steps in details, in your own words. Ask for "
-    "no other permission: the door makes its own work key from this key each day, with the permissions that its "
+    "A cloudflare key is one that only makes tokens. The owner makes it one time for that account, on Cloudflare's "
+    f"own form for it: {CLOUDFLARE_KEY_FORM} Give that address with nothing changed: never put a name or an id in "
+    "place of :account. It opens the form in the account that Cloudflare asks the owner to choose, or else in the one "
+    "whose name shows at the top left: if that is another account, the owner switches there and opens the address "
+    "again. The form comes filled in with the token's name, its two permissions, Account API Tokens: Edit and Account "
+    "Settings: Read, and no end date: the owner clicks Review token, makes the token and copies it into the card. "
+    "Write those steps in details, in your own words, with that full address and the account to choose. Ask for no "
+    "other permission: the door makes its own work key from this key each day, with the permissions that its "
     "Cloudflare forms need")
 
 DOOR_SCRIPT_CHARS = 4000        # characters of the script of a door card: what the card shows whole, as details
@@ -3367,6 +3380,15 @@ def need_view(row, reads=None):
     else:
         view["door_fleet"] = None
     return view
+
+
+def words_held(text, words, head=160):
+    """Whether `text` already holds `words`, or their first `head` characters, as words: in any case, with any spaces
+    and line breaks, and with no quote or Markdown mark between them. A card's details that quote a question hold it."""
+    def plain(value):
+        return " ".join(re.sub(r"[\"'“”‘’*_`>#]", " ", str(value or "")).casefold().split())
+    key = plain(words)[:head]
+    return bool(key) and key in plain(text)
 
 
 def need_recommended(given, options, give=False):
@@ -7570,6 +7592,28 @@ SHELL_OFF_RULE = (" Your Shell box is off: no shell, no file tool and no key rea
                   "comes to this task; a session that your duty's watch started for one line of its check, and a "
                   "task that reads one record, wait for no answer. Go on inside your duty's words. When you cannot "
                   "do what was asked, deliver failed with a typed reason, never completed.")
+# RULES.md "While a task runs": a task of more than two steps keeps its plan in the runtime's own task list, which the
+# owner's app shows under the running task (threads.py, plan records). The task's own block names the tool, because the
+# rule alone did not carry it: over the 7 days to 20 November 2026 (the session "Agent task planning") 169 of 473 large
+# Claude Code tasks had a plan, and 20 of the 295 that never loaded the deferred task tools. A closed session has the
+# list only at a version of lifecycle.PLAN_LIST_VERSIONS (fleet.closed_task_command), named in its --tools with no
+# ToolSearch, so its line says "if" and names no ToolSearch; a runtime with no list here gets no line (plan_line).
+PLAN_KEEP = "keep the plan of a task of more than two steps"
+PLAN_LINES = {"claude": f' {PLAN_KEEP.capitalize()} in your task list: load TaskCreate and TaskUpdate with ToolSearch '
+                        f'"select:TaskCreate,TaskUpdate".',
+              "codex": f" {PLAN_KEEP.capitalize()} with update_plan."}
+PLAN_LINE_CLOSED = f" If TaskCreate is among your tools, {PLAN_KEEP} there."
+
+
+def plan_line(agent, closed):
+    """The task's own line for its plan, by the agent's runtime (PLAN_LINES): a closed Claude Code session's
+    PLAN_LINE_CLOSED, and "" for a runtime with no task list or a closed session of another runtime."""
+    runtime = (agents().get(agent) or {}).get("runtime")       # the team's copy that shell_off reads
+    if closed:
+        return PLAN_LINE_CLOSED if runtime == "claude" else ""
+    return PLAN_LINES.get(runtime, "")
+
+
 RULE_FOUR = (" Never contact the owner from here: if you are blocked, use ask_my_requester, and your line takes the "
              "question up as far as it must go, the owner last. If you are only UNSURE and not "
              "blocked, ask anyway and say in default what you will go on with: the task does not pause, your "
@@ -7734,6 +7778,9 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
          web_hosts_text(agent, task_id) if closed else RULE_FOUR)
     # owner feature secret_requests: the one thing that it asks the owner for itself, in a task that no contact drives
     said += "" if closed or contact_session(agent, ("", tref(task_id), "1")) else SECRET_SELF
+    # its plan of steps, in its runtime's task list (RULES.md, "While a task runs"), but not in a start for a message
+    # alone, whose task waits
+    said += "" if resume == PARK_MESSAGE else plan_line(agent, closed)
     # manager_as_lead: when this task is one part of a split piece of work, which piece and who holds the other
     # parts -- a part that does not know it is a part does the whole piece.
     part = part_start_text(task_id, closed)
@@ -15636,7 +15683,10 @@ def t_raise_needs_you(agent, a):
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
         old = need_replaced(agent, replaces) if replaces else None
         qu = need_question(agent, a.get("question_id"), ignore=old["id"] if old else None)
-        if qu and door_script is None:  # the asker's own words, which the owner answers: behind Details, with no code
+        # the asker's own words, which the owner answers: behind Details, with no code, and once: not where the
+        # agent's details quote them already (the owner, 20 November 2026: "why is the text like repeated ... I need
+        # more brevity and clarity")
+        if qu and door_script is None and not words_held(details, qu["text"]):
             words = clip_lines(qu["text"], 1000)
             gap = "\n" if "\n" in words else " "    # a question of several lines starts on a line of its own
             details = (details + "\n\n" if details else "") + \
@@ -43159,8 +43209,9 @@ TOOLS = [
         "why": {"type": "string", "description": f"One or two plain sentences, at most {NEED_WHY_CHARS} characters: "
                                                 "what the owner decides and why it matters now."},
         "details": {"type": "string", "description": f"The longer part, behind Details on the owner's card: the "
-                    f"reasoning, an agent's words, the facts, at most {NEED_DETAILS_CHARS} characters, in plain "
-                    f"words."},
+                    f"reasoning and the facts that the why and the options do not say, at most {NEED_DETAILS_CHARS} "
+                    f"characters, in plain words. Say each fact once on the card. With question_id the hub adds the "
+                    f"asker's own words here: do not copy them."},
         "multi": {"type": "boolean", "description": "True when the owner may tick several of the options: they send "
                   "the ones they ticked, and the words of those options, joined, are the answer."},
         "recommended": {"type": "string", "description": "The answer that you recommend, which the card marks. With "
@@ -43206,7 +43257,7 @@ TOOLS = [
                                    f"Leave it out for a question that is not a choice; the owner can always write "
                                    f"their own answer instead."},
         "question_id": {"type": "string", "description": "The question with you that only the owner can settle, "
-                        "for example Q-4: the item quotes its asker, the owner's answer and its files go back to it as the answer, "
+                        "for example Q-4: the item quotes its asker behind Details, the owner's answer and its files go back to it as the answer, "
                         "and the item closes by itself when the question is answered another way or its task ends"},
         "ask": {"type": "string", "description": "When work that the owner asked for waits for this item: a task "
                 "of that work, for example T-12, or the owner's message M-<n> itself when a task names it already. "
@@ -43353,8 +43404,9 @@ TOOLS = [
                                                  f"{NEED_WHY_CHARS} characters: the owner reads it before they type "
                                                  f"the value"},
         "details": {"type": "string", "description": f"The longer part, behind Details on the owner's card: how to "
-                    f"make the key (its page, its permissions, its scope), at most {NEED_DETAILS_CHARS} characters, "
-                    f"plain words"},
+                    f"make the key, as numbered steps: its page as its full address with https://, what to click there "
+                    f"by the words on the buttons, its permissions and its scope; at most {NEED_DETAILS_CHARS} "
+                    f"characters, plain words"},
         "give_to": {"type": "object", "additionalProperties": {"type": "string", "enum": ["use", "read"]},
                     "description": "The agents you propose should get it: use (its vault uses it, and the agent "
                                    "never sees it) or, for an API key, read (the key is in its sessions as env). "
@@ -43396,8 +43448,9 @@ TOOLS = [
                                                  f"{NEED_WHY_CHARS} characters: the owner reads it before they type "
                                                  f"the value"},
         "details": {"type": "string", "description": f"The longer part, behind Details on the owner's card: how to "
-                    f"make the key (its page, its permissions, its scope), at most {NEED_DETAILS_CHARS} characters, "
-                    f"plain words"},
+                    f"make the key, as numbered steps: its page as its full address with https://, what to click there "
+                    f"by the words on the buttons, its permissions and its scope; at most {NEED_DETAILS_CHARS} "
+                    f"characters, plain words"},
         "in_reply_to": {"type": "string", "description": "In your owner chat: the request_id of the owner's newest "
                                                          "message to you"},
         "door": {"type": "string", "description": "Only for a key that the DevOps door uses for you: its name in "

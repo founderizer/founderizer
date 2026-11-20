@@ -188,14 +188,17 @@ class Translation(unittest.TestCase):
                 result("t1", "Task #1 created successfully: Read the advisories", made="1"),
                 result("t2", [{"type": "text", "text": "Task #2 created successfully: Upgrade the apps"}]),
                 use("t3", "TaskUpdate", taskId="1", status="in_progress"), result("t3", "Updated task #1 status"),
-                use("t4", "TaskUpdate", taskId="1", status="completed"),
+                use("t4", "TaskUpdate", taskId="1", status="completed"), result("t4", "Updated task #1 status"),
                 use("t5", "TaskUpdate", taskId="2", subject="Upgrade the seven apps", status="in_progress"),
+                result("t5", "Updated task #2 subject, status"),
                 use("t6", "TaskList"), use("t7", "TaskGet", taskId="2"),
                 use("t8", "TaskUpdate", taskId="9", status="completed"),       # a task this session never made
+                result("t8", "Task not found"),
                 use("t9", "TaskUpdate", taskId="2", description="New words"),  # no change that the plan shows
+                result("t9", "Updated task #2 description"),
                 use("t10", "TaskCreate", subject="Refused", description="x"), result("t10", "Invalid input", error=True),
                 use("t11", "TaskCreate", subject="Spare", description="x"), result("t11", "", made="3"),
-                use("t12", "TaskUpdate", taskId="3", status="deleted"),
+                use("t12", "TaskUpdate", taskId="3", status="deleted"), result("t12", "Updated task #3 deleted"),
                 use("t13", "TodoWrite", todos=[{"content": "A list of the other tool", "status": "pending"}]),
                 result("t13", "No such tool available: TodoWrite", error=True),
                 # two refused lists and a new step in one message: the plan is the task list with that step
@@ -217,12 +220,113 @@ class Translation(unittest.TestCase):
                                      [("A list of the other tool", "pending")], [done, doing],
                                      [("One", "pending")], [("Two", "pending")]] +
                          [[done, doing, ("Check the apps", "pending")]] * 3)
-        # a session with no task tool: a refused list gives the newest one that the program took
+        # a session with no task tool: a refused list gives the newest one that the program took; a task tool that
+        # the program refused (it has none) makes it no task session; and a refused list whose result comes after a
+        # second list's call gives that second list, which the program may still take
         rows = [use("w1", "TodoWrite", todos=[{"content": "Kept", "status": "pending"}]), result("w1", "Todos updated"),
                 use("w2", "TodoWrite", todos=[{"content": "Refused", "status": "pending"}]),
-                result("w2", "Invalid input", error=True)]
+                result("w2", "Invalid input", error=True),
+                use("w3", "TaskCreate", subject="No such tool here", description="x"),
+                result("w3", "No such tool available: TaskCreate", error=True),
+                use("w4", "TodoWrite", todos=[{"content": "Refused too", "status": "pending"}]),
+                result("w4", "Invalid input", error=True),
+                use("w5", "TodoWrite", todos=[{"content": "Wrong", "status": "pending"}]),
+                use("w6", "TodoWrite", todos=[{"content": "Taken", "status": "pending"}]),
+                result("w5", "Invalid input", error=True), result("w6", "Todos updated"),
+                use("w7", "TodoWrite", todos=[{"content": "Never answered", "status": "pending"}]),    # no result
+                use("w8", "TodoWrite", todos=[{"content": "Refused again", "status": "pending"}]),
+                result("w8", "Invalid input", error=True),
+                use("w9", "TaskCreate", subject="Not here either", description="x"),
+                use("w10", "TodoWrite", todos=[{"content": "Next", "status": "pending"}]),
+                result("w9", "No such tool available: TaskCreate", error=True), result("w10", "Todos updated"),
+                # a later list's place comes after each earlier one's, also after a result took one away
+                use("w11", "TodoWrite", todos=[{"content": "First", "status": "pending"}]),
+                use("w12", "TodoWrite", todos=[{"content": "Second", "status": "pending"}]),
+                result("w11", "Todos updated"),
+                use("w13", "TodoWrite", todos=[{"content": "Third", "status": "pending"}]),
+                result("w12", "Invalid input", error=True), result("w13", "Todos updated")]
         out, _ = translate("claude", rows)
-        self.assertEqual([[e["content"] for e in r["entries"]] for r in out[1:]], [["Kept"], ["Refused"], ["Kept"]])
+        self.assertEqual([[e["content"] for e in r["entries"]] for r in out[1:]],
+                         [["Kept"], ["Refused"], ["Kept"], ["No such tool here"], ["Kept"], ["Refused too"], ["Kept"],
+                          ["Wrong"], ["Taken"], ["Taken"], ["Never answered"], ["Refused again"], ["Taken"],
+                          ["Not here either"], ["Next"], ["Next"], ["First"], ["Second"], ["Third"], ["Third"]])
+
+    def test_an_update_in_the_message_that_creates_its_task_reaches_the_plan(self):
+        """The model often creates a task and marks it in progress in one message, whose calls all come before their
+        results: the update names the id that only the TaskCreate's result gives, so it waits for its own result, and
+        goes into the plan when that result says the program made it. It was lost, and the owner's app showed the step
+        as pending while the session worked on it or had done it. An update with no result, or one that the program
+        ran before a TaskCreate of its message ("Task #N not found"), changes no later task that gets that id."""
+        def use(call, name, **args):
+            return {"type": "assistant", "sessionId": SESSION, "message": {"content": [
+                {"type": "tool_use", "id": call, "name": name, "input": args}]}}
+
+        def result(call, content, error=False):
+            return {"type": "user", "sessionId": SESSION, "message": {"content": [
+                {"type": "tool_result", "tool_use_id": call, "content": content, "is_error": error}]}}
+
+        rows = [use("u1", "TaskCreate", subject="Read the logs", description="x"),
+                use("u2", "TaskCreate", subject="Fix the job", description="x"),
+                use("u3", "TaskUpdate", taskId="1", status="in_progress"),
+                use("u4", "TaskUpdate", taskId="2", subject="Fix the nightly job"),
+                result("u1", "Task #1 created successfully: Read the logs"),
+                result("u2", "Task #2 created successfully: Fix the job"),
+                result("u3", "Updated task #1 status"), result("u4", "Updated task #2 subject"),
+                use("u5", "TaskCreate", subject="Refused", description="x"),
+                use("u6", "TaskUpdate", taskId="3", status="completed"),
+                result("u5", "Invalid input", error=True),
+                use("u7", "TaskCreate", subject="Deploy", description="x"),
+                result("u7", "Task #3 created successfully: Deploy"),
+                use("u8", "TaskCreate", subject="Verify", description="x"),
+                use("u9", "TaskUpdate", taskId="5", status="completed"),
+                use("u10", "TaskCreate", subject="Ship", description="x"),
+                result("u8", "Task #4 created successfully: Verify"),
+                result("u9", "Task not found"),                  # it ran before the TaskCreate after it
+                result("u10", "Task #5 created successfully: Ship"),
+                # a step that the program no longer has (it clears a list whose steps are all done): not found
+                use("u11", "TaskUpdate", taskId="1", status="completed"), result("u11", "Updated task #1 status"),
+                use("u12", "TaskUpdate", taskId="1", status="in_progress"), result("u12", "Task not found"),
+                # two updates of one id, the first of them called before its task's id came: the order the program ran
+                use("u13", "TaskCreate", subject="Report", description="x"),
+                use("u14", "TaskUpdate", taskId="6", status="in_progress"),
+                result("u13", "Task #6 created successfully: Report"),
+                use("u15", "TaskUpdate", taskId="6", status="completed"),
+                result("u14", "Updated task #6 status"), result("u15", "Updated task #6 status"),
+                # a waiting delete, and an update that the program refused
+                use("u16", "TaskCreate", subject="Spare", description="x"),
+                use("u17", "TaskUpdate", taskId="7", status="deleted"),
+                result("u16", "Task #7 created successfully: Spare"), result("u17", "Updated task #7 deleted"),
+                use("u18", "TaskUpdate", taskId="5", status="done"), result("u18", "Invalid input", error=True),
+                # the program's own record decides, whatever its words: in a later release they may change
+                use("u19", "TaskUpdate", taskId="4", status="completed"),
+                dict(result("u19", "Done."), toolUseResult={"success": True, "taskId": "4", "updatedFields": ["status"]}),
+                use("u20", "TaskUpdate", taskId="5", status="completed"),
+                dict(result("u20", "Updated task #5 status"), toolUseResult={"success": False, "taskId": "5"})]
+        out, _ = translate("claude", rows)
+        plans = [[(e["content"], e["status"]) for e in r["entries"]] for r in out if r["type"] == "plan"]
+        # updates whose result never came (a session that stopped) give their room to the newest: the plan never
+        # freezes once TASK_WAITS of them wait
+        with mock.patch.object(threads, "TASK_WAITS", 2):
+            stale, _ = translate("claude", [use("s1", "TaskCreate", subject="Last", description="x"),
+                                            result("s1", "Task #1 created successfully: Last"),
+                                            use("s2", "TaskUpdate", taskId="1", status="in_progress"),
+                                            use("s3", "TaskUpdate", taskId="1", status="in_progress"),
+                                            use("s4", "TaskUpdate", taskId="1", status="completed"),
+                                            result("s4", "Updated task #1 status")])
+        self.assertEqual([e["status"] for e in [r for r in stale if r["type"] == "plan"][-1]["entries"]], ["completed"])
+        self.assertEqual(plans[2:4], [[("Read the logs", "in_progress"), ("Fix the job", "pending")],
+                                      [("Read the logs", "in_progress"), ("Fix the nightly job", "pending")]])
+        self.assertEqual(plans[-1], [("Read the logs", "completed"), ("Fix the nightly job", "pending"),
+                                     ("Deploy", "pending"), ("Verify", "completed"), ("Ship", "pending"),
+                                     ("Report", "completed")])
+        # a list that the program refuses while a task of the session waits for its result: the task list stands
+        rows = [use("v1", "TodoWrite", todos=[{"content": "The old way", "status": "pending"}]),
+                use("v2", "TaskCreate", subject="Check the apps", description="x"),
+                result("v1", "No such tool available: TodoWrite", error=True),
+                result("v2", "Task #1 created successfully: Check the apps")]
+        out, _ = translate("claude", rows)
+        self.assertEqual([[e["content"] for e in r["entries"]] for r in out if r["type"] == "plan"],
+                         [["The old way"], ["Check the apps"], ["Check the apps"]])
 
     def turns(self, rows, idle=False):
         """The records of rows, and the result records' stop reasons; idle: a read that finds no new line after them."""

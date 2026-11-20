@@ -524,3 +524,13 @@ class Talk(NeedsCase):
         self.assertEqual(self.item(2)["details"], "Dev's question, in its own words:\n\"Which way do I fix the check?\n"
                                                   "A) Add the schema.\n\nB) Skip the file.\n  - one part\n"
                                                   "My suggestion: A.\"")
+        # details that quote the question already get no second copy of it (the owner, 20 November 2026: "why is the
+        # text like repeated ... I need more brevity and clarity")
+        qid = hub.ins("INSERT INTO questions(task, asker, requester, text, asked) VALUES(?,?,?,?,?)",
+                      (task, "dev", "manager", "Strip the seller's branding on import, or keep it?\nOption 1 is faster.",
+                       hub.now()))
+        self.raise_item(question_id=f"Q-{qid}", details="The lead's proposal, as written:\n> **Strip the seller's "
+                                                         "branding** on import, or keep it? Option 1 is faster.\n\n"
+                                                         "I agree with option 1.")
+        self.assertEqual(self.item(3)["details"].count("branding"), 1)
+        self.assertNotIn("in its own words", self.item(3)["details"])

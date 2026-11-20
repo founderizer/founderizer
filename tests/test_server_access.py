@@ -8,6 +8,7 @@ import json
 import threading
 import time
 import unittest
+import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
@@ -1287,17 +1288,27 @@ class DoorCalls(Access):
         """12 November 2026 (the owner, to a card that listed seven rights: "why do I have to do that?"): the key of a
         Cloudflare account of the door is one that only makes tokens, given one time, and the door makes its own work
         key from it. The tool tells each asker which key that is, and the card is the asker's own words: the owner
-        chose no fixed words for it ("No fixed steps")."""
+        chose no fixed words for it ("No fixed steps"). Since 20 November 2026 (the owner, of such a card with no
+        address: "also when possible these tasks should include specific links") the tool gives the address of
+        Cloudflare's own form for that key, which comes with the key's two permissions, and the card keeps it."""
+        form = urllib.parse.urlsplit(hub.CLOUDFLARE_KEY_FORM)
+        asked = urllib.parse.parse_qs(form.query)
+        self.assertEqual((form.scheme, form.netloc, asked["to"]), ("https", "dash.cloudflare.com",
+                                                                    ["/:account/api-tokens"]))
+        self.assertEqual(json.loads(asked["permissionGroupKeys"][0]),
+                         [{"key": "account_api_tokens", "type": "edit"}, {"key": "account_settings", "type": "read"}])
         doors = [json.dumps(t[4]["properties"]["door"]) for t in hub.TOOLS if t[1] == "request_secret"]
         self.assertEqual(len(doors), 2)                                 # the manager's entry, and a worker's
         for words in doors:
             for part in ("only makes tokens", "one time for that account", "Account API Tokens: Edit",
-                         "Account Settings: Read", "no end date", "Ask for no other permission"):
+                         "Account Settings: Read", "no end date", "Ask for no other permission",
+                         hub.CLOUDFLARE_KEY_FORM, "with nothing changed", "with that full address"):
                 self.assertIn(part, words)
         ask = {"kind": "api_key", "site": "https://api.cloudflare.com", "why": "Acme's DNS through the door"}
-        hub.t_request_secret("manager", dict(ask, door="cloudflare:acme", details="One key that only makes tokens."))
+        details = f"One key that only makes tokens, on {hub.CLOUDFLARE_KEY_FORM} in Acme's account."
+        hub.t_request_secret("manager", dict(ask, door="cloudflare:acme", details=details))
         row = hub.q1("SELECT why, details FROM needs WHERE kind='secret' ORDER BY id DESC LIMIT 1")
-        self.assertEqual((row["why"], row["details"]), ("Acme's DNS through the door", "One key that only makes tokens."))
+        self.assertEqual((row["why"], row["details"]), ("Acme's DNS through the door", details))
 
     def door_key(self, name="cloudflare:acme", users=None):
         """The door holds self.ref under this name of its rules, for these agents."""

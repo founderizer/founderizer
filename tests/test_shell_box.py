@@ -870,6 +870,27 @@ class Tools(Fleet):
         self.assertIn("knowledge/", files)
         self.assertIn(files, hub.start_text("desk", tid))
 
+    def test_a_task_start_names_its_runtimes_task_list_and_a_closed_one_only_if_it_has_it(self):
+        """A task of more than two steps keeps its plan in the runtime's task list (RULES.md), which the rule alone did
+        not carry: 169 of 473 large Claude Code tasks had a plan in the 7 days to 20 November 2026. Bug: a start that
+        names no tool, that names Claude Code's tools to Codex, or that tells a closed session, which has the list only
+        at some versions of Claude Code, to use it as if it had it."""
+        tid, _ = self.task("desk", title="Answer the refund ticket")
+        load = 'load TaskCreate and TaskUpdate with ToolSearch "select:TaskCreate,TaskUpdate".'
+        closed = hub.task_start_text("desk", tid)          # its --tools name the list, and no ToolSearch
+        self.assertIn(" If TaskCreate is among your tools, keep the plan of a task of more than two steps there.", closed)
+        self.assertNotIn("ToolSearch", closed)
+        # a start for a message alone, whose task waits, plans nothing
+        self.assertNotIn("plan of a task", hub.task_start_text("desk", tid, resume=hub.PARK_MESSAGE))
+        with patch.object(hub, "shell_off", lambda agent: False):
+            self.assertIn(" Keep the plan of a task of more than two steps in your task list: " + load,
+                          hub.task_start_text("desk", tid))
+            hub.TEAM["agents"]["desk"]["runtime"] = "codex"
+            text = hub.task_start_text("desk", tid)
+            self.assertIn(" Keep the plan of a task of more than two steps with update_plan.", text)
+            self.assertNotIn("TaskCreate", text)
+        self.assertNotIn("plan of a task", hub.task_start_text("desk", tid))       # a closed Codex start has no list
+
     def test_a_closed_start_names_only_the_tools_that_its_session_has(self):
         """A Shell-off session's start sent it to message_agent, ask_my_requester, see_earlier_work, sign_in and
         call_api, which it does not have, and said that an API key was in it (3 November 2026). Each part of its start,
