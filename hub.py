@@ -1860,6 +1860,10 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "office_files",      # the owner, 20 November 2026 ("Yes, fix both"): POST /ui/attachments takes Word,
                                     # Excel and PowerPoint files too (ATTACH_OFFICE, owner API 1.251)
                "mobile_ended",      # owner API 1.166: GET /ui/mobile/ended and the ended_mark of GET /ui/mobile
+               "older_tasks",       # owner API 1.254: GET /ui/state takes tasks=window, and GET /ui/tasks/older has
+                                    # the ended tasks that the window leaves out. A reader goes by `older_tasks` of
+                                    # the answer, not by this name: a hub whose marks are not in place (older_schema)
+                                    # gives the whole state to a reader that asks for the window
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
@@ -3339,6 +3343,302 @@ def phone_ended(query):
         mark = ended_mark()
         asked = ask_names(tasks)             # owner API 1.189: the names of the asks of these heads
     return 200, scrub({"db": generation, "mark": mark, "tasks": tasks, "asked": asked}), {"Cache-Control": "no-store"}
+
+
+# ---------------------------------------------------------------- the lane "A bound for the state page" (owner API 1.254)
+#
+# GET /ui/state held every task that the fleet ever had, with its long texts. On the first fleet, on 20 November 2026,
+# that was 6.63 MB of an answer of 8.88 MB, for 1,528 tasks of which 1,499 had ended, at up to 345 new tasks a day. The
+# owner's tools stopped at 8 MiB on 19 November, and the Mac app reads at most 16,000,000 bytes of the answer.
+#
+# A reader that asks with `tasks=window` gets the tasks that have not ended and the ended tasks of the newest ids
+# (STATE_KEEP ids at the least). It reads the older ended tasks, with their notes, permissions, holds, outcomes and
+# steers, in blocks of TASK_BLOCK ids from GET /ui/tasks/older: once, and again only when the mark of a block moved.
+# So a read of the state does not grow with the tasks, and a reader that keeps the blocks has every task, as before.
+# A reader that does not ask gets the whole answer, as before: an app older than this change reads no blocks.
+#
+# The mark of a block is a count that SQL triggers move (older_triggers), and not a sum over its rows: some 60
+# statements of this file write a task, and a mark that each writer must remember is one that the next writer forgets.
+# A trigger counts each write that changes a value of an ended task or of a row of one in the five tables, a file of
+# a steer of one that comes, changes or leaves (a steer's row holds its files), the event of a steer that is read,
+# leaves or comes with the number of one that left (a steer's row holds its read time, and is in an answer only with
+# its event), the end of a task (its block gets it), and a task that leaves the records or comes back to work. A change of the registered logins counts in
+# every block, because a login that is registered later masks older text (scrub): then each reader reads every block
+# again, so a login that no older text can hold does not count (older_triggers says which). One value of a block's
+# answer moves no count: from_conversation, which a task also takes from the tasks above it. It says whether a task's
+# guidance box takes a file, and an ended task has no such box. A release of the hub that changes what scrub masks
+# moves no count either.
+#
+# A later change that drops a column of tasks, notes, prompts, holds, outcomes, steers, attachments or secrets drops
+# the task_block_* triggers of that table first (older_unwatch): SQLite refuses to drop a column that a trigger names
+# ("error in trigger task_block_... after drop column"), and older_schema makes the triggers again at the same start.
+STATE_KEEP = 100                # the newest task ids whose ended tasks a window read of the state holds, at the least
+TASK_BLOCK = 100                # the task ids of one block of the older tasks
+# (the table, its key in the state and in a block, its read): `t` is the table, so that one WHERE serves all five
+OLDER_TABLES = (("notes", "notes", "SELECT t.* FROM notes t"),
+                ("prompts", "permissions", "SELECT t.* FROM prompts t"),
+                ("holds", "holds", "SELECT t.* FROM holds t"),
+                ("outcomes", "outcomes", "SELECT t.* FROM outcomes t"),
+                ("steers", "steers", "SELECT t.*, e.read_at FROM steers t JOIN events e ON e.id=t.event_id"))
+OLDER = {"on": False}           # the marks' table and triggers are in place (older_schema): the hub serves the window
+OLDER_OPEN = f"state NOT IN {ENDED_STATES}"     # the words of the index task_open, so that SQLite uses it
+# Every other task is a block's: one that ended, and a row with no state, which the line above does not take either
+# (no writer of this file makes one). So the window and the blocks together are every row of the table.
+OLDER_REST = f"(state IS NULL OR state IN {ENDED_STATES})"
+
+
+def older_triggers():
+    """{name: the CREATE TRIGGER statement} of the triggers that move the mark of a block of older tasks (the comment
+    above says what counts). An UPDATE counts only when a value changed: the columns are the table's own of now, so a
+    start after a new column makes its trigger again (older_schema). The count of a block begins with its first
+    write, and each count of a block also counts its ended tasks again (`tasks`), for the number that the state says.
+    The block's row is added with no OR IGNORE: inside a trigger SQLite takes the conflict rule of the statement that
+    fired it, and an INSERT OR REPLACE there would put the count back to its start. A row of the five tables is a
+    block's when its task is none that has not ended: the task ended, or it is gone (older_read gives such a row with
+    the block of its number)."""
+    def block_counts(task):
+        # CAST: a task that is no whole number (no writer makes one) must not make the trigger refuse the write
+        block = f"(CAST({task} AS INTEGER) / {TASK_BLOCK})"
+        return (f"INSERT INTO task_blocks(block, rev, tasks) SELECT {block}, 0, 0 "
+                f"WHERE NOT EXISTS (SELECT 1 FROM task_blocks WHERE block = {block}); "
+                f"UPDATE task_blocks SET rev = rev + 1, tasks = (SELECT COUNT(*) FROM tasks WHERE id >= {block} * "
+                f"{TASK_BLOCK} AND id < ({block} + 1) * {TASK_BLOCK} AND {OLDER_REST}) WHERE block = {block};")
+
+    def task_not_open(row):
+        return f"({row}.state IS NULL OR {row}.state IN {ENDED_STATES})"
+
+    def row_of_no_open_task(row):       # a number below 0 is no task: the window has such a row (window_rows)
+        return f"{row}.task >= 0 AND NOT EXISTS (SELECT 1 FROM tasks WHERE id = {row}.task AND {OLDER_OPEN})"
+
+    def value_differs(table):
+        return "(" + " OR ".join(f"OLD.{c} IS NOT NEW.{c}"
+                                 for c in (r["name"] for r in q(f"PRAGMA table_info({table})"))) + ")"
+
+    ended, was_ended = task_not_open("NEW"), task_not_open("OLD")
+    made = {"task_block_insert": f"AFTER INSERT ON tasks WHEN {ended} BEGIN {block_counts('NEW.id')} END",
+            "task_block_update": f"AFTER UPDATE ON tasks WHEN ({ended} OR {was_ended}) AND {value_differs('tasks')} "
+                                 f"BEGIN {block_counts('NEW.id')} END",
+            "task_block_delete": f"AFTER DELETE ON tasks WHEN {was_ended} BEGIN {block_counts('OLD.id')} END"}
+    for table, _, _ in OLDER_TABLES:
+        new, old = row_of_no_open_task("NEW"), row_of_no_open_task("OLD")
+        made[f"task_block_{table}_insert"] = f"AFTER INSERT ON {table} WHEN {new} BEGIN {block_counts('NEW.task')} END"
+        made[f"task_block_{table}_update"] = f"AFTER UPDATE ON {table} WHEN {new} AND {value_differs(table)} " \
+                                             f"BEGIN {block_counts('NEW.task')} END"
+        # a row that moves to another task leaves the block of the task that it had
+        made[f"task_block_{table}_moved"] = f"AFTER UPDATE OF task ON {table} WHEN OLD.task IS NOT NEW.task AND {old} " \
+                                            f"BEGIN {block_counts('OLD.task')} END"
+        made[f"task_block_{table}_delete"] = f"AFTER DELETE ON {table} WHEN {old} BEGIN {block_counts('OLD.task')} END"
+    # A steer's files are part of its row in a block (steer_view, attachment_view): the keep of a file, and the sweep
+    # that removes it, change that row with no write to `steers`. And a steer's read time is its event's
+    # (events.read_at), and a steer is in an answer only while its event is there (the read joins the two): an agent
+    # that is removed takes its events with it. So a write to a file or to an event counts the block of each steer
+    # that it belongs to (attachments.message is the steer's request_id, steers.event_id the event), when that steer's
+    # task is none that has not ended. A block that has no row yet gets one first (the steer of a task that left the
+    # records while it was open: nothing counted its block until now), with no OR IGNORE, as block_counts. The indexes
+    # steer_request and steer_event find the steers, so a write to a file or an event of no steer costs one look.
+    def steers_count(match):
+        block = f"CAST(s.task AS INTEGER) / {TASK_BLOCK}"
+        steers = (f"FROM steers s WHERE {match} AND s.task >= 0 AND NOT EXISTS (SELECT 1 FROM tasks WHERE id = s.task "
+                  f"AND {OLDER_OPEN})")
+        return (f"INSERT INTO task_blocks(block, rev, tasks) SELECT DISTINCT {block}, 0, 0 {steers} AND NOT EXISTS "
+                f"(SELECT 1 FROM task_blocks WHERE block = {block}); "
+                f"UPDATE task_blocks SET rev = rev + 1 WHERE block IN (SELECT {block} {steers});")
+
+    def of_steer(row):
+        return f"{row}.message IS NOT NULL AND EXISTS (SELECT 1 FROM steers s WHERE s.request_id = {row}.message)"
+
+    new, old = steers_count("s.request_id = NEW.message"), steers_count("s.request_id = OLD.message")
+    made["task_block_file_insert"] = f"AFTER INSERT ON attachments WHEN {of_steer('NEW')} BEGIN {new} END"
+    made["task_block_file_update"] = f"AFTER UPDATE ON attachments WHEN {of_steer('NEW')} AND " \
+                                     f"{value_differs('attachments')} BEGIN {new} END"
+    made["task_block_file_moved"] = f"AFTER UPDATE OF message ON attachments WHEN OLD.message IS NOT NEW.message AND " \
+                                    f"{of_steer('OLD')} BEGIN {old} END"
+    made["task_block_file_delete"] = f"AFTER DELETE ON attachments WHEN {of_steer('OLD')} BEGIN {old} END"
+    made["task_block_event_read"] = f"AFTER UPDATE OF read_at ON events WHEN OLD.read_at IS NOT NEW.read_at AND " \
+                                    f"EXISTS (SELECT 1 FROM steers s WHERE s.event_id = NEW.id) " \
+                                    f"BEGIN {steers_count('s.event_id = NEW.id')} END"
+    made["task_block_event_delete"] = f"AFTER DELETE ON events WHEN EXISTS (SELECT 1 FROM steers s WHERE s.event_id = " \
+                                      f"OLD.id) BEGIN {steers_count('s.event_id = OLD.id')} END"
+    # An event's number can come again: the newest event that left gives its number to the next one (events has no
+    # AUTOINCREMENT), and a steer of the old event is then in its block's answer again, with the new event's read time.
+    made["task_block_event_insert"] = f"AFTER INSERT ON events WHEN EXISTS (SELECT 1 FROM steers s WHERE s.event_id = " \
+                                      f"NEW.id) BEGIN {steers_count('s.event_id = NEW.id')} END"
+    # The registered logins. A new login masks older text, and a login that leaves shows it again, in any block:
+    # every block counts, and each reader reads every block again. So three kinds of write that change no mask of
+    # older text do not count: a row beside one of the same salt, hash and length (the owner's save of a value that
+    # is there already adds its new row and then removes the old one, register_fingerprints); the key of the practice
+    # page, which each open of GET /site/key makes new (practice_key); and a token that a provider gave the hub at
+    # that moment (mcp_fingerprints, and a Google account's), which no older text can hold. When such a key or token
+    # leaves, an answer that a reader kept still masks it, and that is no harm. The labels are the hub's own: a login
+    # that POST /secrets registers under one of them (the route takes the label from the owner's computer; only
+    # selftest.py calls it) would move no mark either.
+    every = "BEGIN UPDATE task_blocks SET rev = rev + 1; END"
+
+    def new_mask(row, other):
+        label = f"COALESCE({row}.label, '')"        # a row with no label counts: NOT of a NULL is no yes
+        made_now = f"({label} = '{SITE_KEY}' OR {label} LIKE 'mcp token %' OR {label} LIKE 'google refresh-token %')"
+        return (f"NOT {made_now} AND NOT EXISTS (SELECT 1 FROM secrets WHERE {other}salt IS {row}.salt AND "
+                f"hash IS {row}.hash AND len IS {row}.len)")
+
+    made["task_block_login_insert"] = f"AFTER INSERT ON secrets WHEN {new_mask('NEW', 'id <> NEW.id AND ')} {every}"
+    made["task_block_login_update"] = f"AFTER UPDATE ON secrets WHEN OLD.salt IS NOT NEW.salt OR OLD.hash IS NOT " \
+                                      f"NEW.hash OR OLD.len IS NOT NEW.len {every}"
+    made["task_block_login_delete"] = f"AFTER DELETE ON secrets WHEN {new_mask('OLD', '')} {every}"
+    return {name: f"CREATE TRIGGER {name} {body}" for name, body in made.items()}
+
+
+def older_unwatch(table):
+    """Drops the task_block_* triggers of one table, so that a column of it can be dropped: an UPDATE trigger of the
+    marks names each column of its table, and SQLite refuses the drop of a column that a trigger names. For a step of
+    migrate() and for a test that makes the records of an earlier release. older_schema, at the end of migrate(),
+    makes the triggers again and counts every block once, for the writes that no trigger saw meanwhile."""
+    for r in q("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=? AND name LIKE 'task\\_block\\_%' "
+               "ESCAPE '\\'", (table,)):
+        q(f"DROP TRIGGER IF EXISTS {r['name']}")
+
+
+def older_schema(problems):
+    """The marks of the blocks of older tasks, at the end of migrate(): their table, the triggers that move them
+    (made again when their words differ from older_triggers, and never at a start that changes nothing), the index
+    of the tasks that have not ended, and a mark for each block that holds an ended task and has none (the tasks of
+    before this change). The hub serves the window only when no step was refused (OLDER): without a trigger a block
+    would change under a mark that stands. For the same reason a start that made a trigger counts every block once
+    and counts its tasks again: a write could have come while that trigger was not there. A refused step goes to
+    `problems`, as every step of the schema."""
+    refused, made = len(problems), False
+    sql_step("CREATE TABLE IF NOT EXISTS task_blocks(block INTEGER PRIMARY KEY, rev INTEGER NOT NULL, "
+             "tasks INTEGER NOT NULL)", problems)
+    sql_step(f"CREATE INDEX IF NOT EXISTS task_open ON tasks(id) WHERE {OLDER_OPEN}", problems)
+    sql_step("CREATE INDEX IF NOT EXISTS steer_event ON steers(event_id)", problems)    # task_block_event_*
+    try:
+        have = {r["name"]: r["sql"] for r in q("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND "
+                                               "name LIKE 'task\\_block\\_%' ESCAPE '\\'")}
+        want = older_triggers()
+    except sqlite3.Error as e:
+        problems.append(f"the triggers of the older tasks: {e}")
+        have, want = {}, {}
+    for name in sorted(set(have) - set(want)):
+        sql_step(f"DROP TRIGGER IF EXISTS {name}", problems)
+    for name, statement in want.items():
+        if have.get(name) != statement:
+            if name in have:
+                sql_step(f"DROP TRIGGER IF EXISTS {name}", problems)
+            sql_step(statement, problems)
+            made = True
+    sql_step(f"INSERT OR IGNORE INTO task_blocks(block, rev, tasks) SELECT id / {TASK_BLOCK}, 1, COUNT(*) FROM tasks "
+             f"WHERE {OLDER_REST} GROUP BY id / {TASK_BLOCK}", problems)
+    if made:
+        sql_step(f"UPDATE task_blocks SET rev = rev + 1, tasks = (SELECT COUNT(*) FROM tasks WHERE id >= block * "
+                 f"{TASK_BLOCK} AND id < (block + 1) * {TASK_BLOCK} AND {OLDER_REST})", problems)
+    OLDER["on"] = bool(want) and len(problems) == refused
+    return problems
+
+
+def older_before():
+    """The id below which an ended task is an older task: no part of a window read of the state, and part of its
+    block. It is a multiple of TASK_BLOCK, so each block is whole on one side of it, and the STATE_KEEP newest ids are
+    at or above it. It moves up with the newest id, one block at a time."""
+    top = q1("SELECT MAX(id) AS top FROM tasks")["top"] or 0
+    return max(0, (top - STATE_KEEP + 1) // TASK_BLOCK * TASK_BLOCK)
+
+
+def older_head(before):
+    """`older_tasks` of a window read of the state, and the head of the list of GET /ui/tasks/older: {before, block,
+    mark, tasks}. mark is a text that changes when a block below `before` changes, or when `before` does: the id, and
+    the sum of those blocks' counts. A count never goes down, so two answers with one mark name the same blocks with
+    the same rows. tasks is the number of the ended tasks below `before`: with the tasks of the window, every task."""
+    counted = q1("SELECT COALESCE(SUM(rev), 0) AS n, COALESCE(SUM(tasks), 0) AS tasks FROM task_blocks "
+                 "WHERE block >= 0 AND block < ?", (before // TASK_BLOCK,))
+    return {"before": before, "block": TASK_BLOCK, "mark": f"{before}.{counted['n']}", "tasks": counted["tasks"]}
+
+
+def window_tasks(before):
+    """The tasks of a window read of the state, by id: each task at or above `before`, and each one below it that has
+    not ended (the index task_open has those)."""
+    return sorted(q("SELECT * FROM tasks WHERE id >= ?", (before,))
+                  + q(f"SELECT * FROM tasks WHERE id < ? AND {OLDER_OPEN}", (before,)), key=lambda r: r["id"])
+
+
+def window_rows(read, before):
+    """The rows of one of the five tables in a window read of the state, by id: the rows of no task (also a number
+    below 0, which no block has), of a task at or above `before`, and of a task below it that has not ended. Every
+    other row is in the block of its task (older_read), so the window and the blocks together are the table."""
+    return sorted(q(f"{read} WHERE t.task IS NULL OR t.task < 0") + q(f"{read} WHERE t.task >= ?", (before,))
+                  + q(f"{read} WHERE t.task >= 0 AND t.task < ? AND t.task IN (SELECT id FROM tasks WHERE id < ? AND "
+                      f"{OLDER_OPEN})", (before, before)), key=lambda r: r["id"])
+
+
+def tasks_above(rows):
+    """{id: (parent, source_conversation)} of the tasks above these rows that are not among them, for the walk of
+    conversation_opened: a window or a block holds a task without the tasks that it is a part of. The walk reads at
+    most 99 tasks above one, so this goes up as many times at the most."""
+    known, above = {r["id"] for r in rows}, {}
+    want = {r["parent"] for r in rows if r["parent"]} - known
+    for _ in range(100):
+        if not want:
+            break
+        found = []
+        for chunk in (sorted(want)[i:i + 500] for i in range(0, len(want), 500)):
+            found += q(f"SELECT id, parent, source_conversation FROM tasks WHERE id IN ({','.join('?' * len(chunk))})",
+                       tuple(chunk))
+        above.update({r["id"]: {"parent": r["parent"], "source_conversation": r["source_conversation"]} for r in found})
+        want = {r["parent"] for r in found if r["parent"]} - known - set(above)
+    return above
+
+
+def older_read(query):
+    """GET /ui/tasks/older after ui_allowed (owner API 1.254). Without `from`: the blocks below the window of the
+    state, each with its mark and the number of its tasks, and the head of them all, which a window read of the state
+    gives too (`older_tasks`, older_head).
+    With `from`, the first id of a block: the ended tasks of that block as GET /ui/state gives a task, with the rows
+    of the five tables that belong to them or to no task of now, and the block's mark of the same moment. A reader
+    keeps a block until its mark differs. A block at or above the window is none: 404, and the reader reads the list
+    again."""
+    generation = kv_get("db_id")
+    if query.get("db") != generation:               # a read of a generation that the client holds (its marks)
+        return 409, refusal_words.answer("hub_changed"), None
+    if not OLDER["on"]:
+        return 404, {"error": "this hub keeps no blocks of older tasks"}, None
+    start = query.get("from")
+    if start is None:
+        with state_moment():
+            before = older_before()
+            head = older_head(before)
+            counts = {r["block"]: r for r in q("SELECT block, rev, tasks FROM task_blocks WHERE block >= 0 AND block < ?",
+                                               (before // TASK_BLOCK,))}
+        nothing = {"rev": 0, "tasks": 0}        # a block that never held an ended task
+        return 200, dict(head, db=generation,
+                         blocks=[{"from": block * TASK_BLOCK, "mark": str(counts.get(block, nothing)["rev"]),
+                                  "tasks": counts.get(block, nothing)["tasks"]}
+                                 for block in range(before // TASK_BLOCK)]), {"Cache-Control": "no-store"}
+    if not (start.isascii() and start.isdigit() and len(start) <= 18) or int(start) % TASK_BLOCK:
+        return 400, {"error": f"from is the first id of a block: a multiple of {TASK_BLOCK}"}, None
+    start = int(start)
+    with state_moment():
+        if start >= older_before():
+            return 404, {"error": "no such block of older tasks"}, None
+        end = start + TASK_BLOCK
+        counted = q1("SELECT rev FROM task_blocks WHERE block=?", (start // TASK_BLOCK,))
+        rows = q(f"SELECT * FROM tasks WHERE id >= ? AND id < ? AND {OLDER_REST} ORDER BY id", (start, end))
+        parts = {key: q(f"{read} WHERE t.task >= ? AND t.task < ? AND t.task NOT IN (SELECT id FROM tasks WHERE id >= ? "
+                        f"AND id < ? AND {OLDER_OPEN}) ORDER BY t.id", (start, end, start, end))
+                 for _, key, read in OLDER_TABLES}
+        steered = sorted({r["request_id"] for r in parts["steers"]})
+        files = q(f"SELECT * FROM attachments WHERE message IN ({','.join('?' * len(steered))}) ORDER BY id",
+                  tuple(steered)) if steered else []
+        above = tasks_above(rows)
+    tasks = [dict(r) for r in rows]
+    by_id = {t["id"]: t for t in tasks}
+    for task in tasks:              # as GET /ui/state says it (owner API 1.231), by the same walk
+        task["from_conversation"] = conversation_opened(task["id"], lambda i: by_id.get(i) or above.get(i))
+    attached = {}
+    for r in files:
+        attached.setdefault(r["message"], []).append(attachment_view(r))
+    answer = {"db": generation, "from": start, "mark": str(counted["rev"] if counted else 0), "tasks": tasks}
+    for _, key, _ in OLDER_TABLES:
+        answer[key] = [steer_view(r, attached.get(r["request_id"], [])) for r in parts[key]] if key == "steers" \
+            else [dict(r) for r in parts[key]]
+    return 200, scrub(answer), {"Cache-Control": "no-store"}
 
 
 def mobile_cut(answer):
@@ -5682,6 +5982,7 @@ def migrate():
     # recorded as a refused step, which is what a release reads (memory_search_probe, history_search_probe).
     memory_search_probe()
     history_search_probe()
+    older_schema(problems)      # the lane "A bound for the state page": last, after every column of its six tables
     return problems
 
 
@@ -11428,7 +11729,9 @@ def t_set_reminder(agent, a):
 
 def t_see_team(agent, a):
     parent = lead_task(agent)
-    return lead_overview(agent, parent) if parent else overview_text()
+    # the door's holds are the manager's own (door_hold): in its answer, and not on the owner's board (overview_text)
+    return lead_overview(agent, parent) if parent else \
+        overview_text() + (door_holds_text() if role_of(agent) == "manager" else "")
 
 
 USAGE_STALE = 900       # seconds: an account reading older than this is stale (helpers read limits every 300 seconds)
@@ -14345,15 +14648,13 @@ def door_hold_of(host):
     return DOOR_HOLD_NAMES.get(stored, stored) if stored else None
 
 
-def door_hold_note(host):
-    """The words about the door's hold on `host` (door_hold), or "" when the door holds it out of nothing: since when,
-    why, and who ends it. While a hold of parts stands, no agent gets the server through the door, whatever Tailscale
-    tag it carries, so a refusal there ("no host of the door") is the hold's, and a card that asks the owner for a tag
-    asks for the wrong step. The reason is the one in the hub's log of the door_hold that set it. read_row only, so it
-    is safe where access_route runs inside a transaction."""
+def door_hold_record(host):
+    """(hold, " since <day>", why) of the door's hold on `host` (door_hold), each "" that the hub does not know: the
+    hold by its owner-facing name, and the day and the reason of the hub's log line of the door_hold that set it. read_row
+    only, so it is safe inside a transaction."""
     hold = door_hold_of(host)
     if not hold:
-        return ""
+        return "", "", ""
     # a hold set before rule-only had that name is in the log under its old one, judged (DOOR_HOLD_STORED)
     row = read_row("SELECT ts, what FROM log WHERE what LIKE ? OR what LIKE ? ORDER BY id DESC LIMIT 1",
                    (f"the door holds {host}: {hold} (%", f"the door holds {host}: {DOOR_HOLD_STORED.get(hold, hold)} (%"))
@@ -14362,6 +14663,33 @@ def door_hold_note(host):
         day = datetime.datetime.fromtimestamp(row["ts"], datetime.timezone.utc)
         since = f" since {day.day} {day.strftime('%b %Y')}"
         why = re.sub(r"\) in [0-9a-f]{7,40}$", "", row["what"].split(" (", 1)[1]) if " (" in row["what"] else ""
+    return hold, since, why
+
+
+def door_holds_text():
+    """The manager's see_team: each hold of the door (door_hold), with its day and its reason, or "" for a fleet with
+    none. On 19 November 2026 the manager wrote that it held no hold on a server that its own rule-only hold of 6
+    November kept from the agents' own calls: no tool showed it its holds."""
+    holds = sorted((TEAM.get("door") or {}).get("holds") or {})
+    if not holds:
+        return ""
+    out = ["", "DOOR HOLDS (yours: door_hold <server> none ends one, once its reason is gone)"]
+    for host in holds:
+        hold, since, why = door_hold_record(host)
+        out.append(f"  {host}: {'out of the door' if hold == 'parts' else hold}{since}" +
+                   (f": {clip(why, 240)}" if why else ""))
+    return "\n".join(out)
+
+
+def door_hold_note(host):
+    """The words about the door's hold on `host` (door_hold), or "" when the door holds it out of nothing: since when,
+    why, and who ends it. While a hold of parts stands, no agent gets the server through the door, whatever Tailscale
+    tag it carries, so a refusal there ("no host of the door") is the hold's, and a card that asks the owner for a tag
+    asks for the wrong step. The reason is the one in the hub's log of the door_hold that set it. read_row only, so it
+    is safe where access_route runs inside a transaction."""
+    hold, since, why = door_hold_record(host)
+    if not hold:
+        return ""
     if hold == "parts":
         head, effect = (f"The door holds {host} out of its hosts", f"no agent gets {host} through the door, whatever "
                                                                     f"Tailscale tag it carries")
@@ -39723,7 +40051,8 @@ TOOLS = [
         "decision": {"type": "string", "enum": ["allow", "deny"]}, "always": {"type": "boolean"}, "reason": STR},
        ["prompt_id", "decision"])),
     ("manager", "see_team", t_see_team,
-     "See every agent, every open task, open questions, pending permission prompts and Needs-you items. A lead sees "
+     "See every agent, every open task, open questions, pending permission prompts, Needs-you items and the door's "
+     "holds that you set (door_hold), each with its day and its reason. A lead sees "
      "its team and the parts of this session's task, a worker the parts of this task that it gave its peers, each "
      "with the questions, prompts and reports that wait on you.",
      S({})),
@@ -64570,11 +64899,22 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(200, f"A-{aid} {link['name']} ({CHAT_FILE_KINDS[link['mime']]}, {size}) is on the hub for one "
                               f"hour. Give A-{aid} in files of the message that sends it.\n", plain)
 
+    def ui_tasks_older(self, query):
+        """GET /ui/tasks/older: the blocks of the ended tasks that a window read of the state leaves out, or one of them
+        (older_read; owner API 1.254)."""
+        if not self.ui_allowed():
+            return
+        return self.json(*older_read(query))
+
     def ui_state(self):
         if not self.ui_allowed():
             return
         plain_rows = {}
         repository = repo_address()     # before LOCK: its first reading asks git
+        # Owner API 1.254: with tasks=window the answer holds the tasks that have not ended and the ended ones of the
+        # newest ids, with the rows of the five tables of those tasks, and `older_tasks`, which says where the others
+        # are (older_read). Without it, or on a hub whose marks are not in place, every task is in this answer.
+        window = OLDER["on"] and self.route()[1].get("tasks") == "window"
         with state_moment() as (token, at):
             # The rows, the token and the team of one moment (state_moment): LOCK is held for that moment only. A write
             # after it is not in this answer, and it moves the token past this answer's (live_changes).
@@ -64582,9 +64922,16 @@ class Handler(BaseHTTPRequestHandler):
                       "manager_flag": manager_flag_shown(),
                       "manager_warning": manager_warning(),
                       "ui_features": ui_features(), "repository": repository}
+            before = older_before() if window else None
+            reads = {table: read for table, _, read in OLDER_TABLES}
             for table, key in (("tasks", "tasks"), ("notes", "notes"),
                                ("prompts", "permissions"), ("holds", "holds"), ("outcomes", "outcomes")):
-                plain_rows[key] = q(f"SELECT * FROM {table} ORDER BY id")
+                if not window:
+                    plain_rows[key] = q(f"SELECT * FROM {table} ORDER BY id")
+                elif table == "tasks":
+                    plain_rows[key] = window_tasks(before)
+                else:
+                    plain_rows[key] = window_rows(reads[table], before)
                 result[key] = None          # its place in the answer: its rows become dicts after the lock
             needs = q("SELECT * FROM needs ORDER BY id")
             needs_read = need_reads() if needs else None    # with no item it reads nothing more, as before
@@ -64609,12 +64956,17 @@ class Handler(BaseHTTPRequestHandler):
             duties = q("SELECT * FROM responsibilities ORDER BY id")
             duties_read = duty_reads() if duties else None
             result["responsibilities"] = None   # its place: views of rows read here, made after the lock
-            steers = q("SELECT s.*, e.read_at FROM steers s JOIN events e ON e.id=s.event_id ORDER BY s.id")
+            steers = window_rows(reads["steers"], before) if window else \
+                q("SELECT s.*, e.read_at FROM steers s JOIN events e ON e.id=s.event_id ORDER BY s.id")
             result["steers"] = None     # its place: views made after the lock, with the files of `files`
             result["secrets"] = [dict(r) for r in q("SELECT id,COALESCE(label,'Registered login') AS label FROM secrets ORDER BY id")]
             parks = parked_until()
             since = task_since(parks, agents_read)
             turns = task_turns()
+            # a window holds a task without the tasks that it is a part of: from_conversation walks through these
+            above = tasks_above(plain_rows["tasks"]) if window else {}
+            if window:
+                result["older_tasks"] = older_head(before)
         # A row holds its own values, so this needs no lock. On the first fleet the tasks were 977 KB of the state's
         # 1.70 MB, and in a copy of its database making their rows into dicts took 2.1 ms of each read's hold of the
         # lock (10 November 2026).
@@ -64632,10 +64984,11 @@ class Handler(BaseHTTPRequestHandler):
         # Owner API 1.231 (feature steer_files): whether a person's conversation opened the task or a task that it is
         # a part of, by contact_session's own walk. That session can open the file of a steer of its task
         # (owner_file_refused), so the person can get what the file says: the owner's app offers no file there. Every
-        # task is in this answer, so the walk reads its rows and nothing else.
+        # task is in this answer, or its tasks above it were read with it (`above`, for a window), so the walk reads
+        # these rows and nothing else.
         task_rows = {task["id"]: task for task in result["tasks"]}
         for task in result["tasks"]:
-            task["from_conversation"] = conversation_opened(task["id"], task_rows.get)
+            task["from_conversation"] = conversation_opened(task["id"], lambda i: task_rows.get(i) or above.get(i))
         # The needs, the messages, the reports and the duties from the rows read in the lock, after it too: with the
         # rows that they were given, these views read nothing themselves (11 November 2026).
         result["needs"] = [need_view(r, needs_read) for r in needs]
@@ -68824,6 +69177,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.machine_login(parts[2], parts[3], post=False)
         if parts == ["ui", "state"]:
             return self.ui_state()
+        if parts == ["ui", "tasks", "older"]:           # owner API 1.254
+            return self.ui_tasks_older(query)
         if parts == ["ui", "wait"]:                     # owner feature live_changes
             return self.ui_wait(query)
         if len(parts) == 3 and parts[:2] == ["ui", "attachments"]:

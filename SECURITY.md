@@ -197,7 +197,8 @@ entries, Docker's folder, other processes' environments, the limits) on a real U
 
 A look runs only on a server that the door holds at `fix`, for the agent that holds it at Fix. The hub's own machine
 and a machine of the fleet's agents hold the fleet's own keys, and a CI host that two businesses share holds the keys
-of both: no look runs there.
+of both: no look runs there. No look runs on a server that the manager's hold keeps at rule-only either, until the
+manager ends the hold.
 
 ## What the holder of the fleet's own servers can do there
 

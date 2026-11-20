@@ -1117,7 +1117,13 @@ snapshot (`GET /ui/state`), which a process reads before its first call for the 
 has a limit of its own in both programs, 64 MiB (`STATE_MAX`, `Transfer.state`): it is an
 answer that holds a fleet's whole history, and on 19 November 2026 a fleet with about 1,400 tasks
 answered 57 KB more than the 8 MiB of a call, so that each tool refused with "The hub's answer is
-larger than this server reads." Every other answer that is no file keeps the 8 MiB. Both write
+larger than this server reads." Every other answer that is no file keeps the 8 MiB. Since owner
+API 1.254 that read, and the one of `fleet_overview`, ask for the window of the tasks
+(`GET /ui/state?tasks=window`; `STATE_READ`, `Transfer.stateRead`): the tasks that have not ended
+and the ended ones of the newest ids, so the answer does not grow with the fleet's history, and
+`fleet_overview` adds the older ended tasks to its count from the answer's `older_tasks`. A hub
+from before 1.254 gives the whole answer. `fleet_read` with the page `state` is still the whole
+snapshot. Both write
 at the path that the agent names: `~` is the home, the folders are made, and a folder takes the
 hub's name of the file. A path with a NUL is refused by each of the three, as the first check on the
 path, before `~` is expanded and before any request: "path cannot hold a NUL character: name a file

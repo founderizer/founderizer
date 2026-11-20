@@ -395,6 +395,25 @@ class SecondLook(Withdraw):
                       [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND kind='say'")])
         self.assertEqual(json.loads(hub.q1("SELECT extra FROM events WHERE agent='manager' AND kind='say' AND text LIKE '[hub] The hub closed%'")["extra"]), hub.LATER_SAY)     # it waits for the next read, an hour at most
 
+    def test_the_manager_s_see_team_lists_each_door_hold_with_its_day_and_its_reason(self):
+        """On 19 November 2026 the manager wrote that it held no hold on a server that its own rule-only hold of 6
+        November kept from the agents' own calls: no tool showed it its holds. Its see_team lists them now, and a
+        hold that ends leaves the list."""
+        hub.TEAM["door"] = {"address": "100.64.0.9", "holds": {"web-1": "judged", "web-2": "parts"}}
+        hub.ins(hub.LOG, (self.T, "manager", "the door holds web-1: judged (Plan step 2.17: old keys) in a1b2c3d"))
+        hub.ins(hub.LOG, (self.T, "manager", self.HOLD.replace("web-1", "web-2")))
+        text, err = hub.call_tool("manager", "see_team", {})
+        self.assertFalse(err, text)
+        self.assertTrue(text.endswith("\nDOOR HOLDS (yours: door_hold <server> none ends one, once its reason is gone)\n"
+                                      "  web-1: rule-only since 15 Jan 2027: Plan step 2.17: old keys\n"
+                                      "  web-2: out of the door since 15 Jan 2027: Plan step 9: the old keys are still "
+                                      "on it"), text)
+        self.assertNotIn("DOOR HOLDS", hub.overview_text())         # the owner's board shows no line of it
+        del hub.TEAM["door"]["holds"]["web-1"]                      # door_hold web-1 none
+        self.assertNotIn("web-1:", hub.call_tool("manager", "see_team", {})[0])
+        del hub.TEAM["door"]["holds"]                               # and the last one
+        self.assertNotIn("DOOR HOLDS", hub.call_tool("manager", "see_team", {})[0])
+
     def test_a_refusal_for_a_held_server_leads_to_words_that_name_the_hold(self):
         """ops sends an agent that the door refused for no host to its requester with needs_access server:<host>, and
         the hub's route for that ask names the hold, which only the manager ends: no Tailscale step of the owner's."""

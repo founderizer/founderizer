@@ -136,6 +136,7 @@ SITES = {
     'need_give_press': {'request_answered': 1},  # the lane "Give on a card": a Give whose agent left the fleet
     'new_invite_code': {'agent_no_telegram_bot': 1, 'bot_name_unknown': 1, 'no_such_person': 1, 'person_blocked': 1,
                         'person_handles_most': 1},     # a person's Telegram invite
+    'older_read': {'hub_changed': 1},              # GET /ui/tasks/older (owner API 1.254)
     'person_remove': {'no_such_person': 1},
     'phone_chat': {'hub_changed': 1, 'no_such_agent': 1},
     'phone_ended': {'hub_changed': 1},
@@ -462,7 +463,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 181)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 182)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

@@ -84,6 +84,13 @@ READ_MAX = 8 * 1024 * 1024              # the largest answer this server reads f
 # its own, and every other answer that is no file keeps READ_MAX.
 STATE_MAX = 64 * 1024 * 1024
 STATE_ROUTE = "/ui/state"
+# The read of the state that this server makes for itself (the generation, the features, fleet_overview, a claim's
+# end check): with the window of the tasks (owner API 1.254), so that it does not grow with the fleet's history. The
+# answer holds the tasks that have not ended and the ended ones of the newest ids, and `older_tasks` says how many
+# more ended. A hub from before 1.254 reads no such word and gives the whole answer. `fleet_read` with the page
+# `state` stays the whole snapshot: it is what the owner's agent asks for by that name.
+STATE_READ = STATE_ROUTE + "?tasks=window"
+OLDER_MOST = 10 ** 9            # a count of older tasks above this, or below 0, is no count: fleet_overview adds 0
 BACKUP_MAX = 256 * 1024 * 1024          # hub.py BACKUP_MAX: the largest copy the hub serves
 ATTACH_MAX = 25 * 1024 * 1024           # hub.py ATTACH_MAX: the largest file the owner attaches
 # The three tools that move a file (attach_file, read_attachment, take_backup) read up to the hub's own limit of that
@@ -774,7 +781,7 @@ def generation(fresh=False):
     """The hub's generation (`db`), which every read and every command is bound to. A hub that restarted with a new
     database answers 409 to the old one, and this server reads it again once, as the app does on that refusal."""
     if fresh or not GENERATION["db"]:
-        answer = call("GET", "/ui/state")
+        answer = call("GET", STATE_READ)
         if answer.status != 200 or not isinstance(answer.data, dict) or not answer.data.get("db"):
             raise refusal(answer, "a read of the fleet")
         GENERATION["db"] = answer.data["db"]
@@ -952,7 +959,7 @@ COSTS_WORDS = ("from", "to", "agent", "minimum")
 
 def overview(_args):
     """What is my fleet doing: the one read that answers it, from the routes the app's own screens read."""
-    state = get("/ui/state", "a read of the fleet").data
+    state = get("/ui/state", "a read of the fleet", tasks="window").data
     found = {"hub": hub_base(), "generation": state.get("db"), "time": state.get("time"),
              "features": state.get("ui_features"), "manager_warning": state.get("manager_warning")}
     found["agents"] = [{k: a.get(k) for k in ("name", "role", "runtime", "active", "reports_to",
@@ -961,7 +968,11 @@ def overview(_args):
     found["open_tasks"] = [{k: t.get(k) for k in ("id", "title", "owner", "requester", "state", "waiting_on",
                                                   "last_activity")}
                            for t in state.get("tasks") or [] if t.get("state") in open_states]
-    found["finished_tasks"] = sum(1 for t in state.get("tasks") or [] if t.get("state") not in open_states)
+    # the ended tasks of the answer, and the older ones that it leaves out (owner API 1.254; 0 from a hub before it)
+    older = state.get("older_tasks")
+    more = older.get("tasks") if isinstance(older, dict) else None
+    found["finished_tasks"] = sum(1 for t in state.get("tasks") or [] if t.get("state") not in open_states) + \
+        (more if isinstance(more, int) and not isinstance(more, bool) and 0 <= more <= OLDER_MOST else 0)
     found["needs_you"] = [n for n in state.get("needs") or [] if not n.get("answered")]
     found["goals"] = [{k: g.get(k) for k in ("id", "title", "state", "next_step", "wake_at", "marker")}
                       for g in state.get("goals") or []]
@@ -2229,7 +2240,7 @@ def claim_hub(args):
     waited, reads = time.monotonic() + 300, None
     while time.monotonic() < waited:
         try:
-            reads = call("GET", "/ui/state", base=base, timeout=10)
+            reads = call("GET", STATE_READ, base=base, timeout=10)
         except Refused:
             reads = None
         if reads is not None and reads.status == 200:
@@ -2306,7 +2317,7 @@ def use_hub(args):
     """Point this server at a hub that runs already: the owner's own fleet. It proves the address by reading the
     owner API from this Mac, which only the owner's Mac can do, and writes nothing but the address."""
     base = hub_address(args.get("address"), int(args.get("port") or PORT))
-    answer = call("GET", "/ui/state", base=base)
+    answer = call("GET", STATE_READ, base=base)
     if answer.status != 200:
         raise refusal(answer, f"a read of the hub at {base}")
     set_hub(base)
@@ -2325,7 +2336,7 @@ def which_hub(_args):
     reads = False
     if base:
         try:
-            reads = call("GET", "/ui/state", base=base).status == 200
+            reads = call("GET", STATE_READ, base=base).status == 200
         except Refused:
             reads = False
     return {"hub": base, "where": str(HUB_FILE), "client": client_label(), "reads_owner_api": reads,

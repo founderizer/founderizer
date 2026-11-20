@@ -1703,6 +1703,7 @@ class Tools(Socket):
         # the search card shows the record's own words, with neither head (HISTORY_HEADS)
         self.assertEqual([hub.history_own_words(r) for r in rows], ["Use plain words.", "Keep it short."])
         # a database of a release before this column gets it at the start (migrate), and its steers read as his own
+        hub.older_unwatch("steers")     # the marks' triggers name each column of the table (owner API 1.254)
         hub.q("ALTER TABLE steers DROP COLUMN connection")
         self.assertNotIn("connection", [c["name"] for c in hub.q("PRAGMA table_info(steers)")])
         hub.migrate()

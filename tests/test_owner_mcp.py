@@ -4060,7 +4060,11 @@ def parity_answer(state, req):
             return parity_json(200, {"ok": True, "backup": {"sha256": body.get("sha256"), "bytes": body.get("bytes")}})
         return parity_json(200, {"ok": True, "route": path})
     if path == "/ui/state":
-        return parity_json(200, parity_state(db))
+        # Owner API 1.254: a read that asks for the window of the tasks gets the ended tasks that it leaves out as a
+        # number, which fleet_overview adds to its finished tasks; the whole snapshot (fleet_read state) has none.
+        older = {"older_tasks": {"before": 100, "block": 100, "mark": "100.3", "tasks": 40}} \
+            if query.get("tasks") == ["window"] else {}
+        return parity_json(200, dict(parity_state(db), **older))
     if query.get("db") != [db]:
         return stale
     parts = path.strip("/").split("/")
@@ -4993,7 +4997,7 @@ class Table(unittest.TestCase):
             return Body(big)
         with patch.object(owner_mcp.OPENER, "open", opened), patch.object(owner_mcp, "HOME", scratch), \
                 patch.object(owner_mcp, "CLIENT_FILE", scratch / "client"):
-            for path in ("/ui/state", "/ui/state?since=7"):
+            for path in ("/ui/state", "/ui/state?since=7", owner_mcp.STATE_READ):
                 self.assertEqual(owner_mcp.call("GET", path, base="http://127.0.0.1:9").data["db"], "g1", path)
             with self.assertRaises(owner_mcp.Refused) as caught:
                 owner_mcp.call("GET", "/ui/health", base="http://127.0.0.1:9")
@@ -5072,7 +5076,7 @@ class Table(unittest.TestCase):
 
         def call(method, path, body=None, **_kw):
             held.append((method, (home / "lock").exists() and taken()))
-            data = {"db": "g1"} if path == "/ui/state" else {"ok": True}
+            data = {"db": "g1"} if path == owner_mcp.STATE_READ else {"ok": True}
             return owner_mcp.Answer(200, data, b"", {})
         owner_mcp.GENERATION["db"] = None
         with patch.object(owner_mcp, "call", call), patch.object(owner_mcp, "HOME", home):
@@ -5092,7 +5096,7 @@ class Table(unittest.TestCase):
 
         def call(method, path, body=None, **_kw):
             sent.append(method)
-            return owner_mcp.Answer(200, {"db": "g1"} if path == "/ui/state" else {"ok": True}, b"", {})
+            return owner_mcp.Answer(200, {"db": "g1"} if path == owner_mcp.STATE_READ else {"ok": True}, b"", {})
         owner_mcp.GENERATION["db"] = None
         with patch.object(owner_mcp, "call", call), patch.object(owner_mcp, "HOME", scratch / ".founderizer"), \
                 patch.object(owner_mcp.fcntl, "flock", flock):
@@ -5117,7 +5121,7 @@ class Table(unittest.TestCase):
                     except BlockingIOError:
                         locked = True
             held.append((method, path.split("?")[0], locked))
-            return owner_mcp.Answer(200, {"db": "g1"} if path == "/ui/state" else {"attachment": 1}, b"", {})
+            return owner_mcp.Answer(200, {"db": "g1"} if path == owner_mcp.STATE_READ else {"attachment": 1}, b"", {})
         owner_mcp.GENERATION["db"] = None
         with patch.object(owner_mcp, "call", call), patch.object(owner_mcp, "HOME", home):
             owner_mcp.attach_file({"path": str(scratch / "note.txt")})
@@ -5236,7 +5240,7 @@ class GoogleConnect(unittest.TestCase):
 
         def call(method, path, body=None, timeout=owner_mcp.TIMEOUT, **_kw):
             waits[path], sent[path] = timeout, body
-            if path == "/ui/state":
+            if path == owner_mcp.STATE_READ:
                 return owner_mcp.Answer(200, {"db": "g1"}, b"", {})
             if path == "/ui/google/connect":
                 return owner_mcp.Answer(200, {"url": self.URL, "state": self.STATE, "expires_at": 1,
