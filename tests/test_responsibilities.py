@@ -1080,6 +1080,10 @@ class Cases(Base):
                                                     hub.now(), 1))
         hub.TEAM["agents"]["lead"]["can"] = ["shell"]
         self.assertEqual(hub.restart_authority("manager", hub.get_task(own)), (True, None))
+        # a lead in setup runs no session at all: the same rule, with its own reason
+        hub.TEAM["agents"]["lead"]["active"] = False
+        self.assertIn("lead is in setup, so manager gives vps its tasks", hub.authority("lead", "vps", "task")[1])
+        self.assertEqual(hub.peer_canceler("vps"), "manager")
 
     def test_a_key_that_another_duty_has_open_joins_that_case_and_keeps_no_copy(self):
         """Live, 3 November 2026: a lead's duty copied each of a DevOps agent's cases into a case of its

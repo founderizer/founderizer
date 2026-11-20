@@ -9,8 +9,8 @@ so its tests need no hub:
 - authority: the hub's one authority function, authority(actor, target, action), decides every rule write, every
   read and every wake, and every task that a wake starts;
 - the route of a wake-up: one inbox message for the fleet manager, or a task whose requester can see its result: the
-  fleet manager directly, or a lead through a parent task in its own task session (for the team of a lead whose
-  Shell box is off, the nearest agent above that lead that can act);
+  fleet manager directly, or a lead through a parent task in its own task session (for the team of a lead that
+  cannot act, in setup or with its Shell box off, the nearest agent above it that can);
 - saved check code: an agent writes a check as text; the hub keeps each version by its SHA-256 and never changes it,
   without a repository commit or an owner pin for each change;
 - where saved code runs (plan P4): only on its own agent's machine, as that agent's user and with that agent's read
@@ -118,8 +118,8 @@ def level(org, caller, target):
 
 
 def boss(org, name):
-    """The agent that gives `name` its tasks: its lead or the fleet manager, and for the team of a lead whose Shell box
-    is off the nearest agent above that lead that can act (Org.giver, hub.task_giver). None for the fleet manager. Without a giver, the
+    """The agent that gives `name` its tasks: its lead or the fleet manager, and for the team of a lead that cannot act
+    (in setup, or with its Shell box off) the nearest agent above it that can (Org.giver, hub.task_giver). None for the fleet manager. Without a giver, the
     team.json reporting line, as hub.reports_to."""
     if org.giver is not None:
         return org.giver(name)
@@ -198,7 +198,8 @@ def wake_route(org, target):
     """(route, None), or (None, why) when a match cannot start anything that someone can follow. A wake-up of the
     fleet manager is one inbox message. Otherwise it is a task for the target, whose requester is the agent that gives
     the target its tasks (boss): its lead, or the fleet manager for an agent with no lead, and for the team of a lead
-    whose Shell box is off, which has no tool to check a result, the nearest agent above that lead that can act:
+    that cannot act (in setup, or with its Shell box off and so no tool to check a result) the nearest agent above it
+    that can:
 
     {"kind": "message", "to": <fleet manager>}
     {"kind": "task", "owner": <target>, "requester": <fleet manager>, "parent": None}

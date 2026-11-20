@@ -11242,9 +11242,9 @@ AUTHORITY_ACTIONS = ("task", "rule")
 def authority(actor, target, action):
     """(allowed, reason): the one authority rule. May `actor` give `target` a task ("task"), or set and change the
     wake-up rules that wake `target` ("rule")? create_task, the lead team tools, trigger runs and the wake-up rules all
-    ask it. A task follows the reporting line (task_giver: the team of a lead whose Shell box is off gets its tasks
-    from the nearest agent above that lead that can act), and only the agent itself or the fleet manager sets its
-    rules. reason is None when allowed."""
+    ask it. A task follows the reporting line (task_giver: the team of a lead that cannot act, in setup or with its
+    Shell box off, gets its tasks from the nearest agent above that lead that can), and only the agent itself or the
+    fleet manager sets its rules. reason is None when allowed."""
     if action not in AUTHORITY_ACTIONS:
         raise ValueError(f"unknown authority action {action!r}")
     team, manager = agents(), manager_name()
@@ -11260,7 +11260,7 @@ def authority(actor, target, action):
     if target not in workers:
         boss, giver = (reports_to(target), task_giver(target)) if target in team else (None, None)
         if giver != boss:
-            return False, f"{boss}'s Shell box is off, so {giver} gives {target} its tasks."
+            return False, f"{cannot_act_words(boss)}, so {giver} gives {target} its tasks."
         return False, (f"{target} reports to {boss}: only {boss} gives it tasks." if boss and boss != actor else
                        f"'{target}' does not report to you. Your team: {', '.join(workers) or 'nobody'}.")
     if not agent_active(target):
@@ -11306,9 +11306,10 @@ def peers(actor, target):
 
 def peer_canceler(agent):
     """The agent that may cancel a task that `agent` gives its peer, beside the giver: the agent above both, or the
-    fleet manager when that is an agent whose Shell box is off, which has no cancel_task (peer_told tells both)."""
+    fleet manager when that agent is in setup or has its Shell box off, so that it has no session or no cancel_task
+    (peer_told tells the manager then)."""
     boss = reports_to(agent)
-    return manager_name() if boss and shell_off(boss) else boss
+    return manager_name() if boss and (shell_off(boss) or not agent_active(boss)) else boss
 
 
 def may_give(actor, target):
@@ -40774,7 +40775,7 @@ def t_set_agent_model(agent, a):
     giver = task_giver(target)
     if giver != agent:
         raise ToolError(f"{target}'s model is the owner's to change." if not giver else
-                        f"{reports_to(target)}'s Shell box is off, so {giver} changes {target}'s model and effort."
+                        f"{cannot_act_words(reports_to(target))}, so {giver} changes {target}'s model and effort."
                         if giver != reports_to(target) else
                         f"{target} reports to {giver}, which is the one that changes its model and effort.")
     if not setting("model_changes"):
@@ -41594,7 +41595,8 @@ TOOLS = [
         "files": CHAT_FILES_FIELD},
        ["person", "text", "request_id"])),
     ("manager", "create_task", t_create_task,
-     "Give one agent a task: one that reports to you, or to a lead under you whose Shell box is off, or, from the "
+     "Give one agent a task: one that reports to you, or to a lead under you that cannot act (in setup, or with its "
+     "Shell box off), or, from the "
      "session of a task of yours and with your Shell box on, a peer, which reports to the same agent as you; a peer's task is a part of yours, its result comes to this "
      "session, and the agent above you both is told and may cancel it. A task that a peer gave you goes to no other "
      "peer, and a session that a person's conversation drives gives none. needs is none, browser or screen; the hub "
@@ -45081,7 +45083,7 @@ def checks_start_text(agent, task_id):
 
 def manager_checks_text(t0):
     """The checks block of the fleet manager's brief (plan P4): its own checks, and the new or changed checks of the
-    agents that it gives tasks to (task_giver: no lead between, or a lead whose Shell box is off), since its last brief (kv checks_brief, which this moves to t0). A
+    agents that it gives tasks to (task_giver: no lead between, or a lead that cannot act), since its last brief (kv checks_brief, which this moves to t0). A
     lead reads its own team's in its sessions' starts. Outside every transaction: the standing session's start asks
     for the brief."""
     manager = manager_name()
@@ -50332,9 +50334,8 @@ def name_check(value):
 # and reads it with setting(key). A key that is not here is a later release's (plan P0): validate_team checks none of
 # those, and every write keeps them as they are.
 SETTINGS = {
-    "model_changes": (True, setting_bool, "The agent that gives an agent its tasks (its lead, or the fleet manager for "
-                                          "an agent with no lead) changes its model and effort inside the account it "
-                                          "has (AUTONOMY.md P8)."),
+    "model_changes": (True, setting_bool, "The agent that gives an agent its tasks changes its model and effort "
+                                          "inside the account it has (AUTONOMY.md P8)."),
     "contacts.v2": (False, setting_bool, "Roles are prompts and conversations act (AUTONOMY.md P1, P2): one switch "
                                          "for the fleet. Turning it on gives employees and supervisors the role "
                                          "peer and deputies the role manager, one time."),
@@ -51650,7 +51651,7 @@ def check_lines(lines):
 
 def reports_to(name):
     """The agent that this agent reports to in the reporting lines: its lead, or the manager. The agent that gives it
-    its tasks is task_giver's, which differs only for the team of a lead whose Shell box is off."""
+    its tasks is task_giver's, which differs only for the team of a lead that cannot act (cannot_act)."""
     a = agents().get(name) or {}
     if a.get("role") == "manager":
         return None
@@ -51658,18 +51659,34 @@ def reports_to(name):
     return up if up in agents() else manager_name()
 
 
+def cannot_act(agent):
+    """True for an agent that cannot act for the agents below it (task_giver): one in setup, which runs no session
+    until the owner activates it, or a lead whose Shell box is off, whose sessions have no tool to give, check or change
+    work (SHELL_OFF_TOOLS). Never for the manager, which the hub keeps active."""
+    return agent != manager_name() and (not agent_active(agent) or role_of(agent) == "lead" and shell_off(agent))
+
+
+def cannot_act_words(agent):
+    """Why `agent` cannot act for its team, in a refusal's words: "<agent> is in setup", or "<agent>'s Shell box is
+    off"."""
+    return f"{agent} is in setup" if not agent_active(agent) else f"{agent}'s Shell box is off"
+
+
 def task_giver(name):
     """The agent that gives this agent its tasks, checks their results and changes its model: the agent that it reports
-    to, or, when that is a lead whose Shell box is off (its sessions have no tool to give, check or change work:
-    SHELL_OFF_TOOLS), the nearest agent above it that can: a lead whose Shell box is on, or the fleet manager. So
-    nobody skips a level that can act. None for the manager. The one authority rule (authority) and the route of a
-    wake-up (wakeups.wake_route, through wake_org) follow it, so no task of such a lead's team waits for a check that
-    nobody can make, and the manager acts for that lead on the work that it requested before (lead_left). The finding
-    of the KPI spec, 20 November 2026: wake_route read the lead's role and not its Shell box."""
+    to, or, when that one cannot act, the nearest agent above it that can: an active lead whose Shell box is on, or the
+    fleet manager. An agent cannot act while it is in setup (agent_active: it runs no session until the owner activates
+    it), and a lead cannot while its Shell box is off (its sessions have no tool to give, check or change work:
+    SHELL_OFF_TOOLS). So nobody skips a level that can act. None for the manager. The one authority rule (authority) and
+    the route of a wake-up (wakeups.wake_route, through wake_org) follow it, so no task of such a lead's team waits for
+    a check that nobody can make, and the manager acts for that lead on the work that it requested before (lead_left).
+    The finding of the KPI spec, 20 November 2026: wake_route read the lead's role and not its Shell box; and a
+    reviewer's of the same day: a lead in setup above it."""
+    manager = manager_name()
     up, seen = reports_to(name), {name}
-    while up and role_of(up) == "lead" and shell_off(up):
+    while up and cannot_act(up):
         if up in seen:              # check_lines refuses a loop in the reporting lines; this ends one all the same
-            return manager_name()
+            return manager
         seen.add(up)
         up = reports_to(up)
     return up
@@ -51880,7 +51897,8 @@ def save_lines(base, lines):
     words = "; ".join(f"{c['agent']} is now a {c['after']['role']} reporting to {c['after']['reports_to']}"
                       for c in changed)
     emit(manager, "say", f"[hub] The owner changed the reporting lines: {words}. Give tasks only to the agents that "
-         f"report to you, and to the team of a lead under you whose Shell box is off; a lead does the same for its "
+         f"report to you, and to the team of a lead under you that cannot act (in setup, or with its Shell box off); "
+         f"a lead does the same for its "
          f"own team.")
     updates = [n for n in moved if request_update(n, commit) == "requested"]
     log("owner", f"changed the reporting lines in {commit[:12]}: {words}")

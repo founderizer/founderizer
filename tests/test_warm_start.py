@@ -582,6 +582,8 @@ class WarmStart(Capacity):
         self.assertNotIn("pma [lead, Codex] -- it gives you your tasks", said)
         hub.TEAM["agents"]["pma"]["reports_to"] = "pmb"
         self.assertIn("pmb [lead, Codex] -- it gives you your tasks:", hub.team_start_text("seo"))
+        hub.TEAM["agents"]["pmb"]["active"] = False             # in setup it runs no session, so it gives no task
+        self.assertIn("manager [manager, Claude Code] -- it gives you your tasks:", hub.team_start_text("seo"))
 
     def test_the_team_block_says_what_a_colleague_holds_and_nothing_it_is_spending(self):
         """What a colleague holds is a fact about the team. Its allowance, its workload, its accounts, its logins
