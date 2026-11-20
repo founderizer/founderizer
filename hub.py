@@ -6800,7 +6800,7 @@ def start_text(agent, task_id, resume=False, note="", row=None, opening=None, fi
 
 # The rules split by role (AUTONOMY.md P9.3): RULES.md is the core that every agent reads, and each part of
 # rules/<part>.md loads only for the agents it is about, in this order.
-RULES_PARTS = ("lead", "manager", "conversations", "logins", "github", "servers")
+RULES_PARTS = ("lead", "manager", "conversations", "logins", "github", "servers", "duty")
 
 
 def rules_parts(agent):
@@ -6808,13 +6808,20 @@ def rules_parts(agent):
     and for the manager, which acts as a lead too; the manager's; the part on conversations for an agent that people
     write to and for the manager, which gets their work requests; the part on logins for an agent that holds a login
     or a key; the part on GitHub for an agent with a repository; the part on servers for an agent that holds a
-    server through the door, at any level. Reads only: start_text runs inside admit_task's transaction."""
+    server through the door, at any level; the part on duties for an agent that holds a duty that is not retired, and
+    for the manager, which may hold one and whose standing conversation keeps the parts that it began with (since 20
+    November 2026, lanes/agent-context-size.md: what a duty is, and how its holder keeps it and builds its watch, which
+    RULES.md said to every agent; the chain of a case stays in RULES.md for each agent that works a case, its holder or
+    not). A worker's or a lead's first duty reaches the part at its next task session. Reads only: start_text runs
+    inside admit_task's transaction."""
     a, role = agents().get(agent) or {}, role_of(agent)
     wanted = {"lead": role in ("lead", "manager"), "manager": role == "manager",
               "conversations": role == "manager" or bool(read_row("SELECT 1 FROM person_agents WHERE agent=? LIMIT 1",
                                                                   (agent,))),
               "logins": bool(granted_logins(agent) or a.get("vault_create") is True or a.get("vault") == "broker"),
-              "github": bool(a.get("repos")), "servers": bool(a.get("servers"))}
+              "github": bool(a.get("repos")), "servers": bool(a.get("servers")),
+              "duty": role == "manager" or bool(read_row("SELECT 1 FROM responsibilities WHERE agent=? AND "
+                                                         "state!='retired' LIMIT 1", (agent,)))}
     return [part for part in RULES_PARTS if wanted[part]]
 
 

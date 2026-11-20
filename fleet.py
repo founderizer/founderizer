@@ -2119,7 +2119,7 @@ def codex_server(name, catalog=None):
 # is the first answer of read_messages. Codex gets RULES.md and its parts as its developer instructions (codex_rules),
 # which a compaction keeps, and reads no AGENTS.md of the folder (CODEX_NO_FOLDER_RULES), and its profile and then its
 # task as its first prompt.
-RULES_PARTS = ("lead", "manager", "conversations", "logins", "github", "servers")  # hub.RULES_PARTS, in that order
+RULES_PARTS = ("lead", "manager", "conversations", "logins", "github", "servers", "duty")  # hub.RULES_PARTS, in order
 STABLE_TASK = ('You are agent "{agent}" in Founderizer, in a session for one task of yours. {where} Your helper '
                'brought this folder up to date just before this session; do not pull at the start. ')
 STABLE_RULES = "{rules} are in your context, so do not read them again."
