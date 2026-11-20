@@ -1295,6 +1295,7 @@ class DoorCalls(Access):
         asked = urllib.parse.parse_qs(form.query)
         self.assertEqual((form.scheme, form.netloc, asked["to"]), ("https", "dash.cloudflare.com",
                                                                     ["/:account/api-tokens"]))
+        self.assertEqual((form.path, sorted(asked)), ("/", ["name", "permissionGroupKeys", "to"]))   # the name too
         self.assertEqual(json.loads(asked["permissionGroupKeys"][0]),
                          [{"key": "account_api_tokens", "type": "edit"}, {"key": "account_settings", "type": "read"}])
         doors = [json.dumps(t[4]["properties"]["door"]) for t in hub.TOOLS if t[1] == "request_secret"]

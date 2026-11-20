@@ -43416,7 +43416,7 @@ TOOLS = [
                                                   "azure or tailscale), or "
                                                   "app:<app>:<NAME> for one setting of an app on a host. The card "
                                                   "gives it to the door alone. " + DOOR_CLOUDFLARE_KEY + ". The "
-                                                  "door uses it for one agent "
+                                                  "door uses such a key for one agent "
                                                   "that holds servers through it: you when you hold them, else the "
                                                   "one agent that does; with several such agents, name the one in "
                                                   "give_to. A key that the door holds for no agent goes to the "
