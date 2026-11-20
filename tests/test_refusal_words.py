@@ -142,6 +142,7 @@ SITES = {
     'knowledge_content': {'login_as_text': 1},
     'knowledge_delete': {'profile_unread': 1, 'revision_unreadable': 1},
     'knowledge_replace': {'revision_unreadable': 1},
+    'known_login': {'profile_unread': 1, 'revision_unreadable': 1},  # the made login's report
     'mcp_package_lookup': {'package_no_record': 1, 'package_no_version': 1, 'package_none_old': 1,
                            'package_record_large': 1, 'package_registry_away': 1, 'package_too_new': 1,
                            'package_too_new_older': 1, 'package_unknown': 1, 'package_unread': 1},
@@ -487,7 +488,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 207)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 209)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

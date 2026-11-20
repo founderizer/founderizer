@@ -1658,7 +1658,7 @@ def key_hold_index(team):
         try:
             listed = profile_logins(name, rev, strict=True)
         except KitUnread:
-            raise Refusal(503, code="profile_unread", names={"agent": name}) from None
+            raise Refusal(503, code="profile_unread", names={"agent": shown_role(name)}) from None
         refs |= set((a.get("secrets") or {}) if isinstance(a, dict) else {}) | listed
     refs |= {x.get("secret") for x in (team.get("accounts") or {}).values() if isinstance(x, dict)}
     for server in (team.get("mcp") or {}).values():
@@ -1920,6 +1920,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # `older_rows` of the answer, as by `older_tasks`
                "ended_asks",        # owner API 1.258: GET /ui/mobile/ended takes chat and from: the ended heads of
                                     # what the owner asked for in one chat, from a time on
+               "ended_blocks",      # owner API 1.270: GET /ui/mobile/ended takes window, blocks and block: the heads
+                                    # of the newest ids, and the older ones in blocks with marks (ended_read); a
+                                    # reader goes by `older` of the window's answer, as by `older_tasks`
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
@@ -3430,11 +3433,18 @@ def phone_ended(query):
     such a message corrects (ChatAskPlaces: a correction stands for the message that it replaced). The iPhone reads its
     rows of a chat's asks so, from the oldest line that it holds of the chat that is open: the answer grows with what
     the phone holds, and not with the fleet's history (on the first fleet, on 20 November 2026, every ended head was
-    839,613 bytes, and the phone kept 177 of the 1,615). The Windows app's Ended lane reads every head, as before."""
+    839,613 bytes, and the phone kept 177 of the 1,615).
+
+    Owner API 1.270 (owner feature ended_blocks): with `window`, `blocks` or `block`, the heads of the newest ids and
+    the older ones in blocks (ended_read), for the Windows app's Ended lane, which needs every head."""
     generation = kv_get("db_id")
     if query.get("db") != generation:               # a read of a generation that the client holds (its mark)
         return 409, refusal_words.answer("hub_changed"), None
     chat = query.get("chat")
+    if chat is None and any(word in query for word in ("window", "blocks", "block")):
+        answer = ended_read(query, generation)
+        if answer is not None:
+            return answer
     if chat is not None:
         try:
             start = float(query.get("from") or 0)
@@ -4343,6 +4353,94 @@ def desktop_refusal(owner, needs, caller, keep=False):
     which = tref(busy["id"]) if caller == manager_name() else "another browser or screen task"
     return f"The desktop of {machine} is busy with {which}; wait until it ends."
 
+
+# ---------------------------------------------------------------- the lane "The Windows app's ended read" (owner API 1.270)
+#
+# GET /ui/mobile/ended gives the head of every ended task (owner API 1.166), and the Windows app's Ended lane needs
+# every one: it counts and opens the ended tasks of its period, as the Mac's lane does from the tasks of its state. On
+# the first fleet, on 20 November 2026, that answer was 868,736 bytes for 1,669 heads. It grew by about 0.13 MB a day,
+# and the Windows app reads at most 32 MiB of it.
+#
+# A reader that asks with `window=1` gets the heads of the ended tasks at or above the window of the state
+# (older_before: the STATE_KEEP newest ids at the least) and `older`: the id below which the other heads are, the size
+# of a block and a mark. It reads the other heads in blocks of TASK_BLOCK ids, after their list (`blocks=1`), with
+# `block=<the first id>`: once, and again only when the list gives the block another mark. So no answer grows with the
+# fleet's history, and a reader that keeps its blocks holds every head, as before.
+#
+# A block's mark is the count of the block of older tasks (task_blocks, owner API 1.254), which SQL triggers move at
+# each write of an ended task (older_triggers): a head is a part of its task's row, so each change of a head moves it.
+# Some writes that change no head move it too (a note of an ended task): a reader then reads one block of heads again,
+# which is no harm. After the count comes the digest of the code that makes a block (ended_shape): a release that
+# changes which heads a block holds, how a head looks, or what scrub masks, moves every mark, and each reader reads
+# each block again once. The heads of these answers carry no `asked`: the Windows app does not read it. A hub whose
+# marks are not in place (OLDER) answers `window=1` with every head and no `older`, so that the reader holds every head.
+def ended_heads(rows):
+    """The heads of these ended tasks in a window or a block, as GET /ui/mobile/ended gives a head: MOBILE_HEAD and the
+    schedule that the task ran for, masked. Its code is a part of the shape of a block (ended_shape)."""
+    return scrub([{k: r[k] for k in MOBILE_HEAD + ("trigger_id",)} for r in rows])
+
+
+def ended_shape():
+    """The digest of the code that makes a block of heads, made once in a process: code_digest of ended_read, and so
+    which tasks a block holds (ENDED_STATES, TASK_BLOCK), the words of a head (MOBILE_HEAD), scrub and the search that it
+    masks with."""
+    return code_digest(("ended_read",))
+
+
+def ended_older(before):
+    """`older` of a window read: {before, block, mark}. The mark differs when a block below `before` changed, when
+    `before` did, or when the shape of a head did. A count of task_blocks never goes down, so two answers with one
+    mark name the same blocks with the same heads."""
+    counted = q1("SELECT COALESCE(SUM(rev), 0) AS n FROM task_blocks WHERE block >= 0 AND block < ?",
+                 (before // TASK_BLOCK,))["n"]
+    return {"before": before, "block": TASK_BLOCK, "mark": f"{before}.{counted}.{ended_shape()}"}
+
+
+def ended_read(query, generation):
+    """GET /ui/mobile/ended with `window`, `blocks` or `block` (owner API 1.270, owner feature ended_blocks), after the
+    check of the generation; None for the read of every head (a value that it does not take, and `window` on a hub
+    whose marks are not in place).
+
+    - window=1: the heads of the ended tasks at or above `before`, the mark of GET /ui/mobile (ended_mark), and
+      `older` (ended_older);
+    - blocks=1: `older`, and each block below `before` with its first id, its mark and the number of its heads;
+    - block=<the first id of a block>: the heads of the ended tasks of that block, and its mark of the same moment. A
+      block at or above `before` is none: 404, and the reader reads the list again."""
+    block, blocks, window = query.get("block"), query.get("blocks") == "1", query.get("window") == "1"
+    if block is None and not blocks:
+        if not window or not OLDER["on"]:
+            return None
+        with state_moment():
+            before = older_before()
+            rows = q(f"SELECT * FROM tasks WHERE id >= ? AND state IN {ENDED_STATES} ORDER BY id", (before,))
+            mark, older = ended_mark(), ended_older(before)
+        return 200, {"db": generation, "mark": mark, "tasks": ended_heads(rows), "older": older}, \
+            {"Cache-Control": "no-store"}
+    if not OLDER["on"]:
+        return 404, {"error": "this hub keeps no blocks of ended tasks"}, None
+    shape = ended_shape()
+    if block is None:
+        with state_moment():
+            before = older_before()
+            older = ended_older(before)
+            counts = {r["block"]: r["rev"] for r in q("SELECT block, rev FROM task_blocks WHERE block >= 0 AND "
+                                                      "block < ?", (before // TASK_BLOCK,))}
+            heads = {r["block"]: r["n"] for r in q(f"SELECT id / {TASK_BLOCK} AS block, COUNT(*) AS n FROM tasks "
+                                                   f"WHERE id < ? AND state IN {ENDED_STATES} GROUP BY 1", (before,))}
+        return 200, dict(older, db=generation, blocks=[
+            {"from": n * TASK_BLOCK, "mark": f"{counts.get(n, 0)}.{shape}", "tasks": heads.get(n, 0)}
+            for n in range(before // TASK_BLOCK)]), {"Cache-Control": "no-store"}
+    if not (block.isascii() and block.isdigit() and len(block) <= 18) or int(block) % TASK_BLOCK:
+        return 400, {"error": f"block is the first id of a block: a multiple of {TASK_BLOCK}"}, None
+    start = int(block)
+    with state_moment():
+        if start >= older_before():
+            return 404, {"error": "no such block of ended tasks"}, None
+        counted = q1("SELECT rev FROM task_blocks WHERE block=?", (start // TASK_BLOCK,))
+        rows = q(f"SELECT * FROM tasks WHERE id >= ? AND id < ? AND state IN {ENDED_STATES} ORDER BY id",
+                 (start, start + TASK_BLOCK))
+    return 200, {"db": generation, "from": start, "mark": f"{counted['rev'] if counted else 0}.{shape}",
+                 "tasks": ended_heads(rows)}, {"Cache-Control": "no-store"}
 
 
 # ---------------------------------------------------------------- the agents' browsers on Linux servers (plan 04, S3)
@@ -13809,11 +13907,25 @@ def temporary_use(agent, t, login):
 def known_login(ref, job):
     """True when the hub already knows this bws:// reference from another place than create job `job`: the label
     catalog, a profile, a fingerprint, a handover or another job. A login that a vault made a moment ago is
-    in none of them. This finds only a reference that the hub has seen; the vault's own record decides the rest."""
-    if ref in logins() or ref in protected_logins() or any(ref in profile_logins(n) for n in agents()):
+    in none of them. This finds only a reference that the hub has seen; the vault's own record decides the rest.
+    The profiles come last, read strictly: a profile that git does not give now may list the reference, so the report
+    waits (503 profile_unread, or revision_unreadable with no revision) and is never taken as new because of a read
+    that failed (a finding of the area "Hub core", 20 November 2026); a reference that the hub's own records hold is
+    known before any read of git."""
+    if ref in logins() or ref in protected_logins() or \
+            q1("SELECT id FROM jobs WHERE lower(login)=? AND id<>?", (ref, job)) or \
+            q1("SELECT id FROM sealed WHERE lower(login)=?", (ref,)):
         return True
-    return bool(q1("SELECT id FROM jobs WHERE lower(login)=? AND id<>?", (ref, job)) or
-                q1("SELECT id FROM sealed WHERE lower(login)=?", (ref,)))
+    rev = kit_revision(fresh=True)                  # one revision for every profile
+    if not rev:
+        raise Refusal(503, code="revision_unreadable")
+    for n in agents():
+        try:
+            if ref in profile_logins(n, rev, strict=True):
+                return True
+        except KitUnread:
+            raise Refusal(503, code="profile_unread", names={"agent": shown_role(n)}) from None
+    return False
 
 
 SAVE_KINDS = {"create": ("login_create", "creates"),         # job kind: the helper's feature, the vault's status field
@@ -57134,10 +57246,10 @@ def save_login(body):
                 if ref in granted_logins(n, strict=True):
                     users.append(n)
             except KitUnread:
-                raise Refusal(503, code="profile_unread", names={"agent": n}) from None
+                raise Refusal(503, code="profile_unread", names={"agent": shown_role(n)}) from None
         if users:
-            raise Conflict(f"{ref} is still listed (profiles and grants: {', '.join(users)}); remove it there first",
-                           agents=users)
+            raise Conflict(f"{ref} is still listed (profiles and grants: {', '.join(map(shown_role, users))}); remove it "
+                           "there first", agents=users)
     # A new title keeps the kind, the variable name, the site and the form of the entry; a site or a form that comes
     # replaces its own, and an empty one takes it away (the key swap: a key with no site is a variable again).
     entry = None if body.get("delete") else dict(logins().get(body["login"]) or {}, title=body["title"],
@@ -74741,7 +74853,12 @@ class Handler(BaseHTTPRequestHandler):
             if row["login"] and row["login"] != ref:
                 return self.json(409, {"error": "this job already has another login"})
             if not row["login"]:
-                if known_login(ref, job):       # a login from a moment ago is in no profile, label or job
+                try:
+                    known = known_login(ref, job)
+                except Refusal as e:            # a profile that git does not give now: the report waits
+                    log(agent, f"WAIT {row['kind']} job {job}: {e}")     # a profile's or the revision's words
+                    return self.json(e.status, refusal_body(e))
+                if known:                       # a login from a moment ago is in no profile, label or job
                     log(agent, f"REFUSED {row['kind']} job {job}: the hub already knows the reported login")
                     return self.json(409, {"error": "the hub already knows this login, so this job did not make it"})
                 q("UPDATE jobs SET login=? WHERE id=?", (ref, job))

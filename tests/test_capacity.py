@@ -489,7 +489,7 @@ class Capacity(OwnerAPI):
                             kit_batch=lambda folder, rev, paths: {} if path in paths else batch(folder, rev, paths),
                             KIT_PATHS=hub.collections.OrderedDict()):
             code, data = label(LOGIN_B, delete=True)
-        self.assertEqual((code, data.get("code"), data.get("names")), (503, "profile_unread", {"agent": "seo"}), data)
+        self.assertEqual((code, data.get("code"), data.get("names")), (503, "profile_unread", {"agent": "SEO Expert"}), data)
         self.assertIn(LOGIN_B, self.request("/ui/team?db=test-generation")[1]["logins"])
         code, data = label(fresh, delete=True)
         self.assertEqual((code, data["deleted"]), (200, True), data)

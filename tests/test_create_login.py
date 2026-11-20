@@ -451,6 +451,19 @@ class CreateLogin(Capacity):
         for known in (LOGIN_A, LOGIN_B, label["login"], protected, used):
             code, data = self.created(job, known)
             self.assertEqual((code, data["error"]), (409, "the hub already knows this login, so this job did not make it"))
+        # While git gives no answer for a profile, which may list the reference, the report waits (503): a failed read is
+        # never a profile with no login, so a known login is never taken as made (a finding of the area "Hub core")
+        def unread(agent, rev=None, strict=False):
+            if agent == "deva" and strict:
+                raise hub.KitUnread("profiles/deva.md")
+            return set()
+        with patch.object(hub, "profile_logins", unread):
+            code, data = self.created(job)
+            self.assertEqual(self.created(job, used)[0], 409)          # the hub's own records first: known, no git read
+        self.assertEqual((code, data.get("code"), data.get("names")), (503, "profile_unread", {"agent": "Deva"}), data)
+        with patch.object(hub, "kit_revision", lambda fresh=False: None):      # no revision at all: no profile is read
+            code, data = self.created(job)
+        self.assertEqual((code, data.get("code")), (503, "revision_unreadable"), data)
         self.assertIsNone(self.job()["login"])
         self.assertEqual(self.created(job)[0], 200)
         self.assertEqual(self.created(job)[0], 200)                     # the same login again

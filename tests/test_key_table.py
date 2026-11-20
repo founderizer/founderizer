@@ -246,7 +246,7 @@ class Catalog(test_grants.Grants):
         with patch.object(hub, "profile_logins", unread), self.assertRaises(hub.Refusal) as got:
             hub.key_hold_index(team)
         self.assertEqual((got.exception.status, got.exception.extra["code"], got.exception.extra["names"]),
-                         (503, "profile_unread", {"agent": "alpha"}))
+                         (503, "profile_unread", {"agent": "Developer"}))      # its role, as the apps show it
 
     def test_an_import_gives_each_row_its_site_by_the_same_conditions_in_one_commit(self):
         before = self.commits()
