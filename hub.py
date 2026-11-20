@@ -61254,6 +61254,19 @@ DOOR_ROUND_WAIT = ("the door gets this new grant at the owner's Mac's next door 
 DOOR_ROUND_NEXT = ("The door gets a new grant at the owner's Mac's next door round, usually within 10 minutes while "
                    "the Mac's app runs: a task session that starts before then has no token for it, and a restart_task "
                    "of a task that asked for it waits for that round by itself.")
+# A task session that started right after a grant had no token for it (three tasks paid a question and a restart on 20
+# November 2026), because the Mac's round came about every five minutes. Now GET /ui/state gives the time of the newest
+# grant that the door may not hold yet (door_grant_waits), the Mac starts a round at once for each new such time
+# (DoorAccess.roundDue), and a session's start waits for that round's word (door_round_wait), once a Mac that starts
+# such rounds has read (early=1 in its read of GET /ui/door). The wait ends on that word; its one bound keeps the
+# hub's answer inside the helper's own call (fleet.integration_env, 90 seconds) with the door's call after it, so a Mac
+# that went off delays a start, and holds none. A grant whose wait ran out delays no later start (DOOR_WAITED): a
+# count, so one group of starts pays it at most. DOOR_EARLY is in memory: after a restart of the hub, a start waits
+# again only once the Mac's next round has read.
+DOOR_HELPER_CALL = 90           # seconds of the helper's call of POST /helper/integrations (fleet.integration_env)
+DOOR_START_WAIT = DOOR_HELPER_CALL - DOOR_WAIT - 20     # the wait, the door's call, and 20 s for the rest of the answer
+DOOR_EARLY = {"at": None}       # when the Mac last read GET /ui/door with early=1: its rounds start at once on a grant
+DOOR_WAITED = {"at": None}      # the newest grant time for which a start's wait ran out
 
 
 def door_mark(view):
@@ -61358,6 +61371,40 @@ def door_lacks(agent, repos):
     held, rose = (agents().get(agent) or {}).get("repos") or {}, door_grant_times().get(agent) or {}
     return sorted({r for r in repos if r in held and r in rose and not door_rounded(rose[r]) and
                    not door_targets.vendor(r)})
+
+
+def door_grant_waits():
+    """GET /ui/state: the time of the newest repository grant that the door may not hold yet (door_lacks), or None.
+    The owner's Mac starts a door round once for each new such time (DoorAccess.roundDue)."""
+    times = [repos[repo] for agent, repos in door_grant_times().items() for repo in door_lacks(agent, sorted(repos))]
+    return max(times) if times else None
+
+
+def door_round_pause():
+    """One look's wait of door_round_wait: a second."""
+    time.sleep(1)
+
+
+def door_round_wait(agent, repos, wait=DOOR_START_WAIT, pause=None):
+    """helper_integrations, outside LOCK: the start of a task session right after a grant of its agent waits until
+    the owner's Mac's round has given the door that grant (door_lacks is empty), at most `wait` seconds, and only once a
+    Mac that starts such a round at once has read (DOOR_EARLY), and not again for a grant whose wait ran out before
+    (DOOR_WAITED). Then the start asks the door as before, and door_round_errors words a grant that the door still
+    lacks. pause: one look's wait (door_round_pause). True when it waited."""
+    pause = pause or door_round_pause
+    lacking = door_lacks(agent, sorted(repos))
+    if DOOR_EARLY["at"] is None or not lacking:
+        return False
+    rose = door_grant_times().get(agent) or {}
+    newest = max(rose.get(r, 0) for r in lacking)
+    if DOOR_WAITED["at"] is not None and newest <= DOOR_WAITED["at"]:
+        return False                # a start waited for this grant already, and the round did not come then
+    end = time.monotonic() + wait
+    while time.monotonic() < end and door_lacks(agent, sorted(repos)):
+        pause()
+    if door_lacks(agent, sorted(repos)):
+        DOOR_WAITED["at"] = max(DOOR_WAITED["at"] or 0, newest)
+    return True
 
 
 def asked_repos(tid, attempt):
@@ -69262,6 +69309,8 @@ class Handler(BaseHTTPRequestHandler):
         # token past this answer's (keep_owner_computer, then changed()), and the app's GET /ui/wait wakes for it; and
         # last, so that every key of before keeps its place and its bytes (test_state_read).
         result["owner_computer"] = owner_computer()
+        # Owner API 1.275: last too; the Mac's door round starts at once for each new value (DoorAccess.roundDue)
+        result["door_grant_waits"] = door_grant_waits()
         return self.json(200, InParts(scrub(result)))
 
     def ui_machines(self, query):
@@ -71511,6 +71560,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(409, refusal_words.answer("hub_changed"))
         if query.get("renew") == "form":     # plan 13, item 4: this Mac app's GitHub App rows take the App's new key
             DOOR_RENEW["form"] = now()
+        if query.get("early") == "1":       # this Mac app starts a round at once on a new grant (door_round_wait)
+            DOOR_EARLY["at"] = now()
         with LOCK:
             view = door_view()
             # after the view: the round that read it holds each grant that it gives; held is the Mac's word of what
@@ -75078,6 +75129,7 @@ class Handler(BaseHTTPRequestHandler):
         if shell_off(agent):        # support plan F1: no repository and no GitHub token for a Shell-off session
             repos = {}
         if repos:
+            door_round_wait(agent, repos)       # a grant of a moment ago: the Mac's round gives it to the door
             try:            # outside the hub's lock: GitHub can take seconds
                 tokens, errors = github_tokens(repos, agent)
             except GitHubError as e:

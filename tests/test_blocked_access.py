@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -451,16 +452,19 @@ class BlockedAccess(OwnerAPI):
                          "errors": errors}
         for patcher in [patch.object(hub, name, value) for name, value in (
                 ("door_call", answer), ("DOOR_ROUNDS", []), ("DOOR_SWEPT", {"round": None}), ("DOOR_OLD_READS", []),
-                ("DOOR_MARKS", {}), ("DOOR_HELD", {"at": None}), ("DOOR_SPOKE", {"at": None}))] + \
+                ("DOOR_MARKS", {}), ("DOOR_HELD", {"at": None}), ("DOOR_SPOKE", {"at": None}),
+                ("DOOR_EARLY", {"at": None}), ("DOOR_WAITED", {"at": None}))] + \
                 [patch.dict(hub.DOOR_RENEW)]:        # a read with renew=form sets its time, and no later test sees it
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def door_round(self, held=None):
+    def door_round(self, held=None, early=False):
         """A door round of the owner's Mac starts: it reads the hub's view (DoorSync), and the tick runs after it. held:
         the mark of the view whose plan the door's file holds, as an app since owner API 1.234 says it ("" for none);
-        None for an app before that word. Gives the mark of the view that the read got."""
-        code, view = self.request("/ui/door?db=test-generation&renew=form" + ("" if held is None else f"&held={held}"))
+        None for an app before that word. early: an app that starts a round at once on a new grant (DoorAccess.roundDue).
+        Gives the mark of the view that the read got."""
+        code, view = self.request("/ui/door?db=test-generation&renew=form" + ("" if held is None else f"&held={held}") +
+                                  ("&early=1" if early else ""))
         self.assertEqual(code, 200, view)
         with hub.LOCK:
             hub.door_grants_sweep(hub.now())
@@ -588,6 +592,50 @@ class BlockedAccess(OwnerAPI):
         self.assertEqual(self.session_of("dev", "127.0.0.5")["errors"],
                          [{"repos": ["acme/web"], "error": "the door gave no GitHub token: dev is not in the door's "
                                                            "access file"}])
+
+    def test_a_session_that_starts_right_after_a_grant_waits_for_the_round_that_the_grant_starts(self):
+        """20 November 2026: three tasks that started right after their grant had no token for it, and each paid a
+        question and a restart, because the owner's Mac gave the door each grant only at its round of five minutes.
+        Now GET /ui/state names the newest grant that the door may lack (door_grant_waits), the Mac starts a round at
+        once for it (DoorAccess.roundDue), and a session's start waits for that round's word, so it gets the token. It
+        waits only once a Mac that starts such rounds has read (early=1), inside the helper's own call, and once for
+        each grant, so an app from before holds no start, and a Mac that went off delays one group of starts and holds
+        none."""
+        file = {}
+        self.linked_door(file)
+        self.stand(WEB, {"max": "write"})
+        self.door_round(held="", early=True)        # a round of a Mac with today's app, before the grant
+        self.grant("dev", WEB, "write")
+        self.assertEqual(self.request()[1]["door_grant_waits"], hub.door_grant_times()["dev"]["acme/web"])
+        pauses = []
+
+        def the_round_comes():                      # the round that the new time starts, while the start waits
+            pauses.append(len(pauses) + 1)
+            if len(pauses) > 2:                     # at once, not at the end of the wait's bound
+                raise AssertionError("the wait went on after the round's word")
+            if len(pauses) == 2:                    # a look after the first: the wait goes on until the word
+                mark = self.door_round(held="", early=True)
+                file["dev"] = {"acme/web": "write"}  # the round writes the door's file from that view
+                self.door_round(held=mark, early=True)
+        with patch.object(hub, "door_round_pause", the_round_comes):
+            got = self.session_of("dev", "127.0.0.5")   # the start's wait comes before it asks the door
+        self.assertEqual((got["errors"], [t["repos"] for t in got["tokens"]]), ([], [["acme/web"]]))
+        self.assertEqual(pauses, [1, 2])            # and it went on at the round's word, not at the end of its wait
+        self.assertIsNone(self.request()[1]["door_grant_waits"])
+        self.stand(BILLING, {"max": "write"})
+        self.grant("dev", BILLING, "write")
+        self.assertEqual(hub.door_lacks("dev", ["acme/billing"]), ["acme/billing"])
+        waited = []                                 # a round that does not come: the start goes on, as before this
+        self.assertTrue(hub.door_round_wait("dev", {"acme/billing": "write"}, wait=0.05,
+                                            pause=lambda: (waited.append(1), time.sleep(0.02))))
+        self.assertTrue(waited)
+        self.assertFalse(hub.door_round_wait("dev", {"acme/billing": "write"}, wait=0.05,
+                                             pause=lambda: self.fail("a second wait for the same grant")))
+        hub.DOOR_WAITED["at"] = None
+        hub.DOOR_EARLY["at"] = None                 # nor does a start wait for a Mac whose read does not say early=1
+        self.door_round(held="")
+        self.assertFalse(hub.door_round_wait("dev", {"acme/billing": "write"}, wait=0.05,
+                                             pause=lambda: self.fail("a wait for an app from before")))
 
     # ---- the sentence that says what an agent looks after
 
