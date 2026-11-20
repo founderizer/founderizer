@@ -71,6 +71,9 @@ The vault protects the value of each secret. The design gives these results:
   puts them into the catalog with one commit (`Sources/Founderizer/SecretImportView.swift`, `hub.py`). A title that
   holds a value, of the catalog or of the same import, is refused before the hub keeps the command (`hub.py`).
 - The catalog takes no second API key with the variable name of another one, also not from one import (`hub.py`).
+  The successor of a GitHub App's key on a fleet with a door is no replace: it stands beside the old key under a
+  reference and a name of its own, the first that the catalog does not have (`GITHUB_APP_<OWNER>_2_KEY`), and the
+  old key's entry stays after GitHub refuses that key (`Sources/FleetCore/GitHubAppKey.swift`).
   When the owner saves a key under a variable name that one key of the catalog has, the app replaces the value of
   that key: the new value goes
   under the same reference, with a `replace` statement that the owner key signs about that one sealed copy (see "The

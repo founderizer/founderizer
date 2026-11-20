@@ -281,6 +281,30 @@ def decide_db(access, agent, me, name, op, args, never, content=None):
 
 # ---------------------------------------------------------------- hosts
 
+def rule_only_refusal(access, name, h, lookups, what, **more):
+    """The refusal of `what` (what a rule-only host does not take) on rule-only host `name`, with its true cause as far
+    as the door's file says it. Root on the hub's server, on the door's own and on a machine of the fleet opens keys of
+    the whole fleet (door.own_server), and on a host that agents of two businesses hold at Fix it opens each one's:
+    code keeps both rule-only, so no route is left. For any other rule-only host the file does not say why: the
+    manager's hold, the host's own install, or a second business tag on the server, which the owner's app reads from
+    Tailscale and the file does not keep (DoorAccess.plan keeps one business). The hub knows the hold, so the route is
+    to ask (on 17 November 2026 the words of the first kind, said for a held server of one business, sent its holder
+    and the manager to "only Founderizer code" for two days, while one call of the manager ended the hold)."""
+    own = (lookups or {}).get("own_server")
+    keys = own(h) if own else ("fleet" if h.get("kind") == "fleet" or
+                               h.get("address") == (access.get("hub") or {}).get("address") else None)
+    if keys:
+        return refused(f"{name} is rule-only: it holds the fleet's own keys, so {what}", **more)
+    # every agent that holds a server has a business in a file that door.validate_access took
+    held_by = {a.get("business") for a in (access.get("agents") or {}).values()
+               if isinstance(a, dict) and (a.get("servers") or {}).get(name) == "fix"}
+    if len(held_by) > 1:
+        return refused(f"{name} is rule-only: agents of two businesses hold it at Fix, so {what}", **more)
+    return refused(f"{name} is rule-only at the door, so {what}. The door's file does not say why: the manager's "
+                   f"hold, the server's own install or a second business on the server made it rule-only",
+                   **dict(more, route="ask", needs=f"server:{name}"))
+
+
 def decide_host(access, agent, me, host, op, args, never, content=None, lookups=None):
     h = (access.get("hosts") or {}).get(host)
     if h is None or host in (never.get("hosts") or []):
@@ -344,20 +368,21 @@ def decide_host(access, agent, me, host, op, args, never, content=None, lookups=
         # write and no network, which the host builds and proves itself (ops-root, look_box and look_proved). It is
         # a read: no yes of the owner, no hash for one, no window, no host lock and no rollback timer.
         if h.get("mode") != "fix":
-            return refused(f"{host} is rule-only: it holds the fleet's own keys, and no look runs there", **more)
+            return rule_only_refusal(access, host, h, lookups, "no look runs there", **more)
         if me.get("business") != h.get("business"):     # as Full access asks it (door.Door.full_access)
             return refused(f"{host} is a server of another business than {agent}'s: no look there", **more)
         return Decision("read", "the holder's wide read: a script in a box with no write and no network", **more)
     if f["kind"] in ("own", "full"):
         if h.get("mode") != "fix":          # Patch only is code's: no yes of the owner lifts it, so no hash asks for it
-            return refused(f"{host} is rule-only: only rule forms run there, and no file install", **more)
+            return rule_only_refusal(access, host, h, lookups, "only rule forms run there, and no file install",
+                                     **more)
         if f["kind"] == "full":             # door-modes proposal, step 3: the owner's yes runs that exact call once
             return Decision("full", f"{op} is a root script with no box, which no grant on {host} covers", **more)
         return Decision("own", f"the host form {op}", **more)
     # N4: a new app lives on a fix host only. ops-root refuses it there too, but the door refuses it first, before it
     # makes a value or a runner's tokens for a call that the host will not run.
     if op in OPS_ROOT.PLAN_WRITES and h.get("mode") != "fix":
-        return refused(f"{host} is rule-only: no form of a new app writes there", **more)
+        return rule_only_refusal(access, host, h, lookups, "no form of a new app writes there", **more)
     return Decision("rule" if f["write"] else "read", f"{op} is a rule call", **more)
 
 

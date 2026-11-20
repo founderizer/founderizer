@@ -11,7 +11,7 @@ host takes a bash script in its box too (`ops web-1 script --content fix.sh`), a
 Fix reads its files with one (`ops web-1 look --content read.sh`): a script in a box with no write and no network,
 which sees the apps' folders and logs and no key store and no file with a secret's name. The door answers what ran, or why it
 refused and the route that is left: the owner's yes to the call's hash, the agent that holds the grant, the owner's
-window, or none. After a commit or a run whose check failed, ops also prints the last log lines of the failed step, as
+window, a question about why a host is rule-only, or none. After a commit or a run whose check failed, ops also prints the last log lines of the failed step, as
 data. The door knows this box by its address on the private network, so this command sends no credential.
 
 The door's address comes from team.json's "door" ({address, port}) in this checkout, or FLEET_DOOR=<address>:<port>.
@@ -89,6 +89,11 @@ def route_line(answer, target):
                     f"holds it, and the manager gives this part of the work to that agent.")
         return (f"route: the agent that holds it. Ask your requester with ask_my_requester: the manager gives this part "
                 f"of the work to the agent that holds {target}.")
+    if route == "ask":
+        needs = answer.get("needs") or f"server:{target}"
+        return (f"route: ask why. Ask your requester with ask_my_requester and needs_access {needs}: the hub says "
+                f"what keeps {target} at rule-only, and who can change that. Until then, only the rule forms run "
+                f"there.")
     if route == "window":
         return "route: the owner's window. Send the same call again when the window allows it."
     if route == "again":

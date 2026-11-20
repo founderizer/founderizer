@@ -400,7 +400,12 @@ class DoorTokens(Access):
         first = hub.q1("SELECT max(id) AS id FROM needs")["id"]
         self.assertIs(renew(), True)
         self.assertIsNone(hub.door_renew(t0 + 10))       # one look each DOOR_RENEW_EVERY
-        self.assertIsNone(hub.door_renew(t0 + hub.DOOR_RENEW_EVERY))     # the door still uses the old key
+        StubDoor.answers["/github/key"] = (200, {"used": [new], "ref": new, "fingerprint": printed, "signs": True,
+                                                 "owner": "acme", "page": page})
+        self.assertIsNone(hub.door_renew(t0 + hub.DOOR_RENEW_EVERY))     # the old key under another reference is
+        self.assertEqual(hub.door_renewal()["step"], "ask")              # the old key: no word to delete it
+        StubDoor.answers["/github/key"] = (200, {"used": [old], "ref": old, "fingerprint": printed, "signs": True,
+                                                 "owner": "acme", "page": page})
         self.assertEqual(self.owner(f"/ui/needs/{first}", answer="Done")[0], 200)
         self.assertIs(renew(), False)                    # the answer closed the item, and the form went with it
         self.assertIsNone(hub.door_renew(t0 + 2 * hub.DOOR_RENEW_EVERY))

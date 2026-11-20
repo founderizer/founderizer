@@ -447,7 +447,7 @@ class Access(DoorCase):
         self.assertEqual(self.door.access()["hosts"]["fleet-1"]["mode"], "rule-only")
         self.assertEqual(self.door.access()["hosts"]["web-1"]["mode"], "fix")
         self.assertEqual(self.call(ONE, "fleet-1", "exec", "ls", "/etc")["why"],
-                         "fleet-1 is rule-only: only rule forms run there, and no file install")
+                         "fleet-1 is rule-only: it holds the fleet's own keys, so only rule forms run there, and no file install")
         self.assertEqual(self.stubs.ssh_calls, [])
         with patch("sys.stdin", io.TextIOWrapper(io.BytesIO(json.dumps(data).encode()))), \
                 self.assertRaisesRegex(SystemExit, "the fleet's own server"):
@@ -463,7 +463,7 @@ class Access(DoorCase):
         self.assertEqual(self.door.access()["hosts"]["hub-1"]["mode"], "rule-only")
         self.assertEqual(self.door.caller(ONE), "ops-one")
         got = self.call(ONE, "hub-1", "install", "htop")
-        self.assertEqual(got["why"], "hub-1 is rule-only: only rule forms run there, and no file install")
+        self.assertEqual(got["why"], "hub-1 is rule-only: it holds the fleet's own keys, so only rule forms run there, and no file install")
         self.assertEqual(self.stubs.ssh_calls, [])
         with patch("sys.stdin", io.TextIOWrapper(io.BytesIO(json.dumps(data).encode()))), \
                 self.assertRaisesRegex(SystemExit, "the hub's own server"):
@@ -731,7 +731,7 @@ class Look(Served):
 
     def test_only_the_holder_at_fix_looks_and_only_at_a_host_that_holds_no_key_of_the_fleet(self):
         for address, host, words in ((ONE, "logs-1", "look reads a host's files for the agent that holds it at Fix"),
-                                     (ONE, "ci-1", "rule-only: it holds the fleet's own keys, and no look runs there"),
+                                     (ONE, "ci-1", "rule-only: agents of two businesses hold it at Fix, so no look runs there"),
                                      (ONE, "fleet-1", "rule-only"), (TWO, "web-1", "holds no grant on web-1"),
                                      (STRANGER, "web-1", "not in the door's access file")):
             got = self.call(address, host, "look", content=self.SCRIPT)
@@ -1046,12 +1046,38 @@ class Refusals(DoorCase):
         self.assertEqual(self.decide("commit:one-org/ops", "push",
                                      content=self.commit(("docs/claude.md.txt", "x"))).kind, "rule")
 
-    def test_an_own_form_on_a_rule_only_host(self):
-        for host in ("ci-1", "fleet-1"):
-            d = self.decide(host, "install", "htop")
-            self.assertEqual((d.kind, d.why),
-                             ("refused", f"{host} is rule-only: only rule forms run there, and no file install"))
-            self.assertEqual(self.decide(host, "upgrade").kind, "rule")
+    def test_an_own_form_on_a_rule_only_host_says_its_true_cause(self):
+        """A rule-only host refuses the agent's own forms, a new app's forms and the look, with the cause that the
+        door's file shows. On 17 November 2026 a server of one business that the manager's hold kept at rule-only got
+        the words of a server of the fleet's keys ("it holds the fleet's own keys", route none), and its holder and
+        the manager waited two days for code, while one call of the manager ended the hold."""
+        data = json.loads(json.dumps(ACCESS))
+        data["hosts"]["web-1"]["mode"] = "rule-only"        # held at Fix by ops-one alone: a hold, its install or a tag
+        made = {"made_app": lambda app: [{"agent": "ops-one", "repo": "one-org/shop"}]}
+        for host, cause, route in (
+                ("fleet-1", "fleet-1 is rule-only: it holds the fleet's own keys, so ", None),
+                ("ci-1", "ci-1 is rule-only: agents of two businesses hold it at Fix, so ", None),
+                ("web-1", "web-1 is rule-only at the door, so ", "ask")):
+            for op, args, content, what in (("install", ["htop"], None, "only rule forms run there, and no file install"),
+                                            ("look", [], b"cat /etc/hostname\n", "no look runs there"),
+                                            ("app-new", ["shop", "8080", "/api/health"], None,
+                                             "no form of a new app writes there")):
+                with self.subTest(host=host, op=op):
+                    d = door_targets.decide(data, "ops-one", host, op, args, content, made)
+                    self.assertEqual((d.kind, d.route), ("refused", route))
+                    self.assertTrue(d.why.startswith(cause + what), d.why)
+                    if route == "ask":      # no claim that the file cannot back: the hub knows the hold
+                        self.assertEqual(d.why, f"{cause}{what}. The door's file does not say why: the manager's "
+                                                f"hold, the server's own install or a second business on the server "
+                                                f"made it rule-only")
+                        self.assertEqual((d.needs, d.level), ("server:web-1", None))
+                    else:                   # code keeps it rule-only: no route, which the door answers as none
+                        self.assertIsNone(d.needs)
+            self.assertEqual(door_targets.decide(data, "ops-one", host, "upgrade", []).kind, "rule")
+        # the hub's server is one of the fleet's own keys by its address, whatever kind the file gives it
+        data["hosts"]["hub-1"] = {"address": HUB, "host_key": KEY, "business": "one", "mode": "rule-only", "kind": "app"}
+        data["agents"]["ops-one"]["servers"]["hub-1"] = "fix"
+        self.assertIsNone(door_targets.decide(data, "ops-one", "hub-1", "install", ["htop"]).route)
 
     def test_what_a_machine_of_the_fleet_takes_and_what_it_refuses(self):
         """The fleet's own servers through the door (the owner, 17 November 2026: "someone should probably have root",
@@ -1064,13 +1090,13 @@ class Refusals(DoorCase):
             with self.subTest(op=op):
                 d = self.decide("fleet-1", op, *args)
                 self.assertEqual((d.kind, d.host, d.business), (kind, "fleet-1", "one"))
-        rule_only = "fleet-1 is rule-only: only rule forms run there, and no file install"
+        rule_only = "fleet-1 is rule-only: it holds the fleet's own keys, so only rule forms run there, and no file install"
         for op, args, content, why in (
                 ("exec", ["systemctl", "status"], None, rule_only), ("script", [], b"id\n", rule_only),
                 ("file", ["/etc/x.conf", "0644", "root"], b"x", rule_only),
                 ("run", [], b"id\n", rule_only), ("install", ["htop"], None, rule_only),
                 ("look", [], b"cat /etc/hostname\n",
-                 "fleet-1 is rule-only: it holds the fleet's own keys, and no look runs there")):
+                 "fleet-1 is rule-only: it holds the fleet's own keys, so no look runs there")):
             with self.subTest(op=op):
                 d = self.decide("fleet-1", op, *args, content=content)
                 self.assertEqual((d.kind, d.why), ("refused", why))
@@ -1096,10 +1122,11 @@ class Refusals(DoorCase):
             with self.subTest(op=op):
                 self.assertIn(op, door_targets.OPS_ROOT.PLAN_WRITES)
                 self.assertEqual(self.decide("web-1", op, *args, lookups=made).kind, "rule")
-                for host in ("ci-1", "fleet-1"):
+                for host, cause in (("ci-1", "agents of two businesses hold it at Fix"),
+                                    ("fleet-1", "it holds the fleet's own keys")):
                     d = self.decide(host, op, *args, lookups=made)
                     self.assertEqual((d.kind, d.why),
-                                     ("refused", f"{host} is rule-only: no form of a new app writes there"))
+                                     ("refused", f"{host} is rule-only: {cause}, so no form of a new app writes there"))
         for op in door_targets.OPS_ROOT.PLAN_WRITES:        # and the ones that are an agent's own forms, as before
             checked = ["shop", "SESSION_SECRET", "random"] if op.startswith("env-") else \
                 ["shop", "8080", "/api/health"] if op == "app-new" else ["shop"]
@@ -1526,7 +1553,7 @@ class OwnCalls(DoorCase):
     def test_the_same_call_without_the_grant_or_on_a_rule_only_host_is_refused_by_code(self):
         for address, host, why in ((TWO, "web-1", "ops-two holds no grant on web-1"),
                                    (ONE, "logs-1", "ops-one holds Read on logs-1: no write"),
-                                   (ONE, "ci-1", "ci-1 is rule-only: only rule forms run there, and no file install")):
+                                   (ONE, "ci-1", "ci-1 is rule-only: agents of two businesses hold it at Fix, so only rule forms run there, and no file install")):
             with self.subTest(host=host):
                 got = self.call(address, host, "install", "htop")
                 self.assertEqual((got["ok"], got["kind"], got["why"]), (False, "refused", why))
@@ -3156,7 +3183,7 @@ class ScriptsAndRuns(Signed, DoorCase):
                          ("refused", "script takes its bytes as the call's content", "none"))
         got = self.call(ONE, "ci-1", "script", content=SCRIPT)
         self.assertEqual((got["why"], got["route"]),
-                         ("ci-1 is rule-only: only rule forms run there, and no file install", "none"))
+                         ("ci-1 is rule-only: agents of two businesses hold it at Fix, so only rule forms run there, and no file install", "none"))
         got = self.call(ONE, "logs-1", "script", content=SCRIPT)
         self.assertEqual((got["why"], got["route"], got["needs"], got["level"]),
                          ("ops-one holds Read on logs-1: no write", "holder", "server:logs-1", "fix"))
@@ -3607,7 +3634,9 @@ class FullAccess(Signed, DoorCase):
         self.write_access(data)
         self.assertEqual(self.door.modes_said()["web-2"], {"mode": "auto", "at": None})
         self.assertEqual(self.run_on("web-2", TWO)["why"],
-                         "web-2 is rule-only: only rule forms run there, and no file install")
+                         "web-2 is rule-only at the door, so only rule forms run there, and no file install. The "
+                         "door's file does not say why: the manager's hold, the server's own install or a second "
+                         "business on the server made it rule-only")
         self.assertFalse(self.door.full_access(self.door.access(), "web-2", "ops-two"))
         self.assertEqual(self.stubs.ssh_calls[-2:], [("100.64.2.1", "run", [], SCRIPT),
                                                       ("100.64.2.1", "timer", ["cancel"], None)])
@@ -3787,6 +3816,7 @@ class Routes(Served):
                 "another way.")
         self.assertEqual(self.route("web-1", "exec", "flock", "/run/lock/x.lock", "true"), none)
         self.assertEqual(self.route("ci-1", "install", "htop"), none)
+        self.assertEqual(self.route("fleet-1", "install", "htop"), none)    # code's, for the fleet's keys: no ask
         self.assertEqual(self.route("site-1", "uptime"), none)
         self.door.clock = lambda: datetime.datetime(2026, 11, 2, 22, 0, tzinfo=datetime.timezone.utc)
         self.assertEqual(self.route("web-1", "restart", "nginx"),
@@ -3794,6 +3824,26 @@ class Routes(Served):
         with patch.object(door_targets, "decide", side_effect=door_providers.Stop("GitHub did not answer")):
             self.assertEqual(self.route("web-1", "uptime"),
                              "route: the same call again later. The door could not check it now.")
+        self.assertEqual(self.stubs.ssh_calls, [])
+
+    def test_a_rule_only_host_of_no_key_of_the_fleet_sends_its_holder_to_ask_why(self):
+        """ops prints the route to ask under the refusal, so the holder asks the hub, which names the manager's hold,
+        and does not stop at "route: none" as on 17 November 2026."""
+        data = json.loads(json.dumps(ACCESS))
+        data["hosts"]["web-1"]["mode"] = "rule-only"
+        self.write_access(data)
+        path = os.path.join(self.root, "read.sh")
+        with open(path, "wb") as f:
+            f.write(b"cat /etc/hostname\n")
+        for argv in (("web-1", "look", "--content", path), ("web-1", "install", "htop")):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.route(*argv),
+                                 "route: ask why. Ask your requester with ask_my_requester and needs_access "
+                                 "server:web-1: the hub says what keeps web-1 at rule-only, and who can change that. "
+                                 "Until then, only the rule forms run there.")
+        got = self.door.call(ONE, "web-1", "install", ["htop"])
+        self.assertEqual((got["route"], got["needs"]), ("ask", "server:web-1"))
+        self.assertNotIn("call", got)               # code refused it: no hash for a yes of the owner
         self.assertEqual(self.stubs.ssh_calls, [])
 
     def test_the_owner_s_yes_names_the_call_hash(self):
@@ -5637,7 +5687,7 @@ class RunnerNew(DoorCase):
         token of the repository and sent them, and only the host refused."""
         got = self.call(ONE, "ci-1", "runner-new", "shopapp")
         self.assertEqual((got["ok"], got["kind"], got["why"]),
-                         (False, "refused", "ci-1 is rule-only: no form of a new app writes there"))
+                         (False, "refused", "ci-1 is rule-only: agents of two businesses hold it at Fix, so no form of a new app writes there"))
         self.assertNotIn("call", got)                   # code refused it: no yes of the owner opens it
         self.assertEqual((self.github, self.stubs.ssh_calls), ([], []))
 

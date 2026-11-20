@@ -252,8 +252,10 @@ FULL_NOTE = (" Its second answer, Full access on {host} (raise_needs_you door_ho
 # holder: the agent lacks the grant, and the agent that holds it does that part (needs names it as ask_my_requester's
 # needs_access takes it, with its level). window: the owner's window refuses it now, and it runs outside the window.
 # again: the door could not check it now. none: no grant and no yes lets this call through: the call or the plan
-# changes.
-ROUTES = ("yes", "holder", "window", "again", "none")
+# changes. ask: the host is rule-only, and the door's file does not say why: it is no server of the fleet's own keys,
+# and agents of two businesses do not hold it at Fix, so the manager's hold, the host's own install or a second
+# business tag made it so; the hub knows the hold (needs names the host as needs_access takes it).
+ROUTES = ("yes", "holder", "window", "again", "none", "ask")
 TIMER_TRIES = 6             # times that the door asks a host to end its rollback countdown after a script or a run
 TIMER_PAUSE = 10            # seconds between them, while the host does not answer
 RUN_WAIT = 50 * 60          # how long a GitOps sync's call waits for its run to end: less than an agent's ops call waits
@@ -1370,6 +1372,8 @@ class Door:
         state of the default branch, a repository's default branch."""
         kind, _, repo = target.partition(":") if isinstance(target, str) else ("", "", "")
         facts = {"minted": self.minted, "default_branch": lambda name: GitHub(self, access, name).branch(),
+                 # hub, door or fleet for a host whose root opens keys of the whole fleet (own_server), else None
+                 "own_server": lambda h: own_server(own_servers(access), h),
                  "made_repo": lambda name: self.repo_record("made", name),
                  "made_app": lambda app: [r for r in (read_json(REPOS_FILE, {}).get("made") or {}).values()
                                           if isinstance(r, dict) and r.get("app") == app]}

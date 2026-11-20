@@ -54223,7 +54223,10 @@ def save_secret(body):
     registered: the catalog takes no second key of one name (key_named). The owner replaces the value of the key
     that is there instead: this same step under that key's own reference, which adds the fingerprints of the new
     value and leaves the entry as it is, and then the intake with his signed statement (owner feature
-    secret_replace)."""
+    secret_replace). The successor of a GitHub App's key on a fleet with a door is no replace: it stands beside the
+    old key under a reference of its own, with which the door shows that GitHub refuses the old key (door_renew), so
+    the Mac app gives it a name of its own, the first that the list does not have: GITHUB_APP_<OWNER>_2_KEY
+    (GitHubAppKey.place). The old key's entry stays after that."""
     ref = body["login"]
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
@@ -54233,7 +54236,8 @@ def save_secret(body):
     before = (team.get("logins") or {}).get(ref) or {}
     if entry.get("kind") == "api_key" and before.get("env") != entry["env"] and key_named(team, entry["env"], ref):
         # The owner, 13 November 2026: "having 2 keys named the same should not be possible". This is the one write
-        # of a key's variable name, so each path ends here: Add secret, a request's card, an import. A write that
+        # of a key's variable name, so each path ends here: Add secret, a request's card, an import, the GitHub App
+        # rows and the form of an MCP server, which both choose a name that the list does not have. A write that
         # leaves an entry's name as it is passes, so a list that has two of one name from before stays writable.
         raise Refusal(409, f"The list already has an API key named {entry['env']}, and it takes no second key of "
                            f"that name.")
@@ -57528,8 +57532,12 @@ def door_renew(t0=None):
                    f"{state['fingerprint']}")
         return state
     if state["step"] == "ask":
-        if key.get("signs") is not True or state["old"] in (key.get("used") or [state["old"]]):
-            if isinstance(key.get("signs"), bool) and state["old"] in (key.get("used") or [state["old"]]):
+        # The door uses the old key while its file names the old reference, and also while the key of another
+        # reference has the old key's fingerprint: the old key saved a second time is no successor. Without the
+        # second part the next step told the owner to delete that fingerprint, which was the one key in use.
+        old = state["old"] in (key.get("used") or [state["old"]]) or key.get("fingerprint") == state["fingerprint"]
+        if key.get("signs") is not True or old:
+            if isinstance(key.get("signs"), bool) and old:
                 door_renew_again(state, t0, manager, refused=key.get("signs") is False)     # the door uses the old key
             return None
         close_github_key_needs(state["owner"], "the door makes every GitHub token with the new App key now")

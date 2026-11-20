@@ -195,9 +195,9 @@ entries, Docker's folder, other processes' environments, the limits) on a real U
   and the count of bytes that went back, never the script and never the bytes), and an agent that reads strangers'
   text all day and has its Shell box off holds no server.
 
-A look runs only on a server that the door holds at `fix`, for the agent that holds it at Fix. The hub's own machine,
-a machine of the fleet's agents and a CI host that two businesses share hold the fleet's own keys: no look runs
-there.
+A look runs only on a server that the door holds at `fix`, for the agent that holds it at Fix. The hub's own machine
+and a machine of the fleet's agents hold the fleet's own keys, and a CI host that two businesses share holds the keys
+of both: no look runs there.
 
 ## What the holder of the fleet's own servers can do there
 
