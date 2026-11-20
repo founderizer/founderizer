@@ -21,6 +21,7 @@ import tracemalloc
 import unittest
 from unittest.mock import patch
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zipfile
@@ -42,6 +43,8 @@ TEAM = {"hub": {"machine": "hub", "port": 8765},
                       "whatsapp-main": {"app": "whatsapp", "label": "Fleet", "agents": ["manager"], "unknown": "ignore"}}}
 WHATSAPP_STUDIO = {"app": "whatsapp", "label": "Studio WA", "agents": ["studio"], "unknown": "ignore"}
 CHAT = ("test-generation", "owner-chat", "1")
+# a PNG of 4 x 3 pixels as its header says (picture_side), which read_attachment shows in its answer
+PICTURE = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + (4).to_bytes(4, "big") + (3).to_bytes(4, "big") + bytes(40)
 
 
 def git(*args, cwd=None):
@@ -88,6 +91,22 @@ class ChatApps(OwnerAPI):
         self.assertEqual(code, 200, data)
         self.assertEqual(data["db"], "test-generation")
         return data["result"], body
+
+    def bridge_upload(self, data, message, n=1, account="discord-studio", sender=OWNER_DISCORD, mime="image/png",
+                      name="screenshot.png", **extra):
+        """POST /bridge/files (CHAT-APPS.md 8.1): one file of a message, as the bridge sends it up before the
+        message, with the bridge's key from the hub machine."""
+        query = urllib.parse.urlencode(dict(account=account, message=message, n=n, name=name, mime=mime,
+                                            sender=sender, **extra))
+        req = urllib.request.Request(f"{self.base}/bridge/files?{query}", data=data, method="POST",
+                                     headers={"Content-Type": "application/octet-stream", "X-Test-Source": BRIDGE,
+                                              "Authorization": f"Bearer {self.key}"})
+        try:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=30) as answer:
+                return answer.status, json.load(answer)
+        except urllib.error.HTTPError as answer:
+            with answer:
+                return answer.code, json.load(answer)
 
     def own(self, app="discord", ident=OWNER_DISCORD, alias=None):
         hub.q("INSERT INTO owner_handles(app,id,alias,name,linked) VALUES(?,?,?,?,?)", (app, ident, alias, "miguel", hub.now()))
@@ -330,6 +349,65 @@ class ChatApps(OwnerAPI):
             "the fleet does not pass on to you yet. If you need it, ask the owner for it in words, or as a file in the "
             "Founderizer app, where read_attachment opens it.]"), events["studio"])
         self.assertIn("[The owner sent a picture with this message on WhatsApp", self.read("manager"))   # its read
+
+    def test_a_file_of_a_chat_app_message_reaches_the_agent_as_its_file(self):
+        """CHAT-APPS.md 8.1 (the owner, 20 November 2026: "pictures and files sohuld be allowed!"): the bridge sends
+        the owner's picture up before its message, past the 1 MiB of every other bridge body, and the message's
+        route makes it a file of that message, which the agent opens with read_attachment. The same upload again is
+        the same file; a sender whose message the hub would not store gets no byte stored; a file that did not come
+        up is named, with why in the hub's own words."""
+        self.own()
+        big = PICTURE + bytes(2 * 1024 * 1024)
+        code, first = self.bridge_upload(big, "m-up")
+        self.assertEqual(code, 200, first)
+        self.assertEqual(self.bridge_upload(big, "m-up")[1], dict(first, replayed=True))     # again: the same one file
+        code, refused = self.bridge_upload(PICTURE, "m-x", sender="999000111")              # a stranger: nothing kept
+        self.assertEqual((code, refused["code"], refused["error"]),
+                         (403, "not_welcome", "not taken: the sender may not write to this account's agent"))
+        self.assertEqual(self.bridge_upload(b"", "m-e")[0], 415)          # empty: never a 400, which the bridge tries again
+        self.assertEqual(self.bridge_upload(b"not a png", "m-f")[0], 415)     # a known type keeps its check of the bytes
+        # the sender's type is a type token or application/octet-stream: nothing else reaches a Content-Type
+        for mime, kept in (("text/plain\r\nX-A: 1", "application/octet-stream"), ("Image/PNG; q=1", "image/png")):
+            code, odd = self.bridge_upload(PICTURE, f"m-{len(mime)}", mime=mime)
+            self.assertEqual((code, hub.q1("SELECT mime FROM attachments WHERE id=?", (odd["id"],))["mime"]),
+                             (200, kept))
+        # a text with a registered login is refused, also when its type says nothing of text (a .env)
+        value, salt = "SYNTHETICFILELOGIN4471", "test-salt"
+        hub.ins("INSERT INTO secrets(label,salt,hash,len) VALUES(?,?,?,?)",
+                ("Synthetic", salt, hashlib.sha256((salt + value).encode()).hexdigest(), len(value)))
+        for mime, name in (("text/plain", "notes.txt"), ("application/octet-stream", ".env")):
+            code, refused = self.bridge_upload(f"KEY={value}\n".encode(), f"m-{name}", mime=mime, name=name)
+            self.assertEqual((code, refused.get("code")), (422, "login_as_file"), name)
+        # the bridge's question before it fetches a byte: a stranger's answer is the 403, the owner's a welcome
+        self.assertEqual(self.bridge_upload(b"", "m-x", sender="999000111", check=1)[0], 403)
+        self.assertEqual(self.bridge_upload(b"", "m-c", check=1), (200, {"db": "test-generation", "welcome": True}))
+        self.assertEqual(self.count("attachments"), 3)          # the big picture and the two of odd types
+        self.assertEqual(self.inbound("Why does it stop here?", kind="image", id="m-up")[0], "stored")
+        req = self.last_request()
+        self.assertEqual(hub.q1("SELECT message FROM attachments WHERE id=?", (first["id"],))["message"],
+                         req["request_id"])
+        event = hub.q1("SELECT text FROM events WHERE id=?", (req["event_id"],))["text"]
+        self.assertIn(f"[The owner attached 1 file: A-{first['id']} screenshot.png (image/png, 2.0 MB).", event)
+        self.assertNotIn("does not pass on", event)
+        text, error = hub.call_tool("studio", "read_attachment", {"attachment_id": f"A-{first['id']}"}, CHAT)
+        self.assertFalse(error, text)
+        self.assertIn("The picture follows", text)
+        # every file that the app lets a person send in one message, of any type (the owner, 20 November 2026: "does
+        # it accept multiple files, images etc? it should"): ten in their order, a video kept as data, no eleventh
+        for n in range(1, 11):
+            mime, name = ("video/mp4", "clip.mp4") if n == 10 else ("image/png", f"f{n}.png")
+            code, got = self.bridge_upload(PICTURE if n < 10 else b"\x00\x00\x00\x18ftypmp42", "m-ten", n=n, mime=mime,
+                                    name=name)
+            self.assertEqual(code, 200, (n, got))
+        self.assertEqual(self.bridge_upload(PICTURE, "m-ten", n=11)[0], 400)
+        self.assertEqual(self.inbound("All of them.", kind="image", id="m-ten")[0], "stored")
+        ten = hub.q1("SELECT text FROM events WHERE id=?", (self.last_request()["event_id"],))["text"]
+        self.assertEqual(re.findall(r"A-\d+ (\S+) \(", ten), [f"f{n}.png" for n in range(1, 10)] + ["clip.mp4"])
+        self.assertIn('clip.mp4 ("video/mp4", 1 KB)', ten)     # a type of no table of the hub's, in quotes
+        # a file that did not come up: its reason, in the hub's words; a code that the hub does not know is left out
+        self.assertEqual(self.inbound("And this one?", kind="image", missed=["size", "nonsense"])[0], "stored")
+        self.assertIn("[The owner sent a picture on Discord, which did not reach the fleet: it is larger than 25 MiB.",
+                      hub.q1("SELECT text FROM events WHERE id=?", (self.last_request()["event_id"],))["text"])
 
     def test_a_registered_secret_in_an_inbound_message_is_not_stored(self):
         self.own()

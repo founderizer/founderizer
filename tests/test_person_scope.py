@@ -142,6 +142,24 @@ class Narrowed(Base):
         self.narrow(self.pat["id"], {f"repo:{REPO}": "write", f"secret:{LOGIN}": "use"})
         self.kim = self.person("Kim", "manager", KIM, app="discord")
 
+    def test_its_window_opens_its_persons_own_files_only(self):
+        """CHAT-APPS.md 8.1: a narrowed window opens the files of its own person's messages (read_attachment is in
+        SCOPE_TOOLS), and a file of the owner's never."""
+        code, up = self.bridge_upload(test_contacts_v2.test_people.test_chat_apps.PICTURE, "m-scope",
+                               account="whatsapp-studio", sender=PAT)
+        self.assertEqual(code, 200, up)
+        self.assertEqual(self.wrote(text="The form.", kind="image", id="m-scope", account="whatsapp-studio",
+                                    sender=PAT), "stored")
+        cid = hub.q1("SELECT conversation FROM conversation_messages WHERE msg_id='m-scope'")["conversation"]
+        self.assertIn("The picture follows", self.ok("read_attachment", self.context(cid), attachment_id=f"A-{up['id']}"))
+        owners = hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,message) "
+                         "VALUES('r-owner','plan.png','image/png',64,?,?,'deterministic-test','u-1')",
+                         (up["id"] and hub.q1("SELECT sha256 FROM attachments WHERE id=?", (up["id"],))["sha256"],
+                          hub.now()))
+        text, error = self.tool("read_attachment", self.context(cid), attachment_id=f"A-{owners}")
+        self.assertTrue(error)
+        self.assertIn("is not a file that Pat sent in this conversation", text)
+
     def test_it_starts_locked_on_the_agents_own_runtime(self):
         cid = self.says(PAT, "Please fix the form of the CRM")["conversation"]
         mode = hub.conversation_modes("studio")[str(cid)]
@@ -207,7 +225,7 @@ class Narrowed(Base):
         for cut in ("open_work", "message_contact", "message_agent", "keep_instruction", "set_target", "set_duty",
                     "save_trigger", "remember", "recall", "see_notes", "read_knowledge", "search_knowledge",
                     "write_notes", "write_knowledge", "report_up", "report_progress", "see_earlier_work",
-                    "read_attachment", "list_my_tasks"):
+                    "list_my_tasks"):           # read_attachment opens the person's own files (CHAT-APPS.md 8.1)
             text, error = self.tool(cut, self.context(cid))
             self.assertTrue(error, cut)
             self.assertIn(f"no tool named {cut}", text)
@@ -216,9 +234,11 @@ class Narrowed(Base):
         self.assertTrue({"open_work", "message_contact", "keep_instruction"} <= names)
         # the owner's files are not for a session that a person drives, as his chats are not (17 November 2026): not
         # for the window, nor for the conversation's task that it runs. A task that the conversation opened reads a
-        # steer's file of its own task only (owner API 1.223, test_contacts_v2)
+        # steer's file of its own task only (owner API 1.223, test_contacts_v2). The window has the tool for its own
+        # person's files only since 20 November 2026 (CHAT-APPS.md 8.1, conversation_attachment)
         task = {x["name"] for x in hub.tools_for("studio", self.task_context(other))}
-        self.assertNotIn("read_attachment", names | task)
+        self.assertNotIn("read_attachment", task)
+        self.assertIn("read_attachment", names)
         self.assertEqual(names & set(hub.REPO_CALLS), set())         # the door's calls are a narrowed thread's only
         self.assertIsNone(self.conversation_task(other)["scope_person"])
 

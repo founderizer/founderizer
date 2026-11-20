@@ -28,6 +28,12 @@ GROUP, CHANNEL, OTHER_GROUP = "-1001000000001", "-1001000000002", "-100100000000
 ACCOUNT = "telegram-sales"
 CONF = {"id": ACCOUNT, "app": "telegram", "label": "Sales", "enabled": True}
 TIMINGS = dict(test_channels.TIMINGS, TELEGRAM_POLL=1, TELEGRAM_TYPING_EVERY=0.1, TELEGRAM_PART_GAP=0)
+# The file ids, file addresses, names and captions of the files of these tests: the log never holds one (a file's
+# address holds the bot's token)
+FILE_TEXTS = ("AgACAgQ-photo", "BQACAgQ-", "AwACAgQ-", "DQACAgQ-", "CAACAgQ-", "CgACAgQ-", "/file/bot", "photos/file_",
+              "documents/file_", "voice/file_", "video_notes/", "stickers/", "animations/", "photo.jpg", "Factura",
+              "file.pdf", "voice.ogg", "video.mp4", "sticker.", "dance.mp4", "Archive.zip",
+              "This is the error that I get", "The invoice")
 
 
 # ---------------------------------------------------------------- stand-in: Telegram's Bot API
@@ -41,6 +47,19 @@ class BotAPIHandler(test_channels.JSONHandler):
 
     def route(self, method):
         api = self.server.owner
+        file = re.match(r"^/file/bot([^/]+)/(.+)$", self.path)
+        if method == "GET" and file:        # a file's own address, which getFile's file_path gives
+            with api.cond:
+                api.downloads.append((file.group(1), file.group(2)))
+                data = next((d for p, d in api.files.values() if p == file.group(2)), None) \
+                    if file.group(1) == api.token else None
+            if data is None:
+                return self.answer(404, {"ok": False, "error_code": 404, "description": "Not Found"})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            return self.wfile.write(data)
         m = re.match(r"^/bot([^/]+)/([A-Za-z]+)$", self.path)
         if method != "POST" or not m:
             return self.answer(404, {"ok": False, "error_code": 404, "description": "Not Found"})
@@ -63,19 +82,31 @@ class BotAPIHandler(test_channels.JSONHandler):
             return self.answer(200, {"ok": True, "result": api.sent(body)})
         if name == "sendChatAction":
             return self.answer(200, {"ok": True, "result": True})
+        if name == "getFile":
+            with api.cond:
+                known = api.files.get(body.get("file_id"))
+            if not known:
+                return self.answer(400, {"ok": False, "error_code": 400, "description": "Bad Request: invalid file_id"})
+            return self.answer(200, {"ok": True, "result": {"file_id": body["file_id"], "file_unique_id": "AQADu",
+                                                            "file_size": len(known[1]), "file_path": known[0]}})
         return self.answer(404, {"ok": False, "error_code": 404, "description": "Not Found"})
 
 
 class BotAPI:
-    """The Bot API of one bot: getMe, getUpdates with offsets and a long poll, sendMessage and sendChatAction, and the
-    faults that a test asks for, by method, in order."""
+    """The Bot API of one bot: getMe, getUpdates with offsets and a long poll, sendMessage and sendChatAction, getFile
+    and a file's own address, and the faults that a test asks for, by method, in order."""
     def __init__(self, token=TOKEN):
         self.token, self.bot = token, (BOT_ID, BOT_NAME)
         self.cond = threading.Condition()
         self.queue, self.offsets, self.messages, self.actions, self.calls = [], [], [], [], []
         self.faults, self.next_update, self.next_message = {}, 100, 900
+        self.files, self.downloads = {}, []     # file id -> (file path, bytes); (token, file path) of each download
         self.server = test_channels.serve(BotAPIHandler, self)
         self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+
+    def add_file(self, file_id, path, data):
+        with self.cond:
+            self.files[file_id] = (path, data)
 
     def called(self, token, name, body):
         with self.cond:
@@ -186,8 +217,8 @@ class Bridge(unittest.TestCase):
         self.hub.shutdown()
         self.api.shutdown()
         logs = self.log.getvalue()
-        for text in (TOKEN, TOKEN.split(":")[1], "How are sales today", "Weekly offers"):
-            self.assertNotIn(text, logs, "the log holds message text or a token")
+        for text in (TOKEN, TOKEN.split(":")[1], "How are sales today", "Weekly offers", *FILE_TEXTS):
+            self.assertNotIn(text, logs, "the log holds message text, a file's name or address, or a token")
         self.tmp.cleanup()
 
     def write_token(self, token=TOKEN):
@@ -265,8 +296,75 @@ class Bridge(unittest.TestCase):
         del doc["text"]
         last = self.api.inject(message=doc)
         self.wait_for(lambda: last + 1 in self.api.offsets, "all six confirmed")
+        self.wait_for(lambda: len(self.hub.inbound) == 2, "the two messages after their files' fetches")
         self.assertEqual([(m["kind"], m["text"]) for m in self.hub.inbound],
                          [("image", "This is the error that I get"), ("file", "The invoice")])
+
+    def test_each_kind_of_file_goes_up_through_getfile(self):
+        """The design of 20 November 2026 (version 2) and the owner's words of that day ("does it accept multiple
+        files, images etc? it should"): a photo's largest size, a document, a voice note, a video note, a sticker and
+        an animation (whose message holds its document too) each reach POST /bridge/files through getFile and the
+        file's own address, which holds the bot's token, with the type that the rule gives; a file that comes with no
+        name goes up with one of its kind. A file above the 20 MB that getFile gives a bot is `size`, with no
+        getFile. The log names no file, address, caption or token (tearDown)."""
+        jpeg, pdf, ogg = b"\xff\xd8\xff\xe0 a screenshot", b"%PDF-1.4 an invoice", b"OggS a voice note"
+        mp4, webp, tgs = b"\x00\x00\x00\x18ftypmp42", b"RIFF\x00\x00\x00\x00WEBPVP8 ", b"\x1f\x8b an animated sticker"
+        for fid, path, data in (("AgACAgQ-photo-large", "photos/file_7.jpg", jpeg),
+                                ("BQACAgQ-invoice", "documents/file_8.pdf", pdf),
+                                ("BQACAgQ-unnamed", "documents/file_9.pdf", pdf),
+                                ("AwACAgQ-voice", "voice/file_10.oga", ogg),
+                                ("DQACAgQ-round", "video_notes/file_11.mp4", mp4),
+                                ("CAACAgQ-sticker", "stickers/file_12.webp", webp),
+                                ("CAACAgQ-moving", "stickers/file_13.tgs", tgs),
+                                ("CgACAgQ-animation", "animations/file_14.mp4", mp4)):
+            self.api.add_file(fid, path, data)
+        self.connected()
+        animation = {"file_id": "CgACAgQ-animation", "file_name": "dance.mp4", "mime_type": "video/mp4",
+                     "file_size": len(mp4)}
+        messages = [
+            private("", mid=11, caption="This is the error that I get", photo=[
+                {"file_id": "AgACAgQ-photo-small", "file_unique_id": "s", "width": 90, "height": 60, "file_size": 900},
+                {"file_id": "AgACAgQ-photo-large", "file_unique_id": "l", "width": 1280, "height": 853,
+                 "file_size": len(jpeg)}]),
+            private("", mid=12, caption="The invoice", document={
+                "file_id": "BQACAgQ-invoice", "file_name": "Factura año 2026.pdf", "mime_type": "application/pdf",
+                "file_size": len(pdf)}),
+            private("", mid=13, document={"file_id": "BQACAgQ-unnamed", "mime_type": "application/pdf"}),
+            private("", mid=14, voice={"file_id": "AwACAgQ-voice", "duration": 3, "mime_type": "audio/ogg",
+                                       "file_size": len(ogg)}),
+            private("", mid=15, video_note={"file_id": "DQACAgQ-round", "length": 240, "duration": 2,
+                                            "file_size": len(mp4)}),
+            private("", mid=16, sticker={"file_id": "CAACAgQ-sticker", "type": "regular", "width": 512, "height": 512,
+                                         "is_animated": False, "is_video": False, "file_size": len(webp)}),
+            private("", mid=17, sticker={"file_id": "CAACAgQ-moving", "type": "regular", "width": 512, "height": 512,
+                                         "is_animated": True, "is_video": False, "file_size": len(tgs)}),
+            private("", mid=18, animation=animation, document=dict(animation)),
+            private("", mid=19, document={"file_id": "BQACAgQ-large", "file_name": "Archive.zip",
+                                          "mime_type": "application/zip", "file_size": (20 << 20) + 1})]
+        for msg in messages:
+            del msg["text"]
+            self.api.inject(message=msg)
+        self.wait_for(lambda: len(self.hub.inbound) == 9, "the nine messages")
+        octets, fields = "application/octet-stream", {"account": ACCOUNT, "n": "1", "sender": OWNER_TG}
+        self.assertEqual(self.hub.uploads, [
+            (dict(fields, message=f"{BOT_ID}:{OWNER_TG}:{mid}", name=name, mime=mime), data, octets)
+            for mid, name, mime, data in ((11, "photo.jpg", "image/jpeg", jpeg),
+                                          (12, "Factura año 2026.pdf", "application/pdf", pdf),
+                                          (13, "file.pdf", "application/pdf", pdf), (14, "voice.ogg", "audio/ogg", ogg),
+                                          (15, "video.mp4", "video/mp4", mp4), (16, "sticker.webp", "image/webp", webp),
+                                          (17, "sticker.tgs", "application/x-tgsticker", tgs),
+                                          (18, "dance.mp4", "video/mp4", mp4))])
+        self.assertEqual([b["file_id"] for _, n, b in self.api.calls if n == "getFile"],
+                         ["AgACAgQ-photo-large", "BQACAgQ-invoice", "BQACAgQ-unnamed", "AwACAgQ-voice", "DQACAgQ-round",
+                          "CAACAgQ-sticker", "CAACAgQ-moving", "CgACAgQ-animation"])
+        self.assertEqual(self.api.downloads, [(TOKEN, path) for path in (
+            "photos/file_7.jpg", "documents/file_8.pdf", "documents/file_9.pdf", "voice/file_10.oga",
+            "video_notes/file_11.mp4", "stickers/file_12.webp", "stickers/file_13.tgs", "animations/file_14.mp4")])
+        self.assertEqual([(m["kind"], m.get("missed"), m.get("media")) for m in self.hub.inbound],
+                         [("image", None, None), ("file", None, None), ("file", None, None), ("audio", None, None),
+                          ("other", None, None), ("other", None, None), ("other", None, None), ("file", None, None),
+                          ("file", ["size"], None)])
+        self.assertEqual([m["text"] for m in self.hub.inbound[:2]], ["This is the error that I get", "The invoice"])
 
     def test_a_group_or_channel_change_goes_to_the_hub_with_who_made_it(self):
         self.connected()

@@ -1641,6 +1641,110 @@ class DoorCalls(Access):
                 hub.t_raise_needs_you("manager", dict({"title": "Start it", "why": "It adds cost",
                                                        "what_to_do": "Say yes"}, **bad))
 
+    def test_the_task_of_a_door_card_hears_run_it_once_and_no(self):
+        """A review of 20 November 2026 (T-1566): the owner's press on the door's card reached only the manager, which
+        raised it, and the task that the card is for asked every two hours. His Run it once, his No and his words
+        reach that task in the same write now, with no quiet mark, on the app and on the hub's own board, also for a
+        card of a call that is no run; the manager reads that the hub told it and which question of that task still
+        waits; Full access stays the door's own news; a card whose question is that task's own answers it once; an
+        ended task hears nothing; and a No takes nothing from another card's yes."""
+        self.grant(agent="vps", server="web-1", level="fix")
+
+        def card(script, task=None, **more):
+            task = task or hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Rotate the logs','vps','working')")
+            fields = run_card(script=script, **more)
+            hub.q("UPDATE door_record SET task=? WHERE call=?", (f"T-{task}", fields["door_call"]))
+            nid = int(hub.t_raise_needs_you("manager", fields).split("N-")[1].split(".")[0])
+            return task, nid, fields["door_call"], hub.need_title(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
+
+        def said(agent, task=None):
+            return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent=? AND kind='say' AND "
+                                             "(? IS NULL OR task=?) ORDER BY id", (agent, task, task))]
+
+        def question(task):
+            return hub.ins("INSERT INTO questions(task,asker,requester,text,asked) VALUES(?,'vps','manager',"
+                           "'Has the owner answered?',?)", (task, hub.now()))
+
+        def run_once(nid, call):
+            yes = json.dumps({"v": 1, "kind": "door-call", "fleet": "f", "need": nid, "call": call, "at": 1},
+                             sort_keys=True, separators=(",", ":"))
+            self.assertEqual(self.owner(f"/ui/needs/{nid}", choice=0, statement=yes, signature="c2ln")[0], 200)
+        once, nid, call, title = card("logrotate -f /etc/logrotate.conf\n")
+        asked = question(once)
+        run_once(nid, call)
+        first = nid
+        self.assertEqual(said("vps", once), [
+            f"[hub] The owner pressed \"Run it once\" on N-{nid} ({title}): the door lets that call through one time. "
+            f"Send the same script again, character for character, and go on with the task; a call that already ran "
+            f"needs nothing more. If the door refuses it again, send it once more after one minute, and if it still "
+            f"refuses it, send it no more and give your requester the door's own words."])
+        self.assertEqual(hub.q1("SELECT extra FROM events WHERE task=? AND kind='say'", (once,))["extra"], "{}")
+        self.assertIn(f"The hub gave T-{once}, the task that the card is for, this answer and what the door does now: "
+                      f"do not pass it on again. Its question Q-{asked} still waits: answer it too, because this "
+                      f"answer closes no question of T-{once}.", said("manager")[-1])
+        # a second card of the same call, answered No: that call keeps the first card's yes, and the manager reads why
+        _, again, _, _ = card("logrotate -f /etc/logrotate.conf\n", task=once)
+        self.assertEqual(self.owner(f"/ui/needs/{again}", choice=2)[0], 200)
+        self.assertEqual(len(said("vps", once)), 1)
+        self.assertIn(f"The hub told T-{once} nothing: the owner's signed answer to that call on N-{first} stands.",
+                      said("manager")[-1])
+        no, nid, _, title = card("journalctl --vacuum-time=7d\n")
+        self.assertEqual(self.owner(f"/ui/needs/{nid}", choice=2)[0], 200)
+        refused = (f"[hub] The owner answered N-{{}} ({{}}): \"No\". This answer gives that call no yes: do not send it "
+                   f"again, and do not do its work another way. Ask your requester what to do instead, unless your "
+                   f"question about it is still open.")
+        self.assertEqual(said("vps", no), [refused.format(nid, title)])
+        # the same No on the hub's own board
+        board, nid, _, title = card("journalctl --vacuum-size=1G\n")
+        status, _ = self.request(f"/needs/{nid}", {"choice": "2"}, source=OWNER,
+                                 headers={"Content-Type": "application/json", "Accept": "application/json"})
+        self.assertIn(status, (200, 303))
+        self.assertEqual(said("vps", board), [refused.format(nid, title)])
+        words, nid, _, title = card("du -sh /srv\n")
+        self.assertEqual(self.owner(f"/ui/needs/{nid}", answer="Why root?")[0], 200)
+        self.assertEqual(said("vps", words), [f"[hub] The owner answered N-{nid} ({title}) in words, which give the "
+                                              f"door no yes: \"Why root?\". manager, which raised the card, tells you "
+                                              f"what comes next: do not end the task for this, and do not send that "
+                                              f"call again until it does."])
+        self.assertIn("these words and told it to wait for you: tell it what comes next.", said("manager")[-1])
+        # Full access: nothing here, because the task hears it when the door has it (door_mode_news)
+        full, nid, _, _ = card("ls /var/log\n")
+        waits = question(full)
+        mode = json.dumps({"v": 1, "kind": "door-mode", "fleet": hub.fleet_id(), "host": "web-1", "mode": "full",
+                           "at": int(time.time())}, sort_keys=True, separators=(",", ":"))
+        status, answer = self.owner(f"/ui/needs/{nid}", choice=1, statement=mode, signature="c2ln")
+        self.assertEqual(status, 200, answer)
+        self.assertEqual(said("vps", full), [])
+        self.assertIn(f"The door tells T-{full} when it has Full access on web-1: do not pass it on. Its question "
+                      f"Q-{waits} still waits", said("manager")[-1])
+        # a card of a call that is no run tells its task too, and takes one answer
+        delete = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Delete the July copies','vps','working')")
+        call = refusal("e" * 64, "aws:acme", "delete")
+        hub.q("UPDATE door_record SET task=? WHERE call=?", (f"T-{delete}", call))
+        fields = {"title": "Delete the July copies?", "why": "They fill the disk", "door_call": call,
+                  "what_to_do": "Answer yes, and the door lets ops aws:acme delete through once",
+                  "options": ["Yes, delete them once", "No"]}
+        with self.assertRaises(hub.ToolError):
+            hub.t_raise_needs_you("manager", dict(fields, multi=True))
+        nid = int(hub.t_raise_needs_you("manager", fields).split("N-")[1].split(".")[0])
+        run_once(nid, call)
+        self.assertTrue(said("vps", delete)[0].startswith(
+            f"[hub] The owner pressed \"Yes, delete them once\" on N-{nid} (Delete the July copies?): the door lets "
+            f"that call through one time. Send the same call again, character for character"), said("vps", delete))
+        # an ended task hears nothing, and a card whose question is the task's own answers that question once
+        ended, nid, _, _ = card("ls /etc\n")
+        hub.q("UPDATE tasks SET state='canceled' WHERE id=?", (ended,))
+        self.assertEqual(self.owner(f"/ui/needs/{nid}", choice=2)[0], 200)
+        self.assertEqual(said("vps", ended), [])
+        own = hub.ins("INSERT INTO tasks(title,owner,state,requester) VALUES('Clean the cache','vps','input-required',"
+                      "'manager')")
+        mine = question(own)
+        hub.q("UPDATE tasks SET waiting_on=? WHERE id=?", (f"Q-{mine}", own))
+        _, nid, _, _ = card("rm -rf /var/cache/app\n", task=own, question_id=f"Q-{mine}")
+        self.assertEqual(self.owner(f"/ui/needs/{nid}", choice=2)[0], 200)
+        self.assertEqual(len(said("vps", own)), 1)                  # the answer of its question, once
+        self.assertNotIn("the task that the card is for", said("manager")[-1])
+
     def test_the_door_s_card_names_the_task_that_asked_after_its_title(self):
         """Incident intake, part 3 (the owner, 14 November 2026, "Yes, as shown", to that title with the name of
         a server of his and of one of his tasks). On 13 November two cards for one server had one title. The title that the Mac

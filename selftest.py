@@ -776,7 +776,7 @@ except Exception as root_rights_problem:     # a changed shape is a failure, nev
 # vault's reader and read None from each signed statement of the owner, so `POST /ui/vault/pin`, `/recovery` and
 # `/grant` refused all of them with 400, until the door's reader got its own name (`approval_kind`). So no name is
 # bound twice at the top level of hub.py or in the body of one of its classes, by `def`, `class`, `=` or `import`
-# (a later `def owner_signed` would replace the one that hub.py imports from releases.py). An import of the very
+# (a later `def owner_signed` would replace the one that hub.py imports from vault.py). An import of the very
 # thing that the name holds already binds nothing new (`import urllib.parse` after `import urllib.error`), and a
 # definition whose decorator reads the one before it (`@rows.setter`) keeps that one: neither is a repeat. Source
 # only. This block failed on the hub.py of da272623 before it shipped, with the two lines of `statement_kind`.

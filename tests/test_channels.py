@@ -336,9 +336,19 @@ class HubHandler(JSONHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             return self.wfile.write(data)
+        if (method, path) == ("POST", "/bridge/files"):     # the bytes of one file of an inbound message
+            n = int(self.headers.get("Content-Length") or 0)
+            code, answer = hub.upload(urllib.parse.parse_qs(query, keep_blank_values=True),
+                                      self.rfile.read(n) if n else b"", self.headers.get("Content-Type") or "")
+            answer.setdefault("db", "testdb")
+            return self.answer(code, answer)
         code, answer = hub.handle(method, path, query, self.body())
         answer.setdefault("db", "testdb")
         self.answer(code, answer)
+
+
+UPLOAD_FIELDS = ("account", "message", "n", "name", "mime", "sender")      # and sender_alt, when the event has one
+MIME = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*")     # a type/subtype, any type
 
 
 class FakeHub:
@@ -351,6 +361,11 @@ class FakeHub:
         self.seen, self.items, self.results = set(), [], {}
         self.receipts, self.statuses, self.links = [], [], []
         self.files = {}                 # (file id, item id as text) -> the bytes that GET /bridge/files serves
+        self.uploads = []               # POST /bridge/files, in order: (its query's fields, bytes and Content-Type)
+        self.upload_answers = []        # what the next uploads get, in order (None: the default 200): a test's script
+        self.checks, self.check_answers = [], []    # the same for its question, check=1 with no body
+        self.file_ids = {}              # (account, message, n) -> the id of its row: the same upload again gets it
+        self.config_fails = 0           # how many readings of /bridge/config fail first
         self.out_queries, self.begun = [], []
         self.bridge_code = None
         self.server = serve(HubHandler, self)
@@ -362,6 +377,9 @@ class FakeHub:
             self.calls.append((method, path))
         if (method, path) == ("GET", "/bridge/config"):
             with self.lock:
+                if self.config_fails:
+                    self.config_fails -= 1
+                    return 503, {"error": "hub error"}
                 return 200, json.loads(json.dumps(self.config))
         if (method, path) == ("POST", "/bridge/inbound"):
             on_disk = any(body["id"] in read(os.path.join(self.journal, n))
@@ -402,6 +420,30 @@ class FakeHub:
                 return 404, {"error": "no such route"}
         return 200, {"ok": True}
 
+    def upload(self, query, data, kind):
+        """POST /bridge/files as the interface of the design's version 2 says (20 November 2026), with any type and n
+        from 1 to 10: 400 for a bad field; else the next answer that the test asked for; else 200 with the id of the row
+        of this account, message and number, which the same upload again gets. With check=1 and no body, the hub's
+        question whether it takes this sender's files: 200 welcome, or the answer that the test asked for."""
+        fields = {k: v[-1] for k, v in query.items()}
+        check = fields.pop("check", None)
+        with self.lock:
+            self.calls.append(("POST", "/bridge/files?check" if check else "/bridge/files"))
+            (self.checks if check else self.uploads).append((fields, data, kind))
+            if kind != "application/octet-stream" or not all(fields.get(k) for k in UPLOAD_FIELDS) or \
+                    set(fields) - set(UPLOAD_FIELDS) - {"sender_alt"} or \
+                    fields["n"] not in [str(n) for n in range(1, 11)] or not MIME.fullmatch(fields["mime"]) or \
+                    len(data) > 25 << 20 or check not in (None, "1") or (check and data):
+                return 400, {"error": "a bad field"}
+            script = self.check_answers if check else self.upload_answers
+            answer = script.pop(0) if script else None
+            if answer:
+                return answer[0], dict(answer[1])
+            if check:
+                return 200, {"welcome": True}
+            return 200, {"id": self.file_ids.setdefault((fields["account"], fields["message"], fields["n"]),
+                                                        7000 + len(self.file_ids))}
+
     def queue(self, *items):
         with self.lock:
             self.items.extend(items)
@@ -416,6 +458,72 @@ class FakeHub:
 
     def shutdown(self):
         self.down()
+
+
+class CDNHandler(JSONHandler):
+    def route(self, method):
+        cdn, path = self.server.owner, self.path.partition("?")[0]
+        with cdn.lock:
+            cdn.requests.append((self.path, self.headers.get("Authorization"), self.headers.get("User-Agent")))
+            data, how = cdn.files.get(path, (None, None))
+        if data is None:
+            return self.answer(404, {"message": "404: Not Found", "code": 0})
+        if how == "slow-head":          # the head of the answer in 1 s, a line each 50 ms, with a length of 100 GB
+            try:
+                self.wfile.write(b"HTTP/1.0 200 OK\r\n")
+                for i in range(20):
+                    self.wfile.write(b"X-Wait: %d\r\n" % i)
+                    time.sleep(0.05)
+                self.wfile.write(b"Content-Length: 100000000000\r\n\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        if how not in ("no-length", "stream"):      # with no length, the answer ends with its connection (HTTP/1.0)
+            self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if how == "once":               # an address that ends after its first fetch, as a signed one does in time
+            with cdn.lock:
+                cdn.files.pop(path, None)
+        try:
+            if how == "slow":           # a byte every 50 ms: each read is quick, the whole is not
+                for i in range(len(data)):
+                    self.wfile.write(data[i:i + 1])
+                    time.sleep(0.05)
+            elif how == "stream":       # data 96 times, as long as the reader reads: cdn.sent counts the times
+                for _ in range(96):
+                    self.wfile.write(data)
+                    with cdn.lock:
+                        cdn.sent[path] = cdn.sent.get(path, 0) + 1
+            else:
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+class CDN:
+    """Discord's CDN, where the files of a message are: the bytes at each path, and the requests that it got."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.files, self.requests, self.sent = {}, [], {}
+        self.server = serve(CDNHandler, self)
+        self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+
+    def add(self, path, data, how=None):
+        """The address of a file at path, signed as Discord signs one. No data: a file that is not there (404)."""
+        if data is not None:
+            with self.lock:
+                self.files[path] = (data, how)
+        return self.url + path + "?ex=6740b2c1&is=673f6141&hm=signed0f3e9a"
+
+    def fetched(self):
+        with self.lock:
+            return [path.partition("?")[0] for path, _, _ in self.requests]
+
+    def shutdown(self):
+        self.server.shutdown()
+        self.server.server_close()
 
 
 # ---------------------------------------------------------------- stand-in: wa-link
@@ -619,10 +727,32 @@ class DiscordTests(Base):
     def setUp(self):
         super().setUp()
         self.write_token()
+        self.cdn = CDN()
+        self.addCleanup(self.cdn.shutdown)
+        cdn = patch.object(channels, "DISCORD_FILES", (self.cdn.url + "/",))
+        cdn.start()
+        self.addCleanup(cdn.stop)
 
     def ready(self):
         self.start()
         self.wait_for(lambda: self.has_state("discord-studio", "connected"), "the connected state")
+
+    def attachment(self, aid, name, data, mime="image/png", size=None, how=None):
+        """A file of a Discord message, on the CDN stand-in (no data: not there). Its name and its address are what
+        the log never holds."""
+        path = f"/attachments/700/{aid}/{name}"
+        self.private += [name, path, "hm=signed"]
+        a = {"id": aid, "filename": name, "size": len(data or b"") if size is None else size,
+             "url": self.cdn.add(path, data, how)}
+        if mime:
+            a["content_type"] = mime
+        return a
+
+    def order(self):
+        """The hub's questions (check=1), the uploads and the inbound posts, in the order that the hub got them."""
+        with self.hub.lock:
+            return [path for _, path in self.hub.calls if path in ("/bridge/files?check", "/bridge/files",
+                                                                    "/bridge/inbound")]
 
     def test_identify_ready_and_status(self):
         self.ready()
@@ -727,6 +857,261 @@ class DiscordTests(Base):
         self.assertEqual([(e["kind"], e["text"]) for e in self.hub.inbound],
                          [("image", "The error that I get"), ("audio", ""), ("other", ""), ("file", "See the invoice")])
 
+    def test_a_picture_with_words_and_a_forwarded_file_go_up_before_their_messages(self):
+        """The design of 20 November 2026 (version 2): the hub says first whether it takes the sender's files (check=1,
+        no body), then each file of a person's message goes to POST /bridge/files with its query fields and its bytes,
+        fetched from Discord's CDN with no bot token, before the message, which then carries no `media`; a forwarded
+        message's file is its first snapshot's. Before, the agent read the words and never the screenshot that they
+        spoke of."""
+        self.ready()
+        png, pdf = b"\x89PNG\r\n\x1a\n a screenshot", b"%PDF-1.4 an invoice"
+        self.private += ["The error that I get", "See the invoice"]
+        peer = self.gw.latest()
+        peer.dispatch("MESSAGE_CREATE", dm(1601, "The error that I get",
+                                           attachments=[self.attachment("11", "screenshot.png", png)]))
+        peer.dispatch("MESSAGE_CREATE", dm(1602, "", message_reference={"type": 1}, message_snapshots=[
+            {"message": {"content": "See the invoice",
+                         "attachments": [self.attachment("12", "Invoice_October.pdf", pdf, "application/pdf")]}}]))
+        self.wait_for(lambda: len(self.hub.inbound) == 2, "both messages")
+        fields = {"account": "discord-studio", "n": "1", "sender": OWNER}
+        first = dict(fields, message="1601", name="screenshot.png", mime="image/png")
+        second = dict(fields, message="1602", name="Invoice_October.pdf", mime="application/pdf")
+        octets = "application/octet-stream"
+        self.assertEqual(self.hub.uploads, [(first, png, octets), (second, pdf, octets)])
+        self.assertEqual(self.hub.checks, [(first, b"", octets), (second, b"", octets)])
+        self.assertEqual([(e["kind"], e["text"]) for e in self.hub.inbound],
+                         [("image", "The error that I get"), ("file", "See the invoice")])
+        self.assertEqual([sorted(set(e) & {"media", "media_more", "missed"}) for e in self.hub.posted], [[], []])
+        self.assertEqual(self.order(), ["/bridge/files?check", "/bridge/files", "/bridge/inbound"] * 2,
+                         "the hub's yes, then each file, then its message")
+        self.assertEqual([(token, agent) for _, token, agent in self.cdn.requests], [(None, channels.USER_AGENT)] * 2,
+                         "no bot token goes to the CDN")
+        self.wait_for(lambda: not self.journal_files(), "an empty journal")
+        self.assertEqual((self.bridge.files_seen, self.bridge.file_held), ({}, None),
+                         "the bridge keeps nothing of a message that left the journal")
+
+    def test_every_file_goes_up_with_the_type_that_the_rule_gives(self):
+        """The owner, 20 November 2026: "does it accept multiple files, images etc? it should". Each file of a message
+        goes up, of any type: Discord's own type without its parameters and in lower case, when it is a valid
+        type/subtype; else its name's extension's (the hub's own first, then Python's); else application/octet-stream.
+        Only a size above 25 MiB that Discord gives is missed before a fetch; the 11th file and later are `many`, and
+        `missed` keeps each code, up to the hub's 20."""
+        self.ready()
+        big, png = channels.FILE_MOST + 1, b"\x89PNG\r\n\x1a\n"
+        files = [self.attachment("21", "clip.mp4", b"\x00\x00\x00\x18ftypmp42", "video/mp4"),
+                 self.attachment("22", "big-1.zip", b"PK\x03\x04", "application/zip", size=big),
+                 self.attachment("23", "notes.txt", b"Notes", "text/plain; charset=utf-8"),
+                 self.attachment("24", "notes.md", b"# Notes", None),
+                 self.attachment("25", "big-2.pdf", b"%PDF-", "application/pdf", size=big),
+                 self.attachment("26", "report.zip", b"PK\x03\x04", "application/x-zip-compressed"),
+                 self.attachment("27", "big-3.png", png, size=big),
+                 self.attachment("28", "drawing.svg", b"<svg/>", "image svg"),
+                 self.attachment("29", "README", b"Read me", None),
+                 self.attachment("30", "Voice.OGG", b"OggS", "AUDIO/OGG")]
+        files += [self.attachment(str(31 + i), f"more-{i}.png", png) for i in range(2)]
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1611, "", attachments=files))
+        event = self.wait_for(lambda: self.hub.posted, "the message")[0]
+        self.assertEqual(event["missed"], ["size", "size", "size", "many", "many"])
+        self.assertEqual([(f["n"], f["name"], f["mime"]) for f, _, _ in self.hub.uploads],
+                         [("1", "clip.mp4", "video/mp4"), ("3", "notes.txt", "text/plain"),
+                          ("4", "notes.md", "text/markdown"), ("6", "report.zip", "application/x-zip-compressed"),
+                          ("8", "drawing.svg", "image/svg+xml"), ("9", "README", "application/octet-stream"),
+                          ("10", "Voice.OGG", "audio/ogg")])
+        self.assertEqual(len(self.cdn.requests), 7, "no fetch of a file that is too large")
+
+    def test_a_file_that_cannot_be_fetched_or_not_in_time_is_missed(self):
+        """A fetch that fails, an address off Discord's CDN, and a fetch that takes longer than its limit in all
+        (FILE_FETCH_TIMEOUT, also when each read is quick: one slow file holds every account's messages) are
+        `download`, and each message goes on without its file."""
+        limit = patch.object(channels, "FILE_FETCH_TIMEOUT", 0.5)
+        limit.start()
+        self.addCleanup(limit.stop)
+        self.ready()
+        gone = self.attachment("61", "gone.png", None)
+        off = self.attachment("62", "off.png", b"\x89PNG\r\n\x1a\n")
+        off["url"] = off["url"].replace("127.0.0.1", "localhost")      # the stand-in, by a name that is not the CDN's
+        slow = self.attachment("63", "slow.png", b"\x89PNG\r\n\x1a\n" + b"s" * 192, how="slow")    # 10 s in all
+        peer = self.gw.latest()
+        for mid, a in ((1661, gone), (1662, off), (1663, slow)):
+            peer.dispatch("MESSAGE_CREATE", dm(mid, "", attachments=[a]))
+        self.wait_for(lambda: len(self.hub.inbound) == 3, "three messages, the slow file's after its limit, not after "
+                                                           "its 10 seconds", timeout=8)
+        self.assertEqual([e.get("missed") for e in self.hub.inbound], [["download"]] * 3)
+        self.assertEqual((self.hub.uploads, self.cdn.fetched()),
+                         ([], ["/attachments/700/61/gone.png", "/attachments/700/63/slow.png"]))
+
+    def test_the_limit_of_a_fetch_holds_before_its_body_too(self):
+        """FILE_FETCH_TIMEOUT is the fetch's time in all, before the body too: a name lookup that takes longer (the
+        system's has no limit of its own) is `download` in about that time, and so is an answer whose head comes after
+        it, whatever length the head gives."""
+        limit = patch.object(channels, "FILE_FETCH_TIMEOUT", 0.5)
+        limit.start()
+        self.addCleanup(limit.stop)
+        real = socket.getaddrinfo
+
+        def lookup(host, *args, **kwargs):          # the CDN stand-in, by a name whose lookup takes 3 s
+            if host == "slow-name.test":
+                time.sleep(3)
+                host = "127.0.0.1"
+            return real(host, *args, **kwargs)
+        prefix = "http://slow-name.test:%d/" % self.cdn.server.server_address[1]
+        for change in (patch.object(socket, "getaddrinfo", lookup),
+                       patch.object(channels, "DISCORD_FILES", (self.cdn.url + "/", prefix))):
+            change.start()
+            self.addCleanup(change.stop)
+        self.ready()
+        named = self.attachment("81", "named.png", b"\x89PNG\r\n\x1a\n")
+        named["url"] = named["url"].replace(self.cdn.url + "/", prefix)
+        head = self.attachment("82", "head.png", b"\x89PNG\r\n\x1a\n", how="slow-head")
+        peer, at = self.gw.latest(), time.monotonic()
+        peer.dispatch("MESSAGE_CREATE", dm(1681, "", attachments=[named]))
+        self.wait_for(lambda: self.hub.inbound, "the message whose file's name was not found in time", timeout=8)
+        self.assertLess(time.monotonic() - at, 2, "the lookup's 3 seconds held the message")
+        peer.dispatch("MESSAGE_CREATE", dm(1682, "", attachments=[head]))
+        self.wait_for(lambda: len(self.hub.inbound) == 2, "the message whose answer's head came late", timeout=8)
+        self.assertEqual([e.get("missed") for e in self.hub.inbound], [["download"], ["download"]])
+        self.assertEqual(self.hub.uploads, [])
+
+    def test_a_file_whose_bytes_pass_25_mib_is_size(self):
+        """The bridge reads at most 25 MiB and one byte of a file, also from an answer that gives no length, so that a
+        file larger than Discord said is `size` and never fills the hub machine's memory; a file of 25 MiB exactly
+        goes up."""
+        self.ready()
+        whole = b"%PDF-" + b"w" * (channels.FILE_MOST - 5)
+        peer = self.gw.latest()
+        peer.dispatch("MESSAGE_CREATE", dm(1671, "", attachments=[       # 96 MiB, with no length in the answer
+            self.attachment("71", "big.pdf", b"%PDF-" + b"b" * ((1 << 20) - 5), "application/pdf", size=1000,
+                            how="stream")]))
+        peer.dispatch("MESSAGE_CREATE", dm(1672, "", attachments=[
+            self.attachment("72", "whole.pdf", whole, "application/pdf", how="no-length")]))
+        self.wait_for(lambda: len(self.hub.inbound) == 2, "both messages", timeout=20)
+        self.assertEqual([e.get("missed") for e in self.hub.inbound], [["size"], None])
+        self.assertEqual([(f["message"], data == whole) for f, data, _ in self.hub.uploads], [("1672", True)])
+        with self.cdn.lock:
+            self.assertLess(self.cdn.sent["/attachments/700/71/big.pdf"], 64, "the bridge read the file to its end")
+
+    def test_the_hubs_refusals_give_their_codes_and_cost_no_fetch(self):
+        """The hub's answers (the interface of version 2): to its question, a 409 (no such account) or a 403 (a sender
+        whose files it does not take, as a stranger's) makes each file of the message `refused` with no fetch, and the
+        message's own post settles the rest; to an upload, 413 is `size`, and 415 (bytes that are not of their type,
+        now that any type goes up), 403, 422 and 400 are `refused`, and a 403 is the answer for the message's other
+        files too, with no fetch. No refusal of a file holds its message back."""
+        self.ready()
+        png = b"\x89PNG\r\n\x1a\n"
+        self.hub.forced = [(409, {"error": "unknown chat app account"})]
+        self.hub.check_answers = [(409, {"error": "unknown chat app account"}),
+                                  (403, {"code": "not_welcome", "error": "not taken"})]
+        self.hub.upload_answers = [(415, {"error": "the bytes are not of the type that the request names"}),
+                                   (422, {"error": "a registered login", "code": "login_as_file"}),
+                                   (403, {"code": "not_welcome"}), (413, {"error": "an attachment is at most 25 MiB"}),
+                                   (400, {"error": "a bad field"})]
+        peer = self.gw.latest()
+        peer.dispatch("MESSAGE_CREATE", dm(1631, "", attachments=[self.attachment("31", "a.png", png),
+                                                                  self.attachment("32", "b.png", png)]))
+        peer.dispatch("MESSAGE_CREATE", dm(1632, "", author="999000111",
+                                           attachments=[self.attachment("33", "c.png", png)]))
+        for mid in range(1633, 1638):
+            second = [self.attachment(f"{mid}b", "e.png", png)] if mid == 1635 else []     # after the upload's 403
+            peer.dispatch("MESSAGE_CREATE", dm(mid, "", attachments=[self.attachment(str(mid), "d.png", png)] + second))
+        self.wait_for(lambda: len(self.hub.posted) == 7 and not self.journal_files(), "seven messages", timeout=10)
+        self.assertEqual([e.get("missed") for e in self.hub.posted], [["refused", "refused"], ["refused"], ["refused"],
+                                                                      ["refused"], ["refused", "refused"], ["size"],
+                                                                      ["refused"]])
+        self.assertEqual(len(self.hub.uploads), 5)
+        self.assertEqual(self.cdn.fetched(), [f"/attachments/700/{mid}/d.png" for mid in range(1633, 1638)],
+                         "no fetch of a file that the hub does not take")
+        self.assertEqual([e["id"] for e in self.hub.inbound], [str(mid) for mid in range(1632, 1638)])
+
+    def test_an_attempt_after_no_answer_sends_only_what_did_not_come_up(self):
+        """No change of the journal (the interface of version 2), and no download for nothing: a 503 to the hub's
+        question keeps the message; a file that the hub took does not go again, though its address ended meanwhile;
+        the bytes of a file whose upload got no answer go again with no new fetch; the message goes after its files,
+        and nothing of it stays in the bridge's memory once it left the journal."""
+        self.ready()
+        first, second = b"\x89PNG\r\n\x1a\n first", b"\x89PNG\r\n\x1a\n second"
+        self.hub.check_answers = [(503, {"error": "hub error"})]
+        self.hub.upload_answers = [None, (503, {"error": "hub error"})]
+        self.hub.forced = [(503, {"error": "hub error"})]
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1641, "", attachments=[
+            self.attachment("41", "first.png", first, how="once"),
+            self.attachment("42", "second.png", second, how="once")]))
+        self.wait_for(lambda: self.hub.inbound and not self.journal_files(), "the message after four attempts")
+        self.assertEqual([(f["n"], data) for f, data, _ in self.hub.uploads],
+                         [("1", first), ("2", second), ("2", second)])
+        self.assertEqual(self.cdn.fetched(), ["/attachments/700/41/first.png", "/attachments/700/42/second.png"])
+        self.assertEqual(self.order(), ["/bridge/files?check"] * 2 + ["/bridge/files"] * 3 + ["/bridge/inbound"] * 2)
+        self.assertEqual([e.get("missed") for e in self.hub.posted], [None, None])
+        self.assertEqual((self.bridge.files_seen, self.bridge.file_held), ({}, None))
+        self.assertIn("inbound discord-studio 1641: the hub did not take file 2 (503); kept", self.log.getvalue())
+
+    def test_a_file_that_the_hub_does_not_take_holds_its_message_three_attempts_at_most(self):
+        """No message's files hold the journal for ever: uploads that the hub answers with a 5xx keep their message for
+        FILE_TRIES attempts in all, whatever its number of files, the first file's bytes fetched once; then the files
+        that are left are `refused` with no fetch and no upload, and the message goes on. A count for each file kept a
+        message of ten files for about seven times as many attempts, with a download of each file at each."""
+        self.ready()
+        pngs = [b"\x89PNG\r\n\x1a\n never taken " + bytes([n]) for n in range(3)]
+        self.hub.upload_answers = [(503, {"error": "hub error"})] * channels.FILE_TRIES
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1643, "", attachments=[
+            self.attachment(f"4{n}", f"never{n}.png", png) for n, png in enumerate(pngs)]))
+        self.wait_for(lambda: self.hub.inbound and not self.journal_files(), "the message after its third attempt")
+        self.assertEqual((self.hub.inbound[0].get("missed"), len(self.hub.posted)), (["refused"] * 3, 1))
+        self.assertEqual([data for _, data, _ in self.hub.uploads], [pngs[0]] * 3)
+        self.assertEqual(len(self.cdn.requests), 1)
+
+    def test_a_file_that_went_up_goes_again_after_half_the_hubs_hour(self):
+        """The hub keeps a file that no message took for an hour (hub.ATTACH_WAIT): a message that still waits
+        FILE_UP_FOR after its file went up sends it again, which renews that hour, so that the file is there when the
+        message comes."""
+        bound = patch.object(channels, "FILE_UP_FOR", 0)
+        bound.start()
+        self.addCleanup(bound.stop)
+        self.ready()
+        png = b"\x89PNG\r\n\x1a\n kept"
+        self.hub.forced = [(503, {"error": "hub error"})]
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1645, "", attachments=[self.attachment("45", "kept.png", png)]))
+        self.wait_for(lambda: self.hub.inbound and not self.journal_files(), "the message after its second attempt")
+        self.assertEqual([data for _, data, _ in self.hub.uploads], [png, png])
+        self.assertEqual(len(self.cdn.requests), 2)
+
+    def test_a_name_or_an_id_that_no_query_can_hold_stops_no_message(self):
+        """A lone half of a surrogate pair, which Discord's JSON can hold: in a file's name it goes out of the name, and
+        in another value of the query the file is `refused`. Before, it raised out of the journal's loop, which then
+        stopped for every account, again at each start."""
+        self.ready()
+        png, half = b"\x89PNG\r\n\x1a\n", chr(0xD83D)
+        self.private.append("and the next message")
+        a = self.attachment("91", "a.png", png)
+        a["filename"] = "a" + half + ".png"
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1691, "", attachments=[a]))
+        self.wait_for(lambda: self.hub.inbound, "the message whose file's name holds half a pair")
+        b = self.attachment("92", "b.png", png)
+        channels.Journal(self.journal).write({
+            "account": "discord-studio", "id": "1692", "chat": "700", "group": False, "sender": OWNER + half,
+            "sender_alt": None, "sender_name": "miguel", "bot": False, "from_me": False, "kind": "image", "text": "",
+            "ts": 1.0, "media": [{"url": b["url"], "name": "b.png", "mime": "image/png", "size": len(png)}]})
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1693, "and the next message"))
+        self.wait_for(lambda: len(self.hub.inbound) == 3, "the other two messages")
+        self.assertEqual([(e["id"], e.get("missed")) for e in self.hub.inbound],
+                         [("1691", None), ("1692", ["refused"]), ("1693", None)])
+        self.assertEqual([f["name"] for f, _, _ in self.hub.uploads], ["a.png"])
+
+    def test_a_file_that_a_restart_left_waits_for_its_account(self):
+        """At a start the journal replays before the bridge has read its accounts: a file of such a message waits for
+        its account, and is not missed."""
+        png = b"\x89PNG\r\n\x1a\n left by a restart"
+        a = self.attachment("51", "left.png", png)
+        channels.Journal(self.journal).write({
+            "account": "discord-studio", "id": "1651", "chat": "700", "group": False, "sender": OWNER,
+            "sender_alt": None, "sender_name": "miguel", "bot": False, "from_me": False, "kind": "image", "text": "",
+            "ts": 1.0, "media": [{"url": a["url"], "name": "left.png", "mime": "image/png", "size": len(png)}]})
+        self.hub.config_fails = 3
+        self.ready()
+        event = self.wait_for(lambda: self.hub.inbound, "the message")[0]
+        self.assertEqual((event["id"], event.get("missed")), ("1651", None))
+        self.assertEqual([data for _, data, _ in self.hub.uploads], [png])
+        self.assertIn("inbound discord-studio 1651: the bridge does not run its account yet; kept", self.log.getvalue())
+
     def test_fragmented_frames_and_a_ping_between_them(self):
         self.ready()
         self.private.append("in three fragments k2")
@@ -737,20 +1122,41 @@ class DiscordTests(Base):
         self.wait_for(lambda: peer.pongs == [b"hi"], "the pong")
 
     def test_hub_down_then_up_loses_nothing(self):
+        """Neither a message nor its file (a release restarts the hub): past FILE_TRIES, a file whose message the hub
+        takes no more than the file goes again with its bytes, fetched once, so that the hub that comes back gets it."""
         self.ready()
         self.private += ["while the hub is down 1", "while the hub is down 2"]
+        png = b"\x89PNG\r\n\x1a\n while the hub is down"
         self.hub.down()
-        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1301, "while the hub is down 1"))
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1301, "while the hub is down 1",
+                                                       attachments=[self.attachment("13", "down.png", png)]))
         self.gw.latest().dispatch("MESSAGE_CREATE", dm(1302, "while the hub is down 2"))
         self.wait_for(lambda: len(self.journal_files()) == 2, "two events in the journal")
         for name in self.journal_files():
             self.assertEqual(os.stat(os.path.join(self.journal, name)).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(self.journal).st_mode & 0o777, 0o700)
-        time.sleep(0.3)
+        time.sleep(0.6)                 # twice FILE_TRIES attempts and more, with the tests' backoff
         self.hub.up()
         self.wait_for(lambda: len(self.hub.inbound) == 2, "both events at the hub")
-        self.assertEqual([e["id"] for e in self.hub.inbound], ["1301", "1302"])
+        self.assertEqual([(e["id"], e.get("missed")) for e in self.hub.inbound], [("1301", None), ("1302", None)])
+        self.assertEqual(([data for _, data, _ in self.hub.uploads], len(self.cdn.requests)), ([png], 1))
         self.wait_for(lambda: not self.journal_files(), "an empty journal")
+
+    def test_a_hub_that_is_down_costs_no_download(self):
+        """The bridge asks the hub at each attempt before it fetches a file (check=1): while the hub is down, no file of
+        the chat app is fetched, also past FILE_TRIES, and a hub that comes back gets each file, fetched once. Before,
+        each attempt past the question's tries fetched the message's files again (up to 250 MB a minute for ten)."""
+        self.ready()
+        pngs = [b"\x89PNG\r\n\x1a\n down " + bytes([n]) for n in range(2)]
+        self.hub.down()
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(1303, "", attachments=[
+            self.attachment(f"3{n}", f"down{n}.png", png) for n, png in enumerate(pngs)]))
+        self.wait_for(lambda: len(self.journal_files()) == 1, "the event in the journal")
+        time.sleep(0.6)                 # twice FILE_TRIES attempts and more, with the tests' backoff
+        self.assertEqual(len(self.cdn.requests), 0)
+        self.hub.up()
+        self.wait_for(lambda: self.hub.inbound and not self.journal_files(), "the message once the hub is back")
+        self.assertEqual((self.hub.inbound[0].get("missed"), len(self.cdn.requests)), (None, 2))
 
     def test_the_journal_replays_at_start_and_a_duplicate_is_removed(self):
         journal = channels.Journal(self.journal)
@@ -1453,7 +1859,8 @@ class RealHub(test_ui_api.OwnerAPI):
         self.rest.shutdown()
         super().tearDown()
         logs = self.log.getvalue()
-        for text in (TOKEN, "How is the scrape going? rh1", "On it, rh2", "LINK-CODE"):
+        for text in (TOKEN, "How is the scrape going? rh1", "On it, rh2", "LINK-CODE", "What does this error say? rh3",
+                     "screenshot.png", "/attachments/700/"):
             self.assertNotIn(text, logs)
         self.assertNotIn(read(os.path.join(self.folder, "bridge.key")).strip(), logs)
 
@@ -1532,6 +1939,36 @@ class RealHub(test_ui_api.OwnerAPI):
                                     if n.endswith(".json")], "an empty journal")
         self.assertNotIn("the hub refused", self.log.getvalue())
 
+    def test_the_owners_picture_reaches_the_agent_through_the_real_hub(self):
+        """The design of 20 November 2026 (version 2), end to end: the owner sends a PNG in a Discord DM; the bridge
+        asks the real hub, fetches the file from the CDN stand-in and uploads it, and the agent's event names A-<id>,
+        whose bytes on the hub are the PNG's. So the two sides agree on the route, its fields and its answers."""
+        wait_for(self, lambda: self.accounts()["discord-studio"]["state"] == "connected", "Discord connected")
+        code, data = self.owner_post("/ui/people/codes", purpose="owner", app="discord")
+        self.assertEqual(code, 200, data)
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(2101, f"link {data['code']}"))
+        wait_for(self, lambda: self.rest.created, "the link reply")
+        cdn = CDN()
+        self.addCleanup(cdn.shutdown)
+        files = patch.object(channels, "DISCORD_FILES", (cdn.url + "/",))
+        files.start()
+        self.addCleanup(files.stop)
+        png = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
+        url = cdn.add("/attachments/700/21/screenshot.png", png)
+        self.gw.latest().dispatch("MESSAGE_CREATE", dm(2102, "What does this error say? rh3", attachments=[
+            {"id": "21", "filename": "screenshot.png", "content_type": "image/png", "size": len(png), "url": url}]))
+        req = wait_for(self, lambda: fleet_hub.q1("SELECT * FROM ui_requests WHERE client=? AND origin LIKE ?",
+                                                  ("fleet-channels/1/discord-studio", '%"2102"%')),
+                       "the owner's message at the hub")
+        text, error = fleet_hub.call_tool("studio", "read_messages", {}, CHAT_CONTEXT)
+        self.assertFalse(error, text)
+        self.assertIn("What does this error say? rh3", text)
+        aid = int(re.search(r"A-(\d+) screenshot\.png \(image/png", text).group(1))
+        row = fleet_hub.q1("SELECT * FROM attachments WHERE id=?", (aid,))
+        self.assertEqual((fleet_hub.attachment_bytes(row), row["message"]), (png, req["request_id"]))
+        self.assertEqual([path.partition("?")[0] for path, _, _ in cdn.requests],
+                         ["/attachments/700/21/screenshot.png"])
+
     def test_an_agents_file_goes_through_the_hubs_queue_and_the_bridge(self):
         """CHAT-APPS.md 20, the done-when of the owner's yes of 15 November 2026: the manager sends a PDF up with
         attach_file's line, names it in message_owner, and the bridge reads its bytes from the real hub and gives them
@@ -1568,6 +2005,17 @@ class RealHub(test_ui_api.OwnerAPI):
 # ---------------------------------------------------------------- functions
 
 class Functions(unittest.TestCase):
+    def test_a_files_type_is_the_apps_own_or_its_names(self):
+        """CHAT-APPS.md 8.1: a file's type is its chat app's own, unless that is none, no type token, or the generic
+        application/octet-stream: then its name's extension's, from the hub's table, then the bridge's own table of
+        media, which is the same on every Python (3.12 names no type for .ogg), then Python's; else
+        application/octet-stream. A wrong type keeps the hub from checking a PDF or a Markdown file as one."""
+        for mime, name, want in (("Image/PNG; q=1", "x", "image/png"), ("application/octet-stream", "notes.md",
+                                 "text/markdown"), ("application/octet-stream", "report.pdf", "application/pdf"),
+                                 (None, "voice.ogg", "audio/ogg"), (None, "sticker.tgs", "application/x-tgsticker"),
+                                 ("not a type", "blob", "application/octet-stream")):
+            self.assertEqual(channels.file_type(mime, name), want, (mime, name))
+
     def test_split_parts(self):
         self.assertEqual(channels.split_parts("short", 2000), ["short"])
         text = "\n\n".join(f"P{i} " + "x" * 1900 for i in range(6))
@@ -1605,6 +2053,15 @@ class Functions(unittest.TestCase):
 
     def test_a_new_token_file_counts_within_15_seconds(self):
         self.assertLessEqual(channels.TOKEN_POLL, 5, "16.4: the poll plus the connection stay under 15 seconds")
+
+    def test_a_file_with_no_type_takes_the_hubs_own_type_of_its_extension(self):
+        """A file whose chat app gives no valid type is of its name's extension, the hub's own types first: the bridge's
+        table is the hub's (ATTACH_TYPES and ATTACH_OFFICE), so that the hub checks and reads a Markdown or an Office
+        file as one and not as data; and the bridge's limit of a file is the hub's, so that no file is fetched for a
+        413 or missed as `size` though the hub takes it."""
+        self.assertEqual(channels.FILE_TYPES, {mime: ext for mime, (ext, _) in fleet_hub.ATTACH_TYPES.items()}
+                         | fleet_hub.ATTACH_OFFICE)
+        self.assertEqual(channels.FILE_MOST, fleet_hub.ATTACH_MAX)
 
     def test_hub_address_from_team_json(self):
         team = {"hub": {"machine": "hub", "port": 8765}, "addresses": {"hub": "100.1.2.3"}}

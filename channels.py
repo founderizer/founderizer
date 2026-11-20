@@ -15,6 +15,7 @@ import contextlib
 import hashlib
 import http.client
 import json
+import mimetypes
 import os
 import queue
 import random
@@ -48,6 +49,29 @@ DISCORD_LIMIT, WHATSAPP_LIMIT, MOST_PARTS = 2000, 4000, 4
 WA_CAPTION = 1024           # WhatsApp: a text this short is the caption of a message's first file (CHAT-APPS.md 20)
 FILE_MOST = 25 << 20        # bytes of one file of a message: the hub's own limit (hub.CHAT_FILE_MAX)
 OUTBOX = "outbox"           # beside the sessions: the files of the messages that are being sent, mode 600
+# The files that a person's or the owner's message brings (the design "Files from chat apps to agents", version 2, of
+# 20 November 2026, and the owner's words of that day: "does it accept multiple files, images etc? it should"): the
+# bridge uploads each file of a message, of any type, to POST /bridge/files before the message's own POST
+# /bridge/inbound. A file that does not come up is one code of the message's `missed`: size (more than FILE_MOST, or
+# than Telegram gives a bot), download, refused (by the hub, also for bytes that are not of their type, and after
+# FILE_TRIES attempts that it did not answer) or many (past FILES_IN).
+FILES_IN = 10               # Discord's own most for one message
+MISSED_MOST = 20            # codes of one message's `missed` that the hub takes
+FILE_TRIES = 3              # attempts that a message's files keep it, in all, after no answer or a 5xx: then `refused`
+# The types whose bytes the hub checks (hub.ATTACH_TYPES and hub.ATTACH_OFFICE), with their extensions. A file whose
+# chat app gives no valid type is of its name's extension: these first, so that the hub reads a Markdown or an Office
+# file as one, then Python's own table (never the system's, so that each machine says the same), else
+# application/octet-stream. Any type goes up: the hub keeps one that it does not check as data.
+FILE_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp",
+              "application/pdf": ".pdf", "application/zip": ".zip", "text/plain": ".txt", "text/markdown": ".md",
+              "text/csv": ".csv", "application/json": ".json",
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+              "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx"}
+FILE_EXTENSIONS = {**{ext: mime for mime, ext in FILE_TYPES.items()}, ".jpeg": "image/jpeg"}
+PYTHON_TYPES = mimetypes.MimeTypes()
+MIME_TOKEN = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}")     # RFC 6838
+DISCORD_FILES = ("https://cdn.discordapp.com/", "https://media.discordapp.net/")   # Discord's CDN: a message's files
 REST_NOTE = "The rest is in Founderizer."
 # Telegram (CHAT-APPS.md 19.2). Facts read on core.telegram.org on 15 November 2026 (Bot API 10.4): every call is
 # <api>/bot<token>/<method>; sendMessage takes 1 to 4,096 characters after the entities; "typing" shows for 5 seconds;
@@ -63,6 +87,17 @@ TELEGRAM_STATUSES = ("creator", "administrator", "member", "restricted", "left",
 # timer), which no person wrote, and the bridge drops it.
 TELEGRAM_OTHER = ("video", "video_note", "animation", "sticker", "location", "venue", "contact", "poll", "dice", "story",
                   "checklist", "game", "paid_media")
+TELEGRAM_FILE_MOST = 20 << 20   # bytes of a file that getFile gives a bot: Telegram's own 20 MB
+# The fields of a message that hold a file, besides its photo, with the name of a file that comes with none. A message
+# with an animation has its document too, so the animation comes first.
+TELEGRAM_FILES = (("animation", "animation.mp4"), ("video", "video.mp4"), ("video_note", "video.mp4"),
+                  ("voice", "voice.ogg"), ("audio", "audio.mp3"), ("sticker", "sticker.webp"), ("document", ""))
+
+# The types of the media that a chat app sends with no type of its own, the same on every machine: Python's table
+# changes with its version (3.12 names no type for .ogg).
+MEDIA_EXTENSIONS = {".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg", ".mp3": "audio/mpeg",
+                    ".m4a": "audio/mp4", ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+                    ".tgs": "application/x-tgsticker", ".heic": "image/heic"}
 
 # Timings in seconds. The tests make them short.
 OUT_WAIT = 25               # the /bridge/out long poll
@@ -82,6 +117,10 @@ WA_STABLE = 60              # a wa-link that ran this long starts its backoff ag
 WA_LOGOUT_WAIT = 5          # WhatsApp: wait this long for wa-link to end the phone's link of a number that left the fleet
 WA_FILE_TIMEOUT = 120       # WhatsApp: wait this long for wa-link's "sent" of a file part (its upload and its send)
 CODE_CHECK = 60             # how often the bridge looks whether a release changed its own code
+FILE_FETCH_TIMEOUT = 60     # seconds of one file's download from its chat app, in all: no account waits long behind it
+FILE_UPLOAD_TIMEOUT = 120   # seconds of one file's upload to the hub, which checks its bytes before it answers
+FILE_UP_FOR = 1800          # seconds that an upload's 200 counts: half the hour that the hub keeps a file that no
+                            # message took (hub.ATTACH_WAIT); after it, the file goes up again, which renews that hour
 
 # wa-link on the hub machine. The bridge builds it itself, so that no hub needs a step by hand: the first time a
 # WhatsApp account runs, and again when a release changes wa-link's source or this Go pin. The build takes Go's own
@@ -334,6 +373,165 @@ def request(url, method="GET", data=None, headers=None, timeout=30, raw=None):
         return status, got, None
 
 
+class Missed(Exception):
+    """A file of an inbound message that does not come up: its code, which the message's POST /bridge/inbound carries
+    in `missed`, and for the log a few words of why, which hold no name, address, caption, file id or token."""
+    def __init__(self, code, why=None):
+        super().__init__(code)
+        self.code, self.why = code, why
+
+
+def lookup(host, port, end):
+    """The addresses of host, found before the monotonic time `end`: the system's lookup has no time limit of its own,
+    so it runs beside, and nothing waits for it past that time."""
+    found = {}
+
+    def run():
+        try:
+            found["addresses"] = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        except (OSError, UnicodeError) as e:
+            found["error"] = e
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(max(0.0, end - time.monotonic()))
+    if worker.is_alive():
+        raise Missed("download", "its name was not found in its time")
+    if "error" in found:
+        raise Missed("download", type(found["error"]).__name__)
+    return found["addresses"]
+
+
+def connect_by(end):
+    """http.client's connection for download(): each address of the host with the time that is left before `end`, not
+    each with the whole time, as socket.create_connection gives it."""
+    def connect(address, timeout=None, source=None):
+        error = None
+        for family, kind, proto, _, where in lookup(address[0], address[1], end):
+            rest = end - time.monotonic()
+            if rest <= 0:
+                break
+            sock = socket.socket(family, kind, proto)
+            try:
+                sock.settimeout(rest)
+                sock.connect(where)
+                return sock
+            except OSError as e:
+                error = e
+                sock.close()
+        raise Missed("download", type(error).__name__ if error else "not connected in its time")
+    return connect
+
+
+def download(url, timeout, headers=None):
+    """The bytes of a GET of a file that a message brings, in `timeout` seconds in all, not only for each read: a slow
+    chat app holds the other accounts' messages no longer. The name lookup and each address of the host get the time
+    that is left, and so does each read; the head of the answer must come in that time too. It reads at most
+    FILE_MOST + 1 bytes, so that a larger file is `size`, also one whose answer gives no length; anything else that
+    fails is `download`, a redirect too (NoRedirect's rule). No reason holds the address: a Telegram file's address
+    holds the bot's token."""
+    end = time.monotonic() + timeout
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        raise Missed("download", "not a web address") from None
+    if parts.scheme not in ("http", "https") or not host:
+        raise Missed("download", "not a web address")
+    if timeout <= 0:
+        raise Missed("download", "no time left")
+
+    def left():
+        rest = end - time.monotonic()
+        if rest <= 0:
+            raise Missed("download", f"not done in {timeout:g} s")
+        return rest
+    cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn, r = cls(host, port, timeout=timeout), None
+    conn._create_connection = connect_by(end)
+    try:
+        conn.connect()
+        sock = conn.sock        # the response may take the connection's socket: each step gets the time that is left
+        sock.settimeout(left())
+        conn.request("GET", (parts.path or "/") + ("?" + parts.query if parts.query else ""),
+                     headers={"Accept": "*/*", **(headers or {})})
+        sock.settimeout(left())
+        r = conn.getresponse()
+        left()                  # each read of the head had the time that was left, but not the head in all
+        if r.status != 200:
+            raise Missed("download", f"HTTP {r.status}")
+        if r.length is not None and r.length > FILE_MOST:
+            raise Missed("size")
+        data = bytearray()
+        while len(data) <= FILE_MOST and not r.isclosed():     # a whole answer of its length closes its socket
+            sock.settimeout(left())
+            chunk = r.read1(min(1 << 16, FILE_MOST + 1 - len(data)))     # one read of the socket at most
+            if not chunk:
+                break
+            data += chunk
+        if r.length:            # the answer ended before the length that it gave
+            raise Missed("download", "cut off")
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        raise Missed("download", type(e).__name__) from None
+    finally:
+        if r is not None:       # an answer that ends the connection holds its socket itself
+            r.close()
+        conn.close()
+    if len(data) > FILE_MOST:
+        raise Missed("size")
+    return bytes(data)
+
+
+def file_type(mime, name):
+    """The type that POST /bridge/files names, of any file: its chat app's own without its parameters, in lower case,
+    when that is a valid type/subtype; else its name's extension's (FILE_TYPES, then Python's own table); else
+    application/octet-stream. The hub checks the bytes of a type that it knows and keeps any other as data."""
+    mime = str(mime or "").split(";", 1)[0].strip().lower()
+    if MIME_TOKEN.fullmatch(mime) and mime != "application/octet-stream":   # the generic type yields to the name's
+        return mime
+    ext = os.path.splitext(str(name or ""))[1].lower()
+    guess = FILE_EXTENSIONS.get(ext) or MEDIA_EXTENSIONS.get(ext) or PYTHON_TYPES.guess_type("file" + ext)[0] or ""
+    return guess if MIME_TOKEN.fullmatch(guess) else "application/octet-stream"
+
+
+def file_name(name, mime):
+    """A file's name for POST /bridge/files: no control character and no lone half of a surrogate pair (JSON can hold
+    one, and no query can: urlencode raises), at most 200 characters, and never empty (the hub makes its own safe
+    name of it)."""
+    name = re.sub(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]", "", str(name or "")).strip()[:200]
+    return name or "file" + FILE_TYPES.get(mime, "")
+
+
+def upload_path(event, n, f, mime, check=False):
+    """POST /bridge/files's path and query for file n of an inbound event, each value URL-encoded (%20, never +, for a
+    space). check: the hub's question, with no body, whether it takes a file of this sender now."""
+    fields = {"account": event.get("account"), "message": event.get("id"), "n": n,
+              "name": file_name(f.get("name"), mime), "mime": mime, "sender": event.get("sender")}
+    if event.get("sender_alt"):
+        fields["sender_alt"] = event["sender_alt"]
+    if check:
+        fields["check"] = 1
+    return "/bridge/files?" + urllib.parse.urlencode(fields, quote_via=urllib.parse.quote)
+
+
+def media(name, mime, size, **where):
+    """One file that a message brings, as its journal event describes it, never with its bytes: its name, its type
+    without parameters in lower case (None: its chat app gave none), its size as its chat app gave it (None: none), and
+    where its account fetches it (Discord: url; Telegram: file_id)."""
+    mime = str(mime or "").split(";", 1)[0].strip().lower() or None
+    size = size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else None
+    return dict(where, name=str(name or ""), mime=mime, size=size)
+
+
+def with_media(event, files):
+    """The inbound event with its message's files: `media`, the first FILES_IN, and `media_more`, how many came after
+    them, which go up as `many`."""
+    if files:
+        event["media"] = files[:FILES_IN]
+        if len(files) > FILES_IN:
+            event["media_more"] = len(files) - FILES_IN
+    return event
+
+
 class Hub:
     """The hub's /bridge/* routes, with the key from bridge.key (read for each request, so a new key counts at once)."""
     def __init__(self, url, key_path):
@@ -351,6 +549,17 @@ class Hub:
         if not key:
             return 0, {"error": "no bridge key"}
         status, _, body = request(self.url + path, method, data, {"Authorization": "Bearer " + key}, timeout)
+        return status, body if isinstance(body, dict) else {}
+
+    def upload(self, path, data, timeout=None):
+        """(status, answer) of a POST whose body is the bytes of one file (POST /bridge/files): the hub's 1 MiB rule of
+        a bridge body does not hold for it. Status 0: no answer, also none in its time (FILE_UPLOAD_TIMEOUT)."""
+        key = self.key()
+        if not key:
+            return 0, {"error": "no bridge key"}
+        status, _, body = request(self.url + path, "POST", None, {"Authorization": "Bearer " + key},
+                                  FILE_UPLOAD_TIMEOUT if timeout is None else timeout,
+                                  raw=(data, "application/octet-stream"))
         return status, body if isinstance(body, dict) else {}
 
     def fetch(self, path, timeout=60, most=FILE_MOST):
@@ -786,6 +995,12 @@ class Account:
             with contextlib.suppress(OSError):
                 os.remove(path)
 
+    def fetch_media(self, f, timeout):
+        """The bytes of one file that a message of this account brought (its description in the journal event's
+        `media`), fetched from the chat app in `timeout` seconds in all; raises Missed. An app whose messages bring no
+        `media` fetches nothing."""
+        raise Missed("download", f"{self.app} fetches no file")
+
     def command_item(self, item):
         log(f"{self.app} {self.id}: out {item['id']} {item.get('kind')} does not apply; skipped")
 
@@ -1025,7 +1240,8 @@ class Discord(Account):
 
     def on_message(self, d):
         """A direct message from a person goes to the journal. Bots, the bot itself, servers and system messages
-        do not."""
+        do not. Its files, or a forward's (those of its first snapshot), go as `media`: each one's CDN address, name,
+        type and size, which the bridge fetches and uploads before the message (Bridge.files_up)."""
         author = d.get("author") or {}
         if d.get("guild_id") or d.get("type", 0) not in (0, 19) or author.get("bot") or author.get("system"):
             return
@@ -1045,9 +1261,19 @@ class Discord(Account):
             kind = "text"
         else:
             kind = "other"
-        self.bridge.inbound({"account": self.id, "id": mid, "chat": chat, "group": False, "sender": sender,
-                             "sender_alt": None, "sender_name": author.get("username"), "bot": False,
-                             "from_me": False, "kind": kind, "text": str(words), "ts": snowflake_time(mid)})
+        files = [media(a.get("filename"), a.get("content_type"), a.get("size"), url=str(a.get("url") or ""))
+                 for a in (attachments if isinstance(attachments, list) else []) if isinstance(a, dict)]
+        self.bridge.inbound(with_media({"account": self.id, "id": mid, "chat": chat, "group": False, "sender": sender,
+                                        "sender_alt": None, "sender_name": author.get("username"), "bot": False,
+                                        "from_me": False, "kind": kind, "text": str(words),
+                                        "ts": snowflake_time(mid)}, files))
+
+    def fetch_media(self, f, timeout):
+        """An HTTPS GET of the file's address on Discord's CDN, which Discord signed itself: no token goes with it."""
+        url = str(f.get("url") or "")
+        if not url.startswith(DISCORD_FILES):
+            raise Missed("download", "not an address of Discord's CDN")
+        return download(url, timeout, {"User-Agent": USER_AGENT})
 
     def catch_up(self, session):
         """After a new session (not a resume): read each known chat after its last stored message."""
@@ -1875,7 +2101,9 @@ class Telegram(Account):
         """A person's message in a private chat goes to the journal. A bot's, a group's and a channel's do not: in a
         group, the bot only posts (19.5). A group that became a supergroup tells the hub its new number. The words of
         a picture, a file or a voice note are its caption, which goes as its text, as Discord's and WhatsApp's words
-        do (CHAT-APPS.md 8.1)."""
+        do (CHAT-APPS.md 8.1). Its file goes as `media`, of any kind (a photo, its largest size, or the file of
+        TELEGRAM_FILES): its file id, name, type and size, which the bridge fetches with getFile and uploads before
+        the message (Bridge.files_up)."""
         chat, sender = msg.get("chat") or {}, msg.get("from") or {}
         kind, cid, mid, uid = chat.get("type"), chat.get("id"), msg.get("message_id"), sender.get("id")
         if not isinstance(cid, int):
@@ -1901,11 +2129,47 @@ class Telegram(Account):
             return True         # Telegram's own message in the chat (a pin, the auto-delete timer): nobody wrote it
         name = " ".join(str(x) for x in (sender.get("first_name"), sender.get("last_name")) if x) or \
             str(sender.get("username") or "") or None
-        return self.bridge.inbound({"account": self.id, "id": f"{self.bot}:{cid}:{mid}", "chat": str(cid),
-                                    "group": False, "sender": str(uid), "sender_alt": None, "sender_name": name,
-                                    "bot": False, "from_me": False, "kind": what,
-                                    "text": str(msg.get("text" if what == "text" else "caption") or ""),
-                                    "ts": number(msg.get("date"), default=time.time())})
+        files, photo = [], msg.get("photo")
+        sizes = [p for p in photo if isinstance(p, dict) and isinstance(p.get("file_id"), str) and p["file_id"]] \
+            if isinstance(photo, list) else []
+        if sizes:           # Telegram gives a photo in several sizes, the largest last: the largest one goes up
+            big = max(sizes, key=lambda p: (number(p.get("width"), default=0) * number(p.get("height"), default=0),
+                                            number(p.get("file_size"), default=0)))
+            files = [media("photo.jpg", "image/jpeg", big.get("file_size"), file_id=big["file_id"])]
+        for field, default in TELEGRAM_FILES:      # the name of a file that comes with none
+            item = msg.get(field)
+            if files or not isinstance(item, dict) or not isinstance(item.get("file_id"), str) or not item["file_id"]:
+                continue
+            if field == "sticker":      # a sticker has no type of its own: its kind gives one
+                default = "sticker.tgs" if item.get("is_animated") else "sticker.webm" if item.get("is_video") else \
+                    default
+            files = [media(item.get("file_name") or default, item.get("mime_type"), item.get("file_size"),
+                           file_id=item["file_id"])]
+        return self.bridge.inbound(with_media({"account": self.id, "id": f"{self.bot}:{cid}:{mid}", "chat": str(cid),
+                                               "group": False, "sender": str(uid), "sender_alt": None,
+                                               "sender_name": name, "bot": False, "from_me": False, "kind": what,
+                                               "text": str(msg.get("text" if what == "text" else "caption") or ""),
+                                               "ts": number(msg.get("date"), default=time.time())}, files))
+
+    def fetch_media(self, f, timeout):
+        """getFile, then the file's own address, <api>/file/bot<token>/<file_path>, which holds the bot's token: nothing
+        here puts the address into a reason. Telegram gives a bot a file of at most 20 MB so: a larger one is `size`,
+        with no getFile, which would refuse it."""
+        end, token, fid, size = time.monotonic() + timeout, self.token(), f.get("file_id"), f.get("size")
+        if isinstance(size, int) and not isinstance(size, bool) and size > TELEGRAM_FILE_MOST:
+            raise Missed("size", "more than Telegram gives a bot")
+        if not token:
+            raise Missed("download", "no bot token")
+        if not isinstance(fid, str) or not fid:
+            raise Missed("download", "no file id")
+        status, answer, _ = self.call(token, "getFile", {"file_id": fid},
+                                      timeout=max(0.1, min(20.0, end - time.monotonic())))
+        result = answer.get("result") if answer.get("ok") else None
+        path = result.get("file_path") if isinstance(result, dict) else None
+        if status != 200 or not isinstance(path, str) or not path or path.startswith("/") or \
+                ".." in path.split("/") or re.search(r"[\x00-\x20\x7f]", path):
+            raise Missed("download", f"getFile answered {status or 'nothing'}")
+        return download(f"{self.api.rstrip('/')}/file/bot{token}/{urllib.parse.quote(path)}", end - time.monotonic())
 
     def on_member(self, change):
         """The bot's own status changed in a chat: in a group or a channel, the hub gets it, with who changed it
@@ -2051,6 +2315,10 @@ class Bridge:
         self.states = {}
         self.configured, self.version = False, None
         self.inbound_due = threading.Event()
+        # files_up's memory, in this process only (the journal does not change): for each journal path, when the hub
+        # took each file ("up", by its number) and the attempts that it kept each one ("tries"; 0 is the hub's
+        # question); and (path, number, bytes) of the one file whose upload got no answer, which goes again as it is
+        self.files_seen, self.file_held = {}, None
         self.status_due = threading.Event()
         self.reports = queue.Queue()
         self.code = own_code()      # the code this bridge runs; each status report carries it
@@ -2083,7 +2351,9 @@ class Bridge:
         return True
 
     def inbound_loop(self):
-        """Post the journal to the hub, oldest first, until the hub answers. Replays what a restart left."""
+        """Post the journal to the hub, oldest first, until the hub answers. Replays what a restart left. The files of
+        a message go up first, at each attempt (files_up), and the message goes with the codes of those that did not
+        and without its `media`."""
         backoff = Backoff()
         while not self.stopping.is_set():
             self.inbound_due.clear()
@@ -2091,14 +2361,23 @@ class Bridge:
             for path, event in self.journal.pending():
                 if self.stopping.is_set():
                     return
-                code, answer = self.hub.call("POST", "/bridge/inbound", event)
                 where = f"{event.get('account')} {event.get('id')}"
+                missed = self.files_up(path, event, where)
+                if missed is None:
+                    retry = True
+                    break
+                body = {k: v for k, v in event.items() if k not in ("media", "media_more")}
+                if missed:
+                    body["missed"] = missed
+                code, answer = self.hub.call("POST", "/bridge/inbound", body)
                 if code == 200:
                     self.journal.remove(path)
+                    self.forget_files(path)
                     log(f"inbound {where}: {answer.get('result')}")
                 elif code in (400, 413) or (code == 409 and answer.get("error") == "unknown chat app account"):
                     # a bad event, or one of an account that the hub does not have (any more): it never gets in
                     self.journal.remove(path)
+                    self.forget_files(path)
                     log(f"inbound {where}: the hub refused the event ({code}); removed")
                 elif code == 409:
                     retry = True
@@ -2112,6 +2391,115 @@ class Bridge:
             else:
                 backoff.reset()
                 self.inbound_due.wait(30)
+
+    def files_up(self, path, event, where):
+        """The files of an inbound event (its `media`), in their order and numbered 1 to FILES_IN, each held to its chat
+        app's size, fetched by its account and uploaded to POST /bridge/files. Before the first fetch of an attempt the
+        hub says whether it takes this sender's files now (check=1), so that a stranger's file costs no download and
+        the other messages no wait. A file that the hub took is not sent again for FILE_UP_FOR, and the bytes of the
+        one file whose upload got no answer go again with no new fetch: an address of the chat app can end meanwhile.
+        The codes of the files that did not come up (at most MISSED_MOST), or None when the event waits for the next
+        attempt: the hub gave no answer to its question or to an upload, or a 5xx, or an answer that the interface
+        does not name (for FILE_TRIES attempts of the entry in all, whatever its number of files: then its files that
+        are left are `refused` with no fetch and the message goes on; if the hub takes no message either, the next
+        attempt asks again, and a hub that comes back gets the files), or the bridge has not read its accounts yet (at
+        a start, the journal replays first)."""
+        files, more = event.get("media"), event.get("media_more")
+        files = [f if isinstance(f, dict) else {} for f in files] if isinstance(files, list) else []
+        more = more if isinstance(more, int) and not isinstance(more, bool) and more > 0 else 0
+        if not files and not more:
+            return []
+        with self.lock:
+            account, configured = self.accounts.get(str(event.get("account") or "")), self.configured
+        if account is None and not configured:
+            log(f"inbound {where}: the bridge does not run its account yet; kept")
+            return None
+        seen = self.files_seen.setdefault(path, {"up": {}, "kept": 0})
+        done = seen["up"]
+
+        def kept():
+            """Whether the entry waits for the next attempt after one more that got no answer, of the hub's question or
+            of an upload: FILE_TRIES of them for the whole entry, whatever its number of files. Past them, the files
+            that are left are `refused` with no fetch, and the message goes on."""
+            seen["kept"] += 1
+            return seen["kept"] < FILE_TRIES
+
+        missed, up, asked, refused_all = [], 0, False, False
+        for n, f in enumerate(files[:FILES_IN], 1):
+            if self.stopping.is_set():
+                return None
+            if n in done and time.monotonic() - done[n] < FILE_UP_FOR:      # the hub keeps it for its message
+                up += 1
+                continue
+            data, held = None, self.file_held
+            if held and held[:2] == (path, n):
+                data, self.file_held = held[2], None
+            try:
+                mime, size = file_type(f.get("mime"), f.get("name")), f.get("size")
+                if data is None:
+                    if isinstance(size, int) and not isinstance(size, bool) and size > FILE_MOST:
+                        raise Missed("size")
+                    if refused_all:     # the hub refused this message's sender or account: it refuses each file
+                        raise Missed("refused")
+                    if account is None:
+                        raise Missed("download", "the bridge does not run its account")
+                    if not asked:       # at each attempt: a hub that is down costs no download
+                        asked = refused_all = True      # until the hub says yes: a fault here refuses them all
+                        code, _ = self.hub.upload(upload_path(event, n, f, mime, check=True), b"")
+                        if code == 0 or code >= 500:
+                            if kept():
+                                log(f"inbound {where}: the hub did not say whether it takes the files "
+                                    f"({code or 'no answer'}); kept")
+                                return None
+                            raise Missed("refused", f"no answer of the hub in {FILE_TRIES} attempts")
+                        if code in (400, 403, 409):
+                            raise Missed("refused", f"the hub answered {code}")
+                        refused_all = False     # a yes, or an answer that only the upload's own answer settles
+                    try:
+                        data = account.fetch_media(f, FILE_FETCH_TIMEOUT)
+                    except Missed:
+                        raise
+                    except Exception as e:      # a fault of one fetch must not stop the journal
+                        raise Missed("download", type(e).__name__) from None
+                code, _ = self.hub.upload(upload_path(event, n, f, mime), data)
+                if code == 200:
+                    done[n] = time.monotonic()
+                    up += 1
+                    continue
+                if code == 413:
+                    raise Missed("size", "the hub answered 413")
+                if code in (400, 403, 409, 415, 422):
+                    # 403 and 409 are of the message's sender or account (409: the hub has no such account, and the
+                    # message's own post lets it go), so they are the answer for its other files too. A 415 is bytes
+                    # that are not of their type, an empty file or a text that is not UTF-8; a 400 comes again at
+                    # each attempt: kept, the message would wait for ever.
+                    refused_all = refused_all or code in (403, 409)
+                    raise Missed("refused", f"the hub answered {code}")
+                # these bytes go again at the next attempt, with no new fetch; past FILE_TRIES too, when the hub then
+                # takes no message either (it is down): a hub that comes back gets the file
+                self.file_held = (path, n, data)
+                if not kept():
+                    refused_all = True          # the files after it go with this one: no fetch, no upload
+                    raise Missed("refused", f"no answer of the hub in {FILE_TRIES} attempts ({code or 'none'})")
+                log(f"inbound {where}: the hub did not take file {n} ({code or 'no answer'}); kept")
+                return None
+            except Missed as e:
+                missed.append(e.code)
+                if e.why:
+                    log(f"inbound {where}: file {n} {e.code} ({e.why})")
+            except Exception as e:      # a name or an id that no query can hold, or another fault after the fetch
+                missed.append("refused")
+                log(f"inbound {where}: file {n} refused ({type(e).__name__})")
+        missed = (missed + ["many"] * min(more, MISSED_MOST))[:MISSED_MOST]
+        log(f"inbound {where}: {up} of {len(files) + more} file(s) came up" +
+            (f"; missed {', '.join(missed)}" if missed else ""))
+        return missed
+
+    def forget_files(self, path):
+        """files_up's memory of an entry that left the journal."""
+        self.files_seen.pop(path, None)
+        if self.file_held and self.file_held[0] == path:
+            self.file_held = None
 
     # configuration and the outbound queue
 

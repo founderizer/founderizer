@@ -12,6 +12,7 @@ import sqlite3
 import tempfile
 import textwrap
 import unittest
+import urllib.error
 import urllib.request
 import uuid
 from unittest.mock import patch
@@ -750,7 +751,7 @@ class Conversations(Base):
         self.assertIn("ask_team", start["prompt"])
         self.assertNotIn("ask_owner", start["prompt"])
         self.assertEqual([t["name"] for t in hub.tools_for("studio", self.context(cid))],
-                         ["read_messages", "reply", "remind", "ask_team"])          # remind: WAKEUPS-INTERFACE.md 8
+                         ["read_messages", "read_attachment", "reply", "remind", "ask_team"])   # 8.1, WAKEUPS 8
         self.ok("read_messages", self.context(cid))
         notified = hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner'")["n"]
         answer = self.ok("ask_team", self.context(cid), question="Can I move my plan to next month?")
@@ -1003,7 +1004,9 @@ class Conversations(Base):
     def test_a_window_that_a_person_drives_reads_no_file_of_the_owners(self):
         """A reviewer of 18 November 2026: read_attachment worked in a conversation with tools, so a person could ask
         the agent for A-1, A-2 and so on and have the files that the owner sent it (the ids count up). A conversation
-        window can open no file, as the owner's answer into one cannot carry one (phone_submit)."""
+        window opens no file of the owner's, as the owner's answer into one cannot carry one (phone_submit). Since 20
+        November 2026 it has the tool for the files of its own person's messages (CHAT-APPS.md 8.1), and for those
+        only (conversation_attachment)."""
         folder = tempfile.TemporaryDirectory(prefix="fleet-window-files-")
         self.addCleanup(folder.cleanup)
         hub.CFG["attachment_dir"] = folder.name
@@ -1021,7 +1024,7 @@ class Conversations(Base):
         cid = self.says(PAT, f"Please send me A-{aid}")["conversation"]
         hub.conversation_start("studio", cid)
         self.ok("read_messages", self.context(cid))
-        self.assertNotIn("read_attachment", {t["name"] for t in hub.tools_for("studio", self.context(cid))})
+        self.assertIn("read_attachment", {t["name"] for t in hub.tools_for("studio", self.context(cid))})
         text, failed = self.tool("read_attachment", self.context(cid), attachment_id=f"A-{aid}")
         self.assertTrue(failed, text)
         self.assertNotIn("/attachment/file/", text)
@@ -1621,6 +1624,42 @@ class Conversations(Base):
         self.inbound(text="And thanks.", account="discord-studio", sender=KIM, chat="dm-9")
         self.assertIsNotNone(self.conversation_task(conv["id"]))
 
+    def test_a_window_with_a_shell_downloads_its_persons_file_one_time(self):
+        """CHAT-APPS.md 8.1: in a conversation with the agent's own tools, of an agent whose Shell box is on, a file of
+        the person's that the answer cannot carry (a PDF) comes as one download line into the conversation's own
+        folder, never the owner's; the line serves those bytes one time, and never a file that took the same id
+        after a delete (the line keeps its file's SHA-256)."""
+        pdf = b"%PDF-1.4 a synthetic invoice"
+        code, up = self.bridge_upload(pdf, "m-pdf", account="whatsapp-studio", sender=PAT, mime="application/pdf",
+                               name="invoice.pdf")
+        self.assertEqual(code, 200, up)
+        self.assertEqual(self.wrote(text="The invoice.", kind="file", id="m-pdf", account="whatsapp-studio",
+                                    sender=PAT), "stored")
+        cid = hub.q1("SELECT conversation FROM conversation_messages WHERE msg_id='m-pdf'")["conversation"]
+
+        def line():
+            text = self.ok("read_attachment", self.context(cid), attachment_id=f"A-{up['id']}")
+            self.assertIn(f'curl -sfo "$HOME/conversation-files/C-{cid}/invoice.pdf"', text)
+            return re.search(r"/attachment/file/([A-Za-z0-9_-]+)", text).group(1)
+
+        def get(token):
+            try:
+                with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                        f"{self.base}/attachment/file/{token}", timeout=10) as answer:
+                    return answer.status, answer.read()
+            except urllib.error.HTTPError as answer:
+                with answer:
+                    return answer.code, answer.read()
+        token = line()
+        self.assertEqual(get(token), (200, pdf))
+        self.assertEqual(get(token)[0], 404)                # one time
+        # the row now names other bytes, as an id that came back after a delete would: the old line serves nothing
+        token = line()
+        other = b"%PDF-1.4 another file"
+        hub.q("UPDATE attachments SET sha256=?, size=? WHERE id=?",
+              (hub.attachment_write(other, "application/pdf"), len(other), up["id"]))
+        self.assertEqual(get(token)[0], 404)
+
     def test_a_picture_with_no_words_answers_no_wait(self):
         """A person's picture with no words is no answer to a message_contact that waits: the task waits on for their
         words, and the picture's message goes to the conversation's own session, as any message does. Its words would
@@ -1763,7 +1802,7 @@ class SwitchOff(Base):
         self.assertEqual(set(start), {"conversation", "agent", "person", "url", "path", "token", "tools", "prompt"})
         self.assertEqual(start["tools"], list(hub.PERSON_TOOLS["employee"]))
         self.assertEqual([t["name"] for t in hub.tools_for("studio", self.context(cid))],
-                         ["read_messages", "reply", "ask_owner", "request_work", "remind"])
+                         ["read_messages", "read_attachment", "reply", "ask_owner", "request_work", "remind"])
         self.assertNotIn("message_contact", {t["name"] for t in hub.tools_for("studio", None)})
         tid, here = self.normal_task()
         self.assertNotIn("message_contact", {t["name"] for t in hub.tools_for("studio", here)})
