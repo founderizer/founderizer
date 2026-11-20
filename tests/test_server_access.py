@@ -189,7 +189,8 @@ class ServerKind(Access):
         text = hub.holdings_start_text("lead")
         self.assertIn("hub (patch), lead-box (patch), vps (patch); at patch", text)
         self.assertIn("at patch, a machine of the fleet, the fixed root forms only, with `ops <server> health`, which "
-                      "says why it failed or is slow", text)
+                      "says why it failed or is slow; the door's own server with `ops door:self <read>`, and a wrong "
+                      "read name lists the reads", text)        # else no round of the holder knows door:self
         self.assertNotIn("look --content", text)
         self.assertIn("servers through the door hub (patch)", hub.colleague_line("lead"))
         # this fleet has no door, so no agent gets such a server, and the hub's words are the ones of before

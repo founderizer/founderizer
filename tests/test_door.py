@@ -114,7 +114,7 @@ ACCESS = {
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(cls(name) for cls in (Access, Callers, Look, Databases, RuleArguments, Refusals, OwnCalls, Order,
+    return unittest.TestSuite(cls(name) for cls in (Access, Callers, Look, DoorSelf, Databases, RuleArguments, Refusals, OwnCalls, Order,
                                                     HubLine, HubRights, GitHubFacts, SyncRuns, CommitChecks, PruneParts, Prunes, Vault, AuditReplay, AWSRole,
                                                     OwnerYes, CallHash, ScriptsAndRuns, FullAccess, Routes, MadeDeletes,
                                                     HostPath, AppSettingsPath, ScriptPath, HostUpdates, KeyCardAccount,
@@ -772,6 +772,55 @@ class Look(Served):
             self.assertEqual(self.ops("ci-1", "look", "--content", path)[0], 3)
         self.assertEqual(err.getvalue(), "")
         self.assertEqual([line.get("task") for line in self.door.record.after(0)[-2:]], ["T-62", "T-62"])
+
+
+class DoorSelf(DoorCase):
+    """The door's own server, door:self: the live review rounds of 19 November 2026 could not read it, because the
+    door patches itself and no agent has root there. The holder of the fleet's own servers reads it with the fixed
+    reads that it reads on each host, which the door runs as its own user."""
+
+    def setUp(self):
+        super().setUp()
+        self.ran = []
+
+        def program(argv, stdin, env, timeout=600, limit=None):
+            self.ran.append(argv)
+            return 0, "Listing...\nopenssl/noble-security 3.0.13-0ubuntu3.7 amd64 [upgradable from: 3.0.13-0ubuntu3.6]\n"
+        stub = patch.object(door, "run_program", program)
+        stub.start()
+        self.addCleanup(stub.stop)
+
+    def test_only_its_fixed_reads_with_no_argument_and_only_for_the_holder_of_the_fleet_s_servers(self):
+        got = self.call(ONE, "door:self", "upgradable")             # ops-one holds fleet-1, of kind fleet, at Fix
+        self.assertEqual((got["ok"], got["kind"]), (True, "read"), got)
+        self.assertIn("openssl/noble-security", got["out"])
+        self.assertEqual(self.ran, [["apt", "list", "--upgradable"]])
+        for address, op, args, content, words in (
+                (TWO, "uptime", [], None, "door:self is for the agent that holds the fleet's own servers"),
+                (ONE, "df", ["/"], None, "df of door:self takes no argument and no content"),
+                (ONE, "free", [], b"x", "free of door:self takes no argument and no content"),
+                (ONE, "journal", ["lines=50"], None, "door:self takes the reads uptime, df"),
+                (ONE, "status", ["fleet-door"], None, "door:self takes the reads uptime, df"),
+                (ONE, "look", [], b"cat /etc/fleet-door/access.json\n", "door:self takes the reads uptime, df")):
+            with self.subTest(address=address, op=op):
+                got = self.door.call(address, "door:self", op, args, content)
+                self.assertEqual((got["ok"], got["kind"]), (False, "refused"), got)
+                self.assertIn(words, got["why"])
+                self.assertNotIn("call", got)       # code refused it: no yes of the owner opens it
+        self.assertEqual(self.call(TWO, "door:self", "uptime")["route"], "holder")
+        self.assertEqual(self.call(ONE, "door:other", "uptime")["why"], "the door's own server is door:self")
+        self.assertEqual((self.ran[1:], self.stubs.ssh_calls), ([], []))
+
+    def test_each_read_of_the_door_s_own_server_is_a_fixed_program_that_reads_no_log_and_no_file(self):
+        """The door's journal names every business's calls, and its files hold its keys: a read that takes an
+        argument, reads a log or reads a file's text (journal, log, status, du, alerts) is never one of them."""
+        for op in door_targets.DOOR_SELF_READS:
+            with self.subTest(op=op):
+                read = door_targets.OPS_READ.READS[op]
+                self.assertNotIn("text", read)                  # a reader of a file of its own, as log's
+                self.assertTrue(read.get("argv"), op)           # a fixed argv: no argument of the caller's
+                self.assertFalse({"journalctl", "cat", "tail", "less", "du", "status"} & set(read["argv"]), op)
+                self.assertNotIn("args", read["argv"][-1])      # ps shows each process by its name, never its command
 
 
 class Databases(Served):

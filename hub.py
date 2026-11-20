@@ -6326,8 +6326,10 @@ def holdings_parts(agent):
                      ("; at fix, `ops <server> look --content <script>` reads its files and its apps' logs with a "
                       "bash script that changes nothing, with nobody's yes" if "fix" in a["servers"].values() else "") +
                      "): " + named_few(f"{h} ({v})" for h, v in sorted(a["servers"].items())) +
+                     # the one holder of the fleet's own servers reads the door's own server too (door_targets.decide_door)
                      ("; at patch, a machine of the fleet, the fixed root forms only, with `ops <server> health`, "
-                      "which says why it failed or is slow" if "patch" in a["servers"].values() else ""))
+                      "which says why it failed or is slow; the door's own server with `ops door:self <read>`, and a "
+                      "wrong read name lists the reads" if "patch" in a["servers"].values() else ""))
     keys = [name for _, name in session_variables(agent)]       # none for an agent with no vault broker
     gone = [k for k in keys if k in vault_missing(agent)]        # C11: not given at its vault's last session read
     if len(gone) < len(keys):

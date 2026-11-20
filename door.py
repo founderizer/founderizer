@@ -1268,6 +1268,12 @@ class Door:
                 raise door_providers.Stop(out.strip()[-4000:] or f"the host answered {status}")
             return out
         plan = d.plan
+        if "self_read" in plan:         # door:self: a fixed read of the door's own server, as the door's own user
+            status, out = run_program(door_targets.OPS_READ.READS[plan["self_read"]]["argv"], None, {}, timeout=120,
+                                      limit=HOST_OUT_MAX)
+            if status not in (0, 3):    # systemctl says 3 when a unit that it lists is not active: still a read
+                raise door_providers.Stop(out.strip()[-4000:] or f"{plan['self_read']} ended with status {status}")
+            return out
         if plan.get("provider"):
             return door_providers.execute(plan, self.provider_ctx(access, d.target))
         if "text" in plan:              # a text that the door gives, such as the product's deploy workflow (N5)

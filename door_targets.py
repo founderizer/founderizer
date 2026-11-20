@@ -15,6 +15,7 @@ gives.
     commit:<owner/repo> a commit that the door makes on a repository the access file gives the agent
     deploy:<owner/repo> that repository's documented deploy
     gitops:<owner/repo> the GitOps repository: a read at HEAD through a filter, and commits of the listed forms
+    door:self           the door's own server: fixed reads that the door runs as its own user (DOOR_SELF_READS)
 
 The host forms come from host/ops-root and host/ops-read themselves, so the door and the host check each form with
 the same code, and the host refuses on its own what the door should never have sent.
@@ -212,6 +213,8 @@ def decide(access, agent, target, op, args, content=None, lookups=None):
         return decide_gitops(access, me, name, op, args, content, lookups or {})
     if kind == "db":
         return decide_db(access, agent, me, name, op, args, never, content)
+    if kind == "door":
+        return decide_door(access, me, name, op, args, content)
     import door_providers
     if kind not in door_providers.PROVIDERS:
         return refused(f"{kind} is no kind of target")
@@ -220,6 +223,34 @@ def decide(access, agent, target, op, args, content=None, lookups=None):
     if target not in (me.get("providers") or []):
         return refused(f"{agent} holds no grant on {target}", route="holder")
     return door_providers.decide(access, agent, kind, name, op, args, content, lookups or {})
+
+
+# ---------------------------------------------------------------- the door's own server
+
+# What the agent that holds the fleet's own servers reads of the door's own server, which no host form reaches: the
+# door patches itself, and no agent has root there. The door runs each read as its own user, with no root, no argument
+# of the caller's, no file's content and no journal, whose lines name every business's calls: the argv reads of
+# host/ops-read, the same programs that the holder reads on each host.
+DOOR_SELF_READS = ("uptime", "df", "free", "swap", "ps", "listen", "packages", "upgradable", "failed", "units",
+                   "timers", "lsblk", "findmnt")
+
+
+def decide_door(access, me, name, op, args, content=None):
+    """The decision on one call to door:self (the review rounds of 19 November 2026 could not read the door's own
+    server). Only for an agent that holds a host of kind fleet, which the owner's app gives to the one agent that holds
+    the fleet's own servers."""
+    target = f"door:{name}"
+    if name != "self":
+        return refused("the door's own server is door:self", target=target)
+    if not any(level == "fix" and ((access.get("hosts") or {}).get(host) or {}).get("kind") == "fleet"
+               for host, level in (me.get("servers") or {}).items()):
+        return refused(f"{target} is for the agent that holds the fleet's own servers", target=target, route="holder")
+    if op not in DOOR_SELF_READS:
+        return refused(f"{target} takes the reads {', '.join(DOOR_SELF_READS)}", target=target)
+    if args or content:
+        return refused(f"{op} of {target} takes no argument and no content", target=target)
+    return Decision("read", f"the fixed read {op} of the door's own server, as the door's own user", target=target,
+                    plan={"self_read": op}, write=False)
 
 
 # ---------------------------------------------------------------- databases

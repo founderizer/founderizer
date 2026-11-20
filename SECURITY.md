@@ -210,7 +210,9 @@ server that is not the hub's. This section says what that agent can do on such a
 the server, run the security upgrades, upgrade Tailscale, empty the journal and the package cache. Read why the
 server failed or is slow with `ops <server> health`. Read the server's logs and its units with the fixed reads, as the
 user `ops-agent`, which has no root. A restart or a reboot can end the work that runs on that server: the holder
-answers for the time.
+answers for the time. On the door's own server it reads the versions, the updates that wait, the failed units, the
+listeners and the disk (`ops door:self <read>`), which the door reads as its own user with no root; it reads no
+file's content and no journal there.
 
 **What it cannot do, whatever the door's file says.** Run a command, a script or a file install of its own, or the
 wide read `look`: the server's own `ops-root` refuses each of them by its mode and by the mark of a machine of the
