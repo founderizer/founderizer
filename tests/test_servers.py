@@ -8,6 +8,7 @@ import http.client
 import io
 import json
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -64,7 +65,7 @@ def sha(text):
 
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Servers, ServerService, TeamAtStartup, InstallRetries,
-                                                    JoinLineStops, CodeOverHubPort)
+                                                    JoinLineStops, CodeOverHubPort, HomeReading)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -2856,3 +2857,270 @@ class CodeOverHubPort(OwnerAPI):
             self.assertEqual(bool(hub.CODE_PROTOCOL.fullmatch(protocol)), kept, protocol)
         self.assertIn("code_over_hub_port", hub.ui_features())
 
+
+class HomeReading(ServerService):
+    """The home reading (the session wall, version 2, slice 0): what stays in each agent's home, read as that agent's
+    own user by a fixed program, posted by the server's own service, and kept by the hub as one row for each item."""
+
+    def reading_of(self, home, proc):
+        import home_reading
+        return home_reading.Reading(str(home), uid=os.getuid(), proc=str(proc), clock=lambda: 1700000000.0).read()
+
+    def test_the_program_gives_names_sizes_and_digests_and_never_content_and_never_waits(self):
+        """A name is data: one with a line end, or a socket's raw byte, is one escaped row; a link is read as a link
+        and never followed; a FIFO stops nothing; no byte of a file's content is in the reading; a checkout's HEAD is
+        read from git's own files, and its git settings are listed; a process with no task is a row of its own
+        beside the same command with a task, and a listener has its port."""
+        home, proc = self.root / "agent-home", self.root / "proc"
+        for rel, data in ((".local/bin/tool\nrm -rf", b"#!/bin/sh\necho the-secret-body\n"),
+                          (".bashrc", b"export PATH=$HOME/.local/bin:$PATH\n"),
+                          (".config/systemd/user/stay.service", b"[Service]\nExecStart=/bin/true\n"),
+                          ("fleet-vps/fleet.py", b"print('kit')\n"), ("fleet-vps/rules/core.md", b"# Rules\n"),
+                          ("fleet-vps/.git/HEAD", b"ref: refs/heads/config\n"), ("fleet-vps/.git/config", b"[core]\n"),
+                          ("fleet-vps/.git/refs/heads/config", b"a" * 40 + b"\n"), ("fleet-hang/.git/x", b""),
+                          (".fleet/programs/tools/uv-0.9/uv-x86_64/uv", b"uv"),
+                          (".fleet/programs/tools/node-24/node-v24/bin/node", b"node"),
+                          (".fleet/programs/tools/node-24/node-v24/lib/uv", b"not this one"),
+                          (".fleet/programs/npm/mcp-thing/1.0.0@2026-11-01/ready.json", b"{}"),
+                          (".fleet/programs/cache/uv/x/uv", b"a cache"),
+                          (".fleet/programs/npm/cache/2.0.0@2026-11-01/ready.json", b"{}"),
+                          (".fleet/programs/tools/python/cpython-3.12/bin/python3.12", b"python")):
+            (home / rel).parent.mkdir(parents=True, exist_ok=True)
+            (home / rel).write_bytes(data)
+        os.symlink("/etc/passwd", str(home / ".local/bin/link"))
+        os.mkfifo(str(home / "fleet-hang/.git/HEAD"))           # an open of it would wait for ever
+        os.mkfifo(str(home / ".profile"))
+        me = str(os.getpid())
+        for pid, comm, parent, task in (("4242", b"node", "1", b"FLEET_TASK=T-15"), ("4243", b"node", "1", b"HOME=/x"),
+                                        (me, b"python3", "4300", b"HOME=/x"), ("4300", b"timeout", "4400", b"HOME=/x"),
+                                        ("4301", b"crontab", me, b"HOME=/x"), ("4400", b"systemd", "1", b"HOME=/x"),
+                                        ("4401", b"stay", "4400", b"HOME=/x")):
+            (proc / pid / "fd").mkdir(parents=True)
+            (proc / pid / "comm").write_bytes(comm + b"\n")
+            (proc / pid / "environ").write_bytes(b"HOME=/x\0" + task + b"\0")
+            (proc / pid / "stat").write_bytes(f"{pid} ({comm.decode()}) S {parent} {pid} {pid} 0".encode())
+        os.symlink("socket:[777]", str(proc / "4243" / "fd" / "3"))
+        (proc / "net").mkdir()
+        (proc / "net" / "tcp").write_text(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+            f"   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  {os.getuid()}        0 1\n"
+            f"   1: 0100007F:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000  {os.getuid() + 1}  0 2\n")
+        (proc / "net" / "unix").write_bytes(b"Num       RefCount Protocol Flags    Type St Inode Path\n"
+                                            b"0000: 00000002 00000000 00010000 0001 01 777 @wait\xffhere\n"
+                                            b"0001: 00000002 00000000 00010000 0001 01 778 @not-of-this-user\n")
+        said = self.reading_of(home, proc)
+        items = {(i["kind"], i["name"]): i for i in said["items"]}
+        body = b"#!/bin/sh\necho the-secret-body\n"
+        self.assertEqual(items["bin", ".local/bin/tool\\x0arm -rf"],
+                         {"kind": "bin", "name": ".local/bin/tool\\x0arm -rf", "size": len(body),
+                          "sha256": hashlib.sha256(body).hexdigest()})
+        self.assertEqual(items["bin", ".local/bin/link"]["sha256"], hashlib.sha256(b"link:/etc/passwd").hexdigest())
+        self.assertNotIn("the-secret-body", json.dumps(said))
+        self.assertNotIn("root:", json.dumps(said))                 # the link's target was not read
+        self.assertNotIn(("dot", ".profile"), items)                # a FIFO is no file of the reading
+        self.assertEqual(items["kit_head", "fleet-vps"]["sha256"], "a" * 40)
+        self.assertIsNone(items["kit_head", "fleet-hang"]["sha256"])
+        self.assertIn(("kit", "fleet-vps/rules/core.md"), items)
+        self.assertIn(("kit_git", "fleet-vps/.git/config"), items)
+        self.assertIn(("unit", ".config/systemd/user/stay.service"), items)
+        self.assertEqual((items["process", "node T-15"]["task"], items["process", "node (no task)"]["size"]),
+                         ("T-15", 1))
+        # the reading's own pipeline (its timeout, itself, its crontab) is no process of the agent's; a process that
+        # the user's own systemd took over (an `env -i setsid` stay) is one
+        self.assertEqual(sorted(k[1] for k in items if k[0] == "process"),
+                         ["node (no task)", "node T-15", "stay (no task)", "systemd (no task)"])
+        self.assertEqual(sorted(k[1] for k in items if k[0] == "program"),
+                         [".fleet/programs/npm/cache/2.0.0@2026-11-01/ready.json",
+                          ".fleet/programs/npm/mcp-thing/1.0.0@2026-11-01/ready.json",
+                          ".fleet/programs/tools/node-24/node-v24/bin/node",
+                          ".fleet/programs/tools/python/cpython-3.12/bin/python3.12",
+                          ".fleet/programs/tools/uv-0.9/uv-x86_64/uv"])
+        self.assertEqual(said["cut"], [])
+        # run by the service itself (a Mac's agent): its parent is no timeout, so that parent and its other
+        # children stay in the reading
+        (proc / me / "stat").write_bytes(f"{me} (python3) S 4400 {me} {me} 0".encode())
+        again = {i["name"] for i in self.reading_of(home, proc)["items"] if i["kind"] == "process"}
+        self.assertLessEqual({"systemd (no task)", "stay (no task)", "timeout (no task)"}, again)
+        self.assertEqual(sorted(k[1] for k in items if k[0] == "listener"),
+                         ["tcp 127.0.0.1:8080", "unix @wait\\xffhere"])
+        self.assertTrue(all(re.fullmatch(r"[\x20-\x7e]+", i["name"]) for i in said["items"]))     # plain characters
+        self.assertEqual(len(set(items)), len(said["items"]))        # one row each
+
+    def test_the_service_runs_the_program_as_each_agent_user_and_the_hub_keeps_its_rows(self):
+        """The command line holds timeout and the system's Python with -I and a file of the service's own, from the
+        folder /: never a word of the hub or of an agent, never a program of the agent's PATH. The file holds the
+        checkout's own program, the agent can read it and not change it, and it is gone after the round. No more
+        than its bound of output reaches the service, however much the agent's processes write. A second round
+        within five minutes reads nothing, and a hub's 404 holds the readings for an hour. The hub keeps the rows of
+        an agent of this server, and none of an agent of another one. An agent that runs as this service's own user
+        is read with this service's Python."""
+        self.join_linux()
+        svc = self.service()
+        self.add_agent(runtime="codex")
+        svc.loop(rounds=1)
+        shutil.copy(Path(hub.__file__).with_name("home_reading.py"), self.own / "home_reading.py")
+        reading = json.dumps({"version": 1, "read": 1700000000.0, "more": 0, "cut": [],
+                              "items": [{"kind": "dot", "name": ".bashrc", "size": 3, "sha256": "b" * 64}]}).encode()
+        seen, outputs, writers = [], {}, []
+
+        class Proc:
+            """The reading's process: its output is a real pipe; `hold` keeps the write end open, as an agent's
+            process can, after the bytes of `next` are in it."""
+            def __init__(inner, argv, stdout=None, stderr=None, stdin=None, cwd=None):
+                path = next(str(a) for a in argv if str(a).startswith("/tmp/fleet-home-reading-"))
+                if os.path.exists(path):
+                    seen.append((list(argv), cwd, stderr, Path(path).read_text(), os.stat(path).st_mode & 0o777))
+                r, w = os.pipe()
+                os.write(w, outputs.get("next", reading))
+                if outputs.get("hold"):
+                    writers.append(w)
+                else:
+                    os.close(w)
+                inner.stdout = os.fdopen(r, "rb")
+
+            def terminate(inner):
+                outputs["terminated"] = True
+
+            kill = terminate
+
+            def wait(inner, timeout=None):
+                return 0
+        self.addCleanup(lambda: [os.close(w) for w in writers])
+        svc.popen = Proc
+        me = pwd.getpwuid(os.getuid()).pw_name
+        users = {"scout": {"user": "fleet-scout", "uid": 4000}, "vps": {"user": "fleet-vps", "uid": 4001},
+                 "studio": {"user": me, "uid": os.getuid()}}
+        clock = [5000.0]
+        svc.clock = lambda: clock[0]
+        svc.homes_at = None
+        with patch.object(svc, "agent_users", return_value=users):
+            self.assertEqual(svc.homes_round(), 200)
+            self.assertIsNone(svc.homes_round())                    # within five minutes: no second reading
+        argv, cwd, stderr, text, mode = seen[0]
+        self.assertEqual(argv[:4], ["sudo", "-n", "-u", "fleet-scout"])
+        self.assertEqual(argv[-7:-1], ["/usr/bin/timeout", "-k", "5", str(self.mod.HOME_READING_TIME),
+                                       self.mod.HOME_PYTHON, "-I"])
+        self.assertRegex(argv[-1], r"^/tmp/fleet-home-reading-[^/]+\.py$")
+        self.assertEqual((cwd, stderr, text, mode),
+                         ("/", subprocess.DEVNULL, (self.own / "home_reading.py").read_text(), 0o644))
+        self.assertFalse(os.path.exists(argv[-1]))
+        self.assertFalse(any(word in " ".join(argv) for word in (self.base, KEY, "/server/")))
+        self.assertEqual(seen[2][0][:2], [sys.executable, "-I"])    # this service's own user: no sudo
+        rows = hub.q("SELECT agent, kind, name, sha256 FROM home_items ORDER BY agent")
+        self.assertEqual([tuple(r) for r in rows], [("scout", "dot", ".bashrc", "b" * 64)])     # vps is not of mini
+        # an agent's process that writes without end into the pipe: the service reads its bound and no more
+        clock[0] += self.mod.REPORT_EVERY
+        outputs.update(next=b"x" * 5000, hold=True)
+        with patch.object(svc, "agent_users", return_value={"scout": users["scout"]}), \
+                patch.object(self.mod, "HOME_READING_MOST", 100):
+            self.assertEqual(svc.home_reading_run(["/tmp/fleet-home-reading-x.py"]), (0, "x" * 101))
+            self.assertTrue(outputs.pop("terminated"))
+            self.assertEqual(svc.homes_round(), 200)
+        self.assertEqual(hub.q1("SELECT error FROM home_readings WHERE agent='scout'")["error"],
+                         "the reading gave no object")
+        # one that holds the pipe open and writes nothing: the service waits until its deadline and no longer
+        outputs.update(next=b"", hold=True)
+        started = time.monotonic()
+        with patch.object(self.mod, "HOME_READING_WAIT", 0.3):
+            self.assertEqual(svc.home_reading_run(["/tmp/fleet-home-reading-x.py"]), (0, ""))
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(outputs.pop("terminated"))
+        outputs.update(hold=False)
+        # a hub with no such route: no reading for an hour, then one again
+        clock[0] += self.mod.REPORT_EVERY
+        with patch.object(svc, "agent_users", return_value={"scout": users["scout"]}), \
+                patch.object(svc.hub, "call", return_value=(404, {})) as call:
+            self.assertEqual(svc.homes_round(), 404)
+            clock[0] += self.mod.REPORT_EVERY
+            self.assertIsNone(svc.homes_round())
+            clock[0] += self.mod.HOME_READING_AGAIN
+            self.assertEqual(svc.homes_round(), 404)
+        self.assertEqual(call.call_count, 2)
+
+    def test_the_hub_keeps_each_item_once_with_its_changes_and_its_bound(self):
+        """A row's changed time moves only when its size, its digest or its task moves, or when it comes back; a
+        file that a whole reading no longer has is gone, a cut reading marks nothing gone, and a process that is gone
+        leaves no row; at its bound the oldest row that went makes room, and with none the rows stay. A kit file is
+        compared with the release of its HEAD, and the HEAD with the revision that the agent's helper reported."""
+        rev = hub.kit_revision(fresh=True)
+        team = (self.kit / "team.json").read_bytes()
+        task = hub.ins("INSERT INTO tasks(title,details,done_when,needs,owner,requester,state,created,attempt) "
+                       "VALUES('Build','x','y','none','scout','manager','working',?,1)", (hub.now(),))
+
+        def keep(items, t0, more=0, cut=()):
+            checked = hub.home_reading_checked({"read": t0, "more": more, "items": items, "cut": list(cut)})
+            with patch.object(hub, "now", return_value=t0), hub.LOCK, hub.transaction():
+                hub.home_keep("mini", "scout", *checked)
+        bash = lambda sha: {"kind": "dot", "name": ".bashrc", "size": 3, "sha256": sha}
+        kit = [{"kind": "kit_head", "name": "fleet-scout", "size": None, "sha256": rev},
+               {"kind": "kit", "name": "fleet-scout/team.json", "size": len(team),
+                "sha256": hashlib.sha256(team).hexdigest()},
+               {"kind": "kit", "name": "fleet-scout/fleet.py", "size": 1, "sha256": "c" * 64},
+               {"kind": "kit", "name": "fleet-scout/hub.py", "size": 5000000, "sha256": None}]
+        work = {"kind": "process", "name": f"node {hub.tref(task)}", "size": 1, "sha256": None, "task": hub.tref(task)}
+        keep([bash("1" * 64), {"kind": "process", "name": "node (no task)", "size": 1, "sha256": None},
+              {"kind": "bin", "name": "x\nfake", "size": 1, "sha256": None}] + kit, 100.0)
+        keep([bash("1" * 64), work] + kit, 200.0)
+        row = lambda kind, name: hub.q1("SELECT * FROM home_items WHERE agent='scout' AND kind=? AND name=?",
+                                        (kind, name))
+        self.assertEqual(row("dot", ".bashrc")["changed"], 100.0)   # the same: not written again
+        self.assertIsNone(row("process", "node (no task)"))         # it went with its session
+        self.assertIsNone(row("bin", "x\nfake"))                   # a name with a line end is no name of a reading
+        keep([bash("2" * 64), work] + kit, 300.0)
+        self.assertEqual(row("dot", ".bashrc")["changed"], 300.0)
+        keep(kit, 350.0, more=1, cut=["dot"])                       # cut: what it left out may still be there
+        self.assertIsNone(row("dot", ".bashrc")["gone"])
+        keep(kit, 400.0)
+        self.assertEqual(row("dot", ".bashrc")["gone"], 400.0)
+        keep([bash("2" * 64), work] + kit, 500.0)                   # it came back
+        self.assertEqual((row("dot", ".bashrc")["gone"], row("dot", ".bashrc")["changed"]), (None, 500.0))
+        view = {i["name"]: i for i in hub.homes_view("scout")["agents"][0]["items"]}
+        self.assertEqual({n: view[f"fleet-scout/{n}"]["release"] for n in ("team.json", "fleet.py", "hub.py")},
+                         {"team.json": "same", "fleet.py": "absent", "hub.py": "unknown"})
+        self.assertEqual((view["fleet-scout"]["release"], view[f"node {hub.tref(task)}"]["task_open"]), ("same", True))
+        (self.kit / "fleet.py").write_text("print('the release')\n")
+        git("add", "fleet.py", cwd=self.kit)
+        git("commit", "-q", "-m", "kit", cwd=self.kit)
+        kit[0]["sha256"] = git("rev-parse", "HEAD", cwd=self.kit).strip()
+        hub._revision_cache.update(at=0.0, value=None)
+        local = {"kind": "kit_head", "name": "fleet-local", "size": None, "sha256": "e" * 40}
+        old = {"kind": "kit_head", "name": "fleet-old", "size": None, "sha256": rev}
+        keep([bash("2" * 64), work, local, old] + kit, 600.0)
+        view = {i["name"]: i for i in hub.homes_view("scout")["agents"][0]["items"]}
+        self.assertEqual((view["fleet-scout/fleet.py"]["release"], view["fleet-scout"]["release"]),
+                         ("differs", "same"))
+        # an older commit of the fleet's history is no change; a commit that it does not have is one
+        self.assertEqual((view["fleet-old"]["release"], view["fleet-local"]["release"]), ("same", "differs"))
+        kit += [local, old]
+        self.assertEqual(hub.homes_view("nobody")["agents"][0]["items"], [])
+        cap = lambda: patch.object(hub, "HOME_AGENT_ROWS",
+                                   hub.q1("SELECT COUNT(*) n FROM home_items WHERE agent='scout'")["n"])
+        with cap():
+            keep([bash("2" * 64), work, {"kind": "bin", "name": "new", "size": 1, "sha256": None}] + kit, 700.0)
+        self.assertIsNone(row("bin", "new"))                        # no row went: the rows stay
+        self.assertEqual(hub.homes_view("scout")["agents"][0]["more"], 1)
+        keep([work] + kit, 800.0)                                   # .bashrc went
+        with cap():
+            keep([work, {"kind": "bin", "name": "new", "size": 1, "sha256": None}] + kit, 900.0)
+        self.assertIsNotNone(row("bin", "new"))                     # it took the place of the oldest that went
+        self.assertIsNone(row("dot", ".bashrc"))
+        with cap():                                                 # no file went: a process that went gives room
+            keep([{"kind": "bin", "name": "new", "size": 1, "sha256": None},
+                  {"kind": "bin", "name": "newer", "size": 1, "sha256": None}] + kit, 1000.0)
+        self.assertIsNotNone(row("bin", "newer"))
+        many = [{"kind": "bin", "name": f"n{i}", "size": 1, "sha256": None} for i in range(7)]
+        keep([{"kind": "process", "name": f"p{i} (no task)", "size": 1, "sha256": None} for i in range(3)] + kit,
+             1100.0)
+        statements = []
+        hub.DB.set_trace_callback(statements.append)
+        try:
+            with cap():
+                keep(many + kit, 1200.0)                            # room: two files that went, three processes
+        finally:
+            hub.DB.set_trace_callback(None)
+        self.assertEqual(sum("ORDER BY gone" in s for s in statements), 1)      # one query for the reading
+        self.assertEqual([i["name"] for i in many if row("bin", i["name"])], ["n0", "n1", "n2", "n3", "n4"])
+        self.assertEqual((row("bin", "new"), row("bin", "newer")), (None, None))       # the files that went, first
+        self.assertEqual(hub.homes_view("scout")["agents"][0]["more"], 2)
+        self.assertEqual(hub.home_reading_checked({"read": 10 ** 400, "items": []})[0],
+                         {"error": "a reading of another shape"})       # no OverflowError for the whole post

@@ -134,6 +134,11 @@ EGRESS_CONTROL = "/run/founderizer-egress/control.sock"     # vault.EGRESS_CONTR
 EGRESS_RULES = "/etc/founderizer-egress/rules.nft"          # vault.EGRESS_RULES: root's, there while the gate is on
 EGRESS_LOADED = "/run/founderizer-egress-table"             # vault.EGRESS_LOADED: root's word on the kernel's table
 EGRESS_KEPT = 20000             # rows of the gate's counts that wait here while the hub does not take them
+HOME_PYTHON = "/usr/bin/python3"    # the system's Python, for the home reading (homes_round): never one on a PATH
+HOME_READING_MOST = 2 * 1024 * 1024     # characters of one agent's home reading that the service posts
+HOME_READING_TIME = 60          # seconds of one agent's home reading, ended by /usr/bin/timeout as that agent
+HOME_READING_AGAIN = 3600       # seconds after a hub's 404 before the service tries its home readings again
+HOME_READING_WAIT = HOME_READING_TIME + 30      # seconds that the service waits for one reading's output, at most
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # The words of `fleet.py install-pinned` when an address of the pin could not be reached: fleet.install_pinned names
 # the failure of each address by its exception ("could not be downloaded (x.ai: URLError; …)"). A refused address
@@ -507,6 +512,7 @@ class Service:
         self.egress_rules = egress_rules                # root's rules file: this machine has the gate
         self.egress_on = True           # the hub may hold this machine's gate from before: a machine with none says so
         self.egress_lock = threading.Lock()             # a report of the job's heartbeat and one of the loop
+        self.homes_at = self.homes_off = None   # by this clock: the last home reading; a hub's 404 for it
 
     @staticmethod
     def command(argv, cwd=None, timeout=120, env=None):
@@ -801,7 +807,8 @@ class Service:
                    isinstance(entry.get("runtime"), str) and lifecycle.runtime_fact(entry["runtime"], "browser_tabs")
                    for _name, entry in self.agents_here())
 
-    def report(self):
+    def report(self, homes=True):
+        """The reading, then the gate's counts and (homes: not in a job's heartbeat) the home reading."""
         reading = self.reading()
         reading["security"]["tailscale"] = self.life.private_network()      # as it leaves (Lifecycle.report)
         status, answer = self.hub.call("POST", f"/server/{self.name}/status", reading)
@@ -811,7 +818,116 @@ class Service:
         if status == 200:
             self.adopt(answer.get("server"))
             self.egress_round()
+            try:
+                if homes:
+                    self.homes_round()
+            except Exception as e:      # noqa: BLE001 -- the home reading never stops this server's report
+                print(f"The home reading of this server could not be made: {type(e).__name__}", flush=True)
         return status
+
+    # ---- the home reading (the session wall, version 2, slice 0): what stays in each agent's home
+    def homes_round(self):
+        """Each agent's home reading, posted to the hub (POST /server/<name>/homes), at most once in REPORT_EVERY by
+        this service's own clock (a report of a job's heartbeat makes none). home_reading.py's text from this
+        service's own checkout goes into a new file of this service that an agent user can read and not change
+        (mkstemp in the sticky /tmp), and not onto the command line, which sudo writes to the system's log.
+
+        An agent with an OS user of its own: that user runs it through the one sudoers line, as
+        `/usr/bin/timeout ... /usr/bin/python3 -I <file>` from the folder /: no word of the hub or of an agent and no
+        program of the agent's PATH, and an end after HOME_READING_TIME that the agent's user cannot lift. An agent
+        that runs as this service's own user (a Mac's one agent, or a Linux agent from before the per-agent move):
+        this service runs it itself, with its own Python. Each process of that user can write into the reading's
+        pipe, so this service reads at most HOME_READING_MOST bytes of it before a deadline and takes no error output
+        (home_reading_run). It records and stops nothing, no message goes out of it, and a fault in one agent's
+        reading costs that one reading only. A hub that has no such route (404) gets no readings for an hour."""
+        if self.homes_off is not None and self.clock() - self.homes_off < HOME_READING_AGAIN:
+            return None
+        if self.homes_at is not None and self.clock() - self.homes_at < REPORT_EVERY:
+            return None
+        self.homes_at = self.clock()
+        me = pwd.getpwuid(os.getuid()).pw_name
+        users = {agent: found["user"] for agent, found in self.agent_users().items() if found.get("user")}
+        if not users:
+            return None
+        try:
+            with open(os.path.join(self.kit, "home_reading.py"), "rb") as f:
+                program = f.read()
+        except OSError:
+            return None
+        fd, path = tempfile.mkstemp(prefix="fleet-home-reading-", suffix=".py", dir="/tmp")
+        readings = {}
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(program)
+            os.chmod(path, 0o644)
+            for agent, user in users.items():
+                if user == me:
+                    argv = [sys.executable, "-I", path]
+                elif os.path.exists(HOME_PYTHON):
+                    argv = self.as_agent(user, ["/usr/bin/timeout", "-k", "5", str(HOME_READING_TIME), HOME_PYTHON,
+                                                "-I", path])
+                else:
+                    continue
+                try:
+                    code, out = self.home_reading_run(argv)
+                    reading = json.loads(out) if code == 0 and out and len(out) <= HOME_READING_MOST else None
+                except Exception:       # noqa: BLE001 -- bytes that are no text, a nesting too deep: that one reading
+                    code, reading = None, None
+                readings[agent] = reading if isinstance(reading, dict) else \
+                    {"error": f"the reading of {user} failed (exit {code})" if code else "the reading gave no object"}
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+        if not readings:
+            return None
+        status, _ = self.hub.call("POST", f"/server/{self.name}/homes", {"agents": readings})
+        self.homes_off = self.clock() if status == 404 else None
+        return status
+
+    def home_reading_run(self, argv):
+        """(exit code or None, the reading's output) of one home reading: at most HOME_READING_MOST + 1 bytes of its
+        standard output, read in this thread with select and os.read until HOME_READING_WAIT has passed, with no error
+        output. A process of the agent's user can write into that pipe as long as it likes, or hold it open and write
+        nothing, so this service never reads more than the bound and never waits past the deadline: then it ends the
+        reading's sudo (whose real user is this service's, so the signal reaches it, and sudo hands it on) and closes
+        the pipe, which no other thread reads, so the close never waits."""
+        try:
+            proc = self.popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                              cwd="/")
+        except OSError:
+            return None, ""
+        fd, got, most = proc.stdout.fileno(), bytearray(), HOME_READING_MOST + 1
+        deadline, ended = time.monotonic() + HOME_READING_WAIT, False
+        waiting = select.poll()         # poll and not select: select refuses a file number of 1024 or more
+        waiting.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        try:
+            while len(got) < most:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                if not waiting.poll(int(min(left, 1.0) * 1000) + 1):
+                    continue
+                block = os.read(fd, min(1 << 16, most - len(got)))
+                if not block:
+                    ended = True
+                    break
+                got += block
+        except (OSError, ValueError):
+            pass
+        if not ended:
+            with contextlib.suppress(OSError):
+                proc.terminate()
+        with contextlib.suppress(OSError, ValueError):
+            proc.stdout.close()
+        try:
+            code = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)    # reaped, so no sudo stays behind as a zombie
+            code = None
+        return code, bytes(got).decode("utf-8", "replace")
 
     # ---- the outgoing gate (vault.py, "the outgoing gate"): the service user is the gate's one road to the hub
     def egress_ask(self, request, timeout=10):
@@ -964,7 +1080,7 @@ class Service:
         def beat():
             while not done.wait(REPORT_EVERY):
                 try:
-                    self.report()
+                    self.report(homes=False)
                 except Exception:
                     pass        # the next beat, or the report after the job, tries again
         threading.Thread(target=beat, name="job-heartbeat", daemon=True).start()

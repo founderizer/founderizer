@@ -502,7 +502,7 @@ class FromNothing(WithServer):
         self.assertEqual(set(reached) | set(missing), set(owner_mcp.PAGES))
         self.assertLessEqual({"state", "machines", "servers", "team", "capacity", "health", "releases", "checks",
                               "triggers", "responsibilities", "resources", "profiles", "people", "conversations",
-                              "chat_apps", "devices", "goal", "responsibility", "agent_messages", "notes"},
+                              "chat_apps", "devices", "goal", "responsibility", "agent_messages", "notes", "homes"},
                              set(reached))
         self.assertEqual(reached["state"]["db"], "test-generation")
         self.assertEqual(reached["goal"]["goal"]["id"], goal)

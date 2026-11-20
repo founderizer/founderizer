@@ -872,6 +872,11 @@ PAGES = {
     "goal": ("/ui/goals/{id}", "one goal with its recorded spending and its history"),
     "resources": ("/ui/resources", "each resource, the owner's standing for it (grant), who holds it; the signed pool "
                                    "of secrets is on the page vault"),
+    "homes": ("/ui/homes", "what stays in each agent's home on a Linux server, as its server's service read it as that "
+                           "agent's own user: kit files (with release: same or differs), units, ~/.local/bin, the "
+                           "Python user site, dot files, runtime settings, the crontab, processes and listeners, each "
+                           "with its size and digest and when it first came, changed and went (give agent for all its "
+                           "rows). A record only: nothing is refused or told"),
     "hosts": ("/ui/hosts", "where each agent's connections went, on each Linux server with the outgoing gate: one row "
                            "for each agent, registrable domain, port and verdict, with its DNS questions, connections, "
                            "bytes and times, and each server's gate (give agent for its full names). Nothing is "

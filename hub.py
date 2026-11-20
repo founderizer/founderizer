@@ -459,6 +459,13 @@ CREATE TABLE IF NOT EXISTS egress_hosts(agent TEXT NOT NULL, domain TEXT NOT NUL
 CREATE TABLE IF NOT EXISTS egress_names(agent TEXT NOT NULL, domain TEXT NOT NULL, name TEXT NOT NULL,
   PRIMARY KEY(agent, domain, name));
 CREATE INDEX IF NOT EXISTS egress_hosts_last ON egress_hosts(agent, last);
+-- The home reading (the session wall, version 2, slice 0): one row for each agent and item of what stays in its home,
+-- as its server's service read it (home_reading.py), and each agent's last reading.
+CREATE TABLE IF NOT EXISTS home_items(agent TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL, size INTEGER,
+  sha256 TEXT, task TEXT, first REAL NOT NULL, changed REAL NOT NULL, gone REAL, server TEXT,
+  PRIMARY KEY(agent, kind, name));
+CREATE TABLE IF NOT EXISTS home_readings(agent TEXT PRIMARY KEY, server TEXT, read REAL, reported REAL NOT NULL,
+  error TEXT, more INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS egress_servers(server TEXT PRIMARY KEY, gate TEXT, other_users INTEGER NOT NULL DEFAULT 0,
   reported REAL NOT NULL, down INTEGER NOT NULL DEFAULT 0, unloaded INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS server_jobs(id INTEGER PRIMARY KEY, server TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT,
@@ -1900,6 +1907,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "default_models",    # the owner, 9 November 2026: "a default for each [AI provider] somewhere under
                                     # settings, and then each agent can be changed individually"
                "web_hosts",         # the host list of an agent whose Shell box is off (UI-API.md, "the host list")
+               "homes",             # the owner, 20 November 2026 ("Yes, slice 0"), the session wall's slice 0:
+                                    # POST /server/<name>/homes takes a home reading, GET /ui/homes reads the rows
                "hosts",             # the owner, 17 November 2026 ("Yes, all nine"), step 1 of the outgoing gate:
                                     # POST /server/<name>/egress takes a gate's counts, GET /ui/hosts reads them
                "hub_shared",        # the owner, 14 November 2026 (the slider's first step, "Yes, as shown"): the
@@ -51728,6 +51737,208 @@ def hosts_view(agent=None):
     return {"servers": servers, "agents": out, "policy": EGRESS_POLICY}
 
 
+# ---------------------------------------------------------------- the home reading (the session wall, slice 0)
+#
+# The owner, 20 November 2026 ("Yes, slice 0") of ~/dev/founderizer-plans/agent-runtime-settings-proposal-v2.md:
+# today a session of an agent can write its whole home, and nothing records it (VAULT.md, "What a session writes on
+# its own machine"). Each server's service now reads, as each agent's own user, a fixed set of what stays there
+# (home_reading.py) and posts it with its reading. The hub keeps one row for each agent, kind and name: its size and
+# digest, when the hub first saw it, when it last changed, when it was last seen and when it went. A process or a
+# listener that is gone leaves no row. No message goes out of it: an agent sets its git name or installs a tool for
+# good reasons, and nobody can judge a digest. The owner reads it with GET /ui/homes (his MCP server's fleet_read
+# homes); nothing of it is on his screen. To undo it: the service's step goes, and nothing else depends on it.
+HOME_KINDS = ("kit_head", "kit", "kit_git", "unit", "bin", "program", "site", "dot", "runtime", "cron", "process",
+              "listener")
+HOME_PASSING = ("process", "listener")      # kinds whose rows go when they are gone: they come and go with sessions
+HOME_ITEMS_MOST = 4000          # items of one agent's reading that the hub takes
+HOME_AGENT_ROWS = 6000          # rows that the hub keeps for one agent: at it, the oldest row that went makes room,
+                                # and with none such no new row comes and `more` counts it
+HOME_PAGE = 300                 # rows of each agent on GET /ui/homes when no agent is named
+HOME_ONE_AGENT = HOME_AGENT_ROWS
+HOME_NAME = re.compile(r"[\x20-\x7e]{1,420}")
+HOME_HELD = "(a name that holds the value of a login)"
+HOME_COLUMNS = ("kind", "name", "size", "sha256", "task", "first", "changed", "gone", "server")
+HOME_KNOWN = {}                 # commit -> True: commits that the hub has (homes_view); an unknown one is asked again
+HOME_HISTORY = {}               # (commit, the hub's revision) -> whether the commit is in the fleet's own history
+
+
+def home_reading_checked(reading):
+    """(the reading's own fields, its items) of one agent's posted home reading, each part checked as the input of a
+    program that the agent's user can change; a reading that is no object, or that holds an error, keeps its error
+    and no item."""
+    if not isinstance(reading, dict):
+        return {"error": "no reading"}, None
+    error = reading.get("error")
+    if error is not None:
+        return {"error": " ".join(str(error).split())[:200]}, None
+    read, more, items, cut = reading.get("read"), reading.get("more", 0), reading.get("items"), reading.get("cut", [])
+    # the range first: a comparison is defined for any number, and an integer of 400 digits makes float() raise
+    if isinstance(read, bool) or not isinstance(read, (int, float)) or not 0 <= read < 2 ** 40 or \
+            isinstance(more, bool) or not isinstance(more, int) or not 0 <= more < 2 ** 31 or \
+            not isinstance(items, list) or not isinstance(cut, list) or len(cut) > len(HOME_KINDS):
+        return {"error": "a reading of another shape"}, None
+    cut = sorted({k for k in cut if k in HOME_KINDS})
+    kept = {}
+    for item in items[:HOME_ITEMS_MOST]:
+        if not isinstance(item, dict) or item.get("kind") not in HOME_KINDS or \
+                not isinstance(item.get("name"), str) or not HOME_NAME.fullmatch(item["name"]):
+            more += 1
+            continue
+        size, sha, task = item.get("size"), item.get("sha256"), item.get("task")
+        if size is not None and (isinstance(size, bool) or not isinstance(size, int) or not 0 <= size < 2 ** 62):
+            size = None
+        if sha is not None and not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)):
+            sha = None
+        if task is not None and not (isinstance(task, str) and re.fullmatch(r"T-[1-9][0-9]{0,17}", task)):
+            task = None
+        name = item["name"]
+        if secret_hit(name):        # before the transaction; each such name stays a row of its own
+            name = f"{HOME_HELD} {hashlib.sha256(name.encode()).hexdigest()[:12]}"
+        kept[item["kind"], name] = (size, sha, task)
+    if len(items) > HOME_ITEMS_MOST:
+        cut = list(HOME_KINDS)          # the hub took only a part: of no kind can it say that something went
+    return {"read": float(read), "more": min(2 ** 31 - 1, more + max(0, len(items) - HOME_ITEMS_MOST)), "cut": cut}, \
+        kept
+
+
+def home_keep(server, agent, reading, items):
+    """One agent's home reading into the rows, inside one transaction (DB.execute only). A new item gets a row; an
+    item whose size, digest or task moved, or that came back, gets the time that it changed; nothing else is written
+    for an item that stayed the same. A file that the reading no longer has is gone, and a process or a listener that
+    is gone leaves no row, in each kind that the reading did not cut at its bound (`cut`): what it left out of such a
+    kind may still be there. A reading with an error keeps the rows as they are. At HOME_AGENT_ROWS, the oldest row of
+    a file that went makes room for a new one, then the oldest row of a process or a listener that this reading does
+    not have; with neither the new one is counted in `more`. A row of a file that is still there never goes."""
+    in_transaction("home_keep")
+    t0 = now()
+    DB.execute("INSERT INTO home_readings(agent,server,read,reported,error,more) VALUES(?,?,?,?,?,?) "
+               "ON CONFLICT(agent) DO UPDATE SET server=excluded.server, read=COALESCE(excluded.read, read), "
+               "reported=excluded.reported, error=excluded.error, more=excluded.more",
+               (agent, server, reading.get("read"), t0, reading.get("error"), reading.get("more", 0)))
+    if items is None:
+        return
+    have = {(r[0], r[1]): (r[2], r[3], r[4], r[5]) for r in DB.execute(
+        "SELECT kind, name, size, sha256, task, gone FROM home_items WHERE agent=?", (agent,))}
+    count, left = len(have), 0
+    # what can make room at the bound, the first last (pop): the rows of files that went, the oldest first, then the
+    # rows of processes and listeners that this reading does not have; never a row that this reading has
+    room = None
+    for (kind, name), (size, sha, task) in items.items():
+        was = have.get((kind, name))
+        if was is None:
+            if count >= HOME_AGENT_ROWS:
+                if room is None:        # read once for each reading, so a reading of many new names costs one query
+                    room = [key for key in ((r[0], r[1]) for r in DB.execute(
+                        "SELECT kind, name FROM home_items WHERE agent=? AND gone IS NOT NULL ORDER BY gone",
+                        (agent,))) if key not in items]
+                    room += sorted(key for key in have if key[0] in HOME_PASSING and key not in items)
+                    room.reverse()
+                if not room:
+                    left += 1           # a row of a file that is still there never goes
+                    continue
+                old = room.pop()
+                DB.execute("DELETE FROM home_items WHERE agent=? AND kind=? AND name=?", (agent, old[0], old[1]))
+                have.pop(old, None)
+                count -= 1
+            count += 1
+            DB.execute("INSERT INTO home_items(agent,kind,name,size,sha256,task,first,changed,server) "
+                       "VALUES(?,?,?,?,?,?,?,?,?)", (agent, kind, name, size, sha, task, t0, t0, server))
+        elif was[:3] != (size, sha, task) or was[3] is not None:
+            DB.execute("UPDATE home_items SET size=?, sha256=?, task=?, changed=?, gone=NULL, server=? WHERE agent=? "
+                       "AND kind=? AND name=?", (size, sha, task, t0, server, agent, kind, name))
+    cut = set(reading.get("cut") or ())
+    for (kind, name), was in have.items():
+        if (kind, name) in items or kind in cut:
+            continue
+        if kind in HOME_PASSING:
+            DB.execute("DELETE FROM home_items WHERE agent=? AND kind=? AND name=?", (agent, kind, name))
+        elif was[3] is None:
+            DB.execute("UPDATE home_items SET gone=? WHERE agent=? AND kind=? AND name=?", (t0, agent, kind, name))
+    if left:
+        DB.execute("UPDATE home_readings SET more=MIN(more+?, 2147483647) WHERE agent=?", (left, agent))
+
+
+def home_commit_known(rev):
+    """True when the hub has this commit. A commit that it has stays known; an unknown one is asked again at the next
+    view, so an agent's random HEAD costs one git call for each view and no memory."""
+    if HOME_KNOWN.get(rev):
+        return True
+    if git_kit("cat-file", "-e", f"{rev}^{{commit}}")[0] != 0:
+        return False
+    if len(HOME_KNOWN) > 4096:
+        HOME_KNOWN.clear()
+    HOME_KNOWN[rev] = True
+    return True
+
+
+@functools.lru_cache(maxsize=8192)
+def home_release_sha(rev, path):
+    """The SHA-256 of a kit file at the release `rev`, a commit that the hub has (home_commit_known), or "" when that
+    release has no such file: what homes_view compares an agent's kit file with."""
+    data = git_blob(rev, path)
+    return hashlib.sha256(data).hexdigest() if data is not None else ""
+
+
+def home_in_history(rev):
+    """True when a checkout's HEAD is a commit of the fleet's own configuration history (an ancestor of the hub's
+    revision, or that revision), False for another commit (a local commit, or one that the hub does not have). Kept
+    for each pair of the commit and the hub's revision, so each view asks git once for each new pair."""
+    hub_rev = kit_revision()
+    if not hub_rev:
+        return None
+    key = (rev, hub_rev)
+    if key not in HOME_HISTORY:
+        if len(HOME_HISTORY) > 4096:
+            HOME_HISTORY.clear()
+        HOME_HISTORY[key] = rev == hub_rev or (home_commit_known(rev) and
+                                               git_kit("merge-base", "--is-ancestor", rev, hub_rev)[0] == 0)
+    return HOME_HISTORY[key]
+
+
+def homes_view(agent=None):
+    """GET /ui/homes: each agent's last home reading and its rows, the last changed first. A kit file has `release`:
+    "same" or "differs" from that file at the commit that its checkout's HEAD names, "absent" when that commit has no
+    such file, or "unknown" when the hub does not have that commit or the reading gave no digest. A checkout's HEAD
+    (kit_head) has `release`: "same" when it is a commit of the fleet's own configuration history (home_in_history),
+    "differs" for another commit, "unknown" with none. A process's row has `task_open` when it names a task."""
+    names = [agent] if agent else [r["agent"] for r in q("SELECT agent FROM home_readings ORDER BY agent")]
+    out = []
+    for name in names:
+        reading = q1("SELECT * FROM home_readings WHERE agent=?", (name,))
+        most = HOME_ONE_AGENT if agent else HOME_PAGE
+        rows = [dict(r) for r in q("SELECT * FROM home_items WHERE agent=? ORDER BY changed DESC, kind, name LIMIT ?",
+                                   (name, most))]
+        total = q1("SELECT COUNT(*) AS n FROM home_items WHERE agent=?", (name,))["n"]
+        heads = {r["name"]: r["sha256"] for r in q("SELECT name, sha256 FROM home_items WHERE agent=? AND "
+                                                   "kind='kit_head'", (name,))}
+        known = {h: home_commit_known(h) for h in set(heads.values()) if h and len(h) == 40}
+        tasks = {r["task"] for r in rows if r["task"]}
+        open_tasks = {tref(r["id"]) for r in q(f"SELECT id FROM tasks WHERE id IN "
+                                                 f"({','.join('?' * len(tasks))}) AND state NOT IN "
+                                                 f"({','.join('?' * len(TERMINAL))})",
+                                                 (*(parse_task(t) for t in tasks), *TERMINAL))} if tasks else set()
+        items = []
+        for r in rows:
+            row = {k: r[k] for k in HOME_COLUMNS}
+            if r["kind"] == "kit":
+                top, _, path = r["name"].partition("/")
+                head = heads.get(top)
+                expected = home_release_sha(head, path) if known.get(head) and "\\" not in path else None
+                row["release"] = ("unknown" if expected is None or r["sha256"] is None else
+                                  "absent" if expected == "" else "same" if expected == r["sha256"] else "differs")
+            elif r["kind"] == "kit_head":
+                history = home_in_history(r["sha256"]) if r["sha256"] and len(r["sha256"]) == 40 else None
+                row["release"] = "unknown" if history is None else "same" if history else "differs"
+            if r["task"]:
+                row["task_open"] = r["task"] in open_tasks
+            items.append(row)
+        out.append({"agent": name, "server": reading["server"] if reading else None,
+                    "read": reading["read"] if reading else None, "reported": reading["reported"] if reading else None,
+                    "error": reading["error"] if reading else None, "items": items,
+                    "more": max(0, total - len(rows)) + (reading["more"] if reading else 0)})
+    return {"agents": out}
+
+
 def servers_view():
     """GET /ui/servers: each server with its kind, address, agents, newest reading, availability (why: the codes of
     what stops a new agent) and newest job; whether the hub's own server takes agents (hub_shared), and the step
@@ -52925,13 +53136,16 @@ AGENT_COLUMNS = (
     ("model_changes", "agent"), ("model_changes", "by"),       # AUTONOMY.md P8: whose model, and its one changer
     ("questions", "answered_by"),           # the agent that answered, or 'owner'
     ("egress_hosts", "agent"), ("egress_names", "agent"),      # the outgoing gate's records of the agent's hosts
+    ("home_items", "agent"), ("home_readings", "agent"),       # the home reading: what stays in the agent's home
     ("needs", "give_agent"),       # the lane "Give on a card": the agent that an item's Give gives access to
     ("link_codes", "agent"))                # Telegram (CHAT-APPS.md 19.4): the agent whose bot a person's invite opens
 # The tables with one row for each agent. A row under the new name is what an agent of that name left before it
 # was removed by hand, so it goes first, and the renamed agent's own row takes the name.
 AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent",
               # the outgoing gate's records: rows under the new name are an earlier agent's of that name, and they go
-              "egress_hosts": "agent", "egress_names": "agent"}
+              "egress_hosts": "agent", "egress_names": "agent",
+              # the home reading: rows under the new name are of an earlier agent of that name, and they go
+              "home_items": "agent", "home_readings": "agent"}
 # The hub's own notes about one agent in kv, each kept under a prefix and the agent's name. test_rename reads every
 # kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
 AGENT_KV = ("tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
@@ -53379,6 +53593,7 @@ AGENT_REMOVAL = {
     ("calls", "agent"): "spent", ("server_jobs", "agent"): "spent", ("attachments", "agent"): "spent",
     ("jobs", "agent"): "spent", ("tool_commands", "agent"): "spent",
     ("egress_hosts", "agent"): "spent", ("egress_names", "agent"): "spent",     # the outgoing gate's records
+    ("home_items", "agent"): "delete", ("home_readings", "agent"): "delete",    # its home went with its OS user
     ("tasks", "owner"): "history", ("tasks", "requester"): "history", ("agent_messages", "sender"): "history",
     ("agent_messages", "recipient"): "history", ("history", "agent"): "history", ("conversations", "agent"): "history",
     ("needs", "by"): "history", ("reports", "from_agent"): "history", ("reports", "to_agent"): "history",
@@ -53823,7 +54038,8 @@ def agent_first_message_sweep(t0):
 MACHINE_COLUMNS = (("server_keys", "server"), ("server_status", "server"), ("server_jobs", "server"),
                    ("deposits", "machine"), ("withdrawals", "machine"), ("placements", "machine"),
                    ("place_codes", "machine"), ("place_hosts", "machine"), ("mac_setups", "server"),
-                   ("first_stores", "machine"), ("egress_servers", "server"), ("egress_hosts", "server"))
+                   ("first_stores", "machine"), ("egress_servers", "server"), ("egress_hosts", "server"),
+                   ("home_items", "server"), ("home_readings", "server"))      # the home reading's rows
 MACHINE_ROWS = (("server_status", "server"), ("place_hosts", "machine"),    # a key of their own: an old row goes
                 ("first_stores", "machine"), ("egress_servers", "server"))
 MACHINE_MAPS = ("addresses", "servers", "access", "vault_stores")      # the team.json maps keyed by a machine
@@ -64917,6 +65133,46 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, {"error": "agent is an agent's name"})
         return self.json(200, scrub(hosts_view(agent)), {"Cache-Control": "no-store"})     # q takes the lock
 
+    def server_homes(self, name):
+        """POST /server/<name>/homes (owner feature homes): each agent user's home reading, which the server's own
+        service made as that user (home_reading.py). An agent that is not of this server is not kept."""
+        name = self.server_caller(name)
+        if name is None:
+            return
+        if len(self.body()) > 8 * 1024 * 1024:
+            return self.json(413, {"error": "the home readings are too large"})
+        readings = self.form().get("agents")
+        if not isinstance(readings, dict) or len(readings) > 64:
+            return self.json(400, {"error": "agents is an object of at most 64 agents, each with its reading"})
+        kept = []
+        for agent, raw in readings.items():
+            if not isinstance(agent, str) or not AGENT_NAME.match(agent):
+                continue
+            try:                # one agent's reading costs no other agent's
+                reading, items = home_reading_checked(raw)      # before the lock: secret_hit reads the logins
+                with LOCK:      # the agent is checked in the same hold as its write: a delete meanwhile keeps nothing
+                    if (agents().get(agent) or {}).get("machine") != name:
+                        continue
+                    with area("activity"), transaction():
+                        home_keep(name, agent, reading, items)
+            except Exception:       # noqa: BLE001
+                print_fault()
+                continue
+            kept.append(agent)
+        return self.json(200, {"ok": True, "kept": sorted(kept)})
+
+    def ui_homes(self, query):
+        """GET /ui/homes (owner feature homes): what stays in each agent's home, as its server's service read it
+        (homes_view). ?agent=<name> gives that agent's rows, up to HOME_ONE_AGENT."""
+        if not self.ui_allowed():
+            return
+        if query.get("db") != kv_get("db_id"):
+            return self.json(409, refusal_words.answer("hub_changed"))
+        agent = query.get("agent")
+        if agent is not None and not AGENT_NAME.match(str(agent)):
+            return self.json(400, {"error": "agent is an agent's name"})
+        return self.json(200, scrub(homes_view(agent)), {"Cache-Control": "no-store"})     # q takes the lock
+
     def server_setup(self, name):
         """POST /server/<name>/setup: the installer's last press on a new Mac. `boot` is this boot of the Mac, and
         `restarts` is false on a Mac with FileVault on, which no automatic login brings back after a restart."""
@@ -68575,6 +68831,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_resources(query)
         if parts == ["ui", "hosts"]:                # owner feature hosts
             return self.ui_hosts(query)
+        if parts == ["ui", "homes"]:                # owner feature homes
+            return self.ui_homes(query)
         if parts == ["ui", "github", "repos"]:      # owner feature repo_picker
             return self.ui_github_repos(query)
         if len(parts) == 3 and parts[:2] == ["ui", "notes"] and AGENT_NAME.match(parts[2]):
@@ -69372,6 +69630,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.server_status(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "egress":     # owner feature hosts
             return self.server_egress(parts[1])
+        if len(parts) == 3 and parts[0] == "server" and parts[2] == "homes":      # owner feature homes
+            return self.server_homes(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "signin":       # owner feature agent_signin
             return self.server_signin(parts[1])
         if len(parts) == 4 and parts[0] == "server" and parts[2] == "jobs" and re.fullmatch(r"[1-9][0-9]{0,17}", parts[3]):

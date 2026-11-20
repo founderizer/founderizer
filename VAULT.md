@@ -951,6 +951,18 @@ host.
       after that app has the new list.
     - During a take-over the agent can see what the owner types.
 
+27. **What a session writes on its own machine.** Each session of an agent runs as the agent's OS user, and that user
+    owns the agent's whole home folder: the helper's code and its service, the agent's hub key, the programs that each
+    session starts, and the settings that each runtime reads. So a session that follows hostile text, and code that an
+    agent runs, can change what each later session of that agent, its checks and its helper read and run, and can
+    leave a program that runs with no session. Founderizer does not stop such a change. The machine's service records,
+    by name, size and digest, the files of that home that later sessions and the helper read and run (the checkout,
+    the user's units, `~/.local/bin`, the Python user site, the shell and tool files, each runtime's settings), the
+    crontab, the processes and the listening ports (`home_reading.py`, the owner's page `homes`). That record stops
+    nothing, and a program of the same user can change what it says. The change stays inside that one agent: another
+    agent's OS user, the hub and the vault's stores are out of its reach. The repair is to remove the agent and add it
+    again.
+
 ## What the owner must do
 
 1. **Protect the Mac.** The owner key and the recovery code are in its login Keychain, and the app uses the owner key
