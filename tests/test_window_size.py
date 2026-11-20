@@ -216,16 +216,19 @@ class Sizes(unittest.TestCase):
 
     def test_a_runner_task_reads_its_prompt_from_a_file_that_it_removes(self):
         """A task in the runner (screen_runner.py) had its prompt, with the list of its repositories, as one word of
-        the command (--prompt). It names the prompt's file now, which the runner reads and removes at its start."""
+        the command (--prompt). It names the prompt's file now, which the runner reads and removes at its start. Its
+        parts of the rules are their names alone (FLEET_RULES), every part here: the runner reads their texts from the
+        checkout and gives them to Codex on its standard input, where no argument limit applies."""
         prompt, env = self.tricky("Task"), self.env()
         with patch.object(sys, "executable", str(self.bin / "python")):     # its program, and the repository command
             command = fleet.session_command(AGENT, RUNNER, prompt, task="T-7", attempt=2, generation="g1",
-                                            session=SESSION, token=TOKEN, env=env)
+                                            session=SESSION, token=TOKEN, env=env, rules=list(fleet.RULES_PARTS))
             whole = prompt + fleet.github_text(env, []) + "\n\n" + fleet.MARKER.format(SESSION)
         words = self.small(command)
         given = self.run_window(command)
         self.assertEqual(given["argv"][0], os.path.join(str(self.kit), "screen_runner.py"))
         self.assertEqual(given["argv"][1:-1], ["--needs", "none", "--prompt-file"])
+        self.assertEqual(given["env"].get("FLEET_RULES"), ",".join(fleet.RULES_PARTS))
         path = Path(given["argv"][-1])
         self.assertEqual(self.private(path), whole)
         self.assertEqual(given["env"]["FLEET_SESSION_TOKEN"], TOKEN)

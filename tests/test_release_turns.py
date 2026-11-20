@@ -1113,6 +1113,13 @@ def later_data(t0=None):
           (made["task"], "Call read_messages with task_id \"T-1\" whenever signalled.", t0,
            json.dumps({"needs": "none", "resume": False, "attempt": 1, "generation": "test-generation",
                        "opening": "read", "rules": ["logins"]})))
+    # The start event of a task in the screen runner on a helper that gives its runner the parts of the rules
+    # (hub.stable_extra, helper feature runner_rules, 20 November 2026): the parts, and no opening
+    hub.q("INSERT INTO events(agent,kind,task,text,created,extra) VALUES('vps','task',?,?,?,?)",
+          (made["task"], "You are agent \"vps\" in Founderizer. Read RULES.md, rules/logins.md and profiles/vps.md in "
+                         "this folder first.", t0,
+           json.dumps({"needs": "screen", "resume": False, "attempt": 1, "generation": "test-generation",
+                       "rules": ["logins"]})))
     hub.q("INSERT INTO notes(task,agent,ts,text) VALUES(?,'vps',?,'the last note, kept by deliver_result')",
           (made["task"], t0))
     # plan P0: the start of a session that starts idle, which a poll handed out, its helper took, and a later answer

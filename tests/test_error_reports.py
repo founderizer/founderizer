@@ -76,7 +76,7 @@ class Report(unittest.TestCase):
         self.assertEqual(body["faults"][0]["frames"][0], lib)
         self.assertEqual((body["refusals"][0]["file"], body["refusals"][0]["line"]), ("lib", 0))
         self.assertEqual(report({"faults": [a_fault(frames=[{"file": "hub.py", "line": 0}])]})["faults"][0]["frames"],
-                         [{"file": "hub.py", "line": 0}])         # a line that Python did not give (diagnostics.place)
+                         [{"file": errorreports.mark("hub.py"), "line": 0}])  # a line that Python did not give
         for wrong in ({"file": "lib", "line": 5}, {"file": "hub.py", "line": -1}, {"file": "lib", "line": False}):
             with self.subTest(frame=wrong):
                 self.assertEqual(report({"faults": [a_fault(frames=[wrong])]})["faults"], [])
@@ -107,6 +107,34 @@ class Report(unittest.TestCase):
                        "refusals": [a_refusal(line=n + 1) for n in range(30)]})
         self.assertEqual((len(body["faults"]), len(body["refusals"])), (errorreports.MOST, errorreports.MOST))
 
+    def test_a_file_and_a_tool_go_as_their_mark_and_names_gives_them_back(self):
+        """Our side takes no name of a file or a tool (words joined by "_", which a stranger's report could spell a
+        sentence with), only its mark: and the reader of the kinds of error needs names() to read the report."""
+        body = report({"faults": [a_fault(frames=[{"file": "hub.py", "line": 120}, {"file": "lib", "line": 0}])],
+                       "refusals": [a_refusal(tool="report_up"), a_refusal(tool="other")]})
+        hub_py, tool = errorreports.mark("hub.py"), errorreports.mark("report_up")
+        self.assertEqual(body["faults"][0]["frames"], [{"file": hub_py, "line": 120}, {"file": "lib", "line": 0}])
+        self.assertEqual([(r["tool"], r["file"]) for r in body["refusals"]], [(tool, hub_py), ("other", hub_py)])
+        self.assertTrue(errorreports.MARK.fullmatch(hub_py) and errorreports.MARK.fullmatch(tool))
+        text = json.dumps(body)
+        self.assertNotIn("hub.py", text)
+        self.assertNotIn("report_up", text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(errorreports.main(["names"]), 0)
+        lines = set(out.getvalue().splitlines())
+        for line in (f"{hub_py} hub.py", f"{tool} report_up"):        # a file of the tree, a tool of hub.TOOLS
+            self.assertIn(line, lines)
+
+    def test_our_side_takes_each_class_of_the_recorder(self):
+        """Our side refuses a whole report whose class it does not hold (founderizer-web, src/lib/errors.ts, CLASSES).
+        A class added to diagnostics.CLASSES goes there first, then to errorreports.THEIR_CLASSES."""
+        self.assertEqual(diagnostics.CLASSES, errorreports.THEIR_CLASSES,
+                         "a class of diagnostics.CLASSES goes to founderizer-web's src/lib/errors.ts CLASSES first, live "
+                         "on the site, and only then to errorreports.THEIR_CLASSES: until then it goes as \"other\"")
+        with unittest.mock.patch.object(errorreports, "THEIR_CLASSES", frozenset({"ValueError"})):
+            self.assertEqual(report({"faults": [a_fault()]})["faults"][0]["class"], "other")
+
     def test_a_class_that_code_chose_never_goes(self):
         body = report({"faults": [a_fault(**{"class": "AnaPerez"}), a_fault(**{"class": "other"})]})
         self.assertEqual([f["class"] for f in body["faults"]], ["other"])
@@ -118,8 +146,12 @@ class Report(unittest.TestCase):
         long = "/".join(["a" * 80] * 4) + ".py"         # the longest file name of diagnostics.FILE
         faults = [a_fault(frames=[{"file": long, "line": 9_999_999}] * 12, last=NOW - 1000 + n, count=10 ** 9)
                   for n in range(20)]
-        body = report({"faults": faults, "refusals": [a_refusal(file=long) for _ in range(20)]})
+        refusals = [a_refusal(file=long) for _ in range(20)]
+        body = report({"faults": faults, "refusals": refusals})
         self.assertLessEqual(len(json.dumps(body, separators=(",", ":")).encode()), errorreports.LIMIT)
+        with unittest.mock.patch.object(errorreports, "LIMIT", 4000):     # marks keep a whole report small now
+            body = report({"faults": faults, "refusals": refusals})
+        self.assertLessEqual(len(json.dumps(body, separators=(",", ":")).encode()), 4000)
         self.assertLess(len(body["faults"]) + len(body["refusals"]), 40)
         self.assertEqual(max(f["last"] for f in body["faults"]), NOW - 1000 + 19)       # the newest stays
 
@@ -385,8 +417,8 @@ class OnTheHub(OwnerAPI):
         (fault,) = body["faults"]
         self.assertEqual(fault["class"], "KeyError")
         files = [f["file"] for f in fault["frames"]]
-        self.assertEqual((files[-1], HERE in files),                                  # fail_with's, called here
-                         (os.path.normpath(os.path.join(FOLDER, "test_diagnostics.py")), True))
+        self.assertEqual((files[-1], errorreports.mark(HERE) in files),               # fail_with's, called here
+                         (errorreports.mark(os.path.normpath(os.path.join(FOLDER, "test_diagnostics.py"))), True))
         text = json.dumps(body)
         for piece in words.split(" "):
             self.assertNotIn(piece, text)

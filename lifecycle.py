@@ -402,7 +402,10 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "web_hosts",
             # a removed person's windows close, and the runtime's own files of their sessions go (the event `forget`
             # of the hub's person_remove: forget_valid, fleet.Helper.forget)
-            "forget_sessions"]
+            "forget_sessions",
+            # a task in the screen runner takes the parts of the rules that the hub names for it (hub.stable_extra,
+            # FLEET_RULES of screen_runner.py): its thread has them after RULES.md as its developer instructions
+            "runner_rules"]
 # ---------------------------------------------------------------- the host list
 #
 # The host list of an agent whose Shell box is off and whose Web box is on (team.json "web_hosts"): the hosts on which

@@ -92,8 +92,22 @@ def reason(error):
 
 
 # What a thread reads between the rules and its instruction, which says to read RULES.md: the rules are already in its
-# context (the words of a stable start, fleet.STABLE_RULES)
-RULES_ABOVE = "The fleet's rules (RULES.md) are above, in your context, so do not read that file again."
+# context (the words of a stable start, fleet.STABLE_RULES). {files}: RULES.md and each part of rules/ after it, by
+# the names that its task text gives them to read (rules_above).
+RULES_ABOVE = "The fleet's rules ({files}) are above, in your context, so do not read {them} again."
+
+
+def rule_parts(names):
+    """The parts of the rules that the hub named for this task (FLEET_RULES) as (part, text), in fleet.RULES_PARTS order
+    and each as fleet.part_texts reads it: a name that is no part, and a part that this checkout lacks, are left out,
+    and the thread reads such a file as its task text names it."""
+    return [(part, text) for part in fleet.RULES_PARTS if part in names for text in fleet.part_texts([part])]
+
+
+def rules_above(parts):
+    """RULES_ABOVE for a thread whose developer instructions hold RULES.md and, after it, these parts of rules/."""
+    files = ["RULES.md"] + [f"rules/{part}.md" for part in parts]
+    return RULES_ABOVE.format(files=", ".join(files), them="those files" if parts else "that file")
 
 
 def primary_instruction(agent, task, needs):
@@ -122,12 +136,13 @@ def primary_instruction(agent, task, needs):
 
 class Runner:
     def __init__(self, agent, task, attempt, generation, prompt, command, http=fleet.http, session="", model=None,
-                 effort=None, needs="screen"):
+                 effort=None, needs="screen", rules=None):
         if not agent or not generation or not task.startswith("T-") or not task[2:].isdigit() or int(attempt) < 1:
             raise ValueError("A screen runner requires an agent, task, attempt and generation")
         if needs not in ("none", "browser", "screen"):
             raise ValueError("A runner task needs none, browser or screen")
         self.agent, self.task, self.prompt, self.command, self.needs = agent, task, prompt, command, needs
+        self.rules = list(rules or ())      # the parts of the rules that the hub named (FLEET_RULES): none, as before
         # A screen task: the agent's screen settings (owner API 1.11). Another task: its primary settings. None: the
         # default of that runtime's account.
         self.model, self.effort = model, effort
@@ -342,13 +357,17 @@ class Runner:
             if self.needs != "screen":      # a primary task: its own instruction, not the screen task's limits
                 instruction = primary_instruction(self.agent, self.task, self.needs)
             # RULES.md first, whole, as every Codex session of the fleet has it (fleet.codex_rules): until 17 November
-            # 2026 the thread read it as the folder's AGENTS.md, which Codex cut at 32 KiB. The words after it still
-            # say to read RULES.md, which a thread without it does. Its parts of rules/ are not here, as they are in a
-            # terminal session's developer instructions: the hub names no parts for a runner's start (hub.stable_extra),
-            # so the thread reads them as the files that its task's start names, and a compaction loses them (an open
-            # gap, lanes/agent-context-size.md).
+            # 2026 the thread read it as the folder's AGENTS.md, which Codex cut at 32 KiB. After it, the parts of
+            # rules/ that the hub named for this task (FLEET_RULES, hub.stable_extra), as a terminal session's developer
+            # instructions have them: Codex builds these again when it compacts the thread, and until 20 November 2026
+            # the thread read its parts only as the files that its task text names, which a compaction lost.
+            # RULES_ABOVE names the files that are here. The words after it still say to read RULES.md, which a thread
+            # without it does; such a thread gets no part either, as a terminal session gets none from codex_rules.
             rules = fleet.rules_text()
-            instruction = rules + "\n\n" + RULES_ABOVE + "\n\n" + instruction if rules else instruction
+            if rules:
+                parts = rule_parts(self.rules)
+                instruction = "\n\n".join([rules] + [text for _, text in parts] +
+                                          [rules_above([part for part, _ in parts]), instruction])
             # The owner's direction excludes full Chrome DevTools Protocol access for the browser tools. No AGENTS.md
             # of the folder (fleet.CODEX_NO_FOLDER_RULES): the published one is for a person's coding agent.
             config = {"mcp_servers.fleet.url":url,"mcp_servers.fleet.tool_timeout_sec":120,
@@ -537,9 +556,11 @@ def main():
         command = lifecycle.exe(lifecycle.APP_SERVER_RUNTIME)
         if not command:
             fleet.die(f"the {label} runtime is not installed")
+    # FLEET_RULES: the parts of the rules that the hub named for this task, joined by commas (fleet.session_command)
     runner = Runner(agent, os.environ.get("FLEET_TASK", ""), os.environ.get("FLEET_ATTEMPT", "0"),
                     os.environ.get("FLEET_GENERATION", ""), args.prompt, command,
-                    session=os.environ.get("FLEET_SESSION", ""), model=args.model, effort=args.effort, needs=args.needs)
+                    session=os.environ.get("FLEET_SESSION", ""), model=args.model, effort=args.effort, needs=args.needs,
+                    rules=[part for part in os.environ.get("FLEET_RULES", "").split(",") if part])
     try:
         return runner.run()
     except (OSError, ValueError, RuntimeError) as exc:

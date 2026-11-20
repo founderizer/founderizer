@@ -14,16 +14,26 @@ name and version, and how many agents and servers the fleet has. Every value is 
 contract's own patterns, and a value out of shape is left out, so that nothing else can ride along. Only what
 happened after the report before it, and after the owner turned reports on, goes.
 
+**No word goes either, not even a name of the code** (the owner, 20 November 2026: "Yes, look at them"). The names of
+files and tools are words joined by "_", and anybody can post a report to our side, whose mail and whose reader of the
+kinds of error (an agent) read them. So a file of this code tree and a refused call's tool go as their mark (mark):
+the first 16 hexadecimal characters of the SHA-256 of the name, which our side takes as hex and nothing else. A class
+goes as its name, from the recorder's fixed list, which our side holds too. `python3 errorreports.py names`, in the
+code of a report's version, prints each mark with its name.
+
 **Where it goes:** only to our own site, over HTTPS, at founderizer.com or a host below it (a staging fleet reports to
 staging), and no redirect is followed. It carries no Authorization header: the route asks for no account, and the
 report needs nothing that names the subscription.
 
 Python standard library only.
 """
+import hashlib
 import http.client
 import json
+import os
 import platform
 import re
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -52,7 +62,21 @@ SYSTEM = re.compile(r"[A-Za-z]{1,16}(?: [0-9]{1,4}(?:\.[0-9]{1,4}){0,3})?")
 SYSTEM_WORD = re.compile(r"[A-Za-z]{1,16}")
 SYSTEM_NUMBER = re.compile(r"[0-9]{1,4}(?:\.[0-9]{1,4}){0,3}(?![0-9])")
 CODE = re.compile(r"[0-9a-f]{1,64}")
-CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+MARK = re.compile(r"[0-9a-f]{16}")   # a file's or a tool's mark: mark()
+# The classes that our side takes (founderizer-web, src/lib/errors.ts, CLASSES), with "other": a report that names
+# another is refused whole. A class added to diagnostics.CLASSES goes to our side first, then here; until then it goes
+# as "other" (test_error_reports says when the two lists differ).
+THEIR_CLASSES = frozenset((
+    "ArithmeticError", "AssertionError", "AttributeError", "BlockingIOError", "BrokenPipeError", "BufferError",
+    "CalledProcessError", "ChildProcessError", "ConnectionAbortedError", "ConnectionError", "ConnectionRefusedError",
+    "ConnectionResetError", "DatabaseError", "EOFError", "FileExistsError", "FileNotFoundError", "HTTPError",
+    "ImportError", "IncompleteRead", "IndexError", "IntegrityError", "InterfaceError", "InterruptedError",
+    "IsADirectoryError", "JSONDecodeError", "KeyError", "LookupError", "MemoryError", "ModuleNotFoundError",
+    "NameError", "NotADirectoryError", "NotImplementedError", "OSError", "OperationalError", "OverflowError",
+    "PermissionError", "ProcessLookupError", "ProgrammingError", "RecursionError", "RemoteDisconnected",
+    "RuntimeError", "SSLError", "StopIteration", "SubprocessError", "TimeoutError", "TimeoutExpired", "ToolError",
+    "TypeError", "URLError", "UnboundLocalError", "UnicodeDecodeError", "UnicodeEncodeError", "UnicodeError",
+    "ValueError", "ZeroDivisionError"))
 COMMIT = re.compile(r"[0-9a-f]{40}")
 
 
@@ -141,9 +165,31 @@ def _times(entry):
     return {"count": count, "first": first, "last": last}
 
 
+def mark(name):
+    """What a report carries for the name of a file of this code tree or of one of the hub's tools: the first 16
+    hexadecimal characters of the SHA-256 of the name, so that no word goes (names() goes back)."""
+    return hashlib.sha256(name.encode()).hexdigest()[:16]
+
+
+def names(root=diagnostics.ROOT, tools=()):
+    """Each mark that a report of this code can carry, with its name: every file under `root` that diagnostics.FILE
+    takes, by its path inside `root`, and each of `tools` that diagnostics.NAME takes."""
+    found = {}
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for file in files:
+            path = os.path.relpath(os.path.join(folder, file), root).replace(os.sep, "/")
+            if diagnostics.FILE.fullmatch(path):
+                found[mark(path)] = path
+    for tool in tools:
+        if isinstance(tool, str) and diagnostics.NAME.fullmatch(tool):
+            found[mark(tool)] = tool
+    return found
+
+
 def _frame(value):
-    """A file of this code tree with its line (0 when Python gave none: diagnostics.place), or exactly ("lib", 0): a
-    frame outside the tree, as diagnostics.py keeps it. Anything else is None."""
+    """A file of this code tree, as its mark, with its line (0 when Python gave none: diagnostics.place), or exactly
+    ("lib", 0): a frame outside the tree, as diagnostics.py keeps it. Anything else is None."""
     if not isinstance(value, dict) or set(value) != {"file", "line"}:
         return None
     file, line = value.get("file"), value.get("line")
@@ -152,7 +198,7 @@ def _frame(value):
     line = _number(line, 0, diagnostics.LINE_MOST)
     if line is None or not isinstance(file, str) or not diagnostics.FILE.fullmatch(file):
         return None
-    return {"file": file, "line": line}
+    return {"file": mark(file), "line": line}
 
 
 def _fault(entry):
@@ -167,6 +213,7 @@ def _fault(entry):
     if None in frames or times is None or entry.get("program") not in diagnostics.PROGRAMS \
             or not isinstance(name, str) or not (name in diagnostics.CLASSES or name == "other"):
         return None
+    name = name if name in THEIR_CLASSES else "other"
     errno, http = entry.get("errno"), entry.get("http")
     if errno is not None and _number(errno, 0, 100_000) is None or http is not None and _number(http, 100, 599) is None:
         return None
@@ -174,13 +221,15 @@ def _fault(entry):
 
 
 def _refusal(entry):
-    """One refused call of diagnostics.view in the contract's shape, checked again, or None."""
+    """One refused call of diagnostics.view in the contract's shape, checked again, or None. Its tool goes as its
+    mark, or as "other" when the recorder did not know it."""
     frame = _frame({"file": entry.get("file"), "line": entry.get("line")})
     times = _times(entry)
     tool = entry.get("tool")
-    if frame is None or times is None or not isinstance(tool, str) or not CLASS.fullmatch(tool):
+    if frame is None or times is None or not isinstance(tool, str) or not diagnostics.NAME.fullmatch(tool):
         return None
-    return dict({"tool": tool, "file": frame["file"], "line": frame["line"]}, **times)
+    return dict({"tool": "other" if tool == "other" else mark(tool), "file": frame["file"], "line": frame["line"]},
+                **times)
 
 
 def _size(body):
@@ -256,3 +305,19 @@ def send(url, body, timeout=None):
         raise ReportError(f"founderizer.com cannot be reached: {str(e.reason)[:200]}") from None
     except (OSError, ValueError, http.client.HTTPException):    # it went, and no answer that HTTP reads came back
         raise ReportError("founderizer.com gave no answer in time") from None
+
+
+def main(argv):
+    """`python3 errorreports.py names`: each mark that a report of this code can carry, with its name, one a line,
+    for the reader of the kinds of error. Run it in the code of the report's version."""
+    if argv != ["names"]:
+        print("usage: python3 errorreports.py names", file=sys.stderr)
+        return 2
+    import hub          # its tool list; imported only here, because the hub itself imports this file
+    for key, name in sorted(names(tools=[tool[1] for tool in hub.TOOLS]).items()):
+        print(key, name)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

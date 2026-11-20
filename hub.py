@@ -6867,6 +6867,7 @@ def stable_opening(agent, needs):
 
 STABLE_START = "stable_start"       # the helper feature (lifecycle.FEATURES)
 ACP_TASKS = "acp_tasks"             # the helper feature of a task of driver acp with the third opening (spec 3.10)
+RUNNER_RULES = "runner_rules"       # the helper feature of a task in the screen runner with its parts (stable_extra)
 
 
 def task_start_text(agent, task_id, resume=False, note="", row=None, opening=None):
@@ -6875,10 +6876,10 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
     session whose start held its rules and its profile (opening) is told nothing about reading them."""
     said = (f'Call read_messages with task_id "{tref(task_id)}" whenever signalled. ' if opening else
             f'You are agent "{agent}" in Founderizer. Read {", ".join(rules_files(rules_parts(agent)))} and '
-            f'profiles/{agent}.md in this folder first, but RULES.md only if your context does not hold it yet: '
-            f'your helper gives it with your start. Your helper brought this folder up to date just before this '
-            f'session; do not pull at the start. Call read_messages with task_id \"{tref(task_id)}\" now and whenever '
-            f'signalled. ')
+            f'profiles/{agent}.md in this folder first, but a file of the rules only if your context does not hold it '
+            f'yet: your helper gives the rules with your start. Your helper brought this folder up to date just before '
+            f'this session; do not pull at the start. Call read_messages with task_id \"{tref(task_id)}\" now and '
+            f'whenever signalled. ')
     closed = shell_off(agent)           # support plan F1: its own tools, and no way up but its typed result
     # A message started this attempt for a task that waits for its reminder (liveness): its work now is the message,
     # so this start does not say "continue and finish", which the note after it would then have to take back.
@@ -7988,14 +7989,35 @@ def attempt_event(t, note="", resume=True):
     return (t["owner"], "task", t["id"],
             start_text(t["owner"], t["id"], resume=resume, note=note, row=t, opening=opening),
             dict({"needs": t["needs"], "resume": True, "attempt": t["attempt"] + 1, "generation": kv_get("db_id")},
-                 **stable_extra(t["owner"], opening),
+                 **stable_extra(t["owner"], opening, t["needs"]),
                  **closed_extra(t["owner"], t["responsibility"], (question_record(t["id"]) or {}).get("record"))))
 
 
-def stable_extra(agent, opening):
+def stable_extra(agent, opening, needs=None):
     """What a start event says to a helper that starts the session with its stable text first (plan P9.2): how the
-    session gets its task, and the parts of the rules it reads. Nothing for a start as before."""
-    return {"opening": opening, "rules": rules_parts(agent)} if opening else {}
+    session gets its task, and the parts of the rules it reads. Nothing for a start as before, but the parts for a task
+    of these needs that runs in the screen runner (lifecycle.app_server_task), on a helper that gives them to its
+    runner (helper feature runner_rules): its thread has them after RULES.md as its developer instructions, which Codex
+    builds again when it compacts the thread (20 November 2026, lanes/agent-context-size.md). Its task text still
+    names their files to read, as a start as before has it, so a thread that lacks one reads it: an older runner
+    ignores the parts. read_row: admit_task runs this inside the transaction that writes the task."""
+    if opening:
+        return {"opening": opening, "rules": rules_parts(agent)}
+    if not needs or not app_server_task(agents().get(agent) or {}, needs):
+        return {}
+    features = start_features(agent)
+    return {"rules": rules_parts(agent)} if RUNNER_RULES in features else {}
+
+
+def start_features(agent):
+    """The helper features of the agent's last status report (lifecycle.FEATURES), as a start event reads them: by
+    read_row, because admit_task writes that event inside the transaction of its task, where helper_features, which
+    commits, may not run."""
+    st = read_row("SELECT data FROM machine_status WHERE agent=?", (agent,))
+    try:
+        return (json.loads(st["data"]).get("features") or []) if st else []
+    except (TypeError, ValueError):
+        return []
 
 
 def attempt_rows(t, reason, event, t0, counted=False):
@@ -11291,7 +11313,7 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
                (f["owner"], "task", tid, start, t0,
                 json.dumps(dict({"needs": f["needs"], "resume": False, "attempt": 1,
                                  "generation": generation[0] if generation else None},
-                                **stable_extra(f["owner"], opening),
+                                **stable_extra(f["owner"], opening, f["needs"]),
                                 **closed_extra(f["owner"], f.get("responsibility"), f.get("question_record"))))))
     if f["needs"] == "browser":
         browser_admit_rows(tid, f["owner"], t0)     # build plan 04 (D6): its place, before its helper reads it

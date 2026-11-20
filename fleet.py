@@ -2452,8 +2452,10 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     settings, MCP configuration and credential. A new Codex session ends its prompt with its session id as a marker,
     by which the helper finds its rollout. env: {NAME: value} of session_env, which the session gets as the
     credential, from a file that its window reads and removes. opening and rules: how the hub said this task's
-    session starts (stable_start); with them, `prompt` is the task's own block and comes last. closed: what the hub
-    said of a closed start (support plan F1), and minted: {server: token} of its mint servers (F3, mint_tokens).
+    session starts (stable_start); with them, `prompt` is the task's own block and comes last. A task in the screen
+    runner gets rules alone: the parts that its thread has after RULES.md (FLEET_RULES of screen_runner.py). closed:
+    what the hub said of a closed start (support plan F1), and minted: {server: token} of its mint servers (F3,
+    mint_tokens).
     browser: the catalog tool of the agent's own browser on Linux (Helper.browser_start), which the session gets as
     the MCP server BROWSER_SERVER, in place of Claude Code's --chrome (build plan 04, S2)."""
     if resume and (task or conf.get("runtime") not in MANAGER_RUNTIMES or not session):
@@ -2510,10 +2512,18 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
             chosen += ["--needs", needs]
             if session:
                 prompt += "\n\n" + MARKER.format(session)  # binds the saved primary rollout to this task attempt
+        # The parts of the rules that the hub named for this task (hub.stable_extra, helper feature runner_rules), of
+        # those that this helper knows: the runner gives them to its thread after RULES.md, as its developer
+        # instructions, which a compaction keeps. None from an older hub: the thread reads them as its task text says.
+        # A variable and not an argument: an older runner, in a checkout that a rollback took back before this helper
+        # restarts, ignores it, where its argument parser would end the start. Always set, and empty for no part, so
+        # that no value from the window's environment (a tmux server that a thread's command started) reaches it.
+        parts = [part for part in RULES_PARTS if part in rules] if isinstance(rules, list) else []
         # Its prompt holds the list of its repositories (github_text, up to 500): the runner reads it from its
         # mode-600 file and removes the file (screen_runner.py --prompt-file).
         start = shlex.join(["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}",
                             f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", f"FLEET_SESSION={session}",
+                            f"FLEET_RULES={','.join(parts)}",
                             sys.executable, os.path.join(KIT, "screen_runner.py"), *chosen,
                             "--prompt-file", session_file(agent, task, "md", prompt)])
         return env_prefix(agent, window, values) + start
