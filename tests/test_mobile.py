@@ -556,7 +556,8 @@ class Devices(test_ui_api.OwnerAPI):
         self.assertEqual(status, 200)
         self.assertEqual(set(state), {"schema_version", "db", "time", "manager_flag", "manager_warning", "agents",
                                       "needs", "answered_needs", "tasks", "recent", "holds", "outcomes", "chat_apps",
-                                      "counts", "ui_features", "token", "ended_mark", "asked"})
+                                      "counts", "ui_features", "token", "ended_mark", "asked",
+                                      "owner_computer"})
         self.assertEqual([n["id"] for n in state["needs"]], [need])     # the open item only
         # owner API 1.244: an item that is no team card says so, so the phone draws each of its options to press
         self.assertIs(state["needs"][0]["team"], False)

@@ -487,6 +487,9 @@ class Talk(NeedsCase):
         self.assertIsNone(self.row()["answer"])
 
     def test_a_replaced_item_takes_the_record_of_its_earlier_discussion_along(self):
+        """Bug: the talk of a replaced item stays on its closed card, or the closed card does not name the item that
+        took its place, so that an app draws the hub's words "Replaced by ..." as a card of their own (owner API
+        1.274)."""
         self.raise_item(options=["A", "B"])
         hub.q("INSERT INTO need_talk(need, ts, who, text) VALUES(1, ?, 'owner', 'Can you add a third way?')",
               (hub.now(),))                                             # a record from before 13 November 2026
@@ -495,6 +498,7 @@ class Talk(NeedsCase):
                                                 "replaces": "N-1", "reason": "person"})
         self.assertIn("Raised N-2", out)
         self.assertEqual(self.row(1)["answer"], "Replaced by manager with a new item: Which name now?")
+        self.assertEqual([hub.need_view(self.row(n))["replaced_by"] for n in (1, 2)], [2, None])
         self.assertEqual([t["text"] for t in self.item(2)["talk"]], ["Can you add a third way?"])
         self.assertEqual(hub.need_talk(1), [])
         with self.assertRaisesRegex(hub.ToolError, "closed already"):

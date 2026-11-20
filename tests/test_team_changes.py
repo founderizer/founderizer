@@ -561,15 +561,19 @@ class TeamChanges(Remove):
 
     def test_one_card_for_one_request_and_a_new_plan_replaces_the_open_one(self):
         """Bug: a repeat of the manager's call, after its answer was lost, makes a second card, or two plans wait side
-        by side."""
+        by side, or the card that a new plan replaced does not name it, so an app draws it, or the owner's talk stays
+        on that card, which no app draws (owner API 1.274)."""
         args = {"request_id": str(uuid.uuid4()), "title": "Remove scout?", "why": "Its work moved.",
                 "changes": [{"kind": "remove", "agent": "scout"}]}
         first = hub.t_change_team("manager", dict(args))
         self.assertEqual(hub.t_change_team("manager", dict(args)), first)
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs WHERE team_plan IS NOT NULL")["n"], 1)
         old = self.card()["id"]
+        hub.q("INSERT INTO need_talk(need, ts, who, text) VALUES(?, ?, 'owner', 'Why scout?')", (old, hub.now()))
         self.plan([{"kind": "settings", "agent": "vps", "title": "Deploys"}], title="Name the VPS agent Deploys?")
+        self.assertEqual([t["text"] for t in hub.need_talk(self.card()["id"])], ["Why scout?"])    # his talk moves
         self.assertIn("Replaced by manager", hub.q1("SELECT answer FROM needs WHERE id=?", (old,))["answer"])
+        self.assertEqual(hub.q1("SELECT replaced_by FROM needs WHERE id=?", (old,))["replaced_by"], self.card()["id"])
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs WHERE team_plan IS NOT NULL AND answer IS NULL")["n"], 1)
 
 

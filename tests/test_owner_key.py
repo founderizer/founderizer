@@ -53,7 +53,7 @@ def sha(text):
 
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
-    for cls in (Rule, Registration, Clients):        # their own cases only: OwnerAPI's are test_ui_api's
+    for cls in (Rule, Registration, Computer, Clients):  # their own cases only: OwnerAPI's are test_ui_api's
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     for cls in (Claim, ClaimScript, HubThatStarts):
         suite.addTests(loader.loadTestsFromTestCase(cls))
@@ -531,6 +531,135 @@ class Registration(WithKeyFolder):
         self.assertIn("owner_proof_mismatch", said)
         for secret in (value, sha(KEY), KEY):
             self.assertNotIn(secret, said)
+
+
+class Computer(WithKeyFolder):
+    """POST /ui/owner/computer, and owner_computer of GET /ui/state and GET /ui/mobile (owner feature owner_computer,
+    owner API 1.273): whether the owner's computer is a Mac or a PC, and what its app can do."""
+
+    # The names that the PC app sends, as UI-API.md 1.273 gives them: the default is a Mac with all of them.
+    MAC = {"kind": "mac", "label": "Mac", "can": ["run", "takeover", "door", "agents", "servers", "secrets", "apps",
+                                                  "people", "channels", "knowledge", "backup", "devices"]}
+    PC = {"kind": "windows", "can": ["run", "agents"]}
+
+    def said(self, token=KEY):
+        """owner_computer of GET /ui/state, which GET /ui/mobile must give the same."""
+        (state, whole), (mobile, phone) = self.ask(token=token), self.ask("/ui/mobile", token=token)
+        self.assertEqual((state, mobile), (200, 200))
+        self.assertEqual(whole["owner_computer"], phone["owner_computer"])
+        return whole["owner_computer"]
+
+    def file(self):
+        return (self.folder / hub.OWNER_KEY_FILE).read_bytes()
+
+    def test_only_the_owner_s_computer_with_its_key_says_what_it_is(self):
+        """A VM or a container on the owner's computer has its address and not its key, and a phone is a device. A
+        route that took the address alone, as POST /ui/owner/key does (address_only), would let a guest say that the
+        owner has a PC that can do nothing, and the agents would stop asking him for what his Mac does. The refused
+        calls leave the key's file as it was, byte for byte. The owner's own call keeps the key and its time in the
+        file: a write that lost the SHA-256 would make the file damaged and refuse the owner on every route."""
+        hub.TEAM["owner_devices"] = {"iphone": {"label": "iPhone", "address": PHONE}}
+        hub.q("INSERT INTO owner_devices(device,sha256,created,last_seen,kind) VALUES('iphone',?,?,NULL,'iphone')",
+              (sha("phone-key"), hub.now()))
+        hub.keep_owner_key(sha(KEY))
+        before = self.file()
+        for token, source, auth in ((None, MAC, "owner_key_required"), (OTHER_KEY, MAC, "owner_key_mismatch"),
+                                    ("phone-key", PHONE, "device_not_allowed"), (KEY, STRANGER, None)):
+            status, said = self.ask("/ui/owner/computer", self.PC, token=token, source=source)
+            self.assertEqual((status, said.get("auth")), (403, auth), source)
+        self.assertEqual(self.file(), before)
+        self.assertEqual(self.said(), self.MAC)
+        status, said = self.ask("/ui/owner/computer", self.PC, token=KEY)
+        pc = {"kind": "windows", "label": "PC", "can": ["run", "agents"]}
+        self.assertEqual((status, said), (200, {"owner_computer": pc, "changed": True}))
+        self.assertEqual(self.said(), pc)
+        self.assertEqual({k: v for k, v in json.loads(self.file()).items() if k in ("sha256", "since")},
+                         json.loads(before))
+
+    def test_a_hub_with_no_kind_answers_as_for_a_mac(self):
+        """A Mac fleet: its app never sends the call, so its hub has no key file (a fleet from before the key), or a
+        file with no kind. Both read as a Mac that can do every name, and so does a kind that this hub does not know.
+        A default of no names, or of a PC, would tell every Mac fleet's agents that the owner can do nothing; a name
+        that the hub renames alone would drop the PC app's name with no error. A read writes nothing."""
+        self.assertEqual(self.said(token=None), self.MAC)                 # no key file
+        hub.keep_owner_key(sha(KEY))
+        before = self.file()
+        self.assertEqual(self.said(), self.MAC)                           # a file with no kind
+        self.assertEqual(self.file(), before)
+        path = self.folder / hub.OWNER_KEY_FILE
+        path.write_text(json.dumps(dict(json.loads(before), kind="linux", can=["run"])))
+        self.assertEqual(self.said(), self.MAC)                           # a kind of a later hub
+        hub.CFG.pop("owner_key_dir")
+        self.assertEqual(self.said(token=None), self.MAC)                 # a hub with no folder for a key
+
+    def test_a_new_key_starts_again_from_the_default(self):
+        """What a PC said belongs to its key. A registration of a new key and a claim write the file anew, and the
+        kind starts again from the default: a hub that carried it over would keep a PC's limits for a Mac that took
+        its place."""
+        hub.keep_owner_key(sha(KEY))
+        self.assertEqual(self.ask("/ui/owner/computer", self.PC, token=KEY)[0], 200)
+        self.assertEqual(self.said()["kind"], "windows")
+        hub.keep_owner_key(sha(OTHER_KEY))                                # POST /ui/owner/key
+        self.assertEqual(self.said(token=OTHER_KEY), self.MAC)
+        self.assertEqual(self.ask("/ui/owner/computer", self.PC, token=OTHER_KEY)[0], 200)
+        with patch.object(hubsetup, "say", lambda _words: None):         # a second claim
+            hubsetup.keep_owner_key(str(self.folder / "pilot.db"), sha(KEY))
+        self.assertEqual(self.said(), self.MAC)
+
+    def test_what_the_route_refuses_drops_and_writes_once(self):
+        """A refused body writes nothing; a name that the hub does not know is dropped, so a later version never
+        reads it as a page that the PC has; and a body that says what the hub holds writes nothing, whatever the
+        order of its names, since the PC app sends it at each start and at each change of `db`. A hub with no key
+        keeps the default and writes no file."""
+        self.assertEqual(self.ask("/ui/owner/computer", self.PC)[0], 409)
+        self.assertFalse((self.folder / hub.OWNER_KEY_FILE).exists())
+        hub.keep_owner_key(sha(KEY))
+        before = self.file()
+        for body in ({"kind": "linux", "can": []}, {"kind": "Windows", "can": []}, {"kind": ["windows"], "can": []},
+                     {"can": ["run"]}, {"kind": "windows"}, {"kind": "windows", "can": "run"},
+                     {"kind": "windows", "can": [], "db": "test-generation"}):
+            self.assertEqual(self.ask("/ui/owner/computer", body, token=KEY)[0], 400, body)
+        self.assertEqual(self.ask("/ui/owner/computer", self.PC, token=KEY,
+                                  headers={"Content-Type": "text/plain"})[0], 415)
+        state = hub.change_token().split(".")[1]           # the part of the token that wakes GET /ui/wait
+        status, said = self.ask("/ui/owner/computer", {"kind": "mac", "can": self.MAC["can"]}, token=KEY)
+        self.assertEqual((status, said["changed"]), (200, False))         # the default, as the file says it
+        self.assertEqual(self.file(), before)
+        self.assertEqual(hub.change_token().split(".")[1], state)
+        body = {"kind": "windows", "can": ["agents", "fly", 7, None, {"run": 1}, "run", "agents"]}
+        status, said = self.ask("/ui/owner/computer", body, token=KEY)
+        self.assertEqual((status, said["owner_computer"]["can"], said["changed"]), (200, ["run", "agents"], True))
+        self.assertNotEqual(hub.change_token().split(".")[1], state, "a change wakes the apps' GET /ui/wait")
+        state, written = hub.change_token().split(".")[1], (self.folder / hub.OWNER_KEY_FILE).stat()
+        status, said = self.ask("/ui/owner/computer", {"kind": "windows", "can": ["agents", "run"]}, token=KEY)
+        self.assertEqual((status, said["changed"]), (200, False))
+        self.assertEqual(hub.change_token().split(".")[1], state, "a write of nothing wakes no app")
+        now = (self.folder / hub.OWNER_KEY_FILE).stat()
+        self.assertEqual((now.st_ino, now.st_mtime_ns), (written.st_ino, written.st_mtime_ns))
+        self.assertEqual(sum("owner's computer says" in r["what"] for r in hub.q("SELECT what FROM log")), 1)
+
+    def test_a_change_during_a_read_is_in_that_read(self):
+        """An app reads owner_computer, then waits on GET /ui/wait with the token of that answer. A read that took
+        the kind before its moment could hold the old kind beside a token that already counts the change: the app's
+        wait would never wake for it, and a PC would stay a Mac on that app. Here the write and its changed() come
+        just before the moment of each read, as a call of the PC can between the two."""
+        hub.keep_owner_key(sha(KEY))
+        real, pending = hub.state_moment, []
+
+        @contextlib.contextmanager
+        def late():
+            if pending:                 # once for each read: a moment inside the read's own moment is that moment
+                self.assertIs(hub.keep_owner_computer(sha(KEY), "windows", pending.pop()), True)
+                hub.changed()
+            with real() as moment:
+                yield moment
+        with patch.object(hub, "state_moment", late):
+            pending.append(("run",))
+            whole = self.ask(token=KEY)[1]
+            pending.append(("agents",))
+            phone = self.ask("/ui/mobile", token=KEY)[1]
+        self.assertEqual(whole["owner_computer"], {"kind": "windows", "label": "PC", "can": ["run"]})
+        self.assertEqual(phone["owner_computer"], {"kind": "windows", "label": "PC", "can": ["agents"]})
 
 
 class Clients(WithKeyFolder):

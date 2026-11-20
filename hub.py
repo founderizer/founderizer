@@ -1997,6 +1997,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "owner_key",         # the owner, 14 November 2026 ("it needs to be tested and verified"): the owner's
                                     # computer sends a key with its address, and POST /ui/owner/key registers it
                                     # (UI-API.md 1.169)
+               "owner_computer",    # windows-app-plan-v2.md 5.3, H1: the owner's computer says that it is a Mac or a
+                                    # PC, and what its app can do, with POST /ui/owner/computer, and owner_computer of
+                                    # GET /ui/state and GET /ui/mobile says it back (UI-API.md 1.273)
                "asks",              # the owner, 15 November 2026 ("the thing I asked for", then "Both places"): a
                                     # task names the owner's message that it comes from, tasks[].ask, with that
                                     # message's messages[].asked and a Needs-you item's needs[].ask of GET /ui/state
@@ -2421,7 +2424,8 @@ def device_rows(source):
 # A hub that holds no key file (a fleet from before the key, until its owner's computer registers one) keeps the
 # address rule. What the key does not guard against: a program that runs on the owner's computer as the owner's user
 # reads the key there, as it reads the owner's SSH keys.
-OWNER_KEY_FILE = "owner-key.json"       # {"sha256", "since"}, mode 600, in CFG owner_key_dir (the folder of --db)
+OWNER_KEY_FILE = "owner-key.json"       # {"sha256", "since", "kind"?, "can"?}, mode 600, in CFG owner_key_dir (the
+#                                         folder of --db); kind and can: owner_computer
 OWNER_PROOF_FILE = "owner-key.proof"    # the one-time value of a registration, mode 600, in the same folder
 OWNER_PROOF_LIFE = 600                  # seconds that one value works
 OWNER_KEY_SHA = re.compile(r"[0-9a-f]{64}")
@@ -2442,9 +2446,10 @@ def owner_key_path(name=OWNER_KEY_FILE):
 
 
 def owner_key():
-    """{sha256, since} of the key that the owner's computer registered, or None while it registered none. A file
-    that is there and cannot be read, or that holds no SHA-256, is OWNER_KEY_BROKEN: it matches no key, so a damaged
-    file never opens the owner's routes to the address alone. Read again only when the file changed."""
+    """{sha256, since, computer} of the key that the owner's computer registered, or None while it registered none.
+    computer is (kind, can) of what that computer said it is (computer_said). A file that is there and cannot be read,
+    or that holds no SHA-256, is OWNER_KEY_BROKEN: it matches no key, so a damaged file never opens the owner's routes
+    to the address alone. Read again only when the file changed."""
     path = owner_key_path()
     if not path:
         return None
@@ -2475,7 +2480,8 @@ def owner_key():
                 ok = False
             since = held.get("since") if ok else None
             OWNER_KEY.update(stamp=stamp, value={"sha256": held["sha256"], "since": since if isinstance(
-                since, (int, float)) and not isinstance(since, bool) else None} if ok else dict(OWNER_KEY_BROKEN))
+                since, (int, float)) and not isinstance(since, bool) else None,
+                "computer": computer_said(held)} if ok else dict(OWNER_KEY_BROKEN))
         return dict(OWNER_KEY["value"])
 
 
@@ -2509,8 +2515,9 @@ def keep_owner_key(digest):
     with OWNER_KEY_LOCK:
         write_owner_file(owner_key_path(), json.dumps({"sha256": digest, "since": t0}) + "\n")
         # The next read takes the file as it is now. Until then this is the key, so a file that goes before that
-        # read is a key that went, and the hub says so (owner_key).
-        OWNER_KEY.update(stamp=None, value={"sha256": digest, "since": t0})
+        # read is a key that went, and the hub says so (owner_key). A new key starts again from the default
+        # (owner_computer): the file has no kind.
+        OWNER_KEY.update(stamp=None, value={"sha256": digest, "since": t0, "computer": OWNER_DEFAULT})
         OWNER_PROOF.update(value=None, expires=0.0, stamp=None)
         with contextlib.suppress(OSError):
             os.remove(owner_key_path(OWNER_PROOF_FILE))
@@ -2558,6 +2565,81 @@ def owner_proof_taken(proof):
         with contextlib.suppress(OSError):
             os.remove(owner_key_path(OWNER_PROOF_FILE))
         return True
+
+
+# ---------------------------------------------------------------- What the owner's computer is (owner feature
+# owner_computer, owner API 1.273; windows-app-plan-v2.md 5.3, H1)
+#
+# The owner's computer is a Mac or a PC, and its app may not have every page yet. It says both with POST
+# /ui/owner/computer, and the hub keeps them in the key's file beside the key's SHA-256: a restore of the records
+# changes neither, and a new key (keep_owner_key, a claim) starts again from the default, because its file has no kind.
+# The default, for a file with no kind and for a hub with no key file (a Mac fleet from before the key), is a Mac that
+# can do every name of OWNER_CAN: a Mac fleet reads what it read before, with one field more.
+OWNER_KINDS = {"mac": "Mac", "windows": "PC"}       # kind -> the label that the owner and the agents read
+# A page name says that the app has those pages; a card in a chat needs no name.
+OWNER_CAN = {                                       # name -> what the owner's app does with it, in words for an agent
+    "run": "run a card's command on their computer",
+    "takeover": "take over an agent's screen",
+    "door": "set up the door to the servers and approve its calls",
+    "agents": "add or change an agent by hand, on the Agents pages",
+    "servers": "add, check or remove a server by hand, on the Servers page",
+    "secrets": "add a secret with no request, or change who may use one, on the Secrets page",
+    "apps": "connect apps: Google, MCP servers and the GitHub App",
+    "people": "add people and give them access",
+    "channels": "link chat apps and read conversations",
+    "knowledge": "write knowledge files",
+    "backup": "make a copy of the fleet and restore one",
+    "devices": "add and remove the owner's devices",
+}
+OWNER_DEFAULT = ("mac", tuple(OWNER_CAN))
+
+
+def can_names(names):
+    """The names of OWNER_CAN that `names` holds, in the table's order and each once. A name that the table does not
+    have, and a value that is no text, is dropped: a newer app may send a name that this hub does not know yet."""
+    said = {name for name in names if isinstance(name, str)} if isinstance(names, list) else set()
+    return tuple(name for name in OWNER_CAN if name in said)
+
+
+def computer_said(held):
+    """(kind, can) of the key's file `held`: OWNER_DEFAULT for a file with no kind, or with a kind that this hub does
+    not know."""
+    kind = held.get("kind")
+    if not isinstance(kind, str) or kind not in OWNER_KINDS:
+        return OWNER_DEFAULT
+    return kind, can_names(held.get("can"))
+
+
+def owner_computer():
+    """owner_computer of GET /ui/state and GET /ui/mobile: {kind, label, can} of the owner's computer, from the key's
+    file, and the default where there is no key or the file has no kind."""
+    kind, can = (owner_key() or {}).get("computer") or OWNER_DEFAULT
+    return {"kind": kind, "label": OWNER_KINDS[kind], "can": list(can)}
+
+
+def keep_owner_computer(digest, kind, can):
+    """POST /ui/owner/computer after its checks: `kind` and the names `can` (can_names) in the key's file, beside the
+    key whose SHA-256 is `digest`, the key that the call came with. True when the file changed; False when it said
+    them already, so the same body twice writes nothing; None when the file holds another key now, or cannot be read:
+    a registration came between the call's check and this write, and that key starts from the default. Every writer
+    of the file in a hub that runs takes OWNER_KEY_LOCK; a claim writes it while the hub is stopped, because the
+    claim's listener takes the hub's port."""
+    path = owner_key_path()
+    with OWNER_KEY_LOCK:
+        try:
+            with open(path, encoding="utf-8") as f:
+                held = json.loads(f.read(4096))
+        except (OSError, ValueError, RecursionError):
+            return None
+        if not (isinstance(held, dict) and isinstance(held.get("sha256"), str)
+                and OWNER_KEY_SHA.fullmatch(held["sha256"]) and hmac.compare_digest(held["sha256"], digest)):
+            return None
+        if computer_said(held) == (kind, can):
+            return False
+        kept = {name: held[name] for name in ("sha256", "since") if name in held}
+        write_owner_file(path, json.dumps(dict(kept, kind=kind, can=list(can))) + "\n")
+        OWNER_KEY.update(stamp=None)        # the next read takes the file as it is now
+    return True
 
 
 def save_recovery_copy(device, sealed):
@@ -6461,6 +6543,9 @@ def migrate():
                   "door_task_id": "INTEGER",  # that task, which hears when the door has taken Full access (door_mode_news)
                   # owner API 1.269: the answer that the agent recommends, one of the options or its own few words
                   "recommended": "TEXT",
+                  # owner API 1.274: the item that took this one's place (raise_needs_you replaces, a new plan of team
+                  # changes), so that an app draws no card for it: its answer is the hub's own words, not the owner's
+                  "replaced_by": "INTEGER",
                   "github_app": "TEXT",       # plan 13, item 4: the account that the item's first option makes an App in
                   "add_device": "INTEGER",    # plan V12 and 8.3: the item's first option opens the Add device picture
                   "github_key": "TEXT",       # plan 13, item 4: the App owner whose key the item renews (door_renew)
@@ -15503,8 +15588,8 @@ def t_raise_needs_you(agent, a):
         if ask:
             q("UPDATE needs SET ask=? WHERE id=?", (ask, nid))
         if old:                 # the old item leaves Needs you, and the record of an earlier discussion moves along
-            q("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
-              (f"Replaced by {agent} with a new item: {title}", now(), agent, old["id"]))
+            q("UPDATE needs SET answer=?, answered=?, answered_by=?, replaced_by=? WHERE id=? AND answer IS NULL",
+              (f"Replaced by {agent} with a new item: {title}", now(), agent, nid, old["id"]))
             q("UPDATE need_talk SET need=? WHERE need=?", (nid, old["id"]))
     if reason:
         log(agent, f"raised N-{nid} for the reason {reason}")      # what each card was for, to count them later
@@ -39050,9 +39135,11 @@ def t_change_team(agent, a):
             DB.execute("INSERT INTO needs(id,title,why,todo,raised,by,options,details,team_plan,ask,recommended) "
                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (nid, title, why, "", t0, agent, options, details, kept,
                                                          ask or (old["ask"] if old else None), picks[0]))
-            if old:
-                DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
-                           (f"Replaced by {agent} with a new plan: {title}", t0, agent, old["id"]))
+            if old:     # the old card leaves, and the owner's talk under it moves along, as at a replaces
+                DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=?, replaced_by=? WHERE id=? AND "
+                           "answer IS NULL", (f"Replaced by {agent} with a new plan: {title}", t0, agent, nid,
+                                              old["id"]))
+                DB.execute("UPDATE need_talk SET need=? WHERE need=?", (nid, old["id"]))
             keep_command(command, {"text": text}, t0)
     log(agent, f"raised N-{nid} for the reason decision: a team change, which the owner's own words keep for them")
     emit("owner", "notify", f"Needs you: {title}")      # the Mac's notice; no phone ring (ping_need): the phone has no
@@ -54104,6 +54191,10 @@ VAULT_REFUSED = "macOS does not let Fleet Vault control Chrome, so it fills no p
 VAULT_NOT_ASKED = ("macOS has not yet asked if Fleet Vault may control Chrome, so it fills no password there: the vault's "
                    "next job there makes macOS ask, and a person at that Mac clicks Allow")
 VAULT_WORDS = (VAULT_JAVASCRIPT_OFF, VAULT_REFUSED, VAULT_NOT_ASKED)
+# Chrome takes that menu item only from the Mac's own keyboard, mouse or trackpad (Chromium's browser_commands_mac.mm
+# refuses an event of another process), and per profile: Screen Sharing cannot tick it.
+VAULT_HANDS_ONLY = ("Only a person at that Mac itself, with its own keyboard or mouse, can tick it, in a Chrome window of "
+                    "the agent's profile: Chrome ignores that menu item through Screen Sharing")
 
 
 def mac_desktop_sweep():
@@ -54191,8 +54282,10 @@ def mac_desktop_sweep():
                  + unlinked_steps(name, account, json.loads(linked) if linked else None, desktop.get("bridge") is False,
                                   account_sharers(name, account["email"]) if account else (), hidden)
                  if words.startswith(EXTENSION_UNLINKED) else
-                 f"[hub] On the Mac {name}, {words}. Only hands at that Mac, or the app's Screen Sharing button, can put "
-                 f"this right: raise it for the owner with raise_needs_you."
+                 f"[hub] On the Mac {name}, {words}. "
+                 + (VAULT_HANDS_ONLY if words == VAULT_JAVASCRIPT_OFF else
+                    "Only hands at that Mac, or the app's Screen Sharing button, can put this right")
+                 + ": raise it for the owner with raise_needs_you."
                  if words in VAULT_WORDS else
                  f"[hub] On the Mac {name}, {words}{click}. Its tasks in Chrome and on its screen wait. Only hands at that "
                  f"Mac, or the app's Screen Sharing button, can put this right: raise it for the "
@@ -65673,7 +65766,10 @@ def phone_mobile(query):
         # LOCK is held for that moment only. A write after it is not in this answer, and it moves the token past
         # this answer's (live_changes). Until 11 November 2026 the build held LOCK for all its statements: 138 on a
         # copy of the first fleet's records, and 148 on one with 2.3 times its rows.
-        result = dict(mobile_state(generation, at), token=token)
+        result = dict(mobile_state(generation, at), token=token, owner_computer=None)
+    # Owner API 1.273: after the moment, so a change of the key's file that this answer does not hold moves the token
+    # past this answer's (keep_owner_computer, then changed()), and the phone's GET /ui/wait wakes for it.
+    result["owner_computer"] = owner_computer()
     # scrub masks a login in old text too, because a login can be registered after the text was stored. As in
     # GET /ui/state, it reads the logins after the moment, so it also masks a login registered during the build.
     # The previews are cut after it (mobile_cut).
@@ -67809,6 +67905,45 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(500, {"error": "the hub could not keep the key on its server"})
         return self.json(200, {"registered": True, "since": since}, {"Cache-Control": "no-store"})
 
+    def ui_owner_computer(self):
+        """POST /ui/owner/computer {kind, can} (owner feature owner_computer, owner API 1.273): the owner's computer
+        says that it is a Mac or a PC, and which names of OWNER_CAN its app can do. Only that computer, with its key
+        (ui_allowed): a device is refused there, and so is a VM or a container on that computer. The hub keeps both
+        beside the key (keep_owner_computer), so a hub that holds no key keeps the default, which is a Mac. A name
+        that the hub does not know is dropped, and the same body twice writes nothing."""
+        if not self.ui_allowed():
+            return
+        if owner_key() is None:     # also a hub with no folder for the key (owner_key_path)
+            return self.json(409, {"error": "this hub keeps no key of the owner's computer"})
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            return self.json(415, {"error": "application/json required"})
+        if len(self.body()) > 4096:
+            return self.json(413, {"error": "request is too large"})
+        data = self.form()
+        extra = sorted(set(data) - {"kind", "can"})
+        if extra:
+            return self.json(400, {"error": f"unknown field {extra[0]}"})
+        kind = data.get("kind")
+        if not isinstance(kind, str) or kind not in OWNER_KINDS:
+            return self.json(400, {"error": "kind must be mac or windows"})
+        if not isinstance(data.get("can"), list):
+            return self.json(400, {"error": "can must be a list of names"})
+        can = can_names(data["can"])
+        try:
+            wrote = keep_owner_computer(hashlib.sha256((self.bearer() or "").encode()).hexdigest(), kind, can)
+        except OSError as e:
+            log("hub", f"what the owner's computer is could not be kept: {type(e).__name__}")
+            return self.json(500, {"error": "the hub could not save the kind of the owner's computer"})
+        if wrote is None:           # another key came since this call's check: that key's rule answers
+            if self.owner_key_allowed():
+                self.json(409, {"error": "the key's file changed during this call; send it again"})
+            return
+        if wrote:
+            log("owner", f"the owner's computer says that it is a {OWNER_KINDS[kind]}, and that its app can do: "
+                         f"{', '.join(can) or 'none of the names'}")
+            changed()               # it lives outside the records: the apps' GET /ui/wait wakes for it
+        return self.json(200, {"owner_computer": owner_computer(), "changed": wrote}, {"Cache-Control": "no-store"})
+
     def device_allowed(self, device):
         """An enrolled owner device (MOBILE-APP.md): its own address and its own key, both. A key that is sent and
         does not match is refused, never taken as absent, and a device whose key the owner removed is refused.
@@ -68377,6 +68512,10 @@ class Handler(BaseHTTPRequestHandler):
         # Keys, ciphertext, helper jobs, raw worker queues and runtime configuration are excluded.
         # Also mask old text if a login was registered after that text was stored. scrub makes each dict and list of
         # the answer new, so it can be written in parts (InParts).
+        # Owner API 1.273: after the moment, so a change of the key's file that this answer does not hold moves the
+        # token past this answer's (keep_owner_computer, then changed()), and the app's GET /ui/wait wakes for it; and
+        # last, so that every key of before keeps its place and its bytes (test_state_read).
+        result["owner_computer"] = owner_computer()
         return self.json(200, InParts(scrub(result)))
 
     def ui_machines(self, query):
@@ -73369,6 +73508,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_owner_enroll()
         if parts == ["ui", "owner", "key"]:         # owner feature owner_key: the owner's computer registers its key
             return self.ui_owner_key()
+        if parts == ["ui", "owner", "computer"]:    # owner feature owner_computer: a Mac or a PC, and what it can do
+            return self.ui_owner_computer()
         if parts == ["bridge", "inbound"]:
             return self.bridge_inbound()
         if parts == ["bridge", "files"]:            # CHAT-APPS.md 8.1: a file of a person's or the owner's message

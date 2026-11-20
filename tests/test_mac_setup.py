@@ -596,6 +596,9 @@ class MacSetup(Servers):
         self.desktop()
         self.assertIn("On the Mac mini, Chrome's menu item View, Developer, Allow JavaScript from Apple Events has no "
                       "tick, so Fleet Vault fills no password there.", heard[0])
+        # Chrome takes that item only from the Mac's own keyboard or mouse: the words never offer Screen Sharing for it.
+        self.assertIn("with its own keyboard or mouse, can tick it, in a Chrome window of the agent's profile", heard[0])
+        self.assertNotIn("Screen Sharing button", heard[0])
         self.assertIn("raise_needs_you", heard[0])
         self.assertFalse(hub.card_sign_in([heard[0]]))
         self.assertEqual(len(readings("javascript_off")), 1)        # said once
