@@ -22,6 +22,19 @@ PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
 JPEG = b"\xff\xd8\xff" + bytes(range(64))
 PDF = b"%PDF-1.7\n" + bytes(range(64))
 CHAT = ("test-generation", "owner-chat", "1")
+DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def office(*parts):
+    """A ZIP that holds these parts, as an Office file is one: [Content_Types].xml and its type's main part."""
+    import io
+    import zipfile
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as package:
+        for part in parts:
+            package.writestr(part, "<x/>")
+    return out.getvalue()
 
 
 def picture(width=2, height=2):
@@ -113,7 +126,12 @@ class Attachments(test_ui_api.OwnerAPI):
     def test_the_bytes_must_be_what_the_request_says_and_hold_no_login(self):
         for data, mime, status in ((PNG, "image/jpeg", 415), (b"MZ\x90", "application/zip", 415),
                                    (PNG, "application/x-sh", 415), (b"", "image/png", 400),
-                                   (b"\xff\xfe\x00bad", "text/plain", 415)):
+                                   (b"\xff\xfe\x00bad", "text/plain", 415),
+                                   # an Office file is a ZIP that holds its type's parts (office_package)
+                                   (b"PK\x03\x04" + bytes(64), DOCX, 415), (PDF, DOCX, 415),
+                                   (office("[Content_Types].xml"), DOCX, 415),
+                                   (office("[Content_Types].xml", "word/document.xml"), XLSX, 415),
+                                   (office("word/document.xml"), DOCX, 415)):
             code, body, _ = self.send_bytes(data, mime=mime, name="f")
             self.assertEqual(code, status, body)
         self.assertEqual(self.count("attachments"), 0)
@@ -122,6 +140,26 @@ class Attachments(test_ui_api.OwnerAPI):
         self.assertEqual(code, 422, body)
         self.assertEqual(self.count("attachments"), 0)
         self.upload(b"nothing secret here\n", mime="text/plain", name="notes.txt")
+
+    def test_the_owner_sends_word_excel_and_powerpoint_files(self):
+        """The owner, 20 November 2026, to "you cannot upload Word, Excel or PowerPoint files": "Yes, fix both". The
+        apps offer them only to a hub that names office_files, and on disk such a file keeps no extension, as an
+        agent's file of the same type had already: the same bytes from both are one file, and none changes its name."""
+        code, state = self.request()
+        self.assertIn("office_files", state["ui_features"])
+        doc = office("[Content_Types].xml", "word/document.xml")
+        one = self.upload(doc, mime=DOCX, name="Contract v2")
+        self.assertEqual((one["mime"], one["name"]), (DOCX, "Contract v2.docx"))
+        self.assertEqual(sorted(os.listdir(self.files.name)), [hashlib.sha256(doc).hexdigest()])
+        sheet = self.upload(office("[Content_Types].xml", "xl/workbook.xml"), mime=XLSX, name="costs.xlsx")
+        self.assertEqual(sheet["name"], "costs.xlsx")
+        self.upload(office("[Content_Types].xml", "ppt/presentation.xml"),
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation", name="deck.pptx")
+        # the sweep keeps the file that a message carries, under the name that it has on disk
+        self.assertEqual(self.message([one["id"]], recipient="manager")[0], 200)
+        hub.kv_set("attachment_sweep_at", 0)
+        hub.attachment_sweep(hub.now() + hub.ATTACH_WAIT + 1)
+        self.assertIsNotNone(hub.attachment_bytes(hub.q1("SELECT * FROM attachments WHERE id=?", (one["id"],))))
 
     def test_a_file_larger_than_the_limit_is_refused_before_it_is_kept(self):
         with patch.object(hub, "ATTACH_MAX", 1024):
@@ -232,6 +270,71 @@ class Attachments(test_ui_api.OwnerAPI):
         event = hub.q1("SELECT * FROM events WHERE id=?", (receipt["event_id"],))
         self.assertIn(f"A-{one['id']} proof.png", event["text"])
         self.assertIsNotNone(hub.q1("SELECT answered FROM needs WHERE id=?", (need,))["answered"])
+
+    def asked(self, question="Send me the signed contract, please."):
+        """A worker's task whose question the fleet manager takes to the owner (raise_needs_you question_id): the
+        task, its session's context, the question and the item."""
+        text, failed = hub.call_tool("manager", "create_task", {"owner": "worker", "title": "File the contract",
+                                                                "done_when": "The contract is filed."})
+        self.assertFalse(failed, text)
+        task = hub.q1("SELECT id FROM tasks WHERE owner='worker' ORDER BY id DESC LIMIT 1")["id"]
+        context = ("test-generation", f"T-{task}", 1)
+        text, failed = hub.call_tool("worker", "ask_my_requester", {"task_id": f"T-{task}", "question": question},
+                                     context)
+        self.assertFalse(failed, text)
+        qid = hub.q1("SELECT id FROM questions WHERE task=?", (task,))["id"]
+        text, failed = hub.call_tool("manager", "raise_needs_you", {
+            "title": "The signed contract", "why": "Only the owner has it", "what_to_do": "Drop the PDF on this card",
+            "reason": "person", "question_id": f"Q-{qid}"})
+        self.assertFalse(failed, text)
+        return task, context, qid, hub.q1("SELECT id FROM needs ORDER BY id DESC LIMIT 1")["id"]
+
+    def test_the_files_of_an_answer_go_to_the_task_whose_question_it_answers(self):
+        """The owner, 20 November 2026, to "a worker that asks for a file does not get it": "Yes, fix both". The fleet
+        manager took a worker's question to him, his answer carried the file, and the hub gave the worker his words
+        alone: the file stayed with the manager, and read_attachment refused it to the worker's task."""
+        task, context, qid, need = self.asked()
+        one = self.upload(PDF, mime="application/pdf", name="contract.pdf")
+        code, receipt = self.request(f"/ui/needs/{need}", self.command(answer="Here it is.", attachments=[one["id"]]))
+        self.assertEqual(code, 200, receipt)
+        said = hub.call_tool("worker", "read_messages", {"task_id": f"T-{task}"}, context=context)[0]
+        self.assertIn(f"Answer to your question Q-{qid}", said)
+        self.assertIn(f"A-{one['id']} contract.pdf (application/pdf", said)
+        manager = hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"]
+        self.assertIn(f"A-{one['id']} contract.pdf", manager)
+        self.assertIn("with its files, as the answer to", manager)
+        text, failed = self.line("worker", context, f"A-{one['id']}", task)
+        self.assertFalse(failed, text)
+        self.assertIn("/attachment/file/", text)
+        self.assertFalse(self.ask("manager", f"A-{one['id']}")["isError"])     # the manager still opens it
+        # a later session of the same task reads the file's name with the answer, in its task list
+        listed = hub.call_tool("worker", "list_my_tasks", {"task_id": f"T-{task}"}, context=context)[0]
+        self.assertIn(f"A-{one['id']} contract.pdf", listed)
+        # and no other session: the worker's other task and its owner chat, another agent's task
+        second, second_context = self.task("worker")
+        self.assertIn("not a file that the owner sent to you",
+                      self.line("worker", second_context, f"A-{one['id']}", second)[0])
+        self.assertIn("not a file that the owner sent to you",
+                      self.ask("worker", f"A-{one['id']}", CHAT)["content"][0]["text"])
+        theirs, theirs_context = self.task("other")
+        self.assertIn("not a file that the owner sent to you",
+                      self.line("other", theirs_context, f"A-{one['id']}", theirs)[0])
+        # the task's own session also when a person's message drives it or its Shell box is off, as a steer's file
+        row = hub.q1("SELECT * FROM attachments WHERE id=?", (one["id"],))
+        self.assertIsNone(hub.owner_file_refused("worker", one["id"], row, task, contact=True, closed=True))
+        self.assertIsNotNone(hub.owner_file_refused("worker", one["id"], row, second, contact=True, closed=True))
+        # a file that the sweep took is named no more
+        os.remove(os.path.join(self.files.name, one["sha256"] + ".pdf"))
+        self.assertNotIn(f"A-{one['id']}", hub.call_tool("worker", "list_my_tasks", {"task_id": f"T-{task}"},
+                                                         context=context)[0])
+        # an answer with no file says nothing of files, to the asker or to the manager
+        task, context, qid, need = self.asked("Which folder?")
+        code, receipt = self.request(f"/ui/needs/{need}", self.command(answer="The blue one."))
+        self.assertEqual(code, 200, receipt)
+        said = hub.call_tool("worker", "read_messages", {"task_id": f"T-{task}"}, context=context)[0]
+        self.assertIn("The blue one.", said)
+        self.assertNotIn("attached", said)
+        self.assertNotIn("with its files", hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"])
 
     def test_a_file_may_travel_without_a_caption(self):
         one = self.upload(PNG, name="mockup.png")

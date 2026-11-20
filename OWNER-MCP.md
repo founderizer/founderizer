@@ -1142,11 +1142,11 @@ such as `.zshenv` replaced that file in the home. They check the hub's SHA-256 b
 file that cannot be read or written is a refusal with the system's reason, in the same words in both
 programs (before 14 November 2026 it was a JSON-RPC error of this server). With no `mime`,
 `attach_file` takes the media type from the file's ending in lower case, from one table that both
-programs read (`MEDIA_TYPES`, which `--dump-tools` carries): the hub's own ten types and their other
+programs read (`MEDIA_TYPES`, which `--dump-tools` carries): the hub's own types and their other
 endings (`png`, `jpg`, `jpeg`, `jpe`, `gif`, `webp`, `pdf`, `zip`, `txt`, `md`, `markdown`, `csv`,
-`json`), and `application/octet-stream` for every other name, which the hub refuses.
-`test_owner_mcp.Table` and `selftest.py` section 0 hold that table to the hub's own types
-(`ATTACH_TYPES`). Until 14 November 2026 this server asked Python's `mimetypes`, whose answer hangs
+`json`, and since owner API 1.251 `docx`, `xlsx` and `pptx`), and `application/octet-stream` for
+every other name, which the hub refuses. `test_owner_mcp.Table` and `selftest.py` section 0 hold
+that table to the hub's own types (`ATTACH_TYPES` and `ATTACH_OFFICE`). Until 14 November 2026 this server asked Python's `mimetypes`, whose answer hangs
 on the Python version and on the Mac's own files.
 
 **Text as Python reads it.** Each split, strip and compare of a text that this server makes, the

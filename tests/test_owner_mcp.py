@@ -5017,13 +5017,15 @@ class Table(unittest.TestCase):
 
     def test_the_media_types_are_the_hubs_own(self):
         """MEDIA_TYPES, which both programs read, gives only types that the hub takes, each of them, and each with the
-        ending that the hub gives it."""
-        self.assertEqual(set(owner_mcp.MEDIA_TYPES.values()), set(hub.ATTACH_TYPES))
-        for mime, (ending, _magic) in hub.ATTACH_TYPES.items():
+        ending that the hub gives it: its own types and, since owner API 1.251, Word, Excel and PowerPoint."""
+        self.assertEqual(set(owner_mcp.MEDIA_TYPES.values()), set(hub.ATTACH_TYPES) | set(hub.ATTACH_OFFICE))
+        endings = {**{mime: ending for mime, (ending, _magic) in hub.ATTACH_TYPES.items()}, **hub.ATTACH_OFFICE}
+        for mime, ending in endings.items():
             self.assertEqual(owner_mcp.MEDIA_TYPES[ending.lstrip(".")], mime)
         self.assertEqual(owner_mcp.dump_tools()["MEDIA_TYPES"], owner_mcp.MEDIA_TYPES)
         for name, mime in (("a.PNG", "image/png"), (".png", "application/octet-stream"), ("a..jpg", "image/jpeg"),
-                           ("noext", "application/octet-stream"), ("a.docx", "application/octet-stream")):
+                           ("noext", "application/octet-stream"), ("a.exe", "application/octet-stream"),
+                           ("Plan.DOCX", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")):
             self.assertEqual(owner_mcp.media_type(name), mime, name)
 
     @needs_the_apps

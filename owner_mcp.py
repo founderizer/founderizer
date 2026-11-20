@@ -92,14 +92,18 @@ ATTACH_MAX = 25 * 1024 * 1024           # hub.py ATTACH_MAX: the largest file th
 # the Founderizer app has the same limits (`Transfer` in OwnerHub.swift).
 FILE_WAIT = 60
 FILE_TOTAL = 900
-# The media type of a file that the agent attaches with no `mime`, by its ending in lower case: the hub's own ten types
-# (hub.py ATTACH_TYPES, which takes no other) and the other endings of the same types. Every other file is
+# The media type of a file that the agent attaches with no `mime`, by its ending in lower case: the hub's own types
+# (hub.py ATTACH_TYPES and, since owner API 1.251, ATTACH_OFFICE, Word, Excel and PowerPoint; it takes no other) and the
+# other endings of the same types. Every other file is
 # application/octet-stream, which the hub refuses. One table for both programs: `--dump-tools` carries it, and the
 # program inside the Founderizer app reads it from there. Until 14 November 2026 this server asked Python's
 # `mimetypes`, whose answer hangs on the Python version and the Mac's own files.
 MEDIA_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "jpe": "image/jpeg", "gif": "image/gif",
                "webp": "image/webp", "pdf": "application/pdf", "zip": "application/zip", "txt": "text/plain",
-               "md": "text/markdown", "markdown": "text/markdown", "csv": "text/csv", "json": "application/json"}
+               "md": "text/markdown", "markdown": "text/markdown", "csv": "text/csv", "json": "application/json",
+               "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+               "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+               "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}
 
 
 def media_type(name):
