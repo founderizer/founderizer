@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -100,13 +101,25 @@ def load_tests(loader, _tests, _pattern):
 
 # ---------------------------------------------------------------- the helper: the closed start (F1) and mint (F3)
 
+# The runtime's task list of a closed start at the default version, where the plan list's live test passed at it
+# (lifecycle.PLAN_LIST_VERSIONS): since 20 November 2026 the default is 2.1.311, so every closed start of a fleet that
+# chose no other version keeps its plan there (fleet.CLOSED_PLAN_TOOLS).
+DEFAULT_PLAN = list(fleet.CLOSED_PLAN_TOOLS) \
+    if lifecycle.runtime_fact("claude", "closed_versions")[0] in lifecycle.PLAN_LIST_VERSIONS else []
+
+
+def with_plan(tools):
+    """A closed start's --tools at the default version: the built-in tools that its boxes give, then its task list."""
+    return ",".join([t for t in tools.split(",") if t] + DEFAULT_PLAN)
+
+
 class Helper(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="fleet-shell-box-"))
         self.addCleanup(shutil.rmtree, self.root, True)
         self.sessions, self.kept = self.root / "sessions", self.root / "kept"
         self.kept.mkdir()
-        self.pinned = self.kept / "claude-2.1.308"
+        self.pinned = self.kept / f"claude-{lifecycle.runtime_fact('claude', 'closed_versions')[0]}"   # the default
         self.pinned.write_text("#!/bin/sh\n")
         self.pinned.chmod(0o755)
         team = {"agents": {"desk": DESK}, "mcp": {"crm": CRM, "crm-review": CRM_REVIEW}}
@@ -145,6 +158,55 @@ class Helper(unittest.TestCase):
         self.assertEqual(Path(path).parent, self.sessions)
         return json.loads(Path(path).read_text())
 
+    def test_a_closed_task_takes_no_credential_while_its_program_downloads(self):
+        """AUTONOMY.md P10 for a task, as for a closed conversation: on a machine without the version of closed
+        sessions (a Codex agent's user, a Mac that kept only 2.1.308), each try of the start while the helper
+        downloads that version asks for no session credential and no mint token, which a start that waits could not
+        use, and a browser task starts no Chrome (the review of the default 2.1.311, 20 November 2026). The first try
+        after the install starts the session with one credential, one mint and one Chrome."""
+        version = lifecycle.runtime_fact("claude", "closed_versions")[0]
+        self.pinned.unlink()
+        done = threading.Event()
+
+        def install(v):                 # the vendor's download, which ends when the test says so
+            done.wait(10)
+            (self.kept / f"claude-{v}").write_text("#!/bin/sh\n")
+            (self.kept / f"claude-{v}").chmod(0o755)
+        helper, windows = fleet.Helper("desk", DESK), []
+        event = {"id": 8, "kind": "task", "task": "T-9", "text": "Your task is T-9.",
+                 "extra": {"generation": "g1", "attempt": 1, "opening": "read", "rules": [], "needs": "browser",
+                           "shell_off": {"runtime": "claude", "version": version, "built_ins": ["WebSearch"],
+                                         "servers": None}}}
+        credential = unittest.mock.Mock(return_value=TOKEN)
+        mint = unittest.mock.Mock(return_value={})
+        browser = unittest.mock.Mock(return_value=None)
+        at = [1000.0]
+        self.addCleanup(done.set)
+        with patch.object(fleet, "install_closed", install), patch.dict(fleet.CLOSED_INSTALLS, clear=True), \
+                patch.object(fleet, "http", lambda *a, **k: (200, {})), \
+                patch.object(fleet, "session_credential", credential), \
+                patch.object(fleet, "session_env", return_value={}), patch.object(fleet, "mint_tokens", mint), \
+                patch.object(fleet, "start_window", lambda session, name, command, options=None:
+                             windows.append((name, command))), \
+                patch.object(fleet, "tmux", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                patch.object(helper, "browser_start", browser), patch.object(fleet, "linux_browser", bool), \
+                patch.object(helper, "look_sure", return_value=[]), patch.object(helper, "sync_checkout"), \
+                patch.object(helper, "runs", return_value={}), patch.object(fleet.time, "monotonic", lambda: at[0]):
+            for wait in (0, 16, 31):
+                at[0] += wait
+                helper.handle_events([event])
+            self.assertEqual(fleet.closed_installing(), version)
+            for asks in (credential, mint, browser):
+                asks.assert_not_called()
+            self.assertEqual(windows, [])
+            done.set()
+            fleet.CLOSED_INSTALLS[version]["thread"].join(10)
+            at[0] += 61
+            helper.handle_events([event])
+        self.assertEqual([name for name, _ in windows], ["T-9"])
+        self.assertIn(str(self.kept / f"claude-{version}"), windows[0][1])
+        self.assertEqual((credential.call_count, mint.call_count, browser.call_count), (1, 1, 1))
+
     def test_a_shell_off_task_starts_the_pinned_claude_with_the_web_box_tools_and_no_other(self):
         env, args, option = self.parts(self.build())
         self.assertEqual(env[0], "env")
@@ -154,7 +216,7 @@ class Helper(unittest.TestCase):
         self.assertIn(fleet.NO_REMOTE_TOOLS, env)       # and serves no command of a cloud session
         self.assertTrue(all(w.startswith(("FLEET_", "CLAUDE_", "DISABLE_")) for w in env[1:]), env)
         self.assertEqual((option("--setting-sources"), option("--permission-mode"), option("--tools")),
-                         ("", "dontAsk", "WebSearch"))
+                         ("", "dontAsk", with_plan("WebSearch")))
         self.assertIn("--strict-mcp-config", args)
         for absent in ("--chrome", "--dangerously-skip-permissions", "--allowedTools", "--add-dir", "--plugin-dir",
                        "--agents", "--resume", "--continue"):
@@ -163,7 +225,7 @@ class Helper(unittest.TestCase):
         self.assertEqual(config, {"mcpServers": {"fleet": {"type": "http", "url": "http://hub.test:8765/mcp/desk/g1/T-5/1",
                                                            "headers": {"Authorization": f"Bearer {TOKEN}"}}}})
         settings = self.private(option("--settings"))
-        self.assertEqual(settings["permissions"], {"allow": ["mcp__fleet__*", "WebSearch"],
+        self.assertEqual(settings["permissions"], {"allow": ["mcp__fleet__*", "WebSearch"] + DEFAULT_PLAN,
                                                    "deny": fleet.DENY, "defaultMode": "dontAsk"})
         self.assertFalse(settings["autoMemoryEnabled"])
         self.assertEqual(settings["crossSessionInbound"], "refuse")       # no message of another Claude session
@@ -179,9 +241,9 @@ class Helper(unittest.TestCase):
                                     (dict(DESK, can=[]), {"built_ins": ["WebSearch", "WebFetch"]}, "")):
             with self.subTest(can=conf["can"], closed=closed):
                 _, args, option = self.parts(self.build(conf, closed=closed))
-                self.assertEqual(option("--tools"), tools)
+                self.assertEqual(option("--tools"), with_plan(tools))
                 allow = self.private(option("--settings"))["permissions"]["allow"]
-                self.assertEqual(allow, ["mcp__fleet__*"] + [t for t in tools.split(",") if t])
+                self.assertEqual(allow, ["mcp__fleet__*"] + [t for t in with_plan(tools).split(",") if t])
 
     def test_a_browser_task_gets_chrome_without_file_upload(self):
         _, args, option = self.parts(self.build(dict(DESK, can=["web", "browser"]), needs="browser"))
@@ -237,7 +299,7 @@ class Helper(unittest.TestCase):
                                                   opening="read", rules=[])
         env, args, option = self.parts(command)
         self.assertIn(f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={fleet.STANDING_COMPACT}", env)
-        self.assertEqual(option("--tools"), "WebSearch")
+        self.assertEqual(option("--tools"), with_plan("WebSearch"))
         self.assertEqual(self.private(option("--mcp-config"))["mcpServers"]["fleet"]["url"],
                          "http://hub.test:8765/mcp/desk/g1/conversation/7")
 
@@ -334,7 +396,7 @@ class Helper(unittest.TestCase):
         start says Shell off: the start is closed, and its environment reads no key."""
         stale = dict(DESK, can=["shell", "web"])
         _, args, option = self.parts(self.build(stale, closed={"built_ins": ["WebSearch"]}))
-        self.assertEqual(option("--tools"), "WebSearch")
+        self.assertEqual(option("--tools"), with_plan("WebSearch"))
         with patch.object(fleet, "read_env", side_effect=AssertionError("no key for a closed start")), \
                 patch.object(fleet, "integration_env", lambda *a, **k: {}):
             self.assertEqual(fleet.session_env("desk", stale, "task", closed=True), {})
@@ -894,7 +956,10 @@ class Tools(Fleet):
     def test_a_closed_start_names_only_the_tools_that_its_session_has(self):
         """A Shell-off session's start sent it to message_agent, ask_my_requester, see_earlier_work, sign_in and
         call_api, which it does not have, and said that an API key was in it (3 November 2026). Each part of its start,
-        in each state that brings words of its own, names only tools of the session's own list."""
+        in each state that brings words of its own, names only tools of the session's own list. Its standing items
+        come whole, also past STANDING_CHARS: the session has no see_standing, and on 20 November 2026 each start of a
+        support agent named 5 of the owner's wishes by their ids alone. A colleague's closed window keeps its own
+        smaller limit, so that its recap keeps its room."""
         t0, tools = hub.now(), {name for _r, name, *_ in hub.TOOLS} - {"answer"}     # "answer": also a plain word
         hub.TEAM.setdefault("settings", {})["memory.start_chars"] = 1000      # so that one lesson does not fit
         hub.q("INSERT INTO agent_notes(agent,text,revision,created,by,why) VALUES('desk',?,1,?,'desk','x')",
@@ -902,7 +967,7 @@ class Tools(Fleet):
         for text in ("A refund needs the order id. " * 30, "Refunds go to a person."):
             hub.q("INSERT INTO memories(agent,about,text,prevents,created,request_id) VALUES('desk','refund',?,?,?,?)",
                   (text, "a wrong refund", t0, str(uuid.uuid4())))
-        for words in ("Answer within the day. " * 400, "Write in English."):     # the second does not fit
+        for words in ("Answer within the day. " * 400, "Write in English."):     # past STANDING_CHARS together
             hub.q("INSERT INTO standing(agent,scope,kind,words,author_kind,author,created) "
                   "VALUES('desk','agent','instruction',?,'owner','owner',?)", (words, t0))
         goal = hub.ins("INSERT INTO goals(title,text,state,revision,limits,created,updated,request_id) "
@@ -941,9 +1006,13 @@ class Tools(Fleet):
                                 "owner chat": (hub.chat_team_once("desk") + hub.chat_people_text("desk"), chat)},
                                state["state"])
                 for kept in ("Read the order before the refund.", "Answer within the day.", "Refunds go to a person.",
-                             "which do not fit here", "did not fit", "ONE PART of step 1", "WHAT CAME BEFORE",
+                             "Write in English.", "did not fit", "ONE PART of step 1", "WHAT CAME BEFORE",
                              "YOUR ALLOWANCE"):
                     self.assertIn(kept, said["start"])          # the words of its own are still all there
+                self.assertNotIn("which do not fit here", said["start"])         # each standing item is whole
+        window = hub.standing_start_text("desk", hub.CLOSED_STANDING_CHARS)    # a colleague's closed window
+        self.assertIn("which do not fit here.", window)
+        self.assertNotIn("Write in English.", window)
         self.assertIn("rewrite them with write_notes", said["review"])         # a duty that names the tools
         self.assertIn("call remember", said["review"])
         hub.q("DELETE FROM agent_notes")

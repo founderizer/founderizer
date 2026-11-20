@@ -158,7 +158,9 @@ class TeamChanges(Remove):
         self.assertIsNone(hub.kv_get(hub.TEAM_PLAN_MARK + str(self.card()["id"])))
 
     def test_the_card_shows_the_change_and_its_press_writes_exactly_that(self):
-        """Bug: the manager's words describe one change, and the press makes another."""
+        """Bug: the manager's words describe one change, and the press makes another. And for a long section, the card
+        showed it whole twice, past the card's limit, so the hub refused exactly the plan that makes a long profile
+        shorter (the design "An agent keeps its own rules", slice 1): the card shows the lines that change."""
         self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"),
                     "sections": [{"key": "responsible_for", "title": "Responsible for",
                                   "text": "Deploys, and their checks."}]}],
@@ -174,6 +176,31 @@ class TeamChanges(Remove):
         profile = self.show("profiles/vps.md")
         self.assertIn("**Responsible for.** Deploys, and their checks.", profile)
         self.assertIn("**Must ask first.** Spending.", profile)            # the sections that the plan left stay
+        # a section of about 7,900 characters, which the owner's save made long, and a plan that removes half of it
+        lines = [(f"Rule {n:02d}: answer the tickets of kind {n} in full, in the customer's own language, and log "
+                  f"each answer in the CRM at once.")[:99].rstrip() for n in range(1, 80)]
+        sections = hub.profile_view("vps", hub.kit_revision(fresh=True))["sections"]
+        for s in sections:
+            if s["key"] == "responsible_for":
+                s["text"] = "\n".join(lines)
+        hub.save_profile("vps", self.base_of("vps"), sections)
+        self.assertGreater(int(hub.kv_get(hub.PROFILE_LONG + "vps")), 7800)
+        leave, stay = lines[::2], lines[1::2]
+        self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"),
+                    "sections": [{"key": "responsible_for", "title": "Responsible for", "text": "\n".join(stay)}]}],
+                  title="Make the profile of vps shorter?", why="Half of its lines are in its duty's words.")
+        details = self.card()["details"]
+        for line in leave:
+            self.assertIn(line, details)
+        for line in stay:
+            self.assertNotIn(line, details)
+        self.assertIn("39 lines of this section stay as they are.", details)
+        status, answer = self.press(0)
+        self.assertEqual(status, 200, answer)
+        profile = self.show("profiles/vps.md")
+        self.assertIn(stay[-1], profile)
+        self.assertNotIn(leave[0], profile)
+        self.assertIsNone(hub.kv_get(hub.PROFILE_LONG + "vps"))        # the count starts from the plan's number
 
     def test_a_press_after_the_owner_changed_the_same_profile_writes_nothing_and_closes_the_card(self):
         """Bug: an old plan writes over the owner's own later edit, or the owner sees a yes that did nothing."""

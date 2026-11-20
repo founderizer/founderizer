@@ -341,9 +341,9 @@ The join line has no `"`, no `'`, no `$` and no new line. If the line you were g
 them, stop and ask the owner for a new line from the app.
 
 It fetches the join script from their own hub and joins the server: base packages, the service
-user, the checkout, the join itself with the one-time code on standard input, security updates,
-the firewall (SSH over the private network only), one OS user for each agent this server already
-has, and `verify` at the end. When the hub does not give the join script, the line stops at once
+user, the checkout, the join itself with the one-time code on standard input, the firewall (SSH over
+the private network only) and the server's hardening, security updates, one OS user for each agent
+this server already has, and `verify` at the end. When the hub does not give the join script, the line stops at once
 with `Founderizer join stopped: This machine cannot reach the Founderizer hub at …` and runs
 nothing of the join: check that Tailscale is connected on the server, then run the same line again.
 

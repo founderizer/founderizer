@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 import fleet
@@ -36,6 +37,15 @@ def setUpModule():
     scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
 
 
+DAY = 86400
+
+
+def release(version, published, pre=False, draft=False, tag=None):
+    """One entry of the vendor's record of Codex's releases, as its API gives it."""
+    return {"tag_name": tag or f"rust-v{version}", "prerelease": pre, "draft": draft,
+            "published_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(published))}
+
+
 class Machine:
     """The runtimes of one OS user as the stubbed commands see them: what is installed in ~/.local/bin, what the
     vendor gives, and which versions fail the check."""
@@ -47,6 +57,7 @@ class Machine:
         self.bad = set()            # versions whose model options cannot be read (claude --help, codex model/list)
         self.silent = set()         # versions whose --version answers nothing
         self.install_fails = False  # the vendor's update exits 1 and changes nothing
+        self.release_ignored = None # a version that Codex's installer puts in place of the release that it was given
         self.rollback_fails = False
         self.scripts = []           # (script, timeout, cwd) of every shell command
         self.could_start = []       # whether a session could start while each of them ran
@@ -95,6 +106,11 @@ class Machine:
         self.could_start.append(can_start(self.lc))
         name = "claude" if "claude" in script else "codex"
         chosen = re.search(r"(?:--release|bash -s) '?([0-9][0-9A-Za-z.-]*)", script)
+        if chosen and name == "codex" and chosen.group(1) == self.newest[name] and self.install_fails:
+            return 1, "", "curl: (6) Could not resolve host: chatgpt.com"       # the round's own install of a release
+        if chosen and name == "codex" and chosen.group(1) == self.newest[name] and self.release_ignored:
+            self.installed[name] = self.release_ignored
+            return 0, "installed\n", ""
         if chosen:                                  # runtime_install: the previous version back, or a first one
             if self.rollback_fails:
                 return 1, "", "curl: (6) Could not resolve host: claude.ai"
@@ -132,6 +148,13 @@ class RuntimeUpdates(unittest.TestCase):
         self.now, self.mono = 1761130000.0, 50000.0     # the wall clock and the monotonic clock, apart
         self.busy = self.in_use = False
         self.posts, self.said = [], []
+        self.record = None          # the vendor's record of Codex's releases: None for its newest, 30 days old
+
+    def releases(self):
+        """The vendor's own record of Codex's releases (lifecycle.codex_releases), as the stub's vendor gives them."""
+        if isinstance(self.record, Exception):
+            raise self.record
+        return self.record if self.record is not None else [release(self.machine.newest["codex"], self.now - 30 * DAY)]
 
     def make(self, **kw):
         def post(payload):
@@ -140,7 +163,8 @@ class RuntimeUpdates(unittest.TestCase):
         lc = Lifecycle("/kit", "alpha", {"role": "worker", "runtime": "claude"}, post, busy=lambda: self.busy,
                        run=self.machine, clock=lambda: self.now, monotonic=lambda: self.mono, platform_name="linux",
                        home=self.home, models=self.machine.models, which=self.machine.which,
-                       **dict({"runtimes_busy": lambda: self.in_use, "say": self.said.append}, **kw))
+                       **dict({"runtimes_busy": lambda: self.in_use, "say": self.said.append,
+                               "releases": self.releases}, **kw))
         self.machine.lc = lc
         return lc
 
@@ -161,7 +185,7 @@ class RuntimeUpdates(unittest.TestCase):
         # Exactly the vendors' own updates, as this user, from its home, with a time limit, and nothing else.
         self.assertEqual(self.machine.scripts, [
             ('mkdir -p "$HOME/.local/bin" && curl -fsSL https://chatgpt.com/codex/install.sh | '
-             'CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false CODEX_NON_INTERACTIVE=1 sh -s --',
+             'CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false CODEX_NON_INTERACTIVE=1 sh -s -- --release 0.163.0',
              RUNTIME_INSTALL_WAIT, self.home),
             ('mkdir -p "$HOME/.local/bin" && "$HOME/.local/bin/claude" update', RUNTIME_INSTALL_WAIT, self.home)])
         # No session started while an installer ran, and one can start once the round is over.
@@ -189,7 +213,8 @@ class RuntimeUpdates(unittest.TestCase):
         self.round(lc)
         self.assertEqual(self.machine.installed, {"claude": "2.1.301", "codex": "0.160.0"})
         rollbacks = [s for s, _, _ in self.machine.scripts if "--release" in s or "bash -s" in s]
-        self.assertEqual(rollbacks, ['mkdir -p "$HOME/.local/bin" && ' + onboard.runtime_install("codex", "0.160.0"),
+        self.assertEqual(rollbacks, ['mkdir -p "$HOME/.local/bin" && ' + onboard.runtime_install("codex", "0.164.0"),
+                                     'mkdir -p "$HOME/.local/bin" && ' + onboard.runtime_install("codex", "0.160.0"),
                                      'mkdir -p "$HOME/.local/bin" && ' + onboard.runtime_install("claude", "2.1.301")])
         self.assertEqual(self.outcome(lc, "claude")["result"], "rolled_back")
         self.assertEqual(self.outcome(lc, "claude")["detail"], "2.1.309 failed its check (claude --help did not "
@@ -230,38 +255,143 @@ class RuntimeUpdates(unittest.TestCase):
         self.assertEqual(self.machine.scripts, [])
 
     def test_one_round_in_six_hours_for_the_user_also_across_a_restart(self):
+        # a round is Claude Code's own update, which runs in each one (Codex's installs only a newer release)
+        rounds = lambda: sum(s.endswith('"$HOME/.local/bin/claude" update') for s, _, _ in self.machine.scripts)
         lc = self.make()
         self.round(lc)
-        self.assertEqual(len(self.machine.scripts), 2)
+        self.assertEqual(rounds(), 1)
         self.now, self.mono = self.now + 3600, self.mono + 3600
         self.round(lc)
         self.round(self.make())         # the helper restarted, as it does with every Fleet update
-        self.assertEqual(len(self.machine.scripts), 2)
+        self.assertEqual(rounds(), 1)
         self.now, self.mono = self.now + RUNTIME_UPDATE_EVERY - 3600, self.mono + RUNTIME_UPDATE_EVERY - 3600
         lc = self.make()
         self.round(lc)
-        self.assertEqual(len(self.machine.scripts), 4)
+        self.assertEqual(rounds(), 2)
         self.assertEqual(self.outcome(lc, "claude"), {"result": "current", "at": self.now,
                                                       "detail": "2.1.308 stays: the vendor gives no newer version."})
         self.assertEqual(lc.runtime_updates()["at"], self.now)
         # A time ahead of the clock, after the clock was set back, does not stop the updates for good.
         lc.save_runtime_updates({"at": self.now + 86400, "runtimes": {}})
         self.round(lc)                  # this process's own round was a moment ago
-        self.assertEqual(len(self.machine.scripts), 4)
+        self.assertEqual(rounds(), 2)
         self.round(self.make())
-        self.assertEqual(len(self.machine.scripts), 6)
+        self.assertEqual(rounds(), 3)
 
     def test_the_installed_version_never_goes_down(self):
         self.machine.newest["codex"] = "0.159.0"        # the vendor's newest is older than the one installed
-        self.machine.newest["claude"] = "2.1.301"       # and Claude Code's own update has nothing newer
+        self.machine.newest["claude"] = "2.1.300"       # and Claude Code's own update would take it down
         lc = self.make()
         self.round(lc)
         self.assertEqual(self.machine.installed, {"claude": "2.1.301", "codex": "0.160.0"})
-        self.assertEqual(self.outcome(lc, "codex"), {
+        self.assertEqual(self.outcome(lc, "codex"), {   # Codex's round installs no release older than this one
+            "result": "current", "at": self.now, "detail": "0.160.0 stays: no newer release of Codex is 7 days old yet."})
+        self.assertFalse(any("codex" in s for s, _, _ in self.machine.scripts))
+        self.assertEqual(self.outcome(lc, "claude"), {
             "result": "rolled_back", "at": self.now,
-            "detail": "0.159.0 failed its check (it is older than 0.160.0), so 0.160.0 is installed again."})
-        self.assertEqual(self.outcome(lc, "claude")["result"], "current")
-        self.assertFalse(any("bash -s" in s for s, _, _ in self.machine.scripts))      # nothing to put back
+            "detail": "2.1.300 failed its check (it is older than 2.1.301), so 2.1.301 is installed again."})
+
+    def test_codex_takes_the_newest_release_that_is_seven_days_old(self):
+        """The owner's npm rule on his machines, min-release-age=7, for Codex's own releases too (his "Yes, start" of
+        20 November 2026): two agents ran Codex 0.171.0 less than 19 hours after it came out, because the round ran
+        the vendor's installer with no release. Now the vendor's own record decides: a pre-release, a draft, a tag of
+        another form and a release of less than seven days wait, the list's order is not the versions' order, and a
+        record that cannot be read changes nothing."""
+        self.record = [release("0.165.0", self.now - 3 * DAY), release("0.164.0", self.now - 20 * DAY, pre=True),
+                       release("0.162.0", self.now - 30 * DAY), release("0.163.0", self.now - 8 * DAY),
+                       release("0.170.0", self.now - 30 * DAY, tag="v0.170.0"),
+                       release("0.169.0", self.now - 40 * DAY, draft=True)]
+        lc = self.make()
+        self.round(lc)
+        self.assertEqual(self.machine.installed["codex"], "0.163.0")
+        self.assertEqual([s for s, _, _ in self.machine.scripts if "codex" in s],
+                         ['mkdir -p "$HOME/.local/bin" && ' + onboard.runtime_install("codex", "0.163.0")])
+        self.assertEqual(self.outcome(lc, "codex")["detail"], "Updated from 0.160.0 to 0.163.0, which passed its check.")
+        for record, result, detail in (
+                ([release("0.163.0", self.now - 8 * DAY)], "current",
+                 "0.163.0 stays: no newer release of Codex is 7 days old yet."),
+                ([release("0.166.0", self.now - 6 * DAY)], "skipped",
+                 "The record of Codex's releases has no release that is 7 days old, so 0.163.0 stays."),
+                (OSError("HTTP Error 403: rate limit exceeded"), "skipped",
+                 "The record of Codex's releases could not be read (HTTP Error 403: rate limit exceeded), so 0.163.0 "
+                 "stays; the next round reads it again.")):
+            self.record, self.machine.scripts = record, []
+            self.now, self.mono = self.now + RUNTIME_UPDATE_EVERY, self.mono + RUNTIME_UPDATE_EVERY     # a new round
+            lc = self.make()
+            self.round(lc)
+            self.assertEqual(self.outcome(lc, "codex"), {"result": result, "at": self.now, "detail": detail})
+            self.assertFalse(any("codex" in s for s, _, _ in self.machine.scripts), detail)
+            self.assertEqual(self.machine.installed["codex"], "0.163.0")
+        # An installer that puts a newer release in place of the one that it was given is the hold's own failure: the
+        # version before comes back.
+        self.machine.newest["codex"], self.machine.release_ignored = "0.164.0", "0.166.0"
+        self.record = [release("0.164.0", self.now - 9 * DAY)]
+        self.now, self.mono = self.now + RUNTIME_UPDATE_EVERY, self.mono + RUNTIME_UPDATE_EVERY
+        lc = self.make()
+        self.round(lc)
+        self.assertEqual(self.machine.installed["codex"], "0.163.0")
+        self.assertEqual(self.outcome(lc, "codex")["detail"], "0.166.0 failed its check (it is not 0.164.0, the "
+                                                              "release that is 7 days old), so 0.163.0 is installed again.")
+
+    def test_the_record_is_the_tags_and_the_release_of_each_new_one_kept(self):
+        """Thirty of Codex's releases are more than 4 MiB (20 November 2026), and GitHub's list of 100 answered 504, so
+        the round reads the vendor's tags, a page after another (newest first), then the release of each stable tag,
+        newest first, down to the first that is seven days old. Each release read is kept, so a round reads only the
+        tags and what is new, against GitHub's 60 reads an hour for each address: a young one until its own time is
+        seven days old, when it is read once more and that read decides, because the vendor can mark a young release
+        a pre-release or pull it. A tag whose release has not come is read again at each round. A refusal that is no
+        404 stops the read, with what it kept; an answer of another shape is not read as "no release"."""
+        published = {"0.172.0": 1, "0.171.0": 3, "0.169.0": 8, "0.168.0": 20, "0.160.0": 40}      # days before now
+        page_one = ["0.172.0", "0.171.0", "0.170.0"] + [f"0.173.0-alpha.{n}" for n in range(97)]   # a full page
+        calls, refuse, marked = [], {"0.171.0"}, set()
+
+        def get(url):
+            calls.append(url)
+            if url.startswith(onboard.CODEX_TAGS):
+                page = {onboard.CODEX_TAGS + "&page=1": page_one, onboard.CODEX_TAGS + "&page=2": ["0.169.0", "0.168.0",
+                        "0.160.0"]}.get(url, [])
+                return [{"name": f"rust-v{v}"} for v in page] + [{"name": "rusty-v8-1.0.0"}, "no tag"]
+            version = url.rsplit("rust-v", 1)[1]
+            if version in refuse:
+                raise urllib.error.HTTPError(url, 403, "rate limit exceeded", {}, None)
+            if version not in published:
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            return dict(release(version, self.now - published[version] * DAY, pre=version in marked),
+                        body="the changelog " * 1000)
+
+        tags = lambda page: onboard.CODEX_TAGS + f"&page={page}"
+        young = [onboard.CODEX_RELEASE.format(v) for v in ("0.172.0", "0.171.0", "0.170.0")]
+        with self.assertRaises(OSError):
+            lifecycle.codex_releases(self.home, self.now, get=get)
+        self.assertEqual(calls, [tags(1), young[0], young[1]])
+        refuse.clear()
+        calls.clear()
+        found = lifecycle.codex_releases(self.home, self.now, get=get)
+        self.assertEqual([r["tag_name"] for r in found], ["rust-v0.172.0", "rust-v0.171.0", "rust-v0.169.0"])
+        self.assertEqual(onboard.codex_release(found, self.now), "0.169.0")
+        # 0.172.0 was kept before the refusal stopped the read
+        self.assertEqual(calls, [tags(1), young[1], young[2], tags(2), onboard.CODEX_RELEASE.format("0.169.0")])
+        calls.clear()
+        self.assertEqual(onboard.codex_release(lifecycle.codex_releases(self.home, self.now, get=get), self.now),
+                         "0.169.0")
+        self.assertEqual(calls, [tags(1), young[2], tags(2)])     # each release is kept; the tag of none is read again
+        # four days on, 0.171.0 is seven days old: it is read once more, and that read decides. The vendor marked it a
+        # pre-release in the meantime, so it is not taken, and that read is kept.
+        later = self.now + 4 * DAY
+        marked.add("0.171.0")
+        for read in ([young[1]], []):
+            calls.clear()
+            self.assertEqual(onboard.codex_release(lifecycle.codex_releases(self.home, later, get=get), later),
+                             "0.169.0")
+            self.assertEqual(calls, [tags(1)] + read + [young[2], tags(2)])
+        # an answer of another shape is not a list with no release in it, and the tags are read on at most
+        # CODEX_TAG_PAGES pages
+        with self.assertRaises(ValueError):
+            lifecycle.codex_releases(self.home, later, get=lambda url: {"message": "Not Found"})
+        calls.clear()
+        full = lambda url: calls.append(url) or [{"name": f"rust-v0.173.0-alpha.{n}"} for n in range(100)]
+        self.assertEqual(lifecycle.codex_releases(self.home, later, get=full), [])
+        self.assertEqual(calls, [tags(page) for page in range(1, lifecycle.CODEX_TAG_PAGES + 1)])
 
     def test_an_update_that_does_not_run_leaves_the_installed_version(self):
         self.machine.install_fails = True

@@ -3,9 +3,9 @@
 # owner runs it with the one line from Founderizer (Servers, Add server); FLEET_JOIN holds the one-time join code.
 #
 #   A VPS (Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13), as root: base packages, the user fleet, then the join,
-#   security updates, the firewall and the server's own hardening (SSH keys only, npm's seven days, Tailscale's own
-#   updates). The line has joined the private network (Tailscale) before this script, and after it SSH reaches the
-#   machine over that network only. With a restart time (UTC) from the hub's answer to the join, or else with
+#   the firewall and the server's own hardening (SSH keys only, npm's seven days, Tailscale's own updates), then the
+#   security updates. The line has joined the private network (Tailscale) before this script, and after it SSH reaches
+#   the machine over that network only. With a restart time (UTC) from the hub's answer to the join, or else with
 #   FLEET_REBOOT_TIME=<HH:MM> on the line, an Ubuntu server also takes the fleet patch policy: Ubuntu's -updates as
 #   well as -security, and a restart at that time when an update needs one. Without a time it takes security updates
 #   only and never restarts by itself.
@@ -22,9 +22,10 @@
 # has: each agent's session runs as its own user, so its checkout, its runtime, that runtime's credential and its
 # vault token are in a home of mode 700 that no other agent can open (PRODUCT.md 4.1). The agents the owner adds
 # later are installed under their own users by the server service, which has no root and uses that helper. The last
-# step is
-# `python3 fleet.py verify` (PRODUCT.md 4.1), whose lines this script prints: a join that half worked says which
-# check failed and how to fix it, instead of looking finished. The line ends with a failure when a check failed.
+# step is `python3 fleet.py verify` (PRODUCT.md 4.1), whose lines this script prints: a join that half worked says
+# which check failed and how to fix it, instead of looking finished. The line ends with a failure when a check failed.
+# With FLEET_VERIFY=caller, which the app sets when its own next step is `fleet.py verify --json`, a Linux join runs
+# none, as hub.sh does with the same word: the self-test runs once, not twice.
 set -eu
 
 HUB="__FLEET_HUB__"
@@ -123,15 +124,25 @@ fail for a moment: run the line again."
     printf '%s\n' "$code" | as_worker env FLEET_REPO_USED="$REPO" python3 "/home/$WORKER/fleet-server/server.py" join \
         --hub "$HUB" --kind linux --ssh-port "${first:-22}"
     hub_time
-    updates
+    # The firewall and the hardening before the security updates: the first updates of a new server can wait about 9
+    # minutes for apt's lock, and until the firewall step its SSH answered the whole internet (point 7 of the review of
+    # 20 November 2026). The updates stay before the agents' steps: they end that first run of apt, whose lock the
+    # vault's own install would wait for, and they write the update settings and the patch policy before the agents'
+    # steps, which can stop the join.
     firewall "/home/$WORKER/fleet-server"
     harden "/home/$WORKER/fleet-server"
+    updates
     current "/home/$WORKER/fleet-server" as_worker
     agent_helper "/home/$WORKER/fleet-server"
     agent_users "/home/$WORKER/fleet-server"
     vault_broker "/home/$WORKER/fleet-server"
     key_swap "/home/$WORKER/fleet-server"
     egress "/home/$WORKER/fleet-server"
+    if [ "${FLEET_VERIFY:-}" = caller ]; then
+        # The app runs the checks itself right after the line, in the form it reads (verify --json): a minute saved.
+        say "the app goes on from here, and it runs the checks itself"
+        return 0
+    fi
     verify_step "/home/$WORKER/fleet-server" as_worker
     say "done. Add an agent to this server in Founderizer: Settings, Servers, this server, Add agent."
 }

@@ -692,7 +692,11 @@ runuser -u $HUB_USER -- systemctl --user status fleet-hub"
     say "  the hub is yours at http://$address:$port — the next step only hardens this server"
 }
 
-updates() {     # unattended security updates on, then the pending ones once; never a restart of the server
+updates() {     # unattended security updates on, then the pending ones once; never a restart of the server. They run as
+                # apt's own two daily services (apt_daily), as in the join, so apt records the run as its timers do
+                # (upgrade-stamp, which this server's own reading gives the hub as the time of its last good security
+                # update): a bare unattended-upgrade installs the same and records nothing until the first daily run
+                # (point 9 of the review of 20 November 2026).
     heading "security updates"
     if [ "$check" = yes ]; then
         plan "turn unattended security updates on and install the pending ones once, without restarting the server"
@@ -708,10 +712,32 @@ updates() {     # unattended security updates on, then the pending ones once; ne
     fi
     say "  security updates are on; installing the pending ones (this can take some minutes)"
     apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" -q install </dev/null >/dev/null 2>&1 || true
-    unattended-upgrade </dev/null >/dev/null 2>&1 || say "  some security updates did not install now; the daily run \
-tries again"
+    apt_daily || say "  some security updates did not install now; the daily run tries again"
     [ ! -f /var/run/reboot-required ] || say "  this server needs a restart for its updates; restart it when it has \
 no work"
+}
+
+apt_daily() {   # apt's two daily services once, to their end: true when both ended well. A systemctl start that waits
+                # holds one connection to systemd, and an update of libc6 or systemd re-executes systemd, which closes
+                # that connection with an error while the services go on (a Debian 13 join, 5 November 2026). So the
+                # join only starts them, asks every 5 seconds whether a job of theirs is still listed, and then reads
+                # the result of each. While systemd re-executes it answers no question, so an unanswered one is asked
+                # again: only 12 in a row end the wait.
+    systemctl start --no-block apt-daily.service apt-daily-upgrade.service </dev/null >/dev/null 2>&1 || return 1
+    unanswered=0
+    while [ "$unanswered" -lt 12 ]; do
+        if ! listed=$(systemctl list-jobs --no-legend apt-daily.service apt-daily-upgrade.service 2>/dev/null); then
+            unanswered=$((unanswered + 1))
+        elif [ -z "$listed" ]; then
+            [ "$(systemctl show -p Result --value apt-daily.service 2>/dev/null)" = success ] \
+                && [ "$(systemctl show -p Result --value apt-daily-upgrade.service 2>/dev/null)" = success ]
+            return
+        else
+            unanswered=0
+        fi
+        sleep 5
+    done
+    return 1
 }
 
 harden() {      # this server's own hardening, the same as each server that joins gets (join.sh): SSH takes keys only
@@ -720,8 +746,8 @@ harden() {      # this server's own hardening, the same as each server that join
                 # server restarts by itself after a kernel panic and when systemd stops (hubsetup.py harden). Each
                 # part checks first and says what it did. A part that cannot be done
                 # leaves the server as it was, and none of them stops the install. It comes after the security
-                # updates, as in the join. As root, it runs the copy this script runs from, as the firewall does, and
-                # never the hub user's checkout. Until 14 November 2026 only the join had this step, so the first
+                # updates: this server's firewall came long before them. As root, it runs the copy this script runs
+                # from, as the firewall does, and never the hub user's checkout. Until 14 November 2026 only the join had this step, so the first
                 # server of a fleet kept the SSH settings of its image. A second claim (--reclaim) leaves it out: its
                 # owner's Mac may be lost, the only SSH key of this server can be that Mac's, and a server that then
                 # takes keys only would let its owner in through its provider's console alone.

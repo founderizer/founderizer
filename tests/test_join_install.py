@@ -21,11 +21,9 @@ from leftovers import ROOT
 KIT = Path(ROOT)
 SCRIPT = KIT / "join.sh"
 TEXT = SCRIPT.read_text()
-# The Linux path, in the order the script takes it. The firewall and the security updates come before the per-agent
-# users and verify, because verify reads the firewall and says whether this machine is healthy as it now stands. The
-# outgoing gate comes after the vault broker, because the installed vault program is what switches it on.
-LINUX = ["reach", "checkout ", "server.py\" join", "updates", "firewall ", "harden ", "current ", "agent_users ",
-         "vault_broker ", "key_swap ", "egress ", "verify_step "]
+# The calls of the Linux join, in its order, as `Shape` runs it with a stand-in for each step and for the system.
+LINUX = ["reach", "checkout", "join", "hub_time", "firewall", "harden", "updates", "current", "agent_helper",
+         "agent_users", "vault_broker", "key_swap", "egress", "verify_step"]
 
 
 def run_step(name, call, stubs):
@@ -38,12 +36,33 @@ class Shape(unittest.TestCase):
         subprocess.run(["sh", "-n", str(SCRIPT)], check=True, capture_output=True)
 
     def test_the_linux_path_takes_its_steps_in_order(self):
-        body = shell_function(SCRIPT, "linux")
-        at = []
-        for step in LINUX:
-            self.assertIn(step, body, f"the Linux join has no step {step.strip()}")
-            at.append(body.index(step))
-        self.assertEqual(at, sorted(at), "the steps are not in the order the join takes them")
+        """The Linux join, run with a stand-in for each step and for the system: the firewall and the hardening come
+        before the security updates (until 20 November 2026 they came after them, and a new server's SSH answered the
+        whole internet while its first updates waited for apt's lock), the updates before the agents' steps (they end
+        that first run of apt, whose lock the vault's own install would wait for), the outgoing gate after the vault
+        broker, whose installed program switches it on, and the checks last. A line that the app runs carries
+        FLEET_VERIFY=caller (InstallPlan.verifyLater, hub.sh's word) and leaves the checks to the app, which runs them
+        right after it: the self-test ran twice in each Add server (point 7 of the review of that day)."""
+        tmp = Path(tempfile.mkdtemp(prefix="fleet-join-order-"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        (tmp / "os-release").write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
+        ran, tools = tmp / "ran", tmp / "bin"
+        tools.mkdir()
+        (tools / "dpkg-query").write_text('#!/bin/sh\necho "install ok installed"\n')    # no function has its name
+        (tools / "dpkg-query").chmod(0o755)
+        stubs = (f'RAN="{ran}"\nPATH="{tools}:$PATH"\nREPO=x\nHUB=x\ncode=ABCD\nREBOOT_TIME=\nPACKAGES=git\n'
+                 + "".join(f'{step}() {{ echo {step} >> "$RAN"; }}\n' for step in LINUX if step != "join")
+                 + 'as_worker() { case "$*" in *"server.py join"*) echo join >> "$RAN" ;; esac; cat > /dev/null; }\n'
+                 'id() { echo 0; }\nsystemctl() { :; }\nuseradd() { :; }\npasswd() { :; }\nchmod() { :; }\n'
+                 'gpasswd() { :; }\nloginctl() { :; }\nsleep() { :; }\nsshd() { echo "port 22"; }\n'
+                 'sshd_folder() { :; }\n')
+        body = shell_function(SCRIPT, "linux").replace("/etc/os-release", str(tmp / "os-release"))
+        for word, steps in (("", LINUX), ("caller", LINUX[:-1]), ("later", LINUX)):
+            ran.unlink(missing_ok=True)
+            code, out = run_shell(body + f"FLEET_VERIFY={word}\nlinux\n", extra=stubs)
+            self.assertEqual(code, 0, out)
+            self.assertEqual(ran.read_text().splitlines(), steps, word or "a line run by hand")
+            self.assertEqual("the app goes on from here, and it runs the checks itself" in out, word == "caller", out)
 
     def test_the_join_code_never_stands_in_an_argument(self):
         """The one-time code goes to server.py on standard input, and the script drops it from its environment."""
@@ -190,12 +209,37 @@ class Updates(unittest.TestCase):
         return out.strip().splitlines()[-1], ran.read_text().splitlines()
 
     def test_the_pending_updates_go_through_apts_own_two_services(self):
-        body = shell_function(SCRIPT, "updates")
+        """In both installers, with one function: hub.sh ran a bare unattended-upgrade until 20 November 2026, so the
+        first server of a fleet gave the hub no time of a good update until its first daily run (point 9 of the
+        review of that day)."""
+        hub_sh = KIT / "hub.sh"
+        self.assertEqual(shell_function(hub_sh, "apt_daily"), shell_function(SCRIPT, "apt_daily"))
         self.assertIn("systemctl " + self.START, shell_function(SCRIPT, "apt_daily"))
-        self.assertIn('apt_daily || say "some security updates did not install now; the daily run tries again"', body)
-        self.assertNotRegex(body, r"(?m)^\s*unattended-upgrade ", "a bare unattended-upgrade records no run")
-        self.assertLess(body.index("Automatic-Reboot"), body.index("apt_daily ||"),
-                        "a server that restarts by itself after updates takes them in its daily run")
+        for script, say in ((SCRIPT, 'say "'), (hub_sh, 'say "  ')):
+            body = shell_function(script, "updates")
+            self.assertIn(f'apt_daily || {say}some security updates did not install now; the daily run tries again"',
+                          body, script.name)
+            self.assertNotRegex(body, r"(?m)^\s*unattended-upgrade ", f"{script.name}: a bare unattended-upgrade "
+                                                                      f"records no run")
+            self.assertLess(body.index("Automatic-Reboot"), body.index("apt_daily ||"),
+                            "a server that restarts by itself after updates takes them in its daily run")
+        # hub.sh's step, run with stand-ins: a server that restarts by itself after updates installs nothing now
+        tmp = Path(tempfile.mkdtemp(prefix="fleet-hub-updates-"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        ran, tools = tmp / "ran", tmp / "bin"
+        tools.mkdir()
+        text = shell_function(hub_sh, "updates").replace("/etc/apt/apt.conf.d/20auto-upgrades", str(tmp / "auto"))
+        for rebooting, steps in (("true", []), ("false", ["apt-get", "apt_daily"])):
+            ran.unlink(missing_ok=True)
+            for name, body in (("apt-config", f"echo \"AUTO_REBOOT='{rebooting}'\"\n"),
+                               ("apt-get", f'echo apt-get >> "{ran}"\n')):
+                (tools / name).write_text("#!/bin/sh\n" + body)
+                (tools / name).chmod(0o755)
+            stubs = (f'PATH="{tools}:$PATH"\nAPT_LOCK_WAIT=1\nsystemctl() {{ :; }}\n'
+                     f'apt_daily() {{ echo apt_daily >> "{ran}"; }}\n')
+            code, out = run_shell(text + "updates\n", extra=stubs)
+            self.assertEqual(code, 0, out)
+            self.assertEqual(ran.read_text().splitlines() if ran.exists() else [], steps, rebooting)
 
     def test_the_join_waits_while_the_jobs_are_listed_and_then_reads_each_result(self):
         said, calls = self.daily(["job", "job"])

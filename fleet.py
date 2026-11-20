@@ -2720,6 +2720,15 @@ def hosts_hook(hosts):
         "command": shlex.join([sys.executable, "-S", os.path.join(KIT, "hook_hosts.py"), *hosts]) + " || exit 2"}]}
 
 
+def closed_start(conf, closed):
+    """(runtime, version) of the program of a closed task start (closed_task_command): what the hub's start names
+    (hub.closed_extra), else the agent's runtime and the first of its versions that passed the lockdown test. None for
+    a runtime whose sessions cannot be held, which closed_task_command refuses."""
+    tested = lifecycle.runtime_fact(conf.get("runtime"), "closed_versions") or ()
+    closed = closed if isinstance(closed, dict) else {}
+    return (closed.get("runtime") or conf.get("runtime"), closed.get("version") or tested[0]) if tested else None
+
+
 def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, session, token, env, opening, rules,
                         closed=None, minted=None):
     """The start of a task session of an agent whose Shell box is off (support plan F1, H1), as a closed conversation
@@ -2748,7 +2757,7 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
     if not (token and session and generation):
         raise Refused("a closed task session needs its credential, its session id and its generation")
     closed = closed if isinstance(closed, dict) else {}
-    version = closed.get("version") or tested[0]
+    runtime, version = closed_start(conf, closed)
     hosts = closed.get("web_hosts")
     if hosts is not None:           # the host list: a start that this helper cannot hold to its hosts starts nothing
         try:
@@ -2760,7 +2769,7 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
                           f"list's test ({', '.join(lifecycle.HOST_LIST_VERSIONS)}), and this start names {version}")
         if needs == "browser":      # a task from before the list, when the Browser box was on: Chrome has no list
             raise Refused("a session with a host list has no browser task: its browser would open every host")
-    program = closed_program(closed.get("runtime") or conf.get("runtime"), version)
+    program = closed_program(runtime, version)
     allowed = [name for box, names in CLOSED_BUILT_INS.items() if box in (conf.get("can") or []) for name in names]
     named = closed.get("built_ins")
     built_ins = [name for name in allowed if not isinstance(named, list) or name in named]
@@ -7270,6 +7279,10 @@ class Helper:
                     # or a mint server (decision D24). Its cause is told once (report_start), as before.
                     start_refusal(self.agent, conf)
                     programs_wait(self.agent)       # its MCP programs install first: no credential, no vault read yet
+                    closed = extra.get("shell_off")
+                    program = closed_start(conf, closed) if isinstance(closed, dict) or shell_off(conf) else None
+                    if program:     # AUTONOMY.md P10, as a closed conversation: no browser, credential or mint token
+                        closed_program(*program)    # while the program that it runs downloads (Installing)
                     # build plan 04 (S2): on Linux, the agent's own browser runs before its session starts, and ends
                     # again when the rest of the start fails, so that no Chrome waits for a session that never comes
                     browser = self.browser_start(task, closed=isinstance(extra.get("shell_off"), dict) or

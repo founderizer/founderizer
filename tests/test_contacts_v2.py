@@ -2028,13 +2028,17 @@ class Conversations(Base):
 
     def test_a_closed_conversation_runs_only_at_a_version_that_passed_the_lockdown_test(self):
         """AUTONOMY.md decision 35: the versions are the release's data, beside the closed-capable fact, and the
-        setting only chooses among them."""
+        setting only chooses among them. The default is one at which the host list's and the plan list's live tests
+        passed too: until 20 November 2026 it was 2.1.308, at which a closed session has no plan list, and a session
+        with a host list ran at 2.1.312 in its place."""
         for name in lifecycle.RUNTIMES:
             tested = lifecycle.runtime_fact(name, "closed_versions")
             self.assertIsInstance(tested, tuple)
             self.assertTrue(lifecycle.runtime_fact(name, "conversation") or not tested, name)
         self.assertNotIn("closed_versions", lifecycle.EDITABLE_FACTS)
         self.assertEqual(hub.CLOSED_TESTED, hub.closed_versions(hub.CLOSED_RUNTIMES[0])[0])
+        self.assertIn(hub.CLOSED_TESTED, lifecycle.PLAN_LIST_VERSIONS)
+        self.assertIn(hub.CLOSED_TESTED, lifecycle.HOST_LIST_VERSIONS)
         code, data = self.settings(**{"conversations.closed_version": "2.1.400"})
         self.assertEqual(code, 400, data)
         self.assertIn("passed the lockdown test", data["error"])

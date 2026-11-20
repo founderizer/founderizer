@@ -955,7 +955,8 @@ SSHD_RUN = "/run/sshd"
 
 def sshd_folder(root=""):
     """Makes sshd's privilege separation folder (SSHD_RUN) when it is missing, so that sshd's own checks answer for
-    sshd's files, whether its service runs or not. The join's security updates install an update of openssh-server
+    sshd's files, whether its service runs or not. A new server's first updates (its image's own run of apt, and until
+    20 November 2026 the join's security updates, which came before the firewall) install an update of openssh-server
     when the server's image is older than it, and the join is one SSH session: no new connection starts the service
     again before the firewall and the hardening run. Until 14 November 2026 the hardening then read sshd's "Missing
     privilege separation directory" as a refusal of its own file and took the file back, so the first server that Add

@@ -198,7 +198,7 @@ class Start(test_shell_box.Helper):
             with self.subTest(closed):
                 _, args, option = self.parts(self.build(closed=closed))
                 settings = self.private(option("--settings"))
-                self.assertEqual(option("--tools"), "WebSearch")
+                self.assertEqual(option("--tools"), test_shell_box.with_plan("WebSearch"))
                 self.assertEqual([rule for rule in settings["permissions"]["allow"] if "WebFetch" in rule], [])
                 self.assertEqual(sorted(settings["hooks"]), ["PostToolUse", "PostToolUseFailure"])
                 self.assertNotIn("skipWebFetchPreflight", settings)
@@ -220,11 +220,10 @@ class Start(test_shell_box.Helper):
                 self.start(web_hosts=hosts)
             self.assertIn(lifecycle.WEB_HOSTS_FORM, str(refused.exception))
         self.assertNotIn("2.1.308", lifecycle.HOST_LIST_VERSIONS)
-        for closed in ({"version": "2.1.308"}, {"version": None}):      # None: the first version of closed sessions
-            with self.subTest(closed), self.assertRaises(fleet.Refused) as refused:
-                self.start(**closed)
-            self.assertIn("passed the host list's test", str(refused.exception))
-            self.assertIn("2.1.308", str(refused.exception))
+        with self.assertRaises(fleet.Refused) as refused:       # a version of closed sessions that the owner chose
+            self.start(version="2.1.308")
+        self.assertIn("passed the host list's test", str(refused.exception))
+        self.assertIn("2.1.308", str(refused.exception))
         with self.assertRaises(fleet.Refused) as refused:   # a task from before the list, with the Browser box on
             shlex.split(self.build(dict(test_shell_box.DESK, can=["web", "browser"]), needs="browser",
                                    closed={"version": PROVED, "built_ins": ["WebSearch", "WebFetch"],
@@ -232,6 +231,8 @@ class Start(test_shell_box.Helper):
         self.assertEqual(str(refused.exception),
                          "a session with a host list has no browser task: its browser would open every host")
         self.assertFalse(self.sessions.exists())            # and no file of a session that did not start
+        # None: the first version of closed sessions, at which the host list's test passed since 20 November 2026
+        self.assertIn(str(self.pinned), self.start(version=None)[0])
 
     def test_the_longest_host_list_fits_a_tmux_command(self):
         longest = ["*." + f"h{n:02d}." + "a" * 36 + "." + "b" * 35 + ".com" for n in range(lifecycle.WEB_HOSTS_MOST)]
@@ -305,8 +306,10 @@ class Hub(test_shell_box.Fleet):
         self.assertEqual(self.line()["web_hosts"], HOSTS)
         told = [e["text"] for e in hub.q("SELECT text FROM events WHERE agent='manager' AND kind='say'")]
         self.assertIn(f"[hub] The owner changed desk: its page reads now open only on: {WORDS}.", told)
-        # each start names the hosts and the page tool, at a version that passed the host list's own test
-        self.assertNotIn(hub.CLOSED_TESTED, lifecycle.HOST_LIST_VERSIONS)
+        # each start names the hosts and the page tool, at a version that passed the host list's own test: also where
+        # the owner chose a version of closed sessions at which it did not pass
+        outside = next(v for v in hub.closed_versions("claude") if v not in lifecycle.HOST_LIST_VERSIONS)
+        hub.TEAM["settings"]["conversations.closed_version"] = outside
         shell_off, text = self.started()
         self.assertEqual(shell_off, {"runtime": "claude", "version": PROVED, "built_ins": ["WebSearch", "WebFetch"],
                                      "servers": None, "web_hosts": HOSTS})
@@ -314,17 +317,24 @@ class Hub(test_shell_box.Fleet):
                       f"another host does not open, also when a web search names it or a listed page sends you to it "
                       f"(only a listed host's own www. name opens that way): do not try another address for it. Web "
                       f"search itself is not limited by the list.", text)
-        other = lifecycle.HOST_LIST_VERSIONS[1]
-        hub.TEAM["settings"]["conversations.closed_version"] = other    # the owner's version, where it passed too
-        self.assertEqual(self.started()[0]["version"], other)
+        # the owner's version where it passed too, also when it is not the list's first; and with no version of the
+        # owner's, the default, which passed it
+        listed = next(v for v in lifecycle.HOST_LIST_VERSIONS if v != PROVED)
+        hub.TEAM["settings"]["conversations.closed_version"] = listed
+        self.assertEqual(self.started()[0]["version"], listed)
+        del hub.TEAM["settings"]["conversations.closed_version"]
+        self.assertEqual(self.started()[0]["version"], hub.CLOSED_TESTED)
+        self.assertIn(hub.CLOSED_TESTED, lifecycle.HOST_LIST_VERSIONS)
         # what the manager and each colleague read about this agent in every later start, and about no other agent
         self.assertIn("reads web pages only on docs.example.com, *.example.org", hub.colleague_facts("desk"))
         self.assertFalse(any("web pages" in fact for fact in hub.colleague_facts("ops")))
         self.assertIn("reads web pages only on docs.example.com, *.example.org", hub.team_start_text("manager"))
-        # a duty that names its tools and no web search: no page read either, and the version of closed sessions
+        # a duty that names its tools and no web search: no page read either, and the owner's version of closed
+        # sessions, which is not the default and has no host list
+        hub.TEAM["settings"]["conversations.closed_version"] = outside
         review = self.duty(watch=[{"kind": "clock", "schedule": test_shell_box.EVERY}], tools=["remember"])
         shell_off, text = self.started(responsibility=review["id"])
-        self.assertEqual(shell_off, {"runtime": "claude", "version": other, "built_ins": [], "servers": None})
+        self.assertEqual(shell_off, {"runtime": "claude", "version": outside, "built_ins": [], "servers": None})
         self.assertNotIn("host list", text)
         ticket = self.duty(watch=[{"kind": "clock", "schedule": test_shell_box.EVERY}], tools=["WebSearch"])
         self.assertEqual(self.started(responsibility=ticket["id"])[0]["built_ins"], ["WebSearch", "WebFetch"])

@@ -420,12 +420,13 @@ WEB_HOST = re.compile(r"(?:\*\.)?(?=[a-z0-9.-]{4,80}\Z)(?:[a-z0-9](?:[a-z0-9-]{0
 WEB_HOSTS_MOST = 20     # with 80 characters each, the start of a session stays far below what tmux takes (16 KiB)
 WEB_HOSTS_FORM = (f"a list of 1 to {WEB_HOSTS_MOST} different hosts, each a host name in lower case such as "
                   f"docs.example.com, or *.example.com for example.com and every host below it")
-# The versions of Claude Code at which a closed session with a host list passed its live test
-# (test_web_hosts.Live, with FLEET_LIVE_LOCKDOWN=1), the default first: on the owner's Mac, 12 November 2026, a page
-# on a listed host opened, and a page on another host, a redirect to another host and Claude Code's own list of
-# documentation hosts did not. A session with a host list runs at the version of closed sessions when it is one of
-# these, else at the first of these (hub.closed_extra), and a helper starts none at another (closed_task_command).
-# A version joins only in a release whose live test passed at it. 2.1.308 was not on that Mac, so it is not here.
+# The versions of Claude Code at which a closed session with a host list passed its live test (test_web_hosts.Live,
+# with FLEET_LIVE_LOCKDOWN=1), first the one that a session takes where the version of closed sessions is not one of
+# these: on the owner's Mac, 12 November 2026, a page on a listed host opened, and a page on another host, a redirect
+# to another host and Claude Code's own list of documentation hosts did not. A session with a host list runs at the
+# version of closed sessions when it is one of these, else at the first of these (hub.closed_extra), and a helper
+# starts none at another (closed_task_command). A version joins only in a release whose live test passed at it.
+# 2.1.308 was not on that Mac, so it is not here.
 HOST_LIST_VERSIONS = ("2.1.312", "2.1.311")
 # The versions of Claude Code at which a closed task session with the runtime's task list passed its live test
 # (test_conversation_lockdown.ClosedTask, with FLEET_LIVE_LOCKDOWN=1; fleet.CLOSED_PLAN_TOOLS): on the owner's Mac,
@@ -667,8 +668,12 @@ RUNTIMES = {
         "conversation": True,
         "conversation_why": None,
         # On the owner's Mac, 27 and 28 October 2026, each with its updater off: only the Fleet tools and
-        # fleet.CLAUDE_BUILT_INS, and only the hub's prompt. 2.1.308 first, because three of the four machines run it
-        "closed_versions": ("2.1.308", "2.1.311", "2.1.312"),
+        # fleet.CLAUDE_BUILT_INS, and only the hub's prompt. 2.1.311 first, the default of every fleet since 20 November
+        # 2026 (the owner's "Yes, start"): the host list's and the plan list's live tests passed at it
+        # (HOST_LIST_VERSIONS, PLAN_LIST_VERSIONS). A user of a Claude Code agent at 2.1.311 holds its program already
+        # (fleet.closed_program links it); another user downloads it at its first closed start, which waits. 2.1.308,
+        # the default before, had neither list, and it stays for a fleet whose owner chose it.
+        "closed_versions": ("2.1.311", "2.1.308", "2.1.312"),
         "mcp_servers": True,
         "app_server": False,
         "switch": True,
@@ -1245,6 +1250,71 @@ def vault_chrome(home, timeout=20):
     except (OSError, ValueError, AttributeError):
         return None
     return cause if cause in VAULT_CHROME else None
+
+
+CODEX_KEPT = "codex-releases.json"      # in ~/.fleet: each Codex release that was old enough when read (codex_releases)
+CODEX_TAG_PAGES = 5     # pages of 100 tags at most: the first held 11 stable tags of about 10 days (20 November 2026)
+
+
+def github_json(url, timeout=30):
+    """One answer of GitHub's public API, at most 2 MiB."""
+    request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
+                                                   "User-Agent": "founderizer-helper"})
+    with urllib.request.urlopen(request, timeout=timeout) as answer:
+        return json.loads(answer.read(2 * 1024 * 1024))
+
+
+def codex_releases(home, now, get=github_json):
+    """The vendor's own record of Codex's newest stable releases, newest first, as its API gives each one, down to the
+    first that is onboard.RELEASE_AGE_DAYS old, which is the newest that its update may take (onboard.codex_release):
+    the list of its tags, a page after another (GitHub gives them newest first, at most CODEX_TAG_PAGES), and the
+    release of each stable tag. Each release read is kept in ~/.fleet (CODEX_KEPT). One that was that old when it was
+    read is kept for good: its time and its marks do not change any more. A younger one is kept with the mark `young`
+    and read once more when its own time is that old, and that read decides: so a release that the vendor marks a
+    pre-release, pulls or publishes again in its first days is read so, and a round reads only the tags and what is
+    new. A tag whose release has not come yet is read again at each round. What a read kept is written also when it
+    stops half-way. Raises when GitHub does not answer as its API does."""
+    path = os.path.join(home, FLEET_DIR, CODEX_KEPT)
+    old = onboard.RELEASE_AGE_DAYS * 86400
+    try:
+        with open(path, encoding="utf-8") as f:
+            kept = json.load(f)
+    except (OSError, ValueError):
+        kept = {}
+    kept = {v: r for v, r in kept.items() if isinstance(v, str) and isinstance(r, dict)} if isinstance(kept, dict) else {}
+    releases = []
+    try:
+        for page in range(1, CODEX_TAG_PAGES + 1):
+            tags = get(f"{onboard.CODEX_TAGS}&page={page}")
+            if not isinstance(tags, list):
+                raise ValueError(f"GitHub gave no list of Codex's tags but {type(tags).__name__}")
+            found = [onboard.CODEX_TAG.fullmatch(str(t.get("name"))) for t in tags if isinstance(t, dict)]
+            for version in sorted({tag.group(1) for tag in found if tag}, key=lambda v: tuple(map(int, v.split("."))),
+                                  reverse=True):
+                record = kept.get(version)
+                age = None if record is None else onboard.published_age(record, now)
+                if record is None or record.get("young") and (age is None or age >= old):
+                    try:
+                        answer = get(onboard.CODEX_RELEASE.format(version))
+                    except urllib.error.HTTPError as e:
+                        if e.code != 404:
+                            raise
+                        kept.pop(version, None)     # a tag whose release has not come, or went: read again
+                        continue
+                    if not isinstance(answer, dict):
+                        raise ValueError(f"GitHub gave no release of Codex {version} but {type(answer).__name__}")
+                    record = {k: answer.get(k) for k in ("published_at", "prerelease", "draft")}
+                    age = onboard.published_age(record, now)
+                    kept[version] = record if age is not None and age >= old else dict(record, young=True)
+                releases.append(dict(record, tag_name=f"rust-v{version}"))
+                if onboard.codex_release(releases, now):
+                    return releases
+            if len(tags) < 100:
+                break                                   # the last page
+        return releases
+    finally:
+        with contextlib.suppress(OSError):
+            write_json(path, kept)
 
 
 def desktop_path(home):
@@ -3943,8 +4013,11 @@ class Lifecycle:
     def __init__(self, kit, agent, conf, post, busy, restart=None, run=_run, clock=time.time,
                  platform_name=sys.platform, home=None, vault=None, probe=None, models=codex_model_list, legacy=None,
                  switch=None, which=None, monotonic=time.monotonic, runtimes_busy=None, say=print, slow_file=None,
-                 floor=None, read_key=None, ended=None):
+                 floor=None, read_key=None, ended=None, releases=None):
         self.kit, self.agent, self.conf, self.post, self.busy = kit, agent, conf, post, busy
+        # () -> the vendor's own record of Codex's newest releases (codex_releases): its update takes the newest that is
+        # onboard.RELEASE_AGE_DAYS old
+        self.releases = releases or (lambda: codex_releases(self.home, self.clock()))
         # (runtime) -> True when that runtime's own account read said that its sign-in is over at the provider
         # (usage.Collector.sign_in_ended). None: nothing reads the account here, as for the server service's readings.
         self.ended = ended
@@ -5105,10 +5178,28 @@ class Lifecycle:
         if problem:
             return outcome("skipped", f"The installed {old or name} does not pass the check now ({problem}), so no "
                                       f"new version is tried.")
-        code, said = shell(onboard.runtime_update(name))
+        if name == "codex":
+            # The newest release that is onboard.RELEASE_AGE_DAYS old, by the vendor's own record, and never an older
+            # one than this user runs: a version that came out hours ago waits, as the owner's npm rule has it.
+            try:
+                aged = onboard.codex_release(self.releases(), self.clock())
+            except Exception as e:      # an answer of GitHub that is cut or of another shape: Claude Code's turn still comes
+                return outcome("skipped", f"The record of Codex's releases could not be read ({e}), so {old} stays; "
+                                          f"the next round reads it again.")
+            if not aged:
+                return outcome("skipped", f"The record of Codex's releases has no release that is "
+                                          f"{onboard.RELEASE_AGE_DAYS} days old, so {old} stays.")
+            if onboard.not_older(old, aged):
+                return outcome("current", f"{old} stays: no newer release of Codex is {onboard.RELEASE_AGE_DAYS} "
+                                          f"days old yet.")
+            code, said = shell(onboard.runtime_install(name, aged))
+        else:
+            code, said = shell(onboard.runtime_update(name))
         new, problem = self.runtime_check(name, exe)
         if not problem and not onboard.not_older(new, old):
             problem = f"it is older than {old}"
+        if not problem and name == "codex" and not onboard.not_older(aged, new):
+            problem = f"it is not {aged}, the release that is {onboard.RELEASE_AGE_DAYS} days old"   # a newer one came
         if not problem:
             if new != old:
                 return outcome("updated", f"Updated from {old} to {new}, which passed its check.")

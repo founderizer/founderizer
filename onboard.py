@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import fcntl
 import hashlib
 import ipaddress
@@ -501,6 +502,46 @@ def not_older(current, wanted):
     return bool(have and want) and tuple(map(int, have.group(0).split("."))) >= tuple(map(int, want.group(0).split(".")))
 
 
+# The vendor's own record of Codex's releases: each stable release is the tag rust-v<version>, with the time that it was
+# published. The helper's update takes the newest one that is RELEASE_AGE_DAYS old (codex_release), with the owner's rule
+# for npm on his machines (min-release-age=7): two agents ran Codex 0.171.0 less than 19 hours after it came out
+# (the owner's "Yes, start" of 20 November 2026). Claude Code's own updates follow its stable channel, about a week.
+# The list of its tags is about 45 KB; each release is about 330 KB, and 30 of them more than 4 MiB (20 November 2026), so
+# the helper reads the tags and then the release of each new stable tag (lifecycle.codex_releases).
+CODEX_TAGS = "https://api.github.com/repos/openai/codex/tags?per_page=100"
+CODEX_RELEASE = "https://api.github.com/repos/openai/codex/releases/tags/rust-v{}"
+CODEX_TAG = re.compile(r"rust-v([0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6})")
+RELEASE_AGE_DAYS = 7
+
+
+def published_age(release, now):
+    """How many seconds before `now` the vendor published `release` (its API's `published_at`), or None when that is
+    not a time with its zone."""
+    try:
+        published = datetime.datetime.fromisoformat(str(release.get("published_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return None if published.tzinfo is None else now - published.timestamp()
+
+
+def codex_release(releases, now, days=RELEASE_AGE_DAYS):
+    """The newest stable Codex release of the vendor's list (`releases`, as its API gives it) that was published at
+    least `days` days before `now`, or None. A pre-release, a draft, a tag of another form and a time that is not one
+    are left out; the list's own order is not the versions' order."""
+    best = None
+    for release in releases if isinstance(releases, list) else ():
+        if not isinstance(release, dict) or release.get("draft") is not False or release.get("prerelease") is not False:
+            continue
+        tag = CODEX_TAG.fullmatch(str(release.get("tag_name") or ""))
+        age = published_age(release, now)
+        if not tag or age is None or age < days * 86400:
+            continue
+        version = tag.group(1)
+        if best is None or tuple(map(int, version.split("."))) > tuple(map(int, best.split("."))):
+            best = version
+    return best
+
+
 # The vendor's Codex installer, for the worker user into ~/.local/bin. Without --release it installs the newest release.
 CODEX_INSTALLER = ("curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false "
                    "CODEX_NON_INTERACTIVE=1 sh -s --")
@@ -538,7 +579,8 @@ def runtime_update(rt):
     """The vendor's own update of one runtime of the worker user in ~/.local/bin, to the newest version that the vendor
     gives: Claude Code's `update` command, which follows the channel and the floor that CLAUDE_CHANNEL set and does
     not go below the build that runs it, and Codex's installer without a release. The helper runs it, as the worker
-    user, and checks what it installed (lifecycle.Lifecycle.update_runtime)."""
+    user, and checks what it installed (lifecycle.Lifecycle.update_runtime). The helper's round runs Codex's installer
+    with the release that codex_release chose in place of this one."""
     if rt == "codex":
         return CODEX_INSTALLER
     return '"$HOME/.local/bin/claude" update'

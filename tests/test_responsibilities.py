@@ -282,6 +282,20 @@ class Duties(Base):
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM responsibilities")["n"], 1)
         self.assertEqual(hub.q1("SELECT request_id FROM responsibilities")["request_id"], "Mgr-Duty-0001")
 
+    def test_a_duty_whose_words_pass_three_quarters_of_their_size_answers_with_the_size(self):
+        """The owner, 20 November 2026: agents must know that their texts can be edited "and must be kept up to date
+        when it gets too long" (agent-own-rules-design, 5.4). Protects against a duty's words that reach 8,000 with no
+        word, as a profile's did, and a size sentence in every answer."""
+        for size, said in ((6000, None), (6001, "Its words are 6,001 of 8,000 characters. A duty says what it "
+                                                  "answers for and what goes up")):
+            words = (DUTY["text"] + " " + "Check each step. " * 400)[:size - 1] + "."
+            text, error = self.tool("manager", "set_duty", request_id=str(uuid.uuid4()), **dict(DUTY, text=words))
+            self.assertFalse(error, text)
+            if said:
+                self.assertIn(said, text)
+            else:
+                self.assertNotIn("characters", text)
+
     def test_the_task_id_the_fence_adds_is_not_read_as_the_callers_own_field(self):
         """message_agent takes no task_id and a worker's session has one added for it, so the check has to read
         what the caller wrote and not what the fence left."""

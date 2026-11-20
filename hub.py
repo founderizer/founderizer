@@ -23764,13 +23764,13 @@ def conversation_message_view(r):
 # conversation tools, at a version that passed the lockdown test on it. Both are the release's data, in the runtime
 # table (lifecycle.RUNTIMES conversation and closed_versions), and the owner's two settings only choose among them.
 def closed_versions(runtime):
-    """The versions of a runtime that passed the lockdown test, oldest first: the only ones that a closed
+    """The versions of a runtime that passed the lockdown test, the default first: the only ones that a closed
     conversation runs at. () for a runtime whose session cannot be locked."""
     return tuple(runtime_fact(runtime, "closed_versions") or ()) if runtime_fact(runtime, "conversation") else ()
 
 
 CLOSED_RUNTIMES = tuple(name for name in runtimes_with("conversation") if closed_versions(name))
-CLOSED_TESTED = closed_versions(CLOSED_RUNTIMES[0])[0]     # the first that passed: closed_version's default
+CLOSED_TESTED = closed_versions(CLOSED_RUNTIMES[0])[0]     # the first of the list: closed_version's default
 
 
 def closed_runtime_check(value):
@@ -23785,7 +23785,8 @@ def version_check(value):
     on any runtime of CLOSED_RUNTIMES: with one such runtime, as today, its own list."""
     tested = tuple(dict.fromkeys(v for name in CLOSED_RUNTIMES for v in closed_versions(name)))
     if not isinstance(value, str) or value not in tested:
-        raise ValueError("must be a version that passed the lockdown test: " + ", ".join(tested))
+        raise ValueError("must be a version that passed the lockdown test: "      # in the versions' order, not the list's
+                         + ", ".join(sorted(tested, key=lambda v: tuple(int(p) for p in v.split(".") if p.isdigit()))))
     return value
 
 
@@ -27499,6 +27500,105 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
             FLIGHT["thread"] = None     # under LOCK: each stretch took it back at its end
 
 
+# A long profile (the design "An agent keeps its own rules", version 2, slice 1; the owner's yes of 20 November 2026 to
+# its decisions 1 and 2): a profile holds what is the owner's, and the fleet manager puts a long one in order in one plan
+# of team changes, which the owner presses. Agents' own texts have stores with no working limit; a profile's section
+# takes 8,000 characters (profile_sections), and on 20 November 2026 four profiles held more than 6,000.
+PROFILE_LONG = "profile_long:"      # kv, with the agent's name after it: the free text of its profile at the last ask
+PROFILE_LONG_SEEDED = "profile_long_seeded"     # kv: the first start of the release that brought the mark read them all
+PROFILE_LONG_MARK = 6000        # characters of free text above which the manager is asked to put a profile in order
+PROFILE_LONG_AGAIN = 1000       # characters more than at the last ask, before the manager is asked again
+PROFILE_LONG_TRIED = {"start": False}       # this process tried the first start's pass (profile_long_seed)
+# The rule of places, at the moment of use: a message of the hub's, so it is in no size ceiling of the rules.
+PROFILE_LONG_RULE = (
+    "A profile holds what is the owner's: what the agent is for, what it may do without asking, what it must ask "
+    "first, and which person decides what. Put it in order with your own tools. A line that one of the agent's duties "
+    "or an owner file that its profile lists already says leaves the profile. How the work of a duty goes moves into "
+    "that duty's words (set_duty). The steps of a job go into a skill of the agent: give it a task to write one; for "
+    "an agent whose Shell box is off, they go into a knowledge file that the duty's words name. Nothing goes into the "
+    "agent's notes or its lessons. A rule that several profiles repeat goes one time into an owner file that they "
+    "list. A line that is the owner's decision stays, word for word. Then write one plan for this profile with "
+    "change_team, whose words say where each line went. When each line is the owner's decision, change nothing.")
+
+
+def profile_free_text(sections):
+    """The free text of a profile, which its mark counts: the larger of the characters of its other sections together
+    and the characters of its longest rule section (the four required ones and each other one, as the app's isRule has
+    them). Knowledge, Logins and Knowledge files do not count: they are lists of what the agent holds and reads."""
+    rules = [len(s["text"]) for s in sections if s["key"] in PROFILE_REQUIRED or s["key"] == "other"]
+    return max(sum(len(s["text"]) for s in sections if s["key"] == "other"), max(rules, default=0))
+
+
+def profile_long_words(agent, n):
+    """The hub's ask to the manager about one long profile."""
+    whose = "Your profile" if agent == manager_name() else f"The profile of {shown_role(agent)}"
+    return (f"{whose} (profiles/{agent}.md) is long: its free text holds {n:,} characters, and one section takes "
+            f"8,000. {PROFILE_LONG_RULE}")
+
+
+def profile_long_after(agent, sections, ask):
+    """After a write of the profile of these sections: the free text that the manager was last asked about, kept in kv,
+    and the ask's words when `ask` and this write took the free text past the mark, or PROFILE_LONG_AGAIN characters
+    past the last ask; else "". A write at or below the mark removes the record, so that the next one past it asks
+    again. ask=False (a plan that the owner pressed, the manager's own) records the new number and asks nothing, so
+    the count starts from it. No ask while the manager may not write a plan (team_manager_refusal): the next save asks.
+    Each ask was the owner's "Dont spam with messages!" (17 November 2026) at each save, so a small save is quiet."""
+    n, key = profile_free_text(sections), PROFILE_LONG + agent
+    if n <= PROFILE_LONG_MARK:
+        kv_set(key, None)
+        return ""
+    if not ask:
+        kv_set(key, n)
+        return ""
+    try:
+        last = int(kv_get(key) or 0)
+    except (TypeError, ValueError):
+        last = 0
+    if last and n < last + PROFILE_LONG_AGAIN or team_manager_refusal():
+        return ""
+    kv_set(key, n)
+    return profile_long_words(agent, n)
+
+
+def profile_long_seed(t0):
+    """At the first pass of the timers of the release that brought the mark, one time for each database: each profile
+    above it is recorded, and the manager gets one message that names them with their numbers. Outside LOCK (timers):
+    its one git read, at most 30 seconds, holds nothing, and its writes take LOCK in their transaction. A revision or a
+    read that git does not answer now does nothing, and the next start of the hub tries again; so does a manager that
+    may not write a plan now. A read that failed is never taken for profiles that are short."""
+    if PROFILE_LONG_TRIED["start"]:
+        return
+    PROFILE_LONG_TRIED["start"] = True
+    if kv_get(PROFILE_LONG_SEEDED) or team_manager_refusal():
+        return
+    rev, mgr, names = kit_revision(), manager_name(), sorted(agents())
+    paths = [f"profiles/{n}.md" for n in names]
+    read = kit_batch(kit_dir(), rev, paths) if rev else {}     # one git read: a missing file, a file, or no answer
+    if not rev or any(path not in read for path in paths):
+        return
+    long = []
+    for n in names:
+        data = read[f"profiles/{n}.md"][1]
+        if data is None:
+            continue
+        free = profile_free_text(parse_profile(data.decode("utf-8", "replace")))
+        if free > PROFILE_LONG_MARK:
+            long.append((n, free))
+    with transaction():
+        for n, free in long:
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       (PROFILE_LONG + n, str(free)))
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   (PROFILE_LONG_SEEDED, str(t0)))
+        if long:
+            event_rows([(mgr, "say", None, "[hub] These profiles are long, each above 6,000 characters of free text, and "
+                         "one section takes 8,000: " + "; ".join(f"{'yours' if n == mgr else shown_role(n)} "
+                                                                 f"(profiles/{n}.md) {free:,}" for n, free in long)
+                         + f". Put each one in order, one plan for each profile. {PROFILE_LONG_RULE}", None)], t0)
+            log_row("hub", f"asked {mgr} to put {len(long)} long profiles in order: "
+                    + ", ".join(n for n, _ in long))
+
+
 def save_profile(agent, base, sections):
     """The owner's profile, committed through the hub."""
     rev = kit_revision(fresh=True)
@@ -27519,7 +27619,9 @@ def save_profile(agent, base, sections):
     mgr = manager_name()
     whose, then = (("your profile", ": it replaces the profile in your start prompt.") if agent == mgr else
                    (f"the profile of {agent}", f", before you give {agent} new work."))
-    emit(mgr, "say", f"[hub] The owner changed {whose} ({path}, commit {commit[:12]}). Read {path} again now{then}")
+    long = profile_long_after(agent, sections, ask=True)       # after the commit: the profile as it stands now
+    emit(mgr, "say", f"[hub] The owner changed {whose} ({path}, commit {commit[:12]}). Read {path} again now{then}"
+         + (f" {long}" if long else ""))
     # Every machine, the manager's too: same_code counts a profile, so a machine left out stands "behind".
     updates = [name for name in agents() if request_update(name, commit) == "requested"]
     log("owner", f"changed {path} in {commit[:12]}")
@@ -32071,7 +32173,7 @@ def duty_fields(data, create):
             raise ValueError("agent must be an agent name")
         body["agent"] = data["agent"]
     if create or "text" in data:
-        body["text"] = goal_text(data.get("text"), "text", 8000)
+        body["text"] = goal_text(data.get("text"), "text", DUTY_WORDS_MAX)
     if create or "watch" in data:
         body["watch"] = duty_watch_spec(data.get("watch", []), create)
     if "tools" in data:         # support plan F1: what the sessions of its cases have, for a Shell-off holder
@@ -35323,6 +35425,11 @@ def duty_moved(key, r, command, watch, seen, mark):
     return text
 
 
+# A duty's words, and the size at which set_duty's answer says so (the owner, 20 November 2026: agents must know
+# that their texts can be edited "and must be kept up to date when it gets too long"; agent-own-rules-design, 5.4)
+DUTY_WORDS_MAX, DUTY_WORDS_NEAR = 8000, 6000
+
+
 def t_set_duty(agent, a):
     """A new duty, or a change of one that exists: the manager for any agent, a lead for its own team."""
     duty_id = None
@@ -35366,8 +35473,13 @@ def t_set_duty(agent, a):
         raise ToolError(str(e)) from None
     duty_seen_set(key, {r["id"]: duty_mark_after(seen, before, duty_read_mark(r))})     # its own write: read
     rules = ", ".join(str(t["id"]) for t in duty_watches(r["id"])) or "none"
-    return (f"Saved {rref(r['id'])} ({duty_name(r['text'])}) for {r['agent']}, revision {r['revision']}. Wake-up "
+    said = (f"Saved {rref(r['id'])} ({duty_name(r['text'])}) for {r['agent']}, revision {r['revision']}. Wake-up "
             f"rules of its watches: {rules}. see_responsibilities shows its cases and markers.")
+    if len(r["text"]) > DUTY_WORDS_NEAR:       # three quarters of its size: put it in order before it is full
+        said += (f" Its words are {len(r['text']):,} of {DUTY_WORDS_MAX:,} characters. A duty says what it answers for "
+                 f"and what goes up: move the steps of its work into a skill of its holder, or, for a holder whose "
+                 f"Shell box is off, into a knowledge file that the words name.")
+    return said
 
 
 def t_change_duty(agent, a):
@@ -39099,6 +39211,32 @@ def team_quote(text):
     return "\n".join("> " + line if line.strip() else "> " for line in str(text).strip().split("\n")) or "> (none)"
 
 
+def team_section_change(was, now_):
+    """A profile section's change on a team card: each block of its lines that changed, as the owner file's part
+    shows a change (team_owner_file), and one line for the lines that stay. A whole section before and after, as
+    before, made a card twice as long as the section, so the hub refused the plan that a long profile needs most:
+    one that makes its section shorter (TEAM_PLAN_DETAILS_CHARS; the design "An agent keeps its own rules", slice 1).
+    A section that is new or removed, or that changed only in its empty lines, reads whole, and so does a section of
+    one line, as before."""
+    whole = f"Before:\n\n{team_quote(was) if was else '> (none)'}\n\nAfter:\n\n{team_quote(now_) if now_ else '> (removed)'}"
+    if not was or not now_:
+        return whole
+    import difflib
+    old, new = ([line for line in text.split("\n") if line.strip()] for text in (was, now_))
+    blocks, kept = [], 0
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+        if op == "equal":
+            kept += i2 - i1
+        else:
+            blocks.append("Before:\n\n" + (team_quote("\n".join(old[i1:i2])) if i2 > i1 else "> (none)") +
+                          "\n\nAfter:\n\n" + (team_quote("\n".join(new[j1:j2])) if j2 > j1 else "> (removed)"))
+    if not blocks:
+        return whole
+    stay = ("" if not kept else "\n\n1 line of this section stays as it is." if kept == 1 else
+            f"\n\n{kept} lines of this section stay as they are.")
+    return "\n\n".join(blocks) + stay
+
+
 def team_said_role(team, name):
     """An agent as the owner's apps name it, from this team: its role title, else its name."""
     a = (team.get("agents") or {}).get(name) or {}
@@ -39510,8 +39648,7 @@ def team_profile(ctx, c):
         was = next((x["text"] for x in old if same(x, s)), None)
         now_ = next((x["text"] for x in sections if same(x, s)), None)
         if was != now_:
-            out.append(f"*{s['title']}*\n\nBefore:\n\n{team_quote(was) if was else '> (none)'}\n\nAfter:\n\n"
-                       f"{team_quote(now_) if now_ else '> (removed)'}")
+            out.append(f"*{s['title']}*\n\n" + team_section_change(was, now_))
     opening = MANAGER_OPENING if n == ctx["mgr"] else "Written by the owner. Agents cannot change it."
     if opening not in view["text"]:     # a profile from before the hub's words for its opening: the save writes them
         out.append(f"*Its opening* becomes the hub's words:\n\n{team_quote(opening)}")
@@ -39953,6 +40090,13 @@ def team_plan_after(nid, need, mark):
     if done and read_row(f"SELECT 1 FROM server_jobs WHERE id=? AND state IN ({','.join('?' * len(JOB_OPEN))})",
                          (done, *JOB_OPEN)):
         kv_set(TEAM_PLAN_JOB + str(done), str(nid))         # a job that ended already is no plan's any more
+    for c in (team_card(need) or {}).get("changes") or []:      # a long profile's count starts from the plan's number
+        if c.get("kind") == "profile" and isinstance(c.get("agent"), str):
+            data = git_blob(commit, f"profiles/{c['agent']}.md")
+            if data is None:            # the plan wrote it, so git did not answer: one more ask is better than none
+                kv_set(PROFILE_LONG + c["agent"], None)
+            else:
+                profile_long_after(c["agent"], parse_profile(data.decode("utf-8", "replace")), ask=False)
     names = list(agents()) if after.get("profiles") else after.get("moved") or []
     updates = [n for n in names if request_update(n, rev) == "requested"]
     jobs = ""
@@ -40454,20 +40598,27 @@ def standing_start_text(agent, limit=None):
     every new session of it (start_text, manager_resume_text), and for the closed conversation of a person whose role
     has its tools on (conversation_prompt, with a smaller limit). The nearest come first and the first always comes;
     one that does not fit is named, for see_standing. When an item came from a person, one sentence says whom it is
-    for: an agent that kept "links for next time" for one colleague had asked for it for two (19 November 2026)."""
+    for: an agent that kept "links for next time" for one colleague had asked for it for two (19 November 2026).
+
+    A session of an agent whose Shell box is off has no see_standing, so its start shows each item whole, with no
+    limit: an item that it named by its id alone was lost to it. On 20 November 2026 each start of a support agent
+    named 5 of the owner's wishes so (design "An agent keeps its own rules", slice 2, item 0). An item holds at most
+    STANDING_WORDS_MAX characters, so their number bounds the block. A colleague's closed window keeps its own limit
+    (conversation_prompt gives CLOSED_STANDING_CHARS), so that its recap keeps its room."""
     rows = steering_items(agent)
     if not rows:
         return ""
-    limit = STANDING_CHARS if limit is None else limit     # read at the call: a setting or a test may change it
+    closed = shell_off(agent)       # support plan F1: no see_standing and no end_standing on its fixed list
+    if limit is None:               # read at the call: a setting or a test may change it
+        limit = None if closed else STANDING_CHARS
     t0, kept, left, people = now(), [], [], False
     for r in rows:
         line = standing_line(r, agent, t0)
-        if not kept or sum(len(x) + 3 for x in kept) + len(line) <= limit:
+        if not kept or limit is None or sum(len(x) + 3 for x in kept) + len(line) <= limit:
             kept.append(line)
             people = people or r["author_kind"] == "person"
         else:
             left.append(iref(r["id"]))
-    closed = shell_off(agent)       # support plan F1: no see_standing and no end_standing on its fixed list
     return ("\nSTANDING ITEMS, lasting wishes that steer your work from now on, inside your access and never beyond it: "
             + " | ".join(kept) + (f" | and {', '.join(left)}, which do not fit here"
                                   + ("" if closed else ": read them with see_standing") if left else "")
@@ -43872,7 +44023,8 @@ TOOLS = [
      "agent answers for, what it does itself and what it brings to you first, because nothing else carries that: "
      "there is no other field. A watch becomes a wake-up rule, so you write no schedule, and the agent builds the "
      "mechanism that finds the event. The holder starts on it at once: a new duty, a moved one and new words start "
-     "a review task of its duties.",
+     "a review task of its duties. A duty that you hold is yours to keep true: change its words when the work "
+     "changed. Keep them to what the duty answers for and what goes up; the steps of a job go into a skill.",
      S({"request_id": REQUEST_ID,
         "responsibility": {"type": "string", "description": "The duty to change, for example R-1. Leave it out for a "
                                                             "new duty."},
@@ -48319,6 +48471,7 @@ def timers():
             with LOCK:
                 DESKTOP.prune(now())
             tick()
+            profile_long_seed(now())        # the long profiles at a first start: its git read outside LOCK
         except Exception:
             print_fault()
 
@@ -56956,6 +57109,7 @@ AGENT_KV = ("tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "
             # results (lead_batch_rows) and the machine that it left in its newest move (MOVED): the review of 17
             # November 2026 found them where test_rename's scan of the kv keys did not look
             "memory_close:", "lead_batch:", "moved_from:",
+            "profile_long:",        # the free text of its profile at the manager's last ask (PROFILE_LONG)
             "default_browser:", "browser_closed_told:")     # build plan 04: BROWSER_DEFAULT and BROWSER_CLOSED_TOLD
 # The same, with more after the name: `<prefix><agent>:<window, task or item>`.
 AGENT_KV_SCOPED = ("listed:", "untaken:", "chased:")
