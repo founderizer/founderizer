@@ -664,8 +664,8 @@ class Refusals(WithServer):
         with patch.object(owner_mcp, "team", return_value={"sha256": "0" * 64}):
             with self.assertRaises(Refused) as caught:
                 self.direct("activate_agent", agent="vps", active=False)
-        self.assertIn("Read the fleet again", str(caught.exception))
-        self.assertIn("team.json", str(caught.exception))
+        self.assertIn("team.json changed meanwhile; reload it", str(caught.exception))
+        self.assertIn(owner_mcp.MOVED, str(caught.exception))
         self.assertNotIn("active", self.origin_team()["agents"]["vps"])
 
     def test_a_field_the_hub_refuses_comes_back_in_the_hubs_own_words(self):
@@ -2923,14 +2923,20 @@ class McpServers(WithServer):
         self.assertIn("has not checked in", answer["machines"][0]["says"])
         self.assertEqual(self.saved(), {})
 
+    @staticmethod
+    def team_base(client):
+        """The SHA-256 of team.json in the client's own read, which a change of a record that is there goes with."""
+        return client.call("fleet_read", page="team")["sha256"]
+
     def test_it_saves_a_server_changes_it_and_removes_it_from_the_fleet(self):
         client = self.started()
-        receipt = client.call("save_mcp_server", name="crm", server=self.URL)
+        receipt = client.call("save_mcp_server", name="crm", server=self.URL)     # a new one: no base is needed
         self.assertEqual(receipt["name"], "crm")
         self.assertEqual(self.saved()["crm"]["url"], self.URL["url"])
         self.assertEqual(self.saved()["crm"]["title"], "The CRM")
 
-        client.call("save_mcp_server", name="crm", server=dict(self.URL, title="The CRM, renamed"))
+        client.call("save_mcp_server", name="crm", server=dict(self.URL, title="The CRM, renamed"),
+                    base_sha256=self.team_base(client))
         self.assertEqual(self.saved()["crm"]["title"], "The CRM, renamed")
 
         gone = client.call("save_mcp_server", name="crm", delete=True)
@@ -2951,17 +2957,19 @@ class McpServers(WithServer):
         self.assertIn("Fleet's own", str(caught.exception))
         self.assertEqual(self.saved(), {})
 
-    def test_a_server_that_moved_under_the_command_is_the_hubs_own_conflict(self):
-        """It carries the SHA-256 of the team.json it was built on, so a change that arrived meanwhile is a 409 and
-        never a silent overwrite of somebody else's entry."""
+    def test_a_server_made_from_an_older_read_of_the_team_is_the_hubs_own_conflict(self):
+        """It carries the SHA-256 of the team.json that the client read before it made the entry, so a change that
+        arrived after that read is a 409 and never a silent overwrite of somebody else's entry. A base that the tool
+        read itself at the time of the write held that change already (the review of 20 November 2026)."""
         client = self.started()
         client.call("save_mcp_server", name="crm", server=self.URL)
-        with patch.object(owner_mcp, "team", lambda: dict(owner_mcp.get("/ui/team", "x").data, sha256="0" * 64)):
-            with self.assertRaises(Refused) as caught:
-                self.direct("save_mcp_server", name="notes",
-                            server={"title": "Notes", "command": "notes-mcp"})
+        read = self.team_base(client)
+        client.call("save_mcp_server", name="crm", server=dict(self.URL, title="The CRM, renamed"), base_sha256=read)
+        with self.assertRaises(Refused) as caught:
+            client.call("save_mcp_server", name="crm", server=dict(self.URL, title="Made from the older read"),
+                        base_sha256=read)
         self.assertIn("changed meanwhile", str(caught.exception))
-        self.assertEqual(list(self.saved()), ["crm"])
+        self.assertEqual(self.saved()["crm"]["title"], "The CRM, renamed")
 
 
 class Admin(WithServer):
@@ -2977,7 +2985,7 @@ class Admin(WithServer):
         before = next(p for p in page["profiles"] if p["agent"] == "studio")
         sections = [dict(s, text="Careful, and quick.") if s["key"] == "character" else s
                     for s in before["sections"]]
-        receipt = client.call("save_profile", agent="studio", sections=sections)
+        receipt = client.call("save_profile", agent="studio", sections=sections, base_sha256=before["sha256"])
         self.assertNotEqual(receipt.get("sha256"), before["sha256"])
         after = next(p for p in client.call("fleet_read", page="profiles")["profiles"] if p["agent"] == "studio")
         self.assertIn("Careful, and quick.", after["text"])
@@ -2989,14 +2997,57 @@ class Admin(WithServer):
             client.call("fleet_read", page="notes", agent="nobody")
         self.assertIn("(404)", str(caught.exception))
 
+    def test_a_profile_made_from_an_older_read_is_the_hubs_refusal_and_the_newer_words_stay(self):
+        """The review of 20 November 2026: the tool read the base itself at the time of the write, so sections made
+        from a read before the owner changed the profile in the app went over that change with no refusal. The base
+        is the client's own read now, and the hub refuses sections made from an older one."""
+        client = self.started()
+        before = next(p for p in client.call("fleet_read", page="profiles")["profiles"] if p["agent"] == "studio")
+
+        def edited(words):
+            return [dict(s, text=words) if s["key"] == "character" else s for s in before["sections"]]
+        client.call("save_profile", agent="studio", sections=edited("The newer words, from the app."),
+                    base_sha256=before["sha256"])
+        with self.assertRaises(Refused) as caught:
+            client.call("save_profile", agent="studio", sections=edited("Made from the older read."),
+                        base_sha256=before["sha256"])
+        self.assertIn("the profile changed meanwhile; reload it", str(caught.exception))
+        self.assertIn(owner_mcp.MOVED, str(caught.exception))
+        after = next(p for p in client.call("fleet_read", page="profiles")["profiles"] if p["agent"] == "studio")
+        self.assertIn("The newer words, from the app.", after["text"])
+        self.assertNotIn("Made from the older read.", after["text"])
+
     def test_it_sets_the_reporting_lines_so_a_worker_reports_to_a_lead(self):
         client = self.started()
+        team = client.call("fleet_read", page="team")
         lines = [{"agent": l["agent"], "role": l["agent"] == "lead" and "lead" or l["role"],
                   "reports_to": "lead" if l["agent"] == "vps" else l.get("reports_to")}
-                 for l in client.call("fleet_read", page="team")["lines"]]
-        client.call("set_reporting_lines", lines=lines)
+                 for l in team["lines"]]
+        client.call("set_reporting_lines", lines=lines, base_sha256=team["sha256"])
         self.assertEqual(self.team_file()["agents"]["vps"]["reports_to"], "lead")
         self.assertEqual(self.team_file()["agents"]["lead"]["role"], "lead")
+
+    def test_a_whole_value_made_from_an_older_read_of_the_team_is_the_hubs_refusal_and_the_change_stays(self):
+        """with_base's `whole` (the review of 20 November 2026): the reporting lines and an agent's lists go with the
+        base of the client's own read, so lines or boxes made from a read before somebody else's change are the hub's
+        409, and that change stays. A base that the tool read at the time of the write held that change already."""
+        client = self.started()
+        team = client.call("fleet_read", page="team")
+        older = [{"agent": l["agent"], "role": l["role"], "reports_to": l.get("reports_to")} for l in team["lines"]]
+        client.call("agent_settings", agent="vps", expertise=["sales"], base_sha256=team["sha256"])
+        with self.assertRaises(Refused) as caught:
+            client.call("agent_settings", agent="vps", expertise=["support"], base_sha256=team["sha256"])
+        self.assertIn("team.json changed meanwhile; reload it", str(caught.exception))
+        self.assertEqual(self.team_file()["agents"]["vps"]["expertise"], ["sales"])
+
+        newer = client.call("fleet_read", page="team")
+        lines = [dict(l, reports_to="lead") if l["agent"] == "vps" else dict(l, role="lead") if l["agent"] == "lead"
+                 else l for l in older]
+        client.call("set_reporting_lines", lines=lines, base_sha256=newer["sha256"])
+        with self.assertRaises(Refused) as caught:
+            client.call("set_reporting_lines", lines=older, base_sha256=newer["sha256"])
+        self.assertIn("team.json changed meanwhile; reload the reporting lines", str(caught.exception))
+        self.assertEqual(self.team_file()["agents"]["vps"]["reports_to"], "lead")
 
     def test_an_account_with_a_kind_and_an_agent_on_it_go_through_the_two_tools(self):
         """Lane 5H (owner API 1.186): save_account gives the hub kind, address and model, and add_agent gives it
@@ -4151,6 +4202,26 @@ def parity_cases():
     case("plain: a part with / ? and %", "check_machine", {"agent": "a/b?c%d"})
     case("with_revision: no id", "duty_state", {"action": "pause"})
     case("with_base: a part that the arguments do not give", "activate_agent", {"active": True})
+    # A field that replaces a whole value goes only with the client's own base; null is no base for team.json, and a
+    # call with no such field reads the base, as before.
+    case("with_base: a whole value with no base", "agent_settings", {"agent": "worker-1", "model": "m", "can": ["web"]})
+    case("with_base: two whole values with a base of null", "agent_settings",
+         {"agent": "worker-1", "expertise": ["sales"], "screen": {"model": None, "effort": None}, "base_sha256": None})
+    case("with_base: no whole value and a base of null", "agent_settings",
+         {"agent": "worker-1", "model": "m", "base_sha256": None})
+    case("with_base: the whole lines with the client's base", "set_reporting_lines",
+         {"lines": [{"agent": "manager", "role": "manager", "reports_to": None}], "base_sha256": "team-sha-0"})
+    case("with_base: the whole lines with no base, on a tool with a feature", "set_reporting_lines",
+         {"lines": [{"agent": "manager", "role": "manager", "reports_to": None}]})
+    case("with_base: the client's base and a part that the arguments do not give", "rename_agent",
+         {"name": "new-name", "base_sha256": "team-sha-0"})
+    case("with_base: the client's base and a part that is two dots", "rename_agent",
+         {"agent": "..", "name": "new-name", "base_sha256": "team-sha-0"})
+    case("with_base: a new record with no base", "save_mcp_server", {"name": "crm", "server": {"title": "CRM"}})
+    # A request id that is not a UUID is refused before any request where owner_mcp.py makes none before its command.
+    case("plain: a request id that is no UUID, on a tool with a feature", "check_releases", {"request_id": "not-one"})
+    case("with_base: the client's base and a request id that is no UUID", "rename_agent",
+         {"agent": "worker-1", "name": "new-name", "base_sha256": "team-sha-0", "request_id": "not-one"})
     # The four reads.
     case("fleet_overview", "fleet_overview")
     case("fleet_overview: a page refused", "fleet_overview", None,
@@ -4213,11 +4284,18 @@ def parity_cases():
     case("decline_secret_request: no reason", "decline_secret_request", {"need": 6})
     # save_profile.
     sections = [{"key": "responsible", "title": "Responsible for", "text": "The site."}]
-    case("save_profile", "save_profile", {"agent": "worker-1", "sections": sections})
-    case("save_profile: a name with a space", "save_profile", {"agent": " ops lead ", "sections": sections})
-    case("save_profile: an agent that does not exist", "save_profile", {"agent": "ghost", "sections": sections})
-    case("save_profile: no agent", "save_profile", {"sections": sections})
+    read = "profile-sha-0"         # the client's own read, older than the stand-in hub's page
+    case("save_profile", "save_profile", {"agent": "worker-1", "sections": sections, "base_sha256": read})
+    case("save_profile: a name with a space", "save_profile",
+         {"agent": " ops lead ", "sections": sections, "base_sha256": read})
+    case("save_profile: an agent that does not exist", "save_profile",
+         {"agent": "ghost", "sections": sections, "base_sha256": read})
+    case("save_profile: no agent", "save_profile", {"sections": sections, "base_sha256": read})
     case("save_profile: a part that is two dots", "save_profile", {"agent": "..", "sections": sections})
+    # The base is the client's read, and null is the base of an agent with no profile yet; with none, no request.
+    case("save_profile: no base", "save_profile", {"agent": "worker-1", "sections": sections})
+    case("save_profile: a base of null", "save_profile",
+         {"agent": "worker-1", "sections": sections, "base_sha256": None})
     # grant_access, each kind.
     for name, args in (("repo", {"resource": "repo:acme/web", "agent": "worker-1", "level": "write"}),
                        ("repo, null ends a hold", {"resource": "repo:acme/web", "agent": "worker-2", "level": None}),
@@ -4617,7 +4695,7 @@ def parity_cases():
     case("grant_access: a combining mark after the colon", "grant_access",
          {"resource": "repo:́x", "agent": "worker-1", "level": "read"})
     case("save_profile: Unicode spaces around the name", "save_profile",
-         {"agent": "\u3000ops lead\u0085", "sections": sections})
+         {"agent": "\u3000ops lead\u0085", "sections": sections, "base_sha256": "profile-sha-0"})
     case("attach_file: a media type with Unicode spaces", "attach_file",
          {"path": "<tmp>/note.txt", "mime": "\u2003text/plain\u3000"}, files=files)
     # A read of the team of another shape: nothing is sent (F6).
@@ -4897,6 +4975,10 @@ class Table(unittest.TestCase):
 
     FIXTURE = HERE / "app" / "Tests" / "FleetOwnerAPITests" / "Fixtures" / "owner-tools.json"
     TABLE_KINDS = ("plain", "with_base", "with_revision")
+    # The commands on team.json that replace one record, new or there (the hub's create or replace): the client's
+    # base goes with a change of a record that it read, and a new record, which replaces nothing, needs none. A new
+    # tool of with_base is here, or its lists are `whole`, or it takes no base of the client's.
+    RECORDS = ("save_chat_account", "save_mcp_server", "save_account", "save_login", "machine_access", "owner_device")
 
     def test_the_table_is_every_tool_with_its_own_schema_and_annotations(self):
         listed = owner_mcp.tools()
@@ -4914,6 +4996,20 @@ class Table(unittest.TestCase):
                 self.assertIsInstance(entry["request_id_from_args"], bool, t["name"])
                 for word in re.findall(r"\{(\w+)\}", entry["route"]):     # a path part is a property of the tool
                     self.assertIn(word, entry["inputSchema"]["properties"], f"{t['name']}: {word}")
+                # with_base's `whole`, which the program inside the app reads from here (the reviews of 20 November
+                # 2026): a value that is always there and that a call replaces whole goes only with the base of the
+                # client's own read. Each list or record of a command on team.json is such a value, but in a tool of
+                # RECORDS, whose base the client gives only for a record that is there, as for its scalar fields.
+                self.assertEqual(tuple(entry["whole"]), run.whole, t["name"])
+                kinds = {name: set(v["type"] if isinstance(v["type"], list) else [v["type"]])
+                         for name, v in entry["inputSchema"]["properties"].items() if "type" in v}
+                lists = [name for name in entry["fields"] if kinds.get(name, set()) & {"array", "object"}]
+                if entry["kind"] != "with_base" or t["name"] in self.RECORDS:
+                    self.assertEqual(entry["whole"], [], t["name"])
+                else:
+                    self.assertEqual(entry["whole"], lists, t["name"])
+                takes = entry["kind"] == "with_base" and (entry["whole"] or t["name"] in self.RECORDS)
+                self.assertEqual("base_sha256" in entry["inputSchema"]["properties"], bool(takes), t["name"])
             else:
                 self.assertFalse(hasattr(run, "kind"), t["name"])
                 self.assertNotIn("route", entry, t["name"])
@@ -5175,6 +5271,53 @@ class Table(unittest.TestCase):
             self.assertEqual(str(caught.exception), 'account cannot be ".": a part of a route is never "." or "..".')
         self.assertEqual(owner_mcp.route_for("/ui/tasks/{task}/control", {"task": 7, "note": ".."}),
                          "/ui/tasks/7/control")
+
+    def test_a_whole_value_with_no_base_of_the_clients_own_read_is_refused_before_any_request(self):
+        """A field that replaces a whole value that is always there (with_base's `whole`) and a profile's sections go
+        only with the base of the read that the client made them from: a base that the tool read at the time of the
+        write would hold the change that must not be lost. For team.json a null base is no base; for a profile null is
+        the base of an agent with no profile yet, so it goes to the hub."""
+        run = {t["name"]: t["run"] for t in owner_mcp.tools()}
+        with patch.object(owner_mcp, "call", lambda *a, **k: self.fail("a request was made")):
+            for tool, args, named in (("set_reporting_lines", {"lines": []}, ["lines"]),
+                                      ("agent_settings", {"agent": "a", "model": "m", "can": ["web"]}, ["can"]),
+                                      ("agent_settings", {"agent": "a", "expertise": [], "screen": {}},
+                                       ["expertise", "screen"]),
+                                      ("agent_settings", {"agent": "a", "web_hosts": [], "base_sha256": None},
+                                       ["web_hosts"])):
+                with self.assertRaises(owner_mcp.Refused) as caught:
+                    run[tool](args)
+                self.assertEqual(str(caught.exception), owner_mcp.team_base_needed(named), tool)
+            with self.assertRaises(owner_mcp.Refused) as caught:
+                run["save_profile"]({"agent": "a", "sections": []})
+            self.assertEqual(str(caught.exception), owner_mcp.PROFILE_BASE_NEEDED)
+        sent = []
+        page = owner_mcp.Answer(200, {"profiles": [{"agent": "a"}]}, b"", {})
+        with patch.object(owner_mcp, "get", lambda *a: page), \
+                patch.object(owner_mcp, "command", lambda route, body, *a: sent.append((route, body))):
+            run["save_profile"]({"agent": "a", "sections": [], "base_sha256": None})
+        self.assertEqual(sent, [("/ui/profiles/a", {"sections": [], "base_sha256": None})])
+        # A record, new or there, goes with the client's base when it gives one, else with the tool's own read.
+        sent.clear()
+        with patch.object(owner_mcp, "team", lambda: {"sha256": "read-here"}), \
+                patch.object(owner_mcp, "command", lambda route, body, *a: sent.append((route, body["base_sha256"]))):
+            run["save_mcp_server"]({"name": "x", "server": {"title": "X"}})
+            run["save_mcp_server"]({"name": "x", "server": {"title": "X"}, "base_sha256": "the-clients"})
+        self.assertEqual(sent, [("/ui/team/mcp", "read-here"), ("/ui/team/mcp", "the-clients")])
+
+    def test_a_grant_goes_with_the_base_of_the_read_that_its_map_is_made_from(self):
+        """grant_access takes the team's holds of a repository, a tool or a Google account from one read, moves one
+        agent in that map and sends the whole map (the reviews of 20 November 2026). A base from a second read would
+        hold a grant that came between the two reads, and the map, which does not hold it, would go over it."""
+        reads = iter([{"sha256": "first", "lines": [{"agent": "a", "repos": {"acme/web": "write"}}, {"agent": "b"}]},
+                      {"sha256": "second", "lines": [{"agent": "a", "repos": {"acme/web": "write"}},
+                                                     {"agent": "b", "repos": {"acme/web": "read"}}]}])
+        sent = []
+        with patch.object(owner_mcp, "team", lambda: next(reads)), \
+                patch.object(owner_mcp, "command", lambda route, body, *a: sent.append((route, body))):
+            owner_mcp.grant_access({"resource": "repo:acme/web", "agent": "c", "level": "read"})
+        self.assertEqual(sent, [("/ui/team/repos", {"repo": "acme/web", "access": {"a": "write", "c": "read"},
+                                                    "base_sha256": "first"})])
 
     def test_the_first_words_say_where_the_owners_yes_is(self):
         words = owner_mcp.rpc({"id": 1, "method": "initialize", "params": {}})["result"]["instructions"]

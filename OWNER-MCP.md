@@ -1446,9 +1446,27 @@ and its own refusals:
   takes the owner's agent's own `request_id` for exactly that);
 - the hub's generation (`db`) on every read and command, read again once when the hub says it
   moved;
-- `base_sha256` of `team.json` on every command that moves it, read from `GET /ui/team`
-  immediately before the command, so a change that arrived meanwhile is the hub's own 409 and not
-  a silent overwrite;
+- `base_sha256` of `team.json` on every command that moves it, so a change that arrived meanwhile is
+  the hub's own 409 and not a silent overwrite (the reviews of 20 November 2026):
+  - a value that is always there and that a command replaces whole (the reporting lines, an agent's
+    `can`, `expertise`, `screen` and `web_hosts`: `with_base`'s `whole`) goes only with the base of
+    the client's own `fleet_read(page="team")` that it was made from, and the command is refused
+    before any request without one. A base read at the time of the write would hold a change made
+    after the client's read, and the write would go over it. `save_profile` takes the agent's
+    `sha256` from the client's own `fleet_read(page="profiles")` in the same way, or null for an
+    agent with no profile yet;
+  - a command that replaces one record, new or there (an account, a login, how the fleet reaches a
+    machine, an owner device, a chat app account, an MCP server), takes the client's base too, from
+    a team read made before the read of the record, or that is that read. A new record replaces
+    nothing and needs none; a change of a record that is there, sent with no base, goes with the
+    tool's own read, and so can go over a change made after the client's read;
+  - every other command reads the base from `GET /ui/team` immediately before the command. Such a
+    command sent again with the same `request_id` after a lost answer carries the base of a new
+    read, and the hub answers that the id was used for another command when team.json moved;
+  - `grant_access` makes its map of the holders of a resource and its base from one read;
+  - not covered: `save_knowledge` with `{path, text}`, the lists of `save_person`, the `prompt` of
+    `save_role` and `token_weights` of `save_settings` replace a whole value on routes that take no
+    base at all, so the hub would need one first;
 - the hub's refusal, given back whole — not only the reason but what came with it, because a
   refusal often carries what is still missing, and that is the part the agent must act on.
 

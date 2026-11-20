@@ -752,6 +752,9 @@ def refusal(answer, what):
 
 
 GENERATION = {"db": None}               # the hub generation, as the app holds it between reads
+# The words after a 409 whose base moved (`command`), the same in the program inside the app (`OwnerHub.moved`).
+MOVED = ("Another change came after the read that this command was made from: read it again, make the change again "
+         "from what is there now, and send that.")
 
 
 @contextlib.contextmanager
@@ -849,8 +852,9 @@ def command(route, body, what, request_id=None, timeout=TIMEOUT):
         answer = once()
     if answer.status != 200:
         if answer.status == 409 and isinstance(answer.data, dict) and answer.data.get("sha256"):
-            raise Refused(f"The hub refused {what}: {answer.error}. Another change reached team.json meanwhile. "
-                          f"Read the fleet again and send this command again.")
+            # The base moved: what the command replaces is made again from a new read, never sent again as it was
+            # with the digest of this answer, which would go over the change that moved it.
+            raise Refused(f"The hub refused {what}: {answer.error}. {MOVED}")
         raise refusal(answer, what)
     return answer.data
 
@@ -1080,13 +1084,14 @@ def one_part(key, value):
         raise Refused(f"{key} cannot be \"{value}\": a part of a route is never \".\" or \"..\".")
 
 
-def table_tool(run, kind, route, fields, what, revision_page=None, rid_from_args=True):
+def table_tool(run, kind, route, fields, what, revision_page=None, rid_from_args=True, whole=()):
     """**The facts of a tool that the table carries** (`dump_tools`): the function that `plain`, `with_base` or
     `with_revision` returns carries its kind, its route, its fields, its words and, for `with_revision`, the page whose
     thing gives its revision. The program inside the Founderizer app builds the same request from these facts, so the
     table is read from the objects that `tools()` uses and cannot drift from them."""
     run.kind, run.route, run.fields, run.what = kind, route, tuple(fields), what
-    run.revision_page, run.rid_from_args = revision_page, rid_from_args
+    # For `with_base`: the fields that replace a whole value, which go only with the base of the client's own read.
+    run.revision_page, run.rid_from_args, run.whole = revision_page, rid_from_args, tuple(whole)
     return run
 
 
@@ -1098,30 +1103,61 @@ def plain(route, fields, what, rid_from_args=True):
     return table_tool(run, "plain", route, fields, what, rid_from_args=rid_from_args)
 
 
-def with_base(route, fields, what):
-    """A command that moves `team.json`: the SHA-256 of the file it is built on comes from `GET /ui/team`, read
-    immediately before the command, and a change that arrived meanwhile is the hub's own 409."""
+def team_base_needed(replaced):
+    """The refusal of a `with_base` command that replaces a whole value with no `base_sha256` of the client's own
+    read. The words are the same in the program inside the app (`OwnerTools.teamBaseNeeded`)."""
+    return (f"base_sha256 is needed with {', '.join(replaced)}: send the sha256 of the fleet_read(page=\"team\") that "
+            f"you made the change from. Then a change of team.json made since that read is refused, and not lost.")
+
+
+# The refusal of save_profile with no base_sha256 (the same words in the program inside the app: OwnerTools).
+PROFILE_BASE_NEEDED = ("base_sha256 is needed: send this agent's sha256 from the fleet_read(page=\"profiles\") that "
+                       "you made the sections from, or null for an agent with no profile yet. Then a change made "
+                       "since that read is refused, and not lost.")
+
+
+def with_base(route, fields, what, whole=()):
+    """A command that moves `team.json`, with the SHA-256 of the file that it is built on. **A field of `whole`
+    replaces a whole value that is always there** (the reporting lines, an agent's lists and screen pair), which the
+    client made from its own read of the team: with such a field the client sends that read's `base_sha256`, so a
+    change of team.json since that read (the owner's in the app, the manager's plan) is the hub's own 409 and not a
+    silent overwrite, and without one the command is refused before any request. A base read here at the time of the
+    write would hold that change already. A tool that replaces one record, new or there (an account, a login, an MCP
+    server), takes the client's base too, which it needs only for a record that is there: a new one replaces
+    nothing. With no base of the client's, the base is `GET /ui/team` read immediately before the command, and a
+    change that arrived meanwhile is the hub's own 409."""
     def run(args):
         body = {name: args[name] for name in fields if args.get(name) is not None}
-        body["base_sha256"] = team()["sha256"]
+        if args.get("base_sha256") is not None:
+            body["base_sha256"] = args["base_sha256"]
+        else:
+            replaced = [name for name in whole if args.get(name) is not None]
+            if replaced:
+                raise Refused(team_base_needed(replaced))
+            body["base_sha256"] = team()["sha256"]
         return command(route_for(route, args), body, what, args.get("request_id"))
-    return table_tool(run, "with_base", route, fields, what)
+    return table_tool(run, "with_base", route, fields, what, whole=whole)
 
 
 def with_profile_base(args):
-    """One agent's profile, with the digest of the profile it is built on. `GET /ui/profiles` carries that digest for
-    each agent, read immediately before the command, so a profile the owner changed in the app meanwhile is the
-    hub's own refusal and not a silent overwrite of his words."""
+    """One agent's profile, with the digest of the profile that the client made its sections from: that agent's
+    `sha256` in the client's own `fleet_read(page="profiles")`, as `base_sha256`, or null for an agent with no
+    profile yet. The sections replace the whole profile, so the base is the client's read and never a read of this
+    tool, which would hold a change made after the client's read already: a profile that the owner changed in the app
+    meanwhile, or the manager's plan of team changes, is the hub's own refusal and not a silent overwrite. The read of
+    `GET /ui/profiles` here only finds the agent."""
     agent = str(args.get("agent") or "").strip()
     if not agent:
         raise Refused("agent must be the name of the agent whose profile this is.")
     one_part("agent", agent)
+    if "base_sha256" not in args:
+        raise Refused(PROFILE_BASE_NEEDED)
     page = get("/ui/profiles", "the profiles").data or {}
     found = next((p for p in page.get("profiles") or [] if p.get("agent") == agent), None)
     if found is None:
         raise Refused(f"There is no agent {agent}. Read fleet_read(page=\"profiles\") for the ones there are.")
     return command(f"/ui/profiles/{urllib.parse.quote(agent, safe='')}",
-                   {"sections": args.get("sections"), "base_sha256": found.get("sha256")},
+                   {"sections": args.get("sections"), "base_sha256": args["base_sha256"]},
                    f"the profile of {agent}", args.get("request_id"))
 
 
@@ -1285,16 +1321,17 @@ def grant_access(args):
             raise Refused(GRANT_NOT_SIGNED)
         return command("/ui/secrets/grant", {"login": what, "agent": agent, "grant": level},
                        f"the grant of {rid} to {agent}", args.get("request_id"))
-    lines = team_lines(team())
+    page = team()           # the map and the base come from this one read, so a grant made after it is the hub's 409
+    lines = team_lines(page)
     what_for = f"the grant of {rid} to {agent}"
     if kind == "repo":
         access = {line["agent"]: team_part(line, "repos", dict)[what]
                   for line in lines if what in team_part(line, "repos", dict)}
-        return _one_moved(access, agent, level, "/ui/team/repos", {"repo": what}, "access", what_for, args)
+        return _one_moved(access, agent, level, "/ui/team/repos", {"repo": what}, "access", what_for, args, page)
     if kind == "tool":
         names = {line["agent"]: "use" for line in lines if what in team_part(line, "tools", list)}
         held_now = _one_moved_map(names, agent, level)
-        return _team_command("/ui/team/tools", {"tool": what, "agents": sorted(held_now)}, what_for, args)
+        return _team_command("/ui/team/tools", {"tool": what, "agents": sorted(held_now)}, what_for, args, page)
     access = {}
     for line in lines:
         service = team_part(team_part(line, "google", dict), kind, dict)
@@ -1303,7 +1340,7 @@ def grant_access(args):
                 raise Refused(TEAM_SHAPE)
             access[line["agent"]] = service["level"]
     return _one_moved(access, agent, level, "/ui/team/google", {"account": what, "service": kind}, "access",
-                      what_for, args)
+                      what_for, args, page)
 
 
 # A folder's ID in a link of it, as hub.py DRIVE_FOLDER_IN reads it: …/folders/<id>, …/drives/<id> or ?id=<id>.
@@ -1516,13 +1553,15 @@ def _one_moved_map(held_now, agent, level):
     return held_now
 
 
-def _one_moved(held_now, agent, level, route, fixed, key, what_for, args):
-    return _team_command(route, dict(fixed, **{key: _one_moved_map(held_now, agent, level)}), what_for, args)
+def _one_moved(held_now, agent, level, route, fixed, key, what_for, args, page):
+    return _team_command(route, dict(fixed, **{key: _one_moved_map(held_now, agent, level)}), what_for, args, page)
 
 
-def _team_command(route, body, what_for, args):
-    """One command that moves `team.json`, with the SHA-256 of the file it is built on."""
-    return command(route, dict(body, base_sha256=team()["sha256"]), what_for, args.get("request_id"))
+def _team_command(route, body, what_for, args, page):
+    """One command that moves `team.json`, with the SHA-256 of the file it is built on: that of `page`, the read of
+    the team that the command's map was made from. A second read here would hold a grant that came after that read,
+    and the map, which does not hold it, would go over it."""
+    return command(route, dict(body, base_sha256=page["sha256"]), what_for, args.get("request_id"))
 
 
 # The words when share_resource does not send a standing for a secret (`standing_reaches`). One fixed sentence, the
@@ -2673,7 +2712,20 @@ def tool(name, about, properties, required, run):
 S = {"text": {"type": "string"}, "int": {"type": "integer"}, "bool": {"type": "boolean"},
      "level": {"type": ["string", "null"]}, "note": {"type": "string"},
      "rid": {"type": "string", "description": "A UUID. Give the same one again only to send a command once more "
-                                              "after an answer was lost; otherwise leave it out."}}
+                                              "after an answer was lost; otherwise leave it out."},
+     "team_base": {"type": "string", "description": "The sha256 of the fleet_read(page=\"team\") that you made this "
+                                                    "change from. A field that replaces a whole value needs it: a "
+                                                    "change of team.json since that read is then refused, and not "
+                                                    "lost."},
+     "record_base": {"type": "string", "description": "Only when you change one that is there: the sha256 of a "
+                                                      "fleet_read(page=\"team\") that you made before the read that "
+                                                      "you made the change from, or that is that read. A change of "
+                                                      "team.json since then is refused, and not lost. A new one needs "
+                                                      "none."},
+     "profile_base": {"type": ["string", "null"],
+                      "description": "This agent's sha256 in the fleet_read(page=\"profiles\") that you made the "
+                                     "sections from, or null for an agent with no profile yet: a profile that "
+                                     "changed since that read is then refused, and not lost."}}
 
 # One MCP server of the owner's own catalog, as lifecycle.mcp_server takes it. The hub checks every field; this is
 # here so that the agent reads the shape before it sends one. No value of a credential is in it: `key` and `env` name
@@ -2858,7 +2910,8 @@ def tools():
              {"agent": S["text"], **rid}, ("agent",),
              with_base("/ui/team/agents/{agent}/remove", (), "the deletion of this agent")),
         tool("agent_settings", "One agent's model, effort, capabilities, title, expertise, account, screen model or "
-                               "host list. "
+                               "host list. can, expertise, screen and web_hosts each replace a whole value: with one "
+                               "of them, send base_sha256 from your fleet_read(page=\"team\"). "
                                "A null model or effort follows the fleet's default_model of its runtime "
                                "(save_settings), else the runtime's own. Each of vault, runtime and vault_create is a "
                                "command of its own, and has a tool of its own here: vault_access, switch_runtime and "
@@ -2890,11 +2943,11 @@ def tools():
                                            "the agent sees. A running session keeps the list that it started "
                                            "with; a Shell or a Browser box that goes on, or a Web box that goes "
                                            "off, removes the list."},
-              **rid},
+              "base_sha256": S["team_base"], **rid},
              ("agent",),
              with_base("/ui/team/agents/{agent}",
                        ("model", "effort", "can", "title", "expertise", "account", "screen", "web_hosts"),
-                       "these agent settings")),
+                       "these agent settings", whole=("can", "expertise", "screen", "web_hosts"))),
         tool("switch_runtime", "Switch one agent to its other runtime, codex or claude. It is a command of its own: "
                                "send nothing else with it. The agent's own start command for that runtime comes "
                                "from its runtime_policies, and prepare_runtime readies the machine first.",
@@ -2975,7 +3028,8 @@ def tools():
                                   "bot token is never a field; with save_bot_token the app's program takes it from "
                                   "a file or a pipe on this Mac, or the app reads the clipboard; or the owner pastes "
                                   "it in the app.",
-             {"id": S["text"], "account": {"type": ["object", "null"]}, **rid}, ("id", "account"),
+             {"id": S["text"], "account": {"type": ["object", "null"]}, "base_sha256": S["record_base"], **rid},
+             ("id", "account"),
              with_base("/ui/team/chat-apps", ("id", "account"), "this chat app account")),
         tool("attach_file", "Send one file of this Mac to the hub, so a message can carry it. Give the id it "
                             "answers with to send_message, steer_task or answer_needs_you. At most 25 MiB.",
@@ -2984,7 +3038,8 @@ def tools():
                                 "An agent loads it only once it also holds tool:<name> — share_resource puts that "
                                 "in the pool and grant_access gives it. Removing the server takes it from every "
                                 "agent that had it. Check it first with check_mcp_server.",
-             {"name": S["text"], "server": MCP_ENTRY, "delete": S["bool"], **rid}, ("name",),
+             {"name": S["text"], "server": MCP_ENTRY, "delete": S["bool"], "base_sha256": S["record_base"], **rid},
+             ("name",),
              with_base("/ui/team/mcp", ("name", "server", "delete"), "this MCP server")),
         tool("grant_access", "Give one agent a resource the fleet already holds, or end that hold with level null: "
                              "repo:<owner/name> read|write|deploy (deploy also runs its workflows), "
@@ -3030,7 +3085,8 @@ def tools():
              plain("/ui/resources/take", ("resource", "agent"), "the end of this hold")),
         tool("set_reporting_lines", "The whole shape of the team at once: for each agent its role (manager, lead or "
                                     "worker) and who it reports to. Send every agent, because this replaces the "
-                                    "lines; read fleet_read(page=\"team\") first.",
+                                    "lines: read fleet_read(page=\"team\") first, and send its sha256 as "
+                                    "base_sha256.",
              {"lines": {"type": "array", "description": "One {agent, role, reports_to} for each agent of the fleet. "
                                                         "reports_to is null for the manager.",
                         "items": {"type": "object",
@@ -3039,17 +3095,19 @@ def tools():
                                                           "enum": ["manager", "lead", "worker"]},
                                                  "reports_to": {"type": ["string", "null"]}},
                                   "required": ["agent", "role", "reports_to"], "additionalProperties": False}},
-              **rid}, ("lines",), with_base("/ui/team/lines", ("lines",), "the reporting lines")),
+              "base_sha256": S["team_base"], **rid}, ("lines", "base_sha256"),
+             with_base("/ui/team/lines", ("lines",), "the reporting lines", whole=("lines",))),
         tool("save_profile", "Write one agent's profile — the owner's own words about it, which the agent cannot "
                              "change. Send every section, because this replaces the profile: read "
-                             "fleet_read(page=\"profiles\") first and change the sections you mean. Each section is "
-                             "{key, title, text}, and the title must be one the key allows.",
+                             "fleet_read(page=\"profiles\") first, change the sections you mean, and send that "
+                             "agent's sha256 there as base_sha256. Each section is {key, title, text}, and the title "
+                             "must be one the key allows.",
              {"agent": S["text"],
               "sections": {"type": "array", "description": "1 to 16 sections of {key, title, text}, in order.",
                            "items": {"type": "object",
                                      "properties": {"key": S["text"], "title": S["text"], "text": S["text"]},
                                      "required": ["key", "title", "text"], "additionalProperties": False}},
-              **rid}, ("agent", "sections"), with_profile_base),
+              "base_sha256": S["profile_base"], **rid}, ("agent", "sections", "base_sha256"), with_profile_base),
         tool("save_account", "One runtime account of the fleet: its provider and the owner's own title for it, or "
                              "delete true to take it out. Agents that share an account share one allowance. With "
                              "kind, an account that an agent added with account runs on: key, an API key in the "
@@ -3069,7 +3127,7 @@ def tools():
                                                          "(own/<name> for server; a name with no part before it "
                                                          "for xai). Needed for opencode-go, openrouter and "
                                                          "ollama-cloud."},
-              "delete": S["bool"], **rid},
+              "delete": S["bool"], "base_sha256": S["record_base"], **rid},
              ("account",), with_base("/ui/team/accounts", ("account", "provider", "title", "kind", "login",
                                                            "address", "model", "delete"), "this runtime account")),
         tool("save_login", "The owner's own title for one login of the vault, by its bws://<uuid> reference, or "
@@ -3080,14 +3138,15 @@ def tools():
                            "of Basic) or basic-password. On a server whose vault swaps keys, an agent that reads a "
                            "key with a site holds a placeholder in its sessions, and the vault puts the key into "
                            "requests to that site only. An empty site or form takes it away.",
-             {"login": S["text"], "title": S["text"], "site": S["text"], "form": S["text"], "delete": S["bool"], **rid},
+             {"login": S["text"], "title": S["text"], "site": S["text"], "form": S["text"], "delete": S["bool"],
+              "base_sha256": S["record_base"], **rid},
              ("login",),
              with_base("/ui/team/logins", ("login", "title", "site", "form", "delete"), "this login's title")),
         tool("machine_access", "How the fleet reaches one machine: its SSH user, its SSH port and whether Screen "
                                "Sharing answers there. delete true takes that record out. The user is the one thing "
                                "nothing can work out by itself.",
              {"machine": S["text"], "ssh_user": S["text"], "ssh_port": S["int"], "screen_sharing": S["bool"],
-              "delete": S["bool"], **rid}, ("machine",),
+              "delete": S["bool"], "base_sha256": S["record_base"], **rid}, ("machine",),
              with_base("/ui/team/access", ("machine", "ssh_user", "ssh_port", "screen_sharing", "delete"),
                        "how the fleet reaches this machine")),
         tool("save_knowledge", "The owner's own knowledge files, which agents read and never write. Five shapes: "
@@ -3198,7 +3257,8 @@ def tools():
         tool("owner_device", "One of the owner's own phones: its name, its label and its address on the private "
                              "network, or delete true to take it out. Its key is taken by the phone itself with a "
                              "code from device_code.",
-             {"device": S["text"], "label": S["text"], "address": S["text"], "delete": S["bool"], **rid},
+             {"device": S["text"], "label": S["text"], "address": S["text"], "delete": S["bool"],
+              "base_sha256": S["record_base"], **rid},
              ("device",),
              with_base("/ui/owner/devices", ("device", "label", "address", "delete"), "this owner device")),
         tool("device_code", "One enrollment code for one of the owner's phones. The hub keeps no code: a repeat "
@@ -3349,8 +3409,9 @@ def dump_tools(listed=None):
     """**The table of the program inside the Founderizer app** (`--dump-tools`), from the same objects that `tools()`
     gives, so that it cannot drift from them: every tool with its name, words, input schema and annotations, and its
     kind. A tool that `plain`, `with_base` or `with_revision` builds carries its route, its fields, its words for a
-    refusal, whether the request id comes from the arguments, the page of its revision (`with_revision`) and the hub's
-    feature that gates it. Each other tool is `swift` or `absent`, and a tool of none of these kinds stops
+    refusal, whether the request id comes from the arguments, the page of its revision (`with_revision`), the fields
+    that replace a whole value and need the client's own base (`whole`, of `with_base`) and the hub's feature that
+    gates it. Each other tool is `swift` or `absent`, and a tool of none of these kinds stops
     the dump: somebody decides which it is. Beside the tools: the facts that the program's own reads take from this
     file, its first words to a client, and a `version`, a SHA-256 of all the rest (this file does not know the
     repository's revision)."""
@@ -3362,7 +3423,7 @@ def dump_tools(listed=None):
         if kind:
             entry.update(kind=kind, route=run.route, fields=list(run.fields), what=run.what,
                          revision_page=run.revision_page, request_id_from_args=run.rid_from_args,
-                         feature=FEATURES.get(name))
+                         feature=FEATURES.get(name), whole=list(run.whole))
         elif name in SWIFT_READS or name in SWIFT_WRITES:
             entry["kind"] = "swift"
         elif name in ABSENT:

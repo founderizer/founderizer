@@ -69,7 +69,10 @@ from desktop import Frames
 import atrest       # the cipher that seals the hub's Google file at rest (UI-API.md 1.202)
 import google
 import hidden       # hidden characters at the hub's exits (strip_hidden); the helper's hook reads the same rule
-import door_targets  # the door's rules of this code, never the ones that a release puts beside it before the restart
+try:
+    import door_targets  # the door's rules of this code, never the ones that a release puts beside it before the restart
+except FileNotFoundError:   # a copy of the kit's top files with no host/ folder (a test's seed): it loads them later
+    pass
 import diagnostics  # the lane "Bug reports": the hub's own faults and refused calls, with no words
 import errorreports  # the lane "Error reports": the day's report of them, while the owner has turned it on
 import mcp
