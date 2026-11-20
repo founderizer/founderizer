@@ -10,6 +10,7 @@ import re
 import shlex
 import sqlite3
 import tempfile
+import threading
 import textwrap
 import unittest
 import urllib.error
@@ -92,6 +93,15 @@ class Base(test_people.People):
     def ok(self, name, context, agent="studio", **args):
         text, error = self.tool(name, context, agent, **args)
         self.assertFalse(error, text)
+        return text
+
+    def reads(self, context, person, agent="studio"):
+        """A session's read of a person's conversation before it writes there: message_contact sends nothing over
+        messages of it that the session has not read, and shows them (conversation_since)."""
+        text, error = self.tool("message_contact", context, agent, person=person, text="(read first)",
+                                request_id=str(uuid.uuid4()))
+        self.assertTrue(error, text)
+        self.assertRegex(text, r"^\[conversation C-[0-9]+\] Not sent: this session has not read the newest messages")
         return text
 
     def task(self, tid):
@@ -853,6 +863,7 @@ class Conversations(Base):
         answer = self.ok("reply", self.context(cid), text="Yes, it is right.", in_reply_to=f"CM-{said['id']}")
         self.assertIn("is in the conversation, but not sent to Pat: daily WhatsApp limit.", answer)
         tid, here = self.normal_task()
+        self.reads(here, "Pat")
         sent = self.ok("message_contact", here, person="Pat", text="May I go on?", request_id=str(uuid.uuid4()),
                        waits=True)
         self.assertIn(f"is in C-{cid}, but not sent to Pat: daily WhatsApp limit.", sent)
@@ -861,6 +872,10 @@ class Conversations(Base):
         mine = hub.q1("SELECT * FROM conversation_messages WHERE who='agent' ORDER BY id DESC LIMIT 1")
         self.assertEqual((mine["task"], mine["waits"]), (tid, None))
         self.assertEqual(hub.q1("SELECT state FROM chat_out WHERE id=?", (mine["outbound"],))["state"], "failed")
+        # a session that reads the conversation later is told that it reached nobody: Pat never read it
+        _, there = self.normal_task(title="Ask again")
+        lines = self.reads(there, "Pat").splitlines()
+        self.assertTrue(lines[lines.index('"May I go on?"') - 1].endswith(", not delivered:"), lines)
 
     def test_a_customers_words_cannot_end_the_quote_of_their_question(self):
         """The security review of 27 October 2026: a question that held the closing mark of the quote put the rest of
@@ -907,11 +922,13 @@ class Conversations(Base):
         pcid = self.says(PAT, "Is order 7781 paid? Ask Kim.")["conversation"]
         hub.conversation_start("studio", pcid)
         self.ok("read_messages", self.context(pcid))
+        self.reads(self.context(pcid), "Kim")                   # Kim's conversation is not this window's
         self.ok("message_contact", self.context(pcid), person="Kim", text="Is order 7781 paid?",
                 request_id=str(uuid.uuid4()), waits=True)
         self.assertEqual(self.inbound(text="Order 7781 is paid.", account="discord-studio", sender=KIM,
                                       chat="dm-9")[0], "stored")
         self.assertIn("7781 is paid", self.ok("read_messages", self.context(pcid)))
+        self.reads(here, "Kim")                 # what the other window asked her, and her answer to it
         self.ok("message_contact", here, person="Kim", text="May I go on?", request_id=str(uuid.uuid4()), waits=True)
         top = [hub.q1(f"SELECT MAX(id) n FROM {table}")["n"] for table in ("conversations", "conversation_messages")]
         hub.history_catch_up(60)                    # the history's cursor stands at the highest message
@@ -944,7 +961,8 @@ class Conversations(Base):
         window = [(r["name"], r["detail"]) for r in hub.q("SELECT name, detail FROM calls WHERE conversation=? "
                                                           "ORDER BY id", (pcid,))]
         self.assertEqual([(name, detail == hub.REMOVED_WORDS) for name, detail in window],
-                         [("read_messages", False), ("message_contact", True), ("read_messages", True)])
+                         [("read_messages", False), ("message_contact", True), ("message_contact", True),
+                          ("read_messages", True)])         # its refusal that showed Kim's messages goes too
         self.assertEqual((waiting["title"], hub.q1("SELECT text FROM notes WHERE task=?", (tid,))["text"]),
                          ("Plan the refunds", "The refund is planned."))
         # the next person's conversation and messages take new numbers, and nothing of a removed one reaches them
@@ -1174,6 +1192,7 @@ class Conversations(Base):
         hub.ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,'studio',?,1,'gmail_send',?,1,"
                 "'Sent.')", (t0, w, json.dumps({"request_id": mailed})))
         # ... a message of her task's session to another person, which is a line of that person's conversation
+        self.reads(("test-generation", hub.tref(w), "1"), "Pat")
         self.ok("message_contact", ("test-generation", hub.tref(w), "1"), person="Pat", request_id=str(uuid.uuid4()),
                 text="Do refunds take a week?")
         asked = hub.q1("SELECT id FROM conversation_messages WHERE who='agent' AND task=?", (w,))["id"]
@@ -1585,6 +1604,7 @@ class Conversations(Base):
         self.assertTrue(error)
         self.assertIn("Pause all", text)
         hub.kv_set("chat_apps_paused", None)
+        self.reads(here, f"P-{self.pat['id']}")
         sent = self.ok("message_contact", here, person=f"P-{self.pat['id']}", text="The export is ready.",
                        request_id=(rid := str(uuid.uuid4())))
         self.assertIn("Sent as CM-", sent)
@@ -1609,6 +1629,11 @@ class Conversations(Base):
         waiting = self.task(tid)
         self.assertEqual(waiting["state"], "input-required")
         self.assertTrue(waiting["waiting_on"].startswith("CM-"))
+        # another task tells her something before she answers (it reads her conversation first)
+        _, there = self.normal_task(title="Send the report")
+        self.assertTrue(self.tool("message_contact", there, person="Kim", text="The report is ready.",
+                                  request_id=str(uuid.uuid4()))[1])
+        self.ok("message_contact", there, person="Kim", text="The report is ready.", request_id=str(uuid.uuid4()))
         # her answer returns to the task that waits, as quoted data; her own conversation opens no task for it. It
         # carries a screenshot, which its header names: the fleet does not pass the picture on (CHAT-APPS.md 8.1)
         self.assertEqual(self.inbound(text="Yes, refund it.", account="discord-studio", sender=KIM, chat="dm-9",
@@ -1617,12 +1642,263 @@ class Conversations(Base):
         self.assertIn("Kim answered your CM-", answer["text"])
         self.assertIn(" · with a picture, which the fleet does not pass on yet\n", answer["text"])
         self.assertIn('\n"Yes, refund it."', answer["text"])                   # one JSON string, as data
+        # with what its session has not read before it: the other task's message, never its own
+        # (conversation_since). An answer to another task's question went to the task that waited, which took it for
+        # a message from another conversation (18 to 20 November 2026)
+        before = answer["text"].split("\n\nBefore it, the conversation had messages that this session has not read, "
+                                      "oldest first:\n\n")
+        self.assertEqual(len(before), 2, answer["text"])
+        self.assertEqual([json.loads(line) for line in before[1].splitlines() if line.startswith('"')],
+                         ["The report is ready."])
         self.assertEqual((self.task(tid)["state"], self.task(tid)["waiting_on"]), ("working", None))
         self.assertIsNone(self.conversation_task(conv["id"]))
         self.assertEqual(hub.q1("SELECT chat FROM conversations WHERE id=?", (conv["id"],))["chat"], "dm-9")
         # her next message is an ordinary one again: a conversation task of her own conversation
         self.inbound(text="And thanks.", account="discord-studio", sender=KIM, chat="dm-9")
         self.assertIsNotNone(self.conversation_task(conv["id"]))
+
+    def test_a_calls_record_keeps_no_word_of_a_conversation_that_a_removal_deleted_meanwhile(self):
+        """A removal that commits between a call and its record (call_record runs after the call's own lock) finds no
+        record to clear. The calls that give a conversation's words name it (conversation_head): a refusal of
+        message_contact that shows them, a message sent there, and a read that gives a person's answer to a waiting
+        session, of a task or of a window. The record of such a call keeps no word when that conversation is gone. The
+        record's text is never read for it, so outside text that looks like the hub's own lines blanks nothing."""
+        self.person("Kim", "manager", KIM, app="discord")
+        named, real = [], hub.call_record
+
+        def record(agent, tid, attempt, name, ok, args, detail, window, own=None):
+            named.append((name, set(hub.CALL.heads)))
+            return real(agent, tid, attempt, name, ok, args, detail, window, own)
+        with patch.object(hub, "call_record", record):
+            tid, here = self.normal_task(title="Plan the refunds")
+            self.ok("message_contact", here, person="Kim", text="May I refund Ana?", request_id=str(uuid.uuid4()),
+                    waits=True)
+            kim = hub.q1("SELECT conversation FROM conversation_messages WHERE task=?", (tid,))["conversation"]
+            self.inbound(text="Yes.", account="discord-studio", sender=KIM, chat="dm-9")
+            self.ok("read_messages", here)
+            _, there = self.normal_task(title="Send the report")
+            self.reads(there, "Kim")
+            pcid = self.says(PAT, "Ask Kim, please.")["conversation"]
+            hub.conversation_start("studio", pcid)
+            self.ok("read_messages", self.context(pcid))
+            self.reads(self.context(pcid), "Kim")
+            self.ok("message_contact", self.context(pcid), person="Kim", text="Is it paid?", request_id=str(uuid.uuid4()),
+                    waits=True)
+            self.inbound(text="It is paid.", account="discord-studio", sender=KIM, chat="dm-9")
+            self.ok("read_messages", self.context(pcid))
+            # an exact repeat answers with its kept text: it names the conversation too
+            rid = str(uuid.uuid4())
+            self.reads(here, "Kim")
+            self.ok("message_contact", here, person="Kim", text="Thanks.", request_id=rid)
+            self.ok("message_contact", here, person="Kim", text="Thanks.", request_id=rid)
+        self.assertEqual([(name, heads) for name, heads in named if heads],
+                         [("message_contact", {kim}), ("read_messages", {kim}), ("message_contact", {kim}),
+                          ("message_contact", {kim}), ("message_contact", {kim}), ("read_messages", {kim})] +
+                         [("message_contact", {kim})] * 3)
+        # the guard: the named conversation, not the record's words
+        for heads, detail, gone in (({kim}, "anything", False), ({99999}, "anything", True),
+                                    (set(), "[conversation C-99999] Kim answered your CM-1 with CM-2: untrusted data",
+                                     False)):
+            hub.CALL.heads = heads
+            try:
+                hub.call_record("studio", tid, 1, "read_messages", 1, '{"text": "Hi"}', detail, None)
+            finally:
+                hub.CALL.heads = ()
+            kept = tuple(hub.q1("SELECT args, detail FROM calls ORDER BY id DESC LIMIT 1"))
+            self.assertEqual(kept, ("{}", hub.REMOVED_WORDS) if gone else ('{"text": "Hi"}', detail), (heads, detail))
+
+    def test_a_windows_read_reads_the_records_under_its_lock_only(self):
+        """A conversation's own read marks its messages read under the lock and masks them after it: a read of the
+        records after the lock takes the lock again, which raises Left for an agent that was renamed or removed
+        meanwhile, and the messages that it had marked read were lost. What the lines of other sessions need (their
+        tasks, whether a message reached nobody) is read under the lock (conversation_said_facts)."""
+        self.person("Kim", "manager", KIM, app="discord")
+        self.inbound(text="Hello.", account="discord-studio", sender=KIM, chat="dm-9")
+        cid = hub.q1("SELECT conversation FROM conversation_messages WHERE text='Hello.'")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        _, here = self.normal_task(title="Plan the refunds")
+        self.reads(here, "Kim")
+        self.ok("message_contact", here, person="Kim", text="May I refund Ana?", request_id=str(uuid.uuid4()))
+        self.inbound(text="One more thing.", account="discord-studio", sender=KIM, chat="dm-9")
+        outside, me = [], threading.get_ident()
+        real_row, real_rows = hub.read_row, hub.read_rows
+
+        def row(*args, **kwargs):
+            if threading.get_ident() == me and not hub.LOCK._is_owned():
+                outside.append(args[0])
+            return real_row(*args, **kwargs)
+
+        def rows(*args, **kwargs):
+            if threading.get_ident() == me and not hub.LOCK._is_owned():
+                outside.append(args[0])
+            return real_rows(*args, **kwargs)
+        hub.CALL.context = self.context(cid)
+        try:
+            with patch.object(hub, "read_row", row), patch.object(hub, "read_rows", rows):
+                text = hub.conversation_read("studio")
+        finally:
+            hub.CALL.context = None
+        self.assertIn('"May I refund Ana?"', text)
+        self.assertEqual(outside, [])
+
+    def test_hidden_characters_in_a_shown_message_cost_its_login_and_no_more(self):
+        """A shown message loses its hidden characters before its mask (hidden_counted), as each read's message
+        does: a zero-width character inside a login hid it from the mask, call_tool's strip after it made the login
+        whole in its escaped form, and the whole answer went out as MASK, after its mark had moved."""
+        login = 'Synth"Pass\\w0rd-731-example'
+        self.person("Kim", "manager", KIM, app="discord")
+        _, here = self.normal_task(title="Plan the refunds")
+        self.ok("message_contact", here, person="Kim", text="Which config?", request_id=str(uuid.uuid4()))
+        self.inbound(text="This one: " + login[:5] + "\u200b" + login[5:], account="discord-studio", sender=KIM,
+                     chat="dm-9")
+        test_people.register(login)                     # registered after her message came
+        text, error = self.tool("message_contact", here, person="Kim", text="Thanks.", request_id=str(uuid.uuid4()))
+        self.assertTrue(error, text)
+        self.assertTrue(text.startswith("[conversation C-"), text)
+        self.assertNotIn("w0rd-731", text)
+        self.assertIn(hub.hidden.count_line(1, 0), text)
+
+    def test_a_task_writes_to_a_person_only_over_what_it_has_read_of_their_conversation(self):
+        """A task session's message to a person goes on from their conversation (conversation_since): its first one
+        there, and one after messages that the person or another session wrote since, is not sent, and the answer
+        gives those messages, each the hub's line and its words as one JSON line. Its exact repeat is refused again, a
+        new request_id sends, and with nothing new the next one goes at once. Each new task of an agent greeted a
+        manager and said who it was again, because no task had read the conversation (18 to 20 November 2026)."""
+        self.person("Kim", "manager", KIM, app="discord")
+        first, here = self.normal_task(title="Plan the refunds")
+        self.ok("message_contact", here, person="Kim", text="Hello Kim, I am Studio. May I refund Ana?",
+                request_id=str(uuid.uuid4()))                   # it opens the conversation: nothing to read
+        mine = hub.q1("SELECT * FROM conversation_messages WHERE task=?", (first,))
+        self.assertEqual(len(self.texts()), 2)                  # the notice and the message
+        # the owner's answer there (a row from before contacts.v2) goes back to that conversation and nowhere else
+        hub.ins("INSERT INTO conversation_messages(id,conversation,who,text,created) VALUES(?,?,?,?,?)",
+                (hub.unused_id("conversation_messages"), mine["conversation"], "owner", "Owner: refund it all.",
+                 hub.now()))
+        _, there = self.normal_task(title="Send the report")
+        rid, words = str(uuid.uuid4()), "Hello Kim, I am Studio. The report is ready."
+        text, error = self.tool("message_contact", there, person="Kim", text=words, request_id=rid)
+        self.assertTrue(error, text)
+        self.assertTrue(text.startswith(f"[conversation C-{mine['conversation']}] Not sent: this session has not read "
+                                        f"the newest messages of your conversation with Kim, so here they are first."),
+                        text)
+        # the hub's log keeps the start of a refusal (LOG_MOST), which holds no message: a removal leaves the log
+        logged = hub.q1("SELECT what FROM log WHERE what LIKE 'message_contact refused:%' ORDER BY id DESC LIMIT 1")
+        self.assertNotIn("refund", logged["what"])
+        lines = text.splitlines()
+        at = lines.index(f"Message {hub.cm_ref(mine['id'])}, you, in {hub.tref(first)}, "
+                         f"{hub.conversation_time(mine['created'])}:")
+        self.assertEqual(json.loads(lines[at + 1]), "Hello Kim, I am Studio. May I refund Ana?")
+        self.assertNotIn("refund it all", text)
+        self.assertEqual(self.texts(), [])                      # nothing went
+        again, error = self.tool("message_contact", there, person="Kim", text=words, request_id=rid)
+        self.assertEqual((again, bool(error)), (text, True))
+        self.ok("message_contact", there, person="Kim", text="The report is ready.", request_id=str(uuid.uuid4()))
+        self.ok("message_contact", there, person="Kim", text="It has the totals.", request_id=str(uuid.uuid4()))
+        self.assertEqual(self.texts(), ["The report is ready.", "It has the totals."])
+        # she writes in her own conversation: the first task reads her words, and the other task's, before it writes
+        self.inbound(text="Thanks, both.", account="discord-studio", sender=KIM, chat="dm-9")
+        text, error = self.tool("message_contact", here, person="Kim", text="Ana is refunded.",
+                                request_id=str(uuid.uuid4()))
+        self.assertTrue(error, text)
+        self.assertEqual([json.loads(line) for line in text.splitlines() if line.startswith('"')],
+                         ["The report is ready.", "It has the totals.", "Thanks, both."])
+        self.ok("message_contact", here, person="Kim", text="Ana is refunded.", request_id=str(uuid.uuid4()))
+        self.assertEqual(self.texts(), ["Ana is refunded."])
+
+    def test_the_conversations_own_session_reads_what_the_agents_other_sessions_said_there(self):
+        """The session of a person's own conversation knows the agent's side of it: its brief's recap has the agent's
+        messages, which no session reads, and a later read gives, once, what the agent's other sessions told the
+        person since its last read and the person's answer that went to a waiting task, never its own reply. Its
+        recap had the person's side alone, and a live session never learned what the agent's tasks wrote there."""
+        self.person("Kim", "manager", KIM, app="discord")
+        tid, here = self.normal_task(title="Plan the refunds")
+        self.ok("message_contact", here, person="Kim", text="May I refund Ana's last month?",
+                request_id=str(uuid.uuid4()), waits=True)
+        cid = hub.q1("SELECT conversation FROM conversation_messages WHERE task=?", (tid,))["conversation"]
+        self.inbound(text="Yes, refund it.", account="discord-studio", sender=KIM, chat="dm-9")       # the task's
+        thanks = self.inbound(text="And thanks.", account="discord-studio", sender=KIM, chat="dm-9")[1]
+        hub.conversation_start("studio", cid)
+        lines = self.ok("read_messages", self.context(cid)).splitlines()
+        studio = hub.agent_display("studio")
+        self.assertIn(f"{studio}: May I refund Ana's last month?", lines)
+        self.assertIn("Kim: Yes, refund it.", lines)
+        mine = hub.q1("SELECT id FROM conversation_messages WHERE msg_id=?", (thanks["id"],))["id"]
+        # the task tells her more and waits again, and her answer goes to it
+        self.assertTrue(self.tool("message_contact", here, person="Kim", text="It is refunded. Anything else?",
+                                  request_id=str(uuid.uuid4()), waits=True)[1])
+        self.ok("message_contact", here, person="Kim", text="It is refunded. Anything else?",
+                request_id=str(uuid.uuid4()), waits=True)
+        self.inbound(text="No, that is all.", account="discord-studio", sender=KIM, chat="dm-9")      # the task's
+        # the conversation's own session writes to her too, before its reply: its own message moves no mark of it,
+        # so what the task said and her answer to the task still come at its next read
+        self.ok("message_contact", self.context(cid), person="Kim", text="Thanks for waiting.",
+                request_id=str(uuid.uuid4()))
+        self.ok("reply", self.context(cid), text="You are welcome.", in_reply_to=f"CM-{mine}")
+        self.inbound(text="One more thing.", account="discord-studio", sender=KIM, chat="dm-9")
+        text = self.ok("read_messages", self.context(cid))
+        told = text.split("Since your last read, the conversation had messages that this session did not write or "
+                          "read: what your other sessions and your reminders told Kim, and their answers that went to "
+                          "a task that waited for them, oldest first:\n\n")
+        self.assertEqual(len(told), 2, text)
+        self.assertEqual([json.loads(line) for line in told[1].splitlines() if line.startswith('"')],
+                         ["It is refunded. Anything else?", "No, that is all.", "One more thing."])
+        self.assertNotIn("You are welcome.", text)
+        self.assertNotIn("Thanks for waiting.", text)
+        self.assertIn(f"Kim (manager), to {hub.tref(tid)}, ", text)
+        self.assertIn(f", you, in {hub.tref(tid)}, ", text)
+        # once
+        last = hub.q1("SELECT id FROM conversation_messages WHERE who='person' ORDER BY id DESC LIMIT 1")["id"]
+        self.ok("reply", self.context(cid), text="Go ahead.", in_reply_to=f"CM-{last}")
+        self.inbound(text="Here it is.", account="discord-studio", sender=KIM, chat="dm-9")
+        self.inbound(text="And this.", account="discord-studio", sender=KIM, chat="dm-9")      # read with it
+        self.assertNotIn("Since your last read", self.ok("read_messages", self.context(cid)))
+        first, second = [r["id"] for r in hub.q("SELECT id FROM conversation_messages WHERE text IN ('Here it is.', "
+                                                "'And this.') ORDER BY id")]
+        self.ok("reply", self.context(cid), text="Got it.", in_reply_to=f"CM-{first}")
+        self.ok("reply", self.context(cid), text="Got that too.", in_reply_to=f"CM-{second}")   # no task of its own
+        # a task that reads the conversation sees that her own conversation's session wrote both replies
+        _, there = self.normal_task(title="Check the refunds")
+        lines = self.reads(there, "Kim").splitlines()
+        self.assertTrue(lines[lines.index('"Got that too."') - 1].startswith(f"Message CM-"), lines)
+        self.assertIn(", you, in their own conversation, ", lines[lines.index('"Got that too."') - 1])
+
+    def test_a_window_that_writes_to_another_person_keeps_its_own_marks(self):
+        """A conversation's own session that writes to another person reads that person's conversation by its own
+        key (conversation_window_key), also for the answer that it waits for: the answer brings no message that it
+        read already, and its next message there goes at once. A task that reads that conversation later sees whose
+        words those were: a contact drove them."""
+        self.person("Kim", "manager", KIM, app="discord")
+        _, here = self.normal_task(title="Plan the refunds")
+        self.ok("message_contact", here, person="Kim", text="May I refund order 7781?", request_id=str(uuid.uuid4()),
+                waits=True)
+        self.inbound(text="Yes, 7781 goes back to my card.", account="discord-studio", sender=KIM, chat="dm-9")
+        pcid = self.says(PAT, "Is order 7781 paid? Ask Kim.")["conversation"]
+        hub.conversation_start("studio", pcid)
+        self.ok("read_messages", self.context(pcid))
+        self.reads(self.context(pcid), "Kim")
+        self.ok("message_contact", self.context(pcid), person="Kim", text="Is order 7781 paid?",
+                request_id=str(uuid.uuid4()), waits=True)
+        self.inbound(text="Order 7781 is paid.", account="discord-studio", sender=KIM, chat="dm-9")
+        task = self.conversation_task(pcid)["id"]
+        answer = hub.q1("SELECT text FROM events WHERE kind='say' AND task=? ORDER BY id DESC LIMIT 1", (task,))["text"]
+        self.assertIn('\n"Order 7781 is paid."', answer)
+        self.assertNotIn("Before it", answer)                  # it read the rest before it asked
+        self.ok("message_contact", self.context(pcid), person="Kim", text="Thanks, I told Pat.",
+                request_id=str(uuid.uuid4()))                  # at once
+        # work that Pat's conversation opened writes to Kim too: a contact drove those words as well
+        self.ok("open_work", self.context(pcid), title="Ask Kim for the receipt", details="Order 7781's receipt.")
+        work = hub.q1("SELECT id FROM tasks WHERE title='Ask Kim for the receipt'")["id"]
+        hub.q("UPDATE tasks SET state='working', started=? WHERE id=?", (hub.now(), work))
+        opened = ("test-generation", hub.tref(work), "1")
+        self.reads(opened, "Kim")
+        self.ok("message_contact", opened, person="Kim", text="Please send the receipt of 7781.",
+                request_id=str(uuid.uuid4()))
+        _, there = self.normal_task(title="Check the refunds")
+        text = self.reads(there, "Kim")
+        self.assertIn(", you, in a conversation with another person, ", text)
+        self.assertIn(", Kim (manager), to you, in a conversation with another person, ", text)    # her answer to it
+        self.assertIn(f", you, in {hub.tref(work)}, which a person's conversation opened, ", text)
 
     def test_a_window_with_a_shell_downloads_its_persons_file_one_time(self):
         """CHAT-APPS.md 8.1: in a conversation with the agent's own tools, of an agent whose Shell box is on, a file of
@@ -1684,6 +1960,7 @@ class Conversations(Base):
         self.assertTrue(error)
         self.assertIn("on WhatsApp only a chat that they already use", text)
         self.says("34600999888@s.whatsapp.net", "Hello")
+        self.reads(here, "Laura")
         self.ok("message_contact", here, person="Laura", text="Hi again", request_id=str(uuid.uuid4()))
         item = [i for i in self.out() if i["kind"] == "message"][-1]
         self.assertEqual((item["chat"], item["text"]), ("34600999888@s.whatsapp.net", "Hi again"))
@@ -2060,6 +2337,7 @@ class ShellOffRule(Base):
         self.assertIsNotNone(hub.q1("SELECT ended FROM standing WHERE id=?", (item["id"],))["ended"])
 
         # the result tells the window what the task already wrote to the colleague, so it does not say it twice
+        self.reads(here, f"P-{pat['id']}")
         self.ok("message_contact", here, person=f"P-{pat['id']}", text="Fine, no more links.",
                 request_id=str(uuid.uuid4()))
         self.ok("deliver_result", here, task_id=hub.tref(work["id"]), outcome="completed", values={"links": "ended"})
@@ -2100,6 +2378,7 @@ class ShellOffRule(Base):
         self.assertEqual(hub.conversation_modes("studio"), {str(old): "closed", str(cid): "tools"})
         tid, here = self.normal_task()
         self.assertIn("message_contact", {t["name"] for t in hub.tools_for("studio", here)})
+        self.reads(here, "Pat")
         self.assertIn("Sent as CM-", self.ok("message_contact", here, person="Pat", text="Is the list for October?",
                                              request_id=str(uuid.uuid4())))
         text, error = self.tool("message_contact", here, person="Ana", text="Hi", request_id=str(uuid.uuid4()))
@@ -2111,6 +2390,7 @@ class ShellOffRule(Base):
         self.person("Pat", "peer", PAT)
         cid = self.says(PAT, "Can you add Lucia to the newsletter list?")["conversation"]
         tid, here = self.normal_task()
+        self.reads(here, "Pat")
         self.ok("message_contact", here, person="Pat", text="Which list?", request_id=str(uuid.uuid4()), waits=True)
         code, data = self.role(name="peer", prompt=hub.ROLE_DEFAULTS["peer"][0], tools=False, daily=30)
         self.assertEqual(code, 200, data)
@@ -2122,6 +2402,32 @@ class ShellOffRule(Base):
         self.assertNotIn("curl", " ".join(e["text"] for e in hub.q("SELECT text FROM events")))
         with self.assertRaises(hub.Refusal):
             hub.conversation_start("studio", cid)
+
+    def test_a_shell_off_task_reads_no_other_sessions_words_in_a_colleagues_conversation(self):
+        """A session whose Shell box is off reads its own task and no other (SHELL_OFF_TOOLS), and a colleague's
+        conversation holds what other tickets' sessions told them: before it writes there, and with the answer that
+        it waits for, it is told how many such messages there are, and no word of them."""
+        self.person("Kim", "manager", KIM, app="discord")
+        _, first = self.normal_task(title="Ticket 81")
+        self.ok("message_contact", first, person="Kim", text="Ana's order 7781 needs a refund.",
+                request_id=str(uuid.uuid4()))
+        second, there = self.normal_task(title="Ticket 82")
+        text, error = self.tool("message_contact", there, person="Kim", text="Hello Kim.", request_id=str(uuid.uuid4()))
+        self.assertTrue(error, text)
+        self.assertIn("1 message of your other sessions with them, or of their answers to those sessions, is in this "
+                      "conversation too: a session whose Shell box is off does not read them.", text)
+        self.assertNotIn("7781", text)
+        self.ok("message_contact", there, person="Kim", text="Ticket 82 needs your answer.",
+                request_id=str(uuid.uuid4()), waits=True)
+        # refused once at most: after its first message there, it sends, and is told how many came meanwhile
+        done = self.ok("message_contact", first, person="Kim", text="Ana's refund 7781 is done.",
+                       request_id=str(uuid.uuid4()))
+        self.assertIn("1 message of your other sessions with them", done)
+        self.inbound(text="Yes for 82.", account="discord-studio", sender=KIM, chat="dm-9")
+        answer = hub.q1("SELECT text FROM events WHERE kind='say' AND task=? ORDER BY id DESC LIMIT 1", (second,))
+        self.assertIn('\n"Yes for 82."', answer["text"])
+        self.assertNotIn("7781", answer["text"])
+        self.assertIn("1 message of your other sessions", answer["text"])
 
     def test_a_colleagues_answer_to_a_session_that_waits_is_one_json_line(self):
         """The answer to a message_contact that waits reaches the task session as one JSON string that no line of the

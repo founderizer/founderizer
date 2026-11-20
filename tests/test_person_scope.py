@@ -5,6 +5,7 @@ with the hub as its door for repositories. An in-process hub with a temporary da
 side: no bridge, no platform, no model, no network and no live hub."""
 import json
 import unittest
+import uuid
 from unittest.mock import patch
 
 import fleet
@@ -141,6 +142,39 @@ class Narrowed(Base):
         super().setUp()
         self.narrow(self.pat["id"], {f"repo:{REPO}": "write", f"secret:{LOGIN}": "use"})
         self.kim = self.person("Kim", "manager", KIM, app="discord")
+
+    def test_a_task_reads_only_what_a_session_with_more_wrote_to_a_narrowed_person(self):
+        """Person access plan, section 5: a narrowed person's words, and the replies of their locked session, reach no
+        session that holds more than their list. A task session's read of their conversation before it writes
+        (conversation_since) gives only what a session with more wrote to them: here another task's message."""
+        cid = self.says(PAT, "The giraffe key is in the drawer.")["conversation"]
+        said = hub.q1("SELECT id FROM conversation_messages WHERE who='person' ORDER BY id DESC LIMIT 1")["id"]
+        later = self.says(PAT, "And the zebra key is in the box.")["id"]        # one conversation task with the first
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("reply", self.context(cid), text="Noted: the giraffe drawer.", in_reply_to=f"CM-{said}")
+        self.ok("reply", self.context(cid), text="Noted: the zebra box.", in_reply_to=f"CM-{later}")
+        self.assertIsNone(hub.q1("SELECT task FROM conversation_messages WHERE text='Noted: the zebra box.'")["task"])
+        _, first = self.normal_task(title="Ask about the deploy")
+        self.ok("message_contact", first, person="Pat", text="Is the deploy done?",
+                request_id=str(uuid.uuid4()))           # nothing in it that this session may read: it goes
+        _, second = self.normal_task(title="Ask about the keys")
+        text = self.reads(second, "Pat")
+        self.assertEqual([json.loads(line) for line in text.splitlines() if line.startswith('"')],
+                         ["Is the deploy done?"])
+        self.assertNotIn("giraffe", text)
+        # and after the owner widened their access: what was said while it was narrowed stays with that pair
+        hub.q("DELETE FROM person_scopes WHERE person=?", (self.pat["id"],))
+        _, third = self.normal_task(title="Ask about the doors")
+        text = self.reads(third, "Pat")
+        self.assertNotIn("giraffe", text)
+        self.assertNotIn("zebra", text)                 # a reply with no task of its own, to a message of that time
+        # nor does the brief of the conversation's next session, which holds more than that list now
+        hub.conversation_start("studio", cid)
+        brief = self.ok("read_messages", self.context(cid))
+        self.assertIn("Is the deploy done?", brief)
+        self.assertNotIn("giraffe", brief)
+        self.assertNotIn("zebra", brief)
 
     def test_its_window_opens_its_persons_own_files_only(self):
         """CHAT-APPS.md 8.1: a narrowed window opens the files of its own person's messages (read_attachment is in

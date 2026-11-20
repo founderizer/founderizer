@@ -406,12 +406,14 @@ class Patience(Tools, Runtime):
         super().setUp()
         self.seq = 0
 
-    def task(self, *args, **kw):
+    def task(self, *args, tools=True, **kw):
         tid = super().task(*args, **kw)
         hub.q("UPDATE events SET read_at=? WHERE task=? AND kind='task'", (hub.now(), tid))     # its start was read
+        if tools and kw.get("state", "working") != "submitted":     # with a call on its own route, as a session reads
+            hub.q("UPDATE attempts SET started=? WHERE task=?", (hub.now(), tid))
         return tid
 
-    def turn(self, tid, said="I looked at the queue.", *more, read=True):
+    def turn(self, tid, said="I looked at the queue.", *more, read=True, attempt=1):
         """One whole turn of the session: it reads its messages (unless read is false), then its words and its end."""
         if read:
             hub.q("UPDATE events SET read_at=? WHERE agent='studio' AND task=? AND read_at IS NULL", (hub.now(), tid))
@@ -419,7 +421,7 @@ class Patience(Tools, Runtime):
                 {"seq": self.seq + 50, "type": "agent_message", "text": said},
                 {"seq": self.seq + 51, "type": "result", "stop_reason": "end_turn"}]
         self.seq += 100
-        self.assertEqual(self.records(tid, rows)[0], 200)
+        self.assertEqual(self.records(tid, rows, attempt=attempt)[0], 200)
 
     def continues(self, tid):
         return [t for t in self.said("studio") if t.startswith(f"[hub] T-{tid} is open and nothing is waiting")]
@@ -460,6 +462,40 @@ class Patience(Tools, Runtime):
         self.records(tid, [{"seq": self.seq + 2, "type": "result", "stop_reason": "end_turn"}])
         self.seq += 100
         self.assertEqual(len(self.continues(tid)), 2)       # a message came between: a new stretch
+        # A session that cannot read (its tools never came: T-1758, 20 November 2026): the hub's own continue line,
+        # unread at its next turn end, is no live reason, so the requester hears at the second empty turn.
+        deaf = self.task()
+        self.turn(deaf)
+        self.turn(deaf, "I will look now.", read=False)
+        self.assertEqual(len(self.continues(deaf)), 1)
+        self.assertEqual(len([t for t in self.said("manager") if f"T-{deaf} " in t and "two turns" in t]), 1)
+        # One whose tools never reached it (no call on its own route): its first empty turn is asked, as any; at the
+        # second, restart_task's own stop and restart in its requester's name; a second such attempt goes to the
+        # requester, once, and starts nothing
+        mute = self.task(tools=False)
+        attempt = lambda: hub.q1("SELECT attempt FROM tasks WHERE id=?", (mute,))["attempt"]
+        self.turn(mute, "I cannot find the tools.", read=False)
+        self.assertEqual((len(self.continues(mute)), attempt()), (1, 1))
+        self.assertIsNone(hub.q1("SELECT id FROM holds WHERE task=?", (mute,)))
+        self.turn(mute, "Still no tools.", read=False)
+        self.assertIsNone(hub.q1("SELECT id FROM holds WHERE task=?", (mute,)))    # not before the helper's word
+        hub.kv_set(f"untaken:studio:T-{mute}", hub.now() + 1)       # the helper: the session did not take the line
+        hub.turn_end_check(hub.q1("SELECT * FROM tasks WHERE id=?", (mute,)),
+                           hub.turn_state(mute, 1), hub.now(), force=True)     # its forced check, as after the report
+        hold = hub.q1("SELECT * FROM holds WHERE task=? AND kind='stop'", (mute,))
+        self.assertEqual((hold["by"], hold["state"], attempt()), ("manager", "requested", 1))   # it waits for the stop
+        self.call("POST", "/helper/control/studio", {"hold": hold["id"], "confirmed": True, "flushed": []}, client=None)
+        self.assertEqual(attempt(), 2)
+        for said in ("No tools.", "No tools at all."):
+            self.turn(mute, said, read=False, attempt=2)
+        hub.kv_set(f"untaken:studio:T-{mute}", hub.now() + 2)
+        self.turn(mute, "None.", read=False, attempt=2)
+        self.assertEqual(attempt(), 2)
+        told = [t for t in self.said("manager") if f"T-{mute} " in t and "starts it no more by itself" in t]
+        self.assertEqual(len(told), 1)
+        self.assertIn("again its session's tools did not reach it", told[0])
+        self.turn(mute, "Still none.", read=False, attempt=2)     # nothing more for the same attempt
+        self.assertEqual(len([t for t in self.said("manager") if f"T-{mute} " in t and "no more" in t]), 1)
 
     def test_a_live_reason_at_the_turn_end_asks_nothing(self):
         tid = self.task()

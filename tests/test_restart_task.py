@@ -445,10 +445,13 @@ class RestartTask(Dying, Capacity):
         other = self.create("manager", "pma", why="a second task of pma")
         plain = self.create("pma", "seo", self.shop)                    # no browser task: it holds the limit below
         for agent, session, changes, why in (
-                ("manager", None, {}, f"T-{self.task} was not requested by you."),
+                # the refusal names the one session that can act (T-1758, 20 November 2026)
+                ("manager", None, {}, f"T-{self.task} was not requested by you. Only the session of T-{self.shop}, "
+                                      f"pma's task above it, acts on it."),
                 ("pmb", self.create("manager", "pmb", why="a task of pmb"), {},
                  f"T-{self.task} was not requested by you."),
-                ("pma", other, {}, f"T-{self.task} is not a subtask of T-{other}, the task of this session."),
+                ("pma", other, {}, f"T-{self.task} is not a subtask of T-{other}, the task of this session. Your "
+                                   f"session of T-{self.shop} acts on it."),
                 ("pma", self.shop, {"expected_attempt": 2}, f"T-{self.task} is at attempt 1 now, not 2"),
                 ("pma", self.shop, {"expected_attempt": True}, "expected_attempt must be the attempt that failed"),
                 ("pma", self.shop, {"expected_attempt": "1"}, "expected_attempt must be the attempt that failed"),
@@ -462,6 +465,8 @@ class RestartTask(Dying, Capacity):
                     **changes), session))
         self.assertEqual((hub.q1("SELECT COUNT(*) c FROM holds")["c"], hub.q1("SELECT COUNT(*) c FROM tool_commands")["c"]),
                          (0, 0))                                        # a refused call keeps nothing
+        self.assertIn(f"Only the session of T-{self.shop}, pma's task above it, acts on it.",       # and cancel_task
+                      self.refused("manager", "cancel_task", {"task_id": f"T-{self.task}", "reason": WHY}, None))
         # a worker restarts only a part of its task that it gave a peer (peer tasks, 19 November 2026), so its own task
         # is not one: seo did not request it
         self.assertIn(f"T-{self.task} was not requested by you.", self.refused("seo", "restart_task", {

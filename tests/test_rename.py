@@ -486,7 +486,7 @@ class Columns(unittest.TestCase):
         "door_news:": "a host of the door", "history_outside:": "a task",
         "browser_room:": "a server", "browser_refused:": "a server", "browser_place:": "a task",     # build plan 04, S3
         "browser_place_told:": "a task", "browser_wake_held:": "a Needs-you item",
-        "seen:": "a task, or the manager's standing session (seen_get)",
+        "seen:": "a task, the manager's standing session, or a conversation's own session (seen_get)",
         "door_untaken_seen:": "a host of the door", "github_app_asked:": "a GitHub account or organization",
         "install_told:": "a server job", "key_swap_answered:": "a server", "key_swap_asked:": "a server",
         "key_swap_read:": "a server", "knowledge_read:": "a knowledge file", "read_base:": "a wake-up rule",
@@ -498,7 +498,7 @@ class Columns(unittest.TestCase):
         "question_record:": "a task",
         "screen_restart:": "a task", "standing_told:": "a conversation", "start_failed:": "a task",
         "stuck_notice:": "a task", "team_plan:": "a team card (a Needs-you item)", "team_plan_job:": "a server job",
-        "turn_ack:": "a task", "turn_checked:": "a task", "turn_empty:": "a task"}
+        "turn_ack:": "a task", "turn_checked:": "a task", "turn_empty:": "a task", "no_tools:": "a task"}
 
     def test_every_column_that_can_hold_an_agent_is_placed(self):
         kept = hub.DB
