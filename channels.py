@@ -58,6 +58,11 @@ TELEGRAM_TOKEN = re.compile(r"^[0-9]{5,20}:[A-Za-z0-9_-]{30,80}$")
 TELEGRAM_CHAT = re.compile(r"^-?[1-9][0-9]{0,19}$")
 TELEGRAM_UPDATES = ["message", "my_chat_member"]
 TELEGRAM_STATUSES = ("creator", "administrator", "member", "restricted", "left", "kicked")
+# The fields of a message that a person sent that is neither words, a picture, a voice note nor a file: the hub passes
+# it on as kind "other" (CHAT-APPS.md 8.1). A message with none of them is Telegram's own (a pin, the auto-delete
+# timer), which no person wrote, and the bridge drops it.
+TELEGRAM_OTHER = ("video", "video_note", "animation", "sticker", "location", "venue", "contact", "poll", "dice", "story",
+                  "checklist", "game", "paid_media")
 
 # Timings in seconds. The tests make them short.
 OUT_WAIT = 25               # the /bridge/out long poll
@@ -1027,18 +1032,22 @@ class Discord(Account):
         sender, mid, chat = str(author.get("id") or ""), str(d.get("id") or ""), str(d.get("channel_id") or "")
         if not sender or not mid or not chat or sender == self.user:
             return
-        attachments = d.get("attachments") or []
+        attachments, words = d.get("attachments") or [], d.get("content") or ""
+        snapshots = d.get("message_snapshots")
+        if not attachments and not words and isinstance(snapshots, list) and snapshots and \
+                isinstance(snapshots[0], dict) and isinstance(snapshots[0].get("message"), dict):
+            forwarded = snapshots[0]["message"]     # a forwarded message: its words and its files are in its snapshot
+            attachments, words = forwarded.get("attachments") or [], forwarded.get("content") or ""
         if attachments:
             ctype = str((attachments[0] or {}).get("content_type") or "")
             kind = "image" if ctype.startswith("image/") else "audio" if ctype.startswith("audio/") else "file"
-        elif d.get("content") and not d.get("sticker_items"):
+        elif words and not d.get("sticker_items"):
             kind = "text"
         else:
             kind = "other"
         self.bridge.inbound({"account": self.id, "id": mid, "chat": chat, "group": False, "sender": sender,
                              "sender_alt": None, "sender_name": author.get("username"), "bot": False,
-                             "from_me": False, "kind": kind, "text": str(d.get("content") or ""),
-                             "ts": snowflake_time(mid)})
+                             "from_me": False, "kind": kind, "text": str(words), "ts": snowflake_time(mid)})
 
     def catch_up(self, session):
         """After a new session (not a resume): read each known chat after its last stored message."""
@@ -1864,7 +1873,9 @@ class Telegram(Account):
 
     def on_message(self, msg):
         """A person's message in a private chat goes to the journal. A bot's, a group's and a channel's do not: in a
-        group, the bot only posts (19.5). A group that became a supergroup tells the hub its new number."""
+        group, the bot only posts (19.5). A group that became a supergroup tells the hub its new number. The words of
+        a picture, a file or a voice note are its caption, which goes as its text, as Discord's and WhatsApp's words
+        do (CHAT-APPS.md 8.1)."""
         chat, sender = msg.get("chat") or {}, msg.get("from") or {}
         kind, cid, mid, uid = chat.get("type"), chat.get("id"), msg.get("message_id"), sender.get("id")
         if not isinstance(cid, int):
@@ -1884,14 +1895,16 @@ class Telegram(Account):
             what = "audio"
         elif msg.get("document"):
             what = "file"
-        else:
+        elif any(msg.get(k) for k in TELEGRAM_OTHER):
             what = "other"
+        else:
+            return True         # Telegram's own message in the chat (a pin, the auto-delete timer): nobody wrote it
         name = " ".join(str(x) for x in (sender.get("first_name"), sender.get("last_name")) if x) or \
             str(sender.get("username") or "") or None
         return self.bridge.inbound({"account": self.id, "id": f"{self.bot}:{cid}:{mid}", "chat": str(cid),
                                     "group": False, "sender": str(uid), "sender_alt": None, "sender_name": name,
                                     "bot": False, "from_me": False, "kind": what,
-                                    "text": str(msg.get("text") or "") if what == "text" else "",
+                                    "text": str(msg.get("text" if what == "text" else "caption") or ""),
                                     "ts": number(msg.get("date"), default=time.time())})
 
     def on_member(self, change):

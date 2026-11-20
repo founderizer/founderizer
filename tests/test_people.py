@@ -237,8 +237,10 @@ class People(test_chat_apps.ChatApps):
         self.person_with_handle()
         for _ in range(3):
             self.assertEqual(self.wrote(text="/whoami"), "stored")
-            self.assertEqual(self.wrote(text="", kind="image"), "stored")
+            self.assertEqual(self.wrote(text="x" * 4001), "stored")
+            self.assertEqual(self.wrote(text=" "), "stored")           # a text message with no words
         self.assertEqual(sorted(self.texts()), ["I can read text only for now.",
+                                                "This message is too long. The limit is 4,000 characters.",
                                                 "You are Ana Ruiz. The owner added you to this fleet as a customer."])
         self.assertEqual(self.count("conversations"), 0)
 
@@ -328,6 +330,26 @@ class Conversations(People):
         self.assertEqual(self.read(), "No unread messages. Wait for the next signal.")
         self.assertIsNotNone(hub.q1("SELECT read_at FROM conversation_messages WHERE id=1")["read_at"])
         self.assertEqual([i["kind"] for i in self.out()[-2:]], ["typing", "read"])     # the person sees it arrive
+
+    def test_a_picture_or_a_file_reaches_the_agent_with_its_words_each_time(self):
+        """A person's message that carries a picture, a file or a voice note reaches the agent with its words, and the
+        header that the hub writes says what came, which the fleet does not pass on yet, so that the agent can answer
+        it; a later session reads it in the recap. Until 20 November 2026 the hub dropped such a message whole, words
+        too, with a fixed reply that went once a day: a person's second picture of a day reached nobody, and they got
+        no answer at all (a manager's screenshot to their agent, on Discord)."""
+        self.read()
+        self.texts()                                # what the hub sent before: the notice of the first message
+        sent = [("This is the error that I get:", "image"), ("", "image"), ("The invoice.", "file")]
+        for text, kind in sent:
+            self.assertEqual(self.wrote(text=text, kind=kind), "stored")
+        self.assertEqual(self.texts(), [])          # no fixed reply: the agent answers each one
+        lines = self.read().splitlines()
+        self.assertEqual([line.split(" · ")[4:] for line in lines if line.startswith("[Fleet C-")],
+                         [["with a picture, which the fleet does not pass on yet"]] * 2 +
+                         [["with a file, which the fleet does not pass on yet"]])
+        self.assertEqual([json.loads(line) for line in lines if line.startswith('"')], [t for t, _ in sent])
+        self.assertIn("Laura: This is the error that I get: (with a picture, which the fleet did not pass on)",
+                      self.recap(self.prompt()))
 
     def test_the_window_has_the_tools_of_the_role_and_nothing_else(self):
         self.assertEqual([t["name"] for t in hub.tools_for("studio", self.context)],
@@ -420,6 +442,9 @@ class Conversations(People):
         # the owner is not interrupted for a decision that he gave away; the item is still there to read
         self.assertFalse([e for e in hub.q("SELECT * FROM events WHERE agent='owner' AND kind='notify'")
                           if f"N-{need['id']}" in e["text"]])
+        # a picture with no words answers nothing: the item would leave Needs you with an empty answer
+        self.assertEqual(self.wrote(text="", kind="image"), "stored")
+        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (need["id"],))["answer"])
         self.assertEqual(self.wrote(text="Yes, the price is fine."), "stored")
         need = hub.q1("SELECT * FROM needs WHERE id=?", (need["id"],))
         self.assertEqual(need["answer"], "Yes, the price is fine.")

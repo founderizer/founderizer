@@ -136,13 +136,25 @@ kept sign-in has the same server, port and protocol (not the same user: the addr
   does and changes later in the session; text that a server puts into the owner's clipboard; Apple's protocol after
   the sign-in; macOS 15 and 26; a fault in Screen Sharing itself that a server's data could use.
 
+On a Linux agent's screen the Mac app also checks the program's first line. Screen Sharing's own connection goes
+through the app, which reads the 12 bytes of the greeting on it and passes the connection on only when they are
+`x11vnc`'s (version 3.8 of the protocol, the only one that the fleet's `x11vnc` sends); the app's check before Screen
+Sharing opens reads them too. Another
+greeting closes that connection before Screen Sharing reads a byte, and the card says so, at once when the app's check
+meets it and at the next press when only Screen Sharing's connection does: stop the agent's task, and treat the logins
+of its browser as exposed. So Apple's greeting, the measured way to Screen Sharing's warning "could not verify the
+authenticity", no longer reaches Screen Sharing from an agent's port. What a program that greets as `x11vnc` does can do
+after its greeting is in the list above, and the owner's rule below stays: Cancel at each warning. If Screen Sharing
+says "Connection failed" at a take-over of an agent on a Linux server, the owner presses Take over once more: the card
+then says whether another program answered. A Mac's own screen is not checked.
+
 So at a take-over of an agent on a Linux server, Screen Sharing opens the agent's screen with no question. If it shows
 a warning, a question or a sign-in window there, the owner presses Cancel (or OK where that is the only button) and
 types nothing in it. The warning that
 it could not verify the authenticity, or a sign-in window, means that the program on that port is not the one that
 the helper started: the owner then answers the card in words (not with "Done"), does not press Take over again, stops
-that agent, and treats the logins of its browser as exposed (the site's "sign out everywhere" or a new password, as
-above). At every take-over, a Mac's too, the owner presses Cancel at the warning that Screen Sharing could not verify
+the agent's task, and treats the logins of its browser as exposed (the site's "sign out everywhere" or a new password,
+as above). At every take-over, a Mac's too, the owner presses Cancel at the warning that Screen Sharing could not verify
 the authenticity and then takes the same steps (on a Mac it means that Apple's server does not hold the port), never
 types a password, a key, a card number or a one-time code on the agent's screen, never uses a
 passkey or signs in there, and copies no password, key or other secret before or during it. An agent asks the owner

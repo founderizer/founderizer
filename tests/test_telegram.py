@@ -252,11 +252,21 @@ class Bridge(unittest.TestCase):
         self.api.inject(message=group)
         self.api.inject(message=bot)
         self.api.inject(edited_message=private("edited", mid=7))
-        photo = private("", mid=8, photo=[{"file_id": "x"}])
+        # a picture goes, with its caption as its words (CHAT-APPS.md 8.1: until 20 November 2026 the bridge dropped
+        # them, and the agent never read what a person wrote under their screenshot)
+        photo = private("", mid=8, photo=[{"file_id": "x"}], caption="This is the error that I get")
         del photo["text"]
-        last = self.api.inject(message=photo)
-        self.wait_for(lambda: last + 1 in self.api.offsets, "all four confirmed")
-        self.assertEqual([(m["kind"], m["text"]) for m in self.hub.inbound], [("image", "")])
+        self.api.inject(message=photo)
+        # Telegram's own message in the chat, which no person wrote: a pin
+        pin = private("", mid=9, pinned_message=private("How are sales today?", mid=3))
+        del pin["text"]
+        self.api.inject(message=pin)
+        doc = private("", mid=10, document={"file_id": "y", "file_name": "invoice.pdf"}, caption="The invoice")
+        del doc["text"]
+        last = self.api.inject(message=doc)
+        self.wait_for(lambda: last + 1 in self.api.offsets, "all six confirmed")
+        self.assertEqual([(m["kind"], m["text"]) for m in self.hub.inbound],
+                         [("image", "This is the error that I get"), ("file", "The invoice")])
 
     def test_a_group_or_channel_change_goes_to_the_hub_with_who_made_it(self):
         self.connected()

@@ -282,7 +282,7 @@ class ChatApps(OwnerAPI):
             self.assertEqual((req["text"], req["recipient"]), (text, "manager"))
         self.assertEqual(self.count("events"), 4)
         self.assertEqual(hub.q("SELECT name FROM sqlite_master WHERE name='chat_selections'"), [])
-        self.assertEqual(say("a photo", kind="image"), ["I can read text only for now."])
+        self.assertEqual(say(" "), ["I can read text only for now."])        # a text message with no words
         self.assertEqual(say("x" * 4001), ["This message is too long. The limit is 4,000 characters."])
         hub.TEAM["chat_apps"]["whatsapp-grok"] = {"app": "whatsapp", "label": "Grok", "agents": ["grok"],
                                                   "unknown": "ignore"}
@@ -300,6 +300,36 @@ class ChatApps(OwnerAPI):
         self.assertEqual(self.texts(), ["Commands:\n/whoami: who you are in Founderizer\n/help: this list"])
         self.inbound("/to vps")
         self.assertEqual((self.last_request()["text"], self.last_request()["recipient"]), ("/to vps", "studio"))
+
+    def test_an_owner_message_with_a_picture_reaches_the_agent_with_its_words(self):
+        """The owner's message from a chat app that carries a picture, a file or a voice note goes on with its words,
+        and the hub's line under them tells the agent what came, which the fleet does not pass on yet, and where it can
+        get it. Until 20 November 2026 such a message got the fixed reply "I can read text only for now." and its
+        words never reached the agent."""
+        self.own("whatsapp", OWNER_WA)
+        self.assertEqual(self.inbound("Is this the right invoice?", account="whatsapp-main", sender=OWNER_WA,
+                                      kind="image")[0], "stored")
+        self.assertEqual(self.inbound("", account="whatsapp-main", sender=OWNER_WA, kind="audio")[0], "stored")
+        self.own()
+        self.assertEqual(self.inbound("Why does the scrape stop here?", kind="file")[0], "stored")
+        self.assertEqual(self.texts(), [])          # no fixed reply: the agent answers
+        said = [r["text"] for r in hub.q("SELECT text FROM ui_requests ORDER BY created, rowid")]
+        self.assertEqual(said, ["Is this the right invoice?", "", "Why does the scrape stop here?"])  # his words alone
+        events = {a: [e["text"] for e in hub.q("SELECT text FROM events WHERE agent=? ORDER BY id", (a,))]
+                  for a in ("manager", "studio")}
+        self.assertEqual(events["manager"], [
+            "[owner via WhatsApp] Is this the right invoice?\n[The owner sent a picture with this message on WhatsApp, "
+            "which the fleet does not pass on to you yet. If you need it, ask the owner for it in words, or as a file "
+            "in the Founderizer app, where read_attachment opens it.]",
+            "[owner via WhatsApp]\n[The owner sent a voice note or a sound file with this message on WhatsApp, which "
+            "the fleet does not pass on to you yet. If you need it, ask the owner for it in words, or as a file in the "
+            "Founderizer app, where read_attachment opens it.]"])
+        self.assertEqual(len(events["studio"]), 1)
+        self.assertTrue(events["studio"][0].endswith(
+            "via=Discord] Why does the scrape stop here?\n[The owner sent a file with this message on Discord, which "
+            "the fleet does not pass on to you yet. If you need it, ask the owner for it in words, or as a file in the "
+            "Founderizer app, where read_attachment opens it.]"), events["studio"])
+        self.assertIn("[The owner sent a picture with this message on WhatsApp", self.read("manager"))   # its read
 
     def test_a_registered_secret_in_an_inbound_message_is_not_stored(self):
         self.own()

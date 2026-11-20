@@ -1606,11 +1606,13 @@ class Conversations(Base):
         waiting = self.task(tid)
         self.assertEqual(waiting["state"], "input-required")
         self.assertTrue(waiting["waiting_on"].startswith("CM-"))
-        # her answer returns to the task that waits, as quoted data; her own conversation opens no task for it
-        self.assertEqual(self.inbound(text="Yes, refund it.", account="discord-studio", sender=KIM, chat="dm-9")[0],
-                         "stored")
+        # her answer returns to the task that waits, as quoted data; her own conversation opens no task for it. It
+        # carries a screenshot, which its header names: the fleet does not pass the picture on (CHAT-APPS.md 8.1)
+        self.assertEqual(self.inbound(text="Yes, refund it.", account="discord-studio", sender=KIM, chat="dm-9",
+                                      kind="image")[0], "stored")
         answer = hub.q1("SELECT * FROM events WHERE kind='say' AND task=? ORDER BY id DESC LIMIT 1", (tid,))
         self.assertIn("Kim answered your CM-", answer["text"])
+        self.assertIn(" · with a picture, which the fleet does not pass on yet\n", answer["text"])
         self.assertIn('\n"Yes, refund it."', answer["text"])                   # one JSON string, as data
         self.assertEqual((self.task(tid)["state"], self.task(tid)["waiting_on"]), ("working", None))
         self.assertIsNone(self.conversation_task(conv["id"]))
@@ -1618,6 +1620,23 @@ class Conversations(Base):
         # her next message is an ordinary one again: a conversation task of her own conversation
         self.inbound(text="And thanks.", account="discord-studio", sender=KIM, chat="dm-9")
         self.assertIsNotNone(self.conversation_task(conv["id"]))
+
+    def test_a_picture_with_no_words_answers_no_wait(self):
+        """A person's picture with no words is no answer to a message_contact that waits: the task waits on for their
+        words, and the picture's message goes to the conversation's own session, as any message does. Its words would
+        be empty, and the task would take them as the answer it waited for."""
+        kim = self.person("Kim", "manager", KIM, app="discord")
+        tid, here = self.normal_task(title="Plan the refunds")
+        self.ok("message_contact", here, person="Kim", text="What is the invoice number?", request_id=str(uuid.uuid4()),
+                waits=True)
+        conv = hub.q1("SELECT * FROM conversations WHERE person=?", (kim["id"],))
+        self.assertEqual(self.inbound(text="", account="discord-studio", sender=KIM, chat="dm-9", kind="image")[0],
+                         "stored")
+        self.assertEqual(self.task(tid)["state"], "input-required")
+        self.assertIsNotNone(self.conversation_task(conv["id"]))
+        self.assertEqual(self.inbound(text="It is 2041.", account="discord-studio", sender=KIM, chat="dm-9")[0],
+                         "stored")
+        self.assertEqual(self.task(tid)["state"], "working")
 
     def test_message_contact_on_whatsapp_only_in_a_chat_that_the_person_already_uses(self):
         self.person("Laura", "peer", "34600999888@s.whatsapp.net")

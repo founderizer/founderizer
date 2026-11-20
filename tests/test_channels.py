@@ -714,13 +714,18 @@ class DiscordTests(Base):
         self.assertIn("inbound discord-studio 1104: stored", self.log.getvalue())
 
     def test_attachments_have_their_kind(self):
+        """Each message's kind, with its words: a picture's words go with it (CHAT-APPS.md 8.1), and a forwarded
+        message's words and files are those of its snapshot, which would otherwise be lost in silence."""
         self.ready()
         peer = self.gw.latest()
-        peer.dispatch("MESSAGE_CREATE", dm(1201, "", attachments=[{"content_type": "image/png"}]))
+        peer.dispatch("MESSAGE_CREATE", dm(1201, "The error that I get", attachments=[{"content_type": "image/png"}]))
         peer.dispatch("MESSAGE_CREATE", dm(1202, "", attachments=[{"content_type": "audio/ogg"}]))
         peer.dispatch("MESSAGE_CREATE", dm(1203, "", sticker_items=[{"id": "1"}]))
-        self.wait_for(lambda: len(self.hub.inbound) == 3, "three messages")
-        self.assertEqual([e["kind"] for e in self.hub.inbound], ["image", "audio", "other"])
+        peer.dispatch("MESSAGE_CREATE", dm(1204, "", message_reference={"type": 1}, message_snapshots=[
+            {"message": {"content": "See the invoice", "attachments": [{"content_type": "application/pdf"}]}}]))
+        self.wait_for(lambda: len(self.hub.inbound) == 4, "four messages")
+        self.assertEqual([(e["kind"], e["text"]) for e in self.hub.inbound],
+                         [("image", "The error that I get"), ("audio", ""), ("other", ""), ("file", "See the invoice")])
 
     def test_fragmented_frames_and_a_ping_between_them(self):
         self.ready()
