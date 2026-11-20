@@ -73,6 +73,11 @@ class Cuts(BlockedAccess):
         self.assertTrue(line.endswith(" w..."), line)
         short = "w " * 85 + "abcdefg hij"                       # a run of 7 across the cut is cut as before
         self.assertEqual(hub.clip(short, 175), short[:175] + "...")
+        # clip_lines keeps a text's lines and cuts as clip does: a one-line text comes out as from clip
+        lines = hub.clip_lines("A question\n" + across(180, login), 191)
+        self.no_part(hub.mask_secrets(lines), login)
+        self.assertTrue(lines.startswith("A question\nw "), lines)
+        self.assertEqual(hub.clip_lines(across(180, login), 180), line)
 
     def test_a_note_carried_into_the_start_of_a_task_that_follows_keeps_no_part_of_a_login(self):
         login = "LqNote-7f3e9a01b2"

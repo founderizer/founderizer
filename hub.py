@@ -8776,6 +8776,22 @@ def clip(text, limit=WARM_LINE):
     return line if len(line) <= limit else cut_whole(line, limit).rstrip() + "..."
 
 
+def clip_lines(text, limit):
+    """The lines of a text that the owner reads as Markdown (a card's Details, the owner's words on the Task page),
+    cut as clip cuts: each line keeps the spaces and tabs at its start and is one line as clip makes it, a run of empty
+    lines is one, and no empty line starts or ends the text. A text with no line break comes out exactly as from clip
+    (20 November 2026: a question of four lines stood on the owner's card as one paragraph)."""
+    lines = []
+    for raw in str(text or "").strip().splitlines():
+        rest = " ".join(raw.split())
+        if rest:
+            lines.append(raw[:len(raw) - len(raw.lstrip(" \t"))] + rest)
+        elif lines and lines[-1]:
+            lines.append("")
+    said = "\n".join(lines).rstrip("\n")
+    return said if len(said) <= limit else cut_whole(said, limit).rstrip() + "..."
+
+
 def capped(lines, limit=WARM_CHARS):
     """The lines of a warm start up to the cap, and one line saying what was left out. This is what keeps a warm
     start from becoming a transcript."""
@@ -14046,8 +14062,10 @@ def t_raise_needs_you(agent, a):
         old = need_replaced(agent, replaces) if replaces else None
         qu = need_question(agent, a.get("question_id"), ignore=old["id"] if old else None)
         if qu and door_script is None:  # the asker's own words, which the owner answers: behind Details, with no code
+            words = clip_lines(qu["text"], 1000)
+            gap = "\n" if "\n" in words else " "    # a question of several lines starts on a line of its own
             details = (details + "\n\n" if details else "") + \
-                f"{shown_role(qu['asker'])}'s question, in its own words: \"{clip(qu['text'], 1000)}\""
+                f"{shown_role(qu['asker'])}'s question, in its own words:{gap}\"{words}\""
         asking = door_asking_task(door_call, qu) if door_host else None
         door_task = door_task_words(asking["title"]) if asking else None
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,door_host,github_app,"
@@ -17497,7 +17515,8 @@ def t_start_task(agent, a):
     busy = desktop_refusal(agent, needs, agent)         # the agent is the caller: it reads no other task's ID
     if busy:
         raise ToolError(busy + " No task is open for this message: tell the owner so with tell_owner.")
-    details = HISTORY_OWNER_TASK + agent + "'s chat: " + clip(source["text"] or "", 2000)
+    # the owner's words with their lines: the Task page shows them in the owner's bubble (FleetTask.ownersWords)
+    details = HISTORY_OWNER_TASK + agent + "'s chat: " + clip_lines(source["text"] or "", 2000)
     why = f"The owner asked {agent} for it in its own chat."
     guard(agent, details, why)
     t0 = now()

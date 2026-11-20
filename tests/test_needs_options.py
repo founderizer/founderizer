@@ -476,3 +476,11 @@ class Talk(NeedsCase):
         self.assertEqual(item["details"], "Dev's question, in its own words: \"I need read on the repository.\"")
         self.assertIsNone(hub.NEED_CODES.search(item["why"] + item["details"]))
         self.assertIn("need_talk", hub.ui_features())
+        # a question of several lines keeps them on the card (20 November 2026: four lines stood as one paragraph)
+        qid = hub.ins("INSERT INTO questions(task, asker, requester, text, asked) VALUES(?,?,?,?,?)",
+                      (task, "dev", "manager", "Which way do I fix the check?\r\nA) Add the schema.  \n\n\n\n"
+                       "B) Skip the file.\n  - one\tpart\nMy suggestion: A.\n", hub.now()))
+        self.raise_item(question_id=f"Q-{qid}")
+        self.assertEqual(self.item(2)["details"], "Dev's question, in its own words:\n\"Which way do I fix the check?\n"
+                                                  "A) Add the schema.\n\nB) Skip the file.\n  - one part\n"
+                                                  "My suggestion: A.\"")

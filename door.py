@@ -63,6 +63,7 @@ import tempfile
 import threading
 import time
 import traceback
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -261,6 +262,17 @@ RUN_FIND = 60               # seconds in which the run of a dispatch whose answe
 LOG_MOST = 1024 * 1024      # bytes of a job's log that the door reads: a listing run prints one line
 LOG_TRIES = 3               # reads of a job's log that GitHub does not give yet, when its job just ended
 LOG_PAUSE = 5               # seconds between them
+# The log lines of a failed check or run (error_lines, GitHub.error_log): the agent holds no token of the repository,
+# so without them it reads only a step's name, and it guessed a cause from one (20 November 2026).
+ERR_RUNS = 2                # failed runs of one answer whose log lines the door gives
+ERR_JOBS = 2                # failed jobs of one such run
+ERR_OUT = 8                 # lines that the failed step printed before its first error line
+ERR_MARKED = 4              # error lines of that step
+ERR_LINE = 300              # characters of one line
+ERR_TOTAL = 3000            # characters of all the lines of one answer
+ERR_LOG_MOST = 4 * 1024 * 1024  # bytes of a failed job's log that the door reads, from its start
+ERR_LOG_TIMEOUT = 10        # seconds for each request of that read
+ERR_BUDGET = 30             # seconds that a failed call waits for all of those lines, at most
 CHECKS_FIND = 45            # seconds after a GitOps commit in which its push's runs show up, the late ones too
 CHECKS_WAIT = 20 * 60       # how long the commit's call waits for those runs to end
 
@@ -532,12 +544,89 @@ def approval(access, statement, signature, devices=None):
 
 class RunFailed(door_providers.Stop):
     """A run that the door waited for ended badly. Its words are the door's own (run_word, the run's address), so
-    they go in the record too, where a provider's answer never goes."""
+    they go in the record too, where a provider's answer never goes. `log` is what the failed steps printed, in
+    GitHub's log (GitHub.error_log): it is the repository's text and not the door's words, so it goes in the caller's
+    answer only and never in the record. None: the door read no log (the run did not end)."""
+
+    def __init__(self, words, log=None):
+        super().__init__(words)
+        self.log = log
 
 
 def run_word(value):
     "A name that GitHub gives for a run, a job or a step, as an answer prints it: 80 plain characters at most."
     return re.sub(r"[^\w .:/()-]", "?", str(value))[:80]
+
+
+LOG_STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z ?")      # the time at the start of a log line
+LOG_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b")
+# A second guard after GitHub's own mask (it prints each registered secret of the repository as ***): a token, a user
+# and a password in an address, the value after Bearer or Basic, and a private key, in a form that a script printed.
+ERR_SECRET = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"
+                        r"|(?i:(?<=bearer )|(?<=basic ))[A-Za-z0-9._~+/=-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----.*")
+
+
+def log_line(line, known=()):
+    """One line of a job's log as the door gives it to the caller: each value of `known` and each token-shaped value
+    as ***, a tab and every other space as a space, each control, format, bidi or invisible character as ?, no space
+    at its end, and ERR_LINE characters at most."""
+    for value in known:
+        if value:
+            line = line.replace(value, "***")
+    line = ERR_SECRET.sub("***", line)
+    line = "".join(" " if c == "\t" or unicodedata.category(c) == "Zs" else
+                   "?" if unicodedata.category(c)[0] in "CZ" else c for c in line).rstrip()
+    return line if len(line) <= ERR_LINE else line[:ERR_LINE] + "..."
+
+
+def error_lines(text, started=None, known=()):
+    """The lines of one job's log that say why its failed step failed, made clean (log_line): the last ERR_OUT lines
+    that the step printed before its first error line, then its error lines, ERR_MARKED in all. [] when the log shows
+    no error line. `started`: the start of the failed step in epoch seconds, or None; `known`: secret values that the
+    door holds.
+
+    A downloaded log names no step. Each step opens with `##[group]Run <its first line>`, and GitHub echoes the whole
+    script up to `##[endgroup]`, with `shell:` and `env:`: those lines are no output, and an `echo "::error::..."` of
+    the script stands there too, so only a line that starts with `##[error]` is an error line. GitHub gives a step's
+    start to the second, and several steps share one second, so `started` only keeps out the error lines of a step
+    before the failed one (a linter that marks errors and passes): those more than one second before it. A group that
+    a script opens itself with a name that starts with "Run " and closes before the step fails reads as a step's
+    header, so its lines are not given: the error line alone is, as no line was before."""
+    out, held, marked, header, stamp = [], None, [], False, None
+    for raw in text.lstrip("\ufeff").split("\n"):
+        found = LOG_STAMP.match(raw)
+        if found:
+            stamp = found.group(1)          # a line with no time has the time of the line before it
+        line = LOG_ANSI.sub("", raw[found.end():] if found else raw).rstrip("\r")
+        if line.startswith("##[error]"):
+            if started is not None and stamp is not None and not marked:
+                try:
+                    at = calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%S"))
+                except ValueError:
+                    at = None
+                if at is not None and at < started - 1:
+                    continue                # an error line of a step before the failed one
+            if header:                      # no step's header holds an error line: it was the step's own group
+                out, header = held, False
+            marked.append(line)
+            if len(marked) == ERR_MARKED:
+                break
+            continue
+        if line.startswith("##[group]Run "):
+            if marked:
+                break                       # the next step
+            header, held, out = True, [], []
+            continue
+        if line.startswith("##[endgroup]"):
+            if header:
+                header, held = False, None
+            continue
+        if line.startswith("##[group]") or not line.strip() or marked:
+            continue
+        (held if header else out).append(line)
+    if not marked:
+        return []
+    return [log_line(x, known) for x in out[-ERR_OUT:] + marked]
 
 
 def call_hash(target, op, args, content=None):
@@ -1095,20 +1184,22 @@ class Door:
             if d.needs:
                 answer.update(needs=d.needs, **({"level": d.level} if d.level else {}))
             return answer
-        ran = None              # a run that the door waited for and that ended badly: the record says how
+        ran = log = None        # a run that the door waited for and that ended badly: the record says how
         try:
             out = self.run(agent, access, d, op, args, content)
             ok, outcome = True, "done"
         except (Refused, door_providers.Stop) as e:
             ok, outcome, out = False, "failed", str(e)
             ran = str(e) if isinstance(e, RunFailed) else None
+            log = e.log if isinstance(e, RunFailed) else None
         made = ((d.plan or {}).get("repo_new") or {}).get("name") if ok else None     # N3: what the call made
         if ok and d.form == "look":     # how much of the host went back to the caller: the count, never the bytes
             noted = dict(noted, bytes=len(out.encode("utf-8", "replace")))
         n = self.record.add(caller=agent, target=target, action=op, kind=d.kind, outcome=outcome,
                             why=(f"{ran}. {d.why}" if ran else d.why)[:300], sha256=sha, **({"made": made} if made else {}),
                             **noted)
-        return {"ok": ok, "kind": d.kind, "out" if ok else "why": out, "n": n}
+        # the failed steps' log lines go to the caller alone: the repository's text, never in the record (RunFailed)
+        return {"ok": ok, "kind": d.kind, "out" if ok else "why": out, "n": n, **({"log": log} if log is not None else {})}
 
     def run(self, agent, access, d, op, args, content):
         """What a decision runs: a host form through its second sshd, or a provider's plan. A write on one host waits
@@ -1186,7 +1277,8 @@ class Door:
             if plan.get("checks"):          # a GitOps commit: the agent learns how its checks ended, at once
                 passed, words = hub.wait_checks(hub.commit_sha, hub.commit_branch)
                 if not passed:
-                    raise RunFailed(f"{out}, and {words}: fix the commit or revert it")
+                    raise RunFailed(f"{out}, and {words}: fix the commit or revert it",
+                                    log=hub.error_log(hub.checks_failed))
                 out = f"{out}; {words}"
             return out
         if "read" in plan:
@@ -1897,7 +1989,7 @@ class GitHub:
                     if ended == "success":
                         return f"{workflow} of {self.repo}: run {run} passed ({url})"
                     raise RunFailed(f"{workflow} of {self.repo}: run {run} ended "
-                                    f"{run_word(ended)}{self.failed_steps(run)} ({url})")
+                                    f"{run_word(ended)}{self.failed_steps(run)} ({url})", log=self.error_log([run]))
             if now() >= deadline:
                 raise RunFailed(f"{workflow} of {self.repo}: run {run} did not end within "
                                 f"{RUN_WAIT // 60} minutes, so the door cannot say that it passed ({url})")
@@ -1909,7 +2001,9 @@ class GitHub:
         has ended, CHECKS_WAIT at most. Before, nobody learned that a commit broke the repository's own checks: on 11
         November 2026 they stayed red for about 31 hours. A run that does not end in time, or runs that GitHub does not
         give, are no failure of the commit: the words say so, and so do they of a check that failed on its run before
-        this commit too (failed_before)."""
+        this commit too (failed_before). After a failure, checks_failed holds the ids of the runs that this commit
+        made fail, whose log lines the caller's answer carries (error_log)."""
+        self.checks_failed = []
         query = urllib.parse.urlencode({"head_sha": sha, "event": "push", "per_page": "50"})
         begun = now()
         while True:
@@ -1944,6 +2038,7 @@ class GitHub:
             return True, (f"its checks passed, except {len(old)} that failed on the run before this commit too, so not "
                           f"by this commit: {said(old)}")
         also = f"; and {len(old)} more that failed on the run before this commit too" if old else ""
+        self.checks_failed = [r["id"] for r in new]
         return False, (f"its check {said(new)}" if len(new) == 1 else f"{len(new)} of its checks failed: {said(new)}") + also
 
     def failed_before(self, run, branch):
@@ -1983,16 +2078,18 @@ class GitHub:
                     time.sleep(LOG_PAUSE)
         return "\n".join(texts)
 
-    def job_log(self, job):
-        """The log of one job, as text, LOG_MOST bytes at most. GitHub answers with a redirect to an address that needs
-        no token, and the door follows it with no token: the App's token never goes to another host."""
+    def job_log(self, job, most=LOG_MOST, timeout=None):
+        """The log of one job, as text, its first `most` bytes at most. GitHub answers with a redirect to an address
+        that needs no token, and the door follows it with no token: the App's token never goes to another host. With
+        `timeout`, each of the two requests takes it; without it, each has its own default."""
+        wait = {} if timeout is None else {"timeout": timeout}
         status, location = http_redirect("GET", f"{self.API}/repos/{self.repo}/actions/jobs/{job}/logs", {
             "Authorization": "Bearer " + self.token(), "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28"})
+            "X-GitHub-Api-Version": "2022-11-28"}, **wait)
         if status not in (301, 302, 303, 307, 308) or not isinstance(location, str) or \
                 not location.startswith("https://"):
             raise door_providers.Stop(f"GitHub gave no log of job {job} ({status})")
-        status, raw = http_raw("GET", location, {}, LOG_MOST)
+        status, raw = http_raw("GET", location, {}, most, **wait)
         if status != 200:
             raise door_providers.Stop(f"the log of job {job} could not be read ({status})")
         return raw.decode("utf-8", "replace")
@@ -2008,6 +2105,64 @@ class GitHub:
                      if isinstance(s, dict) and s.get("conclusion") not in (None, "success", "skipped", "neutral")]
             found.append(" / ".join(run_word(x) for x in [job.get("name")] + steps[:1] if x))
         return (", in " + "; ".join(found[:3])) if found else ""
+
+    def error_log(self, runs):
+        """What the failed steps of these runs printed, for the caller's answer: [{of: "<job> / <step>", lines}],
+        for the first ERR_JOBS failed jobs of each of the first ERR_RUNS runs, ERR_TOTAL characters of lines in all
+        (error_lines). [] when the door got none. It never raises, and it answers after ERR_BUDGET seconds at the
+        latest: a read that still runs then ends by its own timeout, and its lines are not in the answer. On a failure
+        the jobs of a run are read a second time (failed_steps read them first), which keeps failed_steps as it is."""
+        found = []
+
+        def read():
+            used = 0
+            for run in list(runs)[:ERR_RUNS]:
+                status, got = self.call("GET", f"/repos/{self.repo}/actions/runs/{run}/jobs?per_page=50")
+                jobs = [j for j in ((got or {}).get("jobs") or [] if status == 200 and isinstance(got, dict) else [])
+                        if isinstance(j, dict) and j.get("conclusion") not in (None, "success", "skipped", "neutral")
+                        and isinstance(j.get("id"), int) and not isinstance(j.get("id"), bool)]
+                for job in jobs[:ERR_JOBS]:
+                    steps = [s for s in job.get("steps") or [] if isinstance(s, dict)
+                             and s.get("conclusion") not in (None, "success", "skipped", "neutral")]
+                    of = " / ".join(run_word(x) for x in [job.get("name")] + [s.get("name") for s in steps[:1]] if x)
+                    try:
+                        started = calendar.timegm(time.strptime(str(steps[0].get("started_at"))[:19],
+                                                                "%Y-%m-%dT%H:%M:%S")) if steps else None
+                    except ValueError:
+                        started = None
+                    text = None
+                    for attempt in range(LOG_TRIES):
+                        try:
+                            text = self.job_log(job["id"], ERR_LOG_MOST, ERR_LOG_TIMEOUT)
+                            break
+                        except door_providers.Stop:
+                            if attempt < LOG_TRIES - 1:
+                                time.sleep(LOG_PAUSE)
+                    if text is None:
+                        continue
+                    lines, kept = error_lines(text, started, [t for t, _ in list(self.TOKENS.values())]), []
+                    for line in lines:
+                        if used + len(line) > ERR_TOTAL:
+                            break
+                        used += len(line)
+                        kept.append(line)
+                    if kept:
+                        found.append({"of": of, "lines": kept})
+                    if len(kept) < len(lines):
+                        return              # ERR_TOTAL: no line of a later job either
+
+        def safe():
+            try:
+                read()
+            except Exception:           # the log is a help to the caller: its failure changes nothing of the answer
+                pass
+        reader = threading.Thread(target=safe, name="door-error-log", daemon=True)
+        try:
+            reader.start()
+        except RuntimeError:            # no thread can start now: the answer goes as it is, with no line
+            return []
+        reader.join(ERR_BUDGET)
+        return list(found)
 
     def image_made(self, image):
         """True when a green run of the repository that built the image made its tag: the run of that tag's push, or
