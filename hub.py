@@ -60,7 +60,8 @@ import uuid
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from usage import IDENTITY_CHANGED, IDENTITY_ERRORS, READING_AHEAD, SIGN_IN_REQUIRED, local_model, validate_usage
+from usage import IDENTITY_CHANGED, IDENTITY_ERRORS, READING_AHEAD, SCREEN_RUNTIME, SIGN_IN_REQUIRED, local_model, \
+    validate_usage
 from lifecycle import EDITABLE_FACTS, TOKEN_KINDS, facts_now, token_price     # AUTONOMY.md P8, P10: lane L7
 from vault import owner_signed      # owner feature door_calls: a phone's yes, with the central vault's own check
 import wakeups
@@ -68,6 +69,7 @@ from desktop import Frames
 import atrest       # the cipher that seals the hub's Google file at rest (UI-API.md 1.202)
 import google
 import hidden       # hidden characters at the hub's exits (strip_hidden); the helper's hook reads the same rule
+import door_targets  # the door's rules of this code, never the ones that a release puts beside it before the restart
 import diagnostics  # the lane "Bug reports": the hub's own faults and refused calls, with no words
 import errorreports  # the lane "Error reports": the day's report of them, while the owner has turned it on
 import mcp
@@ -24580,7 +24582,7 @@ def live_next_step(g, parts_of=None):
 KIND_AGAIN = 3600       # seconds: a standing session that spent this recently is matched to a task again
 
 
-def record_session_tokens(agent, rows, runtime=None, reading=None):
+def record_session_tokens(agent, rows, runtime=None, reading=None, own=False, screen=False):
     """Per-session totals from a helper's usage report, in one transaction. The hub sums them per goal.
 
     AUTONOMY.md P8: a row of a helper with session_kinds also carries the session's four kinds of tokens, its model
@@ -24591,20 +24593,27 @@ def record_session_tokens(agent, rows, runtime=None, reading=None):
     that spent within KIND_AGAIN is matched again.
 
     The lane "Tokens by day and model": what each session's totals grew by since its stored row goes into token_slots,
-    in the same write (slot_rows)."""
+    in the same write (slot_rows); own: these sessions run on the owner's own model (usage.local_model), so their slots
+    name each model own/<model> (slot_model). screen: the threads of the agent's screen tasks (usage.screen_tokens),
+    which spend from the account of the screen's own reading, not from the agent's model account."""
     if not rows:
         return
     t0 = now()
-    account = model_group(agent) or reading_account(reading)    # the AI providers build: its account's group key
+    # the AI providers build: its account's group key
+    account = (None if screen else model_group(agent)) or reading_account(reading)
     with area("activity"), LOCK:
         ids = [r["session_id"] for r in rows]
         known = {r["session_id"]: r for at in range(0, len(ids), 500) for r in read_rows(
             f"SELECT session_id, total, kind, input, cache_read, cache_write, output, calls, model, models "
             f"FROM session_tokens WHERE agent=? AND session_id IN "
             f"({','.join('?' * len(ids[at:at + 500]))})", (agent, *ids[at:at + 500]))}
-        slots = slot_rows(agent, rows, known, t0)
+        slots = slot_rows(agent, rows, known, t0, own)
         values = []
         for r in rows:
+            if own:         # its model and models by the names of its slots (slot_model), for each reader's prices
+                r = dict(r, model=slot_model(r.get("model"), own) or None,
+                         **({"models": [[slot_model(m[0], own) or None, *m[1:]] for m in r["models"]]}
+                            if isinstance(r.get("models"), list) else {}))
             old = known.get(r["session_id"])
             kind = task_kind = None
             if not old or old["kind"] is None or old["kind"] == "standing" and (
@@ -24817,13 +24826,30 @@ def slot_growth(have, after, grow, model):
     return {m: values for m, values in grew.items() if any(values)}
 
 
-def slot_rows(agent, rows, known, t0):
+def slot_model(model, own):
+    """The name of a model in token_slots: own/<model> for one that runs on the owner's own model server or machine,
+    which costs nothing (costs_series; the price file's own/), as the owner's own server names its models already. A
+    model that no report named stays '' (one with no tokens, in the records of each fleet so far)."""
+    name = str(model or "")
+    return "own/" + name if own and name and not name.startswith("own/") else name
+
+
+def slot_named(split, own):
+    """A split (slot_split) under the names of token_slots (slot_model): two names that become one add up."""
+    named = {}
+    for model, values in split.items():
+        model = slot_model(model, own)
+        named[model] = [a + b for a, b in zip(named.get(model, [0] * len(SLOT_FIELDS)), values)]
+    return named
+
+
+def slot_rows(agent, rows, known, t0, own=False):
     """The token_slots rows of one usage report: what each session with its four kinds grew by since its stored row
     (`known`, read before the report's write), given to its models by slot_growth, in the slot of its newest call, and
     never in one after the hub's own clock (the helper's machine has its own). A session that the hub did not know, or
     knew without its kinds, grew by all of it. A session that a report names twice counts once, at its last row, as
     session_tokens keeps it. A stored row that is not counts (no code of the hub writes one) gives that session no
-    slot, and never stops the report."""
+    slot, and never stops the report. own: each model is own/<model> (slot_model)."""
     machine = (agents().get(agent) or {}).get("machine")
     grown = []
     for r in {r["session_id"]: r for r in rows}.values():
@@ -24841,7 +24867,8 @@ def slot_rows(agent, rows, known, t0):
         if after is not None:
             grow = [max(0, sum(v[i] for v in after.values()) - before[i]) for i in range(len(SLOT_FIELDS))]
             if any(grow):
-                grown.append((r, after, grow, r.get("model") or (old["model"] if old is not None else None)))
+                grown.append((r, slot_named(after, own), grow,
+                              slot_model(r.get("model") or (old["model"] if old is not None else None), own)))
     have, ids = {}, [r["session_id"] for r, *_ in grown]
     for at in range(0, len(ids), 500):
         for h in read_rows(f"SELECT session_id, model, {SLOT_SUMS} FROM token_slots WHERE agent=? AND session_id IN "
@@ -24878,8 +24905,11 @@ def slot_fill():
 
     A release without the slots also renames and deletes agents without them. So first the slots of a session that no
     row of session_tokens holds under their agent go to the one agent whose row holds a session of that id, and the
-    fill does not count that session again."""
+    fill does not count that session again. The models of an agent that runs the owner's own model now take their
+    own/ names (slot_model), as its reports name them."""
     in_transaction("slot_fill")
+    accounts = team_read().get("accounts")
+    owns = {name: local_model(conf, accounts) for name, conf in agents().items()}
     lost = read_rows("SELECT o.agent, o.session_id FROM (SELECT agent, session_id FROM token_slots GROUP BY agent, "
                      "session_id) o WHERE NOT EXISTS (SELECT 1 FROM session_tokens st WHERE st.agent=o.agent AND "
                      "st.session_id=o.session_id)")
@@ -24898,9 +24928,11 @@ def slot_fill():
                        f"s.session_id=st.session_id WHERE st.input IS NOT NULL AND (s.agent IS NULL OR " +
                        " OR ".join(f"COALESCE(st.{k},0)>s.{k}" for k in SLOT_FIELDS) + ")"):
         try:
+            own = owns.get(r["agent"], False)
             after = slot_split(r, slot_models(r["models"]), r["model"])
             if after is None:
                 continue
+            after = slot_named(after, own)
             have = {} if r["slotted"] is None else {
                 h["model"]: [h[k] for k in SLOT_FIELDS] for h in read_rows(
                     f"SELECT model, {SLOT_SUMS} FROM token_slots WHERE agent=? AND session_id=? GROUP BY model",
@@ -24911,7 +24943,7 @@ def slot_fill():
         except (TypeError, ValueError, OverflowError):
             continue                    # a row that no code of the hub wrote: that session gets no slot
         out += [(r["agent"], r["session_id"], slot, m, *values, None)
-                for m, values in slot_growth(have, after, grow, r["model"]).items()]
+                for m, values in slot_growth(have, after, grow, slot_model(r["model"], own)).items()]
     DB.executemany(
         "INSERT INTO token_slots(agent,session_id,slot,model,input,cache_read,cache_write,output,calls,machine) "
         "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,session_id,slot,model) DO UPDATE SET "
@@ -40613,7 +40645,7 @@ def costs_series(names, start, end, by, everyone=False):
         g = groups.setdefault(tuple(parts[p] for p in by), {**dict.fromkeys(SLOT_FIELDS, 0), "cost": None})
         for k in SLOT_FIELDS:
             g[k] += r[k]
-        price = token_price(book.get(r["runtime"]), r["model"] or None)
+        price = token_price(book.get(r["runtime"]), r["model"] or None)       # own/ costs nothing on every runtime
         if price:
             g["cost"] = (g["cost"] or 0) + sum(r[k] * price[k] for k in TOKEN_KINDS) / 1e6
     rows, total = [], {**dict.fromkeys(SLOT_FIELDS, 0), "cost": None}
@@ -72069,9 +72101,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(400, {"error": "invalid usage report"})
             with LOCK:
                 record_session_tokens(agent, (data.get("tokens") or {}).pop("by_session", None) or [],
-                                      agents()[agent]["runtime"], data.get("limits"))
+                                      agents()[agent]["runtime"], data.get("limits"),
+                                      own=local_model(agents()[agent], team_read().get("accounts")))
                 for screen in [data.get("screen") or {}]:
-                    (screen.get("tokens") or {}).pop("by_session", None)
+                    # the lane "Tokens by day and model": each thread of the agent's screen tasks is a session of the
+                    # screen runtime, on the screen's own account (usage.screen_tokens)
+                    record_session_tokens(agent, (screen.get("tokens") or {}).pop("by_session", None) or [],
+                                          SCREEN_RUNTIME, screen.get("limits"), screen=True)
                 # owner feature runtime_switch: the helper's new reading of the runtime before the switch, for its own
                 # sessions in this checkout only, so that its last records count once
                 prev = data.pop("previous", None)

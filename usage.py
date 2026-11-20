@@ -30,6 +30,8 @@ MAX_ROW = 32 * 1024 * 1024          # a longer transcript line is passed over: n
 TAIL = 64                           # the bytes before where a file's reading stopped, to see that they are still there
 TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
 BY_SESSION = 500                    # per-session totals in one report: the newest sessions
+SCREEN_BY_SESSION = 100             # the newest screen threads in one report: a thread that grows is the newest, and
+                                    # 500 of them took a quarter of the report's room (REPORT_MAX) from the models
 SESSION_ID = re.compile(r"[A-Za-z0-9._:-]{1,80}")
 SESSION_FIELDS = ("session_id", "total", "last_activity")
 # Helper feature session_kinds (AUTONOMY.md P8): each session's four kinds of tokens apart, its model calls, the model
@@ -55,6 +57,7 @@ ACP_FILE_MAX = 256 * 1024           # a usage file is numbers and model names: a
 ACP_FILES_MAX = 20000               # the files of one scan; more are a fault, and the reading fails as a whole
 LIMIT_SOURCES = {"claude": "Claude Code /usage cache", "codex": "Codex account/rateLimits/read"}
 SCREEN_SOURCE = "Codex screen task events"
+SCREEN_RUNTIME = "codex"            # the runtime of every screen task, whose readings validate_usage checks
 SCREEN_SCOPE = "Recorded Fleet screen tasks"
 NO_WINDOWS = "No account limits were reported."      # the runtime named its account, but gave no allowance window
 SIGN_IN_REQUIRED = "CLI sign-in is required."        # the runtime itself said that it has no signed-in account
@@ -838,7 +841,7 @@ def validate_usage(data, runtime, screen=False):
         if kind == "screen":
             if screen or not isinstance(value, dict) or set(value) != {"tokens", "limits"}:
                 raise ValueError("invalid screen usage")
-            validate_usage(value, "codex", screen=True)
+            validate_usage(value, SCREEN_RUNTIME, screen=True)
             continue
         if kind == "previous":          # owner feature runtime_switch: the runtime before a switch, tokens only
             if screen or not isinstance(value, dict) or set(value) != {"runtime", "tokens"} or \
@@ -940,11 +943,16 @@ def screen_database(home=None):
         path.touch(mode=0o600)
     db = sqlite3.connect(path, timeout=5)
     db.execute("CREATE TABLE IF NOT EXISTS sessions(kit TEXT, agent TEXT, thread TEXT, raw_input INTEGER, output INTEGER, cache_read INTEGER, since REAL, updated REAL, cache_write INTEGER DEFAULT 0, PRIMARY KEY(kit,agent,thread))")
+    # the lane "Tokens by day and model": each thread's model, as the runtime named it at the thread's start, in a table
+    # of its own, so that `sessions` keeps its nine columns for the insert of a runner that a release did not restart
+    # and of a release before this one
+    db.execute("CREATE TABLE IF NOT EXISTS thread_models(kit TEXT, agent TEXT, thread TEXT, model TEXT, PRIMARY KEY(kit,agent,thread))")
     return db
 
 
-def record_screen_usage(kit, agent, thread, token_usage, home=None):
-    """Store cumulative counters, never prompts. Repeated events cannot add tokens twice."""
+def record_screen_usage(kit, agent, thread, token_usage, home=None, model=None):
+    """Store cumulative counters, never prompts. Repeated events cannot add tokens twice. model: the thread's model as
+    the runtime named it at the thread's start (screen_runner), kept once it is known."""
     if not isinstance(thread, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,80}", thread):
         raise ValueError("invalid thread")
     total = token_usage["total"]
@@ -952,25 +960,42 @@ def record_screen_usage(kit, agent, thread, token_usage, home=None):
     write = number(total.get("cacheWriteInputTokens", 0), True)
     if cache + write > raw or number(total["totalTokens"], True) != raw + out:
         raise ValueError("invalid token totals")
-    ts = time.time()
+    ts, place, name = time.time(), str(Path(kit).resolve()), model_name(model)
     with screen_database(home) as db:
         db.execute("""INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(kit,agent,thread)
             DO UPDATE SET raw_input=max(raw_input,excluded.raw_input), output=max(output,excluded.output),
             cache_read=max(cache_read,excluded.cache_read), cache_write=max(cache_write,excluded.cache_write), updated=excluded.updated""",
-            (str(Path(kit).resolve()), agent, thread, raw, out, cache, ts, ts, write))
+            (place, agent, thread, raw, out, cache, ts, ts, write))
+        if name:
+            db.execute("INSERT INTO thread_models VALUES(?,?,?,?) ON CONFLICT(kit,agent,thread) DO NOTHING",
+                       (place, agent, thread, name))
     db.close()
 
 
 def screen_tokens(kit, agent, home=None):
+    """The tokens of the agent's screen tasks: their totals, and each of the newest SCREEN_BY_SESSION threads its own
+    (`by_session`, with its four kinds, its model and no calls, which the screen's records do not keep), so that the
+    hub keeps each thread as a session of the screen runtime (SCREEN_RUNTIME; the lane "Tokens by day and model"). A
+    thread's input is never below 0: each of its counters is the most that it reported, and a thread whose counters
+    went back would make the whole reading one that validate_usage refuses."""
     with screen_database(home) as db:
-        row = db.execute("SELECT sum(raw_input-cache_read-cache_write),sum(output),sum(cache_read),count(*),min(since),max(updated),sum(cache_write) FROM sessions WHERE kit=? AND agent=?",
-                         (str(Path(kit).resolve()), agent)).fetchone()
+        place = (str(Path(kit).resolve()), agent)
+        row = db.execute("SELECT sum(max(0,raw_input-cache_read-cache_write)),sum(output),sum(cache_read),count(*),min(since),max(updated),sum(cache_write) FROM sessions WHERE kit=? AND agent=?",
+                         place).fetchone()
+        threads = db.execute("SELECT s.thread, max(0,s.raw_input-s.cache_read-s.cache_write), s.output, s.cache_read, "
+                             "s.cache_write, s.updated, m.model FROM sessions s LEFT JOIN thread_models m ON "
+                             "m.kit=s.kit AND m.agent=s.agent AND m.thread=s.thread WHERE s.kit=? AND s.agent=? "
+                             "ORDER BY s.updated DESC LIMIT ?", (*place, SCREEN_BY_SESSION)).fetchall()
     db.close()
     if not row[3]:
         return None
+    by_session = [dict(session_id=thread, total=spent + output + read + write, last_activity=updated, input=spent,
+                       cache_read=read, cache_write=write, output=output, calls=0, model=model_name(model),
+                       first_cache_share=None)
+                  for thread, spent, output, read, write, updated, model in threads if SESSION_ID.fullmatch(str(thread))]
     return dict(input=row[0], output=row[1], cache_read=row[2], cache_write=row[6],
                 total=sum(row[:3])+row[6], sessions=row[3], since=row[4], last_activity=row[5],
-                collected_at=time.time(), source=SCREEN_SOURCE, scope=SCREEN_SCOPE, error=None)
+                collected_at=time.time(), source=SCREEN_SOURCE, scope=SCREEN_SCOPE, error=None, by_session=by_session)
 
 
 def local_model(conf, accounts=None):
@@ -1006,6 +1031,8 @@ def sessions_as(data, fields):
     out = dict(data, tokens=keep(data.get("tokens")))
     if out.get("previous"):
         out["previous"] = dict(out["previous"], tokens=keep(out["previous"].get("tokens")))
+    if out.get("screen"):
+        out["screen"] = dict(out["screen"], tokens=keep(out["screen"].get("tokens")))
     return out
 
 

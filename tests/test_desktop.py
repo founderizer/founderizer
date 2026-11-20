@@ -1,6 +1,8 @@
 import base64
 import copy
 import json
+import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -85,18 +87,59 @@ class DesktopAPI(unittest.TestCase):
 class ScreenUsage(unittest.TestCase):
     def test_cumulative_events_persist_once_with_workspace_agent_isolation(self):
         with tempfile.TemporaryDirectory() as home:
+            # the screen records of a helper from before the threads' models: they are read and written as they are
+            os.makedirs(os.path.join(home, '.fleet'))
+            with sqlite3.connect(os.path.join(home, '.fleet/screen-usage.sqlite3')) as old:
+                old.execute("CREATE TABLE sessions(kit TEXT, agent TEXT, thread TEXT, raw_input INTEGER, output INTEGER, cache_read INTEGER, since REAL, updated REAL, cache_write INTEGER DEFAULT 0, PRIMARY KEY(kit,agent,thread))")
             def event(i, o, c): return {"total": dict(inputTokens=i, outputTokens=o, cachedInputTokens=c,totalTokens=i+o)}
-            for value in [event(100,10,80),event(200,20,150),event(200,20,150),event(100,10,80)]:
-                usage.record_screen_usage('/kit','studio','thread-1',value,home)
+            # the runner names the thread's model from its start; an event without it keeps the one known
+            for at, value in enumerate([event(100,10,80),event(200,20,150),event(200,20,150),event(100,10,80)]):
+                usage.record_screen_usage('/kit','studio','thread-1',value,home,model='gpt-6-luna' if at == 1 else None)
             usage.record_screen_usage('/kit','other','thread-2',event(99,99,0),home)
             usage.record_screen_usage('/other','studio','thread-3',event(99,99,0),home)
             tokens = usage.screen_tokens('/kit','studio',home)
             self.assertEqual([tokens[k] for k in ('input','output','cache_read','total','sessions')], [50,20,150,220,1])
             self.assertEqual(usage.validate_usage(dict(tokens=tokens,limits=None), 'codex',screen=True)['tokens'],tokens)
+            # each thread is a session of its own for the hub, with its four kinds (the lane "Tokens by day and model")
+            self.assertEqual([(r['session_id'], r['input'], r['cache_read'], r['output'], r['calls'], r['model'])
+                              for r in tokens['by_session']], [('thread-1', 50, 150, 20, 0, 'gpt-6-luna')])
             self.assertIsNone(usage.screen_tokens('/kit','new',home))
             usage.record_screen_usage('/kit','studio','thread-4',{'total':dict(inputTokens=10,outputTokens=1,cachedInputTokens=2,cacheWriteInputTokens=3,totalTokens=11)},home)
             self.assertEqual(usage.screen_tokens('/kit','studio',home)['cache_write'],3)
             with self.assertRaises(ValueError): usage.record_screen_usage('/kit','studio','t',event(10,1,11),home)
+            # a thread whose counters went back (each column holds the most that it reported) has no input below 0, so
+            # the reading still passes, with the agent's other sessions in it
+            with sqlite3.connect(os.path.join(home, '.fleet/screen-usage.sqlite3')) as db:
+                db.execute("UPDATE sessions SET raw_input=5, cache_read=4, cache_write=3 WHERE thread='thread-4'")
+            tokens = usage.screen_tokens('/kit','studio',home)
+            self.assertEqual(([r['input'] for r in tokens['by_session'] if r['session_id'] == 'thread-4'], tokens['input']),
+                             ([0], 50))
+            self.assertEqual(usage.validate_usage(dict(tokens=tokens,limits=None), 'codex',screen=True)['tokens'],tokens)
+            # a runner that a release did not restart, and a release before this one, insert their nine values as they
+            # did: the row stays, and the next write of a runner of this release gives it its model
+            kit = str(usage.Path('/kit').resolve())
+            with sqlite3.connect(os.path.join(home, '.fleet/screen-usage.sqlite3')) as db:
+                db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?)", (kit,'studio','thread-9',30,3,10,1.0,2.0,0))
+            self.assertEqual([(r['input'], r['model']) for r in usage.screen_tokens('/kit','studio',home)['by_session']
+                              if r['session_id'] == 'thread-9'], [(20, None)])
+            usage.record_screen_usage('/kit','studio','thread-9',event(40,4,10),home,model='gpt-6-luna')
+            self.assertEqual([(r['input'], r['model']) for r in usage.screen_tokens('/kit','studio',home)['by_session']
+                              if r['session_id'] == 'thread-9'], [(30, 'gpt-6-luna')])
+
+    def test_a_report_takes_the_newest_screen_threads_only(self):
+        """A thread that grows is the newest, and a finished one does not change: SCREEN_BY_SESSION of them keep the
+        report's room (REPORT_MAX) for the models of the agent's own sessions."""
+        with tempfile.TemporaryDirectory() as home:
+            event = {"total": dict(inputTokens=10, outputTokens=1, cachedInputTokens=0, totalTokens=11)}
+            for at in range(usage.SCREEN_BY_SESSION + 1):
+                usage.record_screen_usage('/kit','studio',f'thread-{at}',event,home)
+            with sqlite3.connect(os.path.join(home, '.fleet/screen-usage.sqlite3')) as db:
+                db.execute("UPDATE sessions SET updated=1000+CAST(substr(thread,8) AS INTEGER)")
+            tokens = usage.screen_tokens('/kit','studio',home)
+            names = [r['session_id'] for r in tokens['by_session']]
+            self.assertEqual((len(names), names[0], 'thread-0' in names, tokens['sessions']),
+                             (usage.SCREEN_BY_SESSION, f'thread-{usage.SCREEN_BY_SESSION}', False,
+                              usage.SCREEN_BY_SESSION + 1))
 
     def test_mixed_usage_keeps_sources_separate(self):
         with tempfile.TemporaryDirectory() as home:

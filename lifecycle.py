@@ -1037,10 +1037,13 @@ def token_price(weights, model):
     name, case aside, else "default"; None for a runtime with no prices. A key that ends in "/" matches only the start
     of a model's name, and such a key wins over each other key: it names where a model runs, as "own/" names the
     owner's own model server, whose models cost nothing whatever their names hold (own/deepseek-r1 is no model of a
-    key "deepseek")."""
+    key "deepseek"). own/ costs nothing on every runtime, also on one with no prices (the lane "Tokens by day and
+    model")."""
+    name = str(model or "").lower()
+    if name.startswith("own/"):         # the owner's own server or machine: a runtime whose prices have no own/, or
+        return dict.fromkeys(TOKEN_KINDS, 0)    # that has no prices, prices it too
     if not weights:
         return None
-    name = str(model or "").lower()
     placed = [k for k in weights if k.endswith("/") and name.startswith(k.lower())]
     if placed:
         return weights[max(placed, key=len)]

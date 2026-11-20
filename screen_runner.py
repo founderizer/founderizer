@@ -156,6 +156,7 @@ class Runner:
         self.context = {"attempt": int(attempt), "generation": generation}
         self.http = http
         self.thread = self.turn = None
+        self.thread_model = None            # the model that thread/start reported, for the screen usage records
         self.child = None
         self.stopping = False
         self.replies = queue.Queue()
@@ -394,6 +395,7 @@ class Runner:
             model, effort = result.get("model"), result.get("reasoningEffort")
             if isinstance(model, str):
                 self.record("fleet/model", {"threadId": self.thread, "model": model, "effort": effort})
+            self.thread_model = model if isinstance(model, str) and model else None
             if self.model and model != self.model:
                 raise self.failed(f"Codex started the thread with model {model}, not the requested {self.model}")
             if self.effort and effort != self.effort:
@@ -407,7 +409,7 @@ class Runner:
             self.turn = params.get("turn", {}).get("id", self.turn)
         elif method == "thread/tokenUsage/updated" and params.get("threadId") == self.thread and self.needs == "screen":
             try:
-                record_screen_usage(fleet.KIT, self.agent, self.thread, params["tokenUsage"])
+                record_screen_usage(fleet.KIT, self.agent, self.thread, params["tokenUsage"], model=self.thread_model)
             except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
                 print("Screen token counts could not be saved: " + type(exc).__name__, flush=True)
         elif method == "item/started":

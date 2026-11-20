@@ -75,7 +75,9 @@ class Prices(unittest.TestCase):
         self.assertEqual([price("own/deepseek-r1"), price("OWN/deepseek"), price("own/x")], [0, 0, 0])
         self.assertEqual([price("deepseek-r1"), price("deepseek-v4"), price("seller/deepseek-r1")], [2, 1, 5])
         self.assertEqual([price("known/own/deepseek-r1"), price("town/x"), price(None)], [2, 9, 9])
-        self.assertIsNone(lifecycle.token_price(None, "own/x"))
+        # own/ costs nothing also on a runtime with no prices; every other model of one has no price
+        self.assertEqual(lifecycle.token_price(None, "own/x"), dict.fromkeys(lifecycle.TOKEN_KINDS, 0))
+        self.assertIsNone(lifecycle.token_price(None, "x"))
         real = lifecycle.price_file()
         self.assertEqual(lifecycle.token_price(real, "own/gemini-4-carbon"), real["own/"])
         self.assertEqual(lifecycle.token_price(real, "google/gemini-4-carbon"), real["gemini-4"])

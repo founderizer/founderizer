@@ -115,7 +115,7 @@ ACCESS = {
 
 def load_tests(loader, _tests, _pattern):
     return unittest.TestSuite(cls(name) for cls in (Access, Callers, Look, DoorSelf, Databases, RuleArguments, Refusals, OwnCalls, Order,
-                                                    HubLine, HubRights, GitHubFacts, SyncRuns, CommitChecks, PruneParts, Prunes, Vault, AuditReplay, AWSRole,
+                                                    HubLine, HubRights, HubStart, GitHubFacts, SyncRuns, CommitChecks, PruneParts, Prunes, Vault, AuditReplay, AWSRole,
                                                     OwnerYes, CallHash, ScriptsAndRuns, FullAccess, Routes, MadeDeletes,
                                                     HostPath, AppSettingsPath, ScriptPath, HostUpdates, KeyCardAccount,
                                                     WorkKeys,
@@ -3044,6 +3044,27 @@ CALL_HASHES = r'''
 ["hetzner:one", "server-delete", ["shop \"old\" \\ 1", "caf\u00e9", "\ud83d\ude00 \u007f"], "", "0428db94f078234bf77c8e1b7b416f01560359ff7573ade4db44ae96a2fb7cd8"]
 ["web-1", "file", ["/etc/app/a b.conf", "0644"], "key = \"value\"\n", "1ffa5dbd2fa34e5d48087a042d7dc3e5d0d292bf1119d39ecfee0f343e3da241"]
 '''.strip().split("\n")
+
+
+class HubStart(unittest.TestCase):
+    """The hub reads the door's rules once, with hub.py. A release moves the hub's kit (lifecycle.take) before the hub
+    runs the new code (restart_hub_soon, after a drain), and a restart that fails leaves the hub on the old code. A
+    first import of door_targets in that time read the new door_targets.py beside the old hub.py, so a commit that
+    changed a function of both raised there, or read wrongly (a review of the area "Release, ship and tests", 20
+    November 2026)."""
+
+    def test_an_import_after_a_release_moved_the_rules_gives_the_rules_that_the_hub_started_with(self):
+        with tempfile.TemporaryDirectory() as moved:
+            with open(os.path.join(moved, "door_targets.py"), "w") as f:
+                f.write("raise SystemExit('the hub read the door_targets.py that came after its start')\n")
+            # the release's move, as an import sees it: the file that an import finds now is another one
+            code = ("import sys\nsys.path.insert(0, sys.argv[1])\nimport hub\nsys.path.insert(0, sys.argv[2])\n"
+                    "import door_targets\nprint(door_targets.__file__)\n")
+            done = subprocess.run([sys.executable, "-c", code, ROOT, moved], capture_output=True, text=True,
+                                  timeout=300)
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertEqual(os.path.realpath(done.stdout.strip().splitlines()[-1]),
+                         os.path.realpath(os.path.join(ROOT, "door_targets.py")))
 
 
 class CallHash(unittest.TestCase):

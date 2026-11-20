@@ -970,5 +970,74 @@ class Slots(Base):
         by_day = {r["day"]: r["input"] for r in read("by=day")[1]}
         self.assertEqual(by_day[(day - datetime.timedelta(days=2)).isoformat()], 7_000)
 
+    def test_every_provider_counts_at_its_own_prices_and_a_model_of_the_owner_s_own_costs_nothing(self):
+        """The owner, 20 November 2026: "make sure it works with any ai model provider!!". An ACP runtime's models
+        are priced from the price file, each at its own; a Codex agent that runs a model on its own machine (--oss)
+        names it own/<model> and it costs nothing, also in the slots that a start fills; each thread of an agent's
+        screen tasks is a session of its own, at its model's price and on the screen's account."""
+        at = self.t0 - 600
+        book = hub.price_book()
+
+        def costs(query="by=model"):
+            code, page = self.request(f"/ui/costs?db=test-generation&{query}")
+            self.assertEqual(code, 200, page)
+            return {r["model"]: r for r in page["rows"]}
+        acp = next(n for n, e in lifecycle.RUNTIMES.items() if e["driver"] == "acp")
+        hub.record_session_tokens("scout", [dict(session("a1", at, input=3_000_000, cache_read=0, output=0, calls=3,
+                                                         model="grok-4.3"),
+                                                 models=[["grok-4.3", 2_000_000, 0, 0, 0, 2],
+                                                         ["qwen3.8-max", 1_000_000, 0, 0, 0, 1]])], acp, None)
+        got = costs()
+        for model, tokens in (("grok-4.3", 2_000_000), ("qwen3.8-max", 1_000_000)):
+            self.assertAlmostEqual(got[model]["cost"], hub.token_price(book[acp], model)["input"] * tokens / 1e6,
+                                   places=4, msg=model)
+        self.assertNotEqual(hub.token_price(book[acp], "grok-4.3"), hub.token_price(book[acp], "qwen3.8-max"))
+        # a Codex agent on a model of its own machine: own/<model>, at no cost
+        hub.TEAM["agents"]["solo"]["start"] = "codex --oss"
+        self.usage("solo", [session("o1", at, input=500_000, cache_read=0, output=0, model="gpt-oss:20b")], key=OPENAI)
+        self.assertEqual((costs()["own/gpt-oss:20b"]["input"], costs()["own/gpt-oss:20b"]["cost"]), (500_000, 0.0))
+        self.assertNotIn("gpt-oss:20b", costs())
+        # and in every reader of the sessions: the session's own row names it own/ too, so its costs are nothing
+        self.assertEqual(self.stored("solo", "o1")["model"], "own/gpt-oss:20b")
+        self.assertEqual(hub.costs_view(["solo"], self.t0 - 30 * DAY, self.t0 + 60)["agents"][0]["now"]["cost"], 0.0)
+        # a session of it from before the slots: the next start fills its slots under the same own/ name
+        hub.q("INSERT INTO session_tokens(agent,session_id,total,last_activity,reported,input,cache_read,cache_write,"
+              "output,calls,model,runtime) VALUES('solo','o0',70,?,?,70,0,0,0,1,'gpt-oss:20b','codex')", (at, at))
+        self.assertEqual(hub.migrate(), [])
+        self.assertEqual([k[2] for k in self.slots("solo") if k[0] == "o0"], ["own/gpt-oss:20b"])
+        # the screen tasks of an agent: each thread a session of the screen runtime (usage.screen_tokens), at its own
+        # last activity, and on the screen's account, not on the agent's own model account
+        hub.TEAM["accounts"] = {"team-key": {"kind": "key", "provider": "anthropic"}}
+        hub.TEAM["agents"]["hand"]["account"] = "team-key"
+        older = at - 2 * DAY
+
+        def screen(threads):
+            rows = [dict(session_id=thread, total=n, last_activity=last, input=n, cache_read=0, cache_write=0, output=0,
+                         calls=0, model=model, first_cache_share=None) for thread, n, last, model in threads]
+            tokens = dict(input=sum(n for _, n, *_ in threads), output=0, cache_read=0, cache_write=0,
+                          total=sum(n for _, n, *_ in threads), sessions=len(threads), since=older - 60,
+                          last_activity=max(last for _, _, last, _ in threads), collected_at=time.time(),
+                          source=usage.SCREEN_SOURCE, scope=usage.SCREEN_SCOPE, error=None, by_session=rows)
+            return dict(tokens=tokens, limits=report([], runtime=usage.SCREEN_RUNTIME, key=OPENAI)["limits"])
+        for threads in ([("t-1", 200_000, older, None)],
+                        [("t-1", 200_000, older, None), ("t-2", 60_000, at, "gpt-6.1-sol")]):
+            data = report([session("h1", at)])
+            data["screen"] = screen(threads)
+            self.assertEqual(self.request("/helper/usage/hand", data, source=SOURCE["hand"])[0], 200)
+        first, second = self.stored("hand", "t-1"), self.stored("hand", "t-2")
+        self.assertEqual((first["runtime"], first["account"], second["account"], second["input"]),
+                         (usage.SCREEN_RUNTIME, OPENAI, OPENAI, 60_000))
+        self.assertEqual(self.stored("hand", "h1")["account"], "account:team-key")
+        self.assertEqual([k[1] for k in self.slots("hand") if k[0] == "t-1"], [hub.slot_of(older)])
+        # a thread with the model that its start named: under that model, at its price on the screen runtime
+        self.assertEqual((second["model"], [k[2] for k in self.slots("hand") if k[0] == "t-2"]),
+                         ("gpt-6.1-sol", ["gpt-6.1-sol"]))
+        for model, tokens in ((None, 200_000), ("gpt-6.1-sol", 60_000)):
+            self.assertAlmostEqual(costs()[model]["cost"],
+                                   hub.token_price(book[usage.SCREEN_RUNTIME], model)["input"] * tokens / 1e6, places=4)
+        # a hub that takes no four kinds gets the screen's threads with their totals alone, as every other session
+        self.assertEqual(set(usage.plain_sessions(data)["screen"]["tokens"]["by_session"][0]), set(usage.SESSION_FIELDS))
+
+
 if __name__ == "__main__":
     unittest.main()
