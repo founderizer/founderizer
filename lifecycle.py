@@ -2320,12 +2320,14 @@ def take(kit, target, run=None, floor=None, room=False, starts=None):
     has its larger check, the installers, the owner's MCP server, a new agent's checkout). With a role, a move that
     brings code runs the release's own start check after may_take and before the move (start_problem), and a release
     that does not start on this machine moves nothing and raises no floor; a check that cannot run here stops nothing.
+    The result of each check is kept beside the floor (keep_start_check), and changes nothing of this decision.
     None, or the reason why the checkout stays where it is: a Refused for a release that did not start here."""
     keep_floor(kit, floor, run)
     commit = _commit(kit, run, target)
     if not commit:
         return f"{target} is not a commit of this checkout"
-    problem = may_take(kit, commit, run, floor) or (start_problem(kit, commit, starts, run) if starts else None)
+    problem = may_take(kit, commit, run, floor) or \
+        (start_problem(kit, commit, starts, run, floor=floor) if starts else None)
     if problem:
         return problem
     if room:
@@ -2367,7 +2369,7 @@ def follow_config_ref(kit, run=None, floor=None, starts=None):
         problem = may_take(kit, commit, run, floor) if commit else "the ref is not a commit of this checkout"
         if problem:
             return f"the checkout did not move onto {CONFIG_BRANCH}: {problem}"
-        problem = start_problem(kit, commit, starts, run) if starts else None
+        problem = start_problem(kit, commit, starts, run, floor=floor) if starts else None
         if problem:
             return problem
         code, out, err = git("checkout", "-q", CONFIG_BRANCH) if here else \
@@ -2395,7 +2397,15 @@ START_PROGRAMS = {"helper": "fleet.py", "server": "server.py"}     # each role's
 # hub.py is not loaded: verify.py imports it for one rule, it is the hub's own program, it costs seconds and more than
 # 100 MB, and the hub's own check of a release loads it (releases.Update.checks).
 START_LEFT_OUT = ("hub",)
-_REFUSED = {}               # {a checkout's real path: (the revision of the last release that did not start, the words)}
+# {a checkout's real path: (the revision of the last release that did not start, the words, its record's fields)}
+_REFUSED = {}
+# The result of the last start check of each program of this user (its role), in a file beside the user's release
+# floor, which outlives the restart after a move: the helper's report and the server service's reading carry it as
+# `start_check` (read_start_check), so the hub knows a check that passed from one that could not run, and a refusal as
+# a fact and not as words to match. One file for each role: on a Mac the helper and the server service run as one
+# user, with one floor, and the one that checked last would else write over the other's result.
+START_RECORD = "start-check-{}.json"
+START_RESULTS = ("passed", "not_run", "refused")       # hub.start_check_status takes these three words only
 
 
 class Refused(str):
@@ -2404,10 +2414,65 @@ class Refused(str):
     reason."""
 
 
-def start_problem(kit, commit, role, run=None, head="HEAD"):
+def start_record_path(floor, role):
+    """The file of the last start check of this user's program `role` (a key of START_PROGRAMS), beside its release
+    floor; None with no floor or another role."""
+    return os.path.join(os.path.dirname(floor), START_RECORD.format(role)) if floor and role in START_PROGRAMS else None
+
+
+def keep_start_check(floor, role, result, release, revision, keeps, reason):
+    """Write the result of one start check of the program `role` beside the floor (start_record_path), whole or not at
+    all: a temporary file in the same folder, then os.replace. `result` is one of START_RESULTS; `release` the version
+    of the release checked, else the first 12 of its commit; `revision` the release revision that its release.json
+    names, or None; `keeps` the version of the release that the checkout carries now, or the first 12 of HEAD; `reason`
+    why it did not pass, at most 300 characters, or None. It never raises: a record that cannot be written changes no
+    decision of a move, and the next check writes it again."""
+    temp = None
+    try:
+        path = start_record_path(floor, role)
+        if not path:
+            return
+        said = {"result": result, "release": release, "revision": revision, "keeps": keeps,
+                "reason": None if reason is None else str(reason)[:300], "at": time.time()}
+        folder = os.path.dirname(path)
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        handle, temp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", dir=folder)
+        with os.fdopen(handle, "w", encoding="utf-8") as f:
+            json.dump(said, f)
+        os.replace(temp, path)
+        temp = None
+    except Exception:       # noqa: BLE001 -- a record is never worth a move or a report
+        pass
+    finally:
+        if temp:
+            with contextlib.suppress(OSError):
+                os.unlink(temp)
+
+
+def read_start_check(floor, role):
+    """The record of the last start check of this user's program `role` (keep_start_check) as it was written, or None:
+    no floor, no file, or a file that does not parse as one object. The hub checks each field (hub.start_check_status)."""
+    path = start_record_path(floor, role)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            said = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return said if isinstance(said, dict) else None
+
+
+def start_problem(kit, commit, role, run=None, head="HEAD", floor=None):
     """None when the move of checkout `kit` from `head` onto `commit` brings data only (data_path), when the tree of
     `commit` starts on this machine as `role`, or when its check cannot run here; else a Refused, the words of why the
     checkout stays. Called only after may_take passed on `commit`. It never raises.
+
+    With a `floor` (the caller's release floor), each check that was due leaves its result beside it, in the file of
+    `role`, once its answer decided (keep_start_check): passed, not_run or refused. A refusal served again from this
+    process writes its record again with a new time, so the record is as new as the update that it stopped (the hub
+    takes a helper's record as the cause of its failed update only then). A move of data only and the same commit
+    write nothing.
 
     Only the release's own answer refuses: its command ended with a status that is not 0, or its wait ran out. That
     refusal is kept in this process: a later target that carries the same release (the revision of its release.json)
@@ -2415,7 +2480,7 @@ def start_problem(kit, commit, role, run=None, head="HEAD"):
     once more, because an update of the system can have removed the cause. Anything that goes wrong in this code before
     that answer (no room for the copy, a git step that fails) is a fault of the checker and not of the release: the
     move goes on as it did before this check, one line on standard error says so, and nothing is kept."""
-    name = commit[:12]
+    name, revision, keeps = commit[:12], None, None
     try:
         old = _commit(kit, run, head)
         if old == commit:
@@ -2428,10 +2493,16 @@ def start_problem(kit, commit, role, run=None, head="HEAD"):
         name, key = version or name, os.path.realpath(kit)
         kept = _REFUSED.get(key)
         if revision and kept and kept[0] == revision:
+            keep_start_check(floor, role, "refused", *kept[2])
             return kept[1]
+        if floor and old:               # what the checkout keeps if this release does not start: for the record only
+            mine = _blob(kit, run, old, RELEASE_FILE)
+            keeps = (released(mine)[1] if mine is not None else None) or old[:12]
         passed, reason = start_check(kit, commit, role, run)
     except Exception as e:      # the checker's own fault, never the release's
         passed, reason = None, _fault(e)
+    keep_start_check(floor, role, "passed" if passed else "not_run" if passed is None else "refused", name, revision,
+                     keeps, reason)
     if passed:
         return None
     if passed is None:
@@ -2442,7 +2513,7 @@ def start_problem(kit, commit, role, run=None, head="HEAD"):
     words = Refused(f"Release {name} did not start on this server, so the server keeps the version that it runs: "
                     f"{reason}"[:300])
     if revision:
-        _REFUSED[key] = (revision, words)
+        _REFUSED[key] = (revision, words, (name, revision, keeps, reason))
     return words
 
 
@@ -4073,7 +4144,10 @@ class Lifecycle:
         for n, outcome in outcomes.items() if isinstance(outcomes, dict) else ():
             if n in said and isinstance(outcome, dict):     # its last update, by any helper of this user
                 said[n]["update"] = outcome
-        return {"revision": self.running(), "os": self.os_info(), "security": self.security_reading(fast),
+        # the last start check of this user, read from its file at each report: it outlives the restart after a move
+        checked = read_start_check(self.floor, "helper")
+        return {**({"start_check": checked} if checked else {}),
+                "revision": self.running(), "os": self.os_info(), "security": self.security_reading(fast),
                 "runtime": runtimes[name] if name in runtimes else self.runtime(),
                 "runtimes": said,
                 # one OS user for each agent: the hub compares the uids of a machine's agents (hub.os_user_found)

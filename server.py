@@ -620,7 +620,9 @@ class Service:
         except Exception as e:          # the browser parts never stop this server's report
             print(f"The browser parts of this server could not be read: {e}", flush=True)
             browser = None
-        return {"revision": self.loaded, "os": life.os_info(), "security": life.security(),
+        checked = lifecycle.read_start_check(self.floor, "server")     # its own last start check (lifecycle.take)
+        return {**({"start_check": checked} if checked else {}),
+                "revision": self.loaded, "os": life.os_info(), "security": life.security(),
                 "runtimes": self.runtimes(), "load": lifecycle.machine_load(self.platform),
                 "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name, uid=os.getuid()),
                 "agents": self.agent_users(), "browser": browser, "room": lifecycle.room_reading(self.platform),

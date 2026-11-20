@@ -472,11 +472,25 @@ class StartCheck(Repositories):
     def released(self, commit):
         return json.loads(git("show", f"{commit}:{lifecycle.RELEASE_FILE}", cwd=self.kit))["revision"]
 
+    def record(self, role="helper"):
+        """The result of the last start check of this user's program `role`, from its file beside the floor, without
+        its time; None for no file. Its time is a time of this check."""
+        said = lifecycle.read_start_check(str(self.floor), role)
+        if said is None:
+            self.assertFalse(Path(lifecycle.start_record_path(str(self.floor), role)).exists())
+            return None
+        self.assertLessEqual(abs(said.pop("at") - time.time()), 120)
+        return said
+
     def data(self):
         """A later commit of the hub on the ref: the owner's own file, and no release."""
         return self.fleet.commit(lambda work: (work / "profiles/vps.md").write_text(PROFILE + "Quick.\n"), "Profile")
 
     def test_a_release_that_does_not_start_here_moves_nothing_raises_no_floor_and_says_why(self):
+        """The machine says it as a fact too, beside its floor (part 2): the release, the one it keeps, and why. On a
+        Mac the server service runs as the same user, with the same floor: its own check of the release, which starts
+        as a server, leaves its own record and writes nothing over the helper's."""
+        service = self.fleet.machine("service")         # the server service's own checkout, at release 3
         four = self.fleet.release(4, files=NO_START)
         said = self.take(four)
         self.assertIsInstance(said, lifecycle.Refused)
@@ -484,18 +498,29 @@ class StartCheck(Repositories):
                                "it runs: start-check: broken does not load: RuntimeError: no such setting here")
         self.assertEqual(self.head(), self.three)
         self.assertEqual(lifecycle.read_floor(str(self.floor)), (self.released(self.three), None))
+        git("fetch", "-q", "origin", cwd=service)
+        self.assertIsNone(lifecycle.take(str(service), four, self.commands, str(self.floor), starts="server"))
+        self.assertEqual(self.record("server"), {"result": "passed", "release": "2026.11.4",
+                                                 "revision": self.released(four), "keeps": "2026.11.3", "reason": None})
+        self.assertEqual(self.record(), {"result": "refused", "release": "2026.11.4", "revision": self.released(four),
+                                         "keeps": "2026.11.3",
+                                         "reason": "start-check: broken does not load: RuntimeError: no such setting "
+                                                   "here"})
 
     def test_a_release_that_starts_here_moves_as_before_after_one_check(self):
         four = self.fleet.release(4)
         self.assertIsNone(self.take(four))
         self.assertEqual((self.head(), len(self.copies()), len(self.checks())), (four, 1, 1))
         self.assertEqual(lifecycle.read_floor(str(self.floor)), (self.released(four), None))
+        self.assertEqual(self.record(), {"result": "passed", "release": "2026.11.4", "revision": self.released(four),
+                                         "keeps": "2026.11.3", "reason": None})
 
     def test_a_move_of_data_only_makes_no_copy(self):
         """Each task start syncs the checkout: a change of the owner's files alone pays for no clone."""
         data = self.data()
         self.assertIsNone(self.take(data))
         self.assertEqual((self.head(), self.copies(), self.checks()), (data, [], []))
+        self.assertIsNone(self.record())            # no check was due, so no record says one
 
     def test_a_commit_that_may_take_refuses_is_never_copied_or_run(self):
         """No code of a tree runs before its signature passed."""
@@ -507,11 +532,19 @@ class StartCheck(Repositories):
         """The hub asks again at each change of the owner's files, which are later commits of the same release: they
         are refused with the same words and no new copy. A new release is checked, and moves when it starts."""
         refused = self.take(self.fleet.release(4, files=NO_START))
+        place = Path(lifecycle.start_record_path(str(self.floor), "helper"))
+        first = json.loads(place.read_text())
+        place.write_text(json.dumps(dict(first, at=1.0)))      # as if that refusal was long ago
         self.assertEqual(self.take(self.data()), refused)
         self.assertEqual((self.head(), len(self.copies())), (self.three, 1))
+        # served again from memory: the same record, as new as this refusal, so as new as the update that it stopped
+        again = json.loads(place.read_text())
+        self.assertEqual(dict(again, at=None), dict(first, at=None))
+        self.assertGreaterEqual(again["at"], first["at"])
         five = self.fleet.release(5, files={"fleet.py": STARTS})
         self.assertIsNone(self.take(five))
         self.assertEqual((self.head(), len(self.copies())), (five, 2))
+        self.assertEqual((self.record()["result"], self.record()["release"]), ("passed", "2026.11.5"))
 
     def test_a_check_that_cannot_run_moves_as_before_says_so_and_keeps_nothing(self):
         """A full disk is a fault of the checker, not of the release that may_take let through: the move goes on as it
@@ -529,6 +562,9 @@ class StartCheck(Repositories):
         self.assertEqual(said.getvalue(), "Release 2026.11.4 is taken without its start check, which could not run on "
                                           "this server: fatal: could not create work tree dir: No space left on "
                                           "device\n")
+        self.assertEqual(self.record(), {"result": "not_run", "release": "2026.11.4", "revision": self.released(four),
+                                         "keeps": "2026.11.3",
+                                         "reason": "fatal: could not create work tree dir: No space left on device"})
         self.assertIsInstance(self.take(self.fleet.release(5)), lifecycle.Refused)
         self.assertEqual(self.head(), four)
 
@@ -542,6 +578,21 @@ class StartCheck(Repositories):
         self.assertEqual(self.head(), four)
         self.assertEqual(said.getvalue(), "Release 2026.11.4 is taken without its start check, which could not run on "
                                           "this server: OSError: [Errno 28] No space left on device\n")
+
+    def test_a_record_that_cannot_be_written_changes_no_move_and_raises_nothing(self):
+        """The record is a report, never a gate: where it cannot be written (here a folder stands in its place), a
+        release that does not start is refused with the same words, one that starts moves, nothing raises, and no
+        temporary file stays beside the floor."""
+        place = Path(lifecycle.start_record_path(str(self.floor), "helper"))
+        place.mkdir()
+        said = self.take(self.fleet.release(4, files=NO_START))
+        self.assertEqual((type(said), said[:40]), (lifecycle.Refused, "Release 2026.11.4 did not start on this "))
+        self.assertEqual(self.head(), self.three)
+        five = self.fleet.release(5, files={"fleet.py": STARTS})
+        self.assertIsNone(self.take(five))
+        self.assertEqual(self.head(), five)
+        self.assertTrue(place.is_dir())
+        self.assertEqual(sorted(p.name for p in place.parent.iterdir() if p.name.startswith(place.name)), [place.name])
 
     def test_a_mover_with_no_role_makes_no_copy_and_runs_no_check(self):
         """The hub's own update (it has its larger check), the installers and the owner's MCP server move as before."""
@@ -615,11 +666,17 @@ class HelperUpdate(Mover):
         self.assertFalse(self.restarted)
 
     def test_a_release_that_does_not_start_here_is_a_failed_update_in_its_own_words_and_no_restart(self):
-        self.move(self.fleet.release(4, files=NO_START))
+        four = self.fleet.release(4, files=NO_START)
+        self.move(four)
         self.assertEqual((self.restarted, self.life.state, self.head()), (False, "failed", self.three))
         self.assertEqual(self.life.detail, "Release 2026.11.4 did not start on this server, so the server keeps the "
                                            "version that it runs: start-check: broken does not load: RuntimeError: no "
                                            "such setting here")
+        # beside the helper's floor, where each report of its next process reads it too (Lifecycle.collect)
+        said = lifecycle.read_start_check(str(self.floor), "helper")
+        self.assertEqual((said["result"], said["release"], said["keeps"], said["revision"]),
+                         ("refused", "2026.11.4", "2026.11.3",
+                          json.loads(git("show", f"{four}:{lifecycle.RELEASE_FILE}", cwd=self.kit))["revision"]))
 
 
 class TaskStartSync(Mover):
@@ -649,6 +706,10 @@ class ServerUpdate(Mover):
         self.assertEqual(self.said, "Release 2026.11.4 did not start on this server, so the server keeps the version "
                                     "that it runs: start-check: broken does not load: RuntimeError: no such setting "
                                     "here\n")
+        # beside the service's floor, which its next reading carries (server.Service.reading)
+        self.assertEqual({k: v for k, v in lifecycle.read_start_check(str(self.floor), "server").items()
+                          if k in ("result", "release", "keeps")},
+                         {"result": "refused", "release": "2026.11.4", "keeps": "2026.11.3"})
 
 
 class ServerNewCheckout(Mover):

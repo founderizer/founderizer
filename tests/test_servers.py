@@ -1437,6 +1437,27 @@ class ServerService(Servers):
         reported = hub.q1("SELECT reported FROM server_status WHERE server='mini'")["reported"]
         self.assertEqual(self.servers()[1]["mini"]["load"], dict(load, at=reported))
 
+    def test_the_service_s_reading_carries_its_last_start_check(self):
+        """The release start check, part 2: at each reading the service reads the record of its user's last start
+        check beside its floor (lifecycle.read_start_check); the hub keeps it of its shape and the servers page shows
+        it in the server's reading. A record of another shape is dropped and never refuses the reading."""
+        life = self.mod.lifecycle
+        self.join_by_script(self.code()["code"])
+        svc = self.service()
+        self.assertIsNone(self.servers()[1]["mini"]["reading"]["start_check"])        # a service with no floor
+        svc.floor = str(self.home / ".fleet" / life.FLOOR_FILE)
+        life.keep_start_check(svc.floor, "server", "refused", "2026.11.677", "7" * 40, "2026.11.676",
+                              "start-check: broken does not load: RuntimeError: no such setting here")
+        self.assertEqual(svc.report(), 200)
+        said = self.servers()[1]["mini"]["reading"]["start_check"]
+        self.assertEqual(said, dict(life.read_start_check(svc.floor, "server")))
+        self.assertEqual({k: v for k, v in said.items() if k != "at"},
+                         {"result": "refused", "release": "2026.11.677", "revision": "7" * 40, "keeps": "2026.11.676",
+                          "reason": "start-check: broken does not load: RuntimeError: no such setting here"})
+        Path(life.start_record_path(svc.floor, "server")).write_text(json.dumps(dict(said, result="maybe")))
+        self.assertEqual(svc.report(), 200)
+        self.assertIsNone(self.servers()[1]["mini"]["reading"]["start_check"])
+
     def test_the_join_makes_a_key_saves_the_server_and_sends_only_the_sha256(self):
         answer = self.code()
         self.join_by_script(answer["code"])
