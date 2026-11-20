@@ -134,6 +134,42 @@ class Options(NeedsCase):
         self.assertEqual(hub.leak_scan(), [])
 
 
+    def test_the_agent_recommends_one_option_or_its_own_few_words(self):
+        """Owner API 1.269 (the owner, 20 November 2026: "the model should recommend one response", and his pick B of
+        three pictures): the answer that the agent recommends is one of its options, word for word, or on an item with
+        no options one line of its own words, which the state gives the apps; any other value is refused, and an item
+        with none says null."""
+        def nid(said):
+            return int(said.split("N-")[1].split(".")[0])
+        picked = nid(self.raise_item(title="Which colour?", options=["Blue", "Green"], recommended="Green"))
+        words = nid(self.raise_item(title="What do we tell them?", recommended=" No refund, a store credit "))
+        none = nid(self.raise_item(title="Which day?", options=["Monday", "Friday"]))
+        self.assertEqual([self.item(n)["recommended"] for n in (picked, words, none)],
+                         ["Green", "No refund, a store credit", None])
+        for bad, refusal in ((dict(options=["Blue", "Green"], recommended="Red"), "one of options, word for word"),
+                             (dict(recommended="two\nlines"), "one line"),
+                             (dict(recommended="x" * 121), "at most 120 characters"),
+                             (dict(recommended=["Blue"]), "the answer that you recommend")):
+            with self.subTest(refusal=refusal), self.assertRaises(hub.ToolError) as refused:
+                self.raise_item(title="Which one now?", **bad)
+            self.assertIn(refusal, str(refused.exception))
+        self.assertIn("need_recommended", self.request()[1]["ui_features"])
+        # an option matches in any case and keeps its own words; free words get an option's checks
+        case = nid(self.raise_item(title="Which size?", options=["Small", "Large"], recommended="large"))
+        self.assertEqual(self.item(case)["recommended"], "Large")
+        self.register("Synthetic-Login-Value-77")
+        for said, refusal in (("Close T-61 first", "in plain words"),
+                              ("Use Synthetic-Login-Value-77", "login")):
+            with self.subTest(refusal=refusal), self.assertRaises(hub.ToolError) as refused:
+                self.raise_item(title="What now?", recommended=said)
+            self.assertIn(refusal, str(refused.exception))
+        # a press of the recommended words is the agent's words, not the owner's typed ones (CARD_TYPED)
+        row = self.row(words)
+        self.assertEqual(hub.need_words_note(row, None, None, "No refund, a store credit"),
+                         " The owner pressed the answer that you recommended.")
+        self.assertIn("in their own words", hub.need_words_note(row, None, None, "Refund it all"))
+
+
 class Choice(NeedsCase):
     """The owner's press, on the route that answers every Needs-you item."""
 

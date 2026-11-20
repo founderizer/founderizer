@@ -633,6 +633,15 @@ class Resources(OwnerAPI):
         need = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
         self.assertEqual(need["options"], ["Give Dev write", "No: keep it read-only"])
         self.assertEqual(need["give"], {"agent": "dev", "level": "write", "repos": ["acme/web"]})
+        # the hub writes Give, so the manager's recommendation "Give" is that option (owner API 1.269), and a word
+        # that is no option is refused
+        hub.q("DELETE FROM needs WHERE id=?", (nid,))
+        given = self.give_card(recommended="Give")
+        self.assertEqual(hub.q1("SELECT recommended FROM needs WHERE id=?", (given,))["recommended"], "Give Dev write")
+        hub.q("DELETE FROM needs WHERE id=?", (given,))
+        self.assertIn("recommended is one of options", self.give_card(recommended="Yes"))
+        self.assertIn("recommended is one of options", self.give_card(recommended="Give no access yet"))
+        nid = self.give_card()
         self.assertEqual(need["todo"], "Press Give: it gives Dev write access to acme/web.")
         self.assertNotIn("give_agent", need)
         self.assertIn("need_give", self.request()[1]["ui_features"])

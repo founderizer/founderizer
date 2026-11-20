@@ -2028,9 +2028,11 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # `secret` and of its answer, and of POST /ui/team/logins (UI-API.md 1.249)
                "secret_clarify",    # the same yes ("I prefer Needs clarification"): `clarify` of POST
                                     # /ui/needs/<id>/secret, the owner's words about a key request (UI-API.md 1.249)
-               "secret_clarify_phone"]      # the owner, 20 November 2026 ("Yes, build it" to the picture of the
+               "secret_clarify_phone",      # the owner, 20 November 2026 ("Yes, build it" to the picture of the
                                     # iPhone's key card): the hub takes `clarify` from a phone's key too, and its
                                     # receipt has `created`, as the receipt of an answer has (UI-API.md 1.252)
+               "need_recommended"]  # the owner, 20 November 2026 (his pick B of three pictures): an item's
+                                    # `recommended`, the answer that the agent recommends (UI-API.md 1.269)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -3254,6 +3256,35 @@ def need_view(row, reads=None):
     else:
         view["door_fleet"] = None
     return view
+
+
+def need_recommended(given, options, give=False):
+    """The answer that the agent recommends on its Needs-you item (owner API 1.269; the owner, 20 November 2026: "the
+    model should recommend one response, and we should somehow show that on the UI too, even in multiple choice cards
+    or in image/files one", and his pick, of three pictures, of a badge on that answer's top edge with the agent's
+    glyph and the word Recommended): one of the item's options, word for word, or, on an item with no options, the
+    few words that the agent would answer, which the card draws as one row that sends them. None when it gives none;
+    a ToolError for any other value. An option matches in any case, and is kept in its own words; on a card with
+    Give (give), whose first option the hub writes, a value that starts with Give is that option."""
+    if given is None or given == "":
+        return None
+    if not isinstance(given, str) or not given.strip():
+        raise ToolError("recommended is the answer that you recommend: one of options, word for word, or on an item "
+                        "with no options the few words that you would answer.")
+    words = given.strip()
+    if options:
+        if give and words.casefold() == "give":
+            return options[0]
+        found = next((o for o in options if o.casefold() == words.casefold()), None)
+        if found is None:
+            raise ToolError("recommended is one of options, word for word: " + "; ".join(options) + ".")
+        return found
+    if len(words) > NEED_OPTION_CHARS:
+        raise ToolError(f"The card draws recommended as one row, so it is at most {NEED_OPTION_CHARS} characters: say "
+                        f"the answer in fewer words, and the reasons in why or details.")
+    if any(c in words for c in "\r\n") or any(ord(c) < 32 or ord(c) == 127 for c in words):
+        raise ToolError("recommended is one line of plain words, with no line break or control character.")
+    return words
 
 
 def check_need_options(given):
@@ -6304,6 +6335,8 @@ def migrate():
                   # that asked for the run, which the apps show after the door card's title, " · " between them
                   "door_task": "TEXT",
                   "door_task_id": "INTEGER",  # that task, which hears when the door has taken Full access (door_mode_news)
+                  # owner API 1.269: the answer that the agent recommends, one of the options or its own few words
+                  "recommended": "TEXT",
                   "github_app": "TEXT",       # plan 13, item 4: the account that the item's first option makes an App in
                   "add_device": "INTEGER",    # plan V12 and 8.3: the item's first option opens the Add device picture
                   "github_key": "TEXT",       # plan 13, item 4: the App owner whose key the item renews (door_renew)
@@ -14566,7 +14599,8 @@ CARD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\n]*\)")
 # a row of ui_requests that the owner typed: a message, or the answer in words of an item that is no key request and
 # no run, and no row that a connected app sent; the words of a pressed option are the manager's
 CARD_TYPED = ("u.connection IS NULL AND (u.need_id IS NULL OR (n.chosen IS NULL AND n.chose IS NULL AND "
-              "COALESCE(n.kind, '') != 'secret' AND n.run_command IS NULL))")
+              "COALESCE(n.kind, '') != 'secret' AND n.run_command IS NULL AND (n.recommended IS NULL OR "
+              "u.text IS NOT n.recommended)))")      # the press of an agent's recommended words is its words
 CARD_REASON_REFUSAL = (
     "Not raised: give the item its reason. A card is your last step, because it rings the owner's phone. First decide "
     "yourself where a policy or a standing rule of the owner's lets you, check the claim of the agent that asks in the "
@@ -15234,9 +15268,10 @@ def t_raise_needs_you(agent, a):
                 and github_key.lower() == str(renew.get("owner")).lower()):
             raise ToolError("github_key is the GitHub account whose App key the hub asked you to renew, and only "
                             "while it waits for that: the hub's message names it.")
-        if options or door_call is not None or github_app is not None or add_device is not None:
-            raise ToolError("An item with a github_key has no options, door_call, github_app or add_device: it asks "
-                            "the owner nothing back, and the hub closes it by itself.")
+        if options or door_call is not None or github_app is not None or add_device is not None or \
+                a.get("recommended"):
+            raise ToolError("An item with a github_key has no options, recommended, door_call, github_app or "
+                            "add_device: it asks the owner nothing back, and the hub closes it by itself.")
         github_key = renew["owner"]
     key_swap_server = a.get("key_swap_server")
     if key_swap_server is not None:     # Part B of the changed key swap: the item that asks for one server's word
@@ -15285,6 +15320,15 @@ def t_raise_needs_you(agent, a):
         raise ToolError(CARD_ROUTE_REFUSAL)     # the door's card shows the call that the owner's yes lets through
     reason = None if fixed else card_reason(a, title, why, todo, listed)
     ask = need_ask(agent, a.get("ask"))     # owner feature asks: the ask whose work waits for this item
+    recommended = need_recommended(a.get("recommended"), listed, give=give is not None)
+    if recommended and not listed:          # the free words get every check that an option gets
+        wrong = need_words("", "", "", (recommended,)) or need_is_notice(recommended) or \
+            need_asks_secret(recommended)
+        if wrong:
+            raise ToolError(wrong)
+        if card_route("", "", "", "", (recommended,)):
+            raise ToolError(CARD_ROUTE_REFUSAL)
+        guard(agent, recommended)
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
         old = need_replaced(agent, replaces) if replaces else None
         qu = need_question(agent, a.get("question_id"), ignore=old["id"] if old else None)
@@ -15299,12 +15343,12 @@ def t_raise_needs_you(agent, a):
         door_task = door_task_words(asking["title"]) if asking and door_host else None
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,door_host,github_app,"
                   "add_device,github_key,details,multi,door_script,door_task,door_task_id,key_swap_server,give_agent,"
-                  "give_level,give_repos) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "give_level,give_repos,recommended) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None, door_call,
                    door_host, github_app, 1 if add_device else None, github_key, details or None,
                    1 if multi else None, door_script, door_task, asking["id"] if asking else None, key_swap_server,
                    give["agent"] if give else None, give["level"] if give else None,
-                   json.dumps(give["repos"]) if give else None))
+                   json.dumps(give["repos"]) if give else None, recommended))
         # owner feature asks: the ask that the agent named, else the ask of the item that this one replaces, else the
         # ask of the task whose question it carries to the owner
         if not ask and old:
@@ -42447,9 +42491,13 @@ TOOLS = [
                     f"words."},
         "multi": {"type": "boolean", "description": "True when the owner may tick several of the options: they send "
                   "the ones they ticked, and the words of those options, joined, are the answer."},
+        "recommended": {"type": "string", "description": "The answer that you recommend, which the card marks. With "
+                        "options: one of them, word for word (also Give, Run it once or Switch it on). With none: the "
+                        "answer in a few words, which the owner sends with one press. Put the reasons in why or "
+                        "details. Give one on every item, except a step with no choice."},
         "replaces": {"type": "string", "description": "An open item of yours that this one takes the place of, for "
                      "example N-12, when its options or its words changed: that item leaves Needs you. Give "
-                     "question_id again if it had one."},
+                     "question_id and recommended again."},
         "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now, "
                        "as the card shows it. For a choice: one short sentence. For a person's step: the exact steps "
                        "(each page as its full address, with what to click there; what the hand does at a machine; "
@@ -65589,7 +65637,7 @@ def task_steer_act(task_id, body, client, via=None, connection=None):
                                    "WHERE s.id=?", (sid,)))}
 
 
-def need_words_note(need, choice, ticked):
+def need_words_note(need, choice, ticked, value=None):
     """The hub's words after an answer that the owner typed to a Needs-you item of the manager's: their own words are
     also their one reply on the card (the owner, 13 November 2026: "lets use the free-type text input as the general
     reply too, so we can remove the discuss option completely"). The words close the item as every answer does, so a
@@ -65599,6 +65647,8 @@ def need_words_note(need, choice, ticked):
     if need is None or choice is not None or ticked is not None or need["conversation"] or \
             need["by"] != manager_name():
         return ""
+    if "recommended" in need.keys() and need["recommended"] and value == need["recommended"]:
+        return " The owner pressed the answer that you recommended."    # your words, not theirs (CARD_TYPED)
     gives = (" Words give nothing on a card with Give: the access was not given. If their words ask for it, raise a "
              "new card with needs_agent, and they press Give.") if need_give_view(need) is not None else ""
     return gives + (" The owner wrote this in their own words. If it asks you something back or does not settle the item, "
@@ -65892,7 +65942,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
                                               device=device, connection=connection,
                                               note=need_run_note(need, ran["status"], ran_output) if ran is not None
                                               else team_answer_note(need, choice) or given or
-                                              need_words_note(need, choice, ticked))
+                                              need_words_note(need, choice, ticked, value))
                 if isinstance(pressed, dict):       # owner API 1.214: kept for the plan's steps after this transaction
                     team_plan_pressed_rows(need, pressed, created)
                 if ticked is not None and need is not None:
@@ -66960,6 +67010,31 @@ def capp_ready():
     """connected_apps is in ui_features: the socket is open and the gate forwarded with its version (the hub's own
     ask after it opens the socket is enough: capp_gate_watch)."""
     return capp_on() and CONNECT["server"] is not None and CONNECT["gate"] is not None
+
+
+# The chat events that the helper's delivery poll may still hand out (Handler.events), so that its read leaves out the
+# chat events that are done. A chat with a flag of the hub's own in its extra (agent_message: an agent's message; need:
+# the owner's answer to a secret request; task_result: a task's result) comes until it is read, and an owner's chat
+# message comes until its reply. Until 20 November 2026 the poll read every chat event that the agent ever got, with
+# its text, at each of its rounds (two a second, under LOCK), and one more read for each owner message (the
+# architecture review of that day). This is a superset of the poll's own rule, which still decides each row that it
+# reads, for every extra that json.dumps writes: a flag that SQL reads as no flag (an empty array, which no writer
+# makes) costs a row, never a message, and an extra that is no JSON comes as before. One CASE, cheapest first, because only a CASE stops at its first true branch
+# (an OR of SQLite parsed `extra` also where json_valid said no, and failed): a chat that was read and has its reply is
+# done with no JSON parse. Measured on a scratch copy of the three tables (150 chat events of one agent beside 2,000
+# other events): 0.34 ms a round against 0.70 ms, and 0.83 ms against 3.35 ms at 1,000 chat events.
+CHAT_FLAGS = ("agent_message", "need", "task_result")
+CHAT_SET = "COALESCE(json_type(extra, '$.{0}'), 'null') != 'null'"         # there, and not null
+CHAT_TRUE = ("(COALESCE(json_type(extra, '$.{0}'), 'null') IN ('true', 'integer', 'real', 'text') AND "
+             "json_extract(extra, '$.{0}') NOT IN (0, ''))")              # a value that Python reads as true
+CHAT_REPLY = ("EXISTS (SELECT 1 FROM ui_requests u CROSS JOIN owner_reports r ON r.in_reply_to=u.request_id "
+              "WHERE u.event_id=events.id AND r.agent=events.agent)")    # CROSS: u first, by its event, on any SQLite
+CHAT_OPEN = ("(CASE WHEN read_at IS NOT NULL AND " + CHAT_REPLY + " THEN 0 "      # read and answered: done
+             "WHEN json_valid(extra) IS NOT 1 THEN 1 "                          # no extra, or no JSON: the rule decides
+             "WHEN read_at IS NOT NULL THEN NOT (" +                            # read, with no reply
+             " OR ".join(CHAT_TRUE.format(k) for k in CHAT_FLAGS) + ") "
+             "WHEN " + " OR ".join(CHAT_SET.format(k) for k in CHAT_FLAGS) +    # unread, with a flag of the hub's own
+             " THEN 1 ELSE NOT " + CHAT_REPLY + " END)")                        # unread owner's message: its reply
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -72670,7 +72745,7 @@ class Handler(BaseHTTPRequestHandler):
                 if conf is None:
                     return self.json(404, {"error": "unknown agent"})
                 rows = q("SELECT * FROM events WHERE agent=? AND "
-                         "((kind IN ('task','say') AND read_at IS NULL) OR (kind='chat') OR "
+                         "((kind IN ('task','say') AND read_at IS NULL) OR (kind='chat' AND " + CHAT_OPEN + ") OR "
                          "(kind='conversation' AND (read_at IS NULL OR helper_ack IS NULL)) OR "
                          "(kind NOT IN ('task','say','chat','conversation') AND helper_ack IS NULL)) ORDER BY id",
                          (agent,))
@@ -72747,8 +72822,7 @@ class Handler(BaseHTTPRequestHandler):
                         if not h or h["state"] != "requested" or h["kind"] != extra.get("action"):
                             continue
                     if r["kind"] == "chat" and (r["read_at"] is not None
-                                                if extra.get("agent_message") or extra.get("need") or
-                                                extra.get("task_result") else q1(
+                                                if any(extra.get(k) for k in CHAT_FLAGS) else q1(
                         "SELECT r.id FROM owner_reports r JOIN ui_requests u ON r.in_reply_to=u.request_id "
                         "WHERE u.event_id=? AND r.agent=?", (r["id"], agent))):
                         continue        # an owner chat comes until its reply; an agent's message, his answer to

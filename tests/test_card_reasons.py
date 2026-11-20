@@ -226,8 +226,14 @@ class Reasons(OwnerAPI):
         self.assertEqual(code, 200, receipt)
         hub.q("INSERT INTO standing(agent,scope,kind,words,author_kind,author,message,created) VALUES('manager','team',"
               "'instruction','The release day stays my choice.','owner','owner',?,?)", (receipt["event_id"], hub.now()))
+        # the manager's recommended words on a card with no options, which the owner pressed: its words, not his
+        pressed = self.card(reason="money", options=None, recommended="The release weekday stays mine to choose")
+        code, receipt = self.request(f"/ui/needs/{pressed}",
+                                     self.command(answer="The release weekday stays mine to choose"))
+        self.assertEqual(code, 200, receipt)
         for words in ("The owner keeps every release day for himself.",     # an agent's words about the owner
                       "the release day stays my choice",                    # the manager's option, which he pressed
+                      "The release weekday stays mine to choose",           # its recommended words, which he pressed
                       "Every release needs the owner's yes first.",         # nobody's
                       "published prices are mine",                          # a part of a word of theirs
                       "Refunds above 50 EUR are mine to approve."):         # a connected app's words
