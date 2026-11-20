@@ -2531,24 +2531,204 @@ def owner_key(text):
     return point
 
 
-def owner_signed(conf, statement, signature):
-    """True when one of the owner's keys signed exactly these statement bytes (UTF-8): signature is the standard
-    base64, padded, of the DER form (CryptoKit's derRepresentation), over SHA-256 of the statement."""
+# A second opinion on the owner's signature (the owner's "OpenSSL as a second check" of 20 November 2026, for "each
+# release and the vault's owner signatures"): a statement that the central vault or a machine broker takes
+# (owner_statement: the central vault's pin, unpin, recovery, grant, ungrant, pool, unpool and replace, and a broker's
+# handover pin) counts only when our ECDSA above and this machine's OpenSSL both take its signature
+# (owner_signed_twice), wherever the machine has an OpenSSL that passes the probe: RFC 6979 A.2.5's signature of
+# "sample", and the same signature with one bit changed. Every supported Linux
+# system has OpenSSL (its ca-certificates depends on it). owner_signed, which the door (door.py) and the hub
+# (hub.phone_signed) call, stays our ECDSA alone: a run of OpenSSL there needs a design of its own, because the door
+# checks each of the owner's yeses again at each fetch, and the hub checks a phone's yes under its one lock.
+# releases.py makes a second check of the same kind for each release; this file stands alone, so it has its own, made
+# for a check that must end within its caller's wait.
+# Our own code decides alone where no OpenSSL place holds a program that passes the probe: no program there, one that
+# cannot be started, or one that runs and does not take the probe's signature or takes its changed copy. So a forged
+# statement that our ECDSA took would still pass where OpenSSL breaks in that way on the fixed probe: twice in one
+# check while a program is kept (after its no, and in the new probe), and once in a check that has none kept (the
+# first check of a process, or the one after a check that found none). That is the price of a vault that keeps
+# working with a broken OpenSSL, as on a machine with none. An OpenSSL that is there and could not be asked (it ran
+# out of time, a signal ended it, its files could not be written, no process could be started for it) refuses that
+# one statement with its own words (owner_statement) and a line in the log, and the kept program stays kept, so the
+# next check asks it again: nobody turns the second check off, or opens a probe, by loading the machine.
+# All the runs of one check share OPENSSL_WAIT seconds, and a run that is not done when they end is ended, so one
+# check stays within the hub's 10-second wait for the central vault's answer (hub.CENTRAL_WAIT).
+OPENSSL_PLACES = ("/usr/bin/openssl", "/opt/homebrew/opt/openssl@3/bin/openssl",
+                  "/usr/local/opt/openssl@3/bin/openssl")
+OPENSSL_WAIT = 5                    # seconds for all the runs of one check (about 15 ms each run): the central vault
+#                                     makes them under its one request lock
+ABSENT = "absent"                   # what a run says when no program can be started at that place
+UNKNOWN = "unknown"                 # what the probe says when a run of it could not be asked
+OPENSSL_SAYS = "Verified OK"        # what `openssl dgst -verify` says of a good signature, beside its status 0
+_P256_HEAD = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")   # the DER head of a P-256 key
+_OWNER_PROBE = ((0x60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6,
+                 0x7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299), b"sample",
+                (0xEFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716,
+                 0xF7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8))
+_openssl = []                       # [the program] once one is found in this process; empty before, or with none
+
+
+def der_of(r, s):
+    """(r, s) as a DER signature in its shortest form: what der_signature reads back."""
+    def number(n):
+        raw = n.to_bytes((n.bit_length() + 7) // 8 or 1, "big")
+        raw = b"\0" + raw if raw[0] & 0x80 else raw
+        return b"\x02" + bytes([len(raw)]) + raw
+    body = number(r) + number(s)
+    return b"\x30" + bytes([len(body)]) + body
+
+
+def openssl_verify_p256(program, point, message, signature, until=None):
+    """What the OpenSSL program at this path says of `signature` (DER) as an ECDSA signature of `message` (over its
+    SHA-256) by the P-256 key `point`: True for its status 0 with its line, False when it ran and did not take it,
+    ABSENT when no program can be started at this path, None when it could not be asked otherwise (its files could not
+    be written, it ran out of time, a signal ended it). The run ends by `until`, a time.monotonic() value, else
+    OPENSSL_WAIT seconds from now. Its files go to the service's own runtime directory where systemd gives one (a
+    tmpfs), else to the temporary folder."""
+    folder = None
+    try:
+        folder = tempfile.mkdtemp(prefix="fleet-p256-",
+                                  dir=(os.environ.get("RUNTIME_DIRECTORY") or "").split(":")[0] or None)
+        x, y = point
+        key = base64.b64encode(_P256_HEAD + b"\x04" + x.to_bytes(32, "big") + y.to_bytes(32, "big"))
+        pem = b"-----BEGIN PUBLIC KEY-----\n" + b"\n".join(key[i:i + 64] for i in range(0, len(key), 64)) + \
+            b"\n-----END PUBLIC KEY-----\n"
+        names = ("key.pem", "message", "signature")
+        for name, data in zip(names, (pem, bytes(message), bytes(signature))):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(data)
+        key_file, text_file, signature_file = (os.path.join(folder, name) for name in names)
+        wait = OPENSSL_WAIT if until is None else until - time.monotonic()
+        if wait <= 0:
+            return None             # the check's time is gone: OpenSSL could not be asked
+        try:
+            done = subprocess.run([program, "dgst", "-sha256", "-verify", key_file, "-signature", signature_file,
+                                   text_file], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, timeout=wait)
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.EACCES, errno.ENOEXEC):
+                return ABSENT       # no program can be started here
+            return None             # it could not be started now (no process, no memory)
+    except (TypeError, ValueError, AttributeError, OverflowError):
+        return False                # a value that no key or signature is
+    except (OSError, subprocess.SubprocessError):
+        return None                 # no folder or file of ours, no time: OpenSSL could not be asked
+    finally:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+    if done.returncode < 0:
+        return None                 # a signal ended it
+    return done.returncode == 0 and done.stdout.decode("utf-8", "replace").strip() == OPENSSL_SAYS
+
+
+def owner_verifier(again=False, until=None):
+    """The first OpenSSL of OPENSSL_PLACES that takes RFC 6979's P-256 signature of "sample" and refuses it with one
+    bit changed; None when no place has such a program (then our own ECDSA decides alone); UNKNOWN when a run of the
+    probe could not be asked (then this check refuses). The kept program changes only at a definite end: a program
+    that it found is kept for the process, with none found it looks again at the next check, and UNKNOWN leaves what
+    was kept as it was. `again` probes anew in any case; `until` is the end of the check's time
+    (openssl_verify_p256)."""
+    held = _openssl[:1]             # one read: another thread can empty the list between a test and an index
+    if held and not again:
+        return held[0]
+    point, message, (r, s) = _OWNER_PROBE
+    good = der_of(r, s)
+    forged = good[:-1] + bytes([good[-1] ^ 1])
+    for program in OPENSSL_PLACES:
+        if not (os.path.isfile(program) and os.access(program, os.X_OK)):
+            continue
+        takes = openssl_verify_p256(program, point, message, good, until)
+        if takes is None:
+            return UNKNOWN
+        if takes is not True:       # no program here after all, or one that does not verify P-256
+            continue
+        refuses = openssl_verify_p256(program, point, message, forged, until)
+        if refuses is None:
+            return UNKNOWN
+        if refuses is False:
+            _openssl[:] = [program]
+            return program
+    _openssl[:] = []                # none: the next check looks again
+    return None
+
+
+def _unasked():
+    """What a check says when OpenSSL could not be asked: None, which refuses this one statement with its own words
+    (owner_statement), with a line in the log. The kept program stays kept: the next check asks it again, and only its
+    definite no on the probe's good signature, or its absence, starts a new probe."""
+    log("owner statement refused once: this machine's OpenSSL could not be asked (the next check asks it again)")
+    return None
+
+
+def openssl_takes(point, message, signature):
+    """True when this machine has no OpenSSL that passes the probe, or when its OpenSSL takes this signature too;
+    False when it refuses it; None when OpenSSL could not be asked (_unasked). After OpenSSL's no, the same program is
+    given the probe's good signature: when it takes it, the program works and its no stands; when it does not, or the
+    program is gone, every place is probed anew, so a program that stopped working refuses nothing by itself, and with
+    none left our own ECDSA decides, as on a machine with none. All its runs share OPENSSL_WAIT seconds."""
+    until = time.monotonic() + OPENSSL_WAIT
+    program = owner_verifier(until=until)
+    if program is None:
+        return True
+    if program == UNKNOWN:
+        return _unasked()
+    said = openssl_verify_p256(program, point, message, signature, until)
+    if said is True:
+        return True
+    if said is None:
+        return _unasked()
+    if said is False:
+        probe_point, probe_message, (r, s) = _OWNER_PROBE
+        still = openssl_verify_p256(program, probe_point, probe_message, der_of(r, s), until)
+        if still is True:
+            return False            # a program that works refused this signature
+        if still is None:
+            return _unasked()
+    program = owner_verifier(again=True, until=until)      # the program no longer works, or is gone
+    if program is None:
+        return True
+    if program == UNKNOWN:
+        return _unasked()
+    said = openssl_verify_p256(program, point, message, signature, until)
+    if said is True or said is False:
+        return said
+    return _unasked()               # it could not be asked, or it went away within this check
+
+
+def owner_signer(conf, statement, signature):
+    """The first of the owner's keys that signed exactly these statement bytes (UTF-8), by our own ECDSA, as its point
+    with the signature's DER bytes; None when none did. signature is the standard base64, padded, of the DER form
+    (CryptoKit's derRepresentation), over SHA-256 of the statement."""
     try:
         raw = base64.b64decode(signature, validate=True)
         digest = hashlib.sha256(statement.encode("utf-8")).digest()
     except ValueError:                  # also a UnicodeError: a text that is not UTF-8 was signed by nobody
-        return False
+        return None
     found = der_signature(raw) if base64.b64encode(raw).decode() == signature else None
     if found is None:
-        return False
+        return None
     for text in conf["owner_keys"]:
         try:
-            if ecdsa_verified(owner_key(text), digest, *found):
-                return True
+            point = owner_key(text)
+            if ecdsa_verified(point, digest, *found):
+                return point, raw
         except ValueError:              # load_config refused such a key; this reads them again for one request
             continue
-    return False
+    return None
+
+
+def owner_signed(conf, statement, signature):
+    """True when one of the owner's keys signed exactly these statement bytes, by our own ECDSA alone (owner_signer):
+    the check of the owner's statements in the door and in the hub."""
+    return owner_signer(conf, statement, signature) is not None
+
+
+def owner_signed_twice(conf, statement, signature):
+    """owner_signed with this machine's OpenSSL as a second check (openssl_takes): True when both take the signature,
+    False when one of them refuses it, None when OpenSSL could not be asked. The first key that our ECDSA takes
+    decides, so one call makes one check of OpenSSL, however often a key is listed."""
+    found = owner_signer(conf, statement, signature)
+    return False if found is None else openssl_takes(found[0], statement.encode("utf-8"), found[1])
 
 
 def canonical(value):
@@ -2580,7 +2760,11 @@ def owner_statement(conf, req, kind):
         raise Refused(f"the statement is not a valid {kind} statement")
     if said["fleet"] != conf["fleet"]:
         raise Refused("the statement is for another fleet")
-    if not owner_signed(conf, statement, signature):
+    signed = owner_signed_twice(conf, statement, signature)
+    if signed is None:
+        raise Refused("the vault could not check the owner's signature this time, so the statement is not taken; it "
+                      "can be sent again")
+    if not signed:
         raise Refused("the statement does not carry a valid signature of the owner")
     return said
 

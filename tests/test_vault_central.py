@@ -257,6 +257,167 @@ class Signatures(unittest.TestCase):
                 vault.owner_key(bad)
 
 
+class SecondOpinion(unittest.TestCase):
+    """OpenSSL's ECDSA beside ours (the owner's "OpenSSL as a second check", 20 November 2026): an owner statement
+    counts only when both take its signature, wherever the machine has an OpenSSL that passes the probe, for the
+    central vault and for a machine broker's handover pin alike (both take it through owner_statement, which calls
+    owner_signed_twice). owner_signed, the door's and the hub's, stays our ECDSA alone."""
+
+    owners = {"owner_keys": [OWNER_A, OWNER_B]}
+
+    def setUp(self):
+        vault._openssl.clear()
+        self.addCleanup(vault._openssl.clear)
+        self.logged = []
+        logging = patch.object(vault, "log", self.logged.append)
+        logging.start()
+        self.addCleanup(logging.stop)
+
+    def openssl(self):
+        """The first OpenSSL or LibreSSL at an OpenSSL place (each one verifies P-256), found without the probe, which
+        must take it: a fault of ours that makes the probe refuse every program (a wrong key head, swapped files, a
+        wrong line) fails these tests, where a skip would hide it."""
+        for program in vault.OPENSSL_PLACES:
+            try:
+                said = subprocess.run([program, "version"], capture_output=True, text=True, timeout=30).stdout
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if said.startswith(("OpenSSL ", "LibreSSL ")):
+                self.assertEqual(vault.owner_verifier(), program)
+                return program
+        self.skipTest("this machine has no OpenSSL or LibreSSL")
+
+    def test_a_forged_statement_is_refused_even_where_our_own_check_would_take_it(self):
+        """The point of the second check: a fault of our ECDSA that takes a bad signature lets no machine key or
+        recovery key that the owner did not sign into the central vault, on a machine that has OpenSSL."""
+        self.openssl()
+        with patch.object(vault, "ecdsa_verified", lambda *_: True):
+            self.assertIs(vault.owner_signed_twice(self.owners, PIN_2, SIG_PIN_1), False)     # another statement's
+            self.assertIs(vault.owner_signed_twice({"owner_keys": [OWNER_B]}, PIN_1, SIG_PIN_1), False)
+            self.assertIs(vault.owner_signed_twice(self.owners, PIN_1, SIG_PIN_1), True)
+
+    def test_openssl_reads_the_key_statement_and_signature_as_ours_does(self):
+        """The key goes to OpenSSL as a P-256 public key and the signature as DER: RFC 6979's signatures, which
+        nothing of ours made, and the owner's, verify there; a changed message or another key does not."""
+        program = self.openssl()
+        for message, r, s in RFC_SIGNED:
+            self.assertIs(vault.openssl_verify_p256(program, RFC_KEY, message, vault.der_of(r, s)), True)
+            self.assertIs(vault.openssl_verify_p256(program, RFC_KEY, message + b".", vault.der_of(r, s)), False)
+        self.assertEqual(vault.der_of(*halves(SIG_PIN_1)), base64.b64decode(SIG_PIN_1))
+        self.assertIs(vault.owner_signed_twice(self.owners, PIN_1, SIG_PIN_1), True)
+
+    def test_a_probe_that_failed_once_is_tried_again_at_the_next_check(self):
+        """A short fault of the first probe (a time-out under load, a full /tmp) does not turn the second check off
+        for the life of the central vault."""
+        program = self.openssl()
+        vault._openssl.clear()
+        real, calls = vault.openssl_verify_p256, []
+
+        def faulty_once(*args):
+            calls.append(args)
+            return False if len(calls) == 1 else real(*args)
+        with patch.object(vault, "openssl_verify_p256", faulty_once), \
+                patch.object(vault, "OPENSSL_PLACES", (program,)):
+            self.assertIsNone(vault.owner_verifier())
+            self.assertEqual(vault.owner_verifier(), program)
+
+    def test_a_program_that_takes_everything_is_no_second_opinion(self):
+        """The probe's changed signature keeps out a program that says yes to everything, which would turn the second
+        check off with no sign."""
+        self.openssl()
+        with patch.object(vault, "openssl_verify_p256", lambda *_: True):
+            self.assertIsNone(vault.owner_verifier(again=True))
+
+    def test_an_openssl_that_cannot_be_asked_refuses_this_statement_and_the_next_check_asks_it_again(self):
+        """Loading the machine until a run runs out of time does not turn the second check off: an OpenSSL that is there
+        and could not be asked refuses this one statement with None, the cause that owner_statement names, and a line
+        in the log, with one run also where the owner's key is listed twice (one call stays within the hub's wait for
+        the vault, under its one request lock). The program stays kept, so the next check asks it again and opens no
+        probe that one failure could end: a forged statement that our ECDSA takes is still refused when OpenSSL then
+        fails once on the probe's good signature. owner_signed, which the door and the hub call under their locks, runs
+        no OpenSSL."""
+        program = self.openssl()
+        calls = []
+        twice = {"owner_keys": [OWNER_A, OWNER_A, OWNER_B]}
+        with patch.object(vault, "openssl_verify_p256", lambda *a: calls.append(a)):     # None: could not be asked
+            self.assertTrue(vault.owner_signed(twice, PIN_1, SIG_PIN_1))
+            self.assertIsNone(vault.owner_signed_twice(twice, PIN_1, SIG_PIN_1))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(self.logged), 1)
+        self.assertIn("OpenSSL could not be asked", self.logged[0])
+        self.assertEqual(vault._openssl, [program])
+        real, probes = vault.openssl_verify_p256, []
+
+        def fails_once_on_the_probe(program, point, message, signature, until=None):
+            if message == b"sample":
+                probes.append(signature)
+                if len(probes) == 1:
+                    return False        # one failure with a normal exit, as after a fault inside OpenSSL
+            return real(program, point, message, signature, until)
+        with patch.object(vault, "openssl_verify_p256", fails_once_on_the_probe), \
+                patch.object(vault, "OPENSSL_PLACES", (program,)), \
+                patch.object(vault, "ecdsa_verified", lambda *_: True):
+            self.assertIs(vault.owner_signed_twice(self.owners, PIN_2, SIG_PIN_1), False)     # another statement's
+        self.assertIs(vault.owner_signed_twice(self.owners, PIN_1, SIG_PIN_1), True)
+        self.assertEqual(vault.owner_verifier(), program)
+
+    def test_a_probe_that_could_not_ask_refuses_and_a_place_with_no_program_leaves_it_to_ours(self):
+        """A probe whose run could not be asked is no "none" (which would leave our own ECDSA alone), and it keeps the
+        program that was kept; a place where no program can be started is a none."""
+        program = self.openssl()
+        with patch.object(vault, "openssl_verify_p256", lambda *_: None):
+            self.assertEqual(vault.owner_verifier(again=True), vault.UNKNOWN)
+        self.assertEqual(vault._openssl, [program])
+        vault._openssl.clear()
+        with patch.object(vault, "openssl_verify_p256", lambda *_: None):
+            self.assertEqual(vault.owner_verifier(), vault.UNKNOWN)
+            self.assertIsNone(vault.owner_signed_twice(self.owners, PIN_1, SIG_PIN_1))
+        folder = tempfile.mkdtemp(prefix="fleet-p256-test-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        missing, empty = os.path.join(folder, "openssl"), os.path.join(folder, "empty")
+        with open(empty, "w") as f:
+            f.write("")
+        os.chmod(empty, 0o755)
+        signature = vault.der_of(*RFC_SIGNED[0][1:])
+        self.assertEqual(vault.openssl_verify_p256(missing, RFC_KEY, b"sample", signature), vault.ABSENT)
+        self.assertEqual(vault.openssl_verify_p256(empty, RFC_KEY, b"sample", signature), vault.ABSENT)
+        with patch.object(vault, "OPENSSL_PLACES", (missing, empty)):
+            self.assertIsNone(vault.owner_verifier(again=True))
+            self.assertIs(vault.owner_signed_twice(self.owners, PIN_1, SIG_PIN_1), True)
+        self.assertEqual(vault.owner_verifier(again=True), program)
+
+    def test_the_runs_of_one_check_share_its_time(self):
+        """One check stays within the hub's wait for the central vault (it holds the vault's one request lock),
+        however many OpenSSL places it probes: its runs share OPENSSL_WAIT, the run that is not done when it ends is
+        ended, and the check refuses. Each place here holds a program that takes 0.2 seconds to take nothing: three
+        runs cannot end in 0.5 seconds together, and with a full wait for each run they would, and our own ECDSA would
+        decide alone."""
+        folder = tempfile.mkdtemp(prefix="fleet-p256-test-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        places = tuple(os.path.join(folder, name) for name in ("first", "second", "third"))
+        for place in places:
+            with open(place, "w") as f:
+                f.write("#!/bin/sh\nexec sleep 0.2\n")
+            os.chmod(place, 0o755)
+        with patch.object(vault, "OPENSSL_PLACES", places), patch.object(vault, "OPENSSL_WAIT", 0.5):
+            self.assertIsNone(vault.openssl_takes(RFC_KEY, b"sample", vault.der_of(*RFC_SIGNED[0][1:])))
+
+    def test_a_program_that_stops_working_after_its_probe_refuses_nothing_by_itself(self):
+        """An OpenSSL that passed its probe and later cannot run does not refuse every statement until a restart: a
+        new probe finds none, and our own ECDSA decides, as on a machine with none. A program that the new probe finds,
+        and that is gone by the check's last run, refuses as one that could not be asked (None, with its own words),
+        not as a bad signature."""
+        program = self.openssl()
+        with patch.object(vault, "openssl_verify_p256", lambda *_: False):
+            self.assertIs(vault.owner_signed_twice(self.owners, PIN_1, SIG_PIN_1), True)
+            self.assertIs(vault.owner_signed_twice(self.owners, PIN_2, SIG_PIN_1), False)
+        self.assertEqual(vault.owner_verifier(), program)          # the new probe found none: one is kept again
+        said = iter([False, False, True, False, vault.ABSENT])     # the statement, the probe's good signature, the
+        with patch.object(vault, "openssl_verify_p256", lambda *_: next(said)), \
+                patch.object(vault, "OPENSSL_PLACES", (program,)):  # new probe's two, and the last run
+            self.assertIsNone(vault.owner_signed_twice(self.owners, PIN_1, SIG_PIN_1))
+
+
 class Configuration(unittest.TestCase):
     """The central vault's configuration, and a machine's broker's, which loads as it did."""
 
@@ -674,6 +835,13 @@ class CentralVault(unittest.TestCase):
             self.assertIn(said, text, (op, statement, signature))
             for content in (R1, R2, FLEET, OTHER_FLEET, SIG_PIN_1, "vps", str(T1)):  # no error repeats the statement
                 self.assertNotIn(content, text)
+        # The owner's own signature, while this machine's OpenSSL cannot be asked: refused with that cause, which is
+        # not the owner's signature.
+        with patch.object(vault, "OPENSSL_PLACES", (sys.executable,)), \
+                patch.object(vault, "openssl_verify_p256", lambda *_: None):
+            text = self.refused("pin", statement=PIN_1, signature=SIG_PIN_1)
+        self.assertIn("the vault could not check the owner's signature this time", text)
+        self.assertNotIn("valid signature of the owner", text)
         self.assertFalse(os.path.exists(self.conf["state"]))             # nothing was kept
         self.assertEqual(self.signed("pin", PIN_1, der(r, vault.P256_N - s))["saved"], "new")    # no low-s rule
 
