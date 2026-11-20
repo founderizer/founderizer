@@ -1030,6 +1030,13 @@ def kv_set(k, v):
               (k, str(v)))
 
 
+def kv_range(prefix):
+    """The two bounds of the kv keys that begin with `prefix`, for `k >= ? AND k < ?`: a range of the primary key.
+    LIKE and substr() read every key of the table, which grows with the fleet's history: 6,400 keys on the first fleet
+    after 26 days, 0.37 ms for each such read, six at each pass of the timer (the review of 20 November 2026)."""
+    return prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+
 def now():
     return time.time()
 
@@ -1881,13 +1888,16 @@ def revoked_windows(name):
     revoked row would close them in every round, and the first round with a key closes them (close_keyless)."""
     if agent_key(name) is None:
         return []
-    # One read for both: with MAX(), SQLite takes `revoked` from the newest row of each kind (as chat_session_ready,
-    # this generation's rows only; a session of another one starts again for its generation).
-    newest = {r["kind"]: r["revoked"] for r in q(
-        "SELECT kind, revoked, MAX(created) FROM session_credentials WHERE agent=? AND generation=? AND "
-        "kind IN ('standing', 'chat') GROUP BY kind", (name, kv_get("db_id")))}
-    return [window for kind, window in (("standing", "manager"), ("chat", "owner-chat"))
-            if newest.get(kind) is not None]
+    # One read for both: `revoked` of the newest row of each kind (as chat_session_ready, this generation's rows
+    # only; a session of another one starts again for its generation). The newest is the one written last: each part
+    # reads one row of session_credential_generation, by rowid. With MAX() and GROUP BY it read every credential of
+    # the agent of both kinds at each answer of the poll, and by `created` a clock that went back made an older row
+    # the newest.
+    newest = q1("SELECT (SELECT revoked FROM session_credentials WHERE agent=? AND kind='standing' AND generation=? "
+                "ORDER BY rowid DESC LIMIT 1) AS standing, (SELECT revoked FROM session_credentials WHERE "
+                "agent=? AND kind='chat' AND generation=? ORDER BY rowid DESC LIMIT 1) AS chat",
+                (name, kv_get("db_id"), name, kv_get("db_id")))
+    return [window for kind, window in (("standing", "manager"), ("chat", "owner-chat")) if newest[kind] is not None]
 
 
 UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "limit_holds",
@@ -4270,7 +4280,9 @@ def rows_window(name, before):
                       + q("SELECT * FROM needs WHERE id >= 0 AND id < ? AND answer IS NULL", (before,)),
                       key=lambda r: r["id"])
     if name == "reports":
-        return q("SELECT * FROM owner_reports WHERE id >= ? OR id < 0 ORDER BY id", (before,))
+        # two ranges of the key, which SQLite merges in order; with OR and ORDER BY id it read every report
+        return q("SELECT * FROM owner_reports WHERE id < 0 UNION ALL SELECT * FROM owner_reports WHERE id >= ? "
+                 "ORDER BY id", (before,))
     return q(f"{ROWS_MESSAGES} WHERE u.rowid >= ? OR u.rowid < 0 ORDER BY u.created,u.request_id", (before,))
 
 
@@ -6722,6 +6734,60 @@ def migrate():
         # an agent's owner messages, newest last: the timer's chat_late (every 5 seconds under LOCK, for each worker
         # and lead) and turn_ended_after read them; with no index each read went through every message of the fleet
         "CREATE INDEX IF NOT EXISTS ui_request_recipient ON ui_requests(recipient, created)",
+        # The reads that the hub's lock holds and that went through tables which grow with the fleet's history (the
+        # review of 20 November 2026). The helper's delivery poll reads an agent's newest owner chat credential at
+        # each round, twice a second for each worker and lead (chat_session_ready), its newest chat and standing
+        # credentials at each answer (revoked_windows), and the credential of an open task's attempt
+        # (running_turns, attempt_began). Each read went through every session credential of the fleet, a row for
+        # each session that ever started: 3,500 on the first fleet after 26 days, 0.17 ms a round.
+        "CREATE INDEX IF NOT EXISTS session_credential_newest ON session_credentials(agent, kind, created)",
+        # (and the credential that came last for one kind and one generation, by insertion order, which the clock
+        # cannot change: revoked_windows at each answer of the poll)
+        "CREATE INDEX IF NOT EXISTS session_credential_generation ON session_credentials(agent, kind, generation)",
+        "CREATE INDEX IF NOT EXISTS session_credential_attempt ON session_credentials(agent, kind, task, attempt, "
+        "created)",
+        # the check runs that a helper holds, at each poll (lost_checks), and the check event of one run, at its send
+        # and at its result (dispatch_check, check_result): each read went through every event of the agent, or of
+        # the fleet. The send and the result of a run delete its check event, so the index holds the events of the
+        # runs that are out, and the few of runs that ended another way (end_open_runs, a lost run that then ended).
+        "CREATE INDEX IF NOT EXISTS event_check ON events(agent) WHERE kind='trigger_check'",
+        # the jobs that a helper holds, at each poll (lost_jobs: from the open jobs of the agent to the event of
+        # each), and the manager's unread messages at each pass (manager_flag_update), with the unread messages of one
+        # task (unread_tail at each fleet call of a task session, message_waits): each read went through every event
+        # of the agent
+        "CREATE INDEX IF NOT EXISTS job_open ON jobs(agent) WHERE finished IS NULL AND unknown IS NULL",
+        f"CREATE INDEX IF NOT EXISTS event_job ON events(agent, kind, {JOB_OF_EVENT.format('')}) WHERE kind IN "
+        f"{JOB_EVENTS}",
+        "CREATE INDEX IF NOT EXISTS event_unread_say ON events(agent) WHERE kind='say' AND read_at IS NULL",
+        "CREATE INDEX IF NOT EXISTS event_unread_task ON events(agent, task) WHERE kind='say' AND read_at IS NULL",
+        # the checks of a machine that wait for their report (settle_checks at each pass, the marks of kv that it
+        # clears, and each agent's open check): every check that was ever asked for stays in machine_checks
+        "CREATE INDEX IF NOT EXISTS machine_check_requested ON machine_checks(id) WHERE state='requested'",
+        # an agent's open tasks in the order of their ids: the poll's answer (open_tasks, browser_waits,
+        # running_turns) and about ten other reads. task_owner_state holds every task of the agent, of every state.
+        f"CREATE INDEX IF NOT EXISTS task_owner_open ON tasks(owner, id) WHERE {OPEN_TASK}",
+        "CREATE INDEX IF NOT EXISTS conversation_agent ON conversations(agent, state)",
+        # The timer's pass, every 5 seconds: the ended tasks whose session did not get its stop
+        # (stop_finished_sessions), which read every task, 3.3 ms on the first fleet after 26 days ...
+        f"CREATE INDEX IF NOT EXISTS task_stop_unsent ON tasks(id) WHERE {STOP_UNSENT}",
+        # ... for each open task, its holds, its questions and the usage limits of its agent (liveness, and the
+        # delivery poll's limit at each round) ...
+        "CREATE INDEX IF NOT EXISTS hold_task ON holds(task)",
+        "CREATE INDEX IF NOT EXISTS question_task ON questions(task)",
+        # (and the questions that wait for an answer, which the manager's read_messages joins to their open tasks)
+        "CREATE INDEX IF NOT EXISTS question_open ON questions(id) WHERE answer IS NULL",
+        "CREATE INDEX IF NOT EXISTS agent_limit_agent ON agent_limits(agent)",
+        # ... the check runs that wait and those that a helper holds (trigger_sweep, and checks_in_flight at each
+        # send), the messages whose sender waits (wait_sweep) and the reminders that are not done (reminder_sweep):
+        # each of these holds only the rows that the pass still reads, in the order of their ids, as a scan gave them
+        "CREATE INDEX IF NOT EXISTS trigger_run_waiting ON trigger_runs(id) WHERE state='waiting'",
+        "CREATE INDEX IF NOT EXISTS trigger_run_sent ON trigger_runs(id) WHERE state='sent'",
+        "CREATE INDEX IF NOT EXISTS agent_message_waits ON agent_messages(id) WHERE waits=1 AND wait_end IS NULL",
+        "CREATE INDEX IF NOT EXISTS reminder_open ON reminders(id) WHERE done=0",
+        # ... and the requests for a secret, the few items of one kind among all of the owner's Needs-you items: the
+        # secret request that each open task waits on (secret_wait, from liveness) and the ones that can wake their
+        # tasks (secret_wakes), 0.04 ms for each open task at each pass on the first fleet
+        "CREATE INDEX IF NOT EXISTS need_secret ON needs(id) WHERE kind='secret'",
         # The tasks of one wake-up rule, which GET /ui/triggers reads several times for each rule (trigger_view).
         "CREATE INDEX IF NOT EXISTS task_trigger ON tasks(trigger_id) WHERE trigger_id IS NOT NULL",
         # The notes of one task: the board's newest note of each open task, task_in_full and the phone's task page.
@@ -8038,8 +8104,7 @@ def browser_waits(agent, closed=None, alive=None):
             f"SELECT 1 FROM tasks WHERE owner=? AND needs='browser' AND {OPEN_TASK}", (agent,))):
         return {}
     held = active_limit(agent) is not None
-    rows = q(f"SELECT id, state, waiting_on, needs FROM tasks WHERE owner=? AND state NOT IN "
-             f"({','.join('?' * len(TERMINAL))}) ORDER BY id", (agent, *TERMINAL))
+    rows = q(f"SELECT id, state, waiting_on, needs FROM tasks WHERE owner=? AND {OPEN_TASK} ORDER BY id", (agent,))
     # a take-over's wait keeps its Chrome and its place, also under a usage limit: he works on that screen (S6)
     taking = {r["takeover_task"] for r in q("SELECT takeover_task FROM needs WHERE kind='takeover' AND answer IS NULL "
                                             "AND by=?", (agent,))}
@@ -14483,15 +14548,26 @@ def job_told(job_id):
         event_rows([(job["agent"], "say", filed, f"[hub] {said}", None)], now())
 
 
+JOB_EVENTS = "(" + ",".join(f"'{k}'" for k in JOB_EVENT_KINDS) + ")"     # their words in SQL, as event_job has them
+JOB_OF_EVENT = "json_extract(CASE WHEN json_valid({0}extra) THEN {0}extra END, '$.job')"    # event_job's job id
+
+
 def lost_jobs(agent, held):
     """The helper's poll lists the jobs that it holds: running, or with a report that the hub has not taken (helper
     feature job_runs). A job whose event it acked, that this list leaves out and that has no report, is lost: a helper
     that started again does not run it again, and its outcome is not known (plan C7). Called with LOCK held."""
     t0, ended = now(), []
-    for job in read_rows("SELECT j.* FROM jobs j JOIN events e ON e.agent=j.agent AND e.kind=j.kind AND "
-                         "json_extract(e.extra, '$.job')=j.id WHERE j.agent=? AND j.finished IS NULL AND "
-                         "j.unknown IS NULL AND e.helper_ack IS NOT NULL AND e.helper_ack < ? AND j.kind IN "
-                         "('signin','handover','create','capture','request')", (agent, t0)):
+    # (From the agent's open jobs, through job_open, to the event of each job through event_job, whose words are
+    # e.kind IN JOB_EVENTS and the job id of JOB_OF_EVENT. The JSON is read only where it is valid, so the index never
+    # refuses a write, and +j.id keeps the id's column affinity off the indexed value: a job's event holds its id as a
+    # JSON number. A join that began with the events read every event of the agent at each poll; from the jobs, by
+    # the kind alone, it read every event of that kind once for each open job. CROSS JOIN keeps the order from the
+    # open jobs also where event_job has older words: a database keeps an index's first words (IF NOT EXISTS), so
+    # after a new job kind this read could otherwise begin with every event of the agent again.)
+    for job in read_rows(f"SELECT j.* FROM jobs j CROSS JOIN events e ON e.agent=j.agent AND e.kind=j.kind AND "
+                         f"{JOB_OF_EVENT.format('e.')}=+j.id WHERE j.agent=? AND j.finished IS NULL AND "
+                         f"j.unknown IS NULL AND e.helper_ack IS NOT NULL AND e.helper_ack < ? AND j.kind IN "
+                         f"{JOB_EVENTS} AND e.kind IN {JOB_EVENTS}", (agent, t0)):
         if job["id"] in held:
             continue
         why = f"{agent}'s helper lost it before it reported."
@@ -17056,7 +17132,8 @@ def t_request_secret(agent, a):
     # Each agent's own requests only: another agent's is neither counted nor named, because its answer goes to that
     # agent, so no agent waits on it; the chat's own requests and the tasks' are each their own place. The manager's
     # brief names the asker of each open item.
-    waiting = q("SELECT * FROM needs WHERE kind='secret' AND answer IS NULL AND by=? ORDER BY id", (agent,))
+    # (+kind: through need_open, the open items, and not need_secret, every secret request that was ever raised)
+    waiting = q("SELECT * FROM needs WHERE +kind='secret' AND answer IS NULL AND by=? ORDER BY id", (agent,))
     for r in waiting:
         old = need_secret(r)
         if bool(old.get("tasks")) != bool(tid) or not secret_same(old, kind, env, site, account, failed):
@@ -47385,8 +47462,10 @@ def trigger_sweep(t0):
 
     each(q("SELECT * FROM triggers WHERE state='active' AND next_due<=? ORDER BY next_due, id", (t0,)), due)
     # plan C12: a run that waits for a task goes on when that task ends
-    q(f"UPDATE trigger_runs SET retry_at=?, blocked_task=NULL WHERE state='waiting' AND blocked_task IN "
-      f"(SELECT id FROM tasks WHERE state IN ({','.join(repr(s) for s in TERMINAL)}))", (t0,))
+    # (the task of each waiting run, by its id: IN read the id of every ended task, at each pass with a waiting run)
+    q(f"UPDATE trigger_runs SET retry_at=?, blocked_task=NULL WHERE state='waiting' AND blocked_task IS NOT NULL AND "
+      f"EXISTS (SELECT 1 FROM tasks t WHERE t.id=trigger_runs.blocked_task AND t.state IN "
+      f"({','.join(repr(s) for s in TERMINAL)}))", (t0,))
     def send(r):
         t = trigger_row(r["trigger_id"])
         if t is not None and os_user_held(t["agent"]):
@@ -49352,7 +49431,10 @@ def liveness(t0):
             known[agent] = needs_sign_in(agent)
         return known[agent]
 
-    for t in q("SELECT * FROM tasks WHERE state IN ('submitted','working','input-required','auth-required')"):
+    # OLDER_OPEN: through the index task_open, which holds the tasks that have not ended. Without it this read went
+    # through every task at each pass, 3.9 ms on the first fleet after 26 days (the review of 20 November 2026).
+    for t in q(f"SELECT * FROM tasks WHERE state IN ('submitted','working','input-required','auth-required') AND "
+               f"{OLDER_OPEN}"):
         tid, owner = t["id"], t["owner"]
         if os_user_held(owner):
             # One OS user for each agent: deliberate quiet, with its own words, which the app draws as the orange line
@@ -50012,9 +50094,12 @@ def tick_changes(t0):
     TICK_SEEN["last"] = (offline, stale)
 
 
+STOP_UNSENT = f"state IN {ENDED_STATES} AND stop_sent=0"     # the words of the index task_stop_unsent
+
+
 def stop_finished_sessions(t0):
     """The stop for each session of a finished task (a step of tick)."""
-    for t in q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected','canceled') AND stop_sent=0"):
+    for t in q(f"SELECT * FROM tasks WHERE {STOP_UNSENT}"):
         # plan C5: a helper that closes the window at the end of its turn (turn_close) gets the stop at once;
         # an older one still after stop_after, because it closes at the stop
         if t0 - (t["delivered"] or t0) > CFG["stop_after"] or "turn_close" in helper_features(t["owner"]):
@@ -57729,8 +57814,7 @@ def agent_first_message_sweep(t0):
     The ask is one chat event, so it goes to the agent's own chat window, which its helper starts for it as for an
     owner's message, and it stays until that session reads it (t_read_messages). It says only what the first message
     is: what the agent does with the owner's answer is in RULES.md, which a chat session that starts again reads."""
-    for row in q("SELECT k FROM kv WHERE substr(k, 1, ?)=? AND v='wait'",
-                 (len(AGENT_FIRST_MESSAGE), AGENT_FIRST_MESSAGE)):
+    for row in q("SELECT k FROM kv WHERE k >= ? AND k < ? AND v='wait'", kv_range(AGENT_FIRST_MESSAGE)):
         agent = row["k"][len(AGENT_FIRST_MESSAGE):]
         a = agents().get(agent) or {}
         # An agent whose Shell box is off opens no work from its chat and writes no duty (SHELL_OFF_CHAT), so the
@@ -59839,7 +59923,8 @@ def mcp_renew_sweep(t0):
     the hub, and a new Connect clears it; the mark of a server that is gone goes too. At most every MCP_RENEW_EVERY
     seconds, and nothing at all in a fleet without a server with Connect."""
     servers = {n: e for n, e in (TEAM.get("mcp") or {}).items() if isinstance(e, dict) and e.get("auth") == "oauth"}
-    marks = {r["k"][len("mcp_renew:"):]: r["k"] for r in q("SELECT k FROM kv WHERE k LIKE 'mcp_renew:%'")}
+    marks = {r["k"][len("mcp_renew:"):]: r["k"] for r in q("SELECT k FROM kv WHERE k >= ? AND k < ?",
+                                                           kv_range("mcp_renew:"))}
     if not servers and not marks:
         return
     if t0 - float(kv_get("mcp_renew_at", 0) or 0) < MCP_RENEW_EVERY:
@@ -60182,8 +60267,8 @@ def settle_checks(t0):
     otherwise failed (the helper is there but sent no report, for example an older helper)."""
     # D20: the mark of a check that no longer waits (answered, replaced, or gone with its agent's removal) goes
     for mark in CHECK_MARKS:
-        q("DELETE FROM kv WHERE k LIKE ? AND k NOT IN (SELECT ? || id FROM machine_checks WHERE state='requested')",
-          (mark + "%", mark))
+        q("DELETE FROM kv WHERE k >= ? AND k < ? AND k NOT IN (SELECT ? || id FROM machine_checks WHERE "
+          "state='requested')", (*kv_range(mark), mark))
     for c in q("SELECT * FROM machine_checks WHERE state='requested' AND requested < ?", (t0 - CHECK_WAIT,)):
         if check_waits(c["id"]):
             continue        # D12: its account item runs; D21: its helper has not loaded its settings yet
@@ -73858,9 +73943,9 @@ class Handler(BaseHTTPRequestHandler):
                 "waits": browser_waits(agent, *browser_poll_sets(query)) if worker else None,
                 # 4 November 2026: each task works in its own clones, which the helper deletes once the task is no
                 # longer open (fleet.Helper.sweep_places)
-                "open_tasks": [tref(r["id"]) for r in q(f"SELECT id FROM tasks WHERE owner=? AND state NOT IN "
-                                                        f"({','.join('?' * len(TERMINAL))}) ORDER BY id",
-                                                        (agent, *TERMINAL))] if worker else None,
+                # (OPEN_TASK in the words of the statement: SQLite reads task_owner_open only for those words)
+                "open_tasks": [tref(r["id"]) for r in q(f"SELECT id FROM tasks WHERE owner=? AND {OPEN_TASK} "
+                                                        f"ORDER BY id", (agent,))] if worker else None,
                 # AUTONOMY.md P2: how each open conversation runs now, with contacts.v2; a window that started another
                 # way closes, because its tools were fixed at its start
                 "conversation_modes": conversation_modes(agent) if worker and contacts_v2() else None,
@@ -73890,7 +73975,11 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 time.sleep(0.5)
             last = rows[-1]["id"] if rows else after
-            done = {r["id"] for r in q("SELECT id FROM tasks WHERE state IN ('completed','failed','rejected','canceled')")}
+            # the tasks of these events that ended, read by their ids, and not the id of every ended task
+            task_ids = sorted({r["task"] for r in rows if r["kind"] == "task" and r["task"]})
+            done = {r["id"] for chunk in (task_ids[i:i + 500] for i in range(0, len(task_ids), 500)) for r in q(
+                f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(chunk))}) AND state IN {ENDED_STATES}",
+                tuple(chunk))}
             # never start a session for a task that ended while the helper was away,
             # and never redo a sign-in or handover whose asker has stopped waiting
             asked = {r["id"] for r in q("SELECT id FROM jobs WHERE finished IS NULL")}

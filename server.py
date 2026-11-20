@@ -437,11 +437,14 @@ def cmd_desktop(args):
 
 
 def cmd_chrome_script(args):
-    """One harmless script through this Mac's vault, so that macOS asks its one question while a person is here."""
+    """This Mac's vault's own check of Chrome, for the installer's page Allow JavaScript from Apple Events (owner API
+    1.271): the vault's one line of JSON. Without --quiet, macOS asks its one question for the vault now, while a person
+    is here, and a Chrome that does not run starts. With --quiet the check shows nothing, starts nothing and waits for no
+    window (lifecycle.vault_chrome's request), so the page's later checks keep the vault's one queue of jobs free."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(280)
+        s.settimeout(30 if args.quiet else 280)
         s.connect(os.path.join(HOME, "Library", "Application Support", "AgentFleet", "vault.sock"))
-        s.sendall(b'{"v": 2, "op": "chrome"}\n')
+        s.sendall(b'{"v": 2, "op": "chrome", "quiet": true}\n' if args.quiet else b'{"v": 2, "op": "chrome"}\n')
         print(s.makefile().readline().strip())
 
 
@@ -1778,7 +1781,7 @@ def main():
     sub.add_parser("desktop")
     sub.add_parser("needs")
     sub.add_parser("add-claude")
-    sub.add_parser("chrome-script")
+    sub.add_parser("chrome-script").add_argument("--quiet", action="store_true")
     sub.add_parser("computer-use")
     args = parser.parse_args()
     {"join": cmd_join, "service": cmd_service, "run": cmd_run, "finish": cmd_finish, "desktop": cmd_desktop,
