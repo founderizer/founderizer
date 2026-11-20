@@ -3265,7 +3265,8 @@ def need_recommended(given, options, give=False):
     glyph and the word Recommended): one of the item's options, word for word, or, on an item with no options, the
     few words that the agent would answer, which the card draws as one row that sends them. None when it gives none;
     a ToolError for any other value. An option matches in any case, and is kept in its own words; on a card with
-    Give (give), whose first option the hub writes, a value that starts with Give is that option."""
+    Give (give), whose first option the hub writes, the word Give alone is that option too. A team card's comes from
+    t_change_team: its first yes."""
     if given is None or given == "":
         return None
     if not isinstance(given, str) or not given.strip():
@@ -38254,6 +38255,14 @@ class TeamPassing(ToolError):
         self.owner = owner
 
 
+def team_unread():
+    """The TeamPassing of a plan while git gives no answer now for what it reads of the configuration: the revision,
+    team.json, a profile (KitUnread). A plain ToolError there would close the owner's card at the sweep, and drop a
+    pressed plan, with a reason that is not true (the area Setup, servers and owner tools, 20 November 2026)."""
+    return TeamPassing("The hub cannot read its configuration now. Try again in a minute.",
+                       "the hub cannot read its configuration now")
+
+
 def team_card(need):
     """The kept plan of a team card ({changes, digest, names}), or None for every other item."""
     raw = need["team_plan"] if need is not None and "team_plan" in need.keys() else None
@@ -38376,8 +38385,7 @@ def team_plan_effect(changes, name=None):
     that it changes), never of the time, of the names' own state or of the rest of the fleet: a check at the press
     finds the same digest exactly when nothing that the card showed changed."""
     rev = kit_revision(fresh=True)
-    passing = TeamPassing("The hub cannot read its configuration now. Try again in a minute.",
-                          "the hub cannot read its configuration now")
+    passing = team_unread()
     if not rev:
         raise passing
     try:
@@ -38536,8 +38544,7 @@ def team_remove(ctx, c):
     try:
         ctx["files"].update(removed_files(rev, n))
     except Refusal:     # its profile or its skills, which git does not give now (removed_files): the card stays
-        raise TeamPassing("The hub cannot read its configuration now. Try again in a minute.",
-                          "the hub cannot read its configuration now") from None
+        raise team_unread() from None
     ctx["job"] = {"kind": "remove", "server": server, "agent": n} if serviced else None
     ctx["after"].update(removed={"agent": n, "entry": a, "server": server, "serviced": serviced}, profiles=True,
                         left=accounts)
@@ -38674,7 +38681,10 @@ def team_profile(ctx, c):
     n = c.get("agent")
     if not isinstance(n, str) or n not in team["agents"]:
         raise ToolError(f"There is no agent {n} whose profile a plan can change.")
-    view = profile_view(n, rev)
+    try:
+        view = profile_view(n, rev, strict=True)    # a read that failed is no profile with another SHA-256
+    except KitUnread:
+        raise team_unread() from None
     if view["sha256"] is None or c.get("base_sha256") != view["sha256"]:
         raise ToolError(f"The profile of {team_said_role(team, n)} is not the version that you read: read "
                         f"profiles/{n}.md again, and give its SHA-256 as base_sha256.")
@@ -38809,7 +38819,10 @@ def team_owner_file(ctx, c):
             raise TeamPassing(KNOWLEDGE_PASSING, KNOWLEDGE_PASSING_OWNER) from None
         raise ToolError(str(e)) from None
     ctx["files"][path] = content
-    readers = sorted(knowledge_readers(path, rev))
+    try:        # a profile that git does not give now would drop its agent from the readers, and so change the digest
+        readers = sorted(knowledge_readers(path, rev, strict=True))
+    except KitUnread:
+        raise team_unread() from None
     ctx["access"].append(f"The owner file {path} steers every agent that reads it: "
                          f"{', '.join(team_said_role(team, r) for r in readers) or 'none'}.")
     import difflib
@@ -38873,16 +38886,20 @@ def t_change_team(agent, a):
         old = read_row("SELECT * FROM needs WHERE team_plan IS NOT NULL AND answer IS NULL ORDER BY id DESC LIMIT 1")
         nid, t0 = unused_id("needs"), now()
         picks = json.loads(options)[:-1]
+        # owner API 1.269: the plan is the manager's own, so the card marks its first yes, the yes of the first of a
+        # new agent's names, as the answer that the manager recommends (the owner, 20 November 2026: one recommended
+        # answer on every card)
         text = (f"Raised N-{nid}. The owner's card shows your title and why, and the hub's options ("
-                + "; ".join(picks) + "; No) and Details. Only a press of a yes option, in Founderizer on the Mac or a "
+                + "; ".join(picks) + "; No), the first marked as the answer that you recommend, and Details. Only a "
+                "press of a yes option, in Founderizer on the Mac or a "
                 "PC, makes the change: the hub checks it again then, makes it, and tells you what it did. No, or an "
                 "answer in words, changes nothing, and its words come to you." +
                 (f" It replaces N-{old['id']}." if old else "") +
                 " A new plan replaces this card; withdraw_need closes it.")
         with transaction():
-            DB.execute("INSERT INTO needs(id,title,why,todo,raised,by,options,details,team_plan,ask) "
-                       "VALUES(?,?,?,?,?,?,?,?,?,?)", (nid, title, why, "", t0, agent, options, details, kept,
-                                                       ask or (old["ask"] if old else None)))
+            DB.execute("INSERT INTO needs(id,title,why,todo,raised,by,options,details,team_plan,ask,recommended) "
+                       "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (nid, title, why, "", t0, agent, options, details, kept,
+                                                         ask or (old["ask"] if old else None), picks[0]))
             if old:
                 DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
                            (f"Replaced by {agent} with a new plan: {title}", t0, agent, old["id"]))
@@ -43146,7 +43163,8 @@ TOOLS = [
      "Write a plan of team changes that only the owner decides: add an agent, remove one, change an agent's profile, "
      "its role title or its expertise, change reporting lines, or change an owner file (knowledge/owner/). The hub "
      "checks the plan now, with the app's own checks. Then it raises one card: your title and why, its own options "
-     "(each yes says what it does; the card of a new agent gives one yes for each of its names) and its own Details "
+     "(each yes says what it does; the card of a new agent gives one yes for each of its names; the first yes is "
+     "marked as the answer that you recommend) and its own Details "
      "(the whole change, before and after), with your words under them. Only the owner's press of a yes option, in "
      "Founderizer on the Mac or a PC, makes the change: the hub checks the plan again, makes one commit and at most "
      "one job on a server, and tells you what it did. No, or an answer in words, changes nothing. One open plan at a "
@@ -43168,7 +43186,8 @@ TOOLS = [
                         "kind": {"type": "string", "enum": list(TEAM_PLAN_KINDS)},
                         "server": {"type": "string", "description": "add: a Linux server of the fleet"},
                         "names": {"type": "array", "items": {"type": "string"},
-                                  "description": "add: 1 to 3 names; the owner presses one"},
+                                  "description": "add: 1 to 3 names, the one that you recommend first; the owner "
+                                  "presses one"},
                         "title": {"type": "string", "description": "add and settings: the role title that the "
                                   "owner's apps show"},
                         "runtime": {"type": "string", "enum": list(TEAM_ADD_RUNTIMES),
@@ -50208,7 +50227,7 @@ def page_markdown(content_type, body):
     return page_text(text) if html_page else (None, text)
 
 
-def knowledge_readers(path, rev):
+def knowledge_readers(path, rev, strict=False):
     """Which agents will read this knowledge file, as search_knowledge decides it: the ones whose profile's
     "Knowledge files" section lists the path, and **every manager for a file of the owner's own**, because
     t_search_knowledge gives a manager every owner file whatever its profile says.
@@ -50216,10 +50235,15 @@ def knowledge_readers(path, rev):
     It is here for the empty answer. A knowledge file that no profile lists and no manager reaches is a file that was
     written for nothing, and the owner cannot see that from the file: the Knowledge files section is in the profile,
     which is his own and which nothing else writes. So every add says who will read what it just wrote, at the moment
-    he writes it, instead of leaving him to work it out from four profiles."""
+    he writes it, instead of leaving him to work it out from four profiles.
+
+    strict: KitUnread for a profile that git does not give now (profile_knowledge_files), for a reader whose answer
+    a check compares (a team plan's digest), in place of an agent that reads nothing."""
     owner_file = knowledge_scope(path) == "owner"
     return sorted(name for name in agents()
-                  if (owner_file and role_of(name) == "manager") or path in profile_knowledge_files(name, rev))
+                  if (owner_file and role_of(name) == "manager") or
+                  path in (profile_knowledge_files(name, rev, strict=True) if strict else
+                           profile_knowledge_files(name, rev)))
 
 
 def knowledge_add(path, content, attachment=None):

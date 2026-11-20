@@ -139,6 +139,15 @@ class TeamChanges(Remove):
         self.assertIsNone(hub.kv_get(hub.TEAM_PLAN_MARK + str(card["id"])))
         self.assertIn("removed scout", self.told("made your plan")["text"])
 
+    def test_the_card_marks_the_managers_own_plan_as_the_answer_that_it_recommends(self):
+        """Bug: a team card marks no answer, No, or another name than the manager's first as the answer that the
+        manager recommends, so the owner's badge stands on a choice that the manager did not make (owner API 1.269)."""
+        said = self.plan([{"kind": "remove", "agent": "scout"}], title="Remove scout?")
+        self.assertEqual(self.card()["recommended"], "Yes: remove scout and its service on box")
+        self.assertIn("the first marked as the answer that you recommend", said)
+        self.add_plan()
+        self.assertEqual(self.card()["recommended"], "Yes: add nova, Customer Support 2, on box2")
+
     def test_no_closes_the_card_and_changes_nothing(self):
         """Bug: an off-by-one makes No a yes."""
         self.plan([{"kind": "remove", "agent": "scout"}])
@@ -190,8 +199,8 @@ class TeamChanges(Remove):
         self.assertEqual(self.card()["answered_by"], hub.NEED_CLOSED_BY)
 
     def test_a_card_waits_out_what_passes_and_closes_on_what_lasts(self):
-        """Bug: a valid card leaves the owner's screen because an agent was busy for a minute, or a stale card stays
-        and his press then fails."""
+        """Bug: a valid card leaves the owner's screen because an agent was busy for a minute or git gave no answer
+        for a file, or a stale card stays and his press then fails."""
         self.plan([{"kind": "remove", "agent": "scout"}])
         task = hub.ins("INSERT INTO tasks(owner,requester,title,state,created,last_activity) VALUES('scout','manager',"
                        "'Fix it','working',?,?)", (hub.now(), hub.now()))
@@ -213,6 +222,18 @@ class TeamChanges(Remove):
         hub.team_plan_sweep(hub.now())
         self.assertEqual(self.card()["answer"], hub.TEAM_CLOSED_WORDS)
         self.assertIn("scout", self.origin_team()["agents"])
+        # a profile that git does not give now is no other version of it (team_profile): the sweep and the press
+        # keep its card, and do not say that the manager read another version
+        self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"),
+                    "sections": [{"key": "responsible_for", "title": "Responsible for", "text": "Deploys."}]}])
+        with self.not_given("profiles/vps.md"):
+            hub.kv_set(hub.TEAM_PLAN_SWEEP, None)
+            hub.team_plan_sweep(hub.now())
+            self.assertIsNone(self.card()["answer"])
+            status, answer = self.press(0)
+        self.assertEqual(status, 409, answer)
+        self.assertIn("cannot make this change now: the hub cannot read its configuration now", answer["error"])
+        self.assertIsNone(self.card()["answer"])
 
     def test_a_busy_server_keeps_an_add_card_for_a_later_press(self):
         """Bug: an add card closes for good because its server had too little memory free for a minute."""
@@ -486,6 +507,14 @@ class TeamChanges(Remove):
         with patch.object(hub, "knowledge_entries", lambda: next(reads)), \
                 patch.object(hub, "git_blob", lambda rev, path: before), self.assertRaises(hub.TeamPassing):
             hub.team_owner_file({"rev": "r" * 40, "team": hub.TEAM},
+                                dict(step, base_sha256=hub.hashlib.sha256(before).hexdigest()))
+        # a reader's profile that git does not give now passes by itself too: it would drop that agent from the
+        # readers, and so change the digest that the press compares (knowledge_readers, strict)
+        with patch.object(hub, "knowledge_entries", lambda: [dict(listed[0], bytes=len(before))]), \
+                patch.object(hub, "git_blob", lambda rev, path: before), self.not_given("profiles/vps.md"), \
+                self.assertRaises(hub.TeamPassing):
+            hub.team_owner_file({"rev": "r" * 40, "team": hub.TEAM, "files": {}, "access": [], "parts": [],
+                                 "facts": [], "said": [], "phrases": []},
                                 dict(step, base_sha256=hub.hashlib.sha256(before).hexdigest()))
         # every other refusal of knowledge_replaced still ends the plan: here the file has this text already (409)
         same = "# Brand\n\nSource: brand.pdf · added 2026-10-01\n\n# Brand\n\nGreen.\n".encode()

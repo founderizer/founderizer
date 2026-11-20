@@ -1484,6 +1484,16 @@ def stop_browser_units(run=None):
     return done_well
 
 
+def browser_unit_state(run=None):
+    """What systemd says of this OS user's browser unit (is-active), or "" where it does not answer in 5 s."""
+    try:
+        done = (run or subprocess.run)(["systemctl", "--user", "is-active", lifecycle.BROWSER_UNITS[0]],
+                                       capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (done.stdout or "").strip()
+
+
 def browser_units_ended(run=None):
     """True where systemd says that each of this OS user's browser units (lifecycle.BROWSER_UNITS) has ended: inactive
     or failed, as it says of a unit that it does not have. A stop that `--no-block` queued (stop_browser_units) may
@@ -5551,7 +5561,8 @@ class Helper:
         memory taken for long; and nothing of an open browser task stops. On Linux only, and only where the helper
         runs as its agent's own OS user (own_user). Nothing is decided before the first poll (False), on a list that a
         worker's hub does not give (None; a manager's hub names none, and a manager runs no browser task), or on a
-        tmux that does not answer; a session or a tmux server that is not there is an answer: no window. A stop that
+        tmux that does not answer; a session or a tmux server that is not there is an answer: no window. A unit that
+        systemd is starting again after a crash keeps no name of whose pages it held (browser_pages_write). A stop that
         systemd did not take is tried again in a minute (stop_browser_units). Where the agent's Browser box is off, its
         browser data goes (browser_data_gone) once systemd says that both units have ended (browser_units_ended); a
         stop that still runs is looked at again a minute later."""
@@ -5567,6 +5578,10 @@ class Helper:
         # a window whose needs tmux did not take (a start that ran out of time) may be a browser task's: it holds them
         if any(line.split("\t") in ([name, "browser"], [name, ""]) for name in self.open_tasks or [] for line in lines):
             return
+        # a Chrome that systemd starts again after a crash: the stop ends it before its unit's own program deletes the
+        # pages, and systemd then says that it ended well, so its name names nobody first (D5, browser_start)
+        if browser_unit_state(stop) not in ("active", "inactive", "failed", ""):
+            browser_pages_write(None, "", None, None)
         if not stop_browser_units(stop):
             self.browser_at -= PLACES_EVERY - 60
         elif "browser" not in (self.conf.get("can") or []):     # its Browser box is off: its browser data goes once
@@ -5582,8 +5597,8 @@ class Helper:
         went off. Once no open task holds its units and systemd says that both have ended (sweep_browser),
         this goes: its Chrome profile (browser_profile, in the helper's own folder: its cookies and the sign-ins of its
         websites), the DevTools MCP package that only its browser runs, its browser and screen-sharing units, and the
-        helper's own lists of its browser (its clears and its fresh tasks). Only what the helper made goes: no folder
-        of the agent's home. The fleet's Node stays for the agent's other tools, and so does the package where an MCP
+        helper's own lists of its browser (its clears, its fresh tasks, whose pages it holds). Only what the helper
+        made goes: no folder of the agent's home. The fleet's Node stays for the agent's other tools, and so does the package where an MCP
         server of the owner's names the same package. A tick of the box later installs and starts all of it again, and
         the vault signs in again. The server's own parts are the owner's Mac's (S1b). Nothing is said where nothing was
         there."""
@@ -5606,7 +5621,8 @@ class Helper:
             systemctl_user("daemon-reload", timeout=30)
             gone.append("its browser units")
         for path in (self.clears_file(), self.clears_file(done=True),
-                     os.path.join(HOME, f"browser-fresh-{self.agent}.json")):
+                     os.path.join(HOME, f"browser-fresh-{self.agent}.json"),
+                     os.path.join(browser_folder(), BROWSER_PAGES)):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(path)
         self.browser_fresh = set()
@@ -5622,10 +5638,14 @@ class Helper:
         tool server must give exactly the pinned tools, run as the session will run it (browser_tools_fault; once for
         each package and command in this helper). Then the unit, under the agent's browser lock: written again where
         its text changed, its start count reset (D5), a run that is left stopped. `keep`, at a wait's end, keeps the
-        profile's session files for one start, unless a clear waits; a task's start deletes them, and a big profile's
-        caches. The clears that wait run before a session gets the browser. `run=False` (S3: a task that the poll's
-        `waits` names when its session starts) gives the tool with no unit started: the task's browser starts at the
-        wait's end, as a new one (browser_fresh), so that no page of an earlier task opens in it."""
+        profile's session files for one start, unless a clear waits or they are another task's; a task's start deletes
+        them, and a big profile's caches, unless they are its own. A new attempt of the task whose pages its Chrome
+        holds (browser_pages_mine) gets that Chrome as it runs, with its pages as they are, where it answers; where it
+        ended with no crash, the unit starts again with them; after a crash or a hang none come back (D5). The clears
+        that wait run before a session gets the browser.
+        `run=False` (S3: a task that the poll's `waits` names when its session starts) gives the tool with no unit
+        started: the task's browser starts at the wait's end, as a new one (browser_fresh), so that no page of an
+        earlier task opens in it, or with its pages where they are its own."""
         # one rule with the hub (lifecycle.linux_browser_refusal): a closed session, another runtime, and Codex's
         # app-server start, whose screen_runner.py runs a task in Codex's sandbox (workspace-write, approvals on
         # request) with no Linux browser yet, where a terminal start would give its browser task full access instead
@@ -5686,12 +5706,15 @@ class Helper:
         if not run:
             # no other browser window is open (D9 above), so a Chrome that runs is an earlier session's: it ends as at a
             # wait (browser_close: Chrome's own close keeps its cookies, then the unit's stop), and the new session
-            # reaches none of its pages; one that does not end is tried again after the back-off
-            if systemctl_user("is-active", lifecycle.BROWSER_UNITS[0])[1].strip() not in ("inactive", "failed", "") \
-                    and not self.browser_close():
+            # reaches none of its pages; they come back at the wait's end only where they are its own task's and its
+            # Chrome ran or ended with no crash: not one that failed or that systemd starts again (D5). One that does
+            # not end is tried again after the back-off.
+            state = systemctl_user("is-active", lifecycle.BROWSER_UNITS[0])[1].strip()
+            if state not in ("inactive", "failed", "") and not self.browser_close():
                 raise Refused("an earlier session's browser did not end, so this session waits for it")
             self.browser_waiting = (self.browser_waiting or set()) | {task}
-            self.fresh_tasks(self.fresh_tasks() | {task})
+            if state not in ("active", "inactive") or self.browser_pages_mine(task) is None:
+                self.fresh_tasks(self.fresh_tasks() | {task})
             return tool
         unit = lifecycle.BROWSER_UNITS[0]
         path = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user", unit)
@@ -5720,36 +5743,74 @@ class Helper:
                     if time.monotonic() > end:
                         raise Refused("the browser's lock stayed taken for 15 s")
                     time.sleep(0.2)
-            systemctl_user("reset-failed", unit)
-            if systemctl_user("is-active", unit)[1].strip() not in ("inactive", "failed", ""):
-                systemctl_user("stop", unit, timeout=30)
-            keep = keep and not browser_clears_read(self.clears_file())
-            if keep:
-                open(flag, "w").close()
+            # A new attempt of the task whose pages this Chrome holds (its cache went cold during a take-over or a
+            # wait, its requester started it again) goes on in that Chrome as it is: a start would load the pages again
+            # at best. Live, 20 November 2026: the owner passed a check by Take over, and the attempt after it found a
+            # blank page. Only a Chrome that this helper started or kept for that task, in this hub database, with no
+            # start of the unit since (browser_pages_mine), and that answers now with the same id (chrome_answers):
+            # systemd's `active` says nothing of a Chrome that hangs.
+            self.browser_kept = None
+            state, said, mine = systemctl_user("is-active", unit)[1].strip(), browser_pages_read(), \
+                self.browser_pages_mine(task)
+            kept = state == "active" and mine is not None and chrome_answers(port) == mine
+            systemctl_user("reset-failed", unit)        # each attempt's start count, as at a start (D5)
+            if kept:
+                # the owner's take-over of its screen ends first, as a start of Chrome ended it: the agent never goes
+                # on while the owner can still type on its screen (S6)
+                vnc = lifecycle.BROWSER_UNITS[1]
+                if systemctl_user("is-active", vnc)[1].strip() not in ("inactive", "failed", ""):
+                    systemctl_user("stop", vnc)
+                    if systemctl_user("is-active", vnc)[1].strip() not in ("inactive", "failed", ""):
+                        raise Refused("the sharing of its screen for the owner's take-over has not ended, so this "
+                                      "session waits for it")
             else:
-                with contextlib.suppress(FileNotFoundError):
-                    os.remove(flag)
-                self.browser_caches()           # at a task's start, with no Chrome running
-            code, out, err = systemctl_user("start", unit, timeout=90)
-            if code != 0:
-                with contextlib.suppress(FileNotFoundError):
-                    os.remove(flag)
-                systemctl_user("stop", unit, timeout=30)      # no restart of its own after a start that failed
-                raise Refused(f"the browser did not start: {(err or out).strip()[-200:]}")
+                if state not in ("inactive", "failed", ""):
+                    systemctl_user("stop", unit, timeout=30)
+                # The task's own pages come back where its Chrome ended with no crash (at a wait, after a start that
+                # failed later, at a stop), never after a crash or a hang (D5), never for a task that is to start with
+                # a new browser (fresh_tasks), and never another task's: a name of another task or database, or one
+                # that names nobody, keeps none. A name of this task that a later start of the unit made stale keeps
+                # its pages only at a wait's end (`keep`), as before this name. A stop in systemd's pause before its
+                # own restart after a crash leaves the unit `inactive` with the result success (measured on Ubuntu
+                # 24.04), so each step that stops it there marks the pages: a fresh task (browser_waits, the S3 path
+                # above), the name of nobody (sweep_browser, and this start below).
+                theirs = said is not None and (not said or said[:2] != (self.__dict__.get("poll_db"), task))
+                keep = (keep or mine is not None) and not theirs and task not in self.fresh_tasks() and \
+                    state == "inactive" and not browser_clears_read(self.clears_file())
+                if keep:
+                    open(flag, "w").close()
+                else:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(flag)
+                    # a start that keeps no page names nobody until it ran: one that fails before the unit's own
+                    # program ran leaves the old files, which no later start keeps
+                    browser_pages_write(None, task, None, None)
+                    self.browser_caches()           # at a task's start, with no Chrome running
+                code, out, err = systemctl_user("start", unit, timeout=90)
+                if code != 0:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(flag)
+                    systemctl_user("stop", unit, timeout=30)      # no restart of its own after a start that failed
+                    raise Refused(f"the browser did not start: {(err or out).strip()[-200:]}")
             try:
                 self.browser_clears(port)       # before a session gets it: the logins whose grants ended go
             except Refused:
                 systemctl_user("stop", unit, timeout=30)
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(flag)
                 raise
+            browser_pages_write(self.__dict__.get("poll_db"), task, mine if kept else chrome_answers(port),
+                                screen_key_mark())
+            self.browser_kept = task if kept else None
         if task in self.fresh_tasks():          # its pages are its own from now on (S3)
             self.fresh_tasks(self.fresh_tasks() - {task})
         return tool
 
     def fresh_tasks(self, tasks=None):
-        """**The tasks whose session started with no Chrome** (S3, browser_start's `run=False`): their browser starts
-        as a new one at their wait's end, so that no page of an earlier task opens in it. Kept in a file of this
-        agent's own in ~/.fleet, which a restart of the helper reads; `tasks` writes it (a write that fails keeps the
-        set in memory). Returns the set."""
+        """**The tasks whose session started with no Chrome** (S3, browser_start's `run=False`) while the profile held
+        no pages of their own: their browser starts as a new one at their wait's end, so that no page of an earlier
+        task opens in it. Kept in a file of this agent's own in ~/.fleet, which a restart of the helper reads; `tasks`
+        writes it (a write that fails keeps the set in memory). Returns the set."""
         path = os.path.join(HOME, f"browser-fresh-{self.agent}.json")
         if tasks is not None:
             self.browser_fresh = set(tasks)
@@ -5766,6 +5827,34 @@ class Helper:
             self.browser_fresh = {x for x in got if isinstance(x, str) and re.fullmatch(r"T-\d+", x)} \
                 if isinstance(got, list) else set()
         return self.browser_fresh
+
+    def browser_pages_mine(self, task):
+        """The id of the Chrome whose pages are task `task`'s (browser_pages_read), in the hub's database of the last
+        poll (poll_db: a task's number comes again in another database), with no start of the unit since the helper
+        named it (the screen key's mark), else None."""
+        said, db = browser_pages_read(), self.__dict__.get("poll_db")
+        return said[2] if said and isinstance(db, str) and said[:2] == (db, task) and said[3] == screen_key_mark() \
+            else None
+
+    def browser_pages_follow(self, task, active):
+        """**The name follows its task's Chrome** (browser_pages_read): while the task's window is the agent's one
+        browser window (D9), the Chrome that runs and the pages that it opens are that task's. So where systemd started
+        it again after a crash or a kill at its cap (the key's mark changed), and where the name names nobody or is
+        not there (a start whose Chrome gave no id, a Chrome of an older helper), the name takes that Chrome's id and
+        the key's mark, and the task's next attempt keeps them (browser_start). A name of another task or database
+        stays. `active` says whether the unit runs; it is asked only where the name would change."""
+        said, db, key = browser_pages_read(), self.__dict__.get("poll_db"), screen_key_mark()
+        if not isinstance(db, str) or not key or (said and (said[:2] != (db, task) or said[3] == key)) or \
+                not active():
+            return
+        try:            # the window's own task is of this hub database: a task's number comes again in another one
+            if self.window_attempt(task).rpartition(":")[0] != db:
+                return
+        except Silent:
+            return
+        chrome = chrome_answers(browser_port())
+        if chrome:
+            browser_pages_write(db, task, chrome, key)
 
     def browser_closed(self):
         """The poll's `browser_closed` (S3, D10): the tasks whose Chrome this helper closed for a wait or never started
@@ -6093,11 +6182,13 @@ class Helper:
         """**A wait closes the browser, and its end opens it again** (D10): `waits` is the poll's {task: kind} of this
         agent's tasks that wait for the owner (a secret) or for a usage limit's end. When such a wait starts for a
         live window of an open browser task, Chrome ends (browser_close) and so gives its memory back: a secret wait
-        has no clock. When it ends, Chrome starts again with its pages (keep). At the first round of a helper that
-        started again, a browser task that does not wait gets its browser where its unit does not run. A step that
-        fails is tried again after its back-off, its reason told once (browser_try). A clear that came while systemd
-        restarted Chrome by itself runs at a round with Chrome active. Linux only; nothing on a tmux that does not
-        answer or on a poll that does not say."""
+        has no clock. When it ends, Chrome starts again with its pages (keep), unless systemd was starting it again
+        after a crash at the close (D5). At the first round of a helper that started again, a browser task that does
+        not wait gets its browser where its unit does not run. The name of whose pages its Chrome holds follows a
+        Chrome that systemd started again for that task (browser_pages_follow). A step that fails is tried again
+        after its back-off, its reason told once (browser_try). A clear that came while systemd restarted Chrome by
+        itself runs at a round with Chrome active. Linux only; nothing on a tmux that does not answer or on a poll
+        that does not say."""
         if sys.platform == "darwin" or not isinstance(waits, dict) or not isinstance(self.open_tasks, list) or \
                 not self.own_user():
             return
@@ -6113,13 +6204,17 @@ class Helper:
         waiting = set() if first else set(self.browser_waiting)
         active = lambda: systemctl_user("is-active", unit)[1].strip() == "active"
 
-        def close():
+        def close(task):
+            # a Chrome that systemd starts again after a crash keeps no page for the wait's end (D5): the close stops
+            # it before its unit's own program deletes them
+            if systemctl_user("is-active", unit)[1].strip() not in ("active", "inactive", ""):
+                self.fresh_tasks(self.fresh_tasks() | {task})
             if not self.browser_close():
                 raise Refused("its browser did not end for its wait")
         for task in tasks:
             if task in waits and task not in waiting:
                 self.doing("browser wait", task)
-                if self.browser_try(task, close):
+                if self.browser_try(task, lambda task=task: close(task)):
                     waiting.add(task)
             elif task not in waits and (task in waiting or (first and not active())):
                 waiting.add(task)               # until its browser runs again
@@ -6129,6 +6224,8 @@ class Helper:
                     if task in self.fresh_tasks():
                         self.fresh_tasks(self.fresh_tasks() - {task})
         self.browser_waiting = waiting & set(tasks)
+        if len(tasks) == 1 and tasks[0] not in waits and tasks[0] not in self.browser_waiting:
+            self.browser_pages_follow(tasks[0], active)     # its one browser window holds the Chrome that runs (D9)
         if self.fresh_tasks() - set(self.open_tasks):
             self.fresh_tasks(self.fresh_tasks() & set(self.open_tasks))
         if browser_clears_read(self.clears_file()) and active():
@@ -7194,7 +7291,9 @@ class Helper:
                                                closed=extra["shell_off"] if isinstance(extra.get("shell_off"), dict)
                                                else {} if shell_off(self.conf) else None, held=self.jobs_held))
                     except BaseException:
-                        if browser:
+                        # a Chrome that this start kept as it ran keeps the task's pages for its next try, and the
+                        # sweep stops it where no window comes (sweep_browser)
+                        if browser and self.__dict__.get("browser_kept") != task:
                             self.browser_close()
                         raise
                 self.start(task, command, extra.get("attempt",1), extra.get("generation",""), session, needs=needs)
@@ -10154,9 +10253,64 @@ def browser_tools_fault(tools):
 
 
 def browser_folder():
-    """The agent's runtime folder of its browser (D5, D11): its lock, its screen's display and its one-shot flag. A
-    reboot clears it."""
+    """The agent's runtime folder of its browser (D5, D11): its lock, its screen's display, its one-shot flag and the
+    name of the task whose pages its Chrome holds (BROWSER_PAGES). A reboot clears it."""
     return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "fleet-browser")
+
+
+BROWSER_PAGES = "pages-task"    # in browser_folder(): whose pages the agent's Chrome holds (browser_pages_read)
+
+
+def browser_pages_read():
+    """Whose pages the agent's Chrome holds, as the helper wrote it once a start of the unit or a kept Chrome and its
+    clears ran for a task (Helper.browser_start): (the hub's database generation, the task, the id of the Chrome that it
+    got, the mark of the screen key of that start: screen_key_mark). None where there is no such file, and () where it
+    names nobody (a file that cannot be read): then the pages are nobody's that a start may keep. A Chrome that ended
+    keeps the name for its session files, and any later start of the unit gives the key a new mark."""
+    try:
+        with open(os.path.join(browser_folder(), BROWSER_PAGES), encoding="utf-8") as f:
+            said = tuple(f.read().rstrip("\n").split("\t"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return ()
+    return said if len(said) == 4 and GENERATION.fullmatch(said[0]) and re.fullmatch(r"T-\d+", said[1]) and \
+        re.fullmatch(r"[A-Za-z0-9-]{1,64}", said[2]) and re.fullmatch(r"\d+:\d+", said[3]) else ()
+
+
+def browser_pages_write(db, task, chrome, key):
+    """Writes the name (browser_pages_read) of task `task` in the hub's database `db`, of the Chrome `chrome` and the
+    screen key's mark `key`; where one of them is missing, a name that names nobody, so that no start keeps the pages
+    that it held. A write that fails leaves the old name: a later start of the unit makes it stale."""
+    path = os.path.join(browser_folder(), BROWSER_PAGES)
+    named = chrome and key and isinstance(db, str) and GENERATION.fullmatch(db) and re.fullmatch(r"T-\d+", task)
+    with contextlib.suppress(OSError):
+        with open(path + ".new", "w", encoding="utf-8") as f:
+            f.write(f"{db}\t{task}\t{chrome}\t{key}\n" if named else "\n")
+        os.replace(path + ".new", path)
+
+
+def screen_key_mark():
+    """The mark of the agent's screen key (its inode and its time, in browser_folder()), or None: the browser unit's
+    own program writes the key anew at each start of the unit (cmd_browser_run), in every release and at systemd's own
+    restarts after a crash, so a mark that changed says that a start came after the one that the helper named."""
+    try:
+        st = os.stat(os.path.join(browser_folder(), "screen-key"))
+    except OSError:
+        return None
+    return f"{st.st_ino}:{st.st_mtime_ns}"
+
+
+def chrome_answers(port, wait=5.0):
+    """The id of the agent's own Chrome on its DevTools port (the end of its browser address, new at each start of
+    Chrome) once it answers a call within `wait` seconds, else None: systemd's `active` says nothing of a Chrome that
+    hangs."""
+    try:
+        with Cdp(port, wait) as cdp:
+            cdp.call("Target.getTargets")
+            return cdp.browser
+    except (OSError, ValueError, CdpError):
+        return None
 
 
 def browser_profile():
@@ -10277,6 +10431,7 @@ class Cdp:
             raise CdpError(f"no DevTools address ({type(e).__name__})") from None
         if not re.fullmatch(r"/devtools/browser/[A-Za-z0-9-]{1,64}", path):
             raise CdpError("no DevTools address of Chrome's own form")
+        self.browser = path.rsplit("/", 1)[1]       # Chrome's id, new at each of its starts (chrome_answers)
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
         try:
             key = base64.b64encode(os.urandom(16)).decode()
@@ -10496,9 +10651,9 @@ def cdp_clear(cdp, session, clear, own=None, closed=None):
 
 
 def drop_session_files(profile, flag):
-    """D5: a start deletes both of Chrome's copies of the profile's session, except the start at a wait's end, which
-    the one-shot `flag` names. The flag goes at once, before anything else of the start: a start that stopped before
-    it read the flag left it for a later task. True when the files went."""
+    """D5: a start deletes both of Chrome's copies of the profile's session, except a start with the task's own pages
+    (Helper.browser_start), which the one-shot `flag` names. The flag goes at once, before anything else of the start:
+    a start that stopped before it read the flag left it for a later task. True when the files went."""
     try:
         os.remove(flag)
         return False
@@ -10528,8 +10683,9 @@ def screen_display(read_end, wait=10.0):
 def cmd_browser_run(args):
     """The agent's browser unit's own program (browser_unit_text), as the agent: a new screen key, Xvfb on a display
     that it chooses itself (-displayfd, screen_display) with no TCP, Openbox, and Chrome on the agent's DevTools port
-    with its own profile, with no session bus; the profile's session files go first (D5), except at the end of a
-    wait, which leaves a one-shot flag (keep-session), so that Chrome restores its pages (RestoreOnStartup, D12).
+    with its own profile, with no session bus; the profile's session files go first (D5), except where the helper
+    left a one-shot flag (keep-session) for a start with the task's own pages, so that Chrome restores them
+    (RestoreOnStartup, D12).
     When Chrome ends, the rest ends, and the unit's result is Chrome's."""
     run = browser_folder()
     os.makedirs(run, mode=0o700, exist_ok=True)

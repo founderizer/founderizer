@@ -32,6 +32,7 @@ STOPS = [["systemctl", "--user", "--no-block", "stop", "fleet_browser.service"],
 
 def setUpModule():
     scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
+    os.makedirs(fleet.HOME, exist_ok=True)      # a helper's own folder is always there: its files are written in it
 
 
 class SweepBrowser(unittest.TestCase):
@@ -80,6 +81,21 @@ class SweepBrowser(unittest.TestCase):
         self.assertEqual(self.sweep(["T-4", "T-1"], ["home\t", "T-1\tbrowser", "T-3\tnone"]), ([], 5000.0))
         # A window whose needs tmux did not take (its start ran out of time) may be a browser task's.
         self.assertEqual(self.sweep(["T-1"], ["T-1\t"]), ([], 5000.0))
+
+    def test_a_stop_in_systemds_pause_after_a_crash_leaves_no_page_to_keep(self):
+        """D5: systemd starts the unit again 2 s after a crash, and its own program deletes the session files then. A
+        stop in that pause ends it first, and systemd then says that it ended well (measured on Ubuntu 24.04), so the
+        sweep makes the name name nobody; a stop of a Chrome that runs leaves the name."""
+        run = tempfile.mkdtemp(prefix="fleet-browser-run-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(run, True))
+        pages = Path(run, "fleet-browser", "pages-task")
+        pages.parent.mkdir()
+        for state, wanted in (("activating", "\n"), ("active", f"{DB}\tT-1\tc-1\t1:1\n"),
+                              ("", f"{DB}\tT-1\tc-1\t1:1\n")):          # a systemd that does not answer: it stays
+            pages.write_text(f"{DB}\tT-1\tc-1\t1:1\n")
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}):
+                self.assertEqual(self.sweep([], [], state=(state, "inactive"))[0], STOPS, state)
+            self.assertEqual(pages.read_text(), wanted, state)
 
     def test_only_the_agents_own_os_user_has_these_units(self):
         """The units of a user's systemd are that user's: the helper of an agent that runs as the server's own user
@@ -169,6 +185,9 @@ CLAUDE = {"role": "worker", "runtime": "claude", "can": ["shell", "browser"], "v
 CODEX = {"role": "worker", "runtime": "codex", "can": ["shell", "browser"], "vault": "none",
          "start": lifecycle.RUNTIMES["codex"]["first_worker"]}
 WINDOWS = ("list-windows", "-t", "=fleet-ivy:", "-F", "#{window_name}\t#{@fleet_needs}")
+DB = "0123456789ab"        # the hub's database generation of the stand-in helper's last poll
+# systemd says that the agent's Chrome runs, and that no sharing of its screen does
+ACTIVE = {"is-active": lambda args: (0, "active\n") if args[1] == "fleet_browser.service" else (3, "inactive\n")}
 
 
 def systemd(answers=None):
@@ -184,9 +203,12 @@ def systemd(answers=None):
     return calls, call
 
 
-def tmux_of(windows):
-    """A stand-in for tmux: `windows` are the lines "<name>\t<needs>" of this agent's session; None does not answer."""
+def tmux_of(windows, attempt=""):
+    """A stand-in for tmux: `windows` are the lines "<name>\t<needs>" of this agent's session; None does not answer.
+    `attempt` is each window's @fleet_attempt ("<generation>:<attempt>")."""
     def tmux(*args):
+        if args[:1] == ("show-options",) and args[-1] == "@fleet_attempt":
+            return subprocess.CompletedProcess(args, 0, attempt + "\n" if attempt else "", "")
         if args != WINDOWS:
             return subprocess.CompletedProcess(args, 0, "", "")
         if windows is None:
@@ -200,7 +222,7 @@ def helper(conf=CLAUDE, **fields):
     h = fleet.Helper.__new__(fleet.Helper)
     h.agent, h.conf, h.session, h.worker, h.step, h.said = "ivy", dict(conf), "fleet-ivy", True, None, []
     h.browser_waiting, h.browser_retry, h.browser_told, h.open_tasks = set(), {}, {}, ["T-1"]
-    h.browser_waits_seen, h.browser_fresh = {}, set()
+    h.browser_waits_seen, h.browser_fresh, h.poll_db = {}, set(), DB
     h.say = h.said.append
     h.own_user = lambda: True
     for name, value in fields.items():
@@ -339,13 +361,20 @@ class BrowserStart(unittest.TestCase):
 
     def start(self, keep=False, conf=CLAUDE, closed=False, port=9300, proof=True, ready=True, fault=None,
               answers=None, clears=None, windows=("T-1\tbrowser",), open_tasks=("T-1",), h=None, listed=None,
-              hang=False, run=True):
+              hang=False, run=True, chrome="c-1"):
         """One browser_start of T-1 on a stand-in helper: (systemd's calls, what the tool check ran, the result or the
         refusal). At systemd's start, a line ("flag", whether the one-shot flag is there) and one ("caches", the
-        count of cache deletes until then) follow it."""
+        count of cache deletes until then) follow it. `chrome` is the id of the Chrome that answers (None: none)."""
         caches = []
-        calls, call = systemd(dict({"start": lambda args: (0, "") if not calls.extend(
-            [("flag", os.path.exists(self.flag)), ("caches", len(caches))]) else None}, **(answers or {})))
+
+        def started(args):          # the unit's own program writes the screen key anew at each start (cmd_browser_run)
+            calls.extend([("flag", os.path.exists(self.flag)), ("caches", len(caches))])
+            key = os.path.join(self.run_dir, "fleet-browser", "screen-key")
+            with open(key + ".new", "w", encoding="utf-8") as f:
+                f.write(str(len(calls)))
+            os.replace(key + ".new", key)
+            return 0, ""
+        calls, call = systemd(dict({"start": started}, **(answers or {})))
         checked = {}
 
         def tool_list(command, args, env=None, **_):
@@ -364,12 +393,24 @@ class BrowserStart(unittest.TestCase):
                                  ("install", package["name"]))), \
                 patch.object(fleet, "mcp_tool_list", tool_list), patch.object(fleet, "browser_tools_fault", lambda t: fault), \
                 patch.object(fleet, "systemctl_user", call), patch.object(fleet, "tmux", tmux_of(windows)), \
+                patch.object(fleet, "chrome_answers", lambda port, wait=5.0: chrome), \
                 patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.run_dir}):
             try:
                 result = fleet.Helper.browser_start(h, "T-1", keep=keep, closed=closed, run=run)
             except fleet.Refused as e:
                 result = e
         return calls, checked, result
+
+    def name(self, task="T-1", chrome="c-1", db=DB, key=None):
+        """The name of whose pages the agent's Chrome holds, as browser_start writes it: with the mark of the screen
+        key of now, which a start of the unit wrote, unless `key` gives another."""
+        folder = Path(self.run_dir, "fleet-browser")
+        folder.mkdir(exist_ok=True)
+        if not (folder / "screen-key").exists():
+            (folder / "screen-key").write_text("key")
+        st = (folder / "screen-key").stat()
+        (folder / "pages-task").write_text(f"{db}\t{task}\t{chrome}\t{key or f'{st.st_ino}:{st.st_mtime_ns}'}\n")
+        return folder / "pages-task"
 
     def test_no_browser_without_its_port_a_live_proof_or_the_pinned_tools(self):
         for kwargs in (dict(port=None), dict(proof=False), dict(fault="its tools are not the pinned ones")):
@@ -431,6 +472,17 @@ class BrowserStart(unittest.TestCase):
         self.assertEqual(fleet.Helper.fresh_tasks(again), {"T-1"})
         self.start(h=again)                                 # a start with its Chrome: its pages are its own from now on
         self.assertEqual(fleet.Helper.fresh_tasks(helper(CLAUDE, browser_fresh=None)), set())
+        h = helper(CLAUDE)                                  # its next attempt starts in a wait: they stay its own
+        self.start(h=h, run=False)
+        self.assertEqual((h.browser_waiting, h.browser_fresh), ({"T-1"}, set()))
+        for task, state, key in (("T-9", "inactive", None),       # another task's pages
+                                 ("T-1", "failed", None),         # its own after crashes (D5)
+                                 ("T-1", "activating", None),     # its own while systemd starts Chrome again
+                                 ("T-1", "inactive", "1:1")):     # its own, and a start of the unit came since
+            self.name(task, key=key)
+            h = helper(CLAUDE, browser_close=lambda: True)
+            self.start(h=h, run=False, answers={"is-active": (3, state + "\n")})
+            self.assertEqual(h.browser_fresh, {"T-1"}, (task, state, key))
         with patch("builtins.open", side_effect=OSError(28, "No space left on device")):
             self.assertEqual(fleet.Helper.fresh_tasks(again, {"T-4"}), {"T-4"})     # a full disk stops no loop
 
@@ -476,7 +528,10 @@ class BrowserStart(unittest.TestCase):
             self.assertIn("no such version", str(result))
             self.assertNotIn(folder, fleet.PACKAGE_INSTALLS)            # the next start tries the install again
 
-    def test_the_unit_is_written_when_it_changed_and_keeps_its_pages_only_at_a_waits_end(self):
+    def test_the_unit_is_written_when_it_changed_and_keeps_its_pages_at_a_waits_end_and_for_its_own_task(self):
+        """D5: a task's start loses the profile's last pages, and a wait's end keeps them. A new attempt of the task
+        whose pages the running Chrome holds goes on in that Chrome as it is (live, 20 November 2026: the owner passed
+        a check by Take over, and the attempt after it, whose cache had gone cold, found a blank page)."""
         calls, _, tool = self.start()
         self.assertEqual(tool, fleet.browser_tool(9300))
         self.assertIn(("daemon-reload",), calls)
@@ -485,8 +540,52 @@ class BrowserStart(unittest.TestCase):
         calls, _, _ = self.start(keep=True)
         self.assertNotIn(("daemon-reload",), calls)          # the same text: no reload
         self.assertEqual(calls[-2:], [("flag", True), ("caches", 0)])        # a wait's end keeps its pages
-        calls, _, _ = self.start()                           # a flag that a start left goes before the next one
+        calls, _, _ = self.start(answers={"is-active": (3, "failed\n")})   # a flag that a start left goes before
+        self.assertEqual(calls[-2:], [("flag", False), ("caches", 1)])     # the next one, which keeps no page
+        pages, cleared = Path(self.run_dir, "fleet-browser", "pages-task"), []
+        self.assertEqual(pages.read_text().split("\t")[:3], [DB, "T-1", "c-1"])     # each start names its task
+        calls, _, tool = self.start(answers=ACTIVE, clears=cleared.append)  # T-1's next attempt: its Chrome goes on
+        self.assertEqual((tool, cleared), (fleet.browser_tool(9300), [9300]))         # after the clears that wait
+        self.assertEqual([c for c in calls if c[0] in ("stop", "start")], [])
+        self.assertIn(("reset-failed", "fleet_browser.service"), calls)    # its start count, as at a start (D5)
+        for said, chrome in ((dict(task="T-9"), "c-1"),                    # another task's Chrome
+                             (dict(db="ba9876543210"), "c-1"),             # the same number in another hub database
+                             (dict(key="1:1"), "c-1"),                     # a start of the unit came since its name
+                             (dict(), "c-2"),                              # a Chrome that systemd started again
+                             (dict(), None)):                              # a Chrome that does not answer
+            self.name(**said)
+            calls, _, _ = self.start(answers=ACTIVE, chrome=chrome)
+            self.assertIn(("stop", "fleet_browser.service"), calls, (said, chrome))
+            self.assertEqual(calls[-2:], [("flag", False), ("caches", 1)], (said, chrome))     # none of its pages
+        self.name()
+        calls, _, _ = self.start(chrome="c-2")               # its own Chrome ended with no crash: its pages come back,
+        self.assertEqual(calls[-2:], [("flag", True), ("caches", 0)])
+        self.assertEqual(pages.read_text().split("\t")[2], "c-2")          # and the name gives the new Chrome's id
+        self.name(key="1:1")                                 # a start of the unit came since its name: no old page
+        calls, _, _ = self.start()
         self.assertEqual(calls[-2:], [("flag", False), ("caches", 1)])
+        self.name(key="1:1")                                 # but a wait's end keeps its own task's pages, as before
+        calls, _, _ = self.start(keep=True)
+        self.assertEqual(calls[-2:], [("flag", True), ("caches", 0)])
+        self.name(db="ba9876543210", key="1:1")              # and none of a task of the same number in another database
+        calls, _, _ = self.start(keep=True)
+        self.assertEqual(calls[-2:], [("flag", False), ("caches", 1)])
+        pages.write_text("garbage\n")                         # a name that names nobody keeps nothing
+        calls, _, _ = self.start(keep=True)
+        self.assertEqual(calls[-2:], [("flag", False), ("caches", 1)])
+        self.name()                                          # a task that is to start with a new browser (S3)
+        calls, _, _ = self.start(h=helper(CLAUDE, browser_fresh={"T-1"}, browser_caches=lambda: None,
+                                          browser_clears=lambda port: None))
+        self.assertEqual(calls[-2], ("flag", False))
+        calls, _, _ = self.start(answers={"is-active": (3, "failed\n")})   # after crashes (D5): no old page
+        self.assertEqual(calls[-2:], [("flag", False), ("caches", 1)])
+        self.name("T-9")
+        calls, _, _ = self.start(keep=True)                  # a wait's end keeps no page of another task's
+        self.assertEqual(calls[-2:], [("flag", False), ("caches", 1)])
+        self.unit.write_text("[Unit]\n")                     # a release changed the unit: its Chrome goes on, and the
+        calls, _, _ = self.start(answers=ACTIVE)             # new text holds from its next start
+        self.assertIn(("daemon-reload",), calls)
+        self.assertEqual([c for c in calls if c[0] in ("stop", "start")], [])
         fleet.browser_clears_write(fleet.Helper.clears_file(types.SimpleNamespace(agent="ivy")),
                                    {"7:a": {"origins": ["https://a.test"], "cookies": []}})
         calls, _, _ = self.start(keep=True)                  # a clear waits: the site's pages would load first
@@ -495,12 +594,61 @@ class BrowserStart(unittest.TestCase):
     def test_a_start_that_failed_or_a_clear_that_did_not_finish_stops_the_unit(self):
         def fails(port):
             raise fleet.Refused("the browser did not lose a login whose grant ended: Chrome did not answer")
-        for kwargs in (dict(answers={"start": (1, "")}, keep=True), dict(clears=fails)):
+        for kwargs, named in ((dict(answers={"start": (1, "")}, keep=True), False), (dict(clears=fails), False),
+                              (dict(clears=fails, answers=ACTIVE), True)):     # its own Chrome, kept as it runs
+            if named:
+                self.name()
             calls, _, result = self.start(**kwargs)
             self.assertIsInstance(result, fleet.Refused)
             starts = [n for n, c in enumerate(calls) if c[0] == "start"]
-            self.assertIn(("stop", "fleet_browser.service"), calls[starts[-1]:], kwargs)
+            self.assertIn(("stop", "fleet_browser.service"), calls[starts[-1] if starts else 0:], kwargs)
             self.assertFalse(os.path.exists(self.flag), kwargs)
+        # a start that keeps no page names nobody before it runs: when it fails before the unit's own program ran,
+        # the next try keeps none of the old files either (here a crash's pause, D5)
+        self.name()
+        self.start(answers={"is-active": (3, "activating\n"), "start": (1, "")}, keep=True)
+        calls, _, _ = self.start(keep=True)
+        self.assertEqual(calls[-2:], [("flag", False), ("caches", 1)])
+
+    def test_the_owners_take_over_ends_before_a_new_attempt_gets_its_chrome(self):
+        """S6: the agent never goes on while the owner can still type on its screen. A start of Chrome ended his
+        sharing with the screen; a Chrome that a new attempt keeps as it runs ends it on its own."""
+        stops = []
+
+        def running(args):          # the sharing ends at its stop; Chrome runs
+            return (3, "inactive\n") if args[1] == "fleet_vnc.service" and stops else (0, "active\n")
+        for answers, wanted in (({"is-active": running, "stop": lambda args: stops.append(args[1]) or (0, "")},
+                                 fleet.browser_tool(9300)),
+                                ({"is-active": (0, "active\n")}, fleet.Refused)):   # a sharing that does not end
+            self.name()
+            calls, _, result = self.start(answers=answers)
+            self.assertIn(("stop", "fleet_vnc.service"), calls)
+            self.assertTrue(result == wanted if isinstance(wanted, dict) else isinstance(result, wanted), result)
+            self.assertNotIn(("stop", "fleet_browser.service"), calls)
+        self.assertEqual(stops, ["fleet_vnc.service"])
+
+    def test_a_start_that_fails_after_the_browser_ends_only_a_chrome_that_it_started(self):
+        """A Chrome that the start of a new attempt kept as it ran keeps the task's pages for the next try (the sweep
+        stops it where no window comes); one that it started ends, so that no Chrome waits for a session that never
+        comes."""
+        for kept, wanted in ((True, []), (False, ["close"])):
+            h, closes = fleet.Helper("ivy", dict(CLAUDE)), []
+
+            def start(self, task, kept=kept, **kw):
+                self.browser_kept = task if kept else None
+                return {"t": 1}
+            event = {"id": 9, "kind": "task", "task": "T-7", "text": "Read the page",
+                     "extra": {"generation": "g", "attempt": 2, "needs": "browser"}}
+            with patch.object(fleet.sys, "platform", "linux"), patch.object(h, "look", return_value=[]), \
+                    patch.object(h, "say"), patch.object(h, "sync_checkout"), \
+                    patch.object(fleet.Helper, "browser_start", start), \
+                    patch.object(fleet.Helper, "browser_close", lambda self: closes.append("close") or True), \
+                    patch("fleet.start_refusal", lambda *a, **k: None), patch("fleet.programs_wait", lambda *a, **k: None), \
+                    patch("fleet.session_credential", side_effect=OSError("the hub did not answer")), \
+                    patch("fleet.http", return_value=(200, {})), \
+                    patch("fleet.tmux", return_value=subprocess.CompletedProcess([], 0, "", "")):
+                h.handle_events([event])
+            self.assertEqual(closes, wanted, kept)
 
     def test_the_session_runs_the_tool_server_that_the_helper_checked(self):
         """Its command, its arguments and its variables, for Claude Code (its MCP file) and for Codex (its -c
@@ -892,6 +1040,50 @@ class BrowserCloseAndWaits(unittest.TestCase):
         h.browser_waiting = {"T-1"}
         self.waits(h, {})
         self.assertEqual((done, fleet.Helper.fresh_tasks(h)), ([("T-1", False)], set()))
+
+    def test_a_wait_that_closes_a_chrome_that_systemd_starts_again_keeps_no_page(self):
+        """D5: after a crash systemd starts the unit again a moment later, and its own program deletes the session
+        files then. A close for a wait in that moment stops it first, so the wait's end starts Chrome with no page."""
+        done = []
+        h = helper(browser_close=lambda: True, browser_start=lambda task, keep=False: done.append((task, keep)))
+        for waits, state in (({"T-1": "secret"}, "activating"), ({}, "inactive")):
+            with patch.object(fleet, "tmux", tmux_of(("T-1\tbrowser",))), patch.object(fleet.sys, "platform", "linux"), \
+                    patch.object(fleet, "systemctl_user", systemd({"is-active": (3, state + "\n")})[1]):
+                fleet.Helper.browser_waits(h, waits)
+        self.assertEqual((done, fleet.Helper.fresh_tasks(h)), ([("T-1", False)], set()))
+
+    def test_the_name_follows_a_chrome_that_systemd_started_again_for_its_task(self):
+        """D5 and D9: systemd starts the agent's Chrome again after a crash or a kill at its cap, and the task goes on
+        in the new Chrome: its name follows it while the task's window is the one browser window, so that the task's
+        next attempt keeps that Chrome. Without the window, or before the unit runs again, the name stays."""
+        run = tempfile.mkdtemp(prefix="fleet-browser-run-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(run, True))
+        folder = Path(run, "fleet-browser")
+        folder.mkdir()
+        (folder / "screen-key").write_text("key")
+        st = (folder / "screen-key").stat()
+        old, new = f"{DB}\tT-1\tc-1\t1:1\n", f"{DB}\tT-1\tc-2\t{st.st_ino}:{st.st_mtime_ns}\n"
+        other = "ba9876543210\tT-1\tc-1\t1:1\n"           # the same number in another hub database
+        for windows, state, before, wanted, generation in (
+                ((), "active", old, old, DB), (("T-1\tbrowser",), "activating", old, old, DB),
+                (("T-1\tbrowser",), "active", old, new, DB),
+                (("T-1\tbrowser",), "active", "\n", new, DB),            # a name of nobody
+                (("T-1\tbrowser",), "active", None, new, DB),            # no name: an older helper's Chrome
+                (("T-1\tbrowser",), "active", other, other, DB),
+                (("T-1\tbrowser",), "active", None, None, "ba9876543210")):   # the window of another database's task
+            if before is None:
+                (folder / "pages-task").unlink(missing_ok=True)
+            else:
+                (folder / "pages-task").write_text(before)
+            with patch.object(fleet, "tmux", tmux_of(windows, f"{generation}:1")), \
+                    patch.object(fleet.sys, "platform", "linux"), \
+                    patch.object(fleet, "systemctl_user", systemd({"is-active": (0, state + "\n")})[1]), \
+                    patch.object(fleet, "chrome_answers", lambda port, wait=5.0: "c-2"), \
+                    patch.object(fleet, "browser_port", lambda user=None: 9300), \
+                    patch.dict(os.environ, {"XDG_RUNTIME_DIR": run}):
+                fleet.Helper.browser_waits(helper(), {})
+            said = (folder / "pages-task").read_text() if (folder / "pages-task").exists() else None
+            self.assertEqual(said, wanted, (windows, state, before, generation))
 
     def test_the_poll_says_which_tasks_chrome_this_helper_closed(self):
         """S3 (D10): a wait's place goes back once no Chrome of it runs: the tasks whose Chrome the helper closed, and
