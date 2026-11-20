@@ -1266,8 +1266,9 @@ TODO_TOOLS = "CLAUDE_CODE_ENABLE_TODO_TOOLS=1"
 # variable, and then a session's plan would be text that other sessions of the machine read as their own, and that
 # stays for later ones. So each task session, an open one and a closed one, starts with it empty, which the program
 # reads as not set (read in the program's code at 2.1.311 and 2.1.312, and proved in a real closed start:
-# test_conversation_lockdown.ClosedTask). One way past it stays, as past each word of a start: an `env` map in the
-# user's ~/.claude.json, which the program puts into the session's environment after them.
+# test_conversation_lockdown.ClosedTask). In an open task session one way past it stays, as past each word of its
+# start: an `env` map in the user's ~/.claude.json, which the program puts into the session's environment after them.
+# A closed start gives its words again in its own settings, which come after that map (CLOSED_MODE).
 OWN_TASK_LIST = "CLAUDE_CODE_TASK_LIST_ID="
 PRESENCE = 30           # seconds between two presence pings while the main loop is inside one step (Helper.presence)
 # Owner-contact plan B3 (6 November 2026): the failed starts of the standing manager session in a row after which its
@@ -2738,7 +2739,8 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
         deny += CLOSED_CHROME_DENY
     hook = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.join(KIT, 'fleet.py'))} hook"
     settings = dict({**CLAUDE_NO_MEMORY, **NO_PEER_MESSAGES, "prefersReducedMotion": False,
-                     "permissions": {"allow": allow, "deny": deny},
+                     # its mode here too: no question of the program about the user's own mode (CLOSED_MODE)
+                     "permissions": {"allow": allow, "deny": deny, "defaultMode": CLOSED_MODE},
                      # the activity of its tool calls for the hub's views, as every task session sends it (C7)
                      "hooks": {"PostToolUse": [{"hooks": [{"type": "command", "async": True, "timeout": 10,
                                                            "command": f"{hook} activity {agent} {task}"}]},
@@ -2758,18 +2760,19 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
         raise Refused("a session whose Shell box is off starts only with its rules, its profile and its knowledge "
                       "files in its start, and this start has not got them")
     first = ["--append-system-prompt-file", session_file(agent, task, "md", text + github_text(values, tools))]
+    words = ["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}",
+             f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", NO_TIMERS, NO_TEAMS, NO_FILE_MENTIONS, MOTION,
+             OWN_TASK_LIST, CLOSED_NO_UPDATES] + \
+        [f"{name}={values[name]}" for name in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW",) if name in values]   # a window
+    settings["env"] = start_env(words[1:])      # its words again, after the user's own env map (CLOSED_MODE)
     # Its settings from a file too, as its MCP configuration: they hold one rule for each listed host and for each of
     # its catalog servers, and the hook of its host list names each host again
-    args = [program, "--setting-sources", "", "--session-id", session, "--permission-mode", "dontAsk",
+    args = [program, "--setting-sources", "", "--session-id", session, "--permission-mode", CLOSED_MODE,
             "--tools", ",".join(built_ins), "--strict-mcp-config", "--mcp-config",
             session_file(agent, task, "json", json.dumps({"mcpServers": dict({"fleet": {
                 "type": "http", "url": url, "headers": {"Authorization": f"Bearer {token}"}}}, **servers)})),
             "--settings", session_file(agent, task, "json", json.dumps(settings))] + \
         (["--chrome"] if needs == "browser" else []) + first + shlex.split(model_flags(conf))
-    words = ["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}",
-             f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", NO_TIMERS, NO_TEAMS, NO_FILE_MENTIONS, MOTION,
-             OWN_TASK_LIST, CLOSED_NO_UPDATES] + \
-        [f"{name}={values[name]}" for name in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW",) if name in values]   # a window
     return shlex.join(words + args)
 
 
@@ -3721,24 +3724,52 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
     kept = {key: value for key, value in kept_user_settings().items() if runtime is None or key != "env"}
     # mode "narrowed" (the person access plan): the same lock, with the narrowed tools as the allow list
     allowed = NARROWED_TOOLS if narrowed_mode(mode) else CONVERSATION_TOOLS
-    settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION, **NO_PEER_MESSAGES,
-                     "permissions": {"allow": [f"mcp__fleet__{t}" for t in allowed], "deny": DENY}}, **kept)
-    # --setting-sources "": no user, project or local settings, so no CLAUDE.md, hook or plugin of this machine, and
-    # --settings still applies. --safe-mode would also drop the --mcp-config server, so the session had no tools.
-    own = runtime is None or runtime == conf.get("runtime")
-    args = [program, "--setting-sources", "", "--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config",
-            "--mcp-config", mcp_config_file(agent, window, url, token), "--settings", json.dumps(settings),
-            "--append-system-prompt-file", session_file(agent, window, "md", prompt)] + \
-        (shlex.split(model_flags(conf)) if own else [])
     words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK=", NO_TIMERS,
              NO_TEAMS, NO_FILE_MENTIONS,
              f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"]     # a window that stays open: a bounded context
     if runtime is not None:
         words.append(CLOSED_NO_UPDATES)         # the pinned version stays the version that runs
+    # its mode, and its words again after the user's own env map, with what it keeps of their env (CLOSED_MODE)
+    settings = dict({**CLAUDE_NO_MEMORY, **NO_SUGGESTION, **NO_PEER_MESSAGES,
+                     "permissions": {"allow": [f"mcp__fleet__{t}" for t in allowed], "deny": DENY,
+                                     "defaultMode": CLOSED_MODE}}, **kept)
+    settings["env"] = dict(kept.get("env") or {}, **start_env(words[1:]))
+    # --setting-sources "": no user, project or local settings, so no CLAUDE.md, hook or plugin of this machine, and
+    # --settings still applies. --safe-mode would also drop the --mcp-config server, so the session had no tools.
+    own = runtime is None or runtime == conf.get("runtime")
+    args = [program, "--setting-sources", "", "--permission-mode", CLOSED_MODE, "--tools", "", "--strict-mcp-config",
+            "--mcp-config", mcp_config_file(agent, window, url, token), "--settings", json.dumps(settings),
+            "--append-system-prompt-file", session_file(agent, window, "md", prompt)] + \
+        (shlex.split(model_flags(conf)) if own else [])
     return f"cd {shlex.quote(folder)} && exec " + shlex.join(words + args)
 
 
 CLOSED_NO_UPDATES = "DISABLE_AUTOUPDATER=1"     # Claude Code's own updater, off in a closed session at its pinned version
+# A locked start (closed_task_command, conversation_command) loads no setting source of its machine. But Claude Code
+# still reads two values of the machine user's own files. This was measured on 20 November 2026 at 2.1.301, 2.1.311
+# and 2.1.312 in real closed starts against the stand-ins of test_conversation_lockdown, and read in the program. The
+# start's own --settings closes both:
+# - An `env` map in ~/.claude.json. The program puts it into the session's environment after the words of the start.
+#   So each value there wins over a word of the start, for example NO_TEAMS, OWN_TASK_LIST, MOTION, CLOSED_NO_UPDATES
+#   or FLEET_HUB, to which the activity hook of a closed task session sends the agent's key.
+#   CLAUDE_CODE_RESTRICT_PERSONAL_CONFIG does not stop it. After that map, the program puts in the env of each
+#   setting source, the --settings file's too. So the start gives its words a second time, as the env of its own
+#   settings (start_env). A name of the map that is no word of the start still reaches the session, as before.
+#   Measured too, in a closed task start: a screen reader value in that map gave the trust question another form. The
+#   helper does not answer that form, and the session stopped there. A conversation start has no word for the screen
+#   reader, so that value still reaches it, as before.
+# - permissions.defaultMode in ~/.claude/settings.json. When that mode is not "auto", the program asks "Make auto
+#   mode your default permission mode?" at the start, until somebody answers it one time. The helper's next Enter
+#   answers yes: the session runs in auto mode, the user's file is written again with "auto", and the helper's line
+#   is lost. The program asks only when no other source names a defaultMode. So the start names its own mode in its
+#   settings too (CLOSED_MODE).
+CLOSED_MODE = "dontAsk"
+
+
+def start_env(words):
+    """The env map of a locked start's own settings: each of its env words (NAME=value, after the word "env") with
+    the same value, so that the machine user's ~/.claude.json changes none of them."""
+    return dict(word.split("=", 1) for word in words)
 
 
 def conversation_work_command(agent, conf, generation, conversation, token, prompt, session, env=None, opening=None,

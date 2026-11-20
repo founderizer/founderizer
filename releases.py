@@ -234,12 +234,12 @@ def verify_signature(public, message, signature):
 # ---------------------------------------------------------------- a second opinion: OpenSSL's Ed25519
 #
 # Since 20 November 2026 a release is taken only when this machine's OpenSSL says yes too, where the machine has one
-# that verifies Ed25519 (the owner's "OpenSSL as a second check": ~/dev/founderizer-plans/dependency-reduction.md,
-# item D). So one wrong line of our own code above cannot let a forged release into a fleet, and a machine with no
-# such OpenSSL checks as before. No package comes in: every supported Linux system has OpenSSL 3, because its
-# ca-certificates depends on it, and a Mac's Homebrew Python brings Homebrew's; macOS's own /usr/bin/openssl
-# (LibreSSL 3.3) has no Ed25519, and the probe below passes it over. A program is looked for only at these places,
-# never on the PATH, and is used only once it took RFC 8032's test vector and refused it with one bit changed.
+# that verifies Ed25519 (the owner's "OpenSSL as a second check"). So one wrong line of our own code above cannot let a
+# forged release into a fleet, and a machine with no such OpenSSL checks as before. No package comes in: every supported
+# Linux system has OpenSSL 3, because its ca-certificates depends on it, and a Mac's Homebrew Python brings Homebrew's;
+# macOS's own /usr/bin/openssl (LibreSSL 3.3) has no Ed25519, and the probe below passes it over. A program is looked
+# for only at these places, never on the PATH, and is used only once it took RFC 8032's test vector and refused it with
+# one bit changed.
 OPENSSL_PLACES = ("/usr/bin/openssl", "/opt/homebrew/opt/openssl@3/bin/openssl",
                   "/usr/local/opt/openssl@3/bin/openssl")
 OPENSSL_WAIT = 30                   # seconds for one check by OpenSSL
@@ -282,8 +282,9 @@ def openssl_verifier(again=False):
     None: then our own Ed25519 decides alone. A program that it found is kept for the process; when it found none, it
     looks again at the next check, so a short fault of a probe (a time-out under load, a full /tmp) does not turn the
     second check off for the life of a hub. `again` probes anew in any case."""
-    if _openssl and not again:
-        return _openssl[0]
+    held = _openssl[:1]             # one read: another thread of the hub can empty the list between a test and an index
+    if held and not again:
+        return held[0]
     public, message, signature = _PROBE
     forged = bytes([signature[0] ^ 1]) + signature[1:]
     found = next((program for program in OPENSSL_PLACES

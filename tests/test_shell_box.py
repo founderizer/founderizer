@@ -163,7 +163,7 @@ class Helper(unittest.TestCase):
                                                            "headers": {"Authorization": f"Bearer {TOKEN}"}}}})
         settings = self.private(option("--settings"))
         self.assertEqual(settings["permissions"], {"allow": ["mcp__fleet__*", "WebSearch"],
-                                                   "deny": fleet.DENY})
+                                                   "deny": fleet.DENY, "defaultMode": "dontAsk"})
         self.assertFalse(settings["autoMemoryEnabled"])
         self.assertEqual(settings["crossSessionInbound"], "refuse")       # no message of another Claude session
         self.assertNotIn("enableWorkflows", settings)
