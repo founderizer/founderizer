@@ -327,7 +327,7 @@ installer's own step for it is step 11, and three things follow from it:
   shared the hub's own user, and it is now in the same position as every other agent of
   a fleet these installers make: fetch only. The hub itself commits the owner's own
   files, and each task's output, which the agent's helper sends to it when the agent
-  delivers (RULES.md, "Where work goes").
+  delivers (RULES.md, "Where work goes", for a task's output).
 - **`verify` reads each agent as its own user** (PRODUCT.md 4.1 keeps its check ids; a
   reading it cannot take warns), which is why the root helper of step 8 exists.
 
