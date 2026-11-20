@@ -970,6 +970,54 @@ class SelfUpdate(HostCase):
         bundle, _ = self.release(self.NEWER, seed=early)
         self.assertEqual(self.update(bundle), self.TAKEN)
 
+    def test_a_release_that_this_host_s_openssl_refuses_is_refused(self):
+        """The owner's "OpenSSL as a second check" (20 November 2026), as releases.py checks a release: a fault of
+        ops-root's own Ed25519 that takes a changed signature puts no forged ops-root in root's place on a host that
+        has OpenSSL, and a good release is still taken."""
+        program = next((p for p in ROOT.OPENSSL_PLACES if re.match(r"OpenSSL [3-9]\.", subprocess.run(
+            [p, "version"], capture_output=True, text=True).stdout if os.access(p, os.X_OK) else "")), None)
+        if program is None:
+            self.skipTest("this machine has no OpenSSL 3 or later")
+        bundle, text = self.release(self.NEWER)
+        signature = base64.b64decode(bundle["manifest"]["signature"])
+        forged = dict(bundle, manifest=dict(bundle["manifest"], signature=base64.b64encode(
+            bytes([signature[0] ^ 1]) + signature[1:]).decode()))
+        with patch.object(ROOT, "verify_signature", lambda *_: True):
+            with self.assertRaisesRegex(ROOT.Refused, "this host's OpenSSL refuses the signature"):
+                self.update(forged)
+            self.assertFalse(os.path.exists(self.tmp + "/usr/local/sbin/ops-root"))
+        self.assertEqual(self.update(bundle), self.TAKEN)
+
+    def test_a_host_with_no_working_openssl_checks_a_release_as_before(self):
+        """With no OpenSSL that passes the probe, ops-root's own Ed25519 decides alone, so no host is locked out of
+        its updates for want of OpenSSL."""
+        bundle, _ = self.release(self.NEWER)
+        with patch.object(ROOT, "OPENSSL_PLACES", ()), patch.object(ROOT, "_openssl", []):
+            self.assertEqual(self.update(bundle), self.TAKEN)
+
+    def test_openssl_runs_with_ops_root_s_own_environment(self):
+        """The OpenSSL block starts its program with no env= of its own (releases.py's code, word for word), so
+        ops-root gives it its fixed ENV, where root's environment could name an OpenSSL configuration or modules of
+        somebody else's, and gives the process its own back after."""
+        bundle, _ = self.release(self.NEWER)
+        seen = []
+        with patch.dict(os.environ, {"OPENSSL_CONF": "/nowhere/openssl.cnf"}), \
+                patch.object(ROOT, "openssl_agrees", lambda *_: seen.append(dict(os.environ)) or True):
+            self.assertEqual(self.update(bundle), self.TAKEN)
+            self.assertEqual(os.environ.get("OPENSSL_CONF"), "/nowhere/openssl.cnf")
+        self.assertEqual(seen, [ROOT.ENV])
+
+    def test_ops_root_asks_openssl_with_the_same_code_as_releases_py(self):
+        """ops-root stands alone, so it holds its own copy of releases.py's second check of a release; a fix of one
+        copy that misses the other would check a host's root code otherwise than a hub's release."""
+        def block(text):
+            start = text.index("OPENSSL_PLACES = (")
+            end = text.index("\n\n\n", text.index("def openssl_agrees("))
+            return text[start:end]
+        with open(releases.__file__) as f:
+            ours = block(f.read())
+        self.assertEqual(block(ROOT.__loader__.get_data(ROOT.__file__).decode()), ours)
+
     def test_an_older_ops_root_is_refused(self):
         bundle, _ = self.release(f"VERSION = {ROOT.VERSION - 1}")
         with self.assertRaisesRegex(ROOT.Refused, f"older than {ROOT.VERSION}: never an older one"):

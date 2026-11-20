@@ -665,6 +665,8 @@ class Lists(unittest.TestCase):
         self.assertEqual(hub.case_lists(LISTS_PATH)["cause"], ["ours", "supplier"])
 
     def test_a_value_comes_from_its_list_and_a_list_that_cannot_be_read_takes_none(self):
+        """A typed value comes from its list; a file that cannot be read checks nothing and gives no word of the
+        session's as the owner's; and while a read fails, a value of the list keeps the owner's words."""
         self.assertEqual(hub.listed_values(LISTS_PATH, {"symptom": "wrong_price", "supplier": "8812"}),
                          {"symptom": "wrong_price", "supplier": "8812"})        # a name with no list keeps its word
         with self.assertRaisesRegex(hub.ToolError, "symptom must be one of the values of its list: wrong_price, "
@@ -680,6 +682,14 @@ class Lists(unittest.TestCase):
         self.assertIsNone(hub.resolution_refusal("knowledge/owner/none.md", {}))
         # and no plain line of the owner's comes from it: the word is then the session's own
         self.assertIsNone(hub.typed_plain("knowledge/owner/none.md", {"resolution": "drafted"}))
+        # a read of the catalog that fails now keeps the owner's words of the last one that the hub read, so a task
+        # delivered meanwhile keeps its plain line
+        said = hub.typed_plain(LISTS_PATH, {"resolution": "drafted"})
+        self.assertTrue(said)
+        with patch.object(hub, "knowledge_entries", lambda: hub.UnreadCatalog()):
+            self.assertEqual(hub.typed_plain(LISTS_PATH, {"resolution": "drafted"}), said)
+            # such a read checked no value (listed_values), so a word that no list holds says nothing
+            self.assertIsNone(hub.typed_plain(LISTS_PATH, {"resolution": "refund_sent"}))
         self.assertEqual(hub.listed_values(None, {"resolution": "anything"}), {"resolution": "anything"})   # F1
         self.assertIn("one of drafted, other", hub.resolution_refusal(LISTS_PATH, {}))
         self.assertIsNone(hub.resolution_refusal(LISTS_PATH, {"resolution": "drafted"}))
@@ -1038,6 +1048,13 @@ class Tools(Fleet):
         self.assertIsNone(duty["recent"][1]["facts"])
         self.assertEqual(duty["recent"][2]["facts"], {"cause": "Ours"})
         self.assertEqual([c["id"] for c in duty["cases"]], [cases[3]])
+        # a read of the catalog that fails now keeps the words of the last one that the hub read (Hub core's finding
+        # of 20 November 2026: the facts lost their words until git read again)
+        with patch.object(hub, "knowledge_entries", lambda: hub.UnreadCatalog()):
+            code, state = self.request("/ui/state")
+        self.assertEqual(code, 200, state)
+        duty = next(d for d in state["responsibilities"] if d["id"] == r["id"])
+        self.assertEqual(duty["recent"][0]["facts"], {"cause": "Ours", "resolution": "Reassigned to Ána"})
 
     def test_a_duty_names_the_tools_of_its_sessions(self):
         review = self.duty(watch=[{"kind": "clock", "schedule": EVERY}], tools=["remember", "write_notes"])
@@ -2389,6 +2406,8 @@ class Reports(Cases):
         self.assertFalse(error, text)
 
     def test_a_duty_takes_only_an_owner_file_and_duties_that_can_work_a_report(self):
+        """Each refusal of a duty's lists and report_to says its true cause, and a read of the knowledge files that
+        fails now is no file that is not there: nothing is saved, and the words say so."""
         body = {"agent": "desk", "text": "Answer each ticket.", "watch": []}
         for fields, said in (({"lists": "knowledge/agents.md"}, "one of the owner's knowledge files"),
                              ({"lists": "knowledge/owner/sub/x.md"}, "one of the owner's knowledge files"),
@@ -2411,6 +2430,18 @@ class Reports(Cases):
             with self.assertRaises(hub.Refusal) as caught, hub.LOCK:
                 hub.duty_save(hub.duty_fields(fields, False), "manager", hub.now(), duty_id=duty["id"])
             self.assertIn(said, str(caught.exception))
+        # a read of the knowledge files that fails now is no file that is not there: the duty is not saved, and the
+        # words say why (a finding of 20 November 2026: they said "no owner knowledge file with lists")
+        with patch.object(hub, "knowledge_entries", lambda: hub.UnreadCatalog()), \
+                self.assertRaises(hub.ToolError) as caught, hub.LOCK:
+            hub.duty_save(hub.duty_fields({"lists": LISTS_PATH}, False), "manager", hub.now(), duty_id=self.r["id"])
+        self.assertIn("The knowledge files cannot be read now. Nothing was saved.", str(caught.exception))
+        # and so is a file that the catalog has whose own text cannot be read now
+        hub.CASE_LISTS.clear()
+        with patch.object(hub, "knowledge_text", lambda entry: None), \
+                self.assertRaises(hub.ToolError) as caught, hub.LOCK:
+            hub.duty_save(hub.duty_fields({"lists": LISTS_PATH}, False), "manager", hub.now(), duty_id=self.r["id"])
+        self.assertIn("The knowledge files cannot be read now", str(caught.exception))
         self.once(["T-81 message"])
         hub.TEAM["agents"]["ops"]["can"] = ["web"]                         # its Shell box went off after the save
         text, error = self.report(self.tasks()[0], symptom="wrong_price", component="price_update")

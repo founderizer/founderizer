@@ -32516,7 +32516,10 @@ def duty_view(r, t0=None, reads=None):
         elif reads is not None:
             if reads.catalog is None:
                 reads.catalog = knowledge_entries()
-            lines = reads.lines[r["lists"]] = case_list_lines(r["lists"], reads.catalog)
+            # a catalog that cannot be read now: the one that the hub read last, and the lines that it kept, with no
+            # git process, so a case's facts keep their words while git fails
+            lines = reads.lines[r["lists"]] = case_list_lines(r["lists"], read=False) \
+                if isinstance(reads.catalog, UnreadCatalog) else case_list_lines(r["lists"], reads.catalog)
         else:
             lines = case_list_lines(r["lists"], read=False)     # a duty route holds LOCK: no git process in it
     view["recent"] = [recent_case_view(c, lines) for c in closed]
@@ -33542,8 +33545,11 @@ def duty_report_target(body, want):
     lists from; for report_to, the lists symptom and component and a check watch that prints lines, in which the hub
     starts a covered ticket's session; and duties to report to that are live, are not this one, name lists with cause
     and next_step, and are held by a worker or a lead whose Shell box is on, which can work a report."""
-    lists = case_lists(body["lists"]) if body.get("lists") else {}
+    catalog = knowledge_entries() if body.get("lists") or body.get("report_to") else []
+    lists = case_lists(body["lists"], catalog) if body.get("lists") else {}
     if body.get("lists") and not lists:
+        if lists_unread(body["lists"], catalog):    # a read that failed is no file that is not there
+            raise KnowledgeUnread("set_duty", "Nothing was saved.")
         raise Refusal(400, f"lists names {body['lists']}, which is no owner knowledge file with lists")
     if not body.get("report_to"):
         return
@@ -33562,7 +33568,9 @@ def duty_report_target(body, want):
         if role_of(to["agent"]) not in ("worker", "lead") or shell_off(to["agent"]):
             raise Refusal(400, f"{rref(rid)} is held by {to['agent']}, which cannot work a report: its holder must "
                                f"be a worker or a lead whose Shell box is on")
-        theirs = case_lists(to["lists"]) if to["lists"] else {}
+        theirs = case_lists(to["lists"], catalog) if to["lists"] else {}
+        if to["lists"] and not theirs and lists_unread(to["lists"], catalog):
+            raise KnowledgeUnread("set_duty", "Nothing was saved.")
         if not (theirs.get("cause") and theirs.get("next_step")):
             raise Refusal(400, f"{rref(rid)} names no lists with cause and next_step, so no case of it could cover a "
                                f"ticket")
@@ -44091,12 +44099,16 @@ CASE_LIST_VALUE = re.compile(r"- +`([a-z0-9_]{1,40})`")
 CASE_LISTS = {}                 # (commit, path): the lists of one owner file at that commit
 
 
-def case_lists(path):
+def case_lists(path, catalog=None):
     """The lists of one owner knowledge file (support plan F4, K2), as {name: [values]}: each "## <Name>" heading is
     one list, named in lower case with "_" for each run of other characters ("Next step" is next_step), and each line
     that starts with "- `value`" under it is one of its values, a word of TYPED_WORD. {} for a path that is no owner
-    file at the hub's commit. No database read: tools_for calls it inside the transactions of a call."""
-    entry = next((k for k in knowledge_entries() if k["path"] == path and k["scope"] == "owner"), None) \
+    file at the hub's commit, and also for a read that failed (the catalog's, an UnreadCatalog, or the file's text):
+    a caller that must tell these apart passes the catalog that it read and asks lists_unread. catalog:
+    knowledge_entries(), when the caller read it already.
+    No database read: tools_for calls it inside the transactions of a call."""
+    catalog = knowledge_entries() if catalog is None else catalog
+    entry = next((k for k in catalog if k["path"] == path and k["scope"] == "owner"), None) \
         if isinstance(path, str) else None
     if not entry:
         return {}
@@ -44131,6 +44143,16 @@ def case_lists(path):
 
 
 CASE_LINES = {}                 # (commit, path): the line of each value of one owner file's lists, at that commit
+
+
+def lists_unread(path, catalog):
+    """True when the lists of owner file `path` cannot be read now, so that "no lists" would be false: the catalog's
+    read failed (an UnreadCatalog), or the catalog has the file and case_lists kept no parse of it (it keeps every
+    parse, an empty one too, and never a read of the text that failed)."""
+    if isinstance(catalog, UnreadCatalog):
+        return True
+    entry = next((k for k in catalog if k["path"] == path and k["scope"] == "owner"), None)
+    return entry is not None and (entry["commit"], path) not in CASE_LISTS
 
 
 def case_list_lines(path, catalog=None, read=True):
@@ -44181,7 +44203,7 @@ def listed_values(path, values):
     takes its values from them, never free text). A duty that names no file takes typed words, as in F1. With a file,
     a name of LIST_FIELDS or of one of its lists takes only a value of that list, and one whose list the file does not
     have is refused in words that name the list. A file that the hub cannot read at all, or that holds no list,
-    checks nothing, and its result gets no plain line (typed_plain)."""
+    checks nothing, and no word of its result gets a plain line (typed_plain says only a value that a list holds)."""
     if not path:
         return values
     lists = case_lists(path)
@@ -44223,12 +44245,17 @@ def typed_plain(path, values):
     session's: a value comes from its list (listed_values), a value with no line there says its own words
     (typed_words), and a list's `other` ("none of the values above") says nothing. A duty that names no file gets no
     line, because its values are a session's own words (F1)."""
-    if not path or not case_lists(path):    # no list now (listed_values checked nothing): the word is the session's
+    # while a read fails, the catalog that this hub read last (knowledge_shown), so a task delivered meanwhile keeps
+    # its line; and only a value that a list of the file holds says anything, because such a read checked none
+    # (listed_values took any word then)
+    catalog = (knowledge_shown() or []) if path else []
+    lists = case_lists(path, catalog) if path else {}
+    if not lists:                           # no list (listed_values checked nothing): the word is the session's
         return None
-    lines, said = case_list_lines(path), []
+    lines, said = case_list_lines(path, catalog), []
     for name in PLAIN_LISTS:
         value = values.get(name)
-        if value in (None, "other"):
+        if value in (None, "other") or value not in (lists.get(name) or ()):
             continue
         words = " ".join(((lines.get(name) or {}).get(value) or typed_words(value)).replace("`", "").split())
         # A line may follow its value with a dash and a space in place of a colon; "-10% on the price" keeps its sign

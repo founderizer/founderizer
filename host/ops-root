@@ -3533,6 +3533,21 @@ def tree_entries(body):
     return entries
 
 
+@contextlib.contextmanager
+def fixed_environment():
+    """This process's environment is ENV while it holds: the OpenSSL block below (releases.py's, word for word) starts
+    its program with no env= of its own, so the program takes this process's environment, and root's could name an
+    OpenSSL configuration or modules that turn the second check off or make it refuse a good release."""
+    kept = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(ENV)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(kept)
+
+
 def verify_bundle(bundle):
     """{name: bytes} of the host files in a bundle that a release key signed. The bundle carries the release's
     manifest, its commit object, the root tree, the tree of host/ and each file: each object's git hash is checked
@@ -3546,8 +3561,14 @@ def verify_bundle(bundle):
             raise ValueError
     except (KeyError, TypeError, ValueError, AttributeError):
         raise Refused("the release bundle is not well formed") from None
-    if not any(verify_signature(key, signed_text(m), signature) for key in release_keys()):
+    keys = [key for key in release_keys() if verify_signature(key, signed_text(m), signature)]
+    if not keys:
         raise Refused("no release key of this host signed this release")
+    with fixed_environment():
+        agreed = any(openssl_agrees(key, signed_text(m), signature) for key in keys)
+    if not agreed:
+        raise Refused("a release key of this host signed this release by ops-root's own check, and this host's "
+                      "OpenSSL refuses the signature")
     if git_object("commit", commit) != m["revision"]:
         raise Refused("the commit is not the signed revision")
     tree = re.match(rb"tree ([0-9a-f]{40})\n", commit)
@@ -3670,6 +3691,79 @@ def verify_signature(public, message, signature):
         return _same(_mul(scalar, _G), _add(given, _mul(h, point)))
     except (ValueError, TypeError, OverflowError):
         return False
+
+
+# ---------------------------------------------------------------- a second opinion: OpenSSL's Ed25519
+#
+# As releases.py checks a release (the owner's "OpenSSL as a second check", 20 November 2026): a bundle is taken
+# only when this host's OpenSSL takes the release key's signature too, where the host has one that verifies
+# Ed25519, so one wrong line of the Ed25519 above cannot put a forged ops-root in root's place. The same code as
+# releases.py, here so that this file stands alone (test_host_parts.SelfUpdate holds the two copies equal).
+OPENSSL_PLACES = ("/usr/bin/openssl", "/opt/homebrew/opt/openssl@3/bin/openssl",
+                  "/usr/local/opt/openssl@3/bin/openssl")
+OPENSSL_WAIT = 30                   # seconds for one check by OpenSSL
+OPENSSL_SAYS = "Signature Verified Successfully"    # pkeyutl's line for a good signature, beside its status 0
+_ED25519_HEAD = bytes.fromhex("302a300506032b6570032100")      # the DER head of an Ed25519 public key (RFC 8410)
+# RFC 8032's TEST 2 (section 7.1): OpenSSL's pkeyutl reads no message of zero bytes, so not TEST 1. No manifest is
+# empty, and a message of zero bytes is refused wherever OpenSSL checks.
+_PROBE = (bytes.fromhex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"), b"\x72",
+          bytes.fromhex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+                        "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"))
+_openssl = []                       # [the program] once one is found in this process; empty before, or with none
+
+
+def openssl_verify(program, public, message, signature):
+    """True when the OpenSSL program at this path says that `signature` is the Ed25519 signature of `message` by the
+    32-byte key `public`: both its status 0 and its line. Every failure to ask it is False."""
+    folder = None
+    try:
+        folder = tempfile.mkdtemp(prefix="fleet-ed25519-")
+        names = ("key.pem", "message", "signature")
+        pem = (b"-----BEGIN PUBLIC KEY-----\n" + base64.b64encode(_ED25519_HEAD + bytes(public))
+               + b"\n-----END PUBLIC KEY-----\n")
+        for name, data in zip(names, (pem, bytes(message), bytes(signature))):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(data)
+        key, text, sig = (os.path.join(folder, name) for name in names)
+        done = subprocess.run([program, "pkeyutl", "-verify", "-pubin", "-inkey", key, "-rawin", "-in", text,
+                               "-sigfile", sig], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=OPENSSL_WAIT)
+        return done.returncode == 0 and done.stdout.decode("utf-8", "replace").strip() == OPENSSL_SAYS
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        return False
+    finally:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+def openssl_verifier(again=False):
+    """The first OpenSSL of OPENSSL_PLACES that takes RFC 8032's test vector and refuses it with one bit changed, or
+    None: then our own Ed25519 decides alone. A program that it found is kept for the process; when it found none, it
+    looks again at the next check, so a short fault of a probe (a time-out under load, a full /tmp) does not turn the
+    second check off for the life of a hub. `again` probes anew in any case."""
+    held = _openssl[:1]             # one read: another thread of the hub can empty the list between a test and an index
+    if held and not again:
+        return held[0]
+    public, message, signature = _PROBE
+    forged = bytes([signature[0] ^ 1]) + signature[1:]
+    found = next((program for program in OPENSSL_PLACES
+                  if os.path.isfile(program) and os.access(program, os.X_OK)
+                  and openssl_verify(program, public, message, signature)
+                  and not openssl_verify(program, public, message, forged)), None)
+    _openssl[:] = [found] if found else []
+    return found
+
+
+def openssl_agrees(public, message, signature):
+    """True when this machine has no OpenSSL that verifies Ed25519, or when its OpenSSL takes this signature too.
+    OpenSSL's no is asked once more after a new probe: a program that stopped working since its probe then refuses
+    nothing by itself, and our own Ed25519 decides, as on a machine with none, while an OpenSSL that works refuses a
+    forged signature both times."""
+    program = openssl_verifier()
+    if program is None or openssl_verify(program, public, message, signature):
+        return True
+    program = openssl_verifier(again=True)
+    return program is None or openssl_verify(program, public, message, signature)
 
 
 # ---------------------------------------------------------------- one call
