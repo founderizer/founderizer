@@ -327,59 +327,96 @@ class Machines(test_ui_api.OwnerAPI):
 
     START_CHECK = {"result": "refused", "release": "2026.11.677", "revision": "7" * 40, "keeps": "2026.11.676",
                    "reason": "start-check: broken does not load: RuntimeError: no such setting here", "at": 1795000000.5}
+    KEPT = {k: v for k, v in START_CHECK.items() if k != "at"}
 
-    def test_each_row_says_the_helper_s_last_start_check_as_it_sent_it(self):
+    def test_each_row_says_the_helper_s_last_start_check_as_the_hub_keeps_it(self):
         """The release start check, part 2: the record that a helper reads beside its floor at each report
-        (lifecycle.read_start_check) is on its row; a record of another shape is dropped and never refuses the report,
-        and a helper from before it sends none."""
+        (lifecycle.read_start_check) is on its row, its time as `checked_at`; a record of another shape, or whose
+        release or kept release is words and not a version or a commit, is dropped and never refuses the report, and a
+        helper from before it sends none. A refusal that the helper serves again, with a new time, changes nothing that
+        the apps read at once (untimed): with its time as `at`, each such report changed the state for every app."""
         self.assertEqual(self.status()[0], 200)
         self.assertIsNone(self.row("vps")["start_check"])
         body, record = self.report_body("vps"), self.START_CHECK
         self.assertEqual(self.request("/helper/status/vps", dict(body, start_check=record))[0], 200)
-        self.assertEqual(self.row("vps")["start_check"], record)
+        self.assertEqual(self.row("vps")["start_check"], dict(self.KEPT, checked_at=record["at"]))
+        before, again = hub.CHANGE["state"], dict(record, at=record["at"] + 60)
+        self.assertEqual(self.request("/helper/status/vps", dict(body, start_check=again))[0], 200)
+        self.assertEqual((hub.CHANGE["state"], self.row("vps")["start_check"]["checked_at"]), (before, again["at"]))
         for wrong in ("refused", dict(record, result="failed"), dict(record, release=""), dict(record, release=None),
+                      dict(record, release="2026.11.677, call +1 555 0100 or open example.com/help"),
+                      dict(record, keeps="Your fleet is lost: open https://example.com"),
                       dict(record, revision="7" * 12), dict(record, keeps=7), dict(record, reason="x" * 301),
                       dict(record, at="now"), dict(record, at=True), {k: v for k, v in record.items() if k != "at"}):
             self.assertEqual(self.request("/helper/status/vps", dict(body, start_check=wrong))[0], 200, wrong)
             self.assertIsNone(self.row("vps")["start_check"], wrong)
 
     def test_a_release_that_did_not_start_on_a_server_is_one_warning_in_the_owner_s_words(self):
-        """The owner's words of 20 November 2026, for a server whose helpers or service refused a release: one
+        """The owner's words of 20 November 2026, for a server where the release that the hub runs did not start: one
         `machine_refused` for each server (its agents and its service are one fact), with its first agent in team.json
-        order, and no `machine_failed` for those agents, whose Update cannot help. It is read from each machine's
-        record, never from the words of an update's detail, and a helper's record counts only when it is as new as its
-        update's request: a failed update with an older refusal (here a fetch that failed later) keeps machine_failed
-        and its Update, and a service that runs the hub's code keeps nothing."""
-        hub.TEAM["addresses"].update(box="127.0.0.4", spare="127.0.0.5", fine="127.0.0.6")
+        order, and no machine_failed or machine_behind for those agents, whose Update cannot help. The hub decides by
+        release and says it on each row (`release_refused`): a record that says `refused` for the hub's newest applied
+        release, from a machine that does not run the hub's code and is not stale, whatever its update's state (a
+        request after a change of the owner's files leaves a helper at waiting_idle while a turn runs) and with no
+        clock. A record of an older release keeps machine_failed and its Update, and a machine that names no revision
+        is not refused: no words could name what it keeps. Both releases are named from the hub's own records, never
+        from what a machine wrote: the refused one by its revision, the kept one by the release that the machine's
+        reported revision carries in the hub's repository, else that commit's first 12."""
+        hub.TEAM["addresses"].update(box="127.0.0.4", spare="127.0.0.5", fine="127.0.0.6", gone="127.0.0.7",
+                                     odd="127.0.0.8", busy="127.0.0.9", blank="127.0.0.10", nil="127.0.0.11")
         hub.TEAM["agents"].update(vps2={"role": "worker", "runtime": "codex", "machine": "vps", "can": []},
+                                  busy1={"role": "worker", "runtime": "codex", "machine": "busy", "can": []},
+                                  nil1={"role": "worker", "runtime": "codex", "machine": "nil", "can": []},
                                   box1={"role": "worker", "runtime": "codex", "machine": "box", "can": []})
-        body, record = self.report_body("vps", "a" * 40), self.START_CHECK
+        kept = self.push_file("release.json", json.dumps({"revision": "6" * 40, "version": "2026.11.676"}) + "\n",
+                              "release 2026.11.676")
+        self.move_kit(self.push_file("fleet.py", "# the helper, two\n", "a change of the helper"))
+        with hub.LOCK:
+            hub.q("INSERT INTO releases(seen, revision, version, state, finished) VALUES(?,?,?,?,?), (?,?,?,?,?)",
+                  (1.0, "5" * 40, "2026.11.675", "done", 10.0, 2.0, "7" * 40, "2026.11.677", "done", 20.0))
+        # what a machine wrote is never the owner's words: its own names stand where the hub's records are read
+        record = dict(self.START_CHECK, release="2026.11.999", keeps="2026.11.1")
+        body = self.report_body("vps", kept)
         refusal = "Release 2026.11.677 did not start on this server, so the server keeps the version that it runs."
 
         def report(agent, data):        # what POST /helper/status/<agent> does once its caller passed (helper_status)
             with hub.LOCK:
                 hub.record_status(agent, hub.validate_status(data))
-        for agent, now, detail in (("vps2", True, refusal), ("vps", True, refusal),
-                                   ("box1", False, "The checkout could not fetch: fatal: unable to access the hub")):
+        for agent, update, check in (
+                ("vps2", body["update"], record),           # asked again: requested, and no answer yet
+                ("vps", {"state": "failed", "detail": refusal}, record),
+                ("busy1", {"state": "waiting_idle", "detail": "Waits until no turn runs."}, record),
+                ("box1", {"state": "failed", "detail": "The checkout could not fetch."},
+                 dict(record, revision="5" * 40))):          # a refusal of an older release
             report(agent, body)
             self.assertEqual(self.update(agent)[1]["state"], "requested")
-            # this update's refusal, or one from before its request (record["at"] is days ago)
-            report(agent, dict(body, update={"state": "failed", "detail": detail},
-                               start_check=dict(record, at=hub.now()) if now else record))
-        for server, revision in (("spare", "a" * 40), ("fine", self.rev)):
+            report(agent, dict(body, update=update, start_check=check))
+        report("nil1", dict(body, revision=None, start_check=record))      # it names no revision
+        for server, revision, age in (("spare", kept, 0), ("fine", self.rev, 0), ("gone", kept, hub.MACHINE_STALE + 60),
+                                      ("odd", "a" * 40, 0), ("blank", None, 0)):
             hub.q("INSERT INTO server_status(server,data,reported) VALUES(?,?,?)",
-                  (server, json.dumps({"revision": revision, "start_check": dict(record, keeps="2026.11.675")}),
-                   hub.now()))
+                  (server, json.dumps({"revision": revision, "start_check": record}), hub.now() - age))
+        self.assertEqual({agent: (self.row(agent)["update"]["state"], self.row(agent)["release_refused"])
+                          for agent in ("vps", "vps2", "busy1", "box1", "nil1", "manager")},
+                         {"vps": ("failed", True), "vps2": ("requested", True), "busy1": ("waiting_idle", True),
+                          "box1": ("failed", False), "nil1": (None, False), "manager": (None, False)})
         code, health = self.request("/ui/health?db=test-generation")
         self.assertEqual(code, 200)
         self.assertEqual([w for w in health["warnings"] if w["kind"] == "machine_refused"], [
             {"agent": "vps", "kind": "machine_refused", "fix": None,
              "detail": "vps keeps release 2026.11.676, because release 2026.11.677 did not start there. It takes the "
                        "next release that starts there by itself."},
+            {"agent": "busy1", "kind": "machine_refused", "fix": None,
+             "detail": "busy keeps release 2026.11.676, because release 2026.11.677 did not start there. It takes the "
+                       "next release that starts there by itself."},
             {"kind": "machine_refused", "fix": None,
-             "detail": "spare keeps release 2026.11.675, because release 2026.11.677 did not start there. It takes the "
+             "detail": "spare keeps release 2026.11.676, because release 2026.11.677 did not start there. It takes the "
+                       "next release that starts there by itself."},
+            {"kind": "machine_refused", "fix": None,
+             "detail": "odd keeps release aaaaaaaaaaaa, because release 2026.11.677 did not start there. It takes the "
                        "next release that starts there by itself."}])
-        self.assertEqual([w["agent"] for w in health["warnings"] if w["kind"] == "machine_failed"], ["box1"])
+        self.assertEqual([(w["kind"], w["agent"]) for w in health["warnings"]
+                          if w["kind"] in ("machine_failed", "machine_behind")], [("machine_failed", "box1")])
 
     def test_failed_update_stays_visible(self):
         self.status(revision="a" * 40)

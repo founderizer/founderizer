@@ -1439,8 +1439,12 @@ class ServerService(Servers):
 
     def test_the_service_s_reading_carries_its_last_start_check(self):
         """The release start check, part 2: at each reading the service reads the record of its user's last start
-        check beside its floor (lifecycle.read_start_check); the hub keeps it of its shape and the servers page shows
-        it in the server's reading. A record of another shape is dropped and never refuses the reading."""
+        check beside its floor (lifecycle.read_start_check); the hub keeps it of its shape, its time as `checked_at`,
+        and the servers page shows it in the server's reading, with the hub's one decision from it (`release_refused`:
+        it refused the release that the hub runs, and it runs other code). A record of another shape is dropped and
+        never refuses the reading. The reading says too the revision that the service moves to while it is in the
+        middle of an update (`updating`), and the hub's revision that it knew as it read (`heard`: the answer of its
+        report before), which the approval of a release reads, each a whole commit id or nothing."""
         life = self.mod.lifecycle
         self.join_by_script(self.code()["code"])
         svc = self.service()
@@ -1448,15 +1452,29 @@ class ServerService(Servers):
         svc.floor = str(self.home / ".fleet" / life.FLOOR_FILE)
         life.keep_start_check(svc.floor, "server", "refused", "2026.11.677", "7" * 40, "2026.11.676",
                               "start-check: broken does not load: RuntimeError: no such setting here")
+        svc.loaded = "a" * 40           # it keeps a revision that is not the hub's
         self.assertEqual(svc.report(), 200)
-        said = self.servers()[1]["mini"]["reading"]["start_check"]
-        self.assertEqual(said, dict(life.read_start_check(svc.floor, "server")))
-        self.assertEqual({k: v for k, v in said.items() if k != "at"},
+        reading = self.servers()[1]["mini"]["reading"]
+        written = life.read_start_check(svc.floor, "server")
+        self.assertEqual(reading["start_check"],
                          {"result": "refused", "release": "2026.11.677", "revision": "7" * 40, "keeps": "2026.11.676",
-                          "reason": "start-check: broken does not load: RuntimeError: no such setting here"})
-        Path(life.start_record_path(svc.floor, "server")).write_text(json.dumps(dict(said, result="maybe")))
+                          "reason": "start-check: broken does not load: RuntimeError: no such setting here",
+                          "checked_at": written["at"]})
+        self.assertIs(reading["release_refused"], False)            # the hub has applied no release
+        with hub.LOCK:
+            hub.q("INSERT INTO releases(seen, revision, version, state, finished) VALUES(?,?,?,?,?)",
+                  (1.0, "7" * 40, "2026.11.677", "done", 2.0))
+        self.assertIs(self.servers()[1]["mini"]["reading"]["release_refused"], True)
+        Path(life.start_record_path(svc.floor, "server")).write_text(json.dumps(dict(written, result="maybe")))
+        self.assertIsNone(reading["updating"])
+        self.assertEqual(reading["heard"], hub.kit_revision(fresh=True))       # the answer of its first report
+        svc.updating = "f" * 40
         self.assertEqual(svc.report(), 200)
-        self.assertIsNone(self.servers()[1]["mini"]["reading"]["start_check"])
+        self.assertEqual([self.servers()[1]["mini"]["reading"][k]
+                          for k in ("start_check", "release_refused", "updating")], [None, False, "f" * 40])
+        svc.updating = svc.desired = "f" * 12               # not a whole commit id: dropped, and the reading stays
+        self.assertEqual(svc.report(), 200)
+        self.assertEqual([self.servers()[1]["mini"]["reading"][k] for k in ("updating", "heard")], [None, None])
 
     def test_the_join_makes_a_key_saves_the_server_and_sends_only_the_sha256(self):
         answer = self.code()
@@ -1947,11 +1965,14 @@ class ServerService(Servers):
 
     def lets_every_move_through(self):
         """These tests measure what the service does with a move, with commits that carry no signed release: the one
-        check of every move (lifecycle.may_take, DevOps plan 0.1) refuses those, and test_signed_code.ServerUpdate
-        runs it on this mover with real releases."""
-        patcher = patch.object(self.mod.lifecycle, "may_take", lambda *args, **kwargs: None)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        check of every move (lifecycle.may_take, DevOps plan 0.1) refuses those, and the release's own start check,
+        which runs as a process of its own (lifecycle.start_command), refuses a tree with no lifecycle.py.
+        test_signed_code.ServerUpdate runs both on this mover with real releases."""
+        for name, stand_in in (("may_take", lambda *args, **kwargs: None),
+                               ("start_command", lambda argv, wait, cwd: (0, "start-check: it starts here", ""))):
+            patcher = patch.object(self.mod.lifecycle, name, stand_in)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_an_update_restarts_only_for_code(self):
         self.lets_every_move_through()

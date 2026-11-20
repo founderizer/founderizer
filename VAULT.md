@@ -986,7 +986,13 @@ host.
     the user's units, `~/.local/bin`, the Python user site, the shell and tool files, each runtime's settings), the
     crontab, the processes and the listening ports (`home_reading.py`, the owner's page `homes`). That record stops
     nothing, and a program of the same user can change what it says. The change stays inside that one agent: another
-    agent's OS user, the hub and the vault's stores are out of its reach. The repair is to remove the agent and add it
+    agent's OS user, the hub and the vault's stores are out of its reach. One effect goes further: on the owner's own
+    fleet, a session can hold a release from every customer until a newer release (`autopublish.fleet_took`). It can
+    write a refusal of that release as its machine's start check before the machine takes it, or a check of it that
+    did not end in time while its helper's update is failed, or stop its helper after the release was applied. On a
+    Mac its server service runs as the same user, so the session can write the service's record too, and a service's
+    check that did not end shows nothing on the owner's page. The hub names the releases on the owner's page from its
+    own records, so such a session cannot put words of its own there. The repair is to remove the agent and add it
     again.
 
 ## What the owner must do

@@ -502,6 +502,7 @@ class Service:
         self.desired = self.last_report = None
         self.chrome_opened = self.report_at = None      # keep_chrome: when it last opened Chrome, and the reading due
         self.stuck = None               # a revision that did not fast-forward: no new try for it
+        self.updating = None            # the revision that this checkout moves to now, which each reading says
         self.proof_lock = threading.Lock()     # one live proof of the browser ports at a time (browser_proof)
         self.run_folder = "/run/user"   # where each agent's runtime folder is, with its browser lock
         self.listening = lifecycle.browser_listening
@@ -622,6 +623,10 @@ class Service:
             browser = None
         checked = lifecycle.read_start_check(self.floor, "server")     # its own last start check (lifecycle.take)
         return {**({"start_check": checked} if checked else {}),
+                **({"updating": self.updating} if self.updating else {}),     # in the middle of a move (update)
+                # the hub's revision that it knew as it read: a report before the answer that names a release has not
+                # heard of it yet (autopublish.fleet_took)
+                **({"heard": self.desired} if self.desired else {}),
                 "revision": self.loaded, "os": life.os_info(), "security": life.security(),
                 "runtimes": self.runtimes(), "load": lifecycle.machine_load(self.platform),
                 "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name, uid=os.getuid()),
@@ -1658,32 +1663,58 @@ class Service:
         code branch, and leaves an origin from before the split as it was). A revision that does not fast-forward
         gets no second try. Before each move the release's own start check runs on this machine (lifecycle.take,
         `starts`): a release that does not start here moves nothing and starts nothing, and the line on standard
-        error says which release and why; a later revision of the same release is refused at once."""
+        error says which release and why; a later revision of the same release is refused at once. A check that did
+        not end in time moves nothing either, and the next revision is checked again.
+
+        A move that this process starts again for (code) is said to the hub before its check, as `updating` in a
+        report at once, and the end of a move that did not happen is said at once too: the hub's approval of a
+        release for customers waits while a service is in the middle of its update (autopublish.fleet_took), and
+        hears a refusal at once and not at the next round. The new process reports at its start, as always. A move
+        of data alone, which each task's output and each change of the owner's files makes, sends no report of its
+        own: a reading runs `apt-get -s upgrade`, which can take a minute."""
         desired = self.desired
         if not desired or desired in (self.loaded, self.stuck):
             return
         if self.run(["git", "-C", self.kit, "fetch", "-q", "origin"], timeout=120)[0] != 0:
             return                      # no network: this revision keeps its try for the next round
         code, out, _ = self.run(["git", "-C", self.kit, "diff", "--name-only", self.loaded or "HEAD", desired])
+        loads = code == 0 and any((p.endswith(".py") and not p.startswith((lifecycle.OUTPUTS, lifecycle.SKILLS + "/")))
+                                  or p == "team.json" for p in out.split())
+        if loads:
+            self.updating = desired
+            self.report_now()
         # Every move under the one check (lifecycle.may_take), and the release's start check on this machine: onto
         # the ref, and onto the hub's revision.
         problem = "git diff failed" if code != 0 else \
             lifecycle.follow_config_ref(self.kit, self.run, self.floor, starts="server") or \
             lifecycle.take(self.kit, desired, self.run, self.floor, starts="server")
-        if isinstance(problem, lifecycle.Refused):
-            self.stuck = desired
-            print(problem, file=sys.stderr, flush=True)
-            return
         if problem:
             self.stuck = desired
-            print(f"Fleet could not fast-forward {lifecycle.checkout_branch(self.kit, self.run) or 'this checkout'} "
-                  f"to {desired[:12]}: {problem}; this server keeps {str(self.loaded)[:12]}.", file=sys.stderr,
-                  flush=True)
+            if isinstance(problem, (lifecycle.Refused, lifecycle.CheckTimedOut)):
+                print(problem, file=sys.stderr, flush=True)
+            else:
+                branch = lifecycle.checkout_branch(self.kit, self.run) or "this checkout"
+                print(f"Fleet could not fast-forward {branch} to {desired[:12]}: {problem}; this server keeps "
+                      f"{str(self.loaded)[:12]}.", file=sys.stderr, flush=True)
+            if self.updating:
+                self.updating = None
+                self.report_now()       # its refusal, or the end of a move that did not happen, at once
             return
-        if any((p.endswith(".py") and not p.startswith((lifecycle.OUTPUTS, lifecycle.SKILLS + "/"))) or p == "team.json"
-               for p in out.split()):
+        if loads:
             self.restart()              # a task's output and an agent's skill are no code that this service loads
-        self.loaded = desired
+        self.loaded, self.updating = desired, None
+
+    def report_now(self):
+        """A report out of the loop's turn, for the hub's view of this service's update (update). It changes nothing of
+        that update: the revision that the loop moves to next comes from the loop's own report, and one that fails
+        stops nothing, as the loop's next report says the same."""
+        desired = self.desired
+        try:
+            self.report(homes=False)
+        except Exception as e:      # noqa: BLE001 -- a report is never worth a move
+            print(f"The report of this server's update could not be sent: {type(e).__name__}", file=sys.stderr,
+                  flush=True)
+        self.desired = desired
 
     def vault_program(self):
         """This machine's vault broker onto the vault.py of this checkout, through the one root command the

@@ -50,6 +50,10 @@ OPS_READ = load("ops_read", os.path.join(HERE, "host", "ops-read"))
 # miguelpieras/founderizer-fleet to founderizer/founderizer on 11 November 2026.
 VENDOR_REPOS = ("founderizer/founderizer", "founderizer/founderizer-apps", "miguelpieras/founderizer-fleet",
                 "miguelpieras/founderizer-web", "miguelpieras/agents")
+# The words with which a refusal of a root script with no box (the form run) begins, when only the owner's word is
+# missing: Run it once, or Full access on its server. The hub knows such a refusal in the door's record by them
+# (hub.door_full_waiting), so they are one constant.
+NO_BOX = "is a root script with no box"
 # Host forms that only the door sends, with a value of its own on stdin: never an agent's call.
 DOOR_ONLY = {"self-update", "place", "pro-attach", "runner-register"}
 # Host forms whose content goes to the host on stdin, with its sha256, and the forms whose value the door itself sends
@@ -408,7 +412,7 @@ def decide_host(access, agent, me, host, op, args, never, content=None, lookups=
             return rule_only_refusal(access, host, h, lookups, "only rule forms run there, and no file install",
                                      **more)
         if f["kind"] == "full":             # door-modes proposal, step 3: the owner's yes runs that exact call once
-            return Decision("full", f"{op} is a root script with no box, which no grant on {host} covers", **more)
+            return Decision("full", f"{op} {NO_BOX}, which no grant on {host} covers", **more)
         return Decision("own", f"the host form {op}", **more)
     # N4: a new app lives on a fix host only. ops-root refuses it there too, but the door refuses it first, before it
     # makes a value or a runner's tokens for a call that the host will not run.

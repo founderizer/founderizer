@@ -12,6 +12,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
+import door_targets
 import hub
 from test_mobile import PHONE, Devices
 from test_servers import OTHER, OWNER, Servers, git
@@ -893,6 +894,48 @@ class DoorTokens(Access):
         self.assertEqual((StubDoor.calls[-1][1], hub.kv_get("door_record_base")), ("/record?after=2", "3"))
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM door_record")["n"], 6)
 
+    def test_a_refusal_in_the_read_that_brings_full_access_is_told(self):
+        """The door's record and its word of the modes come in one read. The hub keeps the read's lines before it takes
+        the word, so a root script that the door refused just before it took the owner's Full access is in the record
+        that the news reads (door_full_waiting; a review of 20 November 2026: on 13 November the door refused three
+        times in the minute before it took his Full access)."""
+        self.grant(agent="vps", server="web-1", level="fix")
+        mine = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Read the checkout logs','vps','working')")
+        waits = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Ship the waiting fixes','vps','working')")
+        t = time.time()
+        card = run_card(script="journalctl -u app\n")
+        hub.q("UPDATE door_record SET task=? WHERE call=?", (f"T-{mine}", card["door_call"]))
+        nid = int(hub.t_raise_needs_you("manager", card).split("N-")[1].split(".")[0])
+        full = {"v": 1, "kind": "door-mode", "fleet": hub.fleet_id(), "host": "web-1", "mode": "full",
+                "at": int(t) - 100}
+        hub.q("UPDATE needs SET approval=?, answer='answered', chosen=1, answered=? WHERE id=?",
+              (json.dumps({"statement": json.dumps(full, sort_keys=True, separators=(",", ":")), "signature": "c2ln"}),
+               t - 90, nid))
+        top = hub.q1("SELECT MAX(n) n FROM door_record")["n"]
+        hub.DOOR.update(read_at=0.0, error=None)
+        StubDoor.answers["/record"] = (200, {"entries": [], "last": top, "modes": {"web-1": {"mode": "auto"}}})
+        self.assertEqual(hub.door_sweep(t0=t + 10), 0)
+
+        def told():
+            return [r["task"] for r in hub.q("SELECT task FROM events WHERE agent='vps' AND kind='say' AND "
+                                             "text LIKE '%Full access on web-1 now%' ORDER BY id")]
+        # a full page: the door has more lines after it, so its word waits for the read that brings them
+        page = [{"n": top + i, "ts": t + 20, "caller": "lead", "target": "db-1", "action": "uptime", "kind": "rule",
+                 "outcome": "done", "why": "a rule call"} for i in range(1, hub.DOOR_PAGE + 1)]
+        full_word = {"web-1": {"mode": "full", "at": full["at"]}}
+        StubDoor.answers["/record"] = (200, {"entries": page, "last": top + hub.DOOR_PAGE + 1, "modes": full_word})
+        self.assertEqual(hub.door_sweep(t0=t + 80), hub.DOOR_PAGE)
+        self.assertEqual(told(), [])
+        script = b"apt-get install --only-upgrade openssl\n"
+        StubDoor.answers["/record"] = (200, {"entries": [page[-1], {
+            "n": top + hub.DOOR_PAGE + 1, "ts": t + 50, "caller": "vps", "target": "web-1", "action": "run",
+            "kind": "refused", "outcome": "refused",
+            "why": f"run {door_targets.NO_BOX}, which no grant on web-1 covers.",
+            "sha256": hub.door_call_hash("web-1", "run", [], script), "task": f"T-{waits}"}],
+            "last": top + hub.DOOR_PAGE + 1, "modes": full_word})
+        self.assertEqual(hub.door_sweep(t0=t + 140), 2)
+        self.assertEqual(told(), [mine, waits])
+
     def test_a_repository_that_the_door_made_reaches_the_hub_and_the_manager_gives_it_up_to_write(self):
         """New-projects plan N3: the door's record line names what a repo-new made, the hub keeps it in its copy, and
         grant_check lets the manager give that repository, at write at most, to an agent that holds no server through
@@ -1671,9 +1714,10 @@ class DoorCalls(Access):
     def test_the_hub_says_when_the_door_took_full_access_and_when_it_did_not(self):
         """Incident intake, part 3. On 13 November 2026 the owner's signed Full access was at the door 80 seconds
         after his press, and nothing told the agent that had asked, or the manager. The door's own word comes with
-        each read of its record: when it turns to Full access, the task of the card hears it one time; and when the
-        door has read a fresh statement of the hub two times and keeps none of that time, the manager hears that
-        one time."""
+        each read of its record: when it turns to Full access, the task of the card hears it one time, and so does
+        each other open task whose root script the door refused there (on 20 November 2026 a second task that no card
+        named waited on reminders, asked three times and ended as failed); and when the door has read a fresh
+        statement of the hub two times and keeps none of that time, the manager hears that one time."""
         self.grant(agent="vps", server="web-1", level="fix")
         task = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Read the checkout logs','vps','working')")
         once = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Rotate the logs','vps','working')")
@@ -1697,6 +1741,14 @@ class DoorCalls(Access):
         # a signed Run it once is no Full access: its task hears nothing, or its script would run two times
         answered("logrotate -f /etc/logrotate.conf\n", once,
                  {"v": 1, "kind": "door-call", "fleet": fleet, "need": 0, "call": "ab" * 32, "at": first}, t - 185)
+        # a task that no card names hears it as the card's task does: its newest root script there was refused for
+        # want of the owner's word (door_full_waiting has the other cases)
+        fixes = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Ship the waiting fixes','vps','working')")
+        script = b"apt-get install --only-upgrade openssl\n"
+        n = (hub.q1("SELECT MAX(n) n FROM door_record")["n"] or 0) + 1
+        hub.q("INSERT INTO door_record(n,ts,caller,target,action,kind,outcome,why,call,task) VALUES(?,?,?,?,?,?,?,?,?,?)",
+              (n, t - 150, "vps", "web-1", "run", "refused", "refused", f"run {door_targets.NO_BOX}, which no grant on "
+               f"web-1 covers.", hub.door_call_hash("web-1", "run", [], script), f"T-{fixes}"))
 
         def said(agent):
             return [(r["task"], r["text"]) for r in hub.q("SELECT task, text FROM events WHERE agent=? AND kind='say' "
@@ -1711,13 +1763,14 @@ class DoorCalls(Access):
         self.assertGreaterEqual(hub.DOOR["approvals_at"], t)
         word(first, t + 5)
         word(first, t + 65)
-        self.assertEqual(said("vps"), [(task, "[hub] The door has the owner's Full access on web-1 now: a root script "
-                                              "with no box runs there with no card. If the door refused your call, "
-                                              "send it again; a call that ran needs nothing more.")])
+        news = ("[hub] The door has the owner's Full access on web-1 now: a root script with no box runs there with no "
+                "card. If the door refused your call, send it again; a call that ran needs nothing more.")
+        self.assertEqual(said("vps"), [(task, news), (fixes, news)])
+        self.assertEqual(said("lead"), [])
         # a read in which the door names no server, and the next one: no news a second time
         word(None, t + 70, None)
         word(first, t + 75)
-        self.assertEqual(len(said("vps")), 1)
+        self.assertEqual(len(said("vps")), 2)
         self.assertEqual(said("manager"), [])                           # an old statement that the door keeps
         # a fresh statement that is not in effect at the door: the owner set Auto, and the door still says Full access
         def kept(statement, received):
@@ -1742,14 +1795,14 @@ class DoorCalls(Access):
         self.assertIn("it still says Full access for that server. The door's own log says why", told[0][1])
         # the door says Auto: nothing more
         word(second, t + 325, "auto")
-        self.assertEqual((len(said("manager")), len(said("vps"))), (1, 1))
+        self.assertEqual((len(said("manager")), len(said("vps"))), (1, 2))
         # a newer Full access that the door honours with the statement before it is in effect: no word to the
-        # manager, and the task of that very card hears of it one time
+        # manager, and the task of that very card hears of it one time, as the task whose call is still refused does
         kept(mode(int(t) - 5), t - 3)
         hub.DOOR["approvals_at"] = t + 330
         word(first, t + 385)
         word(first, t + 445)
-        self.assertEqual((len(said("manager")), len(said("vps"))), (1, 2))
+        self.assertEqual((len(said("manager")), len(said("vps"))), (1, 4))
         # a statement that is not fresh, or of a server that no agent holds at Fix, is no news: the door says the
         # same of a statement that it took and does not honour
         hub.kv_set("door_untaken:web-1", "")
@@ -1762,6 +1815,67 @@ class DoorCalls(Access):
         word(first, t + 625)
         word(first, t + 685)
         self.assertEqual(len(said("manager")), 1)
+
+    def test_full_access_reaches_each_task_that_waits_for_it_and_no_other(self):
+        """door_full_waiting: the tasks that hear of Full access on a server beside the task of the card (20 November
+        2026: a task that no card named waited on reminders, asked three times and ended as failed). Each open task of
+        an agent that holds the server at Fix whose newest root script there the door refused in the last week for
+        want of the owner's word alone. Not a call that ran after its refusal; not another agent's task, also when a
+        caller names it; not another server or form; not a refusal of a window, which Full access does not lift; not an
+        older refusal or an ended task; not a call that the owner answered No on a card of that task, also when the
+        task tries it again (RULES.md rule 5); and not one whose Run it once came after its refusal. A Run it once
+        from before the refusal, which the door used, and one of another task with the same script, hide nothing."""
+        self.grant(agent="vps", server="web-1", level="fix")
+        t, no_box = time.time(), f"run {door_targets.NO_BOX}, which no grant on web-1 covers."
+
+        def task(title, owner="vps", state="working"):
+            return hub.ins("INSERT INTO tasks(title,owner,state) VALUES(?,?,?)", (title, owner, state))
+
+        def line(of, script, at, kind="refused", caller="vps", target="web-1", action="run", why=no_box):
+            n = (hub.q1("SELECT MAX(n) n FROM door_record")["n"] or 0) + 1
+            hub.q("INSERT INTO door_record(n,ts,caller,target,action,kind,outcome,why,call,task) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?)", (n, at, caller, target, action, kind,
+                                                 "refused" if kind == "refused" else "done", why,
+                                                 hub.door_call_hash(target, action, [], script.encode()), f"T-{of}"))
+
+        def answer(of, script, at, words):
+            """The owner's answer at `at` to the card of task `of`'s run of this script: No, or Run it once."""
+            card = {"title": "Run one root script on web-1?", "why": "Vps must run one script.",
+                    "what_to_do": "Answer Run it once, or Full access on web-1", "door_host": "web-1",
+                    "door_call": hub.door_call_hash("web-1", "run", [], script.encode()), "door_script": script}
+            nid = int(hub.t_raise_needs_you("manager", card).split("N-")[1].split(".")[0])
+            approval = None if words == "No" else json.dumps({"statement": json.dumps(
+                {"v": 1, "kind": "door-call", "fleet": hub.fleet_id(), "need": nid, "call": card["door_call"],
+                 "at": int(at)}, sort_keys=True, separators=(",", ":")), "signature": "c2ln"})
+            hub.q("UPDATE needs SET approval=?, answer=?, answered=? WHERE id=?", (approval, words, at, nid))
+            self.assertEqual(hub.q1("SELECT door_task_id FROM needs WHERE id=?", (nid,))["door_task_id"], of)
+        waiting = task("Ship the waiting fixes")
+        line(waiting, "apt-get install --only-upgrade openssl\n", t - 150)
+        ran = task("Clear the cache")
+        line(ran, "rm -rf /srv/cache/tmp\n", t - 150)
+        line(ran, "rm -rf /srv/cache/tmp\n", t - 140, kind="own")
+        lead = task("Read the disk", owner="lead")
+        line(lead, "df -h\n", t - 150, caller="lead")                  # lead holds web-1 at no level
+        line(task("Another agent's task", owner="lead"), "du -sh /srv\n", t - 150)     # vps names lead's task
+        line(task("Read web-2"), "uptime\n", t - 150, target="web-2")
+        line(task("A script in the box"), "ls /srv\n", t - 150, action="script")
+        line(task("Restart at night"), "systemctl restart app\n", t - 150,
+             why="a restart on web-1 runs only inside its window (22:00-23:00 UTC)")
+        line(task("Read last month"), "cat /var/log/syslog\n", t - hub.DOOR_APPROVAL_DAYS * 86400 - 60)
+        line(task("An ended task", state="completed"), "free -m\n", t - 150)
+        declined = task("Move the uploads")
+        line(declined, "mv /srv/app/uploads /srv/app/uploads-old\n", t - 150)
+        answer(declined, "mv /srv/app/uploads /srv/app/uploads-old\n", t - 100, "No")
+        line(declined, "mv /srv/app/uploads /srv/app/uploads-old\n", t - 50)        # tried again after the No
+        once, twin = task("Rotate the logs"), task("Rotate the logs too")
+        line(twin, "logrotate -f /etc/logrotate.conf\n", t - 160)
+        line(once, "logrotate -f /etc/logrotate.conf\n", t - 150)
+        answer(once, "logrotate -f /etc/logrotate.conf\n", t - 100, "Run it once")
+        again = task("Prune the journal")
+        line(again, "journalctl --vacuum-time=7d\n", t - 400)
+        answer(again, "journalctl --vacuum-time=7d\n", t - 300, "Run it once")      # used: the door ran it
+        line(again, "journalctl --vacuum-time=7d\n", t - 150)
+        self.assertEqual([r["id"] for r in hub.door_full_waiting("web-1", t)], sorted([waiting, twin, again]))
 
     def test_the_words_of_a_signed_answer_do_not_close_the_door_s_card(self):
         """Words are no signature. An answer in words closes an item as a press does, so the words of Run it once or

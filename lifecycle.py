@@ -2324,7 +2324,8 @@ def take(kit, target, run=None, floor=None, room=False, starts=None):
     brings code runs the release's own start check after may_take and before the move (start_problem), and a release
     that does not start on this machine moves nothing and raises no floor; a check that cannot run here stops nothing.
     The result of each check is kept beside the floor (keep_start_check), and changes nothing of this decision.
-    None, or the reason why the checkout stays where it is: a Refused for a release that did not start here."""
+    None, or the reason why the checkout stays where it is: a Refused for a release that did not start here, a
+    CheckTimedOut for one whose check did not end in time."""
     keep_floor(kit, floor, run)
     commit = _commit(kit, run, target)
     if not commit:
@@ -2400,21 +2401,46 @@ START_PROGRAMS = {"helper": "fleet.py", "server": "server.py"}     # each role's
 # hub.py is not loaded: verify.py imports it for one rule, it is the hub's own program, it costs seconds and more than
 # 100 MB, and the hub's own check of a release loads it (releases.Update.checks).
 START_LEFT_OUT = ("hub",)
+# The files of the tree that each role's program starts by their path, as a program or a hook, and does not import:
+# the import step never reads them, and a line that this machine's Python refuses in hook_hosts.py ends each tool call
+# of each session there with status 2. The check compiles each of them, and each file that it imports that the import
+# step did not load (hook_clean.py's hidden.py), with this machine's Python, and runs none of them: a hook runs at each
+# tool call and a runner for a whole task, and their code reads and writes the machine. The helper starts the two hooks
+# (fleet.clean_hook, fleet.hosts_hook), the two runners of a task (fleet.acp_command, fleet.session_command), the chat
+# bridge (fleet.cmd_service), the door's `ops` command (fleet.ensure_ops) and `lifecycle.py mcp-start`
+# (fleet.program_start); the server service starts `fleet.py` in an agent's checkout of the same release (its key, its
+# service, a pinned install) and home_reading.py as each agent's user. test_signed_code reads fleet.py and server.py and
+# fails for a file that one of them starts by its path and that is in neither list.
+START_FILES = {"helper": ("acp_runner.py", "channels.py", "hook_clean.py", "hook_hosts.py", "lifecycle.py", "ops.py",
+                          "screen_runner.py"),
+               "server": ("fleet.py", "home_reading.py")}
+# Each file that a program names by its path and does not start, and why, for that test.
+START_NOT_STARTED = {"vault.py": "read and hashed, never started: the vault broker runs a root-owned copy of its own, "
+                                 "outside every checkout (server.Service.vault_program)"}
 # {a checkout's real path: (the revision of the last release that did not start, the words, its record's fields)}
 _REFUSED = {}
+# {a checkout's real path: (the revision of the last release whose check did not end in time, how many times in a row
+# in this process, the words, its record's fields)}: from the second time on it is served from here (start_problem)
+_TIMED_OUT = {}
 # The result of the last start check of each program of this user (its role), in a file beside the user's release
 # floor, which outlives the restart after a move: the helper's report and the server service's reading carry it as
 # `start_check` (read_start_check), so the hub knows a check that passed from one that could not run, and a refusal as
 # a fact and not as words to match. One file for each role: on a Mac the helper and the server service run as one
 # user, with one floor, and the one that checked last would else write over the other's result.
 START_RECORD = "start-check-{}.json"
-START_RESULTS = ("passed", "not_run", "refused")       # hub.start_check_status takes these three words only
+START_RESULTS = ("passed", "not_run", "refused", "timed_out")     # hub.start_check_status takes these words only
 
 
 class Refused(str):
     """take()'s reason for a release that did not start on this machine (start_problem): the words that the owner
     reads, which name the release and say why. A caller that starts again after a move tells it apart from any other
     reason."""
+
+
+class CheckTimedOut(str):
+    """take()'s reason for a release whose start check did not end within START_CHECK_WAIT (start_problem): the words
+    that the owner reads. It is no refusal: nothing is kept, so the next request of that release checks it again. A
+    caller shows the words as they are, keeps its checkout and starts nothing."""
 
 
 def start_record_path(floor, role):
@@ -2469,20 +2495,28 @@ def read_start_check(floor, role):
 def start_problem(kit, commit, role, run=None, head="HEAD", floor=None):
     """None when the move of checkout `kit` from `head` onto `commit` brings data only (data_path), when the tree of
     `commit` starts on this machine as `role`, or when its check cannot run here; else a Refused, the words of why the
-    checkout stays. Called only after may_take passed on `commit`. It never raises.
+    checkout stays, or a CheckTimedOut when the check did not end within START_CHECK_WAIT. Called only after may_take
+    passed on `commit`. It never raises.
 
     With a `floor` (the caller's release floor), each check that was due leaves its result beside it, in the file of
-    `role`, once its answer decided (keep_start_check): passed, not_run or refused. A refusal served again from this
-    process writes its record again with a new time, so the record is as new as the update that it stopped (the hub
-    takes a helper's record as the cause of its failed update only then). A move of data only and the same commit
-    write nothing.
+    `role`, once its answer decided (keep_start_check): passed, not_run, refused or timed_out. A refusal served
+    again from this process writes its record again with a new time, so the record says what the last move met; the
+    hub keeps that time as `checked_at` and decides by release, never by it (hub.start_refused). A move of data only
+    and the same commit write nothing.
 
-    Only the release's own answer refuses: its command ended with a status that is not 0, or its wait ran out. That
-    refusal is kept in this process: a later target that carries the same release (the revision of its release.json)
-    is refused with the same words and no new copy, and a target of another release is checked. A new process checks
-    once more, because an update of the system can have removed the cause. Anything that goes wrong in this code before
-    that answer (no room for the copy, a git step that fails) is a fault of the checker and not of the release: the
-    move goes on as it did before this check, one line on standard error says so, and nothing is kept."""
+    Only the release's own answer refuses: its command ended by itself with a status above 0. That refusal is kept in
+    this process: a later target that carries the same release (the revision of its release.json) is refused with the
+    same words and no new copy, and a target of another release is checked. A new process checks once more, because an
+    update of the system can have removed the cause. Anything else is a fault of this machine's moment or of the
+    checker, not of the release: no room for the copy, a git step that fails, a command that could not start (no
+    memory) or that a signal ended (status below 0) (start_check). Then the move goes on as it did before this check,
+    one line on standard error says so, and nothing is kept. A check whose wait ran out is neither: a release that
+    hangs as it loads would hang the program that starts it, the dead machine that this check exists to prevent, and
+    a loaded server can be why. So the checkout stays, as for a refusal, and the next request of the release checks
+    it again, once: a second time-out of the same release in this process is kept (_TIMED_OUT), with words that say
+    so, and each later target of that release gets those words and its record again, with no copy and no wait,
+    because each task start of each agent of the server would else wait START_CHECK_WAIT for it. A new process, or
+    another release, checks again."""
     name, revision, keeps = commit[:12], None, None
     try:
         old = _commit(kit, run, head)
@@ -2498,21 +2532,35 @@ def start_problem(kit, commit, role, run=None, head="HEAD", floor=None):
         if revision and kept and kept[0] == revision:
             keep_start_check(floor, role, "refused", *kept[2])
             return kept[1]
+        hung = _TIMED_OUT.get(key)
+        if revision and hung and hung[0] == revision and hung[1] >= 2:
+            keep_start_check(floor, role, "timed_out", *hung[3])
+            return hung[2]
         if floor and old:               # what the checkout keeps if this release does not start: for the record only
             mine = _blob(kit, run, old, RELEASE_FILE)
             keeps = (released(mine)[1] if mine is not None else None) or old[:12]
-        passed, reason = start_check(kit, commit, role, run)
+        result, reason = start_check(kit, commit, role, run)
     except Exception as e:      # the checker's own fault, never the release's
-        passed, reason = None, _fault(e)
-    keep_start_check(floor, role, "passed" if passed else "not_run" if passed is None else "refused", name, revision,
-                     keeps, reason)
-    if passed:
+        result, reason = "not_run", _fault(e)
+    keep_start_check(floor, role, result, name, revision, keeps, reason)
+    if result == "passed":
         return None
-    if passed is None:
+    if result == "not_run":
         with contextlib.suppress(OSError, ValueError):      # a standard error that is gone stops nothing either
             print(f"Release {name} is taken without its start check, which could not run on this server: {reason}",
                   file=sys.stderr, flush=True)
         return None
+    if result == "timed_out":
+        hung = _TIMED_OUT.get(key) if revision else None
+        times = hung[1] + 1 if hung and hung[0] == revision else 1
+        # the second time-out is kept, and its words, which each later target of the release gets, say so
+        words = CheckTimedOut((f"Release {name} was not taken this time: {reason}. It is checked again at the next "
+                               f"update." if times < 2 else
+                               f"Release {name} was not taken: {reason} two times. It is checked again with the next "
+                               f"release, or when this program starts again.")[:300])
+        if revision:
+            _TIMED_OUT[key] = (revision, times, words, (name, revision, keeps, reason))
+        return words
     words = Refused(f"Release {name} did not start on this server, so the server keeps the version that it runs: "
                     f"{reason}"[:300])
     if revision:
@@ -2527,12 +2575,16 @@ def _fault(e):
 
 
 def start_check(kit, commit, role, run=None):
-    """Whether the tree of `commit` starts on this machine as `role`: (True, None); (False, the reason), which is the
-    last line that is not empty of what the tree's own `lifecycle.py start-check <role>` printed (its standard
-    output, else its standard error), or the end of its wait; or (None, the reason) when anything of this code went
-    wrong before that command answered, the copy most of all. It never raises. The copy is made as the hub makes its
-    own (releases.Update.in_clone), in a new temporary folder that goes in every case, and the command runs in it,
-    with no compiled file written (-B), through `run`, as every git step of take."""
+    """Whether the tree of `commit` starts on this machine as `role`, as (a word of START_RESULTS, the reason):
+    ("passed", None); ("refused", the reason) when the tree's own `lifecycle.py start-check <role>` ended by itself
+    with a status above 0, the reason being the last line that is not empty of what it printed (its standard output,
+    else its standard error); ("timed_out", the reason) when it did not end within START_CHECK_WAIT; or ("not_run",
+    the reason) when it gave no answer of its own: anything of this code went wrong before that command answered
+    (the copy most of all), or the command could not start or a signal ended it (start_command). It never raises.
+    The copy is made as the hub makes its own (releases.Update.in_clone), in a new temporary folder that goes in every
+    case, with each git step through `run`, as every git step of take; the command runs in it with no compiled file
+    written (-B), as a process of its own (start_command), because `run` gives one status for a command that ended
+    with 1 and for one that never ran."""
     run, folder = run or _run, None
     try:
         folder = tempfile.mkdtemp(prefix="fleet-start-check-")
@@ -2542,22 +2594,38 @@ def start_check(kit, commit, role, run=None):
             code, out, err = run(["git", "-C", copy, "checkout", "-q", commit], timeout=120)
         if code != 0:
             said = (err or out or "").strip().splitlines()
-            return None, (said[-1] if said else "git made no copy")[:300]
-        began = time.monotonic()
-        code, out, err = run([sys.executable, "-B", os.path.join(copy, "lifecycle.py"), "start-check", role],
-                             timeout=START_CHECK_WAIT, cwd=copy)
+            return "not_run", (said[-1] if said else "git made no copy")[:300]
+        try:
+            code, out, err = start_command([sys.executable, "-B", os.path.join(copy, "lifecycle.py"), "start-check",
+                                            role], START_CHECK_WAIT, copy)
+        except subprocess.TimeoutExpired:
+            return "timed_out", f"its start check did not end within {START_CHECK_WAIT} seconds"
         if code == 0:
-            return True, None
-        if time.monotonic() - began >= START_CHECK_WAIT:
-            return False, f"its start check did not end within {START_CHECK_WAIT} seconds"
+            return "passed", None
+        if code is None or code < 0:        # no answer of the release's own: the machine's moment, never a refusal
+            return "not_run", (err if code is None else f"its start check was ended by signal {-code}")[:300]
         said = [line.strip() for line in (out or "").splitlines() if line.strip()] or \
             [line.strip() for line in (err or "").splitlines() if line.strip()]
-        return False, (said[-1] if said else f"its start check ended with {code} and said nothing")[:300]
+        return "refused", (said[-1] if said else f"its start check ended with {code} and said nothing")[:300]
     except Exception as e:      # before the release's command answered: the checker's fault
-        return None, _fault(e)
+        return "not_run", _fault(e)
     finally:
         if folder:
             shutil.rmtree(folder, ignore_errors=True)
+
+
+def start_command(argv, wait, cwd):
+    """The release's own start check as a process of its own, in `cwd`: (its status, its standard output, its standard
+    error). The status is None when the command could not start (an OSError: no memory for the process, no such
+    program), and the error then says why; a status below 0 is the signal that ended it. A command that does not end
+    within `wait` seconds is stopped, and subprocess.TimeoutExpired goes to the caller. Its output is read as UTF-8,
+    with each byte that is not replaced."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=wait, cwd=cwd,
+                              stdin=subprocess.DEVNULL)
+    except OSError as e:
+        return None, "", f"its start check could not start: {_fault(e)}"
+    return done.returncode, done.stdout, done.stderr
 
 
 def program_modules(top, program):
@@ -2592,32 +2660,57 @@ def start_readings(role, top, platform_name=sys.platform):
     word for a helper (Lifecycle.collect and leaving). Left out: the runtimes and their model lists, which start the
     vendors' programs, and those can reach the network; a Mac server's desktop, which writes a file and starts Claude
     Code; the live proof of the browser ports, which can stop an agent's browser, and the agents' users, which only
-    the server's own process reads; the vault, the windows and the switch, which only the helper's process can say."""
-    life = Lifecycle(top, role, {}, None, lambda: False, platform_name=platform_name)   # a name: no desktop reading
+    the server's own process reads; the vault, the windows and the switch, which only the helper's process can say.
+
+    Each reading runs its own code, with each command through one runner, but for the package lists: `apt-get -s
+    upgrade` of the security facts can take a minute, while every agent of a server checks a release in the same
+    seconds, and what it finds proves nothing about the code. So here it answers as a command that failed, and the
+    reading's code takes that path (Lifecycle.security, whose other callers still run it)."""
+    def run(argv, timeout=20, cwd=None):
+        if argv[:1] == ["apt-get"]:
+            return 1, "", "the start check reads no package list"
+        return _run(argv, timeout=timeout, cwd=cwd)
+    life = Lifecycle(top, role, {}, None, lambda: False, run=run, platform_name=platform_name)  # a name: no desktop
     taken = {"os": life.os_info(), "security": life.security(), "access": life.access()}
     if role == "server":
-        taken.update(load=machine_load(platform_name), room=room_reading(platform_name),
-                     browser=browser_reading(platform_name))
+        taken.update(load=machine_load(platform_name, run=run), room=room_reading(platform_name),
+                     browser=browser_reading(platform_name, run=run))
     else:
-        taken.update(use=agent_use(role)[0], tailscale=life.private_network())
+        taken.update(use=agent_use(role, run=run)[0], tailscale=life.private_network())
     return taken
 
 
 def start_check_here(role, platform_name=sys.platform):
     """`lifecycle.py start-check <role>`, in the tree under test: (its exit status, its one line). Each module that
     the program of `role` can load (program_modules) loads, dependencies first, so a line names the module that does
-    not load; and the readings of the machine end with no exception (start_readings). What a reading says does not
-    count: a full disk or a firewall that is off never refuses a release. It is the seam of the later parts of the
-    check, not a second `verify`."""
+    not load; each file that the program starts by its path (START_FILES), and each file that one of those imports
+    and that did not load already, compiles with this Python, and none of them runs; and the readings of the machine
+    end with no exception (start_readings). What a reading says does not count: a full disk or a firewall that is off
+    never refuses a release. It is the seam of the later parts of the check, not a second `verify`."""
     import importlib
     sys.dont_write_bytecode = True      # no compiled file in the tree, as -B
     top = os.path.dirname(os.path.abspath(__file__))       # the folder of the tree, which is first on sys.path
-    for name in reversed(program_modules(top, START_PROGRAMS[role])):
+    loaded = program_modules(top, START_PROGRAMS[role])
+    for name in reversed(loaded):
         try:
             importlib.import_module(name)
         except (Exception, SystemExit) as e:        # a module that ends the process at its load does not load either
             said = str(e).strip().splitlines()
             return 1, f"start-check: {name} does not load: {type(e).__name__}: {said[0] if said else ''}".strip()
+    compiled = []
+    for started in START_FILES[role]:
+        compiled += [name for name in program_modules(top, started) if name not in loaded and name not in compiled]
+    for name in compiled:
+        try:
+            with open(os.path.join(top, name + ".py"), "rb") as f:
+                source = f.read()
+        except OSError:
+            continue                    # a file that this tree does not have: nothing here starts it
+        try:
+            compile(source, name + ".py", "exec", dont_inherit=True)
+        except (SyntaxError, ValueError) as e:      # ValueError: a null byte, on a Python before 3.12
+            said = str(e).strip().splitlines()
+            return 1, f"start-check: {name}.py does not compile: {type(e).__name__}: {said[0] if said else ''}".strip()
     try:
         start_readings(role, top, platform_name)
     except Exception as e:
@@ -4761,8 +4854,9 @@ class Lifecycle:
 
     def apply(self, desired):
         """Runs with the gate held. True when the restart was asked for: this process ends soon. A release that does
-        not start on this machine (take, `starts`) is a failed update with its own words, and no restart: this process
-        keeps the code it runs, and so does its checkout."""
+        not start on this machine (take, `starts`), or whose start check did not end in time, is a failed update with
+        its own words, and no restart: this process keeps the code it runs, and so does its checkout. After a time-out
+        the next request checks the release again."""
         self.set("updating", "Updating Fleet while idle.")
         with self.account_lock:         # a check's account item that began after the idle test ends first (Y10)
             while self.account_runs:
@@ -4778,7 +4872,7 @@ class Lifecycle:
             # The one check of every move (may_take), the release's own start check on this machine, and the files of
             # a task that this machine delivered.
             problem = take(self.kit, target, self.run, self.floor, room=True, starts="helper")
-            if isinstance(problem, Refused):
+            if isinstance(problem, (Refused, CheckTimedOut)):     # in its own words: a request later tries again
                 return self.fail(str(problem))
             if problem:
                 return self.fail("The checkout did not move: " + problem[-300:])

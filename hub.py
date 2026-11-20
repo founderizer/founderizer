@@ -50302,18 +50302,22 @@ def use_reading(value):
 def start_check_status(value):
     """The result of a machine's last start check of a release (lifecycle.keep_start_check), as a helper's report and a
     server service's reading carry it, or None. Like load_reading, an optional field of a newer machine: a value of
-    another shape is dropped whole and never refuses the report."""
+    another shape is dropped whole and never refuses the report. `release` and `keeps` are a release's version
+    (releases.VERSION, which also takes the 12 to 40 characters of a commit) and nothing else. The machine's `at` is
+    kept as `checked_at`, so that a refusal served again with a new time changes nothing that the apps read at once
+    (untimed). Nothing of it reaches the owner's words: the hub names the releases from its own records
+    (refused_starts)."""
     if not isinstance(value, dict) or value.get("result") not in lifecycle.START_RESULTS:
         return None
     release, revision, keeps, reason, at = (value.get(k) for k in ("release", "revision", "keeps", "reason", "at"))
-    named = lambda v: isinstance(v, str) and 0 < len(v) <= 64       # a release's version, or the first 12 of a commit
+    named = lambda v: isinstance(v, str) and bool(releases.VERSION.fullmatch(v))
     if not named(release) or not (keeps is None or named(keeps)) or \
             not (revision is None or isinstance(revision, str) and lifecycle.COMMIT.fullmatch(revision)) or \
             not (reason is None or isinstance(reason, str) and len(reason) <= 300) or \
             isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
         return None
     return {"result": value["result"], "release": release, "revision": revision, "keeps": keeps, "reason": reason,
-            "at": at}
+            "checked_at": at}
 
 
 READING_AGE_MAX = 120          # seconds a reading may be older than its report; a larger age is no reading's own
@@ -50515,11 +50519,16 @@ def validate_status(data):
             "models": model_reading(data.get("models")), "verify": verify_items(data.get("verify")),
             "reading_age": reading_age_of(data.get("reading_age")),
             "load": load_reading(data.get("load")), "use": use_reading(data.get("use")),
-            # a server service's reading on Linux (plan 04): only where it sent them, as `agents`; and the last start
-            # check of a release of either machine (lifecycle.keep_start_check), only where it sent one of its shape
+            # a server service's reading on Linux (plan 04): only where it sent them, as `agents`; the last start
+            # check of a release of either machine (lifecycle.keep_start_check), only where it sent one of its shape;
+            # the revision that a server service moves to now (server.Service.update), and the hub's revision that it
+            # knew as it read (server.Service.reading), each a whole commit id or nothing
             **{k: v for k, v in (("browser", browser_status(data.get("browser"))),
                                  ("room", room_status(data.get("room"))),
-                                 ("start_check", start_check_status(data.get("start_check")))) if v is not None}}
+                                 ("start_check", start_check_status(data.get("start_check"))),
+                                 *((name, data[name] if isinstance(data.get(name), str) and
+                                    COMMIT_ID.fullmatch(data[name]) else None) for name in ("updating", "heard")))
+               if v is not None}}
 
 
 # ---------------------------------------------------------------- the fleet's settings (AUTONOMY.md section 4)
@@ -53565,8 +53574,12 @@ def server_reading(name, here):
             # and whom each agent there runs as
             "browser": data.get("browser") if source == "server" else None,
             "agents": data.get("agents") if source == "server" else None,
-            # its server service's last start check of a release (lifecycle.keep_start_check), as it sent it
-            "start_check": data.get("start_check") if source == "server" else None}
+            # its server service's last start check of a release (lifecycle.keep_start_check), as it sent it, the
+            # revision that it moves to now (server.Service.update), and the hub's revision that it knew as it read,
+            # each or null
+            "start_check": data.get("start_check") if source == "server" else None,
+            "updating": data.get("updating") if source == "server" else None,
+            "heard": data.get("heard") if source == "server" else None}
 
 
 HUB_LOAD = {"at": None, "load": None}      # the hub's last measurement of its own machine (server_load)
@@ -54362,7 +54375,7 @@ def servers_view():
     of the slider that the owner chose last (shape); on the hub's own
     row the hub's own read of its server (hardening); on each row how the fleet reaches that server, by its own record
     (access); and the state of the newest join code."""
-    t0, desired = now(), kit_revision()
+    t0, desired, applied = now(), kit_revision(), applied_release()[0]
     expire_server_jobs(t0)
     team, hub_machine = TEAM, (TEAM.get("hub") or {}).get("machine")
     keys = {r["server"] for r in q("SELECT server FROM server_keys")}
@@ -54374,6 +54387,9 @@ def servers_view():
         load = server_load(name, reading, t0)       # beside the reading, which the hub's own machine may not have
         if reading:                     # the reading's Fleet files are the hub's: same_code, as for a helper
             reading["current"] = same_code(reading["revision"], desired) if reading["revision"] and desired else None
+            # the hub's one decision from its service's last start check (start_refused); a helper's reading has none
+            reading["release_refused"] = start_refused(reading["start_check"], reading["revision"], reading["stale"],
+                                                       desired, applied)
             del reading["load"]
         job = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (name,))
         # An agent there already: a new one needs a service that gives it its key, and a server where nobody else has
@@ -60332,7 +60348,6 @@ def door_sweep(t0=None):
     if DOOR["error"] is not None:
         DOOR["error"] = None
         emit(manager_name(), "say", "[hub] The door answers again.")
-    door_modes_said(answer, t0)
     rows = [e for e in answer.get("entries") or [] if isinstance(e, dict) and isinstance(e.get("n"), int)]
     newest, again = answer.get("last"), next((e for e in rows if e["n"] == last), None) if last else None
     other = again is not None and type(again.get("ts")) in (int, float) and abs(again["ts"] - top["ts"]) > 0.001
@@ -60356,6 +60371,11 @@ def door_sweep(t0=None):
                                                          str(e.get("target"))[:120], str(e.get("action"))[:40],
                                                          str(e.get("kind"))[:16], str(e.get("outcome"))[:16],
                                                          str(e.get("why") or "")[:300], made, call, task))
+    # the door's word of its modes after the lines of the same read: a refusal that came just before the door took
+    # Full access is then in the record that door_mode_news reads (door_full_waiting). A full page can have more
+    # lines after it (the door gives RECORD_PAGE, as many as DOOR_PAGE), so the word waits for a read with fewer
+    if len(rows) < DOOR_PAGE:
+        door_modes_said(answer, t0)
     return len(rows)
 
 
@@ -60723,7 +60743,8 @@ def door_mode_news(old, modes, t0):
     three times in that minute, and its work waited for a second card all night. The door asks the hub before it
     refuses now (Door.yes_read), so the agent's call has often run when this comes: the words say what to do only
     for a call that the door refused. One time for one statement: a read in which the door names no server, and the
-    next one that names it again, are no news."""
+    next one that names it again, are no news. Each other open task whose root script the door refused there hears it
+    too (door_full_waiting), and not only the task of the card that the owner answered."""
     held = door_modes_held()
     for host, word in sorted(modes.items()):
         if word["mode"] != "full" or (old.get(host) or {}).get("mode") == "full" or host not in held:
@@ -60732,7 +60753,7 @@ def door_mode_news(old, modes, t0):
         if kv_get(key) == signed:
             continue
         kv_set(key, signed)
-        told = set()
+        told, tasks = set(), []
         for need in q("SELECT approval, door_task_id FROM needs WHERE door_host=? AND door_task_id IS NOT NULL AND "
                       "approval IS NOT NULL AND answered > ? ORDER BY id DESC", (host, t0 - DOOR_APPROVAL_DAYS * 86400)):
             task = q1("SELECT id, owner, state FROM tasks WHERE id=?", (need["door_task_id"],))
@@ -60740,14 +60761,49 @@ def door_mode_news(old, modes, t0):
                 signed = json.loads(need["approval"])["statement"] == held[host]["statement"]
             except (ValueError, TypeError, KeyError, RecursionError):
                 signed = False
-            if not signed or approval_kind(need["approval"]) != "door-mode" or not task \
-                    or task["state"] in TERMINAL or task["id"] in told:
+            if signed and approval_kind(need["approval"]) == "door-mode" and task and task["state"] not in TERMINAL:
+                tasks.append(task)
+        for task in tasks + door_full_waiting(host, t0):
+            if task["id"] in told:
                 continue
             told.add(task["id"])
             emit(task["owner"], "say", f"[hub] The door has the owner's Full access on {host} now: a root script "
                                        f"with no box runs there with no card. If the door refused your call, send "
                                        f"it again; a call that ran needs nothing more.", task=task["id"])
 
+
+def door_full_waiting(host, t0):
+    """The open tasks whose newest root script with no box (a host's run) on `host` the door refused in the last
+    DOOR_APPROVAL_DAYS for want of the owner's word alone, by the task that its caller named on the line of its refusal
+    (door_record.task): Full access lets each of their calls through. On 20 November 2026 the Full access of one card
+    covered the fixes of a second task on that server, and the hub told only the card's task: the second one waited
+    on reminders, asked its manager three times and ended as failed, while nothing had failed. Only a task of the
+    caller itself, which holds the server at Fix, because the door honours Full access for no other (door.full_access);
+    only a refusal that begins with the door's words for a missing word of the owner (door_targets.NO_BOX), and so no
+    refusal of a window, which Full access does not lift; no call that the owner answered No on a card of that task,
+    or in words of his own, whenever the task tried it again (RULES.md rule 5); and no call whose Run it once came
+    after its refusal, which goes to the task with the card's answer. A Run it once from before the refusal was used,
+    as the door asks the hub before it refuses, and one of another task with the same script is that task's own."""
+    import door_targets
+    holders, newest = set(door_mode_servers(TEAM).get(host) or []), {}
+    for line in q("SELECT caller, task, kind, call, why, ts FROM door_record WHERE target=? AND action='run' AND "
+                  "task IS NOT NULL AND ts >= ? ORDER BY n", (host, t0 - DOOR_APPROVAL_DAYS * 86400)):
+        newest[(line["caller"], line["task"])] = line       # a later line: its call ran, or it sent another one
+    found = []
+    for (caller, code), line in newest.items():
+        if line["kind"] != "refused" or caller not in holders or not DOOR_TASK.fullmatch(code) or \
+                not str(line["why"] or "").startswith(f"run {door_targets.NO_BOX}"):
+            continue
+        task = q1("SELECT id, owner, state FROM tasks WHERE id=?", (int(code[2:]),))
+        if not task or task["owner"] != caller or task["state"] in TERMINAL:
+            continue
+        if line["call"] and any(approval_kind(n["approval"]) not in ("door-mode", "door-call") or
+                                n["answered"] >= line["ts"] and approval_kind(n["approval"]) == "door-call" for n in q(
+                "SELECT approval, answered FROM needs WHERE door_call=? AND (door_task_id IS NULL OR door_task_id=?) "
+                "AND answered IS NOT NULL", (line["call"], task["id"]))):
+            continue
+        found.append(task)
+    return sorted(found, key=lambda t: t["id"])
 
 DOOR_UNTAKEN_FRESH = 3600       # seconds after its arrival in which a statement that the door did not take is news
 
@@ -61820,41 +61876,62 @@ def integrity_check(t0):
     kv_set("integrity_at", t0)
 
 
-def refused_update(m):
-    """The record of a release that did not start (lifecycle.keep_start_check) when it is why this row's update failed,
-    else None: the helper reports, its update failed, its record says `refused`, and the record is at least as new as
-    the update's request. An older refusal is not why a later update failed (a fetch that failed, a move that may_take
-    refused), and that one keeps machine_failed and its Update; a refusal that the helper serves again from memory
-    writes its record again, so it is as new. `m` is a row of machine_rows."""
-    record, update = m.get("start_check"), m["update"]
-    requested = update.get("requested_at")
-    if m["stale"] or update["state"] != "failed" or not isinstance(record, dict) or \
-            record.get("result") != "refused" or not isinstance(requested, (int, float)) or record["at"] < requested:
-        return None
-    return record
+def applied_release():
+    """(revision, version) of the release that this hub runs: its newest applied one, the newest done row of its
+    releases records; (None, None) before the first."""
+    row = q1("SELECT revision, version FROM releases WHERE state=? ORDER BY finished DESC, id DESC LIMIT 1",
+             (releases.DONE,))
+    return (row["revision"], row["version"]) if row else (None, None)
 
 
-def refused_starts(machines, desired):
-    """{server: the newest record of a release that did not start there} (lifecycle.keep_start_check), for the
-    owner's health page: a helper whose failed update that record caused (refused_update), and a server service whose
-    record is `refused` while it does not run the hub's code (a service that runs it keeps nothing; it has no request
-    to compare with). A record without both versions has no words for the owner and is left out: the helper's warning
-    stays machine_failed. `machines` are machine_rows' rows; `desired` the hub's revision."""
-    found = {}
+def start_refused(record, revision, stale, desired, applied):
+    """Whether a machine's last start check (start_check_status) says that the release that this hub runs did not start
+    there: its `record` says `refused` for `applied`, that release's revision (applied_release), and the machine does
+    not run the hub's code (its reported `revision` against `desired`: same_code; a machine that names no revision is
+    not refused, as the owner's words could name no release that it keeps). The one decision of a release that
+    did not start, by release, for the machines page, the servers page and the health page: no update state and no
+    clock. So a refusal shows whatever the update's state (a request after a change of the owner's files puts it at
+    requested or waiting_idle while a turn runs), a record of an older release shows nothing, and so does a machine
+    that is stale, whose last word is no fact of now."""
+    return not stale and isinstance(applied, str) and isinstance(revision, str) and bool(REVISION.match(revision)) and \
+        isinstance(record, dict) and record.get("result") == "refused" and record.get("revision") == applied and \
+        not same_code(revision, desired)
 
-    def add(server, record):
-        if server and isinstance(record, dict) and record.get("result") == "refused" and \
-                isinstance(record.get("release"), str) and isinstance(record.get("keeps"), str) and \
-                (server not in found or record["at"] > found[server]["at"]):
-            found[server] = record
+
+def release_named(commit):
+    """The version of the release that `commit` carries in the hub's repository (its release.json), as the owner reads
+    it, else the first 12 characters of the commit."""
+    if isinstance(commit, str) and COMMIT_ID.fullmatch(commit):
+        code, out, _ = git_kit("cat-file", "blob", f"{commit}:{lifecycle.RELEASE_FILE}")
+        version = lifecycle.released(out)[1] if code == 0 else None
+        if isinstance(version, str) and releases.VERSION.fullmatch(version):
+            return version
+    return str(commit or "")[:12]
+
+
+def refused_starts(machines):
+    """{server: the owner's words} of each server where the release that this hub runs did not start (start_refused:
+    a helper's row of machine_rows, `release_refused`, or the reading of its server service), for the health page, in
+    the owner's words of 20 November 2026. Both releases are named from the hub's own records and never from what a
+    machine wrote: the one that did not start by its revision in the releases records, the one that the server keeps
+    by the release that a refusing machine's reported revision carries in the hub's repository (release_named), of the
+    first such machine of that server: its helpers in team.json order, then its service."""
+    revision, version = applied_release()
+    if not revision:
+        return {}
+    kept = {}
     for m in machines:
-        add(m["machine"], refused_update(m))
-    servers = set(server_names())
-    for row in q("SELECT server, data FROM server_status"):
-        reading = json.loads(row["data"])
-        if row["server"] in servers and not same_code(reading.get("revision"), desired):
-            add(row["server"], reading.get("start_check"))
-    return found
+        if m["release_refused"] and m["machine"] and m["machine"] not in kept:
+            kept[m["machine"]] = m["revision"]
+    desired = kit_revision()
+    for name in server_names():
+        reading = server_reading(name, [])          # its service's own reading: no agent stands in for it
+        if name not in kept and reading and \
+                start_refused(reading["start_check"], reading["revision"], reading["stale"], desired, revision):
+            kept[name] = reading["revision"]
+    named = version if isinstance(version, str) and releases.VERSION.fullmatch(version) else revision[:12]
+    return {server: f"{server} keeps release {release_named(commit)}, because release {named} did not start there. "
+                    f"It takes the next release that starts there by itself." for server, commit in kept.items()}
 
 
 def health_view():
@@ -61938,22 +62015,20 @@ def health_view():
                  agent=name)
     # A release that did not start on a server (lifecycle.start_problem) is one fact for its agents and its service: one
     # warning for each server, in the owner's words of 20 November 2026, and no "update failed" for those agents, whose
-    # helpers refuse the same release again at once, so Update cannot help. Read from each machine's record, never from
-    # the words of an update's detail.
-    refused = refused_starts(machines, desired)
+    # helpers refuse the same release again at once, so Update cannot help: neither machine_failed nor machine_behind.
+    # Decided by release from each machine's record (start_refused), never from the words of an update's detail.
+    refused = refused_starts(machines)
     for m in machines:
         if m["stale"]:
             warn("machine_stale", "No status for ten minutes.", None, agent=m["agent"])
-        elif m["machine"] in refused and refused_update(m):
+        elif m["release_refused"]:
             continue                                            # said once for its server below (machine_refused)
         elif m["update"]["state"] in ("behind", "failed"):      # the app's button: Update <Agent>
             warn("machine_" + m["update"]["state"],
                  "It still runs the version it had." if m["update"]["state"] == "failed" else
                  "It runs an older version than the hub.", None, agent=m["agent"])
-    for server, record in refused.items():      # the app's title: A release did not start; its button: Report a problem
-        warn("machine_refused", f"{server} keeps release {record['keeps']}, because release {record['release']} did "
-                                f"not start there. It takes the next release that starts there by itself.", None,
-             agent=next((m["agent"] for m in machines if m["machine"] == server), None))
+    for server, words in refused.items():       # the app's title: A release did not start; its button: Report a problem
+        warn("machine_refused", words, None, agent=next((m["agent"] for m in machines if m["machine"] == server), None))
     # The vault broker is the one piece of the fleet that a release does not reach by itself: it runs a root-owned
     # copy of vault.py outside every checkout a helper updates, and `lifecycle.OWNER_ONLY` lets a commit that
     # changes only that file count as taken, so a machine reports "current" whatever its broker runs. The broker
@@ -62862,7 +62937,7 @@ def signed_in_view(agent, data):
 
 
 def machine_rows():
-    desired, t0 = kit_revision(), now()
+    desired, t0, applied = kit_revision(), now(), applied_release()[0]
     empty_security = {k: None for k in ("unattended_upgrades", "pending_security", "reboot_required", "firewall", "tailscale",
                                         "vault")}
     rows = []
@@ -62886,6 +62961,7 @@ def machine_rows():
                   if ways.get("ssh_user") else None,
                   "screen_sharing": {"available": seen.get("screen_sharing")} if ways.get("screen_sharing") else None}
         runtime_now, runtimes_now = signed_in_view(name, data)
+        stale = (st is None) or t0 - st["reported"] > MACHINE_STALE
         rows.append({"agent": name, "machine": a.get("machine"), "role": a.get("role"), "access": access,
                      "check": check_view(q1("SELECT * FROM machine_checks WHERE agent=? ORDER BY id DESC LIMIT 1", (name,))),
                      "address": TEAM.get("addresses", {}).get(a.get("machine")), "revision": rev, "update": update,
@@ -62903,12 +62979,13 @@ def machine_rows():
                      "runtimes": runtimes_now, "other_runtime_windows": data.get("other_runtime_windows"),
                      "owner_chat_bound": data.get("owner_chat_bound"), "manager_bound": data.get("manager_bound"),
                      "use": data.get("use"),          # what its own processes use (lifecycle.agent_use)
-                     # its helper's last start check of a release (lifecycle.keep_start_check), or null
+                     # its helper's last start check of a release (lifecycle.keep_start_check), or null, and the
+                     # hub's one decision from it: the release that the hub runs did not start there (start_refused)
                      "start_check": data.get("start_check"),
+                     "release_refused": start_refused(data.get("start_check"), rev, stale, desired, applied),
                      "login": login_view(last_login(name)),       # owner feature machine_signin
                      "sign_in_shared": sign_in_shared(name),      # whom a change of its account stops too
-                     "reported_at": st["reported"] if st else None,
-                     "stale": (st is None) or t0 - st["reported"] > MACHINE_STALE})
+                     "reported_at": st["reported"] if st else None, "stale": stale})
     return desired, rows
 
 
@@ -68018,8 +68095,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, {"error": f"invalid status: {e}"})
         reading = {k: data[k] for k in ("revision", "os", "security", "runtimes", "access", "features", "load")}
         # one OS user for each agent: whom each agent here runs as; on Linux the agents' browser parts and the room
-        # for them (plan 04); and its last start check of a release (lifecycle.keep_start_check)
-        reading.update({k: data[k] for k in ("agents", "browser", "room", "start_check") if data.get(k) is not None})
+        # for them (plan 04); its last start check of a release (lifecycle.keep_start_check); the revision that it
+        # moves to now, while it is in the middle of an update (server.Service.update); and the hub's revision that it
+        # knew as it read
+        reading.update({k: data[k] for k in ("agents", "browser", "room", "start_check", "updating", "heard")
+                        if data.get(k) is not None})
         if secret_hit(json.dumps(reading)):
             return self.json(422, {"error": "registered login refused"})
         old = q1("SELECT data FROM server_status WHERE server=?", (name,))

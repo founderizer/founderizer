@@ -53,6 +53,10 @@ PROFILE = "# Profile: vps\n\n**Character.** Careful.\n"
 STARTS = "import lifecycle\n"            # the program of a release that starts: it loads lifecycle, as both programs do
 # A release whose helper does not start on a machine: a module that its program loads raises as it loads.
 NO_START = {"fleet.py": STARTS + "import broken\n", "broken.py": "raise RuntimeError('no such setting here')\n"}
+# A release whose helper, as it loads, ends by a signal or hangs, as the variable START_CASE of its check says.
+STOPS = {"fleet.py": STARTS + "import stops\n",
+         "stops.py": "import os, signal, time\ncase = os.environ.get('START_CASE')\nif case == 'signal':\n"
+                     "    os.kill(os.getpid(), signal.SIGKILL)\nif case == 'wait':\n    time.sleep(60)\n"}
 
 
 def setUpModule():
@@ -100,9 +104,9 @@ def checks_pass(argv, timeout=None, cwd=None, input=None):
 
 
 def machine_run(argv, timeout=20, cwd=None):
-    """A machine's commands: git for real, a release's own start check for real (it reads this computer and changes
-    nothing), and nothing else of this computer."""
-    if argv[0] == "git" or argv[-2:-1] == ["start-check"]:
+    """A machine's commands: git for real, and nothing else of this computer. A release's own start check runs for
+    real as a process of its own (lifecycle.start_command: it reads this computer and changes nothing)."""
+    if argv[0] == "git":
         return lifecycle._run(argv, timeout=timeout, cwd=cwd)
     return 1, "", "not in this test"
 
@@ -454,6 +458,11 @@ class StartCheck(Repositories):
     def setUp(self):
         super().setUp()
         self.calls = []
+        command = lifecycle.start_command           # the release's own command, recorded and run for real
+        recorded = patch.object(lifecycle, "start_command",
+                                lambda argv, wait, cwd: self.calls.append(list(argv)) or command(argv, wait, cwd))
+        recorded.start()
+        self.addCleanup(recorded.stop)
 
     def commands(self, argv, timeout=20, cwd=None):
         self.calls.append(list(argv))
@@ -579,6 +588,68 @@ class StartCheck(Repositories):
         self.assertEqual(said.getvalue(), "Release 2026.11.4 is taken without its start check, which could not run on "
                                           "this server: OSError: [Errno 28] No space left on device\n")
 
+    def test_a_check_that_gave_no_answer_of_its_own_moves_as_before_and_keeps_nothing(self):
+        """Only the release's own answer refuses: its command ended by itself with a status above 0. A command that
+        could not start (no memory for one more process) or that a signal ended (the kernel's out-of-memory killer)
+        gave none: the move goes on as it did before this check, one line on standard error says why, the record says
+        not_run, and nothing is kept, so a later commit of that release would be checked again."""
+        machines = {case: self.fleet.machine(case) for case in ("spawn", "signal")}       # each at release 3
+        four = self.fleet.release(4, files=STOPS)
+        git("fetch", "-q", "origin", cwd=self.kit)
+        real = subprocess.run
+
+        def no_memory(argv, **kwargs):
+            if "start-check" in argv:
+                raise OSError(12, "Cannot allocate memory")
+            return real(argv, **kwargs)
+        for case, why in (("spawn", "its start check could not start: OSError: [Errno 12] Cannot allocate memory"),
+                          ("signal", "its start check was ended by signal 9")):
+            kit = machines[case]
+            git("fetch", "-q", "origin", cwd=kit)
+            with patch.dict(os.environ, START_CASE=case), patch.object(lifecycle, "START_CHECK_WAIT", 3), \
+                    patch.object(lifecycle.subprocess, "run", no_memory if case == "spawn" else real), \
+                    contextlib.redirect_stderr(io.StringIO()) as said:
+                self.assertIsNone(lifecycle.take(str(kit), four, self.commands, str(self.floor), starts="helper"), case)
+            self.assertEqual(self.head(kit), four, case)
+            self.assertEqual(said.getvalue(), "Release 2026.11.4 is taken without its start check, which could not run "
+                                              f"on this server: {why}\n", case)
+            self.assertEqual(self.record(), {"result": "not_run", "release": "2026.11.4", "keeps": "2026.11.3",
+                                             "revision": self.released(four), "reason": why}, case)
+            self.assertNotIn(os.path.realpath(kit), lifecycle._REFUSED, case)
+        self.assertEqual(len(self.checks()), 2)
+
+    def test_a_check_that_did_not_end_in_time_keeps_the_checkout_and_is_checked_again_once(self):
+        """A release that hangs as it loads would hang the program that starts it, the dead machine that this check
+        prevents, and a loaded server can be why too: a check whose wait ran out keeps the checkout and the floor, its
+        record says timed_out, and its words are no refusal (the helper's update fails in them, and Update can try
+        again). The next request of the same release checks it again; a second time-out in this process is kept, with
+        words that say so (the first words, "checked again at the next update", would be false from then on), and
+        each later target of that release gets those words and its record again, with no copy and no wait: each task
+        start of each agent of the server would else wait for it. Another release is checked."""
+        four = self.fleet.release(4, files=STOPS)
+        words = ("Release 2026.11.4 was not taken this time: its start check did not end within 3 seconds. It is "
+                 "checked again at the next update.")
+        kept = ("Release 2026.11.4 was not taken: its start check did not end within 3 seconds two times. It is "
+                "checked again with the next release, or when this program starts again.")
+        place = Path(lifecycle.start_record_path(str(self.floor), "helper"))
+        with patch.dict(os.environ, START_CASE="wait"), patch.object(lifecycle, "START_CHECK_WAIT", 3):
+            said = self.take(four)
+            self.assertEqual((type(said), said), (lifecycle.CheckTimedOut, words))
+            self.assertEqual((self.head(), lifecycle.read_floor(str(self.floor))),
+                             (self.three, (self.released(self.three), None)))
+            self.assertEqual(self.record(), {"result": "timed_out", "release": "2026.11.4", "keeps": "2026.11.3",
+                                             "revision": self.released(four),
+                                             "reason": "its start check did not end within 3 seconds"})
+            self.assertEqual((self.take(four), len(self.checks())), (kept, 2))      # checked again, once
+            place.write_text(json.dumps(dict(json.loads(place.read_text()), at=1.0)))
+            said = self.take(self.data())               # a later commit of the same release
+            self.assertEqual((type(said), said, len(self.copies()), len(self.checks())),
+                             (lifecycle.CheckTimedOut, kept, 2, 2))
+            self.assertGreater(json.loads(place.read_text())["at"], 1.0)        # its record again, as new
+        five = self.fleet.release(5, files=STOPS)       # START_CASE is gone: the release loads at once
+        self.assertIsNone(self.take(five))
+        self.assertEqual((self.head(), len(self.checks())), (five, 3))
+
     def test_a_record_that_cannot_be_written_changes_no_move_and_raises_nothing(self):
         """The record is a report, never a gate: where it cannot be written (here a folder stands in its place), a
         release that does not start is refused with the same words, one that starts moves, nothing raises, and no
@@ -628,6 +699,66 @@ class StartCheckCommand(unittest.TestCase):
         self.assertEqual(self.check({"late.py": "", "early.py": "raise ValueError('no such setting here')\n"}),
                          (1, "start-check: early does not load: ValueError: no such setting here"))
         self.assertEqual(list(self.tree.rglob("*.pyc")), [])
+
+    def test_each_file_that_the_helper_starts_by_its_path_compiles_and_none_runs(self):
+        """The import step never reads a hook or a runner that a program starts by its path: a line that the machine's
+        Python refuses in hook_hosts.py passed the check on Ubuntu 22.04, and then each tool call of each session there
+        ended with status 2. Each such file compiles with the machine's Python, and so does each file that it imports
+        (hook_clean.py's hidden.py), and none of them runs: a hook that ran here would read and write the machine."""
+        ran = "raise SystemExit('it ran')\n"
+        self.assertEqual(self.check({"fleet.py": STARTS, "hook_hosts.py": ran, "hook_clean.py": "import hidden\n",
+                                     "hidden.py": ran}),
+                         (0, "start-check: this release starts here as helper"))
+        code, line = self.check({"hook_hosts.py": "def hosts(:\n"})
+        self.assertEqual(code, 1)
+        self.assertTrue(line.startswith("start-check: hook_hosts.py does not compile: SyntaxError: "), line)
+        code, line = self.check({"hook_hosts.py": ran, "hidden.py": "def clean(:\n"})
+        self.assertEqual(code, 1)
+        self.assertTrue(line.startswith("start-check: hidden.py does not compile: SyntaxError: "), line)
+
+    def test_every_file_that_a_program_starts_by_its_path_is_in_its_role_s_list(self):
+        """A new hook or runner that fleet.py or server.py starts by its path and that START_FILES does not name is a
+        file that no check compiles. Each .py file of this tree that the program names in a path (os.path.join(<a
+        folder>, "<file>.py")) or in a command line ([sys.executable, "<file>.py", ...]) is the program itself, in its
+        role's START_FILES, or in START_NOT_STARTED with why; each listed file is in the tree, and none is in both."""
+        import ast
+        for role, program in lifecycle.START_PROGRAMS.items():
+            found = set()
+            for node in ast.walk(ast.parse((KIT / program).read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Call) and ast.unparse(node.func) == "os.path.join":
+                    named = node.args
+                elif isinstance(node, (ast.List, ast.Tuple)) and node.elts and \
+                        ast.unparse(node.elts[0]) == "sys.executable":
+                    named = node.elts
+                else:
+                    continue
+                found |= {one.value for one in named if isinstance(one, ast.Constant) and isinstance(one.value, str)
+                          and one.value.endswith(".py") and (KIT / one.value).is_file()}
+            self.assertIn({"helper": "hook_hosts.py", "server": "home_reading.py"}[role], found)    # it sees them
+            self.assertEqual(found - {program} - set(lifecycle.START_FILES[role]) - set(lifecycle.START_NOT_STARTED),
+                             set(), role)
+            self.assertEqual([name for name in lifecycle.START_FILES[role] if not (KIT / name).is_file()], [], role)
+        self.assertEqual(set(lifecycle.START_NOT_STARTED) & {one for names in lifecycle.START_FILES.values()
+                                                             for one in names}, set())
+
+    def test_the_readings_run_their_code_and_no_package_scan(self):
+        """`apt-get -s upgrade` can take a minute, and each agent of a server checks a release in the same seconds:
+        the check proves that the code of the readings runs, not what the package lists say. Each reading runs its
+        commands, the scan answers as a command that failed, and Lifecycle.security still runs it for its other
+        callers (a helper's report and a service's reading)."""
+        asked = []
+
+        def run(argv, timeout=20, cwd=None):
+            asked.append(list(argv))
+            return 1, "", ""
+        with patch.object(lifecycle, "_run", run):
+            for role in lifecycle.START_PROGRAMS:
+                lifecycle.start_readings(role, str(self.tree), "linux")
+        self.assertIn("systemctl", [argv[0] for argv in asked])         # the security facts ran their code
+        self.assertEqual([argv for argv in asked if argv[0] == "apt-get"], [])
+        asked.clear()
+        lifecycle.Lifecycle(str(self.tree), "vps", {}, None, lambda: False, run=run, platform_name="linux").security()
+        self.assertIn("apt-get", [argv[0] for argv in asked])
 
 
 # ---------------------------------------------------------------- every mover
@@ -679,6 +810,15 @@ class HelperUpdate(Mover):
                           json.loads(git("show", f"{four}:{lifecycle.RELEASE_FILE}", cwd=self.kit))["revision"]))
 
 
+    def test_a_check_that_did_not_end_in_time_is_a_failed_update_in_its_own_words_and_no_restart(self):
+        four = self.fleet.release(4, files=STOPS)
+        with patch.dict(os.environ, START_CASE="wait"), patch.object(lifecycle, "START_CHECK_WAIT", 3):
+            self.move(four)
+        self.assertEqual((self.restarted, self.life.state, self.head()), (False, "failed", self.three))
+        self.assertEqual(self.life.detail, "Release 2026.11.4 was not taken this time: its start check did not end "
+                                           "within 3 seconds. It is checked again at the next update.")
+
+
 class TaskStartSync(Mover):
     """The helper brings the checkout up to date before a task session (lifecycle.follow_config_ref, as
     fleet.Helper.sync_checkout calls it)."""
@@ -693,6 +833,8 @@ class ServerUpdate(Mover):
                                  home=str(self.home), floor=str(self.floor))
         self.restarts, self.service, said = [], service, io.StringIO()
         service.restart = lambda: self.restarts.append(target)
+        self.reports = []                                   # what each report out of the loop's turn said
+        service.report = lambda homes=True: self.reports.append(service.reading().get("updating"))
         service.desired = target
         with contextlib.redirect_stderr(said):
             service.update()
@@ -706,6 +848,8 @@ class ServerUpdate(Mover):
         self.assertEqual(self.said, "Release 2026.11.4 did not start on this server, so the server keeps the version "
                                     "that it runs: start-check: broken does not load: RuntimeError: no such setting "
                                     "here\n")
+        # the hub heard of the move before the check, and of its end at once, not at the next round
+        self.assertEqual(self.reports, [four, None])
         # beside the service's floor, which its next reading carries (server.Service.reading)
         self.assertEqual({k: v for k, v in lifecycle.read_start_check(str(self.floor), "server").items()
                           if k in ("result", "release", "keeps")},
