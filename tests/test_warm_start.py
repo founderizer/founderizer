@@ -615,12 +615,16 @@ class WarmStart(Capacity):
         self.assertEqual(hub.team_start_text("seo"), "")             # a fleet of one says nothing at all
         hub.TEAM["agents"] = {f"w{n}": {"role": "worker", "runtime": "codex",
                                         "repos": {f"owner/repository-number-{n}": "write"}} for n in range(40)}
-        hub.TEAM["agents"]["seo"] = {"role": "worker", "runtime": "claude"}
+        hub.TEAM["agents"]["seo"] = {"role": "worker", "runtime": "claude", "reports_to": "w39"}
+        hub.TEAM["agents"]["w39"]["role"] = "lead"      # the last of the record, which the cut would drop
+        hub.TEAM["agents"]["manager"] = {"role": "manager", "runtime": "claude"}       # and after it, the manager
         said = hub.team_start_text("seo")
         head = "\nYOUR TEAM, from the fleet's own record and not from profiles: "
         listed = said.split(". For work that needs")[0][len(head):].split(" | and ")[0]
         self.assertLessEqual(len(listed), hub.TEAM_CHARS)
         self.assertIn("more, which manager knows.", said)
+        self.assertTrue(listed.startswith("w39 [lead, Codex] -- it gives you your tasks"), listed[:80])
+        self.assertTrue(listed.split(" | ")[1].startswith("manager [manager, "), listed[:200])
         self.assertNotIn("in setup", said)
 
     def test_an_agent_the_owner_has_not_activated_is_not_on_the_team_yet(self):

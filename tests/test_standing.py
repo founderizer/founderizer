@@ -510,6 +510,10 @@ class Ending(Base):
             with self.subTest(who):
                 self.assertIn("is hand's: ask hand to end it", self.refused(who, "end_standing", id=f"I-{item}",
                                                                             why="I do not like it"))
+        hub.TEAM["agents"]["hand"]["can"] = []      # its Shell box off: it ends no item of its own, so only the manager
+        self.assertIn("is hand's: ask manager to end it.", self.refused("lead", "end_standing", id=f"I-{item}",
+                                                                        why="I do not like it"))
+        hub.TEAM["agents"]["hand"]["can"] = ["shell"]
         self.assertIsNone(self.item(item)["ended"])
         self.assertIn("why is 1 to", self.refused("hand", "end_standing", id=f"I-{item}", why=" "))
         self.assertIn("is not a standing item", self.refused("hand", "end_standing", id="T-4", why="x"))

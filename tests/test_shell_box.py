@@ -774,9 +774,18 @@ class Tools(Fleet):
         (support plan H7). An agent outside its line, a wait and an address are refused."""
         tid, context = self.task("desk")
         chat = (hub.kv_get("db_id"), "owner-chat", 1)
-        line = (" YOUR LINE, the agents that message_agent reaches, and no other: lead (your lead), manager (the fleet "
-                "manager), ops (a peer).")
+        line = (" YOUR LINE, the agents that message_agent reaches, and no other: lead (your lead, which gives you your "
+                "tasks), manager (the fleet manager), ops (a peer).")
         self.assertEqual(hub.shell_line_text("desk"), line)         # cx reports to the manager, not to desk's lead
+        # its lead's Shell box off: the nearest lead above it that can act gives desk its tasks and keeps the wishes
+        # for its team (rules/wishes.md), and the line marks that one
+        lead = dict(hub.TEAM["agents"]["lead"])
+        hub.TEAM["agents"]["mid"] = {"role": "lead", "runtime": "claude", "machine": "lead", "can": ["shell"]}
+        hub.TEAM["agents"]["lead"].update(can=["web"], reports_to="mid")
+        self.assertIn("lead (your lead), mid (a lead above you, which gives you your tasks), manager (the fleet "
+                      "manager)", hub.shell_line_text("desk"))
+        hub.TEAM["agents"]["lead"] = lead
+        del hub.TEAM["agents"]["mid"]
         self.assertIn(line, hub.start_text("desk", tid))
         self.assertIn(line.strip(), hub.chat_team_once("desk"))
 

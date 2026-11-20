@@ -6998,7 +6998,11 @@ def team_start_text(agent):
     # says how)
     peer = [n for n in agents() if gives_subtasks(agent) and peers(agent, n)[0]]
     kept, left = [], 0
-    for name in agents():
+    # the agent that gives this one its tasks first, then the fleet manager, those that it gives tasks to and its
+    # peers, so that the cut at TEAM_CHARS drops a colleague of no tie first: rules/wishes.md sends a team's wish to
+    # the first one
+    head = manager_name()
+    for name in sorted(agents(), key=lambda n: (n != requester, n != head, n not in mine, n not in peer)):
         if name == agent or not agent_active(name):
             continue
         line = colleague_line(name, " -- it gives you your tasks" if name == requester else
@@ -7355,16 +7359,21 @@ def rules_parts(agent):
     RULES.md said to every agent too. And the part of wishes, for an agent with people on its list and for a lead and
     the manager, which get what such an agent passes up: a person's wish for others, and how a step that a person keeps
     becomes the agent's by its record (the sentence table's N6: one part for both states, so that the manager reads it
-    once). Reads only: start_text runs inside admit_task's transaction."""
+    once). Reads only: start_text runs inside admit_task's transaction.
+
+    A lead whose Shell box is off gets no lead's part, and the part of wishes only for people on its list (since 20
+    November 2026): its sessions have none of the tools that the lead's part names, and the agent above it gives its
+    team their tasks and keeps their wishes (task_giver)."""
     a, role = agents().get(agent) or {}, role_of(agent)
     people = bool(read_row("SELECT 1 FROM person_agents WHERE agent=? LIMIT 1", (agent,)))
-    wanted = {"lead": role in ("lead", "manager"), "manager": role == "manager",
+    gives = role == "manager" or (role == "lead" and not shell_off(agent))     # it gives its team their tasks
+    wanted = {"lead": gives, "manager": role == "manager",
               "conversations": role == "manager" or people,
               "logins": bool(granted_logins(agent) or a.get("vault_create") is True or a.get("vault") == "broker"),
               "github": bool(a.get("repos")), "servers": bool(a.get("servers")),
               "duty": role == "manager" or bool(read_row("SELECT 1 FROM responsibilities WHERE agent=? AND "
                                                          "state!='retired' LIMIT 1", (agent,))),
-              "shell-off": shell_off(agent), "wishes": people or role in ("lead", "manager")}
+              "shell-off": shell_off(agent), "wishes": people or gives}
     return [part for part in RULES_PARTS if wanted[part]]
 
 
@@ -13314,13 +13323,14 @@ def t_search_knowledge(agent, a):
         most = max(1, min(int(a.get("max_results") or SEARCH_RESULTS[0]), SEARCH_RESULTS[1]))
     except (TypeError, ValueError):
         most = SEARCH_RESULTS[0]
-    files = knowledge_usable(agent)
+    files = knowledge_usable(agent, "search_knowledge")
     if not files:
         return "There are no knowledge files yet."
-    found = []
+    found, unread = [], []
     for k in files:
         text = knowledge_text(k)
-        if text is None:
+        if text is None:        # a file that cannot be read now is no file without the words
+            unread.append(k["path"])
             continue
         hits = search_lines(text, words)
         named = set().union(*search_lines(f"{k['path'].rsplit('/', 1)[-1][:-3]}\n{k['title']}", words).values())
@@ -13331,13 +13341,18 @@ def t_search_knowledge(agent, a):
             rank = (-len(matched), -max(map(len, hits.values()), default=0), -len(named), -len(hits), k["path"])
             found.append((rank, k, text, hits, named))
     found.sort(key=lambda x: x[0])
-    scope = (f"the {len(files)} knowledge file{'s' * (len(files) > 1)} that you may use, at commit "
-             f"{files[0]['commit'][:12]}")
+    if len(unread) == len(files):
+        raise KnowledgeUnread("search_knowledge")
+    read = len(files) - len(unread)
+    scope = (f"the {read} knowledge file{'s' * (read > 1)} that you may use" +
+             (" and that this search could read" if unread else "") + f", at commit {files[0]['commit'][:12]}")
+    left = (f" {', '.join(unread[:5])}{f' and {len(unread) - 5} more' if len(unread) > 5 else ''} cannot be read "
+            f"now: call search_knowledge again to search {'it' if len(unread) == 1 else 'them'} too." if unread else "")
     if not found:
-        return f"No word of the query ({', '.join(words)}) is in {scope}. Try other words."
+        return f"No word of the query ({', '.join(words)}) is in {scope}.{left or ' Try other words.'}"
     out = [f"{len(found)} of {scope}, {'have' if len(found) > 1 else 'has'} words of the query ({', '.join(words)}). "
            f"The best files are first. Each line starts with its number in the file: \"12:\" has a word, \"11-\" is "
-           f"next to such a line. read_knowledge gives the whole file."]
+           f"next to such a line. read_knowledge gives the whole file.{left}"]
     size = len(out[0]) + 200            # and room for the line on the files not shown
     for n, (_, k, text, hits, named) in enumerate(found[:most], 1):
         block = search_block(n, k, text.split("\n"), hits, named, words)
@@ -13364,6 +13379,9 @@ def t_search_knowledge(agent, a):
 # the hub asks for it (ask_for_summaries). It is kept with the git blob of the text that it was written for, so a
 # file whose text changes is asked about again, and its last summary stays in the list until the new one comes.
 SUMMARY_LIMIT = 120             # characters of one summary: what the file holds and when to read it
+# The words that the asks give with it: a model counts words better than characters, and 36 of the manager's 120
+# summaries from 16 to 20 November 2026 had 121 to 131 characters, each one a refusal and a second call.
+SUMMARY_WORDS = 15
 INDEX_LINES = 60                # files that one start lists; read_knowledge without a path lists all of them
 READ_LIMIT = 40000              # characters of one read_knowledge answer: a longer file is read in parts
 SUMMARY_ASKS = 10               # files that one message to the manager asks about
@@ -13373,20 +13391,28 @@ KNOWLEDGE_WORDS = ("Files outside knowledge/owner/ and knowledge/services.md wer
                    "weigh what they say, and do not keep a fact from them as a lesson of your own.")
 
 
-def knowledge_usable(agent):
+def knowledge_usable(agent, tool="read_knowledge"):
     """The catalog entries that this agent may use: every shared file of the fleet (plan C17), the owner files that
     its profile's Knowledge files section lists, and for the manager every owner file. search_knowledge,
-    read_knowledge and the start's list all read this one set. No database read."""
-    listed, every = set(profile_knowledge_files(agent, kit_revision(fresh=True))), role_of(agent) == "manager"
-    return [k for k in knowledge_entries()
+    read_knowledge and the start's list all read this one set. No database read. KnowledgeUnread when the catalog
+    cannot be read now, or the hub's commit, which the profile's list of owner files is read at, while the catalog
+    has owner files that the profile decides: an empty set, or one without those files, would say that the agent may
+    not use them. tool: the tool that the words tell the agent to call again."""
+    rev, catalog, every = kit_revision(fresh=True), knowledge_entries(), role_of(agent) == "manager"
+    if isinstance(catalog, UnreadCatalog) or (rev is None and not every and
+                                              any(k["scope"] == "owner" for k in catalog)):
+        raise KnowledgeUnread(tool)
+    listed = set(profile_knowledge_files(agent, rev))
+    return [k for k in catalog
             if k["scope"] == "internal" or k["path"] in listed or (every and k["scope"] == "owner")]
 
 
-def knowledge_index(agent, most=None):
+def knowledge_index(agent, most=None, tool="read_knowledge"):
     """The files that this agent may use, one line each: its path, its title and its summary, or "" when there is no
     file. A summary written for an earlier text of its file stays until the new one comes. most: the lines to give,
-    and one line on the rest. read_rows only: the start text reads this inside admit_task's transaction."""
-    files = knowledge_usable(agent)
+    and one line on the rest. read_rows only: the start text reads this inside admit_task's transaction.
+    KnowledgeUnread when the files cannot be read now (knowledge_usable)."""
+    files = knowledge_usable(agent, tool)
     if not files:
         return ""
     said = {r["path"]: r["summary"] for r in read_rows("SELECT path, summary FROM knowledge_summaries")}
@@ -13401,8 +13427,13 @@ def knowledge_index(agent, most=None):
 
 def knowledge_start_text(agent):
     """The start's part on knowledge: the list of the files that this agent may use (knowledge_index), never their
-    text. "" when there is none."""
-    listed = knowledge_index(agent, INDEX_LINES)
+    text. "" when there is none, and one line when the list cannot be read now: it never raises, because the start
+    text is read inside admit_task's transaction, and an error there would refuse the task."""
+    try:
+        listed = knowledge_index(agent, INDEX_LINES)
+    except KnowledgeUnread:
+        return ("\nKNOWLEDGE FILES: the hub cannot read their list now. When your work needs a file, call "
+                "read_knowledge without a path for the list.\n")
     return "\n" + listed if listed else ""
 
 
@@ -13411,7 +13442,11 @@ def t_read_knowledge(agent, a):
     path = str(a.get("path") or "").strip()
     if not path:
         return mask_secrets(knowledge_index(agent) or "There are no knowledge files that you may use.")
-    entry = next((k for k in knowledge_usable(agent) if k["path"] == path), None)
+    try:
+        entry = next((k for k in knowledge_usable(agent) if k["path"] == path), None)
+    except KnowledgeUnread:
+        summary_asked_again(agent, path)
+        raise
     if not entry:
         raise ToolError(f"{path} is not a knowledge file that you may use. read_knowledge without a path lists them.")
     try:
@@ -13420,6 +13455,7 @@ def t_read_knowledge(agent, a):
         raise ToolError("line is the number of the first line to read, 1 or more.") from None
     text = knowledge_text(entry)
     if text is None:
+        summary_asked_again(agent, path)
         raise ToolError(f"{path} cannot be read now. Call read_knowledge again.")
     lines = text.rstrip("\n").split("\n")
     if first > len(lines):
@@ -13438,16 +13474,43 @@ def t_read_knowledge(agent, a):
     return mask_secrets(f"{head}\n\n{body}{rest}")
 
 
+def summary_asked_again(agent, path):
+    """The manager's read of a knowledge file failed: the hub asks for its summary once more at its next look, as
+    when summarize_knowledge fails, because ask_for_summaries asks once for each text of a file (knowledge_asked) and
+    the manager's turn ends at the failed read, before its summary. Once more and no more: the mark of the ask (the
+    file's blob) becomes again:<blob>, which ask_for_summaries asks for and then marks asked-again:<blob>, so a git
+    that keeps failing costs the manager one more turn, and no ask at every look. True when the hub asks again: the
+    words of a refusal may promise it only then."""
+    if role_of(agent) != "manager":
+        return False
+    key = "knowledge_asked:" + path
+    mark = kv_get(key)
+    kept = read_row("SELECT blob FROM knowledge_summaries WHERE path=?", (path,))
+    if kept and (not mark or kept["blob"] == mark.split(":")[-1]):     # it has its summary: no ask comes
+        return False
+    if mark and not mark.startswith(("again:", "asked-again:")):
+        with area("quiet"):
+            kv_set(key, "again:" + mark)
+        return True
+    return not mark or mark.startswith("again:")
+
+
 def t_summarize_knowledge(agent, a):
     """The manager's summary of one knowledge file, for the text that the file has now."""
     path = str(a.get("path") or "").strip()
-    entry = next((k for k in knowledge_entries() if k["path"] == path), None)
+    catalog = knowledge_entries()
+    if isinstance(catalog, UnreadCatalog):      # the hub asks for it again at its next look (ask_for_summaries)
+        raise ToolError("The knowledge files cannot be read now. The summary was not kept: " +
+                        ("the hub asks you for it again when it can read them." if summary_asked_again(agent, path)
+                         else "call summarize_knowledge again when read_knowledge can read the file."))
+    entry = next((k for k in catalog if k["path"] == path), None)
     if not entry:
         raise ToolError(f"{path} is not in the knowledge catalog. read_knowledge without a path lists the files.")
     summary = " ".join(str(a.get("summary") or "").split())
     if not summary or len(summary) > SUMMARY_LIMIT:
-        raise ToolError(f"summary is one line of 1 to {SUMMARY_LIMIT} characters: what the file holds and when an "
-                        f"agent needs it.")
+        raise ToolError(f"summary is one line of 1 to {SUMMARY_LIMIT} characters (about {SUMMARY_WORDS} words): what "
+                        f"the file holds and when an agent needs it." + (f" This one has {len(summary)} characters."
+                                                                        if summary else ""))
     guard(agent, summary)
     with area("quiet"), transaction():
         DB.execute("INSERT INTO knowledge_summaries(path, blob, summary, agent, at) VALUES(?,?,?,?,?) "
@@ -13461,24 +13524,28 @@ def ask_for_summaries():
     """One [hub] message that asks the manager for the summary of the knowledge files whose text has none yet, at
     most SUMMARY_ASKS of them; the next look asks for the next ones. Once for each text of a file: the hub keeps the
     blob that it asked about, so a file is asked about again only when its text changes. Returns how many it asked
-    about."""
+    about. And once more after a read of the manager's that failed (summary_asked_again: again:<blob>, then
+    asked-again:<blob>)."""
     manager = manager_name()
     if not manager:
         return 0
     said = {r["path"]: r["blob"] for r in q("SELECT path, blob FROM knowledge_summaries")}
     due = [k for k in knowledge_entries()
-           if said.get(k["path"]) != k["blob"] and kv_get("knowledge_asked:" + k["path"]) != k["blob"]][:SUMMARY_ASKS]
+           if said.get(k["path"]) != k["blob"]
+           and kv_get("knowledge_asked:" + k["path"]) not in (k["blob"], "asked-again:" + k["blob"])][:SUMMARY_ASKS]
     if not due:
         return 0
     emit(manager, "say", "[hub] These knowledge files have no summary for their text yet: "
          + "; ".join(f'{k["path"]} ("{k["title"]}")' for k in due)
          + f". Read each one with read_knowledge, then give it a summary with summarize_knowledge: one line of at "
-           f"most {SUMMARY_LIMIT} characters that says what the file holds and when an agent needs it. The start of "
+           f"most {SUMMARY_LIMIT} characters (about {SUMMARY_WORDS} words) that says what the file holds and when an "
+           f"agent needs it. The start of "
            f"every agent that may use a file lists it with that line, and the agent reads the file itself only when "
            f"its work needs it.")
     with area("quiet"):
         for k in due:
-            kv_set("knowledge_asked:" + k["path"], k["blob"])
+            again = kv_get("knowledge_asked:" + k["path"]) == "again:" + k["blob"]
+            kv_set("knowledge_asked:" + k["path"], ("asked-again:" if again else "") + k["blob"])
     return len(due)
 
 
@@ -14474,6 +14541,8 @@ CARD_SIGN_IN_REFUSAL = (
     "the owner's own sign-in to an AI provider's account (Claude, ChatGPT), to their Founderizer app or Apple account, "
     "to an MCP server in their app, or at a machine's own keyboard is theirs.")
 OWNER_TEXT_CACHE = {"key": None, "texts": ()}
+OWNER_FILES_UNREAD = ("Not raised: the knowledge files cannot be read now, so the hub cannot check owner_words in "
+                      "them. Call raise_needs_you again in a minute.")
 
 
 def card_plain(text):
@@ -14565,8 +14634,10 @@ def owner_file_texts():
     """(path, plain words) of the owner's own files: the sections of each profile but the manager's, which it may
     write itself, and each file of knowledge/owner/. Kept while the hub's checkout, its owner files and its agents stay
     the same, because each read is a git call and the tool runs under the hub's lock."""
-    rev = kit_revision()
-    entries = [e for e in knowledge_entries() if e["scope"] == "owner"]
+    rev, catalog = kit_revision(), knowledge_entries()
+    if isinstance(catalog, UnreadCatalog):      # not words that are not the owner's (lanes/a-knowledge-read-that-fails.md)
+        raise ToolError(OWNER_FILES_UNREAD)
+    entries = [e for e in catalog if e["scope"] == "owner"]
     key = (rev, tuple((e["path"], e.get("blob")) for e in entries), tuple(sorted(agents())))
     if OWNER_TEXT_CACHE["key"] != key:
         texts = []
@@ -14574,7 +14645,11 @@ def owner_file_texts():
             if rev and role_of(name) != "manager":
                 view = profile_view(name, rev)
                 texts.append((view["path"], card_plain(" ".join(s.get("text") or "" for s in view["sections"]))))
-        texts += [(e["path"], card_plain(knowledge_text(e))) for e in entries]
+        for e in entries:
+            text = knowledge_text(e)
+            if text is None:                    # kept as no words, it would stay until the next commit
+                raise ToolError(OWNER_FILES_UNREAD)
+            texts.append((e["path"], card_plain(text)))
         OWNER_TEXT_CACHE.update(key=key, texts=tuple(texts))
     return OWNER_TEXT_CACHE["texts"]
 
@@ -23345,8 +23420,8 @@ def t_ask_team(agent, a):
                     f"this task waits, and the answer comes to it. A lasting wish of {person['name']}'s about your "
                     f"work for them, in a message of theirs that this task got, you keep with keep_instruction: that "
                     f"message as source, its own words, scope agent; and you end one with end_standing, with the "
-                    f"message of theirs that asks for it as asked_by. A wish for the whole team goes to your lead "
-                    f"with message_agent." if staff else ""))
+                    f"message of theirs that asks for it as asked_by. A wish for the whole team goes with "
+                    f"message_agent to {task_giver(agent)}, which gives you your tasks." if staff else ""))
         same = q1(f"SELECT id FROM tasks WHERE source_conversation=? AND source_message IS NULL AND details=? AND "
                   f"{OPEN_TASK}", (conv["id"], details))
         if same:
@@ -36651,17 +36726,23 @@ def t_write_knowledge(agent, a):
         raise ToolError(f"A knowledge file is at most {per_file // 1024} KiB. Say the fact in fewer words, or ask "
                         f"your requester for a second file.")
     # knowledge_entries drops the files past these limits without a word, and a dropped file is one that
-    # search_knowledge no longer finds. So a write that would push a file out of the catalog is refused instead.
-    inside = [k for k in knowledge_entries() if k["scope"] == "internal"]
+    # search_knowledge no longer finds. So a write that would push a file out of the catalog is refused instead, and
+    # so is a write while the catalog cannot be read, whose room nobody knows (commit_kit_file checks no room).
+    # The answer of an exact repeat first (agent_write reads only): a write whose answer was lost and that the agent
+    # calls again is not refused for a room that its own first call took, or for a catalog that cannot be read now.
+    fields = {"path": path, "sha256": hashlib.sha256(content).hexdigest(), "why": why}
+    command, stored = agent_write(agent, "write_knowledge", a, fields)
+    if stored:
+        return stored["text"]
+    catalog = knowledge_entries()
+    if isinstance(catalog, UnreadCatalog):
+        raise KnowledgeUnread("write_knowledge", "Nothing was written.")
+    inside = [k for k in catalog if k["scope"] == "internal"]
     room = sum(k["bytes"] for k in inside if k["path"] != path) + len(content)
     if room > in_all or (len(inside) >= files and path not in {k["path"] for k in inside}):
         raise ToolError(f"The fleet's knowledge has room for {files} files and {in_all // 1024} KiB in all, and this "
                         f"write would pass it ({room // 1024} KiB). Ask your requester: a file that nothing needs any "
                         f"more is the owner's to delete.")
-    fields = {"path": path, "sha256": hashlib.sha256(content).hexdigest(), "why": why}
-    command, stored = agent_write(agent, "write_knowledge", a, fields)
-    if stored:
-        return stored["text"]
     where, trailers = save_where(agent)
     message = (f"{agent} changed {path}: {why}\n\n"
                f"Written {where}. An agent writes the fleet's shared knowledge files, directly and without asking; it "
@@ -37699,6 +37780,11 @@ TEAM_PRESS_CHANGED = ("The hub did not make this change: the fleet changed after
 TEAM_CLOSED_WORDS = "Closed by the hub: the fleet changed after this card was made, so nothing changed."
 
 
+# A team plan while the knowledge catalog cannot be read: the press and the sweep keep its card (TeamPassing).
+KNOWLEDGE_PASSING = "The hub cannot read its knowledge files now. Try again in a minute."
+KNOWLEDGE_PASSING_OWNER = "the hub cannot read its knowledge files now"
+
+
 class TeamPassing(ToolError):
     """A refusal of a plan that can pass by itself: a server that is busy or silent, too little memory now, an agent
     with an open task or an open case, a runtime that no agent is signed in to now, the configuration unreadable. The
@@ -37791,11 +37877,17 @@ def profile_too_large(agent, sections):
     return len(render_profile(agent, sections).encode()) > PROFILE_MAX
 
 
-def profile_unknown_file(sections):
+def profile_unknown_file(sections, plan=False):
     """The first path of these sections' Knowledge files that is not in the knowledge catalog, or None: the owner's
-    own profile save refuses it (ui_profile_save), and so does a team plan."""
+    own profile save refuses it (ui_profile_save), and so does a team plan. plan: a team plan's check, which raises
+    TeamPassing when the catalog cannot be read now and the sections list a file, so that its card stays and a pressed
+    plan tries again, and never says that a file is not there (lanes/a-knowledge-read-that-fails.md; the owner's
+    save keeps its own answer)."""
     listed = next((knowledge_list(x["text"]) for x in sections if x["key"] == "knowledge_files"), [])
-    catalog = {k["path"] for k in knowledge_entries()}
+    entries = knowledge_entries()
+    if plan and listed and isinstance(entries, UnreadCatalog):
+        raise TeamPassing(KNOWLEDGE_PASSING, KNOWLEDGE_PASSING_OWNER)
+    catalog = {k["path"] for k in entries}
     return next((p for p in listed if p not in catalog), None)
 
 
@@ -38074,7 +38166,7 @@ def team_add(ctx, c):
         raise ToolError("A plan gives no login through a profile: leave out the section Logins it may use, and grant "
                         "a login from the pool (grant_access) once the agent is there.")
     chosen = ctx["name"] if ctx["name"] in names else names[0]
-    unknown = profile_unknown_file(sections)
+    unknown = profile_unknown_file(sections, plan=True)
     if profile_too_large(chosen, sections) or unknown:
         raise ToolError(f"The owner's own profile save would refuse this profile: "
                         f"{f'{unknown} is not in the knowledge catalog' if unknown else 'it is larger than 32 KiB'}.")
@@ -38151,7 +38243,7 @@ def team_profile(ctx, c):
     if logins[0] != logins[1]:
         raise ToolError("A plan does not change the section Logins it may use: grant a login from the pool "
                         "(grant_access), or ask the owner for a new one (request_secret).")
-    unknown = profile_unknown_file(sections)
+    unknown = profile_unknown_file(sections, plan=True)
     if profile_too_large(n, sections) or unknown:
         raise ToolError(f"The owner's own profile save would refuse this profile: "
                         f"{f'{unknown} is not in the knowledge catalog' if unknown else 'it is larger than 32 KiB'}.")
@@ -38229,8 +38321,16 @@ def team_owner_file(ctx, c):
     path, text = c.get("path"), c.get("text")
     if not isinstance(path, str) or knowledge_scope(path) != "owner" or not path.endswith(".md"):
         raise ToolError("path is an owner file: knowledge/owner/<name>.md.")
+    # The catalog first: while it cannot be read, knowledge_replaced would find room in no file, and a file that it
+    # lists but git does not give now is a read that failed, not a file that is gone. A plain ToolError would close
+    # the owner's card at the press and at the sweep; TeamPassing keeps it.
+    catalog = knowledge_entries()
+    if isinstance(catalog, UnreadCatalog):
+        raise TeamPassing(KNOWLEDGE_PASSING, KNOWLEDGE_PASSING_OWNER)
     before = git_blob(rev, path)
     if before is None:
+        if any(k["path"] == path for k in catalog):
+            raise TeamPassing(KNOWLEDGE_PASSING, KNOWLEDGE_PASSING_OWNER)
         raise ToolError(f"There is no owner file {path}.")
     if c.get("base_sha256") != hashlib.sha256(before).hexdigest():
         raise ToolError(f"{path} is not the version that you read: read it again, and give its SHA-256 as "
@@ -38953,14 +39053,17 @@ def shell_line_text(agent):
     """The sentence of a Shell-off session's start that names its reporting line (shell_line): each agent with its
     title and how it stands to this one, so that the session knows whom message_agent reaches without a team
     directory, which no session of such an agent gets. team.json only: start_text runs inside admit_task's
-    transaction."""
-    above, up = line_above(agent), reports_to(agent)
+    transaction. The agent that gives it its tasks is marked (task_giver), as the team directory marks it: its lead,
+    or the agent above a lead whose Shell box is off; rules/wishes.md sends a team's wish to that agent."""
+    above, up, giver = line_above(agent), reports_to(agent), task_giver(agent)
 
     def line_member(name):      # a title can hold half a pair of characters, which no record of a text stores
         title = str((agents().get(name) or {}).get("title") or "").strip()
         title = title.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
         how = "the fleet manager" if role_of(name) == "manager" else "your lead" if name == up else \
             "a lead above you" if name in above else "of your team" if reports_to(name) == agent else "a peer"
+        if name == giver:
+            how += ", which gives you your tasks"
         return f"{name} ({title + ', ' if title else ''}{how})"
     line = shell_line(agent)
     if not line:
@@ -39442,13 +39545,14 @@ def standing_asked(agent, a, field):
 
 def t_keep_instruction(agent, a):
     words = item_words(a.get("words"))
+    # before item_scope, whose "nobody is in your team" would have a worker keep a wish for its whole team for itself
+    if shell_off(agent) and str(a.get("scope") or "").strip().lower() == "team":
+        raise ToolError(f"scope is agent: a colleague's wish steers you, and a wish for the whole team goes with "
+                        f"message_agent to {task_giver(agent)}, which gives you your tasks.")
     scope = item_scope(agent, a.get("scope"))
     task = session_task(agent, a)
     if shell_off(agent):            # a colleague's question task alone has the tool (shell_tools)
         standing_asked(agent, a, "source")
-        if scope != "agent":
-            raise ToolError("scope is agent: a colleague's wish steers you, and a wish for the whole team goes to your "
-                            "lead with message_agent.")
     guard(agent, words)
     kind, author, conversation, message = standing_source(agent, a.get("source"), words)
     return standing_keep(agent, task, {"scope": scope, "kind": "instruction", "words": words, "author_kind": kind,
@@ -39593,7 +39697,9 @@ def t_end_standing(agent, a):
     if not r:
         raise ToolError(f"There is no standing item {iref(item)}.")
     if r["agent"] != agent and role_of(agent) != "manager":
-        raise ToolError(f"{iref(item)} is {r['agent']}'s: ask {r['agent']} to end it, or {manager_name()}.")
+        # a holder whose Shell box is off ends none but a colleague's own wish (shell_tools): only the manager can
+        raise ToolError(f"{iref(item)} is {r['agent']}'s: ask {manager_name()} to end it." if shell_off(r["agent"]) else
+                        f"{iref(item)} is {r['agent']}'s: ask {r['agent']} to end it, or {manager_name()}.")
     if r["ended"]:
         return (f"{iref(item)} already ended {ago(r['ended'])} ago, as {standing_who(r['ended_by'], agent)} asked. "
                 f"Nothing changed.")
@@ -39619,7 +39725,9 @@ def t_see_standing(agent, a):
         out.append(f"EVERY ACTIVE STANDING ITEM OF THE FLEET ({len(rows)}):")
         out += [f"  {r['agent']}: {standing_line(r, agent, t0)}" for r in rows] or ["  none"]
         out.append("You end any of them with end_standing when the owner asks (asked_by=\"M-<n>\"); its agent ends its "
-                   "own.")
+                   "own. An item of an agent whose Shell box is off you end in its place when its author, a person whose "
+                   "role allows it or the owner asks: that agent ends only a colleague's own wish, when that colleague "
+                   "asks it in their conversation.")
         return "\n".join(out)
     rows = steering_items(agent)
     out.append(f"STANDING ITEMS THAT STEER YOU ({len(rows)}):")
@@ -49223,7 +49331,13 @@ def knowledge_entries():
     """The knowledge catalog at the hub's HEAD: bounded regular Markdown blobs only, with their scope and without
     their text (GET /ui/knowledge gives one owner file's text). No working-tree reads or vault access. `blob` is the
     git object of the file's text, which says whether its summary is for this text (knowledge_index); the owner's
-    apps do not get it (knowledge_public)."""
+    apps do not get it (knowledge_public).
+
+    A read that fails (git, or its 5 seconds) gives an UnreadCatalog: empty, as before, for each caller to which a
+    failed read and no file are the same (a look that tries again, the app's list), and told apart where an empty list
+    would tell an agent that the file it needs is not there (knowledge_usable, the room check of t_write_knowledge,
+    t_summarize_knowledge). The hub's output names the fault, with no path or words of git's: a read that keeps
+    failing is seen there, and no agent is told that the fleet has no file."""
     global KNOWLEDGE_CACHE
     repo = CFG.get("artifact_repo", os.path.dirname(os.path.abspath(__file__)))
     def git(*args):
@@ -49232,6 +49346,7 @@ def knowledge_entries():
         commit = head_commit(repo) or git("rev-parse", "HEAD").decode("ascii").strip()      # no process, mostly
         key, cached = (repo, commit), KNOWLEDGE_CACHE       # one read: another reader can store its own meanwhile
         if cached[0] == key:
+            KNOWLEDGE_UNREAD_SAID[0] = False
             return cached[1]
         result, counts, totals = [], {}, {}
         for item in git("ls-tree", "-r", "-l", "-z", commit, "--", "knowledge/").split(b"\0"):
@@ -49267,9 +49382,36 @@ def knowledge_entries():
                                commit=commit, blob=oid))
             counts[scope], totals[scope] = counts.get(scope, 0) + 1, totals.get(scope, 0) + size
         KNOWLEDGE_CACHE = (key, result)
+        KNOWLEDGE_UNREAD_SAID[0] = False
         return result
-    except (OSError, ValueError, UnicodeError, subprocess.SubprocessError):
-        return []
+    except (OSError, ValueError, UnicodeError, subprocess.SubprocessError) as e:
+        # print and not log(): a start reads the catalog inside admit_task's transaction. One line when the reads
+        # begin to fail, and none for each read after it (the app's state read and each start read it); an output
+        # that is closed changes no answer.
+        if not KNOWLEDGE_UNREAD_SAID[0]:
+            KNOWLEDGE_UNREAD_SAID[0] = True
+            try:
+                print(f"hub: the knowledge catalog cannot be read now ({type(e).__name__})", flush=True)
+            except (OSError, ValueError):
+                pass
+        return UnreadCatalog()
+
+
+KNOWLEDGE_UNREAD_SAID = [False]        # the hub's output named the fault of the reads now failing
+
+
+class UnreadCatalog(list):
+    """The knowledge catalog of a read that failed: an empty list, so that the callers to which that and no file are
+    the same need no change, and a type of its own for those that must say "cannot be read now" (knowledge_entries)."""
+
+
+class KnowledgeUnread(ToolError):
+    """The knowledge files cannot be read now. A tool's answer is these words, so that the agent calls it again and
+    does not go on as if the file were not there; the start's list says it in its own line (knowledge_start_text).
+    done: what the call did not do, for a call that writes."""
+    def __init__(self, tool, done=""):
+        super().__init__(f"The knowledge files cannot be read now.{' ' + done if done else ''} Call {tool} again, and "
+                         f"if it fails again, say so in your result or your reply.")
 
 
 def knowledge_public(entry):

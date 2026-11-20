@@ -1942,11 +1942,26 @@ class ShellOffRule(Base):
                 text, error = hub.call_tool("studio", "keep_instruction", args, here)
                 self.assertTrue(error, text)
                 self.assertIn(refusal, text)
-        with patch.object(hub, "team_below", lambda agent: ["vps"] if agent == "studio" else []):
-            text, error = hub.call_tool("studio", "keep_instruction", {"words": wish, "scope": "team",
-                                                                   "source": source}, here)
+        # a wish for the whole team goes to the agent that gives studio its tasks: under a lead whose Shell box is off
+        # (boss), which keeps no wish, the nearest lead above it that can act (mid); the refusal says so to a worker
+        # with no team of its own, and so do the words of a colleague's next question
+        studio = dict(hub.TEAM["agents"]["studio"])
+        hub.TEAM["agents"]["mid"] = {"role": "lead", "runtime": "claude", "machine": "studio-host", "can": ["shell"]}
+        hub.TEAM["agents"]["boss"] = {"role": "lead", "runtime": "claude", "machine": "studio-host", "can": [],
+                                      "reports_to": "mid"}
+        hub.TEAM["agents"]["studio"]["reports_to"] = "boss"
+        text, error = hub.call_tool("studio", "keep_instruction", {"words": wish, "scope": "team", "source": source},
+                                    here)
         self.assertTrue(error, text)
-        self.assertIn("a wish for the whole team goes to your lead", text)
+        self.assertIn("a wish for the whole team goes with message_agent to mid, which gives you your tasks", text)
+        self.ok("ask_team", self.context(cid), question="Pat wants the links for the whole team.",
+                messages=[hub.cm_ref(said["id"])])
+        details = hub.q1("SELECT details FROM tasks WHERE source_conversation=? ORDER BY id DESC LIMIT 1",
+                         (cid,))["details"]
+        self.assertIn("A wish for the whole team goes with message_agent to mid, which gives you your tasks.", details)
+        hub.TEAM["agents"]["studio"] = studio
+        for name in ("boss", "mid"):
+            del hub.TEAM["agents"][name]
         self.ok("keep_instruction", here, words=wish, scope="agent", source=source)
         item = hub.q1("SELECT * FROM standing ORDER BY id DESC LIMIT 1")
         self.assertEqual((item["agent"], item["scope"], item["author"]), ("studio", "agent", f"P-{pat['id']}"))

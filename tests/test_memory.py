@@ -1603,6 +1603,8 @@ class KnowledgeWrite(Base):
         git("clone", "-q", "-b", hub.CONFIG_BRANCH, str(self.root / "origin.git"), str(self.root / "kit"))
         self.kit = self.root / "kit"
         hub.CFG["team_path"] = str(self.kit / "team.json")
+        hub.CFG["artifact_repo"] = str(self.kit)          # the catalog is this checkout's, never the one that tests
+        self.addCleanup(hub.CFG.pop, "artifact_repo", None)
         hub._revision_cache.update(at=0.0, value=None)
         hub._code_diffs.clear()
         hub.KNOWLEDGE_CACHE = (None, [])
@@ -1637,8 +1639,6 @@ class KnowledgeWrite(Base):
 
     def test_a_file_that_changed_after_this_session_started_is_not_written_over(self):
         """The article's shared table: of 57 facts that parallel writers put in one page, 41 survived."""
-        hub.CFG["artifact_repo"] = str(self.kit)                  # read_knowledge reads the hub checkout
-        self.addCleanup(hub.CFG.pop, "artifact_repo", None)
         hub.KNOWLEDGE_CACHE = (None, [])
         self.begin()
         theirs = self.begin(self.new_task())
@@ -1669,8 +1669,6 @@ class KnowledgeWrite(Base):
         self.assertTrue(self.write(text="# Suppliers\n\nAcme: by phone.\n", task=theirs)[1])
 
     def test_a_new_attempt_reads_again_and_a_removed_file_is_written_anew(self):
-        hub.CFG["artifact_repo"] = str(self.kit)
-        self.addCleanup(hub.CFG.pop, "artifact_repo", None)
         hub.KNOWLEDGE_CACHE = (None, [])
         self.begin()
         self.ok("vps", "read_knowledge", path="knowledge/suppliers.md")
@@ -1847,6 +1845,12 @@ class KnowledgeWrite(Base):
             self.assertTrue(error, said)
             self.assertIn("room for 32 files and 0 KiB in all", said)
             self.assertEqual(self.head(), self.seeded)
+            # and while the catalog cannot be read, nobody knows its room (commit_kit_file checks none)
+            with patch.dict(hub.CFG, {"artifact_repo": str(self.root / "gone")}):
+                said, error = self.write(text="# Services\n\nShort.\n")
+            self.assertTrue(error, said)
+            self.assertIn("cannot be read now. Nothing was written. Call write_knowledge again", said)
+            self.assertEqual(self.head(), self.seeded)
             self.assertFalse(self.write(text="# Services\n\nShort.\n")[1])
 
     def test_a_login_is_never_written_to_a_knowledge_file(self):
@@ -1862,6 +1866,8 @@ class KnowledgeWrite(Base):
         first = self.ok("vps", "write_knowledge", request_id=rid, **args)
         at_first = self.head()
         self.assertEqual(first, self.ok("vps", "write_knowledge", request_id=rid, **args))
+        with patch.dict(hub.CFG, {"artifact_repo": str(self.root / "gone")}):     # a lost answer, asked for while
+            self.assertEqual(first, self.ok("vps", "write_knowledge", request_id=rid, **args))   # nothing is read
         self.assertEqual(self.head(), at_first)
 
     def test_what_the_hub_may_write_on_the_configuration_ref_covers_every_knowledge_file(self):

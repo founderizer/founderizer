@@ -251,6 +251,20 @@ class Reasons(OwnerAPI):
             for words in ("Names are the owner's choice, always.", "Ask the owner before every release."):
                 with self.subTest(words=words):
                     self.refused("are not the owner's own words", reason="decision", owner_words=words)
+        # files that cannot be read now hold words that nobody can check, never words that are not the owner's, and
+        # a file whose text cannot be read leaves no empty text in the cache for the next card
+        unread = "Not raised: the knowledge files cannot be read now, so the hub cannot check owner_words in them."
+        with patch.object(hub, "kit_revision", lambda fresh=False: str(uuid.uuid4())), \
+                patch.object(hub, "knowledge_entries", lambda: hub.UnreadCatalog()):
+            self.refused(unread, reason="decision", owner_words="A new supplier | Comes to me")
+        rev = str(uuid.uuid4())
+        with patch.object(hub, "kit_revision", lambda fresh=False: rev), \
+                patch.object(hub, "profile_view", lambda name, rev: {"path": f"profiles/{name}.md", "sections": []}), \
+                patch.object(hub, "knowledge_entries", lambda: files):
+            with patch.object(hub, "knowledge_text", lambda entry: None):
+                self.refused(unread, reason="decision", owner_words="A new supplier | Comes to me")
+            with patch.object(hub, "knowledge_text", lambda entry: text[entry["path"]]):
+                self.assertIsInstance(self.card(reason="decision", owner_words="A new supplier | Comes to me"), int)
 
 
 if __name__ == "__main__":

@@ -450,7 +450,29 @@ class TeamChanges(Remove):
         with self.assertRaises(hub.ToolError) as refused:
             self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"), "sections": [files]}])
         self.assertIn("knowledge/owner/missing.md is not in the knowledge catalog", str(refused.exception))
+        # a catalog that cannot be read now names no file as missing, and the refusal passes by itself, so that a
+        # card stays and a pressed plan tries again (lanes/a-knowledge-read-that-fails.md)
+        with patch.dict(hub.CFG, {"artifact_repo": str(self.root / "gone")}), \
+                self.assertRaises(hub.TeamPassing) as refused:
+            self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"), "sections": [files]}])
+        self.assertEqual((str(refused.exception), refused.exception.owner),
+                         ("The hub cannot read its knowledge files now. Try again in a minute.",
+                          "the hub cannot read its knowledge files now"))
         self.assertIsNone(self.card())
+        # the owner-file step: a catalog that cannot be read, or a file that it lists and git does not give now,
+        # passes by itself; only a file that the catalog does not list is not there
+        step = {"path": "knowledge/owner/brand.md", "base_sha256": "0" * 64, "text": "# Brand\n\nGreen.\n"}
+        listed = [{"path": "knowledge/owner/brand.md", "scope": "owner"}]
+        for catalog, blob, passing in ((hub.UnreadCatalog(), b"# Brand\n\nBlue.\n", True), (listed, None, True),
+                                       ([], None, False)):
+            with self.subTest(catalog=type(catalog).__name__, blob=blob), \
+                    patch.object(hub, "knowledge_entries", lambda: catalog), \
+                    patch.object(hub, "git_blob", lambda rev, path: blob), \
+                    self.assertRaises(hub.ToolError) as refused:
+                hub.team_owner_file({"rev": "r" * 40, "team": hub.TEAM}, step)
+            self.assertEqual(isinstance(refused.exception, hub.TeamPassing), passing, refused.exception)
+            if not passing:
+                self.assertEqual(str(refused.exception), "There is no owner file knowledge/owner/brand.md.")
 
     def test_a_plan_changes_each_thing_once(self):
         """Bug: the card shows two changes of one profile, and the press makes only the last."""
