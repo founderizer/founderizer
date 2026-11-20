@@ -125,6 +125,27 @@ class Reporting(Base):
             self.assertEqual(hub.q1("SELECT delivered FROM reports WHERE id=?", (n + 1,))["delivered"], "now")
         self.assertEqual(len(self.said()), 5)
 
+    def test_a_report_that_names_a_held_server_carries_the_hold_to_the_one_who_decides(self):
+        """On 19 November 2026 a risk report said that a server needed "a door route that only Founderizer code can
+        add", and the manager, whose own rule-only hold kept that server from the agent's own calls, answered that it
+        held no hold there. The report's line and its message at once now name the hold, its date and its reason."""
+        hub.TEAM["door"] = {"address": "100.64.0.9", "holds": {"web-1": "judged", "web-10": "parts"}}
+        hub.ins(hub.LOG, (at("2026-11-06T18:05"), "manager", "the door holds web-1: judged (Plan step 2.17: old keys) in 0123abc"))
+        held = ("[hub] The door holds web-1 at rule-only since 6 Nov 2026: Plan step 2.17: old keys. While that hold "
+                "stands, only the door's rule calls run on web-1, and no call of an agent's own: only the manager ends "
+                "it, with door_hold web-1 none, once its reason is gone.")
+        text, err = self.report(kind="risk", severity="now", about=hub.tref(self.task),
+                                text="The fix for web-1 needs a door route that only Founderizer code can add.")
+        self.assertFalse(err, text)
+        self.assertIn(f"only Founderizer code can add. {held} -- Decide it with", self.said()[0])
+        line = hub.report_line(hub.q1("SELECT * FROM reports WHERE id=1"))
+        self.assertTrue(line.endswith(f"only Founderizer code can add. {held}"), line)
+        self.assertNotIn("web-10", line)                    # a held server that the words do not name
+        self.assertFalse(self.report(text="The shop's feed is stale; web-2 serves it.")[1])
+        self.assertNotIn("[hub]", hub.report_line(hub.q1("SELECT * FROM reports WHERE id=2")))
+        self.assertFalse(self.report(kind="proposal", text="Move the shop off web-1.")[1])     # the owner's board lists it
+        self.assertNotIn("[hub]", hub.report_line(hub.q1("SELECT * FROM reports WHERE id=3")))
+
     def test_three_agents_that_find_one_thing_are_one_line_and_still_three_answers(self):
         other = self.new_task(owner="studio", title="Write the shop's copy")
         self.assertFalse(self.report("vps")[1])

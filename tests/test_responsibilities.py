@@ -2496,8 +2496,8 @@ class Edits(Base):
 class CaseLists(Base):
     """One duty with a long run of open cases (the owner, 8 November 2026: "Yes, shorten it"). Each open case of every
     duty, records and all, made the manager's list of duties 130,000 characters: one duty had 118 open cases, and
-    the ones that its holder worked were its oldest. The list shows the newest whole and counts the rest, one duty in
-    full names every open case in one line, and one case reads whole."""
+    the ones that its holder worked were its oldest. The list names the newest in one line each and counts the rest,
+    one duty in full names every open case in one line, and one case reads whole."""
 
     RECORD = "x" * 270
 
@@ -2535,12 +2535,37 @@ class CaseLists(Base):
         self.assertFalse(error, text)
         return text
 
-    def test_the_list_shows_the_newest_open_cases_whole_and_counts_the_others(self):
+    def test_the_list_names_the_newest_open_cases_in_one_line_each_and_the_session_s_own_case_whole(self):
+        """Step 7 of the agent context plan (20 November 2026): the five newest whole still made the list 22,031
+        characters in the middle of three days on the owner's fleet, the largest 87,848, nearly all of it their
+        records. The list names them in one line each, with the key, and the case that the session works comes whole."""
         text = self.read()
         shown = [n for n in range(14) if f"Advisory {n:02d}," in text]
         self.assertEqual(shown, [9, 10, 11, 12, 13])                   # the newest five of the eleven open ones
         self.assertLess(text.index("Advisory 13,"), text.index("Advisory 09,"))      # newest first
-        self.assertIn(f"Records: triage: triage of 13 {self.RECORD}; next: next of 13", text)
+        self.assertNotIn("triage of", text)                             # no case's records in the list
+        self.assertRegex(text, rf"\n  R-1/C-{self.ids[13]} \[open\] Advisory 13, due 2026-11-23 — key cve/13; "
+                               r"opened [^\n]*; 2 records, the last [^\n]*\.\n")
+        self.assertNotIn("the case of this session's task", text)
+        # the case that this session's own task works in comes whole, its records too, after the list
+        task = hub.parse_task(self.session("vps"))
+        hub.q("UPDATE tasks SET duty_case=? WHERE id=?", (self.ids[0], task))
+        own = self.read()
+        self.assertIn("R-1, the case of this session's task, whole:", own)
+        self.assertIn(f"triage of 00 {self.RECORD}", own)
+        self.assertLess(own.index("Cases: 11 open"), own.index("the case of this session's task, whole:"))
+        # and so does a case where the task wrote a step: one that its duty joined, or a second one that it opened,
+        # which leave the task's own case as it was
+        hub.q("INSERT INTO duty_steps(duty_case,key,text,task,by,ts) VALUES(?,?,?,?,?,?)",
+              (self.ids[5], "looked", "looked at 05", task, "vps", self.clock))
+        two = self.read()
+        self.assertEqual(two.count("the case of this session's task, whole:"), 2)
+        self.assertIn(f"triage of 05 {self.RECORD}", two)
+        # an agent that holds no duty and works a case's task (create_task case_id) reads that case whole too
+        hub.q("UPDATE tasks SET duty_case=? WHERE id=?", (self.ids[0], hub.parse_task(self.session("studio"))))
+        studio = self.read("studio")
+        self.assertTrue(studio.startswith("No duties that you may see yet."), studio[:200])
+        self.assertIn(f"triage of 00 {self.RECORD}", studio)
         oldest = f"R-1/C-{self.ids[0]}"
         self.assertIn(f"    and 6 older open cases, the oldest {oldest}, opened ", text)
         self.assertIn(f': see_responsibilities with responsibility="R-1" shows every open case, and '

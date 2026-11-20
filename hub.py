@@ -9545,6 +9545,16 @@ def access_route(asker, rid, requester, want=None, restarts=None):
                  "Once the owner has done that, this question says how to give the access."))
     # a hold that opened calls a short time ago: the door acts on the old one until its round, also for a restart
     changed = door_hold_change_words(what) if kind == "server" else ""
+    if hold_words and enough and not changed:
+        # A rule-only hold of the manager's, and the asker holds the server already: the hold is the whole answer, and
+        # no restart or grant changes it. On 19 November 2026 the restart line came first, and the manager read that
+        # it held no hold on such a server while a known-exploited hole waited for it.
+        return " ".join([f"ACCESS NEEDED: {asker} needs {resource_phrase(kind, what)} ({rid})" +
+                         (f" at {want}" if want else "") + ".", hold_words,
+                         f"team.json gives it at {mine} already, so no restart and no grant lets more through while "
+                         f"the hold stands."] +
+                        ([] if manager else
+                         ["Pass the question up with answer(..., pass_up=true): only the manager ends the hold."]))
     out = [f"ACCESS NEEDED: {asker} needs {resource_phrase(kind, what)} ({rid})" + (f" at {want}" if want else "") +
            ", and team.json gives it " +
            (f"at {mine} already." if enough and changed else
@@ -9559,6 +9569,19 @@ def access_route(asker, rid, requester, want=None, restarts=None):
         out.append(f"{changed} {DOOR_HOLD_ANSWER if enough else DOOR_EARLY_TASK}")
     if hold_words:          # rule-only: the route below stands, and the hold says why an agent's own calls fail there
         out.append(hold_words)
+    elif kind == "server" and enough and mine == "fix" and not changed and not fleet_server(what):
+        # The door's route ask (door_targets.rule_only_refusal) ends here, also when no hold of the manager is why: the
+        # door's file does not keep the two other causes, and no agent changes either. Only a holder at Fix meets a
+        # refusal for rule-only, because at Read the door refuses every write for the level. A hold that ended a moment
+        # ago still acts at the door until the Mac's next round, and its change's words above say so. The owner's app
+        # installs a server's door parts once (DoorHosts.next), and no route installs them again.
+        out.append(f"If the door refused a call on {what} as rule-only, no hold of the manager is why. Then {what} "
+                   f"carries a second business tag in Tailscale, which keeps a server of two businesses rule-only by "
+                   f"design and which only the owner changes, or its door install wrote rule-only, which no route of "
+                   f"Founderizer changes today. No agent changes either: " +
+                   (f"where the rule forms cannot do the work, raise a Needs-you item that names {what}, the refused "
+                    f"call and these two causes; for the second, the owner can send it to Founderizer with Report a "
+                    f"problem." if manager else "pass the question up with answer(..., pass_up=true)."))
     in_team = False
     if others:
         holder = others[0]["agent"]
@@ -14331,8 +14354,9 @@ def door_hold_note(host):
     hold = door_hold_of(host)
     if not hold:
         return ""
-    row = read_row("SELECT ts, what FROM log WHERE what LIKE ? ORDER BY id DESC LIMIT 1",
-                   (f"the door holds {host}: {hold} (%",))
+    # a hold set before rule-only had that name is in the log under its old one, judged (DOOR_HOLD_STORED)
+    row = read_row("SELECT ts, what FROM log WHERE what LIKE ? OR what LIKE ? ORDER BY id DESC LIMIT 1",
+                   (f"the door holds {host}: {hold} (%", f"the door holds {host}: {DOOR_HOLD_STORED.get(hold, hold)} (%"))
     since = why = ""
     if row:
         day = datetime.datetime.fromtimestamp(row["ts"], datetime.timezone.utc)
@@ -14346,6 +14370,15 @@ def door_hold_note(host):
                                                               f"of an agent's own")
     return (f"{head}{since}" + (f": {clip(why, 240)}" if why else "") + f". While that hold stands, {effect}: only the "
             f"manager ends it, with door_hold {host} none, once its reason is gone.")
+
+
+def named_hold_notes(text):
+    """door_hold_note for each server that the door holds and that `text` names: a report about such a server carries
+    the hold to the one who decides it, as an open card does (need_look_hints). On 19 November 2026 a risk report
+    said that a server "needs a door route that only Founderizer code can add", and the manager, which held that
+    server at rule-only itself, answered that it held no hold there. read_row only, as door_hold_note."""
+    return [door_hold_note(host) for host in sorted((TEAM.get("door") or {}).get("holds") or {})
+            if re.search(rf"(?<![A-Za-z0-9._-]){re.escape(host)}(?!\.?[A-Za-z0-9_-])", text or "")]
 
 
 def need_key_held(r):
@@ -28703,7 +28736,7 @@ DUTY_WATCH_MAX = 8              # watches of one duty
 DUTY_REPEAT_DAYS = 30           # a key that comes back inside this time is a repeat: the preventive action did not work
 DUTY_WATCH_MINUTES = 30         # the cadence of a watch that brings no times of its own
 DUTY_LOOK_BACK = 10             # duties or cases named when an agent looks back, newest first, with a count of more
-DUTY_OPEN_SHOWN = 5             # open cases of a duty that the list of duties shows whole, newest first; it counts more
+DUTY_OPEN_SHOWN = 5             # open cases of a duty that the list of duties names, one line each, newest first
 DUTY_HISTORY_SHOWN = 30         # history rows of one duty: how it was managed, newest kept, oldest of those first
 DUTY_NAME_MAX = 80              # how much of the duty's own words stands for it where a short name is needed
 
@@ -30343,13 +30376,16 @@ def duty_case_brief(c):
 
 
 def duty_case_lines(cases, every_case, read):
-    """Cases newest first, as a read of duties shows them: the newest whole, records and all (DUTY_LOOK_BACK of any
-    state when one duty is read in full, DUTY_OPEN_SHOWN open ones in the list of duties), then the other open ones:
-    one line each in the one duty, and in the list a count that says how to reach them. So no open case is out of
-    reach, and the list stays short (8 November 2026: one duty's 118 open cases, each with its records, made the
-    manager's list 130,000 characters, and the cases that its holder worked were its oldest). `read`: the id of the
-    duty whose full read names them all."""
-    whole = DUTY_LOOK_BACK if every_case else DUTY_OPEN_SHOWN
+    """Cases newest first, as a read of duties shows them. One duty in full: the newest DUTY_LOOK_BACK of any state
+    whole, records and all, then the other open ones one line each. The list of duties: the newest DUTY_OPEN_SHOWN
+    open ones in one line each (duty_case_brief), with its key and how many records it has, and a count that says how
+    to reach the others; the cases of the session's own task come whole after the list (session_cases). So no open case
+    is out of reach, and the list stays short (8 November 2026: one duty's 118 open cases, each with its records, made
+    the manager's list 130,000 characters, and the cases that its holder worked were its oldest; 20 November 2026: the
+    five newest whole still made the list 22,031 characters in the middle of three days, the largest 87,848, nearly
+    all of it their records: step 7 of ~/dev/founderizer-plans/agent-context-proposal.md). `read`: the id of the duty
+    whose full read names them all."""
+    whole = DUTY_LOOK_BACK if every_case else 0
     out = [line for c in cases[:whole] for line in duty_case_text(c)]
     rest = cases[whole:]
     still = [c for c in rest if c["state"] == "open"]
@@ -30358,9 +30394,12 @@ def duty_case_lines(cases, every_case, read):
                    f"gives one whole:")
         out += [duty_case_brief(c) for c in still]
     elif still:
-        out.append(f"    and {len(still)} older open cases, the oldest {cref(still[-1])}, opened "
-                   f"{goal_time(still[-1]['opened'])}: see_responsibilities with responsibility=\"{rref(read)}\" "
-                   f"shows every open case, and case=\"{cref(still[-1])}\" gives one whole.")
+        out += [duty_case_brief(c) for c in still[:DUTY_OPEN_SHOWN]]
+        more = still[DUTY_OPEN_SHOWN:]
+        if more:
+            out.append(f"    and {len(more)} older open cases, the oldest {cref(more[-1])}, opened "
+                       f"{goal_time(more[-1]['opened'])}: see_responsibilities with responsibility=\"{rref(read)}\" "
+                       f"shows every open case, and case=\"{cref(more[-1])}\" gives one whole.")
     if len(rest) > len(still):
         out.append(f"    and {len(rest) - len(still)} older closed cases.")
     return out
@@ -30456,6 +30495,31 @@ def duty_short_text(r):
             f"last changed {goal_time(r['updated'])}")
 
 
+def session_cases(agent, a):
+    """The cases that the calling session's own task works in, for the list of duties, which names each open case in
+    one line: these the session works, so they come whole. The task's own case (tasks.duty_case: a watch's, open_case's
+    first, or create_task's case_id), and each open case where the task wrote a step: a case that its duty joined, or
+    a second case that the task opened, which leave duty_case as it was, the one of its newest step first. Each one
+    that the agent may read as case= reads it (case_reader, case_worker). (the cases, how many more there are): at
+    most DUTY_OPEN_SHOWN, its own case first. None for a session with no task: the manager's standing session and an
+    owner chat."""
+    tid = seen_task(agent, a)[0]
+    if not isinstance(tid, int):
+        return [], 0
+    task = read_row("SELECT duty_case FROM tasks WHERE id=?", (tid,))
+    ids = ([task["duty_case"]] if task and task["duty_case"] else []) + \
+        [s["duty_case"] for s in read_rows("SELECT s.duty_case FROM duty_steps s JOIN duty_cases c ON c.id=s.duty_case "
+                                           "WHERE s.task=? AND c.state='open' GROUP BY s.duty_case "
+                                           "ORDER BY MAX(s.ts) DESC", (tid,))]
+    out = []
+    for cid in dict.fromkeys(ids):
+        c = read_row("SELECT * FROM duty_cases WHERE id=?", (cid,))
+        r = duty_row(c["responsibility"]) if c else None
+        if c and (case_worker(agent, c) or (r and case_reader(agent, c, r))):
+            out.append(c)
+    return out[:DUTY_OPEN_SHOWN], max(0, len(out) - DUTY_OPEN_SHOWN)
+
+
 def t_see_responsibilities(agent, a):
     who = str(a.get("agent") or "").strip()
     if who and who not in agents():
@@ -30512,13 +30576,19 @@ def t_see_responsibilities(agent, a):
     # The duties that run now, which is what a session needs in front of it.
     rows = [r for r in mine if r["state"] != "retired"]
     gone = [r for r in mine if r["state"] == "retired"]
+    cases, more = session_cases(agent, a)
+    own = [line for c in cases for line in
+           [f"{rref(c['responsibility'])}, the case of this session's task, whole:"] + duty_case_text(c)] + \
+        ([f"And {more} more open case{'' if more == 1 else 's'} where this session's task wrote a step: "
+          f"case=\"R-<id>/C-<id>\" gives one whole."] if more else [])
     if not mine:
-        return ("No duties" + (f" of {who}" if who else " that you may see") + " yet. The owner says what an agent "
-                "answers for, and the manager writes it down (RESPONSIBILITIES.md). A duty stays: it has its own "
-                "words and its watches.")
+        return "\n".join([("No duties" + (f" of {who}" if who else " that you may see") + " yet. The owner says what "
+                           "an agent answers for, and the manager writes it down (RESPONSIBILITIES.md). A duty stays: "
+                           "it has its own words and its watches.")] + own)
     out = []
     for r in rows:
         out += duty_text(r, t0)
+    out += own
     duty_seen_set(seen_task(agent, a)[0], {r["id"]: duty_read_mark(r) for r in rows})     # their words: read
     if gone:
         out.append(f"{len(gone)} retired, not listed here: see_responsibilities with retired=true names them, and "
@@ -37749,7 +37819,11 @@ def report_line(r):
             + (f", said by {r['repeats'] + 1} of them" if r["repeats"] else "")
             # the hub's own finding is read whole: its options are what the manager takes to the owner (settings_check)
             + f", {ago(r['created'])} ago: "
-            + clip(r["text"], REPORT_TEXT_MAX if r["from_agent"] == HUB_REPORTER else 300))
+            + clip(r["text"], REPORT_TEXT_MAX if r["from_agent"] == HUB_REPORTER else 300)
+            # a server that it names and that the door holds: the hold, which the one who decides may have set itself.
+            # Not on a proposal, whose list the owner's board shows too.
+            + "".join(f" [hub] {note}" for note in (named_hold_notes(f"{r['about'] or ''} {r['text']}")
+                                                    if r["kind"] != "proposal" else [])))
 
 
 def open_reports(to_agent=None, kinds=True):
@@ -37866,7 +37940,9 @@ def t_report_up(agent, a):
         elif delivered == "now":
             event = DB.execute(EVENT, (to, "say", filed,
                                        f"[hub] Report {upref(rid)} from {agent} on {tref(tid)} [{kind}]"
-                                       + (f", about {about}" if about else "") + f": {text} -- Decide it with "
+                                       + (f", about {about}" if about else "") + f": {text}"
+                                       + "".join(f" [hub] {note}" for note in named_hold_notes(f"{about or ''} {text}"))
+                                       + " -- Decide it with "
                                        f"decide_report(report_id=\"{upref(rid)}\", decision=...): "
                                        + "; ".join(f"{k} ({v})" for k, v in REPORT_DECISIONS.items()) + ".",
                                        t0, "{}")).lastrowid
@@ -40103,7 +40179,8 @@ TOOLS = [
      "newest cases whole, each other open case in one line with its key, and how it was managed from the day it was "
      "written; search=\"<words>\" finds a duty by its own words, retired ones included; retired=true names the "
      "retired ones, newest first; and with none of them you get the duties that run now, each with its newest open "
-     "cases whole and a count of the others, and one line saying how many retired ones there are. So the whole "
+     "cases in one line each and a count of the others, the cases of this session's task whole, and one line saying "
+     "how many retired ones there are. So the whole "
      "history stays out of your session until you ask for a piece of it. The manager sees every agent's duty; pass "
      "agent for one agent.",
      S({"agent": {"type": "string", "description": "Only this agent's duties. The manager sees every agent."},

@@ -6,6 +6,7 @@ import hashlib
 import json
 import unittest
 import uuid
+from unittest.mock import patch
 
 import hub
 import ops
@@ -404,6 +405,29 @@ class SecondLook(Withdraw):
         self.assertTrue(ops.route_line({"route": "none", "why": "web-1 is never a target of the door"}, "web-1")
                         .startswith("route: none. No grant and no yes of the owner"))
         self.assertNotIn("The door holds", hub.access_route("vps", "server:web-1", "manager", "fix"))
+        # the door's route ask ends somewhere when no hold is why: the holder reads the two other causes, and that no
+        # agent changes them, beside its own restart line
+        hub.TEAM["agents"]["vps"]["servers"] = {"web-1": "fix"}
+        causes = ("If the door refused a call on web-1 as rule-only, no hold of the manager is why. Then web-1 carries a "
+                  "second business tag in Tailscale, which keeps a server of two businesses rule-only by design and "
+                  "which only the owner changes, or its door install wrote rule-only, which no route of Founderizer "
+                  "changes today. No agent changes either: ")
+        self.assertIn(causes + "where the rule forms cannot do the work, raise a Needs-you item that names web-1, the "
+                      "refused call and these two causes; for the second, the owner can send it to Founderizer with "
+                      "Report a problem.", hub.access_route("vps", "server:web-1", "manager", "fix"))
+        self.assertIn(causes + "pass the question up with answer(..., pass_up=true).",
+                      hub.access_route("vps", "server:web-1", "vps", "fix"))
+        # the manager ended a hold a moment ago: the door acts on it until the Mac's next door round, so the line has
+        # the change's words, and not the no-hold words, which would be false until then
+        with patch.object(hub, "DOOR_HELD", {"at": None}), patch.object(hub, "DOOR_OLD_READS", []):
+            hub.door_change_keep("hold:web-1", {})
+            line = hub.access_route("vps", "server:web-1", "manager", "fix")
+            hub.door_change_keep("hold:web-1", None)
+        self.assertIn("The hold of web-1 changed", line)
+        self.assertNotIn("no hold of the manager is why", line)
+        hub.TEAM["agents"]["vps"]["servers"] = {"web-1": "read"}       # a holder at Read meets no rule-only refusal
+        self.assertNotIn("rule-only", hub.access_route("vps", "server:web-1", "manager", "read"))
+        del hub.TEAM["agents"]["vps"]["servers"]
         self.hold()
         hub.TEAM["agents"]["vps"]["servers"] = {"web-1": "fix"}         # also an agent that team.json gives it
         for requester, end in (("manager", self.HELD),
@@ -420,9 +444,25 @@ class SecondLook(Withdraw):
         hub.ins(hub.LOG, (self.T, "manager", "the door holds web-1: rule-only (Plan step 10: fixed forms only) in a1b2c3d"))
         line = hub.access_route("vps", "server:web-1", "manager", "read")
         self.assertIn("Held now by ops1 (fix): ops1 can do this part of the work", line)
-        self.assertIn(" none of it. The door holds web-1 at rule-only since 15 Jan 2027: Plan step 10: fixed forms only. "
-                      "While that hold stands, only the door's rule calls run on web-1, and no call of an agent's own: "
-                      "only the manager ends it, with door_hold web-1 none, once its reason is gone. Held now by", line)
+        rule_only = ("The door holds web-1 at rule-only since 15 Jan 2027: Plan step 10: fixed forms only. While that "
+                     "hold stands, only the door's rule calls run on web-1, and no call of an agent's own: only the "
+                     "manager ends it, with door_hold web-1 none, once its reason is gone.")
+        self.assertIn(f" none of it. {rule_only} Held now by", line)
+        # The holder itself asks why its own call was refused (19 November 2026): the hold is the whole answer, first,
+        # and no restart, which would meet the same hold
+        hub.TEAM["agents"]["vps"]["servers"] = {"web-1": "fix"}
+        for requester, end in (("manager", ""),
+                               ("vps", " Pass the question up with answer(..., pass_up=true): only the manager ends "
+                                       "the hold.")):
+            self.assertEqual(hub.access_route("vps", "server:web-1", requester, "fix"),
+                             f"ACCESS NEEDED: vps needs the server web-1 (server:web-1) at fix. {rule_only} team.json "
+                             f"gives it at fix already, so no restart and no grant lets more through while the hold "
+                             f"stands.{end}")
+        # a hold set before rule-only had its name is in the log as judged: its date and reason still come
+        hub.q("DELETE FROM log WHERE what LIKE 'the door holds web-1:%'")
+        hub.ins(hub.LOG, (self.T, "manager", "the door holds web-1: judged (Plan step 11: old keys) in a1b2c3d"))
+        self.assertIn("The door holds web-1 at rule-only since 15 Jan 2027: Plan step 11: old keys. While",
+                      hub.access_route("vps", "server:web-1", "manager", "fix"))
 
 
 if __name__ == "__main__":
