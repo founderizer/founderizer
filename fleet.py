@@ -11504,6 +11504,9 @@ def vault_call(request, timeout=90):
         raise Refused("this machine's vault broker did not answer; ask your requester") from None
     if not isinstance(reply, dict) or reply.get("ok") is not True:
         error = reply.get("error") if isinstance(reply, dict) else None
+        number = reply.get("number") if isinstance(reply, dict) else None
+        if isinstance(error, str) and type(number) is int:
+            error += f" (Chrome or macOS error {number})"   # a Mac vault's number of an error that has no words of its own
         if isinstance(reply, dict) and reply.get("unknown") is True:
             raise Unknown("the vault could not confirm the outcome" + (f": {error}" if isinstance(error, str) else ""))
         if request.get("op") == "request" and not (isinstance(reply, dict) and reply.get("ok") is False):

@@ -100,6 +100,7 @@ from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, DEPLOY_APP_NOTE, GITHUB_T
                        runtimes_with, shown_name, switch_target, tool_catalog, tool_needs)
 from lifecycle import SKILL_FILE, SKILL_NAME, SKILLS, skill_front, skill_rows, skills_text   # design v4 D: agents' skills
 from lifecycle import CONFIG_FILES, floor_path, keep_floor, may_take    # DevOps plan 0.1: the check of every move
+from lifecycle import VAULT_CHROME     # a Mac's word of what stops its vault in Chrome (desktop_status)
 from lifecycle import KEY_SUFFIXES, SCREEN_COMMANDS, key_env, start_form    # DevOps plan 0.2: data stops being code
 from lifecycle import BRIDGE_HOST, ORG_NAME     # a Mac's Claude account for its extension's link (desktop_account)
 from usage import safe_email
@@ -50982,14 +50983,17 @@ def reading_age_of(value):
 
 def desktop_status(value):
     """A Mac's own reading of what only hands there can put right (lifecycle.Lifecycle.desktop), or None.
-    `chatgpt_app` is None from a server service older than 19 November 2026, which does not say."""
+    `chatgpt_app` is None from a server service older than 19 November 2026, which does not say, and `vault_chrome`
+    (one word of lifecycle.VAULT_CHROME) from one older than 20 November 2026 or with no Fleet Vault."""
     if value is None:
         return None
     if not isinstance(value, dict):
         raise ValueError("desktop must be an object or null")
+    vault = value.get("vault_chrome")
+    vault = vault if vault in VAULT_CHROME else None    # a later Mac's new word is none here, as key_generation's is
     return dict({k: _optional(value.get(k), bool)
                  for k in ("locked", "setup", "chrome", "extension", "browser", "chatgpt", "chatgpt_app", "bridge")},
-                claude_account=desktop_account(value.get("claude_account")))
+                claude_account=desktop_account(value.get("claude_account")), vault_chrome=vault)
 
 
 def desktop_account(value):
@@ -54091,6 +54095,17 @@ def account_sharers(server, email):
         for _route, runtime, reading in usage_routes(n)))
 
 
+# What stops Fleet Vault on a Mac whose agent works in Chrome, in the words of the vault's own refusals (VaultFailure's
+# chromeJavaScriptOff and chromeRefused, app/Sources/FleetVaultCore/VaultProtocol.swift). The words say no "sign in"
+# beside a site: the manager's card of them passes card_sign_in.
+VAULT_JAVASCRIPT_OFF = ("Chrome's menu item View, Developer, Allow JavaScript from Apple Events has no tick, so Fleet Vault "
+                        "fills no password there")
+VAULT_REFUSED = "macOS does not let Fleet Vault control Chrome, so it fills no password there"
+VAULT_NOT_ASKED = ("macOS has not yet asked if Fleet Vault may control Chrome, so it fills no password there: the vault's "
+                   "next job there makes macOS ask, and a person at that Mac clicks Allow")
+VAULT_WORDS = (VAULT_JAVASCRIPT_OFF, VAULT_REFUSED, VAULT_NOT_ASKED)
+
+
 def mac_desktop_sweep():
     """What only hands at a Mac can put right reaches the manager once, in the second reading that shows it: a Mac that
     is reopening Chrome is no news. A Mac whose owner sits at it, and a Mac with no agent that works in its Chrome, are
@@ -54107,6 +54122,7 @@ def mac_desktop_sweep():
         active = [a for a in server_agents(name) if agents()[a].get("active", True) is not False]
         browser = any("browser" in (agents()[a].get("can") or []) and browser_tabs(a) for a in active)
         screen = any("screen" in (agents()[a].get("can") or []) for a in active)
+        signs = any(login_signs_in(a) for a in active)     # an agent whose vault fills its logins (t_sign_in)
         if not desktop or not (browser or screen) or (setup and setup["state"] in ("add", "waiting")):
             continue
         account = desktop.get("claude_account") if browser else None
@@ -54127,12 +54143,21 @@ def mac_desktop_sweep():
                  "Chrome does not run" if browser and (desktop.get("extension") or hidden) and
                  desktop.get("chrome") is False else
                  unlinked_words(account) if unlinked else
+                 VAULT_JAVASCRIPT_OFF if signs and desktop.get("vault_chrome") == "javascript_off" else
+                 VAULT_REFUSED if signs and desktop.get("vault_chrome") == "refused" else
+                 VAULT_NOT_ASKED if signs and desktop.get("vault_chrome") == "not_asked" else
                  CHATGPT_NO_APP if screen and desktop.get("chatgpt") is False and desktop.get("chatgpt_app") is False
                  else CHATGPT_SIGNED_OUT if screen and desktop.get("chatgpt") is False else None)
         if not desktop.get("setup") and kv_get(f"desktop_click:{name}"):
             kv_set(f"desktop_click:{name}", None)       # the screens of the next update get a task of their own
         seen, told = kv_get(f"desktop_seen:{name}"), kv_get(f"desktop_told:{name}")
         if not words:
+            # A vault with no clear word now (busy, starting, no window, a Chrome that does not run, an error, none) has
+            # not put its cause right: only `ok` ends what the manager heard of it, so such a reading between two of the
+            # same tells the manager nothing again.
+            if signs and desktop.get("vault_chrome") != "ok" and \
+                    {told, json.loads(seen)[0] if seen else None} & set(VAULT_WORDS):
+                continue
             if seen or told:
                 kv_set(f"desktop_seen:{name}", None)
                 kv_set(f"desktop_told:{name}", None)
@@ -54166,6 +54191,9 @@ def mac_desktop_sweep():
                  + unlinked_steps(name, account, json.loads(linked) if linked else None, desktop.get("bridge") is False,
                                   account_sharers(name, account["email"]) if account else (), hidden)
                  if words.startswith(EXTENSION_UNLINKED) else
+                 f"[hub] On the Mac {name}, {words}. Only hands at that Mac, or the app's Screen Sharing button, can put "
+                 f"this right: raise it for the owner with raise_needs_you."
+                 if words in VAULT_WORDS else
                  f"[hub] On the Mac {name}, {words}{click}. Its tasks in Chrome and on its screen wait. Only hands at that "
                  f"Mac, or the app's Screen Sharing button, can put this right: raise it for the "
                  f"owner with raise_needs_you.")

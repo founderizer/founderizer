@@ -561,6 +561,62 @@ class MacSetup(Servers):
         self.desktop()
         self.assertIn("Claude's extension in Chrome is not linked to Claude Code there. ", self.manager_heard()[-1])
 
+    def test_a_vault_that_fills_no_password_in_chrome_reaches_the_manager_once_with_its_cause(self):
+        """20 November 2026: each sign-in of the vault on the owner's Mac Studio failed in one sentence while Chrome's
+        menu item Allow JavaScript from Apple Events had no tick, and nothing read it; the owner then signed two sites in
+        by hand. The Mac's reading now says what stops its vault (vault_chrome), and the manager hears it once, with
+        words whose card passes the hub's own check of a person's card. A busy reading between two of the same says
+        nothing again, and a word that the hub does not know is none, never a refused report."""
+        self.proving()
+        hub.q("UPDATE mac_setups SET state='done' WHERE server='mini'")
+        self.said.clear()
+        # A Mac whose agents sign in with no login (no credential access) hears nothing of its vault.
+        for _ in range(2):
+            self.report(boot="boot-2", vault_chrome="javascript_off")
+            with patch.object(hub, "login_signs_in", lambda name: False):
+                self.desktop()
+        self.assertEqual([h for h in self.manager_heard() if "Fleet Vault" in h], [])
+        hub.kv_set("desktop_seen:mini", None)
+        # The Mac's agent signs in with logins: a browser or a screen, and credential access (hub.login_signs_in).
+        signs = patch.object(hub, "login_signs_in", lambda name: name == "juno")
+        signs.start()
+        self.addCleanup(signs.stop)
+
+        def readings(word):
+            for _ in range(2):                          # the second reading that shows it is the news
+                self.report(boot="boot-2", vault_chrome=word)
+                self.desktop()
+            return [h for h in self.manager_heard() if "Fleet Vault" in h]
+
+        self.assertEqual(readings("ok"), [])
+        heard = readings("javascript_off")
+        self.assertEqual(len(heard), 1, heard)
+        # A vault that is busy for one reading (no word) has put nothing right: the same cause is not said again.
+        self.report(boot="boot-2", vault_chrome=None)
+        self.desktop()
+        self.assertIn("On the Mac mini, Chrome's menu item View, Developer, Allow JavaScript from Apple Events has no "
+                      "tick, so Fleet Vault fills no password there.", heard[0])
+        self.assertIn("raise_needs_you", heard[0])
+        self.assertFalse(hub.card_sign_in([heard[0]]))
+        self.assertEqual(len(readings("javascript_off")), 1)        # said once
+        heard = readings("refused")                                 # another cause is news again
+        self.assertEqual(len(heard), 2, heard)
+        self.assertIn("macOS does not let Fleet Vault control Chrome, so it fills no password there.", heard[1])
+        self.assertFalse(hub.card_sign_in([heard[1]]))
+        heard = readings("not_asked")                               # macOS never asked: a person must click Allow
+        self.assertEqual(len(heard), 3, heard)
+        self.assertIn("a person at that Mac clicks Allow", heard[2])
+        self.assertFalse(hub.card_sign_in([heard[2]]))
+        status, _ = self.service("/server/mini/status", {
+            "revision": hub.kit_revision(fresh=True), "os": {"name": "macOS 26.6", "boot": "boot-2"},
+            "security": {"desktop": {"locked": False, "chrome": True, "extension": True, "browser": True,
+                                     "vault_chrome": "maybe"}},
+            "runtimes": {"codex": {"version": None, "signed_in": None}, "claude": {"version": "2.1.316", "signed_in": True}},
+            "access": {"user": "dana"}}, key="server-key-of-mini")
+        self.assertEqual(status, 200)                               # a later Mac's new word does not lose the report
+        kept = json.loads(hub.q1("SELECT data FROM server_status WHERE server='mini'")["data"])
+        self.assertIsNone(kept["security"]["desktop"]["vault_chrome"])
+
     def test_an_unlinked_extension_reaches_the_manager_with_the_account_its_cause_and_the_steps(self):
         """19 November 2026: the extension on the owner's Mac Studio stayed unlinked for 19 days through five cards
         that named no account, and the last one blamed Claude Desktop. Claude Code there had changed account

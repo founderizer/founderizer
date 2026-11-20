@@ -741,5 +741,37 @@ class SigninRecords(Routes):
         self.assertEqual((self.records(), len(self.clears())), ([], 2))
 
 
+class MacVaultNumber(unittest.TestCase):
+    def test_a_mac_vaults_error_number_reaches_the_agent_with_its_words(self):
+        """A Mac vault's error that has no words of its own (Chrome's or macOS's number, 20 November 2026) gives its number
+        beside "Chrome gave the vault no answer, or an unknown error.". The vault logs nothing that the hub reads, so a
+        helper that drops the number leaves a timeout and every other fault the same."""
+        import socket
+        home = tempfile.mkdtemp(prefix="vn", dir="/tmp")             # a socket's path has at most 104 bytes
+        self.addCleanup(shutil.rmtree, home, True)
+        path = os.path.join(home, "vault.sock")
+        server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server_socket.close)
+        server_socket.bind(path)
+        server_socket.listen(1)
+
+        def answer():
+            connection, _ = server_socket.accept()
+            with connection, connection.makefile("rwb") as stream:
+                stream.readline()
+                stream.write(b'{"ok": false, "v": 2, "error": "Chrome gave the vault no answer, or an unknown error.", '
+                             b'"number": -1712}\n')
+                stream.flush()
+
+        vault_side = threading.Thread(target=answer)
+        vault_side.start()
+        with patch.object(fleet, "vault_socket", lambda: path), patch.object(fleet.sys, "platform", "darwin"), \
+                self.assertRaises(fleet.Refused) as got:
+            fleet.vault_call({"op": "signin", "job": 7}, timeout=5)
+        vault_side.join(5)
+        self.assertEqual(str(got.exception), "the vault broker refused: Chrome gave the vault no answer, or an unknown "
+                                             "error. (Chrome or macOS error -1712)")
+
+
 if __name__ == "__main__":
     unittest.main()

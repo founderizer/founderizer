@@ -1224,6 +1224,29 @@ MINT_PATH = re.compile(r"/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{0,199}")      # the min
 MINT_FIELD = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,39}")                  # the field of its body that names the case
 
 
+VAULT_CHROME = ("ok", "launching", "not_running", "no_window", "not_asked", "refused", "javascript_off", "error")
+
+
+def vault_chrome(home, timeout=20):
+    """What stops a sign-in of this Mac's Fleet Vault in Chrome now, one word of VAULT_CHROME, or None with no vault
+    here, with one that is busy or older than its answer (`chrome` with `quiet`, ~/dev/founderizer-plans/
+    vault-signin-causes-spec.md, section D). It shows no question of macOS. Only the vault can read it: macOS's
+    permission is the vault's own, and macOS 27 hides Chrome's files from this service (chrome_hidden), so its menu item
+    Allow JavaScript from Apple Events can be read only through the vault's one harmless script."""
+    path = os.path.join(home, "Library", "Application Support", "AgentFleet", "vault.sock")
+    if not os.path.exists(path):
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(path)
+            s.sendall(b'{"v": 2, "op": "chrome", "quiet": true}\n')
+            cause = json.loads(s.makefile().readline(4096)).get("cause")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return cause if cause in VAULT_CHROME else None
+
+
 def desktop_path(home):
     """Where a Mac's server service leaves its reading of Chrome (Lifecycle.remember_browser)."""
     return os.path.join(home, ".fleet", "desktop.json")
@@ -4074,7 +4097,8 @@ class Lifecycle:
         `claude_account` is the account and the organization that the extension must be signed in to for Claude Code
         of this Mac (claude_account), and `bridge` whether this Mac reaches the server that links the two, read only
         while no browser answers (bridge_reachable): with them the manager names the cause and the owner's exact step,
-        where it guessed before."""
+        where it guessed before. `vault_chrome` is what stops a sign-in of this Mac's vault in Chrome now (vault_chrome).
+        """
         console = console_session(self.run)
         code, _, _ = self.run(["pgrep", "-x", "Google Chrome"])
         extension = chrome_extension(self.home)
@@ -4089,7 +4113,8 @@ class Lifecycle:
                 "extension": extension, "browser": browser,
                 "claude_account": claude_account(self.run, claude) if claude else None,
                 "bridge": bridge_reachable() if browser is False else None,
-                "chatgpt": self.chatgpt(), "chatgpt_app": os.path.exists(CHATGPT_CODEX)}
+                "chatgpt": self.chatgpt(), "chatgpt_app": os.path.exists(CHATGPT_CODEX),
+                "vault_chrome": vault_chrome(self.home)}
 
     def chatgpt(self):
         """Whether the ChatGPT app of this Mac is signed in: the copy of Codex it carries, which Computer Use runs
