@@ -8,6 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from unittest import mock
 
 import hub
 from test_ui_api import OwnerAPI
@@ -363,7 +364,8 @@ if __name__ == "__main__":
 
 class Talk(NeedsCase):
     """Owner feature need_talk (the owner, 9 November 2026): a short card with its long part behind Details and no code,
-    and options that combine. Its Discuss left the apps on 13 November 2026: his own words are his one reply."""
+    and options that combine. Its Discuss left the apps on 13 November 2026, and his own words answer; since 20
+    November 2026 he may also ask under a card with Needs clarification (need_clarify), which keeps it open."""
 
     def test_a_card_is_short_and_its_long_part_goes_behind_details(self):
         with self.assertRaisesRegex(hub.ToolError, "The title is at most 70 characters"):
@@ -477,14 +479,111 @@ class Talk(NeedsCase):
         self.assertTrue(said.startswith("[owner] Answer to Needs-you N-1 (Pick a region): Why two regions?"), said)
         self.assertNotIn("raise_needs_you", said)
 
-    def test_discuss_is_gone_from_the_route_and_the_tools(self):
-        self.raise_item()
-        code, _ = self.request("/ui/needs/1/talk", {"request_id": str(uuid.uuid4()), "db": "test-generation",
-                                                     "text": "Why now?"})
-        self.assertEqual(code, 404)
-        self.assertNotIn("discuss_need", [t[1] for t in hub.TOOLS])
-        self.assertNotIn("discuss_need", [t["name"] for t in hub.CAPP_TOOLS])
+    def test_needs_clarification_keeps_the_card_open_and_the_manager_replies_under_it(self):
+        """Owner feature need_clarify (owner API 1.272; the owner, 20 November 2026: "a button link, that then shows the
+        extra text input", and "Keep Your answer too"): his message under the card keeps the item open and reaches
+        the manager with the hub's line on how to reply; the manager's reply joins the card's talk and rings his phone
+        as a card does; his answer still closes the item, and then the card takes no more."""
+        self.raise_item(options=["Tide", "Harbour"])
+        self.assertTrue(self.item()["clarify"])
+        self.assertIn("need_clarify", hub.ui_features())
+        code, receipt = self.request("/ui/needs/1/talk", self.command(text="  Which one costs less?  "))
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual((receipt["need"], [(t["who"], t["text"]) for t in receipt["talk"]]),
+                         (1, [("owner", "Which one costs less?")]))
         self.assertIsNone(self.row()["answer"])
+        said = hub.t_read_messages("manager", {})
+        self.assertIn("[owner] About Needs-you N-1 (Which name?), before answering it: Which one costs less?", said)
+        self.assertIn('discuss_need(need="N-1", text=...)', said)
+        self.assertIn('raise_needs_you(replaces="N-1")', said)
+        with mock.patch.object(hub, "ping_reply") as ping:
+            out = hub.t_discuss_need("manager", {"need": "N-1", "text": "Harbour costs 4 euros less a month."})
+        ping.assert_called_once_with(hub.q1("SELECT id FROM need_talk WHERE who='manager'")["id"])   # the reply's ring
+        self.assertIn("Your reply is under N-1", out)
+        self.assertIn("replied about: Which name?",
+                      hub.q1("SELECT text FROM events WHERE agent='owner' AND kind='notify' ORDER BY id DESC")["text"])
+        self.assertEqual([(t["who"], t["text"]) for t in self.item()["talk"]],
+                         [("owner", "Which one costs less?"), ("manager", "Harbour costs 4 euros less a month.")])
+        self.assertEqual(self.request("/ui/needs/1", self.command(choice=1))[0], 200)
+        self.assertEqual(self.row()["answer"], "Harbour")
+        self.assertFalse(self.item()["clarify"])
+        self.assertEqual(self.request("/ui/needs/1/talk", self.command(text="And now?"))[0], 409)
+        with self.assertRaisesRegex(hub.ToolError, "answered already"):
+            hub.t_discuss_need("manager", {"need": "N-1", "text": "Late."})
+
+    def test_the_manager_replies_once_until_the_owner_writes_again(self):
+        """The area's word of 20 November 2026: one reply to each message of the owner's, so that no loop of replies
+        rings his phone again and again; his next message opens the next reply."""
+        self.raise_item(options=["Tide", "Harbour"])
+        with self.assertRaisesRegex(hub.ToolError, r"no new message of the owner's to reply to.*replaces=\"N-1\""):
+            hub.t_discuss_need("manager", {"need": "N-1", "text": "Before you ask: Harbour costs less."})
+        self.assertEqual(self.request("/ui/needs/1/talk", self.command(text="Which one costs less?"))[0], 200)
+        with mock.patch.object(hub, "ping_reply") as ping:
+            hub.t_discuss_need("manager", {"need": "N-1", "text": "Harbour, by 4 euros a month."})
+            with self.assertRaisesRegex(hub.ToolError, "Wait for their next message there"):
+                hub.t_discuss_need("manager", {"need": "N-1", "text": "Also, Harbour is closer."})
+            self.assertEqual(self.request("/ui/needs/1/talk", self.command(text="And the setup?"))[0], 200)
+            hub.t_discuss_need("manager", {"need": "N-1", "text": "One hour for both."})
+        self.assertEqual(ping.call_count, 2)
+        self.assertEqual([t["who"] for t in self.item()["talk"]], ["owner", "manager", "owner", "manager"])
+
+    def test_a_door_card_and_a_team_card_take_a_message_too(self):
+        """The area's word of 20 November 2026: every card of the manager's takes it, a door card and a plan of team
+        changes too, since the owner may ask about a script or a plan before he presses; the hub's line names no
+        replaces for them, which raise_needs_you does not take the place of."""
+        t0 = hub.now()
+        hub.q("INSERT INTO needs(id,title,why,todo,raised,by,options,door_call,door_host) VALUES(1,'Run one root "
+              "script on web-1?','It reads the logs.','Press Run it once',?,'manager',?,?,'web-1')",
+              (t0, json.dumps(["Run it once", "Full access on web-1", "No"]), "a" * 64))
+        hub.q("INSERT INTO needs(id,title,why,todo,raised,by,options,team_plan) VALUES(2,'Add Nova?','For the shop.',"
+              "'Press one',?,'manager',?,?)", (t0, json.dumps(["Yes: add nova", "No"]), json.dumps({"steps": []})))
+        for nid in (1, 2):
+            with self.subTest(item=nid):
+                self.assertTrue(self.item(nid)["clarify"])
+                code, receipt = self.request(f"/ui/needs/{nid}/talk", self.command(text="Why this one?"))
+                self.assertEqual(code, 200, receipt)
+                said = hub.q1("SELECT text FROM events WHERE agent='manager' AND kind='say' ORDER BY id DESC")["text"]
+                self.assertIn(f"About Needs-you N-{nid}", said)
+                self.assertNotIn("replaces", said)
+
+    def test_a_card_that_answers_by_another_route_takes_no_message_under_it(self):
+        """A key request has its own Needs clarification, whose words answer it (secret_clarify), a conversation's item
+        is that person's question, and only the manager replies under a card: each says so, and its clarify is
+        false, so the apps draw no link there."""
+        t0 = hub.now()
+        hub.q("INSERT INTO needs(id,title,why,todo,raised,by,kind,secret) VALUES(1,'Add the key','Scout reads prices.',"
+              "'Save it',?,'manager','secret',?)", (t0, json.dumps({"kind": "api_key", "env": "SHOP_API_KEY"})))
+        hub.q("INSERT INTO needs(id,title,why,todo,raised,by,kind,conversation) VALUES(2,'Which day?','Mia asks.',"
+              "'Answer',?,'manager','question',5)", (t0,))
+        hub.q("INSERT INTO needs(id,title,why,todo,raised,by) VALUES(3,'Pick a region','For the new server.',"
+              "'Press one',?,'dev')", (t0,))
+        for nid, line in ((1, "its own Needs clarification"), (2, "that person's question"), (3, "only the manager")):
+            with self.subTest(item=nid):
+                self.assertFalse(self.item(nid)["clarify"])
+                code, refused = self.request(f"/ui/needs/{nid}/talk", self.command(text="Why?"))
+                self.assertEqual(code, 409, refused)
+                self.assertIn(line, json.dumps(refused))
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM need_talk")["n"], 0)
+        with self.assertRaisesRegex(hub.ToolError, "you reply only under a card that you raised"):
+            hub.t_discuss_need("manager", {"need": "N-3", "text": "It is cheaper."})
+        with self.assertRaisesRegex(hub.ToolError, "takes no reply under its card"):
+            hub.t_discuss_need("dev", {"need": "N-3", "text": "It is cheaper."})
+
+    def test_a_message_under_a_card_is_one_message_of_plain_words(self):
+        """The route takes its text and nothing else, and a registered login never goes to the manager in it; the
+        manager's reply is one message of plain words, with no code."""
+        self.raise_item()
+        for body, status in ((self.command(text="   "), 400), (self.command(text="x" * 2001), 400),
+                             (self.command(text="Why?", choice=0), 400)):
+            with self.subTest(body=sorted(body)):
+                self.assertEqual(self.request("/ui/needs/1/talk", body)[0], status)
+        self.register("hunter2-for-the-test")
+        self.assertEqual(self.request("/ui/needs/1/talk", self.command(text="It is hunter2-for-the-test"))[0], 422)
+        self.assertEqual(hub.need_talk(1), [])
+        with self.assertRaisesRegex(hub.ToolError, "Say T-12 in plain words"):
+            hub.t_discuss_need("manager", {"need": "N-1", "text": "It waits on T-12."})
+        with self.assertRaisesRegex(hub.ToolError, "1 to 2000 characters"):
+            hub.t_discuss_need("manager", {"need": "N-1", "text": "x" * 2001})
 
     def test_a_replaced_item_takes_the_record_of_its_earlier_discussion_along(self):
         """Bug: the talk of a replaced item stays on its closed card, or the closed card does not name the item that

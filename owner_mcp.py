@@ -299,6 +299,9 @@ NOT_TOOLS = {
     "/ui/secrets/import": "the values of an import's logins, as /ui/secrets/add",
     "/ui/needs/{}/takeover": "the one-time password of an agent's screen on a Linux server, which only the owner's "
                              "app puts in Screen Sharing's address (build plan 04, S6)",
+    "/ui/needs/{}/talk": "the owner's message to the manager under an open Needs-you card (Needs clarification), "
+                         "which the owner writes in the app or on the phone, where the reply shows; the owner's agent "
+                         "answers a card with answer_needs_you",
     "/ui/secrets/fingerprints": "the owner's own secret catalog",
     "/ui/needs/{}/secret": "a secret request's answer with a login, which the app's secure form gives once the value "
                            "is in a vault, and for a secret that the fleet's list has, the app's program on the "

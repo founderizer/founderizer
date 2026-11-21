@@ -559,7 +559,9 @@ CREATE TABLE IF NOT EXISTS owner_device_recovery(device TEXT PRIMARY KEY, sealed
 -- Pings to the owner's devices (MOBILE-APP.md 9, owner feature push): the push token that each device gave, with its
 -- seal key (sealed_push, a column that migrate adds), and one row for each ping. A ping row holds no text, and it is
 -- sent once: queued, sending, then sent, failed, skipped or unknown. Kind `needs` names a Needs-you item in `item`;
--- kind `badge`, a push with only the number for the app's icon, holds that number there (badge_look).
+-- kind `talk`, the manager's reply under a card (ping_reply), names that reply's row of need_talk there (not the
+-- `reply` of MOBILE-APP.md 9, a kind that it plans for a report); kind `badge`, a push with only the number for the
+-- app's icon, holds that number there (badge_look).
 CREATE TABLE IF NOT EXISTS owner_device_push(device TEXT PRIMARY KEY, token TEXT NOT NULL, environment TEXT NOT NULL,
   updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS pings(id INTEGER PRIMARY KEY, device TEXT NOT NULL, kind TEXT NOT NULL,
@@ -2049,8 +2051,11 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "secret_clarify_phone",      # the owner, 20 November 2026 ("Yes, build it" to the picture of the
                                     # iPhone's key card): the hub takes `clarify` from a phone's key too, and its
                                     # receipt has `created`, as the receipt of an answer has (UI-API.md 1.252)
-               "need_recommended"]  # the owner, 20 November 2026 (his pick B of three pictures): an item's
+               "need_recommended",  # the owner, 20 November 2026 (his pick B of three pictures): an item's
                                     # `recommended`, the answer that the agent recommends (UI-API.md 1.269)
+               "need_clarify"]      # the owner, 20 November 2026 ("Keep Your answer too" to the picture of the
+                                    # card): Needs clarification on every card, POST /ui/needs/<id>/talk keeps the
+                                    # item open, and an item's `clarify` and `talk` (UI-API.md 1.272)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -2088,12 +2093,13 @@ DEVICE_PUSH = re.compile(r"/ui/owner/devices/[a-z][a-z0-9-]{1,30}/(push|recovery
 # and GET /ui/attachments/<id> reads the bytes of one that a chat shows (ui_attachment_file). The prefix rule of
 # DEVICE_PATHS would also take POST /ui/attachments/<id>/keep, which stays on the owner's Mac.
 DEVICE_FILE = re.compile(r"/ui/attachments/[^/]+")
-# An item: POST /ui/needs/<id> answers it and POST /ui/needs/<id>/secret its secret request, and no other route under
-# /ui/needs is a device's. Build plan 04, S6: the one-time password of a Linux agent's screen (POST
+# An item: POST /ui/needs/<id> answers it, POST /ui/needs/<id>/secret its secret request and POST /ui/needs/<id>/talk
+# takes his message under its card (Needs clarification, owner API 1.272), and no other route under /ui/needs is a
+# device's. Build plan 04, S6: the one-time password of a Linux agent's screen (POST
 # /ui/needs/<id>/takeover) goes to the owner's Mac app only, which opens the tunnel to it. A prefix would give a device
 # each later route under /ui/needs with nobody having said so (test_access_refusals.DeviceRoutes), and a path as it
 # came (/ui/needs/12/%74akeover, which the router reads as the take-over) matches no entry here.
-DEVICE_NEED = re.compile(r"/ui/needs/[^/]+(?:/secret)?")
+DEVICE_NEED = re.compile(r"/ui/needs/[^/]+(?:/secret|/talk)?")
 
 
 def owner_devices():
@@ -2743,6 +2749,21 @@ def save_push_token(device, token, environment, seal=None):
 def ping_need(nid):
     """A Needs-you item that the owner is told about: one ping for each owner device that gave a push token. The row
     holds no text: the sender reads the item when it sends, and an item that was answered by then gets no ping."""
+    queue_pings("needs", nid)
+
+
+def ping_reply(talk):
+    """The manager's reply under a card (discuss_need, owner feature need_clarify), which the owner is told about: a
+    ping of its own kind, whose row names the reply (need_talk's id), and whose words say that the manager replied,
+    with no options (ping_payload). The area of Needs-you, 20 November 2026, from the review of the iPhone's part: the
+    reply rang with the card's own ping, which said nothing of a reply, and whose buttons answered the card and closed
+    it before he had read the reply. It goes as a card's ping goes: held while he is at a Mac app, with the icon's
+    number, and none for a card that was answered by then."""
+    queue_pings("talk", talk)
+
+
+def queue_pings(kind, item):
+    """One ping of `kind` for `item` to each owner device that gave a push token, which the sender sends."""
     devices = [r["device"] for r in q("SELECT device FROM owner_device_push ORDER BY device")
                if r["device"] in owner_devices()]
     if not devices:
@@ -2750,8 +2771,8 @@ def ping_need(nid):
     t0, generation = now(), kv_get("db_id")
     with transaction():
         for device in devices:
-            DB.execute("INSERT INTO pings(device,kind,item,db,state,created) VALUES(?,'needs',?,?,'queued',?)",
-                       (device, nid, generation, t0))
+            DB.execute("INSERT INTO pings(device,kind,item,db,state,created) VALUES(?,?,?,?,'queued',?)",
+                       (device, kind, item, generation, t0))
     PING_WAKE.set()
 
 
@@ -2801,8 +2822,8 @@ def badge_look():
             device = row["device"]
             if device not in devices or (row["badge"] or 0) == count or BADGE_TRIED.get(device) == count:
                 continue
-            if not present and read_row("SELECT 1 FROM pings WHERE device=? AND kind='needs' AND state='queued'",
-                                        (device,)):
+            if not present and read_row("SELECT 1 FROM pings WHERE device=? AND kind IN ('needs','talk') AND "
+                                        "state='queued'", (device,)):
                 continue
             waiting = read_row("SELECT id, item FROM pings WHERE device=? AND kind='badge' AND state='queued' "
                                "ORDER BY id LIMIT 1", (device,))
@@ -2820,7 +2841,13 @@ def badge_look():
     return True
 
 
-def ping_payload(need, generation, seal=None, badge=None):
+def push_words(text):
+    """Words in a ping's sealed part: screened as /ui/state screens them, and at most PUSH_TEXT characters."""
+    text = scrub(text)
+    return text if len(text) <= PUSH_TEXT else text[:PUSH_TEXT - 1].rstrip() + "…"
+
+
+def ping_payload(need, generation, seal=None, badge=None, reply=None):
     """What a ping carries for one Needs-you item. **Sealed** (the owner, 3 November 2026): our side and Apple carry
     the item's number, the hub's generation and a sealed part, and no word of the item. The banner that they see,
     "Needs you", is all that a phone shows when it cannot open that part; a device that gave no key, an app from
@@ -2832,17 +2859,23 @@ def ping_payload(need, generation, seal=None, badge=None):
     button whole, because a label that is cut can be pressed for the wrong answer. Its text passes the screening of
     /ui/state. The part names the item and the generation again, and the phone answers the item that it names.
 
-    `badge` is the number for the app's icon (owner_count) when the sender gives one: a number, never a word."""
+    `badge` is the number for the app's icon (owner_count) when the sender gives one: a number, never a word.
+
+    `reply`: the manager's reply under the card (ping_reply, a row of need_talk). Its sealed part says "<Role> replied
+    about: <title>", as the Mac's notice says it, over the reply's first words, **and has no options**: a press would
+    answer the card and close it before he has read the reply, and a tap opens the card, where the reply stands."""
     payload = {"need": need["id"], "db": generation,
                "aps": {"alert": {"title": PUSH_BANNER}, "sound": "default", "thread-id": "needs"}}
     if badge is not None:
         payload["aps"]["badge"] = badge
     if not seal:
         return payload
-    title = scrub(need_title(need))
-    if len(title) > PUSH_TEXT:
-        title = title[:PUSH_TEXT - 1].rstrip() + "…"
-    said = {"need": need["id"], "db": generation, "title": shown_role(need["by"]) or PUSH_BANNER, "body": title}
+    if reply:
+        said = {"need": need["id"], "db": generation, "body": push_words(reply["text"]),
+                "title": push_words(f"{shown_role(reply['who']) or PUSH_BANNER} replied about: {need_title(need)}")}
+        return sealed_ping(payload, said, seal)
+    said = {"need": need["id"], "db": generation, "title": shown_role(need["by"]) or PUSH_BANNER,
+            "body": push_words(need_title(need))}
     options = need_options(need)
     # the lane "Give on a card": no buttons for an item that carries its grant, whose Give the phone does not press;
     # the lane "Give on the iPhone" (owner API 1.247): none for the door's card of a run either, whose Run it once
@@ -2852,6 +2885,11 @@ def ping_payload(need, generation, seal=None, badge=None):
     if 2 <= len(options) <= NEED_OPTIONS_MAX and all(len(o) <= PUSH_BUTTON for o in options) \
             and scrub(options) == options and need_give_view(need) is None and not door_run:
         said["options"] = options         # the phone's notification content extension draws one button for each
+    return sealed_ping(payload, said, seal)
+
+
+def sealed_ping(payload, said, seal):
+    """`payload` with `said` sealed with the phone's own key (seal), which its notification service extension opens."""
     sealed = push.seal(push.seal_key(seal), json.dumps(said, ensure_ascii=False, separators=(",", ":")).encode())
     payload["sealed"] = base64.b64encode(sealed).decode()
     payload["aps"]["mutable-content"] = 1
@@ -2911,13 +2949,16 @@ def send_ping():
     present = owner_present_until() > 0     # the owner is at a Mac app: a Needs-you ping waits in the queue
     badges_wait = BADGE["off"] or now() < BADGE["until"]
     with LOCK:
-        row = q1("SELECT * FROM pings WHERE state='queued' AND NOT (? AND kind='needs') AND NOT (? AND kind='badge') "
-                 "ORDER BY kind='badge', id LIMIT 1", (present, badges_wait))
+        row = q1("SELECT * FROM pings WHERE state='queued' AND NOT (? AND kind IN ('needs','talk')) AND NOT "
+                 "(? AND kind='badge') ORDER BY kind='badge', id LIMIT 1", (present, badges_wait))
         if not row:
             return False
         q("UPDATE pings SET state='sending' WHERE id=?", (row["id"],))
         badge = row["kind"] == "badge"
-        need = None if badge else q1("SELECT * FROM needs WHERE id=?", (row["item"],))
+        # a reply's row names the reply (ping_reply), and the reply its card
+        reply = q1("SELECT * FROM need_talk WHERE id=?", (row["item"],)) if row["kind"] == "talk" else None
+        nid = reply["need"] if reply else None if row["kind"] == "talk" else row["item"]
+        need = None if badge or nid is None else q1("SELECT * FROM needs WHERE id=?", (nid,))
         device = q1("SELECT * FROM owner_device_push WHERE device=?", (row["device"],))
         generation, channel, entitlement = kv_get("db_id"), release_channel(), entitlement_token()
         count = owner_count()
@@ -2938,7 +2979,7 @@ def send_ping():
         expires = (row["created"] if row["error"] else now()) + PUSH_KEEP
         try:
             status, reason = push.send(channel, entitlement, device["token"],
-                                       ping_payload(need, generation, device["seal"], count),
+                                       ping_payload(need, generation, device["seal"], count, reply),
                                        device["environment"], collapse=f"need-{need['id']}", expires=expires)
             state, error = ("sent" if status == 200 else "unknown" if status == 0 else "failed"), reason or None
         except push.PushError as e:
@@ -2957,7 +2998,9 @@ def send_ping():
         # phone holds the pings of the other phones back for that time too, push.RETRY_MOST at most: the answer does
         # not say which count is full, and the hub keeps the pings of every phone in one queue.
         _ping_hold["until"] = now() + hold
-    log("hub", f"ping {row['id']} to {row['device']} for N-{row['item']}: {state}" + (f" ({error})" if error else "")
+    log("hub", f"ping {row['id']} to {row['device']} for " + (f"N-{nid}" if nid else "a reply that is gone")
+        + (" (a reply)" if reply else "") + f": {state}"
+        + (f" ({error})" if error else "")
         + (f"; it goes again in {hold} seconds" if state == "queued" else ""))
     return True
 
@@ -3013,6 +3056,7 @@ NEED_OPTION_CHARS = 120         # a short sentence on one row, not a paragraph
 NEED_TITLE_CHARS = 70
 NEED_WHY_CHARS = 240
 NEED_DETAILS_CHARS = 4000
+NEED_TALK_CHARS = 2000          # one message under a card (owner feature need_clarify): the owner's or the agent's reply
 NEED_CODES = re.compile(r"(?<![A-Za-z0-9-])(?:AM|UP|OR|[CGIMNPQRT])-[0-9]+(?![0-9])")
 # A code block of a card's task or details, from a line that begins with three backticks to the next such line: a
 # command that the owner pastes is literal (the owner, 15 November 2026: "manager tasks need to be super specific. Like
@@ -3324,6 +3368,23 @@ def need_talk(nid):
             for r in q("SELECT who, text, ts FROM need_talk WHERE need=? ORDER BY id", (nid,))]
 
 
+def need_unclarified(need):
+    """Why an item takes no message under its card (owner feature need_clarify), or None for one that does: an open
+    item of the manager's that is no conversation's question and no key request. The owner, 20 November 2026, of
+    Needs clarification: "Keep Your answer too": his message under the card keeps it open and goes to the manager,
+    which replies there (discuss_need), and his answer still closes it. A key request has its own Needs clarification,
+    whose words close it (secret_clarify), and a conversation's item is that person's question."""
+    if need["answer"] is not None:
+        return refusal_words.words("request_answered")
+    if need["conversation"]:
+        return "an item of a conversation is that person's question: answer it, or ask the manager in its chat"
+    if need["kind"] == "secret":
+        return "a key request takes the owner's words with its own Needs clarification, which answers it"
+    if need["by"] != manager_name():
+        return f"only the manager replies under a card, and {shown_role(need['by'])} raised this one: answer it"
+    return None
+
+
 def need_reads():
     """What need_view reads for each item, read once for all of them: (need_talk of every item as {item: [{who, text,
     ts}]}, each list oldest first; the fleet's id). The Mac app reads every item with its discussion every 3 seconds
@@ -3375,7 +3436,8 @@ def need_view(row, reads=None):
     for kept in ("give_agent", "give_level", "give_repos"):
         view.pop(kept, None)
     # owner feature need_talk: the long part behind Details, whether the options combine, the indexes he ticked, and
-    # the record of his discussion of the item, which nothing adds to since Discuss left the apps (13 November 2026)
+    # his talk with the manager under the item: Discuss left the apps on 13 November 2026, and Needs clarification
+    # adds to the same record since 20 November 2026 (need_clarify)
     keys = row.keys() if hasattr(row, "keys") else ()
     view["multi"] = bool(row["multi"]) if "multi" in keys else False
     try:
@@ -3385,6 +3447,9 @@ def need_view(row, reads=None):
     if view["secret"]:          # a login request's failed login is the hub's: its why names it
         view["secret"] = {k: v for k, v in view["secret"].items() if k not in SECRET_HUB_ONLY}
     view["talk"] = need_talk(row["id"]) if reads is None else reads[0].get(row["id"], [])
+    # owner feature need_clarify: the card takes the owner's message under it (POST /ui/needs/<id>/talk), and his
+    # talk with the manager there is `talk` (owner API 1.272)
+    view["clarify"] = need_unclarified(row) is None
     if view.get("door_call"):                       # what a phone's statement names
         view["door_fleet"] = kv_get("fleet_id") if reads is None else reads[1]
     else:
@@ -15938,6 +16003,96 @@ def t_withdraw_need(agent, a):
     return (f"Withdrew N-{nid}. It left the owner's Needs you with no notification, and its record keeps your reason. "
             + (f"{theirs} is not told: tell it with message_agent when its work should know. " if theirs else "") +
             "Raise a new item only when the owner must do or decide something now.")
+
+
+# Needs clarification on every card (owner feature need_clarify, owner API 1.272). The owner, 20 November 2026: "I
+# thought we discussed recently about hvaing a option to "Discuss" so instead of replying I could provide additional
+# context?", "Bring it back", "a button link, that then shows the extra text input", and "Keep Your answer too" to the
+# picture of the card: under his answer a quiet link opens one field, his message there keeps the item open and goes
+# to the manager, which replies under the card (discuss_need), and his answer still closes it. The route and the tool
+# of 9 November 2026 (Discuss, owner API 1.106) left on 13 November at his "the discuss interface is terrible"; the
+# record of an item's talk (need_talk) stayed, and the talk moves to an item that replaces it (t_raise_needs_you).
+
+
+def need_talk_said(body, via=None):
+    """POST /ui/needs/<id>/talk, under LOCK: the owner's message under one open card goes to the manager, which replies
+    there (discuss_need), and the item stays open. A refusal is the hub's line of need_unclarified. via: the shown name
+    of the connected app that sent it, which its header says as app:<name>."""
+    need = q1("SELECT * FROM needs WHERE id=?", (body["need"],))
+    if not need:
+        raise Refusal(404, code="request_unknown")
+    if need["answer"] is not None:                  # the table's words and code, which the apps say in their own
+        raise Refusal(409, code="request_answered")
+    why = need_unclarified(need)
+    if why:
+        raise Refusal(409, why)
+    t0 = now()
+    told = (need["by"], "say", filed_about(need["by"], "say", None),
+            f"[owner{f' via {capp_via(via)}' if via else ''}] About Needs-you N-{need['id']} ({need['title']}), "
+            f"before answering it: {body['text']}\n(The hub: the item stays open. Reply under the card with "
+            f"discuss_need(need=\"N-{need['id']}\", text=...), in plain words and in a few sentences.{need_again(need)} "
+            f"Their answer to the item comes as its own message.)", {})
+    with transaction():         # his message stands on the card only with its line to the manager
+        DB.execute("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (need["id"], t0, "owner", body["text"]))
+        event_rows([told], t0)
+    return {"need": need["id"], "talk": need_talk(need["id"])}
+
+
+def need_again(need):
+    """The sentence that says how the talk changes an open item: its agent raises it again with replaces. "" for an
+    item that raise_needs_you does not take the place of (need_replaced: a door call, an App, a phone, a key renewal,
+    a server's key swap or a plan of team changes), so the hub never names a call that it then refuses."""
+    if not need_replaceable(need):
+        return ""
+    return f" If the talk changes its options or its words, raise it again with raise_needs_you(replaces=\"N-{need['id']}\")."
+
+
+def need_replaceable(need):
+    """Whether raise_needs_you takes the place of this item (need_replaced), for the words that name that call."""
+    try:
+        need_replaced(need["by"], need["id"])
+    except ToolError:
+        return False
+    return True
+
+
+def t_discuss_need(agent, a):
+    """discuss_need (the manager; owner feature need_clarify): one reply under one of its open cards, where the owner
+    asked about it (Needs clarification). The card shows it in his talk with the manager, his phone rings with it
+    (ping_reply), and the item stays open until he answers it."""
+    nid = parse_id(a.get("need"), "Needs-you item")
+    text = str(a.get("text") or "").strip()
+    if not text or len(text) > NEED_TALK_CHARS:
+        raise ToolError(f"text is your reply, 1 to {NEED_TALK_CHARS} characters.")
+    code = NEED_CODES.search(text)
+    if code:
+        raise ToolError(f"Say {code.group(0)} in plain words: the owner reads names and what a thing is about, never "
+                        f"a code.")
+    guard(agent, text)
+    with LOCK:
+        need = q1("SELECT * FROM needs WHERE id=?", (nid,))
+        if not need:
+            raise ToolError(f"There is no Needs-you item N-{nid}.")
+        if need["by"] != agent:
+            raise ToolError(f"N-{nid} is {need['by']}'s: you reply only under a card that you raised.")
+        if need["answer"] is not None:
+            raise ToolError(f"N-{nid} is answered already: {clip(need['answer'], 200)}")
+        why = need_unclarified(need)
+        if why:
+            raise ToolError(f"N-{nid} takes no reply under its card: {why}.")
+        # **One reply, and the next only after his next message** (the area's word of 20 November 2026): a reply needs
+        # a message of theirs after the last reply, so no loop of replies rings their phone again and again
+        last = q1("SELECT who FROM need_talk WHERE need=? ORDER BY id DESC LIMIT 1", (nid,))
+        if not last or last["who"] != "owner":
+            again = f", or raise the item again with raise_needs_you(replaces=\"N-{nid}\")" if need_replaceable(need) else ""
+            raise ToolError(f"N-{nid} has no new message of the owner's to reply to: you reply once, and again only "
+                            f"after they write again under the card. Wait for their next message there{again}.")
+        talk = ins("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (nid, now(), agent, text))
+        again = need_again(need)
+    emit("owner", "notify", f"{shown_role(agent)} replied about: {need['title']}")
+    ping_reply(talk)                    # his phone rings with the reply, which has no buttons (owner feature push)
+    return (f"Your reply is under N-{nid} on the owner's card. Their next message there comes to you, and their answer "
+            f"to the item comes as its own message.{again}")
 
 
 ITEMS_NAMED = 5                 # open items that one accept names; the rest are a count
@@ -43423,7 +43578,8 @@ TOOLS = [
      "of the options, set multi: they tick any of them and send them together, so never write combined options such as "
      "\"Yes to A and C\". The owner answers with an option or in their own words, and either one closes the item. "
      "When their words ask you something back or do not settle it, reply with a new item: its why answers what they "
-     "asked, with the options that follow from it. When an open item's options or words change, raise it again with "
+     "asked, with the options that follow from it. Before they answer, they may ask about it under its card "
+     "(Needs clarification): you reply there with discuss_need. When an open item's options or words change, raise it again with "
      "replaces. what_to_do is what the owner does, and the card shows it under why: for a choice, one short sentence "
      "that names the decision; for a person's step, the exact steps, a page as its full address with what to click "
      "there by the words on the buttons, and a numbered list for more than one step. Two kinds of item have their own "
@@ -43545,6 +43701,15 @@ TOOLS = [
      S({"need": {"type": "string", "description": "The item, for example N-12"},
         "why": {"type": "string", "description": "What made it unnecessary, in plain words"}},
        ["need", "why"])),
+    ("manager", "discuss_need", t_discuss_need,
+     "Reply under one of your open Needs-you cards where the owner asked about it (Needs clarification): the reply "
+     "shows there and rings their phone, and the item stays open until they answer it. Reply once, and again only "
+     "after their next message there: what they asked, in a few plain sentences with the facts that they need, no "
+     "codes. When the talk changes the item's options or words, raise it again with raise_needs_you replaces, where "
+     "the hub's line under their message names it.",
+     S({"need": {"type": "string", "description": "The item, for example N-12."},
+        "text": {"type": "string", "description": f"Your reply, at most {NEED_TALK_CHARS} characters."}},
+       ["need", "text"])),
     ("manager", "door_rollout", t_door_rollout,
      "Let the app put the door's parts on the business servers after the first one, or stop it. The app puts them on "
      "one server first, checks that server's second sshd itself (test 1), and the hub tells you when that passed. Then "
@@ -66791,6 +66956,17 @@ def task_steer_act(task_id, body, client, via=None, connection=None):
                                    "WHERE s.id=?", (sid,)))}
 
 
+def need_talk_read(need_id, data):
+    """The body of POST /ui/needs/<id>/talk (owner feature need_clarify), for need_talk_said. ValueError."""
+    extra = sorted(set(data) - {"request_id", "db", "text"})
+    if extra:
+        raise ValueError(f"unknown field {extra[0]}")
+    text = data.get("text")
+    if not isinstance(text, str) or not text.strip() or len(text.strip()) > NEED_TALK_CHARS:
+        raise ValueError(f"text is the owner's message, 1 to {NEED_TALK_CHARS} characters")
+    return {"need": need_id, "text": text.strip()}
+
+
 def need_words_note(need, choice, ticked, value=None):
     """The hub's words after an answer that the owner typed to a Needs-you item of the manager's: their own words are
     also their one reply on the card (the owner, 13 November 2026: "lets use the free-type text input as the general
@@ -71478,6 +71654,13 @@ class Handler(BaseHTTPRequestHandler):
             return {"secrets": entries}
         return self.ui_command("secrets/import", read, save_secrets, limit=SECRETS_IMPORT_MAX * 2048, unlocked=True)
 
+    def ui_need_talk(self, need_id):
+        """POST /ui/needs/<id>/talk (owner feature need_clarify, owner API 1.272): the owner's message under one open
+        card, apart from his answer. The owner, 20 November 2026: "a button link, that then shows the extra text
+        input", and "Keep Your answer too": it goes to the manager, which replies under the card (discuss_need), and
+        the item stays open until he answers it (need_talk_said)."""
+        return self.ui_command(f"needs/{need_id}/talk", lambda data: need_talk_read(need_id, data), need_talk_said)
+
     def ui_need_secret(self, need_id):
         """POST /ui/needs/<id>/secret (owner feature secret_requests): the answer of one request_secret, from the app's
         secure form once the value is in the vault and registered: login, the reference of the secret that answers
@@ -74508,6 +74691,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_submit(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["ui", "needs"] and parts[3] == "secret" and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
             return self.ui_need_secret(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["ui", "needs"] and parts[3] == "talk" and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
+            return self.ui_need_talk(int(parts[2]))          # owner feature need_clarify
         if len(parts) == 4 and parts[:2] == ["ui", "needs"] and parts[3] == "takeover" and \
                 re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):     # build plan 04, S6: Take over on a Linux server
             return self.ui_need_takeover(int(parts[2]))

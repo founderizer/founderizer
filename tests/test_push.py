@@ -297,6 +297,24 @@ class Sender(PushCase):
             self.assertEqual(self.opened(hub.ping_payload(other, "g", SEAL))["options"],
                              ["Run it once", "Full access on web-1", "No"])
 
+    def test_the_managers_reply_under_a_card_rings_as_a_reply_with_no_button(self):
+        """Needs clarification (owner API 1.272; the area's review of 20 November 2026): the ring of the manager's reply
+        says that it replied, and its first words, and has no options, so that no press on the lock screen answers the
+        card and closes it before the owner has read the reply. Bug: the reply rang with the card's own ping, whose
+        buttons answer the card and which said nothing of a reply."""
+        self.give(self.enrolled(), seal=SEAL)
+        nid = self.raise_item(options=["Pay €12 now", "Not this year"])
+        self.sent()
+        self.assertIn("options", self.opened(self.side.got[0]["body"]["payload"]))     # the card's own ring
+        hub.need_talk_said({"need": nid, "text": "Which one costs less?"})
+        hub.t_discuss_need("manager", {"need": f"N-{nid}", "text": "Not this year: nothing is paid until March."})
+        ping = self.sent()
+        got = self.side.got[1]["body"]
+        self.assertEqual((ping["kind"], ping["state"], got["collapse"]), ("talk", "sent", f"need-{nid}"))
+        self.assertEqual(self.opened(got["payload"]), {"need": nid, "db": "test-generation",
+                                                       "title": "Manager replied about: Pay for the domain?",
+                                                       "body": "Not this year: nothing is paid until March."})
+
     def test_an_option_that_does_not_fit_a_button_opens_the_app(self):
         self.give(self.enrolled(), seal=SEAL)
         fits = "Stop the task and keep what it has written so far."

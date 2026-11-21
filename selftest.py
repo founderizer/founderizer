@@ -229,6 +229,8 @@ EVERY_AGENT = ["read_messages", "search_knowledge", "read_knowledge", "write_kno
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "see_team", "see_capacity", "see_goals",
                                "update_goal", "record_spend", "raise_needs_you", "withdraw_need", "request_secret",
+                               # the owner, 20 November 2026: the reply under a card where he asked (need_clarify)
+                               "discuss_need",
                                # new-projects plan N8 (b): the door's parts on the servers after the first one
                                "door_rollout", "door_hold",
                                # DevOps plan X3: a GitOps repository through the door
