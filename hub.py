@@ -43451,7 +43451,8 @@ TOOLS = [
        ["task_id", "outcome", "what_was_done"])),
     ("worker", "sign_in", t_sign_in,
      "Have this machine's helper sign in to a site in Chrome with a login you name. Open the site's sign-in page "
-     "first. You never see the password.",
+     "first. Do this by yourself each time a site signed you out. Then look at the page. Ask your requester only when "
+     "the answer says that a person must act. You never see the password.",
      S({"task_id": TASK_ID, "login": {"type": "string", "description": "bws://<secret-id> (its UUID in the fleet's vault), or sealed:<number>"}},
        ["task_id", "login"])),
     ("worker", "hand_over", t_hand_over,

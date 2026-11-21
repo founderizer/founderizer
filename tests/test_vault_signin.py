@@ -36,7 +36,7 @@ def setUpModule():
 
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
-    for cls in (BrokerFill, HelperSide, SigninRecords):
+    for cls in (BrokerFill, HelperSide, SigninRecords, MacVaultNumber):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -771,6 +771,19 @@ class MacVaultNumber(unittest.TestCase):
         vault_side.join(5)
         self.assertEqual(str(got.exception), "the vault broker refused: Chrome gave the vault no answer, or an unknown "
                                              "error. (Chrome or macOS error -1712)")
+
+    def test_a_tab_that_left_the_site_after_the_login_went_is_no_sign_in_and_no_refusal(self):
+        """The Mac vault answers "left": true when the tab left the login's site, or closed, after the login went (a
+        single sign-on page, a site's own redirect). The helper says that the login went and that the agent looks at
+        the page: "Signed in", which nobody saw, would hide a sign-in that failed, and a refusal would make the agent
+        type the login again."""
+        answer = {"ok": True, "v": 2, "job": 5, "origin": ORIGIN, "label": "Shop", "authenticator": False, "left": True}
+        with patch.object(fleet, "vault_mode", lambda a: "broker"), patch.object(fleet, "broker_job", lambda agent, job: job), \
+                patch.object(fleet, "broker_job_request", lambda agent, req: answer if req == {"op": "signin", "job": 5}
+                             else {}):
+            self.assertEqual(fleet.do_signin("bws://x", "beta", "T-1", 5),
+                             f"The login was sent on {ORIGIN}, and the tab then left that site. Look at the page to see "
+                             f"if you are signed in.")
 
 
 if __name__ == "__main__":

@@ -12018,6 +12018,9 @@ def do_signin(name, agent, task="", job=None):
     if vault_mode(agent) == "broker":   # the signed Mac vault helper, or a Linux server's broker in the agent's own
         # browser (plan 04, S5), fills the form; no login comes here
         done = broker_job_request(agent, {"op": "signin", "job": broker_job(agent, job)})
+        if done.get("left") is True:    # the Mac vault: the tab left the site or closed after the login went
+            return (f"The login was sent on {done.get('origin')}, and the tab then left that site. Look at the page to "
+                    f"see if you are signed in.")
         return (f"Signed in on {done.get('origin')} with the login \"{done.get('label')}\"" +
                 (", with its authenticator code" if done.get("authenticator") is True else "") +
                 ". The password was never shown to you.")
