@@ -11,6 +11,7 @@ import re
 import shlex
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1138,6 +1139,42 @@ class BrowserCloseAndWaits(unittest.TestCase):
 class ScreenAndReady(unittest.TestCase):
     """The unit's own start (browser-run) and its check (browser-ready)."""
 
+    def test_the_screen_s_number_goes_with_the_screen(self):
+        """S7: browser-run starts the agent's screen with screen_arguments, and its display file is there while Chrome
+        runs and goes when Chrome ends or the unit stops: a file left behind names a number that another user's X
+        server can hold, and the take-over's x11vnc and the live view's capture read that file. The key stays: its
+        mark says that no start came since the helper named the Chrome's pages, also after Chrome ended."""
+        folder = tempfile.mkdtemp(prefix="fleet-run-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, True))
+        shown, started, seen, handlers = os.path.join(folder, "display"), [], [], {}
+        key = os.path.join(folder, "screen-key")
+
+        class Process:
+            def __init__(self, args, **kw):
+                started.append(args)
+
+            def wait(self):
+                seen.append((Path(shown).read_text(), os.path.exists(key)))
+                return 0
+            terminate = kill = lambda self: None
+        with patch.object(fleet, "browser_folder", lambda: folder), patch.object(fleet, "browser_profile", lambda: folder), \
+                patch.object(fleet, "browser_port", lambda user=None: 9301), \
+                patch.object(fleet.subprocess, "run", lambda *a, **kw: Path(key).write_text("xauth wrote it")), \
+                patch.object(fleet.subprocess, "Popen", Process), patch.object(fleet, "screen_display", lambda fd: "7"), \
+                patch.object(fleet.signal, "signal", lambda sign, handler: handlers.update({sign: handler})), \
+                self.assertRaises(SystemExit):
+            fleet.cmd_browser_run(None)
+        fd = started[0][started[0].index("-displayfd") + 1]
+        self.assertEqual(started[0], fleet.screen_arguments(os.path.join(folder, "screen-key"), fd))
+        self.assertEqual(started[0][-3:], ["-screen", "0", "1280x800x24"])
+        self.assertIn("--window-size=1280,800", started[2])         # one size for the screen and Chrome's window
+        self.assertEqual((seen, os.path.exists(shown), os.path.exists(key)), ([("7", True)], False, True))
+        Path(shown).write_text("7")                 # a stop of the unit (SIGTERM) while Chrome runs
+        Path(key).write_text("xauth wrote it")
+        with patch.object(fleet.signal, "signal", lambda *a: None), patch.object(fleet.os, "kill", lambda *a: None):
+            handlers[fleet.signal.SIGTERM](fleet.signal.SIGTERM, None)
+        self.assertEqual((os.path.exists(shown), os.path.exists(key)), (False, True))
+
     def test_the_screens_number_is_read_to_its_newline(self):
         """Xvfb writes the number and its newline in two writes; a pipe closed after the first ended it in half of all
         starts (live, 17 November 2026)."""
@@ -1381,7 +1418,11 @@ class TakeOver(unittest.TestCase):
         with patch.object(fleet, "browser_folder", lambda: self.folder), \
                 patch.object(fleet.lifecycle, "screen_port", lambda user=None: 5911), \
                 patch.object(fleet.os, "execv", lambda program, args: ran.append((program, args))):
-            with self.assertRaisesRegex(SystemExit, "screen does not run"):
+            # only the display file names a screen: a key that a dead screen left names a number that another OS
+            # user's X server can hold, and x11vnc would connect to it
+            Path(self.folder, "screen-key").write_bytes(b"\x01\x00\x00\x03box\x00\x017\x00\x12MIT-MAGIC-COOKIE-1")
+            with patch.object(fleet.subprocess, "run", side_effect=AssertionError("no program lists the key")), \
+                    self.assertRaisesRegex(SystemExit, "screen does not run"):
                 fleet.cmd_vnc_run(None)
             Path(self.folder, "display").write_text("7")
             with self.assertRaisesRegex(SystemExit, "no new one-time password"):
@@ -1393,6 +1434,109 @@ class TakeOver(unittest.TestCase):
                 fleet.cmd_vnc_run(None)
         self.assertEqual(ran, [("/usr/bin/x11vnc", fleet.vnc_arguments(
             "7", os.path.join(self.folder, "screen-key"), 5911, os.path.join(self.folder, fleet.VNC_PASSWORD)))])
+
+    def x_server(self, sockets, display, cookie, size=(4, 2)):
+        """A stand-in for the agent's X server on the socket file of `display`: it takes the protocol's setup with the
+        screen's cookie and answers GetImage of the root window. Returns what each client sent."""
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(os.path.join(sockets, f"X{display}"))
+        listener.listen(8)
+        self.addCleanup(listener.close)
+        got, (w, h) = [], size
+        pad = lambda b: b + b"\0" * (-len(b) % 4)
+
+        def serve():
+            while True:
+                try:
+                    client, _ = listener.accept()
+                except OSError:
+                    return
+                with client:
+                    client.settimeout(5)
+                    try:
+                        hello = client.recv(4096)
+                        got.append(hello)
+                        if cookie not in hello:
+                            client.sendall(struct.pack("<BBHHH", 0, 0, 11, 0, 0))
+                            continue
+                        vendor = b"stand-in"
+                        screen = struct.pack("<IIIIIHHHHHHIBBBB", 0x123, 0, 0, 0, 0, w, h, 1, 1, 1, 1, 0, 0, 0, 24, 0)
+                        body = struct.pack("<IIIIHHBBBBBBBBI", 0, 0, 0, 0, len(vendor), 0xffff, 1, 1, 0, 0, 32, 32, 8,
+                                           255, 0) + pad(vendor) + struct.pack("<BBBxI", 24, 32, 32, 0) + screen
+                        client.sendall(struct.pack("<BBHHH", 1, 0, 11, 0, len(body) // 4) + body)
+                        ask = client.recv(4096)
+                        got.append(ask)
+                        code, kind, _, root, x, y, aw, ah, planes = struct.unpack("<BBHIhhHHI", ask)
+                        if (code, kind, root, x, y, aw, ah) != (73, 2, 0x123, 0, 0, w, h):
+                            continue
+                        client.sendall(struct.pack("<BBHII20x", 1, 24, 2, w * h, 0) + b"BGRx" * (w * h))
+                    except OSError:
+                        pass
+        threading.Thread(target=serve, daemon=True).start()
+        return got
+
+    def test_the_capture_gives_a_frame_of_the_agent_s_own_screen_that_the_hub_takes(self):
+        """Build plan 04, S7: the live view's capture program reads the screen that browser-run started (its display's
+        socket file, with its cookie) with the X protocol's GetImage, makes a JPEG of it through ffmpeg by its path,
+        and prints the line that the hub takes as a frame. It gives no line (the view then waits) where the picture is
+        not one whole JPEG of at most 1 MiB, and while the screen is not this task's own: the Chrome's pages are named
+        for another task or for an earlier start of the unit (an earlier task's Chrome would show under this task), the
+        unit does not run, or the process at the other end of the socket is not this OS user's. That last one gets no
+        byte of the cookie: another user's X server there would get the screen's key, and the owner would see its
+        picture under this task."""
+        jpeg, ran = b"\xff\xd8\xff" + b"screen" * 9 + b"\xff\xd9", []
+        shots = [(0, jpeg), (1, jpeg), (0, jpeg[:-2]), (0, b"PNG" + jpeg), (0, jpeg[:-2] + b"x" * (1 << 20) + jpeg[-2:])]
+
+        def run(args, **kw):
+            ran.append((args, kw))
+            code, out = shots.pop(0)
+            return subprocess.CompletedProcess(args, code, out, b"")
+        key, cookie = os.path.join(self.folder, "screen-key"), bytes(range(16))
+        field = lambda b: len(b).to_bytes(2, "big") + b
+        Path(key).write_bytes(b"".join(                 # xauth's file: display 0 with another cookie, then display 7
+            b"\x01\x00" + field(b"box") + field(number) + field(b"MIT-MAGIC-COOKIE-1") + field(data)
+            for number, data in ((b"0", b"\xee" * 16), (b"7", cookie))))
+        sockets = tempfile.mkdtemp(prefix="x", dir="/tmp")           # short: a socket's path holds 104 characters
+        self.addCleanup(lambda: __import__("shutil").rmtree(sockets, True))
+        got = self.x_server(sockets, 7, cookie)
+        said = {"pages": ("db", "T-4", "chrome-1", "5:9"), "mark": "5:9", "unit": "active", "peer": os.getuid()}
+        task = types.SimpleNamespace(db="db", task="T-4")
+        with patch.object(fleet, "browser_folder", lambda: self.folder), \
+                patch.object(fleet.subprocess, "run", run), \
+                patch.object(fleet, "browser_pages_read", lambda: said["pages"]), \
+                patch.object(fleet, "screen_key_mark", lambda: said["mark"]), \
+                patch.object(fleet, "browser_unit_state", lambda: said["unit"]), \
+                patch.object(fleet, "peer_uid", lambda sock: said["peer"]), \
+                patch.object(fleet, "X_SOCKETS", sockets), patch.object(fleet.time, "sleep", lambda s: None):
+            self.assertIsNone(fleet.screen_frame(self.folder, "db", "T-4"))         # no display is written
+            Path(self.folder, "display").write_text("7")
+            for change in (dict(pages=("db", "T-5", "chrome-1", "5:9")), dict(pages=("db2", "T-4", "chrome-1", "5:9")),
+                           dict(pages=None), dict(pages=()), dict(mark="6:1"), dict(unit="inactive"), dict(unit=""),
+                           dict(peer=os.getuid() + 1)):
+                with patch.dict(said, change):
+                    self.assertIsNone(fleet.screen_frame(self.folder, "db", "T-4"), change)
+            Path(self.folder, "display").write_text("9")
+            self.assertIsNone(fleet.screen_frame(self.folder, "db", "T-4"))         # no screen listens there
+            Path(self.folder, "display").write_text("7")
+            time.sleep(0.2)
+            self.assertEqual((ran, [g for g in got if g]), ([], []))    # no picture made; the screen got no byte
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                fleet.cmd_screen_capture(task, rounds=3)        # a frame, then two rounds with none: one line
+            line = json.loads(out.getvalue())
+            self.assertEqual((out.getvalue().count("\n"), len(ran)), (1, 3))
+            others = [fleet.screen_frame(self.folder, "db", "T-4") for _ in range(2)]
+        args, kw = ran[0]
+        self.assertTrue(any(cookie in g for g in got))
+        self.assertEqual((args[0], args[args.index("-i") + 1], args[-1], kw["input"]),
+                         ("/usr/bin/ffmpeg", "-", "-", b"BGRx" * 8))       # the screen's own picture, of its own size
+        self.assertEqual((args[args.index("-video_size") + 1], args[args.index("-pixel_format") + 1]), ("4x2", "bgr0"))
+        self.assertNotIn("x11grab", args)               # it puts the picture in a memory segment of mode 777
+        frames = __import__("desktop").Frames()
+        frames.view("k", line["captured_at"])
+        self.assertTrue(frames.put("k", line, line["captured_at"]))
+        self.assertEqual(__import__("base64").b64decode(line["image"]), jpeg)
+        self.assertEqual(others, [None, None])
 
     def press(self, pages=None, browser="active", listens=True, taken=True, cdp_fault=None, fault=None, keep=False,
               helper_h=None):
@@ -1500,17 +1644,6 @@ class TakeOver(unittest.TestCase):
         self.assertEqual(calls.count(("start", "fleet_vnc.service")), 1)
         posted2, calls2, _ = self.press(helper_h=h, keep=True)
         self.assertEqual((posted2, calls2), ([], []))
-
-    def test_a_screen_from_before_its_display_file_is_found_by_its_key(self):
-        ran = []
-        listed = "app-1/unix:0  MIT-MAGIC-COOKIE-1  00ff\napp-1/unix:7  MIT-MAGIC-COOKIE-1  00ff\n"
-        Path(self.folder, fleet.VNC_PASSWORD).write_text("Ab3dEf7h\n")
-        with patch.object(fleet, "browser_folder", lambda: self.folder), \
-                patch.object(fleet.lifecycle, "screen_port", lambda user=None: 5911), \
-                patch.object(fleet.subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(args, 0, listed, "")), \
-                patch.object(fleet.os, "execv", lambda program, args: ran.append(args)):
-            fleet.cmd_vnc_run(None)
-        self.assertEqual(ran[0][ran[0].index("-display") + 1], ":7")
 
     def test_a_press_that_nobody_waits_for_any_more_stops_the_sharing(self):
         posted, calls, said, _ = self.press(taken=False)

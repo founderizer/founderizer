@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -35,12 +36,90 @@ class DesktopFrames(unittest.TestCase):
         frames.prune(26)
         self.assertEqual(frames.rows, {})
 
-    def test_capture_never_starts_without_owner_lease(self):
-        http = Mock(return_value=(409, {}))
-        publisher = desktop.Publisher("studio", "T-1", {"attempt": 1, "generation": "db"}, http)
-        with patch("desktop.subprocess.Popen") as start:
+    def test_a_capture_runs_and_its_frames_go_only_while_the_owner_s_view_asks(self):
+        """The publisher starts its capture program (a whole command, as a Linux agent's screen-capture) only when the
+        hub says that a view watches, posts the lines that the program prints, and stops the program when the view
+        stops: all of its process group, so that a program which the capture started (ffmpeg on a screen that does
+        not answer) does not stay behind. A capture that ran with no view would read the screen, and send it, while
+        nobody looks. With `hub_clock` each frame's time goes on the hub's clock, which here is 100 seconds ahead and
+        then 90 (a slow answer): the hub refuses a frame whose time is more than 2 seconds ahead of its own, or 5
+        behind, or before the frame that it holds, so the second frame's time is never before the first one's. A
+        Mac's frames keep their time. The view watches until two frames came, however long this machine takes."""
+        program = ("import json, subprocess, sys, time\n"
+                   "child = subprocess.Popen(['sleep', '60'])\n"
+                   "for n in range(600):\n"
+                   f"    print(json.dumps(dict({frame(5)!r}, captured_at=5 + n / 100, child=child.pid)), flush=True)\n"
+                   "    time.sleep(0.1)\n")
+        for hub_clock in (False, True):
+            calls, ran, sent = [], [], []
+
+            def http(method, path, data=None, timeout=None):
+                ran.append(publisher.process is not None)       # whether the capture runs when this call starts
+                calls.append(method)
+                if method == "POST":
+                    sent.append(data["frame"])
+                    return 200, {}
+                if len(calls) == 1:
+                    return 200, {"watching": False}
+                if len(sent) < 2:                               # the view watches until its second frame came
+                    return 200, {"watching": True, "now": time.time() + (90 if sent else 100)}
+                return (200, {"watching": False}) if calls[-2] == "POST" else (409, {})
+            publisher = desktop.Publisher("studio", "T-1", {"attempt": 1, "generation": "db"}, http,
+                                          command=[sys.executable, "-c", program], hub_clock=hub_clock)
+            publisher.stop.wait = lambda seconds: None
             publisher.run()
-        start.assert_not_called()
+            self.assertEqual((calls[:2], calls[-3:], len(sent)), (["GET", "GET"], ["POST", "GET", "GET"], 2))
+            self.assertEqual((ran[:2], ran[-2:]), ([False, False], [True, False]))
+            self.assertEqual((publisher.process, publisher.ended), (None, 409))
+            child = sent[0].pop("child")
+            times = [f.pop("captured_at") for f in sent]
+            self.assertEqual(sent[0], {k: v for k, v in frame(5).items() if k != "captured_at"})
+            if hub_clock:
+                self.assertTrue(104 < times[0] < 112, times)
+                self.assertEqual(times[1], times[0])            # 10 seconds less ahead: not before the first one
+            else:
+                self.assertTrue(5 <= times[0] < times[1] < 12, times)
+            for _ in range(50):                 # the child of the capture went with its group
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            else:
+                os.kill(child, 9)
+                self.fail("a program that the capture started stayed behind")
+
+    def test_a_jump_of_a_clock_does_not_hold_the_frames_times_ahead(self):
+        """A frame's time on the hub's clock is never before the last one sent, and a time more than the hub's 2
+        seconds after its clock comes back to 1 second after it. This machine's clock stepped 1,000 seconds forward
+        between the hub's answer and a frame: that frame's time is too new, and without the limit every later frame
+        kept that time, which the hub refuses for the 1,000 seconds."""
+        sent, times = [], iter([time.time() + 1000, time.time(), time.time()])
+        answers = iter([(200, {"watching": True, "now": time.time()})] * 2 + [(409, {})])
+
+        def http(method, path, data=None, timeout=None):
+            if method == "POST":
+                sent.append(data["frame"]["captured_at"])
+                return 200, {}
+            return next(answers)
+        publisher = desktop.Publisher("box", "T-1", {"attempt": 1, "generation": "db"}, http, hub_clock=True)
+        publisher.frame = lambda: frame(next(times))
+        publisher.stop.wait = lambda seconds: None
+        publisher.run()
+        self.assertEqual(len(sent), 2)
+        self.assertLessEqual(sent[0], sent[1])
+        self.assertLess(sent[1], time.time() + 2)
+
+    def test_a_capture_that_does_not_end_never_stops_the_publisher_s_close(self):
+        """close_capture gives the capture two signals and two short waits, and then lets it go: a wait that raised
+        (a process that the kernel had not ended yet) left the publisher's thread with an error and its capture's
+        pipe open."""
+        publisher = desktop.Publisher("studio", "T-1", {"attempt": 1, "generation": "db"}, lambda *a, **kw: (409, {}))
+        publisher.process = Mock(pid=2 ** 22 + 7)               # no such process group
+        publisher.process.wait.side_effect = desktop.subprocess.TimeoutExpired("capture", 2)
+        process = publisher.process
+        publisher.close_capture()
+        self.assertEqual((publisher.process, process.stdout.close.call_count), (None, 1))
 
 
 class DesktopAPI(unittest.TestCase):

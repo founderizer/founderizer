@@ -103,6 +103,16 @@ can still reach in its own browser (a filled field, the vault's script, the brow
 [VAULT.md](VAULT.md), "What the vault does not protect": a copied session works until the site ends it, so after a
 grant's end the owner's step is the site's "sign out everywhere" or a new password.
 
+The live view of a browser task on a Linux server (build plan 04, S7) shows the agent's own screen as it is: the page
+in its Chrome, a field that a page shows in clear included, as the live view of a Mac shows that Mac's screen. Who sees
+it: the owner, in the Mac and iPhone apps, while the task's page is open (the frames go through the hub, which keeps the
+newest one in memory only, for 8 seconds after the last look), and the agent's own programs, which can read their own
+screen at any time. No other agent of the server sees it: the screen has a key of its own and no shared memory (Xvfb
+starts with `-extension MIT-SHM`, x11vnc with `-noshm`), and the capture connects to the screen's socket file only,
+reads it only where the kernel says that its X server runs as the agent's own user, and only while its Chrome is this
+task's. The frames come from a program of the agent's own user, so an agent that turns
+against the owner decides what they show, as at a take-over (below).
+
 At the owner's Take over (UI-API.md 1.225), the agent's helper shares that browser's screen with `x11vnc` on loopback
 and the agent's screen-sharing port, for one viewer, with no shared clipboard, and with a new one-time password at each
 press; only root and the server's worker user reach that port, so the owner's Mac opens it through its own SSH tunnel

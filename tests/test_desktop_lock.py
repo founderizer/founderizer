@@ -56,6 +56,16 @@ def jpeg(size, start=0):
     return b"\xff\xd8\xff" + filling[:size - 5] + b"\xff\xd9"
 
 
+
+def clocked(answer):
+    """(status, body) of an answer to the helper with its `now` checked and taken out: the hub's clock, which a Linux
+    publisher stamps its frames with (build plan 04, S7); a Mac's frames keep their own time."""
+    status, body = answer
+    body = dict(body)
+    now = body.pop("now", None)
+    assert isinstance(now, (int, float)) and abs(now - time.time()) < 60, now
+    return status, body
+
 class Watched(desktop.Frames):
     """desktop.Frames, with a record of each use of its rows while the thread does not hold the hub's lock: the name of
     the function of hub.py that used them. The rows are a plain dict that view, put, prune and drop change, so every
@@ -130,7 +140,7 @@ class Frames(unittest.TestCase):
         self.assertEqual(self.request(self.view)[1]["status"], "waiting")           # the owner's look opens the lease
         first, second = self.frame(desktop.MAX_FRAME), self.frame(desktop.MAX_FRAME, start=1 << 20)
         newer = self.frame(desktop.MAX_FRAME, start=3 << 20)
-        self.assertEqual(self.request(self.worker, dict(self.context, frame=first), source=WORKER),
+        self.assertEqual(clocked(self.request(self.worker, dict(self.context, frame=first), source=WORKER)),
                          (200, {"watching": True}))
         writing, written, failed, newer_put = threading.Event(), threading.Event(), [], []
         send, answer, setup = hub.Handler.send, hub.Handler.json, hub.Handler.setup
@@ -180,8 +190,8 @@ class Frames(unittest.TestCase):
                 self.assertTrue(taken, "the hub held its lock while the reader of a frame had read nothing")
                 # and the hub serves its other callers, each of which needs the lock: the worker asks if somebody
                 # watches and sends its next frame, and the owner reads that frame on another connection.
-                self.assertEqual(self.request(self.asks, source=WORKER), (200, {"watching": True}))
-                self.assertEqual(self.request(self.worker, dict(self.context, frame=second), source=WORKER),
+                self.assertEqual(clocked(self.request(self.asks, source=WORKER)), (200, {"watching": True}))
+                self.assertEqual(clocked(self.request(self.worker, dict(self.context, frame=second), source=WORKER)),
                                  (200, {"watching": True}))
                 self.assertFalse(written.is_set())                  # all of that while the first read is under way
                 data = b""
@@ -224,7 +234,9 @@ class Frames(unittest.TestCase):
             # The worker's question and its frame, with the one header of their route.
             for answer in (self.ask(self.asks, source=WORKER),
                            self.ask(self.worker, dict(self.context, frame=shown), source=WORKER)):
-                self.assertEqual(said(answer), (200, PLAIN + ["Cache-Control"], {"watching": True}))
+                status, headers, body = said(answer)
+                self.assertEqual((status, headers, clocked((status, body))[1]), (200, PLAIN + ["Cache-Control"],
+                                                                                  {"watching": True}))
                 self.assertEqual(answer[2]["Cache-Control"], "no-store")
             live = self.ask(self.view)
             self.assertEqual(said(live), (200, PLAIN + ["Cache-Control", "X-Content-Type-Options"],

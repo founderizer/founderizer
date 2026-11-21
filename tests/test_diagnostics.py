@@ -796,10 +796,11 @@ class OnTheHub(OwnerAPI):
                     hub.HubServer.handle_error(server, None, ("127.0.0.1", 1))
         self.assertEqual([row["name"] for row in diagnostics.pending()], ["ConnectionAbortedError"])
 
-    def test_a_stall_reaches_the_route_and_no_element_of_the_owners_screen(self):
-        """No app reads a stall yet, and the owner has no element for one: it is no fault, no warning of System status
-        and no part of the day's error report. A stall that goes on over several writes stays one row, whose first and
-        last time say how long it lasted, also when the database refused the write of its first count."""
+    def test_a_stall_reaches_the_route_and_the_days_report_and_no_warning(self):
+        """The owner's "Yes, reports only" of 21 November 2026: a stall is in the route (Report a problem's rows read it)
+        and in the day's error report, as a fault of its kind's class, and it is no fault of the hub and no warning of
+        System status. A stall that goes on over several writes stays one row, whose first and last time say how long
+        it lasted, also when the database refused the write of its first count."""
         clock, me = [100.0, hub.now() - 60], sys._getframe()
         w = diagnostics.Watch(cpu=lambda ids: {7: (clock[0] - 100.0) * 0.9}, frames=lambda: {70: me},
                               threads=lambda: [types.SimpleNamespace(native_id=7, ident=70)],
@@ -835,8 +836,8 @@ class OnTheHub(OwnerAPI):
         with hub.LOCK:
             self.assertEqual([x for x in hub.health_view()["warnings"] if x["kind"] == "hub_fault"], [])
             body = hub.error_report_body(0)
-        self.assertEqual((body["faults"], body["refusals"]), ([], []))
-        self.assertNotIn("stall", json.dumps(body))
+        self.assertEqual(sorted(f["class"] for f in body["faults"]), ["StallBusy", "StallPaused"])
+        self.assertEqual(body["refusals"], [])
 
     def test_the_table_keeps_the_newest_stall_rows_and_every_fault(self):
         """A stall's places vary from one stall to the next, so its rows are not bounded by the code's places as a

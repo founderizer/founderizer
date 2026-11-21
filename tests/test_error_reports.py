@@ -126,10 +126,31 @@ class Report(unittest.TestCase):
         for line in (f"{hub_py} hub.py", f"{tool} report_up"):        # a file of the tree, a tool of hub.TOOLS
             self.assertIn(line, lines)
 
+    def test_a_stall_goes_as_a_fault_of_its_kind_after_the_faults(self):
+        """The owner's "Yes, reports only" of 21 November 2026: each stall of the view goes as a fault of its kind's class,
+        with its places as marks and no value, and a run of stalls never pushes a real fault out of the twenty."""
+        stall = {"kind": "hold", "frames": [{"file": "hub.py", "line": 5574}, {"file": "lib", "line": 0}],
+                 "count": 1, "first": NOW - 300, "last": NOW - 60}
+        body = report({"faults": [a_fault()], "stalls": [stall] + [dict(stall, kind=k) for k in ("busy", "collect",
+                                                                                                    "paused", "slow")]})
+        self.assertEqual([f["class"] for f in body["faults"]],
+                         [a_fault()["class"], "StallHold", "StallBusy", "StallCollect", "StallPaused"])
+        self.assertEqual(body["faults"][1], {"program": "hub", "class": "StallHold", "errno": None, "http": None,
+                                             "frames": [{"file": errorreports.mark("hub.py"), "line": 5574},
+                                                        {"file": "lib", "line": 0}],
+                                             "count": 1, "first": NOW - 300, "last": NOW - 60})
+        many = report({"faults": [a_fault()], "stalls": [stall] * 30})["faults"]
+        self.assertEqual((len(many), many[0]["class"]), (errorreports.MOST, a_fault()["class"]))
+        with unittest.mock.patch.object(errorreports, "LIMIT", 1500):     # past the size, stalls go before an older fault
+            cut = report({"faults": [a_fault(last=NOW - 3000)], "stalls": [stall] * 10})["faults"]
+        self.assertEqual((cut[0]["class"], len(cut) < 11), (a_fault()["class"], True))
+        self.assertEqual(set(errorreports.STALL_CLASSES), set(diagnostics.STALLS))
+
     def test_our_side_takes_each_class_of_the_recorder(self):
         """Our side refuses a whole report whose class it does not hold (founderizer-web, src/lib/errors.ts, CLASSES).
-        A class added to diagnostics.CLASSES goes there first, then to errorreports.THEIR_CLASSES."""
-        self.assertEqual(diagnostics.CLASSES, errorreports.THEIR_CLASSES,
+        A class added to diagnostics.CLASSES goes there first, then to errorreports.THEIR_CLASSES; so do the classes
+        of a stall's kinds (STALL_CLASSES)."""
+        self.assertEqual(diagnostics.CLASSES | set(errorreports.STALL_CLASSES.values()), errorreports.THEIR_CLASSES,
                          "a class of diagnostics.CLASSES goes to founderizer-web's src/lib/errors.ts CLASSES first, live "
                          "on the site, and only then to errorreports.THEIR_CLASSES: until then it goes as \"other\"")
         with unittest.mock.patch.object(errorreports, "THEIR_CLASSES", frozenset({"ValueError"})):

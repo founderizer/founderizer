@@ -2099,9 +2099,12 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # "shouldn't we show somehow that they are being done?": for the manager,
                                     # turn_ended_after and waits_since count his answers too (chat_waited_kinds), and
                                     # an app waits under such an answer only on a hub that names this (UI-API.md 1.283)
-               "need_pictures"]     # the owner, 20 November 2026 ("the idea would be that Needs You shows multiple
+               "need_pictures",     # the owner, 20 November 2026 ("the idea would be that Needs You shows multiple
                                     # options as images too"): this hub reads X-Fleet-Draws, and an item can have
                                     # `pictures`, one for each option (UI-API.md 1.285)
+               "agent_tags"]        # the owner, 20 November 2026 ("Name a helper", "Yes, as drawn", "Build tags
+                                    # now"): POST /ui/messages takes `mentions`, the @ tags of a message, and
+                                    # messages[].mentions of GET /ui/state gives them (UI-API.md 1.288)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -4603,6 +4606,8 @@ def message_views(rows, attached, conf, named=None):
         about = message_view_about(m.pop("about", None), named or {})
         if about:
             m["about"] = about
+        # owner feature agent_tags: the tags as a list ([] for none), each entry as stored, also when its agent left
+        m["mentions"] = mentions_read(m.get("mentions"))
     for m in views:                         # owner feature attachments: the files of each message
         m["attachments"] = attached.get(m["request_id"], [])
     return views
@@ -5699,6 +5704,15 @@ def parse_id(value, what):
 
 class ToolError(Exception):
     pass
+
+
+DESKTOP_READY = {}              # agent -> (its Linux server, when, ready): Handler.desktop_task, in memory only
+DESKTOP_READY_KEEP = 5          # seconds that a look at a server's reading for the live view holds
+
+
+class DesktopWaits(ToolError):
+    """A task's live view has no frames now and may have them again (Handler.desktop_task): its Linux server's reading
+    says that the agent's browser is not ready there."""
 
 
 # ---------------------------------------------------------------- the hub's own faults (the lane "Bug reports")
@@ -7122,7 +7136,10 @@ def migrate():
                         "asked": "TEXT",
                         # owner feature message_about: the task or the job that the whole message is about, as JSON
                         # ({"task": <id>} or {"job": <id>}), from the page that the owner wrote it on; NULL for none
-                        "about": "TEXT"},
+                        "about": "TEXT",
+                        # owner feature agent_tags: the tags of a message, as JSON ([{agent, start, length}]); NULL
+                        # for none
+                        "mentions": "TEXT"},
         # the resource that a blocked ask names (needs_access), the level of it that the task needs (needs_level:
         # null when any level does), and what the asker said it would go on with when it asked without stopping
         # (asking_and_waiting): the record of what was decided by default
@@ -8587,11 +8604,13 @@ def task_itself(task_id, closed=False):
     # never in the details, which the apps show as the owner's own words
     about = message_about_of_task(t) if t["owner"] in agents() else None
     page = message_about_words(t["owner"], about, task=True, closed=closed) if about else ""
+    tags = tag_words(t["owner"], task_mentions(t)) if t["owner"] in agents() else ""    # owner feature agent_tags
     return (f'Your task is {tref(task_id)}, from {t["requester"]}: "{mask_secrets(str(t["title"]))}". Done when: '
             f'{mask_secrets(str(t["done_when"]))}'
             + (f"\nDetails: {shown}" + (" ... (list_my_tasks gives the rest)" if more else "")
                if line else "")
             + (f"\n{page}" if page else "")
+            + (f"\n{tags}" if tags else "")
             + attachment_words(files)
             + (f"\n{summary}" if summary else "")       # a report's task: its reporter's summary, as data
             + ((f'\nIt belongs to {gref(goal["id"])} "{aim}".' if closed else
@@ -20700,7 +20719,7 @@ def message_about_reads(rows):
 
 
 def owner_message_text(request_id, value, recipient, origin, replaces, files, device=False, connection=None,
-                       about=None):
+                       about=None, mentions=(), unsure=()):
     """The words of one owner chat message, as its reader gets them: the owner's text under the header that says who
     wrote it, and for a worker or a lead the request id that its reply names. A correction says what it corrects; a
     message that the owner edited before anything read it says nothing, because it is the same message with other
@@ -20712,7 +20731,8 @@ def owner_message_text(request_id, value, recipient, origin, replaces, files, de
     before a device. Its mark has a form that no other channel has (capp_via): via=app:Claude, [owner via app:Claude],
     so that no app's name reads as a chat app or a device. about: the task or the job that the message is about (owner
     feature message_about), whose reader's line comes after the owner's words and before the correction line and the
-    files, built at this moment (message_about_words)."""
+    files, built at this moment (message_about_words). mentions, unsure: the tags of the message and the words that fit
+    two agents (owner feature agent_tags), whose line comes after that one, built at this moment (tag_words)."""
     via = CHAT_APP_NAMES[origin["app"]] if origin else capp_via(connection) if connection else \
         (device if isinstance(device, str) else OWNER_DEVICE_VIA) if device else None
     if agents()[recipient].get("role") in ("worker", "lead"):
@@ -20722,6 +20742,9 @@ def owner_message_text(request_id, value, recipient, origin, replaces, files, de
     line = message_about_words(recipient, about) if about else ""
     if line:
         text += "\n" + line
+    tags = tag_words(recipient, mentions, unsure) if mentions or unsure else ""
+    if tags:
+        text += "\n" + tags
     if replaces:
         text += f"\n[Correction to request {replaces}. This is a new message, not cancellation or replay of earlier work.]"
     return text.rstrip() + attachment_words(files)
@@ -20743,7 +20766,7 @@ def message_unread(previous):
         "SELECT 1 FROM owner_reports WHERE in_reply_to=?", (previous["request_id"],)).fetchone() is None
 
 
-def owner_message_replace(previous, value, request_id, t0, device=False):
+def owner_message_replace(previous, value, request_id, t0, device=False, mentions=(), unsure=()):
     """Inside a transaction: the owner edited a message that nothing had read, so the message itself changes. Its
     ui_requests row and its event keep their id and their time, which is why the bubble changes where it stands;
     their text becomes the new words with nothing appended, and the words they replace go into the log, so the
@@ -20751,7 +20774,9 @@ def owner_message_replace(previous, value, request_id, t0, device=False):
     owner_message_text's, for the request of the edit (an edit comes only from the client that sent the message).
     A message that a connected app sent (ui_requests.connection) keeps the mark of that app, whatever client the
     edit names: the row says who sent it, and the header is built from the row. So is the reader's line of what the
-    message is about (owner feature message_about): an edit keeps the row's `about`, and its line is built again."""
+    message is about (owner feature message_about): an edit keeps the row's `about`, and its line is built again. The
+    tags of the new words are the message's tags now (owner feature agent_tags): the row takes them, and their line is
+    built again; the edits log keeps the words alone."""
     in_transaction("owner_message_replace")
     files = DB.execute("SELECT * FROM attachments WHERE message=? ORDER BY id", (previous["request_id"],)).fetchall()
     origin = json.loads(previous["origin"]) if previous["origin"] else None
@@ -20760,11 +20785,11 @@ def owner_message_replace(previous, value, request_id, t0, device=False):
         app = DB.execute("SELECT name FROM capp_connections WHERE id=?", (previous["connection"],)).fetchone()
         via = app["name"] if app else "App"     # a connection's row stays as the record; "App" as shown_name's last name
     text = owner_message_text(previous["request_id"], value, previous["recipient"], origin, None, files, device, via,
-                              about=message_about_read(previous["about"]))
+                              about=message_about_read(previous["about"]), mentions=mentions, unsure=unsure)
     edits = json.loads(previous["edits"] or "[]") + [{"request_id": request_id, "text": value, "at": t0}]
     DB.execute("UPDATE events SET text=? WHERE id=?", (text, previous["event_id"]))
-    DB.execute("UPDATE ui_requests SET text=?,edits=? WHERE request_id=?",
-               (value, json.dumps(edits), previous["request_id"]))
+    DB.execute("UPDATE ui_requests SET text=?,edits=?,mentions=? WHERE request_id=?",
+               (value, json.dumps(edits), json.dumps(list(mentions)) if mentions else None, previous["request_id"]))
     history_rewrite_message(previous["request_id"])     # AUTONOMY.md P6: the history reads it as it stands now
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI message {request_id} replaced the "
                f"words of {previous['request_id']} (M-{previous['event_id']} for {previous['recipient']}), which "
@@ -20773,7 +20798,7 @@ def owner_message_replace(previous, value, request_id, t0, device=False):
 
 def owner_message_rows(request_id, kind, need, value, client, recipient, replaces, t0, origin=None, files=(),
                        chosen=None, task=None, quiet=False, note="", device=False, connection=None, about=None,
-                       pictured=""):
+                       pictured="", mentions=(), unsure=()):
     """Inside a transaction: one owner message or answer, from the app (POST /ui/messages, /ui/needs/<id>) or from a
     chat app (origin): the answer of the need, one event and one ui_requests row. The caller checked everything.
     Returns the event ID. task: the task whose session the answer of a secret request goes to (answer_secret), and
@@ -20786,7 +20811,8 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     task or the job that a message is about (owner feature message_about), which phone_submit checked: it goes into
     ui_requests.about, and its reader's line into the event's words. pictured:
     which picture the option that the owner pressed has (need_picture_note, owner API 1.285), for the agent that raised
-    the item and for the asker of its question, and never in the stored answer."""
+    the item and for the asker of its question, and never in the stored answer. mentions: the tags of a message (owner
+    feature agent_tags), which go into ui_requests.mentions, with unsure their reader's line (tag_words)."""
     in_transaction("owner_message_rows")
     worker_chat = need is None and agents()[recipient].get("role") in ("worker", "lead")
     # owner feature secret_requests: a worker or a lead asks in its owner chat, so his answer goes back there, read
@@ -20799,7 +20825,7 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     via = connection["name"] if connection else None
     if need is None:
         text = owner_message_text(request_id, value, recipient, origin, replaces, files, device, via,
-                                  about=about) + (note or "")
+                                  about=about, mentions=mentions, unsure=unsure) + (note or "")
     else:
         mark = f" via {capp_via(via)}" if via else ""
         text = f"[owner{mark}] Answer to Needs-you N-{need['id']} ({need['title']}): {value}"
@@ -20845,15 +20871,357 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     if takeover:        # its next owner wait holds the task, else it works again
         secret_wait_moved(task)
     DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,"
-               "replaces_request_id,origin,connection,about) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+               "replaces_request_id,origin,connection,about,mentions) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (request_id, kind, need["id"] if need is not None else None, value, event_id, t0, client, recipient,
                 replaces, json.dumps(origin) if origin else None, connection["id"] if connection else None,
-                json.dumps(about) if about and need is None else None))
+                json.dumps(about) if about and need is None else None,
+                json.dumps(list(mentions)) if mentions and need is None else None))
     for f in files:
         DB.execute("UPDATE attachments SET message=? WHERE id=?", (request_id, f["id"]))
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} accepted as "
                f"M-{event_id} for {recipient}" + (f" from {origin['account']}" if origin else "")))
     return event_id
+
+
+# ---------------------------------------------------------------- owner feature agent_tags: @ tags in a message
+#
+# The owner, 20 November 2026: "@<agent-name> or @<agent-role> allows tagging an agent", and to "What must a tag do?":
+# "Name a helper" (~/dev/founderizer-plans/agent-tags-build-design-2026-11-21.md). A tag is a range of the owner's
+# message that names one agent of the team. It moves nothing and copies nothing: the message and its work stay with
+# its recipient, which reads one line of the hub's under the owner's words (tag_words) with the route of each tagged
+# agent, and gives that agent its part. The Mac and the iPhone find the tags of the words that they send and give
+# them as `mentions` of POST /ui/messages (mentions_kept checks them); the hub reads the words itself (tags_found) for
+# a chat app and for each caller that sends no `mentions`. When the work of the message ends and a tagged agent got
+# no task and no message in it, the hub tells the chat's agent (tags_unserved). A tag never stops a message: an entry
+# that does not hold is left out, and the message goes.
+MENTIONS_MAX = 10                   # tags of one message, from an app or from the hub's own reading
+MENTION_LENGTH = (2, 80)            # the length of one tag in characters: "@" and its label
+MENTIONS_SHAPE = "mentions is a list of at most 10 {agent, start, length}, for a chat message"
+TAG_BEFORE = "([{\"'"                # a tag starts at the start of the text, after whitespace or after one of these,
+TAG_AFTER = ".,;:!?)]}\"'"           # and ends at the end of the text, at whitespace or at one of these
+TAG_WORD = re.compile(r"[\w-]+")     # the one word of rule 3: letters, digits, "-" and "_"
+TAG_WORD_MIN = 3                     # its least length
+TAGS_TOLD = "tags_told:"             # kv: the manager was told of the tagged agents that the work of a message left out
+
+
+def mentions_given(value):
+    """The `mentions` of POST /ui/messages as the hub takes them, or None for a wrong shape: a list of at most
+    MENTIONS_MAX objects, each with exactly the keys agent (a string), start (0 or more) and length (2 to 80), whole
+    numbers (a bool is none)."""
+    if not isinstance(value, list) or len(value) > MENTIONS_MAX:
+        return None
+    out = []
+    for m in value:
+        if not isinstance(m, dict) or set(m) != {"agent", "start", "length"} or not isinstance(m["agent"], str):
+            return None
+        if any(isinstance(m[k], bool) or not isinstance(m[k], int) for k in ("start", "length")) or m["start"] < 0 or \
+                not MENTION_LENGTH[0] <= m["length"] <= MENTION_LENGTH[1]:
+            return None
+        out.append({"agent": m["agent"], "start": m["start"], "length": m["length"]})
+    return out
+
+
+def mentions_read(stored):
+    """The tags that a ui_requests row keeps (ui_requests.mentions, JSON), as a list: [] for NULL and for a value that
+    is no such list."""
+    try:
+        said = json.loads(stored) if stored else []
+    except ValueError:
+        return []
+    return [m for m in said if isinstance(m, dict) and isinstance(m.get("agent"), str)] if isinstance(said, list) else []
+
+
+def tag_label(agent, team=None):
+    """The words of an agent's tag (`@` + this): its role, on single spaces, when no other agent has the same role or
+    that role as its name, without regard to case; else its name as the apps show it (shown_name). So each label names
+    one agent, as CardNames does in the apps: a role that two agents hold names neither."""
+    team = agents() if team is None else team
+    role = " ".join(str((team.get(agent) or {}).get("title") or "").split())
+    said = agent_words(role)
+    if role and not any(other != agent and (agent_words(a.get("title")) == said or other.casefold() == said)
+                        for other, a in team.items()):
+        return role
+    return shown_name(agent)
+
+
+def tag_start(text, at):
+    """True when the "@" at `at` can start a tag: it is the first character of the text, or after whitespace or one of
+    TAG_BEFORE. An email (pat@marketing.example), a URL (https://example.com/@marketing) and a handle inside a word
+    never start one."""
+    return text[at:at + 1] == "@" and (at == 0 or text[at - 1].isspace() or text[at - 1] in TAG_BEFORE)
+
+
+def tag_end(text, at):
+    """True when a tag can end before `at`: at the end of the text, at whitespace or at one of TAG_AFTER, but a "."
+    before a letter or a digit is no end (@marketing.example)."""
+    if at >= len(text):
+        return True
+    c = text[at]
+    return c.isspace() or c in TAG_AFTER and not (c == "." and text[at + 1:at + 2].isalnum())
+
+
+def tag_code(text):
+    """For each character of the text, True where it is code, which holds no tag: a fenced block, from a line that
+    starts with three backticks to the next such line or to the end of the text, and what stands between two
+    backticks on one line."""
+    code, fenced, at = [False] * len(text), False, 0
+    for line in text.split("\n"):
+        if line.startswith("```") or fenced:
+            code[at:at + len(line)] = [True] * len(line)
+            fenced = fenced != line.startswith("```")
+        else:
+            ticks = [at + i for i, c in enumerate(line) if c == "`"]
+            for a, b in zip(ticks[::2], ticks[1::2]):
+                code[a:b + 1] = [True] * (b + 1 - a)
+        at += len(line) + 1
+    return code
+
+
+def tag_roles(team):
+    """[(the pattern of a role, [the agents that hold it])]: each space of the role is one run of spaces or tabs, and
+    the case does not count. Two agents' roles that differ only in case and spaces are one."""
+    roles, seen = {}, {}
+    for n, a in team.items():
+        role = " ".join(str((a or {}).get("title") or "").split())
+        if role:
+            roles.setdefault(seen.setdefault(agent_words(role), role), []).append(n)
+    return [(re.compile(r"[ \t]+".join(map(re.escape, role.split())), re.IGNORECASE), holders)
+            for role, holders in roles.items()]
+
+
+def tag_at(text, at, recipient, team, roles):
+    """What the words after the "@" at `at` name, by the three rules of the hub's reading, the first rule that finds an
+    agent deciding: (end, [agent]) for a tag, (end, [two agents or more]) for words that fit more than one, or None.
+    1: a whole role (tag_roles), the longest match first; a role that two agents hold fits both. 2: a name, without
+    regard to case. 3: one word of at least TAG_WORD_MIN letters, digits, "-" or "_" that starts a word of the role or
+    the name of the other agents, counted together. After the words a tag ends (tag_end). The chat's own agent is no
+    tag: words that name it by rule 1 or 2 name nobody, and it does not count in rule 3."""
+    longest = None
+    for pattern, holders in roles:
+        m = pattern.match(text, at + 1)
+        if m and tag_end(text, m.end()) and (longest is None or m.end() > longest[0]):
+            longest = (m.end(), [n for n in holders if n != recipient])
+    if longest:
+        return longest if longest[1] else None
+    named = [n for n in team if text[at + 1:at + 1 + len(n)].lower() == n and tag_end(text, at + 1 + len(n))]
+    if named:
+        name = max(named, key=len)
+        return (at + 1 + len(name), [name]) if name != recipient else None
+    word = TAG_WORD.match(text, at + 1)
+    if not word or len(word.group()) < TAG_WORD_MIN or not tag_end(text, word.end()):
+        return None
+    start = word.group().casefold()
+    fits = [n for n in team if n != recipient and (n.casefold().startswith(start) or any(
+        w.casefold().startswith(start) for w in str((team[n] or {}).get("title") or "").split()))]
+    return (word.end(), fits) if fits else None
+
+
+def tags_found(text, recipient):
+    """The hub's own reading of the owner's words, for a chat app and for each caller of POST /ui/messages that sends
+    no `mentions`: (found, unsure). found: the tags, [{agent, start, length}] in the order of the text, at most
+    MENTIONS_MAX; unsure: [(the words, [the agents that they fit])] for words that fit two agents or more, which are no
+    tag and which the reader's line names. Only at a tag start (tag_start) outside code (tag_code). Words that fit no
+    agent stay plain words, and nothing is said of them."""
+    team, found, unsure = agents(), [], []
+    code, roles, at = tag_code(text), tag_roles(team), 0
+    while len(found) < MENTIONS_MAX:
+        at = text.find("@", at)
+        if at < 0:
+            break
+        hit = tag_at(text, at, recipient, team, roles) if not code[at] and tag_start(text, at) else None
+        if hit is None:
+            at += 1
+            continue
+        end, fits = hit
+        if len(fits) == 1:
+            found.append({"agent": fits[0], "start": at, "length": end - at})
+        elif len(unsure) < MENTIONS_MAX and agent_words(text[at:end]) not in (agent_words(w) for w, _ in unsure):
+            unsure.append((" ".join(text[at:end].split()), fits))
+        at = end
+    return found, unsure
+
+
+def mentions_kept(value, mentions, recipient, lead=0):
+    """The app's tags of a message (mentions_given) that hold in its words, in the order of the text: under LOCK, after
+    the recipient's check. lead: the characters that the hub stripped from the start of the words, which moves each
+    start. An entry is left out, and the message goes, when its range goes past the end of the words or overlaps an
+    earlier one, when no "@" stands at its start or that "@" can start no tag (tag_start), and when it names no agent
+    of the team or the recipient itself. The words after the "@" are not compared with the agent's label: a rename
+    or a new role between the pick and the send must not drop his tag."""
+    team, kept, last = agents(), [], 0
+    for m in sorted(({"agent": m["agent"], "start": m["start"] - lead, "length": m["length"]} for m in mentions),
+                    key=lambda m: m["start"]):
+        start, end = m["start"], m["start"] + m["length"]
+        if start < last or end > len(value) or not tag_start(value, start) or m["agent"] not in team or \
+                m["agent"] == recipient:
+            continue
+        kept.append(m)
+        last = end
+    return kept
+
+
+def tag_named(mentions):
+    """The agents of these tags, each once, in the order of the text."""
+    return list(dict.fromkeys(m["agent"] for m in sorted(mentions, key=lambda m: m["start"])))
+
+
+def tag_above(recipient, agent):
+    """True when `agent` is the agent that gives the recipient its tasks (task_giver), or above it."""
+    up, seen = task_giver(recipient), set()
+    while up and up not in seen:
+        if up == agent:
+            return True
+        seen.add(up)
+        up = reports_to(up)
+    return False
+
+
+def tag_route(recipient, agent):
+    """How the recipient of a message (a worker or a lead) gives a tagged agent its part, by the record of now and
+    RULES.md "Who answers to whom": a peer gets a task directly, any other agent goes through the line. A recipient
+    whose Shell box is off is no peer of anybody (peers), and its sessions have message_agent and neither
+    ask_my_requester nor report_up (SHELL_OFF_CHAT, SHELL_OFF_TOOLS), so its words name that tool."""
+    if agent not in agents():
+        return "it is no longer in the team, so it gets no part."
+    if not agent_active(agent):
+        return "it is in setup and takes no work: tell the owner."
+    if authority(recipient, agent, "task")[0]:
+        return "it is on your team: give it its part as a subtask."
+    if peers(recipient, agent)[0]:
+        return "it is your peer: give it its part as a task, from your task's session."
+    off = shell_off(recipient)
+    if tag_above(recipient, agent):
+        return "it is above you: ask it with message_agent." if off else \
+            "it is above you: ask it with ask_my_requester or report_up."
+    giver = task_giver(recipient)
+    return (f"it is not on your line: ask {giver} for its part with message_agent. Say what it must do and when."
+            if off else
+            f"it is not on your line: ask {giver} for its part, with ask_my_requester when you are blocked, else "
+            f"report_up. Say what it must do and when.")
+
+
+def tag_listed(names):
+    """'A (a); B (b)' for the line of tags."""
+    return "; ".join(f"{tag_label(n)} ({n})" for n in names)
+
+
+def tag_words(recipient, mentions, unsure=()):
+    """The reader's line of a message with tags (owner feature agent_tags), for its recipient, at this moment: who the
+    tags name, that a tag sends them nothing, and how each one gets its part. In the chat of a worker or a lead, and
+    in the session of the task that it opened from the message (task_itself), each agent's route (tag_route); in the
+    manager's chat, one job: the tasks that it gives them name the message as their ask. unsure: words of the hub's
+    own reading that fit two agents or more (tags_found), each one sentence, or the whole line when the message has
+    no tag. "" for neither. read_row only: owner_message_rows builds the line inside its transaction."""
+    names, said = tag_named(mentions), []
+    if names and role_of(recipient) == "manager":
+        one = len(names) == 1
+        setup = [f"{n} is in setup and takes no work: tell the owner." for n in names
+                 if n in agents() and not agent_active(n)]
+        said = [f"The owner tagged {tag_listed(names)} for this message." if one else
+                f"The owner tagged {len(names)} agents for this message: {tag_listed(names)}.",
+                "The tag says who gets a task of this one job." if one else
+                "The tags say who gets a task of this one job.",
+                "Give it its task with ask the M-number of this message, so that all of it shows on one job card."
+                if one else "Give each of them its task with ask the M-number of this message, in the order that the "
+                            "work needs, so that all of it shows on one job card.",
+                "A tag sends it nothing." if one else "A tag sends them nothing.", *setup,
+                "If it gets no task, tell the owner why." if one else "If one of them gets no task, tell the owner why."]
+    elif len(names) == 1:
+        n = names[0]
+        said = [f"The owner tagged {tag_listed(names)} as a helper for this message.",
+                f"A tag sends {n} nothing: the message and the work stay yours.",
+                f"If the work needs {n}, give it its part at the correct time: {tag_route(recipient, n)}",
+                f"If {n} gets no part, say why in your result."]
+    elif names:
+        said = [f"The owner tagged {len(names)} agents as helpers for this message: {tag_listed(names)}.",
+                "A tag sends them nothing: the message and the work stay yours.",
+                "If the work needs one of them, give it its part at the correct time.",
+                *(f"{n}: {tag_route(recipient, n)}" for n in names),
+                "If one of them gets no part, say why in your result."]
+    for word, fits in unsure:
+        listed = [f"{tag_label(n)} ({n})" for n in fits]
+        said.append(f'The owner wrote "{word}", which fits {", ".join(listed[:-1])} and {listed[-1]}. The hub took '
+                    f'{"neither" if len(fits) == 2 else "none of them"} as a tag: ask the owner which one, when it '
+                    f'matters.')
+    return "[" + " ".join(said) + "]" if said else ""
+
+
+def task_mentions(t):
+    """The tags of the owner's message that a task comes from, for the session of that task (task_itself): of its ask
+    and each correction under it, when the task's agent is their recipient, as start_task opens it. A task that the
+    manager or a lead gave a tagged agent gets none: its words are its requester's. A narrowed pair's task gets none
+    too (tasks.scope_person): its session reads no words of another person or agent, and the line names colleagues.
+    read_rows only, as task_itself."""
+    if not t["ask"] or t["scope_person"] is not None:
+        return []
+    return [m for r in read_rows("WITH RECURSIVE chain(r) AS (SELECT ? UNION SELECT u.request_id FROM ui_requests u "
+                                 "JOIN chain ON u.replaces_request_id=chain.r) SELECT u.mentions FROM ui_requests u "
+                                 "JOIN chain ON u.request_id=chain.r WHERE u.recipient=? AND u.mentions IS NOT NULL "
+                                 "ORDER BY u.created", (t["ask"], t["owner"]))
+            for m in mentions_read(r["mentions"])]
+
+
+def tags_message_named(request_id):
+    """(the row of the owner's message `request_id`, the agents of the team that it and each correction under it
+    tagged, in the order of the text), or (None, []) for no such message. A tagged agent that left the team is none:
+    nothing can give it a part. read_rows only, and no scan of the tasks: the callers ask this first, so a message with
+    no tags costs two reads by key. The chain of corrections goes to the same recipient after the message
+    (phone_submit), so its read keeps to the index of the recipient's messages. The row's text is its first 200
+    characters, for a line that names the message."""
+    head = read_row("SELECT request_id, recipient, created, event_id, asked, substr(text, 1, 200) AS text FROM "
+                    "ui_requests WHERE request_id=? AND kind='message'", (request_id,))
+    if head is None:
+        return None, []
+    rows = read_rows("WITH RECURSIVE chain(r) AS (SELECT ? UNION SELECT u.request_id FROM ui_requests u JOIN chain ON "
+                     "u.replaces_request_id=chain.r WHERE u.recipient=? AND u.created>=?) SELECT u.mentions FROM "
+                     "ui_requests u JOIN chain ON u.request_id=chain.r WHERE u.mentions IS NOT NULL ORDER BY u.created",
+                     (request_id, head["recipient"], head["created"]))
+    return head, [n for n in tag_named([m for r in rows for m in mentions_read(r["mentions"])]) if n in agents()]
+
+
+def tags_unserved(request_id):
+    """The tagged agents of the owner's message `request_id` and of each correction under it (tags_message_named)
+    that its work left out: those that, after the message's time, own no task whose ask is this message (in any
+    state), and got no agent message from its recipient or from the agent of a task of this ask. In the order of the
+    text. read_rows only."""
+    head, names = tags_message_named(request_id)
+    if not names:
+        return []
+    owners = {r["owner"] for r in read_rows("SELECT owner FROM tasks WHERE ask=?", (request_id,))}
+    senders = sorted(owners | {head["recipient"]})
+    told = {r["recipient"] for r in read_rows(
+        f"SELECT DISTINCT recipient FROM agent_messages WHERE sender IN ({','.join('?' * len(senders))}) AND "
+        f"created>=?", (*senders, head["created"]))}
+    return [n for n in names if n not in owners and n not in told]
+
+
+def tags_unserved_words(names):
+    """(the labels, the names) of the tagged agents that the work left out, as one list each in words: "Marketing
+    (atlas) and DevOps (iris)", "atlas and iris"."""
+    labels = [f"{tag_label(n)} ({n})" for n in names]
+    return (", ".join(labels[:-1]) + " and " + labels[-1] if len(labels) > 1 else labels[0],
+            ", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else names[0])
+
+
+def tags_check(task_id):
+    """A task ended (end_waits, beside chat_result): when its ask is a message of the owner's to the manager whose tags
+    named agents, no task of that ask is open any more, and a tagged agent got no task and no message in its work
+    (tags_unserved), the manager gets one quiet line, once for each ask. A worker's or a lead's chat hears it in the
+    result of the task that it opened (chat_result). Committing."""
+    t = q1("SELECT ask FROM tasks WHERE id=?", (task_id,))
+    head, named = tags_message_named(t["ask"]) if t and t["ask"] else (None, [])
+    if not named or role_of(head["recipient"]) != "manager" or kv_get(TAGS_TOLD + head["request_id"]) or \
+            q1(f"SELECT 1 FROM tasks WHERE ask=? AND {OPEN_TASK} LIMIT 1", (head["request_id"],)):
+        return
+    names = tags_unserved(head["request_id"])
+    if not names:
+        return
+    labels, said = tags_unserved_words(names)
+    emit(head["recipient"], "say", f'[hub] The owner tagged {labels} in M-{head["event_id"]} ("'
+                                   f'{clip(head["asked"] or head["text"], 120)}"). All of its tasks ended, and {said} '
+                                   f'got no task and no message in that work. Tell the owner why, or give '
+                                   f'{said if len(names) == 1 else "each of them"} its task now.', extra=QUIET_SAY)
+    kv_set(TAGS_TOLD + head["request_id"], now())
 
 
 def need_question_rows(need, value, t0, files=(), more=""):
@@ -21270,8 +21638,12 @@ def chat_route(account, acc, m, t0, hit, preview):
     # the files that the bridge sent up for this message become files of the owner's message, as his uploads from the
     # Mac do: the agent opens them with read_attachment, and a task that the message opens gets them (task_files)
     files = bridge_file_rows(account, m["id"])
+    # owner feature agent_tags: a chat app sends the words as they are, so the hub finds the tags in them (CHAT-APPS.md
+    # 21); a person's conversation (person_route) has none
+    found, unsure = tags_found(m["text"].strip(), agent)
     owner_message_rows(request_id, "message", None, m["text"].strip(), f"fleet-channels/1/{account}", agent, None, t0,
-                       origin, files=files, note=chat_unopened_line(m["kind"], acc["app"], m["missed"], len(files)))
+                       origin, files=files, note=chat_unopened_line(m["kind"], acc["app"], m["missed"], len(files)),
+                       mentions=found, unsure=unsure)
     return "stored", request_id
 
 
@@ -22269,6 +22641,7 @@ def end_waits(task_id):
     conversation_result(task_id)        # AUTONOMY.md P2: a task that a conversation opened tells it its result
     secret_waits_end(task_id)           # owner feature secret_requests: its waits on the owner's secrets end with it
     chat_result(task_id)                # and one that an owner chat opened (start_task) tells that chat
+    tags_check(task_id)                 # owner feature agent_tags: the manager hears of a tagged agent left out
 
 
 def wait_sweep(t0):
@@ -25500,12 +25873,25 @@ def chat_result(task_id):
     a = (agents().get(t["owner"]) or {}) if source else {}
     if not source or a.get("role") not in ("worker", "lead") or not owner_chat(a):
         return
+    # owner feature agent_tags: a tag is never lost. The result names the tagged agents that the work left out once
+    # for each ask (TAGS_TOLD, as tags_check), at the end of the last open task that this chat opened from it: another
+    # such task may still give a tagged agent its part. A task that another agent owns does not wait for it.
+    left = tags_unserved(t["ask"]) if t["ask"] and tags_message_named(t["ask"])[1] and \
+        not kv_get(TAGS_TOLD + t["ask"]) and not q1(
+            f"SELECT 1 FROM tasks s WHERE s.ask=? AND s.owner=? AND s.id<>? AND {OPEN_TASK} AND EXISTS (SELECT 1 "
+            f"FROM tool_commands c WHERE c.agent=s.owner AND c.tool='start_task' AND json_extract(c.receipt, "
+            f"'$.task')=s.id) LIMIT 1", (t["ask"], t["owner"], task_id)) else []
+    labels, names = tags_unserved_words(left) if left else ("", "")
     said = (f"[hub] {tref(task_id)} ({clip(t['title'] or '', 120)}), which you opened from the owner's message "
             f"{source} in this chat, is {t['state']}: {clip(t['what'] or '', 3000)}"
-            + (f" Where: {clip(t['where_'], 300)}" if t["where_"] else "") +
+            + (f" Where: {clip(t['where_'], 300)}" if t["where_"] else "")
+            + (f" The owner tagged {labels} for this work, and {names} got no task and no message in it: say why in "
+               f"your words to the owner." if left else "") +
             " Tell the owner in a few words what came of it, with message_owner: your next message_owner goes "
             "where they wrote that message. It needs no other reply.")
     emit(t["owner"], "chat", said, extra={"generation": kv_get("db_id"), "task_result": task_id})
+    if left:
+        kv_set(TAGS_TOLD + t["ask"], now())
     log(t["owner"], f"the result of {tref(task_id)} went back into its owner chat")
 
 
@@ -60516,6 +60902,12 @@ def rename_rows(old, new, t0, key_moves=False):
             if isinstance(names, list):
                 DB.execute(f"UPDATE {table} SET {column}=? WHERE rowid=?",
                            (json.dumps([new if n == old else n for n in names]), row["row_id"]))
+    # owner feature agent_tags: the tags of the owner's messages name the agent by its new name; their words stay
+    for row in DB.execute("SELECT rowid AS row_id, mentions FROM ui_requests WHERE mentions LIKE ?",
+                          (f'%"{old}"%',)).fetchall():
+        DB.execute("UPDATE ui_requests SET mentions=? WHERE rowid=?", (json.dumps(
+            [dict(m, agent=new) if m.get("agent") == old else m for m in mentions_read(row["mentions"])]),
+            row["row_id"]))
 
 
 def rename_agent(agent, body):
@@ -70181,6 +70573,14 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
         about = message_about_given(about) if need_id is None else None
         if about is None:
             return (400, {"error": MESSAGE_ABOUT_SHAPE})
+    # owner feature agent_tags: the tags that the app found in the words of a chat message; [] says that it read them
+    # and found none. No key, and null, are no reading: the hub reads the words itself (tags_found).
+    mentions = data.get("mentions")
+    if mentions is not None:
+        mentions = mentions_given(mentions) if need_id is None else None
+        if mentions is None:
+            return (400, {"error": MENTIONS_SHAPE})
+    lead = 0                            # the characters that the strip of the words takes from their start
     yes, signed = data.get("statement"), data.get("signature")      # his signed yes to a door call
     if (yes is not None or signed is not None) and (need_id is None or not isinstance(yes, str) or
                                                     not isinstance(signed, str) or len(yes) > 2048 or
@@ -70228,6 +70628,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
             value = ""                  # the files are the message
         if not isinstance(value, str) or len(value) > 16000 or (not value.strip() and not files):
             return (400, {"error": "text must contain 1 to 16000 characters, or the message carries a file"})
+        lead = len(value) - len(value.lstrip())
         value = value.strip()
         if secret_hit(value):
             return (422, refusal_words.answer("login_as_text"))
@@ -70371,7 +70772,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
        created=old["created"], read_at=read_at, replayed=True, client=client, edited=False,
        message_request_id=request_id,
        recipient=recipient, replaces_request_id=replaces, attachments=had,
-       chosen=need["chosen"] if need is not None else None))
+       chosen=need["chosen"] if need is not None else None, mentions=mentions_read(old["mentions"])))
         # owner API 1.223: a request id is a message's or a steer's, never both (owner_file_refused), and the replay
         # of this same message got its stored answer above
         if DB.execute("SELECT 1 FROM steers WHERE request_id=?", (request_id,)).fetchone():
@@ -70409,7 +70810,8 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
                 return (200, dict(ok=True, request_id=request_id, event_id=previous["event_id"],
            created=previous["created"], read_at=read_at, replayed=True, client=client, edited=True,
            message_request_id=previous["request_id"],
-           recipient=recipient, replaces_request_id=replaces, attachments=[], chosen=None))
+           recipient=recipient, replaces_request_id=replaces, attachments=[], chosen=None,
+           mentions=mentions_read(previous["mentions"])))
         worker_chat = need_id is None and agents()[recipient].get("role") in ("worker", "lead")
         if worker_chat and not owner_chat(agents()[recipient]):
             return (409, {"error": f"direct chat with a "
@@ -70430,6 +70832,15 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
                 about = None
             elif recipient not in (named["owner"], named["requester"]) or named["scope_person"] is not None:
                 return (409, refusal_words.answer("about_unreadable", agent=shown_role(recipient)))
+        # owner feature agent_tags: the app's tags that hold in the words, or the hub's own reading of them, against the
+        # team of now; an answer to a Needs-you item has none
+        unsure = []
+        if need is not None:
+            mentions = []
+        elif mentions is None:
+            mentions, unsure = tags_found(value, recipient)
+        else:
+            mentions = mentions_kept(value, mentions, recipient, lead)
         try:
             rows = owner_upload_rows(files, client)
         except Refusal as e:
@@ -70448,12 +70859,13 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
             # the same moment wins and this edit falls back to a correction.
             edited = previous is not None and not files and message_unread(previous)
             if edited:
-                owner_message_replace(previous, value, request_id, created, device)
+                owner_message_replace(previous, value, request_id, created, device, mentions=mentions, unsure=unsure)
                 event_id, created = previous["event_id"], previous["created"]
             else:
                 event_id = owner_message_rows(request_id, kind, need, value, client, recipient, replaces, created,
                                               files=rows, chosen=None if ticked is not None else choice,
                                               device=device, connection=connection, about=about,
+                                              mentions=mentions, unsure=unsure,
                                               note=need_run_note(need, ran["status"], ran_output) if ran is not None
                                               else team_answer_note(need, choice) or given or
                                               need_words_note(need, choice, ticked, value),
@@ -70472,7 +70884,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
    created=created, read_at=None, replayed=False, client=client, edited=edited,
    message_request_id=previous["request_id"] if edited else request_id,
    recipient=recipient, replaces_request_id=replaces, attachments=[r["id"] for r in rows],
-   chosen=choice))
+   chosen=choice, mentions=mentions))
     if need is not None and not edited and need["key_swap_server"]:
         key_swap_answered()     # the owner's press of a server's key swap item: after LOCK, in the turn (kit_lock)
     if isinstance(pressed, dict):
@@ -76819,10 +77231,33 @@ class Handler(BaseHTTPRequestHandler):
             DESKTOP.drop(key)       # a task of a removed person's conversation: its view ends as any ended task's
             raise ToolError("Desktop viewing is stopped for this task.") from None
         owner = agents().get(task["owner"]) or {}
-        browser = task["needs"] == "browser" and ("screen" in owner.get("can", []) or
-                                                  server_kind_of(TEAM, owner.get("machine")) == "mac")
-        if (task["needs"] != "screen" and not browser) or task["state"] in TERMINAL or active_hold(tid):
+        # A browser task shows the screen of a Mac, or of an agent with the Screen box. On a Linux server (build plan
+        # 04, S7) it shows the agent's own screen, where its helper would start its browser there now: the same rule
+        # as a new browser task's (browser_refusal), without the places.
+        #
+        # **A server's reading that says "not ready" stops the frames, and it does not end the worker's publisher**
+        # (DesktopWaits). A reading changes at each report of the server (the live proof of its port rule can fail
+        # at one and hold at the next), and a publisher that got a 409 starts again only when a line goes into its
+        # task's window (Helper.sweep_desktop): the view of that attempt stayed empty after the server was ready
+        # again. What the agent's own entry says (its Shell box, its runtime) is no reading, and it refuses as before.
+        # The owner's view gets the answer of a view that waits for its first frame, so that it shows frames again
+        # at the next reading. The readiness is kept DESKTOP_READY_KEEP seconds for each agent: the worker asks
+        # twice a second, and each look parses the server's whole reading under the hub's lock.
+        linux = browser_server(task["owner"])
+        on_linux = task["needs"] == "browser" and bool(linux) and not lifecycle.linux_browser_refusal(owner)
+        shown = "screen" in owner.get("can", []) or server_kind_of(TEAM, owner.get("machine")) == "mac"
+        waits = False
+        if on_linux and not shown:
+            kept = DESKTOP_READY.get(task["owner"])
+            if not kept or kept[0] != linux or not 0 <= now() - kept[1] < DESKTOP_READY_KEEP:
+                kept = DESKTOP_READY[task["owner"]] = (linux, now(), not browser_not_ready(task["owner"], linux))
+            waits = not kept[2]
+        browser = task["needs"] == "browser" and (shown or on_linux and not waits)
+        ended = task["state"] in TERMINAL or active_hold(tid)
+        if (task["needs"] != "screen" and not browser) or ended:
             DESKTOP.drop(key)
+            if waits and not shown and not ended:
+                raise DesktopWaits("Desktop viewing is stopped for this task.")
             raise ToolError("Desktop viewing is stopped for this task.")
         return task, key
 
@@ -76847,8 +77282,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             with LOCK:
-                task, key = self.desktop_task("T-" + task_id, query.get("db"), query.get("attempt"))
-                answer = dict(db=key[0], task=task["id"], attempt=task["attempt"], **DESKTOP.view(key, now()))
+                try:
+                    task, key = self.desktop_task("T-" + task_id, query.get("db"), query.get("attempt"))
+                    answer = dict(db=key[0], task=task["id"], attempt=task["attempt"], **DESKTOP.view(key, now()))
+                except DesktopWaits:        # its Linux server reads "not ready" now: the view waits, with no lease
+                    answer = dict(db=query.get("db"), task=int(task_id), attempt=int(query.get("attempt")),
+                                  status="waiting", image=None, captured_at=None)
         except ToolError as e:
             return self.json(409, refusal_body(e))
         return self.json(200, answer, {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
@@ -76866,11 +77305,14 @@ class Handler(BaseHTTPRequestHandler):
                 if write:
                     DESKTOP.put(key, data.get("frame", {}), now())
                 watching = DESKTOP.watching(key, now())
+        except DesktopWaits:        # the server's reading says "not ready" now: nobody watches, and the worker asks on
+            return self.json(200, {"watching": False, "now": now()}, {"Cache-Control": "no-store"})
         except ToolError as e:
             return self.json(409, refusal_body(e))
         except (ValueError, TypeError, KeyError):
             return self.json(400, {"error": "invalid desktop frame"})
-        return self.json(200, {"watching": watching}, {"Cache-Control": "no-store"})
+        # `now`: the hub's clock, for a publisher that puts its frames' times on it (desktop.Publisher, hub_clock)
+        return self.json(200, {"watching": watching, "now": now()}, {"Cache-Control": "no-store"})
 
     def body(self):
         return self._raw

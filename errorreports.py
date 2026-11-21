@@ -7,7 +7,8 @@ The owner, 16 November 2026, to the picture of Settings › General with a secti
 <channel>/api/errors`, which the Mac app and the website follow too.
 
 **What goes is what he was told goes, and nothing else:** the hub's errors as diagnostics.view gives them (a class
-from the fixed list, files and lines of this code tree, numbers and times, never a word of an error), the refused
+from the fixed list, files and lines of this code tree, numbers and times, never a word of an error), its stalls in
+the same shape (a class of STALL_CLASSES; the owner's "Yes, reports only" of 21 November 2026), the refused
 calls in the same shape, and facts: the fleet's random id, the version of the release that runs (from its signed
 manifest, never a commit of the configuration ref, which is this fleet's own), the code's id, the operating system's
 name and version, and how many agents and servers the fleet has. Every value is checked again here against the
@@ -77,6 +78,11 @@ THEIR_CLASSES = frozenset((
     "RuntimeError", "SSLError", "StopIteration", "SubprocessError", "TimeoutError", "TimeoutExpired", "ToolError",
     "TypeError", "URLError", "UnboundLocalError", "UnicodeDecodeError", "UnicodeEncodeError", "UnicodeError",
     "ValueError", "ZeroDivisionError"))
+# A stall of the hub (diagnostics.STALLS, owner API 1.284) goes as a fault of its kind's class, on the owner's "Yes,
+# reports only" of 21 November 2026: our side takes these four (founderizer-web, src/lib/errors.ts, CLASSES) since
+# that day, and a class that it lacked would refuse the whole report.
+STALL_CLASSES = {"busy": "StallBusy", "hold": "StallHold", "collect": "StallCollect", "paused": "StallPaused"}
+THEIR_CLASSES = THEIR_CLASSES | frozenset(STALL_CLASSES.values())
 COMMIT = re.compile(r"[0-9a-f]{40}")
 
 
@@ -220,6 +226,19 @@ def _fault(entry):
     return dict({"program": entry["program"], "class": name, "frames": frames, "errno": errno, "http": http}, **times)
 
 
+def _stall(entry):
+    """One stall of diagnostics.view as a fault of its kind's class (STALL_CLASSES), checked again, or None."""
+    kind, frames = entry.get("kind"), entry.get("frames")
+    name = STALL_CLASSES.get(kind) if isinstance(kind, str) else None
+    if name is None or not isinstance(frames, list) or not frames or len(frames) > diagnostics.MAX_FRAMES:
+        return None
+    frames, times = [_frame(f) for f in frames], _times(entry)
+    if None in frames or times is None:
+        return None
+    return dict({"program": "hub", "class": name if name in THEIR_CLASSES else "other", "frames": frames,
+                 "errno": None, "http": None}, **times)
+
+
 def _refusal(entry):
     """One refused call of diagnostics.view in the contract's shape, checked again, or None. Its tool goes as its
     mark, or as "other" when the recorder did not know it."""
@@ -237,9 +256,9 @@ def _size(body):
 
 
 def report(fleet, version, system, code, agents, servers, view, since=0):
-    """The day's report: the facts and the faults and refused calls of `view` (diagnostics.view) whose last time is
-    after `since`, at most MOST of each, and the oldest of them left out until the report is LIMIT bytes or less. None
-    when a required fact is out of shape: then nothing goes."""
+    """The day's report: the facts and the faults, stalls (as faults of STALL_CLASSES) and refused calls of `view`
+    (diagnostics.view) whose last time is after `since`, at most MOST of each, and the oldest of them left out until
+    the report is LIMIT bytes or less. None when a required fact is out of shape: then nothing goes."""
     if not isinstance(fleet, str) or not FLEET.fullmatch(fleet) or not isinstance(version, str) \
             or not VERSION.fullmatch(version):
         return None
@@ -252,14 +271,20 @@ def report(fleet, version, system, code, agents, servers, view, since=0):
         if _number(value, 0, COUNT_MOST) is not None:
             body[key] = value
     view = view if isinstance(view, dict) else {}
-    for key, check in (("faults", _fault), ("refusals", _refusal)):
+
+    def checked(key, check):
         given = view.get(key)
         given = given if isinstance(given, list) else []
         newer = [e for e in given if isinstance(e, dict) and (_time(e.get("last")) or 0) > since]
-        body[key] = [x for x in map(check, newer) if x is not None][:MOST]
-    while _size(body) > LIMIT and (body["faults"] or body["refusals"]):
-        oldest = min((x["last"], key, i) for key in ("faults", "refusals") for i, x in enumerate(body[key]))
-        del body[oldest[1]][oldest[2]]
+        return [x for x in map(check, newer) if x is not None]
+    # a stall goes as a fault, after the faults: a run of stalls never pushes an exception out of the twenty
+    body["faults"] = (checked("faults", _fault) + checked("stalls", _stall))[:MOST]
+    body["refusals"] = checked("refusals", _refusal)[:MOST]
+    stalls = set(STALL_CLASSES.values())
+    while _size(body) > LIMIT and (body["faults"] or body["refusals"]):     # a stall goes first, then the oldest
+        oldest = min((x.get("class") not in stalls, x["last"], key, i) for key in ("faults", "refusals")
+                     for i, x in enumerate(body[key]))
+        del body[oldest[2]][oldest[3]]
     return body
 
 

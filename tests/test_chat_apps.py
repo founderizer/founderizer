@@ -272,6 +272,38 @@ class ChatApps(OwnerAPI):
         self.assertEqual(mine["text"], f"[owner chat request_id={receipt['request_id']}] Write a test label.")
         self.assertIsNone(self.request()[1]["messages"][1]["origin"])
 
+    def test_the_hub_finds_the_tags_in_a_chat_app_message(self):
+        """Owner feature agent_tags (CHAT-APPS.md 21): a chat app sends the owner's words as they are, so the hub finds
+        the @ tags itself: a whole role (spaces as one run, the longest role first), a name, one word that starts the
+        role or the name of one other agent. Words that fit two agents are no tag, and the line names both; an email, a
+        URL, a "." before a letter, code, a fenced block, the chat's own agent and an unknown word are never tags, so a
+        tag never opens work for the wrong agent. The table of rules 1 and 2 is the same as the one of FleetCore's
+        AgentTagsTests, by hand."""
+        self.own()
+        for name, title in (("nova", "Customer Support"), ("kai", "Customer Support Lead"),
+                            ("atlas", "Growth Marketing Lead")):
+            hub.TEAM["agents"][name] = {"role": "worker", "runtime": "codex", "machine": "vps-host", "can": ["shell"],
+                                        "title": title}
+        for text, tags in (("@Customer Support, look at it", [("nova", 0, 17)]),
+                           ("Ask @Customer Support Lead?", [("kai", 4, 22)]),
+                           ("@Growth  Marketing\tLead now", [("atlas", 0, 23)]),
+                           ("@VPS and @vps", [("vps", 0, 4), ("vps", 9, 4)]),
+                           ("(@grok) then @marketing.", [("grok", 1, 5), ("atlas", 13, 10)]),
+                           ("pat@marketing.example", []), ("https://example.com/@marketing", []),
+                           ("see @marketing.example", []), ("run `@marketing` now", []),
+                           ("```\n@marketing\n```\nok", []), ("@studio, you", []), ("@nobody here", []),
+                           ("@support, then", [])):
+            self.assertEqual(self.inbound(text)[0], "stored", text)
+            req = self.last_request()
+            self.assertEqual([(m["agent"], m["start"], m["length"]) for m in hub.mentions_read(req["mentions"])],
+                             tags, text)
+            said = hub.q1("SELECT text FROM events WHERE id=?", (req["event_id"],))["text"]
+            self.assertEqual(("\n[The owner tagged " in said, "\n[The owner wrote " in said),
+                             (bool(tags), text.startswith("@support")), text)
+        self.assertTrue(said.endswith('\n[The owner wrote "@support", which fits Customer Support (nova) and Customer '
+                                      'Support Lead (kai). The hub took neither as a tag: ask the owner which one, '
+                                      'when it matters.]'), said)
+
     def test_owner_message_from_whatsapp_reaches_the_manager_on_its_number(self):
         self.own("whatsapp", OWNER_LID, alias=OWNER_WA)
         result, body = self.inbound("Start the Acme goal.", account="whatsapp-main", sender=OWNER_LID,

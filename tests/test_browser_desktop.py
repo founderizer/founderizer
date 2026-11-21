@@ -1,9 +1,12 @@
-"""Owner live view of browser tasks on a Mac that can show its screen; and the places of the agents' browsers on a Linux
+"""Owner live view of browser tasks on a Mac that can show its screen and of an agent's own screen on a ready Linux
+server (build plan 04, S7); and the places of the agents' browsers on a Linux
 server (build plan 04, S3). In-process hub; no capture or AI calls."""
+import base64
 import json
+import os
 import subprocess
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import desktop
 import fleet
@@ -43,6 +46,61 @@ class BrowserLease(OwnerAPI):
     def test_no_view_without_screen_capability_or_for_plain_tasks(self):
         self.assertEqual(self.view(self.task("vps", "browser"))[0], 409)
         self.assertEqual(self.view(self.task("studio", "none"))[0], 409)
+
+    def test_a_browser_task_on_a_ready_linux_server_shows_the_agent_s_own_screen(self):
+        """Build plan 04, S7: the hub takes the frames of a Linux agent's browser task where its helper would start
+        its browser (the parts ready, a session with its shell). Without that rule the owner's view of such a task
+        said that viewing was stopped, and a server with no browser got a view that never has a frame."""
+        def reading(state):
+            hub.q("INSERT INTO server_status(server,data,reported) VALUES('studio',?,?) ON CONFLICT(server) DO UPDATE "
+                  "SET data=excluded.data, reported=excluded.reported", (json.dumps(
+                      {"agents": {"studio": {"user": "fleet-studio", "uid": 1001}}, "browser": {"state": state, "ports": [
+                          {"user": "fleet-studio", "devtools": 9301, "screen": 5911}]}}), hub.now()))
+            hub.DESKTOP_READY.clear()           # the hub keeps a look at the reading for some seconds
+        tid = self.task("studio", "browser")
+        hub.TEAM["servers"] = {"studio": {"kind": "linux", "user": "fleet"}}        # the agent's machine is a server
+        hub.TEAM["agents"]["studio"]["can"] = ["shell", "browser"]
+        hub.TEAM["addresses"]["vps"] = "127.0.0.3"          # alone on its address, as the helper's route asks
+        reading("ready")
+        self.assertEqual(self.view(tid)[1].get("status"), "waiting")
+        jpeg = base64.b64encode(b"\xff\xd8\xffscreen\xff\xd9").decode()
+        sent = dict(generation="test-generation", attempt=1,
+                    frame=dict(status="live", image=jpeg, captured_at=hub.now()))
+        self.assertEqual(self.request(f"/helper/desktop/studio/T-{tid}", sent)[0], 200)
+        self.assertEqual(self.view(tid)[1].get("image"), jpeg)
+        # A reading that says "not ready" stops the frames and does not end the worker's publisher (its GET says that
+        # nobody watches, never 409): at the next reading that says "ready" the same publisher sends again. A 409
+        # there ended it for the whole attempt, and the view stayed empty after the server was ready again.
+        asks = f"/helper/desktop/studio/T-{tid}?generation=test-generation&attempt=1"
+        self.assertEqual(self.request(asks)[1]["watching"], True)
+        reading("missing")
+        code, waits = self.view(tid)        # the owner's view waits, as before a first frame: it shows frames again
+        self.assertEqual((code, waits["status"], waits["image"], waits["attempt"]), (200, "waiting", None, 1))
+        code, answer = self.request(asks)
+        self.assertEqual((code, answer["watching"]), (200, False))
+        self.assertEqual(self.request(f"/helper/desktop/studio/T-{tid}", sent)[1], dict(answer, now=ANY))
+        reading("ready")
+        self.assertEqual(self.view(tid)[1].get("status"), "waiting")      # the frame of before the gap is gone
+        sent["frame"]["captured_at"] = hub.now()
+        self.assertEqual(self.request(f"/helper/desktop/studio/T-{tid}", sent)[1]["watching"], True)
+        self.assertEqual(self.view(tid)[1].get("image"), jpeg)
+        self.assertLess(abs(self.request(asks)[1]["now"] - hub.now()), 5)       # the hub's clock, for the frames' times
+        # the worker asks twice a second: one look at the server's reading holds for some seconds, and a new one
+        # comes after them (a look parses the whole reading under the hub's lock)
+        with patch.object(hub, "browser_not_ready", wraps=hub.browser_not_ready) as looks:
+            hub.DESKTOP_READY.clear()
+            self.assertEqual([self.request(asks)[1]["watching"] for _ in range(3)], [True] * 3)
+            self.assertEqual(looks.call_count, 1)
+            hub.DESKTOP_READY["studio"] = hub.DESKTOP_READY["studio"][:1] + (hub.now() - hub.DESKTOP_READY_KEEP - 1, True)
+            self.request(asks)
+            self.assertEqual(looks.call_count, 2)
+        hub.q("UPDATE tasks SET attempt=2 WHERE id=?", (tid,))      # a replaced attempt gets 409, also while it waits
+        reading("missing")
+        self.assertEqual((self.view(tid)[0], self.request(asks)[0]), (409, 409))
+        hub.q("UPDATE tasks SET attempt=1 WHERE id=?", (tid,))
+        reading("ready")
+        hub.TEAM["agents"]["studio"]["can"] = ["browser"]      # a closed session gets no browser on Linux: no reading
+        self.assertEqual((self.view(tid)[0], self.request(asks)[0]), (409, 409))
 
 
 class BrowserPublisher(unittest.TestCase):
@@ -108,11 +166,29 @@ class BrowserPublisher(unittest.TestCase):
             helper.sweep_desktop()
         made.return_value.close.assert_called_once()
 
-    def test_no_publisher_on_linux_or_without_a_desktop(self):
+    def test_on_linux_the_publisher_runs_the_capture_of_the_agent_s_own_screen(self):
+        """Build plan 04, S7: a Linux agent with the Browser box gets a publisher whose capture program is
+        screen-capture (the Mac's Fleet Worker.app is not there: its frames would all say `unavailable`). The Screen
+        box alone gives none: a server has no screen but the agent's browser."""
         helper, tmux = self.helper(["T-4\tdb:1\tbrowser"])
         made = MagicMock()
+        helper.conf = dict(role="worker", runtime="claude", can=["shell", "screen"])
         with tmux, patch("fleet.Publisher", made), patch.object(fleet.sys, "platform", "linux"):
             helper.sweep_desktop()
+            made.assert_not_called()
+            helper.conf = dict(role="worker", runtime="claude", can=["shell", "browser"])
+            helper.sweep_desktop()
+        made.assert_called_once_with("studio", "T-4", {"attempt": 1, "generation": "db"}, fleet.http,
+                                     [*fleet.LINUX_CAPTURE, "--db", "db", "--task", "T-4"], hub_clock=True)
+        self.assertEqual(fleet.LINUX_CAPTURE[-2:], [os.path.join(fleet.KIT, "fleet.py"), "screen-capture"])
+        with patch.object(fleet, "cmd_screen_capture") as ran, patch.object(fleet, "AGENT", fleet.AGENT), \
+                patch.object(fleet.sys, "argv", ["fleet.py", *made.call_args.args[4][4:]]):
+            fleet.main()                    # the helper's own parser takes that command
+        self.assertEqual((ran.call_args.args[0].db, ran.call_args.args[0].task), ("db", "T-4"))
+
+    def test_no_publisher_without_a_desktop(self):
+        helper, tmux = self.helper(["T-4\tdb:1\tbrowser"])
+        made = MagicMock()
         helper.conf = dict(role="worker", runtime="claude", can=["shell", "web"])
         with tmux, patch("fleet.Publisher", made), patch.object(fleet.sys, "platform", "darwin"):
             helper.sweep_desktop()

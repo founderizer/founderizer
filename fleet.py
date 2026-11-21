@@ -76,7 +76,7 @@ from lifecycle import (APP_SERVER_RUNTIME, CHECK_FILE, CHECK_STORE, FLOOR_FILE, 
                        facts_now, follow_config_ref, key_env, mcp_variable, no_sign_in, reuse_settings, runtime_fact,
                        runtimes_with, screen_codex, screen_program, session_reuse, skills_text, start_form, tool_catalog,
                        tool_needs)
-from desktop import Publisher
+from desktop import MAX_FRAME, Publisher
 import onboard
 from onboard import CLAUDE_UPDATES_OFF
 
@@ -6843,10 +6843,18 @@ class Helper:
         """The owner's live view of a browser task, on a Mac whose agent can show its screen: one publisher per
         task attempt, the same one that screen tasks use. It captures only while the owner's view renews its
         lease, and the hub refuses it for a held or finished task. A task in the runner (app_server_task) keeps the
-        runner's own publisher."""
+        runner's own publisher.
+
+        **On a Linux server** (build plan 04, S7) an agent with the Browser box gets the same publisher, with the
+        capture program of its own screen (screen-capture: the Xvfb of its browser unit, never another agent's), which
+        gives a frame only while that screen shows this task's own Chrome (screen_of_task), and the frames' times on
+        the hub's clock (desktop.Publisher, hub_clock). The Screen box alone gives none there: a server has no desktop
+        but the agent's browser."""
         publishers = self.__dict__.setdefault("publishers", {})
         started = self.__dict__.setdefault("publishers_started", {})
-        if not (self.worker and {"browser", "screen"} & set(self.conf.get("can", [])) and sys.platform == "darwin"):
+        can = set(self.conf.get("can", []))
+        linux = sys.platform.startswith("linux") and "browser" in can
+        if not (self.worker and (linux or {"browser", "screen"} & can and sys.platform == "darwin")):
             return
         r = tmux("list-windows", "-t", f"={self.session}:", "-F", "#{window_name}\t#{@fleet_attempt}\t#{@fleet_needs}")
         live = set()
@@ -6870,7 +6878,9 @@ class Helper:
                     self.typed_at.get(key[0], float("-inf")) <= started.get(key, float("inf")):
                 continue
             name, generation, number = key
-            publishers[key] = Publisher(self.agent, name, {"attempt": number, "generation": generation}, http)
+            publishers[key] = Publisher(self.agent, name, {"attempt": number, "generation": generation}, http,
+                                        *([[*LINUX_CAPTURE, "--db", generation, "--task", name]] if linux else []),
+                                        **({"hub_clock": True} if linux else {}))
             started[key] = time.monotonic()
             publishers[key].start()
 
@@ -10899,6 +10909,9 @@ def screen_display(read_end, wait=10.0):
     return display if said.endswith(b"\n") and display.isdigit() else None
 
 
+BROWSER_SCREEN = "1280x800"     # the agent's screen and its Chrome's window (the capture asks the screen for its size)
+
+
 def screen_arguments(key, write_end):
     """Xvfb's arguments for the agent's own screen (cmd_browser_run): its key, no TCP, a display that it chooses
     itself (-displayfd), and no MIT-SHM. Measured on x86 Ubuntu 24.04 with Chrome 158 (21 November 2026, a throwaway
@@ -10908,7 +10921,7 @@ def screen_arguments(key, write_end):
     Xvfb holds that name no other user can bind it, and X clients try it before the socket file; the screen key
     refuses every other user on either."""
     return ["Xvfb", "-auth", key, "-nolisten", "tcp", "-extension", "MIT-SHM", "-nopn", "-displayfd", str(write_end),
-            "-screen", "0", "1280x800x24"]
+            "-screen", "0", f"{BROWSER_SCREEN}x24"]
 
 
 def cmd_browser_run(args):
@@ -10953,6 +10966,20 @@ def cmd_browser_run(args):
     with contextlib.suppress(OSError):
         os.remove(shown)
     write_private(shown, str(display))
+
+    def gone():
+        # Nothing names a screen that ended (screen_shown). Its key stays: the mark of the key file says that no start
+        # of the unit came since the helper named the Chrome's pages (screen_key_mark, Helper.browser_pages_mine), also
+        # after a Chrome that ended with no crash, whose pages the task's next attempt gets back. A key with no display
+        # file opens nothing: no program reads a display's number from it any more.
+        with contextlib.suppress(OSError):
+            os.remove(shown)
+
+    def ended(*_):                  # a stop of the unit: the screen's number goes first, then this ends as before
+        gone()
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+    signal.signal(signal.SIGTERM, ended)
     # No session bus: through it Chrome moves itself out of this unit into a scope of its own, where the unit's memory
     # cap does not hold it (seen on x86 Ubuntu 24.04, 17 November 2026; browser-ready then refuses the start).
     env = dict(os.environ, DISPLAY=f":{display}", XAUTHORITY=key, DBUS_SESSION_BUS_ADDRESS="disabled:")
@@ -10964,25 +10991,189 @@ def cmd_browser_run(args):
     chrome = subprocess.Popen([BROWSER_CHROME, f"--user-data-dir={profile}", f"--remote-debugging-port={port}",
                                "--no-first-run", "--no-default-browser-check", "--password-store=basic",
                                "--disable-back-forward-cache", "--hide-crash-restore-bubble",
-                               "--window-size=1280,800", "--window-position=0,0",
+                               f"--window-size={BROWSER_SCREEN.replace('x', ',')}", "--window-position=0,0",
                                "about:blank"], env=env, stdin=subprocess.DEVNULL)
     code = chrome.wait()
+    gone()
     for process in (openbox, xvfb):
         with contextlib.suppress(OSError):
             process.terminate()
     sys.exit(code)
 
 
-def screen_key_display(key):
-    """The display number of the screen that this key unlocks, by xauth's list of it: the largest, because browser-run
-    adds display 0 first and its screen's own after it. For a screen that started before browser-run wrote its display
-    file (build plan 04, S6). "" where the key names none."""
+def screen_shown(run):
+    """The display number of the agent's own screen, as browser-run wrote it in its folder `run`, or "" where none
+    is written: browser-run removes the file when it ends. Nothing else names a screen, the key file's list least: a
+    number that no screen of the agent holds any more is one that another OS user's X server can take, and x11vnc
+    and the capture would go to it."""
     try:
-        out = subprocess.run(["xauth", "-q", "-f", key, "list"], capture_output=True, text=True, timeout=10).stdout
-    except (OSError, subprocess.SubprocessError):
+        with open(os.path.join(run, "display"), encoding="ascii") as f:
+            display = f.read(16).strip()
+    except (OSError, UnicodeDecodeError):
         return ""
-    numbers = {int(n) for n in re.findall(r"/unix:(\d+)\s", out or "")}
-    return str(max(numbers)) if numbers else ""
+    return display if display.isdigit() else ""
+
+
+# what desktop.Publisher runs for a Linux agent's live view: this file's screen-capture, as the browser unit runs it
+LINUX_CAPTURE = [sys.executable, "-E", "-s", os.path.join(KIT, "fleet.py"), "screen-capture"]
+FFMPEG = "/usr/bin/ffmpeg"      # the package's program (S1b installs ffmpeg), by its path, never by PATH
+CAPTURE_SECONDS = 1.0           # between two frames of the live view, as the Mac's capture program (FleetWorker.swift)
+X_SOCKETS = "/tmp/.X11-unix"    # where an X server of this machine listens: the socket file X<display>
+
+
+def capture_arguments(width, height):
+    """ffmpeg's arguments for one frame of the live view (build plan 04, S7): the raw picture of a screen of this
+    size on its input (X's own ZPixmap of depth 24: blue, green, red and a spare byte) as one JPEG on its output.
+    It takes no input from the terminal, reads no sound, opens no screen and writes no file."""
+    return [FFMPEG, "-nostdin", "-loglevel", "error", "-f", "rawvideo", "-pixel_format", "bgr0",
+            "-video_size", f"{width}x{height}", "-i", "-", "-frames:v", "1", "-q:v", "5", "-f", "mjpeg", "-"]
+
+
+def screen_cookie(key, display):
+    """The cookie of display `display` in the screen's key file (xauth's own format: for each entry a family and four
+    counted fields, the address, the number, the name and the data), or None."""
+    try:
+        with open(key, "rb") as f:
+            data = f.read(1 << 16)
+    except OSError:
+        return None
+    at = 0
+    while at + 2 <= len(data):
+        at, fields = at + 2, []
+        for _ in range(4):
+            if at + 2 > len(data):
+                return None
+            size = int.from_bytes(data[at:at + 2], "big")
+            fields.append(data[at + 2:at + 2 + size])
+            at += 2 + size
+        if fields[1] == str(display).encode() and fields[2] == b"MIT-MAGIC-COOKIE-1":
+            return fields[3]
+    return None
+
+
+def peer_uid(sock):
+    """The OS user of the process at the other end of a Unix socket, as the kernel says it (SO_PEERCRED)."""
+    return struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[1]
+
+
+MAX_SCREEN = 32 << 20           # bytes of one raw picture that the capture takes (a 1280x800 screen has 4,096,000)
+
+
+def screen_picture(display, key, wait=5.0):
+    """(width, height, the raw picture) of the agent's own screen, read from its X server with the protocol's own
+    GetImage, or None. It connects to the socket file of the display in X_SOCKETS, never to the abstract name
+    (which another OS user can bind while no Xvfb of the agent holds it), and **it sends the screen's cookie only
+    where the kernel says that the process at the other end runs as this OS user** (peer_uid): another user's X
+    server on that number gets nothing, and its picture is never shown. So the capture needs nothing of the
+    screen's own sockets (screen_arguments keeps the abstract one). No shared memory: the picture comes through
+    the socket.
+
+    Not ffmpeg's x11grab: it puts each picture in a System V memory segment of mode 777, which every OS user of the
+    server reads and writes, and on a screen with no MIT-SHM (cmd_browser_run) ffmpeg 6.1.1 gives no frame at all
+    (measured on x86 Ubuntu 24.04, 21 November 2026). The pointer is not in the picture."""
+    cookie = screen_cookie(key, display)
+    if not cookie:
+        return None
+    name = b"MIT-MAGIC-COOKIE-1"
+    pad = lambda b: b + b"\0" * (-len(b) % 4)
+
+    def take(sock, n):
+        out = bytearray()
+        while len(out) < n:
+            part = sock.recv(min(1 << 20, n - len(out)))
+            if not part:
+                raise OSError("the screen closed the connection")
+            out += part
+        return bytes(out)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(wait)
+            sock.connect(os.path.join(X_SOCKETS, f"X{display}"))
+            if peer_uid(sock) != os.getuid():
+                return None
+            sock.sendall(b"l\0" + struct.pack("<HHHHH", 11, 0, len(name), len(cookie), 0) + pad(name) + pad(cookie))
+            head = take(sock, 8)
+            if head[0] != 1:
+                return None
+            setup = take(sock, struct.unpack("<H", head[6:8])[0] * 4)
+            vendor, = struct.unpack("<H", setup[16:18])
+            screens, formats, order = setup[20], setup[21], setup[22]
+            at = 32 + len(pad(b"x" * vendor))
+            depths = {setup[at + 8 * n]: setup[at + 8 * n + 1] for n in range(formats)}     # depth: bits of a pixel
+            at += 8 * formats
+            root, = struct.unpack("<I", setup[at:at + 4])
+            width, height = struct.unpack("<HH", setup[at + 20:at + 24])
+            depth = setup[at + 38]
+            if not screens or order != 0 or depth != 24 or depths.get(24) != 32 or \
+                    not 0 < width * height * 4 <= MAX_SCREEN:
+                return None
+            sock.sendall(struct.pack("<BBHIhhHHI", 73, 2, 5, root, 0, 0, width, height, 0xffffffff))
+            answer = take(sock, 32)
+            size = struct.unpack("<I", answer[4:8])[0] * 4
+            if answer[0] != 1 or size != width * height * 4:
+                return None
+            return width, height, take(sock, size)
+    except (OSError, struct.error, IndexError):
+        return None
+
+
+def screen_of_task(run, db, task):
+    """The display number of the agent's own screen while it shows task `task` of the hub's database `db`, else
+    None (build plan 04, S7). Each is read anew for each frame:
+
+    - **The Chrome on it is this task's**: the helper named its pages for this task (browser_pages_read), and no start
+      of the unit came since (the screen key's mark), as Helper.browser_pages_mine reads it. So the Chrome of an
+      earlier task, which a task that waits for its browser's start still finds there, never shows under a new task.
+    - **The agent's browser unit runs** (systemd's own word). With the unit down no X server of the agent holds the
+      display's number, and any OS user of the server can start one there (screen_picture then refuses it too)."""
+    said = browser_pages_read()
+    if not said or said[:2] != (db, task) or said[3] != screen_key_mark():
+        return None
+    display = screen_shown(run)
+    return display if display and browser_unit_state() == "active" else None
+
+
+def screen_frame(run, db, task):
+    """One line of the live view for desktop.Publisher, as the Mac's capture program gives it: the agent's own screen
+    now (the display and the key of browser-run, in its folder `run`) as a JPEG in base64 with its time. None, and so
+    no line, while the screen does not show this task (screen_of_task), where the screen gives no picture
+    (screen_picture), and where ffmpeg gives no whole JPEG of at most the size that the hub takes: the owner's view
+    then says that it waits. It never says `unavailable`, which the owner's apps explain with a Mac's worker
+    installer and screen permission."""
+    display = screen_of_task(run, db, task)
+    picture = screen_picture(display, os.path.join(run, "screen-key")) if display else None
+    if not picture:
+        return None
+    try:
+        shot = subprocess.run(capture_arguments(*picture[:2]), input=picture[2], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    image = shot.stdout or b""
+    if shot.returncode != 0 or not image.startswith(b"\xff\xd8\xff") or not image.endswith(b"\xff\xd9") or \
+            len(image) > MAX_FRAME:
+        return None
+    return {"status": "live", "image": base64.b64encode(image).decode("ascii"), "captured_at": time.time()}
+
+
+def cmd_screen_capture(args, rounds=None):
+    """The capture program of a Linux agent's live view (build plan 04, S7), as the agent, for the task and the hub's
+    database that its arguments name: each CAPTURE_SECONDS one line of screen_frame on its output, or none while
+    there is no frame, until its reader closes it. desktop.Publisher starts it only while the owner's view renews its
+    lease and ends it when the view stops, so it runs no longer than the owner looks. `rounds`: how many a test takes."""
+    run = browser_folder()
+    while rounds is None or rounds > 0:
+        frame = screen_frame(run, args.db, args.task)
+        try:
+            if frame:
+                sys.stdout.write(json.dumps(frame) + "\n")
+                sys.stdout.flush()
+        except OSError:
+            return
+        if rounds is not None:
+            rounds -= 1
+        if rounds != 0:
+            time.sleep(CAPTURE_SECONDS)
 
 
 def cmd_vnc_run(args):
@@ -10993,14 +11184,8 @@ def cmd_vnc_run(args):
     port = lifecycle.screen_port()
     if not port:
         sys.exit("this agent has no screen-sharing port in /etc/fleet-browser/ports")
-    try:
-        with open(os.path.join(run, "display"), encoding="ascii") as f:
-            display = f.read(16).strip()
-    except (OSError, UnicodeDecodeError):
-        display = ""
-    if not display.isdigit():           # a screen that a browser-run from before this file started
-        display = screen_key_display(os.path.join(run, "screen-key"))
-    if not display.isdigit():
+    display = screen_shown(run)
+    if not display:
         sys.exit("this agent's screen does not run")
     secret = os.path.join(run, VNC_PASSWORD)
     if not os.path.isfile(secret):
@@ -12574,6 +12759,8 @@ def main():
     p = sub.add_parser("start"); p.add_argument("agent"); p.set_defaults(fn=cmd_start)
     p = sub.add_parser("browser-run"); p.set_defaults(fn=cmd_browser_run)          # build plan 04, D5: the unit's own
     p = sub.add_parser("browser-ready"); p.set_defaults(fn=cmd_browser_ready)      # and its start's check (D11)
+    p = sub.add_parser("screen-capture"); p.set_defaults(fn=cmd_screen_capture)    # build plan 04, S7: the live view
+    p.add_argument("--db", required=True); p.add_argument("--task", required=True)
     p = sub.add_parser("vnc-run"); p.set_defaults(fn=cmd_vnc_run)                  # build plan 04, S6: the take-over
     p = sub.add_parser("hook"); p.add_argument("kind", choices=["permission", "activity"])
     p.add_argument("agent"); p.add_argument("task"); p.set_defaults(fn=cmd_hook)

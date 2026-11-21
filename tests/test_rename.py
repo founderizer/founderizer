@@ -239,8 +239,14 @@ class Rename(Servers):
             hub.kv_set(key, "1")
         plant("questions", "asker", "manager")
         hub.q("UPDATE questions SET passed=?", (json.dumps(["scout", "lead"]),))
+        # owner feature agent_tags: the tags of the owner's messages, or an old message loses its badge
+        tags = [{"agent": "scout", "start": 0, "length": 6}, {"agent": "scouts", "start": 7, "length": 7}]
+        plant("ui_requests", "recipient", "manager")
+        hub.q("UPDATE ui_requests SET mentions=?", (json.dumps(tags),))
         status, receipt = self.rename(base=base)
         self.assertEqual(status, 200, receipt)
+        self.assertEqual(hub.mentions_read(hub.q1("SELECT mentions FROM ui_requests")["mentions"]),
+                         [dict(tags[0], agent="nova"), tags[1]])
         held = {r["k"] for r in hub.q("SELECT k FROM kv WHERE k LIKE 'chased:%' OR k LIKE 'untaken:%' OR "
                                       "k LIKE 'listed:%' OR k LIKE 'duty_review:%' OR k LIKE 'talk_guard:%'")}
         # Another agent's own key stays its own, and what an earlier agent of the new name left goes, as in AGENT_KV.
@@ -500,7 +506,8 @@ class Columns(unittest.TestCase):
         "screen_restart:": "a task", "standing_told:": "a conversation", "start_failed:": "a task",
         "stuck_notice:": "a task", "team_plan:": "a team card (a Needs-you item)", "team_plan_job:": "a server job",
         "turn_ack:": "a task", "turn_checked:": "a task", "turn_empty:": "a task", "no_tools:": "a task",
-        "kpi_spell:": "a KPI's standing item (lanes/agent-kpis.md)"}
+        "kpi_spell:": "a KPI's standing item (lanes/agent-kpis.md)",
+        "tags_told:": "a message of the owner's whose tagged agents the manager was told of (hub.tags_check)"}
 
     def test_every_column_that_can_hold_an_agent_is_placed(self):
         kept = hub.DB
