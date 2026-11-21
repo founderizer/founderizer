@@ -202,7 +202,7 @@ class ScreenFailure(unittest.TestCase):
         hub.q("UPDATE agents SET last_seen=?, alive='', alive_ts=? WHERE name='dana'", (hub.now(), hub.now()))
         hub.tick()
         self.assertEqual(hub.q1("SELECT attempt, live_path FROM tasks WHERE id=?", (tid,))["attempt"], 1)
-        self.assertEqual(hub.q1("SELECT live_path FROM tasks WHERE id=?", (tid,))["live_path"], "paused by the manager")
+        self.assertEqual(hub.q1("SELECT live_path FROM tasks WHERE id=?", (tid,))["live_path"], "paused by manager")
         self.assertEqual(len(self.said("manager")), 1)
         # The owner's Resume works as on every hold: a new attempt, which the helper starts one time.
         code, body = self.call("POST", f"/ui/tasks/{tid}/control", {"request_id": str(uuid.uuid4()), "db": "gen1", "action": "resume"})

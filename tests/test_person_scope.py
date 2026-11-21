@@ -29,7 +29,7 @@ def setUpModule():
 def load_tests(loader, _tests, _pattern):
     """Only the tests of this file: the fixtures that it borrows carry their own."""
     suite = unittest.TestSuite()
-    for cls in (Rule, Narrowed, Owner, Door):
+    for cls in (Rule, Narrowed, Owner, Settle, Door, Writers):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -59,6 +59,23 @@ class Base(test_contacts_v2.Base):
     def task_context(self, cid):
         t = self.conversation_task(cid)
         return ("test-generation", hub.tref(t["id"]), "1")
+
+    def owner_does(self, cid, action):
+        """The owner pauses a conversation, or lets it run again (POST /ui/conversations/<id>)."""
+        body = dict(self.command(), action=action)
+        body.pop("text", None)
+        code, data = self.request(f"/ui/conversations/{cid}", body)
+        self.assertEqual(code, 200, data)
+
+    def answers(self, cid, cm, text):
+        """The conversation's window starts, reads what is unread, and answers CM-<cm>."""
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        return self.ok("reply", self.context(cid), text=text, in_reply_to=f"CM-{cm}")
+
+    def found(self, context, word):
+        """Whether a session's search of its history finds `word`."""
+        return "Nothing in your history matches" not in self.ok("search_history", context, query=word)
 
 
 class Rule(Base):
@@ -315,6 +332,12 @@ class Narrowed(Base):
         self.assertNotIn(hub.SCOPE_OUTSIDE, hub.login_refusal("studio", other, KEY) or "")
 
     def test_history_keeps_a_narrowed_pairs_records_apart(self):
+        """Person access plan, section 5: a narrowed pair's records reach no session of the agent that holds more,
+        while the pair is narrowed and after the owner widened it, and the owner reads them all. Each of their rows
+        carries the person's mark (narrowed_mark), which history_scope_sql reads beside the task. The bug: the filter
+        reads only the row's task, and two rows have none, the second reply to two messages that the window read
+        together (only the first reply ends the conversation task), and a message that came while the owner had
+        paused the conversation, with its reply."""
         mine = self.says(PAT, "the export of the zebra form fails")["conversation"]
         theirs = self.says(KIM, "deploy the giraffe shop", account="discord-studio")["conversation"]
         nothing = "Nothing in your history matches"
@@ -327,6 +350,65 @@ class Narrowed(Base):
         self.assertNotIn("zebra", self.ok("read_history", self.context(theirs), ref=f"CM-{ref}"))
         self.assertTrue(hub.history_found("studio", {"query": "zebra"}, True, 10)[0])
         self.assertTrue(hub.history_records("studio", f"CM-{ref}"))
+        # two messages read together and two replies: the second reply has no task of its own
+        later = self.says(PAT, "and the walrus form too")["id"]
+        hub.conversation_start("studio", mine)
+        self.ok("read_messages", self.context(mine))
+        self.ok("reply", self.context(mine), text="Fixing the zebra export.", in_reply_to=f"CM-{ref}")
+        self.ok("reply", self.context(mine), text="And the narwhal check of the walrus form.",
+                in_reply_to=f"CM-{later}")
+        # a message while the owner paused the conversation, and the reply to it: neither has a task
+        self.owner_does(mine, "pause")
+        paused = self.says(PAT, "the okapi password is in the safe")["id"]
+        self.owner_does(mine, "resume")
+        self.answers(mine, paused, "Thanks for the okapi note.")
+        self.assertEqual([r["task"] for r in hub.q("SELECT task FROM conversation_messages WHERE text LIKE "
+                                                   "'%narwhal%' OR text LIKE '%okapi%'")], [None] * 3)
+        _, task = self.normal_task(title="Look for the forms")
+        for when in ("narrowed", "widened"):
+            for context in (self.context(theirs), task):
+                for word in ("narwhal", "okapi", "zebra", "walrus"):
+                    self.assertFalse(self.found(context, word), (when, context, word))
+            self.assertTrue(self.found(task, "giraffe"))
+            if when == "narrowed":
+                code, data = self.change(self.pat["id"], scopes={"studio": None})       # the owner widens it
+                self.assertEqual(code, 200, data)
+        self.assertTrue(hub.history_found(None, {"query": "okapi"}, True, 10)[0])          # the owner reads all
+
+    def test_a_widening_gives_back_what_nobody_answered_and_nothing_else(self):
+        """person-scope-row-mark-spec.md, section E: a list back to All gives back the narrowed person's messages that
+        nobody answered, which wait for a reader: those of the open conversation task, an unread one with no task (it
+        came in a pause), and an unread one whose task ended with no reply. Each reply, and each message that the
+        locked window answered, keeps its mark. The bugs: the widening clears every mark, and a session with more
+        finds the locked window's reply that had no task; or it clears none, and a session with the agent's tools
+        never finds the message that waits for it; or it gives back an unread message only when it has no task; or the
+        next start marks again the message of an ended task, which keeps its person."""
+        cid = self.says(PAT, "The giraffe key is in the drawer.")["conversation"]
+        first = hub.q1("SELECT id FROM conversation_messages WHERE who='person' ORDER BY id DESC LIMIT 1")["id"]
+        later = self.says(PAT, "And the zebra key is in the box.")["id"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("reply", self.context(cid), text="Noted: the giraffe drawer.", in_reply_to=f"CM-{first}")
+        self.ok("reply", self.context(cid), text="Noted: the zebra box.", in_reply_to=f"CM-{later}")
+        lynx = self.says(PAT, "The lynx fence is down.")         # nobody read it, and its task ends with no reply
+        hub.q("UPDATE tasks SET state='canceled' WHERE id=?", (lynx["task"],))
+        self.says(PAT, "The tapir gate is open.")               # the next conversation task, which nobody read
+        self.owner_does(cid, "pause")
+        self.says(PAT, "The okapi door sticks.")                # no task, and nobody read it
+        self.owner_does(cid, "resume")
+        code, data = self.change(self.pat["id"], scopes={"studio": None})
+        self.assertEqual(code, 200, data)
+        hub.settle_narrowed_rows()                              # the next start of the hub
+        marks = {r["text"]: r["scope_person"] for r in hub.q(
+            "SELECT text, scope_person FROM conversation_messages WHERE conversation=? AND who IN ('person','agent')",
+            (cid,))}
+        p = self.pat["id"]
+        self.assertEqual(marks, {"The giraffe key is in the drawer.": p, "And the zebra key is in the box.": p,
+                                 "Noted: the giraffe drawer.": p, "Noted: the zebra box.": p,
+                                 "The lynx fence is down.": None, "The tapir gate is open.": None,
+                                 "The okapi door sticks.": None})
+        _, task = self.normal_task(title="Look for the gates")
+        self.assertEqual([self.found(task, word) for word in ("tapir", "okapi", "zebra")], [True, True, False])
 
     def test_no_session_waits_for_a_narrowed_persons_answer(self):
         theirs = self.says(KIM, "Hello", account="discord-studio")["conversation"]
@@ -398,6 +480,11 @@ class Owner(Base):
         self.assertIsNone(hub.q1("SELECT revoked FROM session_credentials WHERE sha256=?", ("b" * 64,))["revoked"])
 
     def test_a_first_list_ends_old_work_and_back_to_all_widens_the_open_task(self):
+        """Person access plan, section 7: a first list ends the open work that the conversation opened before it, and
+        gives the open conversation task the person, so that the messages that join it and its result, the locked
+        window's reply, stay the narrowed pair's (section 5); a list back to All gives the open task the agent's own
+        tools again. The bug: the open task keeps no person, and a session with more finds the narrowed time's words
+        in its result."""
         cid = self.says(PAT, "Hi")["conversation"]
         hub.q("INSERT INTO session_credentials(sha256,agent,kind,generation,task,created) VALUES(?,?,?,?,?,?)",
               ("a" * 64, "studio", "conversation", "test-generation", cid, hub.now()))
@@ -410,9 +497,132 @@ class Owner(Base):
         self.assertIsNotNone(hub.q1("SELECT revoked FROM session_credentials WHERE sha256=?", ("a" * 64,))["revoked"])
         self.assertNotIn((cid, REPO, "write"), hub.THREAD_TOKENS)
         open_task = self.conversation_task(cid)
-        hub.q("UPDATE tasks SET scope_person=? WHERE id=?", (self.pat["id"], open_task["id"]))
+        self.assertEqual(open_task["scope_person"], self.pat["id"])
+        said = self.says(PAT, "the quokka code is 4411")
+        self.assertEqual(said["task"], open_task["id"])         # it joins the open task
+        self.answers(cid, said["id"], "Noted the quokka code.")
+        self.assertEqual(self.task(open_task["id"])["state"], "completed")
+        _, task = self.normal_task(title="Look for the codes")
+        self.assertFalse(self.found(task, "quokka"))
+        self.assertTrue(hub.history_found(None, {"query": "quokka"}, True, 10)[0])         # the owner's
+        open_task = self.conversation_task(self.says(PAT, "and the wombat code?")["conversation"])
         self.assertEqual(self.scopes(None)[0], 200)
         self.assertIsNone(hub.q1("SELECT scope_person FROM tasks WHERE id=?", (open_task["id"],))["scope_person"])
+
+
+    def test_a_narrowed_session_finds_no_record_of_what_a_session_with_more_did(self):
+        """The review of person-scope-row-mark-spec.md: a narrowed session's history gives the records of its own
+        conversation's tasks, and a task of a time at All ran in a session with the agent's own tools, whose records
+        hold what it read and ran: a read from more access to less. So it finds the person's and the agent's messages
+        of its conversation, and of the other records only those of a task of its person's list from the time that the
+        list began. The bug: the scope reads only that the task is one of the conversation, and the locked window finds
+        what a session with more did in a task that ended before the first list, or in the open task that the first
+        list gave its person, or the result of work of that time that the hub wrote into the conversation, or what
+        such a task wrote to another person in that person's own conversation."""
+        hello = self.says(PAT, "Hi there")
+        ended = hello["task"]
+        self.answers(hello["conversation"], hello["id"], "Hello Pat.")          # a window with the agent's tools
+        open_one = self.says(PAT, "One more thing")["task"]
+        made = []
+
+        def record(tid, at, text):          # one record of the task's session (thread_events), as its helper sends it
+            made.append(hub.ins("INSERT INTO thread_events(task,attempt,session,seq,ts,type,data,created) VALUES(?,1,"
+                                "'s-1',?,?,'agent_message',?,?)", (tid, len(made) + 1, at, json.dumps({"text": text}),
+                                                                   at)))
+            return made[-1]
+        t0 = hub.now()
+        at_all = (record(ended, t0 - 100, "The launchpad plan is for Friday."),
+                  record(open_one, t0 - 50, "The capybara budget is nine thousand."))
+        conv = hub.q1("SELECT * FROM conversations WHERE id=?", (hello["conversation"],))
+        with hub.LOCK, hub.transaction():           # a result of work of the time at All, which joins the open task
+            line = hub.conversation_post_rows(conv, "T-99 (Prices) is completed: the ocelot prices are ready.", t0 - 40)
+        self.assertEqual(hub.q1("SELECT task FROM conversation_messages WHERE id=?", (line,))["task"], open_one)
+        self.person("Kim", "manager", KIM, app="discord")       # the open task writes to another person: a row of
+        self.ok("message_contact", self.context(hello["conversation"]), person="Kim",        # Kim's conversation
+                text="The serval invoice is late.", request_id=str(uuid.uuid4()))
+        self.assertEqual(self.scopes({f"repo:{REPO}": "write"})[0], 200)
+        narrowed = record(open_one, hub.now() + hub.CONVERSATION_RECORD_SKEW + 1, "The koala branch is ready.")
+        here = self.context(hello["conversation"])
+        self.assertEqual([self.found(here, w) for w in ("launchpad", "capybara", "ocelot", "serval", "koala", "thing")],
+                         [False, False, False, False, True, True])
+        for ref in at_all:
+            self.assertIn("is not in your history", self.ok("read_history", here, ref=f"TR-{ref}"))
+        self.assertIn("koala", self.ok("read_history", here, ref=f"TR-{narrowed}"))
+        _, task = self.normal_task(title="Look at the plans")
+        self.assertTrue(self.found(task, "launchpad"))          # a session with the agent's tools: its own work
+
+
+class Settle(Base):
+    """settle_narrowed_rows: the marks of the rows that a hub stored before the column came, at the start."""
+    # person_route's INSERT of the release before the column, which a hub of that release still runs during a
+    # restart or after a rollback
+    OLD = ("INSERT INTO conversation_messages(id,conversation,who,text,created,msg_id,kind,missed) "
+           "VALUES(?,?,?,?,?,?,?,?)")
+
+    def conversation(self, pid):
+        return hub.ins("INSERT INTO conversations(person,agent,account,chat,state,created,last) VALUES(?,?,?,?,?,?,?)",
+                       (pid, "studio", "whatsapp-studio", f"chat-{pid}", "open", 1000.0, 1000.0))
+
+    def said(self, cid, who, at, task=None, reply_to=None, read=True):
+        """One row, as the release before wrote it: the old INSERT, and the columns that its writers set after it."""
+        cm = hub.ins(self.OLD, (hub.unused_id("conversation_messages"), cid, who, f"words of {who} at {at}", at, None,
+                                None, None))
+        hub.q("UPDATE conversation_messages SET task=?, reply_to=?, read_at=? WHERE id=?",
+              (task, reply_to, at if read else None, cm))
+        return cm
+
+    def marks(self, *ids):
+        return [hub.q1("SELECT scope_person FROM conversation_messages WHERE id=?", (i,))["scope_person"] for i in ids]
+
+    def test_the_start_marks_a_narrowed_pairs_rows_of_before_once_and_all_time_rows_never(self):
+        """person-scope-row-mark-spec.md, section C: rows stored before the column (or by the release before, whose
+        INSERT names no scope_person and still works after migrate) get the person's mark at the start: each start,
+        a row of a narrowed task and a reply to a marked row; one time, in a pair that had a list, each message of
+        the person and each reply from a minute before its first log line of a list, leaving out, for a pair at All
+        now, what a widening gives back. The bugs: the column is NOT NULL and the old writer fails; the one-time pass
+        runs at each start and marks the words of a time at All after it; a pair that never had a list loses its
+        records; an unread message that a pair at All now waits on is hidden from the window that must answer it; a
+        read message with no task is left open when the conversation has an open task (an IN over NULL is NULL, and
+        so is its NOT); a line of the hub's that joined a narrowed task keeps a mark that no widening takes back."""
+        kim, lee = self.person("Kim", "manager", KIM, app="discord"), self.add(name="Lee", role="peer")
+        hub.q("DELETE FROM kv WHERE k=?", (hub.NARROWED_SETTLED,))
+        pat_c, kim_c, lee_c = (self.conversation(p["id"]) for p in (self.pat, kim, lee))
+        self.narrow(self.pat["id"], {f"repo:{REPO}": "write"})          # Pat has a list now; Kim had one
+        for at, pid, words in ((5000.0, self.pat["id"], "1 resource(s) of its own"),
+                               (5000.0, kim["id"], "1 resource(s) of its own"), (7000.0, kim["id"], "all of it")):
+            hub.ins("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
+                    (at, "owner", f"P-{pid}'s access with studio: {words}"))
+        narrowed = hub.ins("INSERT INTO tasks(title,owner,requester,state,created,source_conversation,source_message,"
+                           "scope_person) VALUES('Answer Pat','studio','manager','completed',4400,?,1,?)",
+                           (pat_c, self.pat["id"]))
+        hub.ins("INSERT INTO tasks(title,owner,requester,state,created,source_conversation,source_message) "
+                "VALUES('Answer Kim','studio','manager','working',8500,?,1)", (kim_c,))     # Kim's open task
+        before = self.said(pat_c, "person", 4000.0)                     # at All, long before the list
+        of_task = self.said(pat_c, "person", 4500.0, task=narrowed)         # rule 1
+        its_reply = self.said(pat_c, "agent", 4501.0, reply_to=of_task)     # rule 2
+        line = self.said(pat_c, "action", 4502.0, task=narrowed)        # a line of the hub's that joined the task
+        paused = self.said(pat_c, "person", 6000.0)                     # rule 3: no task, a message in a pause
+        reply = self.said(pat_c, "agent", 6001.0, reply_to=paused)
+        sent = self.said(pat_c, "agent", 6002.0)                        # message_contact of a session with more
+        owners = self.said(pat_c, "owner", 6003.0)
+        answered = self.said(kim_c, "person", 6000.0)
+        kim_reply = self.said(kim_c, "agent", 6001.0, reply_to=answered)
+        waiting = self.said(kim_c, "person", 8000.0, read=False)        # after Kim's widening: nobody read it
+        read_later = self.said(kim_c, "person", 8001.0)                 # read, never answered: fails closed
+        lee_rows = (self.said(lee_c, "person", 6000.0), self.said(lee_c, "agent", 6001.0))
+        hub.settle_narrowed_rows()
+        p, k = self.pat["id"], kim["id"]
+        self.assertEqual(self.marks(before, of_task, its_reply, line, paused, reply, sent, owners),
+                         [None, p, p, None, p, p, None, None])
+        self.assertEqual(self.marks(answered, kim_reply, waiting, read_later), [k, k, None, k])
+        self.assertEqual(self.marks(*lee_rows), [None, None])
+        # a later start: the one-time pass does not run again, and the two rules of each start still do
+        all_time = self.said(kim_c, "person", 9000.0)
+        old_reply = self.said(pat_c, "agent", 9001.0, reply_to=paused)
+        old_row = self.said(pat_c, "person", 9002.0, task=narrowed)
+        hub.settle_narrowed_rows()
+        self.assertEqual(self.marks(all_time, old_reply, old_row), [None, p, p])
+        self.assertEqual(self.marks(waiting), [None])
 
 
 class Door(Base):
@@ -550,6 +760,31 @@ class Door(Base):
                                 message="m", changes=[{"path": "a.txt", "content": "a"}])
         self.assertTrue(error)
         self.assertIn("commits today", text)
+
+
+class Writers(unittest.TestCase):
+    """The source of hub.py itself: no hub, no database."""
+
+    def test_each_write_of_a_conversation_message_says_its_mark(self):
+        """Person access plan, section 5: a narrowed pair's rows carry the person's mark (narrowed_mark), and every
+        read of the other sessions leaves a marked row out. So each INSERT into conversation_messages in hub.py names
+        scope_person, with narrowed_mark or NULL, and names its columns, so that a hub of the release before still
+        writes into the table after the column came. The bug: a new writer (WhatsApp files, say) stores a narrowed
+        person's words with no mark, and every session with more reads them."""
+        import ast
+        import re
+        from pathlib import Path
+        found = []
+        for node in ast.walk(ast.parse(Path(hub.__file__).read_text())):
+            text = node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else \
+                "".join(v.value for v in node.values if isinstance(v, ast.Constant)) \
+                if isinstance(node, ast.JoinedStr) else ""
+            for m in re.finditer(r"INTO\s+conversation_messages\s*(\(([^)]*)\))?", text):
+                found.append((m.group(2) or "", text[:120]))
+        self.assertGreaterEqual(len(found), 9, found)       # the nine writers of the spec, at least
+        for columns, text in found:
+            self.assertTrue(columns, f"names no columns: {text}")
+            self.assertIn("scope_person", [c.strip() for c in columns.split(",")], text)
 
 
 if __name__ == "__main__":

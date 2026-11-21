@@ -197,7 +197,7 @@ class RestartTask(Dying, Capacity):
         self.assertEqual((hub.q1("SELECT COUNT(*) c FROM holds WHERE task=?", (self.task,))["c"],
                           len(self.told("seo", "control"))), (1, 1))
         # While it waits: the session is stopped, and the task keeps the desktop of its machine.
-        self.assertIn(f"STOP: T-{self.task} is stopped by the pma",
+        self.assertIn(f"STOP: T-{self.task} is stopped by pma",
                       self.call("seo", "report_progress", {"note": "x"}, self.task)[0])
         self.assertEqual(hub.desktop_busy("seo")["id"], self.task)
         self.assertIn("is busy with", hub.desktop_refusal("seo", "screen", "pma"))      # a screen task waits for it
@@ -218,7 +218,7 @@ class RestartTask(Dying, Capacity):
         start = hub.q1("SELECT * FROM events WHERE agent='seo' AND kind='task' ORDER BY id DESC LIMIT 1")
         self.assertEqual(json.loads(start["extra"]), {"needs": "browser", "resume": True, "attempt": 2,
                                                        "generation": "test-generation"})
-        for part in (f"T-{self.task} is resumed by the pma, with a check.", "without repeating any of them",
+        for part in (f"T-{self.task} is resumed by pma, with a check.", "without repeating any of them",
                      f"O-{outcomes[1]['id']} Attempt 1 was stopped for a restart ({WHY})", hub.RESTART_TABS,
                      f"Your question Q-{question} ended with the earlier session"):
             self.assertIn(part, start["text"])
@@ -467,6 +467,14 @@ class RestartTask(Dying, Capacity):
                          (0, 0))                                        # a refused call keeps nothing
         self.assertIn(f"Only the session of T-{self.shop}, pma's task above it, acts on it.",       # and cancel_task
                       self.refused("manager", "cancel_task", {"task_id": f"T-{self.task}", "reason": WHY}, None))
+        # a session of a task that ended acts on nothing, so the words do not send pma to it (the review, 20 November)
+        state = hub.q1("SELECT state FROM tasks WHERE id=?", (self.shop,))["state"]
+        hub.q("UPDATE tasks SET state='completed' WHERE id=?", (self.shop,))
+        said = self.refused("pma", "restart_task", {"task_id": f"T-{self.task}", "request_id": str(uuid.uuid4()),
+                                                    "expected_attempt": 1, "reason": WHY}, other)
+        self.assertNotIn(f"Your session of T-{self.shop}", said)
+        self.assertIn("acts on it", said)
+        hub.q("UPDATE tasks SET state=? WHERE id=?", (state, self.shop))
         # a worker restarts only a part of its task that it gave a peer (peer tasks, 19 November 2026), so its own task
         # is not one: seo did not request it
         self.assertIn(f"T-{self.task} was not requested by you.", self.refused("seo", "restart_task", {

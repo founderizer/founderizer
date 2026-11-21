@@ -105,6 +105,15 @@ class Base(OwnerAPI):
         self.assertTrue(error, text)
         return text
 
+    def owner(self, path, **body):
+        """One owner command (owner API 1.277, the owner's undo): (status, answer)."""
+        return self.request(path, dict(request_id=str(uuid.uuid4()), db="test-generation", **body))
+
+    def told(self, about):
+        """{task: text} of the hub's lines of the owner's undo (memory_news_rows) about `about`."""
+        return {e["task"]: e["text"] for e in hub.q("SELECT task, text FROM events WHERE kind='say' AND "
+                                                    "json_extract(extra, '$.memory')=?", (about,))}
+
     def remember(self, who="vps", about="acme/web", text=LESSON, prevents=PREVENTS, task=None, **more):
         return self.ok(who, "remember", task=task, request_id=str(uuid.uuid4()), about=about, text=text,
                        prevents=prevents, **more)
@@ -487,6 +496,55 @@ class Removal(Base):
         self.assertIn("Only its own agent removes it", self.refused(
             "manager", "forget", request_id=str(uuid.uuid4()), memory="M-1", reason="not mine"))
         self.assertIsNone(self.row(1)["dropped"])
+
+    def test_the_owner_removes_a_lesson_as_the_agent_does_and_the_agent_is_told_why(self):
+        """The owner's undo of a lesson (owner API 1.277): the lesson leaves every start and every recall, the history
+        keeps it with the owner as the one who removed it, and each running session of the agent reads the why, so
+        that it does not write the same lesson again."""
+        why = "The smoke runs in CI since 18 October."
+        other = self.new_task()
+        chat = self.new_task(title="A person's message")         # a conversation's task, whose window may be a person's
+        hub.q("UPDATE tasks SET source_conversation=1, source_message=1 WHERE id=?", (chat,))
+        narrowed = self.new_task(title="Pat's request")            # a task that a narrowed person's words drive
+        hub.q("INSERT INTO person_scopes(person,agent,grants,updated) VALUES(7,'vps','{}',?)", (self.clock,))
+        hub.q("UPDATE tasks SET scope_person=7 WHERE id=?", (narrowed,))
+        self.assertIn("M-1", self.block())
+        code, data = self.owner("/ui/memory/vps/1/forget", why=why)
+        self.assertEqual((code, data["agent"], data["memory"], data["removed"]), (200, "vps", 1, self.clock), data)
+        self.assertNotIn("M-1", self.block())
+        self.assertIn("You have written no memories yet.", hub.start_text("vps", other))
+        self.assertIn("You have no lessons yet", self.ok("vps", "recall"))
+        self.assertNotIn("M-1", self.ok("vps", "recall", search="package.json"))
+        self.assertEqual(hub.memory_view("vps")["lessons"], [])
+        m = self.row(1)
+        self.assertEqual((m["dropped"], m["dropped_by"], m["drop_reason"], m["text"]), (self.clock, "owner", why, LESSON))
+        self.assertIn(f"M-1 was removed 2026-10-19 14:20 CEST by owner: {why}", self.ok("vps", "recall", memory="M-1"))
+        self.assertIn(f"M-1 forgotten by owner: {why}", self.ok("vps", "search_history", query="smoke CI October"))
+        opened = self.ok("vps", "read_history", ref="M-1")
+        self.assertIn("package.json", opened)
+        self.assertIn("forgotten by owner", opened)
+        line = f"[hub] The owner removed your lesson M-1 (acme/web): {why} No start and no recall shows it again"
+        self.assertEqual(set(self.told("M-1")), {self.task, other})       # not the conversation's, not the narrowed
+        self.assertTrue(all(text.startswith(line) for text in self.told("M-1").values()), self.told("M-1"))
+        # The agent's own forget finds it removed, and so does a second press of the owner's.
+        self.assertIn("was already removed 2026-10-19 14:20 CEST by owner",
+                      self.refused("vps", "forget", request_id=str(uuid.uuid4()), memory="M-1", reason="Wrong."))
+        code, data = self.owner("/ui/memory/vps/1/forget", why="Again.")
+        self.assertEqual(code, 409, data)
+        self.assertIn(f"by owner: {why}", data["error"])
+        # Only a lesson of that agent, with a why of one line; nothing is written for a refusal.
+        self.remember(who="studio", task=self.new_task(owner="studio"))
+        self.assertEqual(self.row(2)["agent"], "studio")
+        for path, body, status in (("/ui/memory/vps/2/forget", {"why": why}, 404),
+                                   ("/ui/memory/vps/99/forget", {"why": why}, 404),
+                                   ("/ui/memory/nobody/2/forget", {"why": why}, 404),
+                                   ("/ui/memory/studio/2/forget", {}, 400),
+                                   ("/ui/memory/studio/2/forget", {"why": "a\nb"}, 400),
+                                   ("/ui/memory/studio/2/forget", {"why": why, "reason": why}, 400)):
+            code, data = self.owner(path, **body)
+            self.assertEqual(code, status, (path, body, data))
+        self.assertIsNone(self.row(2)["dropped"])
+        self.assertIn("memory_undo", self.request("/ui/state")[1]["ui_features"])
 
     def test_removing_it_twice_says_who_removed_it_and_why(self):
         self.forget()
@@ -1984,6 +2042,50 @@ class NotesBase(Base):
         said, error = self.notes("Look for my other sessions first. The check timeout cap is 60 s.")
         self.assertFalse(error, said)                                       # the refusal showed them: read
         self.assertIn("revision 2", said)
+
+    def test_the_owners_restore_is_a_new_version_that_a_session_which_read_an_older_one_reads_first(self):
+        """The owner's undo of the notes (owner API 1.277): the words of an earlier version come back as a new
+        version by the owner, and each version stays. A running review that read the version before would write its
+        own words over the restore, unseen: notes_moved refuses that write once and shows the restored words. Each
+        running session reads one line about it, and that line starts no session for a parked task."""
+        self.assertFalse(self.notes("One.")[1])
+        self.assertFalse(self.notes("One. A wrong turn.")[1])          # revision 2, read: this session wrote it
+        other = self.started(self.new_task())
+        self.clock += 60
+        code, data = self.owner("/ui/notes/vps/restore", revision=1)
+        self.assertEqual((code, data["agent"], data["revision"], data["restored"]), (200, "vps", 3, 1), data)
+        view = hub.notes_view("vps")
+        self.assertEqual([(v["revision"], v["text"], v["by"], v["task"]) for v in view["versions"]],
+                         [(3, "One.", "owner", None), (2, "One. A wrong turn.", "vps", self.task),
+                          (1, "One.", "vps", self.task)])
+        self.assertEqual(view["versions"][0]["why"], "The owner restored revision 1")
+        self.assertEqual(hub.agent_notes_text("vps"), "One.")
+        said, error = self.notes("One. A wrong turn. Mine.")
+        self.assertTrue(error, said)
+        self.assertIn("Your notes changed after this session read them: revision 3", said)
+        self.assertIn("The owner restored revision 1", said)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM agent_notes")["n"], 3)
+        said, error = self.notes("One. Mine.")                         # the refusal showed them: read
+        self.assertFalse(error, said)
+        self.assertIn("revision 4", said)
+        line = "[hub] The owner restored your notes: revision 3 has the words of revision 1 again."
+        self.assertEqual(set(self.told("notes")), {self.task, other})
+        self.assertTrue(all(text.startswith(line) for text in self.told("notes").values()), self.told("notes"))
+        self.assertFalse(hub.message_waits(hub.q1("SELECT * FROM tasks WHERE id=?", (other,)), self.clock))
+        # The same request_id gives its answer again; a revision that is not there, or the words of the notes as
+        # they stand, change nothing.
+        body = dict(request_id=str(uuid.uuid4()), db="test-generation", revision=2)
+        first = self.request("/ui/notes/vps/restore", body)
+        self.assertEqual((first[0], first[1]["revision"], first[1]["restored"]), (200, 5, 2), first)
+        self.assertEqual(self.request("/ui/notes/vps/restore", body), (200, dict(first[1], replayed=True)))
+        for path, revision, status in (("/ui/notes/vps/restore", 5, 409), ("/ui/notes/vps/restore", 2, 409),
+                                       ("/ui/notes/vps/restore", 9, 404), ("/ui/notes/nobody/restore", 1, 404),
+                                       ("/ui/notes/studio/restore", 1, 404), ("/ui/notes/vps/restore", "1", 400),
+                                       ("/ui/notes/vps/restore", True, 400), ("/ui/notes/vps/restore", 0, 400)):
+            code, data = self.owner(path, revision=revision)
+            self.assertEqual(code, status, (path, revision, data))
+        self.assertEqual(self.owner("/ui/notes/vps/restore", revision=1, text="New words.")[0], 400)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM agent_notes")["n"], 5)
 
     def test_a_refused_write_is_refused_again_for_the_same_request_id(self):
         """mcp.py gives up on an answer after 20 seconds while the hub is busy, and RULES.md asks for the same

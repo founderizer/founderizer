@@ -1027,6 +1027,60 @@ class Tools(Fleet):
         for line in ("ask_my_requester", "YOUR TEAM", "see_earlier_work", "WHAT YOU HOLD"):
             self.assertIn(line, hub.start_text("ops", ops, resume=True, note="It stopped."))   # the Shell box on
 
+    def test_each_tool_of_a_worker_is_on_a_shell_off_list_or_held_with_its_reason(self):
+        """The list of 20 November 2026 ("What stops the next surprise"): the owner met each gap of an agent whose Shell
+        box is off before anybody had decided its tools. Bug: a session adds a tool that a worker has, and decides
+        nothing for such an agent; or a list of a Shell-off session takes a tool and the table still holds it back.
+        Each tool that a worker can have is on a list of a Shell-off session or held here with its reason."""
+        # Each tool that a worker with a shell can have, which no session of an agent whose Shell box is off has, and why
+        # (~/dev/founderizer-plans/shell-off-tools-list-2026-11-20.md, with the reasons of the review of 19 November 2026).
+        KEY = "the box itself: a ticket's text must not reach a key, a login, an account, a screen or a repository"
+        CODE = "standing work and code that runs with the agent's key: its line keeps the watches of such an agent"
+        OWN_WORDS = "its own free words to a session with access: its words go to its line with message_agent, as data"
+        STEERS = "text that steers its later sessions or other agents: its line writes it, after its own check"
+        OUT = "a file or a public post can carry data out"
+        READER = "a tool of the duty that reads a report, which needs a shell: report_defect is its side"
+        WINDOW = ("a tool of a conversation with the agent's own tools: such an agent's conversations are closed "
+                  "(CONVERSATION_CLOSED_TOOLS)")
+        HISTORY = "its history holds every customer's tickets: one could pull another customer's record into a draft"
+        START = "its start shows them whole (its notes, and its standing items since 20 November 2026)"
+        TASKS = ("a ticket's text must not become a task of another agent: report_defect and message_agent are in "
+                 "their place")
+        TEAM = "a read of the whole fleet, more than its start gives (its line and its people), held with its peers' reads"
+        held = dict(
+            {name: KEY for name in ("sign_in", "hand_over", "create_login", "save_key", "call_api", "request_secret",
+                                    "request_takeover", "note_secret", "resolve_outcome", "repo_change", "repo_checks",
+                                    "repo_files", "repo_pull_request", "repo_read", "repo_search", "drive_move",
+                                    "drive_read", "drive_search", "drive_sheet", "drive_write", "gmail_draft",
+                                    "gmail_label", "gmail_read", "gmail_search", "gmail_send")},
+            **{name: CODE for name in ("save_trigger", "change_trigger", "see_triggers", "attach_watch", "open_case",
+                                    "set_duty", "change_duty")},
+        **{name: TASKS for name in ("create_task", "cancel_task", "restart_task", "answer", "check_result",
+                                    "decide_permission", "decide_report")},
+        set_agent_model="a lead's team tool, which changes another agent: a ticket's text must not reach it",
+        **{name: TEAM for name in ("see_team", "see_capacity")},
+            **{name: OWN_WORDS for name in ("report_progress", "ask_my_requester", "report_up", "start_task")},
+            **{name: STEERS for name in ("write_knowledge", "write_skill", "set_target")},
+            **{name: OUT for name in ("attach_file", "post_to_chat")},
+            **{name: READER for name in ("ask_reporter", "join_report")},
+            **{name: WINDOW for name in ("ask_owner", "request_work", "open_work")},
+            **{name: HISTORY for name in ("search_history", "read_history", "see_earlier_work", "see_history")},
+            **{name: START for name in ("see_notes", "see_standing")},
+            forget=("held until the lesson plan's trial ends after 30 November 2026 (a change of what a review does "
+                    "waits for it); then it comes with remember to the duty that names remember"))
+        lists = (set(hub.SHELL_OFF_TOOLS) | set(hub.SHELL_OFF_DUTY_TOOLS) | set(hub.SHELL_OFF_ASKED_TOOLS) |
+                 set(hub.SHELL_OFF_CHAT) | set(hub.CONVERSATION_CLOSED_TOOLS) |
+                 {"report_defect", "answer_report", "set_reminder"})         # shell_tools adds them by the task's kind
+        # a worker's and a lead's (role_offers: its own duty writes, its peer tasks' tools, a lead's team tools), since
+        # each one's Shell box can be off
+        worker = {name for who, name, *_ in hub.TOOLS
+                  if hub.role_offers("worker", who, name) or hub.role_offers("lead", who, name)}
+        self.assertEqual(set(held) - worker, set())                        # no reason for a tool that is gone
+        self.assertEqual(sorted(worker - lists - set(held)), [],
+                         "a worker's tool that no session of an agent whose Shell box is off has: put it on a list of "
+                         "such a session (shell_tools), or hold it in this table with its reason")
+        self.assertEqual(sorted(set(held) & lists), [], "a held tool that a list gives: take it out of this table")
+
     def test_the_typed_forms_take_no_free_text(self):
         _, context = self.task("desk")
         tools = {t["name"]: t for t in hub.tools_for("desk", context)}

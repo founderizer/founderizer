@@ -3162,8 +3162,12 @@ CHAT_SIGNAL = "New fleet messages. Call read_messages now."     # the helper's s
 # The Fleet tools that a Claude owner chat may call: hub.CHAT_TOOLS, a junction that test_direct_chat and
 # test_chat_agents pin on both sides. request_secret is allowed here one release before the hub offers it to a
 # worker's chat (owner feature secret_requests), so that no machine that has not updated yet refuses it.
+# keep_instruction and end_standing come the same way (the design "An agent keeps its own rules", slice 4, release
+# one): the owner's lasting wish in an agent's own chat stays there, with the owner's message as its source, once the
+# hub offers them in a later release, after each machine runs this one (test_secret_requests holds the order).
 CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall",
-              "start_task", "request_secret", "search_history", "read_history", "read_attachment")
+              "start_task", "request_secret", "search_history", "read_history", "read_attachment",
+              "keep_instruction", "end_standing")
 def chat_instructions(agent, conf):
     """The instructions of an owner chat, the head of its start text (chat_command, standing_text)."""
     prompt = (f'You are {agent}, speaking directly with the owner in this agent\'s chat. '
@@ -6773,7 +6777,12 @@ class Helper:
         once (Handler.helper_dialog, kind "untaken"); nothing is typed again because of time. A standing session is
         not typed into while a turn runs (STANDING_WINDOWS): it reads once more at the end of the turn. A new window
         (its tmux id) knows nothing of earlier lines. A manager session that a message finds cold and long is not told
-        at all: it starts again on a new conversation, and that one is told (restart_fresh)."""
+        at all: it starts again on a new conversation, and that one is told (restart_fresh).
+
+        The memory of a line told twice is this process's own, and a new helper, or the end of a release run whose
+        hold hid the window's messages, typed the same two lines again (20 November 2026). So the hub holds the
+        messages of a task window that came up to its untaken report (hub.line_untaken), and a later one comes alone:
+        its ids are not the line's, so it gets a line of its own."""
         target = f"={self.session}:={window}"
         if not self.first_line_due(window):
             return

@@ -376,7 +376,7 @@ class BlockedAccess(OwnerAPI):
         outcome = hub.q1("SELECT * FROM outcomes WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
         self.assertEqual(json.loads(start["extra"]), {"needs": "none", "resume": True, "attempt": 2,
                                                       "generation": "test-generation"})
-        for part in (f"T-{tid} is resumed by the manager, with a check.", "without repeating any of them",
+        for part in (f"T-{tid} is resumed by manager, with a check.", "without repeating any of them",
                      f"O-{outcome['id']} Attempt 1 was stopped for a restart (the repository is granted): check what "
                      f"its last actions did",
                      "The access that you asked for is settled, and this session has it: "

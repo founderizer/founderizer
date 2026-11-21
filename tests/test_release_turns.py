@@ -878,7 +878,9 @@ LATER_COLUMNS = (("tasks", "source_conversation", "INTEGER"), ("tasks", "source_
                  # owner feature need_takeover (16 November 2026): the task that asked for a step on its screen
                  ("needs", "takeover_task", "INTEGER"),
                  ("duty_cases", "opened_in", "INTEGER"),     # one event, one case (3 November 2026)
-                 ("tasks", "scope_person", "INTEGER"))       # the person access plan (11 November 2026)
+                 ("tasks", "scope_person", "INTEGER"),       # the person access plan (11 November 2026)
+                 # and the mark on a narrowed pair's rows (person-scope-row-mark-spec.md, 20 November 2026)
+                 ("conversation_messages", "scope_person", "INTEGER"))
 LATER = """
 CREATE TABLE IF NOT EXISTS person_scopes(person INTEGER NOT NULL, agent TEXT NOT NULL, grants TEXT NOT NULL,
   updated REAL NOT NULL, PRIMARY KEY(person, agent));

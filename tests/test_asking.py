@@ -455,6 +455,7 @@ class Patience(Tools, Runtime):
         self.assertEqual(hub.q1("SELECT nudge_level FROM tasks WHERE id=?", (tid,))["nudge_level"], 2)    # Stalled
         self.turn(tid, "Still here.")                       # nothing more until an event
         self.assertEqual((len(self.continues(tid)), len([t for t in self.said("manager") if "two turns" in t])), (1, 1))
+        self.assertEqual(hub.q1("SELECT nudge_level FROM tasks WHERE id=?", (tid,))["nudge_level"], 2)    # still Stalled
         hub.emit("studio", "say", "[message from manager on T-1 id=AM-1] Please deliver it now.", task=tid)
         hub.q("UPDATE events SET read_at=? WHERE agent='studio' AND task=? AND kind='say'", (hub.now(), tid))
         self.records(tid, [{"seq": self.seq + 1, "type": "user_message", "text": "New fleet messages."}])
@@ -479,7 +480,7 @@ class Patience(Tools, Runtime):
         self.assertIsNone(hub.q1("SELECT id FROM holds WHERE task=?", (mute,)))
         self.turn(mute, "Still no tools.", read=False)
         self.assertIsNone(hub.q1("SELECT id FROM holds WHERE task=?", (mute,)))    # not before the helper's word
-        hub.kv_set(f"untaken:studio:T-{mute}", hub.now() + 1)       # the helper: the session did not take the line
+        hub.kv_set(f"untaken:studio:T-{mute}", hub.now())       # the helper: the session did not take the line
         hub.turn_end_check(hub.q1("SELECT * FROM tasks WHERE id=?", (mute,)),
                            hub.turn_state(mute, 1), hub.now(), force=True)     # its forced check, as after the report
         hold = hub.q1("SELECT * FROM holds WHERE task=? AND kind='stop'", (mute,))
@@ -488,14 +489,74 @@ class Patience(Tools, Runtime):
         self.assertEqual(attempt(), 2)
         for said in ("No tools.", "No tools at all."):
             self.turn(mute, said, read=False, attempt=2)
-        hub.kv_set(f"untaken:studio:T-{mute}", hub.now() + 2)
+        hub.kv_set(f"untaken:studio:T-{mute}", hub.now())        # after its new start, as a real report comes
         self.turn(mute, "None.", read=False, attempt=2)
         self.assertEqual(attempt(), 2)
         told = [t for t in self.said("manager") if f"T-{mute} " in t and "starts it no more by itself" in t]
         self.assertEqual(len(told), 1)
         self.assertIn("again its session's tools did not reach it", told[0])
+        self.assertIn('Its last words: "None."', told[0])
+        stalled = lambda: hub.q1("SELECT nudge_level FROM tasks WHERE id=?", (mute,))["nudge_level"]
+        self.assertEqual(stalled(), 2)          # the Stalled mark, so the owner sees it when nobody reads the notice
+        hub.kv_set("turn_ended:manager", hub.now() + 5)         # its requester had a turn and left the notice unread
+        self.assertIn(f"T-{mute} (Send the note once, owner studio) got no fleet tools in two sessions",
+                      " ".join(line for _, line in hub.tasks_stuck(hub.now())))
         self.turn(mute, "Still none.", read=False, attempt=2)     # nothing more for the same attempt
         self.assertEqual(len([t for t in self.said("manager") if f"T-{mute} " in t and "no more" in t]), 1)
+        self.assertEqual(stalled(), 2)          # its new turn took the mark off; that turn's end puts it back
+
+    def test_a_session_that_takes_no_line_of_its_messages_reaches_its_requester_at_its_helper_s_report(self):
+        """The review of 20 November 2026: a session with its tools that read nothing was asked again, no helper typed
+        that line, and its requester heard nothing until a release. At the helper's report that it took neither line of
+        its messages, with nothing waiting, its requester hears at once, and once."""
+        tid = self.task()
+        self.turn(tid, "I wait.", read=False)
+        self.assertEqual(len(self.continues(tid)), 1)       # its first empty turn: asked, as any
+        report = lambda: self.call("POST", f"/helper/dialog/studio/T-{tid}", {"kind": "untaken"}, client=None)[0]
+        self.assertEqual(report(), 200)
+        told = [t for t in self.said("manager") if f"T-{tid} " in t and "took none of the lines" in t]
+        self.assertEqual(len(told), 1)
+        self.assertIn('Its last words: "I wait."', told[0])
+        self.assertEqual(hub.q1("SELECT nudge_level FROM tasks WHERE id=?", (tid,))["nudge_level"], 2)    # Stalled
+        self.assertEqual(report(), 200)                     # a second report tells nothing more
+        self.assertEqual((len(self.continues(tid)), len([t for t in self.said("manager") if f"T-{tid} " in t])), (1, 1))
+        hub.kv_set("turn_ended:manager", hub.now() + 5)     # the manager had a turn and left the notice unread
+        self.assertIn(f"T-{tid} (Send the note once, owner studio) took none of the lines of its messages",
+                      " ".join(line for _, line in hub.tasks_stuck(hub.now())))
+        # With no ask before it: a turn that ended with a message that it did not read asks nothing; the report tells
+        unread = self.task()
+        hub.emit("studio", "say", "[message from manager on T-1 id=AM-2] Here is the answer.", task=unread)
+        self.turn(unread, "I wait for the answer.", read=False)
+        self.assertEqual((self.continues(unread), [t for t in self.said("manager") if f"T-{unread} " in t]), ([], []))
+        self.assertEqual(self.call("POST", f"/helper/dialog/studio/T-{unread}", {"kind": "untaken"}, client=None)[0], 200)
+        self.assertEqual(self.continues(unread), [])
+        self.assertEqual(len([t for t in self.said("manager") if f"T-{unread} " in t and "took none of the lines" in t]),
+                         1)
+        # A session that read after the report took a later line: its next empty turn is asked, as any
+        late = self.task()
+        self.records(late, [{"seq": self.seq + 1, "type": "user_message", "text": "Go on."}])
+        self.assertEqual(self.call("POST", f"/helper/dialog/studio/T-{late}", {"kind": "untaken"}, client=None)[0], 200)
+        self.seq += 100
+        hub.q("UPDATE events SET read_at=? WHERE agent='studio' AND task=?", (hub.now() + 1, late))   # it read since
+        self.records(late, [{"seq": self.seq + 2, "type": "result", "stop_reason": "end_turn"}])
+        self.seq += 100
+        self.assertEqual((len(self.continues(late)), [t for t in self.said("manager") if f"T-{late} " in t]), (1, []))
+        # A conversation's window C-<n> is no task T-<n>: its report tells nothing about the task of that number
+        other = self.task()
+        self.turn(other)
+        hub.q("UPDATE events SET read_at=? WHERE agent='studio' AND task=?", (hub.now(), other))  # it read the ask too
+        self.call("POST", f"/helper/dialog/studio/C-{other}", {"kind": "untaken"}, client=None)
+        self.assertEqual([t for t in self.said("manager") if f"T-{other} " in t and "took none" in t], [])
+        # The report can come while its turn still runs: the end of that turn decides as the report would have
+        run = self.task()
+        self.records(run, [{"seq": self.seq + 1, "type": "user_message", "text": "Go on."}])
+        self.assertEqual(self.call("POST", f"/helper/dialog/studio/T-{run}", {"kind": "untaken"}, client=None)[0], 200)
+        self.assertEqual([t for t in self.said("manager") if f"T-{run} " in t], [])      # its turn runs: nothing yet
+        self.records(run, [{"seq": self.seq + 2, "type": "agent_message", "text": "I wait too."},
+                           {"seq": self.seq + 3, "type": "result", "stop_reason": "end_turn"}])
+        self.seq += 100
+        self.assertEqual(self.continues(run), [])           # no ask that its helper would not type
+        self.assertEqual(len([t for t in self.said("manager") if f"T-{run} " in t and "took none of the lines" in t]), 1)
 
     def test_a_live_reason_at_the_turn_end_asks_nothing(self):
         tid = self.task()

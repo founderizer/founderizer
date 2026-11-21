@@ -345,6 +345,12 @@ NOT_TOOLS = {
     "/ui/error-reports": "the owner's consent to send error reports to Founderizer's developers, which only the owner "
                          "gives, with the switch of Settings › General in the app, and never an agent (the owner's "
                          "yes of 16 November 2026, feedback-diagnostics-plan.md Phase 3)",
+    "/ui/notes/{}/restore": "the owner's restore of an agent's notes (owner API 1.277), until its tool restore_notes "
+                            "comes with slice 8b of the design \"An agent keeps its own rules\", which takes this "
+                            "line out",
+    "/ui/memory/{}/{}/forget": "the owner's removal of one lesson of an agent (owner API 1.277), until its tool "
+                               "forget_lesson comes with slice 8b of the design \"An agent keeps its own rules\", "
+                               "which takes this line out",
 }
 
 # What this file repeats from the hub because it cannot import it: this server runs on the owner's Mac with the

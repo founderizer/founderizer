@@ -709,8 +709,34 @@ class Lines(test_runtime.Runtime):
         self.alive("studio", f"T-{tid}")
         answer = self.call("GET", f"/events/studio?delivery=1&wait=0&alive=T-{tid}", client=None)[1]
         self.assertEqual(answer["listed"], {f"T-{tid}": 2, "manager": 0})
-        self.assertEqual(self.call("POST", f"/helper/dialog/studio/T-{tid}", {"kind": "untaken"}, client=None)[0], 200)
+
+    def test_a_window_that_took_neither_line_gets_those_messages_no_more_and_a_new_one_alone(self):
+        """The review of 20 November 2026: a new helper, or the end of a release run, typed the same two lines again
+        into a task window that took neither, two model turns each time. The hub holds the messages that the helper's
+        report covered, once the session ran a turn, and a later one comes alone, so the helper that reported, whose
+        line still holds the older ones, types a line for it. A report from before its start could be typed into is
+        an earlier window's."""
+        tid = self.task()
+        self.alive("studio", f"T-{tid}")
+        got = lambda alive=f"T-{tid}": sorted(e["kind"] for e in self.call(
+            "GET", f"/events/studio?delivery=1&wait=0&alive={alive}", client=None)[1]["events"] if e["task"] == f"T-{tid}")
+        report = lambda: self.call("POST", f"/helper/dialog/studio/T-{tid}", {"kind": "untaken"}, client=None)[0]
+        self.assertEqual(got(), ["task"])                   # its start is handed out
+        self.assertEqual(report(), 200)
+        self.assertIsNone(hub.kv_get(f"untaken:studio:T-{tid}"))    # no line of it was typed yet: kept nothing
+        hub.emit("studio", "say", "[hub] Read this.", task=tid)
+        self.assertEqual(got(), ["say", "task"])            # its start again and the message: the helper types lines
+        self.assertEqual(report(), 200)
         self.assertIsNotNone(hub.kv_get(f"untaken:studio:T-{tid}"))
+        self.assertEqual(got(), ["say", "task"])            # no turn yet: a new helper may get its first line in
+        self.assertEqual(self.records(tid, [{"seq": 1, "type": "user_message", "text": "Go on."},
+                                            {"seq": 2, "type": "result", "stop_reason": "end_turn"}])[0], 200)
+        self.assertEqual(got(), [])                         # it ran a turn and took neither line: no third time
+        self.assertEqual([e["kind"] for e in self.call("GET", "/events/studio?delivery=1&wait=0&alive_unknown=1", client=None)[1][
+            "events"] if e["task"] == f"T-{tid}"], ["task"])   # tmux did not answer: its message is held, its start not
+        self.assertEqual(got(alive=""), ["say", "task"])    # its window is gone: its start comes, as before
+        hub.emit("studio", "say", "[hub] And this.", task=tid)
+        self.assertEqual(got(), ["say"])                    # a later message comes alone, and gets a line of its own
 
 
 class Closes(test_runtime.Runtime):
