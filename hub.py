@@ -4937,15 +4937,15 @@ def desktop_busy(name, needs="screen"):
     return None
 
 
-def desktop_refusal(owner, needs, caller, keep=False):
+def desktop_refusal(owner, needs, caller, keep=False, exact=False):
     """Why a new browser or screen task for `owner` must wait (owner API 1.12: a screen task alone on each machine,
     and browser tasks side by side in tabs of their own; desktop_busy), or None. Only the fleet manager sees the
-    other task's ID."""
+    other task's ID. `exact`: the words of the reason itself, for an agent that tells the owner (browser_refusal)."""
     if needs not in ("browser", "screen"):
         return None
     machine = agents()[owner].get("machine")
     if needs == "browser" and linux_agent(owner):
-        return browser_refusal(owner, caller, keep)     # build plan 04, S3: its own Chrome, and a place of its server
+        return browser_refusal(owner, caller, keep, exact)  # build plan 04, S3: its own Chrome, a place of its server
     if needs == "screen":
         # Screen control on them could press Agree on terms that are the owner's to accept (4 November 2026). The one
         # screen task that they let through is the hub's own SETUP_CLICK (setup_click), which no agent can ask for.
@@ -5067,8 +5067,11 @@ BROWSER_NEED_SHELL = 11 * GIB // 4  # D6: an agent with a shell, the manager too
 BROWSER_NEED_CLOSED = 3 * GIB // 5  # D6: an agent without one: its sessions
 BROWSER_MARGIN = GIB // 2           # D6: what stays free of the room
 BROWSER_STALL = 5_000_000           # D6: microseconds of `full` stall in 300 s of readings that is a real shortage
-BROWSER_ROOM = "browser_room:"      # kv + server: its counts at its last reading, and the places that real shortages
-#                                     took since its boot or since its limits or its swap changed (browser_room_seen)
+BROWSER_QUIET = 6                   # D6: calm windows in a row that give back one place a shortage took (at first)
+BROWSER_WINDOW = 240                # D6: seconds of readings that a stall is judged over (REPORT_EVERY is 300)
+BROWSER_CALM = BROWSER_STALL // 5   # D6: microseconds of `full` stall in 300 s under which a window is calm
+BROWSER_ROOM = "browser_room:"      # kv + server: its counts at its last reading, its stall window, the places that
+#                                     real shortages took and the calm windows toward one's way back (browser_room_seen)
 BROWSER_HOLD = "browser_place:"     # kv + task id: this browser task holds a place of {server} since {since}
 BROWSER_WAIT_TOLD = "browser_place_told:"   # kv + task id: its session knows that its browser waits for a place
 BROWSER_WAKE_HELD = "browser_wake_held:"    # kv + need id: its saved secret waits only for a browser place now
@@ -5108,45 +5111,97 @@ def browser_server(name, team=None):
 
 def browser_room_seen(server, reading, t0):
     """At each reading of a server's service (Handler.server_status): the places that a real shortage takes away
-    (D6). A new `oom` count of user.slice (an end at its own limit; a browser's end at its own cap is not counted
-    there), a new `fail` count of its swap, or more than BROWSER_STALL microseconds of `full` stall for each 300 seconds
-    since the last reading (never fewer than one) is a sign, and each reading with a sign takes one place. They stay
-    until the server boots again (its boot id, when both counters start again at 0) or its limits or its swap change.
-    A reading with no room changes nothing."""
+    (D6), and the ones that come back. A new `oom` count of user.slice (an end at its own limit; a browser's end at its
+    own cap is not counted there), a new `fail` count of its swap, or more than BROWSER_STALL microseconds of `full`
+    stall for each 300 seconds of a window is a sign, and each reading with a sign takes one place, never more than the
+    room gives (browser_room_places). A boot of the server (its boot id, when both counters start again at 0) or a
+    change of its limits or its swap gives all of them back.
+
+    **Calm windows give one back** (21 November 2026: one stall of an agent's own work took the only place of
+    worker-4, and every browser task of its agent was refused for hours, because only a boot or new limits gave it back;
+    two reviews). A stall is judged over a window of at least BROWSER_WINDOW seconds of readings, so the short readings
+    of a job, an update or a restart neither hide a stall in pieces nor count as calm. A window under BROWSER_CALM is
+    calm; one between the two bounds neither counts nor starts the count again. `need` calm windows in a row give back
+    one place; a sign within BROWSER_QUIET calm windows of a place that came back doubles `need`, up to eight times
+    BROWSER_QUIET, so a server whose browser brings the shortage back is not tried again every half an hour; 2 · `need`
+    calm windows after a place came back set it back to BROWSER_QUIET. These are counts of readings' windows, never a
+    clock. A kernel with no stall counter closes its windows on their length, calm while no counter grew; a window
+    with the counter at one end only (a read that failed once) is neither calm nor a sign. Every reading
+    takes `less` down to the places that the room gives now (an agent more there can leave none). A window with a sign
+    at any of its readings is no calm window (`window_sign`). A reading whose
+    counters went down within a window of the last one (an older one that came late) changes nothing; later, its
+    counters are the new base (a boot with no boot id). A reading with no room changes nothing. One reading at a time
+    (LOCK): two posts at once could each drop the other's sign. BROWSER_CALM: worker-4's `full` stall was 0.33 s for each
+    300 s over 30 hours of its agent's work, and a build's burst about 7 s (21 November 2026)."""
     room = reading.get("room")
     if not isinstance(room, dict):
         return
     number = lambda v: v if type(v) is int else None       # noqa: E731
     now_ = {k: number(room.get(k)) for k in ("memory_max", "swap_max", "swap_total", "oom", "swap_fail", "full_us")}
     now_["boot"] = (reading.get("os") or {}).get("boot")
-    try:
-        old = json.loads(kv_get(BROWSER_ROOM + server) or "null")
-    except ValueError:
-        old = None
-    less = 0
-    if isinstance(old, dict) and all(old.get(k) == now_[k] for k in ("boot", "memory_max", "swap_max", "swap_total")):
-        less = old.get("less") if type(old.get("less")) is int else 0
+    with LOCK:
+        try:
+            old = json.loads(kv_get(BROWSER_ROOM + server) or "null")
+        except ValueError:
+            old = None
+        same = isinstance(old, dict) and all(old.get(k) == now_[k] for k in ("boot", "memory_max", "swap_max",
+                                                                               "swap_total"))
+        if not same:
+            state = dict(now_, at=t0, less=0, quiet=0, need=BROWSER_QUIET, since_back=None, base_at=t0,
+                         base_full=now_["full_us"])
+            browser_kv(BROWSER_ROOM + server, json.dumps(state, sort_keys=True))
+            return
+        state = dict(old)
+        down = any(now_[k] is not None and type(old.get(k)) is int and now_[k] < old[k] for k in ("oom", "swap_fail",
+                                                                                                    "full_us"))
+        if down and isinstance(old.get("at"), (int, float)) and t0 - old["at"] < BROWSER_WINDOW:
+            return                                       # an older reading that came late: the counters only grow
+        if down:                                         # counters that started again with no new boot id: a new base
+            old = dict(old, oom=now_["oom"], swap_fail=now_["swap_fail"], base_at=t0, base_full=now_["full_us"])
         grew = lambda k: now_[k] is not None and type(old.get(k)) is int and now_[k] > old[k]     # noqa: E731
-        gap = max(t0 - old["at"], 0.0) if isinstance(old.get("at"), (int, float)) else 0.0
-        stall = now_["full_us"] is not None and type(old.get("full_us")) is int and \
-            now_["full_us"] - old["full_us"] > BROWSER_STALL * max(1.0, gap / 300)
-        less += 1 if grew("oom") or grew("swap_fail") or stall else 0
-    browser_kv(BROWSER_ROOM + server, json.dumps(dict(now_, at=t0, less=less), sort_keys=True))
+        whole = lambda k: old.get(k) if type(old.get(k)) is int else 0                            # noqa: E731
+        room_places = browser_room_places(server, room)
+        less, quiet, need = min(whole("less"), room_places), whole("quiet"), max(whole("need"), BROWSER_QUIET)
+        since = old.get("since_back") if type(old.get("since_back")) is int else None
+        sign = grew("oom") or grew("swap_fail")
+        held = old.get("window_sign") is True             # a sign at a short reading of this window: no calm window
+        calm = closed = False
+        base_at = old.get("base_at") if isinstance(old.get("base_at"), (int, float)) else old.get("at")
+        base_full = old.get("base_full") if type(old.get("base_full")) is int else old.get("full_us")
+        if isinstance(base_at, (int, float)) and t0 - base_at >= BROWSER_WINDOW:
+            if now_["full_us"] is not None and type(base_full) is int:
+                stall = (now_["full_us"] - base_full) * 300 / (t0 - base_at)
+                sign, calm = sign or stall > BROWSER_STALL, stall <= BROWSER_CALM
+            elif now_["full_us"] is None and base_full is None:  # a kernel with no stall counter: its counts alone
+                calm = True
+            # one end of the window with no stall counter (a read that failed once): its stall is unknown, not calm
+            closed, calm = True, calm and not held and not sign
+            base_at, base_full, held = t0, now_["full_us"], False
+        held = held or (sign and not closed)
+        if sign:
+            if since is not None and since < BROWSER_QUIET:
+                need = min(2 * need, 8 * BROWSER_QUIET)      # the place came back, and so did the shortage
+            less, quiet, since = min(less + 1, room_places), 0, None
+        elif closed and calm:
+            if since is not None:
+                since += 1
+                if since >= 2 * need:
+                    need, since = BROWSER_QUIET, None
+            if less > 0:
+                quiet += 1
+                if quiet >= need:
+                    less, quiet, since = less - 1, 0, 0
+        state.update(now_, at=t0, less=less, quiet=quiet, need=need, since_back=since, base_at=base_at,
+                     base_full=base_full, window_sign=held)
+        browser_kv(BROWSER_ROOM + server, json.dumps(state, sort_keys=True))
 
 
-def browser_places(server, team=None):
-    """How many browsers can run at one time on this Linux server (D6): of the room of user.slice (its MemoryMax and
-    its swap, min(memory.swap.max, SwapTotal)), the need of every agent on it and the margin, in places of BROWSER_PLACE,
-    never more than its workers and leads with a shell (one browser task each, D9; only they can have a browser, D2),
-    less what real shortages took (browser_room_seen). 0 without a reading of its room or a limit of the slice: no
-    browser runs before part 1 of the memory route is on a server. read_row only: an admission reads it inside a
-    transaction."""
+def browser_room_places(server, room, team=None):
+    """The places that the room of this server's user.slice gives (D6), before what shortages took: of its MemoryMax
+    and its swap, min(memory.swap.max, SwapTotal), the need of every agent on it and the margin, in places of
+    BROWSER_PLACE, never more than its workers and leads with a shell (one browser task each, D9; only they can have a
+    browser, D2). 0 without a limit of the slice."""
     team = team or TEAM
-    row = read_row("SELECT data FROM server_status WHERE server=?", (server,))
-    try:
-        room = (json.loads(row["data"]) if row else {}).get("room") or {}
-    except (ValueError, TypeError, AttributeError):
-        room = {}
     memory, swap = room.get("memory_max"), room.get("swap_total")
     if type(memory) is not int:
         return 0
@@ -5156,11 +5211,31 @@ def browser_places(server, team=None):
     shell = lambda a: a.get("role") == "manager" or "shell" in (a.get("can") or [])       # noqa: E731
     need = sum(BROWSER_NEED_SHELL if shell(a) else BROWSER_NEED_CLOSED for a in here)
     takers = sum(1 for a in here if a.get("role") in ("worker", "lead") and shell(a))
+    return max(0, min((memory + swap - need - BROWSER_MARGIN) // BROWSER_PLACE, takers))
+
+
+def browser_places(server, team=None):
+    """How many browsers can run at one time on this Linux server (D6): of the room of user.slice (its MemoryMax and
+    its swap, min(memory.swap.max, SwapTotal)), the need of every agent on it and the margin, in places of BROWSER_PLACE,
+    never more than its workers and leads with a shell (one browser task each, D9; only they can have a browser, D2),
+    less what real shortages took (browser_room_seen). 0 without a reading of its room or a limit of the slice: no
+    browser runs before part 1 of the memory route is on a server. read_row only: an admission reads it inside a
+    transaction."""
+    row = read_row("SELECT data FROM server_status WHERE server=?", (server,))
+    try:
+        room = (json.loads(row["data"]) if row else {}).get("room") or {}
+    except (ValueError, TypeError, AttributeError):
+        room = {}
+    return max(0, browser_room_places(server, room, team) - browser_room_less(server))
+
+
+def browser_room_less(server):
+    """The places of this server that shortages took now (browser_room_seen). read_row only."""
     try:
         less = json.loads(kv_read(BROWSER_ROOM + server) or "{}").get("less")
     except (ValueError, TypeError, AttributeError):
         less = 0
-    return max(0, min((memory + swap - need - BROWSER_MARGIN) // BROWSER_PLACE, takers) - (less if type(less) is int else 0))
+    return less if type(less) is int else 0
 
 
 def browser_active(owner, alive=None):
@@ -5270,7 +5345,7 @@ def browser_not_ready(owner, server):
     return None
 
 
-def browser_refusal(owner, caller, keep=False):
+def browser_refusal(owner, caller, keep=False, exact=False):
     """Why a new browser task of `owner`, an agent on a Linux server, must not start now (build plan 04, S3), or None.
     Its session would get no browser (lifecycle.linux_browser_refusal: its runtime, its Shell box, Codex's app-server
     start), the hub's own server runs none (D6), or its helper would not start it there now (browser_not_ready); another
@@ -5279,16 +5354,20 @@ def browser_refusal(owner, caller, keep=False):
     requester and tells it when a place is free there (browser_place_sweep), a refusal and an event with no queue. A
     run of a wake-up rule or of a duty records its refusal as the run's reason, which the owner's apps show: the busy
     desktop's words where a task holds the place, else BROWSER_RUN_NOT_NOW (the owner's yes to it waits). Only the
-    fleet manager sees another task's ID."""
+    fleet manager sees another task's ID. `exact` (start_task, whose agent tells the owner why no task opened): the same
+    words as `keep`'s, without its promise and its record, because nobody waits for that task: with the run's words an
+    agent told the owner on 21 November 2026 to turn its browser on in its settings, where it was on."""
     a, server = agents()[owner], browser_server(owner)
     machine = a.get("machine")
     why = (lifecycle.linux_browser_refusal(a) or browser_not_ready(owner, server)) if server else \
         "a browser of an agent runs on a Linux server that joined, and not on the hub's own"
     if why:
+        if exact:
+            return f"You get no browser on {machine}: {why}."
         return f"{owner} gets no browser on {machine}: {why}." if keep else BROWSER_RUN_NOT_NOW.format(
             agent=shown_role(owner), server=machine)
     busy = desktop_busy(owner, "browser")
-    other = "another browser task" if keep else "another browser or screen task"        # a run's: the known words
+    other = "another browser task" if keep or exact else "another browser or screen task"   # a run's: the known words
     if busy is not None:
         which = tref(busy["id"]) if caller == manager_name() else other
         return f"The desktop of {machine} is busy with {which}; wait until it ends."
@@ -5304,9 +5383,25 @@ def browser_refusal(owner, caller, keep=False):
             browser_kv(BROWSER_REFUSED + server, json.dumps(dict(refused, **{caller: lead_task(caller)}), sort_keys=True))
     holders = browser_holders(server)
     which = tref(holders[0]) if caller == manager_name() and holders else other
-    if not keep:            # a run's reason, which the owner's apps show: a busy desktop's, else that it cannot now
+    if not keep and not exact:  # a run's reason, which the owner's apps show: a busy desktop's, else that it cannot now
         return f"The desktop of {machine} is busy with {which}; wait until it ends." if holders else \
             BROWSER_RUN_NOT_NOW.format(agent=shown_role(owner), server=machine)
+    if exact:
+        # the agent tells the owner: the cause, and whether the place comes back by itself (two reviews, 21 November)
+        row = read_row("SELECT data FROM server_status WHERE server=?", (server,))
+        try:
+            room = (json.loads(row["data"]) if row else {}).get("room") or {}
+        except (ValueError, TypeError, AttributeError):
+            room = {}
+        if type(room.get("memory_max")) is not int:
+            return f"{machine} has no place for a browser now: the memory limit of its agents is not in place there yet."
+        if not browser_room_places(server, room):
+            return (f"{machine} has no place for a browser now: its memory does not hold a browser beside its agents' "
+                    f"work; it needs more memory, or an agent fewer.")
+        if not browser_places(server):
+            return (f"{machine} has no place for a browser now: a shortage of memory there took it, and it comes back "
+                    f"by itself once its memory is calm again.")
+        return f"{machine} has no free place for a browser now: other browser tasks there hold its places."
     if not browser_places(server):
         return (f"{machine} has no place for a browser now: the memory of its agents, or a shortage of it, leaves none. "
                 f"The hub tells you when a browser place is free there.")
@@ -20698,7 +20793,8 @@ def t_start_task(agent, a):
     if route is None or route["kind"] != "task":
         raise ToolError(f"No task can be opened for you: {why_not or 'there is no line to request it'}")
     requester = route["requester"]
-    busy = desktop_refusal(agent, needs, agent)         # the agent is the caller: it reads no other task's ID
+    # the agent is the caller: it reads no other task's ID, and the reason itself, which it tells the owner
+    busy = desktop_refusal(agent, needs, agent, exact=True)
     if busy:
         raise ToolError(busy + " No task is open for this message: tell the owner so with tell_owner.")
     # the owner's words with their lines: the Task page shows them in the owner's bubble (FleetTask.ownersWords)

@@ -284,9 +284,11 @@ class LinuxPlaces(OwnerAPI):
         self.room(dict(ONE_PLACE, swap_total=0, swap_max=1907 * MIB))  # and only the swap that exists counts
         self.assertEqual(hub.browser_places("box"), 0)
 
-    def test_a_real_shortage_takes_a_place_until_the_next_boot_or_a_change_of_the_limits(self):
+    def test_a_real_shortage_takes_a_place_until_calm_windows_a_boot_or_new_limits_give_it_back(self):
         """D6: a new oom of the slice, a new fail of its swap, or more than 5 s of full stall in 300 s takes one place
-        for each reading that shows one; a reading of a new boot or of new limits starts again."""
+        for each reading that shows one; a reading of a new boot or of new limits starts again, and BROWSER_QUIET calm
+        windows in a row give one place back (21 November 2026: one stall took the only place of a server, and its
+        agent's browser tasks were refused for hours)."""
         hub.TEAM["agents"]["kai"]["can"] = ["shell", "browser"]
         t0 = 1_000_000.0
         reading = lambda **room: self.room(dict(dict(CX23, memory_max=7000 * MIB), **room))     # noqa: E731
@@ -309,6 +311,74 @@ class LinuxPlaces(OwnerAPI):
         self.assertEqual(hub.browser_places("box"), 1)
         seen(dict(reading(oom=1, memory_max=7100 * MIB), os={"boot": "b2"}), t0 + 3000)    # a new limit
         self.assertEqual(hub.browser_places("box"), 2)
+        # **Calm windows give a place back** (21 November 2026: one stall took the only place of a server for hours).
+        # Each section starts fresh at new limits; a reading is a window only at BROWSER_WINDOW seconds or more.
+        clock = [t0 + 3000]
+
+        def at(gap, mib, **room):
+            clock[0] += gap
+            seen(dict(reading(memory_max=mib * MIB, **room), os={"boot": "b2"}), clock[0])
+            return hub.browser_places("box")
+
+        calm = lambda n, mib, **room: [at(300, mib, **room) for _ in range(n)][-1]      # noqa: E731
+        at(300, 7200)                                                    # new limits: fresh
+        self.assertEqual(at(300, 7200, oom=1), 1)                        # a sign takes one
+        self.assertEqual([at(20, 7200, oom=1) for _ in range(12)][-1], 1)    # 12 short readings are one window
+        self.assertEqual(calm(hub.BROWSER_QUIET - 2, 7200, oom=1), 1)
+        self.assertEqual(at(300, 7200, oom=1), 2)                        # the sixth calm window gives it back
+        # a stall in pieces of short readings is still a stall, over its window
+        at(300, 7300)
+        for i in range(1, 13):
+            at(20, 7300, full_us=i * 600_000)                            # 7.2 s in 240 s: 9 s in 300 s
+        self.assertEqual(hub.browser_places("box"), 1)
+        # a window between the bounds neither counts nor starts the count again
+        self.assertEqual(calm(hub.BROWSER_QUIET - 1, 7300, full_us=7_200_000), 1)
+        self.assertEqual(at(300, 7300, full_us=7_200_000 + 3_000_000), 1)    # 3 s in 300 s: between
+        self.assertEqual(at(300, 7300, full_us=10_200_000), 2)               # the sixth calm one
+        # a sign soon after a place came back doubles the wait (windows between the bounds do not count toward it);
+        # signs never take more than the room gives
+        full = 10_200_000
+        for _ in range(hub.BROWSER_QUIET):
+            full += 3_000_000
+            at(300, 7300, full_us=full)                                   # between: no step toward the reset
+        self.assertEqual(at(300, 7300, full_us=full, swap_fail=1), 1)
+        self.assertEqual(at(300, 7300, full_us=full, swap_fail=2), 0)
+        self.assertEqual(at(300, 7300, full_us=full, swap_fail=3), 0)
+        self.assertEqual(json.loads(hub.kv_get(hub.BROWSER_ROOM + "box"))["less"], 2)
+        self.assertEqual(calm(2 * hub.BROWSER_QUIET - 1, 7300, full_us=full, swap_fail=3), 0)
+        self.assertEqual(at(300, 7300, full_us=full, swap_fail=3), 1)     # twelve calm windows now
+        self.assertEqual(calm(2 * hub.BROWSER_QUIET, 7300, full_us=full, swap_fail=3), 2)
+        # a long calm after it sets the wait back
+        calm(4 * hub.BROWSER_QUIET, 7300, full_us=full, swap_fail=3)
+        self.assertEqual(at(300, 7300, full_us=full, swap_fail=4), 1)
+        self.assertEqual(calm(hub.BROWSER_QUIET, 7300, full_us=full, swap_fail=4), 2)
+        # an older reading that comes late, within a window, changes nothing; counters that start again later, with
+        # no new boot id, are the new base
+        before = hub.kv_get(hub.BROWSER_ROOM + "box")
+        seen(dict(reading(memory_max=7300 * MIB, full_us=full, swap_fail=3), os={"boot": "b2"}), clock[0] + 60)
+        self.assertEqual(hub.kv_get(hub.BROWSER_ROOM + "box"), before)
+        self.assertEqual(at(300, 7300, full_us=0, swap_fail=0), 2)
+        self.assertEqual(at(300, 7300, full_us=0, swap_fail=1), 1)          # a sign from the new base
+        # a window that had a sign at a short reading is no calm window when it closes
+        at(300, 7350)
+        self.assertEqual(at(60, 7350, oom=1), 1)
+        self.assertEqual(at(240, 7350, oom=1), 1)
+        self.assertEqual(calm(hub.BROWSER_QUIET - 2, 7350, oom=1), 1)
+        # a reading whose stall counter failed once: the two windows that it ends and starts are not calm
+        self.assertEqual(at(300, 7350, oom=1, full_us=None), 1)
+        self.assertEqual(at(300, 7350, oom=1), 1)
+        self.assertEqual(at(300, 7350, oom=1), 1)
+        self.assertEqual(at(300, 7350, oom=1), 2)                          # the sixth calm window
+        # a kernel with no stall counter: its windows close on their length, calm while no counter grows
+        at(300, 7400, full_us=None)
+        self.assertEqual(at(300, 7400, full_us=None, oom=1), 1)
+        self.assertEqual(calm(hub.BROWSER_QUIET, 7400, full_us=None, oom=1), 2)
+        # an agent more leaves the room no place: the places that shortages took go down with it
+        self.assertEqual(at(300, 7400, full_us=None, oom=2), 1)
+        hub.TEAM["agents"]["gus"] = {"role": "worker", "runtime": "claude", "machine": "box", "can": ["shell"]}
+        at(300, 7400, full_us=None, oom=2)
+        self.assertEqual(json.loads(hub.kv_get(hub.BROWSER_ROOM + "box"))["less"], 0)
+        del hub.TEAM["agents"]["gus"]
 
     def test_a_browser_task_takes_its_place_and_the_next_one_hears_when_one_is_free(self):
         first = self.task("ivy")
@@ -478,10 +548,50 @@ class LinuxPlaces(OwnerAPI):
             self.assertEqual(hub.browser_refusal("ivy", "manager"), "Ivy cannot run a browser task on box now.")
         self.room(dict(ONE_PLACE, memory_max=None))        # no place at all, and no task that holds one
         self.assertEqual(hub.browser_refusal("ivy", "manager"), "Ivy cannot run a browser task on box now.")
+
         self.room(ONE_PLACE)
         hub.kv_set(hub.SERVICE_USER + "ivy", "1")
         self.assertIn("does not run as an OS user of its own there yet", self.task("ivy"))
         self.assertEqual(hub.browser_holds(), {})
+
+    def test_an_agent_s_own_chat_task_hears_why_it_gets_no_browser(self):
+        """start_task, from the agent's own chat: the refusal says the cause, which the agent tells the owner (21
+        November 2026: with the run's words an agent told the owner to turn on its browser in its settings, where it
+        was on), and promises no notice that nobody would send."""
+        context = ("test-generation", "owner-chat", "1")
+
+        def ask(text):
+            body = self.command(recipient="ivy", text=text)
+            self.request("/ui/messages", body)
+            hub.call_tool("ivy", "read_messages", {}, context)
+            said, error = hub.call_tool("ivy", "start_task", dict(title="Open the page", done_when="its words are read",
+                                                                  in_reply_to=body["request_id"], needs="browser"), context)
+            self.assertTrue(error, said)
+            return said
+
+        data = self.room(ONE_PLACE)
+        data["browser"].update(proof_kept=False)
+        hub.q("UPDATE server_status SET data=? WHERE server='box'", (json.dumps(data),))
+        self.assertIn("You get no browser on box: its server service cannot keep the live proof", ask("Open the page."))
+        self.room(dict(ONE_PLACE, memory_max=None))
+        self.assertIn("box has no place for a browser now: the memory limit of its agents is not in place there yet",
+                      ask("Open the page now."))
+        self.room(dict(ONE_PLACE, memory_max=2000 * MIB))
+        self.assertIn("box has no place for a browser now: its memory does not hold a browser beside its agents' work",
+                      ask("Open it now."))
+        self.room(ONE_PLACE)
+        hub.kv_set(hub.BROWSER_ROOM + "box", json.dumps({"less": 1}))
+        self.assertIn("a shortage of memory there took it, and it comes back by itself", ask("Open it again."))
+        # an agent more leaves the room no place at all: never "it comes back by itself" then
+        hub.TEAM["agents"]["gus"] = {"role": "worker", "runtime": "claude", "machine": "box", "can": ["shell"]}
+        self.assertIn("its memory does not hold a browser beside its agents' work", ask("Open it, please."))
+        del hub.TEAM["agents"]["gus"]
+        hub.kv_set(hub.BROWSER_ROOM + "box", json.dumps({"less": 0}))
+        self.assertIsInstance(self.task("kai"), int)                      # kai's task holds the one place
+        said = ask("And open it once more.")
+        self.assertIn("box has no free place for a browser now: other browser tasks there hold its places.", said)
+        self.assertNotIn("T-", said)                                      # only the manager sees another task's ID
+        self.assertIsNone(hub.kv_get(hub.BROWSER_REFUSED + "box"))        # and no promise of a notice
 
     def test_one_agent_holds_one_place_however_many_browser_tasks_a_run_admits(self):
         """A duty's run admits up to three tasks at once, and the helper runs one at a time (D9): one place."""
