@@ -22,12 +22,15 @@ the same code, and the host refuses on its own what the door should never have s
 """
 import base64
 import calendar
+import collections
+import copy
 import difflib
 import fnmatch
 import importlib.machinery
 import importlib.util
 import json
 import os
+import posixpath
 import re
 import time
 
@@ -89,12 +92,16 @@ def kind_line(names):
     return ITEM + r"(?i:kind)[ \t]*:\s*[\"']?(?i:" + names + ")" + END
 
 
+# The three reference forms take each key that ENDS in secretKeyRef, secretRef or secretName, in any case (a CSI
+# volume's nodePublishSecretRef, a store's tokenSecretRef), and the operator's kinds each group of external-secrets.io
+# (generators.external-secrets.io too).
 MANIFEST_REFUSED = {
-    "a new secretKeyRef": r"\bsecretKeyRef\s*:", "a new secretRef": r"\bsecretRef\s*:",
-    "a new secret volume": ITEM + r"secret[ \t]*:[ \t\r]*(?:#.*)?$|\bsecretName\s*:", "a hostPath": r"\bhostPath\s*:",
+    "a new secretKeyRef": r"(?i:\w*secretKeyRef)\s*:", "a new secretRef": r"(?i:\w*secretRef)\s*:",
+    "a new secret volume": ITEM + r"(?i:secret)[ \t]*:[ \t\r]*(?:#.*)?$|(?i:\w*secretName)\s*:",
+    "a hostPath": r"\bhostPath\s*:",
     "privileged": r"\bprivileged\s*:" + TRUE, "a host namespace": r"\bhost(Network|PID|IPC)\s*:" + TRUE,
     "an Application": kind_line("Application|ApplicationSet|AppProject"),
-    "an external-secrets kind": ITEM + r"apiVersion[ \t]*:\s*[\"']?(?i:external-secrets\.io)/",
+    "an external-secrets kind": ITEM + r"apiVersion[ \t]*:\s*[\"']?(?i:(?:[\w-]+\.)*external-secrets\.io)/",
     "a CRD": kind_line("CustomResourceDefinition"),
     "a webhook": kind_line("(?:Mutating|Validating)WebhookConfiguration"),
     "a new LoadBalancer": r"\btype\s*:\s*[\"']?LoadBalancer\b", "a Secret object": kind_line("Secret"),
@@ -911,6 +918,30 @@ def as_block(value, depth=0):
     return "".join(out)
 
 
+def as_lines(value, depth=0):
+    """A JSON value as as_block writes it, but with each line of a text on a line of its own, below its key: a form
+    inside a text value or a block scalar (an Application's helm.values) stands at the start of a line, where the
+    patterns read it."""
+    def flat(v):
+        return re.sub(r"\s+", " ", v) if isinstance(v, str) else json.dumps(v)
+
+    def text(v, pad):
+        lines = v.splitlines() if isinstance(v, str) else []
+        if len(lines) < 2:
+            return " " + flat(v) + "\n"
+        return " |\n" + "".join(f"{pad}  {flat(line)}\n" for line in lines)
+    pad, out = "  " * depth, []
+    for key, v in value.items() if isinstance(value, dict) else [(None, v) for v in value]:
+        out.append(pad + ("-" if key is None else flat(key) + ":"))
+        out.append("\n" + as_lines(v, depth + 1) if isinstance(v, (dict, list)) else text(v, pad))
+    return "".join(out)
+
+
+def lines_text(docs):
+    "Documents as as_lines writes them, one document each: the second text of the count."
+    return "---\n".join(as_lines(doc) for doc in docs if isinstance(doc, (dict, list)))
+
+
 def no_key_twice(pairs):
     if len({k for k, _ in pairs}) != len(pairs):
         raise ValueError("a key is there twice")
@@ -949,12 +980,15 @@ def manifest_name(path):
 # tag by which YAML reads a key from base64. Role, Application and a secret volume are words of plain speech too, so
 # LOOSE_KEYS takes them with their key, in the text with its quotes, spaces, tabs and braces taken out.
 LOOSE_WORDS = ("secretkeyref", "secretref", "secretname", "hostpath", "privileged", "hostnetwork", "hostpid", "hostipc",
-               "applicationset", "appproject", "external-secrets.io", "customresourcedefinition",
-               "mutatingwebhookconfiguration", "validatingwebhookconfiguration", "loadbalancer", "clusterrole",
+               "applicationset", "appproject", "external-secrets.io", "secrets-store.csi.x-k8s.io",
+               "customresourcedefinition", "mutatingwebhookconfiguration", "validatingwebhookconfiguration",
+               "loadbalancer", "clusterrole",
                "rolebinding", "clusterrolebinding", "tailscale.com/tags", "proxyclass", "upgrade.cattle.io",
                "serviceaccountname", "!!binary", "tag:yaml.org,2002:binary")
 LOOSE_KEYS = {"kind: role": r"kind:\s*role(?![a-z0-9])", "kind: application": r"kind:\s*application(?![a-z0-9])",
               "secret:": r"(?<![a-z0-9_./-])secret:",
+              # each key that ends so, as MANIFEST_REFUSED reads them: a word of LOOSE_WORDS is a whole word only
+              "*secretkeyref:": r"secretkeyref:", "*secretref:": r"secretref:", "*secretname:": r"secretname:",
               # and the two that a text can turn on with no new word, from false to true
               "privileged: true": r"privileged:\s*(?:true|yes|on|y)(?![a-z0-9])",
               "a host namespace: true": r"host(?:network|pid|ipc):\s*(?:true|yes|on|y)(?![a-z0-9])"}
@@ -988,7 +1022,8 @@ def loose_danger(old_text, new_text):
     word = next((w for w in new if new[w] > old[w]), None)
     if word:
         return f"the word {word}"
-    accounts, sizes = (lambda bare: re.findall(r"serviceaccountname:([^,\s\]]*)", bare)), \
+    # serviceAccount, the old name of the pod's field, too: a pattern, as a loose word would take kind: ServiceAccount
+    accounts, sizes = (lambda bare: re.findall(r"serviceaccount(?:name)?:([^,\s\]]*)", bare)), \
         (lambda bare: [quantity(x) for x in re.findall(r"storage:([0-9.]+[kmgtp]i?)", bare)])
     if accounts(old_bare) != accounts(new_bare):
         return "a changed serviceAccountName"
@@ -1048,6 +1083,162 @@ def kept_back(path, data):
 LISTED_LINE = re.compile(r"\s*-?\s*replicas\s*:\s*\d{1,2}\s*|"
                          r"\s*[\w./-]*restartedAt['\"]?\s*:\s*['\"]?[0-9T:.Z+-]{10,40}['\"]?\s*|"
                          r"\s*-?\s*(?:image|tag|digest|newTag|newName)\s*:\s*[\w./:@-]+\s*")
+# What makes a file that no parser of the door reads one that changes only on listed lines (the rule of references to
+# Secrets, A8): a key that contains secret, with its spaces kept, so that "the secrets of an application:" in a README
+# is no key; an apiVersion of the operator's groups, of the Secrets Store CSI driver, of Argo CD or of RBAC; and, where
+# the door reads no object in the file (a values file, a file of another name), a key that contains serviceaccount.
+# In a manifest of objects the count reads serviceAccountName and serviceAccount by their values (sa_changed).
+# imagePullSecrets names a Secret that only the node reads, to pull an image: no key of this rule.
+HELD_GROUPS = (r"(?:(?:[\w-]+\.)*external-secrets\.io|argoproj\.io|secrets-store\.csi\.x-k8s\.io|"
+               r"rbac\.authorization\.k8s\.io)/")
+# A key's colon may stand on the next line: in a flow mapping ({"secretKeyRef"\n: ...}) and after YAML's explicit key
+# (? secretKeyRef\n: ...).
+NAMES_SECRET = re.compile(r"(?<![\w.-])(?!imagepullsecrets[\"']?\s*:)[\w.-]*secret[\w.-]*[\"']?\s*:")
+NAMES_HELD = re.compile(r"apiversion[\"']?\s*:\s*[\"']?" + HELD_GROUPS)
+NAMES_ACCOUNT = re.compile(r"[\w.-]*serviceaccount[\w.-]*[\"']?\s*:")
+
+
+def uncommented(text):
+    """A text with each YAML comment taken out: a # at a line's start or after a space, a tab or a CR, to the line's
+    end, which a CR alone makes too (YAML reads one as a line break, and re's lines end at a LF only)."""
+    return re.sub(r"(^|[ \t\r])#[^\n\r]*", r"\1", text, flags=re.M)
+
+
+def names_secret(text, accounts=True):
+    """True when a text names a Secret, a held kind or, with accounts, a service account, in the loose reading
+    (NAMES_SECRET, NAMES_HELD, NAMES_ACCOUNT), as it stands and without its comments: a comment can stand between a
+    key and its colon on the next line."""
+    low = loose_text(text)
+    return any(NAMES_SECRET.search(t) or NAMES_HELD.search(t) or accounts and NAMES_ACCOUNT.search(t)
+               for t in (low, uncommented(low)))
+
+
+def sensitive_key(key):
+    "True for a key that names a Secret or an account: it contains secret or serviceaccount; but imagePullSecrets."
+    low = key.lower() if isinstance(key, str) else ""
+    return ("secret" in low or "serviceaccount" in low) and low != "imagepullsecrets"
+
+
+def name_and_key(node, parent):
+    """True for a mapping of exactly a name and a key (and optional), outside a ConfigMap's (a parent configMap,
+    configMapKeyRef or configMapRef, by its whole name: a chart may read a key such as dbConfigMap as a Secret's) and a
+    selector: how the Prometheus operator and many charts name a key of a Secret (basicAuth.password,
+    authorization.credentials)."""
+    low = parent.lower() if isinstance(parent, str) else ""
+    return isinstance(node, dict) and {"name", "key"} <= set(node) <= {"name", "key", "optional"} and \
+        low not in ("configmap", "configmapkeyref", "configmapref") and low != "matchlabels" and \
+        "selector" not in low
+
+
+def sensitive(docs):
+    """What of parsed documents names a Secret, a service account or a held kind, with its place, in their order: each
+    value under a key that contains secret or serviceaccount, each mapping of a name and a key (name_and_key), and
+    each mapping with an apiVersion of a held group. Check 1 of a file that the parser reads compares it at HEAD and
+    after the commit, and nothing else."""
+    out = []
+
+    def walk(node, at, parent):
+        if isinstance(node, dict):
+            if isinstance(node.get("apiVersion"), str) and re.match(HELD_GROUPS, node["apiVersion"], re.I) or \
+                    name_and_key(node, parent):
+                out.append((at, json.dumps(node, sort_keys=True, default=str)))
+                return
+            for k, v in node.items():
+                if sensitive_key(k):
+                    out.append((at + (str(k),), json.dumps(v, sort_keys=True, default=str)))
+                else:
+                    walk(v, at + (str(k),), k)
+        elif isinstance(node, list):
+            for n, v in enumerate(node):
+                walk(v, at + (n,), parent)
+    for n, doc in enumerate(docs or []):
+        walk(doc, (n,), None)
+    return out
+
+
+def block_tree(text):
+    """A text that unread reads as block style, as the tree of mappings, lists and texts that it says, for sensitive:
+    a value is the text of its line with no comment and no quotes, and a block scalar's value its lines. Each
+    document of the text is one item of the list that it gives."""
+    def split(text):
+        colon = re.search(r":(?=[ \t]|$)", text)
+        return (text[:colon.start()].rstrip(" \t"), text[colon.end():].strip(" \t")) if colon else (None, text)
+
+    def value(text):
+        text = re.sub(r"(?:^|[ \t]+)#.*$", "", text).strip(" \t")
+        return text[1:-1] if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'" else text
+    rows = []                   # [column, text, the lines of its block scalar or None]
+    scalar = None               # (the column that its lines stand to the right of, its lines)
+    for line in text.replace("\r\n", "\n").split("\n"):
+        rest = line.lstrip(" ")
+        col = len(line) - len(rest)
+        if scalar is not None:
+            if not rest.strip(" \t") or col > scalar[0]:
+                scalar[1].append(line)
+                continue
+            scalar = None
+        if not rest.strip(" \t") or rest.startswith("#") or re.fullmatch(r"(?:---|\.\.\.)[ \t]*(?:#.*)?", rest):
+            continue
+        owner = col
+        while re.match(r"-(?:[ \t]+|$)", rest):
+            dash = re.match(r"-[ \t]*", rest).end()
+            rows.append([col, "-", None])
+            owner, col, rest = col, col + dash, rest[dash:]
+        rest = rest.rstrip(" \t")
+        if not rest:
+            continue
+        rows.append([col, rest, None])
+        # a block scalar: the value after its key, with no comment, or the text after a dash, is | or > alone
+        key, said = split(rest)
+        if re.fullmatch(r"[|>][-+0-9]*", re.sub(r"(?:^|[ \t]+)#.*$", "", said).strip(" \t")):
+            rows[-1][2] = []
+            scalar = (col if key is not None else owner, rows[-1][2])
+
+    def node(i, col):
+        "(the node whose rows start at row i in column col, the row after it)"
+        if rows[i][1] == "-":
+            items = []
+            while i < len(rows) and rows[i][0] == col and rows[i][1] == "-":
+                i += 1
+                item = None
+                if i < len(rows) and rows[i][0] > col:
+                    item, i = node(i, rows[i][0])
+                items.append(item)
+            return items, i
+        key, said = split(rows[i][1])
+        if key is None:         # a text, and the lines that go on with it
+            text, lines, i = rows[i][1], rows[i][2], i + 1
+            while i < len(rows) and rows[i][0] > col and rows[i][1] != "-":
+                text, i = text + " " + rows[i][1], i + 1
+            return ("\n".join(lines) if lines is not None else value(text)), i
+        out = {}
+        while i < len(rows) and rows[i][0] == col and rows[i][1] != "-":
+            key, said = split(rows[i][1])
+            lines, i = rows[i][2], i + 1
+            if lines is not None:
+                out[key] = "\n".join(lines)
+            elif said and not said.startswith("#"):
+                while i < len(rows) and rows[i][0] > col and rows[i][1] != "-":
+                    said, i = said + " " + rows[i][1], i + 1
+                out[key] = value(said)
+            elif i < len(rows) and (rows[i][0] > col or rows[i][0] == col and rows[i][1] == "-"):
+                out[key], i = node(i, rows[i][0])
+            else:
+                out[key] = None
+        return out, i
+    docs, i = [], 0
+    while i < len(rows):
+        found, i = node(i, rows[i][0])
+        docs.append(found)
+    return docs
+
+
+def sensitive_lines(text):
+    """What of a block style text names a Secret, a service account or a held kind (sensitive of its block_tree), or
+    None for a text that is not block style (unread)."""
+    if unread(text):
+        return None
+    return sensitive(block_tree(text))
 
 
 def loose_read(path, data, old):
@@ -1089,10 +1280,11 @@ def plan_channels(text):
                if re.search(ITEM + r"apiVersion[ \t]*:\s*[\"']?(?i:upgrade\.cattle\.io)/", doc, re.M))
 
 
+SERVICE_ACCOUNT = re.compile(r"serviceAccount(?:Name)?\s*:\s*(\S+)")      # the pod's field and its old name
+
+
 def sa_changed(old_text, new_text):
-    a = re.findall(r"serviceAccountName\s*:\s*(\S+)", old_text)
-    b = re.findall(r"serviceAccountName\s*:\s*(\S+)", new_text)
-    return a != b
+    return SERVICE_ACCOUNT.findall(old_text) != SERVICE_ACCOUNT.findall(new_text)
 
 
 def storage_grew(old_text, new_text):
@@ -1865,6 +2057,523 @@ def decide_prune(lookups, repo, target, caller, app):
                     plan=plan, hash_content=listed.encode())
 
 
+# ---------------------------------------------------------------- references to Secrets (stage A)
+#
+# The owner, 21 November 2026, "Yes, send it", to the door's rule for a reference to a Secret in a GitOps commit (its
+# design of that day, version 3): a new reference of a pod to a Secret that exists is the door's existing card (kind
+# full), with the exact change and one press; a new Secret that the commit makes for a key that the owner gave on a
+# key card is to pass by itself, which is the next stage and no code here yet. One rule for every fleet. Until then:
+# - each NEW reference of a pod (env[].valueFrom.secretKeyRef, envFrom[].secretRef, volumes[].secret,
+#   volumes[].projected.sources[].secret, and a CSI volume's SecretProviderClass, below a mapping that has
+#   containers) is the owner's card, which names it. New: the object at HEAD, looked up by its name (or its
+#   generateName) in every file of the commit, in the same place, holds no reference of the same form, Secret, key
+#   and namespace. The place is the Application of HEAD that applies the file, with its namespace or the object's
+#   own; with no such Application, the file's folder (namespace_token): so the same namespace of two clusters'
+#   folders, or of two folders that no Application names, is no same place, and only a moved object is new;
+# - each other new reference (a key that ends in secretKeyRef, secretRef or secretName, in any case, a secret:
+#   mapping, and, in an object of the Prometheus operator, a mapping of a name and a key and the secrets of its
+#   servers) is refused, unless an object of its kind in the same place holds it at HEAD and is gone after the commit
+#   (a renamed one), or holds it at all for an Ingress and a Certificate (a moved one); and so is a new object of the
+#   operator's groups, of the Secrets
+#   Store CSI driver, of Argo CD's Application kinds or of RBAC, and a change of one at HEAD outside the fields that
+#   are free (held_change);
+# - the count of MANIFEST_REFUSED reads copies of the objects in which each reference is renamed to a key that no form
+#   reads, as as_block and as as_lines write them (each line of a text value at the start of a line), and the text
+#   that it read before, for each form but the three of a reference;
+# - check 1: a file that no parser of the door reads as objects alone (a values file), with no unit that rendered it
+#   whole, and a file that a chart's source of HEAD takes as its values (whatever it holds), keeps what of it names a
+#   Secret, a service account or a held kind (sensitive), where the parser read it; where no parser did, it changes
+#   only on listed lines when it names one (names_secret: a service account only where the door reads no object);
+# - a unit that can read a path that the door gives no agent (closed) gets the same rule, and a refusal in the place
+#   of each card;
+# - the words of a commit's new references fit the door's record (REFERENCES_MOST). A render's names are a template's
+#   words, and a template can write there what it read: a unit's card names its chart or Kustomize folder, never an
+#   object, and a Secret or a key only where that very word stands in a file of the commit.
+# The holes that stay open: a workload's own Secrets (the agent can change the command or the image of a workload
+# that reads a Secret already and read its log, and it builds the image); the value of its job's own key in a log;
+# the words of a card are the agent's line's words, and the hub checks only the hash, the target and the action; a
+# file that no parser reads and that names a Secret by a key with neither secret nor serviceaccount in it
+# (auth.existing: db); a chart upgrade that changes RBAC rules or the spec of an ExternalSecret has no route (a person
+# makes that commit outside the door); a folder that only an ApplicationSet's template names is in no namespace that
+# the door knows apart; another operator (Argo Events, KEDA) reads a Secret by fields of its own, and can make or copy
+# a Secret from an object that is the agent's own call; in a manifest that no parser reads, the count reads a
+# serviceAccount: whose name: stands on the next line by that next line, not by the account; with no render box, or
+# with Applications of HEAD that the box cannot read, the door knows no file that a chart takes as its values, so one
+# that looks like an object (apiVersion and kind atop the values) is read as an object; an operator or an Application
+# field newer than these lists is refused; a store that the Vault area cannot write has no next stage.
+
+REFERENCE_FORMS = ("a new secretKeyRef", "a new secretRef", "a new secret volume")
+SECRET_ENDS = ("secretkeyref", "secretref", "secretname")      # the endings of a key of another reference
+OPERATOR_GROUP = re.compile(r"(?:[a-z0-9-]+\.)*external-secrets\.io")
+STORE_GROUP = "secrets-store.csi.x-k8s.io"      # the Secrets Store CSI driver: a SecretProviderClass reads a store
+# An annotation that the operator copies to the Secret is read there by a reflector or a replicator, and one of an
+# Application by a tool beside Argo CD (the image updater's pull secret): only these change
+FREE_ANNOTATIONS = ("argocd.argoproj.io/", "app.kubernetes.io/", "helm.sh/", "reloader.stakater.com/")
+APP_ANNOTATIONS = FREE_ANNOTATIONS + ("notifications.argoproj.io/subscribe", "link.argocd.argoproj.io/")
+APP_KINDS = ("application", "applicationset", "appproject")
+# The kinds whose other reference is known when an object of the kind in the same place holds it at HEAD (a renamed or
+# moved Ingress): never the Prometheus operator's, whose name and key can read any Secret of the namespace.
+KNOWN_OTHERS = (("networking.k8s.io", "ingress"), ("cert-manager.io", "certificate"))
+RBAC_KINDS = ("role", "clusterrole", "rolebinding", "clusterrolebinding")
+AGGREGATION = "rbac.authorization.k8s.io/"      # a ClusterRole's label of this prefix adds its rules to another's
+# What a commit may change in an Application's spec; every other field is refused, so one that the door does not know
+# is closed. A source's targetRevision is free only with a chart: in a git source it can name a commit that never went
+# through the door. The helm values of a source of this repository whose chart a unit rendered whole are the
+# render's to decide (rendered_by); of each other source (a chart of a helm repository or of another git repository,
+# which the door does not render) they are free where they name no Secret, service account or held kind (sensitive,
+# sensitive_lines: also a mapping of a name and a key), and its valueFiles not at all.
+APP_FREE = ("syncPolicy", "ignoreDifferences", "info")
+HELM_FREE = ("values", "valuesObject", "parameters", "valueFiles")
+KUSTOMIZE_FREE = ("images", "replicas")
+SERVER_KINDS = ("prometheus", "prometheusagent", "alertmanager", "thanosruler")     # their spec.secrets are mounted
+REFERENCES_MOST = 300       # characters of the words of a commit's new references: what door.py's record keeps
+NAME_SHOWN = 63             # characters of one name in those words
+
+
+def is_object(doc):
+    "True for a document that a cluster applies as an object: a mapping with an apiVersion and a kind."
+    return isinstance(doc, dict) and isinstance(doc.get("apiVersion"), str) and isinstance(doc.get("kind"), str)
+
+
+def objects_in(docs):
+    "The objects of documents, the items of a List too, at any depth."
+    return [o for d in docs or [] if isinstance(d, dict) for o in listed_objects(d) if is_object(o)]
+
+
+def shown(value):
+    "A name out of the agent's own file as the words print it: its letters, digits and a few marks."
+    return re.sub(r"[^\w.:/-]", "?", value)[:NAME_SHOWN] if isinstance(value, str) and value else "?"
+
+
+def plain(value):
+    "True for a name that is plain text: a text with no line break and no other control character."
+    return isinstance(value, str) and re.fullmatch(r"[^\x00-\x1f\x7f\x85\u2028\u2029]+", value) is not None
+
+
+def namespace_token(o, given, place, alone):
+    """What stands for an object's namespace in the rule: (its own namespace, or given, the destination of the
+    Application that applies it, and place, that Application's root or the unit), so that the same namespace of two
+    clusters' folders is no same place; or (None, alone, its file or unit) when no Application gives one."""
+    meta = o.get("metadata") if isinstance(o.get("metadata"), dict) else {}
+    own = meta.get("namespace")
+    if isinstance(own, str) and own:
+        return own, place
+    if own in (None, "") and given:
+        return given, place
+    return None, alone
+
+
+def secret_facts(obj, namespace, strip=False):
+    """Each reference to a Secret in one object (A3), as a dict: form (the form of MANIFEST_REFUSED of a pod's
+    reference, or another's key as written), pod, name and key (of the Secret, as the object writes them), what (a
+    Secret, or a SecretProviderClass) and ns. A pod's references stand below a mapping that has containers:
+    env[].valueFrom.secretKeyRef, envFrom[].secretRef, volumes[].secret, volumes[].projected.sources[].secret and
+    volumes[].csi.volumeAttributes.secretProviderClass. Each other key at any depth that ends in secretKeyRef,
+    secretRef or secretName, in any case, and each other secret: mapping, is another reference; in an object of the
+    Prometheus operator also each mapping of exactly a name and a key (and optional) outside a configMap and a
+    selector, and the spec.secrets of its servers. strip: rename each reference's key, in place, to one that no form
+    reads, for the count (A7)."""
+    facts, spots, holders = [], set(), []
+    group = obj.get("apiVersion", "").rpartition("/")[0].lower() if isinstance(obj.get("apiVersion"), str) else ""
+    kind = obj.get("kind", "").lower() if isinstance(obj.get("kind"), str) else ""
+
+    def field(node, name, kind):
+        value = node.get(name) if isinstance(node, dict) else None
+        return value if isinstance(value, kind) else kind()
+
+    def items(node, name):
+        return [x for x in field(node, name, list) if isinstance(x, dict)]
+
+    def hold(holder, name):
+        spots.add((id(holder), name))
+        holders.append((holder, name))
+
+    def pod(holder, name, form, ref, of="name", key=False, what="Secret"):
+        hold(holder, name)
+        found = ref if isinstance(ref, dict) else {}
+        facts.append({"form": form, "pod": True, "name": found.get(of) if isinstance(ref, dict) else
+                      (ref if what != "Secret" else None), "key": found.get("key") if key else None, "what": what,
+                      "ns": namespace})
+
+    def pod_spec(spec):
+        for box in items(spec, "containers") + items(spec, "initContainers") + items(spec, "ephemeralContainers"):
+            for env in items(box, "env"):
+                held = field(env, "valueFrom", dict)
+                if "secretKeyRef" in held:
+                    pod(held, "secretKeyRef", "a new secretKeyRef", held["secretKeyRef"], key=True)
+            for env in items(box, "envFrom"):
+                if "secretRef" in env:
+                    pod(env, "secretRef", "a new secretRef", env["secretRef"])
+        for volume in items(spec, "volumes"):
+            if "secret" in volume:
+                ref = volume["secret"]
+                if isinstance(ref, dict) and "secretName" in ref:
+                    hold(ref, "secretName")
+                pod(volume, "secret", "a new secret volume", ref, of="secretName")
+            for source in items(field(volume, "projected", dict), "sources"):
+                if "secret" in source:
+                    pod(source, "secret", "a new secret volume", source["secret"])
+            attributes = field(field(volume, "csi", dict), "volumeAttributes", dict)
+            if "secretProviderClass" in attributes:
+                pod(attributes, "secretProviderClass", "a new secret volume", attributes["secretProviderClass"],
+                    what="SecretProviderClass")
+
+    def other(holder, name, value):
+        hold(holder, name)
+        facts.append({"form": name, "pod": False, "name": value, "key": None, "what": "Secret", "ns": namespace})
+
+    def walk(node, parent=None, above=None):
+        if isinstance(node, dict):
+            if "containers" in node:
+                pod_spec(node)
+            if group == MONITORING and above is not None and isinstance(parent, str) and \
+                    name_and_key(node, parent) and (id(above), parent) not in spots:
+                other(above, parent, node)
+            for name, value in list(node.items()):
+                low = name.lower() if isinstance(name, str) else ""
+                if (id(node), name) not in spots and (low.endswith(SECRET_ENDS) or
+                                                       low == "secret" and isinstance(value, dict)):
+                    other(node, name, value)
+                walk(value, name, node)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    spec = obj.get("spec") if isinstance(obj.get("spec"), dict) else {}
+    if group == MONITORING and kind in SERVER_KINDS and isinstance(spec.get("secrets"), list):
+        hold(spec, "secrets")
+        for name in spec["secrets"]:
+            facts.append({"form": "secrets", "pod": False, "name": name, "key": None, "what": "Secret",
+                          "ns": namespace})
+    walk(obj)
+    if strip:
+        for holder, name in holders:
+            if name in holder:
+                n = 0
+                while f"ref{n}" in holder:
+                    n += 1
+                holder[f"ref{n}"] = holder.pop(name)
+    return facts
+
+
+def stripped(docs):
+    "Copies of documents with each reference to a Secret of their objects renamed to a key that no form reads (A7)."
+    out = copy.deepcopy([d for d in docs or [] if isinstance(d, (dict, list))])
+    for o in objects_in(out):
+        secret_facts(o, None, strip=True)
+    return out
+
+
+def neutral(text):
+    "A text without the three forms of a reference, which the rule decides on the objects: what the count reads."
+    for form in REFERENCE_FORMS:
+        text = re.sub(MANIFEST_REFUSED[form], "", text, flags=re.M)
+    return text
+
+
+def fact_id(fact):
+    "What makes two references the same: their form, Secret, key and namespace."
+    return (fact["form"], json.dumps(fact["name"], sort_keys=True, default=str),
+            json.dumps(fact["key"], sort_keys=True, default=str), fact["ns"])
+
+
+def held_kind(obj):
+    """The form of an object whose change the door refuses (A4): of the operator's groups, of the Secrets Store CSI
+    driver, an Application, an ApplicationSet or an AppProject of Argo CD, a Role, a ClusterRole or a binding; or
+    None."""
+    group, kind = obj["apiVersion"].rpartition("/")[0].lower(), obj["kind"].lower()
+    if OPERATOR_GROUP.fullmatch(group):
+        return "an external-secrets kind"
+    if group == STORE_GROUP:
+        return "a SecretProviderClass"
+    if group == "argoproj.io" and kind in APP_KINDS:
+        return "an Application"
+    if group == "rbac.authorization.k8s.io" and kind in RBAC_KINDS:
+        return "RBAC"
+    return None
+
+
+def notes_changed(old, new, free=FREE_ANNOTATIONS):
+    "True when an object's annotations gain or change one whose key has no prefix of free."
+    a, b = ((o.get("metadata") if isinstance(o.get("metadata"), dict) else {}).get("annotations") or {}
+            for o in (old, new))
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return a != b
+    return any(not (isinstance(k, str) and k.startswith(free)) for k, v in b.items() if k not in a or a[k] != v)
+
+
+def helm_changed(key, x, y):
+    """True when a free helm field of an Application's source changes what names a Secret, a service account or a held
+    kind (sensitive): in values, valuesObject and parameters (a values text that is not block style, when it names
+    one or has a key: key, a part of a mapping of a name and a key); and each change of its valueFiles, which name
+    files whatever they hold. source_changed asks it of each source that no unit of the door rendered whole."""
+    if key == "values" and isinstance(x or "", str) and isinstance(y or "", str):
+        a, b = sensitive_lines(x or ""), sensitive_lines(y or "")
+        if a is None or b is None:
+            return any(names_secret(t) or any(re.search(r"(?<![\w.-])key[\"']?\s*:", low)
+                                              for low in (loose_text(t), uncommented(loose_text(t))))
+                       for t in (x or "", y or ""))
+        return a != b
+    if key == "valuesObject":
+        return sensitive([x]) != sensitive([y])
+    lists = (x or [], y or [])
+    if key == "parameters" and all(isinstance(v, list) and all(isinstance(p, dict) for p in v) for v in lists):
+        a, b = ([p for p in v if sensitive_key(p.get("name"))] for v in lists)
+        return a != b
+    return True
+
+
+def source_changed(a, b, rendered=None):
+    """True when a source of an Application changes outside what is free: its helm values (a source that a unit of
+    the door rendered whole with this Application's own values, rendered(source), is decided by the render; for each
+    other one, only what names no
+    Secret, service account or held kind: helm_changed), a chart's version, and its Kustomize images and replicas."""
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return a != b
+    seen = rendered is not None and rendered(a) and rendered(b)
+    for key in set(a) | set(b):
+        if key == "targetRevision" and "chart" in a and "chart" in b:
+            continue
+        x, y = a.get(key, {} if key in ("helm", "kustomize") else None), \
+            b.get(key, {} if key in ("helm", "kustomize") else None)
+        free = HELM_FREE if key == "helm" else KUSTOMIZE_FREE if key == "kustomize" else None
+        if free and isinstance(x, dict) and isinstance(y, dict):      # such a block may come or go
+            for k in set(x) | set(y):
+                if x.get(k) == y.get(k):
+                    continue
+                if k not in free or key == "helm" and not seen and helm_changed(k, x.get(k), y.get(k)):
+                    return True
+        elif x != y:
+            return True
+    return False
+
+
+def app_spec_changed(old, new, rendered=None):
+    "True when an Application's spec changes outside APP_FREE and the free fields of its sources (source_changed)."
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return old != new
+    for key in set(old) | set(new):
+        a, b = old.get(key), new.get(key)
+        if key in APP_FREE:
+            continue
+        if key == "source":
+            if source_changed(a, b, rendered):
+                return True
+        elif key == "sources" and isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
+            if any(source_changed(x, y, rendered) for x, y in zip(a, b)):
+                return True
+        elif a != b:               # destination, project, a source added or taken away, and each other field
+            return True
+    return False
+
+
+def without(value, *keys):
+    return {k: v for k, v in value.items() if k not in keys} if isinstance(value, dict) else value
+
+
+def held_change(old, new, rendered=None):
+    """True when an object that the door holds (held_kind) changes, from old at HEAD to new, outside what is free (A4).
+    The operator's groups and the Secrets Store driver: the spec, the name and the namespace are compared; labels are
+    free, and a new or changed annotation only with a prefix of FREE_ANNOTATIONS; apiVersion between v1beta1 and v1
+    is free for the operator's kinds only. Argo CD's kinds: an Application's spec outside its free fields
+    (app_spec_changed), an ApplicationSet's spec outside the free fields of its template's spec, an AppProject's spec,
+    each field beside metadata and spec (an operation), and an annotation as above. RBAC: all but labels and
+    annotations, and a label of the prefix AGGREGATION is no free label."""
+    form = held_kind(new)
+    if form in ("an external-secrets kind", "a SecretProviderClass"):
+        versions = {old["apiVersion"].rpartition("/")[2], new["apiVersion"].rpartition("/")[2]}
+        if len(versions) > 1 and (form != "an external-secrets kind" or versions != {"v1beta1", "v1"}):
+            return True
+        meta_old, meta_new = (o.get("metadata") if isinstance(o.get("metadata"), dict) else {} for o in (old, new))
+        if old.get("spec") != new.get("spec") or any(meta_old.get(k) != meta_new.get(k) for k in ("name", "namespace")):
+            return True
+        return notes_changed(old, new)
+    if form == "an Application":
+        if without(old, "metadata", "spec", "status") != without(new, "metadata", "spec", "status") or \
+                notes_changed(old, new, APP_ANNOTATIONS):
+            return True
+        a, b, kind = old.get("spec"), new.get("spec"), new["kind"].lower()
+        own = rendered and (lambda source: rendered(source, new))     # this object's own values
+        if kind == "application":
+            return app_spec_changed(a, b, own)
+        if kind == "applicationset" and isinstance(a, dict) and isinstance(b, dict):
+            x, y = a.get("template"), b.get("template")
+            if without(a, "template") != without(b, "template") or without(x, "spec") != without(y, "spec"):
+                return True         # the generators, the templatePatch and each other field of the spec
+            return isinstance(x, dict) and isinstance(y, dict) and \
+                app_spec_changed(x.get("spec"), y.get("spec"), own)
+        return a != b
+
+    def bare(o):
+        meta = o.get("metadata")
+        if not isinstance(meta, dict):
+            return without(o, "status")
+        labels = meta.get("labels")
+        kept = {k: v for k, v in labels.items() if str(k).startswith(AGGREGATION)} if isinstance(labels, dict) \
+            else labels
+        return dict(without(o, "status", "metadata"), metadata=dict(without(meta, "labels", "annotations"),
+                                                                     labels=kept))
+    return bare(old) != bare(new)
+
+
+def head_key(o):
+    """What finds an object at HEAD, with its namespace: its group, its kind, its own namespace and its name, any
+    name (a ClusterRole's system:x too, which no prune names), or its generateName; None for one with neither."""
+    meta = o.get("metadata") if isinstance(o.get("metadata"), dict) else {}
+    name, stem = meta.get("name"), meta.get("generateName")
+    if not (isinstance(name, str) and name) and not (isinstance(stem, str) and stem):
+        return None
+    return o["apiVersion"].rpartition("/")[0], o["kind"], str(meta.get("namespace") or ""), \
+        name if isinstance(name, str) and name else ("generateName", stem)
+
+
+def at_head(before):
+    "{(key, namespace): [object]} of the objects at HEAD, [(object, namespace)]."
+    out = {}
+    for o, ns in before:
+        key = head_key(o)
+        if key:
+            out.setdefault((key, ns), []).append(o)
+    return out
+
+
+def held_objects(before, after, rendered=None):
+    """[(form, object, new)]: each object after the commit that the door holds (held_kind) and that is new, or that
+    changes from a version at HEAD outside what is free (held_change). before, after: [(object, namespace)]."""
+    heads, out = at_head(before), []
+    for o, ns in after:
+        form = held_kind(o)
+        if form:
+            old = heads.get((head_key(o), ns), []) if head_key(o) else []
+            if not old or any(held_change(h, o, rendered) for h in old):
+                out.append((form, o, not old))
+    return out
+
+
+def object_words(o):
+    "One object of the agent's own file as the words name it: its kind, its own namespace and its name."
+    meta = o.get("metadata") if isinstance(o.get("metadata"), dict) else {}
+    name = meta.get("name") if isinstance(meta.get("name"), str) else None
+    namespace = meta.get("namespace")
+    return f"{shown(o['kind'])} " + (f"{shown(namespace)}/" if isinstance(namespace, str) and namespace else "") + \
+        (shown(name) if name else f"{shown(meta.get('generateName'))}*")
+
+
+def secret_rule(before, after, where, named=True, pool=None, words=None, card_at=None, after_all=None,
+                rendered=None):
+    """The rule of references to Secrets on the objects of one place (A2 to A6). before: [(object, namespace)] at HEAD;
+    after: [(object, namespace)] after the commit. where: the place, as the words name it. named: False for a render,
+    whose objects the words never name, and whose Secret and key they name only where it is one of words, the words
+    of the commit's own files; card_at names the place in its cards. pool: the objects at HEAD by whose kind and
+    namespace another reference is known (before, when None): for an Ingress and a Certificate, when one of that kind
+    in the same place holds it at HEAD; for every kind, when the one that holds it at HEAD is gone from after_all, the
+    commit's objects after it (after, when None): a renamed object, and no copy. rendered(source, object): the test
+    of an Application's source whose chart a unit rendered whole with that object's own values (rendered_by), for the
+    objects of a file of the commit only. (why or None, [(form, words)] of each new
+    reference of a pod, which is the owner's to decide)."""
+    for form, o, new in held_objects(before, after, rendered):
+        if new:
+            return f"{where}: {form}" + ("" if named else ", more than at HEAD") + ", which no commit passes", []
+        return (f"{where}: {form}: a change of {object_words(o) if named else 'the object'} at HEAD, which no commit "
+                f"passes", [])
+    def kind_of(o):
+        return o["apiVersion"].rpartition("/")[0].lower(), o["kind"].lower()
+    present = {(head_key(o), ns) for o, ns in (after if after_all is None else after_all) if head_key(o)}
+    known_others = {(kind_of(h), ns, f["form"], json.dumps(f["name"], sort_keys=True, default=str))
+                    for h, ns in (before if pool is None else pool)
+                    if kind_of(h) in KNOWN_OTHERS or (head_key(h), ns) not in present
+                    for f in secret_facts(h, ns) if not f["pod"]}
+    heads, cards, words = at_head(before), [], words or set()
+    for o, ns in after:
+        old = heads.get((head_key(o), ns), []) if head_key(o) else []
+        if old and all(h == o for h in old):
+            continue                # the commit leaves the object as it is at HEAD
+        known = None                # the references that each version of it at HEAD holds, and how often
+        for h in old:
+            found = collections.Counter(fact_id(f) for f in secret_facts(h, ns))
+            known = found if known is None else known & found
+        known, seen = known or collections.Counter(), collections.Counter()
+        for fact in secret_facts(o, ns):
+            same = fact_id(fact)
+            seen[same] += 1
+            if seen[same] <= known[same]:
+                continue            # a reference that the object holds at HEAD
+            if not fact["pod"]:
+                if (kind_of(o), ns, fact["form"],
+                        json.dumps(fact["name"], sort_keys=True, default=str)) in known_others:
+                    continue        # an object of its kind in its namespace holds it at HEAD: renamed or moved
+                return (f"{where}: a new {shown(fact['form'])}" if named else
+                        f"{where}: a new reference to a Secret outside a pod's places") + ", which no commit passes", []
+            if not plain(fact["name"]) or fact["form"] == "a new secretKeyRef" and not plain(fact["key"]):
+                return f"{where}: {fact['form']} to a Secret by a name that is no plain text, which no commit " \
+                       f"passes", []
+            name, key = fact["name"], fact["key"]
+            if named:
+                said = f"{object_words(o)} reads {fact['what']} {shown(name)}" + \
+                    (f" key {shown(key)}" if key is not None else "")
+            else:
+                said = f"{card_at or where} reads " + (f"{fact['what']} {shown(name)}" if name in words else
+                                                       f"a {fact['what']} that only the render names") + \
+                    ("" if key is None else f" key {shown(key)}" if key in words else
+                     ", by a key that only the render names")
+            cards.append((fact["form"], f"{fact['form']}: {said}"))
+    return None, cards
+
+
+def same_repository(url, repo):
+    """True when an Application's repoURL names this repository (owner/name on GitHub), in any of git's forms. The
+    host is GitHub's own and stands first, after an optional scheme of git's network (https, http, ssh, git) and
+    user: another host with the same owner and name (or one such as evilgithub.com, github.com.example.com,
+    example.com/github.com, file://github.com or evil.com\\@github.com) is another repository, whose chart the door
+    never read."""
+    found = re.match(r"(?:(?:https?|ssh|git)://)?(?:[^@/\\\s]+@)?github\.com[:/]([^/:\s]+/[^/:\s]+?)(?:\.git)?/?$",
+                     url.strip(), re.I) if isinstance(url, str) else None
+    return bool(found) and found.group(1).lower() == repo.lower()
+
+
+def app_key(path, o):
+    """An Application or an ApplicationSet of a file as the box names the one whose values a unit rendered (the
+    unit's apps, door_render.value_sets): its file, kind, name and namespace."""
+    meta = o.get("metadata") if isinstance(o.get("metadata"), dict) else {}
+    return [path] + [v if isinstance(v, str) else None for v in (o.get("kind"), meta.get("name"),
+                                                                  meta.get("namespace"))]
+
+
+def rendered_by(report, repo, revisions=lambda: {None, "", "HEAD"}):
+    """The test of an Application's source whose chart a unit of the door rendered whole, test(source, app): of this
+    repository, at the revision that the door rendered (one of revisions()), with no chart of a helm repository, and
+    the path of such a unit's root, where that unit rendered this Application's own values (app_key: a box with no
+    word of them renders no Application's). The render decides its helm values; every other source's are held where
+    they name a Secret (helm_changed)."""
+    units = [u for u in ((report or {}).get("units") or {}).values()
+             if u.get("kind") == "helm" and u.get("ok") and not u.get("closed")]
+    accepted = []
+
+    def test(source, app):
+        path, revision = source.get("path"), source.get("targetRevision")
+        if "chart" in source or not isinstance(path, str) or not same_repository(source.get("repoURL"), repo):
+            return False
+        if not accepted:
+            accepted.append(revisions())
+        if not (revision is None or isinstance(revision, str)) or revision not in accepted[0]:
+            return False        # the cluster renders the chart of another revision than the door's
+        root = posixpath.normpath(path).strip("/")
+        root = root if root not in ("", ".") else "."
+        return any(u.get("root") == root and app in (u.get("apps") or []) for u in units)
+    return test
+
+
+def reference_card(cards, target, plan):
+    """The owner's card for a commit's new references of pods (A10), the references first, or a refusal when their
+    words pass what the door's record keeps."""
+    counted = collections.Counter(cards)
+    said = "; ".join(card + (f" ({n} times)" if n > 1 else "") for card, n in counted.items())
+    if len(said) > REFERENCES_MOST:
+        return refused(f"the commit makes {len(cards)} new references to Secrets, more than the door's record names "
+                       f"in {REFERENCES_MOST} characters: commit fewer new references at a time", target=target)
+    return Decision("full", f"{said}: a reference to a Secret, which is the owner's to decide, once for each change "
+                    f"(the owner, 21 November 2026)", target=target, plan=plan, window="deploy")
+
+
 def objects_text(docs):
     """Objects as the block style lines that say the same, one document each: what the patterns read of a render,
     and of a file that the real parser read."""
@@ -1881,14 +2590,29 @@ def render_broken(report):
                  for _uid, unit in sorted(report["units"].items()) if unit.get("broke")), None)
 
 
-def render_refusal(report):
-    """Why the render of a commit refuses it, or None. For each chart and each Kustomize folder that the door
-    rendered, with each value set: an object that the cluster gets after the commit has no more of a refused form
-    than the same object at HEAD, a new object has none, and no Secret object is new or changed."""
-    for _uid, unit in sorted(report["units"].items()):
+def render_refusal(report, words=None):
+    """(why the render of a commit refuses it, or None; the cards of its new references to Secrets). For each chart
+    and each Kustomize folder that the door rendered, with each value set: an object that the cluster gets after the
+    commit has no more of a refused form than the same object at HEAD, a new object has none, and no Secret object is
+    new or changed. The rule of references to Secrets reads the objects first (secret_rule), with the objects of the
+    same value set at HEAD as those that make another reference known by kind and namespace: a new reference of a pod
+    is a card, and in a closed unit a refusal; the count reads the objects with each reference renamed. words: the
+    words of the commit's own files, the only names out of a render that a card prints. The same reference in each
+    value set of a unit is one card. An Application that a render makes has its helm values held where they name a
+    Secret (helm_changed): no unit rendered with them."""
+    apps, most = report.get("apps"), {}
+    for uid, unit in sorted(report["units"].items()):
         where = unit_name(unit)
         if not unit.get("ok"):
             continue                # the door did not render it: its files kept the rules that need no render
+        given = next((r["namespace"] for r in apps or [] if r["root"] == unit.get("root") and r["namespace"]), None)
+
+        def token(o):
+            return namespace_token(o, given, uid, uid)
+        pools, afters = {}, {}
+        for group in unit["changed"]:
+            pools.setdefault(group["set"], []).extend((o, token(o)) for o in objects_in(group["before"]))
+            afters.setdefault(group["set"], []).extend((o, token(o)) for o in objects_in(group["after"]))
         for group in unit["changed"]:
             before, after = group["before"], group["after"]
             if not after:
@@ -1896,30 +2620,101 @@ def render_refusal(report):
             what = f"{where}, rendered with {group['set']}: {group['object']}"
             if any(isinstance(o.get("kind"), str) and o["kind"].lower() == "secret" and o not in before
                    for o in after):
-                return f"{what} is a new or a changed Secret object, which no commit passes"
-            hit = manifest_refusal(objects_text(before), objects_text(after))
+                return f"{what} is a new or a changed Secret object, which no commit passes", []
+            closed = unit.get("closed")
+            why, found = secret_rule([(o, token(o)) for o in objects_in(before)],
+                                     [(o, token(o)) for o in objects_in(after)], what, named=False,
+                                     pool=pools[group["set"]], words=None if closed else words, card_at=where,
+                                     after_all=afters[group["set"]])
+            if why:
+                return why, []
+            if found and closed:    # the door widens nothing in a unit that can read what it gives no agent
+                return f"{what}: {found[0][0]}, more than at HEAD, which no commit passes", []
+            most.setdefault((uid, group["set"]), collections.Counter()).update(card for _form, card in found)
+            free_before, free_after = stripped(before), stripped(after)
+            hit = manifest_refusal(objects_text(free_before), objects_text(free_after)) or \
+                manifest_refusal(lines_text(free_before), lines_text(free_after))
             if hit:
-                return f"{what}: {hit}, more than at HEAD, which no commit passes"
-    return None
+                return f"{what}: {hit}, more than at HEAD, which no commit passes", []
+    cards = collections.Counter()
+    for found in most.values():                 # in each value set its own, and the most of any set
+        cards |= found
+    return None, list(cards.elements())
+
+
+def json_docs(path, data):
+    "The one document of a JSON file as the door parses it, in a list, or None for no JSON file or no JSON."
+    if data is None or not path.lower().endswith(".json"):
+        return None
+    try:
+        return [json.loads(data)]
+    except (ValueError, RecursionError):
+        return None
 
 
 def gitops_files(lookups, op, target, plan, files, report):
-    """The decision on the files of a GitOps commit, after the path rules. report: the render of the commit, or None."""
+    """The decision on the files of a GitOps commit, after the path rules. report: the render of the commit, or None.
+    A refusal comes before the owner's card for new references to Secrets, the card before the agent's own call, and
+    that before a rule call."""
     if report:
         plan["parent"] = report.get("head")         # the commit that the door rendered: the commit's only parent
         why = render_broken(report)
         if why:
             return refused(why, target=target)
-    own = None
+    apps = report.get("apps") if report else None
+    def revisions():
+        """The targetRevision words of the branch that the commit goes to, whose head the door rendered: its name, and
+        no word, "" and HEAD too where it is the repository's default branch, which Argo CD reads for them."""
+        try:
+            default = (lookups.get("default_branch") or (lambda name: None))(target.partition(":")[2])
+        except Exception:       # GitHub gave no default branch: only a branch that the door's file names is known
+            default = None
+        branch = plan.get("branch") or default
+        names = {branch, "refs/heads/" + branch} if isinstance(branch, str) and branch else set()
+        return names | ({None, "", "HEAD"} if not plan.get("branch") or plan["branch"] == default else set())
+    rendered = rendered_by(report, target.partition(":")[2], revisions)
+
+    def head_of(path):
+        "(the file at HEAD or None, its entry in the report)"
+        info = report["files"].get(path) or {} if report else {}
+        if report:
+            return (None if info.get("head") is None else base64.b64decode(info["head"])), info
+        return (lookups.get("base_file") or (lambda p: None))(path), info
+
+    def namespaced(docs, path):
+        """[(object, namespace token)] of documents of one path (namespace_token): the place is the root of the
+        Application of HEAD that applies the path, or the path's folder when none does or the box could not read the
+        Applications of HEAD; so an object is "at HEAD" only in the same folder or under the same Application."""
+        app = next((r for r in apps or [] if applies(r, path) and r["namespace"]), None) or \
+            next((r for r in apps or [] if applies(r, path)), None)
+        folder = path.rpartition("/")[0]
+        given, place = (app["namespace"] or None, app["root"]) if app else (None, folder)
+        return [(o, namespace_token(o, given, place, folder)) for o in objects_in(docs)]
+
+    def trusted(info):
+        "True when the documents of the box's reading of a YAML file are what a cluster applies, as parsed below."
+        units = [report["units"][u] for u in info.get("units") or []]
+        return not units or all(u.get("ok") and not u.get("closed") for u in units)
+    # The objects at HEAD of every file of the commit, so that an object that moves from one file to another is found
+    # (A2), and one that moves to a folder of another namespace is a new object there.
+    before_all, after_all = [], []
+    for path, data, _mode in files:
+        old, info = head_of(path)
+        head = info.get("before")
+        docs = json_docs(path, old) if path.lower().endswith(".json") else \
+            head if isinstance(head, list) and trusted(info) and all(isinstance(d, dict) for d in head) else None
+        before_all += namespaced(docs, path)
+        if data is not None:            # an object of a file that the parser does not read after it is not gone
+            after = info.get("after")
+            read = json_docs(path, data) if path.lower().endswith(".json") else \
+                after if isinstance(after, list) and trusted(info) and all(isinstance(d, dict) for d in after) else None
+            after_all += namespaced(docs if read is None else read, path)
+    own, cards = None, []
     for path, data, mode in files:
         if data is None:
             own = own or f"{path} is deleted"
             continue
-        info = report["files"].get(path) or {} if report else {}
-        if report:
-            old = None if info.get("head") is None else base64.b64decode(info["head"])
-        else:
-            old = (lookups.get("base_file") or (lambda p: None))(path)
+        old, info = head_of(path)
         units = [report["units"][u] for u in info.get("units") or []]
         # whole: every chart and Kustomize folder that reads this file rendered, so the render says what the file
         # does. A unit that can read a path that the door gives no agent (closed) is rendered and decided, and the
@@ -1981,13 +2776,60 @@ def gitops_files(lookups, op, target, plan, files, report):
                 text = objects_text([d for d in docs if isinstance(d, dict)])
                 before = objects_text([d for d in head if isinstance(d, dict)])
                 block = True
+        # The object reading (A1): a YAML file that the box's parser read whole, and a JSON file, which the door parses.
+        # (the documents after the commit, at HEAD or None), or None for a file that no parser reads.
+        reading = (json_docs(path, data), json_docs(path, old)) if path.lower().endswith(".json") and \
+            text is not None else \
+            (parsed, info["before"] if isinstance(info.get("before"), list) else None) if parsed is not None else None
         if text is not None:
             if secret_object(text) if block else SECRET_KIND.search(text):
                 return refused(f"{path} holds a Secret object", target=target)
-            hit = manifest_refusal(before, text)
+            if reading and reading[0] is not None:
+                why, found = secret_rule(before_all, namespaced(reading[0], path), path, after_all=after_all,
+                                         rendered=lambda source, o, path=path: rendered(source, app_key(path, o)))
+                if why:
+                    return refused(why, target=target)
+                cards += [card for _form, card in found]
+                # The references are the rule's: today's text without their three forms, and the objects with each
+                # reference renamed, as as_block and as as_lines write them (a text value line by line, A7)
+                head = None if reading[1] is None else stripped(reading[1])
+                free = stripped(reading[0])
+                hit = manifest_refusal(neutral(before), neutral(text)) or \
+                    manifest_refusal(neutral(before) if head is None else objects_text(head), objects_text(free)) or \
+                    manifest_refusal(neutral(before) if head is None else lines_text(head), lines_text(free))
+            else:
+                hit = manifest_refusal(before, text)
             if hit:
                 return refused(f"{path}: {hit}, which no commit passes", target=target)
+        # Check 1 (A8), after the checks above: a file that no parser of the door reads as objects alone (a document
+        # that is no object: a values file), with no unit that rendered it whole, and a file that a source of HEAD
+        # takes as its values from another source, unless a unit rendered that source whole (the box's values: a chart
+        # that the door does not render reads it as values, whatever it holds). Where the parser read it at HEAD and
+        # after, what of it names a Secret, a service account or a held kind stays as it is (sensitive); else, when it
+        # names one, only its listed lines change. The render decides a file that each unit reading it rendered whole,
+        # so that a chart's template stays free to edit, but for a jsonnet file, which ArgoCD runs. A service account
+        # counts only where the door reads no object in it.
+        held = f"{path} names a Secret, a service account or a held kind, and no parser of the door reads it: only " \
+               f"an image, a tag, a replica count and a restart time change in it{unrendered}"
+        # (a box that names no source's targetRevision renders none of them as the cluster does)
+        named = report is not None and any(fnmatch.fnmatchcase(path, v["path"]) and not (
+            "targetRevision" in v["source"] and rendered(v["source"], v.get("app")))
+            for v in report.get("values") or [])
+        read = reading[0] if reading and reading[0] is not None else None
+        check = named or not (whole and not runs) and not (read is not None and all(is_object(d) for d in read))
+        unparsed = False
+        if check and read is not None and (old is None or reading[1] is not None):
+            def pick(docs):
+                return [d for d in docs or [] if named or not is_object(d)]
+            if sensitive(pick(read)) != sensitive(pick(reading[1])):
+                return refused(held, target=target)
+        elif check:
+            accounts = not (object_keys(path, data) or object_keys(path, old))
+            unparsed = names_secret(data.decode("utf-8", "replace"), accounts) or \
+                names_secret((old or b"").decode("utf-8", "replace"), accounts)
         if old is None:
+            if unparsed:
+                return refused(held, target=target)
             own = own or f"{path} is a new manifest"
             continue
         changed = changed_lines(old, data)
@@ -2001,6 +2843,8 @@ def gitops_files(lookups, op, target, plan, files, report):
                            f"image, a tag, a replica count and a restart time change in such a file. Write a "
                            f"manifest in block style first, as a commit of its own; a template has no such commit"
                            f"{unrendered}", target=target)
+        if unparsed and not listed:
+            return refused(held, target=target)
         if changed is None or not kept or not (lines or listed):
             # in a file that code does not read by lines, a line can hold more than its first key: a rule call
             # there is a change of listed lines only
@@ -2019,9 +2863,14 @@ def gitops_files(lookups, op, target, plan, files, report):
         else:
             own = own or f"{path}: other manifest lines"
     if report:
-        why = render_refusal(report)
+        said = {w for _path, data, _mode in files if data is not None
+                for w in re.findall(r"[A-Za-z0-9._-]+", data.decode("utf-8", "replace"))}
+        why, found = render_refusal(report, said)
         if why:
             return refused(why, target=target)
+        cards += found
+    if cards:
+        return reference_card(cards, target, plan)
     if own:
         return Decision("own", own, target=target, plan=plan, window="deploy")
     return Decision("rule", "a listed GitOps change", target=target, plan=plan, window="deploy")

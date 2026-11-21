@@ -811,6 +811,9 @@ def value_sets(found, kind, root, exposure=()):
                 # report (mute). Its values make the unit closed.
                 one.update(name="the values of an Application", mute=True,
                            closed=bool(one["steps"]) or one["flags"] != OWN["flags"])
+            else:               # the Application whose values these are, for the unit's apps
+                one["app"] = [file] + [v if isinstance(v, str) else None for v in (app.get("kind"), meta.get("name"),
+                                                                                    meta.get("namespace"))]
             sets[f"{key}#{seen[key]}"] = one
             if len(sets) > SETS_MOST:
                 raise Unknown(f"more than {SETS_MOST} value sets")
@@ -1129,6 +1132,38 @@ def app_roots(found):
     return out
 
 
+def chart_values(found, exposure=()):
+    """[{path, source}]: each path of the repository that a source of an Application takes as its values at HEAD from
+    another source (each $<ref>/<path> of its valueFiles and fileParameters, with a template's {{ }} as a *), with
+    that source's repoURL, path, chart and targetRevision (None for none, ? for one that is no text), and the
+    Application's file, kind, name and namespace (app, as value_sets names it; None in a path that the door gives no
+    agent). Unless a unit of the door rendered that source's chart whole, its chart is
+    one that the door does not render (of a helm repository, or of another git repository), so the door reads such a
+    file as values whatever it holds (door_targets: the rule of references to Secrets)."""
+    out = {}
+    for app, rel in found:
+        meta = app.get("metadata") if isinstance(app.get("metadata"), dict) else {}
+        key = None if hidden_path(rel, exposure) else \
+            [rel] + [v if isinstance(v, str) else None for v in (app.get("kind"), meta.get("name"),
+                                                                 meta.get("namespace"))]
+        for _name, _namespace, source, _every, _patched in sources(app):
+            helm = source.get("helm") if isinstance(source.get("helm"), dict) else {}
+            named = [v for v in helm.get("valueFiles") or [] if isinstance(v, str)] if \
+                isinstance(helm.get("valueFiles"), list) else []
+            named += [p.get("path") for p in helm.get("fileParameters") or [] if isinstance(p, dict)
+                      and isinstance(p.get("path"), str)] if isinstance(helm.get("fileParameters"), list) else []
+            given = {k: source[k] for k in ("repoURL", "path", "chart") if isinstance(source.get(k), str)}
+            revision = source.get("targetRevision")
+            given["targetRevision"] = revision if revision is None or isinstance(revision, str) else "?"
+            for value in named:
+                if value.startswith("$"):
+                    path = inside("", value[1:].partition("/")[2])
+                    if path:
+                        entry = {"path": re.sub(r"\{\{.*?\}\}", "*", path), "source": given, "app": key}
+                        out[json.dumps(entry, sort_keys=True)] = entry
+    return [out[k] for k in sorted(out)]
+
+
 # The YAML tags of a commit's files (the coordinator of the DevOps plan, 16 November 2026): a tag outside YAML's core
 # schema can make a reader build an object of its own program, as Psych's !ruby/object and PyYAML's !!python/object
 # do, and the generator of a declaration, the repository's checks and its people's tools are such readers. The pinned
@@ -1376,13 +1411,18 @@ def answer(header, tar, blobs, tools, scratch, log=False):
                         pairs.append(pair)
                 units[uid] = unit_report(runner, trees, kind, root, pairs,
                                          shut=closed(runner, trees, kind, root, kustomize, pairs, exposure))
+                # The Applications whose values after the commit the unit rendered: door_targets decides the helm
+                # values of those alone by the render (rendered_by), and holds every other one's where they name a
+                # Secret (an Application in a file that the box does not read, or that a chart renders).
+                units[uid]["apps"] = [one["app"] for one in new_sets.values() if one.get("app")]
         tags = yaml_tags(runner, after, [p for p in commit if read(after, p) is not None])
         held = sorted(p for p, v in (tags or {}).items() if v.get("tags"))
         stop = f"{held[0]} of the commit holds a YAML tag outside the core schema, so the box ran no generator" \
             if held else None
         report = {"v": 1, "ok": True, "files": files, "units": units, "tags": tags,
                   "generated": generated(runner, before, after, stop=stop), "owner": owned(runner, before),
-                  "apps": None if apps[0][1] else app_roots(apps[0][0])}
+                  "apps": None if apps[0][1] else app_roots(apps[0][0]),
+                  "values": None if apps[0][1] else chart_values(apps[0][0], exposure)}
     except Skip as e:
         return {"v": 1, "ok": False, "skip": str(e)}
     except Late:
