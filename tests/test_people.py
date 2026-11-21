@@ -137,6 +137,9 @@ class People(test_chat_apps.ChatApps):
                          [["read_messages", "reply", "ask_owner", "remind", "read_attachment"]])   # 8.1
 
     def test_a_handle_belongs_to_one_person_and_never_to_the_owner(self):
+        """A handle is one person's, and never the owner's. Each row that the People page lists can be removed, also a
+        row of an app that is no chat app of this hub (a place that another part of the hub writes, Teams design 4,
+        S6): until then its delete was refused, and past that check its log line raised."""
         person = self.person_with_handle()
         self.assertEqual([h["handle"] for h in person["handles"]], [ANA])
         self.assertEqual(self.handle(person["id"])[0], 409)                     # the same handle again
@@ -156,6 +159,24 @@ class People(test_chat_apps.ChatApps):
         code, data = self.handle(person["id"], delete=True)
         self.assertEqual((code, data["deleted"]), (200, True), data)
         self.assertEqual(self.count("person_handles"), 0)
+        # a row of an app that the hub does not know: listed, and removed by the app and the handle that it lists
+        hub.q("INSERT INTO person_handles(app,handle,person,name,added) VALUES(?,?,?,?,?)",
+              ("founderizer", "link-1", person["id"], "Founderizer", hub.now()))
+        page = self.request("/ui/people?db=test-generation")[1]
+        listed = [p["handles"] for p in page["people"] if p["id"] == person["id"]][0]
+        self.assertEqual([(h["app"], h["handle"]) for h in listed], [("founderizer", "link-1")])
+        gone = dict(self.command(), app="founderizer", handle="link-1", delete=True)
+        gone.pop("text")
+        code, data = self.request(f"/ui/people/{person['id']}/handles", gone)
+        self.assertEqual((code, data.get("deleted"), data.get("person", {}).get("handles")), (200, True, []), data)
+        self.assertEqual(self.count("person_handles"), 0)
+        # a repeat of the same command (a call that was cut off) gets the first answer: read reads no row
+        self.assertEqual(self.request(f"/ui/people/{person['id']}/handles", gone), (200, dict(data, replayed=True)))
+        # with no such row, the delete of such an app gets the words that it got before, and no person's row goes
+        self.assertEqual(self.handle(other["id"], app="founderizer", handle="link-1", delete=True),
+                         (400, {"error": "app must be discord, telegram or whatsapp"}))
+        self.assertEqual(self.handle(other["id"], app="signal", handle=ANA, delete=True),
+                         (400, {"error": "app must be discord, telegram or whatsapp"}))
 
     # ---- the inbound path
     def test_a_person_reaches_the_agent_they_were_given_and_no_other(self):

@@ -604,6 +604,12 @@ class ChatApps(OwnerAPI):
         self.assertEqual(self.inbound("/whoami")[0], "stored")         # a command is no inbound message to an agent
         self.assertEqual(self.request("/ui/chat-apps?db=test-generation")[1]["inbound_today"], 500)
         self.assertEqual(self.count("events"), 1)
+        # a person's message counts in the same count of all accounts, and its number stops it too (person_route)
+        hub.TEAM["agents"]["studio"]["can"] = []        # an outsider reaches only an agent whose Shell box is off
+        self.assertEqual(self.post("/ui/people", name="Ana Ruiz", role="customer", agents=["studio"],
+                                   handles=[{"app": "discord", "handle": "500600700"}])[0], 200)
+        self.assertEqual(self.inbound("Hello", sender="500600700", chat="dm-ana")[0], "ignored")
+        self.assertEqual((self.count("conversations"), self.count("events")), (0, 1))
 
     # ---- link codes and handles
     def test_link_codes_bind_the_owner_once_and_refuse_wrong_expired_and_repeated_codes(self):
@@ -2777,14 +2783,23 @@ class AgentFiles(ChatApps):
 
     def test_an_older_bridge_is_never_starved_by_items_with_files(self):
         """The second review: the filter is in the read, so that 50 items with files ahead of a text do not keep the
-        text from a bridge that does not take files."""
+        text from a bridge that does not take files. The items of the built-in account (Teams design 4, S5) are left
+        out in the read too: no bridge ever gets one, and a check after the read would let them fill the limit, so
+        that each chat app's replies stop."""
         self.own("whatsapp", OWNER_WA)
         for _ in range(2):
             self.assertFalse(self.owner_message([f"A-{self.attach()}"])[1])
+        with hub.LOCK, hub.transaction():
+            built_in = [hub.chat_queue("message", hub.BUILT_IN_ACCOUNT, hub.now(), chat="link-1/manager",
+                                       text="For the app."),
+                        hub.chat_queue("typing", hub.BUILT_IN_ACCOUNT, hub.now(), chat="link-1/manager", seconds=8)]
         self.assertFalse(hub.call_tool("manager", "message_owner", {"request_id": str(uuid.uuid4()), "text": "Text."},
                                        None)[1])
         given = hub.chat_give(hub.now(), limit=2, files=False)
         self.assertEqual([i["text"] for i in given], ["Text."])
+        self.assertNotIn(hub.BUILT_IN_ACCOUNT, [i["account"] for i in hub.chat_give(hub.now(), files=True)])
+        self.assertEqual([hub.q1("SELECT state FROM chat_out WHERE id=?", (i,))["state"] for i in built_in],
+                         ["queued", "queued"])       # left for their own sender, neither given nor expired
 
     def test_a_csv_value_in_quotes_is_read_whole(self):
         """The second review: a CSV is read by its own rules, so a value with the separator in it is one value."""

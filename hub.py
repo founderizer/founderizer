@@ -20937,6 +20937,13 @@ LINK_STATES = ("waiting", "linked", "logged_out", "error")
 CHAT_SENDING = 120              # seconds a message item may stay sending before it is unknown
 CHAT_TYPING = 120               # seconds of one typing item
 CHAT_TEXT_MAX = 4000
+# The hub's fixed replies to a message of a chat app, each one sentence that its sender reads: the first three to the
+# owner (chat_route) and to a person (person_route), the last one to a person only. A refusal of person_route keeps its
+# sentence in the message (m["refusal"]), so that a caller can tell which one it was (Teams design 4, S4).
+CHAT_TEXT_ONLY = "I can read text only for now."
+CHAT_TOO_LONG = "This message is too long. The limit is 4,000 characters."
+CHAT_SECRET_HELD = "That message held a saved secret. It was not stored."
+PERSON_DAY_LIMIT = "You reached today's limit. Try again tomorrow."
 CHAT_INBOUND_DAY = 500          # inbound messages a day over all accounts
 WHATSAPP_PARTS_DAY = 200        # sent WhatsApp parts a day for each account
 CHAT_IGNORED_KEEP = 20          # ignored messages kept for each account
@@ -20952,6 +20959,20 @@ def chat_apps():
     """team.json "chat_apps" (owner feature chat_apps): {account: {"app", "label", "agents", "unknown", "enabled"}}.
     agents has exactly one agent: the account's agent."""
     return team_read().get("chat_apps") or {}
+
+
+# The account of the conversations that the Teams part person_links writes (Teams design 4, S5). No account of
+# team.json can have this ID (CHAT_ACCOUNT has no colon), so no item of a chat app's account is ever one of it.
+BUILT_IN_ACCOUNT = "founderizer:"
+
+
+def conversation_place(conv):
+    """The place of a conversation's account: its entry of chat_apps(), or None when team.json no longer has that
+    account. It is the one read of the place for the header of a person's message, for reply and for a reminder
+    (Teams design 4, S3), so that the place of the built-in account comes from this one function later. A read of
+    chat_apps() alone has no entry for that account: reply would refuse it, or raise a KeyError where it reads the
+    app, and a reminder would end at its first run."""
+    return chat_apps().get(conv["account"])
 
 
 def chat_enabled(acc):
@@ -22427,9 +22448,9 @@ def chat_route(account, acc, m, t0, hit, preview):
     reply = chat_command(m)
     # a picture, a file or a voice note goes on with its words, and the agent reads what came (chat_unopened_line)
     if reply is None and m["kind"] == "text" and not m["text"].strip():
-        reply = "I can read text only for now."
+        reply = CHAT_TEXT_ONLY
     if reply is None and len(m["text"]) > CHAT_TEXT_MAX:
-        reply = "This message is too long. The limit is 4,000 characters."
+        reply = CHAT_TOO_LONG
     if reply is not None:
         chat_reply(account, m["chat"], reply, t0)
         return "stored", None
@@ -22442,7 +22463,7 @@ def chat_route(account, acc, m, t0, hit, preview):
         chat_reply(account, m["chat"], f"{agent_display(agent)} cannot chat now.", t0)
         return "stored", None
     if hit:
-        chat_reply(account, m["chat"], "That message held a saved secret. It was not stored.", t0)
+        chat_reply(account, m["chat"], CHAT_SECRET_HELD, t0)
         return "stored", None
     request_id = str(uuid.uuid4())
     origin = {"app": acc["app"], "account": account, "chat": m["chat"], "id": m["id"], "sender": m["sender"],
@@ -22607,9 +22628,11 @@ def chat_give(t0, limit=50, files=False):
     if chat_paused():
         return []
     # CHAT-APPS.md 20: a bridge from before files would send the words of an item with files alone, so such an item
-    # waits for a bridge that says files=1; the filter is in the read, so that every other item still goes to it
-    rows = q("SELECT * FROM chat_out WHERE state='queued'" + ("" if files else " AND files IS NULL") +
-             " ORDER BY id LIMIT ?", (limit,))
+    # waits for a bridge that says files=1; the filter is in the read, so that every other item still goes to it.
+    # An item of the built-in account is never the bridge's (Teams design 4, S5), and it is left out in the read
+    # too: a check after the read would let such items fill the limit, and each chat app's replies would stop.
+    rows = q("SELECT * FROM chat_out WHERE state='queued' AND account<>?" + ("" if files else " AND files IS NULL") +
+             " ORDER BY id LIMIT ?", (BUILT_IN_ACCOUNT, limit))
     out = []
     with transaction():
         for r in rows:
@@ -24689,25 +24712,30 @@ def person_route(account, acc, person, m, t0, hit):
         # Until 20 November 2026 it got the fixed reply below, once a day, and its words were lost: a person's second
         # picture of a day reached nobody, and they got no answer at all.
         if refusal is None and m["kind"] == "text" and not m["text"].strip():
-            refusal = "I can read text only for now."
+            refusal = CHAT_TEXT_ONLY
         if refusal is None and len(m["text"]) > CHAT_TEXT_MAX:
-            refusal = "This message is too long. The limit is 4,000 characters."
+            refusal = CHAT_TOO_LONG
         if refusal is None and hit:
-            refusal = "That message held a saved secret. It was not stored."
+            refusal = CHAT_SECRET_HELD
     if refusal is not None:
+        m["refusal"] = refusal          # which sentence refused it, for a caller that answers with a code (S4)
         fixed_once(account, m["chat"], refusal, t0, person["id"])   # at most once a day, so no answer can be spammed
         return "stored"
     if m["sender_alt"]:     # WhatsApp sends two forms of one ID: learn the other one, as an owner handle does
         DB.execute("UPDATE person_handles SET alias=? WHERE app=? AND person=? AND alias IS NULL AND handle<>? AND "
                    "(handle=? OR handle=?)",
                    (m["sender_alt"], acc["app"], person["id"], m["sender_alt"], m["sender"], m["sender_alt"]))
-    if chat_count("*", "inbound", t0) >= CHAT_INBOUND_DAY:
+    # the day's count of messages in and its number: all chat apps' together, or the count that the account names (an
+    # account that the hub makes itself: no account of team.json can hold these keys, validate_chat_apps)
+    counted, most = acc.get("day_count", "*"), acc.get("day_most", CHAT_INBOUND_DAY)
+    if chat_count(counted, "inbound", t0) >= most:
         return "ignored"
     daily = person_daily(person, agent)     # None: no limit, which only contacts.v2 gives (staff, plan P1)
     if daily is not None and person_today(person["id"], t0) >= daily:
-        fixed_once(account, m["chat"], "You reached today's limit. Try again tomorrow.", t0, person["id"])
+        m["refusal"] = PERSON_DAY_LIMIT
+        fixed_once(account, m["chat"], PERSON_DAY_LIMIT, t0, person["id"])
         return "ignored"
-    chat_count("*", "inbound", t0, 1)
+    chat_count(counted, "inbound", t0, 1)
     conv, first = conversation_of(person, agent, m, account, t0)
     if first:
         chat_reply(account, m["chat"], CONVERSATION_NOTICE.format(agent=agent_display(agent)), t0,       # EU AI Act 50
@@ -24752,7 +24780,7 @@ def conversation_header(conv, person, row, files=None):
     (CHAT_UNOPENED, from the row's kind), so the agent can answer it: files, given by a reader that names the files
     after the words (conversation_read, conversation_files_line), takes the mark away when one came; a reader that
     gives none (a waiting task, open work) keeps it, because its session does not open them."""
-    app = CHAT_APP_NAMES.get((chat_apps().get(conv["account"]) or {}).get("app"), "a chat app")
+    app = CHAT_APP_NAMES.get((conversation_place(conv) or {}).get("app"), "a chat app")
     who = (f"{person['name']} · {person['role']} · {app}" if row["who"] == "person" else
            "the owner of this fleet" if row["who"] == "owner" else "Fleet")
     what = chat_unopened(row["kind"]) if row["who"] == "person" and not files else None
@@ -25523,11 +25551,12 @@ def t_reply(agent, a):
                 raise ToolError(f"You already answered {cm_ref(row['id'])} with another text. It was sent and cannot "
                                 f"be taken back. Answer the newest message instead.")
             return f"{cm_ref(old['id'])} was already sent to {person['name']}. Nothing was sent again."
-        if conv["account"] not in chat_apps():
+        place = conversation_place(conv)        # one read: the check and the app are of the same entry
+        if place is None:
             raise ToolError("This conversation's chat app is gone, so nothing can be sent. The owner must add it "
                             "again.")
         t0 = now()
-        rows = chat_files_rows(agent, ids, chat_apps()[conv["account"]]["app"], t0)
+        rows = chat_files_rows(agent, ids, place["app"], t0)
         with transaction():
             new = unused_id("conversation_messages")
             files = chat_files_carry(rows, t0, cm=new)
@@ -25668,12 +25697,17 @@ def person_agent_view(agent, person=None):
     return out
 
 
+# The words that refuse a person's handle of an app that is no chat app of this hub (person_handle_fields), and the
+# delete of a handle that no row of the person has with such an app (ui_person_handles)
+PERSON_HANDLE_APPS = "app must be discord, telegram or whatsapp"
+
+
 def person_handle_fields(data):
     """{app, handle, name} of one chat handle, checked as an inbound sender is."""
     if not isinstance(data, dict):
         raise ValueError("a handle is {app, handle, name}")
     if data.get("app") not in CHAT_APP_NAMES:
-        raise ValueError("app must be discord, telegram or whatsapp")
+        raise ValueError(PERSON_HANDLE_APPS)
     handle = data.get("handle")
     if not isinstance(handle, str) or not 1 <= len(handle.strip()) <= 200 or CONTROL.search(handle):
         raise ValueError("handle must be the ID that the chat app sends: a Discord user ID, a WhatsApp number or "
@@ -25705,7 +25739,7 @@ def person_handle_free(h, pid):
     row = q1("SELECT * FROM person_handles WHERE app=? AND handle=?", (h["app"], h["handle"]))
     if row:
         raise Refusal(409, "this person already has that handle" if row["person"] == pid else
-                      f"another person already has that {CHAT_APP_NAMES[h['app']]} handle")
+                      f"another person already has that {CHAT_APP_NAMES.get(h['app'], h['app'])} handle")
 
 
 def person_remove(pid, t0):
@@ -27109,6 +27143,13 @@ def conversation_work_prompt(agent, conv, person, opening=None):
             f'first answer is this conversation\'s brief and its messages.')
 
 
+# The first words of the line that the conversation's record gets for a task that open_work or ask_team opened
+# (conversation_line_task): "Opened work: <title> (T-<id>)" and "Asked the team: <question> (T-<id>)". A reader tells
+# the two kinds apart by them (Teams design 4, S13).
+WORK_OPENED = "Opened work: "
+TEAM_ASKED = "Asked the team: "
+
+
 def t_open_work(agent, a):
     """Larger work from a conversation with the agent's tools (AUTONOMY.md P2): a normal task on this agent, with its
     own line as requester (its lead, in whose one task for its team's results it is a subtask, as a wake is; else the
@@ -27147,7 +27188,7 @@ def t_open_work(agent, a):
             f"This work comes from conversation C-{conv['id']} with {person['name']} ({person['role']}). The "
             f"conversation's session passes on their later messages that concern it, as messages. Your result goes "
             f"back into the conversation by itself, and its session tells {person['name']}; write to them yourself "
-            f"only when the work needs them, with message_contact."), f"Opened work: {title}",
+            f"only when the work needs them, with message_contact."), f"{WORK_OPENED}{title}",
             f"{person['name']} asked for it in C-{conv['id']}.",
             follows=follows)
     return (f"Opened {tref(tid)} ({title}), with {requester} as its requester. It runs in its own task session, and "
@@ -27279,7 +27320,7 @@ def t_ask_team(agent, a):
                   f"{OPEN_TASK}", (conv["id"], details))
         if same:
             return f"{tref(same['id'])} with the same question is already open. Nothing was asked twice."
-        tid, _ = conversation_line_task(agent, conv, person, title, details, f"Asked the team: {question}",
+        tid, _ = conversation_line_task(agent, conv, person, title, details, f"{TEAM_ASKED}{question}",
                                         f"{person['name']} asked in C-{conv['id']}.",
                                         question={"record": record, "message": rows[-1]["id"]} if record else None)
         if closed:          # read by this task's own session alone: no requester reads a message of its task
@@ -28069,7 +28110,7 @@ def send_conversation(t, send):
     nor without this agent, and its account still this agent's own and on. Else (None, None)."""
     conv = read_row("SELECT * FROM conversations WHERE id=?", (send.get("conversation"),))
     person = read_row("SELECT * FROM people WHERE id=?", (conv["person"],)) if conv else None
-    acc = chat_apps().get(conv["account"]) if conv else None
+    acc = conversation_place(conv) if conv else None
     if not conv or conv["agent"] != t["agent"] or conv["state"] != "open" or not conv["chat"] or person is None or \
             person["blocked"] is not None or not person_may(person["id"], t["agent"]) or not acc or \
             not chat_enabled(acc) or acc["agents"] != [t["agent"]]:
@@ -28083,7 +28124,7 @@ def reminder_held(t, send):
     of those can come back, so the reminder stays; anything else that stops it ends it (send_way). read_row only."""
     conv = read_row("SELECT * FROM conversations WHERE id=?", (send.get("conversation"),))
     person = read_row("SELECT * FROM people WHERE id=?", (conv["person"],)) if conv else None
-    acc = chat_apps().get(conv["account"]) if conv else None
+    acc = conversation_place(conv) if conv else None
     if not conv or conv["agent"] != t["agent"] or not conv["chat"] or person is None or \
             person["blocked"] is not None or not person_may(person["id"], t["agent"]) or not acc or \
             acc["agents"] != [t["agent"]]:
@@ -78325,6 +78366,12 @@ class Handler(BaseHTTPRequestHandler):
         to one person only, and never to the owner."""
         def read(data):
             self.only(data, ("app", "handle", "name", "delete"))
+            if data.get("delete") is True and data.get("app") not in CHAT_APP_NAMES:
+                # a delete takes the app of a row that exists (Teams design 4, S6): the People page lists each row of
+                # a person, also of an app that is no chat app of the hub, so the owner can remove each one. act finds
+                # the row under the lock; read reads no row, so that a repeat of the command reads the same body.
+                return {"app": data.get("app"), "handle": data.get("handle"), "name": None, "delete": True,
+                        "person": pid}
             body = person_handle_fields(data)
             if data.get("delete") is not None:
                 if data["delete"] is not True:
@@ -78333,6 +78380,11 @@ class Handler(BaseHTTPRequestHandler):
             return dict(body, person=pid)
 
         def act(body):
+            if body.get("delete") and body["app"] not in CHAT_APP_NAMES and not (
+                    isinstance(body["app"], str) and isinstance(body["handle"], str) and
+                    q1("SELECT 1 FROM person_handles WHERE app=? AND handle=? AND person=?",
+                       (body["app"], body["handle"], pid))):
+                raise Refusal(400, PERSON_HANDLE_APPS)      # no such row: the words that read gave it before
             p = q1("SELECT * FROM people WHERE id=?", (pid,))
             if not p:
                 raise Refusal(404, code="no_such_person")
@@ -78342,14 +78394,14 @@ class Handler(BaseHTTPRequestHandler):
                           (body["app"], body["handle"], pid)):
                     raise Refusal(404, "this person has no such handle")
                 q("DELETE FROM person_handles WHERE app=? AND handle=?", (body["app"], body["handle"]))
-                log("owner", f"removed a {CHAT_APP_NAMES[body['app']]} handle of P-{pid}")
+                log("owner", f"removed a {CHAT_APP_NAMES.get(body['app'], body['app'])} handle of P-{pid}")
                 return {"person": person_view(p, t0), "deleted": True}
             person_handle_free(body, pid)
             if q1("SELECT COUNT(*) n FROM person_handles WHERE person=?", (pid,))["n"] >= PERSON_HANDLES_MAX:
                 raise Refusal(409, code="person_handles_most", names={"most": PERSON_HANDLES_MAX})
             q("INSERT INTO person_handles(app,handle,person,name,added) VALUES(?,?,?,?,?)",
               (body["app"], body["handle"], pid, body["name"], t0))
-            log("owner", f"gave P-{pid} a {CHAT_APP_NAMES[body['app']]} handle")
+            log("owner", f"gave P-{pid} a {CHAT_APP_NAMES.get(body['app'], body['app'])} handle")
             return {"person": person_view(p, t0)}
         return self.ui_command(f"people/{pid}/handles", read, act)
 

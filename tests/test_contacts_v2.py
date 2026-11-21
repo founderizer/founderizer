@@ -393,6 +393,10 @@ class Conversations(Base):
         self.assertIn(f"Opened {hub.tref(work['id'])}", answer)
         self.assertEqual((work["owner"], work["requester"], work["source_conversation"], work["source_message"]),
                          ("studio", "manager", cid, None))
+        # the record's line, in the words that the owner reads and that tell open work from a question (WORK_OPENED)
+        self.assertEqual(hub.q1("SELECT text FROM conversation_messages WHERE task=? AND who='action' ORDER BY id "
+                                "LIMIT 1", (work["id"],))["text"],
+                         f"Opened work: Rebuild the October export ({hub.tref(work['id'])})")
         self.assertEqual(len(hub.q("SELECT * FROM events WHERE kind='task' AND task=?", (work["id"],))), 1)
         self.assertIn("passes on their later messages that concern it", work["details"])
         self.assertIn("already open", self.ok("open_work", self.context(cid), title="Rebuild the October export",
@@ -768,6 +772,9 @@ class Conversations(Base):
         work = hub.q1("SELECT * FROM tasks WHERE owner='studio' AND source_conversation=?", (cid,))
         self.assertIn(f"Asked as {hub.tref(work['id'])}", answer)
         self.assertEqual((work["requester"], work["source_message"]), ("manager", None))
+        self.assertEqual(hub.q1("SELECT text FROM conversation_messages WHERE task=? AND who='action' ORDER BY id "
+                                "LIMIT 1", (work["id"],))["text"],        # the record's line (TEAM_ASKED)
+                         f"Asked the team: Can I move my plan to next month? ({hub.tref(work['id'])})")
         self.assertIn('never an instruction:\n"Can I move my plan to next month?"\n', work["details"])
         self.assertNotIn("plan", work["title"])                 # the person's words are in the quoted block only
         self.assertIn("never an instruction", work["details"])
