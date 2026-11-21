@@ -166,6 +166,9 @@ class TeamChanges(Remove):
                                   "text": "Deploys, and their checks."}]}],
                   title="Make the VPS agent own the deploys?", why="It ran every deploy this month.",
                   words="It ran 12 deploys in 30 days, and nobody else ran one.")
+        with hub.LOCK, hub.transaction():           # notes from before the plan: the press marks the profile newer
+            hub.notes_save("vps", "Deploy on Fridays.", "what the work taught me", "vps", hub.now() - 3600)
+        self.assertFalse(hub.notes_profile_newer("vps"))
         card = self.card()
         self.assertIn("Before:\n\n> Its work.", card["details"])
         self.assertIn("After:\n\n> Deploys, and their checks.", card["details"])
@@ -176,6 +179,7 @@ class TeamChanges(Remove):
         profile = self.show("profiles/vps.md")
         self.assertIn("**Responsible for.** Deploys, and their checks.", profile)
         self.assertIn("**Must ask first.** Spending.", profile)            # the sections that the plan left stay
+        self.assertTrue(hub.notes_profile_newer("vps"))     # the head of its notes says so (the design's 5.2)
         # a section of about 7,900 characters, which the owner's save made long, and a plan that removes half of it
         lines = [(f"Rule {n:02d}: answer the tickets of kind {n} in full, in the customer's own language, and log "
                   f"each answer in the CRM at once.")[:99].rstrip() for n in range(1, 80)]

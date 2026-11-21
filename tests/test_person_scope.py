@@ -374,6 +374,14 @@ class Narrowed(Base):
         other = self.says(KIM, "Hello", account="discord-studio")["conversation"]
         names = {x["name"] for x in hub.tools_for("studio", self.context(other))}
         self.assertTrue({"open_work", "message_contact", "keep_instruction"} <= names)
+        # Its answers name only the tools that it holds: write_notes and remember, and no write_skill (the design "An
+        # agent keeps its own rules", 5.4)
+        self.assertIn("write_notes", names)
+        self.assertNotIn("write_skill", names)
+        text, error = self.tool("write_notes", self.context(other), request_id=str(uuid.uuid4()),
+                                text="x" * (hub.NOTES_MAX + 1), why="what the work taught me")
+        self.assertTrue(error, text)
+        self.assertTrue(text.endswith("move a tested rule to remember, and keep one line that points to it."), text)
         # the owner's files are not for a session that a person drives, as his chats are not (17 November 2026): not
         # for the window, nor for the conversation's task that it runs. A task that the conversation opened reads a
         # steer's file of its own task only (owner API 1.223, test_contacts_v2). The window has the tool for its own

@@ -1587,9 +1587,13 @@ class StartText(Base):
                            "what this task taught me", "vps", self.clock, task=self.task)
         said = hub.start_text("vps", self.task)
         self.assertIn("Run the repository's own check before the smoke", said)
-        # carried as the agent's own words, never as rules (RULES.md, "Your memory")
+        # carried as the agent's own words, never as rules (RULES.md, "Your memory"), and its own to keep in order (the
+        # design "An agent keeps its own rules", 5.2)
         self.assertIn("They are notes, not rules", said)
         self.assertIn("your words and not the owner's", said)
+        self.assertIn("weigh them against the work in front of you. They are yours to keep true and short: rewrite "
+                      "them with write_notes when this task shows a line wrong or out of date. see_notes reads the "
+                      "versions before.", said)
         self.remember()
         self.assertIn("Your own memory: 1 lesson. This one matches this task", hub.start_text("vps", self.task))
 
@@ -2058,12 +2062,12 @@ class NotesBase(Base):
         self.assertEqual([(v["revision"], v["text"], v["by"], v["task"]) for v in view["versions"]],
                          [(3, "One.", "owner", None), (2, "One. A wrong turn.", "vps", self.task),
                           (1, "One.", "vps", self.task)])
-        self.assertEqual(view["versions"][0]["why"], "The owner restored revision 1")
+        self.assertEqual(view["versions"][0]["why"], "Restored version 1")       # as the owner's app shows it
         self.assertEqual(hub.agent_notes_text("vps"), "One.")
         said, error = self.notes("One. A wrong turn. Mine.")
         self.assertTrue(error, said)
         self.assertIn("Your notes changed after this session read them: revision 3", said)
-        self.assertIn("The owner restored revision 1", said)
+        self.assertIn("by the owner: Restored version 1", said)                 # the agent reads who wrote it
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM agent_notes")["n"], 3)
         said, error = self.notes("One. Mine.")                         # the refusal showed them: read
         self.assertFalse(error, said)

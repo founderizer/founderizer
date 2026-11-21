@@ -1014,6 +1014,12 @@ class Tools(Fleet):
         self.assertIn("which do not fit here.", window)
         self.assertNotIn("Write in English.", window)
         self.assertIn("rewrite them with write_notes", said["review"])         # a duty that names the tools
+        self.assertIn("They are yours to keep true and short", said["review"])
+        self.assertNotIn("They are yours to keep true and short", said["start"])   # it cannot write them there
+        hub.kv_set(hub.PROFILE_CHANGED + "desk", t0 + 1)        # the owner changed its profile after the notes
+        self.assertIn("Your profile changed after you wrote them", hub.start_text("desk", rid))
+        self.assertNotIn("Your profile changed after you wrote them", hub.start_text("desk", tid))
+        hub.kv_set(hub.PROFILE_CHANGED + "desk", None)
         self.assertIn("call remember", said["review"])
         hub.q("DELETE FROM agent_notes")
         hub.q("DELETE FROM memories")

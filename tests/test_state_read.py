@@ -1193,8 +1193,15 @@ class KeptSearch(StateCase):
         """search_version is a digest of the code and the values of the search. A name that the search reads, and that
         is not one of them, could change in a release while the version stays: a start would then take a text as
         searched by a search that finds less than its own."""
-        modules = {"re", "hashlib", "json", "functools", "collections", "threading", "sys"}
-        passes_on = {"find_secret_spans", "SpanCacheInfo", "write_owner_file", "search_version"}    # change no answer
+        modules = {"re", "hashlib", "json", "functools", "collections", "threading", "sys", "subprocess", "inspect",
+                   "dis", "builtins"}
+        # names that change no answer: where and how the search runs (a child gives the same spans; its program is made
+        # of LOGIN_SEARCH_PARTS and LOGIN_SEARCH_VALUES and LOGIN_SEARCH_MAIN, which the version holds, and code_text
+        # decides only whether there is one), its record of faults, the lock that decides only the child's priority,
+        # the places of the children, and the pipe that ends a child with its hub
+        passes_on = {"find_secret_spans", "SpanCacheInfo", "write_owner_file", "search_version", "AHEAD",
+                     "searched_once", "SEARCH_CHILD_SECONDS", "SEARCH_UNDONE", "print_fault", "LOGIN_SEARCH_PROGRAM",
+                     "LOGIN_SEARCH_LIFE", "LOCK", "SEARCH_CHILDREN", "SEARCH_CHILD_WORK", "code_text"}
         allowed = set(hub.SEARCH_CODE) | set(hub.SEARCH_VALUES) | set(dir(builtins)) | modules | passes_on
         for name in hub.SEARCH_CODE:
             fn = ast.parse(textwrap.dedent(inspect.getsource(getattr(hub, name)))).body[0]

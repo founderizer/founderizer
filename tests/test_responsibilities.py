@@ -1542,9 +1542,22 @@ class Notes(Base):
         self.assertEqual(self.request("/ui/notes/vps?db=test-generation")[1]["revision"], 1)
 
     def test_notes_are_capped_guarded_and_written_once_for_one_request_id(self):
+        """And near the cap and over it, the answer names the places where lines go, not only the number: else the
+        agent cuts words where a rule must move (the design "An agent keeps its own rules", 5.4)."""
+        places = "take out what your profile, a duty or a lesson already says"
         text, error = self.write(text="x" * (hub.NOTES_MAX + 1))
         self.assertTrue(error)
-        self.assertIn(f"1 to {hub.NOTES_MAX} characters", text)
+        self.assertEqual(text, f"Your notes take 2,000 characters, and this text has 2,001. Nothing was written. Make "
+                               f"it shorter and call again: {places}, move a tested rule to remember and the steps "
+                               f"of a job to write_skill, and keep one line that points to each.")
+        # A session whose Shell box is off holds no write_skill, and its answer names only what it holds.
+        with patch.object(hub, "session_holds", lambda agent, task, name: name != "write_skill"):
+            text, error = self.write(text="x" * (hub.NOTES_MAX + 1))
+            self.assertTrue(text.endswith(f"{places}, move a tested rule to remember, and keep one line that points "
+                                          f"to it."), text)
+        with patch.object(hub, "session_holds", lambda agent, task, name: False):    # a session with neither
+            self.assertTrue(self.write(text="x" * (hub.NOTES_MAX + 1))[0].endswith(f"call again: {places}."))
+        self.assertIn(f"1 to {hub.NOTES_MAX} characters", self.write(text=" ")[0])
         # The guard itself is test_capacity's; what this checks is that write_notes goes through it.
         with patch.object(hub, "secret_hit", lambda *texts: any("hunter2" in str(t) for t in texts)):
             text, error = self.write(text="The admin password of shop.example is hunter2.")
@@ -1559,6 +1572,15 @@ class Notes(Base):
                                  task_id=hub.tref(self.task["id"]))
         self.assertEqual((again, error), (first, False))
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM agent_notes")["n"], 1)
+        self.assertNotIn("characters", self.write(text="y" * hub.NOTES_MARK)[0])
+        said, error = self.write(text="y" * (hub.NOTES_MARK + 1))
+        self.assertFalse(error, said)
+        self.assertTrue(said.endswith(f" They are 1,501 of 2,000 characters. Before you add to them again, {places}, "
+                                      f"and move a tested rule to remember and the steps of a job to write_skill."),
+                        said)
+        with patch.object(hub, "session_holds", lambda agent, task, name: name != "write_skill"):
+            said, error = self.write(text="z" * (hub.NOTES_MARK + 1))
+        self.assertTrue(said.endswith(f"{places}, and move a tested rule to remember."), said)
 
     def test_the_owner_reads_every_version(self):
         self.write()

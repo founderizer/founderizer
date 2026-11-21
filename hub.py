@@ -22,9 +22,11 @@ private (Tailscale) network.
 """
 import argparse
 import base64
+import builtins
 import collections
 import contextlib
 import datetime
+import dis
 import fcntl
 import functools
 import hashlib
@@ -5790,7 +5792,26 @@ def secret_spans_each(text, key):
     key holds twice (register_fingerprints writes a row again before it deletes the old one) is searched once. What a
     row finds does not depend on the other rows: one search finds the runs long enough for the shortest row
     (run_least), and a row reads only the runs long enough for itself. So a cache of the search (SpanCache) searches a
-    text again for the rows that it has not searched it for, and for no other."""
+    text again for the rows that it has not searched it for, and for no other.
+
+    A text whose search hashes SEARCH_CHILD_WORK windows or more (search_work) is searched in a child process, and
+    every other text here (secret_spans_here). The search hashes each window of each run for each login, in pure
+    Python, and it holds Python's interpreter lock while it runs: on 20 November 2026 the 5.7 MB of one delivery's
+    files took about 4 minutes, and every call of the hub ran about 100 times slower meanwhile (16 to 29 s for each MB
+    with 166 logins). A thread that waits for a child holds no interpreter lock. A text that a delivery's search ahead
+    has searched already (searched_ahead) gives that answer."""
+    ahead = getattr(AHEAD, "found", None)
+    if ahead is not None and (text, tuple(key)) in ahead:
+        return ahead.pop((text, tuple(key)))
+    # (characters times logins first: no more work than that, and most texts are short enough to need no count)
+    if len(text) >= SECRET_TEXT_LEAST and key and len(text) * len(set(key)) >= SEARCH_CHILD_WORK and \
+            search_work(text, key) >= SEARCH_CHILD_WORK:
+        return searched_once([(text, tuple(key))])[0]
+    return secret_spans_here(text, key)
+
+
+def secret_spans_here(text, key):
+    """secret_spans_each in this process: the search itself, which login_search_child runs in a child as well."""
     found = {}
     if len(text) < SECRET_TEXT_LEAST or not key:
         return found
@@ -5830,6 +5851,222 @@ def secret_spans_each(text, key):
         if spans:
             found[row] = spans
     return found
+
+
+SEARCH_CHILD_WORK = 100000      # windows that the search hashes: some 0.03 s here, 0.05 s with a child's start
+SEARCH_LONG_WORK = 3000000      # and about 1 s here: a search that waits for a place, or counts as a login undone
+SEARCH_CHILD_SECONDS = 7200     # the most for a child: one run of 24 MiB, the most of a delivery, at 186 us for each
+                                # character is 4,680 s. A long text that a child did not search in it counts as a login
+LOGIN_SEARCH_VALUES = ("SECRET_TEXT_LEAST", "LOGIN_LEAST", "DROPPED_DOTS", "DOTS_RUN_MOST", "DOTS_TAIL", "JSON_BREAK")
+LOGIN_SEARCH_PARTS = ("rest_ends", "long_runs", "run_least", "secret_spans_here")    # the search, as the child runs it
+LOGIN_SEARCH_MAIN = """
+def watch(fd):
+    while os.read(fd, 1):       # the hub writes nothing: the read ends when no hub holds the pipe's other end
+        pass
+    os._exit(3)
+
+
+def main():
+    head = json.loads(sys.stdin.buffer.readline())
+    signal.alarm(head["seconds"])       # and no search outlives the wait of the hub that asked for it
+    threading.Thread(target=watch, args=(head["life"],), daemon=True).start()
+    try:
+        os.nice(head["nice"])   # the hub's own threads come first, unless the asker holds the hub's lock
+    except (AttributeError, OSError):
+        pass
+    rows = [tuple(row) for row in head["rows"]]
+    answers = []
+    for size, places in head["texts"]:
+        text = sys.stdin.buffer.read(size).decode("utf-8", "surrogatepass")
+        key = tuple(rows[place] for place in places)
+        found = secret_spans_here(text, key)
+        answers.append([[places[key.index(row)], spans] for row, spans in found.items()])
+    sys.stdout.write(json.dumps(answers))
+
+
+main()
+"""
+# The read end of a pipe whose write end only this process holds (os.pipe makes both ends non-inheritable). Each child
+# of the search gets the read end, and its read ends when this process ends or starts its new code (exec_again keeps
+# its children, and systemd's KillMode=process stops only the hub), so no child searches on for a hub that is gone.
+LOGIN_SEARCH_LIFE = os.pipe()
+# login_search_child's answer when no child finished the search: one passed SEARCH_CHILD_SECONDS, or two failed
+SEARCH_UNDONE = object()
+# The children of long searches (SEARCH_LONG_WORK) at one time, of the threads that hold no LOCK: at most one for
+# each processor. Each searches for up to SEARCH_CHILD_SECONDS, and its asker holds the text and its bytes meanwhile;
+# a shorter search takes no place, so that it never waits hours behind a delivery's.
+SEARCH_CHILDREN = threading.BoundedSemaphore(max(1, os.cpu_count() or 1))
+AHEAD = threading.local()       # found: {(text, rows): spans}, this thread's answers of a search ahead (searched_ahead)
+SEARCHING = {}                  # the digests and rows of a search's texts: [done, answer] of a search that runs now
+SEARCHING_LOCK = threading.Lock()
+
+
+def search_work(text, key):
+    """At most how many windows secret_spans_here hashes for this text: the characters of its runs that are long enough
+    for the shortest row, for each row. Characters alone do not tell it: a text of 32,767 characters that is one run
+    (base64, a JSON on one line) took 2.0 s here with 166 logins, and one of words with spaces almost nothing."""
+    rows = set(key)
+    least = max(1, min(run_least(n) for _, _, n in rows))
+    return sum(m.end() - m.start() for m in long_runs(least).finditer(text)) * len(rows)
+
+
+def login_search_program():
+    """The program of a child that searches texts (login_search_child): the values of the search
+    (LOGIN_SEARCH_VALUES) and its functions (LOGIN_SEARCH_PARTS), as this process runs them, made once at the import
+    of the hub. Their text comes from hub.py on the disk, which a release changes before the hub starts again: so the
+    functions of the program must do what this process's own functions do (code_text), or there is no program, and
+    every search runs here."""
+    lines = ["import functools, hashlib, json, os, re, signal, sys, threading"]
+    for name in LOGIN_SEARCH_VALUES:
+        value = globals()[name]
+        lines.append(f"{name} = re.compile({value.pattern!r}, {int(value.flags)})" if isinstance(value, re.Pattern)
+                     else f"{name} = {value!r}")
+    lines += [inspect.getsource(globals()[name]) for name in LOGIN_SEARCH_PARTS]
+    program = "\n".join(lines)
+    try:
+        made = {}
+        exec(compile(program, "<the login search>", "exec"), made)        # noqa: S102 -- this file's own functions
+        if any(code_text(inspect.unwrap(made[name]).__code__) != code_text(inspect.unwrap(globals()[name]).__code__)
+               for name in LOGIN_SEARCH_PARTS):
+            raise ValueError("hub.py on the disk is not the code that runs")
+        # and every name that the parts read is in the program: a value or a function that the search began to read
+        # and that LOGIN_SEARCH_VALUES or LOGIN_SEARCH_PARTS do not name would fail each child with a NameError
+        unknown = {name for part in LOGIN_SEARCH_PARTS
+                   for name in global_names(inspect.unwrap(made[part]).__code__)} - set(made) - set(dir(builtins))
+        if unknown:
+            raise ValueError(f"the program of the search lacks {sorted(unknown)}")
+    except Exception:       # noqa: BLE001 -- no child then: the search runs here, as it always did
+        print_fault()
+        return None
+    return program + LOGIN_SEARCH_MAIN
+
+
+def global_names(code):
+    """The global names that a function's code reads, also in the functions and comprehensions inside it."""
+    names = {one.argval for one in dis.get_instructions(code) if one.opname in ("LOAD_GLOBAL", "LOAD_NAME")}
+    for inner in code.co_consts:
+        if isinstance(inner, type(code)):
+            names |= global_names(inner)
+    return names
+
+
+def login_search_child(asks):
+    """secret_spans_here of each (text, rows) of `asks`, in one child process; SEARCH_UNDONE when no child finished it
+    (one passed SEARCH_CHILD_SECONDS, or two failed), and None when this process has no program for a child
+    (LOGIN_SEARCH_PROGRAM): the caller then searches here, as every search ran before the child (searched_by_child).
+    The child gets the rows, which hold salted hashes only, and each text as its UTF-8 bytes (with
+    "surrogatepass", so that each character comes back as it was: JSON would make one character of a pair of
+    surrogates and move every span after it), and gives each row's spans. A thread that waits for it holds no
+    interpreter lock, so the rest of the hub goes on meanwhile. A child that fails is tried once more, one that timed
+    out is not (a second child would take as long); a failure is the hub's own fault, with its place in diagnostics."""
+    if LOGIN_SEARCH_PROGRAM is None or not sys.executable:
+        return None
+    for _ in range(2):
+        try:
+            rows, place, texts, parts = [], {}, [], []
+            for text, key in asks:
+                places = []
+                for row in key:
+                    if row not in place:
+                        place[row] = len(rows)
+                        rows.append(row)
+                    places.append(place[row])
+                data = text.encode("utf-8", "surrogatepass")
+                texts.append([len(data), places])
+                parts.append(data)
+            # nice 10, unless this thread holds the hub's lock: then every route waits for this child, as for no
+            # other. The child's own alarm comes after this process's time for it, which decides
+            head = {"rows": rows, "texts": texts, "nice": 0 if LOCK._is_owned() else 10,
+                    "life": LOGIN_SEARCH_LIFE[0], "seconds": SEARCH_CHILD_SECONDS + 60}
+            asked = json.dumps(head).encode() + b"\n" + b"".join(parts)
+            done = subprocess.run([sys.executable, "-I", "-S", "-c", LOGIN_SEARCH_PROGRAM], input=asked, env={},
+                                  capture_output=True, timeout=SEARCH_CHILD_SECONDS, check=True,
+                                  pass_fds=(LOGIN_SEARCH_LIFE[0],))
+            answers = json.loads(done.stdout)
+            return [{rows[place]: [tuple(span) for span in spans] for place, spans in found} for found in answers]
+        except subprocess.TimeoutExpired:
+            print_fault()
+            return SEARCH_UNDONE
+        except Exception:       # noqa: BLE001 -- once more: a missed login is worse than a slow search
+            print_fault()
+    return SEARCH_UNDONE
+
+
+def searched_by_child(asks):
+    """The spans of each (text, rows) of `asks`: a child's (login_search_child), else this process's own search. A text
+    whose own search is long (SEARCH_LONG_WORK windows or more, about a second here) and that no child finished (one
+    passed SEARCH_CHILD_SECONDS, or two failed) counts as holding each login of its ask, its whole text one span of each
+    row: so each row that stays registered still marks it in SpanCache, and a row that comes later is searched for. Its
+    search here would hold the interpreter lock for minutes or hours (the stall of 20 November 2026), and a search that
+    did not end must not let a login through. Every other text of that child is searched here, and with no program for
+    a child at all every text is, as before the child. An ask whose search together is long waits for a place among
+    SEARCH_CHILDREN, unless its thread holds LOCK, for which every route waits."""
+    works = [search_work(text, rows) for text, rows in asks]
+    if LOCK._is_owned() or sum(works) < SEARCH_LONG_WORK:
+        found = login_search_child(asks)
+    else:
+        with SEARCH_CHILDREN:
+            found = login_search_child(asks)
+    if found is SEARCH_UNDONE:
+        return [{row: [(0, len(text))] for row in dict.fromkeys(rows)} if work >= SEARCH_LONG_WORK else
+                secret_spans_here(text, rows) for (text, rows), work in zip(asks, works)]
+    return found or [secret_spans_here(text, rows) for text, rows in asks]
+
+
+def searched_once(asks):
+    """searched_by_child of these (text, rows), with one search of the same asks at a time: an ask of the same texts
+    and rows while that search runs (a helper sends a delivery's files again after its own 120 s, and again) waits for
+    it and takes its answer. No thread waits for the search of other texts, but a long one for a place among
+    SEARCH_CHILDREN. The thread that searches gives the waiters searched_by_child's answer, so that no waiter takes a
+    search that failed for one that found nothing; a waiter whose searcher ended with no answer (an exception) searches
+    itself. A thread that holds LOCK joins no search of another thread, whose child runs at nice 10 behind the hub's
+    own threads while every route waits for that lock: it runs its own."""
+    if LOCK._is_owned():
+        return searched_by_child(asks)
+    mark = tuple((text_digest(text), rows) for text, rows in asks)
+    with SEARCHING_LOCK:
+        running = SEARCHING.get(mark)
+        mine = running is None
+        if mine:
+            running = SEARCHING[mark] = [threading.Event(), None]
+    if not mine:
+        running[0].wait()
+        return running[1] if running[1] is not None else searched_once(asks)
+    try:
+        running[1] = searched_by_child(asks)
+    finally:
+        with SEARCHING_LOCK:
+            SEARCHING.pop(mark, None)
+        running[0].set()
+    return running[1]
+
+
+@contextlib.contextmanager
+def searched_ahead(texts):
+    """Inside it, each of these texts that secret_hit searches (the text, its skeleton and its JSON-decoded form) is
+    searched already, by one child for all of them when their search together is SEARCH_CHILD_WORK windows or more:
+    a delivery's files, of which each one alone is small enough to be searched here, and 100 of them were 100 s of the
+    interpreter lock (a review of 20 November 2026). Each ask of one of them in this thread takes its answer once."""
+    key, asks = secret_key(), []
+    if key:
+        forms = []
+        for text in texts:
+            forms += hit_forms(str(text or ""))
+        for text in dict.fromkeys(forms):
+            missing = _secret_spans.missing(text, key)
+            if missing:
+                asks.append((text, missing))
+    # a text whose own search reaches the bound goes to a child of its own at its ask (secret_spans_each), where the
+    # sends of one delivery share it: one batch of all would be as long as the longest search and the sum of the rest
+    asks = [(text, rows) for text, rows in asks if search_work(text, rows) < SEARCH_CHILD_WORK]
+    found = None
+    if asks and sum(search_work(text, rows) for text, rows in asks) >= SEARCH_CHILD_WORK:
+        found = {(text, rows): answer for (text, rows), answer in zip(asks, searched_once(asks))}
+    AHEAD.found = found
+    try:
+        yield
+    finally:
+        AHEAD.found = None
 
 
 # ---------------------------------------------------------------- the caches of the search, kept for each login
@@ -5937,6 +6174,22 @@ class SpanCache:
                 self.joins[pair] = got
         return got
 
+    def missing(self, text, key):
+        """The rows of key that a call of this cache would search this text for now (searched_ahead), in its order."""
+        if len(text) < SECRET_TEXT_LEAST or not key:
+            return ()
+        logins, rows = self.logins_of(key)
+        with self.lock:
+            entry = self.texts.get(text)
+            if entry is not None and entry[2] is logins:
+                return ()
+        if entry is not None:
+            searched = entry[0]
+        else:
+            loaded = self.loaded
+            searched = (loaded.get(text_digest(text)) if loaded else None) or self.none
+        return tuple(row for _, row in self.unsearched(searched, logins, rows)[0])
+
     def __call__(self, text, key):
         if len(text) < SECRET_TEXT_LEAST or not key:
             return ()
@@ -6038,9 +6291,9 @@ class SpanCache:
 # What the search finds (secret_spans_each), and what a line of the file of its cache means (SpanCache): a change of
 # any of these is another version of the search, and a start does not read a file of another. test_state_read.KeptSearch
 # holds that every name that these read is here, a builtin, a module or one that only passes the answers on.
-SEARCH_CODE = ("secret_spans_each", "rest_ends", "long_runs", "run_least", "fingerprint_digest", "text_digest",
-               "SpanCache")
-SEARCH_VALUES = ("SECRET_TEXT_LEAST", "LOGIN_LEAST", "DROPPED_DOTS", "DOTS_RUN_MOST", "DOTS_TAIL", "JSON_BREAK")
+SEARCH_CODE = ("secret_spans_each", "secret_spans_here", "login_search_child", "searched_by_child", "search_work",
+               "login_search_program", "global_names", "rest_ends", "long_runs", "run_least", "fingerprint_digest",
+               "text_digest", "SpanCache")
 
 
 def code_text(value):
@@ -6058,6 +6311,13 @@ def code_text(value):
     if isinstance(value, tuple):
         return b"(" + b",".join(code_text(v) for v in value) + b")"
     return repr(value).encode()
+
+
+LOGIN_SEARCH_PROGRAM = login_search_program()      # at the import: the search of the code that this process runs
+# the parts are in SEARCH_CODE, by their code, and the names that make the child's program here; SEARCH_LONG_WORK
+# decides which text that no child finished counts as a login (searched_by_child)
+SEARCH_VALUES = LOGIN_SEARCH_VALUES + ("LOGIN_SEARCH_MAIN", "LOGIN_SEARCH_VALUES", "LOGIN_SEARCH_PARTS",
+                                       "SEARCH_LONG_WORK")
 
 
 @functools.lru_cache(maxsize=1)
@@ -6133,23 +6393,26 @@ def secret_hit(*texts):
     key = secret_key()
     if not key:
         return False
-    for text in texts:
-        text = str(text or "")
-        if len(text) < SECRET_TEXT_LEAST:
-            continue
-        if spans_of(text, key):
-            return True
-        bare = login_skeleton(text)
-        if bare is not text and spans_of(bare, key):
-            return True
-        if "\\" in text:
-            plain = json_plain(text)
-            if spans_of(plain, key):
-                return True
-            bare = login_skeleton(plain)
-            if bare is not plain and spans_of(bare, key):
-                return True
-    return False
+    return any(spans_of(form, key) for text in texts for form in hit_forms(str(text or "")))
+
+
+def hit_forms(text):
+    """The forms of a text that secret_hit searches, in its order: the text, its skeleton where that differs, and for a
+    text with a backslash its JSON-decoded form and that form's skeleton. None for a text shorter than
+    SECRET_TEXT_LEAST, which it does not look up. searched_ahead searches the same forms."""
+    if len(text) < SECRET_TEXT_LEAST:
+        return []
+    forms = [text]
+    bare = login_skeleton(text)
+    if bare is not text:
+        forms.append(bare)
+    if "\\" in text:
+        plain = json_plain(text)
+        forms.append(plain)
+        bare = login_skeleton(plain)
+        if bare is not plain:
+            forms.append(bare)
+    return forms
 
 
 # A helper's usage report, searched run by run (runs_hold_login). Each helper sends one every 30 seconds: the totals of
@@ -11336,6 +11599,9 @@ OUTPUTS_CACHE = "__pycache__"
 # call that waited, and the agent's deliver_result, which then failed, sends its files again.
 OUTPUTS = {}
 OUTPUTS_LOCK = threading.Lock()
+# The token of each delivery whose files one send checks now (helper_outputs): [done, its `taken`, or None when it gave
+# no 200 answer], under OUTPUTS_LOCK. A send of the same files meanwhile waits for it with none of its own body.
+OUTPUTS_CHECKS = {}
 
 
 def outputs_allow(ref):
@@ -28026,6 +28292,7 @@ def save_profile(agent, base, sections):
     if new == old:
         return {"agent": agent, "sha256": current, "commit": rev, "revision": rev, "unchanged": True, "updates_requested": []}
     commit = commit_kit_file(path, new, f"Owner changed the {agent} profile")
+    kv_set(PROFILE_CHANGED + agent, now())      # the head of the agent's notes compares it (notes_start_text)
     mgr = manager_name()
     whose, then = (("your profile", ": it replaces the profile in your start prompt.") if agent == mgr else
                    (f"the profile of {agent}", f", before you give {agent} new work."))
@@ -32282,6 +32549,7 @@ DUTY_NAME_MAX = 80              # how much of the duty's own words stands for it
 
 
 NOTES_MAX = 2000                # how much an agent may write about how it works
+NOTES_MARK = 1500               # three quarters of it: a longer version's answer says its size and where lines go
 NOTES_SHOWN = 10                # earlier versions named when it reads its own history
 
 
@@ -32412,7 +32680,7 @@ def notes_moved(agent, a, command):
     seen = seen_get(key, "notes")
     if (seen == str(cur["revision"])) if seen is not None else cur["created"] <= start:
         return None
-    where = f" in {tref(cur['task'])}" if cur["task"] else ""
+    where = (" by the owner" if cur["by"] == "owner" else "") + (f" in {tref(cur['task'])}" if cur["task"] else "")
     text = (f"Your notes changed after this session read them: revision {cur['revision']} was written "
             f"{goal_time(cur['created'])}{where}: {cur['why']}. Nothing was written, so that no words of it are lost. "
             f"Here are your notes as they stand now: put what you meant to add into them, and call write_notes again "
@@ -32500,10 +32768,12 @@ def memory_news_rows(agent, said, about, t0):
 def notes_restore(agent, revision, t0):
     """POST /ui/notes/<agent>/restore, under LOCK (command_run): the owner takes `agent`'s notes back to the words of
     `revision`. Those words become a new version, by 'owner', through notes_save, so no version is lost and the ones
-    between stay. A session that read an older version is refused at its next write_notes and shown these words
-    (notes_moved: the new version has no task), and each running session reads one line of the hub about it. Masked
-    at this write, as t_write_notes masks: a login registered after the old version was written. Refusal: an agent or a
-    revision that is not there, or the words that the notes hold now."""
+    between stay. Its why is "Restored version <n>": the owner's app shows each version's why under the notes in its
+    own words, and the agent reads who wrote it in `by` (see_notes, notes_moved) and in the hub's line. A session that
+    read an older version is refused at its next write_notes and shown these words (notes_moved: the new version has
+    no task), and each running session reads one line of the hub about it. Masked at this write, as t_write_notes
+    masks: a login registered after the old version was written. Refusal: an agent or a revision that is not there, or
+    the words that the notes hold now."""
     if agent not in agents():
         raise Refusal(404, code="no_such_agent")
     cur = notes_row(agent)
@@ -32516,7 +32786,7 @@ def notes_restore(agent, revision, t0):
         raise Refusal(409, f"revision {revision} has the words of {agent}'s notes as they stand now (revision "
                            f"{cur['revision']}): nothing changes")
     with transaction():
-        rid = notes_save(agent, text, f"The owner restored revision {revision}", "owner", t0)
+        rid = notes_save(agent, text, f"Restored version {revision}", "owner", t0)    # the app shows it as written
         new = DB.execute("SELECT revision FROM agent_notes WHERE id=?", (rid,)).fetchone()["revision"]
         memory_news_rows(agent, f"[hub] The owner restored your notes: revision {new} has the words of revision "
                                 f"{revision} again. Your next task sessions start with your notes as they stand. If "
@@ -34235,9 +34505,31 @@ def t_see_notes(agent, a):
     return "\n".join(out)
 
 
+def notes_moves(agent, a):
+    """Where the lines of a long text of notes go instead, for the answers of write_notes at NOTES_MARK and above
+    NOTES_MAX (the design "An agent keeps its own rules", 5.4): a tested rule to remember and the steps of a job to
+    write_skill, each only when this session holds that tool (session_holds), so that no answer sends a session whose
+    Shell box is off to a tool that it does not have. A conversation window with the agent's tools calls as its
+    conversation task (call_tool), whose tools hold no write_skill (CONVERSATION_NOT_WORK)."""
+    key = seen_task(agent, a)[0]
+    tid = key if isinstance(key, int) else None
+    chat = is_conversation_task(read_row("SELECT source_message FROM tasks WHERE id=?", (tid,)) if tid else None)
+    return [move for move, tool in (("a tested rule to remember", "remember"),
+                                    ("the steps of a job to write_skill", "write_skill"))
+            if session_holds(agent, tid, tool) and not (chat and tool in CONVERSATION_NOT_WORK)]
+
+
 def t_write_notes(agent, a):
     """A new version of an agent's own working notes. Every version is kept, and the owner reads all of them."""
-    text = goal_text_or_error(a.get("text"), "text", NOTES_MAX)
+    given = a.get("text")
+    size = len(given.replace("\r\n", "\n").strip()) if isinstance(given, str) else 0
+    if size > NOTES_MAX:            # the places, not only the number: else the agent cuts words where a rule must move
+        moves = notes_moves(agent, a)
+        raise ToolError(f"Your notes take {NOTES_MAX:,} characters, and this text has {size:,}. Nothing was written. "
+                        f"Make it shorter and call again: take out what your profile, a duty or a lesson already says"
+                        + (f", move {' and '.join(moves)}, and keep one line that points to "
+                           f"{'each' if len(moves) > 1 else 'it'}" if moves else "") + ".")
+    text = goal_text_or_error(given, "text", NOTES_MAX)
     why = duty_one_line(a.get("why"), "why", 200)
     guard(agent, text, why)
     tid = parse_task(a["task_id"]) if a.get("task_id") not in (None, "") else None
@@ -34249,12 +34541,18 @@ def t_write_notes(agent, a):
     moved = notes_moved(agent, a, command)  # after agent_write: a repeat of a write that went through gets its answer
     if moved:
         raise ToolError(moved)
+    kept = mask_secrets(text)
+    moves = notes_moves(agent, a) if len(kept) > NOTES_MARK else None
     t0 = now()
     with transaction():
-        rid = notes_save(agent, mask_secrets(text), why, agent, t0, task=tid, duty_case=case_id)
+        rid = notes_save(agent, kept, why, agent, t0, task=tid, duty_case=case_id)
         revision = DB.execute("SELECT revision FROM agent_notes WHERE id=?", (rid,)).fetchone()["revision"]
         said = (f"Your notes are revision {revision} now, and your next task session starts with them. The version "
                 f"before it is kept, and the owner reads every one.")
+        if moves is not None:       # near NOTES_MAX: put them in order now, while this session knows each line
+            said += (f" They are {len(kept):,} of {NOTES_MAX:,} characters. Before you add to them again, take out "
+                     f"what your profile, a duty or a lesson already says"
+                     + (f", and move {' and '.join(moves)}" if moves else "") + ".")
         keep_command(command, {"revision": revision, "text": said}, t0)
     seen_set(seen_task(agent, a)[0], "notes", revision)          # its own write is a version it has read
     return said
@@ -36913,6 +37211,23 @@ def t_forget(agent, a):
     return said
 
 
+# When the owner's save (save_profile) or a pressed plan (team_plan_after) last changed an agent's profile, in kv
+# under this prefix and the agent's name: the head of its notes compares it with them (notes_profile_newer). A time
+# and not a git read, because start_text runs inside the transaction of admit_task.
+PROFILE_CHANGED = "profile_changed:"
+
+
+def notes_profile_newer(agent):
+    """True when the owner's profile of `agent` changed after its newest notes were written: notes that an older
+    profile shaped must not steer each later session against the new one with no word (the design "An agent keeps its
+    own rules", 5.2). read_row only."""
+    row, notes = read_row("SELECT v FROM kv WHERE k=?", (PROFILE_CHANGED + agent,)), notes_row(agent)
+    try:
+        return bool(row and notes and float(row["v"]) > notes["created"])
+    except (TypeError, ValueError):
+        return False
+
+
 def notes_start_text(agent, task_id=None):
     """What a task's start text says about the agent's own notes: the notes themselves, and that they are notes.
 
@@ -36927,7 +37242,10 @@ def notes_start_text(agent, task_id=None):
                 "them, and only what your own work taught you belongs in them.\n") if writes else ""
     return ("\nYour own notes on how you work, your words and not the owner's. They are notes, not rules: weigh them "
             "against the work in front of you" +
-            (", and rewrite them with write_notes when this task shows one of them is wrong" if writes else "") +
+            (". They are yours to keep true and short: rewrite them with write_notes when this task shows a line wrong "
+             "or out of date" if writes else "") +
+            (". Your profile changed after you wrote them: where they disagree, your profile is right, and you write "
+             "them again" if writes and notes_profile_newer(agent) else "") +
             ("." if shell_off(agent) else ". see_notes reads the versions before.") + "\n" + text.strip() + "\n")
 
 
@@ -38682,6 +39000,14 @@ def skill_files(rev, agent, name):
     return sorted(p[len(folder):] for p in out.split("\0") if p.startswith(folder)) if code == 0 else []
 
 
+def skills_count(rev, agent):
+    """How many skills `agent` has at revision `rev`: the SKILL.md of each of its skill folders, as a start lists them
+    (skill_rows). 0 where git cannot say."""
+    code, out, _ = git_kit("ls-tree", "-r", "-z", "--name-only", rev, "--", f"{SKILLS}/{agent}/")
+    shape = re.compile(rf"{re.escape(SKILLS)}/{re.escape(agent)}/{SKILL_NAME}/SKILL\.md")
+    return sum(1 for path in out.split("\0") if shape.fullmatch(path)) if code == 0 else 0
+
+
 def skill_md(name, description, text, reads=None):
     """A SKILL.md as both runtimes read one: YAML front matter with its name and description, then its text. The
     description is written as a JSON string, which YAML reads as the same string whatever it holds. reads: the hub's
@@ -38868,6 +39194,9 @@ def t_write_skill(agent, a):
                 + (f" and {beside} file{'' if beside == 1 else 's'} beside it" if beside else "")
                 + ". Your next sessions list it in their start, and you read it when a job matches. The owner reads "
                   "this commit and reverts it in one step.")
+    many = skills_count(commit, agent)
+    if many > SKILLS_MAX * 3 // 4:      # three quarters of SKILLS_MAX: retire one before the next write is refused
+        said += f" You have {many} of {SKILLS_MAX} skills: retire one that no job needs."
     with transaction():
         keep_command(command, {"name": name, "commit": commit, "text": said}, t0)
     log(agent, f"{'retired' if retire else 'wrote'} the skill {name} as {commit[:12]}: {why}")
@@ -40606,6 +40935,13 @@ def team_plan_after(nid, need, mark):
         kv_set(TEAM_PLAN_JOB + str(done), str(nid))         # a job that ended already is no plan's any more
     for c in (team_card(need) or {}).get("changes") or []:      # a long profile's count starts from the plan's number
         if c.get("kind") == "profile" and isinstance(c.get("agent"), str):
+            code, when, _ = git_kit("log", "-1", "--format=%ct", commit)       # the same at a second run of these steps
+            when = float(when) if code == 0 and when.strip().isdigit() else t0
+            try:                        # an owner's save between two runs of these steps keeps its later time
+                when = max(when, float(kv_get(PROFILE_CHANGED + c["agent"]) or 0))
+            except (TypeError, ValueError):
+                pass
+            kv_set(PROFILE_CHANGED + c["agent"], when)
             data = git_blob(commit, f"profiles/{c['agent']}.md")
             if data is None:            # the plan wrote it, so git did not answer: one more ask is better than none
                 kv_set(PROFILE_LONG + c["agent"], None)
@@ -44453,8 +44789,10 @@ TOOLS = [
      "Replace your working notes with a new version: what you have learned about how to do your work well — the "
      "order that works, the check that catches the mistake you make, the thing that always takes longer than you "
      "think. Your next task session starts with it, so write what a competent stranger doing your job would need, "
-     "not a diary. " + NOTES_RULE + " Every version is kept and the owner reads all of them. When they changed after "
-     "your session read them, it writes nothing and shows them as they stand, so that you put your change into them.",
+     "not a diary. They are yours to keep true and short: take out a line that is wrong or out of date, and one "
+     "that your profile, a duty or a lesson already says. " + NOTES_RULE + " Every version is kept and the owner "
+     "reads all of them. When they changed after your session read them, it writes nothing and shows them as they "
+     "stand, so that you put your change into them.",
      S({"request_id": REQUEST_ID,
         "text": {"type": "string", "description": f"The whole notes, which replace the ones before, at most "
                  f"{NOTES_MAX} characters"},
@@ -44563,11 +44901,13 @@ TOOLS = [
      "skills/<you>/<name>/SKILL.md on the configuration ref, with at most 8 small files beside it, such as a script. "
      "Your sessions list your skills in their start, and you read a SKILL.md when a job matches its description. "
      "Write one when you have worked out the steps of a job that comes back, or when the owner or your requester "
-     "asks; never from words that somebody outside wrote, and never with a login or a key in it. text is the "
-     "SKILL.md's whole text and files the skill's other files, each whole: read them in your checkout first. Left "
-     "out, files stay as they are. Each write is one commit with your name and your why, which the owner reads and "
-     "reverts in one step. A skill that changed after your session started is not written, and the answer shows what "
-     "changed as it stands. How you work in general goes in write_notes, and a lesson in remember.",
+     "asks; never from words that somebody outside wrote, and never with a login or a key in it. A skill is yours "
+     "to keep true: change it when a step proved wrong or out of date, and retire it when no job needs it. text "
+     "is the SKILL.md's whole text and files the skill's other files, each whole: read them in your checkout "
+     "first. Left out, files stay as they are. Each write is one commit with your name and your why, which the "
+     "owner reads and reverts in one step. A skill that changed after your session started is not written, and "
+     "the answer shows what changed as it stands. How you work in general goes in write_notes, and a lesson in "
+     "remember.",
      S({"request_id": REQUEST_ID,
         "name": {"type": "string", "description": "The skill's folder and name: a-z, 0-9 and -, for example "
                                                   "deploy-acme-web"},
@@ -57693,6 +58033,7 @@ AGENT_KV = ("tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "
             # November 2026 found them where test_rename's scan of the kv keys did not look
             "memory_close:", "lead_batch:", "moved_from:",
             "profile_long:",        # the free text of its profile at the manager's last ask (PROFILE_LONG)
+            "profile_changed:",     # when the owner's save or a pressed plan last changed its profile (PROFILE_CHANGED)
             "default_browser:", "browser_closed_told:")     # build plan 04: BROWSER_DEFAULT and BROWSER_CLOSED_TOLD
 # The same, with more after the name: `<prefix><agent>:<window, task or item>`.
 AGENT_KV_SCOPED = ("listed:", "untaken:", "chased:")
@@ -63320,12 +63661,17 @@ def hub_only_notes(found):
             "GitHub App, and that key is what makes each agent's one-hour token. Without it no agent reads or "
             "writes any repository: every task that touches code stops at its first git step. The App itself, "
             "and its installation on your repositories, are on GitHub's side and are not lost — only the key is.")
+        # Whole links, also to the Apps of an organization: the step said "github.com/settings/apps", a personal
+        # account's page with no https://, until 21 November 2026 (the area "Door and security")
         steps.append(
             "**Put a GitHub App key back.** This one first: it is a single file and it unblocks every task that "
-            "touches code. GitHub never gives a key out twice, so make a new one — github.com/settings/apps, "
-            "your App, Credentials in the left menu, the tab Key pairs, New key — and paste it with the App ID "
-            "into the app, which writes the file. Then delete the old key on that same tab. `config/team.json` "
-            "in this copy names your repositories, so the App you want is the one installed on them.")
+            "touches code. GitHub never gives a key out twice, so make a new one on your App's page on GitHub: "
+            "https://github.com/settings/apps lists the Apps of your own account, and "
+            "https://github.com/organizations/YOUR-ORGANIZATION/settings/apps, with your organization's name in it, "
+            "those of an organization. Open your App, then Credentials in the left menu, the tab Key pairs, New key, "
+            "and paste the key with the App ID into the app, which writes the file. Then delete the old key on that "
+            "same tab. `config/team.json` in this copy names your repositories, so the App you want is the one "
+            "installed on them.")
     else:
         had_none.append("GitHub App")
     n = google.get("accounts")
@@ -63428,8 +63774,11 @@ def hub_only_notes(found):
     elif had_none:
         said.append("Your hub had no " + " and no ".join(had_none) + ", so there is nothing of those to put back.")
     said = "\n\n".join(textwrap.fill(one, 110) for one in said)
-    steps = "".join(f"{n}. {textwrap.fill(one, 110, subsequent_indent='   ')}\n"
-                    for n, one in enumerate(steps, 6))
+    # a link stays whole on its line, also one with a hyphen and one longer than the line: no link of today needs it,
+    # and a later step's words could put one at the end of a line
+    wrap = functools.partial(textwrap.fill, width=110, subsequent_indent="   ", break_on_hyphens=False,
+                             break_long_words=False)
+    steps = "".join(f"{n}. {wrap(one)}\n" for n, one in enumerate(steps, 6))
     if steps:
         steps += "\n" + textwrap.fill(
             "Until each of those is done, an agent that reaches for what is missing is told so and stops. "
@@ -63499,8 +63848,8 @@ different object, and it would need somewhere to hide.
 remembered. Everything in this section is public and holds no secret of yours, which is exactly why it is in
 here: the day somebody reads it is the day nothing else is left.
 
-1. **Founderizer for Mac is at founderizer.com.** Download it there and open it. That address is the only one
-   you have to know, because the app carries both ways of putting a hub on a machine and asks you for what it
+1. **Founderizer for Mac is at https://founderizer.com.** Download it there and open it. That address is the only
+   one you have to know, because the app carries both ways of putting a hub on a machine and asks you for what it
    needs as it goes.
 2. **Any small Linux server becomes the hub.** Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, with root, and
    nothing else on port 8765; a €5 VPS is enough. You type nothing in its console: the app either installs over
@@ -76017,19 +76366,50 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, {"error": f"files must be a list of at most {OUTPUTS_FILES}, skipped a list"})
         if not outputs_waiting(token, agent):
             return self.json(200, {"taken": False})
+        # A helper sends the files again after its own 120 s while the first send of them is still checked (a long
+        # search for logins: one run of 24 MiB is more than an hour), and again: each send held the whole delivery
+        # meanwhile (24 MiB, more than 100 MiB decoded and searched), until a small hub's memory ended. A send that
+        # comes while the first one is checked keeps none of its body and answers what the first one answered; after a
+        # first one with no 200 answer it gives none, so that its helper sends the files again, to a check of their own.
+        with OUTPUTS_LOCK:
+            first = OUTPUTS_CHECKS.get(token)
+            if first is None:
+                OUTPUTS_CHECKS[token] = mine = [threading.Event(), None]
+        if first is not None:
+            self._raw = f = sent = unsent = None
+            first[0].wait()
+            if first[1] is None:
+                self.close_connection = True
+                return None
+            return self.json(200, {"taken": first[1]})
+        try:
+            return self.outputs_checked(agent, token, ref, sent, unsent, mine)
+        finally:
+            with OUTPUTS_LOCK:
+                OUTPUTS_CHECKS.pop(token, None)
+            mine[0].set()
+
+    def outputs_checked(self, agent, token, ref, sent, unsent, mine):
+        """helper_outputs of the one send of a delivery's files that checks them: every file's checks, the search for
+        logins, and the answer to the delivery that waits. mine[1]: its `taken`, for the sends that wait for it."""
         allow, files, skipped, seen, total = outputs_allow(ref), {}, [], set(), 0
+        # Every file's checks first, and then the search for logins of all of them at once, in one child when it is long
+        # (searched_ahead): 100 files that each alone are searched here were 100 s of Python's interpreter lock, and the
+        # hub waited meanwhile. A delivery that is refused is not searched. `pending` keeps the delivery's order: a skip
+        # (a dict), or a file that passed its checks (its path, its data, its text or None).
+        pending = []
         for one in sent:
             path = one.get("path") if isinstance(one, dict) else None
             if isinstance(path, str) and len(path) <= 400 and OUTPUTS_AGENTS_MD.search(path) and \
                     allow.match(OUTPUTS_AGENTS_MD.sub("x", path)):      # the AI providers build: no AGENTS.md
-                skipped.append({"path": path, "why": OUTPUTS_BAD_NAME})
+                pending.append({"path": path, "why": OUTPUTS_BAD_NAME})
                 continue
             if not isinstance(path, str) or len(path) > 400 or not allow.match(path):
                 return self.json(400, {"error": f"{str(path)[:200]} is not a file of outputs/{ref}/"})
             if OUTPUTS_CACHE in path.split("/")[2:-1]:
                 continue                    # Python's cache, from a helper of a release before it left it out
             if path.lower() in seen:        # two names that differ only in case are one file on a Mac
-                skipped.append({"path": path, "why": "another file has this name in other letter case"})
+                pending.append({"path": path, "why": "another file has this name in other letter case"})
                 continue
             seen.add(path.lower())
             try:
@@ -76044,10 +76424,17 @@ class Handler(BaseHTTPRequestHandler):
                 text = data.decode("utf-8")
             except UnicodeDecodeError:
                 text = None                 # an image: what the owner's app shows of it is checked there
-            if text is not None and secret_hit(text):
-                skipped.append({"path": path, "why": "it holds a registered secret"})
-                continue
-            files[path] = data
+            pending.append((path, data, text))
+        with searched_ahead([one[2] for one in pending if isinstance(one, tuple) and one[2] is not None]):
+            for one in pending:
+                if isinstance(one, dict):
+                    skipped.append(one)
+                    continue
+                path, data, text = one
+                if text is not None and secret_hit(text):
+                    skipped.append({"path": path, "why": "it holds a registered secret"})
+                    continue
+                files[path] = data
         for one in unsent[:50]:             # what the helper did not send, and why: said in the result as it is
             one = one if isinstance(one, dict) else {}
             path = LINE_CONTROL.sub("", " ".join(str(one.get("path") or "").split()))
@@ -76056,7 +76443,7 @@ class Handler(BaseHTTPRequestHandler):
             if path and why:
                 skipped.append({"path": "a file whose name holds a registered secret" if secret_hit(path) else path,
                                 "why": "a registered secret" if secret_hit(why) else why})
-        taken = outputs_answer(agent, token, ref, files, skipped)
+        taken = mine[1] = outputs_answer(agent, token, ref, files, skipped)
         if taken:
             late_outputs(token)         # plan C7: files that came after the delivery stopped waiting
         return self.json(200, {"taken": taken})

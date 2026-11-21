@@ -438,7 +438,13 @@ class HubOnly(Fixture):
         self.assertIn("the one MCP server you connected", notes)
         self.assertIn("held 3 files", notes)
         self.assertIn("no agent reads or writes any repository", notes)      # what it costs him, not what it is
-        self.assertIn("github.com/settings/apps", notes)                     # and where he goes for it
+        # and where he goes for it, as whole links, also to the Apps of an organization (until 21 November 2026 the
+        # step said "github.com/settings/apps", a personal account's page with no https://)
+        self.assertIn("make a new one on your App's page on GitHub: https://github.com/settings/apps lists the Apps of "
+                      "your own account, and https://github.com/organizations/YOUR-ORGANIZATION/settings/apps, with "
+                      "your organization's name in it, those of an organization.", " ".join(notes.split()))
+        self.assertIn("https://github.com/organizations/YOUR-ORGANIZATION/settings/apps", notes)    # whole on its line
+        self.assertIn("1. **Founderizer for Mac is at https://founderizer.com.**", notes)
         steps = notes[notes.index("## Putting it back"):]
         self.assertLess(steps.index("GitHub App key back"), steps.index("Connect Google again"), steps)
         self.assertIn("6. **Put a GitHub App key back.**", steps)

@@ -2,6 +2,7 @@
 an agent delivers, its helper sends the files of outputs/T-<id>/, and the hub commits only those, signed by the agent,
 before the task closes. In-process hub, temporary Git repositories and a helper thread; no fleet or AI calls."""
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -323,6 +324,58 @@ class Delivery(OwnerAPI):
         self.assertEqual(self.request("/helper/outputs/vps", answer, source=VPS), (200, {"taken": False}))
         self.assertFalse(hub.outputs_waiting(token, "vps"))
 
+    def test_a_send_while_the_first_one_is_checked_keeps_no_body_and_takes_its_answer(self):
+        """A helper sends the files again after its own 120 s while the first send is still checked, and again: each
+        send held the whole delivery while it waited (24 MiB, more than 100 MiB decoded and searched), so a check of
+        an hour could take a small hub's memory (a review of 21 November 2026). A send that comes meanwhile reads none
+        of its files and answers what the first one answered; after a first one with no answer of 200 it gives none,
+        so that its helper sends the files again, to a check of their own."""
+        write(self.checkout, {f"outputs/{self.ref}/report.md": "x"})
+        with patch.object(hub, "OUTPUTS_WAIT", 0.5):
+            self.assertFalse(self.deliver()[1])
+        token = json.loads(hub.q1("SELECT extra FROM events WHERE kind='outputs'")["extra"])["outputs"]
+        files, _ = fleet.collect_outputs(str(self.checkout), self.ref)
+        answer, real, checks = {"outputs": token, "task": self.ref, "files": files}, hub.searched_ahead, []
+
+        def sends(fail):
+            started, release, answers = threading.Event(), threading.Event(), []
+
+            @contextlib.contextmanager
+            def slow(texts):                    # the first send's search for logins takes long
+                checks.append(len(texts))
+                started.set()
+                self.assertTrue(release.wait(60))
+                if fail:
+                    raise MemoryError("no room")
+                with real(texts):
+                    yield
+
+            def send():
+                try:
+                    answers.append(self.request("/helper/outputs/vps", answer, source=VPS))
+                except OSError:                 # no answer: its helper keeps the event, and sends again
+                    answers.append("no answer")
+
+            with patch.object(hub, "searched_ahead", slow), patch.object(hub.diagnostics, "record"):
+                first = threading.Thread(target=send)
+                first.start()
+                self.assertTrue(started.wait(60))
+                second = threading.Thread(target=send)
+                second.start()
+                second.join(1)                  # it waits for the first one's answer, and keeps no body
+                with hub.CALLS:
+                    bodies = sorted(getattr(one, "_raw", None) is not None for one in hub.CONNECTIONS
+                                    if getattr(one, "path", "") == "/helper/outputs/vps")
+                self.assertEqual(bodies, [False, True])
+                release.set()
+                for thread in (first, second):
+                    thread.join(60)
+            return sorted(answers, key=str)
+
+        self.assertEqual(sends(fail=True), [(500, {"error": "hub error"}), "no answer"])
+        self.assertEqual(sends(fail=False), [(200, {"taken": True})] * 2)
+        self.assertEqual(checks, [1, 1])        # only the first send of each read its files
+
     def test_a_fault_of_git_keeps_the_delivery_open_once_and_the_next_one_lands_the_files(self):
         """A short fault of git (KitFault) does not close a delivery without its files: deliver_result tells the agent
         to call it again, and the next call lands them. Here the push lands and git answers that it failed (a time
@@ -382,17 +435,33 @@ class Delivery(OwnerAPI):
         self.assertEqual(self.origin("rev-parse", hub.CONFIG_BRANCH), before)
 
     def test_a_file_with_a_registered_secret_stays_out_and_is_named(self):
+        """A file that holds a registered login stays out, named. The files of a delivery are searched together, in
+        one child process (searched_ahead): one by one in the hub, 100 short files were 100 s of its interpreter lock,
+        and one delivery of 5.7 MB stalled every call of the hub for 4 minutes (20 November 2026)."""
         salt, value = "salt", "Synthetic-Secret-Value-123"
         hub.ins("INSERT INTO secrets(label,salt,hash,len) VALUES(?,?,?,?)",
                 ("Synthetic label", salt, hashlib.sha256((salt + value).encode()).hexdigest(), len(value)))
+        parts = {f"outputs/{self.ref}/part{n:02}.txt": f"part {n} " + "y" * 3000 + "\n" for n in range(40)}
         write(self.checkout, {f"outputs/{self.ref}/report.md": "# Report\n",
-                              f"outputs/{self.ref}/notes.txt": f"the key is {value}\n"})
+                              f"outputs/{self.ref}/notes.txt": f"the key is {value}\n", **parts})
+        children, child, here = [], hub.login_search_child, hub.secret_spans_here
+
+        def counted(asks):
+            children.append(len(asks))
+            return child(asks)
+
+        def short_only(text, key):
+            self.assertNotIn("yyyy", text)          # no file of the delivery is searched in the hub's own process
+            return here(text, key)
+
         self.helper()
-        text, error = self.deliver()
+        with patch.object(hub, "login_search_child", counted), patch.object(hub, "secret_spans_here", short_only):
+            text, error = self.deliver()
         self.assertFalse(error, text)
         self.assertIn(f"Not sent: outputs/{self.ref}/notes.txt (it holds a registered secret).", text)
-        self.assertEqual(self.origin("ls-tree", "-r", "--name-only", hub.CONFIG_BRANCH, f"outputs/{self.ref}"),
-                         f"outputs/{self.ref}/report.md")
+        self.assertEqual(self.origin("ls-tree", "-r", "--name-only", hub.CONFIG_BRANCH, f"outputs/{self.ref}").split(),
+                         sorted(parts) + [f"outputs/{self.ref}/report.md"])
+        self.assertEqual(len(children), 1)
 
     def test_the_route_takes_only_files_of_the_tasks_own_folder_from_the_agents_machine(self):
         token = "t" * 22
@@ -410,6 +479,14 @@ class Delivery(OwnerAPI):
                                                           "files": [{"path": f"outputs/{self.ref}/x.md", "data": "%%"}]},
                                   source=VPS)
         self.assertEqual((code, data["error"]), (400, f"outputs/{self.ref}/x.md: data must be base64"))
+        # a delivery that is refused is not searched for logins, also not its files before the refused one
+        good = {"path": f"outputs/{self.ref}/long.md", "data": base64.b64encode(b"w" * 200000).decode()}
+        with patch.object(hub, "searched_ahead", side_effect=AssertionError("searched")), \
+                patch.object(hub, "secret_hit", side_effect=AssertionError("searched")):
+            code, data = self.request("/helper/outputs/vps", {"outputs": token, "task": self.ref,
+                                                              "files": [good, {"path": "team.json", "data": "eA=="}]},
+                                      source=VPS)
+        self.assertEqual(code, 400, data)
         self.assertEqual(self.request("/helper/outputs/vps", {"outputs": token, "task": self.ref, "files": []},
                                       source=TEAM["addresses"]["hub"])[0], 403)       # another machine
         self.assertEqual(self.request("/helper/outputs/vps", {"outputs": token, "task": "T-99", "files": []},
