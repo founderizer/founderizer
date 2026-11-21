@@ -627,17 +627,36 @@ try:
             stale.append(f"{name}: it says {said(repeated)!r}, the hub says {said(real)!r}")
     check("what the owner's MCP server repeats from the hub is what the hub says", not stale, "; ".join(stale))
 
-    # And the document the owner reads: a tool nobody wrote down is a tool he will not know he has.
+    # And the document the owner reads: a tool nobody wrote down is a tool the owner will not know they have. Each tool
+    # of this server, and each of the program inside the app (owner_mcp.PROGRAM_TOOLS), stands in a row under the
+    # heading of its category in "The tools", and the ten headings stand in the order of the categories
+    # (agent-own-rules-design-2026-11-20.md, slice 8a).
     owner_mcp.TOOLS.update({x["name"]: x for x in owner_mcp.tools()})
     written = open(os.path.join(KIT, "OWNER-MCP.md")).read()
-    unwritten = sorted(n for n in owner_mcp.TOOLS if f"`{n}`" not in written)
-    check("every tool of the owner's MCP server is named in OWNER-MCP.md", not unwritten,
-          f"not in the document: {unwritten}")
+    section = written.split("\n## The tools\n", 1)[1].split("\n## ", 1)[0] if "\n## The tools\n" in written else ""
+    check("OWNER-MCP.md has its section \"The tools\"", bool(section), "no heading \"## The tools\" in the document")
+    headed, heading = {}, None
+    for line in section.splitlines():
+        if line.startswith("### "):
+            heading = line[4:].strip()
+            headed.setdefault(heading, [])
+        elif line.startswith("| `") and heading:
+            headed[heading] += re.findall(r"`(\w+)`", line.split("|")[1])
+    check("OWNER-MCP.md's \"The tools\" has a heading for each category of the owner's tools, in their order",
+          list(headed) == list(owner_mcp.CATEGORY_NAMES), f"its headings: {list(headed)}")
+    category = {x["name"]: owner_mcp.category_of(x) for x in owner_mcp.TOOLS.values()}
+    category.update({name: of for of, name in owner_mcp.PROGRAM_TOOLS})
+    astray = sorted({f"{name} ({of})" for name, of in category.items() if name not in headed.get(of, ())} |
+                    {f"{name} (under {heading})" for heading, names in headed.items() for name in names
+                     if category.get(name) != heading})
+    check("each tool of the owner's MCP server and of the app's program stands under its category in OWNER-MCP.md, "
+          "and under no other heading", not astray, f"not so: {astray}")
     table = {m for m in re.findall(r"^\| `(\w+)`", written, re.M)} | \
         {w for line in written.splitlines() if line.startswith("| `")
          for w in re.findall(r"`(\w+)`", line.split("|")[1])}
-    check("every tool OWNER-MCP.md's table names is a tool the server has", not (table - set(owner_mcp.TOOLS)),
-          f"the document names tools that are gone: {sorted(table - set(owner_mcp.TOOLS))}")
+    tools_there = set(owner_mcp.TOOLS) | {name for _category, name in owner_mcp.PROGRAM_TOOLS}
+    check("every tool OWNER-MCP.md's table names is a tool the server or the app's program has",
+          not (table - tools_there), f"the document names tools that are gone: {sorted(table - tools_there)}")
 
     # And the table that the Mac app's own program reads (`owner_mcp.py --dump-tools`): every tool, with the schema and
     # the annotations that the server lists, a kind for each, a route and fields for each tool that the table builds,

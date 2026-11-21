@@ -1495,73 +1495,178 @@ would read as an empty fleet instead of as a mistake.
 
 ## The tools
 
+Each tool's words start with its category, and `tools/list` gives the tools in the order of the ten
+categories below (the owner, 20 November 2026: "ensure all tools are properly categorized and so the
+AI Agent knows what to use"). The protocol has no field for a category, so it is in the words, which
+`tool()` in `owner_mcp.py` writes. Each tool's first sentence says its job, and where the design's
+table of close tools names one (agent-own-rules-design-2026-11-20.md, 6.5), a sentence says "Not
+for ...: use ...", except where 6.6 gives a tool's exact words. The program's own nine keep their
+words, with their category in front.
+
+**The instructions.** A client with tool search, as Claude Code is by default, loads only the tool
+names and the server's instructions at its start, and a tool's words only after a search. So the
+instructions have three parts: the words on authority and secrets; the rule of places (below); and
+the map, each category with its job and its tools (`instructions()`). The map is made from the list
+that the client gets: this server's map names its own tools, and the app's table names what its program
+lists, the table's tools that are not `absent` and then the program's own of each category
+(`PROGRAM_TOOLS`). So it names no tool that the client cannot call. Claude Code cuts a server's
+instructions at 4,096 characters, and before its version 2.1.296 at 2,048: the rule of places ends
+before character 2,048 (`test_owner_mcp.Table`).
+
+**Where a rule for an agent goes** (the rule of places, in the instructions):
+
+- How an agent does its work (a step, a style, a workflow, "from now on ...") is the agent's own to
+  keep: `send_message`, in the owner's own words, to that agent, or to its lead or the fleet manager
+  when the agent's Shell box is off. They keep it and keep it in order. Never into a profile.
+- `save_profile` is only for what the owner decides: what the agent is for, what it may do alone,
+  what it must ask first, which person decides what, its logins and its knowledge files.
+- A policy for a whole team is a file of the owner's: `save_knowledge`.
+- What steers one agent is on the pages `profiles`, `responsibilities`, `standing`, `notes` and
+  `skills` of `fleet_read`. `end_standing` takes back a kept wish, `remove_skill` a skill and
+  `duty_state` a duty.
+
+### Read
+
+See the fleet.
+
 | Tool | Route | What it does |
 | --- | --- | --- |
 | `fleet_overview` | `/ui/state`, `/ui/health`, `/ui/releases`, `/ui/servers` | What is my fleet doing. Start here. |
 | `fleet_read` | every owner `GET` route, by page name | Every check the app reads. A word that the page does not take is refused before any request, also one that the schema does not have, with what the page needs and takes (`PAGE_TAKES`; `machines` reads no `agent`, and gave every machine). |
 | `search_history` | `/ui/history` | Search what one agent, or every agent, took part in, by words, dates, person, task and kind; with `ref`, one record in full. |
 | `see_costs` | `/ui/costs` | What every agent's work cost, against the period before: list dollars, the four kinds of tokens, results without rework by kind of work, checks, each account's window and the model changes. |
-| `which_hub` / `use_hub` | `/ui/state` | Which hub, on what authority; and point at one. |
-| `install_hub` | SSH, `hub.sh` (INSTALL-PROMPT.md A1–A5) | Install a hub on a server the owner names. It puts the server on the private network first (A2), with `authkey_file`, and starts the install at the server's address there. It changes nothing on a server where an install runs. `servers` is the owner's own choice, 1 or 2, and the tool takes no default ("How many servers a fleet starts with", below). `manager_name` is the owner's own name for the manager, which the tool gives to `hub.sh` (the same section). |
-| `install_log` | SSH, `tail` | The install's own log, with the claim code read out of it. When SSH gets no connection to the host, because of the install's firewall, it reads the log at the server's address on the private network. |
-| `claim_hub` | `POST /claim` | Prove this Mac's address. This is what grants the authority. |
-| `add_machine` | `/ui/servers/join` | The one-time join line, and with `host` it runs it over SSH: as root on Linux, as the Mac user on a Mac. A Linux server that is not on the private network goes on it first, with `authkey_file` (B2); without that file, it stops before the hub makes a code. |
-| `add_agent` | `/ui/servers/<s>/agents` | An agent on an available server, with its install job. With `account` (an account that `save_account` saved with a `kind`) and no `runtime`, an agent on an API key or on the owner's own model server, which runs the account's program on a Linux server whose `model_providers` (page `servers`) names that provider (owner API 1.186). |
-| `remove_machine` | `/ui/servers/<s>/remove` | A server with no agent leaves. |
-| `server_key_swap` | `/ui/servers/<s>/key-swap` | The owner's yes (`on`) or off (`off`) for the key swap of a Linux server (`VAULT.md`), or neither (`rule`): the owner's Mac app switches the server's vault on or off at its next round, and off costs each session there that holds a placeholder its key until its next start. The word that a server swaps comes only from the app's own reading (`/ui/servers/<s>/key-swap-reading`, which is no tool). |
-| `activate_agent` / `agent_settings` | `/ui/team/agents/<a>` | Turn an agent on or off; its model, effort, capabilities and host list. |
-| `agent_key` | `/ui/team/agents/<a>/key` | Register, replace or remove an agent's key, by its SHA-256. Never a key. A key that a server service registered is replaced, never removed. |
-| `rename_agent` | `/ui/team/agents/<a>/rename` | A new name for an agent: everything it has moves with it, and nobody signs in again. The manager only while it has no server yet. |
-| `move_agent` | `/ui/team/agents/<a>/move` | An agent onto another server: a Linux server, also beside other agents (each has its own user account), or an empty Mac (a Mac runs one agent); one with the browser or the screen stays on a Mac. The install job there, and its old session ends. A new fleet's manager onto its first server, with `runtime` its AI provider. |
-| `remove_agent` | `/ui/team/agents/<a>/remove` | Delete an agent: what is its own goes, on the hub and on its server (its service, files and own OS user), and nothing of another agent. Its tasks stay as history. |
-| `switch_runtime` | `/ui/team/agents/<a>` | Switch one agent to its other runtime. A command of its own. |
-| `vault_access` | `/ui/team/agents/<a>` | Give one agent its machine's vault broker, or take it away. |
-| `login_creation` | `/ui/team/agents/<a>` | Let one agent make new logins in the vault, or stop it. |
-| `set_reporting_lines` | `/ui/team/lines` | The whole shape of the team: each agent's role and who it reports to. |
-| `save_profile` | `/ui/profiles/<a>` | Write one agent's profile — the owner's own words, which the agent cannot change. |
-| `prepare_runtime` | `/ui/servers/<s>/prepare` | Prepare an agent's other runtime before its switch. |
-| `start_manager_session` | `/ui/machines/<a>/manager` | Ask the manager's machine to start the standing session. |
-| `sign_in_machine` / `sign_in_code` | `/ui/machines/<a>/signin[/code]` | Start a machine's own provider sign-in, and carry the code back. The install job of a new or moved agent opens its sign-in by itself: the job's prompt on the page `servers` has the link and the code (Codex), or names a login of the page `machines` (Claude Code). |
-| `check_machine` / `update_machine` | `/ui/machines/<a>/check`, `/update` | Take a reading now; update Fleet when idle. |
-| `check_mcp_server` | `/ui/mcp/check` | Does this MCP server answer? Asked before it is saved, and of a machine for a `command` server. Writes nothing. |
-| `save_mcp_server` | `/ui/team/mcp` | Add one of the owner's own MCP servers, change it, or remove it. An agent loads it only once it also holds `tool:<name>`. |
-| `grant_access` | `/ui/team/repos`, `/ui/team/tools`, `/ui/team/google`, `/ui/secrets/grant` | One agent's hold of one resource, as `<kind>:<what>` and a level. Before it gives a secret it reads `GET /ui/vault`, and `GET /ui/team` when that page does not settle it: a give that the hub's reading of the central vault shows as one whose value reaches no server is refused ("A give of a secret that would reach no server"). |
-| `share_resource` / `take_resource` | `/ui/resources`, `/ui/resources/take` | The pool's standing; and end one hold. Before it sends a standing for a secret, `share_resource` reads `GET /ui/vault`, and `GET /ui/team`, whose one read also gives the command its base: a standing from which, by the hub's reading of the central vault, no give of the manager could bring the value to a server is refused ("A standing for a secret from which no give would reach a server"). |
-| `save_account` | `/ui/team/accounts` | One runtime account: its provider and the owner's title for it. With `kind`: `key`, an API key by its `login` reference (`bws://<uuid>`, never the key; the hub's field `secret`), or `server`, the owner's own model server by its `address`, each with its `model` as the program names it (owner API 1.165). Each write is the whole entry. |
-| `save_login` | `/ui/team/logins` | The owner's title for one vault login, by its `bws://` reference. The label only. For an API key also its `site` and its `form` (the key swap, `VAULT.md`). |
-| `machine_access` | `/ui/team/access` | How the fleet reaches a machine: its SSH user, port, Screen Sharing. |
-| `save_knowledge` | `/ui/knowledge` | The owner's own knowledge files: text, new text in place, a page the hub fetches, a kept file, a delete. |
-| `remove_skill` | `/ui/skills/remove` | Remove one agent's own skill in one commit. The agents write their skills; `fleet_read(page="skills")` lists them. |
-| `save_person` / `person_handle` | `/ui/people`, `/ui/people/<id>/handles` | The people who may write to an agent, and their chat handles. `scopes` gives a person All of an agent, or only some of its repositories and secrets (the person access plan). |
-| `save_role` | `/ui/roles` | The roles those people hold: a name, a prompt in the owner's words, tools on or off, a daily limit for a closed role. A held role is not deleted. |
-| `save_settings` | `/ui/settings` | The fleet's settings in `team.json`, such as `contacts.v2`, and the runtime facts the owner changes (`cache_seconds`, `compact_tokens`, `token_weights`, `routine`); null gives each its default. |
-| `person_code` / `remove_owner_handle` | `/ui/people/codes`, `/ui/people/handles` | Link the owner's own chat account, or make a person's Telegram invite; remove one of the owner's handles. |
-| `control_conversation` | `/ui/conversations/<id>` | Pause one conversation with a person, or let it run again. |
-| `save_chat_account` | `/ui/team/chat-apps` | One chat app account. The account, never its bot token. |
-| `pause_chat_apps` | `/ui/chat-apps/pause` | Pause all: every inbound message and every outbound item at once. |
-| `link_chat_app` | `/ui/chat-apps/<id>/link`, `/unlink` | Link or unlink a WhatsApp account. The QR is a read. |
-| `send_again` | `/ui/outbound/<id>/again` | Send one chat message again, for an unknown or failed one. |
-| `connect_google` | `/ui/google/connect`, `/ui/google/finish` | Connect one service (Gmail or Google Drive) of a Google account, as the app's Connect account does: first the owner's agent says the app's notice of that service word for word (`GOOGLE_NOTICE`, the app's `GoogleService.notice`; Google asks for it before each consent) and calls the tool when the owner says to go on, as the app's Continue; then Google's page in the owner's browser, the code on this server's own listener. The account then has no agent: `grant_access` gives it. The program in the app has it as `absent`. |
-| `disconnect_google` / `disconnect_mcp_server` | `/ui/google/disconnect`, `/ui/mcp/disconnect` | End a saved connection. The grants stay. |
-| `attach_file` / `read_attachment` / `keep_attachment` | `/ui/attachments*` | A file to the hub, a file back to this Mac, and keeping one. |
-| `owner_device` / `device_code` | `/ui/owner/devices[/<d>/code]` | The owner's phones, and one enrollment code. Its key is the phone's. |
-| `reload_team` | `/ui/team/reload` | Apply `team.json` from a pushed revision without restarting the hub. |
-| `send_message` | `/ui/messages` | Say something to an agent, with files from `attach_file`. **This is how a goal or a duty is set.** |
-| `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words, by choosing an option, or by ticking the options of an item that lets them combine (`choices`). A secret request takes neither: the app's secure form answers it. Since 18 November 2026 it also takes files (the owner's "Yes, build it" to "Should your agent be able to attach files to its answers on Needs you?"). `attachments` holds at most four ids that `attach_file` gave, and they go with an answer in words or alone, as the files that the owner drops on the item in the app do. Beside a `choice` or `choices` they are refused before any request, with one sentence in both programs, so that a door card's press never leaves a file behind. An item whose answer goes into a conversation takes no file, and the hub says so. |
-| `clarify_needs_you` | `/ui/needs/<id>/talk` | The owner's message to the manager under an open Needs-you item, before answering it (Needs clarification, owner API 1.272, feature `need_clarify`): the item stays open, and the manager's reply joins its `talk`, as when the owner writes it in the app. An item whose `clarify` is false takes none (409), and the hub's words say why. Since 21 November 2026, in place of the line of `NOT_TOOLS` that named the route until then. |
-| `decline_secret_request` | `/ui/needs/<id>/secret` | Decline a secret request, with a reason or none. A decline carries no value, so this server sends it; an answer with a value stays the app's secure form. |
+
+### Work
+
+Give work, steer it, send and get files.
+
+| Tool | Route | What it does |
+| --- | --- | --- |
+| `send_message` | `/ui/messages` | Say something to an agent, with files from `attach_file`. **This is how a goal or a duty is set**, and how a lasting rule about how an agent works reaches the agent, which keeps it (or its lead or the fleet manager, when its Shell box is off). |
 | `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task, with files from `attach_file` (owner API 1.223), which open in that task's session: when a person's conversation opened the task, that person's messages drive it, so they can get what a file says. |
-| `goal_state` / `duty_state` / `trigger_state` | `/ui/goals/<id>/state` and the two beside it | Pause, resume, finish, drop. |
-| `end_standing` | `/ui/standing/<id>/end` | End one standing instruction or target of any agent. `fleet_read(page="standing")` lists them. |
+| `goal_state` | `/ui/goals/<id>/state` | Pause, resume, finish, drop or reopen one goal. A new goal: `send_message`. |
 | `settle_outcome` | `/ui/outcomes/<id>` | Record whether an unknown outcome took effect. |
-| `check_releases` / `take_release` / `automatic_releases` | `/ui/releases/*` | Ask the channel; take the release; turn automatic updates off or on (on by default). |
-| `take_backup` | `/ui/backup`, `/ui/backups/confirm` | A copy of the fleet into a file on this Mac, checked. |
+| `attach_file` / `read_attachment` / `keep_attachment` | `/ui/attachments*` | A file to the hub, a file back to this Mac, and keeping one. |
 
 **A goal and a duty have no form.** UI-API.md version 1.20 took the owner's own writers out of the
 hub on the owner's direction: they say in chat what they want the fleet to reach, and the manager
 writes it down with `update_goal`, or a duty with `set_duty`. So this server sets a goal with
 `send_message` and nothing else, and `goal_state` and `duty_state` are the state changes that
 stayed.
+
+### Needs you
+
+Answer what waits for the owner.
+
+| Tool | Route | What it does |
+| --- | --- | --- |
+| `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words, by choosing an option, or by ticking the options of an item that lets them combine (`choices`). A secret request takes neither: the app's secure form answers it. Since 18 November 2026 it also takes files (the owner's "Yes, build it" to "Should your agent be able to attach files to its answers on Needs you?"). `attachments` holds at most four ids that `attach_file` gave, and they go with an answer in words or alone, as the files that the owner drops on the item in the app do. Beside a `choice` or `choices` they are refused before any request, with one sentence in both programs, so that a door card's press never leaves a file behind. An item whose answer goes into a conversation takes no file, and the hub says so. |
+| `clarify_needs_you` | `/ui/needs/<id>/talk` | The owner's message to the manager under an open Needs-you item, before answering it (Needs clarification, owner API 1.272, feature `need_clarify`): the item stays open, and the manager's reply joins its `talk`, as when the owner writes it in the app. An item whose `clarify` is false takes none (409), and the hub's words say why. Since 21 November 2026, in place of the line of `NOT_TOOLS` that named the route until then. |
+| `decline_secret_request` | `/ui/needs/<id>/secret` | Decline a secret request, with a reason or none. A decline carries no value, so this server sends it; an answer with a value stays the app's secure form. |
+| `answer_secret_request` | the link to the running app | The program's own: answer an agent's request for a secret with a secret that the fleet holds already. The app signs the gives, and no value passes. |
+
+### Behaviour
+
+What steers an agent.
+
+| Tool | Route | What it does |
+| --- | --- | --- |
+| `save_profile` | `/ui/profiles/<a>` | The owner's part of one agent's profile: what it is for, what it may do alone, what it must ask first, which person decides what, its logins and its knowledge files. The agent cannot change it. How the agent does its work goes with `send_message`. |
+| `save_knowledge` | `/ui/knowledge` | The owner's own knowledge files, such as a policy for a team: text, new text in place, a page the hub fetches, a kept file, a delete. |
+| `end_standing` | `/ui/standing/<id>/end` | End one standing instruction or target that an agent keeps, with why: the owner's way to take back a kept wish. `fleet_read(page="standing")` lists them. |
+| `duty_state` / `trigger_state` | `/ui/responsibilities/<id>/state`, `/ui/triggers/<id>/state` | Pause, resume, retire or reopen one duty; pause, resume, delete, run now or check now one wake-up rule. New words for a duty: `send_message` to the fleet manager. |
+| `remove_skill` | `/ui/skills/remove` | Remove one agent's own skill in one commit. The agents write their skills; `fleet_read(page="skills")` lists them. |
+
+### Team
+
+Agents and their settings.
+
+| Tool | Route | What it does |
+| --- | --- | --- |
+| `add_agent` | `/ui/servers/<s>/agents` | An agent on an available server, with its install job. With `account` (an account that `save_account` saved with a `kind`) and no `runtime`, an agent on an API key or on the owner's own model server, which runs the account's program on a Linux server whose `model_providers` (page `servers`) names that provider (owner API 1.186). |
+| `remove_agent` | `/ui/team/agents/<a>/remove` | Delete an agent: what is its own goes, on the hub and on its server (its service, files and own OS user), and nothing of another agent. Its tasks stay as history. |
+| `rename_agent` | `/ui/team/agents/<a>/rename` | A new name for an agent: everything it has moves with it, and nobody signs in again. The manager only while it has no server yet. |
+| `move_agent` | `/ui/team/agents/<a>/move` | An agent onto another server: a Linux server, also beside other agents (each has its own user account), or an empty Mac (a Mac runs one agent); one with the browser or the screen stays on a Mac. The install job there, and its old session ends. A new fleet's manager onto its first server, with `runtime` its AI provider. |
+| `activate_agent` / `agent_settings` | `/ui/team/agents/<a>` | Turn an agent on or off; its model, effort, capabilities and host list. |
+| `set_reporting_lines` | `/ui/team/lines` | The whole shape of the team: each agent's role and who it reports to. |
+| `switch_runtime` | `/ui/team/agents/<a>` | Switch one agent to its other runtime. A command of its own. |
+| `prepare_runtime` | `/ui/servers/<s>/prepare` | Prepare an agent's other runtime before its switch. |
+| `start_manager_session` | `/ui/machines/<a>/manager` | Ask the manager's machine to start the standing session. |
+| `save_settings` | `/ui/settings` | The fleet's settings in `team.json`, such as `contacts.v2`, and the runtime facts the owner changes (`cache_seconds`, `compact_tokens`, `token_weights`, `routine`); null gives each its default. |
+| `reload_team` | `/ui/team/reload` | Apply `team.json` from a pushed revision without restarting the hub. |
+
+### Servers
+
+Machines, accounts and sign-ins.
+
+| Tool | Route | What it does |
+| --- | --- | --- |
+| `add_machine` | `/ui/servers/join` | The one-time join line, and with `host` it runs it over SSH: as root on Linux, as the Mac user on a Mac. A Linux server that is not on the private network goes on it first, with `authkey_file` (B2); without that file, it stops before the hub makes a code. |
+| `remove_machine` | `/ui/servers/<s>/remove` | A server with no agent leaves. |
+| `check_machine` / `update_machine` | `/ui/machines/<a>/check`, `/update` | Take a reading now; update Fleet when idle. |
+| `machine_access` | `/ui/team/access` | How the fleet reaches a machine: its SSH user, port, Screen Sharing. |
+| `sign_in_machine` / `sign_in_code` | `/ui/machines/<a>/signin[/code]` | Start a machine's own provider sign-in, and carry the code back. The install job of a new or moved agent opens its sign-in by itself: the job's prompt on the page `servers` has the link and the code (Codex), or names a login of the page `machines` (Claude Code). |
+| `save_account` | `/ui/team/accounts` | One runtime account: its provider and the owner's title for it. With `kind`: `key`, an API key by its `login` reference (`bws://<uuid>`, never the key; the hub's field `secret`), or `server`, the owner's own model server by its `address`, each with its `model` as the program names it (owner API 1.165). Each write is the whole entry. |
+| `agent_key` | `/ui/team/agents/<a>/key` | Register, replace or remove an agent's key, by its SHA-256. Never a key. A key that a server service registered is replaced, never removed. |
+| `server_key_swap` | `/ui/servers/<s>/key-swap` | The owner's yes (`on`) or off (`off`) for the key swap of a Linux server (`VAULT.md`), or neither (`rule`): the owner's Mac app switches the server's vault on or off at its next round, and off costs each session there that holds a placeholder its key until its next start. The word that a server swaps comes only from the app's own reading (`/ui/servers/<s>/key-swap-reading`, which is no tool). |
+
+### Access
+
+Secrets, logins, repositories and connected tools.
+
+| Tool | Route | What it does |
+| --- | --- | --- |
+| `grant_access` | `/ui/team/repos`, `/ui/team/tools`, `/ui/team/google`, `/ui/secrets/grant` | One agent's hold of one resource, as `<kind>:<what>` and a level. Before it gives a secret it reads `GET /ui/vault`, and `GET /ui/team` when that page does not settle it: a give that the hub's reading of the central vault shows as one whose value reaches no server is refused ("A give of a secret that would reach no server"). |
+| `share_resource` / `take_resource` | `/ui/resources`, `/ui/resources/take` | The pool's standing; and end one hold. Before it sends a standing for a secret, `share_resource` reads `GET /ui/vault`, and `GET /ui/team`, whose one read also gives the command its base: a standing from which, by the hub's reading of the central vault, no give of the manager could bring the value to a server is refused ("A standing for a secret from which no give would reach a server"). |
+| `save_login` | `/ui/team/logins` | The owner's title for one vault login, by its `bws://` reference. The label only. For an API key also its `site` and its `form` (the key swap, `VAULT.md`). |
+| `vault_access` | `/ui/team/agents/<a>` | Give one agent its machine's vault broker, or take it away. |
+| `login_creation` | `/ui/team/agents/<a>` | Let one agent make new logins in the vault, or stop it. |
+| `save_mcp_server` | `/ui/team/mcp` | Add one of the owner's own MCP servers, change it, or remove it. An agent loads it only once it also holds `tool:<name>`. |
+| `check_mcp_server` | `/ui/mcp/check` | Does this MCP server answer? Asked before it is saved, and of a machine for a `command` server. Writes nothing. |
+| `connect_google` | `/ui/google/connect`, `/ui/google/finish` | Connect one service (Gmail or Google Drive) of a Google account, as the app's Connect account does: first the owner's agent says the app's notice of that service word for word (`GOOGLE_NOTICE`, the app's `GoogleService.notice`; Google asks for it before each consent) and calls the tool when the owner says to go on, as the app's Continue; then Google's page in the owner's browser, the code on this server's own listener. The account then has no agent: `grant_access` gives it. The program in the app has it as `absent`. |
+| `disconnect_google` / `disconnect_mcp_server` | `/ui/google/disconnect`, `/ui/mcp/disconnect` | End a saved connection. The grants stay. |
+| `save_secret` | the link to the running app | The program's own: a new login or API key into the fleet's central vault, from a file, a pipe or the clipboard of this Mac. Never a value in a field. |
+| `grant_secret` | the link to the running app | The program's own: one secret to one agent with the owner's signature, or its end. The app signs it. |
+| `share_secret` | the link to the running app | The program's own: who may give one secret, with the owner's signature, or its end. The app signs it. |
+
+### People
+
+People who write to agents, and chat apps.
+
+| Tool | Route | What it does |
+| --- | --- | --- |
+| `save_person` / `person_handle` | `/ui/people`, `/ui/people/<id>/handles` | The people who may write to an agent, and their chat handles. `scopes` gives a person All of an agent, or only some of its repositories and secrets (the person access plan). |
+| `save_role` | `/ui/roles` | The roles those people hold: a name, a prompt in the owner's words, tools on or off, a daily limit for a closed role. A held role is not deleted. |
+| `person_code` / `remove_owner_handle` | `/ui/people/codes`, `/ui/people/handles` | Link the owner's own chat account, or make a person's Telegram invite; remove one of the owner's handles. |
+| `control_conversation` | `/ui/conversations/<id>` | Pause one conversation with a person, or let it run again. |
+| `save_chat_account` | `/ui/team/chat-apps` | One chat app account. The account, never its bot token. |
+| `pause_chat_apps` | `/ui/chat-apps/pause` | Pause all: every inbound message and every outbound item at once. |
+| `link_chat_app` | `/ui/chat-apps/<id>/link`, `/unlink` | Link or unlink a WhatsApp account. The QR is a read. |
+| `send_again` | `/ui/outbound/<id>/again` | Send one chat message again, for an unknown or failed one. |
+| `save_bot_token` | the link to the running app | The program's own: a Discord or Telegram bot's token to the hub, from a file, a pipe or the clipboard of this Mac, or its delete. Never the token in a field. |
+
+### Releases
+
+Updates and backup.
+
+| Tool | Route | What it does |
+| --- | --- | --- |
+| `check_releases` / `take_release` / `automatic_releases` | `/ui/releases/*` | Ask the channel; take the release; turn automatic updates off or on (on by default). |
+| `take_backup` | `/ui/backup`, `/ui/backups/confirm` | A copy of the fleet into a file on this Mac, checked. |
+
+### Setup
+
+A new fleet, this Mac and the owner's phones.
+
+| Tool | Route | What it does |
+| --- | --- | --- |
+| `which_hub` / `use_hub` | `/ui/state` | Which hub, on what authority; and point at one. |
+| `install_hub` | SSH, `hub.sh` (INSTALL-PROMPT.md A1–A5) | Install a hub on a server the owner names. It puts the server on the private network first (A2), with `authkey_file`, and starts the install at the server's address there. It changes nothing on a server where an install runs. `servers` is the owner's own choice, 1 or 2, and the tool takes no default ("How many servers a fleet starts with", below). `manager_name` is the owner's own name for the manager, which the tool gives to `hub.sh` (the same section). |
+| `install_log` | SSH, `tail` | The install's own log, with the claim code read out of it. When SSH gets no connection to the host, because of the install's firewall, it reads the log at the server's address on the private network. |
+| `claim_hub` | `POST /claim` | Prove this Mac's address. This is what grants the authority. |
+| `owner_device` / `device_code` | `/ui/owner/devices[/<d>/code]` | The owner's phones, and one enrollment code. Its key is the phone's. |
+| `setup_state` / `setup_show` / `setup_diagnosis` | the link to the running app | The program's own reads: where the setup stands in the app on this Mac; the app to the front on one of its pages; why the hub does not answer. |
+| `prepare_problem_report` | the link to the running app | The program's own: the agent's text into the app's problem report form. It sends nothing: only the owner sends it. |
 
 ## How many servers a fleet starts with
 
@@ -1785,7 +1890,13 @@ and a tool was taken out of this file's own table, and every check failed naming
   annotations that this server lists, a kind for each, the route and the fields of each tool that the table builds,
   each feature a name that every hub lists, the Swift tests' copy equal to the print, a path part from an argument
   escaped, the lock held for one command's request and never for a read, the first words to a client, and the page
-  `devices`, which gives when a code ends and never a code.
+  `devices`, which gives when a code ends and never a code. And the categories: each tool's words start with its
+  category, the list stands in the order of the categories, a category that the list does not have stops the program,
+  each map names each tool that its client can call, one time, under its category, and no other tool or page, and the
+  instructions fit Claude Code's cut, with the rule of places before character 2,048. `selftest.py` section 0 holds
+  each tool of this server and of the program to the heading of its category in "The tools", and the Swift test
+  `eachListedToolStartsWithItsCategoryAndTheMapNamesItOnce` holds each tool that the program lists to the table's
+  categories and map.
 - **`Shape`** — an MCP client lists the tools, every page is a `GET` route `hub.py` really serves, and without a hub
   every tool says how to get one. And the three drift checks of "Keeping it in step with the hub" above, which are
   what answers "does it have all the admin actions" and keeps answering it: every owner route is a tool or is in

@@ -5109,10 +5109,14 @@ class Table(unittest.TestCase):
         self.assertEqual(sum(len(kinds.get(k, [])) for k in self.TABLE_KINDS), built)
         self.assertEqual((len(owner_mcp.SWIFT_READS), len(owner_mcp.SWIFT_WRITES), len(owner_mcp.ABSENT), built),
                          (4, 9, 7, 55))
-        # A tool of no kind stops the dump: somebody decides which it is.
-        stray = owner_mcp.tool("stray", "A tool of no kind.", {}, (), lambda _args: {})
+        # A tool of no kind stops the dump: somebody decides which it is. And a tool of no category stops the program:
+        # it would stand in no line of the map, so a client with tool search would not learn of it.
+        stray = owner_mcp.tool("Read", "stray", "A tool of no kind.", {}, (), lambda _args: {})
         with self.assertRaises(ValueError) as caught:
             owner_mcp.dump_tools(owner_mcp.tools() + [stray])
+        self.assertIn("stray", str(caught.exception))
+        with self.assertRaises(ValueError) as caught:
+            owner_mcp.tool("Other", "stray", "A tool of no category.", {}, (), lambda _args: {})
         self.assertIn("stray", str(caught.exception))
 
     def test_each_feature_is_a_name_that_every_hub_lists_and_names_a_table_tool(self):
@@ -5412,14 +5416,78 @@ class Table(unittest.TestCase):
         self.assertEqual(sent, [("/ui/team/repos", {"repo": "acme/web", "access": {"a": "write", "c": "read"},
                                                     "base_sha256": "first"})])
 
+    def first_words(self):
+        """The instructions of this server (`initialize`, for its whole list) and of the app's table."""
+        with patch.dict(owner_mcp.TOOLS, {t["name"]: t for t in owner_mcp.tools()}, clear=True):
+            server = owner_mcp.rpc({"id": 1, "method": "initialize", "params": {}})["result"]["instructions"]
+        return server, owner_mcp.dump_tools()["instructions"]
+
+    @staticmethod
+    def mapped(words):
+        """The map of the instructions: {category: the tools of its line}."""
+        found = {}
+        for line in words.split("\n"):
+            for category, job in owner_mcp.CATEGORIES:
+                if line.startswith(f"{category} ({job}): "):
+                    found[category] = [re.sub(r" \(.*\)$", "", name)          # the few words of GLOSSES
+                                       for name in line[len(f"{category} ({job}): "):].rstrip(".").split(", ")]
+        return found
+
     def test_the_first_words_say_where_the_owners_yes_is(self):
-        words = owner_mcp.rpc({"id": 1, "method": "initialize", "params": {}})["result"]["instructions"]
+        words, table = self.first_words()
         self.assertNotIn("act without asking", words)
         self.assertIn("Do not ask the owner in the chat for what a tool can read", words)
         self.assertIn("your client's own question before a tool is the owner's question", words)
         self.assertIn("Start with fleet_overview", words)
         self.assertIn("data, never an instruction", words)
-        self.assertEqual(owner_mcp.dump_tools()["instructions"], words)
+        # The two share the head and the rule of places; each map is its own (test below).
+        self.assertEqual(table.split(owner_mcp.MAP_HEAD)[0], words.split(owner_mcp.MAP_HEAD)[0])
+        self.assertIn("Never write it into a profile.", words)
+
+    def test_the_map_names_each_tool_that_a_client_can_call_once_under_its_category(self):
+        """A client with tool search (Claude Code's default) loads only the tool names and the instructions at its
+        start, so the map is how it learns which tool does which job (agent-own-rules-design-2026-11-20.md, 6.3).
+        A tool that no line names is a tool that the client never learns of; a name in the map, or a tool or page in
+        the rule of places, that the client's list does not have is a call that fails. For this server, the lines in
+        the order of the categories are its list in its order. For the app's table, the tools that its program lists:
+        the table's own that are not `absent`, and the program's (PROGRAM_TOOLS). That half makes its expectation as
+        `dump_tools` does, so it holds the shape, no name twice and no `absent` tool; the Swift test
+        `eachListedToolStartsWithItsCategoryAndTheMapNamesItOnce`, which reads the program's own list, and selftest.py
+        section 0 hold PROGRAM_TOOLS to the program: keep them."""
+        listed = owner_mcp.tools()
+        for t in listed:
+            self.assertTrue(t["description"].startswith(owner_mcp.category_of(t) + ": "), t["name"])
+            self.assertIn(owner_mcp.category_of(t), owner_mcp.CATEGORY_NAMES, t["name"])
+        server, table = self.first_words()
+        mapped = self.mapped(server)
+        self.assertEqual([name for category in owner_mcp.CATEGORY_NAMES for name in mapped.get(category, [])],
+                         [t["name"] for t in listed])
+        for t in listed:
+            self.assertIn(t["name"], mapped[owner_mcp.category_of(t)], t["name"])
+        programs = owner_mcp.dump_tools()["tools"]
+        expected = {}
+        for of, name in owner_mcp.categorized(e for e in programs if e["kind"] != "absent") + \
+                list(owner_mcp.PROGRAM_TOOLS):
+            expected.setdefault(of, []).append(name)
+        mapped = self.mapped(table)
+        self.assertEqual(mapped, expected)
+        names = [name for line in mapped.values() for name in line]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertNotIn("add_machine", names)                       # absent: the app's own Add server does it
+        self.assertEqual(owner_mcp.dump_tools()["categories"], [list(c) for c in owner_mcp.CATEGORIES])
+        for words, callable_ in ((server, {t["name"] for t in listed}), (table, set(names))):
+            self.assertLessEqual(set(re.findall(r"\b[a-z]+(?:_[a-z]+)+\b", words)), callable_)
+            shown = re.search(r"read with fleet_read: ([^.]*)\.", words).group(1).replace(" and ", ", ").split(", ")
+            self.assertLessEqual(set(shown), set(owner_mcp.PAGES), shown)
+
+    def test_the_instructions_fit_a_clients_cut_and_the_rule_of_places_comes_first(self):
+        """Claude Code cuts a server's instructions at 4,096 characters, and before its version 2.1.296 at 2,048: a
+        later line that pushes the rule of places past that cut leaves it unread, and a client then writes the owner's
+        "from now on" into a profile again."""
+        for words in self.first_words():
+            self.assertLessEqual(len(words), 4096)
+            self.assertLess(words.index(owner_mcp.MAP_HEAD), 2048)
+            self.assertLess(words.index("Where a rule for an agent goes:"), words.index(owner_mcp.MAP_HEAD))
 
     def test_the_devices_page_says_that_it_gives_no_code(self):
         what = owner_mcp.PAGES["devices"][1]
