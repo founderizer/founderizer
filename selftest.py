@@ -220,6 +220,9 @@ EVERY_AGENT = ["read_messages", "search_knowledge", "read_knowledge", "write_kno
                "write_skill",
                # support plan F4: a typed report that reached a duty of the agent joins one of its cases
                "join_report",
+               # the request workflow, gap 3 (lanes/tell-the-tickets-of-an-open-case.md): the holder of an open case
+               # tells the tickets of its joined reports where it stands, before its close
+               "tell_tickets",
                # CHAT-APPS.md 20: a file that a message carries to a person in a chat
                "attach_file",
                # the owner, 17 November 2026: the file that he sends with a message, in any session of the agent

@@ -920,13 +920,16 @@ class Devices(test_ui_api.OwnerAPI):
     def test_the_phones_list_knows_since_when_a_chat_waits_for_its_answer(self):
         """Owner feature chat_waits (UI-API.md 1.142): agents[].waits_since is the time of the owner's newest chat
         message to an agent that waits for its answer, by the apps' rule for "Thinking". The phone's list of chats had
-        only each conversation's last line, so it could say "Thinking" only for a chat that the phone itself had read."""
+        only each conversation's last line, so it could say "Thinking" only for a chat that the phone itself had read.
+        For the manager, his answer to its Needs-you item waits too (UI-API.md 1.283, chat_waits_answers): the manager
+        works on it in its chat session, and no row moved for three answers of 21 November 2026. A worker's or a lead's
+        answer goes to the task that asked, and no chat turn follows it, so a wait on it would never end."""
         hub.TEAM["addresses"]["w1"] = "127.0.0.3"
         hub.TEAM["agents"]["leo"] = {"role": "worker", "runtime": "claude", "machine": "w1", "can": []}
 
         def waits():
             state = self.call("/ui/mobile")[1]
-            self.assertIn("chat_waits", state["ui_features"])
+            self.assertTrue({"chat_waits", "chat_waits_answers"} <= set(state["ui_features"]))
             return {a["name"]: a["waits_since"] for a in state["agents"]}
 
         def says(agent, at, kind="message"):
@@ -956,6 +959,15 @@ class Devices(test_ui_api.OwnerAPI):
         says("manager", 106.0)
         reports("manager", 105.5)
         self.assertEqual(waits(), {"manager": 106.0, "leo": None})         # what it wrote before the message says nothing
+        reports("manager", 107.0)
+        says("manager", 108.0, kind="answer")
+        self.assertEqual(waits()["manager"], 108.0)                        # the manager's answer to its card waits
+        reports("manager", 109.0)
+        self.assertIsNone(waits()["manager"])                              # and its next word ends that wait
+        hub.TEAM["agents"]["ava"] = {"role": "lead", "runtime": "claude", "machine": "w1", "can": []}
+        says("ava", 110.0)
+        says("ava", 111.0, kind="answer")
+        self.assertEqual(waits()["ava"], 110.0)                            # a lead's answer waits as a worker's: never
         self.assertTrue(second)
 
 

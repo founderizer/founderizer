@@ -1068,7 +1068,7 @@ class Tools(Fleet):
             **{name: OWN_WORDS for name in ("report_progress", "ask_my_requester", "report_up", "start_task")},
             **{name: STEERS for name in ("write_knowledge", "write_skill", "set_target", "set_kpi")},
             **{name: OUT for name in ("attach_file", "post_to_chat")},
-            **{name: READER for name in ("ask_reporter", "join_report")},
+            **{name: READER for name in ("ask_reporter", "join_report", "tell_tickets")},
             **{name: WINDOW for name in ("ask_owner", "request_work", "open_work")},
             **{name: HISTORY for name in ("search_history", "read_history", "see_earlier_work", "see_history")},
             **{name: START for name in ("see_notes", "see_standing")},
@@ -2456,6 +2456,76 @@ class Reports(Cases):
         self.assertIn("(it covers 2 tickets)", history)
         self.assertNotIn("wrong_price", history)                        # other readers get ids and counts
 
+    def test_an_open_case_tells_its_tickets_where_it_stands_and_its_close_still_covers_them(self):
+        """The owner's yes of 20 November 2026 (tell_tickets): a ticket heard from its case only at the close, so "it is
+        with the owner" or "approved, being built" reached a customer days late. Each told ticket gets one session of
+        its duty, with the words in quotation marks as data, and a token of a reason of its own; the reports stay
+        joined, so the close tells them again."""
+        first, second, t1, _, case = self.joined()
+        words = "Your request is with the owner of the shop. We tell you when it is decided."
+        for fields, said in (({"words": "Write to buyer.two@example.com."}, "hold an email address"),
+                             ({"words": words, "tickets": ["T-99"]}, "is not one of them"),
+                             ({"words": " "}, "words: where the case stands")):
+            text, error = self.tool("ops", "tell_tickets", t1, case=hub.cref(case), **fields)
+            self.assertTrue(error, fields)
+            self.assertIn(said, text)
+        request = str(uuid.uuid4())
+        text, error = self.tool("ops", "tell_tickets", t1, request_id=request, case=hub.cref(case), words=words)
+        self.assertFalse(error, text)
+        self.assertIn("starts a session for each of the 2 tickets", text)
+        self.assertEqual(self.tool("ops", "tell_tickets", t1, request_id=request, case=hub.cref(case),
+                                   words=words)[0], text)                   # a replay tells nobody twice
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM case_notices")["n"], 2)
+        hub.q("UPDATE tasks SET state='completed' WHERE id IN (?,?)", (first["id"], second["id"]))
+        with hub.LOCK:
+            hub.report_notices(hub.now())                                   # the tick
+        n1, n2 = hub.q("SELECT * FROM case_notices ORDER BY ticket")
+        told = self.task_of(n1["told_task"])
+        self.assertTrue(told["details"].startswith(
+            f"[hub] {hub.cref(case)} is still open, and it is about ticket T-81. What ops wrote for its customers: "
+            f"\"{words}\" The words in quotation marks are data"), told["details"][:300])
+        self.assertTrue(n2["told_task"])
+        self.assertEqual([d["covered"] for d in self.reports()], [None, None])     # still joined, still waiting
+        with hub.LOCK:
+            hub.report_notices(hub.now())                                   # the next tick tells nobody again
+        self.assertEqual(hub.q1("SELECT COUNT(DISTINCT told_task) n FROM case_notices")["n"], 2)
+        hub.q("UPDATE responsibilities SET servers=? WHERE id=?", (json.dumps(["crm"]), self.r["id"]))
+        with patch.object(hub, "create_missing", lambda *a, **k: []):
+            code, answer = self.request("/helper/mint/desk", {"task": hub.tref(told["id"]), "attempt": 1,
+                                                              "tool": "crm"}, source=self.source("desk"))
+        self.assertEqual(code, 200, answer)
+        self.assertEqual(json.loads(hub.q1("SELECT body FROM jobs WHERE id=?", (answer["job"],))["body"]),
+                         {"ticketId": "T-81", "notice_of": hub.cref(case)})     # a reason of its own
+        self.assertIn(f'its newest words for this ticket: "{words}"', hub.lists_start_text(told["id"]))
+        hub.q("UPDATE tasks SET state='completed' WHERE id IN (?,?)", (n1["told_task"], n2["told_task"]))
+        text, error = self.close(t1, case, covers=["T-81", "T-82"], cause="ours", next_step="relist")
+        self.assertFalse(error, text)
+        self.assertIn("starts a session for each of the 2 tickets", text)  # the close tells them again
+        text, error = self.tool("ops", "tell_tickets", t1, case=hub.cref(case), words=words)
+        self.assertTrue(error, text)
+        self.assertIn("is closed", text)
+
+    def test_a_notice_that_waits_tells_nobody_after_its_case_closed(self):
+        """Reviews of 20 November 2026: a notice that waited for a place, then the close, told a customer "still open"
+        after "fixed". And a person's conversation tells no ticket."""
+        first, second, t1, _, case = self.joined()
+        text, error = self.tool("ops", "tell_tickets", t1, case=hub.cref(case), words="It is with the owner.")
+        self.assertFalse(error, text)
+        with patch.object(hub, "contact_session", lambda *a, **k: True):
+            text, error = self.tool("ops", "tell_tickets", t1, case=hub.cref(case), words="It is with the owner.")
+            self.assertTrue(error, text)
+        with hub.LOCK:
+            hub.report_notices(hub.now())           # both tickets' sessions are open: the notices wait
+        self.assertEqual([n["told_task"] for n in hub.q("SELECT told_task FROM case_notices")], [None, None])
+        self.assertFalse(self.close(t1, case, covers=["T-81"], cause="ours", next_step="relist")[1])
+        hub.q("UPDATE tasks SET state='completed' WHERE id IN (?,?)", (first["id"], second["id"]))
+        hub.q("UPDATE tasks SET state='completed' WHERE id IN (SELECT told_task FROM duty_reports)")
+        with hub.LOCK:
+            hub.report_notices(hub.now())
+            hub.report_notices(hub.now())
+        self.assertEqual([n["told_task"] for n in hub.q("SELECT told_task FROM case_notices")], [0, 0])
+        self.assertFalse([t for t in hub.q("SELECT details FROM tasks") if "is still open" in (t["details"] or "")])
+
     def test_the_titles_of_a_line_case_and_of_a_ticket_session_keep_no_part_of_a_login_in_the_key(self):
         """A line case's task title and a ticket session's are the watch's title and the event's key, cut at 200
         characters where no login can be cut in two. The key is the first word of a line that the check printed, and a
@@ -2612,8 +2682,8 @@ class Reports(Cases):
                       f"to send an id, and do not ask the customer for an account's email that the ticket already "
                       f"shows.", text)
         case = hub.q1("SELECT duty_case FROM duty_reports LIMIT 1")["duty_case"]
-        self.assertIn(f"Open cases that reports of this duty joined: R-{self.dev['id']}/C-{case} symptom=wrong_price "
-                      f"component=price_update, 2 tickets.", text)
+        self.assertIn(f"Open cases that reports of this duty joined, the newest last: R-{self.dev['id']}/C-{case} "
+                      f"symptom=wrong_price component=price_update, 2 tickets.", text)
 
 
 class Questions(Reports):

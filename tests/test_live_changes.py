@@ -164,9 +164,17 @@ class LiveChanges(ManagerSwitch):
         self.turn(ended=hub.now())
         self.assertEqual((hub.CHANGE["state"], self.turn_ended_after()), (before + 1, second))
 
-    def test_an_old_turn_end_and_an_answer_to_a_request_end_no_wait(self):
-        """A helper that reads its transcript again sends old marks, and the answer to a Needs-you item is no chat
-        message: its card shows it, and neither app waits under it."""
+    def test_an_old_turn_end_ends_no_wait_and_the_turn_that_read_an_answer_to_the_manager_ends_its_wait(self):
+        """A helper that reads its transcript again sends old marks: a turn that ended before the read ends no wait.
+        The owner's answer to a Needs-you item of the manager's is a message that the apps wait under too (UI-API.md
+        1.283; the owner, 21 November 2026, after three answers: "nothing moved on the left sidebar and the cards just
+        remained with a check"). The manager reads it in its standing session, so the phone's row of the manager
+        moves while waits_since is later than turn_ended_after, and the end of the turn that read the answer ends that
+        and wakes the apps. The bug: the answer counts for waits_since and not here, and the row moves until the
+        manager writes, or for neither, and nothing moves at all."""
+        def waits_since():
+            return next(a for a in self.request("/ui/mobile")[1]["agents"] if a["name"] == "manager")["waits_since"]
+
         self.say("What is the status?")
         hub.t_read_messages("manager", {})
         read = hub.q1("SELECT e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id")["read_at"]
@@ -174,13 +182,16 @@ class LiveChanges(ManagerSwitch):
         self.assertIsNone(self.turn_ended_after())
         self.turn(ended=hub.now())
         asked = self.sent("What is the status?")
-        self.assertEqual(self.turn_ended_after(), asked)
+        self.assertEqual((waits_since(), self.turn_ended_after()), (asked, asked))      # its turn is over: no motion
         self.assertEqual(self.request(f"/ui/needs/{self.need()}", self.command(answer="The second one."))[0], 200)
-        self.assertEqual(hub.q1("SELECT kind FROM ui_requests WHERE text='The second one.'")["kind"], "answer")
+        answer = hub.q1("SELECT kind, created FROM ui_requests WHERE text='The second one.'")
+        self.assertEqual(answer["kind"], "answer")
         hub.t_read_messages("manager", {})
+        self.assertEqual((waits_since(), self.turn_ended_after()), (answer["created"], asked))   # it works on it
         before = hub.CHANGE["state"]
-        self.turn(ended=hub.now())
-        self.assertEqual((hub.CHANGE["state"], self.turn_ended_after()), (before, asked))
+        self.turn(ended=hub.now())                                      # the turn that read the answer ends
+        self.assertEqual((hub.CHANGE["state"], self.turn_ended_after()), (before + 1, answer["created"]))
+        self.assertEqual(waits_since(), answer["created"])              # no report: the turn end alone ends the motion
 
     def test_a_turn_that_a_usage_limit_cut_ends_no_wait_while_the_limit_holds(self):
         """A turn that stops at a usage limit ends as every turn does (threads: a result with the stop reason
