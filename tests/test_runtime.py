@@ -835,7 +835,7 @@ class Runtime(unittest.TestCase):
         hub.tick()
         t = hub.q1("SELECT * FROM tasks WHERE id=?", (tid,))
         self.assertEqual((t["live_path"], t["nudge_level"]), ("paused by the owner", 0))
-        self.assertIn("HELD: paused by the owner", hub.overview_text())
+        self.assertIn("HELD: paused by the owner", hub.overview_text(hub.OWNER_VIEW))
 
     # ---- 5. task start
     def records_of_new_tasks(self):

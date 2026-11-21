@@ -408,7 +408,7 @@ class SecondLook(Withdraw):
                                       "  web-1: rule-only since 15 Jan 2027: Plan step 2.17: old keys\n"
                                       "  web-2: out of the door since 15 Jan 2027: Plan step 9: the old keys are still "
                                       "on it"), text)
-        self.assertNotIn("DOOR HOLDS", hub.overview_text())         # the owner's board shows no line of it
+        self.assertNotIn("DOOR HOLDS", hub.overview_text(hub.OWNER_VIEW))         # the owner's board shows no line of it
         del hub.TEAM["door"]["holds"]["web-1"]                      # door_hold web-1 none
         self.assertNotIn("web-1:", hub.call_tool("manager", "see_team", {})[0])
         del hub.TEAM["door"]["holds"]                               # and the last one

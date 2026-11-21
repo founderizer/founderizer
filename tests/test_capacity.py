@@ -628,7 +628,7 @@ class Capacity(OwnerAPI):
         self.assertFalse(error, text)
         self.assertIn("(claude@example.com): ", text)
         self.assertIn("(second@example.com): ", text)
-        self.assertNotIn("@example.com", hub.overview_text())
+        self.assertNotIn("@example.com", hub.overview_text(hub.OWNER_VIEW))
         with patch.object(hub, "contact_session", return_value=True):
             text, error = self.call("manager", "see_capacity", {})
         self.assertFalse(error, text)

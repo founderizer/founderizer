@@ -235,15 +235,15 @@ class ManagerLists(test_report_up.Base):
         self.assertFalse(err, text)
         brief = hub.manager_resume_text()
         self.assertNotIn("Which colour?", brief)        # answer() refuses the manager: it was asked of the lead
-        team = hub.overview_text()
+        team = hub.overview_text(hub.OWNER_VIEW)
         self.assertIn("asked of lead, which answers it: Which colour?", team)
         hub.q("UPDATE tasks SET state='completed', outcome='completed', what='Theme fixed', delivered=? WHERE id=?",
               (self.clock, sub))
         self.assertNotIn(f"T-{sub}", hub.manager_resume_text().split("Results waiting")[-1])
-        self.assertNotIn("Theme fixed", hub.overview_text())    # check_result refuses the manager this one too
+        self.assertNotIn("Theme fixed", hub.overview_text(hub.OWNER_VIEW))    # check_result refuses the manager this one too
         mine = self.new_task(state="completed", outcome="completed", what="Deploy fixed", delivered=self.clock)
         self.assertIn(f"Results waiting for your check: T-{mine}", hub.manager_resume_text())
-        self.assertIn("Deploy fixed", hub.overview_text())
+        self.assertIn("Deploy fixed", hub.overview_text(hub.OWNER_VIEW))
 
     def test_a_question_of_an_ended_task_is_neither_chased_nor_listed(self):
         text, err = self.tool("vps", "ask_my_requester", question="Staging or production?")
@@ -254,7 +254,7 @@ class ManagerLists(test_report_up.Base):
         hub.tick()
         self.assertFalse([t for t in self.said() if "has waited" in t])
         self.assertNotIn("Staging or production?", hub.manager_resume_text())
-        self.assertNotIn("Staging or production?", hub.overview_text())
+        self.assertNotIn("Staging or production?", hub.overview_text(hub.OWNER_VIEW))
         text, err = self.tool("manager", "answer", question_id="Q-1", text="Staging.")
         self.assertFalse(err, text)
         self.assertIn(f"T-{self.task} is already canceled, so no session of it reads this answer", text)
@@ -263,7 +263,7 @@ class ManagerLists(test_report_up.Base):
         text, err = self.tool("vps", "ask_my_requester", question="Metric or imperial?", default="metric")
         self.assertFalse(err, text)
         self.assertNotIn("Metric or imperial?", hub.manager_resume_text())
-        self.assertIn("NOT WAITING", hub.overview_text())          # see_team still says what it went on with
+        self.assertIn("NOT WAITING", hub.overview_text(hub.OWNER_VIEW))          # see_team still says what it went on with
 
 
 class CaseLeftOpen(test_responsibilities.Base):
@@ -593,7 +593,7 @@ class ReviewedLeads(Runtime):
     def test_see_team_says_which_prompts_another_agent_decides(self):
         pid = hub.ins("INSERT INTO prompts(task,agent,tool,input,key,created) VALUES(?,?,?,?,?,?)",
                       (self.sub, "vps", "Bash", "make deploy", "k", hub.now()))
-        self.assertIn(f"P-{pid} from vps on T-{self.sub}, for studio to decide", hub.overview_text())
+        self.assertIn(f"P-{pid} from vps on T-{self.sub}, for studio to decide", hub.overview_text(hub.OWNER_VIEW))
 
 
 class ReviewedRequests(test_call_api.CallApi):

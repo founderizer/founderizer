@@ -258,7 +258,7 @@ class Setup(OwnerAPI):
         text, error = hub.call_tool("manager", "create_task", {"owner": "vps", "title": "Check", "done_when": "Checked."})
         self.assertEqual((error, text), (True, "vps is in setup. The owner activates it in Fleet."))
         self.assertEqual(self.request("/ui/messages", self.command(recipient="vps"))[0], 409)
-        self.assertIn("vps (in setup: no tasks)", hub.overview_text())
+        self.assertIn("vps (in setup: no tasks)", hub.overview_text(hub.OWNER_VIEW))
         self.assertFalse(next(a for a in self.request()[1]["agents"] if a["name"] == "vps")["active"])
         code, data = self.settings(active=True)
         self.assertEqual((code, [(m["kind"], m["ref"]) for m in data["missing"]]), (409, [("check", "latest")]))

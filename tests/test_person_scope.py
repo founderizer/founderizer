@@ -259,6 +259,105 @@ class Narrowed(Base):
         self.assertTrue(error, text)
         self.assertIsNone(hub.q1("SELECT 1 FROM events WHERE kind='say' AND text LIKE '%quokka%'"))      # where it would go
 
+    def finished_pair(self):
+        """A narrowed pair's finished conversation task, whose result holds the locked window's reply (the fault
+        that the Chat area found in conversation_task_end), and a finished task of the agent's own beside it."""
+        cid = self.says(PAT, "The giraffe key is in the drawer.")["conversation"]
+        narrowed = self.conversation_task(cid)["id"]
+        hub.q("UPDATE tasks SET state='completed', what='Noted: the giraffe drawer.', delivered=? WHERE id=?",
+              (hub.now(), narrowed))
+        plain, _ = self.normal_task(title="Send the zebra report")
+        hub.q("UPDATE tasks SET state='completed', what='The zebra report went out.', delivered=? WHERE id=?",
+              (hub.now(), plain))
+        return narrowed, plain
+
+    def test_a_narrowed_pairs_task_is_no_earlier_work_of_any_other_session(self):
+        """Person access plan, sections 13 and 16 item 9: a session with more reads nothing of a narrowed pair's task
+        in see_earlier_work, by no count and no title: not in its own finished work (mine, outcome), its search, its
+        full read, the chain that its task follows, or the line of what followed a task. Its other work stays."""
+        narrowed, plain = self.finished_pair()
+        mine, context = self.normal_task(title="Prepare the next report")
+        hub.q("UPDATE tasks SET follows=? WHERE id=?", (narrowed, mine))      # as an old link would hold it
+        for args in ({"mine": True}, {"search": "giraffe"}, {"outcome": "completed"}, {}):
+            text = self.ok("see_earlier_work", context, task_id=hub.tref(mine), **args)
+            self.assertNotIn("drawer", text, args)        # its result's words (a search says the word it looked for)
+            self.assertNotIn(hub.tref(narrowed), text, args)
+        self.assertIn(f"{hub.tref(mine)} follows no earlier task", self.ok("see_earlier_work", context,
+                                                                          task_id=hub.tref(mine)))
+        text, error = self.tool("see_earlier_work", context, task_id=hub.tref(mine), task=hub.tref(narrowed))
+        self.assertTrue(error)
+        self.assertNotIn("drawer", text)
+        self.assertIn("is neither a task that", text)       # the words of a task that does not exist
+        listed = self.ok("list_my_tasks", context, task_id=hub.tref(mine))      # its own task, and what it follows
+        self.assertNotIn("drawer", listed)
+        self.assertNotIn(hub.tref(narrowed), listed)
+        hub.q("UPDATE tasks SET follows=? WHERE id=?", (plain, narrowed))     # it followed the agent's own task
+        behind = self.ok("see_earlier_work", context, task_id=hub.tref(mine))
+        self.assertIn(f"{hub.tref(mine)} follows 1 earlier task(s)", behind)    # the walk goes on behind it
+        self.assertIn(hub.tref(plain), behind)
+        own = self.ok("see_earlier_work", context, task_id=hub.tref(mine), mine=True)
+        self.assertIn("The zebra report went out.", own)
+        self.assertNotIn(hub.tref(narrowed), own)          # and is not in that task's "Followed by"
+        # the manager's see_team names it nowhere, nor a permission prompt of it; the owner's own overview reads it
+        hub.ins("INSERT INTO prompts(task,agent,tool,input,key,created) VALUES(?,'studio','Bash','cat drawer','k',?)",
+                (narrowed, hub.now()))
+        team = hub.t_see_team("manager", {})
+        self.assertNotIn(hub.tref(narrowed), team)
+        self.assertNotIn("drawer", team)
+        self.assertIn(hub.tref(narrowed), hub.overview_text(hub.OWNER_VIEW))
+
+    def test_a_leads_view_of_its_team_names_no_narrowed_pairs_task(self):
+        """Person access plan v4 (a lead's team view): a narrowed pair's conversation task has the agent's lead for its
+        requester (task_giver), so see_team listed it under what the lead gave out, with the first words of the
+        locked window's reply. It is no row there now; the lead's other work stays."""
+        narrowed, plain = self.finished_pair()
+        hub.TEAM["agents"]["boss"] = {"role": "lead", "runtime": "claude", "machine": "studio-host", "can": ["shell"]}
+        hub.TEAM["agents"]["studio"]["reports_to"] = "boss"
+        hub.q("UPDATE tasks SET requester='boss' WHERE id IN (?,?)", (narrowed, plain))
+        _, context = self.normal_task(owner="boss", title="Lead the team")
+        view = self.ok("see_team", context, agent="boss")
+        self.assertIn(hub.tref(plain), view)
+        self.assertNotIn(hub.tref(narrowed), view)
+        self.assertNotIn("drawer", view)
+
+    def test_a_narrowed_pairs_task_answers_its_requesters_controls_as_no_task(self):
+        """The Opus review of the fix: check_result, restart_task and cancel_task of a narrowed pair's conversation
+        task wrote on it for its requester (the manager here), and their refusal said to anyone else that it exists.
+        Each one now answers as for a task that does not exist; a task of the agent's own is checked as before."""
+        narrowed, plain = self.finished_pair()
+        hub.q("UPDATE tasks SET requester='manager' WHERE id IN (?,?)", (narrowed, plain))
+        for tool, args in (("check_result", {"accepted": True}), ("restart_task", {"reason": "again", "request_id": str(uuid.uuid4()),
+                                                                     "expected_attempt": 1}),
+                           ("cancel_task", {"reason": "done"})):
+            with self.assertRaises(hub.ToolError, msg=tool) as refused:
+                getattr(hub, f"t_{tool}")("manager", dict(args, task_id=hub.tref(narrowed)))
+            self.assertEqual(str(refused.exception), f"There is no task {hub.tref(narrowed)}.", tool)
+        self.assertIsNone(hub.q1("SELECT accepted FROM tasks WHERE id=?", (narrowed,))["accepted"])
+        hub.t_check_result("manager", {"task_id": hub.tref(plain), "accepted": True})
+        self.assertEqual(hub.q1("SELECT accepted FROM tasks WHERE id=?", (plain,))["accepted"], 1)
+
+    def test_no_new_task_follows_a_narrowed_pairs_task_or_starts_with_its_words(self):
+        """Person access plan, sections 13 and 16 item 9: create_task's follows of a narrowed pair's task is refused
+        with the words of a task that does not exist, and a task that follows one (an old link) starts with nothing of
+        it; a task that follows the agent's own work starts with that work's result, as before."""
+        narrowed, plain = self.finished_pair()
+        with self.assertRaises(hub.ToolError) as refused:
+            hub.t_create_task("manager", {"owner": "studio", "title": "Go on with it", "done_when": "done",
+                                          "follows": hub.tref(narrowed)})
+        self.assertIn(f"There is no task {hub.tref(narrowed)} to follow.", str(refused.exception))
+        # nor open_work of a conversation with the agent's own tools: the words of a task that is not the agent's
+        other = self.says(KIM, "Hello", account="discord-studio")["conversation"]
+        text, error = self.tool("open_work", self.context(other), title="Go on with it", details="The next step.",
+                                follows=hub.tref(narrowed))
+        self.assertTrue(error)
+        self.assertIn(f"{hub.tref(narrowed)} is not a finished task of yours.", text)
+        self.assertNotIn("drawer", text)
+        mine, _ = self.normal_task(title="Prepare the next report")
+        hub.q("UPDATE tasks SET follows=? WHERE id=?", (narrowed, mine))
+        self.assertNotIn("drawer", hub.start_text("studio", mine))
+        hub.q("UPDATE tasks SET follows=? WHERE id=?", (plain, mine))
+        self.assertIn("The zebra report went out.", hub.start_text("studio", mine))
+
     def test_its_window_opens_its_persons_own_files_only(self):
         """CHAT-APPS.md 8.1: a narrowed window opens the files of its own person's messages (read_attachment is in
         SCOPE_TOOLS), and a file of the owner's never."""
@@ -481,7 +580,8 @@ class Narrowed(Base):
         locked window answered, keeps its mark. The bugs: the widening clears every mark, and a session with more
         finds the locked window's reply that had no task; or it clears none, and a session with the agent's tools
         never finds the message that waits for it; or it gives back an unread message only when it has no task; or the
-        next start marks again the message of an ended task, which keeps its person."""
+        next start marks again the message of an ended task, which keeps its person; or the given-back message stays
+        in that ended task, whose person hides it and its reply from the reads, and the next start marks them again."""
         cid = self.says(PAT, "The giraffe key is in the drawer.")["conversation"]
         first = hub.q1("SELECT id FROM conversation_messages WHERE who='person' ORDER BY id DESC LIMIT 1")["id"]
         later = self.says(PAT, "And the zebra key is in the box.")["id"]
@@ -495,6 +595,8 @@ class Narrowed(Base):
         self.owner_does(cid, "pause")
         self.says(PAT, "The okapi door sticks.")                # no task, and nobody read it
         self.owner_does(cid, "resume")
+        _, task = self.normal_task(title="Look for the gates")
+        self.assertFalse(self.found(task, "lynx"))               # the history holds its row now, with its task
         code, data = self.change(self.pat["id"], scopes={"studio": None})
         self.assertEqual(code, 200, data)
         hub.settle_narrowed_rows()                              # the next start of the hub
@@ -506,8 +608,19 @@ class Narrowed(Base):
                                  "Noted: the giraffe drawer.": p, "Noted: the zebra box.": p,
                                  "The lynx fence is down.": None, "The tapir gate is open.": None,
                                  "The okapi door sticks.": None})
-        _, task = self.normal_task(title="Look for the gates")
-        self.assertEqual([self.found(task, word) for word in ("tapir", "okapi", "zebra")], [True, True, False])
+        self.assertEqual([self.found(task, word) for word in ("tapir", "okapi", "zebra", "lynx")],
+                         [True, True, False, True])            # lynx: its history row left the ended task too
+        # the given-back message left its ended task: the window with the agent's tools reads it and answers it, and
+        # neither the task conditions of the reads nor the next start take them away again
+        self.assertIsNone(hub.q1("SELECT task FROM conversation_messages WHERE id=?", (lynx["id"],))["task"])
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("reply", self.context(cid), text="The lynx fence is fixed.", in_reply_to=f"CM-{lynx['id']}")
+        reply = hub.q1("SELECT id FROM conversation_messages WHERE text='The lynx fence is fixed.'")["id"]
+        hub.settle_narrowed_rows()
+        shown = hub.q(f"SELECT id, scope_person FROM conversation_messages WHERE id IN (?,?) AND "
+                      f"{hub.CONVERSATION_NOT_NARROWED}", (lynx["id"], reply))
+        self.assertEqual(sorted((r["id"], r["scope_person"]) for r in shown), [(lynx["id"], None), (reply, None)])
 
     def test_no_session_waits_for_a_narrowed_persons_answer(self):
         theirs = self.says(KIM, "Hello", account="discord-studio")["conversation"]
@@ -609,6 +722,23 @@ class Owner(Base):
         self.assertIsNone(hub.q1("SELECT scope_person FROM tasks WHERE id=?", (open_task["id"],))["scope_person"])
 
 
+    def test_a_first_list_ends_a_conversation_task_that_holds_no_message_of_the_person(self):
+        """Fable's review of bf422aead: a conversation task that only a line of the hub's opened (a result of work of
+        the time at All) waits on no message of the person, so nothing would end it before a widening: a first list
+        ends it with the open work. The bug: it stays open with the person's list, and every later message of the
+        person joins it."""
+        hello = self.says(PAT, "Hi")
+        self.answers(hello["conversation"], hello["id"], "Hello Pat.")          # a window with the agent's tools
+        conv = hub.q1("SELECT * FROM conversations WHERE id=?", (hello["conversation"],))
+        with hub.LOCK, hub.transaction():
+            line = hub.conversation_post_rows(conv, "T-97 (Stock) is completed: the tamarin stock is counted.",
+                                              hub.now())
+        opened = self.conversation_task(hello["conversation"])
+        self.assertEqual(opened["source_message"], line)
+        self.assertEqual(self.scopes({f"repo:{REPO}": "write"})[0], 200)
+        self.assertEqual(self.task(opened["id"])["state"], "canceled")
+        self.assertIsNone(self.conversation_task(hello["conversation"]))
+
     def test_a_narrowed_session_finds_no_record_of_what_a_session_with_more_did(self):
         """The review of person-scope-row-mark-spec.md: a narrowed session's history gives the records of its own
         conversation's tasks, and a task of a time at All ran in a session with the agent's own tools, whose records
@@ -617,11 +747,17 @@ class Owner(Base):
         list began. The bug: the scope reads only that the task is one of the conversation, and the locked window finds
         what a session with more did in a task that ended before the first list, or in the open task that the first
         list gave its person, or the result of work of that time that the hub wrote into the conversation, or what
-        such a task wrote to another person in that person's own conversation."""
+        such a task wrote to another person in that person's own conversation; or its window reads that line of the
+        hub's, which nobody read before the first list (person_scope_rows reads it at the list), or a line that the
+        fleet filed under the open task, and an unread line keeps the conversation task open after the window's
+        answer; or the first list ends the open task, whose message the old window read and did not answer yet; or it
+        reads for nobody the owner's steer of that task, which the window must follow; or it reads an agent's message
+        there for nobody, and its sender never hears that nobody will."""
         hello = self.says(PAT, "Hi there")
         ended = hello["task"]
         self.answers(hello["conversation"], hello["id"], "Hello Pat.")          # a window with the agent's tools
         open_one = self.says(PAT, "One more thing")["task"]
+        self.ok("read_messages", self.context(hello["conversation"]))         # read, and not answered yet
         made = []
 
         def record(tid, at, text):          # one record of the task's session (thread_events), as its helper sends it
@@ -636,10 +772,25 @@ class Owner(Base):
         with hub.LOCK, hub.transaction():           # a result of work of the time at All, which joins the open task
             line = hub.conversation_post_rows(conv, "T-99 (Prices) is completed: the ocelot prices are ready.", t0 - 40)
         self.assertEqual(hub.q1("SELECT task FROM conversation_messages WHERE id=?", (line,))["task"], open_one)
+        hub.emit("studio", "say", "[hub] Result for T-98 (Cats): the margay report is ready.", task=open_one)
+        said = hub.ins(hub.EVENT, ("studio", "say", open_one, "[message from manager] The puma files are in the vault.",
+                                   hub.now(), "{}"))       # an agent's message filed under the open task
+        message = hub.ins("INSERT INTO agent_messages(sender,recipient,text,created,request_id,event_id) VALUES("
+                          "'manager','studio','The puma files are in the vault.',?,?,?)",
+                          (hub.now(), str(uuid.uuid4()), said))
+        with hub.LOCK:                              # and the owner's guidance on it, which nobody read yet
+            hub.task_steer_act(open_one, {"expected_attempt": None, "text": "Keep the answer short, please.",
+                                          "attachments": [], "request_id": str(uuid.uuid4())}, "test")
+        steer = hub.q1("SELECT event_id FROM steers WHERE task=?", (open_one,))["event_id"]
         self.person("Kim", "manager", KIM, app="discord")       # the open task writes to another person: a row of
         self.ok("message_contact", self.context(hello["conversation"]), person="Kim",        # Kim's conversation
                 text="The serval invoice is late.", request_id=str(uuid.uuid4()))
         self.assertEqual(self.scopes({f"repo:{REPO}": "write"})[0], 200)
+        self.assertEqual(self.task(open_one)["state"], "working")          # still open: it waits on that message
+        told = hub.q("SELECT text FROM events WHERE agent='manager' AND text LIKE ?", (f"[hub] AM-{message} %",))
+        self.assertEqual([r["text"] for r in told], [f"[hub] AM-{message} reached T-{open_one}, which will not read "
+                                                     f"it."])          # its sender hears it, with no word of it
+        self.assertIsNone(hub.q1("SELECT read_at FROM events WHERE id=?", (steer,))["read_at"])
         narrowed = record(open_one, hub.now() + hub.CONVERSATION_RECORD_SKEW + 1, "The koala branch is ready.")
         here = self.context(hello["conversation"])
         self.assertEqual([self.found(here, w) for w in ("launchpad", "capybara", "ocelot", "serval", "koala", "thing")],
@@ -647,6 +798,19 @@ class Owner(Base):
         for ref in at_all:
             self.assertIn("is not in your history", self.ok("read_history", here, ref=f"TR-{ref}"))
         self.assertIn("koala", self.ok("read_history", here, ref=f"TR-{narrowed}"))
+        # the line of the hub's that nobody read, and the line filed under the open task, were read at the first list:
+        # the locked window never gets them, and its answer to the person's message ends the open task, which no
+        # unread line keeps open
+        self.assertIsNotNone(hub.q1("SELECT read_at FROM conversation_messages WHERE id=?", (line,))["read_at"])
+        more = hub.q1("SELECT id FROM conversation_messages WHERE text='One more thing'")["id"]
+        hub.conversation_start("studio", hello["conversation"])
+        read = self.ok("read_messages", here)
+        self.assertNotIn("ocelot", read)
+        self.assertNotIn("margay", read)
+        self.assertNotIn("puma", read)
+        self.assertIn("Keep the answer short, please.", read)             # the owner's guidance reaches it
+        self.ok("reply", here, text="Noted.", in_reply_to=f"CM-{more}")
+        self.assertIsNone(self.conversation_task(hello["conversation"]))
         _, task = self.normal_task(title="Look at the plans")
         self.assertTrue(self.found(task, "launchpad"))          # a session with the agent's tools: its own work
 

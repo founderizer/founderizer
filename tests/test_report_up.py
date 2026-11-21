@@ -545,7 +545,7 @@ class Resume(Base):
         # the team directory and the manager's parts of the rules are the brief's too (plan P9.1 and P9.3): see_team
         # never carried them, so the comparison with see_team leaves them out
         brief = said.replace(hub.team_start_text(hub.manager_name()), "").replace(hub.manager_parts_line(), "")
-        self.assertLess(len(brief), len(hub.overview_text()))
+        self.assertLess(len(brief), len(hub.overview_text(hub.OWNER_VIEW)))
         self.assertLess(len(brief.splitlines()), 20)
 
     def test_an_empty_fleet_s_brief_says_so_in_a_line_each(self):
@@ -689,7 +689,7 @@ class OwnerScreen(Base):
 class Bugs(Base):
     def test_the_why_of_a_task_is_in_the_lists_an_agent_reads(self):
         hub.q("UPDATE tasks SET why=? WHERE id=?", ("vps is the only agent with the deploy secret", self.task))
-        self.assertIn("given to vps because: vps is the only agent with the deploy secret", hub.overview_text())
+        self.assertIn("given to vps because: vps is the only agent with the deploy secret", hub.overview_text(hub.OWNER_VIEW))
         parent = self.new_task(owner="lead", requester="manager", title="Ship the shop")
         sub = self.new_task(owner="hand", requester="lead", parent=parent, why="hand knows the shop's theme")
         earlier = self.new_task(owner="hand", requester="lead", state="completed", outcome="completed",

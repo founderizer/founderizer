@@ -8213,8 +8213,8 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
         said += ((" " + mask_secrets(note) if note else "") + unknown_start_text(task_id, closed, note) +
                  (warm_attempt(t) if t else ""))
     else:
-        t = read_row("SELECT follows FROM tasks WHERE id=?", (task_id,))
-        said += warm_follows(t["follows"] if t else None, closed)
+        t = read_row("SELECT id, owner, follows, scope_person, source_conversation FROM tasks WHERE id=?", (task_id,))
+        said += warm_follows(t["follows"] if t else None, closed, task_scope(t), t["owner"] if t else None)
     return said + report_feedback(agent) + "\n"
 
 
@@ -10551,7 +10551,7 @@ def describe_task(t, details=None):
     lines += [f"  {x}" for x in report_answer_lines("m.sender_task=?", (t["id"],))]    # and the answers that it asked for
     if t["follows"]:
         p = q1("SELECT * FROM tasks WHERE id=?", (t["follows"],))
-        if p:
+        if p and not narrowed_from(p, task_scope(t), t["owner"]):     # a narrowed pair's is no other task's
             lines.append(f"  Follows: {tref(p['id'])} ({p['state']}, by {p['owner']}). "
                          f"What was done: {p['what'] or '-'}. Output: {p['where_'] or '-'}.")
             if p["check_note"]:
@@ -10718,12 +10718,13 @@ def result_lines(p):
     return out
 
 
-def warm_follows(follows, closed=False):
+def warm_follows(follows, closed=False, scope=None, owner=None):
     """The opening of a task that follows another: what the earlier task did, where its output is, how it was
     checked, why it fell short, and the last of what its agent wrote down while doing it. The requester no longer
-    has to remember any of that, and no longer has to write it into the details."""
+    has to remember any of that, and no longer has to write it into the details. scope: the new task's own list
+    (task_scope's): a narrowed pair's task that is not its own gives it nothing (narrowed_from)."""
     p = read_row("SELECT * FROM tasks WHERE id=?", (follows,)) if follows else None
-    if not p:
+    if not p or narrowed_from(p, scope, owner):
         return ""
     lines = [f"WHAT CAME BEFORE. Your task follows {tref(p['id'])} ({clip(p['title'], 120)}), which {p['owner']} did."]
     lines += result_lines(p)
@@ -10899,15 +10900,33 @@ def warm_records(task_id, attempt):
         return []
 
 
-def earlier_chain(t):
+def narrowed_from(p, scope, agent=None):
+    """True when task row `p` is a narrowed pair's (tasks.scope_person) and `scope`, the list of the session that reads
+    (session_scope's, or task_scope's of a task that is starting), is not that pair's own: that session gets neither
+    the task's words nor its result, and does not learn that it exists, by no count and no title (person access plan,
+    sections 13 and 16 item 9; the history hides the same rows, history_scope_sql). A conversation task's what holds
+    the locked window's reply (conversation_task_end). agent: the reading session's agent, where it can be another
+    agent than the task's owner (a lead, the manager): the pair is a person and an agent, as in history_scope_sql.
+    Reads nothing."""
+    pid = p["scope_person"] if p is not None and "scope_person" in p.keys() else None
+    if pid is None:
+        return False
+    if scope is None or scope.get("person") != pid:
+        return True
+    return agent is not None and "owner" in p.keys() and p["owner"] != agent
+
+
+def earlier_chain(t, scope=None):
     """The tasks that this one follows, the nearest first: its own follows, then that task's, as far back as
-    FOLLOWS_CHAIN. A worker reads the work its task continues, and nothing else."""
+    FOLLOWS_CHAIN. A worker reads the work its task continues, and nothing else: a narrowed pair's task in it reaches
+    only that pair's own session (narrowed_from), so the chain leaves it out and goes on behind it."""
     chain, seen, nxt = [], {t["id"]}, t["follows"]
-    while nxt and nxt not in seen and len(chain) < FOLLOWS_CHAIN:
+    while nxt and nxt not in seen and len(seen) <= FOLLOWS_CHAIN:
         p = read_row("SELECT * FROM tasks WHERE id=?", (nxt,))
         if not p:
             break
-        chain.append(p)
+        if not narrowed_from(p, scope):
+            chain.append(p)
         seen.add(p["id"])
         nxt = p["follows"]
     return chain
@@ -11028,10 +11047,13 @@ MINE_REFUSALS = 8       # the refusals of one task, collapsed by tool and reason
 MINE_OUTCOMES = TERMINAL + ("not_accepted",)
 
 
-def follow_ups(task_id, depth=FOLLOWS_CHAIN):
-    """(the tasks that follow this one, how far the chain of follow-ups runs forward from it). The chain is the
-    circle-breaker: one follow-up is a fix, three in a row is the same work being tried again the same way."""
-    rows = read_rows("SELECT * FROM tasks WHERE follows=? ORDER BY id", (task_id,))
+def follow_ups(task_id, scope, depth=FOLLOWS_CHAIN):
+    """(the tasks that follow this one, how far the chain of follow-ups runs forward from it), for a session whose
+    list is `scope` (session_scope's): a narrowed pair's follow-up that is not its own is neither a row nor a hop
+    (narrowed_from). The chain is the circle-breaker: one follow-up is a fix, three in a row is the same work being
+    tried again the same way."""
+    shown = lambda rows: [r for r in rows if not narrowed_from(r, scope)]
+    rows = shown(read_rows("SELECT * FROM tasks WHERE follows=? ORDER BY id", (task_id,)))
     hops, seen, step = 0, {task_id}, rows
     while step and hops < depth:
         hops += 1
@@ -11039,13 +11061,14 @@ def follow_ups(task_id, depth=FOLLOWS_CHAIN):
         if last in seen:
             break
         seen.add(last)
-        step = read_rows("SELECT id FROM tasks WHERE follows=? ORDER BY id", (last,))
+        step = shown(read_rows("SELECT id, scope_person FROM tasks WHERE follows=? ORDER BY id", (last,)))
     return rows, hops
 
 
-def follows_line(task_id):
-    """One line on what followed a task, or none. A follow-up that was itself followed says so."""
-    rows, hops = follow_ups(task_id)
+def follows_line(task_id, scope=None):
+    """One line on what followed a task, or none, for a session whose list is `scope` (session_scope's). A follow-up
+    that was itself followed says so."""
+    rows, hops = follow_ups(task_id, scope)
     if not rows:
         return None
     said = "Followed by " + ", ".join(f"{tref(f['id'])} [{f['state']}] {clip(f['title'], 60)}" for f in rows)
@@ -11064,22 +11087,25 @@ def accepted_words(p):
     return " Its requester did NOT accept it" + (f": {clip(p['check_note'], 200)}" if p["check_note"] else ".")
 
 
-def mine_line(p):
+def mine_line(p, scope=None):
     """One finished task of an agent's own: how it ended, whether it was accepted and why not, and what followed it.
-    No progress note and no refusal: those are the session's own detail, which a lead reading its team must not get."""
+    No progress note and no refusal: those are the session's own detail, which a lead reading its team must not get.
+    scope: the reading session's list (session_scope's), for what followed it."""
     said = (f"  {tref(p['id'])} [{p['state']}] {clip(p['title'], 100)}" +
             (f", delivered {when(p['delivered'])}" if p["delivered"] else "") + "." + accepted_words(p))
     if p["what"]:
         said += f" What was done: {clip(p['what'], 160)}"
-    followed = follows_line(p["id"])
+    followed = follows_line(p["id"], scope)
     return said + (" " + followed if followed else "")
 
 
-def mine_tasks(who, want, find, count):
+def mine_tasks(who, want, find, count, scope=None):
     """(the newest `count` of them, how many there are): the finished tasks of one agent, by how they ended and by a
-    plain text search over their own words. task_owner_state is the index this reads by."""
+    plain text search over their own words. task_owner_state is the index this reads by. scope: the reading session's
+    list (session_scope's): a narrowed pair's task that is not its own is no row and no count (narrowed_from)."""
     marks = ",".join("?" * len(TERMINAL))
-    rows = read_rows(f"SELECT * FROM tasks WHERE owner=? AND state IN ({marks}) ORDER BY id DESC", (who, *TERMINAL))
+    rows = [p for p in read_rows(f"SELECT * FROM tasks WHERE owner=? AND state IN ({marks}) ORDER BY id DESC",
+                                 (who, *TERMINAL)) if not narrowed_from(p, scope)]
     if want == "not_accepted":
         rows = [p for p in rows if p["accepted"] == 0]
     elif want:
@@ -11108,8 +11134,9 @@ def refusal_lines(task_id, agent):
                   for (name, detail), n in list(kept.items())[:MINE_REFUSALS]]
 
 
-def mine_text(agent, who, want, find, count):
-    """An agent's own finished work, or, for a lead, one of its team's: the list, and what it is filtered by."""
+def mine_text(agent, who, want, find, count, scope=None):
+    """An agent's own finished work, or, for a lead, one of its team's: the list, and what it is filtered by, for a
+    session whose list is `scope` (session_scope's)."""
     mine = not who or who == agent
     if not mine:
         if role_of(agent) != "lead":
@@ -11128,7 +11155,7 @@ def mine_text(agent, who, want, find, count):
         many = MINE_TASKS if count in (None, "") else max(1, min(MINE_MAX, int(count)))
     except (TypeError, ValueError):
         raise ToolError(f"count must be a whole number, at most {MINE_MAX}.") from None
-    rows, total = mine_tasks(who or agent, want, find, many)
+    rows, total = mine_tasks(who or agent, want, find, many, scope)
     whose = "Your own" if mine else f"{who}'s"
     said = whose + " finished tasks" + (f" that ended {want}" if want and want != "not_accepted" else
                                         " that were delivered and not accepted" if want == "not_accepted" else "") + \
@@ -11136,7 +11163,7 @@ def mine_text(agent, who, want, find, count):
     if not rows:
         return (f"{said}: none. {whose} finished work is read here by how it ended (outcome=), by words "
                 f"(search=\"<words>\") or newest first (mine=true).")
-    out = [f"{said} ({len(rows)} of {total}, the newest first):"] + [mine_line(p) for p in rows]
+    out = [f"{said} ({len(rows)} of {total}, the newest first):"] + [mine_line(p, scope) for p in rows]
     if total > len(rows):
         out.append(f"({total - len(rows)} more: narrow it with outcome= or search=, or raise count up to {MINE_MAX}.)")
     out.append('task="T-<id>" gives one of your own in full, with what it sent outside and what was refused in it.'
@@ -11165,7 +11192,8 @@ def t_see_earlier_work(agent, a):
 def earlier_work_said(agent, a):
     """t_see_earlier_work's answer before its mask, made under the lock."""
     t = get_task(parse_task(a.get("task_id")), owner=agent)
-    chain = earlier_chain(t)
+    scope = session_scope(agent)        # a narrowed pair's task reaches only that pair's own session (narrowed_from)
+    chain = earlier_chain(t, scope)
     attempts = read_rows("SELECT * FROM attempts WHERE task=? AND attempt<? ORDER BY attempt", (t["id"], t["attempt"]))
     find = str(a.get("search") or "").strip().lower()
 
@@ -11173,7 +11201,7 @@ def earlier_work_said(agent, a):
     # outcome= and agent= only make sense here, so either of them means this list as plainly as mine=true does.
     who, want = str(a.get("agent") or "").strip(), str(a.get("outcome") or "").strip().lower()
     if who or want or str(a.get("mine")).lower() == "true":
-        return mine_text(agent, who, want, find, a.get("count"))
+        return mine_text(agent, who, want, find, a.get("count"), scope)
 
     # One task in full: the chain of this task, or one of your own, which also says what was refused in it.
     if a.get("task") not in (None, ""):
@@ -11183,14 +11211,14 @@ def earlier_work_said(agent, a):
         # for what is already over.
         p = next((x for x in chain if x["id"] == wanted), None) or \
             read_row(f"SELECT * FROM tasks WHERE id=? AND owner=? AND state IN ({marks})", (wanted, agent, *TERMINAL))
-        if not p:
+        if not p or narrowed_from(p, scope):        # the words of one that does not exist: nothing says it does
             raise ToolError(f"{tref(wanted)} is neither a task that {tref(t['id'])} follows nor a finished task of "
                             f"your own. " +
                             (f"It follows {', '.join(tref(x['id']) for x in chain)}. "
                              if chain else f"{tref(t['id'])} follows no task. ") +
                             "mine=true names your own finished tasks.")
         lines = task_in_full(p)
-        followed = follows_line(p["id"])
+        followed = follows_line(p["id"], scope)
         if followed:
             lines.append("  " + followed)
         if p["owner"] == agent:         # another agent's refusals are its own session's detail, never yours
@@ -11979,8 +12007,12 @@ def acts_for(agent, t):
 
 
 def requested_task(agent, task_id):
-    """get_task(requester=agent), with the manager acting for a lead that cannot (acts_for)."""
+    """get_task(requester=agent), with the manager acting for a lead that cannot (acts_for). A narrowed pair's task
+    that is not the calling session's own (narrowed_from) answers as a task that does not exist: its requester's
+    check_result and restart_task wrote on it, and anyone's refusal said that it exists."""
     t = get_task(task_id)
+    if narrowed_from(t, session_scope(agent), agent):
+        raise ToolError(f"There is no task {tref(task_id)}.")
     if not acts_for(agent, t):
         raise ToolError(f"{tref(task_id)} was not requested by you." + acting_session_words(t))
     return t
@@ -12060,6 +12092,9 @@ LEAD_LOOK_ROWS = 12
 
 def lead_overview(agent, parent):
     team = [n for n in agents() if task_giver(n) == agent]
+    # A narrowed pair's conversation task has this lead for its requester (task_giver), and its result holds the
+    # locked window's reply: it reaches only that pair's own session, so it is no row here (narrowed_from).
+    scope = session_scope(agent)
     # a worker reads the parts that it gave its peers (peer tasks), and has no team of its own
     out = [f"YOUR TEAM ({agent})"] if role_of(agent) != "worker" else [f"WHAT YOU GAVE YOUR PEERS ({agent})"]
     for name in team:
@@ -12090,8 +12125,8 @@ def lead_overview(agent, parent):
     out += ["  none"] if not rows else []
     # A lead's second task had no memory of its first, so it gave the same work out twice and asked a worker what
     # that worker had already answered. These are the tasks this lead requested, this session's subtasks apart.
-    earlier = q("SELECT * FROM tasks WHERE requester=? AND parent IS NOT ? AND created>? ORDER BY id DESC",
-                (agent, parent, now() - LEAD_LOOK_BACK * 86400))
+    earlier = [t for t in q("SELECT * FROM tasks WHERE requester=? AND parent IS NOT ? AND created>? ORDER BY id DESC",
+                            (agent, parent, now() - LEAD_LOOK_BACK * 86400)) if not narrowed_from(t, scope, agent)]
     out += ["", f"WHAT YOU GAVE OUT IN THE LAST {LEAD_LOOK_BACK} DAYS, OUTSIDE THIS TASK"]
     for t in earlier[:LEAD_LOOK_ROWS]:
         out.append(f"  {tref(t['id'])} [{t['state']}] {clip(t['title'], 80)} -- {t['owner']}"
@@ -12673,7 +12708,10 @@ def check_task(agent, a, by_goal=False):
     busy = desktop_refusal(owner, needs, agent, keep=by_goal)       # S3: create_task's own requester hears later
     if busy:
         raise ToolError(busy)
-    if follows and not q1("SELECT 1 FROM tasks WHERE id=?", (follows,)):
+    followed = read_row("SELECT id, scope_person FROM tasks WHERE id=?", (follows,)) if follows else None
+    if follows and (not followed or narrowed_from(followed, session_scope(agent))):
+        # A narrowed pair's task reaches only that pair's own session (narrowed_from): its words are no other task's
+        # start (warm_follows), and its refusal is the one of a task that does not exist.
         raise ToolError(f"There is no task {tref(follows)} to follow.")
     if len(why) > 300:
         raise ToolError("why is at most 300 characters.")
@@ -12845,6 +12883,8 @@ def t_cancel_task(agent, a):
     reason = str(a.get("reason") or "").strip() or "no reason given"
     guard(agent, reason)
     t = get_task(tid)
+    if narrowed_from(t, session_scope(agent), agent):      # as for a task that does not exist (requested_task)
+        raise ToolError(f"There is no task {tref(tid)}.")
     # peer tasks: the agent above both peers was told of a peer task, and may end it; it is no requester of it, so
     # it acts from any session of its own, but never from one that a person's conversation drives (peer_task_refusal)
     boss = bool(t["peer"]) and t["requester"] not in (agent, t["owner"]) and \
@@ -13326,7 +13366,7 @@ def t_see_team(agent, a):
     parent = lead_task(agent)
     # the door's holds are the manager's own (door_hold): in its answer, and not on the owner's board (overview_text)
     return lead_overview(agent, parent) if parent else \
-        overview_text() + (door_holds_text() if role_of(agent) == "manager" else "")
+        overview_text(session_scope(agent)) + (door_holds_text() if role_of(agent) == "manager" else "")
 
 
 USAGE_STALE = 900       # seconds: an account reading older than this is stale (helpers read limits every 300 seconds)
@@ -21908,12 +21948,14 @@ def narrowed_mark(conv):
 def narrowed_rows_sql(alias, scope):
     """(condition, args) on conversation_messages rows `alias` for a session's read: the rows that it may read of
     what a narrowed pair wrote. scope is session_scope's, or OWNER_VIEW: the owner reads all; a session with no list
-    reads no marked row; a narrowed session reads the rows with no mark and its own person's."""
+    reads no marked row; a narrowed session reads the rows with no mark and its own person's. Never NULL, so that its
+    negation lets no row through. (A line of the hub's that a session with more made before the first list, and that
+    nobody read then, is read at that list: person_scope_rows.)"""
     if scope == OWNER_VIEW:
         return "", ()
     if scope is None:
         return f"{alias}.scope_person IS NULL", ()
-    return f"({alias}.scope_person IS NULL OR {alias}.scope_person=?)", (scope["person"],)
+    return f"({alias}.scope_person IS NULL OR IFNULL({alias}.scope_person=?, 0))", (scope["person"],)
 
 
 NARROWED_SETTLED = "narrowed_rows_settled"      # kv: the newest message id that the one-time pass of the settle took
@@ -22087,7 +22129,10 @@ def person_scope_rows(p, scopes, t0):
     it works with the agent's own tools again: the owner widened it; and the person's messages that nobody answered
     lose their mark, so that the next window reads them (narrowed_adopted). A first list collects the open work that the
     conversation opened earlier, which ui_person ends right after the commit, and gives the open conversation task its
-    person, so that its result (the locked window's reply) and its records stay the narrowed pair's (section 5).
+    person, so that its result (the locked window's reply) and its records stay the narrowed pair's (section 5); it
+    reads the hub's lines that nobody read and the open conversation task's filed lines, and ends with the open work
+    an open conversation task that holds no message of the person. A list back to All takes a given-back message out
+    of a task that ended.
     Returns (those task rows, the ids of the conversations whose kept tokens go, the log lines that ui_person writes
     after the commit)."""
     in_transaction("person_scope_rows")
@@ -22112,14 +22157,61 @@ def person_scope_rows(p, scopes, t0):
         if convs and grants is None:
             # what nobody answered goes back with the pair, as its open task does (narrowed_adopted): a message that
             # waits must have a reader. Each reply, and each message that a reply answered, keeps its mark (section 5)
+            # A given-back message leaves a task that ended (a canceled conversation task keeps its person, so its
+            # records stay hidden): the task conditions of the reads would hide it and its reply again, and the next
+            # start would mark them again. The history row keeps a copy of the task, so it is indexed again.
             for cid in convs:
-                DB.execute("UPDATE conversation_messages SET scope_person=NULL WHERE conversation=? AND scope_person=? "
-                           f"AND {narrowed_adopted('conversation_messages')}", (cid, p["id"], cid))
+                given = f"conversation=? AND scope_person=? AND {narrowed_adopted('conversation_messages')}"
+                left = [r["id"] for r in read_rows(
+                    f"SELECT id FROM conversation_messages WHERE {given} AND task IS NOT NULL AND NOT EXISTS (SELECT 1 "
+                    f"FROM tasks t WHERE t.id=conversation_messages.task AND t.{OPEN_TASK})", (cid, p["id"], cid))]
+                DB.execute(f"UPDATE conversation_messages SET scope_person=NULL, task=(SELECT t.id FROM tasks t WHERE "
+                           f"t.id=conversation_messages.task AND t.{OPEN_TASK}) WHERE {given}", (cid, p["id"], cid))
+                for cm in left:
+                    history_rewrite("conversation", cm, cm_ref(cm))
             DB.execute(f"UPDATE tasks SET scope_person=NULL WHERE source_conversation IN ({marks}) AND {OPEN_TASK}",
                        tuple(convs))
         if convs and before is None:
             ended += read_rows(f"SELECT * FROM tasks WHERE source_conversation IN ({marks}) AND source_message IS NULL "
                                f"AND {OPEN_TASK}", tuple(convs))
+            # a line of the hub's that nobody read yet (a result of work of the time at All) is a session's with more:
+            # it is read now, so it never reaches the locked window, and no reply of that window gives it a new
+            # conversation task (conversation_task_end); so are the lines that the fleet filed under the open
+            # conversation task (its `say` events: a result, an agent's answer), which the window reads with the
+            # person's messages. An open conversation task that holds no message of the person (a line opened it)
+            # ends with the open work, as nothing would end it before a widening
+            lines = f"conversation IN ({marks}) AND read_at IS NULL AND who='action' AND event IS NOT NULL"
+            DB.execute(f"UPDATE events SET read_at=COALESCE(read_at,?) WHERE id IN (SELECT event FROM "
+                       f"conversation_messages WHERE {lines})", (t0, *convs))
+            DB.execute(f"UPDATE conversation_messages SET read_at=? WHERE {lines}", (t0, *convs))
+            # (not the owner's steer of that task, which is his guidance: the locked window reads it, and his app
+            # shows it read only once a session read it). An agent's message that this reads for nobody is told to
+            # its sender in one line, as end_waits tells it when a task ends first, with no word of the message
+            filed = (f"kind='say' AND read_at IS NULL AND task IN (SELECT id FROM tasks WHERE source_conversation IN "
+                     f"({marks}) AND source_message IS NOT NULL AND {OPEN_TASK}) AND id NOT IN (SELECT event_id FROM "
+                     f"steers WHERE event_id IS NOT NULL)")
+            unread = read_rows(f"SELECT m.*, (SELECT task FROM events WHERE id=m.event_id) AS e_task FROM "
+                               f"agent_messages m WHERE m.event_id IN (SELECT id FROM events WHERE {filed})",
+                               tuple(convs))
+            DB.execute(f"UPDATE events SET read_at=? WHERE {filed}", (t0, *convs))
+            for m in unread:
+                open_ = read_row(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (m["sender_task"],)) \
+                    if m["sender_task"] else None
+                if m["waits"] == 1 and m["wait_end"] is None:
+                    DB.execute("UPDATE agent_messages SET wait_end=? WHERE id=?",
+                               (f"{tref(m['e_task'])} will not read it", m["id"]))
+                    log_row("hub", f"the wait of AM-{m['id']} ended: {tref(m['e_task'])} will not read it")
+                    line = (f"[hub] AM-{m['id']} will get no answer: {tref(m['e_task'])} will not read it. Go on "
+                            f"without it, or {wait_next(m['sender'])}.") if open_ else None
+                else:
+                    line = f"[hub] AM-{m['id']} reached {tref(m['e_task'])}, which will not read it." \
+                        if m["waits"] is None and (open_ or role_of(m["sender"]) == "manager") else None
+                if line:
+                    task = m["sender_task"] if open_ else None
+                    event_rows([(m["sender"], "say", filed_about(m["sender"], "say", task), line, None)], t0)
+            ended += read_rows(f"SELECT * FROM tasks WHERE source_conversation IN ({marks}) AND source_message IS NOT "
+                               f"NULL AND {OPEN_TASK} AND NOT EXISTS (SELECT 1 FROM conversation_messages m WHERE "
+                               f"m.task=tasks.id AND m.who='person')", tuple(convs))
             DB.execute(f"UPDATE tasks SET scope_person=? WHERE source_conversation IN ({marks}) AND source_message IS "
                        f"NOT NULL AND scope_person IS NULL AND {OPEN_TASK}", (p["id"], *convs))
         dropped += convs
@@ -43327,11 +43419,12 @@ CIRCLE_SHOWN = 10
 
 
 def circle_chain(t):
-    """The follows chain that ends at task row `t`, nearest first, and a few more than it takes to be a circle."""
+    """The follows chain that ends at task row `t`, nearest first, and a few more than it takes to be a circle. It
+    stops at a narrowed pair's task, which the manager's notice does not name (narrowed_from)."""
     chain, seen, nxt = [t], {t["id"]}, t["follows"]
     while nxt and nxt not in seen and len(chain) <= CIRCLE_CHAIN + 3:
         p = q1("SELECT * FROM tasks WHERE id=?", (nxt,))
-        if not p:
+        if not p or narrowed_from(p, None):
             break
         chain.append(p)
         seen.add(p["id"])
@@ -43357,6 +43450,8 @@ def circles(t0):
     # 2. a follows chain that keeps failing
     for t in q(f"SELECT * FROM tasks WHERE follows IS NOT NULL AND (outcome IN ('failed','rejected') OR accepted=0) "
                f"AND NOT ({OPEN_TASK}) ORDER BY id"):
+        if narrowed_from(t, None):
+            continue                # the manager's notice names no narrowed pair's task (narrowed_from)
         chain = circle_chain(t)
         if len(chain) >= CIRCLE_CHAIN:
             found.append((f"chain:{t['id']}",
@@ -43368,6 +43463,8 @@ def circles(t0):
     # that counted (plan C6), and at CIRCLE_RESTARTS the hub restarts it no more by itself. A task whose sessions
     # are lost while they work is no circle: its requester gets a quiet note every LOST_NOTE losses (session_lost).
     for t in q(f"SELECT * FROM tasks WHERE restarts>=? AND {OPEN_TASK} ORDER BY id", (CIRCLE_RESTARTS,)):
+        if narrowed_from(t, None):
+            continue
         found.append((f"restarts:{t['id']}:{t['restarts']}",
                       f"{tref(t['id'])} ({t['owner']}) lost {t['restarts']} sessions in a row that left nothing and is "
                       f"still {t['state']}: {clip(t['title'], 100)}"))
@@ -46429,11 +46526,16 @@ def call_tool(agent, name, args, context=None):
 
 # ---------------------------------------------------------------- overview and board
 
-def overview_text():
+def overview_text(scope):
+    """The fleet's team and its open work: the owner's read (OWNER_VIEW, his overview route), or an agent's see_team
+    with its session's list (session_scope's), which a narrowed pair's task does not reach (narrowed_from): no id, no
+    title, no result."""
+    shown = (lambda t: True) if scope == OWNER_VIEW else (lambda t: not narrowed_from(t, scope))
     out = ["TEAM"]
     for name, a in agents().items():
         row = q1("SELECT * FROM agents WHERE name=?", (name,))
-        running = q("SELECT id FROM tasks WHERE owner=? AND state IN ('working','input-required','submitted')", (name,))
+        running = [r for r in q("SELECT id, scope_person FROM tasks WHERE owner=? AND state IN ('working',"
+                                "'input-required','submitted')", (name,)) if shown(r)]
         lim = active_limit(name)
         out.append(f"  {name}{'' if agent_active(name) else ' (in setup: no tasks)'}: {a.get('role')}"
                    + (f" ({a['title']})" if a.get("title") else "") + f", {a.get('runtime')} on {a.get('machine')}, can: "
@@ -46445,7 +46547,8 @@ def overview_text():
                       f"; AT ITS USAGE LIMIT until {clock(lim['until'])}" if lim else ""))
     out.append("")
     out.append("OPEN TASKS")
-    rows = q("SELECT * FROM tasks WHERE state NOT IN ('completed','failed','rejected','canceled') ORDER BY id")
+    rows = [t for t in q("SELECT * FROM tasks WHERE state NOT IN ('completed','failed','rejected','canceled') ORDER BY "
+                         "id") if shown(t)]
     for t in rows:
         note = q1("SELECT text FROM notes WHERE task=? ORDER BY id DESC LIMIT 1", (t["id"],))
         hold = active_hold(t["id"])
@@ -46472,7 +46575,7 @@ def overview_text():
     # manager any task it did not request, but for a lead that cannot check it any more (lead_left).
     rows = [t for t in q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected') AND accepted IS NULL "
                          "ORDER BY id")
-            if (t["requester"] or manager_name()) == manager_name() or lead_left(t["requester"], t)]
+            if shown(t) and ((t["requester"] or manager_name()) == manager_name() or lead_left(t["requester"], t))]
     for t in rows:
         out.append(f"  {tref(t['id'])} [{t['state']}] {t['title']} by {t['owner']}: {t['what']} "
                    f"Output: {t['where_'] or '-'}. Checked: {t['how'] or '-'}")
@@ -46483,8 +46586,8 @@ def overview_text():
     out.append("")
     out.append("OPEN QUESTIONS")
     # A question of a task that has ended waits for nothing, and stood here for ever.
-    rows = q(f"SELECT * FROM questions WHERE answer IS NULL AND task IN (SELECT id FROM tasks WHERE {OPEN_TASK}) "
-             f"ORDER BY id")
+    rows = [r for r in q(f"SELECT * FROM questions WHERE answer IS NULL AND task IN (SELECT id FROM tasks WHERE "
+                         f"{OPEN_TASK}) ORDER BY id") if shown(get_task(r["task"]))]
     for r in rows:
         holder = r["requester"]
         out.append(f"  Q-{r['id']} from {r['asker']} on {tref(r['task'])}, waiting {ago(r['asked'])}"
@@ -46501,8 +46604,8 @@ def overview_text():
         out.append("  none")
     out.append("")
     out.append("PERMISSION PROMPTS WAITING")
-    rows = q("SELECT p.*, t.requester FROM prompts p LEFT JOIN tasks t ON t.id=p.task WHERE p.decision IS NULL "
-             "ORDER BY p.id")
+    rows = [r for r in q("SELECT p.*, t.requester, t.scope_person FROM prompts p LEFT JOIN tasks t ON t.id=p.task "
+                         "WHERE p.decision IS NULL ORDER BY p.id") if shown(r)]
     for r in rows:
         out.append(f"  P-{r['id']} from {r['agent']} on {tref(r['task'])}"
                    + ((f", for {r['requester']} to decide" if not r["task"] or
@@ -74706,7 +74809,7 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["board.txt"]:
             if not self.owner_allowed():
                 return
-            return self.send(200, overview_text() + "\n", "text/plain; charset=utf-8")
+            return self.send(200, overview_text(OWNER_VIEW) + "\n", "text/plain; charset=utf-8")
         if parts == ["health"]:
             return self.json(200, {"ok": True, "agents": list(agents())})
         if parts[:1] == ["mcp"]:
