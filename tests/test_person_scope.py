@@ -622,6 +622,22 @@ class Narrowed(Base):
                       f"{hub.CONVERSATION_NOT_NARROWED}", (lynx["id"], reply))
         self.assertEqual(sorted((r["id"], r["scope_person"]) for r in shown), [(lynx["id"], None), (reply, None)])
 
+    @unittest.expectedFailure       # the hole is late_permission_word's (lanes/fleet-awareness.md): its fix ends this
+    def test_a_late_decision_on_a_narrowed_task_brings_no_words_of_its_decider(self):
+        """The Chat area's privacy review: a decision that comes after a permission prompt of a narrowed task expired
+        is written into that task (late_permission_word), and its locked window reads it. Its decider is the task's
+        requester, a session with more than the list, so a line in that task says at most that a late decision came, with
+        no reason. The bug: the decider's own words reach the narrowed window."""
+        t = self.conversation_task(self.says(PAT, "Please fix the form of the CRM")["conversation"])
+        prompt = hub.ins("INSERT INTO prompts(task,agent,tool,input,key,created,decision) VALUES(?,'studio','Bash',"
+                         "'{}','k',?,'expired')", (t["id"], hub.now()))
+        text, error = hub.call_tool("manager", "decide_permission", {"prompt_id": f"P-{prompt}", "decision": "allow",
+                                                                    "reason": "the alpaca budget is approved"})
+        self.assertTrue(error, text)            # a late decision decides nothing
+        said = [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='studio' AND kind='say' AND task=?",
+                                          (t["id"],))]
+        self.assertFalse([line for line in said if "alpaca" in line], said)
+
     def test_no_session_waits_for_a_narrowed_persons_answer(self):
         theirs = self.says(KIM, "Hello", account="discord-studio")["conversation"]
         text, error = self.tool("message_contact", self.context(theirs), person="Pat", text="Is it fixed?", waits=True,
@@ -667,6 +683,106 @@ class Owner(Base):
         code, data = self.scopes({f"repo:{REPO}": "write"}, agent="vps")      # not on Pat's list
         self.assertEqual(code, 400, data)
         self.assertEqual(hub.q("SELECT * FROM person_scopes"), [])
+
+    def test_an_answer_to_what_the_pairs_task_asked_before_a_first_list_does_not_come_into_it(self):
+        """Person access plan, section 5: a task that a narrowed person's words drive reads no other person's or agent's
+        words. The window asked Kim and the agent vps, each with waits, before the owner gave Pat a first list; their
+        answers came after it. Each answer stays where it belongs (Kim's in her own conversation, vps's in studio's chat
+        window), the waits end, and the task hears only that an answer came. The bug: the answer went into the waiting
+        task (conversation_waiting_rows, agent_delivery), whose locked window then read it."""
+        self.person("Kim", "manager", KIM, app="discord")
+        cid = self.says(PAT, "Is order 7781 paid? Ask Kim.")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("message_contact", self.context(cid), person="Kim", text="Is order 7781 paid?",
+                request_id=str(uuid.uuid4()), waits=True)
+        text, error = hub.call_tool("studio", "message_agent", {"agent": "vps", "text": "Is the 7781 refund deployed?",
+                                                               "waits": True, "request_id": str(uuid.uuid4())},
+                                    self.context(cid))
+        self.assertFalse(error, text)
+        asked = hub.q1("SELECT id FROM agent_messages WHERE sender='studio' ORDER BY id DESC LIMIT 1")["id"]
+        task = self.conversation_task(cid)["id"]
+        code, data = self.scopes({f"repo:{REPO}": "read"})          # the owner's first list for Pat
+        self.assertEqual(code, 200, data)
+        self.assertEqual(hub.task_scope(hub.q1("SELECT * FROM tasks WHERE id=?", (task,)))["person"], self.pat["id"])
+        self.assertEqual(self.inbound(text="Order 7781 is paid, the wombat way.", account="discord-studio",
+                                      sender=KIM, chat="dm-9")[0], "stored")
+        vps_task, theirs = self.normal_task(owner="vps", title="Deploy the refunds")
+        text, error = hub.call_tool("vps", "message_agent", {"agent": "studio", "text": "The quokka build of 7781 is "
+                                                             "deployed.", "in_reply_to": f"AM-{asked}",
+                                                             "request_id": str(uuid.uuid4())}, theirs)
+        self.assertFalse(error, text)
+        # a second answer to the same message: the wait is over already, so the task hears nothing more
+        text, error = hub.call_tool("vps", "message_agent", {"agent": "studio", "text": "And the quokka logs are kept.",
+                                                             "in_reply_to": f"AM-{asked}",
+                                                             "request_id": str(uuid.uuid4())}, theirs)
+        self.assertFalse(error, text)
+        # and a new message of vps from a task that the pair's task requested (a link of plan C11) goes there neither:
+        # that task is no link, so the one other link takes it, with no question which of two
+        hub.q("UPDATE tasks SET requester='studio', parent=? WHERE id=?", (task, vps_task))
+        mine, _ = self.normal_task(title="Check the refund log")
+        hub.q("UPDATE tasks SET requester='vps', parent=? WHERE id=?", (vps_task, mine))    # vps's own subtask
+        text, error = hub.call_tool("vps", "message_agent", {"agent": "studio", "text": "The numbat check passed.",
+                                                             "request_id": str(uuid.uuid4())}, theirs)
+        self.assertFalse(error, text)
+        self.assertTrue(hub.q1("SELECT 1 FROM events WHERE task=? AND kind='say' AND text LIKE '%numbat%'", (mine,)))
+        lines = [r["text"] for r in hub.q("SELECT text FROM events WHERE task=? AND kind='say'", (task,))]
+        for word in ("wombat", "quokka", "numbat"):
+            self.assertFalse([line for line in lines if word in line], (word, lines))
+        self.assertEqual(sum(hub.NARROWED_ANSWER.split("{ref}")[1] in line for line in lines), 2, lines)
+        self.assertIsNone(hub.q1("SELECT 1 FROM conversation_messages WHERE conversation=? AND waits IS NOT NULL",
+                                 (hub.q1("SELECT conversation FROM conversation_messages WHERE text LIKE '%wombat%'")
+                                  ["conversation"],)))
+        said = hub.q1("SELECT event FROM conversation_messages WHERE text LIKE '%wombat%'")
+        self.assertIsNotNone(said["event"])                 # Kim's window has her answer as any message of hers
+        ended = hub.q1("SELECT state, waiting_on FROM tasks WHERE id=?", (task,))
+        self.assertEqual((ended["state"], ended["waiting_on"]), ("working", None))
+        self.assertTrue(hub.q1("SELECT wait_end FROM agent_messages WHERE id=?", (asked,))["wait_end"])
+        # the chat window's read finds vps's answer by its own event (agent_messages.event_id)
+        self.assertEqual(hub.q1("SELECT e.kind FROM agent_messages m JOIN events e ON e.id=m.event_id WHERE m.text "
+                                "LIKE '%quokka%'")["kind"], "chat")
+        self.assertTrue(hub.q1("SELECT 1 FROM events WHERE agent='studio' AND kind='chat' AND text LIKE '%quokka%'"))
+        hub.conversation_start("studio", cid)
+        text = self.ok("read_messages", self.context(cid))
+        for word in ("wombat", "quokka"):
+            self.assertNotIn(word, text)
+        # and Kim's own window reads what the agent asked her, with her answer, though Pat's task asked it
+        kim_cid = hub.q1("SELECT conversation FROM conversation_messages WHERE text LIKE '%wombat%'")["conversation"]
+        hub.conversation_start("studio", kim_cid)
+        brief = self.ok("read_messages", self.context(kim_cid))
+        self.assertIn("Is order 7781 paid?", brief)
+        self.assertIn("wombat", brief)
+        # nor does an agent that gave the pair's task reach it by its id (same_work_note names no such road)
+        hub.q("UPDATE tasks SET requester='vps' WHERE id=?", (task,))
+        self.assertFalse(hub.given_reach("vps", "studio", task))
+        self.assertEqual(hub.same_work("studio", None, f"Go on with {hub.tref(task)}."), [])     # no note names it
+
+    def test_the_next_wait_takes_an_answer_that_a_narrowed_task_waited_for(self):
+        """An answer that a narrowed pair's task waited for goes to the next task that waits in that conversation, and
+        each wait of the narrowed task there ends, also the newer one that its waiting_on names. The bugs: the narrowed
+        wait used the answer up and left the other task waiting; a task that asked twice stayed input-required."""
+        self.person("Kim", "manager", KIM, app="discord")
+        cid = self.says(PAT, "Ask Kim about order 7781.")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        for words in ("Is order 7781 paid?", "And is it shipped?"):
+            self.ok("message_contact", self.context(cid), person="Kim", text=words, request_id=str(uuid.uuid4()),
+                    waits=True)
+        task = self.conversation_task(cid)["id"]
+        other, theirs = self.normal_task(title="Check order 7781")
+        self.reads(theirs, "Kim")
+        self.ok("message_contact", theirs, person="Kim", text="Can I close 7781?", request_id=str(uuid.uuid4()),
+                waits=True)
+        code, data = self.scopes({f"repo:{REPO}": "read"})          # the owner's first list for Pat
+        self.assertEqual(code, 200, data)
+        self.assertEqual(self.inbound(text="Yes, 7781 is the dingo case: close it.", account="discord-studio",
+                                      sender=KIM, chat="dm-9")[0], "stored")
+        mine = [r["text"] for r in hub.q("SELECT text FROM events WHERE task=? AND kind='say'", (task,))]
+        self.assertFalse([line for line in mine if "dingo" in line], mine)
+        self.assertTrue([line for line in mine if hub.NARROWED_ANSWER.split("{ref}")[1] in line], mine)
+        ended = hub.q1("SELECT state, waiting_on FROM tasks WHERE id=?", (task,))
+        self.assertEqual((ended["state"], ended["waiting_on"]), ("working", None))
+        self.assertTrue(hub.q1("SELECT 1 FROM events WHERE task=? AND kind='say' AND text LIKE '%dingo%'", (other,)))
 
     def test_a_list_is_written_read_and_set_back_to_all(self):
         code, data = self.scopes({f"repo:{REPO}": "read", f"secret:{LOGIN}": "use"})
@@ -722,6 +838,25 @@ class Owner(Base):
         self.assertIsNone(hub.q1("SELECT scope_person FROM tasks WHERE id=?", (open_task["id"],))["scope_person"])
 
 
+    def test_a_first_list_ends_the_wait_of_a_message_that_nobody_will_read(self):
+        """Fable's round 4: a message that another agent's open task sent with waits=true, filed under the open
+        conversation task, is read for nobody at the first list (the locked window must not read it), so its wait
+        ends there and its asker hears it once, in its own task, with no word of the message. The bug: the asker's
+        task waits for an answer that never comes."""
+        said = self.says(PAT, "Hi")
+        asker, _ = self.normal_task(owner="vps", title="Ask studio about the stock")
+        event = hub.ins(hub.EVENT, ("studio", "say", said["task"], "[message from vps] How many otters are in stock?",
+                                    hub.now(), "{}"))
+        message = hub.ins("INSERT INTO agent_messages(sender,sender_task,recipient,text,created,request_id,event_id,"
+                          "waits) VALUES('vps',?,'studio','How many otters are in stock?',?,?,?,1)",
+                          (asker, hub.now(), str(uuid.uuid4()), event))
+        self.assertEqual(self.scopes({f"repo:{REPO}": "write"})[0], 200)
+        self.assertIsNotNone(hub.q1("SELECT wait_end FROM agent_messages WHERE id=?", (message,))["wait_end"])
+        told = [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='vps' AND task=? AND kind='say'",
+                                         (asker,))]
+        self.assertEqual(told, [f"[hub] AM-{message} will get no answer: T-{said['task']} will not read it. Go on "
+                                f"without it, or {hub.wait_next('vps')}."])
+
     def test_a_first_list_ends_a_conversation_task_that_holds_no_message_of_the_person(self):
         """Fable's review of bf422aead: a conversation task that only a line of the hub's opened (a result of work of
         the time at All) waits on no message of the person, so nothing would end it before a widening: a first list
@@ -752,7 +887,9 @@ class Owner(Base):
         fleet filed under the open task, and an unread line keeps the conversation task open after the window's
         answer; or the first list ends the open task, whose message the old window read and did not answer yet; or it
         reads for nobody the owner's steer of that task, which the window must follow; or it reads an agent's message
-        there for nobody, and its sender never hears that nobody will."""
+        there for nobody, and its sender never hears that nobody will; or it finds a late record of the revoked wide
+        window's session, which the time rule lets through when it comes after the list (Fable's decision (a): no
+        session record of a conversation task is a narrowed session's)."""
         hello = self.says(PAT, "Hi there")
         ended = hello["task"]
         self.answers(hello["conversation"], hello["id"], "Hello Pat.")          # a window with the agent's tools
@@ -791,13 +928,19 @@ class Owner(Base):
         self.assertEqual([r["text"] for r in told], [f"[hub] AM-{message} reached T-{open_one}, which will not read "
                                                      f"it."])          # its sender hears it, with no word of it
         self.assertIsNone(hub.q1("SELECT read_at FROM events WHERE id=?", (steer,))["read_at"])
-        narrowed = record(open_one, hub.now() + hub.CONVERSATION_RECORD_SKEW + 1, "The koala branch is ready.")
+        # a late record of the revoked wide window, filed under the task that now has the person: a locked window
+        # sends no session record, so every one of a conversation task is a wide window's
+        late = record(open_one, hub.now() + hub.CONVERSATION_RECORD_SKEW + 1, "The koala branch is ready.")
+        # and a call record of the list's own time, which the narrowed session made (its call_api)
+        call = hub.ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,'studio',?,1,"
+                       "'call_api',?,1,'200 OK')", (hub.now() + hub.CONVERSATION_RECORD_SKEW + 1, open_one,
+                                                    json.dumps({"url": "https://api.example.com/jaguar"})))
         here = self.context(hello["conversation"])
-        self.assertEqual([self.found(here, w) for w in ("launchpad", "capybara", "ocelot", "serval", "koala", "thing")],
-                         [False, False, False, False, True, True])
-        for ref in at_all:
+        self.assertEqual([self.found(here, w) for w in ("launchpad", "capybara", "ocelot", "serval", "koala", "jaguar",
+                                                        "thing")], [False, False, False, False, False, True, True])
+        for ref in at_all + (late,):
             self.assertIn("is not in your history", self.ok("read_history", here, ref=f"TR-{ref}"))
-        self.assertIn("koala", self.ok("read_history", here, ref=f"TR-{narrowed}"))
+        self.assertIn("jaguar", self.ok("read_history", here, ref=f"CR-{call}"))
         # the line of the hub's that nobody read, and the line filed under the open task, were read at the first list:
         # the locked window never gets them, and its answer to the person's message ends the open task, which no
         # unread line keeps open

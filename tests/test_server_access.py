@@ -1779,6 +1779,27 @@ class DoorCalls(Access):
         self.assertEqual(len(said("vps", own)), 1)                  # the answer of its question, once
         self.assertNotIn("the task that the card is for", said("manager")[-1])
 
+    def test_a_long_script_comes_to_the_owner_one_part_at_a_time(self):
+        """The owner, 21 November 2026, after six cards of one 13,152-character root script came at once, each with
+        the same title and task, so that each read as the last one again: "One part at a time". Bug: the manager
+        raises the door's card of the next part while the card of the same task is still open on the same server."""
+        self.grant(agent="vps", server="web-1", level="fix")
+        task = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Set up the worker','vps','working')")
+
+        def card(script, **more):
+            c = run_card(script=script, **more)
+            hub.q("UPDATE door_record SET task=? WHERE call=?", (f"T-{task}", c["door_call"]))
+            return c
+        nid = int(hub.t_raise_needs_you("manager", card("echo part one\n")).split("N-")[1].split(".")[0])
+        with self.assertRaises(hub.ToolError) as refused:
+            hub.t_raise_needs_you("manager", card("echo part two\n", why="Part 2 of 2."))
+        self.assertIn(f"N-{nid}, the door's card of the same task on web-1, is still open: the owner gets one part at "
+                      f"a time.", str(refused.exception))
+        self.grant(agent="vps", server="web-2", level="fix")       # another server's job is not a part of this one
+        self.assertIn("N-", hub.t_raise_needs_you("manager", card("echo other job\n", host="web-2")))
+        hub.q("UPDATE needs SET answer='Run it once', answered=? WHERE id=?", (hub.now(), nid))     # the owner answered
+        self.assertIn("N-", hub.t_raise_needs_you("manager", card("echo part two\n", why="Part 2 of 2.")))
+
     def test_the_door_s_card_names_the_task_that_asked_after_its_title(self):
         """Incident intake, part 3 (the owner, 14 November 2026, "Yes, as shown", to that title with the name of
         a server of his and of one of his tasks). On 13 November two cards for one server had one title. The title that the Mac

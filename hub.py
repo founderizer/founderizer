@@ -16283,6 +16283,17 @@ def t_raise_needs_you(agent, a):
         # the title names it only on the card of a run, whose title the owner's Mac signs under
         asking = door_asking_task(door_call, qu) if door_call else None
         door_task = door_task_words(asking["title"]) if asking and door_host else None
+        # one part at a time (the owner's choice of 21 November 2026, after six cards of one 13,152-character script
+        # came at once and each looked like the last one again): a run's card waits until the owner has answered the
+        # door's card that the same task has open on the same server
+        if door_host and asking:
+            open_card = read_row("SELECT id FROM needs WHERE door_host=? AND door_task_id=? AND answer IS NULL",
+                                 (door_host, asking["id"]))
+            if open_card:
+                raise ToolError(f"N-{open_card['id']}, the door's card of the same task on {door_host}, is still open: the owner gets "
+                                f"one part at a time. Raise this one after the owner has answered that card and the "
+                                f"agent has run it, and say in why which part it is (Part 2 of 6). If that card is not "
+                                f"needed any more, close it first: answer its question, or use withdraw_need.")
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,door_host,github_app,"
                   "add_device,github_key,details,multi,door_script,door_task,door_task_id,key_swap_server,give_agent,"
                   "give_level,give_repos,recommended) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -21277,6 +21288,20 @@ def agent_message_view(m):
             "in_reply_to": am_ref(m["in_reply_to"]), "created": m["created"], "read_at": m["read_at"]}
 
 
+# What a task that a narrowed person's words drive hears of an answer to what it asked before the owner narrowed them:
+# that it came, and no word of it (conversation_waiting_rows, agent_delivery).
+NARROWED_ANSWER = ("[hub] The answer to {ref} came, and it does not come into this task: this task carries a narrowed "
+                   "person's list now, and reads no words of another person or another agent. Your wait for it is "
+                   "over.")
+
+
+def narrowed_task(task_id):
+    """task_scope of the task with this id: its narrowed person's list, or None. read_row only: safe anywhere, also
+    inside a transaction, whose writes never change these columns."""
+    return task_scope(read_row("SELECT id, owner, scope_person, source_conversation FROM tasks WHERE id=?",
+                               (task_id,)))
+
+
 def agent_delivery(m, parent, t0, linked=None, as_data=None):
     """Inside a transaction: the event of one agent message (16.2). The manager gets a say event. A worker or a lead
     gets it in the task session that sent the message that this one answers, while that task is open; else in its chat
@@ -21299,6 +21324,8 @@ def agent_delivery(m, parent, t0, linked=None, as_data=None):
     said = f'"{m["text"]}"' if as_data else m["text"]
     text = f"[message from {m['sender']}{on} id=AM-{m['id']}{waits}{data}] {said}"
     to = m["recipient"]
+    if linked and narrowed_task(linked[0]) is not None:
+        linked = None   # no colleague's words go into a task that a narrowed person's words drive: the chat window
     if linked:          # plan C11: into the recipient's task that the hub links to the sender's, with what it may do
         task, relation, limit = linked
         about = f", {relation}," if relation else ""
@@ -21309,7 +21336,13 @@ def agent_delivery(m, parent, t0, linked=None, as_data=None):
         return DB.execute(EVENT, (to, "say", None, text, t0, "{}")).lastrowid
     task = parent["sender_task"] if parent and parent["sender"] == to else None
     if task and DB.execute(f"SELECT 1 FROM tasks WHERE id=? AND owner=? AND {OPEN_TASK}", (task, to)).fetchone():
-        return DB.execute(EVENT, (to, "say", task, text, t0, "{}")).lastrowid
+        if narrowed_task(task) is None:
+            return DB.execute(EVENT, (to, "say", task, text, t0, "{}")).lastrowid
+        # a task that a narrowed person's words drive now reads no colleague's words (person access plan, section 5):
+        # the answer goes to the agent's chat window, as an answer with no task does, and a wait of the task's hears
+        # once that it is over, with no word of the answer
+        if parent["waits"] and not parent["wait_end"]:
+            DB.execute(EVENT, (to, "say", task, NARROWED_ANSWER.format(ref=f"AM-{parent['id']}"), t0, "{}"))
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     return DB.execute(EVENT, (to, "chat", None, text, t0, json.dumps({
         "generation": generation["v"] if generation else None, "agent_message": m["id"]}))).lastrowid
@@ -21358,9 +21391,11 @@ def given_reach(agent, to, task_id):
     """True when the words of this session of `agent` reach the open task `task_id` of `to` by its id: `agent` gave
     that task (given_task), from any session of its own. Not from a session whose Shell box is off, which reads
     strangers' text, and not from one that a person's conversation drives: their words are no order for another
-    agent's task (peer_task_refusal). linked_choice opens the road with it, and same_work_note names the road only
+    agent's task (peer_task_refusal). Never to a task that a narrowed person's words drive now, which reads no
+    colleague's words (agent_delivery). linked_choice opens the road with it, and same_work_note names the road only
     where it is open."""
-    return not shell_off(agent) and not contact_session(agent) and given_task(agent, to, task_id)
+    return not shell_off(agent) and not contact_session(agent) and given_task(agent, to, task_id) and \
+        narrowed_task(task_id) is None
 
 
 # The ids that a task's words name: a task (T-7), a report (D-3), a case (C-12, also after its duty: R-5/C-12).
@@ -21389,8 +21424,10 @@ def same_work(owner, tid, words, case_id=None):
     found.discard(tid)
     if not found:
         return []
-    return q(f"SELECT id, title FROM tasks WHERE owner=? AND {OPEN_TASK} AND id IN ({','.join('?' * len(found))}) "
-             f"ORDER BY id LIMIT ?", (owner, *sorted(found), SAME_WORK_MOST))
+    rows = q(f"SELECT id, title FROM tasks WHERE owner=? AND {OPEN_TASK} AND id IN ({','.join('?' * len(found))}) "
+             f"ORDER BY id", (owner, *sorted(found)))
+    # never a task that a narrowed person's words drive: its title names that person, and no colleague's words reach it
+    return [r for r in rows if narrowed_task(r["id"]) is None][:SAME_WORK_MOST]
 
 
 def same_work_note(agent, owner, tid, a, f):
@@ -21426,7 +21463,8 @@ def linked_choice(agent, tid, to, to_task):
     """(task id, relation, limit) of the recipient's task that a new message goes to (plan C11), or None for its chat
     window as before. Refused: a to_task that is not linked, several links with none named, and a task that waits on
     the sender's own answer or decision."""
-    links = linked_tasks(agent, tid, to)
+    # no colleague's words go into a task that a narrowed person's words drive (agent_delivery): it is no link
+    links = {k: v for k, v in linked_tasks(agent, tid, to).items() if narrowed_task(k) is None}
     if to_task not in (None, ""):
         want = parse_task(to_task)
         if want not in links and given_reach(agent, to, want):
@@ -22896,11 +22934,15 @@ def conversation_newest(cid):
 # a message of such a task, and each row that carries the pair's mark (narrowed_mark: also a message that came while
 # the owner had paused the conversation, which no task holds, and the reply to it). history_scope_sql hides that
 # pair's records for good, and so does a read of their conversation for any session but their own locked one. The
-# task conditions stay beside the mark: a hub's line of a narrowed task carries no mark, and the task hides it.
+# task conditions stay beside the mark: a hub's line of a narrowed task carries no mark, and the task hides it. They
+# hold in that pair's own conversation only: a row in another person's conversation that names the pair's task came
+# from before the list (a narrowed session has no message_contact), and that person's window reads it.
 CONVERSATION_NOT_NARROWED = (
-    "NOT EXISTS (SELECT 1 FROM tasks n WHERE n.id=conversation_messages.task AND n.scope_person IS NOT NULL) AND NOT "
+    "NOT EXISTS (SELECT 1 FROM tasks n WHERE n.id=conversation_messages.task AND n.scope_person IS NOT NULL AND "
+    "n.source_conversation=conversation_messages.conversation) AND NOT "
     "EXISTS (SELECT 1 FROM conversation_messages a JOIN tasks n ON n.id=a.task WHERE "
-    "a.id=conversation_messages.reply_to AND n.scope_person IS NOT NULL) AND conversation_messages.scope_person IS NULL")
+    "a.id=conversation_messages.reply_to AND n.scope_person IS NOT NULL AND n.source_conversation=a.conversation) AND "
+    "conversation_messages.scope_person IS NULL")
 
 
 def conversation_since(cid, mark, before=None, others_of=None, narrowed=False, own_task=None):
@@ -24651,7 +24693,10 @@ def conversation_records(agent, cid, generation, attempt, session, events):
     C-<cid> (threads.Tailer, helper feature conversation_tasks). Each record belongs to the conversation task of its
     time, the newest one that had begun by then, and is kept and counted for it as for any task's session: its
     records, its turn state (which running_turns reads), its activity and a usage limit. A conversation task gets no
-    turn-end chase (turn_end_check). (status, answer) of the route."""
+    turn-end chase (turn_end_check). A locked narrowed window sends no record: it runs closed, with no session id,
+    so its helper tails none of it (fleet.Helper.task_windows). The narrowed history depends on that, and shows no
+    session record of a conversation task, since each one is a window's with the agent's own tools
+    (history_scope_sql). (status, answer) of the route."""
     if generation != kv_get("db_id"):
         return 409, {"error": "hub generation changed"}
     if not q1("SELECT 1 FROM conversations WHERE id=? AND agent=?", (cid, agent)) or str(attempt) != str(cid):
@@ -24979,18 +25024,32 @@ def conversation_waiting_rows(conv, person, cm, text, t0):
     when nothing waits. Its header names what came with the words (conversation_header, from the row), which this
     session does not open."""
     in_transaction("conversation_waiting_rows")
-    asked = read_row("SELECT m.id, m.waits, t.source_conversation, t.source_message FROM conversation_messages m "
-                     "JOIN tasks t ON t.id=m.waits WHERE m.conversation=? AND m.who='agent' AND m.waits IS NOT NULL "
-                     f"AND {OPEN_TASK.replace('state', 't.state')} ORDER BY m.id LIMIT 1", (conv["id"],))
-    if not asked:
-        return None
-    DB.execute("UPDATE conversation_messages SET waits=NULL WHERE conversation=? AND waits=?",
-               (conv["id"], asked["waits"]))
-    DB.execute("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' AND "
-               "waiting_on=?", (asked["waits"], cm_ref(asked["id"])))
-    secret_rewait(asked["waits"])           # the owner's secret holds it still (secret_requests)
-    if asked["source_conversation"] == conv["id"] and asked["source_message"] is not None:
-        return None             # this conversation's own task: the message reaches it there as every message does
+    while True:
+        # the connection's own read, which sees this transaction's writes: a wait that a narrowed task held is over
+        asked = DB.execute(
+            "SELECT m.id, m.waits, t.source_conversation, t.source_message FROM conversation_messages m JOIN tasks t "
+            "ON t.id=m.waits WHERE m.conversation=? AND m.who='agent' AND m.waits IS NOT NULL AND "
+            f"{OPEN_TASK.replace('state', 't.state')} ORDER BY m.id LIMIT 1", (conv["id"],)).fetchone()
+        if not asked:
+            return None
+        # each wait of that task in this conversation ends with the answer: its waiting_on names the newest of them
+        refs = [cm_ref(r["id"]) for r in DB.execute("SELECT id FROM conversation_messages WHERE conversation=? AND "
+                                                    "waits=?", (conv["id"], asked["waits"]))]
+        DB.execute("UPDATE conversation_messages SET waits=NULL WHERE conversation=? AND waits=?",
+                   (conv["id"], asked["waits"]))
+        DB.execute(f"UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' AND "
+                   f"waiting_on IN ({','.join('?' * len(refs))})", (asked["waits"], *refs))
+        secret_rewait(asked["waits"])           # the owner's secret holds it still (secret_requests)
+        if asked["source_conversation"] == conv["id"] and asked["source_message"] is not None:
+            return None         # this conversation's own task: the message reaches it there as every message does
+        # a task that a narrowed person's words drive now reads no other person's words (person access plan, section
+        # 5): it asked before the owner narrowed that pair, so its wait is over, it hears that the answer came, with
+        # no word of it, and the answer goes to the next task that waits here, or stays in its own conversation
+        scope = narrowed_task(asked["waits"])
+        if scope is None or scope["person"] == conv["person"]:
+            break
+        owner = DB.execute("SELECT owner FROM tasks WHERE id=?", (asked["waits"],)).fetchone()["owner"]
+        DB.execute(EVENT, (owner, "say", asked["waits"], NARROWED_ANSWER.format(ref=cm_ref(asked["id"])), t0, "{}"))
     row = DB.execute("SELECT * FROM conversation_messages WHERE id=?", (cm,)).fetchone()
     # the messages before it that the waiting session has not read (conversation_since): an answer may answer a
     # question that another session of the agent asked, and its reader then knows it as that answer
@@ -38658,7 +38717,10 @@ def history_scope_sql(agent, scope):
     those of a task of its person's list (tasks.scope_person) from the time that the list began (person_scopes.updated,
     and CONVERSATION_RECORD_SKEW after it, for a machine's clock that is ahead). So it never finds what a session with
     the agent's own tools did in a task of a time at All, before the first list, also in the open task that the first
-    list gave its person (person_scope_rows), nor what a session of a wider list did before a change."""
+    list gave its person (person_scope_rows), nor what a session of a wider list did before a change. Nor any record
+    of a session (thread_events, src 'tool'): a locked narrowed window sends none (conversation_records), so each one
+    of a conversation task is a window's with the agent's own tools, also a revoked window's that came late; the
+    time rule is for the hub's own rows (a call record, a result)."""
     if scope == OWNER_VIEW:
         return "", ()
     if scope is None:
@@ -38669,8 +38731,9 @@ def history_scope_sql(agent, scope):
     return ("h.task IN (SELECT t.id FROM tasks t JOIN conversations c ON c.id=t.source_conversation WHERE "
             "c.person=? AND c.agent=? AND t.source_message IS NOT NULL) AND ((h.src='conversation' AND EXISTS "
             "(SELECT 1 FROM conversation_messages m JOIN conversations c ON c.id=m.conversation WHERE m.id=h.src_id "
-            "AND m.who IN ('person','agent') AND c.person=? AND c.agent=?)) OR (h.task IN (SELECT id FROM tasks WHERE "
-            "scope_person=?) AND h.at>=(SELECT updated FROM person_scopes WHERE person=? AND agent=?)+?))",
+            "AND m.who IN ('person','agent') AND c.person=? AND c.agent=?)) OR (h.src<>'tool' AND h.task IN (SELECT id "
+            "FROM tasks WHERE scope_person=?) AND h.at>=(SELECT updated FROM person_scopes WHERE person=? AND "
+            "agent=?)+?))",
             (scope["person"], agent, scope["person"], agent, scope["person"], scope["person"], agent,
              CONVERSATION_RECORD_SKEW))
 
@@ -38856,7 +38919,8 @@ def history_records(agent, ref, owner_chats=True, scope=OWNER_VIEW):
         s = HISTORY_BY_NAME["tool" if prefix == "TR" else "call"]
         row = read_row(f"{s.select} WHERE {s.key}=?" + (f" AND {s.where}" if s.where else ""), (int(number),))
         return [dict(r, ref=ref, owner_chat=0) for r in (s.build(row) if row else [])
-                if (agent is None or r["agent"] == agent) and history_row_visible(agent, r["task"], scope, r["at"])]
+                if (agent is None or r["agent"] == agent) and history_row_visible(agent, r["task"], scope, r["at"])
+                and not (prefix == "TR" and scope not in (OWNER_VIEW, None))]     # history_scope_sql: no session record
     cond, cond_args = history_scope_sql(agent, scope)
     rows = history_healed(lambda: read_rows(
         "SELECT * FROM history h WHERE h.ref=? AND h.kind<>'tool'" + (" AND h.agent=?" if agent else "") +
