@@ -22084,6 +22084,26 @@ def shown_mime(mime):
     return mime if mime in ATTACH_TYPES or mime in ATTACH_OFFICE else json.dumps(mime)
 
 
+OWNER_FILE_WAIT = 2        # seconds that the owner's upload waits for another file's check (owner_file_checked)
+
+
+def owner_file_checked(data):
+    """The owner's own file from his apps (POST /ui/attachments): no registered login in any text that its bytes give,
+    searched as a chat app's file is (inbound_texts_searched). Unlike a person's file, a file whose search would cost
+    more than its bounds is taken, searched up to them, and not refused (TooCostly): it is his own work, and a refusal
+    that he cannot act on (a large PDF on a hub with many saved logins) would stop it, while the bounds are there so
+    that a stranger's file never holds the hub. For the same reason his check waits at most OWNER_FILE_WAIT seconds for
+    another file's check (CHAT_FILE_CHECKS) and is skipped after that: his app's upload ends after 10 seconds."""
+    if not CHAT_FILE_CHECKS.acquire(timeout=OWNER_FILE_WAIT):
+        return
+    try:
+        inbound_texts_searched(inbound_pieces(data), take_costly=True)
+    except TooCostly:
+        return                      # searched up to the bounds, with no login found there
+    finally:
+        CHAT_FILE_CHECKS.release()
+
+
 def inbound_bytes_checked(data):
     """The rule of a message's words for the bytes of a file that came from a chat app: no registered login in any text
     of it (inbound_pieces), found as secret_hit finds one (each form: the text, JSON's escapes undone, the
@@ -22246,7 +22266,7 @@ INBOUND_CUTS = "".join(c for c in map(chr, range(0x3001)) if c.isspace() and hid
 INBOUND_LAST_CUT = re.compile("(?s).*[%s]" % re.escape(INBOUND_CUTS))
 
 
-def inbound_texts_searched(texts):
+def inbound_texts_searched(texts, take_costly=False):
     """No registered login in these texts of one file, (text, zero) each, in each form that secret_hit searches, at a
     cost of at most CHAT_FILE_HASHES and CHAT_FILE_READS in all, or a Refusal. Called with CHAT_FILE_CHECKS held.
 
@@ -22269,24 +22289,37 @@ def inbound_texts_searched(texts):
         return
     search = InboundSearch(key)
     stretches = re.compile("[^%s]{%d,}" % (re.escape(INBOUND_CUTS), search.least))
-    for text, zero in texts:
-        if zero and not search.whole:
-            continue
-        search.count(len(text))
-        longest = min(search.longest, CHAT_FILE_STRETCH // (1 if text.isascii() else 4))
-        wide = min(search.longest, CHAT_FILE_STRETCH // 4)
-        batch, size = [], 0
-        for m in stretches.finditer(text):
-            # a stretch of ASCII with a JSON escape \u makes a form that may hold any letter: four bytes a character
-            if m.end() - m.start() > longest or (m.end() - m.start() > wide and text.find("\\u", *m.span()) >= 0):
-                raise Refusal(422, CHAT_FILE_TOO_MUCH)
-            batch.append(m.group())
-            size += m.end() - m.start()
-            if size >= CHAT_FILE_CHUNK:
+    batch, zero = [], False
+    try:
+        for text, zero in texts:
+            if zero and not search.whole:
+                continue
+            search.count(len(text))
+            longest = min(search.longest, CHAT_FILE_STRETCH // (1 if text.isascii() else 4))
+            wide = min(search.longest, CHAT_FILE_STRETCH // 4)
+            batch, size = [], 0
+            for m in stretches.finditer(text):
+                # a stretch of ASCII with a JSON escape \u makes a form that may hold any letter: four bytes a character
+                if m.end() - m.start() > longest or (m.end() - m.start() > wide and text.find("\\u", *m.span()) >= 0):
+                    if take_costly:         # the stretches before it are searched yet (below)
+                        with contextlib.suppress(TooCostly):
+                            search.take(batch, zero)
+                    raise TooCostly(422, CHAT_FILE_TOO_MUCH)
+                batch.append(m.group())
+                size += m.end() - m.start()
+                if size >= CHAT_FILE_CHUNK:
+                    search.take(batch, zero)
+                    batch, size = [], 0
+            if batch:
                 search.take(batch, zero)
-                batch, size = [], 0
-        if batch:
-            search.take(batch, zero)
+    except TooCostly:
+        if not take_costly:
+            raise
+        # The owner's own file is taken past the bounds (owner_file_checked), and what was read up to them is
+        # searched first: the runs that wait in the search were within the bounds, and dropped, a login on a PDF's
+        # first page before a costly page passed (the review of 21 November 2026)
+        search.flush()
+        raise
     search.flush()
 
 
@@ -22352,7 +22385,7 @@ class InboundSearch:
     def count(self, chars):
         self.reads += chars
         if self.reads > CHAT_FILE_READS:
-            raise Refusal(422, CHAT_FILE_TOO_MUCH)
+            raise TooCostly(422, CHAT_FILE_TOO_MUCH)
 
     def forms(self, text):
         """The forms of a text that secret_hit reads, in its order, each made when the last one is searched: the text,
@@ -22390,7 +22423,7 @@ class InboundSearch:
             if self.hashes <= CHAT_FILE_HASHES:
                 self.hashes += secret_cost(text, rows, CHAT_FILE_HASHES - self.hashes)
             if self.hashes > CHAT_FILE_HASHES:
-                raise Refusal(422, CHAT_FILE_TOO_MUCH)
+                raise TooCostly(422, CHAT_FILE_TOO_MUCH)
             self.waiting[zero].append(text)
             self.size[zero] += len(text)
             if self.size[zero] >= CHAT_FILE_CHUNK:
@@ -55620,6 +55653,12 @@ class Refusal(ArtifactError):
     """An owner command the hub will not carry out, with its HTTP status."""
 
 
+class TooCostly(Refusal):
+    """The 422 of a file whose search for registered logins would cost more than its bounds (CHAT_FILE_TOO_MUCH): a
+    person's file is refused whole, never searched in part (inbound_texts_searched); the owner's own file is taken
+    (owner_file_checked)."""
+
+
 class Conflict(Refusal):
     """A 409 that tells the app the current value, so it can reload and show the difference."""
     def __init__(self, message=None, code=None, names=None, **extra):
@@ -74327,6 +74366,11 @@ class Handler(BaseHTTPRequestHandler):
         data = self.body()
         try:
             attachment_check(data, mime)
+            # Any text that the file's bytes give holds no registered login either, searched as a chat app's file is
+            # (owner_file_checked). Until 21 November 2026 only a text type was searched (attachment_check), so a
+            # PNG's text chunk, a PDF's page or a Word file's words could carry one of his logins into a chat, where
+            # an agent's session reads it.
+            owner_file_checked(data)
         except Refusal as e:
             return self.json(e.status, refusal_body(e))
         name = attachment_name(self.headers.get("X-Fleet-Name", ""), mime)

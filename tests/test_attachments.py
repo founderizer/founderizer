@@ -138,8 +138,35 @@ class Attachments(test_ui_api.OwnerAPI):
         token = self.register_login()
         code, body, _ = self.send_bytes(f"the login is {token}\n".encode(), mime="text/plain", name="notes.txt")
         self.assertEqual(code, 422, body)
+        # and in a picture, a PDF or an Office file, whose own text an agent's session reads too (until 21 November 2026
+        # only a text type was searched)
+        import io
+        import zipfile
+        words = io.BytesIO()
+        with zipfile.ZipFile(words, "w", zipfile.ZIP_DEFLATED) as package:
+            package.writestr("[Content_Types].xml", "<x/>")
+            package.writestr("word/document.xml", f"<w:t>the login is {token}</w:t>")
+        for data, mime, name in ((PNG + b"tEXtComment\x00the login is " + token.encode(), "image/png", "shot.png"),
+                                 (PDF + f"\n% the login is {token}\n".encode(), "application/pdf", "page.pdf"),
+                                 (words.getvalue(), DOCX, "notes.docx")):
+            code, body, _ = self.send_bytes(data, mime=mime, name=name)
+            self.assertEqual((code, json.loads(body).get("code")), (422, "login_as_file"), name)
         self.assertEqual(self.count("attachments"), 0)
         self.upload(b"nothing secret here\n", mime="text/plain", name="notes.txt")
+        self.upload(PNG + b"tEXtComment\x00a plain line", mime="image/png", name="clean.png")
+        # his own file whose search would cost more than its bounds is taken, not refused as a person's file is: a large
+        # PDF on a hub with many saved logins is his work, and he could not act on the refusal
+        with patch.object(hub, "CHAT_FILE_HASHES", 10):
+            self.upload(PDF + b"\n" + b"x" * 5000 + b"\n", mime="application/pdf", name="big.pdf")
+        # but what was read up to the bounds is searched: a login on the first page before a costly page is refused
+        with patch.object(hub, "CHAT_FILE_HASHES", 200):
+            code, body, _ = self.send_bytes(PDF + f"\n% the login is {token}\n".encode() + b"x" * 5000 + b"\n",
+                                            mime="application/pdf", name="first.pdf")
+        self.assertEqual((code, json.loads(body).get("code")), (422, "login_as_file"))
+        # and a check that waits for another file's check too long is skipped: his app's upload ends after 10 s
+        with patch.object(hub, "OWNER_FILE_WAIT", 0.05):
+            with hub.CHAT_FILE_CHECKS:
+                self.upload(PNG + b"tEXtComment\x00the login is " + token.encode(), mime="image/png", name="late.png")
 
     def test_the_owner_sends_word_excel_and_powerpoint_files(self):
         """The owner, 20 November 2026, to "you cannot upload Word, Excel or PowerPoint files": "Yes, fix both". The
