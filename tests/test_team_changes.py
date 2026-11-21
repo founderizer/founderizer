@@ -599,7 +599,7 @@ class TeamChanges(Remove):
         hub.q("INSERT INTO need_talk(need, ts, who, text) VALUES(?, ?, 'owner', 'Why scout?')", (old, hub.now()))
         self.plan([{"kind": "settings", "agent": "vps", "title": "Deploys"}], title="Name the VPS agent Deploys?")
         self.assertEqual([t["text"] for t in hub.need_talk(self.card()["id"])], ["Why scout?"])    # his talk moves
-        self.assertIn("Replaced by manager", hub.q1("SELECT answer FROM needs WHERE id=?", (old,))["answer"])
+        self.assertIn(f"Replaced by {hub.shown_role('manager')}", hub.q1("SELECT answer FROM needs WHERE id=?", (old,))["answer"])
         self.assertEqual(hub.q1("SELECT replaced_by FROM needs WHERE id=?", (old,))["replaced_by"], self.card()["id"])
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs WHERE team_plan IS NOT NULL AND answer IS NULL")["n"], 1)
 

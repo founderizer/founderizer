@@ -172,6 +172,13 @@ class Narrowed(Base):
         self.ok("reply", self.context(cid), text="Noted: the giraffe drawer.", in_reply_to=f"CM-{said}")
         self.ok("reply", self.context(cid), text="Noted: the zebra box.", in_reply_to=f"CM-{later}")
         self.assertIsNone(hub.q1("SELECT task FROM conversation_messages WHERE text='Noted: the zebra box.'")["task"])
+        # a message while the owner paused the conversation, and the reply to it: no task holds either, only the mark
+        self.owner_does(cid, "pause")
+        paused = self.says(PAT, "The okapi code is under the mat.")["id"]
+        self.owner_does(cid, "resume")
+        self.answers(cid, paused, "Noted: the okapi mat.")
+        self.assertEqual([r["task"] for r in hub.q("SELECT task FROM conversation_messages WHERE text LIKE '%okapi%'")],
+                         [None, None])
         _, first = self.normal_task(title="Ask about the deploy")
         self.ok("message_contact", first, person="Pat", text="Is the deploy done?",
                 request_id=str(uuid.uuid4()))           # nothing in it that this session may read: it goes
@@ -180,18 +187,77 @@ class Narrowed(Base):
         self.assertEqual([json.loads(line) for line in text.splitlines() if line.startswith('"')],
                          ["Is the deploy done?"])
         self.assertNotIn("giraffe", text)
+        self.assertNotIn("okapi", text)
         # and after the owner widened their access: what was said while it was narrowed stays with that pair
-        hub.q("DELETE FROM person_scopes WHERE person=?", (self.pat["id"],))
+        code, data = self.change(self.pat["id"], scopes={"studio": None})
+        self.assertEqual(code, 200, data)
         _, third = self.normal_task(title="Ask about the doors")
         text = self.reads(third, "Pat")
-        self.assertNotIn("giraffe", text)
-        self.assertNotIn("zebra", text)                 # a reply with no task of its own, to a message of that time
+        for word in ("giraffe", "zebra", "okapi"):      # zebra: a reply with no task; okapi: a message in a pause
+            self.assertNotIn(word, text)
         # nor does the brief of the conversation's next session, which holds more than that list now
         hub.conversation_start("studio", cid)
         brief = self.ok("read_messages", self.context(cid))
         self.assertIn("Is the deploy done?", brief)
-        self.assertNotIn("giraffe", brief)
-        self.assertNotIn("zebra", brief)
+        for word in ("giraffe", "zebra", "okapi"):
+            self.assertNotIn(word, brief)
+
+    def test_a_wider_window_names_no_message_or_file_of_the_narrowed_time_by_its_number(self):
+        """Person access plan, section 5 (person-scope-row-mark-spec.md, test 5): after the owner widened a person's
+        access, the conversation's window holds the agent's tools again, and could name a message or a file of the
+        narrowed time by its number: open_work and ask_team pass a message's words on to a task, and read_attachment
+        opens a file. Each refuses a row that carries the pair's mark, as each read of the conversation leaves it out.
+        The bug: a read by id with no rule."""
+        code, up = self.bridge_upload(test_contacts_v2.test_people.test_chat_apps.PICTURE, "m-narrow",
+                                      account="whatsapp-studio", sender=PAT)
+        self.assertEqual(code, 200, up)
+        self.assertEqual(self.wrote(text="The tapir form.", kind="image", id="m-narrow", account="whatsapp-studio",
+                                    sender=PAT), "stored")
+        said = hub.q1("SELECT id, conversation FROM conversation_messages WHERE msg_id='m-narrow'")
+        cid = said["conversation"]
+        self.answers(cid, said["id"], "Noted: the tapir form.")        # answered, so the widening keeps its mark
+        code, data = self.change(self.pat["id"], scopes={"studio": None})
+        self.assertEqual(code, 200, data)
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("open_work", self.context(cid), title="Rebuild the October export", details="All of October.")
+        work = hub.q1("SELECT * FROM tasks WHERE title='Rebuild the October export'")
+        text, error = self.tool("open_work", self.context(cid), task=hub.tref(work["id"]), messages=[f"CM-{said['id']}"])
+        self.assertTrue(error, text)
+        self.assertIsNone(hub.q1("SELECT 1 FROM events WHERE kind='say' AND task=? AND text LIKE '%tapir%'",
+                                 (work["id"],)))
+        text, error = self.tool("read_attachment", self.context(cid), attachment_id=f"A-{up['id']}")
+        self.assertTrue(error, text)
+        self.assertIn("is not a file that Pat sent in this conversation", text)
+        # reply tells nothing of the locked window's answer: the same refusal as for a message that it never read
+        for words in ("Noted: the tapir form.", "Another answer."):
+            text, error = self.tool("reply", self.context(cid), text=words, in_reply_to=f"CM-{said['id']}")
+            self.assertTrue(error, text)
+            self.assertIn("must be a message of this conversation that you read", text)
+        # nor of its answer to a message from before the list (the settle marks such a message only at the next start)
+        hub.q("UPDATE conversation_messages SET scope_person=NULL WHERE id=?", (said["id"],))
+        for words in ("Noted: the tapir form.", "Another answer."):
+            text, error = self.tool("reply", self.context(cid), text=words, in_reply_to=f"CM-{said['id']}")
+            self.assertTrue(error, text)
+            self.assertIn("must be a message of this conversation that you read", text)
+        # and the start of work that follows the locked window's task would carry its result
+        narrowed = hub.q1("SELECT id FROM tasks WHERE source_conversation=? AND scope_person IS NOT NULL", (cid,))
+        text, error = self.tool("open_work", self.context(cid), title="Check the tapir form again", details="Again.",
+                                follows=hub.tref(narrowed["id"]))
+        self.assertTrue(error, text)
+        # a closed conversation (a customer's): ask_team passes the named words on to a task in the same way
+        ana = self.person("Ana", "customer", test_contacts_v2.ANA)
+        self.narrow(ana["id"], {})
+        closed = self.says(test_contacts_v2.ANA, "The quokka refund is for order 7.")
+        self.answers(closed["conversation"], closed["id"], "Noted: the quokka refund.")
+        code, data = self.change(ana["id"], scopes={"studio": None})
+        self.assertEqual(code, 200, data)
+        hub.conversation_start("studio", closed["conversation"])
+        self.ok("read_messages", self.context(closed["conversation"]))
+        text, error = self.tool("ask_team", self.context(closed["conversation"]), question="Can you check it?",
+                                messages=[f"CM-{closed['id']}"])
+        self.assertTrue(error, text)
+        self.assertIsNone(hub.q1("SELECT 1 FROM events WHERE kind='say' AND text LIKE '%quokka%'"))      # where it would go
 
     def test_its_window_opens_its_persons_own_files_only(self):
         """CHAT-APPS.md 8.1: a narrowed window opens the files of its own person's messages (read_attachment is in

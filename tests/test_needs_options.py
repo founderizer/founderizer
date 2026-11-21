@@ -596,7 +596,7 @@ class Talk(NeedsCase):
                                                 "what_to_do": "Press one", "options": ["A", "B", "C"],
                                                 "replaces": "N-1", "reason": "person"})
         self.assertIn("Raised N-2", out)
-        self.assertEqual(self.row(1)["answer"], "Replaced by manager with a new item: Which name now?")
+        self.assertEqual(self.row(1)["answer"], f"Replaced by {hub.shown_role('manager')} with a new item: Which name now?")
         self.assertEqual([hub.need_view(self.row(n))["replaced_by"] for n in (1, 2)], [2, None])
         self.assertEqual([t["text"] for t in self.item(2)["talk"]], ["Can you add a third way?"])
         self.assertEqual(hub.need_talk(1), [])

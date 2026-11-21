@@ -1969,6 +1969,10 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "manager_server",    # the owner, 4 November 2026: a new fleet's manager gets its server in its setup
                "knowledge_edit",    # the owner, 5 November 2026: the pencil of a knowledge file, whose edit says
                                     # "changed" and stops a page's daily read (knowledge_replace)
+               "knowledge_internal_read",
+                                    # the owner, 20 November 2026 ("Yes, read-only"): GET /ui/knowledge gives the
+                                    # owner's computer an internal file too, which a card's badge opens (UI-API.md
+                                    # 1.278)
                "door_setup",        # the owner, 6 November 2026 (DevOps D24): the app keeps the door, no hand step
                "agent_remove",      # the owner, 7 November 2026: "an option to Delete an agent (after confirmation)"
                "repo_picker",       # the owner, 9 November 2026: "ok yes" to the list that gives an agent repositories
@@ -9841,8 +9845,8 @@ def restart_continue(hold_id):
                        (RESTART_ANSWER.format(by=r["by"], task=name), t0, x))
         if asked:           # and a Needs-you item raised for one of them asks the owner nothing any more
             question_needs_close(f"id IN ({','.join('?' * len(asked))})", asked,
-                                 f"Closed: {r['by']} restarted {name}, and its question ended with the session that "
-                                 f"asked it.", t0)
+                                 f"Closed: {shown_role(r['by'])} started that work again, and its question ended with "
+                                 f"the session that asked it.", t0)
         # The requester acted: its restart counts no loss, and the losses in a row count again from nothing (plan C6).
         DB.execute("UPDATE tasks SET restarts=0 WHERE id=?", (tid,))
         if asked:
@@ -12738,7 +12742,10 @@ def answer_rows(qu, t, text, by, t0, files=()):
     for to, said, extra in rows:
         filed, about = filed_about(to, "say", tid)
         DB.execute(*event_row(to, "say", filed, said, t0, json.dumps(extra or {}), about))
-    question_needs_close("id=?", (qid,), f"Closed: Q-{qid} was answered by {who}: {clip(text, 300)}", t0)
+    # the owner reads it on the card (NeedAnswerBox), so in his words: no code, an agent by its role, and the
+    # answer's own words only when they are his, since an agent's answer is written for the agent that asked
+    question_needs_close("id=?", (qid,), f"Closed: you answered it: {clip(text, 300)}" if by == "owner" else
+                         f"Closed: {shown_role(by)} answered it, so it needs nothing from you.", t0)
     return {"held": held, "restarter": restarts if held else None}
 
 
@@ -15924,7 +15931,7 @@ def t_raise_needs_you(agent, a):
             q("UPDATE needs SET ask=? WHERE id=?", (ask, nid))
         if old:                 # the old item leaves Needs you, and the record of an earlier discussion moves along
             q("UPDATE needs SET answer=?, answered=?, answered_by=?, replaced_by=? WHERE id=? AND answer IS NULL",
-              (f"Replaced by {agent} with a new item: {title}", now(), agent, nid, old["id"]))
+              (f"Replaced by {shown_role(agent)} with a new item: {title}", now(), agent, nid, old["id"]))
             q("UPDATE need_talk SET need=? WHERE need=?", (nid, old["id"]))
     if reason:
         log(agent, f"raised N-{nid} for the reason {reason}")      # what each card was for, to count them later
@@ -16062,7 +16069,7 @@ def t_withdraw_need(agent, a):
                             f"owner's answer.")
         t0 = now()
         DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
-                   (f"Withdrawn by {agent}: {why}", t0, agent, nid))
+                   (f"Withdrawn by {shown_role(agent)}: {why}", t0, agent, nid))
         DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
                    (t0, agent, f"withdrew N-{nid} {clip(need['title'] or '', 80)}: {clip(why, 240)}"))
     # Another agent's request came from its owner chat, which reads only the owner's messages and agents' messages: the
@@ -16397,8 +16404,8 @@ def need_look_sweep(t0):
             continue
         with transaction():
             if DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
-                          (f"Closed by the hub: {r['by']} holds {secret_asked(need_secret(r))} now ({ref}), given "
-                           f"another way.", t0, NEED_CLOSED_BY, r["id"])).rowcount:
+                          (f"Closed by the hub: {shown_role(r['by'])} holds {secret_asked(need_secret(r))} now, "
+                           f"given another way.", t0, NEED_CLOSED_BY, r["id"])).rowcount:
                 log_row("hub", f"closed N-{r['id']} {clip(r['title'] or '', 80)}: {r['by']} holds {ref} now")
                 closed.append(f"N-{r['id']} ({r['by']}: {secret_asked(need_secret(r))})")
     if closed and mgr:      # the agent's owner chat reads no word of the hub's: only the manager can tell it
@@ -21327,10 +21334,9 @@ def end_waits(task_id):
         if open_ or role_of(m["sender"]) == "manager":
             emit(m["sender"], "say", f"[hub] AM-{m['id']} reached {tref(task_id)}, which ended before it read it.",
                  task=m["sender_task"] if open_ else None)
-    t = q1("SELECT state FROM tasks WHERE id=?", (task_id,))
     with transaction():                 # a Needs-you item raised for one of its questions asks the owner nothing now
-        question_needs_close("task=? AND answer IS NULL", (task_id,), f"Closed: {tref(task_id)} ended "
-                             f"({t['state'] if t else 'gone'}) before an answer came, so nothing waits for it.", now())
+        question_needs_close("task=? AND answer IS NULL", (task_id,), "Closed: the work that asked it ended before "
+                             "an answer came, so nothing waits for it.", now())
     conversation_result(task_id)        # AUTONOMY.md P2: a task that a conversation opened tells it its result
     secret_waits_end(task_id)           # owner feature secret_requests: its waits on the owner's secrets end with it
     chat_result(task_id)                # and one that an owner chat opened (start_task) tells that chat
@@ -22459,14 +22465,16 @@ def conversation_newest(cid):
     return row["n"] or 0
 
 
-# A message of a narrowed pair's time (person access plan, section 5): of a task with scope_person, or a reply whose
+# A message of a narrowed pair's time (person access plan, section 5): of a task with scope_person, a reply whose
 # own row has no task (the reply that ends a conversation task gets it; a later reply in the same read gets none) to
-# a message of such a task. history_scope_sql hides that pair's records for good, and so does a read of their
-# conversation for any session but their own locked one.
+# a message of such a task, and each row that carries the pair's mark (narrowed_mark: also a message that came while
+# the owner had paused the conversation, which no task holds, and the reply to it). history_scope_sql hides that
+# pair's records for good, and so does a read of their conversation for any session but their own locked one. The
+# task conditions stay beside the mark: a hub's line of a narrowed task carries no mark, and the task hides it.
 CONVERSATION_NOT_NARROWED = (
     "NOT EXISTS (SELECT 1 FROM tasks n WHERE n.id=conversation_messages.task AND n.scope_person IS NOT NULL) AND NOT "
     "EXISTS (SELECT 1 FROM conversation_messages a JOIN tasks n ON n.id=a.task WHERE "
-    "a.id=conversation_messages.reply_to AND n.scope_person IS NOT NULL)")
+    "a.id=conversation_messages.reply_to AND n.scope_person IS NOT NULL) AND conversation_messages.scope_person IS NULL")
 
 
 def conversation_since(cid, mark, before=None, others_of=None, narrowed=False, own_task=None):
@@ -22636,8 +22644,12 @@ def conversation_read(agent):
     (conversation_brief)."""
     with LOCK:
         conv, person = conversation_fence(agent)
+        # a window that holds more than a pair's list now (the owner widened it) reads none of the marked rows of its
+        # narrowed time that are left unread (narrowed_rows_sql); the pair's own locked window reads its own
+        seen, seen_args = narrowed_rows_sql("conversation_messages", session_scope(agent))
         rows = q("SELECT * FROM conversation_messages WHERE conversation=? AND read_at IS NULL AND "
-                 "(who IN ('person','owner') OR (who='action' AND event IS NOT NULL)) ORDER BY id", (conv["id"],))
+                 "(who IN ('person','owner') OR (who='action' AND event IS NOT NULL))" + (f" AND {seen}" if seen else "")
+                 + " ORDER BY id", (conv["id"], *seen_args))
         works = conversation_works(person, agent)
         t = conversation_task(conv["id"]) if works else None
         says = q("SELECT * FROM events WHERE agent=? AND task=? AND kind='say' AND read_at IS NULL ORDER BY id",
@@ -23121,12 +23133,19 @@ def t_reply(agent, a):
     with LOCK:
         conv, person = conversation_fence(agent)
         chat_files_check_session(agent, ids, person)
-        row = q1("SELECT * FROM conversation_messages WHERE id=? AND conversation=?", (int(m.group(1)), conv["id"]))
+        # a message of a narrowed pair's time is no message of this window's once the owner widened it: its number
+        # tells nothing, not even whether the locked window answered it (narrowed_rows_sql)
+        seen, seen_args = narrowed_rows_sql("conversation_messages", session_scope(agent))
+        row = q1("SELECT * FROM conversation_messages WHERE id=? AND conversation=?" + (f" AND {seen}" if seen else ""),
+                 (int(m.group(1)), conv["id"], *seen_args))
         readable = row and (row["who"] in ("person", "owner") or (row["who"] == "action" and row["event"]))
         if not readable or row["read_at"] is None:
             raise ToolError("in_reply_to must be a message of this conversation that you read with read_messages.")
         old = q1("SELECT * FROM conversation_messages WHERE conversation=? AND who='agent' AND reply_to=?",
                  (conv["id"], row["id"]))
+        if old and seen and not q1(f"SELECT 1 FROM conversation_messages WHERE id=? AND {seen}", (old["id"], *seen_args)):
+            # the locked window's answer to a message from before the list: neither its text nor that it exists
+            raise ToolError("in_reply_to must be a message of this conversation that you read with read_messages.")
         if old:
             if (old["text"], cm_file_ids(old["id"])) != (text, sorted(ids)):
                 raise ToolError(f"You already answered {cm_ref(row['id'])} with another text. It was sent and cannot "
@@ -24696,8 +24715,12 @@ def t_open_work(agent, a):
             raise ToolError("open_work is for a conversation with your own tools.")
         # only the agent's own work: the start of a task that follows another carries that task's result and notes
         marks = ",".join("?" * len(TERMINAL))
-        if follows and not q1(f"SELECT 1 FROM tasks WHERE id=? AND owner=? AND state IN ({marks})",
-                              (follows, agent, *TERMINAL)):
+        # and none of a narrowed pair's time for a window that holds more than that list: its start would carry what
+        # the locked window did and wrote (task_scope)
+        scope = session_scope(agent)
+        held = "scope_person IS NULL" if scope is None else "(scope_person IS NULL OR scope_person=?)"
+        if follows and not q1(f"SELECT 1 FROM tasks WHERE id=? AND owner=? AND state IN ({marks}) AND {held}",
+                              (follows, agent, *TERMINAL, *([] if scope is None else [scope["person"]]))):
             raise ToolError(f"{tref(follows)} is not a finished task of yours. follows names your own earlier task "
                             f"whose work this fixes.")
         same = q1(f"SELECT id FROM tasks WHERE source_conversation=? AND source_message IS NULL AND title=? AND "
@@ -24734,8 +24757,10 @@ def open_work_pass(agent, a):
                   f"{OPEN_TASK}", (tid, conv["id"])):
             raise ToolError(f"{tref(tid)} is not open work of this conversation. Open new work with "
                             f"open_work(title, details).")
+        seen, seen_args = narrowed_rows_sql("conversation_messages", session_scope(agent))     # by number, too
         rows = q(f"SELECT * FROM conversation_messages WHERE conversation=? AND who='person' AND id IN "
-                 f"({','.join('?' * len(ids))}) ORDER BY id", (conv["id"], *ids))
+                 f"({','.join('?' * len(ids))})" + (f" AND {seen}" if seen else "") + " ORDER BY id",
+                 (conv["id"], *ids, *seen_args))
         if len(rows) != len(ids):
             raise ToolError(f"Each message must be one that {person['name']} wrote in this conversation.")
         with transaction():
@@ -24794,8 +24819,10 @@ def t_ask_team(agent, a):
         conv, person = conversation_fence(agent)
         if not contacts_v2() or conversation_works(person, agent):
             raise ToolError("ask_team is for a closed conversation.")
+        seen, seen_args = narrowed_rows_sql("conversation_messages", session_scope(agent))     # by number, too
         named = q(f"SELECT * FROM conversation_messages WHERE conversation=? AND who IN ('person','agent') AND id "
-                  f"IN ({','.join('?' * len(ids))}) ORDER BY id", (conv["id"], *ids)) if ids else []
+                  f"IN ({','.join('?' * len(ids))})" + (f" AND {seen}" if seen else "") + " ORDER BY id",
+                  (conv["id"], *ids, *seen_args)) if ids else []
         if len(named) != len(ids):
             raise ToolError(f"Each of messages must be one that {person['name']} or you wrote in this conversation.")
         rows = [r for r in named if r["who"] == "person"]         # their words reach the task; yours stay here
@@ -30530,8 +30557,10 @@ def conversation_attachment(agent, a, context):
         raise ToolError("attachment_id names one file, for example A-3.") from None
     name = " ".join(person["name"].split())
     row = q1("SELECT * FROM attachments WHERE id=?", (aid,))
-    said = q1("SELECT conversation, who FROM conversation_messages WHERE id=?", (row["cm"],)) \
-        if row and row["cm"] is not None else None
+    # a file of a narrowed pair's time opens only in that pair's own locked window: the row is read through the rule
+    seen, seen_args = narrowed_rows_sql("conversation_messages", session_scope(agent, context))
+    said = q1("SELECT conversation, who FROM conversation_messages WHERE id=?" + (f" AND {seen}" if seen else ""),
+              (row["cm"], *seen_args)) if row and row["cm"] is not None else None
     if not said or said["conversation"] != conv["id"] or said["who"] != "person" or row["agent"] is not None or \
             row["message"] is not None or row["report"] is not None:
         raise ToolError(f"A-{aid} is not a file that {name} sent in this conversation.")
@@ -40298,7 +40327,7 @@ def t_change_team(agent, a):
                                                          ask or (old["ask"] if old else None), picks[0]))
             if old:     # the old card leaves, and the owner's talk under it moves along, as at a replaces
                 DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=?, replaced_by=? WHERE id=? AND "
-                           "answer IS NULL", (f"Replaced by {agent} with a new plan: {title}", t0, agent, nid,
+                           "answer IS NULL", (f"Replaced by {shown_role(agent)} with a new plan: {title}", t0, agent, nid,
                                               old["id"]))
                 DB.execute("UPDATE need_talk SET need=? WHERE need=?", (nid, old["id"]))
             keep_command(command, {"text": text}, t0)
@@ -51391,7 +51420,8 @@ KNOWLEDGE_LIMITS = {"internal": (32, 64 * 1024, 512 * 1024), "owner": (200, MIB,
 
 def knowledge_scope(path):
     """The owner's knowledge is in knowledge/owner/. Every other knowledge file is internal: it stays as it is for the
-    agents, and the app does not show it."""
+    agents, and the app's Knowledge page does not list it (a card's badge opens one on the owner's computer,
+    read-only: knowledge_internal_read)."""
     return "owner" if path.startswith(OWNER_KNOWLEDGE) else "internal"
 
 
@@ -51407,7 +51437,8 @@ def knowledge_heading(text):
 
 def knowledge_entries():
     """The knowledge catalog at the hub's HEAD: bounded regular Markdown blobs only, with their scope and without
-    their text (GET /ui/knowledge gives one owner file's text). No working-tree reads or vault access. `blob` is the
+    their text (GET /ui/knowledge gives one file's text: an owner file, and to the owner's computer an internal one
+    too). No working-tree reads or vault access. `blob` is the
     git object of the file's text, which says whether its summary is for this text (knowledge_index); the owner's
     apps do not get it (knowledge_public).
 
@@ -67178,21 +67209,24 @@ def phone_task(task_id, query):
         {"Cache-Control": "no-store"}
 
 
-def phone_knowledge(query):
-    """GET /ui/knowledge after ui_allowed: one owner knowledge file with its text (owner feature owner_knowledge).
-    Internal files stay internal. A read that fails, of the catalog (an UnreadCatalog) or of a listed file's text, is
-    503 knowledge_unread and never the 404 of a file that is not there: the app's list keeps the file while the reads
-    fail (knowledge_shown)."""
+def phone_knowledge(query, internal=False):
+    """GET /ui/knowledge after ui_allowed: one knowledge file with its text (owner feature owner_knowledge). An owner
+    file for each reader (the owner's devices, a connected app's read_knowledge); an internal file too for the owner's
+    computer only (internal, owner feature knowledge_internal_read): the owner, 20 November 2026, "Yes, read-only" to
+    a card's badge of an agents' internal file that opens it on the Knowledge page. A read that fails, of the catalog
+    (an UnreadCatalog) or of a listed file's text, is 503 knowledge_unread and never the 404 of a file that is not
+    there: the app's list keeps the file while the reads fail (knowledge_shown)."""
     generation = kv_get("db_id")
     if query.get("db") != generation:
         return 409, refusal_words.answer("hub_changed"), None
     catalog = knowledge_entries()
-    entry = next((k for k in catalog if k["path"] == query.get("path") and k["scope"] == "owner"), None)
+    scopes = ("owner", "internal") if internal else ("owner",)
+    entry = next((k for k in catalog if k["path"] == query.get("path") and k["scope"] in scopes), None)
     text = knowledge_text(entry) if entry else None
     if isinstance(catalog, UnreadCatalog) or entry and text is None:
         return 503, refusal_words.answer("knowledge_unread"), None
     if text is None:
-        return 404, {"error": "no such owner knowledge file"}, None
+        return 404, {"error": "no such knowledge file" if internal else "no such owner knowledge file"}, None
     return 200, dict(scrub(knowledge_public(entry)), db=generation, text=mask_secrets(text)), \
         {"Cache-Control": "no-store"}
 
@@ -68773,6 +68807,9 @@ class Handler(BaseHTTPRequestHandler):
     # A connection's values before setup sets them, for a stand-in setup of a test that does not call this one
     # (test_answer_write): not in CONNECTIONS, and conn_fresh None says "as the server counted it" (fresh_ends).
     conn_fresh, in_call, conn_state, late = None, False, "idle", False
+    # The owner device that ui_allowed took this request for, or None for the owner's computer: set at each call of it,
+    # because one handler serves every request of a keep-alive connection, and a device until a call sets it.
+    ui_device = ""
 
     def log_message(self, fmt, *args):
         pass
@@ -69159,6 +69196,7 @@ class Handler(BaseHTTPRequestHandler):
             self.json(403, {"error": "browser origins are not accepted"})
             return False
         device = owner_device_at(self.client_address[0])         # the owner's phone (MOBILE-APP.md)
+        self.ui_device = device     # the one lookup that decides it, for a route that answers a device less
         if device is not None:
             return self.device_allowed(device)
         if not self.owner_allowed():
@@ -72697,11 +72735,12 @@ class Handler(BaseHTTPRequestHandler):
         return self.ui_command(f"profiles/{agent}", read, act, unlocked=True)
 
     def ui_knowledge(self, query):
-        """One owner knowledge file with its text (owner feature owner_knowledge): /ui/state lists the files without
-        their text. Internal files stay internal (phone_knowledge)."""
+        """One knowledge file with its text (owner feature owner_knowledge): /ui/state lists the files without their
+        text. An internal file for the owner's computer only (knowledge_internal_read, phone_knowledge), by the
+        lookup that ui_allowed made: a device that the owner adds or removes meanwhile reads none."""
         if not self.ui_allowed():
             return
-        return self.json(*phone_knowledge(query))
+        return self.json(*phone_knowledge(query, internal=self.ui_device is None))
 
     def ui_knowledge_change(self):
         """The owner's knowledge files (owner feature owner_knowledge): add a file's text {title, text, source}, add a

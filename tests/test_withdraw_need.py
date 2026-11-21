@@ -63,7 +63,7 @@ class Withdraw(OwnerAPI):
         self.assertFalse(error, said)
         self.assertIn(f"Withdrew N-{nid}", said)
         row = hub.q1("SELECT * FROM needs WHERE id=?", (nid,))
-        self.assertEqual((row["answer"], row["answered_by"]), ("Withdrawn by manager: A plan change replaced it.",
+        self.assertEqual((row["answer"], row["answered_by"]), (f"Withdrawn by {hub.shown_role('manager')}: A plan change replaced it.",
                                                                "manager"))
         self.assertIsNotNone(row["answered"])
         self.assertNotIn(nid, self.open_ids())                  # it left Needs you, as an answered item does
@@ -83,7 +83,7 @@ class Withdraw(OwnerAPI):
         self.refused({"need": f"N-{theirs}", "why": "Not needed."}, "only the agent that raised an item withdraws it")
         nid = self.raise_item()
         self.assertFalse(hub.call_tool("manager", "withdraw_need", {"need": f"N-{nid}", "why": "Fixed."})[1])
-        self.refused({"need": f"N-{nid}", "why": "Again."}, f"N-{nid} is closed already: Withdrawn by manager: Fixed.")
+        self.refused({"need": f"N-{nid}", "why": "Again."}, f"N-{nid} is closed already: Withdrawn by {hub.shown_role('manager')}: Fixed.")
 
     def test_an_item_that_others_wait_on_closes_their_way(self):
         asked = self.item(41, question=7)
@@ -115,7 +115,7 @@ class Withdraw(OwnerAPI):
         self.assertFalse(error, said)
         self.assertIn("vps is not told: tell it with message_agent when its work should know.", said)
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (chat,))["answer"],
-                         "Withdrawn by manager: The work found a route")
+                         f"Withdrawn by {hub.shown_role('manager')}: The work found a route")
         self.assertEqual((self.notices(), hub.q1("SELECT COUNT(*) n FROM events WHERE agent='vps'")["n"]),
                          (told, written))
         self.assertEqual([n for n in self.open_ids() if n in (chat, waited)], [waited])
@@ -382,10 +382,10 @@ class SecondLook(Withdraw):
         hub.need_look_sweep(t0 + hub.NEED_HELD_WAIT)
         row = hub.q1("SELECT * FROM needs WHERE id=?", (chat,))
         self.assertEqual((row["answer"], row["answered_by"]),
-                         (f"Closed by the hub: vps holds the API key ACME_TOKEN now ({ref}), given another way.",
+                         (f"Closed by the hub: {hub.shown_role('vps')} holds the API key ACME_TOKEN now, given another way.",
                           hub.NEED_CLOSED_BY))
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (site,))["answer"],
-                         f"Closed by the hub: vps holds a login for shop.example.com now ({login}), given another way.")
+                         f"Closed by the hub: {hub.shown_role('vps')} holds a login for shop.example.com now, given another way.")
         self.assertEqual([n for n in self.open_ids() if n in mine], [waited, door, named, failed])
         self.assertEqual(self.notices(), told)
         self.assertIsNone(hub.kv_get("need_held"))

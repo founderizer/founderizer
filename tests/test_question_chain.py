@@ -273,7 +273,10 @@ class Needs(Chain):
         self.answer("top", qid, "Blue.", self.t1)
         row = hub.q1("SELECT * FROM needs WHERE id=?", (need["id"],))
         self.assertEqual(row["answered_by"], "Fleet")
-        self.assertIn(f"Closed: Q-{qid} was answered by top: Blue.", row["answer"])
+        # the owner reads it on the card: no code, the agent by its role, and an agent's words, written for the
+        # agent that asked, stay out (21 November 2026: "Closed: Q-388 was answered by manager: Miguel checked
+        # (M-29708): ...")
+        self.assertEqual(row["answer"], f"Closed: {hub.shown_role('top')} answered it, so it needs nothing from you.")
         # and the owner's late answer is refused, as for every answered item
         code, _ = self.request(f"/ui/needs/{need['id']}", self.command(answer="Green."))
         self.assertEqual(code, 409)
@@ -285,7 +288,8 @@ class Needs(Chain):
         self.ok("mid", "cancel_task", {"task_id": f"T-{self.t3}", "reason": "not needed"}, self.t2)
         row = hub.q1("SELECT * FROM needs WHERE id=?", (need["id"],))
         self.assertEqual(row["answered_by"], "Fleet")
-        self.assertIn(f"Closed: T-{self.t3} ended (canceled)", row["answer"])
+        self.assertEqual(row["answer"], "Closed: the work that asked it ended before an answer came, so nothing waits "
+                                        "for it.")
 
     def test_the_item_closes_when_a_restart_ends_the_question(self):
         qid = self.up_to_manager()
@@ -299,7 +303,8 @@ class Needs(Chain):
         self.assertIn("This question ended when mid restarted", self.question(qid)["answer"])
         row = hub.q1("SELECT * FROM needs WHERE id=?", (need["id"],))
         self.assertEqual(row["answered_by"], "Fleet")
-        self.assertIn(f"Closed: mid restarted T-{self.t3}", row["answer"])
+        self.assertIn(f"Closed: {hub.shown_role('mid')} started that work again", row["answer"])
+        self.assertNotIn(f"T-{self.t3}", row["answer"])
 
     def test_what_raise_needs_you_refuses_for_a_question(self):
         qid = self.ask()
