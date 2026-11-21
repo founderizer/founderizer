@@ -763,6 +763,25 @@ class Updates(Repositories):
         self.assertEqual(self.ran, [])
         self.assertEqual(git("remote", cwd=self.kit), "origin")      # the remote was not even added
 
+    def test_a_fetch_that_fails_says_first_which_host_this_server_could_not_download_from(self):
+        """The owner's test fleet, 21 November 2026: its server had no route to github.com, and every release stopped
+        with only "The fetch of upstream failed: fatal: unable to access…". The line names the release and the host in
+        plain words first, then keeps git's own words, and the fleet does not move."""
+        inner, said = self.runner(), ("fatal: unable to access 'https://github.com/example/fleet.git/': Failed to "
+                                      "connect to github.com port 443 after 1 ms: Couldn't connect to server")
+
+        def run(argv, timeout=None, cwd=None, input=None):
+            if argv[3:5] == ["fetch", "-q"]:
+                return 128, "", said
+            return inner(argv, timeout=timeout, cwd=cwd, input=input)
+        answer = releases.Update(str(self.kit), releases.check(manifest(self.publish(self.code(2))), KEY),
+                                 upstream="https://github.com/example/fleet.git", origin=self.origin, run=run).apply()
+        self.assertEqual((answer["state"], answer["step"]), (releases.KEPT, "fetch"))
+        self.assertTrue(answer["says"].startswith("This server could not download release 2026.10.2 from github.com, "
+                                                  "so this fleet did not take it. "), answer["says"])
+        self.assertTrue(answer["says"].endswith("failed: " + said), answer["says"])
+        self.unchanged(answer)
+
     def test_code_that_reached_the_ref_without_a_release_does_not_survive_one(self):
         """DevOps plan 0.1: a release takes its own tree outside the fleet's data, so a line of code that reached the
         configuration ref without a release is replaced by the release's, and every machine can then prove that what

@@ -32,6 +32,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from unittest.mock import patch
@@ -98,7 +99,8 @@ def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
     for cls in (Template, Repository, Claim, SecondClaim, AgentUsers, FleetId, VerifyStep, Prompt, PromptThroughSudo,
                 CheckMode, Systems, ZoneData, NoProviderCredential, ProviderToolsRefuse, RuntimeInstall, Firewall,
-                Harden, HardenMemory, HardenRestart, HubTcp, NetworkStep, PackageStops, PackageLists, AptUpdate):
+                Harden, HardenMemory, HardenRestart, HubTcp, NetworkStep, PackageStops, PackageLists, AptUpdate,
+                ReleasesReach):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return suite
 
@@ -3798,7 +3800,8 @@ class PackageStops(unittest.TestCase):
 
     def tool(self, name, status):
         path = self.tmp / name
-        path.write_text(f"#!/bin/sh\nexit {status}\n")
+        path.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {shlex.quote(str(self.tmp / (name + ".log")))}\n'
+                        f"exit {status}\n")
         path.chmod(0o755)
 
     def run_in(self, shell, text, install):
@@ -3827,7 +3830,9 @@ class PackageStops(unittest.TestCase):
             self.assertEqual((ran.returncode, ran.stderr), (0, ""), shell)
 
     def test_hub_sh_preflight_git_stops_with_each_sentence(self):
-        """The preflight's own install of git, which a minimal server lacks, stops with the same two sentences."""
+        """The preflight's own install of git, which a minimal server lacks, stops with the same two sentences. It
+        brings ca-certificates too, which git's HTTPS needs and which is only a recommended package of git: without it
+        the check of the releases (ReleasesReach) stops a server that can reach them."""
         text = SCRIPT.read_text()
         start = text.index('say "  installing git"')
         block = text[start:text.index("\n        fi\n", start)]
@@ -3840,8 +3845,12 @@ class PackageStops(unittest.TestCase):
                 ran = self.run_in(shell, stubs + f"apt_update() {{ return {update}; }}\n" + block + "\n", install)
                 self.assertEqual(ran.returncode, 1, (shell, ran.stderr))
                 self.assertIn(f"Founderizer install stopped: {sentence} {self.AGAIN}", ran.stderr, shell)
+            (self.tmp / "apt-get.log").unlink(missing_ok=True)
             ran = self.run_in(shell, stubs + "apt_update() { return 0; }\n" + block + "\n", 0)
             self.assertEqual((ran.returncode, ran.stderr), (0, ""), shell)
+            installed = (self.tmp / "apt-get.log").read_text().split()
+            self.assertEqual(installed[installed.index("--no-install-recommends") + 1:], ["git", "ca-certificates"],
+                             shell)
 
     def test_join_sh_stops_with_each_sentence(self):
         text = (KIT / "join.sh").read_text()
@@ -3860,6 +3869,113 @@ class PackageStops(unittest.TestCase):
             self.assertIn(f"Founderizer join stopped: {self.PACKAGES} {self.AGAIN}", ran.stderr, shell)
             ran = self.run_in(shell, stubs + "apt_update() { return 0; }\n" + update + "\n" + install + "\n", 0)
             self.assertEqual((ran.returncode, ran.stderr), (0, ""), shell)
+
+
+class ReleasesReach(unittest.TestCase):
+    """**A hub install stops on a server that can never take a release** (the case of 21 November 2026: a hub on a
+    server with IPv6 only installed, and then each release stopped at its fetch with "Failed to connect to github.com
+    port 443", because github.com answers over IPv4 only). hub.sh's `releases_reach` runs with a stand-in git and a
+    folder that stands in for /proc: the stop says the cause that the person can fix, git's own line stays above it,
+    and the address that it reaches is the one that the hub takes its releases from (releases.DEFAULT_UPSTREAM), with
+    no settings of root's own, no password prompt and a time limit (a stand-in `timeout`, which each Linux server has).
+    A hub that is there already goes on. Under sh, and under dash where this machine has it, as Ubuntu runs the
+    installers."""
+
+    FAILED = ("fatal: unable to access 'https://github.com/founderizer/founderizer.git/': Failed to connect to "
+              "github.com port 443 after 1 ms: Couldn't connect to server")
+    # /proc/net/route: its heading, a default IPv4 route, and a route of the server's own network only
+    HEAD = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+    DEFAULT = "eth0\t00000000\t0101FEA9\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+    LOCAL = "eth0\t0000FEA9\t00000000\t0001\t0\t0\t100\t0000FFFF\t0\t0\t0\n"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="releases-reach-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        (self.tmp / "bin").mkdir()
+        (self.tmp / "proc" / "net").mkdir(parents=True)
+        import releases
+        self.address = releases.DEFAULT_UPSTREAM
+        self.host = urllib.parse.urlsplit(self.address).hostname
+
+    def run_reach(self, shell, git_status, route, present=False, words=True, tree=KIT):
+        """`releases_reach` of a real run (not --check), on a new hub or on one that is `present`: (exit status,
+        output, what `timeout` and git got)."""
+        log = self.tmp / "git.log"
+        git = self.tmp / "bin" / "git"
+        git.write_text('#!/bin/sh\nprintf "GIT_TERMINAL_PROMPT=%s GIT_CONFIG_GLOBAL=%s %s\\n" "$GIT_TERMINAL_PROMPT" '
+                       f'"$GIT_CONFIG_GLOBAL" "$*" >> {shlex.quote(str(log))}\n'
+                       + (f"echo {shlex.quote(self.FAILED)} >&2\n" if git_status and words else "")
+                       + f"exit {git_status}\n")
+        git.chmod(0o755)
+        limit = self.tmp / "bin" / "timeout"
+        limit.write_text(f'#!/bin/sh\nprintf "timeout %s\\n" "$1" >> {shlex.quote(str(log))}\nshift\nexec "$@"\n')
+        limit.chmod(0o755)
+        bare = self.tmp / "fleet.git"
+        if present:
+            bare.mkdir(exist_ok=True)
+        elif bare.exists():
+            bare.rmdir()
+        (self.tmp / "proc" / "net" / "route").write_text(self.HEAD + route)
+        text = ("set -eu\n"
+                "say() { printf 'Founderizer: %s\\n' \"$*\"; }\n"
+                "stop() { printf 'Founderizer install stopped: %s\\n' \"$*\" >&2; exit 1; }\n"
+                "plan() { [ \"$check\" = yes ] && printf 'Founderizer:   would %s\\n' \"$*\" || true; }\n"
+                f"check=no\nroot={shlex.quote(str(self.tmp))}\ntree={shlex.quote(str(tree))}\n"
+                f"bare={shlex.quote(str(bare))}\n"
+                + shell_function(SCRIPT, "releases_reach") + "releases_reach\n")
+        log.unlink(missing_ok=True)
+        done = subprocess.run([shell, "-c", text], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+                              env=dict(os.environ, PATH=f"{self.tmp / 'bin'}:/usr/bin:/bin"))
+        return done.returncode, done.stdout + done.stderr, log.read_text() if log.exists() else ""
+
+    def test_a_server_that_cannot_reach_the_releases_stops_with_the_cause_that_it_can_fix(self):
+        for shell in PackageStops.shells():
+            status, out, _ = self.run_reach(shell, 128, self.LOCAL)
+            self.assertEqual(status, 1, (shell, out))
+            self.assertIn("Founderizer install stopped: This server has no IPv4 route, and GitHub, where the hub "
+                          "takes its releases, answers over IPv4 only. Give it a public IPv4 address at your "
+                          "provider, then run the line again.", out, shell)
+            self.assertIn(f"Founderizer:   git: {self.FAILED}", out, shell)
+            elsewhere = (f"Founderizer install stopped: This server could not use {self.host} over HTTPS, where the "
+                         f"hub takes its releases: the line above says why. If it cannot connect to {self.host}, let "
+                         f"it make outgoing HTTPS connections to {self.host}. Then run the line again.")
+            status, out, _ = self.run_reach(shell, 128, self.DEFAULT)
+            self.assertEqual(status, 1, (shell, out))
+            self.assertIn(f"Founderizer:   git: {self.FAILED}\n", out, shell)
+            self.assertIn(elsewhere, out, shell)
+            self.assertNotIn("IPv4", out, shell)
+            # `timeout` ends a git that got no answer with 124, and git said nothing: the line above says so.
+            status, out, _ = self.run_reach(shell, 124, self.DEFAULT, words=False)
+            self.assertEqual((status, out), (1, f"Founderizer:   git: no answer within 60 seconds\n{elsewhere}\n"),
+                             shell)
+            # IPv4 is GitHub's need: a hub whose upstream is another host gets the HTTPS sentence with that host.
+            other = self.tmp / "other-copy"
+            other.mkdir(exist_ok=True)
+            (other / "releases.py").write_text('DEFAULT_UPSTREAM = "https://code.example.com/fleet.git"\n')
+            status, out, _ = self.run_reach(shell, 128, self.LOCAL, tree=other)
+            self.assertEqual(status, 1, (shell, out))
+            self.assertIn("Founderizer install stopped: This server could not use code.example.com over HTTPS", out,
+                          shell)
+            self.assertNotIn("IPv4", out, shell)
+
+    def test_a_server_that_reaches_the_releases_goes_on_and_asks_the_hubs_own_address(self):
+        for shell in PackageStops.shells():
+            status, out, asked = self.run_reach(shell, 0, self.LOCAL)
+            self.assertEqual((status, out), (0, f"Founderizer:   this server reaches {self.host}, where the hub takes "
+                                                "its releases\n"), shell)
+            self.assertEqual(asked, f"timeout 60\nGIT_TERMINAL_PROMPT=0 GIT_CONFIG_GLOBAL=/dev/null ls-remote -q "
+                                    f"{self.address} HEAD\n", shell)
+
+    def test_a_hub_that_is_there_already_goes_on_and_says_why_it_takes_no_release(self):
+        """A second run and --reclaim (the owner's way back after a lost Mac) need no GitHub: a stop there keeps
+        nothing from happening."""
+        for shell in PackageStops.shells():
+            status, out, _ = self.run_reach(shell, 128, self.LOCAL, present=True)
+            self.assertEqual(status, 0, (shell, out))
+            self.assertEqual(out, f"Founderizer:   git: {self.FAILED}\nFounderizer:   this server has no IPv4 route, "
+                                  "and GitHub answers over IPv4 only\n"
+                                  "Founderizer:   the hub is there already, so the install goes on; the hub takes "
+                                  f"no release until git on this server can use {self.host}\n", shell)
 
 
 class AptUpdate(unittest.TestCase):
@@ -5089,6 +5205,27 @@ class CheckMode(unittest.TestCase):
         out = self.run_check(more_env={"FLEET_MANAGER_SERVER": "later"})
         self.assertIn("one manager with no server yet", out)
         self.assertIn("find none on a new hub", out)
+
+    def test_the_plan_checks_that_the_server_reaches_the_releases_and_asks_nothing(self):
+        """The first step plans the check of the address that the hub takes its releases from (ReleasesReach), and a
+        plan asks that address nothing: --check runs on any machine and changes nothing."""
+        import releases
+        host = urllib.parse.urlsplit(releases.DEFAULT_UPSTREAM).hostname
+        folder = Path(tempfile.mkdtemp(prefix="fleet-hub-check-git-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        log = folder / "asked"
+        (folder / "git").write_text(f'#!/bin/sh\ncase " $* " in *" ls-remote "*) echo "$*" >> {shlex.quote(str(log))} '
+                                    f'; exit 0 ;; esac\nexec {shlex.quote(shutil.which("git"))} "$@"\n')
+        (folder / "git").chmod(0o755)
+        out = self.run_check(more_env={"PATH": f"{folder}:{os.environ['PATH']}"})
+        self.assertIn(f"Founderizer:   would check that this server reaches {host} over HTTPS, where the hub takes "
+                      "its releases\n", out)
+        # With --source the plan has no clone yet, so no releases.py to read: it names the check all the same.
+        out = self.run_check("--source", "git://example.invalid/fleet.git",
+                             more_env={"PATH": f"{folder}:{os.environ['PATH']}"})
+        self.assertIn("Founderizer:   would check that this server reaches the address that the hub takes its releases "
+                      "from, over HTTPS\n", out)
+        self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
 
     def test_the_plan_names_the_manager_only_when_a_name_is_given(self):
         """`--manager-name`: the plan says the name and where the profile goes. Without it the plan has no word of

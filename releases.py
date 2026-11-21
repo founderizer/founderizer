@@ -599,6 +599,13 @@ def _ended(code, out, err):
     return f"{ended}; the end of what it printed: {tail}" if tail else ended
 
 
+def _host(url):
+    """The host of a git address, `https://github.com/…` or `git@github.com:…`, or None for a path."""
+    found = re.match(r"[a-z][a-z0-9+.-]*://(?:[^@/]*@)?([^/:?#]+)", url or "", re.I) or \
+        re.match(r"[^@/:]+@([^/:]+):", url or "")
+    return found.group(1).lower() if found else None
+
+
 def _said(text):
     """One line the owner reads on the app's Updates page, so it starts with a capital (the owner, 19 October 2026).
     A line that starts with a name this fleet itself uses keeps it: a revision, a branch or a version."""
@@ -760,7 +767,12 @@ class Update:
                                                   f"repository")
         code, _, err = self.git("fetch", "-q", "--no-write-fetch-head", self.remote)
         if code != 0:
-            return self.answer(KEPT, "fetch", f"the fetch of {self.remote} failed: {err[-200:]}")
+            # First what a person reads in one go, then git's own line: a server with no route to github.com (the
+            # owner's test fleet, 21 November 2026) said only "The fetch of upstream failed: fatal: unable to access…".
+            where = _host(self.upstream or url) or "the published repository"
+            return self.answer(KEPT, "fetch", f"This server could not download release {self.manifest['version']} "
+                                              f"from {where}, so this fleet did not take it. The fetch of "
+                                              f"{self.remote} failed: {err[-200:]}")
         return None
 
     def in_clone(self):

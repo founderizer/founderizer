@@ -81,7 +81,10 @@ vCPU, 4 GB): UI-API.md 1.171 says what it proved.
 ## Before you run it
 
 1. **A server.** Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, with systemd, and
-   root. A €5 VPS is enough to start. Nothing else may be using port 8765.
+   root. A €5 VPS is enough to start. Nothing else may be using port 8765. It must
+   reach github.com over HTTPS, where the hub takes its releases. GitHub answers over
+   IPv4 only, so a server with IPv6 only needs a public IPv4 address. The install's
+   first step checks it, and a first install stops on a server that cannot reach it.
 2. **A Tailscale auth key** for the fleet's own tailnet, from its Tailscale admin
    console. One use is enough; a pre-authorized key saves a sign-in. The key goes to
    the installer on **standard input**, so run the line in a terminal on the server,
@@ -142,8 +145,9 @@ notification of a Needs-you item, the chat that opens first), so with those apps
 
 ### What the seventeen steps do
 
-1. **This server and this copy of Founderizer.** Root, the system, systemd, and that the
-   copy is a Founderizer checkout with a commit.
+1. **This server and this copy of Founderizer.** Root, the system, systemd, that the
+   copy is a Founderizer checkout with a commit, and that the server reaches the address
+   that the hub takes its releases from (github.com) over HTTPS.
 2. **Base packages:** `git tmux python3 curl ca-certificates ufw unattended-upgrades sudo tzdata libatomic1`.
 3. **The user `fleet`:** created, password locked, out of `sudo`, `admin` and `wheel`,
    home mode 700, and lingering on, so its services run after logout and after a

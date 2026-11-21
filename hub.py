@@ -7921,15 +7921,19 @@ def chat_team_once(agent):
     the owner adds a person and then asks the agent about that person in the chat that already runs."""
     listed = str(kv_get(f"listed:{agent}:owner-chat") or 0)
     people = people_once(agent, listed, chat_people_text(agent))
-    if kv_get(f"chat_team:{agent}") == listed:
+    before = kv_get(f"chat_team:{agent}")
+    if before == listed:
         return people.strip() + "\n\n" if people else ""
     kv_set(f"chat_team:{agent}", listed)
+    # a change of the owner's name or language in Settings (owner_lines_changed): the directory again, which opens
+    # with the new lines, and a word that they replace what this conversation read before
+    lead = OWNER_LINES_CHANGED + "\n" if before == OWNER_LINES_MARK else ""
     # An agent whose Shell box is off has no team directory (support plan F1), and its chat still answers the owner
     # (tell_owner, message_owner) and its reporting line (message_agent): it gets the owner's name and language, its
     # line (shell_line_text) and the people of its own list.
     team = ((owner_start_text() + "\n" + shell_line_text(agent).strip() + "\n" if shell_off(agent) else
              team_start_text(agent)) + people).strip()
-    return team + "\n\n" if team else ""
+    return lead + team + "\n\n" if team else lead
 
 
 START_READ = ("The start of this task attempt: the text that this session began with, so it is not repeated here. "
@@ -8186,6 +8190,60 @@ def team_start_text(agent):
               "in every tool as its name does. None of this gives you their access.\n")
 
 
+def language_said(tag):
+    """A language tag in words: "Spanish (es-ES)", or "the language of the tag <tag>" for a tag with no name in
+    LANGUAGE_NAMES."""
+    base = tag.split("-")[0].lower()
+    return f"{LANGUAGE_NAMES[base]} ({tag})" if base in LANGUAGE_NAMES else f"the language of the tag {tag}"
+
+
+# A change of the owner's name or language in Settings, for the sessions that run (owner_lines_changed). The owner, 21
+# November 2026: "I changed the user name and the agent kept calling me by the previous name".
+OWNER_LINES_MARK = "owner-lines"            # chat_team:<agent> after such a change: the chat reads its directory again
+OWNER_LINES_CHANGED = ("[hub] The owner changed their name or language in Settings. The lines below are the new ones: "
+                       "they replace what this conversation, your start and your notes said before. A name with no "
+                       "line below is gone: use none. A language with no line below is English.")
+
+
+def owner_lines_changed(changed, before):
+    """After save_settings changed owner.name or owner.language: each session that read the owner's lines in its start
+    (owner_start_text) keeps those words, and a warm owner chat or standing session does not start again
+    (session_reuse), so the hub gives the new lines to the sessions that run, under the hood. Each owner chat reads its
+    directory again with its next read, which opens with them (chat_team_once); the fleet manager's standing session,
+    and each live task whose start had them, get them in a quiet say, which wakes nobody and comes with its next read.
+    No line for a task of a narrowed pair (task_scope) or of an agent whose Shell box is off: their starts hold no
+    owner's line. A later start reads the setting itself."""
+    name, tag = setting("owner.name"), setting("owner.language")
+    lines = []
+    if "owner.name" in changed:
+        lines.append(f"THE OWNER'S NAME is now {name}: use it where a colleague would use a name." if name else
+                     "The owner has no name in Settings now: use none for them.")
+    # before: the settings that team.json held before the write; an empty or English tag is English, so a first fill
+    # of an English Mac is no news for a session
+    if "owner.language" in changed and (str(before.get("owner.language") or "en").split("-")[0].lower() != "en" or
+                                        (tag or "en").split("-")[0].lower() != "en"):
+        base = tag.split("-")[0].lower()
+        lines.append(f"THE OWNER'S LANGUAGE is now {language_said(tag) if tag and base != 'en' else 'English'}: write "
+                     f"in it every text that the owner's apps show.")
+    if not lines:
+        return
+    text = "[hub] The owner changed this in Settings, and it replaces what your start said: " + " ".join(lines)
+    with LOCK:
+        # an open task: one whose session runs, and one that waits for its first session with its start text stored
+        live = [r for r in read_rows("SELECT id, owner, scope_person, source_conversation, source_message FROM tasks "
+                                     f"WHERE {OPEN_TASK}")
+                if r["owner"] in agents() and r["owner"] != manager_name() and not shell_off(r["owner"])
+                and task_scope(r) is None]           # the manager's standing session reads every say: one is enough
+        rows = [(manager_name(), "say", None, text, QUIET_SAY)] if manager_name() in agents() else []
+        # each line goes to the task's own agent, so it is filed under that task itself (filed_under gives the same)
+        rows += [(r["owner"], "say", r["id"], text, QUIET_SAY) for r in live]
+        marked = [f"chat_team:{agent}" for agent in agents() if kv_get(f"chat_team:{agent}") is not None]
+        with transaction():                     # the chats that have read their directory, and the says, at once
+            for key in marked:
+                DB.execute("UPDATE kv SET v=? WHERE k=?", (OWNER_LINES_MARK, key))
+            event_rows(rows, now())
+
+
 def owner_start_text():
     """The owner's name and language (the settings owner.name and owner.language), a line each, which open the team
     directory (team_start_text): so every session that can write what the owner reads -- a task's start, the
@@ -8196,7 +8254,7 @@ def owner_start_text():
     stands as it is. Reads no row."""
     name, tag = setting("owner.name"), setting("owner.language")
     base = tag.split("-")[0].lower()
-    said = f"{LANGUAGE_NAMES[base]} ({tag})" if base in LANGUAGE_NAMES else f"the language of the tag {tag}"
+    said = language_said(tag)
     return (f"\nTHE OWNER'S NAME is {name}: use it where a colleague would use a name.\n" if name else "") + \
         (f"\nTHE OWNER'S LANGUAGE is {said}: write in it every text that the owner's apps show -- your replies and "
          f"messages to the owner, Needs-you items, the titles of goals, tasks and duties, your notes on them and your "
@@ -56355,6 +56413,7 @@ def save_settings(changes, facts=None, only_unset=False):
     commit = commit_kit_file("team.json", data, f"Owner set {said}")
     apply_team(team)
     log("owner", f"set {said} in {commit[:12]}")
+    owner_lines_changed(changed, before)    # the owner, 21 November 2026: an agent kept calling him by his old name
     return {"settings": settings_view(), "runtime_facts": runtime_facts_view(), "changed": changed,
             "revision": commit, "sha256": hashlib.sha256(data).hexdigest()}
 

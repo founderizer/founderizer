@@ -1291,6 +1291,39 @@ class Roles(People):
             self.assertEqual(self.settings(**values)[0], 400, why)
         self.assertEqual(self.settings(only_unset="yes", **{"owner.name": "Sam"})[0], 400)
 
+    def test_a_new_name_or_language_reaches_the_sessions_that_run(self):
+        """The owner, 21 November 2026: "I changed the user name and the agent kept calling me by the previous name". A
+        session keeps the words of its start, and a warm owner chat or standing session does not start again. The bug:
+        a chat, the manager or a task that runs reads the old name until its next start; or a narrowed pair's task,
+        whose start names no owner, reads the owner's lines."""
+        self.assertEqual(self.settings(only_unset=True, **{"owner.language": "en-US"})[0], 200)    # an English Mac
+        self.assertFalse(hub.q("SELECT id FROM events WHERE text LIKE '%changed this in Settings%'"))  # no news
+        self.assertEqual(self.settings(**{"owner.name": "Alex"})[0], 200)
+        chat = ("test-generation", "owner-chat", 1)
+        first, error = hub.call_tool("vps", "read_messages", {}, chat)          # the chat has read its directory
+        self.assertFalse(error, first)
+        self.assertIn("THE OWNER'S NAME is Alex", first)
+        work = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Check the logs','vps','working')")
+        narrowed = hub.ins("INSERT INTO tasks(title,owner,state,scope_person) VALUES('Reply to Pat','vps','working',1)")
+        done = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Old work','vps','completed')")
+        # a task that waits for its first session: its start text is stored already
+        waits = hub.ins("INSERT INTO tasks(title,owner,state) VALUES('Next work','vps','submitted')")
+        self.assertEqual(self.settings(**{"owner.name": "Sam", "owner.language": "es-ES"})[0], 200)
+        said = "THE OWNER'S NAME is now Sam: use it where a colleague would use a name. THE OWNER'S LANGUAGE is now " \
+               "Spanish (es-ES): write in it every text that the owner's apps show."
+        rows = hub.q("SELECT agent, task, text, extra FROM events WHERE kind='say' AND text LIKE '%changed this in "
+                     "Settings%' AND text LIKE '%now Sam%'")
+        self.assertEqual(sorted((r["agent"], r["task"] or 0) for r in rows),
+                         [("manager", 0), ("vps", work), ("vps", waits)])
+        self.assertTrue(all(said in r["text"] and json.loads(r["extra"])["quiet"] for r in rows), rows)
+        self.assertNotIn(narrowed, [r["task"] for r in rows])
+        self.assertNotIn(done, [r["task"] for r in rows])
+        again, error = hub.call_tool("vps", "read_messages", {}, chat)          # the same chat, its next read
+        self.assertFalse(error, again)
+        self.assertTrue(again.startswith(hub.OWNER_LINES_CHANGED), again[:200])
+        self.assertIn("THE OWNER'S NAME is Sam", again)
+        self.assertNotIn("THE OWNER'S NAME is Sam", hub.call_tool("vps", "read_messages", {}, chat)[0])   # once
+
     def test_validate_team_checks_the_settings_it_knows_and_keeps_a_later_releases(self):
         team = json.loads(json.dumps(hub.TEAM))
         for bad in ({"contacts.v2": "on"}, ["contacts.v2"]):

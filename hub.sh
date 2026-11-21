@@ -91,7 +91,7 @@ PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo tzd
 # The Founderizer files this installer needs in the copy it runs from. The rules, the manager's parts of them and its
 # profile are in the list because the manager reads them at every start: a hub without them runs but has no manager
 # worth the name.
-NEEDED="hub.py fleet.py hubsetup.py selftest.py config-ref.sh team.json RULES.md rules/lead.md rules/manager.md profiles/manager.md"
+NEEDED="hub.py fleet.py hubsetup.py releases.py selftest.py config-ref.sh team.json RULES.md rules/lead.md rules/manager.md profiles/manager.md"
 # Seconds that each apt-get waits for the package lock: a new server runs its first updates for about 9 minutes after
 # its first boot, and they hold it (hubsetup.py's APT_LOCK_WAIT).
 APT_LOCK_WAIT=1200
@@ -290,16 +290,20 @@ or 13."
         say "  no systemd here; the hub runs as a systemd user service"
     fi
     # The clone and the check of the copy's commit both need git, which a minimal server does not carry: without
-    # it a copy of the repository was refused as "not a git checkout" (the installer test of 22 October 2026).
+    # it a copy of the repository was refused as "not a git checkout" (the installer test of 22 October 2026). Its
+    # HTTPS needs ca-certificates, which is only a recommended package of git: without it the check of the releases
+    # (releases_reach) and a clone over HTTPS fail with "server certificate verification failed".
     if ! command -v git >/dev/null 2>&1; then
         if [ "$check" = yes ]; then
-            plan "install git, which the clone and the check of this copy's commit need"
+            plan "install git and ca-certificates, which the clone, the check of this copy's commit and the check of \
+the releases need"
         else
             say "  installing git"
             export DEBIAN_FRONTEND=noninteractive
             apt_update || stop "The package lists could not be updated: apt-get update did not finish. A package mirror \
 can fail for a moment: run the line again."
-            apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" install -y -q --no-install-recommends git </dev/null >/dev/null \
+            apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" install -y -q --no-install-recommends git ca-certificates \
+                </dev/null >/dev/null \
                 || stop "The packages of this system could not be installed: apt-get install did not finish. A package mirror can \
 fail for a moment: run the line again."
         fi
@@ -307,8 +311,9 @@ fail for a moment: run the line again."
     if [ -n "$source" ]; then
         plan "clone the Founderizer repository from $source, then install from that clone"
         if [ "$check" = yes ]; then
-            # The clone is not made in check mode, so there is no copy yet to measure.
+            # The clone is not made in check mode, so there is no copy yet to measure, and no releases.py to read.
             plan "check that the clone carries $NEEDED, and a commit"
+            plan "check that this server reaches the address that the hub takes its releases from, over HTTPS"
             return 0
         fi
         fresh="/root/fleet-kit"
@@ -333,6 +338,58 @@ this server, or pass --source with its address."
 repository is made from this one, so it must carry its history: copy a git checkout, or pass --source with its address."
     fi
     say "  Founderizer is in $tree"
+    releases_reach
+}
+
+releases_reach() {  # The hub takes each release from its upstream (hub.py release_upstream: releases.DEFAULT_UPSTREAM,
+                    # read from this copy, on a hub that sets no other) over HTTPS, so a server that cannot reach it
+                    # installs and then takes no release: a hub on a server with IPv6 only stopped at each fetch with
+                    # "Failed to connect to github.com port 443" (the case of 21 November 2026), because github.com
+                    # answers over IPv4 only. This check is in each run of this line: the app's, install_hub's, the
+                    # install prompt's and a run by hand on a copy. One `git ls-remote`, the protocol of the hub's own
+                    # fetch, which changes nothing, with no settings of root's own (the hub fetches as its own user),
+                    # no password prompt and at most a minute; git's last line stays above the stop. A hub that is
+                    # there already (a second run, --reclaim) goes on, with a line that says so: a stop there keeps
+                    # nothing from happening, and the owner's reclaim of a lost Mac needs no GitHub.
+    releases=$(sed -n 's/^DEFAULT_UPSTREAM = "\([^"]*\)".*/\1/p' "$tree/releases.py" 2>/dev/null)
+    [ -n "$releases" ] || stop "$tree/releases.py gives no address of the releases. Copy the repository again."
+    host=${releases#*://}
+    host=${host%%/*}
+    if [ "$check" = yes ]; then
+        plan "check that this server reaches $host over HTTPS, where the hub takes its releases"
+        return 0
+    fi
+    limit=""
+    if command -v timeout >/dev/null 2>&1; then limit="timeout 60"; fi
+    got=0
+    # shellcheck disable=SC2086
+    said=$(GIT_TERMINAL_PROMPT=0 GIT_CONFIG_GLOBAL=/dev/null $limit git ls-remote -q "$releases" HEAD 2>&1 \
+        >/dev/null </dev/null) || got=$?
+    if [ "$got" = 0 ]; then
+        say "  this server reaches $host, where the hub takes its releases"
+        return 0
+    fi
+    last=$(printf '%s\n' "$said" | sed '/^$/d' | tail -n 1)
+    if [ -n "$last" ]; then say "  git: $last"
+    elif [ "$got" = 124 ]; then say "  git: no answer within 60 seconds"
+    else say "  git: it stopped with status $got and gave no reason"
+    fi
+    # github.com answers over IPv4 only, so a server with no default IPv4 route cannot reach it.
+    ipv4=yes
+    if [ "$host" = github.com ] && ! awk 'NR > 1 && $2 == "00000000" {f = 1} END {exit !f}' "$root/proc/net/route" \
+            2>/dev/null; then
+        ipv4=no
+    fi
+    if [ -e "$bare" ]; then
+        [ "$ipv4" = yes ] || say "  this server has no IPv4 route, and GitHub answers over IPv4 only"
+        say "  the hub is there already, so the install goes on; the hub takes no release until git on this server \
+can use $host"
+        return 0
+    fi
+    [ "$ipv4" = yes ] || stop "This server has no IPv4 route, and GitHub, where the hub takes its releases, answers \
+over IPv4 only. Give it a public IPv4 address at your provider, then run the line again."
+    stop "This server could not use $host over HTTPS, where the hub takes its releases: the line above says why. If it \
+cannot connect to $host, let it make outgoing HTTPS connections to $host. Then run the line again."
 }
 
 packages() {
