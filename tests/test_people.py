@@ -916,6 +916,22 @@ class Conversations(People):
         self.assertEqual(whole["items"][2]["in_reply_to"], "CM-1")
         self.assertEqual(self.request(f"/ui/conversations/{self.cid}?db=test-generation&after=2")[1]["items"][0]["id"],
                          "CM-3")
+        # Owner API 1.292: `limit` alone is the newest and `before` pages back, oldest first, as GET
+        # /ui/agent-messages. The head's `last` stays the time of the newest message, which the Mac's list shows: a
+        # paging `last` in its place would show a wrong time. Bug: `limit` ignored, or the head's time overwritten.
+        def items(query):
+            code, page = self.request(f"/ui/conversations/{self.cid}?db=test-generation&{query}")
+            self.assertEqual(code, 200, (query, page))
+            self.assertEqual(page["last"], one["last"], query)
+            return [i["id"] for i in page["items"]], page["more"]
+
+        self.assertEqual(items(""), (["CM-1", "CM-2", "CM-3"], False))
+        self.assertEqual(items("limit=1"), (["CM-3"], True))
+        self.assertEqual(items("before=3&limit=1"), (["CM-2"], True))
+        self.assertEqual(items("before=3"), (["CM-1", "CM-2"], False))
+        self.assertEqual(items("after=0&limit=2"), (["CM-1", "CM-2"], True))
+        for query in ("limit=0", "limit=201", "before=0", "after=1&before=3"):
+            self.assertEqual(self.request(f"/ui/conversations/{self.cid}?db=test-generation&{query}")[0], 400, query)
         self.assertEqual(self.request("/ui/conversations?db=test-generation&agent=vps")[1]["conversations"], [])
         self.assertEqual(self.request("/ui/conversations?db=old")[0], 409)
         self.assertEqual(self.request("/ui/conversations/999?db=test-generation")[0], 404)

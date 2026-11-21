@@ -22601,6 +22601,46 @@ def narrowed_task(task_id):
                                (task_id,)))
 
 
+PAGE_MOST = 200         # the rows of one page of GET /ui/agent-messages and GET /ui/conversations/<id>
+PAGE_REFUSED = (f"after must be 0 or more, before 1 or more and limit 1 to {PAGE_MOST}, and after and before do not "
+                "go together")
+
+
+def page_words(query, most=PAGE_MOST):
+    """The cursors of a read that pages by number (owner API 1.292): `after` (0 or more), `before` (1 or more) and
+    `limit` (1 to `most`), each None when it is not given; a word with no value is not given, as `after=` always
+    meant 0. ValueError for a word that is not a whole number in its range, and for `after` with `before`, which ask
+    for two directions at once. A limit outside the range is refused and never taken as SQL's LIMIT -1 (every row),
+    and a number above SQLite's largest integer is refused and never a 500."""
+    def number(word, least, highest=2 ** 63 - 1):
+        text = query.get(word)
+        if text is None or text == "":
+            return None
+        n = int(text)
+        if not least <= n <= highest:
+            raise ValueError(word)
+        return n
+    after, before, limit = number("after", 0), number("before", 1), number("limit", 1, most)
+    if after is not None and before is not None:
+        raise ValueError("after and before")
+    return after, before, limit
+
+
+def page_rows(select, args, words, most=PAGE_MOST):
+    """One page of the rows of `select` (a SELECT with a WHERE, whose table's `id` is the cursor), oldest first, and
+    whether more rows lie in the direction of the read (owner API 1.292). With `after` (0 too), or with no word at all
+    as before 1.292: the first `limit` (default `most`) above it, and `more` when newer ones follow. With `before`, or
+    with `limit` alone: the newest `limit` below `before` (or of all of them), and `more` when older ones are left."""
+    after, before, limit = words
+    size = limit or most
+    if before is None and (after is not None or limit is None):
+        rows = q(f"{select} AND id>? ORDER BY id LIMIT ?", (*args, after or 0, size + 1))
+        return rows[:size], len(rows) > size
+    below = () if before is None else (before,)
+    rows = q(f"{select}{' AND id<?' if below else ''} ORDER BY id DESC LIMIT ?", (*args, *below, size + 1))
+    return rows[:size][::-1], len(rows) > size
+
+
 def agent_delivery(m, parent, t0, linked=None, as_data=None):
     """Inside a transaction: the event of one agent message (16.2). The manager gets a say event. A worker or a lead
     gets it in the task session that sent the message that this one answers, while that task is open; else in its chat
@@ -70799,6 +70839,8 @@ def phone_chat(agent, query):
         return 404, refusal_words.answer("no_such_agent"), None
     try:
         since = float(query.get("since") or 0)
+        if not math.isfinite(since):        # 1e400 or nan: the page's cursor would be Infinity or NaN, not JSON
+            raise ValueError(since)
     except (TypeError, ValueError):
         return 400, {"error": "since must be the cursor of the page before"}, None
     with LOCK:
@@ -77318,8 +77360,9 @@ class Handler(BaseHTTPRequestHandler):
         return self.ui_command("github-app", read, act)
 
     def ui_agent_messages(self, query):
-        """GET /ui/agent-messages (16.2): the messages that one agent sent or got, oldest first after `after`, at most
-        200. Not in /ui/state."""
+        """GET /ui/agent-messages (16.2): the messages that one agent sent or got, oldest first, at most 200: after
+        `after` (default 0), or the newest `limit` below `before` or of all (owner API 1.292, page_rows). Not in
+        /ui/state."""
         if not self.ui_allowed():
             return
         generation = kv_get("db_id")
@@ -77329,14 +77372,13 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(name, str) or not AGENT_NAME.match(name):
             return self.json(400, {"error": "agent must be an agent name"})
         try:
-            after = int(query.get("after") or 0)
-            if after < 0:
-                raise ValueError()
+            words = page_words(query)
         except ValueError:
-            return self.json(400, {"error": "after must be 0 or more"})
-        rows = q("SELECT * FROM agent_messages WHERE (sender=? OR recipient=?) AND id>? ORDER BY id LIMIT 200",
-                 (name, name, after))
-        return self.json(200, scrub({"db": generation, "messages": [agent_message_view(m) for m in rows]}),
+            return self.json(400, {"error": PAGE_REFUSED})
+        rows, more = page_rows("SELECT * FROM agent_messages WHERE (sender=? OR recipient=?)", (name, name), words)
+        return self.json(200, scrub({"db": generation, "messages": [agent_message_view(m) for m in rows],
+                                     "more": more, "first": rows[0]["id"] if rows else None,
+                                     "last": rows[-1]["id"] if rows else None}),
                          {"Cache-Control": "no-store"})
 
     def ui_outbound_again(self, item_id):
@@ -77699,28 +77741,27 @@ class Handler(BaseHTTPRequestHandler):
                          {"Cache-Control": "no-store"})
 
     def ui_conversation(self, cid, query):
-        """GET /ui/conversations/<id>: the whole conversation, oldest first after `after`, at most 200 at a time:
-        what the person wrote, what the agent answered and how it was delivered, what the agent asked the owner, and
-        what the owner answered. This is the record of requirement 2."""
+        """GET /ui/conversations/<id>: the whole conversation, oldest first, at most 200 at a time, after `after`
+        (default 0) or the newest `limit` below `before` or of all (owner API 1.292, page_rows): what the person
+        wrote, what the agent answered and how it was delivered, what the agent asked the owner, and what the owner
+        answered. This is the record of requirement 2."""
         if not self.ui_allowed():
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
             return self.json(409, refusal_words.answer("hub_changed"))
         try:
-            after = int(query.get("after") or 0)
-            if after < 0:
-                raise ValueError()
+            words = page_words(query)
         except ValueError:
-            return self.json(400, {"error": "after must be 0 or more"})
+            return self.json(400, {"error": PAGE_REFUSED})
         c = q1("SELECT * FROM conversations WHERE id=?", (cid,))
         if not c:
             return self.json(404, {"error": "no such conversation"})
-        rows = q("SELECT * FROM conversation_messages WHERE conversation=? AND id>? ORDER BY id LIMIT 200",
-                 (cid, after))
+        rows, more = page_rows("SELECT * FROM conversation_messages WHERE conversation=?", (cid,), words)
         # CHAT-APPS.md 20: an agent's files of a line; 8.1: a person's files of their line
         files = carried_files("cm", [r["id"] for r in rows])
-        return self.json(200, scrub(dict(conversation_view(c, last=False), db=generation,
+        # `more` only: the head's `last` is the time of the conversation's newest message (owner API 1.292)
+        return self.json(200, scrub(dict(conversation_view(c, last=False), db=generation, more=more,
                                          items=[dict(conversation_message_view(r), attachments=files.get(r["id"], []))
                                                 for r in rows])),
                          {"Cache-Control": "no-store"})

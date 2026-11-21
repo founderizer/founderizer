@@ -368,15 +368,18 @@ class Shape(WithServer):
 
     def test_every_page_of_fleet_read_is_a_get_route_the_hub_really_serves(self):
         """The one list this server keeps of the owner API. A page that names a route the hub does not serve would
-        read as an empty fleet instead of a mistake, so the dispatch itself is the check. **And each page offers the
-        words that its route reads, and no other** (PAGE_TAKES): a hub that records each word that a route reads gets
-        every word of PAGE_QUERY. A word that a route did not read changed nothing, and the agent took the whole page
-        for the narrowed one (`machines` read no `agent`, point 2 of the review of 20 November 2026); a word left out
-        is refused, and the agent cannot narrow the page. The schema offers those words and no other (it had no
-        `name` for chat_link, and a `since` that no route read). A route that refuses its item before it reads its
-        words, or reads one word only when another is absent, needs its own case here: the knowledge list has one file,
-        so that the route reads `path` whether git gave the list in time or not."""
-        dispatch = (HERE / "hub.py").read_text()
+        read as an empty fleet instead of a mistake, so the dispatch itself is the check: the GET dispatch only
+        (`Handler.get`), and in it one condition with the route's length, every fixed part before its subject (three
+        for /ui/mobile/chat/{agent}) and each fixed part after it (a page under /ui/mobile/ or /ui/tasks/<id>/ with a
+        wrong part passed because another route had the same first two parts, or a POST route had the path). **And
+        each page offers the words that its route reads, and no other** (PAGE_TAKES): a hub that records each word
+        that a route reads gets every word of PAGE_QUERY. A word that a route did not read changed nothing, and the
+        agent took the whole page for the narrowed one (`machines` read no `agent`, point 2 of the review of 20
+        November 2026); a word left out is refused, and the agent cannot narrow the page. The schema offers those
+        words and no other (it has no `name` for chat_link; its `since` is owner_chat's). A route that refuses its
+        item before it reads its words, or reads one word only when another is absent, needs its own case here: the
+        knowledge list has one file, so that the route reads `path` whether git gave the list in time or not."""
+        dispatch = re.search(r"\n    def get\(self\):\n(.*?)\n    def ", (HERE / "hub.py").read_text(), re.S).group(1)
         read, page_now = {}, [None]
 
         class Recorded(dict):
@@ -396,14 +399,22 @@ class Shape(WithServer):
         def recorded(handler):
             parts, words = route(handler)
             return parts, Recorded(words)
-        query = {word: "1" if word in ("after", "before", "limit") else "manager" for word in owner_mcp.PAGE_QUERY}
+        query = {word: "1" if word in ("after", "before", "since", "limit") else "manager"
+                 for word in owner_mcp.PAGE_QUERY}
         listed = [{"path": "knowledge/owner/none.md", "scope": "owner"}]
         with patch.object(hub.Handler, "route", recorded), patch.object(hub, "knowledge_entries", lambda: listed):
             for page, (path, about) in owner_mcp.PAGES.items():
-                parts = [p for p in path.replace("{id}", "1").split("/") if p]
+                parts = [p for p in path.split("/") if p]
                 self.assertTrue(about.strip(), page)
-                found = re.search(r'parts == \[' + ", ".join(f'"{p}"' for p in parts) + r'\]', dispatch) or \
-                    re.search(r'parts\[:\d\] == \[' + ", ".join(f'"{p}"' for p in parts[:2]) + r'\]', dispatch)
+                subject = next((i for i, p in enumerate(parts) if p.startswith("{")), None)
+                if subject is None:
+                    found = re.search(r'parts == \[' + ", ".join(f'"{p}"' for p in parts) + r'\]', dispatch)
+                else:
+                    head = re.escape(f"len(parts) == {len(parts)} and parts[:{subject}] == [") + \
+                        ", ".join(f'"{p}"' for p in parts[:subject]) + r"\]"
+                    tail = "".join(rf'(?=.*parts\[{i}\] (== "{p}"|in \([^)]*"{p}"))' for i, p in enumerate(parts)
+                                   if i > subject)
+                    found = re.search(head + tail, dispatch)
                 self.assertTrue(found, f"{page}: the hub has no GET route {path}")
                 page_now[0] = page
                 address = path.replace("{id}", "1").replace("{agent}", "manager").replace("{name}", "nobody")
@@ -413,9 +424,10 @@ class Shape(WithServer):
                 self.assertEqual(sorted(read.get(page, set()) & set(owner_mcp.PAGE_QUERY)),
                                  sorted(owner_mcp.PAGE_TAKES.get(page, ())), f"{page}: the words that {path} reads")
         self.assertLessEqual(set(owner_mcp.PAGE_TAKES), set(owner_mcp.PAGES))
-        # The schema keeps its words of before in this release (`since`, and no `name`): see PAGE_QUERY's comment.
+        # The schema has no `name` in this release: see PAGE_QUERY's comment.
         schema = next(t for t in owner_mcp.tools() if t["name"] == "fleet_read")["inputSchema"]["properties"]
-        self.assertEqual(set(schema) - {"since"}, {"page"} | {w for page in owner_mcp.PAGES for w in owner_mcp.page_words(page)} - {"name"})
+        self.assertEqual(set(schema), {"page"} | {w for page in owner_mcp.PAGES for w in owner_mcp.page_words(page)} - {"name"})
+        self.assertEqual(schema["since"], {"type": "number"})       # owner_chat's cursor is a time: an integer cuts it
 
     def test_without_a_hub_every_tool_says_how_to_get_one(self):
         client = self.client(hub_base=None)
@@ -549,7 +561,8 @@ class FromNothing(WithServer):
         self.assertEqual(set(reached) | set(missing), set(owner_mcp.PAGES))
         self.assertLessEqual({"state", "machines", "servers", "team", "capacity", "health", "releases", "checks",
                               "triggers", "responsibilities", "resources", "profiles", "people", "conversations",
-                              "chat_apps", "devices", "goal", "responsibility", "agent_messages", "notes", "homes"},
+                              "chat_apps", "devices", "goal", "responsibility", "agent_messages", "notes", "homes",
+                              "owner_chat"},
                              set(reached))
         self.assertEqual(reached["state"]["db"], "test-generation")
         self.assertEqual(reached["goal"]["goal"]["id"], goal)
@@ -615,6 +628,15 @@ class FromNothing(WithServer):
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (need,))["answer"], "The company card.")
         self.assertEqual(hub.q1("SELECT r.need_id FROM attachments a JOIN ui_requests r ON r.request_id = a.message "
                                 "WHERE a.id=?", (sent["id"],))["need_id"], need)
+        # Both are on the page owner_chat, the owner's own chat with the agent, where its reply comes too. Bug: the
+        # page names a wrong route, or there is none, and an agent that reads conversations (people on chat apps)
+        # does not find its message and sends it again.
+        chat = client.call("fleet_read", page="owner_chat", agent="manager")
+        said = {i["id"]: i for i in chat["items"] if i["kind"] == "message"}
+        self.assertEqual((said[receipt["request_id"]]["text"], said[receipt["request_id"]]["answer_to"]),
+                         ("I want one paying customer this month.", None))
+        self.assertEqual((said[answered["request_id"]]["text"], said[answered["request_id"]]["answer_to"]),
+                         ("The company card.", need))
         # The review of 20 November 2026, issue 4: words to an item that has options are the hub's refusal, word
         # for word, and the item stays open; the option that the owner chose goes
         raised, error = hub.call_tool("manager", "raise_needs_you", {
@@ -4330,14 +4352,17 @@ def parity_cases():
     case("fleet_overview: a page refused", "fleet_overview", None,
          lambda s, r: parity_json(403, {"error": "is not owner's machine"}) if r["path"] == "/ui/servers" else None)
     # A word that the page does not read is refused before any request (PAGE_TAKES): notes' limit, trigger's after,
-    # and machines' agent and id; standing reads both of its words.
+    # and machines' agent and id; standing reads both of its words; owner_chat sends its time cursor whole (a since
+    # that the program cut or dropped reads the wrong page), and takes no after.
     for args in ({"page": "health"}, {"page": "notes", "agent": "a b", "limit": 5},
                  {"page": "trigger", "id": 2, "after": 9}, {"page": "knowledge", "path": "a/b.md"},
                  {"page": "chat_link", "name": "wa 1"}, {"page": "goal"}, {"page": "nothing"},
                  {"page": "notes", "agent": "a/b"}, {"page": "machines", "agent": "worker-1", "id": 3},
                  {"page": "standing", "agent": "a b", "limit": 5}, {"page": "machines", "agent": None, "limit": 0},
                  {"page": "machines", "limit": False}, {"page": "chat_link", "name": "wa 1", "agent": "x"},
-                 {"page": "events", "id": 5, "since": 100, "after": 2, "machine": None}):
+                 {"page": "events", "id": 5, "since": 100, "after": 2, "machine": None},
+                 {"page": "owner_chat", "agent": "manager", "since": 1792134000.25},
+                 {"page": "owner_chat", "agent": "manager", "after": 3}):
         case(f"fleet_read: {json.dumps(args, sort_keys=True)}", "fleet_read", args)
     case("search_history", "search_history", {"agent": "worker-1", "query": "a b", "limit": 3})
     case("see_costs", "see_costs", {"from": "2026-11-01", "minimum": 3})

@@ -705,6 +705,10 @@ class Devices(test_ui_api.OwnerAPI):
         after = self.call(f"/ui/mobile/chat/manager?since={page['cursor']}")[1]
         self.assertEqual(after["items"], [])                            # the cursor gives what comes after it
         self.assertEqual(self.call("/ui/mobile/chat/nobody")[0], 404)
+        # A since that is no finite number gave 200 with "cursor": Infinity or NaN, which no strict JSON reader takes
+        # (the owner tools' page owner_chat passes since as it is given).
+        for since in ("x", "1e400", "inf", "-inf", "nan"):
+            self.assertEqual(self.call(f"/ui/mobile/chat/manager?since={since}")[0], 400, since)
 
     def test_the_compact_read_names_the_features_as_the_whole_snapshot_does(self):
         state, mobile = self.call("/ui/state")[1], self.call("/ui/mobile")[1]

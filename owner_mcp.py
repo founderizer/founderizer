@@ -930,9 +930,27 @@ PAGES = {
     "people": ("/ui/people", "the people the owner added, their roles and handles, and the unknown senders"),
     "roles": ("/ui/roles", "the roles a person can hold: each one's prompt, its tools switch and its daily limit"),
     "settings": ("/ui/settings", "the fleet's settings: each one's value, its default, and what it does"),
-    "conversations": ("/ui/conversations", "every conversation between an agent and a person, newest first"),
-    "conversation": ("/ui/conversations/{id}", "one whole conversation, oldest first after `after`"),
-    "agent_messages": ("/ui/agent-messages", "the messages one agent sent or got (give agent)"),
+    "conversations": ("/ui/conversations", "every conversation between an agent and a person on a chat app (Discord, "
+                                           "WhatsApp, Telegram), newest first. The owner's own chat with an agent "
+                                           "is the page owner_chat"),
+    "conversation": ("/ui/conversations/{id}", "one whole conversation of an agent with a person on a chat app, oldest "
+                                               "first after `after`; limit with no cursor gives the newest, and "
+                                               "before pages back: give it the number n of the first item's CM-n. "
+                                               "The head's last is a time, not a cursor. An answer with no more is "
+                                               "from an older hub, which ignored limit and before. The owner's own "
+                                               "chat with an agent is the page owner_chat"),
+    "owner_chat": ("/ui/mobile/chat/{agent}", "the owner's own chat with one agent (give agent), where "
+                                              "send_message and answer_needs_you write, as the owner's apps do: the "
+                                              "owner's messages and answers and the agent's reports to the owner, "
+                                              "oldest first. Without since, and with since=0, the newest 30 items "
+                                              "only. since is a time in epoch seconds: the 30 items after it, so "
+                                              "the cursor that the page before gave reads on from that page, and an "
+                                              "earlier time reads from that point. Older items are in "
+                                              "search_history"),
+    "agent_messages": ("/ui/agent-messages", "the messages one agent sent or got (give agent), oldest first after "
+                                             "`after`; limit with no cursor gives the newest, and before pages back "
+                                             "(the answer's first and last are the numbers to page with). An answer "
+                                             "with no more is from an older hub, which ignored limit and before"),
     "chat_apps": ("/ui/chat-apps", "Pause all, when the bridge last called, and each chat account"),
     "events": ("/ui/tasks/{id}/events", "one task's runtime thread records, from a cursor"),
     "artifacts": ("/ui/tasks/{id}/artifacts", "the checked output files of one accepted task"),
@@ -951,12 +969,12 @@ PAGES = {
                                                "name, the account id). The QR is only here, and it dies in seconds"),
 }
 PAGE_QUERY = ("path", "agent", "person", "expertise", "needs", "login",      # the words these routes narrow by
-              "after", "before", "limit")                                    # and the cursors they page with
-# fleet_read's schema keeps `since`, which no page reads (it is refused as a word of no page), and has no `name` for
-# chat_link: the program relay of a session that started on Founderizer 0.1.383 to 0.1.396 compared a read's whole
-# schema with the new program's, so a change of it ended fleet_read in each such session (the reviews of 20 November
-# 2026). Since 0.1.397 the relay compares a read's marks only, and slice 8b put the page `lessons` into the schema's
-# list of pages; `since` out and `name` in, with the test of the exact schema, are still to do.
+              "after", "before", "since", "limit")                           # and the cursors they page with
+# fleet_read's schema: `since` is a number, the time of owner_chat's cursor (an integer cut it), and there is no `name`
+# for chat_link. The program relay of a session that started on Founderizer 0.1.383 to 0.1.396 (builds 384 to 397)
+# compares a read's whole schema with the new program's, so a change of it (the pages lessons and owner_chat, and that
+# `since`) refuses fleet_read at each call of such a session until it starts again (the reviews of 20 November 2026).
+# Since 0.1.397 the relay compares a read's marks only. `name` for chat_link is still to do.
 PAGE_WORDS = ("path", "agent", "person", "expertise", "needs", "login")
 PAGE_IN_PATH = ("{agent}", "{name}")        # a page whose subject is a path segment and not a query word
 # **The words of PAGE_QUERY that each page's own route reads**; a page that is not here reads none of them. A word that
@@ -964,8 +982,9 @@ PAGE_IN_PATH = ("{agent}", "{name}")        # a page whose subject is a path seg
 # `agent` and gives every machine, about 93,000 characters on the owner's fleet (point 2 of the review of this area,
 # 20 November 2026). So `fleet_read` refuses such a word before any request, and says which words the page reads.
 # `test_owner_mcp.Shape` holds each entry to the words that the hub's route reads, on a hub that records them.
-PAGE_TAKES = {"agent_messages": ("agent", "after"), "capacity": ("expertise", "needs", "login"),
-              "conversation": ("after",), "conversations": ("agent", "person"), "events": ("after", "limit"),
+PAGE_TAKES = {"agent_messages": ("agent", "after", "before", "limit"), "capacity": ("expertise", "needs", "login"),
+              "conversation": ("after", "before", "limit"), "conversations": ("agent", "person"),
+              "events": ("after", "limit"), "owner_chat": ("since",),
               "homes": ("agent",), "hosts": ("agent",), "knowledge": ("path",), "kpis": ("agent",),
               "responsibility": ("before", "limit"),
               "skills": ("agent",), "standing": ("agent", "before", "limit"), "trigger": ("before", "limit")}
@@ -2913,7 +2932,7 @@ def tools():
               "id": {"type": "integer", "description": "The id, for a page about one goal, duty, rule, task or "
                                                        "conversation."},
               **{k: {"type": "string"} for k in PAGE_WORDS},
-              **{k: {"type": "integer"} for k in PAGE_QUERY + ("since",) if k not in PAGE_WORDS}},
+              **{k: {"type": "number" if k == "since" else "integer"} for k in PAGE_QUERY if k not in PAGE_WORDS}},
              ("page",), read_page),
         tool("Read",
              "search_history", "Search what one agent took part in, or every agent with no agent: its conversations "
@@ -2946,7 +2965,8 @@ def tools():
                              "about how an agent works is the same too: say it in the owner's own words to that "
                              "agent, or to its lead or the fleet manager when the agent's Shell box is off, and they "
                              "keep it and keep it in order. Not for a task that runs: steer_task. attachments: the "
-                             "ids that attach_file gave.",
+                             "ids that attach_file gave. Read the reply on the page owner_chat of the agent that got "
+                             "it.",
              {"text": S["text"], "recipient": S["text"], "attachments": {"type": "array", "items": {"type": "integer"}},
               **rid}, ("text",), write_message),
         tool("Work",
@@ -2998,7 +3018,10 @@ def tools():
                                  "changes the team: it adds or removes an agent, or changes a profile, the reporting "
                                  "lines or an owner file. attachments: at most four ids from attach_file. They go "
                                  "with an answer in words, or alone, as in the Founderizer app. A choice or choices "
-                                 "carries no file. An item whose answer goes into a conversation takes none.",
+                                 "carries no file. An item whose answer goes into a conversation takes none. Read "
+                                 "the reply on the page owner_chat of the agent that asked; a question back comes as "
+                                 "a new Needs-you item. The reply to an item of a conversation goes to the person, "
+                                 "on the page conversation.",
              {"need": S["int"], "answer": S["text"], "choice": S["int"],
               "choices": {"type": "array", "items": {"type": "integer"}},
               "attachments": {"type": "array", "items": {"type": "integer"}}, **rid}, ("need",), answer_need),
