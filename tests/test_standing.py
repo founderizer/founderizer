@@ -309,6 +309,36 @@ class Keeping(Base):
         with patch.object(hub, "STANDING_CHARS", 10):                   # the first comes, whole, whatever its size
             self.assertIn(rules[0].strip(), hub.standing_start_text("hand"))
 
+    def test_a_keep_that_crowds_a_members_start_tells_its_keeper(self):
+        """The design "An agent keeps its own rules", slice 2: a start shows 8,000 characters of items whole and names
+        the rest by their ids. Bug: a keep takes the items that steer a team member past three quarters of that, and
+        the keeper hears nothing, so that member's starts lose the newest wishes to an id (the state of 20 November
+        2026); or every keep says it, also one that stays under the mark; or a keeper whose Shell box is off, whose
+        start shows each item whole, reads of a limit that it does not have."""
+        def words(n):
+            return (f"Rule {n}: " + "answer each ticket in full and in the customer's own language, " * 10)[:590]
+        for n in range(1, 5):                                           # hand's own items
+            self.assertNotIn("that a start shows whole", self.ok("hand", "keep_instruction", words=words(n),
+                                                                     scope="agent"))
+        team = hub.team_below("lead")
+        n, said = 4, ""
+        while hub.standing_fit("hand") <= hub.STANDING_MARK:
+            self.assertNotIn("that a start shows whole", said)          # under the mark: not a word of it
+            n += 1
+            said = self.ok("lead", "keep_instruction", words=words(n), scope="team")
+            self.assertIn(f"It now reaches {len(team)} agents: {', '.join(hub.shown_role(x) for x in team)}. An item "
+                          f"for fewer of them goes to those agents, which keep it.", said)
+        self.assertLessEqual(hub.standing_fit("lead"), hub.STANDING_MARK)
+        self.assertIn(f"The items that steer {hub.shown_role('hand')} now take {hub.standing_fit('hand'):,} of the "
+                      f"8,000 characters that a start shows whole. Put yours in order: end one that is done; pass one "
+                      f"that is for one agent to that agent; write the rule of one duty into that duty's words, and "
+                      f"end the item with that place in why.", said)
+        with patch.object(hub, "shell_off", lambda name: name == "hand"):   # a keeper whose start shows them all
+            closed = hub.standing_crowded("hand", ["hand"])
+        self.assertEqual(closed, f" The items that steer you now take {hub.standing_fit('hand'):,} characters at each "
+                                 f"start. Your line keeps them in order: tell {hub.task_giver('hand')} with "
+                                 f"message_agent.")
+
 
 class Provenance(Base):
     def test_the_owner_s_words_to_the_agent_or_to_its_line_are_his(self):

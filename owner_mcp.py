@@ -729,13 +729,20 @@ def _call(method, path, body, base, timeout, limit, mime, extra, total, key):
         raise Refused(f"The call to the hub at {base} was lost: {e}. The request can have arrived: read the fleet "
                       f"before you send it again.") from None
     if len(raw) > limit:
-        raise Refused("The hub's answer is larger than this server reads.")
+        raise Refused(LARGER if method in ("GET", "HEAD") else LARGER_SENT)
     kind = (got.get("Content-Type") or "").split(";")[0].strip().lower()
     try:
         parsed = json.loads(raw) if kind == "application/json" and raw.strip() else None
     except ValueError:
         parsed = None
     return Answer(status, parsed, raw, got)
+
+
+# An answer larger than this server reads, with what to do (the same words in the program inside the app, `OwnerHub`):
+# a command can have done its work, and a page can be read in smaller parts.
+LARGER = "The hub's answer is larger than this server reads, so it was not read."
+LARGER_SENT = LARGER + " The request can have arrived: read the fleet before you send it again."
+LARGER_PAGE = LARGER + " Read less at a time: one item by its id, or a page with a word that narrows it."
 
 
 def refusal(answer, what):
@@ -932,9 +939,49 @@ PAGES = {
                                                "name, the account id). The QR is only here, and it dies in seconds"),
 }
 PAGE_QUERY = ("path", "agent", "person", "expertise", "needs", "login",      # the words these routes narrow by
-              "after", "before", "since", "limit")                           # and the cursors they page with
+              "after", "before", "limit")                                    # and the cursors they page with
+# fleet_read's schema stays as it was in this release: `since`, which no page reads (it is refused as a word of no
+# page), and no `name` for chat_link. The program relay of a session that started before the release that brings this
+# rule compares a read's whole schema with the new program's, so a change of it ends fleet_read in each such session
+# until it starts again; the schema changes in a later release, with its test (the reviews of 20 November 2026).
 PAGE_WORDS = ("path", "agent", "person", "expertise", "needs", "login")
 PAGE_IN_PATH = ("{agent}", "{name}")        # a page whose subject is a path segment and not a query word
+# **The words of PAGE_QUERY that each page's own route reads**; a page that is not here reads none of them. A word that
+# a route does not read changed nothing, and the agent took the whole page for the narrowed one: `machines` reads no
+# `agent` and gives every machine, about 93,000 characters on the owner's fleet (point 2 of the review of this area,
+# 20 November 2026). So `fleet_read` refuses such a word before any request, and says which words the page reads.
+# `test_owner_mcp.Shape` holds each entry to the words that the hub's route reads, on a hub that records them.
+PAGE_TAKES = {"agent_messages": ("agent", "after"), "capacity": ("expertise", "needs", "login"),
+              "conversation": ("after",), "conversations": ("agent", "person"), "events": ("after", "limit"),
+              "homes": ("agent",), "hosts": ("agent",), "knowledge": ("path",), "responsibility": ("before", "limit"),
+              "skills": ("agent",), "standing": ("agent", "before", "limit"), "trigger": ("before", "limit")}
+
+
+def page_needs(page):
+    """The words that one page needs: its id, and the subject in its path."""
+    route = PAGES[page][0]
+    return (["id"] if "{id}" in route else []) + [mark[1:-1] for mark in PAGE_IN_PATH if mark in route]
+
+
+def page_words(page):
+    """The words that `fleet_read` takes for one page, in the order of its route: the ones it needs, then the words of
+    its query."""
+    return page_needs(page) + list(PAGE_TAKES.get(page, ()))
+
+
+def page_takes(page):
+    """What one page takes, in the words of a refusal (the same in the program inside the app, `OwnerTools`)."""
+    needs, takes = page_needs(page), list(PAGE_TAKES.get(page, ()))
+    if not needs and not takes:
+        return "it takes only page, and gives all of it in one answer."
+    return "it " + ", and ".join(([f"needs {and_list(needs)}"] if needs else [])
+                                 + ([f"takes {and_list(takes)}"] if takes else [])) + "."
+
+
+def and_list(words, last="and"):
+    """"a", "a and b", "a, b and c"; after "no", "a or b"."""
+    words = list(words)
+    return words[0] if len(words) == 1 else ", ".join(words[:-1]) + f" {last} " + words[-1]
 
 
 def read_page(args):
@@ -942,6 +989,13 @@ def read_page(args):
     if page not in PAGES:
         raise Refused("page must be one of: " + ", ".join(sorted(PAGES)))
     route, what = PAGES[page]
+    # Each word of the call that this page does not take is refused before any request, also one that the schema does
+    # not have (an older list's `since`, a word of the agent's own): the hub would give the whole page.
+    takes, known = page_words(page), tuple(dict.fromkeys(("id",) + tuple(m[1:-1] for m in PAGE_IN_PATH) + PAGE_QUERY))
+    extra = [word for word in known if word not in takes and args.get(word) is not None] + \
+        sorted(word for word in args if word != "page" and word not in known and args[word] is not None)
+    if extra:
+        raise Refused(f"the page {page} takes no {and_list(extra, 'or')}, so nothing was read: {page_takes(page)}")
     if "{id}" in route:
         number = args.get("id")
         if isinstance(number, bool) or not isinstance(number, int) or number < 1:
@@ -956,7 +1010,12 @@ def read_page(args):
             one_part(word, value)
             route, args = route.replace(mark, urllib.parse.quote(value, safe="")), \
                 {k: v for k, v in args.items() if k != word}
-    return get(route, what, **{k: args[k] for k in PAGE_QUERY if args.get(k) is not None}).data
+    try:
+        return get(route, what, **{k: args[k] for k in PAGE_QUERY if args.get(k) is not None}).data
+    except Refused as e:
+        if str(e) != LARGER:
+            raise
+        raise Refused(LARGER_PAGE) from None
 
 
 def history(args):
@@ -1081,9 +1140,16 @@ def route_for(route, args):
     names no other route. A part that the arguments do not give is the KeyError that `call_tool` says. A part that is
     "." or ".." is refused before any request (`one_part`), as the program inside the app refuses it."""
     for key in re.findall(r"\{(\w+)\}", route):
-        if key in args:
-            one_part(key, args[key])
+        if args.get(key) is None or str(args[key]) == "":
+            raise Refused(route_needs(key))         # null was the part "None", and "" a route with no part there
+        one_part(key, args[key])
     return route.format(**{key: urllib.parse.quote(str(value), safe="") for key, value in args.items()})
+
+
+def route_needs(key):
+    """A part of a route that the arguments do not give: the words are the same in the program inside the app
+    (`OwnerTools.route`). Until 20 November 2026 it was Python's KeyError, "<tool> could not be sent: 'agent'"."""
+    return f"give {key}: this tool's route needs it, so the command was not sent."
 
 
 def one_part(key, value):
@@ -1302,7 +1368,9 @@ def with_revision(route, read, fields, what):
     read gives, so two changes at once cannot undo each other."""
     def run(args):
         number = whole_number(args, "id")
-        page = read_page({"page": read, "id": number})
+        # Its revision is the one number that this read needs: a page that takes `limit` gives one of its items with
+        # it, and not the 50 of its default (a duty's page holds its cases).
+        page = read_page(dict({"page": read, "id": number}, **({"limit": 1} if "limit" in page_words(read) else {})))
         thing = page.get({"goal": "goal", "responsibility": "responsibility", "trigger": "trigger"}[read])
         body = sent(run, fields, args)
         body["base_revision"] = (thing or {}).get("revision")
@@ -2790,7 +2858,7 @@ def tools():
               "id": {"type": "integer", "description": "The id, for a page about one goal, duty, rule, task or "
                                                        "conversation."},
               **{k: {"type": "string"} for k in PAGE_WORDS},
-              **{k: {"type": "integer"} for k in PAGE_QUERY if k not in PAGE_WORDS}},
+              **{k: {"type": "integer"} for k in PAGE_QUERY + ("since",) if k not in PAGE_WORDS}},
              ("page",), read_page),
         tool("search_history", "Search what one agent took part in, or every agent with no agent: its conversations "
                                "with people, its chats with you, its messages with other agents, its tasks with their "
@@ -3462,6 +3530,7 @@ def dump_tools(listed=None):
         entries.append(entry)
     table = {"tools": entries, "instructions": INSTRUCTIONS, "protocol": PROTOCOL, "supported": list(SUPPORTED),
              "PAGES": {page: list(found) for page, found in PAGES.items()}, "PAGE_QUERY": list(PAGE_QUERY),
+             "PAGE_TAKES": {page: list(words) for page, words in PAGE_TAKES.items()},
              "PAGE_WORDS": list(PAGE_WORDS), "PAGE_IN_PATH": list(PAGE_IN_PATH), "HISTORY_WORDS": list(HISTORY_WORDS),
              "COSTS_WORDS": list(COSTS_WORDS), "MEDIA_TYPES": dict(MEDIA_TYPES)}
     table["version"] = hashlib.sha256(json.dumps(table, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -3480,7 +3549,9 @@ def call_tool(name, args):
         return str(e), True
     except (ValueError, TypeError, KeyError) as e:
         return f"{name} could not be sent: {e}", True
-    return json.dumps(result, indent=1, sort_keys=True, default=str), False
+    # With no indent: the same answer in about a fifth fewer characters (an indent of 1 cost 7 to 33% on the pages of
+    # the owner's fleet, 20 November 2026), and the agent reads it the same.
+    return json.dumps(result, sort_keys=True, default=str), False
 
 
 # ---- the MCP server on standard input and output

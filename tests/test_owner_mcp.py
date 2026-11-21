@@ -363,22 +363,63 @@ class Shape(WithServer):
 
     def test_every_page_of_fleet_read_is_a_get_route_the_hub_really_serves(self):
         """The one list this server keeps of the owner API. A page that names a route the hub does not serve would
-        read as an empty fleet instead of a mistake, so the dispatch itself is the check."""
+        read as an empty fleet instead of a mistake, so the dispatch itself is the check. **And each page offers the
+        words that its route reads, and no other** (PAGE_TAKES): a hub that records each word that a route reads gets
+        every word of PAGE_QUERY. A word that a route did not read changed nothing, and the agent took the whole page
+        for the narrowed one (`machines` read no `agent`, point 2 of the review of 20 November 2026); a word left out
+        is refused, and the agent cannot narrow the page. The schema offers those words and no other (it had no
+        `name` for chat_link, and a `since` that no route read). A route that refuses its item before it reads its
+        words, or reads one word only when another is absent, needs its own case here: the knowledge list has one file,
+        so that the route reads `path` whether git gave the list in time or not."""
         dispatch = (HERE / "hub.py").read_text()
-        for page, (path, about) in owner_mcp.PAGES.items():
-            parts = [p for p in path.replace("{id}", "1").split("/") if p]
-            self.assertTrue(about.strip(), page)
-            found = re.search(r'parts == \[' + ", ".join(f'"{p}"' for p in parts) + r'\]', dispatch) or \
-                re.search(r'parts\[:\d\] == \[' + ", ".join(f'"{p}"' for p in parts[:2]) + r'\]', dispatch)
-            self.assertTrue(found, f"{page}: the hub has no GET route {path}")
+        read, page_now = {}, [None]
+
+        class Recorded(dict):
+            def get(self, key, default=None):
+                read.setdefault(page_now[0], set()).add(key)
+                return super().get(key, default)
+
+            def __getitem__(self, key):
+                read.setdefault(page_now[0], set()).add(key)
+                return super().__getitem__(key)
+
+            def __contains__(self, key):
+                read.setdefault(page_now[0], set()).add(key)
+                return super().__contains__(key)
+        route = hub.Handler.route
+
+        def recorded(handler):
+            parts, words = route(handler)
+            return parts, Recorded(words)
+        query = {word: "1" if word in ("after", "before", "limit") else "manager" for word in owner_mcp.PAGE_QUERY}
+        listed = [{"path": "knowledge/owner/none.md", "scope": "owner"}]
+        with patch.object(hub.Handler, "route", recorded), patch.object(hub, "knowledge_entries", lambda: listed):
+            for page, (path, about) in owner_mcp.PAGES.items():
+                parts = [p for p in path.replace("{id}", "1").split("/") if p]
+                self.assertTrue(about.strip(), page)
+                found = re.search(r'parts == \[' + ", ".join(f'"{p}"' for p in parts) + r'\]', dispatch) or \
+                    re.search(r'parts\[:\d\] == \[' + ", ".join(f'"{p}"' for p in parts[:2]) + r'\]', dispatch)
+                self.assertTrue(found, f"{page}: the hub has no GET route {path}")
+                page_now[0] = page
+                address = path.replace("{id}", "1").replace("{agent}", "manager").replace("{name}", "nobody")
+                with contextlib.suppress(urllib.error.HTTPError):
+                    urllib.request.urlopen(self.base + address + "?" + urllib.parse.urlencode(
+                        dict(query, db="test-generation")), timeout=30).close()
+                self.assertEqual(sorted(read.get(page, set()) & set(owner_mcp.PAGE_QUERY)),
+                                 sorted(owner_mcp.PAGE_TAKES.get(page, ())), f"{page}: the words that {path} reads")
+        self.assertLessEqual(set(owner_mcp.PAGE_TAKES), set(owner_mcp.PAGES))
+        # The schema keeps its words of before in this release (`since`, and no `name`): see PAGE_QUERY's comment.
+        schema = next(t for t in owner_mcp.tools() if t["name"] == "fleet_read")["inputSchema"]["properties"]
+        self.assertEqual(set(schema) - {"since"}, {"page"} | {w for page in owner_mcp.PAGES for w in owner_mcp.page_words(page)} - {"name"})
 
     def test_without_a_hub_every_tool_says_how_to_get_one(self):
         client = self.client(hub_base=None)
         client.start()
         self.assertIsNone(client.call("which_hub")["hub"])
-        for name in ("fleet_overview", "fleet_read", "send_message", "take_release"):
-            with self.assertRaises(Refused) as caught:
-                client.call(name, page="state", text="x", need=1)
+        for name, args in (("fleet_overview", {}), ("fleet_read", {"page": "state"}), ("send_message", {"text": "x"}),
+                           ("take_release", {})):
+            with self.assertRaises(Refused) as caught:          # each with its own words: fleet_read refuses others
+                client.call(name, **args)
             self.assertIn("does not know a hub yet", str(caught.exception))
             self.assertIn("install_hub", str(caught.exception))
 
@@ -4215,6 +4256,8 @@ def parity_cases():
          lambda s, r: parity_json(200, {"goal": {"id": 3}}) if r["path"] == "/ui/goals/3" else None)
     case("plain: the agent's own request id", "control_task", {"task": 7, "action": "pause", "request_id": PARITY_RID})
     case("plain: a part that the arguments do not give", "check_machine", {})
+    case("plain: a part that is null", "check_machine", {"agent": None})
+    case("plain: a part that is empty", "check_machine", {"agent": ""})
     case("plain: a part that is two dots", "check_machine", {"agent": ".."})
     case("plain: a part with / ? and %", "check_machine", {"agent": "a/b?c%d"})
     case("with_revision: no id", "duty_state", {"action": "pause"})
@@ -4253,10 +4296,15 @@ def parity_cases():
     case("fleet_overview", "fleet_overview")
     case("fleet_overview: a page refused", "fleet_overview", None,
          lambda s, r: parity_json(403, {"error": "is not owner's machine"}) if r["path"] == "/ui/servers" else None)
+    # A word that the page does not read is refused before any request (PAGE_TAKES): notes' limit, trigger's after,
+    # and machines' agent and id; standing reads both of its words.
     for args in ({"page": "health"}, {"page": "notes", "agent": "a b", "limit": 5},
                  {"page": "trigger", "id": 2, "after": 9}, {"page": "knowledge", "path": "a/b.md"},
                  {"page": "chat_link", "name": "wa 1"}, {"page": "goal"}, {"page": "nothing"},
-                 {"page": "notes", "agent": "a/b"}):
+                 {"page": "notes", "agent": "a/b"}, {"page": "machines", "agent": "worker-1", "id": 3},
+                 {"page": "standing", "agent": "a b", "limit": 5}, {"page": "machines", "agent": None, "limit": 0},
+                 {"page": "machines", "limit": False}, {"page": "chat_link", "name": "wa 1", "agent": "x"},
+                 {"page": "events", "id": 5, "since": 100, "after": 2, "machine": None}):
         case(f"fleet_read: {json.dumps(args, sort_keys=True)}", "fleet_read", args)
     case("search_history", "search_history", {"agent": "worker-1", "query": "a b", "limit": 3})
     case("see_costs", "see_costs", {"from": "2026-11-01", "minimum": 3})
@@ -5161,7 +5209,20 @@ class Table(unittest.TestCase):
                 self.assertEqual(owner_mcp.call("GET", path, base="http://127.0.0.1:9").data["db"], "g1", path)
             with self.assertRaises(owner_mcp.Refused) as caught:
                 owner_mcp.call("GET", "/ui/health", base="http://127.0.0.1:9")
-        self.assertEqual(str(caught.exception), "The hub's answer is larger than this server reads.")
+        # The refusal says what to do (point 6 of the review of 20 November 2026): it said only that it was too large.
+        # A command's answer can come after its work, and a page can be read in smaller parts.
+        self.assertEqual(str(caught.exception), "The hub's answer is larger than this server reads, so it was not read.")
+        with patch.object(owner_mcp.OPENER, "open", opened), patch.object(owner_mcp, "HOME", scratch), \
+                patch.object(owner_mcp, "CLIENT_FILE", scratch / "client"):
+            with self.assertRaises(owner_mcp.Refused) as sent:
+                owner_mcp.call("POST", "/ui/servers/join", {"kind": "linux"}, base="http://127.0.0.1:9")
+            with patch.dict(os.environ, {"FOUNDERIZER_HUB": "http://127.0.0.1:9"}), self.assertRaises(owner_mcp.Refused) as page:
+                owner_mcp.read_page({"page": "health"})
+        self.assertEqual(str(sent.exception), "The hub's answer is larger than this server reads, so it was not read. "
+                                              "The request can have arrived: read the fleet before you send it again.")
+        self.assertEqual(str(page.exception), "The hub's answer is larger than this server reads, so it was not read. "
+                                              "Read less at a time: one item by its id, or a page with a word that "
+                                              "narrows it.")
 
     def test_a_file_from_the_hub_is_new_and_follows_no_link(self):
         """write_here with the agent's folder: an exclusive create, which leaves a file, a link and its target as they

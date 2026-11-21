@@ -1498,7 +1498,7 @@ would read as an empty fleet instead of as a mistake.
 | Tool | Route | What it does |
 | --- | --- | --- |
 | `fleet_overview` | `/ui/state`, `/ui/health`, `/ui/releases`, `/ui/servers` | What is my fleet doing. Start here. |
-| `fleet_read` | every owner `GET` route, by page name | Every check the app reads. |
+| `fleet_read` | every owner `GET` route, by page name | Every check the app reads. A word that the page does not take is refused before any request, also one that the schema does not have, with what the page needs and takes (`PAGE_TAKES`; `machines` reads no `agent`, and gave every machine). |
 | `search_history` | `/ui/history` | Search what one agent, or every agent, took part in, by words, dates, person, task and kind; with `ref`, one record in full. |
 | `see_costs` | `/ui/costs` | What every agent's work cost, against the period before: list dollars, the four kinds of tokens, results without rework by kind of work, checks, each account's window and the model changes. |
 | `which_hub` / `use_hub` | `/ui/state` | Which hub, on what authority; and point at one. |

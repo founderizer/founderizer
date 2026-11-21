@@ -519,6 +519,8 @@ def web_hosts(value):
 #                     for many pictures in one request, as its source says: read_attachment gives such an agent the
 #                     owner's picture as the answer's image (hub.ATTACH_PICTURES). False where no source says so, and
 #                     such an agent gets the download line
+#   plan_lines        the task's own line for its plan (hub.plan_line): {"open": the line of an open session,
+#                     "closed": a closed session's, or None}, or None for a runtime with no task list
 #   cache_seconds     how long the provider keeps a session's prompt cache after its last model call, as far as
 #                     the fleet knows; a session told of a message later than that reads its whole context again at
 #                     the price of writing it (plan P9.10, session_reuse). A session's own records can say less (a
@@ -645,6 +647,8 @@ RUNTIMES = {
         # it to later threads. Off by default, but one config line turns it on (the owner's own Mac has it on), and an
         # agent's Codex reads that user's config: so every Fleet session passes it off (fleet.CODEX_NO_MEMORY).
         "memory_off": {"config": {"features.memories": False}},
+        # the task's own line for its plan (hub.plan_line): its update_plan; a closed session has none
+        "plan_lines": {"open": " Keep the plan of a task of more than two steps with update_plan.", "closed": None},
         "acp_auth": None, "acp_quiet": None, "acp_models": None, "acp_allowance": None, "key_env": None,
         "own_env": None, "pinned": False, "continues": True, "acp_adapter": None,
     },
@@ -732,6 +736,12 @@ RUNTIMES = {
                           "haiku": {"input": 0.1, "cache_read": 0.01, "cache_write": 0.2, "output": 0.5}},
         # Claude Code's auto memory, in every session's settings (fleet.CLAUDE_NO_MEMORY).
         "memory_off": {"settings": {"autoMemoryEnabled": False}},
+        # the task's own line for its plan (hub.plan_line): its deferred task tools. A closed session has the list
+        # only at a version of PLAN_LIST_VERSIONS, named in its --tools with no ToolSearch, so its line says "if"
+        "plan_lines": {"open": " Keep the plan of a task of more than two steps in your task list: load TaskCreate "
+                               "and TaskUpdate with ToolSearch \"select:TaskCreate,TaskUpdate\".",
+                       "closed": " If TaskCreate is among your tools, keep the plan of a task of more than two steps "
+                                 "there."},
         "acp_auth": None, "acp_quiet": None, "acp_models": None, "acp_allowance": None, "key_env": None,
         "own_env": None, "pinned": False, "continues": True, "acp_adapter": None,
     },
@@ -781,6 +791,7 @@ RUNTIMES = {
         # Grok Build's memory and its automatic dreaming: off by default, and on with GROK_MEMORY=1, its config or a
         # managed remote setting. GROK_MEMORY=0 turns it off for the whole process, whatever the others say.
         "memory_off": {"env": {"GROK_MEMORY": "0"}},
+        "plan_lines": None,     # no task list that a task session is told of
         # It names "xai.api_key" in its initialize answer only while it has a key, and "cached_token" only while a
         # sign-in is stored.
         "acp_auth": {"plan": "cached_token", "key": "xai.api_key"},
@@ -839,6 +850,7 @@ RUNTIMES = {
         "starts_idle": False,
         "token_weights": None,
         "memory_off": {"env": {}},      # the program has no memory of its own to switch off
+        "plan_lines": None,     # no task list that a task session is told of
         "acp_auth": None,               # its one method, opencode-login, does nothing: the key is in its configuration
         # The working folder's configuration and its .opencode folder, each AGENTS.md from the working folder to the
         # home folder, Claude Code's skills, its own update, and the address of its model catalog. ~/.agents/skills/
@@ -865,7 +877,7 @@ RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manage
                  "compact_tokens", "routine", "default_model", "task_denied", "task_allowed", "conversation_denied",
                  "manager_denied", "task_opening", "starts_idle", "token_weights", "memory_off",
                  "acp_auth", "acp_quiet", "acp_models", "acp_allowance", "key_env", "own_env", "pinned", "continues",
-                 "acp_adapter", "own_hosts", "tool_pictures")
+                 "acp_adapter", "own_hosts", "tool_pictures", "plan_lines")
 
 
 # The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":

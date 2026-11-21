@@ -7735,21 +7735,15 @@ SHELL_OFF_RULE = (" Your Shell box is off: no shell, no file tool and no key rea
 # rule alone did not carry it: over the 7 days to 20 November 2026 (the session "Agent task planning") 169 of 473 large
 # Claude Code tasks had a plan, and 20 of the 295 that never loaded the deferred task tools. A closed session has the
 # list only at a version of lifecycle.PLAN_LIST_VERSIONS (fleet.closed_task_command), named in its --tools with no
-# ToolSearch, so its line says "if" and names no ToolSearch; a runtime with no list here gets no line (plan_line).
-PLAN_KEEP = "keep the plan of a task of more than two steps"
-PLAN_LINES = {"claude": f' {PLAN_KEEP.capitalize()} in your task list: load TaskCreate and TaskUpdate with ToolSearch '
-                        f'"select:TaskCreate,TaskUpdate".',
-              "codex": f" {PLAN_KEEP.capitalize()} with update_plan."}
-PLAN_LINE_CLOSED = f" If TaskCreate is among your tools, {PLAN_KEEP} there."
+# ToolSearch, so its line says "if" and names no ToolSearch; a runtime with no list gets no line (plan_line). The
+# words are each runtime's own fact (lifecycle.RUNTIMES "plan_lines"), so hub.py names no runtime (test_runtime_table).
 
 
 def plan_line(agent, closed):
-    """The task's own line for its plan, by the agent's runtime (PLAN_LINES): a closed Claude Code session's
-    PLAN_LINE_CLOSED, and "" for a runtime with no task list or a closed session of another runtime."""
+    """The task's own line for its plan, by the agent's runtime: its fact "plan_lines", the line of an open session or
+    of a closed one, and "" for a runtime with no task list or with none for that kind of session."""
     runtime = (agents().get(agent) or {}).get("runtime")       # the team's copy that shell_off reads
-    if closed:
-        return PLAN_LINE_CLOSED if runtime == "claude" else ""
-    return PLAN_LINES.get(runtime, "")
+    return (runtime_fact(runtime, "plan_lines") or {}).get("closed" if closed else "open") or ""
 
 
 RULE_FOUR = (" Never contact the owner from here: if you are blocked, use ask_my_requester, and your line takes the "
@@ -27870,7 +27864,7 @@ PROFILE_LONG = "profile_long:"      # kv, with the agent's name after it: the fr
 PROFILE_LONG_SEEDED = "profile_long_seeded"     # kv: the first start of the release that brought the mark read them all
 PROFILE_LONG_MARK = 6000        # characters of free text above which the manager is asked to put a profile in order
 PROFILE_LONG_AGAIN = 1000       # characters more than at the last ask, before the manager is asked again
-PROFILE_LONG_TRIED = {"start": False}       # this process tried the first start's pass (profile_long_seed)
+PROFILE_LONG_TRIED = {"start": False}       # this process tried the first start's pass (long_texts_seed)
 # The rule of places, at the moment of use: a message of the hub's, so it is in no size ceiling of the rules.
 PROFILE_LONG_RULE = (
     "A profile holds what is the owner's: what the agent is for, what it may do without asking, what it must ask "
@@ -27922,43 +27916,70 @@ def profile_long_after(agent, sections, ask):
     return profile_long_words(agent, n)
 
 
-def profile_long_seed(t0):
-    """At the first pass of the timers of the release that brought the mark, one time for each database: each profile
-    above it is recorded, and the manager gets one message that names them with their numbers. Outside LOCK (timers):
-    its one git read, at most 30 seconds, holds nothing, and its writes take LOCK in their transaction. A revision or a
-    read that git does not answer now does nothing, and the next start of the hub tries again; so does a manager that
-    may not write a plan now. A read that failed is never taken for profiles that are short."""
+def long_texts_seed(t0):
+    """At the first pass of the timers of the release that brought a mark, one time for each database and each mark:
+    one message to the manager that names each profile above PROFILE_LONG_MARK with its number (each one recorded,
+    slice 1 of the design "An agent keeps its own rules"), and each agent whose standing items pass STANDING_MARK,
+    with how many items the manager keeps itself (slice 2). Each part has its own kv mark, so a release that brings the
+    second one after the first is live still names the items. Outside LOCK (timers): its one git read, at most 30
+    seconds, holds nothing, and its writes take LOCK in their transaction. A revision or a read that git does not
+    answer now leaves the profiles for the next start of the hub; a commit of the configuration between the read and
+    the write (a profile saved then would keep an old number) leaves the whole pass, the items too; and a manager that
+    may not write a plan now leaves both. A read that failed is never taken for profiles that are short."""
     if PROFILE_LONG_TRIED["start"]:
         return
     PROFILE_LONG_TRIED["start"] = True
-    if kv_get(PROFILE_LONG_SEEDED) or team_manager_refusal():
+    due = [k for k in (PROFILE_LONG_SEEDED, STANDING_LONG_SEEDED) if not kv_get(k)]
+    if not due or team_manager_refusal():
         return
-    rev, mgr, names = kit_revision(), manager_name(), sorted(agents())
-    paths = [f"profiles/{n}.md" for n in names]
-    read = kit_batch(kit_dir(), rev, paths) if rev else {}     # one git read: a missing file, a file, or no answer
-    if not rev or any(path not in read for path in paths):
+    mgr, names, long, crowded, long_rev = manager_name(), sorted(agents()), [], [], None
+    if PROFILE_LONG_SEEDED in due:
+        rev = kit_revision(fresh=True)
+        paths = [f"profiles/{n}.md" for n in names]
+        read = kit_batch(kit_dir(), rev, paths) if rev else {}     # one git read: a missing file, a file, or no answer
+        if not rev or any(path not in read for path in paths):
+            due.remove(PROFILE_LONG_SEEDED)
+        else:
+            long_rev = rev
+            for n in names:
+                data = read[f"profiles/{n}.md"][1]
+                if data is None:
+                    continue
+                free = profile_free_text(parse_profile(data.decode("utf-8", "replace")))
+                if free > PROFILE_LONG_MARK:
+                    long.append((n, free))
+    if STANDING_LONG_SEEDED in due:
+        crowded = [(n, fit) for n, fit in ((n, standing_fit(n)) for n in names) if fit > STANDING_MARK]
+    said = []
+    if long:
+        said.append("These profiles are long, each above 6,000 characters of free text, and one section takes 8,000: "
+                    + "; ".join(f"{'yours' if n == mgr else shown_role(n)} (profiles/{n}.md) {free:,}"
+                                for n, free in long)
+                    + f". Put each one in order, one plan for each profile. {PROFILE_LONG_RULE}")
+    if crowded:
+        mine = read_row("SELECT count(*) n FROM standing WHERE agent=? AND ended IS NULL", (mgr,))["n"]
+        said.append("The standing items that steer these agents take more than 6,000 of the 8,000 characters that a "
+                    "start shows whole: " + "; ".join(f"{'you' if n == mgr else shown_role(n)} {fit:,}"
+                                                      for n, fit in crowded)
+                    + f". You keep {mine} active item{'s' if mine != 1 else ''} yourself. Put yours in order: end one "
+                    "that is done; pass one that is for one agent to that agent; write the rule of one duty into that "
+                    "duty's words, and end the item with that place in why. Tell each lead that keeps items for others "
+                    "to do the same. Then ask the owner one time, in one message, which of the owner's older wishes "
+                    "still stand.")
+    if not due:
         return
-    long = []
-    for n in names:
-        data = read[f"profiles/{n}.md"][1]
-        if data is None:
-            continue
-        free = profile_free_text(parse_profile(data.decode("utf-8", "replace")))
-        if free > PROFILE_LONG_MARK:
-            long.append((n, free))
     with transaction():
+        if long_rev and kit_revision(fresh=True) != long_rev:
+            return              # a profile changed after the read: nothing is written, and the next start reads again
         for n, free in long:
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                        (PROFILE_LONG + n, str(free)))
-        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                   (PROFILE_LONG_SEEDED, str(t0)))
-        if long:
-            event_rows([(mgr, "say", None, "[hub] These profiles are long, each above 6,000 characters of free text, and "
-                         "one section takes 8,000: " + "; ".join(f"{'yours' if n == mgr else shown_role(n)} "
-                                                                 f"(profiles/{n}.md) {free:,}" for n, free in long)
-                         + f". Put each one in order, one plan for each profile. {PROFILE_LONG_RULE}", None)], t0)
-            log_row("hub", f"asked {mgr} to put {len(long)} long profiles in order: "
-                    + ", ".join(n for n, _ in long))
+        for k in due:
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(t0)))
+        if said:
+            event_rows([(mgr, "say", None, "[hub] " + "\n\n".join(said), None)], t0)
+            log_row("hub", f"asked {mgr} to put in order {len(long)} long profiles and the standing items of "
+                    f"{len(crowded)} agents: " + ", ".join(n for n, _ in long + crowded))
 
 
 def save_profile(agent, base, sections):
@@ -40847,7 +40868,8 @@ def grant_names(rids, team=None, catalog=None):
 # A standing item is a lasting wish that steers an agent from then on: an instruction (how to behave, what to decide)
 # or a target (what to reach: a measure, a number, a date and how it is measured). The agent keeps it itself -- from
 # its own data, or because the owner, a person whose role allows it or another agent asked -- and ends it when its
-# author, such a person or the owner asks, or when a target is reached. When the words came in a message, the hub
+# author, such a person or the owner asks, when a target is reached, or when it wrote the wish whole into the place
+# that its work reads (AUTONOMY.md decision 52). When the words came in a message, the hub
 # checks that they are that message's own words, so a line inside a customer's email cannot pass for the manager
 # contact's wish. An item steers work inside the agent's access: it never gives access, money or a credential. Every
 # new session of the agent starts with its active items (standing_start_text), a running session gets a new or an
@@ -40861,6 +40883,10 @@ STANDING_FIELD_MAX = 300        # characters of a target's measure and of how it
 STANDING_WHY_MAX = 500          # characters of why an item ended
 STANDING_CHARS = 8000           # the most that the items add to a session's opening text, as for its lessons
 STANDING_PAGE = 200             # items of one owner read
+# Three quarters of STANDING_CHARS: above it, a keep tells its keeper which agents its items crowd, and the first start
+# of the release that brought it tells the manager once (the design "An agent keeps its own rules", slice 2)
+STANDING_MARK = 6000
+STANDING_LONG_SEEDED = "standing_long_seeded"   # kv: that first start named them
 TARGET_FIELDS = ("words", "measure", "number", "due", "how", "check")       # what a target says, beside its progress
 ITEM_REF = re.compile(r"(?i)^\s*I-?([1-9][0-9]{0,17})\s*$")
 SOURCE_REF = re.compile(r"(?i)^\s*(M|CM)-?([1-9][0-9]{0,17})\s*$")
@@ -41057,6 +41083,35 @@ def steering_items(agent):
     return sorted(rows, key=lambda r: (order.get(r["agent"], len(order)), r["id"]))
 
 
+def standing_fit(agent):
+    """The characters of the lines of the items that steer `agent`, as standing_start_text counts them: each line
+    and 3 for its separator. A read that commits nothing."""
+    t0 = now()
+    return sum(len(standing_line(r, agent, t0)) + 3 for r in steering_items(agent))
+
+
+def standing_crowded(agent, names):
+    """The words of a keep's answer for the agents of `names` whose items now pass STANDING_MARK, or "": the
+    keeper can put its own in order before a start of one of them names one by its id alone. A keeper whose Shell
+    box is off keeps only a colleague's own wish, so its line keeps the rest in order (shell_tools)."""
+    crowded = [(n, fit) for n, fit in ((n, standing_fit(n)) for n in names) if fit > STANDING_MARK]
+    if not crowded:
+        return ""
+    whose = "; ".join(f"{'you' if n == agent else shown_role(n)} {fit:,}" for n, fit in crowded)
+    if shell_off(agent):
+        return (f" The items that steer you now take {crowded[0][1]:,} characters at each start. Your line keeps "
+                f"them in order: tell {task_giver(agent)} with message_agent.")
+    if len(crowded) == 1:
+        n, fit = crowded[0]
+        head = (f" The items that steer {'you' if n == agent else shown_role(n)} now take {fit:,} of the 8,000 "
+                f"characters that a start shows whole.")
+    else:
+        head = (f" The items that steer each of these agents now take more than {STANDING_MARK:,} of the 8,000 "
+                f"characters that a start shows whole: {whose}.")
+    return (head + " Put yours in order: end one that is done; pass one that is for one agent to that agent; "
+            "write the rule of one duty into that duty's words, and end the item with that place in why.")
+
+
 def standing_start_text(agent, limit=None):
     """L3's part of the per-task block (AUTONOMY.md 6.4): the active items that steer `agent`, each one whole, for
     every new session of it (start_text, manager_resume_text), and for the closed conversation of a person whose role
@@ -41066,8 +41121,9 @@ def standing_start_text(agent, limit=None):
 
     A session of an agent whose Shell box is off has no see_standing, so its start shows each item whole, with no
     limit: an item that it named by its id alone was lost to it. On 20 November 2026 each start of a support agent
-    named 5 of the owner's wishes so (design "An agent keeps its own rules", slice 2, item 0). An item holds at most
-    STANDING_WORDS_MAX characters, so their number bounds the block. A colleague's closed window keeps its own limit
+    named 5 of the owner's wishes so (design "An agent keeps its own rules", slice 2, item 0). An item's words hold
+    at most STANDING_WORDS_MAX characters, and a target's measure and how STANDING_FIELD_MAX each, so their number
+    bounds the block. A colleague's closed window keeps its own limit
     (conversation_prompt gives CLOSED_STANDING_CHARS), so that its recap keeps its room."""
     rows = steering_items(agent)
     if not rows:
@@ -41087,8 +41143,9 @@ def standing_start_text(agent, limit=None):
             + " | ".join(kept) + (f" | and {', '.join(left)}, which do not fit here"
                                   + ("" if closed else ": read them with see_standing") if left else "")
             + "." + (" " + STANDING_PERSON if people else "")
-            + ("\n" if closed else " End one of yours with end_standing when its author, a person whose role allows "
-                                   "it or the owner asks, or when a target is reached.\n"))
+            + ("\n" if closed else " Keep yours in order: end one with end_standing when its author, a person whose "
+                                   "role allows it or the owner asks, when a target is reached, or when you wrote it "
+                                   "whole into the place that its work reads.\n"))
 
 
 # The sentence beside the items when one of them came from a person (standing_start_text)
@@ -41389,12 +41446,16 @@ def standing_keep(agent, task, fields):
         item = standing_new_rows(agent, fields, task, t0)
     standing_seen_here(agent, task, item)
     team = team_below(agent) if fields["scope"] == "team" else []
-    return (f"Kept as {iref(item)}. It steers your work from now on" + (f", and the work of {', '.join(team)}" if team
-                                                                       else "")
+    return (f"Kept as {iref(item)}. It steers your work from now on" + (", and the work of your team" if team else "")
             + ": every new session starts with it, and every other running session gets it as a message."
             + (" The owner reads one line about it." if fields["author_kind"] == "person" else "")
             + f" End it with end_standing(id=\"{iref(item)}\", why=...) when its author, a person whose role allows it "
-              "or the owner asks" + (", or when it is reached" if fields["kind"] == "target" else "") + ".")
+              "or the owner asks" + (", when it is reached" if fields["kind"] == "target" else "")
+            + ", or when you wrote it whole into the place that its work reads, with that place in why."
+            + (f" It now reaches {len(team)} agent{'s' if len(team) != 1 else ''}: "
+               f"{', '.join(shown_role(n) for n in team)}. An item for fewer of them goes to those agents, which keep "
+               f"it." if team else "")
+            + standing_crowded(agent, [agent] + team))
 
 
 def standing_asked(agent, a, field):
@@ -41601,7 +41662,8 @@ def t_see_standing(agent, a):
         out += [f"  {r['agent']}: {standing_line(r, agent, t0)}" for r in rows] or ["  none"]
         out.append("You end any of them with end_standing when the owner asks (asked_by=\"M-<n>\"); its agent ends its "
                    "own. An item of an agent whose Shell box is off you end in its place when its author, a person whose "
-                   "role allows it or the owner asks: that agent ends only a colleague's own wish, when that colleague "
+                   "role allows it or the owner asks, or when you wrote it whole into the place that its work reads, "
+                   "with that place in why: that agent ends only a colleague's own wish, when that colleague "
                    "asks it in their conversation.")
         return "\n".join(out)
     rows = steering_items(agent)
@@ -41615,8 +41677,8 @@ def t_see_standing(agent, a):
         out += [f"  {r['agent']}: {standing_line(r, r['agent'], t0)}" for r in held] or ["  none"]
     out.append("A lasting wish (\"from now on ...\", \"reach ... by ...\") of yours, the owner's, a person's or another "
                "agent's is kept with keep_instruction or set_target, naming its message as source. End one of yours "
-               "with end_standing when its author, a person whose role allows it or the owner asks, or when a target "
-               "is reached.")
+               "with end_standing when its author, a person whose role allows it or the owner asks, when a target "
+               "is reached, or when you wrote it whole into the place that its work reads, with that place in why.")
     return "\n".join(out)
 
 
@@ -44645,7 +44707,9 @@ TOOLS = [
      "own words as written there, and the item is its author's; without source it is your own, also when another "
      "agent asked. It steers your work "
      "inside your access and never gives access, money or a credential. Every new session of yours starts with it, "
-     "and the owner reads one line about an item that a person gives.",
+     "and the owner reads one line about an item that a person gives. Your items are yours to keep in order: end "
+     "one that is done, and one that you wrote whole into the place that its work reads (end_standing, with that "
+     "place in why). An item that somebody else gave keeps its author's words.",
      S({"words": {"type": "string", "description": "The instruction in one sentence"},
         "scope": {"type": "string", "enum": list(STANDING_SCOPES),
                   "description": "agent: it steers you; team: it steers you and every agent of your team"},
@@ -44677,8 +44741,9 @@ TOOLS = [
         "progress": {"type": "number", "description": "Where it stands now, for a target with no check"},
         "task_id": TASK_ID})),
     ("all", "end_standing", t_end_standing,
-     "End one of your standing items when its author, a person whose role allows it or the owner asks, or when a "
-     "target is reached. asked_by names the message that asked (M-12 or CM-41); without it, you asked. The "
+     "End one of your standing items when its author, a person whose role allows it or the owner asks, when a "
+     "target is reached, or when you wrote it whole into the place that its work reads (a duty's words, a skill "
+     "or a file), with that place in why. asked_by names the message that asked (M-12 or CM-41); without it, you asked. The "
      "fleet manager ends any agent's item when the owner asks.",
      S({"id": {"type": "string", "description": "The item, for example I-7"},
         "why": {"type": "string", "description": "Why it ends, in one line: the owner reads it"},
@@ -48950,7 +49015,7 @@ def timers():
             with LOCK:
                 DESKTOP.prune(now())
             tick()
-            profile_long_seed(now())        # the long profiles at a first start: its git read outside LOCK
+            long_texts_seed(now())          # long profiles and items at a first start: its git read outside LOCK
         except Exception:
             print_fault()
 

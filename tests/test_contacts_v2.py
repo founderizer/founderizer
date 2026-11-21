@@ -2294,6 +2294,13 @@ class ShellOffRule(Base):
         self.assertIn(f"{hub.iref(item['id'])} instruction, from Pat", theirs)
         self.assertIn(hub.STANDING_PERSON, theirs)
         self.assertNotIn("cannot give you work", theirs)
+        # the window keeps its own, smaller limit, so that its recap keeps its room: a task's start of this agent shows
+        # each item whole since 20 November 2026, and the window's call must not take that rule
+        extra = hub.ins("INSERT INTO standing(agent,scope,kind,words,author_kind,author,created) VALUES('studio',"
+                        "'agent','instruction',?,'owner','owner',?)", ("Answer within the day. " * 25, hub.now()))
+        with patch.object(hub, "CLOSED_STANDING_CHARS", 300):
+            self.assertIn(f"and {hub.iref(extra)}, which do not fit here.", prompt(cid, pat["id"]))
+        hub.q("DELETE FROM standing WHERE id=?", (extra,))
         ana = self.person("Ana", "customer", ANA)
         hello = self.says(ANA, "Hello")
         outsider = prompt(hello["conversation"], ana["id"])
