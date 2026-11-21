@@ -241,9 +241,13 @@ class Needs(Chain):
         self.assertEqual(need["details"], 'W\'s question, in its own words: "Blue or green?"')
         self.assertNotIn("Quoting", need["why"])
         self.assertIn(f"the owner's answer goes to w as the answer of Q-{qid} by itself", said)
-        self.assertEqual(self.item(need["id"])["question"], qid)          # /ui/state carries the link
+        # /ui/state carries the link, and the task that waits for the answer (owner API 1.280: an app draws that
+        # task's own mark on the answered card; with no id, or the manager's task, the card shows the wrong work)
+        item = self.item(need["id"])
+        self.assertEqual((item["question"], item["task"]), (qid, self.t3))
         code, receipt = self.request(f"/ui/needs/{need['id']}", self.command(answer="Green, always."))
         self.assertEqual(code, 200, receipt)
+        self.assertEqual(self.item(need["id"])["task"], self.t3)        # the answered card names it too
         row = self.question(qid)
         self.assertEqual((row["answer"], row["answered_by"]), ("Green, always.", "owner"))
         self.assertEqual(self.task(self.t3)["state"], "working")

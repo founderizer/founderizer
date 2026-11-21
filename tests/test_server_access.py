@@ -1797,6 +1797,9 @@ class DoorCalls(Access):
             return hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
         first, second = raised("journalctl -u app\n", f"T-{logs}"), raised("mv /srv/a /srv/b\n", f"T-{long}")
         self.assertEqual((first["title"], first["door_task"]), ("Run one root script on web-1?", "Read the checkout logs"))
+        # owner API 1.280: the card names that task by its id too, for the mark that an app draws on the answered
+        # card (the task's title alone finds no task: two tasks can have one title)
+        self.assertEqual((first["task"], second["task"]), (logs, long))
         # one line of plain words, at most 60 characters: no backtick, no mark that turns the line, no line feed
         self.assertEqual(second["title"], first["title"])
         self.assertEqual(second["door_task"], "Move uploads to the new disk and check each one of the 4,00…")
@@ -1813,8 +1816,8 @@ class DoorCalls(Access):
         # a card that is not the door's card of a run has none
         plain = hub.t_raise_needs_you("manager", {"title": "Choose the plan", "why": "Two plans fit.",
                                                   "what_to_do": "Say which one", "reason": "money"})
-        self.assertIsNone(hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?",
-                                               (int(plain.split("N-")[1].split(".")[0]),)))["door_task"])
+        plain = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (int(plain.split("N-")[1].split(".")[0]),)))
+        self.assertEqual((plain["door_task"], plain["task"]), (None, None))
         self.assertEqual(hub.need_title({"title": "Choose the plan"}), "Choose the plan")
         # two agents sent one script to one server, and the item carries the question of one of them: its own line
         # says its task, also when the other agent's line is the newer one; with no line of its own, the task of

@@ -107,6 +107,9 @@ class Ask(Fixture):
         item = self.item(need["id"])
         self.assertEqual((item["kind"], item["takeover_task"], item["by"], item["title"]),
                          ("takeover", tid, "ivy", TITLE))
+        # owner API 1.280: the task whose own mark an app draws on the answered card (with none, the card of a step
+        # that the session still works on shows the check)
+        self.assertEqual(item["task"], tid)
         self.assertIsNone(item["secret"])       # no secure form: he answers it as any item
 
     def test_a_screen_task_and_a_leads_task_ask_too(self):

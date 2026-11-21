@@ -48,6 +48,16 @@ class TeamChanges(Remove):
     def press(self, choice=0):
         return self.owner(f"/ui/needs/{self.card()['id']}", choice=choice)
 
+    def stands(self):
+        """Where the newest team card's plan stands (owner API 1.280): the values of the card's own row, which the
+        owner's apps read as they are (need_view). They are on the row, and not in kv alone, because a write of an
+        answered item's row is what moves the mark of its block, so that an app which kept the item reads it again
+        (test_older_rows)."""
+        card = self.card()
+        view = hub.need_view(card)
+        self.assertEqual((view["team_state"], view["team_reason"]), (card["team_state"], card["team_reason"]))
+        return card["team_state"], card["team_reason"]
+
     def from_device(self, kind):
         """The owner's press from an enrolled device of this kind (iphone or windows): the hub's own mapping of the
         device's row to its class runs, and the request's own sign-in check is the Mac's."""
@@ -105,7 +115,10 @@ class TeamChanges(Remove):
     def test_only_a_press_of_its_yes_on_the_mac_or_a_pc_makes_the_plan(self):
         """Bug: typed words, a phone, a connected app or the hub's old board, none of which shows the Details, removes
         an agent; or the phone rings for a card that it cannot press, or does not learn that it is one (owner API
-        1.244: the iPhone draws a line to the Mac in place of its yes)."""
+        1.244: the iPhone draws a line to the Mac in place of its yes). Owner API 1.280: or the card of a pressed
+        plan shows the check until the plan's first pass, which can wait for the turn of the hub's files; or a card
+        whose plan the hub made says making for ever, because the plan's end clears its mark and writes nothing on
+        the card."""
         with patch.object(hub, "ping_need") as ring:
             said = self.plan([{"kind": "remove", "agent": "scout"}], title="Remove scout?")
         ring.assert_not_called()
@@ -128,9 +141,15 @@ class TeamChanges(Remove):
         self.assertIsNone(self.card()["answer"])
         self.assertIn("scout", self.origin_team()["agents"])
         before = self.head()
-        with self.from_device("windows"):
+        first_pass, at_the_answer = hub.team_plans_pressed, []
+
+        def pass_after_the_answer():        # what the answer's own write left on the card, before the plan's first pass
+            at_the_answer.append(self.card()["team_state"])
+            return first_pass()
+        with self.from_device("windows"), patch.object(hub, "team_plans_pressed", pass_after_the_answer):
             status, answer = self.press(0)
         self.assertEqual(status, 200, answer)
+        self.assertEqual(at_the_answer, [hub.TEAM_MAKING])
         self.assertNotIn("scout", self.origin_team()["agents"])
         self.assertEqual(git("--git-dir", str(self.root / "origin.git"), "rev-list", "--count", f"{before}..main"), "1")
         self.assertEqual(len(self.commits_of(card["id"])), 1)
@@ -138,6 +157,8 @@ class TeamChanges(Remove):
         self.assertEqual((job["server"], job["state"]), ("box", "queued"))
         self.assertIsNone(hub.kv_get(hub.TEAM_PLAN_MARK + str(card["id"])))
         self.assertIn("removed scout", self.told("made your plan")["text"])
+        self.assertEqual(self.stands(), (hub.TEAM_MADE, None))
+        self.assertIn("need_marks", hub.ui_features())
 
     def test_the_card_marks_the_managers_own_plan_as_the_answer_that_it_recommends(self):
         """Bug: a team card marks no answer, No, or another name than the manager's first as the answer that the
@@ -300,7 +321,9 @@ class TeamChanges(Remove):
 
     def test_stops_at_any_step_end_the_plan_once(self):
         """Bug: an agent in team.json with no install, a second commit or a second install, or a stop that nobody
-        hears of."""
+        hears of. Owner API 1.280: or the card of a plan that a stop cut says made, or nothing, while the hub still
+        tries it; or a stop between the two writes of the plan's end takes its mark away and leaves its card at
+        making, which no later pass can end."""
         self.add_plan()
         nid = self.card()["id"]
         self.assertEqual(json.loads(self.card()["options"]),
@@ -316,6 +339,7 @@ class TeamChanges(Remove):
         self.assertIn("lia", self.origin_team()["agents"])
         self.assertIsNone(hub.q1("SELECT 1 FROM server_jobs WHERE agent='lia'"))
         self.assertIn("the hub stopped here", self.told("waits")["text"])
+        self.assertEqual(self.stands(), (hub.TEAM_MAKING, None))
         real_kv_set = hub.kv_set
 
         def stop_after_the_job(key, value):
@@ -324,7 +348,15 @@ class TeamChanges(Remove):
             return real_kv_set(key, value)
         with patch.object(hub, "kv_set", side_effect=stop_after_the_job):
             hub.team_plans_pressed()        # the next start, which stops after the install job
+        self.assertEqual(self.stands(), (hub.TEAM_MAKING, None))
+        hub.q("CREATE TRIGGER stop_at_the_end BEFORE UPDATE OF team_state ON needs WHEN NEW.team_state='made' "
+              "BEGIN SELECT RAISE(ABORT, 'the hub stopped at the end'); END")
+        hub.team_plans_pressed()            # a stop in the write of the plan's end: the mark stays with its card
+        self.assertEqual(self.stands(), (hub.TEAM_MAKING, None))
+        self.assertEqual(json.loads(hub.kv_get(hub.TEAM_PLAN_MARK + str(nid)) or "{}").get("step"), "committed")
+        hub.q("DROP TRIGGER stop_at_the_end")
         hub.team_plans_pressed()            # and the pass after it
+        self.assertEqual(self.stands(), (hub.TEAM_MADE, None))
         self.assertEqual([r["kind"] for r in hub.q("SELECT kind FROM server_jobs WHERE agent='lia'")], ["install"])
         self.assertEqual(len(self.commits_of(nid)), 1)
         self.assertIsNone(hub.kv_get(hub.TEAM_PLAN_MARK + str(nid)))
@@ -345,7 +377,8 @@ class TeamChanges(Remove):
 
     def test_a_cut_plan_meets_its_card_again_before_its_commit(self):
         """Bug: a plan that a stop cut before its commit is made later, after the fleet changed in a way that its card
-        did not show."""
+        did not show. Owner API 1.280: or the card of the plan that the hub then drops stays at making, or says made;
+        or the owner reads the manager's words for the reason, with its codes."""
         self.plan([{"kind": "remove", "agent": "scout"}])
         nid = self.card()["id"]
         with patch.object(hub, "commit_kit_file", side_effect=RuntimeError("the push failed")):
@@ -357,6 +390,8 @@ class TeamChanges(Remove):
         self.assertEqual(self.commits_of(nid), [])
         self.assertIsNone(hub.kv_get(hub.TEAM_PLAN_MARK + str(nid)))
         self.assertIn("did not make the plan", self.told("pressed yes on")["text"])
+        self.assertEqual(self.stands(), (hub.TEAM_NOT_MADE, "The hub did not make this change: the fleet changed after "
+                                                             "your yes. Nothing changed, and Manager knows."))
 
     def test_the_steps_after_a_commit_apply_the_team_as_it_stands(self):
         """Bug: a later pass applies the plan's own, older team.json, and the hub forgets what changed since; or the
@@ -381,11 +416,15 @@ class TeamChanges(Remove):
 
     def test_the_hubs_own_undo_of_a_plan_is_not_its_commit(self):
         """Bug: the revert that the hub makes of a push that it could not take in is taken for the plan's commit, and
-        the steps after it run on a team where the plan never happened."""
+        the steps after it run on a team where the plan never happened. Owner API 1.280: or the end of such a plan
+        clears its mark and leaves its card at making, which then turns for ever, or the card says made for a change
+        that is not in the fleet."""
         self.plan([{"kind": "remove", "agent": "scout"}])
         nid = self.card()["id"]
-        status, answer = self.press(0)
+        with patch.object(hub, "team_plan_after", side_effect=RuntimeError("the job table is locked")):
+            status, answer = self.press(0)          # its commit is made, and the steps after it wait
         self.assertEqual(status, 200, answer)
+        self.assertEqual(self.stands(), (hub.TEAM_MAKING, None))
         made = self.commits_of(nid)[0]
         self.assertEqual(hub.team_plan_commit_of(nid), made)
         for made_now in (False, True, False):       # the hub's undo, a person's undo of it, the hub's undo again
@@ -394,10 +433,17 @@ class TeamChanges(Remove):
             self.assertEqual(hub.team_plan_commit_of(nid), made if made_now else None)
             self.assertEqual(hub.team_plan_commit_of(nid, made), made if made_now else None)
         self.assertIsNone(hub.team_plan_commit_of(nid, "0" * 40))      # a commit that the ref does not have
+        hub.team_plans_pressed()                    # the next pass finds the plan undone, and stops it
+        self.assertIsNone(hub.kv_get(hub.TEAM_PLAN_MARK + str(nid)))
+        self.assertIsNone(hub.q1("SELECT 1 FROM server_jobs WHERE agent='scout' AND kind='remove'"))
+        self.assertIn("is not in the configuration any more", self.told("The commit of the plan")["text"])
+        self.assertEqual(self.stands(), (hub.TEAM_NOT_MADE, "The hub did not finish this change: it was undone in the "
+                                                             "fleet's configuration, and Manager knows."))
 
     def test_a_committed_plan_is_never_dropped(self):
         """Bug: a plan whose commit is in team.json is dropped after its last try, and its new agent never gets its
-        install."""
+        install. Owner API 1.280: or its card says not made at that try, while the hub goes on; or the card of a plan
+        that was pressed under the release before, and still waits, shows the check while the hub makes it."""
         self.add_plan()
         nid = self.card()["id"]
         with patch.object(hub, "team_plan_after", side_effect=RuntimeError("the job table is locked")):
@@ -406,12 +452,15 @@ class TeamChanges(Remove):
             mark = json.loads(hub.kv_get(key))
             self.assertEqual(mark["step"], "committed")
             hub.kv_set(key, json.dumps(dict(mark, tries=hub.TEAM_PLAN_TRIES - 1)))
+            hub.q("UPDATE needs SET team_state=NULL WHERE id=?", (nid,))    # as the release before left its card
             hub.team_plans_pressed()
         self.assertEqual(status, 200, answer)
         self.assertEqual(json.loads(hub.kv_get(key))["tries"], hub.TEAM_PLAN_TRIES)
         self.assertIn("its commit is made", self.told("waits")["text"])
+        self.assertEqual(self.stands(), (hub.TEAM_MAKING, None))
         hub.team_plans_pressed()
         self.assertIsNone(hub.kv_get(key))
+        self.assertEqual(self.stands(), (hub.TEAM_MADE, None))
         self.assertEqual([r["kind"] for r in hub.q("SELECT kind FROM server_jobs WHERE agent='nova'")], ["install"])
 
     def test_a_plan_whose_commit_can_be_on_the_ref_outlasts_a_git_fault(self):
@@ -446,17 +495,38 @@ class TeamChanges(Remove):
 
     def test_a_plan_whose_commit_fails_before_its_push_stops_at_its_last_try(self):
         """Bug: a commit that the hub refuses each time leaves each pass at committing, so the plan tries once a minute
-        for ever and every new plan of the manager's is refused."""
+        for ever and every new plan of the manager's is refused. Owner API 1.280: or the card of the plan that the hub
+        stops there turns for ever; or the owner reads a program's words for the fault ("Refusal: ..."), or reads no
+        cause where the hub has words of its own for the owner."""
         self.plan([{"kind": "remove", "agent": "scout"}])
         key = hub.TEAM_PLAN_MARK + str(self.card()["id"])
         refused = hub.Refusal(409, "the hub checkout has local changes")
         with patch.object(hub, "commit_kit_file", side_effect=refused):
             self.press(0)
             hub.kv_set(key, json.dumps(dict(json.loads(hub.kv_get(key)), tries=hub.TEAM_PLAN_TRIES - 1)))
+            self.assertEqual(self.stands(), (hub.TEAM_MAKING, None))
             hub.team_plans_pressed()
         self.assertIsNone(hub.kv_get(key))
         self.assertIn("could not be made", self.told("pressed on")["text"])
         self.assertIn("scout", self.origin_team()["agents"])
+        self.assertEqual(self.stands(), (hub.TEAM_NOT_MADE, f"The hub did not make this change: it stopped after "
+                                                             f"{hub.TEAM_PLAN_TRIES} tries. Nothing changed, and "
+                                                             f"Manager knows."))
+        # a fault that can pass by itself has the hub's own words for the owner: the card says them, and none of the
+        # words that the manager reads
+        self.plan([{"kind": "remove", "agent": "scout"}], title="Remove scout now?")
+        key = hub.TEAM_PLAN_MARK + str(self.card()["id"])
+        with patch.object(hub, "commit_kit_file", side_effect=refused):
+            self.press(0)
+        hub.kv_set(key, json.dumps(dict(json.loads(hub.kv_get(key)), tries=hub.TEAM_PLAN_TRIES - 1)))
+        busy = hub.TeamPassing("A job runs on box (job 4): wait for it.", "box runs another job now")
+        with patch.object(hub, "team_plan_effect", side_effect=busy):
+            hub.team_plans_pressed()
+        self.assertIsNone(hub.kv_get(key))
+        self.assertEqual(self.stands(), (hub.TEAM_NOT_MADE, f"The hub did not make this change: it stopped after "
+                                                             f"{hub.TEAM_PLAN_TRIES} tries, the last time because box "
+                                                             f"runs another job now. Nothing changed, and Manager "
+                                                             f"knows."))
 
     def test_an_old_plan_of_a_card_number_that_comes_back_is_not_this_plans_commit(self):
         """Bug: after the hub's database comes back from an older backup, a new card gets an old card's number, and

@@ -487,6 +487,7 @@ class SameBytes(StateCase):
                                                     "signed_in",
                                                     "chat_ready", "placed", "turn_ended_after",
                                                     "chat_undelivered", "limit",
+                                                    "kpis",                                 # UI-API.md 1.275
                                                     *hub.AGENT_SEEN])
         self.assertEqual(hub.AGENT_SEEN, ("last_seen", "alive", "alive_ts", "client", "client_seen"))
         self.assertEqual({tuple(a) for a in state["agents"]}, {tuple(state["agents"][0])})    # also with no agents row
@@ -619,8 +620,9 @@ class Reads(StateCase):
             reads, before = self.traced(hub.agent_reads)
             views, seen = self.traced(lambda: [hub.agent_view(name, config, reads) for name, config in team])
         self.assertEqual(views, own)
-        # agents, usage, limits, machine readings, server sign-ins, sign-ins, keys, turn ends, late chat messages
-        self.assertEqual(len([s for s in before if s.startswith("SELECT")]), 9)
+        # agents, usage, limits, machine readings, server sign-ins, sign-ins, keys, turn ends, late chat messages,
+        # and the active KPIs of each agent (one GROUP BY)
+        self.assertEqual(len([s for s in before if s.startswith("SELECT")]), 10)
         self.assertEqual(sorted(s.split(" WHERE")[0] for s in seen),
                          ["SELECT MAX(u.created) AS created FROM ui_requests u JOIN events e ON e.id=u.event_id",
                           "SELECT agent, ready FROM session_credentials", "SELECT v FROM kv"])
@@ -666,9 +668,14 @@ class Reads(StateCase):
         """need_view, goal_view and duty_view give the same view with what need_reads, goal_reads and duty_reads read
         for all of them as with their own reads. Also: a discussion of two turns, a door call, a part with no state, a
         next step whose parts all ended, a session of two goals, a duty with no case and no rule, a rule with no run, a
-        rule's newest run, an ended rule, an agent's own rule, a join of a closed case."""
+        rule's newest run, an ended rule, an agent's own rule, a join of a closed case, and an item that takes a
+        question to the owner (owner API 1.280: its `task` is the question's, also from the rows read for all, where
+        the view reads no question itself)."""
         self.fill()
         with hub.LOCK:
+            asked = hub.ins("INSERT INTO questions(task,asker,requester,text,asked) VALUES(7,'mia','manager',?,?)",
+                            ("Which export?", T0 - 700))
+            hub.q("UPDATE needs SET question=? WHERE id=2", (asked,))
             needs, goals, duties = (hub.q(f"SELECT * FROM {table} ORDER BY id")
                                     for table in ("needs", "goals", "responsibilities"))
             own = ([hub.need_view(r) for r in needs], [hub.goal_view(g) for g in goals],
@@ -679,9 +686,10 @@ class Reads(StateCase):
                 [hub.duty_view(r, T0, reads[2]) for r in duties]))
             goal_reads = self.traced(lambda: [hub.goal_view(g, reads[1]) for g in goals])[1]
         self.assertEqual((need_views, goal_views, duty_views), own)
-        # The discussions and the fleet's id; the tokens and the parts of the steps; the cases twice, the joins, the
-        # rules and their runs, and the steps and the tasks of the cases.
-        self.assertEqual(len([s for s in before if s.startswith("SELECT")]), 2 + 2 + 5 + 2)
+        self.assertEqual([view["task"] for view in need_views], [None, 7, None, None])
+        # The discussions, the fleet's id and the tasks of the items' questions; the tokens and the parts of the steps;
+        # the cases twice, the joins, the rules and their runs, and the steps and the tasks of the cases.
+        self.assertEqual(len([s for s in before if s.startswith("SELECT")]), 3 + 2 + 5 + 2)
         self.assertEqual(len(seen), len(goal_reads))          # the needs and the duties read nothing more
         self.assertFalse([s for s in goal_reads if "session_tokens" in s or "FROM tasks WHERE step" in s])
         self.assertEqual([t["text"] for t in need_views[0]["talk"]], ["why this one?", "because the export waits"])

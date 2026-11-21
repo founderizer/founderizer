@@ -146,7 +146,7 @@ links a WhatsApp account to the fleet: the owner reads that QR in the app, and `
 Since 14 November 2026 `call` also takes the setup tools `setup_state` and `setup_show` by
 name (below, "The link to the running app"), and the read `setup_diagnosis` on the same link.
 `write` takes each other tool that the
-program has: the nine below, the 54 of the table, and `save_bot_token`, `prepare_problem_report`,
+program has: the nine below, the 55 of the table, and `save_bot_token`, `prepare_problem_report`,
 `save_secret`, `grant_secret`, `share_secret` and `answer_secret_request` on the link. A read
 through `write` is refused, and a write through `call` is refused, each with words that name the
 right verb; a tool that the program does
@@ -183,7 +183,7 @@ Claude Code's own "always allow" button in its window, and Codex, which has no r
 
 **Its tools in this version.** The tools of this server, with the same names, words, fields and
 `readOnlyHint` (one exception: the program's words of `answer_needs_you` have its sentences about the
-door's card after the table's). 54 come from a table that this file prints, `python3 owner_mcp.py --dump-tools`,
+door's card after the table's). 55 come from a table that this file prints, `python3 owner_mcp.py --dump-tools`,
 from the same objects that its own tools are: `release.sh` and `run.sh` put it in the app as
 `Contents/Resources/owner-tools.json`, from the same revision as `onboard.py`. Thirteen are written
 again in Swift (the table's kind `swift`): four reads, `fleet_overview`, `fleet_read`,
@@ -203,7 +203,7 @@ program's own and are not
 in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
 the running app (below). Six more, `save_bot_token`, `prepare_problem_report`, `save_secret`,
 `grant_secret`, `share_secret` and `answer_secret_request`, write on the same link (below). So
-`tools/list` gives 76 tools: the 54 of the table, the thirteen, the three reads of the link and its
+`tools/list` gives 77 tools: the 55 of the table, the thirteen, the three reads of the link and its
 six writes. One request more writes on the link and is no tool of its own: `answer_needs_you`'s
 signed press of a door card.
 
@@ -1333,7 +1333,7 @@ hub came through the link. **Not proved:** Codex's own window (only `codex exec`
 provider's server, and the verbs `call` and `write` and the nine writes in a release build (they
 came after that build).
 
-**The parity check** holds the two programs to each other. Each tool that both have (the 54 of the
+**The parity check** holds the two programs to each other. Each tool that both have (the 55 of the
 table, the four reads and the nine writes) runs on one fixed script of arguments against a
 stand-in hub with fixed answers, with more cases for the shared part and the nine: a new
 generation read again once, a 409 with `sha256`, a bad request id and the agent's own, each kind
@@ -1548,6 +1548,7 @@ would read as an empty fleet instead of as a mistake.
 | `reload_team` | `/ui/team/reload` | Apply `team.json` from a pushed revision without restarting the hub. |
 | `send_message` | `/ui/messages` | Say something to an agent, with files from `attach_file`. **This is how a goal or a duty is set.** |
 | `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words, by choosing an option, or by ticking the options of an item that lets them combine (`choices`). A secret request takes neither: the app's secure form answers it. Since 18 November 2026 it also takes files (the owner's "Yes, build it" to "Should your agent be able to attach files to its answers on Needs you?"). `attachments` holds at most four ids that `attach_file` gave, and they go with an answer in words or alone, as the files that the owner drops on the item in the app do. Beside a `choice` or `choices` they are refused before any request, with one sentence in both programs, so that a door card's press never leaves a file behind. An item whose answer goes into a conversation takes no file, and the hub says so. |
+| `clarify_needs_you` | `/ui/needs/<id>/talk` | The owner's message to the manager under an open Needs-you item, before answering it (Needs clarification, owner API 1.272, feature `need_clarify`): the item stays open, and the manager's reply joins its `talk`, as when the owner writes it in the app. An item whose `clarify` is false takes none (409), and the hub's words say why. Since 21 November 2026, in place of the line of `NOT_TOOLS` that named the route until then. |
 | `decline_secret_request` | `/ui/needs/<id>/secret` | Decline a secret request, with a reason or none. A decline carries no value, so this server sends it; an answer with a value stays the app's secure form. |
 | `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task, with files from `attach_file` (owner API 1.223), which open in that task's session: when a person's conversation opened the task, that person's messages drive it, so they can get what a file says. |
 | `goal_state` / `duty_state` / `trigger_state` | `/ui/goals/<id>/state` and the two beside it | Pause, resume, finish, drop. |

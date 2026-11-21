@@ -1066,7 +1066,7 @@ class Tools(Fleet):
         set_agent_model="a lead's team tool, which changes another agent: a ticket's text must not reach it",
         **{name: TEAM for name in ("see_team", "see_capacity")},
             **{name: OWN_WORDS for name in ("report_progress", "ask_my_requester", "report_up", "start_task")},
-            **{name: STEERS for name in ("write_knowledge", "write_skill", "set_target")},
+            **{name: STEERS for name in ("write_knowledge", "write_skill", "set_target", "set_kpi")},
             **{name: OUT for name in ("attach_file", "post_to_chat")},
             **{name: READER for name in ("ask_reporter", "join_report")},
             **{name: WINDOW for name in ("ask_owner", "request_work", "open_work")},

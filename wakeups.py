@@ -31,6 +31,7 @@ Refused to its ToolError. Standard library only.
 """
 import hashlib
 import json
+import math
 import re
 import shlex
 
@@ -77,9 +78,19 @@ class Org:
     None). The module never decides authority itself: it asks this function, so the rules of the module and of the hub
     cannot drift apart."""
 
-    def __init__(self, manager, agents, authority, features=None, giver=None):
+    def __init__(self, manager, agents, authority, features=None, giver=None, kpi_reads=None):
         self.manager, self.agents, self.authority, self.giver = manager, agents, authority, giver
         self.features = features or (lambda agent: ())     # hub.helper_features: what an agent's helper reports
+        # hub.kpi_readable: the rules of its team that a lead may read for its KPIs (lanes/agent-kpis.md), read once
+        # for each caller of this Org, which lives for one call
+        self.kpi_reads, self.kpi_seen = kpi_reads, {}
+
+    def kpi_rules(self, caller):
+        if self.kpi_reads is None:
+            return ()
+        if caller not in self.kpi_seen:
+            self.kpi_seen[caller] = set(self.kpi_reads(caller))
+        return self.kpi_seen[caller]
 
 
 def number_text(x):
@@ -144,8 +155,10 @@ def creator_rank(org, rule):
 def may_read(org, caller, rule):
     """By current authority only: the fleet manager sees every rule, and an agent the rules that wake it. An agent
     that left the team, and an author that lost its authority, see nothing (the source and history can hold the
-    team's own data)."""
-    return caller == org.manager or level(org, caller, rule["agent"]) >= SELF
+    team's own data). A lead also reads the rules of its team that its KPIs need (lanes/agent-kpis.md, spec 5.1):
+    the one that a KPI links, and the ones that the measuring agent saved in a KPI's setup task."""
+    return caller == org.manager or level(org, caller, rule["agent"]) >= SELF or \
+        rule.get("id") in org.kpi_rules(caller)
 
 
 def may_control(org, caller, rule, action=None):
@@ -729,6 +742,25 @@ def progress_of(lines):
     if not found:
         return None, list(lines)
     return float(found.group(1)), list(lines[1:])
+
+
+KPI_LINE = re.compile(r"kpi[ \t]+([a-z0-9_]{1,40})[ \t]+([-+]?(?:\d+(?:\.\d*)?|\.\d+))")   # a KPI's value line
+
+
+def kpi_block(lines):
+    """({metric: value}, the other lines): the leading run of lines "kpi <metric> <number>" of a check's lines, after
+    progress_of took a first "progress" line (lanes/agent-kpis.md, spec 5.2). These lines are never wake lines, on any
+    line check; a metric that the run prints twice keeps its first value. The lines after the block stay as they are:
+    one whose first word is "kpi" is dropped only on a check that a KPI links (the hub's check_result)."""
+    values, at = {}, 0
+    for line in lines:
+        found = KPI_LINE.fullmatch(line.strip())
+        number = float(found.group(2)) if found else None
+        if number is None or not math.isfinite(number):
+            break
+        values.setdefault(found.group(1), number)
+        at += 1
+    return values, list(lines[at:])
 
 
 def new_lines(printed, accepted):

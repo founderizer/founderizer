@@ -299,9 +299,6 @@ NOT_TOOLS = {
     "/ui/secrets/import": "the values of an import's logins, as /ui/secrets/add",
     "/ui/needs/{}/takeover": "the one-time password of an agent's screen on a Linux server, which only the owner's "
                              "app puts in Screen Sharing's address (build plan 04, S6)",
-    "/ui/needs/{}/talk": "the owner's message to the manager under an open Needs-you card (Needs clarification), "
-                         "which the owner writes in the app or on the phone, where the reply shows; the owner's agent "
-                         "answers a card with answer_needs_you",
     "/ui/secrets/fingerprints": "the owner's own secret catalog",
     "/ui/needs/{}/secret": "a secret request's answer with a login, which the app's secure form gives once the value "
                            "is in a vault, and for a secret that the fleet's list has, the app's program on the "
@@ -902,6 +899,8 @@ PAGES = {
     "responsibility": ("/ui/responsibilities/{id}", "one duty with its cases, newest first"),
     "standing": ("/ui/standing", "the standing instructions and targets that steer agents, newest first, ended ones "
                                  "included (give agent for the ones that steer one agent)"),
+    "kpis": ("/ui/kpis", "the active KPIs, of one agent when you give agent: each one's words, level, state, weekly "
+                         "values with the ones that count, and the marks of its changes"),
     "goal": ("/ui/goals/{id}", "one goal with its recorded spending and its history"),
     "resources": ("/ui/resources", "each resource, the owner's standing for it (grant), who holds it; the signed pool "
                                    "of secrets is on the page vault"),
@@ -953,7 +952,8 @@ PAGE_IN_PATH = ("{agent}", "{name}")        # a page whose subject is a path seg
 # `test_owner_mcp.Shape` holds each entry to the words that the hub's route reads, on a hub that records them.
 PAGE_TAKES = {"agent_messages": ("agent", "after"), "capacity": ("expertise", "needs", "login"),
               "conversation": ("after",), "conversations": ("agent", "person"), "events": ("after", "limit"),
-              "homes": ("agent",), "hosts": ("agent",), "knowledge": ("path",), "responsibility": ("before", "limit"),
+              "homes": ("agent",), "hosts": ("agent",), "knowledge": ("path",), "kpis": ("agent",),
+              "responsibility": ("before", "limit"),
               "skills": ("agent",), "standing": ("agent", "before", "limit"), "trigger": ("before", "limit")}
 
 
@@ -3391,6 +3391,14 @@ def tools():
              {"need": S["int"], "answer": S["text"], "choice": S["int"],
               "choices": {"type": "array", "items": {"type": "integer"}},
               "attachments": {"type": "array", "items": {"type": "integer"}}, **rid}, ("need",), answer_need),
+        tool("clarify_needs_you", "Send the owner's message to the manager under one open Needs-you item, before "
+                                  "answering it: more context, or a question about it (Needs clarification). The "
+                                  "item stays open, and the manager's reply joins its talk. fleet_read(page=\"state\") "
+                                  "gives each item's talk and clarify in needs: an item whose clarify is false takes "
+                                  "no message. text: 1 to 2000 characters, only the owner's own words: the manager reads "
+                                  "them as the owner's. To answer the item, use answer_needs_you.",
+             {"need": S["int"], "text": S["text"], **rid}, ("need", "text"),
+             plain("/ui/needs/{need}/talk", ("text",), "the message")),
         tool("decline_secret_request", "Decline one Needs-you item that asks for a secret, a key or a login: the "
                                        "request ends, and the agent that asked reads that it is not given, with "
                                        "the reason if there is one. A decline carries no value. A value goes in "
@@ -3497,7 +3505,7 @@ FEATURES = {
     "device_code": "mobile", "keep_attachment": "attachments", "control_task": "task_controls",
     "steer_task": "task_steering", "goal_state": "goals", "duty_state": "responsibilities",
     "end_standing": "standing", "trigger_state": "triggers", "check_releases": "releases",
-    "take_release": "releases", "automatic_releases": "releases",
+    "take_release": "releases", "automatic_releases": "releases", "clarify_needs_you": "need_clarify",
 }
 
 
