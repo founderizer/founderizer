@@ -95,7 +95,10 @@ fleet's own nftables table lets only the agent's user, the vault's broker and ro
 server, and closes each port of both ranges that no agent holds; after a flush of the ruleset by hand, that rule has
 a gap of one reading of the server (at most five minutes). The vault signs the agent in there, and the end of the
 agent's use of a login clears the sites of that sign-in in that browser within a minute while it runs, else at its
-next start. What the agent's own programs
+next start. The agent's screen offers no shared memory (Xvfb's MIT-SHM is off, and x11vnc runs with `-noshm`).
+Before 21 November 2026 it did, and Chrome kept its window's picture in a memory segment that another OS user of
+the same server (another agent with a shell) could read and write (measured on a throwaway server); a browser
+that ran when the change arrived keeps its old screen until its next start. What the agent's own programs
 can still reach in its own browser (a filled field, the vault's script, the browser's cookies) is item 26 of
 [VAULT.md](VAULT.md), "What the vault does not protect": a copied session works until the site ends it, so after a
 grant's end the owner's step is the site's "sign out everywhere" or a new password.

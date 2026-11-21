@@ -1351,9 +1351,22 @@ class TakeOver(unittest.TestCase):
         self.folder = tempfile.mkdtemp(prefix="fleet-takeover-")
         self.addCleanup(lambda: __import__("shutil").rmtree(self.folder, True))
 
+    def test_the_screen_keeps_its_picture_from_other_users(self):
+        """Measured 21 November 2026 (x86 Ubuntu 24.04, Chrome 158): with MIT-SHM on the agent's Xvfb, Chrome kept its
+        window's picture in a memory segment of mode 606 that another agent's OS user read and could write. The screen
+        starts with no MIT-SHM and no TCP. It keeps its abstract socket: a name that Xvfb does not hold, another user
+        can bind, and X clients try it first (a review of 21 November 2026)."""
+        args = fleet.screen_arguments("/run/key", 7)
+        self.assertEqual(args[:3], ["Xvfb", "-auth", "/run/key"])
+        joined = " ".join(args)
+        for pair in ("-extension MIT-SHM", "-nolisten tcp", "-displayfd 7"):
+            self.assertIn(pair, joined)
+        self.assertNotIn("-nolisten local", joined)
+
     def test_the_sharing_is_one_viewer_on_loopback_with_no_clipboard_and_its_password_from_a_file(self):
         args = fleet.vnc_arguments("7", "/run/key", 5911, "/run/vnc-password")
-        for flag in ("-norc", "-nocmds", "-localhost", "-noipv6", "-nosel", "-noremote", "-novncconnect", "-once"):
+        for flag in ("-norc", "-nocmds", "-localhost", "-noipv6", "-nosel", "-noremote", "-novncconnect", "-once",
+                     "-noshm"):         # -noshm: no picture of the screen in a memory segment that others read
             self.assertIn(flag, args)
         self.assertEqual(args[args.index("-passwdfile") + 1], "rm:/run/vnc-password")
         self.assertEqual(args[args.index("-rfbport") + 1], "5911")

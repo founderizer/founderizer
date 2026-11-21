@@ -687,9 +687,10 @@ class Reads(StateCase):
             goal_reads = self.traced(lambda: [hub.goal_view(g, reads[1]) for g in goals])[1]
         self.assertEqual((need_views, goal_views, duty_views), own)
         self.assertEqual([view["task"] for view in need_views], [None, 7, None, None])
-        # The discussions, the fleet's id and the tasks of the items' questions; the tokens and the parts of the steps;
-        # the cases twice, the joins, the rules and their runs, and the steps and the tasks of the cases.
-        self.assertEqual(len([s for s in before if s.startswith("SELECT")]), 3 + 2 + 5 + 2)
+        # The discussions, the fleet's id, the tasks of the items' questions and the pictures of the items (owner
+        # API 1.285); the tokens and the parts of the steps; the cases twice, the joins, the rules and their runs,
+        # and the steps and the tasks of the cases.
+        self.assertEqual(len([s for s in before if s.startswith("SELECT")]), 4 + 2 + 5 + 2)
         self.assertEqual(len(seen), len(goal_reads))          # the needs and the duties read nothing more
         self.assertFalse([s for s in goal_reads if "session_tokens" in s or "FROM tasks WHERE step" in s])
         self.assertEqual([t["text"] for t in need_views[0]["talk"]], ["why this one?", "because the export waits"])

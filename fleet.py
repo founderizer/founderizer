@@ -10584,7 +10584,7 @@ def vnc_arguments(display, key, port, secret):
     (SECURITY.md)."""
     return ["x11vnc", "-norc", "-nocmds", "-display", f":{display}", "-auth", key, "-rfbport", str(port),
             "-localhost", "-noipv6", "-nosel", "-noremote", "-novncconnect", "-once", "-passwdfile", f"rm:{secret}",
-            "-quiet"]
+            "-noshm", "-quiet"]     # -noshm: no picture of the screen in a memory segment (screen_arguments)
 
 
 def browser_locale(team=None, zones="/usr/share/zoneinfo"):
@@ -10899,6 +10899,18 @@ def screen_display(read_end, wait=10.0):
     return display if said.endswith(b"\n") and display.isdigit() else None
 
 
+def screen_arguments(key, write_end):
+    """Xvfb's arguments for the agent's own screen (cmd_browser_run): its key, no TCP, a display that it chooses
+    itself (-displayfd), and no MIT-SHM. Measured on x86 Ubuntu 24.04 with Chrome 158 (21 November 2026, a throwaway
+    server): with MIT-SHM, Chrome keeps its window's picture in a System V memory segment of mode 606, and another OS
+    user of the server (another agent) attached it and read 4 MB of the page, and could write it. Without it, Chrome
+    draws through the X protocol and no segment of the agent's is left. The screen keeps its abstract socket: while
+    Xvfb holds that name no other user can bind it, and X clients try it before the socket file; the screen key
+    refuses every other user on either."""
+    return ["Xvfb", "-auth", key, "-nolisten", "tcp", "-extension", "MIT-SHM", "-nopn", "-displayfd", str(write_end),
+            "-screen", "0", "1280x800x24"]
+
+
 def cmd_browser_run(args):
     """The agent's browser unit's own program (browser_unit_text), as the agent: a new screen key, Xvfb on a display
     that it chooses itself (-displayfd, screen_display) with no TCP, Openbox, and Chrome on the agent's DevTools port
@@ -10928,8 +10940,7 @@ def cmd_browser_run(args):
             os.umask(old)
     allow(0)
     read_end, write_end = os.pipe()
-    xvfb = subprocess.Popen(["Xvfb", "-auth", key, "-nolisten", "tcp", "-nopn", "-displayfd", str(write_end),
-                             "-screen", "0", "1280x800x24"], pass_fds=(write_end,), stdin=subprocess.DEVNULL,
+    xvfb = subprocess.Popen(screen_arguments(key, write_end), pass_fds=(write_end,), stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.close(write_end)
     display = screen_display(read_end)
