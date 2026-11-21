@@ -822,6 +822,14 @@ class DoorTokens(Access):
             github = self.request("/ui/team?db=test-generation", source=OWNER)[1]["github"]
         self.assertEqual((github["app"], github["app_id"]), (True, "777"))
         self.assertEqual(self.owner("/ui/door/github-app", owner="Acme", app_id="x")[0], 400)
+        # H2 (windows-app-plan-v2.md 5.3): an owner whose PC cannot keep the door gets no card of it, door or not
+        with patch.object(hub, "owner_computer", lambda: {"kind": "windows", "label": "PC", "can": ["agents"]}), \
+                self.assertRaisesRegex(hub.ToolError, "The owner's computer is a PC, and its app cannot set up the "
+                                                      "door to the servers and approve its calls yet, so the hub "
+                                                      "offers no door"):
+            hub.t_raise_needs_you("manager", {"title": "A GitHub App for Acme", "why": "Agents get no token there.",
+                                              "what_to_do": "Make it on GitHub.", "github_app": "Acme",
+                                              "options": options})
         team = self.origin_team()
         del team["door"]
         self.write_team(team)
@@ -1044,7 +1052,14 @@ class DoorCalls(Access):
     def test_a_key_saved_for_the_door_becomes_a_credential_of_its_rules(self):
         """DevOps plan 13, item 3: the card that asks for a key for the door names it in the door's rules; the owner's
         Save gives it to the door, and the hub keeps that name with the agent that asked, which the app writes into
-        the door's access file. Taking the key back from the door ends the credential too."""
+        the door's access file. Taking the key back from the door ends the credential too. An owner whose PC cannot
+        keep the door gets no such card (H2): its key would wait in team.json for a round that never comes."""
+        with patch.object(hub, "owner_computer", lambda: {"kind": "windows", "label": "PC", "can": ["secrets"]}), \
+                self.assertRaisesRegex(hub.ToolError, "its app cannot set up the door .* Leave door out"):
+            hub.t_request_secret("manager", {"kind": "api_key", "env": "CLOUDFLARE_ACME_DOOR_TOKEN",
+                                             "site": "https://api.cloudflare.com", "door": "Cloudflare:ACME",
+                                             "why": "Acme's DNS through the door"})
+        self.assertIsNone(hub.q1("SELECT id FROM needs WHERE kind='secret'"))
         said = hub.t_request_secret("manager", {"kind": "api_key", "env": "CLOUDFLARE_ACME_DOOR_TOKEN",
                                                 "site": "https://api.cloudflare.com", "door": "Cloudflare:ACME",
                                                 "why": "Acme's DNS through the door"})

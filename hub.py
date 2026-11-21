@@ -7851,7 +7851,37 @@ def owner_start_text():
         (f"\nTHE OWNER'S LANGUAGE is {said}: write in it every text that the owner's apps show -- your replies and "
          f"messages to the owner, Needs-you items, the titles of goals, tasks and duties, your notes on them and your "
          f"results. Code, commands, commit messages, and the codes and names of things stay as they are. Any other "
-         f"person gets your answer in the language that they write in.\n" if tag and base != "en" else "")
+         f"person gets your answer in the language that they write in.\n" if tag and base != "en" else "") + \
+        computer_start_text()
+
+
+# The hub asks an owner whose computer is a PC only for what the PC can do (windows-app-plan-v2.md 5.3, H2). It reads
+# owner_computer() (H1) where it asks: a Mac fleet has every name of OWNER_CAN, so its words and answers stay the same.
+# A session keeps the words of its start: a change of `can` reaches the next session's start, and each refusal below
+# is read at the moment of the call.
+def owner_cannot(name):
+    """The words "The owner's computer is a PC, and its app cannot <OWNER_CAN[name]> yet" while the owner's computer
+    cannot do `name`, for an agent's refusal; None while it can, as a Mac always can (OWNER_DEFAULT). Safe under LOCK,
+    as owner_computer is."""
+    computer = owner_computer()
+    if name in computer["can"]:
+        return None
+    return f"The owner's computer is a {computer['label']}, and its app cannot {OWNER_CAN[name]} yet"
+
+
+def computer_start_text():
+    """The line of the agents' start for a fleet whose owner's computer is a PC (owner_start_text): the owner has no
+    Mac, what their app cannot do yet (the phrase of each name of OWNER_CAN that `can` lacks), and that a card works
+    with no page, so a manager of a PC fleet still asks for keys and agents. "" for a Mac. Reads no row."""
+    computer = owner_computer()
+    if computer["kind"] == "mac":
+        return ""
+    lacks = [phrase for name, phrase in OWNER_CAN.items() if name not in computer["can"]]
+    return (f"\nTHE OWNER'S COMPUTER is a {computer['label']}, and they have no Mac: where a rule or a tool names the "
+            f"owner's Mac, read their {computer['label']}."
+            + (f" Their app cannot do these yet, so do not ask them to: {'; '.join(lacks)}. A card works with no "
+               f"page: a key card, a team card and a new agent's setup with its server and sign-in." if lacks else "")
+            + "\n")
 
 
 def contacts_start_text(agent):
@@ -8467,8 +8497,13 @@ def part_start_text(task_id, closed=False):
 
 
 def get_task(task_id, owner=None, requester=None):
+    """The task row, or a ToolError. With owner= or requester= it is a tool's read for the session that calls (each
+    such caller runs inside call_tool, where session_scope reads that session's context): a narrowed pair's task that
+    is not that session's own (narrowed_from) answers as a task that does not exist, before the fence and the owner's
+    check, whose words named its owner. The bare get_task(id) is the hub's own read, and reads every task."""
     t = q1("SELECT * FROM tasks WHERE id=?", (task_id,))
-    if not t:
+    who = owner or requester
+    if not t or (who and narrowed_from(t, session_scope(who), who)):
         raise ToolError(f"There is no task {tref(task_id)}.")
     if owner and getattr(CALL, "context", None) is not None:
         fence(owner, task_id)
@@ -8477,6 +8512,15 @@ def get_task(task_id, owner=None, requester=None):
     if requester and t["requester"] != requester:
         raise ToolError(f"{tref(task_id)} was not requested by you.")
     return t
+
+
+def named_task(agent, task_id):
+    """The row of the task that a tool's caller names by its id, or None when there is no such task for that session:
+    none has the id, or it is a narrowed pair's task that is not the session's own (narrowed_from). The caller keeps
+    its own words for a missing id, so the answer for a narrowed pair's task is the answer for an id that no task has.
+    For a call inside call_tool, where session_scope reads the session's context. read_row only."""
+    t = read_row("SELECT * FROM tasks WHERE id=?", (task_id,))
+    return None if t is None or narrowed_from(t, session_scope(agent), agent) else t
 
 
 def activity(task_id, tool=None):
@@ -12727,7 +12771,7 @@ def task_job(agent, a, follows, parent, step, case_id):
     ref, own_ask = a.get("job"), a.get("ask") not in (None, "")
     if ref not in (None, "", 0, "0"):
         job = parse_task(ref)
-        first = q1("SELECT ask FROM tasks WHERE id=?", (job,))
+        first = named_task(agent, job)          # a narrowed pair's task is no job to join, as an id of no task
         if not first:
             raise ToolError(f"There is no task {tref(job)} whose job this task could join.")
         # The ask of the job's own task is no second piece of work: the manager may name both, as its rules for an
@@ -12779,7 +12823,7 @@ def need_ask(agent, ref):
             raise ToolError(f"No work is filed under M-{message['event_id']} yet, so no item can wait for it: name a "
                             f"task of the work that waits for this item (T-<id>), or leave ask out.")
         return message["request_id"]
-    row = q1("SELECT ask FROM tasks WHERE id=?", (int(task.group(1)),))
+    row = named_task(agent, int(task.group(1)))        # a narrowed pair's task answers as an id of no task
     if not row:
         raise ToolError(f"There is no task {tref(int(task.group(1)))}: ask names a task of the work that waits for "
                         f"this item, or the owner's message M-<n> that the work comes from.")
@@ -16199,6 +16243,11 @@ def t_raise_needs_you(agent, a):
     if wrong:
         raise ToolError(wrong)
     replaces = None if a.get("replaces") in (None, "") else parse_id(a.get("replaces"), "Needs-you item")
+    lacks = None if all(a.get(k) is None for k in ("door_call", "door_host", "door_script", "github_app")) else \
+        owner_cannot("door")        # H2: no card of the door for an owner whose app cannot keep one
+    if lacks:
+        raise ToolError(f"{lacks}, so the hub offers no door: agents work on the fleet's own servers. Leave door_call, "
+                        f"door_host, door_script and github_app out.")
     door_call = a.get("door_call")
     if door_call is not None and not (isinstance(door_call, str) and re.fullmatch(r"[0-9a-f]{64}", door_call)):
         raise ToolError("door_call is the call hash that the door gave with its refusal: 64 hex characters.")
@@ -17589,6 +17638,10 @@ def t_request_secret(agent, a):
                         'call_api, or "login", a user name and a password that its vault signs in with.')
     door = door_key_name(a.get("door"))
     if door:                # DevOps plan 13, item 3: a key that the door uses for the agent that asks, as its holder
+        lacks = owner_cannot("door")        # H2: no key for a door that the owner's app cannot keep
+        if lacks:
+            raise ToolError(f"{lacks}, so the hub offers no door: agents work on the fleet's own servers. Leave door "
+                            f"out.")
         if not TEAM.get("door"):
             raise ToolError("This fleet has no door, so there is no key to ask for it. Leave door out.")
         if kind != "api_key" or not DOOR_CREDENTIAL.fullmatch(door):
@@ -18049,6 +18102,9 @@ def t_request_takeover(agent, a):
         raise ToolError("request_takeover is for a worker or a lead, in the session of a browser or screen task.")
     if chat_context(agent) or contact_session(agent):
         raise ToolError("You have no tool named request_takeover.")
+    lacks = owner_cannot("takeover")        # H2: a PC's app opens no agent's screen, on a Mac or on Linux
+    if lacks:
+        raise ToolError(f"{lacks}. Ask your requester with ask_my_requester.")
     tid = parse_task(a.get("task_id") or (getattr(CALL, "context", None) or ("", ""))[1])
     t = read_row("SELECT * FROM tasks WHERE id=?", (tid,)) if tid else None
     if not t or t["owner"] != agent or t["state"] in TERMINAL:
@@ -21608,7 +21664,9 @@ def linked_tasks(agent, tid, to):
                     else None
                 out[r["id"]] = (f"part of step {step['n']}" if step else f"beside you under {tref(r['parent'])}",
                                 COLLEAGUE_LIMIT)
-    return out
+    # a narrowed pair's task is linked to no session but its own (named_task): no message lands in it, and no refusal
+    # lists it
+    return {k: v for k, v in out.items() if named_task(agent, k)}
 
 
 def given_task(agent, to, task_id):
@@ -21697,7 +21755,7 @@ def linked_choice(agent, tid, to, to_task):
     links = {k: v for k, v in linked_tasks(agent, tid, to).items() if narrowed_task(k) is None}
     if to_task not in (None, ""):
         want = parse_task(to_task)
-        if want not in links and given_reach(agent, to, want):
+        if want not in links and given_reach(agent, to, want) and named_task(agent, want):
             # A task that the sender gave itself, named by its id, from any session of the sender: a lead's session
             # sees only the subtasks of its own task (linked_tasks), so until 19 November 2026 its words for work
             # that already ran under another task of its own could only start a second session of the same agent.
@@ -22377,6 +22435,77 @@ def narrowed_tasks_settle():
     return len(rows)
 
 
+NARROWED_ENDED_SETTLED = "narrowed_ended_settled"      # kv: narrowed_ended_settle ran (one time)
+# the owner's log line of a rename (rename_agent), with the agent's name of before and its new one: the log keeps the
+# name of its time, so narrowed_spans carries a pair's lines of before a rename over to the new name
+RENAMED_LINE = re.compile(r"renamed (?:agent|the manager) ([a-z][a-z0-9-]{1,30}) to ([a-z][a-z0-9-]{1,30})[ ,]")
+
+
+def narrowed_spans():
+    """{(person id, agent): [(from, until or None), ...]}: the times in which each pair had a list, oldest first, from
+    the owner's log lines of a change of a list (person_scope_rows' NARROWED_LINE), under the agent's name of now
+    (RENAMED_LINE), and an open span for each pair that has a list now (person_scopes). A line "all of it" ends the
+    open span; each other line opens one, or keeps it open. read_rows only: safe inside a caller's transaction."""
+    spans = {}
+    for r in read_rows("SELECT ts, what FROM log WHERE agent='owner' AND (what LIKE 'P-%' OR what LIKE 'renamed %') "
+                       "ORDER BY id"):
+        what = r["what"] or ""
+        moved = RENAMED_LINE.match(what)
+        if moved:
+            for pid, agent in [k for k in spans if k[1] == moved.group(1)]:
+                spans.setdefault((pid, moved.group(2)), []).extend(spans.pop((pid, agent)))
+            continue
+        m = NARROWED_LINE.match(what)
+        if not m:
+            continue
+        mine = spans.setdefault((int(m.group(1)), m.group(2)), [])
+        is_open = bool(mine) and mine[-1][1] is None
+        if what[m.end():].startswith("all of it"):
+            if is_open:
+                mine[-1] = (mine[-1][0], r["ts"])
+        elif not is_open:
+            mine.append((r["ts"], None))
+    for r in read_rows("SELECT person, agent, updated FROM person_scopes"):
+        mine = spans.setdefault((r["person"], r["agent"]), [])
+        if not mine or mine[-1][1] is not None:
+            mine.append((r["updated"], None))
+    return spans
+
+
+def narrowed_ended_settle():
+    """Inside the caller's transaction, one time (kv NARROWED_ENDED_SETTLED, written in the same transaction): the
+    conversation tasks with no person to which today's code gives one. A conversation task has its person when it ended
+    while its pair had a list (by its delivered time, else its last activity), or when it is open and its pair has a
+    list now. From 11 to 20 November 2026 a task that a locked window worked in but that ended another way (canceled,
+    failed), or that is still open, kept none, so its call records stayed readable to each session with more
+    (history_scope_sql reads the task's person, so the history needs no change). A task that ended at All gets nothing,
+    and so does an open task of a pair at All: with a person and no list it would lose the agent's tools (task_scope).
+    It reads the log once (narrowed_spans), each pair's tasks by task_of_conversation, and no call record. Two limits
+    of the log: a lost "all of it" line leaves a span open, so a task that ended after it gets the person (it fails
+    closed); and a task that ended in a span after it was open at All loses its records of the time at All too, as each
+    task that was open at a first list does since 20 November 2026. Returns how many tasks it changed."""
+    in_transaction("narrowed_ended_settle")
+    if read_row("SELECT v FROM kv WHERE k=?", (NARROWED_ENDED_SETTLED,)) is not None:
+        return 0
+    changed = 0
+    for (pid, agent), mine in sorted(narrowed_spans().items()):
+        conv = read_row("SELECT id FROM conversations WHERE person=? AND agent=?", (pid, agent))
+        if conv is None:
+            continue
+        listed = person_scope(pid, agent) is not None
+        for t in read_rows(f"SELECT id, delivered, last_activity, ({OPEN_TASK}) AS open FROM tasks WHERE "
+                           f"source_conversation=? AND source_message IS NOT NULL AND scope_person IS NULL",
+                           (conv["id"],)):
+            at = None if t["open"] else t["delivered"] or t["last_activity"]
+            if (t["open"] and listed) or \
+                    (at is not None and any(a <= at and (b is None or at < b) for a, b in mine)):
+                changed += DB.execute("UPDATE tasks SET scope_person=? WHERE id=? AND scope_person IS NULL",
+                                      (pid, t["id"])).rowcount
+    DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+               (NARROWED_ENDED_SETTLED, str(changed)))
+    return changed
+
+
 def settle_narrowed_rows():
     """At the start, after the schema: the marks (narrowed_mark) of a narrowed pair's rows that were stored before
     the column came, or by a hub of the release before it during a restart or after a rollback, which stores NULL
@@ -22391,6 +22520,10 @@ def settle_narrowed_rows():
        each message of the person and each reply, from NARROWED_LEAD seconds before the pair's first such line, or
        from the conversation's start when the log has none. For a pair at All now it leaves out what a widening
        gives back (narrowed_adopted).
+    4. One time (kv NARROWED_TASKS_SETTLED), after the marks: a completed conversation task that a marked reply
+       ended, with no person, gets the reply's person (narrowed_tasks_settle).
+    5. One time (kv NARROWED_ENDED_SETTLED), after the marks: an old conversation task with no person that ended while
+       its pair had a list, or that is open while its pair has one now, gets the person (narrowed_ended_settle).
 
     The hub kept no list of before, no time back at All and no writer of a reply, so rule 3 fails closed: the pair's
     words of a time at All after its first list stay hidden from the sessions with more, which is a loss, where a
@@ -22405,6 +22538,9 @@ def settle_narrowed_rows():
             tasks = narrowed_tasks_settle()             # after the marks: a reply that rule 2 marks counts
             if tasks:
                 log_row("hub", f"gave {tasks} ended conversation task(s) of narrowed pairs their person")
+            ended = narrowed_ended_settle()             # after the marks and narrowed_tasks_settle
+            if ended:
+                log_row("hub", f"gave {ended} old conversation task(s) of narrowed pairs their person")
     except Exception as e:
         print_fault()
         log("hub", f"the rows of narrowed pairs could not be marked at this start: {type(e).__name__}: {e}")
@@ -27722,7 +27858,7 @@ def t_record_spend(agent, a):
     if cents <= 0 or currency != money["currency"] or not 1 <= len(what) <= 500:
         raise ToolError(f"Record a spend of more than 0 in {money['currency']}, and say in at most 500 characters what it pays for.")
     task = parse_task(a["task"]) if a.get("task") not in (None, "") else None
-    if task is not None and not q1("SELECT id FROM tasks WHERE id=?", (task,)):
+    if task is not None and not named_task(agent, task):       # a narrowed pair's task too (narrowed_from)
         raise ToolError(f"There is no task {tref(task)}.")
     guard(agent, what)
     spent, cap = spent_cents(g["id"]), round(money["amount"] * 100)
@@ -43916,7 +44052,7 @@ def t_decide_report(agent, a):
                             "became_task. A report decided as a task with no task is the loop this tool is here to "
                             "end.")
         became = parse_task(a.get("became_task"))
-        if not q1("SELECT 1 FROM tasks WHERE id=?", (became,)):
+        if not named_task(agent, became):       # a narrowed pair's task too (narrowed_from)
             raise ToolError(f"There is no task {tref(became)}.")
     if r["kind"] == "proposal" and decision == "goal":
         # AUTONOMY.md P3: only the owner's yes makes a proposal a goal, and the decision names that goal
@@ -44332,16 +44468,25 @@ def history_questions(a, days, start, before):
     return out
 
 
+# The calls of no narrowed pair (narrowed_from), as a condition on `calls`: not of a narrowed pair's task, and not of a
+# locked window of a pair that has a list now, whose read_messages, reply and read_attachment carry no task.
+CALLS_NOT_NARROWED = ("NOT EXISTS (SELECT 1 FROM tasks n WHERE n.id=calls.task AND n.scope_person IS NOT NULL) AND "
+                      "NOT EXISTS (SELECT 1 FROM conversations c JOIN person_scopes s ON s.person=c.person AND "
+                      "s.agent=c.agent WHERE c.id=calls.conversation)")
+
+
 def history_refusals(a, days, start, before):
     """calls WHERE ok=0, grouped by agent, tool and the words of the refusal. The cheapest self-diagnosis the fleet
-    has, and the table has been full of it all along."""
-    where, args = "ok=0 AND ts>=?", [start]
+    has, and the table has been full of it all along. A narrowed pair's calls are in neither window
+    (CALLS_NOT_NARROWED): their words, their task and their count stay with that pair, and the two windows compare the
+    same rows."""
+    where, args = f"ok=0 AND ts>=? AND {CALLS_NOT_NARROWED}", [start]
     if a.get("agent"):
         where, args = where + " AND agent=?", args + [a["agent"]]
     groups, old = {}, {}
     for r in q(f"SELECT * FROM calls WHERE {where}", tuple(args)):
         groups.setdefault((r["agent"], r["name"], normal_words(r["detail"], 10)), []).append(r)
-    for r in q("SELECT * FROM calls WHERE ok=0 AND ts>=? AND ts<?", (before, start)):
+    for r in q(f"SELECT * FROM calls WHERE ok=0 AND ts>=? AND ts<? AND {CALLS_NOT_NARROWED}", (before, start)):
         key = (r["agent"], r["name"], normal_words(r["detail"], 10))
         old[key] = old.get(key, 0) + 1
     out = [f"WHAT WAS REFUSED, the last {days} days against the {days} before them: "
@@ -44944,8 +45089,9 @@ def circles(t0):
     for r in q("SELECT task, agent, name, detail, COUNT(*) n FROM calls WHERE ok=0 AND task IS NOT NULL "
                "GROUP BY task, agent, name, SUBSTR(detail,1,?) HAVING n>=? ORDER BY task",
                (HISTORY_DETAIL, CIRCLE_REFUSALS)):
-        if not q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (r["task"],)):
-            continue
+        t = q1(f"SELECT * FROM tasks WHERE id=? AND {OPEN_TASK}", (r["task"],))
+        if not t or narrowed_from(t, None):
+            continue                # the locked window's refusals: their words and its task stay with that pair
         found.append((f"refusals:{r['task']}:{r['name']}:{r['n'] // CIRCLE_REFUSALS}",
                       f"{r['agent']} called {r['name']} on {tref(r['task'])} {r['n']} times and was refused every "
                       f"time: {refusal_said(r['agent'], r['detail'], 160)}"))
@@ -45207,7 +45353,9 @@ def resume_lines(t0):
     if waits:
         out.append(f"The door's parts wait after {waits}, whose door check passed: once its Operator's normal work "
                    f"there through the door with rule calls passed (test 6), call door_rollout with go true.")
-    tasks = q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id")
+    # a narrowed pair's task is in no line, in no count and in no "and N more" (narrowed_from): it is filtered before
+    # the slice, and its question too
+    tasks = [t for t in q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id") if not narrowed_from(t, None)]
     if tasks:
         out.append("Open tasks:")
         for t in tasks[:RESUME_ROWS * 2]:
@@ -45223,15 +45371,17 @@ def resume_lines(t0):
     # question asked of a lead stood here as the manager's to do, check_result and answer refused both as another
     # agent's, and a question whose task had ended -- or that its asker went on from with a default -- stood here
     # for ever, with "answer." after it.
-    waiting = q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected') AND accepted IS NULL "
-                "AND COALESCE(requester, ?)=? ORDER BY id", (manager_name(), manager_name()))
+    waiting = [t for t in q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected') AND accepted IS NULL "
+                            "AND COALESCE(requester, ?)=? ORDER BY id", (manager_name(), manager_name()))
+               if not narrowed_from(t, None)]
     if waiting:
         out.append("Results waiting for your check: " + ", ".join(f"{tref(t['id'])} ({t['owner']}, {t['state']})"
                                                                   for t in waiting[:RESUME_ROWS * 2])
                    + (f" and {len(waiting) - RESUME_ROWS * 2} more" if len(waiting) > RESUME_ROWS * 2 else "")
                    + ". check_result.")
     asks = q(f"SELECT * FROM questions WHERE answer IS NULL AND assumed IS NULL AND COALESCE(requester, ?)=? "
-             f"AND task IN (SELECT id FROM tasks WHERE {OPEN_TASK}) ORDER BY id", (manager_name(), manager_name()))
+             f"AND task IN (SELECT id FROM tasks WHERE {OPEN_TASK}) AND task NOT IN (SELECT id FROM tasks WHERE "
+             f"scope_person IS NOT NULL) ORDER BY id", (manager_name(), manager_name()))
     if asks:
         out.append("Open questions: " + "; ".join(f"Q-{r['id']} from {r['asker']}: {clip(r['text'], 90)}"
                                                   for r in asks[:RESUME_ROWS])
@@ -69574,6 +69724,8 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
                     return (409, {"error": "this owner request has no command to run: answer it in words"})
                 if connection is not None or (address and owner_device_at(address)):
                     return (409, {"error": "Run is pressed in Founderizer on the Mac, which runs the command"})
+                if "run" not in owner_computer()["can"]:        # H2: a PC's app runs no command of a card
+                    return (409, {"error": "Founderizer on this computer runs no command: answer this item in words"})
                 value = need_run_answer(need, ran["status"])
             host = need["door_host"] if "door_host" in need.keys() else None
             if yes is not None:

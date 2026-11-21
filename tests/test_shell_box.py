@@ -1010,6 +1010,13 @@ class Tools(Fleet):
                              "YOUR ALLOWANCE"):
                     self.assertIn(kept, said["start"])          # the words of its own are still all there
                 self.assertNotIn("which do not fit here", said["start"])         # each standing item is whole
+        # a PC fleet's start line (H2) names only its reader's tools too: a Shell-off chat has no request_secret and
+        # no change_team, which a key card and a team card are (Fable 5.2's review of H2, 21 November 2026)
+        hub.q("DELETE FROM kv WHERE k=?", ("chat_team:desk",))
+        with patch.object(hub, "owner_computer", lambda: {"kind": "windows", "label": "PC", "can": []}):
+            pc = checked({"start": (hub.start_text("desk", tid), context),
+                          "owner chat": (hub.chat_team_once("desk") + hub.chat_people_text("desk"), chat)}, "a PC")
+        self.assertIn("THE OWNER'S COMPUTER is a PC", pc["owner chat"])     # a task of it never asks the owner
         window = hub.standing_start_text("desk", hub.CLOSED_STANDING_CHARS)    # a colleague's closed window
         self.assertIn("which do not fit here.", window)
         self.assertNotIn("Write in English.", window)

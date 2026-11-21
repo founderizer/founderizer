@@ -323,7 +323,11 @@ class Narrowed(Base):
     def test_a_narrowed_pairs_task_answers_its_requesters_controls_as_no_task(self):
         """The Opus review of the fix: check_result, restart_task and cancel_task of a narrowed pair's conversation
         task wrote on it for its requester (the manager here), and their refusal said to anyone else that it exists.
-        Each one now answers as for a task that does not exist; a task of the agent's own is checked as before."""
+        Each one now answers as for a task that does not exist; a task of the agent's own is checked as before. So does
+        each other tool that takes a task id: set_reminder said who owns it, and create_task's job, raise_needs_you's
+        ask, record_spend's task, decide_report's became_task and message_agent's to_task wrote on it. A plain
+        message_agent listed its title among the tasks that the message could go to, and create_task's note named it
+        as work that runs now."""
         narrowed, plain = self.finished_pair()
         hub.q("UPDATE tasks SET requester='manager' WHERE id IN (?,?)", (narrowed, plain))
         for tool, args in (("check_result", {"accepted": True}), ("restart_task", {"reason": "again", "request_id": str(uuid.uuid4()),
@@ -335,6 +339,94 @@ class Narrowed(Base):
         self.assertIsNone(hub.q1("SELECT accepted FROM tasks WHERE id=?", (narrowed,))["accepted"])
         hub.t_check_result("manager", {"task_id": hub.tref(plain), "accepted": True})
         self.assertEqual(hub.q1("SELECT accepted FROM tasks WHERE id=?", (plain,))["accepted"], 1)
+        # the pair's open task that the manager gave, one open task of the agent's own beside it, and an id of no task
+        opened = self.conversation_task(self.says(PAT, "The okapi code is under the mat.")["conversation"])["id"]
+        hub.q("UPDATE tasks SET requester='manager' WHERE id=?", (opened,))
+        other, _ = self.normal_task(title="Prepare the next report")
+        missing = hub.q1("SELECT MAX(id) n FROM tasks")["n"] + 500
+        t0 = hub.now()
+        goal = hub.ins("INSERT INTO goals(title,text,state,revision,limits,created,updated,request_id) "
+                       "VALUES('Sell more','Sell the spring range.','active',1,?,?,?,?)",
+                       (json.dumps({"money": {"amount": 100, "currency": "EUR"}, "tokens": None, "deadline": None,
+                                    "not_to_do": []}), t0, t0, str(uuid.uuid4())))
+        report = hub.ins("INSERT INTO reports(from_agent,to_agent,kind,text,severity,delivered,created,request_id) "
+                         "VALUES('studio','manager','fact','The queue grows.','info','delivered',?,?)",
+                         (t0, str(uuid.uuid4())))
+        # a plain message lands in the one other task: the pair's task is no second place for it
+        landed = json.loads(hub.t_message_agent("manager", {"agent": "studio", "text": "Is it done?",
+                                                            "request_id": str(uuid.uuid4())}))
+        self.assertEqual(landed["landed"], f"studio's session of {hub.tref(other)}")
+        for tool, field, args in (
+                ("set_reminder", "task_id", {"minutes": 30, "note": "Look at it again."}),
+                ("create_task", "job", {"owner": "studio", "title": "Go on with it", "done_when": "done"}),
+                ("raise_needs_you", "ask", {"title": "Switch the Mac on", "why": "The Mac is off.",
+                                            "what_to_do": "Switch it on at its own keyboard.", "reason": "person"}),
+                ("record_spend", "task", {"goal": f"G-{goal}", "amount": 5, "currency": "EUR", "what": "A banner"}),
+                ("decide_report", "became_task", {"report_id": f"UP-{report}", "decision": "task"}),
+                ("message_agent", "to_task", {"agent": "studio", "text": "Is it done?"})):
+            said = []
+            for tid in (missing, opened):
+                with self.assertRaises(hub.ToolError, msg=tool) as refused:
+                    getattr(hub, f"t_{tool}")("manager", dict(args, request_id=str(uuid.uuid4()),
+                                                              **{field: hub.tref(tid)}))
+                said.append(str(refused.exception).replace(hub.tref(tid), "T-?"))
+            self.assertEqual(said[1], said[0], tool)
+            self.assertNotIn("Answer Pat", said[1], tool)
+            if tool != "message_agent":         # whose refusal names the agent that the call names
+                self.assertNotIn("studio", said[1], tool)
+        made = hub.t_create_task("manager", {"owner": "studio", "title": "Check the mat", "done_when": "done",
+                                             "details": f"As in {hub.tref(opened)}.", "request_id": str(uuid.uuid4())})
+        self.assertNotIn("names work that", made)
+
+    def test_the_managers_circles_and_refused_calls_quote_no_locked_window(self):
+        """The manager's circle notice (circles) and the refused calls of its history (history_refusals) quote each
+        refusal and name its task: the locked window's refusals of a repository outside its list named the narrowed
+        pair's task and the repository. Neither names either now, nor counts the window's own calls that carry no
+        task; the refusals of a task of the agent's own are there as before. Bug: the manager's circle notice and its
+        refused-calls page quote the locked window's refusal and name its task."""
+        cid = self.says(PAT, "Please read the vault notes")["conversation"]
+        narrowed = self.conversation_task(cid)["id"]
+        mine, context = self.normal_task(title="Prepare the next report")
+        for _ in range(hub.CIRCLE_REFUSALS):
+            text, error = self.tool("repo_read", self.context(cid), repo="acme/zebra-vault", path="README.md")
+            self.assertTrue(error, text)
+            text, error = self.tool("set_reminder", context, task_id=hub.tref(mine))
+            self.assertTrue(error, text)
+        text, error = self.tool("read_attachment", self.context(cid), attachment_id="A-999999")
+        self.assertTrue(error, text)
+        # the window's refusals are its task's calls, and its read_attachment is a call of no task
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM calls WHERE ok=0 AND task=?", (narrowed,))["n"],
+                         hub.CIRCLE_REFUSALS)
+        self.assertIsNotNone(hub.q1("SELECT 1 FROM calls WHERE ok=0 AND task IS NULL AND conversation=? AND "
+                                    "name='read_attachment'", (cid,)))
+        t0 = hub.now()
+        circles = "\n".join(line for _, line in hub.circles(t0))
+        history = "\n".join(hub.history_refusals({}, 7, t0 - 7 * 86400, t0 - 14 * 86400))
+        for text in (circles, history):
+            self.assertNotRegex(text, rf"\b{hub.tref(narrowed)}\b")
+            self.assertNotIn("zebra-vault", text)
+        self.assertNotIn("read_attachment", history)
+        self.assertIn(f"studio called set_reminder on {hub.tref(mine)} {hub.CIRCLE_REFUSALS} times", circles)
+        line = next((x for x in history.splitlines() if "studio / set_reminder" in x), "")
+        self.assertIn(hub.tref(mine), line, history)
+
+    def test_the_managers_first_prompt_names_no_narrowed_pairs_task(self):
+        """The manager's first prompt (manager_resume_text) lists the open tasks, the results that wait for its check
+        and the open questions, with "and N more" counts: a narrowed pair's task is in none of them, by its id, its
+        title or its why ("Pat wrote in C-<n>"), and a task of a person with no list is there as before. The people
+        list names every person, so Pat's name alone is no sign. Bug: the manager's first prompt names a narrowed
+        pair's task and its person."""
+        done, plain = self.finished_pair()          # two results that wait for the manager's check
+        hub.q("UPDATE tasks SET requester='manager' WHERE id IN (?,?)", (done, plain))
+        pat = self.conversation_task(self.says(PAT, "The okapi code is under the mat.")["conversation"])["id"]
+        kim = self.conversation_task(self.says(KIM, "Hello", account="discord-studio")["conversation"])["id"]
+        hub.ins("INSERT INTO questions(task,asker,requester,text,asked) VALUES(?,'studio','manager',"
+                "'Where is the tapir key?',?)", (pat, hub.now()))
+        text = hub.manager_resume_text()
+        self.assertIn(hub.tref(kim), text)
+        self.assertIn(hub.tref(plain), text)
+        for word in (rf"\b{hub.tref(pat)}\b", rf"\b{hub.tref(done)}\b", "Answer Pat", "Pat wrote in", "tapir"):
+            self.assertNotRegex(text, word)
 
     def test_no_new_task_follows_a_narrowed_pairs_task_or_starts_with_its_words(self):
         """Person access plan, sections 13 and 16 item 9: create_task's follows of a narrowed pair's task is refused
@@ -1139,6 +1231,56 @@ class Settle(Base):
         hub.settle_narrowed_rows()
         self.assertEqual(self.marks(all_time, old_reply, old_row), [None, p, p])
         self.assertEqual(self.marks(waiting), [None])
+
+    def test_the_start_gives_an_old_conversation_task_its_person_by_the_times_of_its_lists(self):
+        """From 11 to 20 November 2026 a conversation task that a locked window worked in, but that ended another way
+        (canceled, failed) or is still open, kept no person, so its call records stayed readable to each session with
+        more. One time at the start (narrowed_ended_settle), a task gets its person when it ended while its pair had a
+        list, by the owner's log lines of the lists, or when it is open and its pair has a list now. A task that ended
+        at All gets none, nor an open task of a pair at All, which would lose the agent's tools, nor a task of a pair
+        that never had a list. A line under the agent's name of before a rename counts. The bugs: no settle; a span
+        with no start or no end; an open task that takes the person of a list of before; a rename that loses a pair's
+        lines; a second start that settles a later task."""
+        kim, lee = self.person("Kim", "manager", KIM, app="discord"), self.add(name="Lee", role="peer")
+        ana = self.add(name="Ana", role="peer")
+        hub.q("DELETE FROM kv WHERE k=?", (hub.NARROWED_ENDED_SETTLED,))
+        pat_c, kim_c, lee_c, ana_c = (self.conversation(p["id"]) for p in (self.pat, kim, lee, ana))
+        self.narrow(self.pat["id"], {f"repo:{REPO}": "write"})          # Pat has a list now
+        for at, line in ((5000.0, f"P-{self.pat['id']}'s access with studio: 1 resource(s) of its own"),
+                         (5000.0, f"P-{kim['id']}'s access with studio: 1 resource(s) of its own"),
+                         (5000.0, f"P-{ana['id']}'s access with atelier: 1 resource(s) of its own"),
+                         (5200.0, "renamed agent atelier to studio on server s1 in 0123456789ab: job 7"),
+                         (7000.0, f"P-{self.pat['id']}'s access with studio: all of it"),
+                         (7000.0, f"P-{kim['id']}'s access with studio: all of it"),
+                         (7000.0, f"P-{ana['id']}'s access with studio: all of it"),
+                         (9000.0, f"P-{self.pat['id']}'s access with studio: 1 resource(s) of its own")):
+            hub.ins("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (at, "owner", line))
+
+        def task(conv, state, at):
+            return hub.ins("INSERT INTO tasks(title,owner,requester,state,created,last_activity,delivered,"
+                           "source_conversation,source_message) VALUES('Answer','studio','manager',?,?,?,?,?,1)",
+                           (state, at - 100, at, at if state == "completed" else None, conv))
+        in_span = task(pat_c, "canceled", 6000.0)
+        before, after, pat_open = task(pat_c, "completed", 4000.0), task(pat_c, "canceled", 8000.0), \
+            task(pat_c, "working", 9500.0)
+        kim_open, lee_ended, ana_ended = task(kim_c, "working", 9500.0), task(lee_c, "canceled", 6000.0), \
+            task(ana_c, "failed", 6000.0)
+        done_in_span = hub.ins("INSERT INTO tasks(title,owner,requester,state,created,last_activity,delivered,"
+                               "source_conversation,source_message) VALUES('Answer','studio','manager','completed',"
+                               "6100,8000,6200,?,1)", (pat_c,))      # it ended at 6200; a later touch is no end
+        hub.ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(5500,'studio',?,1,'call_api',?,1,"
+                "'The narwhal list.')", (in_span, json.dumps({"path": "/narwhal"})))
+        _, wider = self.normal_task(title="Look for the lists")
+        self.assertTrue(self.found(wider, "narwhal"))       # a session with more reads the record until the start
+        hub.settle_narrowed_rows()
+        self.assertFalse(self.found(wider, "narwhal"))
+        person = lambda tid: hub.q1("SELECT scope_person FROM tasks WHERE id=?", (tid,))["scope_person"]
+        p = self.pat["id"]
+        self.assertEqual([person(t) for t in (in_span, before, after, pat_open, done_in_span)], [p, None, None, p, p])
+        self.assertEqual([person(t) for t in (kim_open, lee_ended, ana_ended)], [None, None, ana["id"]])
+        late = task(pat_c, "canceled", 6500.0)              # a second start changes nothing
+        hub.settle_narrowed_rows()
+        self.assertIsNone(person(late))
 
 
 class Door(Base):

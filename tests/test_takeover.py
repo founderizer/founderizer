@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from unittest.mock import patch
 
 import hub
 import test_mobile
@@ -374,6 +375,29 @@ class Linux(Fixture):
         self.assertFalse(hub.takeover_way("nora"))      # a Linux agent has only its own browser's screen
         self.assertTrue(hub.device_may("/ui/needs/5", "POST"))
         self.assertFalse(hub.device_may("/ui/needs/5/takeover", "POST"))      # the password goes to the Mac only
+
+    def test_an_owner_s_pc_is_asked_for_no_screen_of_a_mac_or_a_linux_agent(self):
+        """H2 (windows-app-plan-v2.md 5.3): the owner's PC has no Take over (Windows has no Screen Sharing, and its app
+        no screen viewer yet). A card that asked for one would hold the task on an answer that the owner cannot give.
+        The hub refuses the call before any card, for a Mac agent's screen and a Linux agent's alike (a refusal inside
+        one machine's way would let the other ask), and names the way that is left. A Mac, which says every name, is
+        asked as before; a Mac fleet has no kind at all, as every other test of this file."""
+        mac_task, linux_task = self.task(), self.task(owner="nora")
+        pc = {"kind": "windows", "label": "PC", "can": [name for name in hub.OWNER_CAN if name != "takeover"]}
+        with patch.object(hub, "owner_computer", lambda: pc):
+            for agent, tid in (("ivy", mac_task), ("nora", linux_task)):
+                text, err = self.ask(tid, agent=agent)
+                self.assertTrue(err, text)
+                self.assertIn("The owner's computer is a PC, and its app cannot take over an agent's screen yet. Ask "
+                              "your requester with ask_my_requester.", text)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], 0)
+        self.assertEqual(self.state(mac_task), ("working", None))
+        mac = {"kind": "mac", "label": "Mac", "can": list(hub.OWNER_CAN)}
+        with patch.object(hub, "owner_computer", lambda: mac):
+            for agent, tid in (("ivy", mac_task), ("nora", linux_task)):
+                text, err = self.ask(tid, agent=agent)
+                self.assertFalse(err, text)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs WHERE kind='takeover'")["n"], 2)
 
     def test_his_press_gets_the_screen_and_its_password_once_and_no_row_or_log_line_holds_it(self):
         tid, nid = self.asked()

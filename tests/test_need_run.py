@@ -180,6 +180,24 @@ class Ran(RunCase):
         self.assertEqual(code, 409, body)
         self.assertIsNone(self.row()["answer"])
 
+    def test_a_pc_that_cannot_run_sends_no_run_and_a_mac_runs_as_before(self):
+        """H2 (windows-app-plan-v2.md 5.3): the owner's PC has no Run (no Mac login shell to run a card's command in).
+        A press that reached the hub from a computer whose app said that it cannot run would write "Ran it on the
+        owner's Mac" as the owner's answer, and the manager would read an output that no machine gave as data from it.
+        The item stays open for an answer in words. A Mac says every name (a Mac fleet has no kind at all, as every
+        other test of this class), and its press answers with the bytes of before."""
+        pc = {"kind": "windows", "label": "PC", "can": [name for name in hub.OWNER_CAN if name != "run"]}
+        with patch.object(hub, "owner_computer", lambda: pc):
+            code, body = self.run_answer()
+        self.assertEqual((code, body), (409, {"error": "Founderizer on this computer runs no command: answer this "
+                                                       "item in words"}))
+        self.assertIsNone(self.row()["answer"])
+        mac = {"kind": "mac", "label": "Mac", "can": list(hub.OWNER_CAN)}
+        with patch.object(hub, "owner_computer", lambda: mac):
+            code, body = self.run_answer()
+        self.assertEqual(code, 200, body)
+        self.assertEqual(self.row()["answer"], "Ran it on the owner's Mac")
+
     def test_an_answer_in_words_runs_nothing_and_keeps_the_run_fields_empty(self):
         code, body = self.request("/ui/needs/1", {"request_id": str(uuid.uuid4()), "db": "test-generation",
                                                   "answer": "Someone uses that login on purpose"})
