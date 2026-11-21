@@ -10,7 +10,7 @@
 [![Python 3.10 or later](https://img.shields.io/badge/python-3.10%2B-blue)](HUB-INSTALL.md)
 [![The last release](https://img.shields.io/github/last-commit/founderizer/founderizer/main?label=last%20release&color=blue)](https://github.com/founderizer/founderizer/commits/main)
 
-[Website](https://founderizer.com) · [Download&nbsp;for&nbsp;Mac&nbsp;and&nbsp;iPhone](https://founderizer.com/download) · [Install&nbsp;a&nbsp;hub](HUB-INSTALL.md) · [Source&nbsp;of&nbsp;the&nbsp;apps](https://github.com/founderizer/founderizer-apps)
+[Website](https://founderizer.com) · [Download&nbsp;for&nbsp;Mac&nbsp;and&nbsp;iPhone](https://platform.founderizer.com/download) · [Install&nbsp;a&nbsp;hub](HUB-INSTALL.md) · [Source&nbsp;of&nbsp;the&nbsp;apps](https://github.com/founderizer/founderizer-apps)
 
 <a href="https://founderizer.com"><img src="https://raw.githubusercontent.com/founderizer/founderizer-apps/main/.github/founderizer-mac-iphone.webp" alt="Founderizer on a Mac and an iPhone, with an example team of four agents: the Tasks board on the Mac, the chats on the iPhone" width="860"></a>
 

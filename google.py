@@ -25,13 +25,13 @@ import uuid
 
 HOSTS = {"auth": "https://accounts.google.com", "token": "https://oauth2.googleapis.com",
          "drive": "https://www.googleapis.com", "gmail": "https://gmail.googleapis.com",
-         "sheets": "https://sheets.googleapis.com", "founderizer": "https://founderizer.com"}
+         "sheets": "https://sheets.googleapis.com", "founderizer": "https://platform.founderizer.com"}
 SCOPES = ("https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/gmail.modify")
 # Founderizer's own Google app (UI-API.md, "Founderizer's Google app"; the owner's yes of 15 November 2026): one Desktop
 # client of the project "Founderizer" for every hub, so that a customer connects with no client file. The release
 # brings its client ID. Google's token address wants its secret too (it answered 400 invalid_request and 401
 # invalid_client without one, 15 November 2026), and GitHub reports a secret of that shape in public code to Google, so
-# the secret is in no public repository: a hub asks founderizer.com for it (client_secret) and keeps it in its own
+# the secret is in no public repository: a hub asks the platform for it (client_secret) and keeps it in its own
 # Google file (the owner's choice of the same day). Google's own words for such a secret: desktop apps "are public
 # clients and cannot keep secrets confidential", and the secret of an installed app "is obviously not treated as a
 # secret".
@@ -215,20 +215,21 @@ def revoke(token):
 
 
 def client_secret():
-    """The secret of CLIENT's app, from founderizer.com (HOSTS["founderizer"] + CLIENT_PATH), which keeps it in no
+    """The secret of CLIENT's app, from the platform (HOSTS["founderizer"] + CLIENT_PATH), which keeps it in no
     public repository. The answer counts only when it names CLIENT's own client ID, so the site can give a hub no other
-    app. A GoogleError when founderizer.com cannot be reached or answers anything else, whose text names
-    founderizer.com (not Google) and never holds the answer."""
+    app. A GoogleError when the platform cannot be reached or answers anything else, whose text names
+    platform.founderizer.com (not Google) and never holds the answer."""
     try:
         answer = _call("GET", HOSTS["founderizer"] + CLIENT_PATH, limit=SITE_MAX)
     except GoogleError as e:
-        words = (f"founderizer.com answered {e.status}" if e.status else
-                 "founderizer.com gave no readable answer" if e.unknown else "founderizer.com cannot be reached now")
+        words = (f"platform.founderizer.com answered {e.status}" if e.status else
+                 "platform.founderizer.com gave no readable answer" if e.unknown
+                 else "platform.founderizer.com cannot be reached now")
         raise GoogleError(words, e.status) from None
     secret = answer.get("client_secret")
     if answer.get("client_id") != CLIENT.get("client_id") or not (
             isinstance(secret, str) and re.fullmatch(r"[!-~]{8,200}", secret)):
-        raise GoogleError("founderizer.com gave no client secret of Founderizer's Google app")
+        raise GoogleError("platform.founderizer.com gave no client secret of Founderizer's Google app")
     return secret
 
 

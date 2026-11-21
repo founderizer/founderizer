@@ -439,7 +439,7 @@ class Fixture:
                 (now - 600, "c" * 40, "2026.10.3", "verified", None, None, None)):
             hub.q("INSERT INTO releases(seen,revision,version,notes,minimum,hold,state,step,says,pinned,reached,"
                   "started,finished,automatic) VALUES(?,?,?,?,NULL,0,?,?,?,?,?,?,?,0)",
-                  (seen, revision, version, f"https://founderizer.com/releases/{version}", state, step, says,
+                  (seen, revision, version, f"https://platform.founderizer.com/releases/{version}", state, step, says,
                    here if state != "verified" else None, reached,
                    seen + 10 if state != "verified" else None, seen + 400 if state != "verified" else None))
 

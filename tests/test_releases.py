@@ -308,14 +308,14 @@ class Manifest(unittest.TestCase):
         self.assertTrue(all(isinstance(key, bytes) and len(key) == 32 for key in here), here)
 
     def test_a_manifest_is_read_field_by_field(self):
-        good = manifest("a" * 40, notes="https://founderizer.com/releases/2026.10.2", minimum="b" * 40)
+        good = manifest("a" * 40, notes="https://platform.founderizer.com/releases/2026.10.2", minimum="b" * 40)
         self.assertEqual(releases.read_manifest(good)["revision"], "a" * 40)
         self.assertEqual(releases.read_manifest(manifest("a" * 40))["minimum"], None)
         for wrong, why in [({}, "revision"), ("text", "manifest"),
                            (manifest("a" * 39), "revision"), (manifest("A" * 40), "revision"),
                            (dict(manifest("a" * 40), version=""), "version"),
                            (dict(manifest("a" * 40), version="x" * 60), "version"),
-                           (dict(manifest("a" * 40), notes="http://founderizer.com/x"), "notes"),
+                           (dict(manifest("a" * 40), notes="http://platform.founderizer.com/x"), "notes"),
                            (dict(manifest("a" * 40), minimum="zz"), "minimum"),
                            (dict(manifest("a" * 40), hold="yes"), "hold"),
                            (dict(manifest("a" * 40), signature=None), "signature")]:
@@ -324,7 +324,7 @@ class Manifest(unittest.TestCase):
             self.assertIn(why, str(caught.exception))
 
     def test_only_this_key_s_signature_of_this_manifest_is_acted_on(self):
-        good = manifest("a" * 40, minimum="b" * 40, notes="https://founderizer.com/n")
+        good = manifest("a" * 40, minimum="b" * 40, notes="https://platform.founderizer.com/n")
         self.assertEqual(releases.check(good, KEY)["version"], "2026.10.2")
         for changed, why in [(dict(good, revision="c" * 40), "signature"),
                              (dict(good, version="2026.10.3"), "signature"),
@@ -442,25 +442,25 @@ class Entitlement(unittest.TestCase):
 class Channel(unittest.TestCase):
     def test_a_good_manifest_comes_back_with_the_entitlement_as_a_bearer(self):
         fetch = answers(manifest("a" * 40))
-        answer = releases.latest("https://founderizer.com", KEY, "tok.en", fetch=fetch)
+        answer = releases.latest("https://platform.founderizer.com", KEY, "tok.en", fetch=fetch)
         self.assertEqual(answer["manifest"]["revision"], "a" * 40)
         self.assertIsNone(answer["says"])
-        self.assertEqual(fetch.seen[0]["url"], "https://founderizer.com/releases/latest")
+        self.assertEqual(fetch.seen[0]["url"], "https://platform.founderizer.com/releases/latest")
         self.assertEqual(fetch.seen[0]["token"], "tok.en")
 
     def test_a_fleet_with_no_entitlement_still_asks(self):
         fetch = answers(manifest("a" * 40))
-        releases.latest("https://founderizer.com/", KEY, None, fetch=fetch)
+        releases.latest("https://platform.founderizer.com/", KEY, None, fetch=fetch)
         self.assertIsNone(fetch.seen[0]["token"])
 
     def test_one_release_is_asked_for_by_its_revision_and_no_other_is_taken(self):
         """The release that a newer one names as its minimum (hub.poll_release)."""
         fetch = answers(manifest("a" * 40))
-        answer = releases.latest("https://founderizer.com", KEY, "tok.en", fetch=fetch, revision="a" * 40)
+        answer = releases.latest("https://platform.founderizer.com", KEY, "tok.en", fetch=fetch, revision="a" * 40)
         self.assertEqual((answer["manifest"]["revision"], answer["says"]), ("a" * 40, None))
-        self.assertEqual(fetch.seen[0]["url"], "https://founderizer.com/releases/" + "a" * 40)
+        self.assertEqual(fetch.seen[0]["url"], "https://platform.founderizer.com/releases/" + "a" * 40)
         self.assertEqual(fetch.seen[0]["token"], "tok.en")
-        other = releases.latest("https://founderizer.com", KEY, "tok.en", fetch=answers(manifest("a" * 40)),
+        other = releases.latest("https://platform.founderizer.com", KEY, "tok.en", fetch=answers(manifest("a" * 40)),
                                 revision="b" * 40)
         self.assertIsNone(other["manifest"])
         self.assertIn("another release than " + "b" * 12, other["says"])
@@ -468,11 +468,11 @@ class Channel(unittest.TestCase):
     def test_a_fleet_that_takes_releases_early_asks_the_early_track(self):
         """PRODUCT.md 4.3 "Two tracks": the newest release, and one by its revision, each on the early track."""
         fetch = answers(manifest("a" * 40))
-        releases.latest("https://founderizer.com", KEY, "tok.en", fetch=fetch, early=True)
-        releases.latest("https://founderizer.com", KEY, "tok.en", fetch=fetch, revision="a" * 40, early=True)
+        releases.latest("https://platform.founderizer.com", KEY, "tok.en", fetch=fetch, early=True)
+        releases.latest("https://platform.founderizer.com", KEY, "tok.en", fetch=fetch, revision="a" * 40, early=True)
         self.assertEqual([one["url"] for one in fetch.seen],
-                         ["https://founderizer.com/releases/latest?track=early",
-                          "https://founderizer.com/releases/" + "a" * 40 + "?track=early"])
+                         ["https://platform.founderizer.com/releases/latest?track=early",
+                          "https://platform.founderizer.com/releases/" + "a" * 40 + "?track=early"])
 
     def test_what_it_cannot_check_or_read_gives_no_manifest_and_one_line(self):
         for body, status, why in [(manifest("a" * 40, seed=OTHER_SEED), 200, "signature"),
@@ -480,7 +480,7 @@ class Channel(unittest.TestCase):
                                   ("not json", 200, "JSON"),
                                   ({}, 401, "refused this fleet (401)"), ({}, 403, "refused this fleet (403)"),
                                   ({}, 500, "answered 500"), ("no route to host", 0, "did not answer")]:
-            answer = releases.latest("https://founderizer.com", KEY, "t.k", fetch=answers(body, status))
+            answer = releases.latest("https://platform.founderizer.com", KEY, "t.k", fetch=answers(body, status))
             self.assertIsNone(answer["manifest"], why)
             self.assertIn(why, answer["says"])
             self.assertNotIn("subscription", answer["says"])
@@ -526,9 +526,9 @@ class Channel(unittest.TestCase):
                                                       "until": 2000000000, "machines": 4, "agents": 6})
         for body in (dict(manifest("a" * 40), entitlement=fresh),
                      dict(manifest("a" * 40, seed=OTHER_SEED), entitlement=fresh)):
-            answer = releases.latest("https://founderizer.com", KEY, "old.one", fetch=answers(body))
+            answer = releases.latest("https://platform.founderizer.com", KEY, "old.one", fetch=answers(body))
             self.assertEqual(answer["entitlement"], fresh)
-        self.assertIsNone(releases.latest("https://founderizer.com", KEY, None,
+        self.assertIsNone(releases.latest("https://platform.founderizer.com", KEY, None,
                                           fetch=answers(dict(manifest("a" * 40), entitlement="nonsense")))["entitlement"])
 
 
@@ -1282,7 +1282,7 @@ class HubRoutes(OwnerAPI):
 
     def test_a_check_records_the_release_the_channel_offers(self):
         with self.channel(manifest("a" * 40, version="2026.10.3",
-                                   notes="https://founderizer.com/releases/2026.10.3")):
+                                   notes="https://platform.founderizer.com/releases/2026.10.3")):
             code, answer = self.press("check")
             self.assertEqual((code, answer["started"], answer["applying"]), (200, True, False))
             self.finish()
@@ -1291,7 +1291,7 @@ class HubRoutes(OwnerAPI):
         one = state["releases"][0]
         self.assertEqual((one["revision"], one["version"], one["state"], one["hold"], one["applied"]),
                          ("a" * 40, "2026.10.3", "verified", False, False))
-        self.assertEqual(one["notes"], "https://founderizer.com/releases/2026.10.3")
+        self.assertEqual(one["notes"], "https://platform.founderizer.com/releases/2026.10.3")
         self.assertEqual(state["last_check"]["status"], 200)
         self.assertIsNone(state["last_check"]["says"])
         self.assertEqual(state["revision"], git("rev-parse", "HEAD", cwd=self.kit))      # and nothing moved
