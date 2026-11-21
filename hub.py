@@ -78322,6 +78322,7 @@ class Handler(BaseHTTPRequestHandler):
                 # waits for that read (conversation_reads); an older one takes it at its ack, as before
                 reads = "conversation_reads" in helper_features(agent)
                 keep, waiting = [], set()      # waiting: own tasks whose new attempt's start waits in the hub
+                gone = set()        # own tasks whose started window the helper's list of this poll does not have
                 worker = conf.get("role") in ("worker", "lead")       # a lead works like a worker
                 limited = active_limit(agent)          # the manager's own limit holds its signals too
                 shared = os_user_held(agent)           # one OS user for each agent: no session of it starts
@@ -78398,6 +78399,8 @@ class Handler(BaseHTTPRequestHandler):
                             began[(t["id"], t["attempt"])] = attempt_began(t)
                         if not began[(t["id"], t["attempt"])]:
                             waiting.add(t["id"])        # its new attempt's start waits in the hub (below)
+                        elif "alive" in query and tref(t["id"]) not in query["alive"].split(","):
+                            gone.add(t["id"])           # its helper's list has no window of it (below)
                     if r["kind"] == "control":
                         h = q1("SELECT state, kind FROM holds WHERE id=?", (extra.get("hold"),))
                         if not h or h["state"] != "requested" or h["kind"] != extra.get("action"):
@@ -78444,7 +78447,19 @@ class Handler(BaseHTTPRequestHandler):
                 # line in the window of the attempt before would begin a turn there, with a cold cache, that reads only
                 # STOP (on 19 November 2026 old sessions ran such turns while a release held the starts).
                 starts = {r["task"] for r in keep if r["kind"] == "task"}
-                rows = [r for r in keep if not (r["kind"] == "say" and r["task"] in waiting - starts)]
+                # A message for a task whose window is gone waits in the hub as well, until the task's next start
+                # (liveness: a restart, the message's own new session, or the reminder of a parked task) hands it out
+                # with that start: a line reaches no session there. Handed out, it made its helper try the window that
+                # was gone at every poll, and the poll came back at once each time: a parked task's session was lost
+                # when its machine started again, the hub's news of 27 standing items, which wakes no parked task
+                # (message_waits), came for it, and its helper wrote "inbox signal gone" every 2 s for 30 hours
+                # (20 and 21 November 2026). A start counts here only in the answer that hands it out first: one that
+                # its helper took already starts no window again (START_ONCE), and one that went out before and has no
+                # window failed or waits for its next try (Helper.handle_events), so its messages wait with it.
+                fresh = {r["task"] for r in keep if r["kind"] == "task" and r["handed"] is None and
+                         not (once and r["helper_ack"])}
+                rows = [r for r in keep if not (r["kind"] == "say" and (r["task"] in waiting - starts or
+                                                                        r["task"] in gone - fresh))]
                 # Owner feature chat_warm: whether this agent's owner chat should run now, before any message, and
                 # whether its session has its tools. A change ends the wait, so the chat starts as soon as it may.
                 chat = {"warm": chat_wanted(agent, limited or pending or holding or shared),

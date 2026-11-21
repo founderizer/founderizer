@@ -734,7 +734,8 @@ class Lines(test_runtime.Runtime):
         self.assertEqual(got(), [])                         # it ran a turn and took neither line: no third time
         self.assertEqual([e["kind"] for e in self.call("GET", "/events/studio?delivery=1&wait=0&alive_unknown=1", client=None)[1][
             "events"] if e["task"] == f"T-{tid}"], ["task"])   # tmux did not answer: its message is held, its start not
-        self.assertEqual(got(alive=""), ["say", "task"])    # its window is gone: its start comes, as before
+        self.assertEqual(got(alive=""), ["task"])           # its window is gone: its start comes, as before, and its
+                                                            # message waits for the window that the start makes
         hub.emit("studio", "say", "[hub] And this.", task=tid)
         self.assertEqual(got(), ["say"])                    # a later message comes alone, and gets a line of its own
 
@@ -1022,20 +1023,40 @@ class Losses(test_runtime.Runtime):
     def test_only_a_message_that_somebody_is_behind_starts_a_session_for_a_parked_task(self):
         """The hub's own news starts no session: a new session reads its standing items at its start, a usage limit's
         notice is over when the limit is, a steer of an earlier attempt goes over by itself, and a message that was
-        read waits for nobody. Each of them stays for the reminder's own time."""
+        read waits for nobody. Each of them stays for the reminder's own time, and in the hub: while the task has no
+        window, its helper's poll gets none of them, and the hub holds the poll as for a helper with nothing to do.
+        Handed out, they made a helper try the window that was gone at every poll, and each poll came back at once:
+        "inbox signal gone" every 2 s for 30 hours (20 and 21 November 2026). The task's next start takes them."""
         tid, _ = self.parked()
-        hub.emit("studio", "say", "[hub] New standing item: I-1 instruction, from manager: Sign every reply.", task=tid,
-                 extra={"standing": 1})
-        hub.emit("studio", "say", "[hub] You reached your usage limit.", task=tid, extra=hub.LIMIT_SAY)
+        first = hub.q1("SELECT id FROM events WHERE agent='studio' AND kind='task' AND task=?", (tid,))["id"]
+        standing = hub.emit("studio", "say", "[hub] New standing item: I-1 instruction, from manager: Sign every reply.",
+                            task=tid, extra={"standing": 1})
+        limit = hub.emit("studio", "say", "[hub] You reached your usage limit.", task=tid, extra=hub.LIMIT_SAY)
         hub.emit("studio", "say", "[owner] Steering from the owner for this task: an old word.", task=tid,
                  extra={"steer": True, "attempt": 0})
         read = hub.emit("studio", "say", "[message from manager on this task] Read long ago.", task=tid)
         hub.q("UPDATE events SET read_at=? WHERE id=?", (hub.now(), read))
         self.assertEqual(self.attempt(tid), 1)
         self.assertIn("waiting until", hub.q1("SELECT live_path FROM tasks WHERE id=?", (tid,))["live_path"])
-        hub.emit("studio", "say", "[owner] Steering from the owner for this task: stop the build.", task=tid,
-                 extra={"steer": True, "attempt": 1})
+
+        def handed(listed):
+            """The events of the task in an answer to its helper's poll with this word of its windows."""
+            code, data = self.call("GET", f"/events/studio?delivery=1&after=0&wait=0{listed}", client=None)
+            self.assertEqual(code, 200)
+            return [(e["kind"], e["id"]) for e in data["events"] if e["task"] == f"T-{tid}"]
+        self.assertEqual(handed("&alive="), [("task", first)])  # a start that its helper took starts no window again
+        hub.q("UPDATE events SET read_at=? WHERE id=?", (hub.now(), first))        # its session read it, as one does
+        self.assertEqual(handed("&alive="), [])                 # its window is gone: no line, and no poll comes back
+        for listed in (f"&alive=T-{tid}", "&alive_unknown=1", ""):  # its window stands, tmux gave no list, or no word
+            self.assertEqual(handed(listed), [("say", standing), ("say", limit)], listed)
+        self.alive("studio")                                    # and it is gone again
+        steer = hub.emit("studio", "say", "[owner] Steering from the owner for this task: stop the build.", task=tid,
+                         extra={"steer": True, "attempt": 1})
         self.assertEqual(self.attempt(tid), 2)                  # a steer of this attempt is the owner's word: it starts
+        start = hub.q1("SELECT id FROM events WHERE agent='studio' AND kind='task' AND task=? ORDER BY id DESC", (tid,))
+        # the next start takes them with it, and a start that went out and made no window lets them wait again
+        self.assertEqual(handed("&alive="), [("say", standing), ("say", limit), ("say", steer), ("task", start["id"])])
+        self.assertEqual(handed("&alive="), [("task", start["id"])])
 
     def test_a_parked_task_starts_for_a_message_only_on_the_facts_of_its_helper(self):
         """The loss is a fact of the helper's window list (plan C6), and so is this start: nothing starts while the
