@@ -146,14 +146,12 @@ Say in each part's `why` why that agent suits that part.
   `ops` prints it: the agent that holds the grant; the owner's window, after which the same call runs; none, which
   changes the plan; or the owner's yes, for a call that the door refused with its call hash (a delete of what no agent
   made, an AWS delete, or a host's `run`, a root script with no box). For that last one, raise one Needs-you item with
-  `door_call` set to that hash and the exact command in `what_to_do`, as the call that the owner's yes lets through once: the owner presses the first option and runs nothing. For a
-  `run`, give `door_host`, its server, too: the item is then the door's card, "Run one root script on <server>?", with
-  the script in `details`, and the hub gives it the three answers Run it once, Full access on <server>, and No. A script too long for one card goes one part at a time: the next part's card only after the owner answered the last one and it ran, with the part in `why`. The
-  owner reads the asking task's title after that title; the hub adds it. Full
-  access lets every later root script on that server through, so no later run there needs an item. A script
-  that only reads files needs no item at all: the holder runs it with `ops <server> look`. The owner's
-  app signs the first two answers, and the door asks the hub for a signed answer before it refuses a call: so when
-  the owner has answered, the agent sends the same call again at once. If the door still refuses it, pass on the
+  `door_call` set to that hash and the exact command in `what_to_do`, as the call that the owner's yes lets through once. For a
+  `run`, give `door_host`, its server, too: the item is then the door's card, with
+  the script in `door_script` and the hub's three answers Run it once, Full access on <server>, and No. One job on one server is one script and one card: never raise the parts of a script as several cards. When a card of the same job is open, raise the new one with `replaces`. On the door's card, `why` names each thing that the script changes, in plain words, in at most 240 characters: each service, file, package or setting. For a script that runs a file, it says what the file does and where its text is. Take a long script from the file in the task's outputs, not from a message. Full
+  access lets every later root script on that server through. A script
+  that only reads files needs no item: the holder runs it with `ops <server> look`. When the owner
+  has said yes, the agent sends the same call again at once: the door reads the owner's signed answer before it refuses. If the door still refuses it, pass on the
   door's own words; never tell the owner on a guess that the answer did not arrive, and raise no second item for the
   same call before you know why. No item asks the owner to do a server step by hand: the holder does it, through
   the door. The fleet's own Linux servers, where agents run, and the hub's server go to the door too, at rule-only:
