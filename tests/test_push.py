@@ -1,6 +1,6 @@
 """Pings to the owner's phone (MOBILE-APP.md 9, owner feature push): the phone's push token and its seal key, one
 ping for each new Needs-you item, what our side carries, and the states of a ping. A local hub with a test source
-address for the Mac and the phone, and a stand-in for our side's push route (founderizer.com /api/push) on loopback.
+address for the Mac and the phone, and a stand-in for our side's push route (the release channel's /api/push) on loopback.
 No real device, key, network or AI call."""
 import base64
 import hashlib
@@ -391,7 +391,7 @@ class Sender(PushCase):
                 self.side.answer = (status, {"error": "lapsed"})
                 ping = self.sent()
                 self.assertEqual((ping["state"], ping["status"]), ("failed", None))
-                self.assertEqual(ping["error"], f"founderizer.com refused this fleet ({status}), so it sends no pings "
+                self.assertEqual(ping["error"], f"127.0.0.1 refused this fleet ({status}), so it sends no pings "
                                                 f"for it")
                 self.assertIsNotNone(hub.q1("SELECT 1 FROM owner_device_push"))  # our side refused, not Apple
 
@@ -407,7 +407,7 @@ class Sender(PushCase):
                 self.side.answer = (status, {"error": error, "says": f"the {error} line"})
                 ping = self.sent()
                 self.assertEqual((ping["state"], ping["status"]), ("failed", None))
-                self.assertEqual(ping["error"], f"founderizer.com answered {status}: the {error} line")
+                self.assertEqual(ping["error"], f"127.0.0.1 answered {status}: the {error} line")
                 self.assertIsNotNone(hub.q1("SELECT 1 FROM owner_device_push"))
                 self.assertEqual(hub._ping_hold["until"], 0.0)              # and nothing holds the next ping back
 
@@ -427,7 +427,7 @@ class Sender(PushCase):
                 self.assertTrue(hub.send_ping())
                 held = self.pings()[-2]
                 self.assertEqual((held["item"], held["state"], held["status"]),  (first, "queued", None))
-                self.assertEqual(held["error"], "founderizer.com answered 429: a count is full")
+                self.assertEqual(held["error"], "127.0.0.1 answered 429: a count is full")
                 self.assertAlmostEqual(hub._ping_hold["until"], t0 + 120, delta=5)
                 self.side.answer = (200, {"status": 200, "reason": ""})
                 self.assertFalse(hub.send_ping())                    # nothing goes before the time our side named
@@ -456,7 +456,7 @@ class Sender(PushCase):
         hub.q("UPDATE pings SET created=?", (hub.now() - hub.PUSH_KEEP + 60,))
         self.side.answer = (429, {"error": "busy", "says": "a count is full"}, {"Retry-After": "120"})
         ping = self.sent()
-        self.assertEqual((ping["state"], ping["error"]), ("failed", "founderizer.com answered 429: a count is full"))
+        self.assertEqual((ping["state"], ping["error"]), ("failed", "127.0.0.1 answered 429: a count is full"))
         self.assertGreater(hub._ping_hold["until"], hub.now())
 
     def test_a_held_back_ping_whose_day_ended_while_the_hub_was_down_fails_before_it_goes(self):
@@ -464,11 +464,11 @@ class Sender(PushCase):
         fails with our side's line before it goes, and our side gets nothing: its expiry would be in the past."""
         self.give(self.enrolled())
         self.raise_item()
-        hub.q("UPDATE pings SET error='founderizer.com answered 429: a count is full', created=?",
+        hub.q("UPDATE pings SET error='127.0.0.1 answered 429: a count is full', created=?",
               (hub.now() - hub.PUSH_KEEP - 1,))
         ping = self.sent()
         self.assertEqual((ping["state"], ping["status"], ping["error"]),
-                         ("failed", None, "founderizer.com answered 429: a count is full"))
+                         ("failed", None, "127.0.0.1 answered 429: a count is full"))
         self.assertEqual(self.side.got, [])
 
     def test_the_sender_looks_again_when_the_hold_ends(self):
@@ -495,7 +495,7 @@ class Sender(PushCase):
         with self.assertRaises(push.PushError) as refused:
             push.send(hub.CFG["release_channel"], None, TOKEN, {"aps": {"alert": {"title": "Needs you"}}}, "production")
         self.assertEqual((refused.exception.retry_after, str(refused.exception)),
-                         (30, "founderizer.com answered 429: a count is full"))
+                         (30, "127.0.0.1 answered 429: a count is full"))
         for status in (400, 401, 402, 413, 502, 503):                  # no other refusal is held back
             self.side.answer = (status, {"error": "x"}, {"Retry-After": "30"})
             with self.assertRaises(push.PushError) as refused:
@@ -517,7 +517,7 @@ class Sender(PushCase):
         `says` line of our side passes as our side wrote it.)"""
         for status in (400, 401, 402, 403, 404, 413, 429, 500, 502, 503):
             for text in ("", "{}", json.dumps({"says": "a line"})):
-                said = push._refusal(status, text).lower()
+                said = push._refusal(status, text, push._side("https://platform.founderizer.com")).lower()
                 self.assertNotIn("subscription", said, status)
                 self.assertNotIn("entitlement", said, status)
 

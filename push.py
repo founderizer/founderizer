@@ -16,6 +16,7 @@ import base64
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import atrest
@@ -84,18 +85,25 @@ def seal_key(text):
 
 # ---------------------------------------------------------------- the send
 
-def _refusal(status, text):
+def _side(channel):
+    """The name of our side in a ping's words: the host of the release channel that the ping went to (the hub's
+    release_channel(), platform.founderizer.com for every client since 21 November 2026), so that the words name the
+    server that answered and never one that the channel left."""
+    return urllib.parse.urlsplit(str(channel)).hostname or "our side"
+
+
+def _refusal(status, text, side):
     try:
         says = json.loads(text).get("says")
     except (ValueError, AttributeError):
         says = None
     if status in (401, 402):        # only a route that still asks for an account answers these
-        return f"founderizer.com refused this fleet ({status}), so it sends no pings for it"
+        return f"{side} refused this fleet ({status}), so it sends no pings for it"
     if status == 502:
-        return "founderizer.com could not reach Apple's push service"
+        return f"{side} could not reach Apple's push service"
     if status == 503:
-        return "founderizer.com sends no pings yet"
-    return f"founderizer.com answered {status}" + (f": {str(says)[:200]}" if says else "")
+        return f"{side} sends no pings yet"
+    return f"{side} answered {status}" + (f": {str(says)[:200]}" if says else "")
 
 
 def send(channel, entitlement, device_token, payload, environment, collapse=None, expires=None, timeout=None):
@@ -123,18 +131,18 @@ def send(channel, entitlement, device_token, payload, environment, collapse=None
             text = answer.read(65536).decode("utf-8", "replace")
     except urllib.error.HTTPError as answer:
         with answer:
-            says = _refusal(answer.code, answer.read(65536).decode("utf-8", "replace"))
+            says = _refusal(answer.code, answer.read(65536).decode("utf-8", "replace"), _side(channel))
             raise PushError(says, retry_after=_retry_after(answer.headers) if answer.code == 429 else None,
                             status=answer.code) from None
     except urllib.error.URLError as e:          # the request did not get out: no connection, no name, no TLS
-        raise PushError(f"founderizer.com cannot be reached: {str(e.reason)[:200]}") from None
+        raise PushError(f"{_side(channel)} cannot be reached: {str(e.reason)[:200]}") from None
     except (OSError, ValueError):               # it went, and the answer did not come back
-        return 0, "founderizer.com gave no answer in time"
+        return 0, f"{_side(channel)} gave no answer in time"
     try:
         got = json.loads(text)
         status, reason = got["status"], got.get("reason") or ""
     except (ValueError, KeyError, TypeError, AttributeError):
-        return 0, "founderizer.com answered with something other than Apple's answer"
+        return 0, f"{_side(channel)} answered with something other than Apple's answer"
     if isinstance(status, bool) or not isinstance(status, int):
-        return 0, "founderizer.com answered with something other than Apple's answer"
+        return 0, f"{_side(channel)} answered with something other than Apple's answer"
     return status, str(reason)[:100]
