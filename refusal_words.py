@@ -140,6 +140,9 @@ WORDS = {
     "takeover_no_browser": "{agent}'s browser does not run now, so there is no screen to take over",
     "takeover_provider": "{agent}'s browser shows an AI provider's site, which is never taken over",
     "takeover_screen_failed": "{agent}'s server could not share its screen: press Take over again",
+    # a message about a task or a job (POST /ui/messages `about`, UI-API.md 1.279) to an agent whose chat cannot read
+    # that task: neither its agent nor its requester, or a task of a narrowed pair
+    "about_unreadable": "{agent} cannot read this work in its chat, so it cannot get a message about it",
 }
 
 

@@ -2076,9 +2076,13 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                                     # and the task that an answer lets go on, `task` (UI-API.md 1.280)
                "need_recommended",  # the owner, 20 November 2026 (his pick B of three pictures): an item's
                                     # `recommended`, the answer that the agent recommends (UI-API.md 1.269)
-               "need_clarify"]      # the owner, 20 November 2026 ("Keep Your answer too" to the picture of the
+               "need_clarify",      # the owner, 20 November 2026 ("Keep Your answer too" to the picture of the
                                     # card): Needs clarification on every card, POST /ui/needs/<id>/talk keeps the
                                     # item open, and an item's `clarify` and `talk` (UI-API.md 1.272)
+               "message_about"]     # the owner, 21 November 2026 ("Yes, build it" to the drawing of the feedback
+                                    # box): POST /ui/messages takes `about`, the task or the job that a message is
+                                    # about, and messages[].about of GET /ui/state names it with its title (UI-API.md
+                                    # 1.279)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -4404,9 +4408,10 @@ def rows_window(name, before):
     return q(f"{ROWS_MESSAGES} WHERE u.rowid >= ? OR u.rowid < 0 ORDER BY u.created,u.request_id", (before,))
 
 
-def message_views(rows, attached, conf):
+def message_views(rows, attached, conf, named=None):
     """The messages of GET /ui/state and of a block of them, from their rows (u.* with the read time of their event):
-    attached is {request_id: [the views of its files]}, conf the chat apps of the moment (chat_apps)."""
+    attached is {request_id: [the views of its files]}, conf the chat apps of the moment (chat_apps), named the
+    titles of the tasks that they are about, read in the moment of the rows (message_about_reads)."""
     # ui_requests.connection is the hub's own record of a connected app's message: the apps do not read it
     views = [{k: r[k] for k in r.keys() if k != "connection"} for r in rows]
     for m in views:                         # owner feature chat_apps: the chat app of a message, without its IDs
@@ -4416,6 +4421,10 @@ def message_views(rows, attached, conf):
         # edit_in_place: when he last changed its words, and not every text it has had
         m["edited"] = message_edited(m)
         m.pop("edits", None)
+        # owner feature message_about: the task or the job with its title, and no key for a message about nothing
+        about = message_view_about(m.pop("about", None), named or {})
+        if about:
+            m["about"] = about
     for m in views:                         # owner feature attachments: the files of each message
         m["attachments"] = attached.get(m["request_id"], [])
     return views
@@ -4490,6 +4499,7 @@ def rows_read(query):
             rows = q(f"{ROWS_MESSAGES} WHERE u.rowid >= ? AND u.rowid < ? ORDER BY u.created,u.request_id", (start, end))
             files = q("SELECT * FROM attachments WHERE message IN (SELECT request_id FROM ui_requests WHERE rowid >= ? "
                       "AND rowid < ?) ORDER BY id", (start, end))
+            named = message_about_reads(rows)       # owner feature message_about: none for a block about nothing
         conf, team = chat_apps(), team_read()       # a grant line's title and a message's label are of the moment
     # The views from the rows read in the moment, after it, as Handler.ui_state makes its views: they read nothing.
     if name == "needs":
@@ -4500,7 +4510,7 @@ def rows_read(query):
         attached = {}
         for r in files:
             attached.setdefault(r["message"], []).append(attachment_view(r))
-        views = message_views(rows, attached, conf)
+        views = message_views(rows, attached, conf, named)
     answer = {"db": generation, "list": name, "from": start,
               "mark": row_block_mark(name, counted["rev"] if counted else 0, rows_team(name, resources, conf, team)),
               name: views}
@@ -5560,6 +5570,9 @@ def fault_flush(t0):
                     (diagnostics.signature(f["kind"], f["program"], f["name"], f["frames"]), f["kind"], f["program"],
                      f["name"], json.dumps(f["frames"], separators=(",", ":")), f["errno"], f["http"], f["count"],
                      f["first"], f["last"], code))
+            if any(f["kind"] == "stall" for f in taken):      # a stall's places vary: its rows are kept the newest
+                DB.execute("DELETE FROM faults WHERE kind='stall' AND sig NOT IN (SELECT sig FROM faults "
+                           "WHERE kind='stall' ORDER BY last DESC LIMIT ?)", (diagnostics.STALL_ROWS,))
     except sqlite3.Error:       # a database that refuses the write: this pass's counts go, and no new fault comes
         return
 
@@ -6923,7 +6936,10 @@ def migrate():
                         "connection": "INTEGER",    # the connected app that sent it (capp_connections.id)
                         # owner feature asks: what the owner asked for in this message, as the few words that their
                         # apps show for it, written by the first task that names the message (ask_name_row)
-                        "asked": "TEXT"},
+                        "asked": "TEXT",
+                        # owner feature message_about: the task or the job that the whole message is about, as JSON
+                        # ({"task": <id>} or {"job": <id>}), from the page that the owner wrote it on; NULL for none
+                        "about": "TEXT"},
         # the resource that a blocked ask names (needs_access), the level of it that the task needs (needs_level:
         # null when any level does), and what the asker said it would go on with when it asked without stopping
         # (asking_and_waiting): the record of what was decided by default
@@ -8319,7 +8335,8 @@ TASK_ITSELF_CLOSED_END = "\nDo the task and finish with deliver_result."    # th
 def task_itself(task_id, closed=False):
     """The task as list_my_tasks gives it, in its own start (plan P9.4): its title, its requester, its done-when line
     and its details, so that a session needs no call to learn its task, and the files of the owner's message that it
-    comes from (task_files), which list_my_tasks does not give. Its first fleet call marks it started
+    comes from (task_files) and the page that the owner wrote it on (message_about_of_task), which list_my_tasks does
+    not give. Its first fleet call marks it started
     (task_started), and deliver_result keeps its last note. A goal's own words and limits are not here: they are read
     when the worker asks, so a goal that the manager corrects after the task was given out reads as corrected.
     closed: a session whose Shell box is off, which has no report_progress (support plan F1).
@@ -8345,10 +8362,15 @@ def task_itself(task_id, closed=False):
     # the owner's files, never in the details; none where read_attachment is not: a contact drives it
     files = task_files(t) if t["owner"] in agents() and \
         not contact_session(t["owner"], ("", tref(task_id), "1")) else []
+    # owner feature message_about: the page that the owner wrote the message of this task on, as its chat read it,
+    # never in the details, which the apps show as the owner's own words
+    about = message_about_of_task(t) if t["owner"] in agents() else None
+    page = message_about_words(t["owner"], about, task=True, closed=closed) if about else ""
     return (f'Your task is {tref(task_id)}, from {t["requester"]}: "{mask_secrets(str(t["title"]))}". Done when: '
             f'{mask_secrets(str(t["done_when"]))}'
             + (f"\nDetails: {shown}" + (" ... (list_my_tasks gives the rest)" if more else "")
                if line else "")
+            + (f"\n{page}" if page else "")
             + attachment_words(files)
             + (f"\n{summary}" if summary else "")       # a report's task: its reporter's summary, as data
             + ((f'\nIt belongs to {gref(goal["id"])} "{aim}".' if closed else
@@ -19878,11 +19900,17 @@ def t_start_task(agent, a):
     why = f"The owner asked {agent} for it in its own chat."
     guard(agent, details, why)
     t0 = now()
+    about = message_about_read(source["about"])     # owner feature message_about: the task that the message is about
     with transaction():
         parent = lead_batch_rows(requester, t0) if route["parent"] else None    # plan P9.11: the lead's one task
+        # A message about a task or a job opens work that follows that task, when the hub still has it: its session
+        # starts with what came before (warm_follows), and a finished task is never reopened (RULES.md, rule 2). The
+        # message stays the task's own ask.
+        follows = message_about_task(about) if about and DB.execute(
+            "SELECT 1 FROM tasks WHERE id=?", (message_about_task(about),)).fetchone() else None
         tid = admit_task(requester, {"owner": agent, "title": title, "details": details, "done_when": done_when,
                                      "needs": needs, "goal": "", "goal_id": None, "parent": parent, "step": None,
-                                     "follows": None, "case_id": None, "why": why, "ask": ask, "asked": asked})
+                                     "follows": follows, "case_id": None, "why": why, "ask": ask, "asked": asked})
         # **The sentence before the task becomes the reply now** (after_task_words; the chat's rules since 13
         # November 2026, fleet.chat_command): a request for work got its first words only after this call, which
         # the model wrote for 5 to 8 seconds.
@@ -20199,7 +20227,160 @@ def chat_reply(account, chat, text, t0, person=None):
                       **({"person": person} if person is not None else {}))
 
 
-def owner_message_text(request_id, value, recipient, origin, replaces, files, device=False, connection=None):
+# Owner feature message_about (the owner, 21 November 2026: "Yes, build it" to the drawing of the feedback box on the
+# card of a task): the owner writes a message on the page of a task or of a job, and the message says which, with
+# `about` of POST /ui/messages: {"task": <id>}, or {"job": <id>} with one task of the job, as create_task's `job` names
+# a job. It is one fact of the whole message, which the page that he wrote it on gives. The hub takes it only for an
+# agent whose chat can read that task (the 409 about_unreadable), keeps it in ui_requests.about, gives it with its title
+# in messages[].about of the state (message_view_about), writes the reader's line under the owner's words
+# (message_about_words), and makes the task that start_task opens from such a message follow that task. A task that
+# the hub has no more is left out, and the message goes: a reference never stops a message of the owner's.
+MESSAGE_ABOUT_KINDS = ("task", "job")
+MESSAGE_ABOUT_SHAPE = ('about is {"task": <id>} or {"job": <id>}, with the number of one task, for a chat message and '
+                       'never for an answer to a Needs-you item')
+MESSAGE_ABOUT_WALK = 100        # links that the name of a job walks at most: the board ends a walk whose links loop
+
+
+def message_about_given(value):
+    """`about` as the hub keeps it, {"task": n} or {"job": n}, or None for a wrong shape: an object with exactly one of
+    the two keys, whose value is the whole number of a task, 1 or more (a bool is none)."""
+    if not isinstance(value, dict) or len(value) != 1:
+        return None
+    (kind, number), = value.items()
+    if kind not in MESSAGE_ABOUT_KINDS or isinstance(number, bool) or not isinstance(number, int) or \
+            not 0 < number < 2 ** 63:
+        return None
+    return {kind: number}
+
+
+def message_about_read(stored):
+    """The `about` that a ui_requests row keeps, or None for NULL and for a value that is no such object."""
+    try:
+        return message_about_given(json.loads(stored)) if stored else None
+    except ValueError:
+        return None
+
+
+def message_about_task(about):
+    """The task that an `about` names: the task itself, or the task that names its job."""
+    return next(iter(about.values()))
+
+
+def message_about_names(ids):
+    """{task id: {"title", "state", "owner", "job", "hidden"}} for each of these tasks that the hub has: its title, its
+    state and its agent, and the name of its job as the owner's Tasks board gives it (HubState.jobs of the apps). For a
+    task with an ask, the name of that message of the owner's (its `asked`), else the task's title; else the title of
+    the case of the task, or of the first task before it on its links that has a case; else the job_name of the task
+    that the links `job`, then `follows`, reach last, else that task's title. hidden: a task that the walk passed
+    after this one is a narrowed pair's (tasks.scope_person), whose words reach no session outside its pair, so the
+    job's name can be such words: the owner reads it, an agent does not (message_about_words). One statement for each
+    ID_LIST of them and none for none: a read of the state reads it once for all of its messages, never once for each.
+    read_rows only: owner_message_rows builds a message's words inside its transaction."""
+    named = {}
+    for chunk in id_lists(sorted(set(ids))):
+        rows = read_rows(
+            f"WITH RECURSIVE about_walk(start, id, n) AS (SELECT id, id, 0 FROM tasks WHERE id IN "
+            f"({','.join('?' * len(chunk))}) UNION ALL SELECT w.start, COALESCE(NULLIF(t.job, t.id), "
+            f"NULLIF(t.follows, t.id)), w.n + 1 FROM about_walk w JOIN tasks t ON t.id=w.id WHERE w.n < ? AND "
+            f"t.duty_case IS NULL AND (w.n > 0 OR COALESCE(t.ask, '') = '') AND COALESCE(NULLIF(t.job, t.id), "
+            f"NULLIF(t.follows, t.id)) IS NOT NULL) "
+            f"SELECT w.start, w.n, t.title, t.state, t.owner, t.ask, t.job_name, t.duty_case, t.scope_person, u.asked, "
+            f"c.title AS case_title FROM about_walk w JOIN tasks t ON t.id=w.id LEFT JOIN ui_requests u ON w.n=0 AND "
+            f"u.request_id=t.ask LEFT JOIN duty_cases c ON c.id=t.duty_case", (*chunk, MESSAGE_ABOUT_WALK))
+        ends = {}
+        for r in rows:
+            if r["n"] == 0:
+                named[r["start"]] = {"title": r["title"], "state": r["state"], "owner": r["owner"],
+                                     "job": (r["asked"] or r["title"]) if r["ask"] else None, "hidden": False}
+        for r in rows:
+            if r["n"] > 0 and r["scope_person"] is not None:
+                named[r["start"]]["hidden"] = True
+            if r["start"] not in ends or r["n"] > ends[r["start"]]["n"]:
+                ends[r["start"]] = r        # where the links end: a task with a case, or the task that begins the job
+        for start, end in ends.items():
+            if named[start]["job"] is None:
+                named[start]["job"] = (end["case_title"] if end["duty_case"] is not None else end["job_name"]) or \
+                    end["title"]
+    return named
+
+
+def message_about_words(agent, about, task=False, closed=False):
+    """The reader's line of a message of the owner's that is about a task or a job, for `agent`: the page that the owner
+    wrote it on, with the task's state in words, and how work goes on from it, with the tools that its session has.
+    In an owner chat (task False): a worker's or a lead's opens the work with start_task, whose task follows that task
+    by itself; one whose Shell box is off has neither start_task nor read_history (SHELL_OFF_CHAT); the manager gives
+    its new task follows. In the session of the task that start_task opened from such a message (task True,
+    task_itself), only the page: that task is the work, and its start says what came before (warm_follows); closed,
+    its Shell box is off, so no read_history. A job whose name the walk took past a narrowed pair's task is named by
+    the named task's own title: the agent reads no words of that pair. "" for a task that the hub has no more.
+    read_rows only, as message_about_names."""
+    number = message_about_task(about)
+    named = message_about_names([number]).get(number)
+    if not named:
+        return ""
+    ref = tref(number)
+    if "job" in about:
+        job = named["title"] if named["hidden"] else named["job"]
+        page = f"the page of the job of {ref} ({' '.join(str(job).split())})"
+    else:
+        doer = "you" if named["owner"] == agent else named["owner"]
+        state = {"completed": f"which {doer} completed", "failed": f"which {doer} failed",
+                 "rejected": f"which {doer} rejected", "canceled": "which was canceled"}.get(named["state"],
+                                                                                           "which is open")
+        page = f"the page of {ref} ({' '.join(str(named['title']).split())}), {state}"
+    off = closed if task else shell_off(agent)
+    said = [f"The owner wrote this on {page}."] + ([] if off else [f"Read it with read_history {ref} if you need it."])
+    if not task:
+        said.append(f"If it needs work, give the task follows {ref}." if role_of(agent) == "manager" else
+                    "If it needs work, tell the owner who can do it." if off else
+                    f"If it needs work, open it with start_task: the new task follows {ref} by itself.")
+    return "[" + " ".join(said) + "]"
+
+
+def message_about_of_task(t):
+    """The `about` of the owner's message that start_task opened this task from, or None: a message of the task's ask
+    (the ask itself, or a correction under it) to the task's own agent, whose task is the one that this task follows.
+    A task that the manager or a lead gave names a message of the owner's too, but its agent got no such message: the
+    words of its task are its requester's. read_row and read_rows only, as task_itself."""
+    if not (t["ask"] and t["follows"]):
+        return None
+    head = read_row("SELECT about FROM ui_requests WHERE request_id=? AND recipient=?", (t["ask"], t["owner"]))
+    if head is None:
+        return None
+    about = message_about_read(head["about"])
+    if about and message_about_task(about) == t["follows"]:
+        return about
+    # the message that start_task named was a correction of the ask, which carries an `about` of its own
+    for r in read_rows("WITH RECURSIVE chain(r) AS (SELECT ? UNION SELECT u.request_id FROM ui_requests u JOIN chain "
+                       "ON u.replaces_request_id=chain.r) SELECT u.about FROM ui_requests u JOIN chain ON "
+                       "u.request_id=chain.r WHERE u.recipient=? AND u.about IS NOT NULL ORDER BY u.created DESC",
+                       (t["ask"], t["owner"])):
+        about = message_about_read(r["about"])
+        if about and message_about_task(about) == t["follows"]:
+            return about
+    return None
+
+
+def message_view_about(stored, named):
+    """messages[].about of the state, from the row's `about` and message_about_names of the read: {"task": id, "title"}
+    or {"job": id, "title"}, the task's title or the name of its job; the title is null for a task that the hub has no
+    more. None for a message about nothing, whose view has no `about`."""
+    about = message_about_read(stored)
+    if not about:
+        return None
+    number = message_about_task(about)
+    found = named.get(number)
+    return dict(about, title=(found["job"] if "job" in about else found["title"]) if found else None)
+
+
+def message_about_reads(rows):
+    """message_about_names of the tasks that these message rows are about, read in the moment of the rows."""
+    return message_about_names([message_about_task(a) for a in map(message_about_read, (r["about"] for r in rows))
+                                if a])
+
+
+def owner_message_text(request_id, value, recipient, origin, replaces, files, device=False, connection=None,
+                       about=None):
     """The words of one owner chat message, as its reader gets them: the owner's text under the header that says who
     wrote it, and for a worker or a lead the request id that its reply names. A correction says what it corrects; a
     message that the owner edited before anything read it says nothing, because it is the same message with other
@@ -20209,13 +20390,18 @@ def owner_message_text(request_id, value, recipient, origin, replaces, files, de
     app's origin wins. connection: the shown name of the connected app that sent
     it (capp_connections.name, which the hub chose: never the app's own claim to be Claude or ChatGPT), which comes
     before a device. Its mark has a form that no other channel has (capp_via): via=app:Claude, [owner via app:Claude],
-    so that no app's name reads as a chat app or a device."""
+    so that no app's name reads as a chat app or a device. about: the task or the job that the message is about (owner
+    feature message_about), whose reader's line comes after the owner's words and before the correction line and the
+    files, built at this moment (message_about_words)."""
     via = CHAT_APP_NAMES[origin["app"]] if origin else capp_via(connection) if connection else \
         (device if isinstance(device, str) else OWNER_DEVICE_VIA) if device else None
     if agents()[recipient].get("role") in ("worker", "lead"):
         text = f"[owner chat request_id={request_id}" + (f" via={via}" if via else "") + f"] {value}"
     else:
         text = f"[owner via {via}] {value}" if via else f"[owner] {value}"
+    line = message_about_words(recipient, about) if about else ""
+    if line:
+        text += "\n" + line
     if replaces:
         text += f"\n[Correction to request {replaces}. This is a new message, not cancellation or replay of earlier work.]"
     return text.rstrip() + attachment_words(files)
@@ -20244,7 +20430,8 @@ def owner_message_replace(previous, value, request_id, t0, device=False):
     record still holds what he first said. The files it carries stay with it: an edit brings none. device: as
     owner_message_text's, for the request of the edit (an edit comes only from the client that sent the message).
     A message that a connected app sent (ui_requests.connection) keeps the mark of that app, whatever client the
-    edit names: the row says who sent it, and the header is built from the row."""
+    edit names: the row says who sent it, and the header is built from the row. So is the reader's line of what the
+    message is about (owner feature message_about): an edit keeps the row's `about`, and its line is built again."""
     in_transaction("owner_message_replace")
     files = DB.execute("SELECT * FROM attachments WHERE message=? ORDER BY id", (previous["request_id"],)).fetchall()
     origin = json.loads(previous["origin"]) if previous["origin"] else None
@@ -20252,7 +20439,8 @@ def owner_message_replace(previous, value, request_id, t0, device=False):
     if previous["connection"] is not None:
         app = DB.execute("SELECT name FROM capp_connections WHERE id=?", (previous["connection"],)).fetchone()
         via = app["name"] if app else "App"     # a connection's row stays as the record; "App" as shown_name's last name
-    text = owner_message_text(previous["request_id"], value, previous["recipient"], origin, None, files, device, via)
+    text = owner_message_text(previous["request_id"], value, previous["recipient"], origin, None, files, device, via,
+                              about=message_about_read(previous["about"]))
     edits = json.loads(previous["edits"] or "[]") + [{"request_id": request_id, "text": value, "at": t0}]
     DB.execute("UPDATE events SET text=? WHERE id=?", (text, previous["event_id"]))
     DB.execute("UPDATE ui_requests SET text=?,edits=? WHERE request_id=?",
@@ -20264,7 +20452,7 @@ def owner_message_replace(previous, value, request_id, t0, device=False):
 
 
 def owner_message_rows(request_id, kind, need, value, client, recipient, replaces, t0, origin=None, files=(),
-                       chosen=None, task=None, quiet=False, note="", device=False, connection=None):
+                       chosen=None, task=None, quiet=False, note="", device=False, connection=None, about=None):
     """Inside a transaction: one owner message or answer, from the app (POST /ui/messages, /ui/needs/<id>) or from a
     chat app (origin): the answer of the need, one event and one ui_requests row. The caller checked everything.
     Returns the event ID. task: the task whose session the answer of a secret request goes to (answer_secret), and
@@ -20273,7 +20461,9 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     chat_unopened_line). device: the message came from an enrolled owner device (owner_message_text); an answer to
     a Needs-you item keeps its words. connection: {id, name} of the connected app that sent it: its name goes into
     the header of a message and of an answer (outside text, so its reader sees where it came from), and its id into
-    ui_requests.connection; origin stays NULL, because origin is a chat app's (chat_takes, chat_source)."""
+    ui_requests.connection; origin stays NULL, because origin is a chat app's (chat_takes, chat_source). about: the
+    task or the job that a message is about (owner feature message_about), which phone_submit checked: it goes into
+    ui_requests.about, and its reader's line into the event's words."""
     in_transaction("owner_message_rows")
     worker_chat = need is None and agents()[recipient].get("role") in ("worker", "lead")
     # owner feature secret_requests: a worker or a lead asks in its owner chat, so his answer goes back there, read
@@ -20285,7 +20475,8 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
         asker.get("role") in ("worker", "lead") and owner_chat(asker)
     via = connection["name"] if connection else None
     if need is None:
-        text = owner_message_text(request_id, value, recipient, origin, replaces, files, device, via) + (note or "")
+        text = owner_message_text(request_id, value, recipient, origin, replaces, files, device, via,
+                                  about=about) + (note or "")
     else:
         mark = f" via {capp_via(via)}" if via else ""
         text = f"[owner{mark}] Answer to Needs-you N-{need['id']} ({need['title']}): {value}"
@@ -20330,9 +20521,10 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     if takeover:        # its next owner wait holds the task, else it works again
         secret_wait_moved(task)
     DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,"
-               "replaces_request_id,origin,connection) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+               "replaces_request_id,origin,connection,about) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                (request_id, kind, need["id"] if need is not None else None, value, event_id, t0, client, recipient,
-                replaces, json.dumps(origin) if origin else None, connection["id"] if connection else None))
+                replaces, json.dumps(origin) if origin else None, connection["id"] if connection else None,
+                json.dumps(about) if about and need is None else None))
     for f in files:
         DB.execute("UPDATE attachments SET message=? WHERE id=?", (request_id, f["id"]))
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} accepted as "
@@ -69006,6 +69198,13 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
     files = data.get("attachments") or []
     if not attachment_ids_ok(files):
         return (400, {"error": ATTACH_IDS_WORDS})
+    # owner feature message_about: the task or the job that a chat message is about, which the page gives that the owner
+    # wrote it on. Null is none.
+    about = data.get("about")
+    if about is not None:
+        about = message_about_given(about) if need_id is None else None
+        if about is None:
+            return (400, {"error": MESSAGE_ABOUT_SHAPE})
     yes, signed = data.get("statement"), data.get("signature")      # his signed yes to a door call
     if (yes is not None or signed is not None) and (need_id is None or not isinstance(yes, str) or
                                                     not isinstance(signed, str) or len(yes) > 2048 or
@@ -69238,6 +69437,21 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
             return (409, {"error": f"direct chat with a "
                                    f"{runtime_label(agents()[recipient].get('runtime'))} agent is not "
                                    f"available yet"})
+        if about is not None:
+            # A task that the hub has no more is left out, and the message goes. A task that the recipient's chat cannot
+            # read refuses the whole message, and nothing is written: the reader's line would name work that its chat
+            # cannot read, so the message would reach an agent that cannot know what it is about. What read_history
+            # gives that chat (history_records with an owner chat's scope: no contact drives it, and no person's list
+            # narrows it) is the task's agent and its requester, of a task of no narrowed pair (history_task,
+            # history_result, history_check; history_scope_sql leaves out each task with scope_person). The check reads
+            # that from the task's own row, and not from the history's index, which takes a new task in later: work
+            # that the agent did a minute ago would read as work of another.
+            number = message_about_task(about)
+            named = read_row("SELECT owner, requester, scope_person FROM tasks WHERE id=?", (number,))
+            if not named:
+                about = None
+            elif recipient not in (named["owner"], named["requester"]) or named["scope_person"] is not None:
+                return (409, refusal_words.answer("about_unreadable", agent=shown_role(recipient)))
         try:
             rows = owner_upload_rows(files, client)
         except Refusal as e:
@@ -69261,7 +69475,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
             else:
                 event_id = owner_message_rows(request_id, kind, need, value, client, recipient, replaces, created,
                                               files=rows, chosen=None if ticked is not None else choice,
-                                              device=device, connection=connection,
+                                              device=device, connection=connection, about=about,
                                               note=need_run_note(need, ran["status"], ran_output) if ran is not None
                                               else team_answer_note(need, choice) or given or
                                               need_words_note(need, choice, ticked, value))
@@ -71388,6 +71602,9 @@ class Handler(BaseHTTPRequestHandler):
                 outbound = q("SELECT * FROM chat_out WHERE id IN (SELECT MAX(id) FROM chat_out WHERE kind='message' "
                              "AND report IS NOT NULL GROUP BY report)")
                 reports = q("SELECT * FROM owner_reports ORDER BY id")
+            # owner feature message_about: the titles of the tasks that those messages are about, in one read for all
+            # of them, and in none when no message is about one
+            about_named = message_about_reads(messages)
             grant_records = q("SELECT ts, resource, agent, level, by FROM resource_grants")      # owner API 1.236
             grant_team = team_read()            # the team of this moment, for the titles of those records' resources
             result["messages"] = result["reports"] = None      # their places: they are made after the lock
@@ -71451,7 +71668,7 @@ class Handler(BaseHTTPRequestHandler):
         attached = {}                           # owner feature attachments: the files of each message
         for r in files:
             attached.setdefault(r["message"], []).append(attachment_view(r))
-        result["messages"] = message_views(messages, attached, conf)
+        result["messages"] = message_views(messages, attached, conf, about_named)
         # owner API 1.223: a steer's files are linked by its request_id as a message's are, so `files` has them too
         result["steers"] = [steer_view(r, attached.get(r["request_id"], [])) for r in steers]
         result["reports"] = report_views(reports, report_files, outbound, report_grants(reports, grant_records, grant_team))
@@ -72354,7 +72571,8 @@ class Handler(BaseHTTPRequestHandler):
     def ui_diagnostics(self, query):
         """GET /ui/diagnostics?db= (owner feature diagnostics, UI-API.md 1.167): the hub's own faults and refused
         calls of the code that runs now, as diagnostics.view gives them: classes, files and lines, numbers and times,
-        and no words. Report a problem shows each line that it makes of them before it sends anything."""
+        and no words. Report a problem shows each line that it makes of them before it sends anything. Its stalls
+        (UI-API.md 1.284) no app reads yet."""
         if not self.ui_allowed():
             return
         generation = kv_get("db_id")
@@ -72367,7 +72585,7 @@ class Handler(BaseHTTPRequestHandler):
             rows = []
         answer = diagnostics.view(rows, tools={tool[1] for tool in TOOLS})
         if secret_hit(json.dumps(answer)):      # the types leave no room for one; this gate is the last word
-            answer = {"faults": [], "refusals": []}
+            answer = {"faults": [], "refusals": [], "stalls": []}
         return self.json(200, dict(answer, db=generation), {"Cache-Control": "no-store"})
 
     def ui_error_reports(self, query):
@@ -79094,6 +79312,7 @@ def main():
     threading.Thread(target=read_watcher, name="read-checks", daemon=True).start()  # a read check of a wake-up rule
     # AUTONOMY.md P6: the records written before this start, into the history, a short step at a time (the backfill)
     threading.Thread(target=history_indexer, name="history-index", daemon=True).start()
+    diagnostics.watch_stalls()      # Hub core: a stall names itself in faults (kind "stall"), after the start's own work
     TAILNET_NAMES["names"] = tailnet_names()        # devops task 1.1: the names that a client may call this hub by
     capp_sync_later()           # the connected apps' socket, with guard 6(b) (nothing runs while it cannot be on)
     server = hub_server(host, port, listener)

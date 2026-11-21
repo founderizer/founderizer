@@ -8,12 +8,17 @@ GET /ui/diagnostics: a message, a secret, a path of the machine, a name of the f
 The first class needs no hub. The second runs the test hub of test_ui_api (OwnerAPI), as test_health does: a
 temporary database, its own checkout, and nothing of the developer's own fleet."""
 import contextlib
+import gc
 import http.client
 import inspect
 import io
 import json
 import os
 import re
+import sys
+import tempfile
+import threading
+import time
 import types
 import unittest
 import unittest.mock
@@ -174,7 +179,7 @@ class Recorder(unittest.TestCase):
     def test_frames_nested_too_deep_drop_their_row_and_raise_nothing(self):
         row = {"kind": "fault", "program": "hub", "name": "KeyError", "frames": "[" * 100_000 + "]" * 100_000,
                "errno": None, "http": None, "count": 1, "first": 5.0, "last": 6.0}
-        self.assertEqual(diagnostics.view([row]), {"faults": [], "refusals": []})
+        self.assertEqual(diagnostics.view([row]), {"faults": [], "refusals": [], "stalls": []})
 
 
     def test_a_deep_recursion_keeps_its_innermost_twelve_frames(self):
@@ -224,6 +229,307 @@ def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite(loader.loadTestsFromTestCase(Recorder))
     suite.addTests(OnTheHub(name) for name in OnTheHub.__dict__ if name.startswith("test_"))
     return suite
+
+
+def spin(flag):
+    while not flag: pass    # noqa: E701  (the one line of the loop: the place that a busy stall names)
+
+
+def spin_too(flag):
+    while not flag: pass    # noqa: E701  (a second place)
+
+
+SPUN = inspect.getsourcelines(spin)[1] + 1
+SPUN_TOO = inspect.getsourcelines(spin_too)[1] + 1
+
+
+class Stalls(unittest.TestCase):
+    """The stall watch (diagnostics.Watch), with a clock, a wall clock, the process's time and each thread's time on
+    a CPU of the test's own, and real threads for their frames."""
+
+    def setUp(self):
+        diagnostics.pending()
+        self.addCleanup(diagnostics.pending)
+        self.now, self.cpu, self.process, self.journal = [5000.0, 1_795_000_000.0], {}, [0.0], io.StringIO()
+
+    def watch(self, cpu=True):
+        read = (lambda ids: {n: self.cpu[n] for n in ids if n in self.cpu}) if cpu else (lambda ids: None)
+        return diagnostics.Watch(me=threading.get_native_id(), cpu=read, clock=lambda: self.now[0],
+                                 wall=lambda: self.now[1], process=lambda: self.process[0], out=self.journal)
+
+    def later(self, seconds):
+        self.now[0] += seconds
+        self.now[1] += seconds
+
+    def go(self, w, seconds, rates, late=0.001, process=None):
+        """`seconds` looks a second apart, in which each thread of `rates` ran that share of each second."""
+        for _ in range(seconds):
+            self.later(1.0)
+            for thread, rate in rates.items():
+                self.cpu[thread.native_id] += rate
+            used = sum(rates.values()) if process is None else process
+            self.process[0] += used
+            w.look(late, used)
+
+    def spinner(self, target=spin):
+        """A thread that runs Python and nothing else, as the login search of 20 November 2026 did, once it stands
+        in its loop."""
+        flag = []
+        thread = threading.Thread(target=target, args=(flag,), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(flag.append, 1)
+        line = inspect.getsourcelines(target)[1] + 1
+        for _ in range(500):
+            frame = sys._current_frames().get(thread.ident)
+            if frame is not None and frame.f_code is target.__code__ and frame.f_lineno == line:
+                break
+            time.sleep(0.01)
+        del frame
+        self.cpu[thread.native_id] = 0.0
+        return thread
+
+    def code(self, frames):
+        """The places of a row in the code tree, innermost first."""
+        return [tuple(f) for f in reversed(frames) if f[0] != "lib"]
+
+    def test_a_thread_that_runs_half_a_window_is_one_stall_however_long_it_runs(self):
+        """The stall of 20 November 2026: a thread ran Python for minutes, and nobody could tell which code. It is one
+        stall with that thread's places and no value, counted once while it lasts, also across the edge of a
+        window, and its first and last time say how long it lasted."""
+        hog = self.spinner()
+        w = self.watch()
+        start = self.now[1]
+        self.go(w, 4, {hog: 0.0})
+        self.go(w, 6, {hog: 0.95})      # 5.7 s of the first window, from its fourth second
+        (row,) = diagnostics.pending()
+        self.assertEqual((row["kind"], row["program"], row["name"], row["count"]), ("stall", "hub", "busy", 1))
+        self.assertEqual(self.code(row["frames"])[0], (HERE, SPUN))
+        self.assertAlmostEqual(row["first"], start + 10 - 5.7, places=6)        # it ran 5.7 s of it
+        self.assertEqual(row["last"], self.now[1])
+        self.go(w, 30, {hog: 0.95})     # it goes on: no second stall, and its last time moves
+        (row,) = diagnostics.pending()
+        self.assertEqual((row["name"], row["count"], row["last"]), ("busy", 0, self.now[1]))
+        self.assertAlmostEqual(row["first"], start + 10 - 5.7, places=6)
+        del self.cpu[hog.native_id]     # it ended: its seconds stay in the window for a while, and no row says them
+        self.go(w, 10, {})
+        self.assertEqual(diagnostics.pending(), [])
+        said = self.journal.getvalue().splitlines()
+        self.assertEqual(said[0], f"WARNING: the hub stalls (busy) at {HERE} {SPUN}")
+        self.assertEqual(said[1], f"the hub's stall (busy) at {HERE} {SPUN} ended after about 36 s")      # 4.3 to 40
+        self.assertEqual(len(said), 2)
+        again = self.spinner()          # another thread runs there: a second stall
+        self.go(w, 6, {again: 0.95})
+        self.assertEqual([(r["name"], r["count"]) for r in diagnostics.pending()], [("busy", 1)])
+
+    def test_a_little_work_is_no_stall_and_threads_that_ended_or_a_slow_machine_are(self):
+        """The owner's hub, 21 November 2026: its process ran 0.004 to 0.12 of each window. A process that runs 0.5 of
+        it is a stall, which names each thread that ran 0.1 of it; with no such thread (short threads that ended),
+        it names no place; and looks that came late for half of a window while the process hardly ran are a slow
+        machine."""
+        hog, other = self.spinner(), self.spinner(spin_too)
+        w = self.watch()
+        self.go(w, 12, {hog: 0.4, other: 0.05})
+        self.assertEqual(diagnostics.pending(), [])
+        self.go(w, 10, {hog: 0.3, other: 0.25})
+        rows = diagnostics.pending()
+        self.assertEqual([(r["name"], r["count"]) for r in rows], [("busy", 1), ("busy", 1)])
+        self.assertEqual({self.code(r["frames"])[0] for r in rows}, {(HERE, SPUN), (HERE, SPUN_TOO)})
+        w = self.watch()        # a bystander that ran 1.1 s while the process ran 9.1 s is not named
+        self.go(w, 12, {hog: 0.8, other: 0.11})
+        self.assertEqual([self.code(r["frames"])[0] for r in diagnostics.pending()], [(HERE, SPUN)])
+        w = self.watch()
+        self.go(w, 12, {hog: 0.0}, process=0.8)
+        self.assertEqual([(r["name"], r["frames"]) for r in diagnostics.pending()], [("busy", [["lib", 0]])])
+        w = self.watch()
+        self.go(w, 12, {hog: 0.0}, late=0.6, process=0.1)
+        self.assertEqual([(r["name"], r["frames"]) for r in diagnostics.pending()], [("paused", [["lib", 0]])])
+
+    def test_a_late_look_names_the_thread_that_held_the_lock_and_a_pause_names_none(self):
+        """A look that comes STALL_HOLD late: one call held Python's interpreter lock. The thread that ran in that time
+        is named, from when the hold began, also after another thread ran Python for most of the window; a hub that
+        got no CPU, and a full collection of the garbage collector, are said as such."""
+        busy, holder = self.spinner(), self.spinner(spin_too)
+        w = self.watch()
+        self.go(w, 6, {busy: 0.9, holder: 0.0})
+        self.later(2.6)
+        self.cpu[holder.native_id] += 2.5
+        self.process[0] += 2.5
+        w.look(2.5, 2.5)
+        (row,) = diagnostics.pending()
+        self.assertEqual((row["name"], row["first"], row["last"]), ("hold", self.now[1] - 2.5, self.now[1]))
+        self.assertEqual(self.code(row["frames"])[0], (HERE, SPUN_TOO))
+        self.go(w, 12, {busy: 0.0, holder: 0.0})        # that stall ends
+        diagnostics.pending()
+        self.cpu[holder.native_id] += 1.5   # a hold that came while the watch read: its newest reading is in the hold
+        self.go(w, 1, {busy: 0.0, holder: 0.0}, process=1.5)
+        self.later(0.1)
+        self.cpu[holder.native_id] += 1.0
+        self.process[0] += 1.0
+        w.look(2.5, 2.5, inside=True)
+        self.assertEqual([(r["name"], self.code(r["frames"])[0]) for r in diagnostics.pending()],
+                         [("hold", (HERE, SPUN_TOO))])
+        w = self.watch(cpu=False)
+        for used, collecting in ((0.2, 0.0), (3.0, 2.0), (3.0, 0.5)):      # a pause, a collection, a short one
+            self.later(3.1)
+            w.look(3.0, used, collecting)
+        self.assertEqual({r["name"]: r["frames"] for r in diagnostics.pending()},
+                         {"paused": [["lib", 0]], "collect": [["lib", 0]], "hold": [["lib", 0]]})
+
+    def test_a_thread_that_runs_near_the_bound_is_one_stall(self):
+        """A thread at about half a CPU puts 4.88 to 5.12 s into each window, so the window crosses STALL_SHARE 63 times
+        in 200 s: that is one stall, not 30, and the journal says it once."""
+        hog = self.spinner()
+        w = self.watch()
+        for t in range(200):
+            self.go(w, 1, {hog: 0.56 if (t // 3) % 2 == 0 else 0.44})
+        self.assertEqual([(r["name"], r["count"]) for r in diagnostics.pending()], [("busy", 1)])
+        self.assertEqual(self.journal.getvalue().count("WARNING"), 1)
+
+    def test_a_thread_whose_time_before_the_window_is_not_known_is_not_named(self):
+        """A thread that is not in a window's first reading counts all of its time only when that time fits in the
+        window: one that ran 500 s before is not named for them."""
+        w = self.watch()
+        old = self.spinner(spin_too)
+        self.cpu[old.native_id] = 500.0
+        self.go(w, 10, {old: 0.6})
+        self.assertEqual([(r["name"], r["frames"]) for r in diagnostics.pending()], [("busy", [["lib", 0]])])
+
+    def test_a_fault_of_the_watch_is_counted_and_it_starts_again_three_times(self):
+        """A look that raises is a fault of the hub, counted at each of STALL_TRIES starts, and then the watch ends:
+        it neither dies at its first fault nor counts one ten times a second."""
+        starts = []
+
+        class Broken:
+            def __init__(self, me):
+                starts.append(me)
+
+            def look(self, late, used, collecting=0.0, inside=False):
+                raise KeyError("a fault of the watch")
+
+        thread = threading.Thread(target=diagnostics.watch, args=(None, 0.001, Broken, 0.01), daemon=True)
+        thread.start()
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(starts), diagnostics.STALL_TRIES)
+        self.assertEqual([(r["kind"], r["name"], r["count"]) for r in diagnostics.pending()],
+                         [("fault", "KeyError", diagnostics.STALL_TRIES)])
+
+    def test_a_hold_that_comes_while_the_watch_reads_is_a_late_look(self):
+        """The watch lets the interpreter lock go while it reads each thread's time. A look that took STALL_HOLD (a
+        call held the lock in the meantime) is followed by a late look of that length."""
+        looks = []
+
+        class Slow:
+            def __init__(self, me):
+                pass
+
+            def look(self, late, used, collecting=0.0, inside=False):
+                looks.append(late)
+                if len(looks) == 3:
+                    time.sleep(0.3)         # as long as a hold that came while it read
+
+        stop = threading.Event()
+        with unittest.mock.patch.object(diagnostics, "STALL_HOLD", 0.2):
+            thread = threading.Thread(target=diagnostics.watch, args=(stop, 0.01, Slow), daemon=True)
+            thread.start()
+            for _ in range(1000):
+                if len(looks) >= 4:
+                    break
+                time.sleep(0.01)
+            stop.set()
+            thread.join(5)
+        self.assertGreaterEqual(looks[3], 0.29)       # the look after the third, with no sleep of its own
+
+    def test_a_hold_that_names_no_thread_is_not_also_a_busy_stall(self):
+        """The seconds of a hold stay in the window after it: while the hold's stall goes on, they make no busy row with
+        no place beside it."""
+        w = self.watch(cpu=False)
+        self.go(w, 9, {}, process=0.2)
+        self.later(5.1)
+        self.process[0] += 5.0
+        w.look(5.0, 5.0)
+        self.go(w, 12, {}, process=0.2)
+        self.assertEqual([r["name"] for r in diagnostics.pending()], ["hold"])
+
+    def test_a_hold_and_a_pause_are_not_also_a_slow_machine(self):
+        """A slow machine is many small delays in a window. A window that holds a hold and a pause, each said already,
+        is not one: the pause keeps its own length (a run on Linux, 21 November 2026, said it twice)."""
+        w = self.watch(cpu=False)
+        self.go(w, 2, {})
+        self.later(3.5)
+        w.look(3.4, 1.0)            # a hold in which the process ran a little
+        self.go(w, 1, {})
+        self.later(3.1)
+        w.look(3.0, 0.0)            # and a pause
+        pause = self.now[1]
+        self.go(w, 12, {}, late=0.05)
+        rows = {r["name"]: r for r in diagnostics.pending()}
+        self.assertEqual(sorted(rows), ["hold", "paused"])
+        self.assertEqual((rows["paused"]["count"], rows["paused"]["first"], rows["paused"]["last"]),
+                         (1, pause - 3.0, pause))
+
+    def test_a_look_waits_for_the_interpreter_lock_and_counts_the_process_and_the_collector(self):
+        """The real loop: while one call of C code holds the interpreter lock, the watch's look comes as late as that
+        call took, with the process's time in it, and a full collection is timed (gc.callbacks)."""
+        looks = []
+
+        class Seen:
+            def __init__(self, me):
+                self.me = me
+
+            def look(self, late, used, collecting=0.0, inside=False):
+                looks.append((late, used, collecting))
+
+        gc.callbacks.append(diagnostics._gc_timer)
+        self.addCleanup(gc.callbacks.remove, diagnostics._gc_timer)
+        stop = threading.Event()
+        thread = threading.Thread(target=diagnostics.watch, args=(stop, 0.01, Seen), daemon=True)
+        thread.start()
+        time.sleep(0.1)
+        wall, cpu = time.perf_counter(), time.process_time()
+        sum(range(30_000_000))          # one call: no other thread of Python runs until it returns
+        held, spent = time.perf_counter() - wall, time.process_time() - cpu
+        time.sleep(0.05)
+        gc.collect()
+        time.sleep(0.05)
+        stop.set()
+        thread.join(5)
+        late, used, _ = max(looks)
+        self.assertGreater(late, held * 0.8 - 0.02)
+        self.assertGreater(used, spent * 0.8 - 0.02)
+        self.assertGreater(sum(look[2] for look in looks), 0.0)
+        self.assertEqual(diagnostics.pending(), [])         # the loop itself counts nothing
+
+    def test_a_run_of_library_frames_is_one_place_and_the_innermost_twelve_stay(self):
+        """A stall's places as a fault's: the code tree's files and lines, a run of the library's frames as one
+        ("lib", 0), and the innermost MAX_FRAMES."""
+        seen = []
+
+        def hook(obj):
+            seen.append(diagnostics.stack(diagnostics.frames_of(sys._getframe())))      # the innermost
+            return obj
+
+        json.loads("{}", object_hook=hook)          # json's own frames lie between this line and the hook
+        called = inspect.currentframe().f_lineno - 1
+        (places,) = seen
+        self.assertEqual(places[-1], (HERE, inspect.getsourcelines(hook)[1] + 1))
+        self.assertEqual(places[-2], ("lib", 0))
+        self.assertEqual(places[-3], (HERE, called))
+
+        def deep(n):
+            return diagnostics.stack(diagnostics.frames_of(sys._getframe())) if n == 0 else deep(n - 1)
+
+        self.assertEqual(len(deep(30)), diagnostics.MAX_FRAMES)
+
+    def test_a_threads_time_is_its_user_and_system_time_past_a_name_with_brackets(self):
+        """Linux's stat line of a thread: its name, in brackets, can hold spaces and brackets of its own."""
+        with tempfile.TemporaryDirectory() as tasks:
+            os.makedirs(os.path.join(tasks, "77"))
+            with open(os.path.join(tasks, "77", "stat"), "w") as f:
+                f.write("77 (a (b) c) S" + " 1" * 10 + " 250 50" + " 7" * 30 + "\n")
+            self.assertEqual(diagnostics.thread_cpu([77, 78], tasks=tasks), {77: 300 / diagnostics._TICKS})
+        self.assertIsNone(diagnostics.thread_cpu([77], tasks=os.path.join(tasks, "gone")))
 
 
 class OnTheHub(OwnerAPI):
@@ -352,6 +658,7 @@ class OnTheHub(OwnerAPI):
         start = inspect.getsource(hub.main)                           # read at the start, and a dying thread
         self.assertIn("diagnostics.code_id()", start)
         self.assertIn("threading.excepthook = thread_fault", start)
+        self.assertIn("diagnostics.watch_stalls()", start)          # and a stall names itself while the hub runs
 
     def test_the_tick_writes_what_was_counted(self):
         try:
@@ -488,6 +795,67 @@ class OnTheHub(OwnerAPI):
                 with contextlib.redirect_stderr(io.StringIO()):
                     hub.HubServer.handle_error(server, None, ("127.0.0.1", 1))
         self.assertEqual([row["name"] for row in diagnostics.pending()], ["ConnectionAbortedError"])
+
+    def test_a_stall_reaches_the_route_and_no_element_of_the_owners_screen(self):
+        """No app reads a stall yet, and the owner has no element for one: it is no fault, no warning of System status
+        and no part of the day's error report. A stall that goes on over several writes stays one row, whose first and
+        last time say how long it lasted, also when the database refused the write of its first count."""
+        clock, me = [100.0, hub.now() - 60], sys._getframe()
+        w = diagnostics.Watch(cpu=lambda ids: {7: (clock[0] - 100.0) * 0.9}, frames=lambda: {70: me},
+                              threads=lambda: [types.SimpleNamespace(native_id=7, ident=70)],
+                              clock=lambda: clock[0], wall=lambda: clock[1], process=lambda: clock[0] - 100.0,
+                              out=io.StringIO())
+        for second in range(20):
+            clock[0] += 1
+            clock[1] += 1
+            looked = sys._getframe().f_lineno + 1
+            w.look(0.001, 1.0)
+            if second % 5 == 4:
+                with hub.LOCK:
+                    hub.fault_flush(hub.now())
+        later = [0.0, hub.now() - 10]
+        w = diagnostics.Watch(cpu=lambda ids: None, clock=lambda: later[0], wall=lambda: later[1],
+                              process=lambda: 0.0, out=io.StringIO())
+        for _ in range(2):          # a pause that goes on, whose first count a write that the database refused lost
+            later[0] += 3.1
+            later[1] += 3.1
+            w.look(3.0, 0.1)
+            diagnostics.pending() if _ == 0 else None
+        with hub.LOCK:
+            hub.fault_flush(hub.now())
+        code, answer = self.request("/ui/diagnostics?db=test-generation")
+        self.assertEqual((code, answer["faults"], answer["refusals"]), (200, [], []))
+        stalls = {s["kind"]: s for s in answer["stalls"]}
+        self.assertEqual(sorted(stalls), ["busy", "paused"])
+        busy, paused = stalls["busy"], stalls["paused"]
+        self.assertEqual((busy["count"], round(busy["last"] - busy["first"])), (1, 19))      # it ran 9 s of the first window
+        self.assertEqual(busy["frames"][-1], {"file": HERE, "line": looked})      # this test's frame, innermost
+        self.assertEqual((paused["count"], round(paused["last"] - paused["first"]), paused["frames"]),
+                         (1, 6, [{"file": "lib", "line": 0}]))
+        with hub.LOCK:
+            self.assertEqual([x for x in hub.health_view()["warnings"] if x["kind"] == "hub_fault"], [])
+            body = hub.error_report_body(0)
+        self.assertEqual((body["faults"], body["refusals"]), ([], []))
+        self.assertNotIn("stall", json.dumps(body))
+
+    def test_the_table_keeps_the_newest_stall_rows_and_every_fault(self):
+        """A stall's places vary from one stall to the next, so its rows are not bounded by the code's places as a
+        fault's are: the table keeps the newest STALL_ROWS of them, and no fault goes with them."""
+        t, code = hub.now(), diagnostics.code_id()
+        for n in range(diagnostics.STALL_ROWS + 5):
+            hub.ins("INSERT INTO faults(sig,kind,program,name,frames,count,first,last,code) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (f"stall-{n}", "stall", "hub", "busy", f'[["hub.py",{n + 1}]]', 1, t - 900 + n, t - 900 + n, code))
+        hub.ins("INSERT INTO faults(sig,kind,program,name,frames,count,first,last,code) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("a-fault", "fault", "hub", "KeyError", '[["hub.py",1]]', 1, t - 990, t - 990, code))
+        diagnostics._count(("stall", "hub", "hold", diagnostics.NO_PLACE), t)
+        with hub.LOCK:
+            hub.fault_flush(t)
+        stalls = {r["sig"] for r in hub.q("SELECT sig FROM faults WHERE kind='stall'")}
+        self.assertEqual(len(stalls), diagnostics.STALL_ROWS)
+        self.assertNotIn("stall-0", stalls)
+        self.assertNotIn("stall-5", stalls)
+        self.assertIn(f"stall-{diagnostics.STALL_ROWS + 4}", stalls)
+        self.assertEqual([r["sig"] for r in hub.q("SELECT sig FROM faults WHERE kind='fault'")], ["a-fault"])
 
     def test_a_flush_with_nothing_counted_writes_nothing(self):
         with hub.LOCK:

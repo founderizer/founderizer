@@ -118,6 +118,9 @@ OLD = {
     "takeover_no_browser": "{agent}'s browser does not run now, so there is no screen to take over",
     "takeover_provider": "{agent}'s browser shows an AI provider's site, which is never taken over",
     "takeover_screen_failed": "{agent}'s server could not share its screen: press Take over again",
+    # a message about a task or a job, to an agent whose chat cannot read it (owner feature message_about, UI-API.md
+    # 1.279)
+    "about_unreadable": "{agent} cannot read this work in its chat, so it cannot get a message about it",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
@@ -161,8 +164,8 @@ SITES = {
     'phone_ended': {'hub_changed': 1},
     'phone_knowledge': {'hub_changed': 1, 'knowledge_unread': 1},
     'phone_mobile': {'hub_changed': 1},
-    'phone_submit': {'command_reused_content': 2, 'hub_changed_sending': 1, 'login_as_text': 3, 'request_answered': 1,
-                     'request_unknown': 1, 'signature_unchecked': 1},
+    'phone_submit': {'about_unreadable': 1, 'command_reused_content': 2, 'hub_changed_sending': 1, 'login_as_text': 3,
+                     'request_answered': 1, 'request_unknown': 1, 'signature_unchecked': 1},
     'phone_task': {'hub_changed': 1, 'no_such_task': 1},
     'prepare_server_agent': {'no_such_agent': 1, 'no_such_server': 1, 'server_no_service': 1, 'server_silent': 1},
     'profile_unknown_file': {'knowledge_unread': 1},
@@ -489,7 +492,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 210)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 211)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one
