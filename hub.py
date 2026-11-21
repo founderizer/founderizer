@@ -40997,8 +40997,11 @@ def standing_source(agent, source, words=None):
         if not people_items_on():
             raise ToolError("Items from people start with the fleet setting contacts.v2, which is off. Keep this one "
                             "as your own, or not at all.")
+        # a narrowed pair's rows reach no session with more (person access plan, section 5; the row mark)
+        cond, args = narrowed_rows_sql("m", session_scope(agent))
         said = read_row("SELECT m.text, m.who, c.id conversation, c.agent, c.person FROM conversation_messages m "
-                        "JOIN conversations c ON c.id=m.conversation WHERE m.id=?", (n,))
+                        "JOIN conversations c ON c.id=m.conversation WHERE m.id=?" + (f" AND {cond}" if cond else ""),
+                        (n, *args))
         person = read_row("SELECT * FROM people WHERE id=?", (said["person"],)) if said else None
         if not said or said["agent"] != agent or said["who"] != "person" or not person or \
                 person["blocked"] is not None or not person_may(person["id"], agent):
@@ -41217,9 +41220,10 @@ def standing_news_rows(r, said, by_agent, by_task, t0):
             if name != by_agent:
                 DB.execute(EVENT, (name, "say", None, said(name), t0, "{}"))
             continue
-        for t in DB.execute(f"SELECT id FROM tasks WHERE owner=? AND {OPEN_TASK} AND source_message IS NULL",
-                            (name,)).fetchall():
-            if t["id"] != by_task:      # marked: it starts no session for a parked task (message_waits)
+        for t in DB.execute(f"SELECT id, owner, scope_person, source_conversation FROM tasks WHERE owner=? AND "
+                            f"{OPEN_TASK} AND source_message IS NULL", (name,)).fetchall():
+            # a task that a narrowed person's words drive reads no standing item (start_text), and so no news of one
+            if t["id"] != by_task and task_scope(t) is None:    # marked: it starts no session for a parked task
                 DB.execute(EVENT, (name, "say", t["id"], said(name), t0, json.dumps({"standing": r["id"]})))
 
 
@@ -41471,9 +41475,10 @@ def standing_asked(agent, a, field):
         raise ToolError("Your Shell box is off: only a task that a colleague's question opened, and that reads no "
                         "record, keeps or ends a lasting wish, and only that colleague's own.")
     m = SOURCE_REF.match(str(a.get(field) or ""))
+    cond, args = narrowed_rows_sql("r", session_scope(agent))       # a narrowed pair's message decides nothing here
     if not m or m.group(1).upper() != "CM" or not q1(
-            "SELECT 1 FROM conversation_messages WHERE id=? AND conversation=? AND who='person'",
-            (int(m.group(2)), conv["id"])):
+            "SELECT 1 FROM conversation_messages r WHERE r.id=? AND r.conversation=? AND r.who='person'"
+            + (f" AND {cond}" if cond else ""), (int(m.group(2)), conv["id"], *args)):
         raise ToolError(f"{field} names the message of {person['name']} that this comes from: CM-<number>, of the "
                         f"conversation C-{conv['id']} that opened this task.")
     return conv, person
@@ -75733,7 +75738,13 @@ class Handler(BaseHTTPRequestHandler):
         """The GitHub repositories and tools of a task session that starts now (owner feature integrations), as the
         owner set them in team.json now: {repos, tools, tokens, errors}. tokens: one GitHub App installation token for
         each account and access, limited to the agent's repositories with that access, for one hour. The hub keeps no
-        token and never logs one."""
+        token and never logs one.
+
+        A body {"renew": true} (owner API 1.276): the helper renews the tokens of its live task sessions before their
+        hour ends (fleet.Helper.renew_tokens). The hub decides again from the agent's grants of now, with the same
+        checks, and an agent that is not active gets no repository. The answer is {repos, tokens, errors, renew}:
+        GitHub tokens only, and no access token of an OAuth MCP server, which a session gets at its start only. Its log
+        line gives the count of the tokens."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
@@ -75742,11 +75753,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.refuse(agent, "os_user_shared", f"{shown_role(agent)} {os_user_hold_reason(agent)}, "
                                                         f"so the hub gives it no credential until it runs in a "
                                                         f"user account of its own")
-        a = agents()[agent]
+        a, renew = agents()[agent], self.form().get("renew") is True
         if a.get("role") not in ("worker", "lead"):
             return self.json(409, {"error": "only a worker or a lead has task sessions"})
         repos, tools, tokens, errors = dict(a.get("repos") or {}), list(a.get("tools") or []), [], []
-        if shell_off(agent):        # support plan F1: no repository and no GitHub token for a Shell-off session
+        # support plan F1: no repository and no GitHub token for a Shell-off session; and none renewed for an agent
+        # that the owner made inactive
+        if shell_off(agent) or (renew and not agent_active(agent)):
             repos = {}
         if repos:
             door_round_wait(agent, repos)       # a grant of a moment ago: the Mac's round gives it to the door
@@ -75755,14 +75768,21 @@ class Handler(BaseHTTPRequestHandler):
             except GitHubError as e:
                 errors = [{"repos": sorted(repos), "error": str(e)}]
             errors = door_round_errors(agent, errors)       # a grant that the door gets at the Mac's next round
-            log(agent, "GitHub tokens for a task session: " + ("; ".join(
-                f"{t['access']} {', '.join(t['repos'])}" for t in tokens) or "none") +
-                "".join(f"; refused for {', '.join(e['repos'])}: {e['error']}" for e in errors))
+            if renew:
+                log(agent, f"GitHub tokens renewed for a task session: {len(tokens)}" +
+                    (f", {len(errors)} group(s) refused" if errors else ""))
+            else:
+                log(agent, "GitHub tokens for a task session: " + ("; ".join(
+                    f"{t['access']} {', '.join(t['repos'])}" for t in tokens) or "none") +
+                    "".join(f"; refused for {', '.join(e['repos'])}: {e['error']}" for e in errors))
             # plan 13, item 4: a token that the door made shows that its App key works, and the renewal may start (a
             # refused repository is a grant or a reach, not the key)
             if tokens and door_conf() is not None and not kv_get("door_first_token"):
                 kv_set("door_first_token", str(round(now())))
                 log("hub", f"the first task session's GitHub tokens through the door worked ({agent})")
+        if renew:
+            return self.json(200, {"repos": repos, "tokens": tokens, "errors": errors, "renew": True},
+                             {"Cache-Control": "no-store"})
         # Each oauth MCP server that this agent has gets one access token for this session (owner feature mcp): the
         # hub refreshes it from its own file, and no refresh token and no client secret leaves the hub. The hub logs
         # no token.

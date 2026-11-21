@@ -248,6 +248,31 @@ class Narrowed(Base):
                              ("narrowedx", False)):
             self.assertEqual(fleet.narrowed_mode(mode), locked, mode)
 
+    def test_a_narrowed_pairs_message_keeps_no_item_and_its_task_hears_of_none(self):
+        """person-scope-row-mark-spec.md: the row mark is the one rule of each read, and standing items are one. Bugs:
+        standing_source read a person's message by its id alone, so a session with more than the narrowed person's
+        list kept a lasting wish in words that only the locked window may read; and standing_news_rows gave the pair's
+        own task the words of each new item of the agent, which that task's start leaves out (start_text)."""
+        cid = self.says(PAT, "From now on put the giraffe links in every reply.")["conversation"]
+        cm = hub.q1("SELECT id, scope_person FROM conversation_messages WHERE who='person' ORDER BY id DESC LIMIT 1")
+        self.assertEqual(cm["scope_person"], self.pat["id"])          # the row carries the narrowed person's mark
+        tid, task = self.normal_task(title="Look for the links")
+        text, error = hub.call_tool("studio", "keep_instruction", {"words": "put the giraffe links in every reply",
+                                                                  "scope": "agent", "source": f"CM-{cm['id']}",
+                                                                  "task_id": task[1]}, task)
+        self.assertTrue(error, text)
+        self.assertIn(f"CM-{cm['id']} is no message of a person's in your own conversation", text)
+        self.assertIsNone(hub.q1("SELECT 1 FROM standing"))
+        pair = self.conversation_task(cid)
+        self.assertEqual(pair["scope_person"], self.pat["id"])
+        hub.q("UPDATE tasks SET source_message=NULL WHERE id=?", (pair["id"],))    # as a task that the pair opened
+        text, error = hub.call_tool("studio", "keep_instruction", {"words": "Answer within the day.", "scope": "agent",
+                                                                  "task_id": task[1]}, task)
+        self.assertFalse(error, text)
+        news = [r["task"] for r in hub.q("SELECT task FROM events WHERE agent='studio' AND kind='say' AND text LIKE "
+                                         "'%New standing item%'")]
+        self.assertNotIn(pair["id"], news)
+
     def test_the_helper_runs_it_locked_with_the_narrowed_allow_list(self):
         self.assertEqual(fleet.NARROWED_TOOLS, hub.SCOPE_TOOLS)     # dontAsk refuses a mismatch in silence
         command = fleet.conversation_command("studio", hub.TEAM["agents"]["studio"], "test-generation", 7,

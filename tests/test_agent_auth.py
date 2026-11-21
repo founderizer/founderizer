@@ -696,19 +696,24 @@ class HelperSide(unittest.TestCase):
         self.assertEqual(fleet.launch_words(cases[1][1])[0], "codex")
 
     def test_windows_without_a_credential_are_legacy_and_unused_files_go(self):
+        """A file of SESSIONS goes a minute after it was made once no window's start command names it. The file of a
+        task window's GitHub tokens (fleet.tokens_file), which no command names, stays while its window lives, because
+        the helper renews it there (Helper.renew_tokens), and goes at the first sweep after its window ended, with no
+        minute's wait, so that no token of a task that ended stays on the disk."""
         helper = fleet.Helper("alpha", self.conf("claude"))
         self.home.mkdir(mode=0o700)
         (self.home / "sessions").mkdir(mode=0o700)
-        used, stale, fresh, other = (self.home / "sessions" / n for n in
-                                     ("alpha.T-3.aa.json", "alpha.T-1.bb.json", "alpha.T-4.cc.env", "beta.T-1.dd.json"))
-        for p in (used, stale, fresh, other):
+        used, stale, fresh, other, live, ended = (
+            self.home / "sessions" / n for n in ("alpha.T-3.aa.json", "alpha.T-1.bb.json", "alpha.T-4.cc.env",
+                                                 "beta.T-1.dd.json", "alpha.T-3.ee.tokens", "alpha.T-1.ff.tokens"))
+        for p in (used, stale, fresh, other, live, ended):
             p.write_text("x")
         # T-3 names the MCP configuration of its credential, which legacy_windows reads (fleet.holds_credential); a
         # standing session's first prompt, also a file of that folder, is none (test_window_size)
         used.write_text(json.dumps({"mcpServers": {"fleet": {"type": "http", "url": "http://hub:8765/mcp/alpha/g/T-3/1",
                                                              "headers": {"Authorization": "Bearer " + "s" * 43}}}}))
         old = time.time() - 120
-        for p in (used, stale, other):
+        for p in (used, stale, other, live):        # the tokens of the window that ended were written just now
             os.utime(p, (old, old))
         listing = f"manager\tclaude ...\nT-3\tclaude --mcp-config {used} ...\nowner-chat\tenv FLEET_GENERATION=g codex\n"
         answer = subprocess.CompletedProcess([], 0, listing, "")
@@ -716,7 +721,7 @@ class HelperSide(unittest.TestCase):
             self.assertEqual(helper.legacy_windows(), ["manager", "owner-chat"])
             helper.sweep_sessions()
         self.assertEqual(sorted(p.name for p in (self.home / "sessions").iterdir()),
-                         sorted([used.name, fresh.name, other.name]))
+                         sorted([used.name, fresh.name, other.name, live.name]))
         gone = subprocess.CompletedProcess([], 1, "", "can't find session: fleet-alpha")
         with patch.object(fleet, "tmux", return_value=gone):
             self.assertEqual(helper.legacy_windows(), [])            # tmux says that the session does not exist

@@ -34,6 +34,7 @@ APP_ID = "4242"
 SESSION = "11111111-2222-4333-8444-555555555555"
 TAIL = "." + "y-z" * 110            # GitHub's current installation tokens: about 400 characters, with - and .
 WRITE, READ = "ghs_" + "w" * 36 + TAIL, "ghs_" + "r" * 36 + TAIL
+NEW_WRITE, NEW_READ = "ghs_" + "W" * 36 + TAIL, "ghs_" + "R" * 36 + TAIL      # the tokens of a renewal
 CLAUDE = {"role": "worker", "runtime": "claude", "machine": "w1", "can": ["shell"], "allow": ["mcp__fleet__*"],
           "start": "claude --permission-mode dontAsk {chrome} {settings} {prompt}"}
 CODEX_CONF = {"role": "worker", "runtime": "codex", "machine": "w2", "can": ["shell"], "start": CODEX}
@@ -55,6 +56,11 @@ def start_text(words):
 
 def setUpModule():
     scratch_home()      # no test of this file reads or writes the real ~/.fleet (leftovers.scratch_home)
+
+
+def at(seconds):
+    """A time this many seconds from now, as GitHub writes a token's expires_at."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
 
 
 def git(*args, cwd=None, env=None):
@@ -543,6 +549,35 @@ class HubSide(OwnerAPI):
         self.assertEqual(self.tokens("ghost")[0], 404)
         self.assertFalse([c for c in self.calls if c[0] == "POST"])
 
+    def test_a_renewal_gets_github_tokens_only_for_the_grants_of_now_and_logs_no_token(self):
+        """A helper renews the tokens of its live task sessions before their hour ends (fleet.Helper.renew_tokens)
+        with {"renew": true} (owner API 1.276). The hub decides again from the agent's grants of that moment (the rule
+        of the area "Vault, keys and access", 20 November 2026): a repository taken back gets no token, and an agent
+        whose Shell box is off, that is not active or that the hub holds gets none. The answer has GitHub tokens only,
+        and its log line counts them and holds no token."""
+        self.agents(dev={"repos": {"acme/web": "write", "acme/lib": "read"}, "tools": ["github"]})
+        code, data = self.request("/helper/integrations/dev", {"renew": True})
+        self.assertEqual(code, 200, data)
+        self.assertEqual(sorted(data), ["errors", "renew", "repos", "tokens"])      # no tools, no MCP access token
+        self.assertEqual([(t["access"], t["repos"]) for t in data["tokens"]],
+                         [("write", ["acme/web"]), ("read", ["acme/lib"])])
+        lines = [r["what"] for r in hub.q("SELECT what FROM log WHERE agent='dev' ORDER BY id")]
+        self.assertEqual(lines[-1], "GitHub tokens renewed for a task session: 2")
+        self.assertFalse([line for line in lines if "ghs_" in line])
+        self.agents(dev={"repos": {"acme/web": "write"}})          # the owner took acme/lib back
+        code, data = self.request("/helper/integrations/dev", {"renew": True})
+        self.assertEqual((data["repos"], [t["repos"] for t in data["tokens"]]), ({"acme/web": "write"}, [["acme/web"]]))
+        self.calls.clear()
+        for fields in ({"can": []}, {"can": ["shell"], "active": False}):
+            with self.subTest(fields=fields):
+                self.agents(dev=fields)
+                code, data = self.request("/helper/integrations/dev", {"renew": True})
+                self.assertEqual((code, data["repos"], data["tokens"]), (200, {}, []))
+        self.assertEqual(self.calls, [])                            # and GitHub was not asked
+        self.agents(dev={"active": True})
+        with patch.object(hub, "os_user_held", return_value=True):
+            self.assertEqual(self.request("/helper/integrations/dev", {"renew": True})[0], 403)
+
 
 class HelperSide(unittest.TestCase):
     def setUp(self):
@@ -590,6 +625,39 @@ class HelperSide(unittest.TestCase):
             values[name] = shlex.split(value)[0] if value else ""
         return values
 
+    def start_tokens(self, answer, window="T-3"):
+        """A task start in this window with this answer of the hub: the values of its environment, and the path of the
+        file of its tokens (fleet.tokens_file), or None when it has none."""
+        with patch.object(fleet, "checkout_conf", return_value={"repos": {"acme/web": "write"}}), \
+                patch.object(fleet, "http", answer), patch.object(fleet, "prepare_repos", return_value={}), \
+                patch.object(fleet, "exe", return_value=None):
+            values = fleet.integration_env("dev", CLAUDE, window=window)
+        return values, Path(values["FLEET_GIT_TOKENS_FILE"]) if "FLEET_GIT_TOKENS_FILE" in values else None
+
+    def renewing(self, windows):
+        """A helper of dev whose tmux lists these windows (the test may change the dict), and the lines it says."""
+        helper, said = fleet.Helper("dev", CLAUDE), []
+        helper.started, helper.say = (lambda: windows), said.append
+        return helper, said
+
+    def stand_in(self, *answers):
+        """A stand-in hub that gives these answers in turn: (code, body), an exception that it raises, or a function
+        that gives (code, body). Each call goes into self.asked."""
+        answers = list(answers)
+
+        def http(method, path, data=None, timeout=40):
+            self.asked.append((method, path, data))
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer() if callable(answer) else answer
+        return http
+
+    def round_at(self, helper, clock, *answers):
+        """One round of the helper's renewal at this time of the clock, with these answers of the stand-in hub."""
+        with patch.object(fleet.time, "time", lambda: clock), patch.object(fleet, "http", self.stand_in(*answers)):
+            return helper.renew_tokens()
+
     def test_a_claude_task_gets_github_only_through_its_env_file_and_strict_mcp_configuration(self):
         command = self.command(CLAUDE)
         for secret in (WRITE, READ, "s" * 43):
@@ -633,6 +701,20 @@ class HelperSide(unittest.TestCase):
                                    "FLEET_GIT_TOKENS": json.dumps({"acme/web": WRITE})}, [])
         self.assertIn("GH_TOKEN and git's credentials", whole)
         self.assertNotIn("fleet.py gh", whole)
+        # with the file that the helper renews (fleet.tokens_file), only GH_TOKEN stops after its hour
+        old = "GH_TOKEN and git's credentials for these repositories stop working one hour after this start."
+        gh = shlex.join([sys.executable, os.path.join(fleet.KIT, "fleet.py"), "gh"]) + " <gh arguments>"
+        renewing = fleet.github_text(dict(values, FLEET_GIT_TOKENS_FILE=str(self.tmp / "dev.T-3.aa.tokens")), [])
+        self.assertIn(old, prompt)
+        self.assertNotIn(old, renewing)
+        self.assertIn("GH_TOKEN (plain gh and the GitHub tool) stops working one hour after this start; git and gh run "
+                      f"as `{gh}` get new tokens while this window is open.", renewing)
+        # a start whose every group GitHub refused learns that its tokens can still come, without a restart
+        none = dict({k: v for k, v in values.items() if k != "GH_TOKEN"}, FLEET_GIT_TOKENS="{}")
+        later = ("This session has no GitHub token yet. The helper asks again within about an hour; git and gh run as "
+                 f"`{gh}` then get the tokens, so a restart is not needed for this.")
+        self.assertEqual((later in fleet.github_text(dict(none, FLEET_GIT_TOKENS_FILE="/x/dev.T-3.aa.tokens"), []),
+                          later in fleet.github_text(none, [])), (True, False))
 
     def test_a_codex_task_gets_the_tool_as_options_and_a_runner_gets_no_tool(self):
         command = self.command(CODEX_CONF)
@@ -860,7 +942,7 @@ class HelperSide(unittest.TestCase):
                 patch.object(helper, "sync_checkout", side_effect=lambda: order.append("sync")), \
                 patch("fleet.session_credential", return_value=None), \
                 patch("fleet.session_env",
-                      side_effect=lambda agent, conf, kind, place=None, closed=False, attempt=None:
+                      side_effect=lambda agent, conf, kind, place=None, closed=False, attempt=None, window=None:
                       order.append(kind) or {}), \
                 patch("fleet.session_command", side_effect=lambda *a, **kw: order.append("command") or "true"), \
                 patch("fleet.start_window", side_effect=lambda session, name, command: order.append(command)), \
@@ -897,10 +979,17 @@ class HelperSide(unittest.TestCase):
             self.assertEqual(helper.start_waits, {})
 
     def test_the_credential_helper_answers_only_get_for_github_with_a_token(self):
-        def ask(action, text, tokens):
+        """git's credential helper gives the session's token for the github.com repository that git names, and
+        nothing else. It reads the file that the helper renews (FLEET_GIT_TOKENS_FILE, fleet.tokens_file) before
+        FLEET_GIT_TOKENS of the start, which the session keeps for its whole life: a session past its hour pushes with
+        the renewed token. A file that is missing or cannot be read leaves the start's tokens, as for a session of an
+        older helper."""
+        def ask(action, text, tokens, held=None):
+            env = dict(os.environ, FLEET_GIT_TOKENS=tokens)
+            env.pop("FLEET_GIT_TOKENS_FILE", None)
+            env.update({"FLEET_GIT_TOKENS_FILE": str(held)} if held else {})
             return subprocess.run([sys.executable, os.path.join(fleet.KIT, "fleet.py"), "git-credential", action],
-                                  input=text, capture_output=True, text=True, timeout=60,
-                                  env=dict(os.environ, FLEET_GIT_TOKENS=tokens)).stdout
+                                  input=text, capture_output=True, text=True, timeout=60, env=env).stdout
         tokens = json.dumps({"acme/web": WRITE})
         self.assertEqual(ask("get", "protocol=https\nhost=github.com\npath=Acme/Web.git\n", tokens),
                          f"username=x-access-token\npassword={WRITE}\n")
@@ -910,7 +999,181 @@ class HelperSide(unittest.TestCase):
                              ("get", "protocol=https\nhost=github.com\npath=acme/lib.git\n")):
             self.assertEqual(ask(action, text, tokens), "", (action, text))
         self.assertEqual(ask("get", "protocol=https\nhost=github.com\npath=acme/web.git\n", "not json"), "")
+        web, lib = ("protocol=https\nhost=github.com\npath=acme/web.git\n",
+                    "protocol=https\nhost=github.com\npath=acme/lib.git\n")
+        both = json.dumps({"acme/web": WRITE, "acme/lib": READ})
+        held = self.tmp / "dev.T-3.0123456789abcdef.tokens"
+        held.write_text(json.dumps({"tokens": {"acme/web": NEW_WRITE}, "first": NEW_WRITE}))
+        self.assertEqual(ask("get", web, both, held), f"username=x-access-token\npassword={NEW_WRITE}\n")
+        self.assertEqual(ask("get", lib, both, held), "")           # the file holds what the session has now
+        (self.tmp / "broken.tokens").write_text('{"tokens": ')
+        (self.tmp / "list.tokens").write_text("[]")
+        for name in ("missing.tokens", "broken.tokens", "list.tokens"):
+            with self.subTest(file=name):
+                self.assertEqual(ask("get", web, both, self.tmp / name), f"username=x-access-token\npassword={WRITE}\n")
 
+    def test_a_start_writes_its_tokens_into_a_file_that_the_helper_renews_before_they_end(self):
+        """A session that works past its hour, or that a reminder or an answer wakes in its window, keeps the
+        environment of its start: until 20 November 2026 its git push then failed, and agents asked for a restart.
+        The start also writes its tokens, with their ends, into a mode-600 file that FLEET_GIT_TOKENS_FILE names
+        (fleet.tokens_file); FLEET_GIT_TOKENS and GH_TOKEN stay for an older reader. When a token of a live task
+        window ends within ten minutes, the helper asks the hub once, with {"renew": true}, and writes the file again
+        whole with the new tokens (Helper.renew_tokens); the next round asks nothing. A new start in the same window
+        removes the file of the start before. A start whose every group GitHub refused gets the file too, with no
+        token, and an hour later a renewal brings its tokens (until the review of 21 November 2026 it got no file and
+        never renewed); a start with no repository gets none."""
+        soon = self.answer(tokens=[{"token": WRITE, "access": "write", "repos": ["acme/web"], "expires_at": at(300)},
+                                   {"token": READ, "access": "read", "repos": ["acme/lib"], "expires_at": at(300)}])
+        _, before = self.start_tokens(soon)
+        values, path = self.start_tokens(soon)
+        self.assertFalse(before.exists())
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual((values["GH_TOKEN"], json.loads(values["FLEET_GIT_TOKENS"])),
+                         (WRITE, {"acme/web": WRITE, "acme/lib": READ}))
+        held = json.loads(path.read_text())
+        self.assertEqual((held["tokens"], held["first"], held["repos"]),
+                         ({"acme/web": WRITE, "acme/lib": READ}, WRITE, {"acme/web": "write", "acme/lib": "read"}))
+        self.assertAlmostEqual(held["ends"], time.time() + 300, delta=10)
+        renewed = {"repos": {"acme/web": "write", "acme/lib": "read"}, "errors": [], "renew": True, "tokens": [
+            {"token": NEW_WRITE, "access": "write", "repos": ["acme/web"], "expires_at": at(3600)},
+            {"token": NEW_READ, "access": "read", "repos": ["acme/lib"], "expires_at": at(3600)}]}
+        windows = {"T-3": "claude"}
+        helper, said = self.renewing(windows)
+        self.asked.clear()
+        with patch.object(fleet, "http", self.stand_in((200, renewed))):
+            self.assertEqual(helper.renew_tokens(), 1)
+            self.assertEqual(helper.renew_tokens(), 0)          # an hour left: no call
+        self.assertEqual(self.asked, [("POST", "/helper/integrations/dev", {"renew": True})])
+        session = {"FLEET_GIT_TOKENS_FILE": str(path), "FLEET_GIT_TOKENS": values["FLEET_GIT_TOKENS"]}
+        self.assertEqual(fleet.session_tokens(session), ({"acme/web": NEW_WRITE, "acme/lib": NEW_READ}, NEW_WRITE))
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(os.listdir(fleet.SESSIONS), [path.name])          # and no other file beside it
+        self.assertEqual(said, ["GitHub tokens of dev renewed for 1 task window(s)"])
+        windows.clear()
+        windows["T-7"] = "claude"                       # alone: no other window's time helps it
+        values, empty = self.start_tokens(self.answer(tokens=[], errors=[
+            {"repos": ["acme/lib", "acme/web"], "error": "GitHub answered 502"}]), window="T-7")
+        held = json.loads(empty.read_text())
+        self.assertEqual((held["tokens"], held["first"], held["ends"], "GH_TOKEN" in values), ({}, None, None, False))
+        self.assertAlmostEqual(held["asks"], time.time() + 3600, delta=10)
+        start, asked = time.time(), len(self.asked)
+        self.assertEqual(self.round_at(helper, start + 3000), 0)        # not before its hour
+        self.assertEqual(self.round_at(helper, start + 3600, lambda: (200, dict(renewed, tokens=[
+            dict(t, expires_at=at(3600)) for t in renewed["tokens"]]))), 1)
+        self.assertEqual(len(self.asked), asked + 1)
+        self.assertEqual(json.loads(empty.read_text())["tokens"], {"acme/web": NEW_WRITE, "acme/lib": NEW_READ})
+        self.assertIsNone(self.start_tokens(self.answer(repos={}), window="T-8")[1])
+
+    def test_a_renewal_that_fails_keeps_the_old_file_and_only_a_refusal_waits_ten_rounds(self):
+        """No hub, a refusal (403), a fault of the hub (500) and an answer that is no answer write nothing: the session
+        keeps its old tokens, never an empty or half file. After the refusal the next nine rounds ask nothing, and the
+        tenth asks again, so an agent that the hub holds, or whose key it refuses, costs one call in ten minutes and
+        not one each minute. After each other failure the next round asks again: the first ask comes ten minutes
+        before the first token ends, so ten rounds of waiting after one fault would let it end (the reviews of 21
+        November 2026). The log line counts the windows and gives the hub's code, never a token."""
+        _, path = self.start_tokens(self.answer(tokens=[
+            {"token": WRITE, "access": "write", "repos": ["acme/web"], "expires_at": at(120)}]))
+        kept = path.read_bytes()
+        helper, said = self.renewing({"T-3": "claude"})
+        failures = [OSError("no hub"), (403, {"error": "held", "auth": "os_user_shared"}), (500, {"error": "fault"}),
+                    (200, {"tokens": []}), (200, ["not an answer"])]
+        self.asked.clear()
+        with patch.object(fleet, "http", self.stand_in(*failures)):
+            for failure in failures:
+                with self.subTest(failure=failure):
+                    asked, refusal = len(self.asked), isinstance(failure, tuple) and failure[0] == 403
+                    for _ in range(fleet.TOKENS_FAILED_ROUNDS if refusal else 1):   # a refusal: nine rounds with none
+                        self.assertEqual(helper.renew_tokens(), 0)
+                    self.assertEqual((path.read_bytes(), len(self.asked)), (kept, asked + 1))
+        self.assertEqual(os.listdir(fleet.SESSIONS), [path.name])
+        line = "GitHub tokens of dev: 1 task window(s) not renewed ({}); {}"
+        self.assertEqual(said[:3], [line.format("OSError", "the next round asks again"),
+                                    line.format(403, "the helper asks again in 10 minutes"),
+                                    line.format(500, "the next round asks again")])
+        self.assertFalse([line for line in said if "ghs_" in line])
+
+    def test_a_renewal_gives_new_tokens_only_for_the_grants_and_the_windows_of_now(self):
+        """The rule of the area "Vault, keys and access" for a renewal (20 November 2026): it decides again from the
+        agent's grants of that moment, and the old file's token is not refreshed. A repository taken back loses its
+        token at once; a window that ended, and a file that the sweep removed while the hub answered, get nothing. A
+        repository that GitHub refused this time keeps its old token while that one lives, and the window asks again
+        at its end, not at each round. A window that an answer left with no token (an agent whose Shell box is off, or
+        that is not active) asks again about an hour later, not at each round, and its tokens come back with its
+        grants: until the review of 21 November 2026 such a window never asked again."""
+        three = self.answer(repos={"acme/web": "write", "acme/api": "write", "acme/lib": "read"}, tokens=[
+            {"token": WRITE, "access": "write", "repos": ["acme/api", "acme/web"], "expires_at": at(300)},
+            {"token": READ, "access": "read", "repos": ["acme/lib"], "expires_at": at(300)}])
+        _, path = self.start_tokens(three)
+        _, ended = self.start_tokens(three, window="T-4")
+        _, swept = self.start_tokens(three, window="T-5")
+        untouched = ended.read_bytes()
+        helper, said = self.renewing({"T-3": "claude", "T-5": "claude"})
+        refused = {"repos": {"acme/web": "write", "acme/lib": "read"}, "renew": True,     # acme/api taken back
+                   "tokens": [{"token": NEW_WRITE, "access": "write", "repos": ["acme/web"], "expires_at": at(3600)}],
+                   "errors": [{"repos": ["acme/lib"], "error": "GitHub answered 502"}]}
+        given = dict(refused, errors=[], tokens=refused["tokens"] + [
+            {"token": NEW_READ, "access": "read", "repos": ["acme/lib"], "expires_at": at(3600)}])
+        start = time.time()
+        self.asked.clear()
+        self.assertEqual(self.round_at(helper, start, lambda: swept.unlink() or (200, refused)), 1)     # T-3
+        held = json.loads(path.read_text())
+        self.assertEqual((held["tokens"], held["first"], held["waits"]),
+                         ({"acme/web": NEW_WRITE, "acme/lib": READ}, NEW_WRITE, ["acme/lib"]))
+        self.assertTrue(start + 290 < held["asks"] == held["ends"] <= start + 300, held)    # acme/lib's old end
+        self.assertEqual((ended.read_bytes(), swept.exists()), (untouched, False))
+        self.assertEqual(self.round_at(helper, start + 60), 0)          # not at each round
+        self.assertEqual(self.round_at(helper, start + 301, (200, given)), 1)
+        held = json.loads(path.read_text())
+        self.assertEqual((held["tokens"], held["waits"]), ({"acme/web": NEW_WRITE, "acme/lib": NEW_READ}, []))
+        empty = {"repos": {}, "tokens": [], "errors": [], "renew": True}
+
+        def back():                 # the grants again, with tokens of an hour from the clock of that round
+            return 200, dict(given, tokens=[dict(t, expires_at=at(3600)) for t in given["tokens"]])
+        self.assertEqual(self.round_at(helper, start + 3100, (200, empty)), 1)
+        held = json.loads(path.read_text())
+        self.assertEqual((held["tokens"], held["first"], held["waits"]), ({}, None, []))
+        self.assertAlmostEqual(held["asks"], start + 3100 + 3600, delta=1)          # an hour later
+        self.assertEqual(self.round_at(helper, start + 3160), 0)
+        self.assertEqual(self.round_at(helper, start + 6700, back), 1)
+        self.assertEqual(json.loads(path.read_text())["tokens"], {"acme/web": NEW_WRITE, "acme/lib": NEW_READ})
+        self.assertEqual((len(self.asked), said), (4, ["GitHub tokens of dev renewed for 1 task window(s)"] * 4))
+
+    def test_a_token_that_github_refuses_at_its_end_is_asked_for_again_every_five_minutes(self):
+        """A refusal of GitHub or the door at the end of a token must not stop the renewal for long (the review of 21
+        November 2026): a repository that had a token in the window and that the hub still grants waits in the file,
+        and the window asks again five minutes later, and every five minutes until a token comes, also when no other
+        window or token is due. A repository that GitHub refused since the start does not wait: it costs one ask an
+        hour, not one each five minutes."""
+        ended_at = time.time() - 5
+        late = Path(fleet.tokens_file("dev", "T-6", {"tokens": {"acme/lib": READ}, "first": READ, "ends": ended_at,
+                                                     "repos": {"acme/lib": "read"}, "until": {"acme/lib": ended_at},
+                                                     "waits": [], "asks": ended_at - 600}))
+        windows = {"T-6": "claude"}                     # alone: no other window's time helps it
+        helper, _ = self.renewing(windows)
+        refused = {"repos": {"acme/web": "write", "acme/lib": "read"}, "renew": True, "tokens": [],
+                   "errors": [{"repos": ["acme/lib", "acme/web"], "error": "GitHub answered 502"}]}
+        given = dict(refused, errors=[], tokens=[
+            {"token": NEW_READ, "access": "read", "repos": ["acme/lib"], "expires_at": at(3600)}])
+        start = time.time()
+        self.asked.clear()
+        for later, answer in ((0, (200, refused)), (60, None), (300, (200, refused)), (360, None), (600, (200, given))):
+            self.assertEqual(self.round_at(helper, start + later, *([answer] if answer else [])), 1 if answer else 0,
+                             later)
+            held = json.loads(late.read_text())
+            if later < 600:                             # its old token had ended: it waits, and asks again in five
+                self.assertEqual((held["tokens"], held["waits"]), ({}, ["acme/lib"]), later)
+                self.assertAlmostEqual(held["asks"], start + (later // 300) * 300 + 300, delta=1, msg=later)
+        self.assertEqual((held["tokens"], held["waits"], len(self.asked)), ({"acme/lib": NEW_READ}, [], 3))
+        windows.clear()
+        windows["T-7"] = "claude"
+        _, never = self.start_tokens(self.answer(tokens=[], errors=refused["errors"]), window="T-7")
+        start = time.time()
+        self.assertEqual(self.round_at(helper, start + 3600, (200, refused)), 1)
+        held = json.loads(never.read_text())
+        self.assertEqual((held["tokens"], held["waits"]), ({}, []))
+        self.assertAlmostEqual(held["asks"], start + 3600 + 3600, delta=1)          # an hour, not five minutes
+        asked = len(self.asked)                         # its start asked the hub too
+        self.assertEqual((self.round_at(helper, start + 3900), len(self.asked)), (0, asked))
 
 if __name__ == "__main__":
     unittest.main()

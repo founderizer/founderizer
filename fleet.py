@@ -605,7 +605,7 @@ PLACE_PUBLIC = re.compile(r"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{4
 ENV_RESERVED = lifecycle.ENV_RESERVED
 
 
-def session_env(agent, conf, kind, place=None, closed=False, attempt=None):
+def session_env(agent, conf, kind, place=None, closed=False, attempt=None, window=None):
     """{NAME: value} for the environment of a session of this agent that starts now (kind: task, chat or manager). Each
     session start uses this one hook: the API keys that the owner lets this agent read (read_env), and for a task
     session its GitHub repositories, their credentials and its tools (integration_env, owner feature integrations). A
@@ -615,11 +615,12 @@ def session_env(agent, conf, kind, place=None, closed=False, attempt=None):
     Support plan F1: a session of an agent whose Shell box is off gets no key and no GitHub token. A task session of
     it gets only what its own MCP servers need, which closed_task_command writes into its MCP file, never into its
     environment. closed: the hub's start says the Shell box is off, whatever this checkout's team.json says yet.
-    attempt: the attempt of a task session, so that a later one gets its clones' facts (attempt_note)."""
+    attempt: the attempt of a task session, so that a later one gets its clones' facts (attempt_note). window: the
+    task's window (T-<id>), whose GitHub tokens the helper renews from a file of SESSIONS (tokens_file)."""
     if closed or shell_off(conf):
         return integration_env(agent, conf, {}, closed=True) if kind == "task" else {}
     keys = read_env(agent, conf, kind)
-    later = {"attempt": attempt} if attempt else {}
+    later = dict({"attempt": attempt} if attempt else {}, **({"window": window} if window else {}))
     return dict(keys, **(integration_env(agent, conf, keys, place, **later) if kind == "task" else {}))
 
 
@@ -1575,7 +1576,7 @@ def team_refused():
     return refused
 
 
-def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=None):
+def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=None, window=None):
     """A task session's GitHub repositories and tools, as the hub gives them at its start (owner feature integrations):
     FLEET_REPOS, GH_TOKEN and git's credentials for them (FLEET_GIT_TOKENS, GIT_CONFIG_*), FLEET_TOOLS with the
     tools' own variables, and FLEET_GITHUB_NOTE for what the session lacks. With a place (task_place), which FLEET_WORK
@@ -1585,7 +1586,9 @@ def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=No
     (read_env), which a tool of the owner may need; they are already in the session's environment, so they are not
     given again. closed: a session of an agent whose Shell box is off (support plan F1), which gets its MCP servers and
     no repository or GitHub token. attempt: a later attempt of the task gets, for each clone that the task has, a
-    snapshot ref and one line of facts in FLEET_GITHUB_NOTE (attempt_note)."""
+    snapshot ref and one line of facts in FLEET_GITHUB_NOTE (attempt_note). window: the task's window (T-<id>): its
+    tokens also go into a file of SESSIONS, which FLEET_GIT_TOKENS_FILE names and the helper renews before they end
+    (tokens_file, Helper.renew_tokens)."""
     mine = checkout_conf(agent)
     if conf.get("role") not in ("worker", "lead") or not (mine.get("tools") or (mine.get("repos") and not closed)):
         return {}
@@ -1600,7 +1603,8 @@ def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=No
         return {"FLEET_GITHUB_NOTE": "The hub gave no GitHub access at this start."}
     repos = {r: v for r, v in data["repos"].items() if isinstance(r, str) and REPO_NAME.fullmatch(r) and v in REPO_ACCESS
              and not closed}
-    groups = [{"token": t["token"], "repos": [r for r in t["repos"] if isinstance(r, str) and r in repos]}
+    groups = [{"token": t["token"], "repos": [r for r in t["repos"] if isinstance(r, str) and r in repos],
+               "ends": token_end(t.get("expires_at"))}
               for t in data.get("tokens") or [] if isinstance(t, dict) and isinstance(t.get("token"), str)
               and GITHUB_TOKEN.fullmatch(t["token"]) and isinstance(t.get("repos"), list)]
     groups = [g for g in groups if g["repos"]]      # the first is GH_TOKEN's: the hub sends the highest access first
@@ -1667,6 +1671,12 @@ def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=No
             tools.append(name)
     if waits:           # every missing program installs now, each in its thread, and the start waits for them
         raise waits[0]
+    if window and repos:        # also when GitHub refused every group: a renewal can bring the tokens later
+        ends = min(g["ends"] for g in groups) if groups else None
+        values["FLEET_GIT_TOKENS_FILE"] = tokens_file(agent, window, {
+            "tokens": tokens, "first": groups[0]["token"] if groups else None, "repos": repos,
+            "until": {r: g["ends"] for g in groups for r in g["repos"]}, "ends": ends, "waits": [],
+            "asks": ends - TOKENS_RENEW_BEFORE if groups else int(time.time()) + TOKEN_LIFE})
     if tools:
         values["FLEET_TOOLS"] = " ".join(tools)
     if notes:
@@ -1685,6 +1695,105 @@ def git_credentials():
     for i, (key, value) in enumerate(pairs):
         values[f"GIT_CONFIG_KEY_{i}"], values[f"GIT_CONFIG_VALUE_{i}"] = key, value
     return values
+
+
+# A task session's GitHub tokens live one hour (GitHub's rule), and the session as long as its task: the helper types a
+# reminder or an answer into the same window, whose process keeps the environment of its start. Until 20 November
+# 2026 git push then failed, and agents asked for a restart (five times in two days). So a start also writes the
+# tokens, with the end of each one, into a mode-600 file of SESSIONS (tokens_file), which FLEET_GIT_TOKENS_FILE names
+# and which git's credential helper and `fleet.py gh` read first (session_tokens), and the helper writes it again with
+# new tokens before they end (Helper.renew_tokens). The file says when its window asks next ("asks", renewed_tokens):
+# ten minutes before its first token ends; at most five minutes after GitHub refused a token that ends; an hour later
+# for a window with no token, so its tokens come back when its grants or GitHub do. Plain gh and the GitHub MCP server
+# keep GH_TOKEN of the start.
+TOKENS_RENEW_EVERY = 60         # seconds between two rounds of the helper's look at the tokens of its task windows
+TOKENS_RENEW_BEFORE = 600       # a window asks this many seconds before its first token ends
+TOKENS_RETRY = 300              # seconds at most before a window asks again for a token that GitHub refused
+TOKEN_LIFE = 3600               # seconds: GitHub's life of a token, and the wait of a window with no token
+TOKENS_FAILED_ROUNDS = 10       # rounds from a refusal of the hub (a 4xx answer) to the agent's next ask
+TOKENS_LOCK = threading.Lock()  # the .tokens files have one writer at a time: a renewal, a start or the sweep
+
+
+def token_end(value):
+    """GitHub's expires_at of a token ("2026-11-20T23:00:00Z") in seconds since the epoch; for a value that is no such
+    time, one hour from now, which is GitHub's life of a token."""
+    try:
+        return int(datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+    except (ValueError, OverflowError, OSError):
+        return int(time.time()) + TOKEN_LIFE
+
+
+def tokens_window(agent, name):
+    """The window of a file of SESSIONS that holds the GitHub tokens of one of this agent's task windows
+    (<agent>.<window>.<hex>.tokens, tokens_file), or None for any other file."""
+    parts = name[len(agent) + 1:].split(".") if name.startswith(agent + ".") else []
+    return parts[0] if len(parts) == 3 and parts[0] and parts[2] == "tokens" else None
+
+
+def tokens_file(agent, window, data):
+    """The file of the GitHub tokens of a task window that starts now, mode 600, and its path. data: {"tokens": {repo:
+    token}, "first": the first group's token, which GH_TOKEN is too, "repos": {repo: level} of the start, "until":
+    {repo: the end of its token}, "ends": the first of those or None, "asks": when the window asks for new tokens
+    next, "waits": the repositories that wait for a new token (renewed_tokens)}. The window's older files go, so that a
+    new attempt in a window of the same name never keeps the tokens of the one before."""
+    with TOKENS_LOCK:
+        with contextlib.suppress(OSError):
+            for name in os.listdir(SESSIONS):
+                if tokens_window(agent, name) == window:
+                    with contextlib.suppress(OSError):
+                        os.remove(os.path.join(SESSIONS, name))
+        return session_file(agent, window, "tokens", json.dumps(data, sort_keys=True))
+
+
+def read_tokens(path):
+    """What a window's tokens file (tokens_file) holds, with only its valid values, or None for a file that cannot be
+    read: a renewal leaves such a file as it is."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(data, dict) and isinstance(data.get("tokens"), dict) and isinstance(data.get("repos"), dict)):
+        return None
+    number = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool)
+    until = data["until"] if isinstance(data.get("until"), dict) else {}
+    waits = data["waits"] if isinstance(data.get("waits"), list) else []
+    return {"tokens": {r: t for r, t in data["tokens"].items() if isinstance(t, str) and GITHUB_TOKEN.fullmatch(t)},
+            "first": data.get("first"), "repos": data["repos"], "until": {r: e for r, e in until.items() if number(e)},
+            "waits": [r for r in waits if isinstance(r, str)],
+            "ends": data.get("ends") if number(data.get("ends")) else None,
+            "asks": data.get("asks") if number(data.get("asks")) else None}
+
+
+def renewed_tokens(data, answer, now):
+    """A window's tokens file (read_tokens) after the hub's answer to a renewal. Each repository of the window's start
+    that the hub still grants gets its new token, and the window asks again TOKENS_RENEW_BEFORE seconds before the
+    first of them ends, never sooner than TOKENS_RETRY seconds from now. One that GitHub or the door refused this time,
+    and that had a token in this window, waits: it keeps its old token while that one lives, and the window asks again
+    at that token's end or TOKENS_RETRY seconds from now, whichever comes first, and then every TOKENS_RETRY seconds
+    until a token comes, also when no other token of the window ends. One that GitHub refused since the start does not
+    wait: a grant outside the App's reach costs one ask an hour, not one each five minutes. One that the hub grants no
+    more (a repository taken back, an agent whose Shell box is off or that is not active) loses its token at once and
+    waits no more. A window with no token and nothing that waits asks again TOKEN_LIFE seconds from now, so its tokens
+    come back when its grants or GitHub do. Only the repositories of the start: a new grant comes with the agent's next
+    session, as before."""
+    mine = {r for r in data["repos"] if r in answer["repos"]}
+    groups = [(t["token"], [r for r in t["repos"] if isinstance(r, str) and r in mine], token_end(t.get("expires_at")))
+              for t in answer["tokens"] if isinstance(t, dict) and isinstance(t.get("token"), str)
+              and GITHUB_TOKEN.fullmatch(t["token"]) and isinstance(t.get("repos"), list)]
+    groups = [g for g in groups if g[1]]        # the first is the one of the highest access, as at the start
+    tokens = {r: token for token, names, _ in groups for r in names}
+    until = {r: end for _, names, end in groups for r in names}
+    asks = [max(min(until.values()) - TOKENS_RENEW_BEFORE, now + TOKENS_RETRY)] if until else []
+    waits = sorted(r for r in mine if r not in tokens and (r in data["tokens"] or r in data["waits"]))
+    for repo in waits:
+        end = data["until"].get(repo, 0) if repo in data["tokens"] else 0
+        if end > now:
+            tokens[repo], until[repo] = data["tokens"][repo], end       # its old token, while that one lives
+        asks.append(min(end, now + TOKENS_RETRY) if end > now else now + TOKENS_RETRY)
+    first = groups[0][0] if groups else data["first"] if data["first"] in tokens.values() else None
+    return {"tokens": tokens, "first": first, "repos": data["repos"], "until": until, "waits": waits,
+            "ends": min(until.values()) if until else None, "asks": min(asks) if asks else now + TOKEN_LIFE}
 
 
 GIT_STALLED = 600       # seconds a git transfer may move no data before git ends it (prepare_repos)
@@ -2099,14 +2208,24 @@ def github_text(values, tools):
         text += ("deploy is write and the repository's own deployment: its .github/workflows files, which a write "
                  "token may not push at all, and the start of its GitHub Actions runs (gh workflow run, "
                  "gh run rerun). ")
+    gh = shlex.join([sys.executable, os.path.join(KIT, "fleet.py"), "gh"]) + " <gh arguments>"
     if "GH_TOKEN" in values and gh_token_partial(values):
-        gh = shlex.join([sys.executable, os.path.join(KIT, "fleet.py"), "gh"]) + " <gh arguments>"
         text += ("gh holds one token, GH_TOKEN, and yours covers only some of your repositories. For each other one, "
                  f"run gh as `{gh}`: it gives gh the token of the repository that the call is for, which is the one "
                  "that -R names, the one in a repos/<owner>/<name> path of gh api, or the clone that you are in. ")
-    if "GH_TOKEN" in values:
+    if "GH_TOKEN" in values and values.get("FLEET_GIT_TOKENS_FILE"):
+        # the helper renews the tokens of git and of `fleet.py gh` in the window's file (Helper.renew_tokens), and
+        # never GH_TOKEN, which the session's environment holds
+        text += ("GH_TOKEN (plain gh and the GitHub tool) stops working one hour after this start; git and gh run as "
+                 f"`{gh}` get new tokens while this window is open. Never show them or put them in a note, a file, a "
+                 "command or a commit. ")
+    elif "GH_TOKEN" in values:
         text += ("GH_TOKEN and git's credentials for these repositories stop working one hour after this start. Never "
                  "show them or put them in a note, a file, a command or a commit. ")
+    elif repos and values.get("FLEET_GIT_TOKENS_FILE"):
+        # a start whose every group GitHub refused: a renewal of the window's file can still bring them
+        text += ("This session has no GitHub token yet. The helper asks again within about an hour; git and gh run "
+                 f"as `{gh}` then get the tokens, so a restart is not needed for this. ")
     if tools:
         catalog = team_catalog()
         text += ("Your MCP servers besides Fleet's: " + ", ".join(
@@ -6397,23 +6516,101 @@ class Helper:
         return closed
 
     def sweep_sessions(self):
-        """Remove this agent's session files that no window names any more, a minute after they were made."""
-        windows = self.started()
-        if windows is None:
-            return                      # tmux did not answer: keep everything until it does
-        used = "\n".join(windows.values())
-        try:
-            names = os.listdir(SESSIONS)
-        except OSError:
-            return
-        for name in names:
-            path = os.path.join(SESSIONS, name)
-            if name.startswith(self.agent + ".") and name not in used:
-                with contextlib.suppress(OSError):
-                    if time.time() - os.lstat(path).st_mtime > 60:
-                        os.remove(path)
+        """Remove this agent's session files that no window names any more, a minute after they were made. The file of
+        a task window's GitHub tokens (tokens_file) is named by no start command: it stays while its window lives, and
+        goes at the first sweep after its window ended, with no minute's wait, so that no token of a task that ended
+        stays on the disk. A start writes it in this thread just before its window starts, so no sweep comes between."""
+        with TOKENS_LOCK:               # never between a renewal's look at the windows and its write (renew_tokens)
+            windows = self.started()
+            if windows is None:
+                return                  # tmux did not answer: keep everything until it does
+            used = "\n".join(windows.values())
+            try:
+                names = os.listdir(SESSIONS)
+            except OSError:
+                return
+            for name in names:
+                path, window = os.path.join(SESSIONS, name), tokens_window(self.agent, name)
+                if name.startswith(self.agent + ".") and name not in used and window not in windows:
+                    with contextlib.suppress(OSError):
+                        if window or time.time() - os.lstat(path).st_mtime > 60:
+                            os.remove(path)
         if runtime_fact(self.conf.get("runtime"), "driver") == "acp":
             sweep_acp_folders(self.conf.get("runtime"))     # and the own folders of sessions whose windows ended
+
+    def renew_tokens(self):
+        """One round of the renewal of the GitHub tokens of this agent's live task windows (tokens_file), which the
+        thread keep_tokens runs every TOKENS_RENEW_EVERY seconds. When the time at which a live window's file asks
+        ("asks", renewed_tokens) has come, one call asks the hub for the agent's tokens of now, GitHub tokens only
+        ({"renew": true}), and the file of each live window is written again whole, as a new file that takes the old
+        one's place, so that no reader sees half of one (renewed_tokens: what each repository gets). A failed call, a
+        refusal of the hub and an answer that is not one write nothing. After a refusal of the hub (a 4xx answer: an
+        agent that it holds, a key that it refuses) the next TOKENS_FAILED_ROUNDS - 1 rounds ask nothing, so such an
+        agent costs one call in ten minutes, not one each minute. After a failed call or a fault of the hub (no hub, a
+        timeout, a hub that starts again for a release, a 5xx answer) the next round asks again: the first ask comes
+        only TOKENS_RENEW_BEFORE seconds before the first token ends, and ten rounds would let it end. A window that
+        ended and a file that the sweep removed meanwhile get nothing. The time of each window's next ask is in its
+        file, so a helper that started again renews from there. The log gives counts, never a token. Returns how many
+        files were written again."""
+        wait = self.__dict__.get("tokens_wait", 0)
+        if wait:                    # rounds after a failed ask
+            self.tokens_wait = wait - 1
+            return 0
+        windows = self.started()
+        if not windows:
+            return 0
+        try:
+            names = sorted(os.listdir(SESSIONS))
+        except OSError:
+            names = []
+        held = []
+        for name in names:
+            window = tokens_window(self.agent, name)
+            data = read_tokens(os.path.join(SESSIONS, name)) if window in windows else None
+            if data is not None:
+                held.append((os.path.join(SESSIONS, name), window, data))
+        now = time.time()
+        if not any(data["asks"] is not None and data["asks"] <= now for _, _, data in held):
+            return 0
+        try:
+            code, answer = http("POST", f"/helper/integrations/{self.agent}", {"renew": True}, timeout=90)
+        except Exception as e:      # no hub, or an answer cut off
+            code, answer = type(e).__name__, None
+        if code != 200 or not isinstance(answer, dict) or not isinstance(answer.get("repos"), dict) or \
+                not isinstance(answer.get("tokens"), list):
+            refused = isinstance(code, int) and 400 <= code < 500
+            self.tokens_wait = TOKENS_FAILED_ROUNDS - 1 if refused else 0
+            self.say(f"GitHub tokens of {self.agent}: {len(held)} task window(s) not renewed ({code}); " +
+                     (f"the helper asks again in {TOKENS_FAILED_ROUNDS * TOKENS_RENEW_EVERY // 60} minutes" if refused
+                      else "the next round asks again"))
+            return 0
+        written = 0
+        with TOKENS_LOCK:           # a start and the sweep remove these files only under it
+            alive = self.started()
+            for path, window, data in held:
+                if alive is None or window not in alive or not os.path.exists(path):
+                    continue
+                new = f"{path}.{secrets.token_hex(4)}.new"
+                try:
+                    write_private(new, json.dumps(renewed_tokens(data, answer, now), sort_keys=True))
+                    os.replace(new, path)
+                    written += 1
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        os.remove(new)
+        self.say(f"GitHub tokens of {self.agent} renewed for {written} task window(s)")
+        return written
+
+    def keep_tokens(self):
+        """The thread of renew_tokens, for the life of the helper: a round every TOKENS_RENEW_EVERY seconds. A round
+        that fails is said, and the next one tries again."""
+        while True:
+            time.sleep(TOKENS_RENEW_EVERY)
+            try:
+                self.renew_tokens()
+            except Exception as e:
+                self.say(f"GitHub tokens of {self.agent}: the renewal failed ({type(e).__name__}); the next round "
+                         f"tries again")
 
     def chat_record_rules(self, runtime):
         """The parts of the rules that this agent's recorded owner chat began with (its record's rules), or None: a
@@ -7303,7 +7500,7 @@ class Helper:
                         env = session_env(self.agent, self.conf, "task",
                                           task_place(self.agent, extra.get("generation"), task),
                                           closed=isinstance(extra.get("shell_off"), dict),
-                                          attempt=extra.get("attempt", 1))
+                                          attempt=extra.get("attempt", 1), window=task)
                         return session_command(self.agent, conf, ev["text"],
                             task=task, needs=needs, attempt=extra.get("attempt",1),
                             generation=extra.get("generation",""), session=session, token=token, env=env,
@@ -10873,6 +11070,8 @@ def cmd_run(args):
     threading.Thread(target=h.lifecycle.run_forever, name="machine-status", daemon=True).start()
     threading.Thread(target=h.tailer.run, name="thread-records", daemon=True).start()
     threading.Thread(target=h.presence, name="presence", daemon=True).start()      # plan C2
+    if h.worker:            # the GitHub tokens of its task windows, before their hour ends (Helper.renew_tokens)
+        threading.Thread(target=h.keep_tokens, name="github-tokens", daemon=True).start()
     has_key = False
     while True:
         try:
@@ -12221,15 +12420,38 @@ def cmd_repo(args):
         sys.exit(1)
 
 
+def session_tokens(environ):
+    """(tokens, first) of a task session: its GitHub tokens, {repo: token}, from the file that FLEET_GIT_TOKENS_FILE
+    names, which the helper renews before they end (tokens_file, Helper.renew_tokens), and from FLEET_GIT_TOKENS of the
+    start only when there is no readable file (a session of an older helper, a file that went); tokens is None for a
+    value that is no JSON object. first: the file's token of the first group, which was GH_TOKEN at the start, or
+    None."""
+    data, path = None, environ.get("FLEET_GIT_TOKENS_FILE")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = None
+    if isinstance(data, dict) and isinstance(data.get("tokens"), dict):
+        first = data.get("first")
+        return data["tokens"], first if isinstance(first, str) and GITHUB_TOKEN.fullmatch(first) else None
+    try:
+        tokens = json.loads(environ.get("FLEET_GIT_TOKENS") or "{}")
+    except ValueError:
+        return None, None
+    return (tokens if isinstance(tokens, dict) else None), None
+
+
 def cmd_git_credential(args):
     """git's credential helper in a task session (owner feature integrations; git_credentials): the session's token
-    for the github.com repository that git names, from FLEET_GIT_TOKENS. Only get answers; git stores nothing here."""
+    for the github.com repository that git names, from the file that the helper renews, else from FLEET_GIT_TOKENS
+    (session_tokens). Only get answers; git stores nothing here."""
     if args.action != "get":
         return
     asked = dict(line.split("=", 1) for line in sys.stdin.read().splitlines() if "=" in line)
-    try:
-        tokens = json.loads(os.environ.get("FLEET_GIT_TOKENS") or "{}")
-    except ValueError:
+    tokens, _ = session_tokens(os.environ)
+    if tokens is None:
         return
     path = asked.get("path", "").strip("/").lower()
     repo = path[:-4] if path.endswith(".git") else path
@@ -12297,13 +12519,10 @@ def gh_origin():
 
 def gh_token(words, environ, origin=gh_origin):
     """(token, repository) for a gh call: the session's token for the repository that the call is for (gh_repo), from
-    FLEET_GIT_TOKENS, and that repository. The token is None for no repository, for one that the session does not
-    hold, and for a value that is no token; the repository is None when the call names none or the session has no
-    tokens at all."""
-    try:
-        tokens = json.loads(environ.get("FLEET_GIT_TOKENS") or "{}")
-    except ValueError:
-        return None, None
+    the file that the helper renews, else from FLEET_GIT_TOKENS (session_tokens), and that repository. The token is
+    None for no repository, for one that the session does not hold, and for a value that is no token; the repository
+    is None when the call names none or the session has no tokens at all."""
+    tokens, _ = session_tokens(environ)
     repo = gh_repo(words, environ, origin) if isinstance(tokens, dict) and tokens else None
     token = tokens.get(repo) if repo else None
     return (token if isinstance(token, str) and GITHUB_TOKEN.fullmatch(token) else None), repo
@@ -12311,13 +12530,17 @@ def gh_token(words, environ, origin=gh_origin):
 
 def cmd_gh(words):
     """fleet.py gh <gh arguments>: gh itself, with the session's token for the repository that the call is for in
-    GH_TOKEN (gh_token); with no such token, gh as the session has it, and one line on stderr when the call is for a
-    repository that the session holds no token for, so that a 404 of gh has its reason beside it. The token goes to
-    gh's own process and nowhere else: nothing here prints it."""
+    GH_TOKEN (gh_token); for a call for no repository (gh api graphql), the renewed token of the first group, which
+    was GH_TOKEN at the start (session_tokens); else gh as the session has it, and one line on stderr when the call is
+    for a repository that the session holds no token for, so that a 404 of gh has its reason beside it. The token goes
+    to gh's own process and nowhere else: nothing here prints it. Plain gh and the GitHub MCP server keep GH_TOKEN of
+    the start, which ends after its hour: only this command and git's credential helper read the renewed tokens."""
     program = shutil.which("gh")
     if not program:
         die("gh is not on this machine's PATH")
     token, repo = gh_token(words, os.environ)
+    if not token and not repo:
+        token = session_tokens(os.environ)[1]
     if token:
         os.environ["GH_TOKEN"] = token
     elif repo:

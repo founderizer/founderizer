@@ -25,6 +25,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+import urllib.request
 import uuid
 
 import fleet
@@ -348,6 +349,17 @@ class HubSide(OwnerAPI):
         self.assertEqual(form(self.stand.find("POST", "/oauth/token")[-1])["grant_type"], "refresh_token")
         code, third = self.request("/helper/integrations/dev", {})          # the new token is kept while it lives
         self.assertEqual((third["mcp"], len(self.stand.find("POST", "/oauth/token"))), ({TOKEN: ACCESS2}, 2))
+        # a renewal of a running session's GitHub tokens (owner API 1.276) gets no access token: only a start does
+        code, renewed = self.request("/helper/integrations/dev", {"renew": True})
+        self.assertEqual((code, sorted(renewed)), (200, ["errors", "renew", "repos", "tokens"]))
+        self.assertNotIn(ACCESS2, json.dumps(renewed))
+        # and only a JSON body whose renew is true is a renewal: each other body is a start, with the access token
+        for body, kind in ((b'{"renew": "yes"}', "application/json"), (b'{"renew": tru', "application/json"),
+                           (b"renew=true", "application/x-www-form-urlencoded")):
+            asked = urllib.request.Request(self.base + "/helper/integrations/dev", data=body,
+                                           headers={"Content-Type": kind, "X-Fleet-Client": "deterministic-test"})
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(asked, timeout=30) as answer:
+                self.assertEqual((answer.status, json.load(answer)["mcp"]), (200, {TOKEN: ACCESS2}), body)
         for text in (json.dumps([dict(r) for r in hub.q("SELECT * FROM log")]),):
             for secret in (ACCESS, ACCESS2, REFRESH, SECRET):
                 self.assertNotIn(secret, text)

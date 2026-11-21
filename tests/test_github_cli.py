@@ -363,7 +363,9 @@ class GitHubCLI(unittest.TestCase):
         the others "use git only". An agent that released from one of them got 404 from gh for its build run, and
         reported that it could not read the run, though that repository's own token reads it. `fleet.py gh` gives gh
         the token of the repository that the call names: by -R, by a path of gh api, by gh repo, by GH_REPO, and
-        last by the clone that the call runs in."""
+        last by the clone that the call runs in. The tokens come from the file that the helper renews before their
+        hour ends (fleet.tokens_file), and from FLEET_GIT_TOKENS of the start, which the session keeps for its whole
+        life, only when there is no readable file."""
         tokens = {"acme/deploys": "ghs_" + "a" * 36, "acme/web": "ghs_" + "b" * 36, "acme/lib": "ghs_" + "c" * 36}
         env = {"FLEET_GIT_TOKENS": json.dumps(tokens), "GH_TOKEN": tokens["acme/deploys"]}
 
@@ -400,10 +402,24 @@ class GitHubCLI(unittest.TestCase):
         self.assertEqual(fleet.gh_token(["run", "list", "-R", "other/repo"], env, no_clone), (None, "other/repo"))
         for words in (["api", "graphql"], ["auth", "status"], ["run", "list", "-R"]):
             self.assertEqual(fleet.gh_token(words, env, no_clone), (None, None), words)
+        renewed = {repo: "ghs_" + "n" * 35 + str(i) for i, repo in enumerate(sorted(tokens))}
+        held, broken = os.path.join(self.root, "dev.T-3.0123456789abcdef.tokens"), os.path.join(self.root, "x.tokens")
+        with open(held, "w") as f:
+            json.dump({"tokens": renewed, "first": renewed["acme/deploys"]}, f)
+        with open(broken, "w") as f:
+            f.write("[]")
+        words = ["run", "list", "-R", "acme/web"]
+        self.assertEqual(fleet.gh_token(words, dict(env, FLEET_GIT_TOKENS_FILE=held), no_clone),
+                         (renewed["acme/web"], "acme/web"))
+        for path in (broken, os.path.join(self.root, "missing.tokens")):
+            self.assertEqual(fleet.gh_token(words, dict(env, FLEET_GIT_TOKENS_FILE=path), no_clone),
+                             (tokens["acme/web"], "acme/web"), path)
 
     def test_the_helpers_gh_command_runs_gh_with_that_token_and_every_word(self):
         """The command itself, as a session runs it: gh's own process gets the token, and every word reaches gh, also
-        one that starts with "-" (the helper's own options take none of them)."""
+        one that starts with "-" (the helper's own options take none of them). With the file that the helper renews
+        (fleet.tokens_file), gh gets its tokens, and for a call for no repository the renewed token of the first
+        group, in place of GH_TOKEN of the start, which ends after its hour."""
         tokens = {"acme/deploys": "ghs_" + "a" * 36, "acme/web": "ghs_" + "b" * 36}
         os.makedirs(self.bin)
         with open(self.target, "w") as f:
@@ -424,6 +440,15 @@ class GitHubCLI(unittest.TestCase):
             self.assertEqual("holds no token" in done.stderr, bool(said), done.stderr)
             self.assertIn(said, done.stderr)
             self.assertNotIn("ghs_", done.stderr)
+        renewed = {"acme/deploys": "ghs_" + "c" * 36, "acme/web": "ghs_" + "d" * 36}
+        held = os.path.join(self.root, "dev.T-3.0123456789abcdef.tokens")
+        with open(held, "w") as f:
+            json.dump({"tokens": renewed, "first": renewed["acme/deploys"]}, f)
+        for words, token in ((["-R", "acme/web", "run", "list"], renewed["acme/web"]),
+                             (["api", "graphql"], renewed["acme/deploys"])):
+            done = subprocess.run([sys.executable, script, "gh", *words], env=dict(env, FLEET_GIT_TOKENS_FILE=held),
+                                  cwd=self.empty, capture_output=True, text=True, timeout=60)
+            self.assertEqual((done.returncode, done.stdout.strip()), (0, f"{token}|{' '.join(words)}"), done.stderr)
 
     def test_a_worker_or_a_lead_starts_it_and_a_manager_does_not(self):
         """The roles whose task sessions get GitHub repositories (integration_env). The thread starts at the helper's
