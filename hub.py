@@ -22009,30 +22009,45 @@ def chat_file_welcome(account, acc, sender, sender_alt, t0):
 
 def chat_file_in_check(data, mime):
     """The checks of a file that a person or the owner sent through a chat app (POST /bridge/files): a type that the
-    owner's own uploads take keeps their checks (attachment_check: its first bytes, a text file in UTF-8 with no NUL
-    and no registered login); any other type is data, which the hub keeps as it came and never opens or runs, under
-    the same size; and every file whose bytes are UTF-8, whatever its type, holds no registered login, the rule of
-    a message's words. Any
-    type comes (the owner, 20 November 2026: "does it accept multiple files, images etc? it should"). The search for
-    a login in a text costs at most CHAT_FILE_HASHES (inbound_text_checked): a person's file never holds the hub."""
+    owner's own uploads take keeps their checks (attachment_check: its first bytes; a text type, UTF-8 with no NUL);
+    any other type is data, which the hub keeps as it came and never opens or runs, under the same size; and every
+    file, whatever its type, holds no registered login in any text that its bytes give, the rule of a message's
+    words (inbound_bytes_checked): the texts of its reader, chosen by its first bytes whatever type its sender names
+    (a PNG, a JPEG, a PDF, an Office file: inbound_reader, which also reads the text that they pack), and the texts of
+    its bytes as bytes_texts gives them, of all of them or of those that the reader did not read. Any type comes (the
+    owner, 20 November 2026: "does it accept multiple files, images etc? it should"). The search for a login costs at
+    most CHAT_FILE_HASHES and CHAT_FILE_READS (inbound_texts_searched), and a reader unpacks at most CHAT_FILE_UNPACK:
+    a person's file never holds the hub. A file whose search would cost more is refused, never searched in part, so
+    some files that hold no login are refused: Adobe's own icons.pdf with 167 saved logins (its runs alone cost 34
+    million hashes, 21 November 2026), and a spreadsheet that packs more than CHAT_FILE_UNPACK of XML (413).
+
+    Not found, besides what bytes_texts does not find: a login in a ZIP that is no Office package (its text is
+    packed, and the hub reads no archive), or in another packed or coded form (a GIF's or a WebP's packed data,
+    base64); a login in a picture's pixels or a font's program; the words of an encrypted PDF, which only its password
+    reads; and a login written as the hex digits of a PDF's hex string, in a place where the PDF's syntax can hide it
+    from the search: a string that a page shows (an operand of Tj, TJ, ' or "), which the hub reads as the letters
+    that it draws, not as hex digits (pdf_glyph_codes_out), or a crafted page whose syntax the hub reads otherwise
+    than a PDF's reader does. A printed key is in a page's drawn text, which the hub reads (pdf_drawn_texts). A
+    stretch with no space of more than CHAT_FILE_STRETCH characters of ASCII, or a quarter of that of any other text
+    or of one with a JSON escape \\u, is refused, whatever the logins. The file name is searched too, by its route
+    (POST /bridge/files)."""
     text_type = mime.startswith("text/") or mime == "application/json"
     if (mime in ATTACH_TYPES or mime in ATTACH_OFFICE) and not text_type:
-        return attachment_check(data, mime)
-    if not data:            # a fault of the file, which the bridge says as refused
-        raise Refusal(415, "the file is empty")
-    if len(data) > ATTACH_MAX:
-        raise Refusal(413, f"an attachment is at most {ATTACH_MAX // (1024 * 1024)} MiB")
-    # every file whose bytes read as text is searched, whatever its type says: a .env or a key file comes as
-    # application/octet-stream, and a session with a shell would read its login from the download line
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        if mime in ATTACH_TYPES:
-            raise Refusal(415, "a text attachment must be UTF-8") from None
-        return              # bytes that read as no text (a video, a picture): data, which the hub never opens
-    if "\0" in text and mime in ATTACH_TYPES:
-        raise Refusal(415, "a text attachment must hold no NUL byte")
-    inbound_text_checked(text)
+        attachment_check(data, mime)
+    else:
+        if not data:            # a fault of the file, which the bridge says as refused
+            raise Refusal(415, "the file is empty")
+        if len(data) > ATTACH_MAX:
+            raise Refusal(413, f"an attachment is at most {ATTACH_MAX // (1024 * 1024)} MiB")
+        if mime in ATTACH_TYPES and not utf8_bytes(data):     # a text type of the owner's uploads keeps its checks
+            raise Refusal(415, "a text attachment must be UTF-8")
+        if mime in ATTACH_TYPES and b"\0" in data:
+            raise Refusal(415, "a text attachment must hold no NUL byte")
+    # every file is searched, whatever its type says, and by its first bytes before its code: a .env or a key file
+    # comes as application/octet-stream, a PDF in plain ASCII as text/plain, and a session with a shell would read its
+    # login from the download line (until 21 November 2026 UTF-8 bytes were searched as text alone, and other bytes
+    # not at all: the area Hub core's reviews)
+    inbound_bytes_checked(data)
 
 
 def shown_mime(mime):
@@ -22041,23 +22056,326 @@ def shown_mime(mime):
     return mime if mime in ATTACH_TYPES or mime in ATTACH_OFFICE else json.dumps(mime)
 
 
-def inbound_text_checked(text):
-    """The rule of a message's words for the text of a file that came from a chat app: no registered login in it,
-    found as secret_hit finds one (each form: the text, JSON's escapes undone, the hidden-character skeleton), at a
-    cost of at most CHAT_FILE_HASHES in all, as an agent's own file for a chat (chat_file_check). A costlier text is
-    refused, never searched in part: one person's file must not hold the hub, nor the bridge's messages behind it."""
+def inbound_bytes_checked(data):
+    """The rule of a message's words for the bytes of a file that came from a chat app: no registered login in any text
+    of it (inbound_pieces), found as secret_hit finds one (each form: the text, JSON's escapes undone, the
+    hidden-character skeleton), at a cost of at most CHAT_FILE_HASHES and CHAT_FILE_READS in all
+    (inbound_texts_searched), as an agent's own file for a chat (chat_file_check). A costlier file is refused, never
+    searched in part: one person's file must not hold the hub, nor the bridge's messages behind it. The reading of the
+    bytes is under CHAT_FILE_CHECKS: one file's check at a time."""
     with CHAT_FILE_CHECKS:
-        key, cost = secret_key(), 0
-        if not key:
-            return
-        forms = [text, json_plain(text)] if "\\" in text else [text]
-        forms += [bare for bare in map(login_skeleton, forms) if bare not in forms]
-        for form in forms:
-            cost += secret_cost(form, key, CHAT_FILE_HASHES - cost)
-            if cost > CHAT_FILE_HASHES:
-                raise Refusal(422, "the file holds too much text without spaces for the hub's check for saved keys")
-            if find_secret_spans(form, key):
-                raise Refusal(422, code="login_as_file")
+        inbound_texts_searched(inbound_pieces(data))
+
+
+def inbound_reader(data):
+    """(texts, rest) of a chat app's file by its first bytes, never by the type that its sender named: the texts of its
+    reader, as an agent's file of its kind gives them (chat_file_texts), with none of the refusals of an agent's file
+    (inbound), and the bytes that the search also reads as bytes (bytes_pieces), for what the reader does not read.
+
+    - A PNG and a JPEG: their text chunks (zTXt and iTXt unpacked) and the segments before the picture, and as bytes
+      every byte outside them (the pixels, a private chunk, what follows the end), which their reader gives in order:
+      rest is None. The segments are not read twice: as bytes, the thumbnail of a photo's XMP would cost twice.
+    - A PDF: its text streams (inflated) and drawn words, and all its bytes, without the hex strings of its streams
+      (pdf_inbound_bytes): its syntax, and a stream that the reader passes over (4 KB of binary, and a login).
+    - An Office package: its XML parts (unpacked), and all its bytes, for a part that is no XML and is not packed.
+    - Any other bytes: no texts, and all the bytes.
+
+    Each text is a text, or bytes that the search reads as it reads any bytes (bytes_pieces): a picture's EXIF and ICC
+    profile and a PDF's streams hold binary data, whose every byte the text of an agent's file reads as a letter."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return png_texts(data, inbound=True), None
+    if data.startswith(b"\xff\xd8\xff"):
+        return jpeg_texts(data, inbound=True), None
+    if data.startswith(b"%PDF-"):
+        return pdf_texts(data, inbound=True), pdf_inbound_bytes(data)
+    if data.startswith(b"PK\x03\x04"):
+        for mime in OOXML_MAIN:
+            if office_package(data, mime):
+                return ooxml_texts(data, mime, CHAT_FILE_KINDS[mime], inbound=True), data
+    return None, data
+
+
+def inbound_pieces(data):
+    """(text, zero) for each text of a chat app's bytes that the search reads (inbound_texts_searched): the texts of
+    its reader, each bytes of them read by bytes_pieces, then the rest of inbound_reader by bytes_pieces. Bytes that
+    their reader cannot parse are the file's, never a fault of the hub nor a refusal: their reader's texts end there,
+    and all the bytes are read as bytes."""
+    texts, rest = inbound_reader(data)
+    if texts is not None:
+        try:
+            for text in texts:
+                if isinstance(text, bytes):
+                    yield from bytes_pieces(text)
+                else:
+                    yield text, False
+        except Refusal:
+            raise
+        except Exception as e:      # noqa: BLE001 -- bytes that do not parse as their first bytes say
+            print(f"hub: a chat app's file did not parse as its first bytes say ({type(e).__name__})", flush=True)
+            rest = data
+    if rest is not None:
+        yield from bytes_pieces(rest)
+
+
+def utf8_bytes(data):
+    """True when the bytes are UTF-8, read a BYTES_CHUNK at a time: no text of them is made whole."""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    try:
+        for at in range(0, len(data), BYTES_CHUNK):
+            decoder.decode(data[at:at + BYTES_CHUNK], at + BYTES_CHUNK >= len(data))
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def bytes_pieces(data):
+    """The texts of bytes_texts(data), as (text, zero), each in pieces of about CHAT_FILE_CHUNK bytes that are made
+    when the search takes them: no text of the bytes is in memory whole (a text of 25 MiB with one emoji is 100 MB in
+    Python, and its forms more), UTF-8 bytes included. A piece ends after a space or a line break, or after a byte that
+    ends every run of printable ASCII, so no stretch of a text (inbound_texts_searched) lies across two. zero is True
+    for the text that ends a run at each zero byte, whose search is for the logins with no length only (bytes_texts
+    says why)."""
+    if utf8_bytes(data):
+        for part in spaced_pieces(data):
+            yield part.decode("utf-8"), False
+        return
+    bare = data.replace(b"\0", b"")
+    most, bad, letters = max(len(bare) // BYTES_BAD_MOST, BYTES_BAD_FEW), 0, False
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    for at in range(0, len(bare), BYTES_CHUNK):     # utf8_text's count, with no text kept
+        part = decoder.decode(bare[at:at + BYTES_CHUNK], at + BYTES_CHUNK >= len(bare))
+        bad += part.count("\ufffd")
+        if bad > most:
+            break
+        letters = letters or not part.replace("\ufffd", "").isascii()
+    if bad > most:
+        for part in printable_pieces(bare):
+            yield ascii_runs(part), False
+    else:
+        for code in ("utf-8", "cp1252") if letters else ("cp1252",):
+            for part in spaced_pieces(bare):
+                yield part.decode(code, "replace"), False
+    del bare
+    if b"\0" in data:
+        for part in printable_pieces(data):
+            yield ascii_runs(part), True
+    for mark, code in BYTES_BOMS:
+        if data.startswith(mark):
+            decoder, odd, size = codecs.getincrementaldecoder(code)("replace"), 0, 0
+            for at in range(0, len(data), BYTES_CHUNK):
+                part = decoder.decode(data[at:at + BYTES_CHUNK], at + BYTES_CHUNK >= len(data))
+                odd, size = odd + part.count("\ufffd"), size + len(part)
+            if odd * BYTES_WIDE_BAD_MOST <= size + BYTES_WIDE_BAD_MOST:
+                decoder, tail = codecs.getincrementaldecoder(code)("replace"), ""
+                for at in range(0, len(data), BYTES_CHUNK):
+                    block = tail + decoder.decode(data[at:at + BYTES_CHUNK], at + BYTES_CHUNK >= len(data))
+                    m = INBOUND_LAST_CUT.match(block)
+                    block, tail = (block[:m.end()], block[m.end():]) if m else ("", block)
+                    if block:
+                        yield block, False
+                if tail:
+                    yield tail, False
+            break
+
+
+BYTES_SPACED = re.compile(rb"[ \n]")
+BYTES_UNPRINTABLE = re.compile(rb"[^\x21-\x7e]")
+
+
+def spaced_pieces(data):
+    """Bytes in pieces of about CHAT_FILE_CHUNK, each ending after a space or a line break, or at the end: a cut there
+    is a cut between two characters of UTF-8 and of Windows-1252, and between two stretches of a text
+    (inbound_texts_searched). A stretch longer than a piece stays whole in its piece."""
+    at = 0
+    while at < len(data):
+        end = at + CHAT_FILE_CHUNK
+        if end < len(data):
+            cut = max(data.rfind(b" ", at, end), data.rfind(b"\n", at, end))
+            if cut < at:
+                m = BYTES_SPACED.search(data, end)
+                cut = m.start() if m else len(data) - 1
+            end = cut + 1
+        yield data[at:end]
+        at = end
+
+
+def printable_pieces(data):
+    """Bytes in pieces of about CHAT_FILE_CHUNK, each ending after a byte that is not printable ASCII, or at the end:
+    ascii_runs of each piece gives the runs of ascii_runs of all the bytes."""
+    at = 0
+    while at < len(data):
+        m = BYTES_UNPRINTABLE.search(data, at + CHAT_FILE_CHUNK) if at + CHAT_FILE_CHUNK < len(data) else None
+        end = m.end() if m else len(data)
+        yield data[at:end]
+        at = end
+
+
+# The characters at which the search of a chat app's file cuts a text into stretches (inbound_texts_searched): the
+# white space that ends a run (SECRET_RUN) and that the skeleton keeps (a space, a tab, a line break, a carriage return
+# and the wide spaces of Unicode). JSON's escapes never hold one. A control character that is white space (\x0b, \x1c)
+# is no cut: the skeleton takes it away and joins the runs on each side of it.
+INBOUND_CUTS = "".join(c for c in map(chr, range(0x3001)) if c.isspace() and hidden.skeleton(f"a{c}a") == f"a{c}a")
+INBOUND_LAST_CUT = re.compile("(?s).*[%s]" % re.escape(INBOUND_CUTS))
+
+
+def inbound_texts_searched(texts):
+    """No registered login in these texts of one file, (text, zero) each, in each form that secret_hit searches, at a
+    cost of at most CHAT_FILE_HASHES and CHAT_FILE_READS in all, or a Refusal. Called with CHAT_FILE_CHECKS held.
+
+    A form of a text is made of the whole text, and only its runs are searched (find_secret_spans finds a login inside
+    one run). JSON's escapes and the skeleton never make, take away or join across a character of INBOUND_CUTS: so
+    each run of each form lies inside one stretch of the text between two of them, and a stretch shorter than the
+    shortest run that the search reads (run_least) holds none. So the forms are made of the long stretches alone,
+    CHAT_FILE_CHUNK of them at a time (InboundSearch): a file of short words costs one scan of its text and no form.
+    Until 21 November 2026 each form was made of a whole text: 25 MiB of short words, each with a backslash and a
+    control character, cost no hash, 13 s and 694 MiB (the area Hub core's review).
+
+    A stretch longer than stretch_most is refused, measured before it or a form of it is made: one run of that
+    length costs more than CHAT_FILE_HASHES, and the skeleton of a stretch is one run where the skeleton takes
+    away its white space. 25 MiB of words that \x0b joins, with one emoji, held 525 MiB for 6.9 s before the bound
+    refused their skeleton (round 2 of that review). So is a stretch longer than CHAT_FILE_STRETCH bytes of Python's
+    memory, whatever the logins: a character of a text of ASCII is one byte, of any other text, or of a stretch with
+    a JSON escape \\u, whose form undoes it, four at most."""
+    key = secret_key()
+    if not key:
+        return
+    search = InboundSearch(key)
+    stretches = re.compile("[^%s]{%d,}" % (re.escape(INBOUND_CUTS), search.least))
+    for text, zero in texts:
+        if zero and not search.whole:
+            continue
+        search.count(len(text))
+        longest = min(search.longest, CHAT_FILE_STRETCH // (1 if text.isascii() else 4))
+        wide = min(search.longest, CHAT_FILE_STRETCH // 4)
+        batch, size = [], 0
+        for m in stretches.finditer(text):
+            # a stretch of ASCII with a JSON escape \u makes a form that may hold any letter: four bytes a character
+            if m.end() - m.start() > longest or (m.end() - m.start() > wide and text.find("\\u", *m.span()) >= 0):
+                raise Refusal(422, CHAT_FILE_TOO_MUCH)
+            batch.append(m.group())
+            size += m.end() - m.start()
+            if size >= CHAT_FILE_CHUNK:
+                search.take(batch, zero)
+                batch, size = [], 0
+        if batch:
+            search.take(batch, zero)
+    search.flush()
+
+
+CHAT_FILE_READS = 128 * 1024 * 1024     # characters of a chat app's file that its search reads, its texts and the
+#                                         forms that it makes of them: a file that needs more is refused, as one that
+#                                         needs more than CHAT_FILE_HASHES. At most four texts are copies of the bytes.
+CHAT_FILE_KEPT = 32 * 1024 * 1024       # bytes of the runs that the search of one file keeps as searched, at some 80
+#                                         bytes for each run besides its letters: past them, a run that comes again is
+#                                         searched again and counted again
+CHAT_FILE_TOO_MUCH = "the file holds too much text without spaces for the hub's check for saved keys"
+# The memory of the longest stretch that the search makes forms of, whatever the logins, in bytes: Python keeps a text
+# of ASCII at one byte a character, and one with an emoji at four, which its forms and the skeleton's work hold
+# several times. With one login of no length stretch_most is 120 million characters, and 25 MiB of words that \x0b
+# joins, with one emoji, held 588 MiB for 12.2 s (round 4 of the area Hub core's review); a bound of 4 Mi characters
+# for every text refused a minified JSON and a one-line base64 mail of 6.4 and 6.7 MiB at one login (round 5). JSON's
+# escapes and the skeleton hold some 11 bytes for each character of a stretch while they make its form (re.sub): 16 Mi
+# characters of ASCII held 220 MiB, 12 Mi hold less than 200.
+CHAT_FILE_STRETCH = 12 * 1024 * 1024
+
+
+def stretch_most(key):
+    """The longest stretch that the search of a chat app's file makes forms of (inbound_texts_searched): the longest
+    run whose cost by secret_cost's own count is at most CHAT_FILE_HASHES, a window for each login of a length and a
+    token of LOGIN_LEAST letters for each login with none. Until 21 November 2026 a login with no length counted a
+    window for each letter, as one with a length does: with 30 logins and 30 with no length, a JSON file with one base64
+    line of 300,000 letters, at 10.1 million hashes, was refused (round 3 of the area Hub core's review)."""
+    sized = collections.Counter(n for _, _, n in key if n)
+    plain = sum(1 for _, _, n in key if not n)
+
+    def cost(size):
+        windows = sum(count * (size - n + 1) for n, count in sized.items() if size >= n)
+        return windows + plain * (size // LOGIN_LEAST + 1)
+    low, high = 0, (CHAT_FILE_HASHES + 1) * LOGIN_LEAST + max(sized, default=0)
+    while low < high:
+        middle = (low + high + 1) // 2
+        low, high = (middle, high) if cost(middle) <= CHAT_FILE_HASHES else (low, middle - 1)
+    return low
+
+
+class InboundSearch:
+    """The search of one file of a chat app (inbound_texts_searched): what it has counted, the runs that it has
+    searched, and the runs that wait for their search. Each distinct run is searched once for the whole file, as in
+    runs_hold_login: the texts of one file are in part copies of each other (the Windows-1252 text of bytes and the
+    text of their byte order mark; the runs of bytes without their zero bytes and with them; a form and its
+    skeleton), and until 21 November 2026 each copy counted: Adobe's own icons.pdf cost 15.2 million hashes for 30
+    logins, and a photo with the base64 thumbnail that Lightroom writes into its XMP 21.3 million for 167, where
+    CHAT_FILE_HASHES is 15 million (now 10.9 and 10.7 million). A run of the text that ends a run at each zero byte is
+    searched for the logins with no length only (bytes_pieces), and so a run kept from it is not one that the search
+    for the other logins has read. Each login reads each run, at about the cost of a hash, so each new run counts one
+    for each login too: 25 MiB of distinct runs, each too short for any login, took 53 s before the refusal."""
+
+    def __init__(self, key):
+        self.key, self.whole = key, tuple(row for row in key if not row[2])
+        self.logins = {False: len(set(key)), True: len(set(self.whole))}
+        self.least = max(1, min(run_least(n) for _, _, n in key))
+        self.longest = stretch_most(key)
+        self.runs = long_runs(self.least)
+        self.hashes = self.reads = self.kept = 0
+        self.seen = {False: set(), True: set()}
+        self.waiting = {False: [], True: []}
+        self.size = {False: 0, True: 0}
+
+    def count(self, chars):
+        self.reads += chars
+        if self.reads > CHAT_FILE_READS:
+            raise Refusal(422, CHAT_FILE_TOO_MUCH)
+
+    def forms(self, text):
+        """The forms of a text that secret_hit reads, in its order, each made when the last one is searched: the text,
+        JSON's escapes undone, and the skeleton of each where it differs."""
+        yield text
+        made = [text]
+        plain = json_plain(text) if "\\" in text else text
+        if plain != text:
+            made.append(plain)
+            yield plain
+        for form in tuple(made):
+            bare = login_skeleton(form)
+            if bare not in made:
+                made.append(bare)
+                yield bare
+
+    def take(self, stretches, zero):
+        """Cost the new runs of each form of these stretches of one text, and keep them for their search: a costly
+        text is refused before its next form is made."""
+        rows = self.whole if zero else self.key
+        for form in self.forms("\n".join(stretches)):
+            self.count(len(form))
+            new = []
+            for run in self.runs.findall(form):
+                if run in self.seen[False] or (zero and run in self.seen[True]):
+                    continue
+                if self.kept < CHAT_FILE_KEPT:
+                    self.seen[zero].add(run)
+                    self.kept += len(run) + 80
+                new.append(run)
+            if not new:
+                continue
+            self.hashes += len(new) * self.logins[zero]     # each login reads each run
+            text = "\n".join(new)
+            if self.hashes <= CHAT_FILE_HASHES:
+                self.hashes += secret_cost(text, rows, CHAT_FILE_HASHES - self.hashes)
+            if self.hashes > CHAT_FILE_HASHES:
+                raise Refusal(422, CHAT_FILE_TOO_MUCH)
+            self.waiting[zero].append(text)
+            self.size[zero] += len(text)
+            if self.size[zero] >= CHAT_FILE_CHUNK:
+                self.flush(zero)
+
+    def flush(self, *which):
+        """Search the runs that wait, in one text for each kind: few searches, and few children for long ones."""
+        for zero in which or (False, True):
+            if self.waiting[zero]:
+                text = "\n".join(self.waiting[zero])
+                self.waiting[zero], self.size[zero] = [], 0
+                if find_secret_spans(text, self.whole if zero else self.key):
+                    raise Refusal(422, code="login_as_file")
 
 
 def inbound_file_name(name, mime):
@@ -33010,14 +33328,22 @@ def pdf_stream_spans(data):
         at = end
 
 
-def pdf_texts(data):
+def pdf_texts(data, inbound=False):
     """The texts of a PDF that the search reads: its syntax outside the streams (the dictionaries, the strings and the
     metadata), each stream whose bytes are text, inflated when it inflates and decoded from ASCII85 or hex first
     when it is written so (reportlab writes [/ASCII85Decode /FlateDecode]), where a stream's first 64 KB decide; and
     last the text that its pages draw in their fonts' letters (pdf_drawn_texts). An object stream holds the PDF's own
     dictionaries, so it is always read and searched for PDF_RISKS, whatever its first bytes; one that cannot be read
     as text is refused. Refused too: an encrypted PDF, which the hub cannot read; a PDF that names PDF_RISKS in its
-    syntax or an object stream; more than CHAT_FILE_UNPACK of text."""
+    syntax or an object stream; more than CHAT_FILE_UNPACK of text.
+
+    inbound: a person's PDF from a chat app (inbound_reader), which the hub keeps as data and never opens or runs: the
+    same texts, with no refusal of its kind, and those of its syntax and its streams as bytes without their hex
+    strings (pdf_inbound_bytes), for the search to read as bytes (bytes_pieces). An object stream that cannot be read
+    as text is passed over, and of an encrypted PDF only the syntax and the streams that read as text are read, not
+    the pages. CHAT_FILE_UNPACK and the limits of pdf_drawn_texts stay refusals: they keep the hub's own time and
+    memory."""
+    shown = pdf_glyph_codes_out if inbound else (lambda piece: piece.decode("latin-1"))
     outside, risky, left, at = [], False, CHAT_FILE_UNPACK, 0
     for start, begin, end in pdf_stream_spans(data):
         objects = bool(PDF_OBJECTS.search(data, at, start))     # this stream's dictionary is in the syntax before it
@@ -33037,6 +33363,8 @@ def pdf_texts(data):
             pieces = inflate_pieces(source)
         elif head is None and (objects or text_like(source[:4096])):
             if objects and not text_like(source[:4096]):
+                if inbound:
+                    continue                        # nothing in it that the search can read
                 raise Refusal(415, "the hub cannot read an object stream of this PDF, so it cannot check it")
             pieces = space_pieces(source)
         else:
@@ -33046,16 +33374,105 @@ def pdf_texts(data):
             if left < 0:
                 raise Refusal(413, f"the PDF packs more than {CHAT_FILE_UNPACK >> 20} MB")
             risky = risky or (objects and bool(PDF_RISKS.search(piece)))
-            yield piece.decode("latin-1")
+            yield shown(piece)
     outside.append(data[at:])
     syntax = b"".join(outside)
-    if PDF_ENCRYPT.search(syntax):
+    encrypted = bool(PDF_ENCRYPT.search(syntax))
+    if encrypted and not inbound:
         raise Refusal(415, "the hub cannot read an encrypted PDF, so it cannot check it: send it without a password")
-    if risky or PDF_RISKS.search(syntax):
+    if (risky or PDF_RISKS.search(syntax)) and not inbound:
         raise Refusal(415, "a PDF that runs a script, carries a file or launches a program cannot go to a chat")
-    for piece in space_pieces(syntax):
-        yield piece.decode("latin-1")
-    yield from pdf_drawn_texts(data)
+    for piece in () if inbound else space_pieces(syntax):     # a person's PDF: its bytes are read (inbound_reader)
+        yield shown(piece)
+    if not encrypted:                               # the pages of an encrypted PDF draw what only its password reads
+        yield from pdf_drawn_texts(data)
+
+
+PDF_HEX_STRING = re.compile(rb"<[0-9A-Fa-f \t\r\n\x0c\x00]*>")
+
+
+# The hex strings that a page shows, as pdf_drawn_texts reads them: the operand of Tj, ' and ", and those of the array
+# of TJ (an operator ends where a character of PDF_REGULAR does not follow). An array with a bracket in one of its
+# strings is left whole.
+PDF_SHOWN_HEX = re.compile(rb"<[0-9A-Fa-f \t\r\n\x0c\x00]*>(?=[ \t\r\n\x0c\x00]*(?:Tj|'|\")(?![^\s\x00\[\]()<>{}/%]))")
+PDF_SHOWN_ARRAY = re.compile(rb"\[[^\[\]]*\](?=[ \t\r\n\x0c\x00]*TJ(?![^\s\x00\[\]()<>{}/%]))")
+PDF_DICT_STREAM = re.compile(rb">>[ \t\r\n\x0c\x00]*stream\r?\n")     # a stream follows its dictionary
+
+
+def pdf_glyph_codes_out(piece):
+    """A piece of a stream of a person's PDF (pdf_texts, inbound) without the hex strings that its page shows (the
+    operands of Tj, TJ, ' and "), for the search to read as bytes, as it reads a picture's (bytes_pieces). Those are
+    glyph codes (<002c0026...>), which pdf_drawn_texts reads as the letters that they draw, and a stream that starts
+    as text can hold a picture's bytes inline: read as text and as hex digits, they cost what long runs cost. Apple's
+    own License.pdf of 2.8 MB, read so, cost 100 million hashes for 167 logins, where CHAT_FILE_HASHES is 15 million;
+    read as bytes without them, 6.7 million with its drawn words (21 November 2026). Every other hex string stays: a
+    login of hex digits can stand in a comment of a page or in the syntax (until round 4 of the area Hub core's
+    review, a stream's hex strings all went). The patterns match in a copy of the piece whose comments and the
+    insides of whose literal strings are spaces (pdf_page_view): neither shows anything, and "% <...> Tj" in a comment
+    and "(<...> Tj)" in an /ActualText hid a login until rounds 5 and 6."""
+    view = pdf_page_view(piece)
+    spans = [m.span() for m in PDF_SHOWN_HEX.finditer(view)]
+    for array in PDF_SHOWN_ARRAY.finditer(view):
+        spans += [m.span() for m in PDF_HEX_STRING.finditer(view, array.start(), array.end())]
+    if not spans:
+        return piece
+    out, at = [], 0
+    for start, end in sorted(spans):
+        if start >= at:
+            out += [piece[at:start], b" "]
+            at = end
+    return b"".join(out + [piece[at:]])
+
+
+PDF_COMMENT_MARKS = re.compile(rb"[%()\\]")
+PDF_LINE_REST = re.compile(rb"[^\r\n]*")    # the rest of a comment's line, matched in place (pdf_page_view)
+
+
+def pdf_page_view(piece):
+    """The bytes of a page with each comment, from a % outside a string to the end of its line, and the inside of each
+    literal string as spaces, so that every other byte keeps its place: what the patterns of pdf_glyph_codes_out may
+    read as shown. A string's parentheses nest, and a backslash escapes the byte after it; a string that does not end
+    is blank to the end. Where the page is unclear (a parenthesis inside a hex string), the view blanks more, which
+    keeps more hex strings in the search, never fewer."""
+    if b"%" not in piece and b"(" not in piece:
+        return piece
+    out, at, depth, opened = bytearray(piece), 0, 0, 0
+    while True:
+        m = PDF_COMMENT_MARKS.search(piece, at)
+        if m is None:
+            if depth:
+                out[opened:] = b" " * (len(piece) - opened)
+            return bytes(out)
+        mark, at = piece[m.start()], m.end()
+        if mark == 0x5C:                            # a backslash: in a string, the next byte is its own
+            at += 1 if depth else 0
+        elif mark == 0x28:
+            depth += 1
+            opened = at if depth == 1 else opened
+        elif mark == 0x29:
+            depth = max(0, depth - 1)
+            if not depth:
+                out[opened:m.start()] = b" " * (m.start() - opened)
+        elif not depth:                             # a comment, to the end of its line
+            end = PDF_LINE_REST.match(piece, m.start()).end()     # no copy of the rest: a copy for each comment
+                                                                  # took time by the square of the comments
+            out[m.start():end] = b" " * (end - m.start())
+            at = end
+
+
+def pdf_inbound_bytes(data):
+    """The bytes of a person's PDF that the search reads as bytes (inbound_reader): all of them, with the hex strings
+    that the pages of its streams show taken out (pdf_glyph_codes_out). A stream is found only after its dictionary's
+    >>: a comment that says stream is syntax, which pdf_stream_spans takes for a stream."""
+    out, at = [], 0
+    for m in PDF_DICT_STREAM.finditer(data):
+        if m.start() < at:
+            continue                                # inside the stream before it
+        end = data.find(b"endstream", m.end())
+        end = len(data) if end < 0 else end
+        out += [data[at:m.end()], pdf_glyph_codes_out(data[m.end():end])]
+        at = end
+    return b"".join(out + [data[at:]])
 
 
 # ---- the words that the pages of a PDF draw (CHAT-APPS.md 20.2)
@@ -34046,10 +34463,15 @@ def ooxml_relations(raw):
         yield piece[:stop if stop >= 0 else 4096]
 
 
-def ooxml_texts(data, mime, kind):
+def ooxml_texts(data, mime, kind, inbound=False):
     """The XML parts of an Office file, for the search, after its checks (the OOXML rules above). A part's markup
     goes (< and > are never inside a value) and its entities are read as the characters that they write (&amp; is
-    &), so the search reads the values that the person sees."""
+    &), so the search reads the values that the person sees.
+
+    inbound: a person's Office file from a chat app (inbound_reader), which the hub keeps as data and never opens or
+    runs: the same parts, with none of the OOXML rules above, so a file with a macro or a DDE field still comes, and a
+    part that does not unpack is passed over. The binary parts (a macro's project, an embedded object) are not read,
+    as in every Office file. CHAT_FILE_UNPACK stays a refusal."""
     import io
     import zipfile
     try:
@@ -34061,25 +34483,31 @@ def ooxml_texts(data, mime, kind):
         raise Refusal(415, f"these bytes are not a {kind}")
     code = Refusal(415, f"a {kind} with a macro, an ActiveX control, an OLE object, a template from another computer "
                         f"or a DDE field cannot go to a chat")
-    if any("vbaproject" in n.lower() or "/activex/" in "/" + n.lower() for n in names):
+    if not inbound and any("vbaproject" in n.lower() or "/activex/" in "/" + n.lower() for n in names):
         raise code
     left = CHAT_FILE_UNPACK
     for info in package.infolist():
         name = info.filename.lower()
         if not name.endswith((".xml", ".rels", ".vml")):
             continue
-        with package.open(info) as part:
-            raw = part.read(left + 1)
+        try:
+            with package.open(info) as part:
+                raw = part.read(left + 1)
+        except Exception:       # noqa: BLE001 -- a part that does not unpack: the bytes' fault, never the hub's
+            if not inbound:
+                raise
+            continue            # a person's file: its other parts are read (a wrong CRC of one part hid the next)
         left -= len(raw)
         if left < 0:
             raise Refusal(413, f"the {kind} packs more than {CHAT_FILE_UNPACK >> 20} MB of text")
-        if name == "[content_types].xml" and OOXML_RISKY_TYPES.search(raw):
-            raise code
-        for tag in ooxml_relations(raw):
-            if OOXML_RISKY_RELATION.search(tag) or (OOXML_TEMPLATE.search(tag) and OOXML_REMOTE.search(tag)):
+        if not inbound:                             # the OOXML rules, for an agent's own file
+            if name == "[content_types].xml" and OOXML_RISKY_TYPES.search(raw):
                 raise code
-        if b"<ddeLink" in raw or OOXML_DDE.search(ooxml_fields(raw)):
-            raise code
+            for tag in ooxml_relations(raw):
+                if OOXML_RISKY_RELATION.search(tag) or (OOXML_TEMPLATE.search(tag) and OOXML_REMOTE.search(tag)):
+                    raise code
+            if b"<ddeLink" in raw or OOXML_DDE.search(ooxml_fields(raw)):
+                raise code
         for piece in space_pieces(raw.translate(OOXML_SPACES)):
             yield html.unescape(piece.decode("utf-8", "replace"))
 
@@ -34090,18 +34518,24 @@ def text_like(data):
     return bool(sample) and sum(32 <= b < 127 or b in (9, 10, 13) for b in sample) >= 0.85 * len(sample)
 
 
-def png_texts(data):
+def png_texts(data, inbound=False):
     """The text chunks of a PNG (tEXt, zTXt, iTXt and eXIf): what a picture can carry besides its pixels. A chunk that
-    does not parse is read as it stands."""
-    at, left = 8, CHAT_FILE_UNPACK
+    does not parse is read as it stands. inbound (a person's PNG, inbound_reader): their bytes, with a keyword apart
+    from its text and without a zTXt's packed bytes, and between them, in order, every byte that they do not hold (the
+    pixels, a private chunk, what follows IEND), for the search to read as bytes (bytes_pieces)."""
+    at, left, last = 8, CHAT_FILE_UNPACK, 0
     while at + 8 <= len(data):
         size, kind = int.from_bytes(data[at:at + 4], "big"), data[at + 4:at + 8]
-        body = data[at + 8:at + 8 + size]
+        start = at + 8
+        body = data[start:start + size]
         at += 12 + size
         if kind == b"IEND":
             break
         if kind not in (b"tEXt", b"zTXt", b"iTXt", b"eXIf"):
             continue
+        if inbound:
+            yield data[last:start]
+            last = start + len(body)
         packed = None
         try:
             if kind == b"zTXt":                             # keyword, 0, method, the packed text
@@ -34113,19 +34547,27 @@ def png_texts(data):
                 packed = text if rest[:1] == b"\x01" else None
         except ValueError:
             packed = None                                   # a chunk that does not parse: its bytes as they stand
+        if inbound and kind in (b"tEXt", b"zTXt"):         # keyword, 0, the text (or a zTXt's method and packed text)
+            keyword, _, text = body.partition(b"\0")
+            body = keyword if kind == b"zTXt" else keyword + b" " + text
         for piece in space_pieces(body):
-            yield piece.decode("latin-1")
+            yield piece if inbound else piece.decode("latin-1")
         if packed is not None:
             for piece in inflate_pieces(packed):
                 left -= len(piece)
                 if left < 0:
                     raise Refusal(413, f"the PNG picture packs more than {CHAT_FILE_UNPACK >> 20} MB of text")
-                yield piece.decode("latin-1")
+                yield piece if inbound else piece.decode("latin-1")
+    if inbound:
+        yield data[last:]
 
 
-def jpeg_texts(data):
-    """The segments of a JPEG before its picture: comments, EXIF and XMP (APP0 to APP15, COM)."""
-    at = 2
+def jpeg_texts(data, inbound=False):
+    """The segments of a JPEG before its picture: comments, EXIF and XMP (APP0 to APP15, COM). inbound (a person's
+    JPEG, inbound_reader): their bytes, an APP segment's name (Exif, ICC_PROFILE, XMP's namespace), which ends at its
+    first zero byte, apart from what follows it, and between them, in order, every byte that they do not hold (the
+    picture, what follows its end), for the search to read as bytes (bytes_pieces)."""
+    at, last = 2, 0
     while at + 4 <= len(data) and data[at] == 0xFF:
         marker = data[at + 1]
         if marker == 0xFF:                          # a fill byte before a marker
@@ -34137,8 +34579,21 @@ def jpeg_texts(data):
         if size < 2:
             break
         if 0xE0 <= marker <= 0xEF or marker == 0xFE:
-            yield data[at + 4:at + 2 + size].decode("latin-1")
+            body = data[at + 4:at + 2 + size]
+            if inbound:                         # the bytes before the marker, then the segment's length bytes in
+                yield data[last:at + 2]         # front of its first text: a login can run across them ("SY" is a
+                last = at + 4 + len(body)       # length of 21,337 bytes, and strings shows them whole)
+            if not inbound:
+                yield body.decode("latin-1")
+            elif marker == 0xFE:
+                yield data[at + 2:at + 4] + body
+            else:
+                name, _, rest = body.partition(b"\0")
+                yield data[at + 2:at + 4] + name
+                yield rest
         at += 2 + size
+    if inbound:
+        yield data[last:]
 
 
 def secret_cost(text, key, most):
@@ -77141,11 +77596,16 @@ class Handler(BaseHTTPRequestHandler):
         data = self.body()
         if not data:            # a fault of the file and not of the call: the bridge says it as refused
             return self.json(415, {"db": db, "error": "the file is empty"})
+        raw = str(query.get("name") or "")[:200]
+        name, key = inbound_file_name(raw, mime), bridge_file_key(account, msg_id, n)
         try:
+            # the name goes to the agent as it is, in the one-time download line: the rule of a message's words is
+            # its rule too (until 21 November 2026 it was not searched: the area Hub core's review)
+            if secret_hit(raw, name):
+                raise Refusal(422, code="login_as_file")
             chat_file_in_check(data, mime)
         except Refusal as e:
             return self.json(e.status, dict(refusal_body(e), db=db))
-        name, key = inbound_file_name(str(query.get("name") or "")[:200], mime), bridge_file_key(account, msg_id, n)
         digest = attachment_write(data, mime)
         aid = replayed = why = None
         with transaction():         # the answer goes after the commit, never from inside it

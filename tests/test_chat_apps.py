@@ -47,6 +47,40 @@ CHAT = ("test-generation", "owner-chat", "1")
 PICTURE = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + (4).to_bytes(4, "big") + (3).to_bytes(4, "big") + bytes(40)
 
 
+def png_with(*chunks):
+    """PICTURE's header with more chunks, (kind, body) each, and its end."""
+    def chunk(name, data):
+        return len(data).to_bytes(4, "big") + name + data + zlib.crc32(name + data).to_bytes(4, "big")
+    return PICTURE[:33] + b"".join(chunk(kind, body) for kind, body in chunks) + chunk(b"IEND", b"")
+
+
+def office_file(text, parts=(), stored=False, part="word/document.xml"):
+    """A Word document whose one paragraph is `text`, with more parts (name, bytes) before it; `part` names the part
+    that holds the paragraph."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED) as package:
+        package.writestr("[Content_Types].xml", '<Types xmlns="http://schemas.openxmlformats.org/package/2006/'
+                         'content-types"><Default Extension="xml" ContentType="application/xml"/></Types>')
+        for name, data in parts:
+            package.writestr(name, data)
+        package.writestr(part, f"<w:document><w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>")
+    return out.getvalue()
+
+
+def pdf_page(content, trailer=b"", code="flate"):
+    """A PDF of one page that draws `content`: packed with FlateDecode, also written in hex digits (code "hex", a PDF
+    in plain ASCII), or as it is (None)."""
+    stream, filters = content, b""
+    if code:
+        stream, filters = zlib.compress(content), b"/Filter/FlateDecode"
+    if code == "hex":
+        stream, filters = stream.hex().encode() + b">", b"/Filter[/ASCIIHexDecode/FlateDecode]"
+    return (b"%PDF-1.4\n1 0 obj <</Type/Catalog/Pages 2 0 R>> endobj\n2 0 obj <</Type/Pages/Kids[3 0 R]/Count 1>> "
+            b"endobj\n3 0 obj <</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R>> endobj\n4 0 obj "
+            b"<</Length " + str(len(stream)).encode() + filters + b">>\nstream\n" + stream +
+            b"\nendstream\nendobj\ntrailer <</Root 1 0 R" + trailer + b">>\n%EOF\n")
+
+
 def git(*args, cwd=None):
     return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main", *args],
                           cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
@@ -386,7 +420,8 @@ class ChatApps(OwnerAPI):
         """CHAT-APPS.md 8.1 (the owner, 20 November 2026: "pictures and files sohuld be allowed!"): the bridge sends
         the owner's picture up before its message, past the 1 MiB of every other bridge body, and the message's
         route makes it a file of that message, which the agent opens with read_attachment. The same upload again is
-        the same file; a sender whose message the hub would not store gets no byte stored; a file that did not come
+        the same file; a sender whose message the hub would not store gets no byte stored; a file that holds a
+        registered login in any text that it gives or packs, or in its name, is refused; a file that did not come
         up is named, with why in the hub's own words."""
         self.own()
         big = PICTURE + bytes(2 * 1024 * 1024)
@@ -407,13 +442,122 @@ class ChatApps(OwnerAPI):
         value, salt = "SYNTHETICFILELOGIN4471", "test-salt"
         hub.ins("INSERT INTO secrets(label,salt,hash,len) VALUES(?,?,?,?)",
                 ("Synthetic", salt, hashlib.sha256((salt + value).encode()).hexdigest(), len(value)))
-        for mime, name in (("text/plain", "notes.txt"), ("application/octet-stream", ".env")):
-            code, refused = self.bridge_upload(f"KEY={value}\n".encode(), f"m-{name}", mime=mime, name=name)
+        # and when its bytes are not UTF-8: a .env in UTF-16 with its byte order mark, a Windows text with one letter
+        # that is no UTF-8, and a picture with the login in a text chunk of its own (until 21 November 2026 none of
+        # these was searched: the area Hub core's review); a control character that the skeleton takes away splits
+        # no login. And in the text that a file packs, read by its first bytes whatever type its sender names, a PDF
+        # in plain ASCII and a .env that starts as a picture too: a PDF's page, a Word document, a spreadsheet, a
+        # PNG's packed text chunk; and in the bytes that a reader does not read: a part of an Office file that is no
+        # XML, or after a part that does not unpack, a PDF's stream that starts as binary, a PNG's private chunk, and
+        # what follows a picture's end
+        line = f"KEY={value}\n"
+        broken = office_file(f"KEY={value}", stored=True).replace(b"<w:document>", b"<w:documenX>", 1)
+        crc = office_file(f"KEY={value}", [("a.xml", "<a>first part</a>")])
+        entry = crc.find(b"a.xml", crc.find(b"a.xml") + 1) - 46          # a.xml's entry in the central directory
+        crc = crc[:entry + 16] + bytes(4) + crc[entry + 20:]              # a wrong CRC-32 of a.xml
+        page, packed = f"BT /F1 12 Tf 72 720 Td ({line}) Tj ET".encode(), zlib.compress(line.encode())
+        sheet = office_file(f"KEY={value}", [("xl/workbook.xml", "<workbook/>")], part="xl/sharedStrings.xml")
+        stored = office_file("Budget", [("word/notes.txt", line)], stored=True)
+        raw = pdf_page(bytes(range(256)) * 16 + line.encode(), code=None)
+        private = png_with((b"prVt", line.encode()), (b"tEXt", b"Comment\x00a"))
+        hexed = "0123456789abcdef0123456789abcdef01234567"             # a login of hex digits, as in a PDF's hex string
+        hub.ins("INSERT INTO secrets(label,salt,hash,len) VALUES(?,?,?,?)",
+                ("Hexed", salt, hashlib.sha256((salt + hexed).encode()).hexdigest(), len(hexed)))
+        # a JPEG comment whose two length bytes are the login's first two letters: 21,337 bytes for "SY"
+        size = int.from_bytes(value[:2].encode(), "big")
+        comment = b"\xff\xd8\xff\xfe" + value.encode() + b"\n" + b" " * (size - len(value) - 1)
+        commented = pdf_page(b"BT ET").replace(b"%PDF-1.4\n", b"%PDF-1.4\n% <" + hexed.encode() + b">\n")
+        titled = pdf_page(b"BT ET", b"/Title <" + hexed.encode() + b">")
+        # and in a page's comment, also one that ends in Tj or lies in an array of TJ, in a literal string that the page
+        # does not show, after a parenthesis inside a hex string, and after a comment that says stream, where it is
+        # syntax: a stream follows a dictionary, and only the hex strings that a page shows are glyph codes, which a
+        # comment or a string never shows
+        noted = pdf_page(b"BT ET\n% <" + hexed.encode() + b"> Tj\n", code=None)
+        arrayed = pdf_page(b"BT /F1 12 Tf [ (x)\n% <" + hexed.encode() + b">\n] TJ ET", code=None)
+        actual = pdf_page(b"BT /Span <</ActualText (<" + hexed.encode() + b"> Tj)>> BDC (x) Tj EMC ET", code=None)
+        opened = pdf_page(b"BT ET\n<(>\n% <" + hexed.encode() + b"> Tj\n)\n", code=None)
+        fake = pdf_page(b"BT ET").replace(b"%PDF-1.4\n",
+                                          b"%PDF-1.4\n% stream\n% <" + hexed.encode() + b"> Tj\n% endstream\n")
+        # the page view reads a page once: a copy of the rest of the page for each comment took time by the square of
+        # the comments (20,000 before 4 MiB: 8.4 s; a crafted 25 MiB page: some 40 minutes), and one person's PDF held
+        # the hub's check of every chat app's file that long
+        began = time.monotonic()
+        hub.pdf_page_view(b"%\n" * 50000 + b"x" * (4 << 20))
+        self.assertLess(time.monotonic() - began, 5)
+        photo = (b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xda\x00\x08" +
+                 bytes(range(256)) * 4 + b"\xff\xd9")
+        for mime, name, data in (("text/plain", "notes.txt", line.encode()),
+                                 ("application/octet-stream", ".env", line.encode()),
+                                 ("application/octet-stream", "wide.env", line.encode("utf-16")),
+                                 ("application/octet-stream", "old.env", f"# café\n{line}".encode("cp1252")),
+                                 ("image/png", "shot.png", png_with((b"tEXt", b"Comment\x00" + line.encode()))),
+                                 ("application/octet-stream", "tab.env", f"KEY={value[:9]}\x0b{value[9:]}\n".encode()),
+                                 ("application/pdf", "page.pdf", pdf_page(page)),
+                                 ("application/octet-stream", "page", pdf_page(page)),
+                                 ("text/plain", "ascii.pdf", pdf_page(page, code="hex")),
+                                 ("application/octet-stream", "jpeg.env", b"\xff\xd8\xff" + line.encode()),
+                                 ("application/octet-stream", "png.env", b"\x89PNG\r\n\x1a\n" + line.encode()),
+                                 (hub.DOCX, "notes.docx", office_file(f"KEY={value}")),
+                                 ("application/zip", "notes.zip", office_file(f"KEY={value}")),
+                                 (hub.XLSX, "sheet.xlsx", sheet),
+                                 ("image/png", "packed.png", png_with((b"zTXt", b"Comment\x00\x00" + packed))),
+                                 (hub.DOCX, "broken.docx", broken),
+                                 (hub.DOCX, "stored.docx", stored),
+                                 (hub.DOCX, "crc.docx", crc),
+                                 ("application/pdf", "raw.pdf", raw),
+                                 ("image/png", "private.png", private),
+                                 ("image/png", "after.png", png_with((b"tEXt", b"Comment\x00a")) + line.encode()),
+                                 ("image/jpeg", "after.jpg", photo + line.encode()),
+                                 ("application/pdf", "comment.pdf", commented),
+                                 ("application/pdf", "title.pdf", titled),
+                                 ("application/pdf", "noted.pdf", noted),
+                                 ("application/pdf", "arrayed.pdf", arrayed),
+                                 ("application/pdf", "actual.pdf", actual),
+                                 ("application/pdf", "opened.pdf", opened),
+                                 ("application/pdf", "fake.pdf", fake),
+                                 ("image/jpeg", "comment.jpg", comment)):
+            code, refused = self.bridge_upload(data, f"m-{name}", mime=mime, name=name)
             self.assertEqual((code, refused.get("code")), (422, "login_as_file"), name)
+        # a piece of a file's text ends at a space or a line break, never inside a login: here pieces of 16 bytes, where
+        # pieces of a fixed size would cut the login in two
+        with patch.object(hub, "CHAT_FILE_CHUNK", 16), patch.object(hub, "BYTES_CHUNK", 16):
+            for name, data in (("long.env", f"# notes {'x ' * 20}{line}".encode()),
+                               ("long.bin", b"\xff" * 300 + line.encode())):     # bytes that are no text
+                at = data.find(value.encode())
+                self.assertNotEqual(at // 16, (at + len(value)) // 16)
+                code, refused = self.bridge_upload(data, f"m-{name}", mime="application/octet-stream", name=name)
+                self.assertEqual((code, refused.get("code")), (422, "login_as_file"), name)
+        # a reader that fails on odd bytes is no fault of the hub, and the file's bytes are still read
+        with patch.object(hub, "inflate_pieces", side_effect=zlib.error("odd bytes")):
+            odd = png_with((b"zTXt", b"Comment\x00\x00" + packed)) + line.encode()
+            code, refused = self.bridge_upload(odd, "m-odd", name="odd.png")
+        self.assertEqual((code, refused.get("code")), (422, "login_as_file"))
+        # the name that the agent's download line gives is a text of the file too: nothing of it is kept
+        code, refused = self.bridge_upload(PICTURE, "m-n", name=f"{value}.png")
+        self.assertEqual((code, refused.get("code")), (422, "login_as_file"))
+        # a login with no length is a whole token, which a zero byte of C strings joins to the next one: only the
+        # text that ends a run at each zero byte holds it alone, so each text of the bytes is searched, not the first
+        whole = "SYNTHETICWHOLETOKEN7"
+        hub.ins("INSERT INTO secrets(label,salt,hash,len) VALUES(?,?,?,?)",
+                ("Whole", salt, hashlib.sha256((salt + whole).encode()).hexdigest(), None))
+        code, refused = self.bridge_upload(b"\xff" + whole.encode() + b"\0next", "m-z", mime="application/octet-stream",
+                                           name="dump.bin")
+        self.assertEqual((code, refused.get("code")), (422, "login_as_file"))
+        self.assertEqual(self.bridge_upload("# café, no key\n".encode("utf-16"), "m-w", mime="application/octet-stream",
+                                            name="clean.env")[0], 200)      # bytes with no login still come
+        self.assertEqual(self.bridge_upload(PICTURE + b"tEXtComment\x00a plain line", "m-p")[0], 200)
+        # a person's file is data that the hub never opens or runs: the rules of an agent's own file refuse none of it
+        # (a macro, an encrypted PDF), and bytes that do not parse as their kind are no fault of the hub
+        macro = office_file("Budget", [("word/vbaProject.bin", b"\xd0\xcf\x11\xe0" + bytes(64))])
+        secret = pdf_page(b"BT (Budget) Tj ET", b"/Encrypt <</Filter/Standard/V 1/R 2/O(o)/U(u)/P -4>>")
+        torn = office_file("Budget", stored=True).replace(b"<w:document>", b"<w:documenX>", 1)
+        for mime, name, data in ((hub.DOCX, "macro.docx", macro), ("application/pdf", "locked.pdf", secret),
+                                 (hub.DOCX, "torn.docx", torn)):
+            self.assertEqual(self.bridge_upload(data, f"m-{name}", mime=mime, name=name)[0], 200, name)
         # the bridge's question before it fetches a byte: a stranger's answer is the 403, the owner's a welcome
         self.assertEqual(self.bridge_upload(b"", "m-x", sender="999000111", check=1)[0], 403)
         self.assertEqual(self.bridge_upload(b"", "m-c", check=1), (200, {"db": "test-generation", "welcome": True}))
-        self.assertEqual(self.count("attachments"), 3)          # the big picture and the two of odd types
+        self.assertEqual(self.count("attachments"), 8)          # the big picture, two of odd types and five clean ones
         self.assertEqual(self.inbound("Why does it stop here?", kind="image", id="m-up")[0], "stored")
         req = self.last_request()
         self.assertEqual(hub.q1("SELECT message FROM attachments WHERE id=?", (first["id"],))["message"],
