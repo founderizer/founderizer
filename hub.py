@@ -1045,7 +1045,7 @@ def kv_get(k, default=None):
 # Times the hub keeps for itself, which no screen of the owner's shows: their writes are quiet (live_changes).
 QUIET_KEYS = ("tick_ok", "releases_swept", "releases_found", "bridge_seen", "bridge_code",
               "error_reports_tried", "error_reports_sent", "error_reports_hold", "error_reports_on_at", "door_grants",
-              "door_changes")
+              "door_changes", "door_long_script")     # the last: the Mac's word long=1 (door_script_bounds)
 
 
 def kv_set(k, v):
@@ -3415,6 +3415,20 @@ DOOR_CARD_TITLE = "Run one root script on {host}?"         # the title of the do
 DOOR_SCRIPT_GAP = 32
 DOOR_SCRIPT_BLANK = 2
 DOOR_SCRIPT_LINES = 200         # lines of a script that a card shows: more is a file for the agent to install, not a card
+# The bounds while the owner's Mac app signs a longer card (door_script_bounds): one job on one server is one card,
+# and the six cards of one script of 13,152 characters (21 November 2026) gave him the same text in six presses.
+DOOR_SCRIPT_CHARS_LONG = 16000
+DOOR_SCRIPT_LINES_LONG = 600
+DOOR_LONG_KEY = "door_long_script"      # kv: the newest read of GET /ui/door said long=1 (ui_door)
+# A text that nobody reads on a card (door_script_dense, DoorCall.dense): a line of more than DOOR_SCRIPT_LINE
+# characters, a run of more than DOOR_SCRIPT_RUN with no space (base64, hex), and more than DOOR_SCRIPT_DENSE
+# characters in all on lines with no space and in runs of more than DOOR_SCRIPT_BLOB with no space (a blob cut into
+# many short lines, or into chunks with a space between them).
+DOOR_SCRIPT_LINE = 200
+DOOR_SCRIPT_RUN = 120
+DOOR_SCRIPT_DENSE = 2000
+DOOR_SCRIPT_BLOB = 64          # a run with no space longer than a SHA-256: a line of such runs counts as a blob
+DOOR_SCRIPT_CODED = 16         # a part of a run in base64's letters, this long, that reads as encoded text counts too
 
 
 def door_call_hash(target, action, args, content=b""):
@@ -3455,6 +3469,55 @@ def door_script_padded(script):
     return False
 
 
+def door_script_dense(script):
+    """The rule of a script's text that it breaks, or None: "line" for a line of more than DOOR_SCRIPT_LINE
+    characters or a run of more than DOOR_SCRIPT_RUN with no space, "dense" for more than DOOR_SCRIPT_DENSE characters
+    in all on lines with no space and, on the other lines, in what of a run with no space reads as encoded text
+    (door_script_coded: a blob cut into chunks with a space between them, which the line and run rules let through),
+    and "end" for a line that
+    ends in a space. The owner cannot read a packed line or a blob, and a space at a line's end can change what runs
+    and not what he reads: a heredoc's end line with a space after it ends nothing, and a backslash before it joins no
+    line (DoorCall.dense)."""
+    lines = script.split("\n")
+    if script.endswith("\n"):
+        lines.pop()
+    dense = 0
+    for line in lines:
+        if len(line) > DOOR_SCRIPT_LINE or any(len(run) > DOOR_SCRIPT_RUN for run in line.split(" ")):
+            return "line"
+        if line.endswith(" "):
+            return "end"
+        if " " not in line:
+            dense += len(line)
+        else:
+            dense += sum(door_script_coded(run) for run in line.split(" "))
+    return "dense" if dense > DOOR_SCRIPT_DENSE else None
+
+
+def door_script_coded(run):
+    """The characters of a run with no space that read as encoded text (DoorCall.coded): all of a run of more than
+    DOOR_SCRIPT_BLOB, and of a shorter one each part of DOOR_SCRIPT_CODED or more of base64's letters (A-Z, a-z, 0-9,
+    +, /, =) that holds a digit and a letter, or that is hex for four fifths or more: a checksum, 0x and base32 count,
+    a word or a path with no digit does not. A shorter part, or a code in words, is no rule's: no count of characters
+    makes a text readable, and the owner still reads it."""
+    if len(run) > DOOR_SCRIPT_BLOB:
+        return len(run)
+    return sum(len(part) for part in re.findall(r"[A-Za-z0-9+/=]{%d,}" % DOOR_SCRIPT_CODED, run)
+               if re.search(r"[0-9]", part) and re.search(r"[A-Za-z]", part) or
+               len(re.findall(r"[0-9A-Fa-f]", part)) * 5 >= len(part) * 4)
+
+
+def door_script_bounds():
+    """(characters, lines) of a door card's script now. The long bounds while the owner's Mac app signs them: its
+    reads of GET /ui/door say long=1, which ui_door keeps in kv. A read without it is an older Mac, which signs only
+    the short bounds, so the key goes; two Macs of two builds make it come and go, and then the short bounds hold
+    at times, which is safe. The word is the Mac's only: an iPhone of an older build signs no long card, and the owner
+    answers that card on the Mac."""
+    if kv_get(DOOR_LONG_KEY):
+        return DOOR_SCRIPT_CHARS_LONG, DOOR_SCRIPT_LINES_LONG
+    return DOOR_SCRIPT_CHARS, DOOR_SCRIPT_LINES
+
+
 def door_script_details(script):
     """The script as the card's details: one code block, which the owner's app draws character for character. The
     app's own parser of that text must give back exactly this script, which the owner's Mac checks before it signs
@@ -3487,24 +3550,44 @@ def door_script_card(title, host, call, script, words=()):
                         f"one that the door gave. Give the script character for character as the agent sent it "
                         f"(ask the agent for it again, or for the file), and the door_call and door_host of that "
                         f"same refusal.")
-    if len(found) > DOOR_SCRIPT_CHARS:
-        raise ToolError(f"door_script is at most {DOOR_SCRIPT_CHARS} characters, because the card shows it whole "
-                        f"and the owner reads it before Run it once. This one has {len(found)}: the agent sends a "
-                        f"shorter script, or the owner sets the server to Full access.")
+    # the bounds in force, which the refusal names: one job is one card, so a longer job is never cut into several
+    chars, rows = door_script_bounds()
+    lines = len(found.removesuffix("\n").split("\n"))
+    if len(found) > chars or lines > rows:
+        raise ToolError(f"door_script is at most {chars} characters in {rows} lines now, because the card shows it "
+                        f"whole and the owner reads it before Run it once. This one has {len(found)} characters in "
+                        f"{lines} lines. One job is one card: never send it as several shorter scripts. First: the "
+                        f"agent makes the job shorter, or the owner sets the server to Full access. Only when neither "
+                        f"fits, and only for plain commands that a person reads, never for encoded text: the agent "
+                        f"installs the long part as a file with `ops {host} file`, delivers the same "
+                        f"text in outputs/T-<id>/, and sends one short script that checks the file and runs it "
+                        f"through one file descriptor: `exec 3</root/job.sh; echo \"<sha256>  /dev/fd/3\" | "
+                        f"sha256sum -c && bash /dev/fd/3`. The card's why then says in plain words what the file does "
+                        f"and where its text is.")
     hidden = door_script_hidden(found)
     if hidden:
         raise ToolError(f"door_script holds a character that is not plain text ({hidden}). The owner's Mac signs Run "
                         f"it once only for a script of printable ASCII characters and line feeds, because any other "
                         f"character can change what runs and not what the owner reads; a tab is drawn to a tab stop, "
                         f"as no gap or as a new row. The agent sends the script without it, with spaces for tabs.")
-    if len(found.removesuffix("\n").split("\n")) > DOOR_SCRIPT_LINES:
-        raise ToolError(f"door_script is at most {DOOR_SCRIPT_LINES} lines, because the owner reads it whole before "
-                        f"Run it once. The agent sends a shorter script, or the owner sets the server to Full "
-                        f"access.")
     if door_script_padded(found):
         raise ToolError(f"door_script has a run of more than {DOOR_SCRIPT_GAP} spaces, or more than "
                         f"{DOOR_SCRIPT_BLANK} blank lines in a row, which can put a command out of the owner's "
                         f"sight. The agent sends the script without that padding.")
+    dense = door_script_dense(found)
+    blob = (" The owner cannot read that, so the card takes none of it, also not as a file that the script runs: "
+            "the agent writes the script in short lines of plain commands, with no encoded text.")
+    if dense == "line":
+        raise ToolError(f"A line of door_script has more than {DOOR_SCRIPT_LINE} characters, or a run of more than "
+                        f"{DOOR_SCRIPT_RUN} characters with no space (base64, hex, a packed one-liner)." + blob)
+    if dense == "dense":
+        raise ToolError(f"door_script has more than {DOOR_SCRIPT_DENSE} characters on lines with no space and in "
+                        f"encoded text (runs of more than {DOOR_SCRIPT_BLOB} characters with no space, and parts of "
+                        f"{DOOR_SCRIPT_CODED} or more in hex or in base64)." + blob)
+    if dense == "end":
+        raise ToolError("A line of door_script ends in a space, which can change what runs and not what the owner "
+                        "reads (a heredoc's end line, a backslash before it). The agent sends the script without "
+                        "spaces at line ends.")
     if any(line.strip(" ").startswith("```") for line in found.split("\n")):
         raise ToolError("A line of door_script starts with ```, which ends the card's code block: the card would "
                         "not show the whole script. The agent sends the script without such a line.")
@@ -16859,7 +16942,7 @@ def t_raise_needs_you(agent, a):
             raise ToolError(CARD_ROUTE_REFUSAL)
         guard(agent, recommended)
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
-        old = need_replaced(agent, replaces) if replaces else None
+        old = need_replaced(agent, replaces, door_host) if replaces else None
         qu = need_question(agent, a.get("question_id"), ignore=old["id"] if old else None)
         # owner API 1.285: each picture, checked under the lock that the item's own write holds, so that no message
         # and no other item takes one between this check and the take (need_takes_pictures)
@@ -16877,17 +16960,8 @@ def t_raise_needs_you(agent, a):
         # the title names it only on the card of a run, whose title the owner's Mac signs under
         asking = door_asking_task(door_call, qu) if door_call else None
         door_task = door_task_words(asking["title"]) if asking and door_host else None
-        # one part at a time (the owner's choice of 21 November 2026, after six cards of one 13,152-character script
-        # came at once and each looked like the last one again): a run's card waits until the owner has answered the
-        # door's card that the same task has open on the same server
-        if door_host and asking:
-            open_card = read_row("SELECT id FROM needs WHERE door_host=? AND door_task_id=? AND answer IS NULL",
-                                 (door_host, asking["id"]))
-            if open_card:
-                raise ToolError(f"N-{open_card['id']}, the door's card of the same task on {door_host}, is still open: the owner gets "
-                                f"one part at a time. Raise this one after the owner has answered that card and the "
-                                f"agent has run it, and say in why which part it is (Part 2 of 6). If that card is not "
-                                f"needed any more, close it first: answer its question, or use withdraw_need.")
+        if door_host:           # one job on one server is one card, and a second open card of it needs replaces
+            door_card_open(door_call, door_host, asking, old)
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,door_host,github_app,"
                   "add_device,github_key,details,multi,door_script,door_task,door_task_id,key_swap_server,give_agent,"
                   "give_level,give_repos,recommended,pictures) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -16962,10 +17036,13 @@ def t_raise_needs_you(agent, a):
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{later}{door}{picks}"
 
 
-def need_replaced(agent, nid):
+def need_replaced(agent, nid, door_host=None):
     """The open item that raise_needs_you takes the place of (owner feature need_talk: the manager offers new options
     or new words), checked: one of this agent's that he has not answered, of a kind whose
-    answer comes back to this agent. A key request, a door call, an App, a phone or a renewal has its own route."""
+    answer comes back to this agent. A key request, a door call, an App, a phone or a renewal has its own route.
+    door_host: the server of the new item when it is the door's card of a run. That card takes the place of this
+    agent's open door card of the same server (door_card_open: one job on one server is one card), which then
+    closes as replaced, and its task hears nothing: only the owner's answer is told to it (need_door_task_rows)."""
     need = q1("SELECT * FROM needs WHERE id=?", (nid,))
     if not need:
         raise ToolError(f"There is no Needs-you item N-{nid}.")
@@ -16973,12 +17050,54 @@ def need_replaced(agent, nid):
         raise ToolError(f"N-{nid} is {need['by']}'s: you replace only an item that you raised.")
     if need["answer"] is not None:
         raise ToolError(f"N-{nid} is closed already: {clip(need['answer'], 200)}")
-    if need["conversation"] or need["kind"] == "secret" or need["door_call"] or need["github_app"] or \
-            need["add_device"] or need["github_key"] or need["key_swap_server"] or need["team_plan"]:
+    door_card = need["door_call"] and door_host is not None and need["door_host"] == door_host
+    if need["conversation"] or need["kind"] == "secret" or (need["door_call"] and not door_card) or \
+            need["github_app"] or need["add_device"] or need["github_key"] or need["key_swap_server"] or \
+            need["team_plan"]:
         raise ToolError(f"N-{nid} closes by its own route (a conversation, a key, a door call, an App, a phone, a "
                         f"key renewal, a server's key swap or a plan of team changes, which a new plan replaces), so "
                         f"it is not replaced: withdraw it with withdraw_need if it is not needed.")
     return need
+
+
+def door_call_caller(call):
+    """The agent that sent the call of this hash to the door, by the newest line of the door's record, or None."""
+    row = q1("SELECT caller FROM door_record WHERE call=? ORDER BY n DESC LIMIT 1", (call,))
+    return row["caller"] if row else None
+
+
+def door_card_open(call, host, asking, old):
+    """Under LOCK, in raise_needs_you: a ToolError when an open door card asks for this call already, or for another
+    root script of the same job on the same server. The owner, 21 November 2026, of six cards of one script of 13,152
+    characters for one task on one server: "every time the same?". Two cards are of one job when they have the same
+    door_host and the same task (door_task_id), or, when neither has a task, the same caller in the door's record. The
+    card that the new one replaces (old) is no second card, and neither is an answered one: a task that runs one
+    script, reads its result and needs a second is real work. replaces takes only a card of the same job: it closes the
+    old card with no word to its task."""
+    task, caller = asking["id"] if asking else None, door_call_caller(call)
+
+    def same_job(r):            # a card of a task is of that task's job alone; with no task, of the caller's
+        if task or r["door_task_id"]:
+            return r["door_task_id"] == task
+        return caller is not None and door_call_caller(r["door_call"]) == caller
+    if old and not same_job(old):
+        raise ToolError(f"N-{old['id']} is the door card of another job on {host} (another task, or another agent), "
+                        f"and replaces takes only the open card of the same job. Raise this card without replaces.")
+    rows = q("SELECT id, door_call, door_task_id, question FROM needs WHERE door_host=? AND answer IS NULL AND "
+             "id IS NOT ? ORDER BY id", (host, old["id"] if old else None))
+    same = next((r for r in rows if r["door_call"] == call), None)
+    if same:
+        raise ToolError(f"N-{same['id']} already asks the owner for this call. Raise no second card: wait for the "
+                        f"answer.")
+    for r in rows:
+        if not same_job(r):
+            continue
+        question = (f" N-{r['id']} takes Q-{r['question']} to the owner, so it cannot be withdrawn: give question_id "
+                    f"Q-{r['question']} with replaces, and the new card takes that question." if r["question"] else "")
+        raise ToolError(f"One job on one server is one card. N-{r['id']} is open for a root script of the same "
+                        f"{'task' if task else 'agent'} on {host}. The agent sends the whole job "
+                        f"as one script, and you raise its card with replaces set to N-{r['id']}. Never raise the "
+                        f"parts of a script as several cards.{question}")
 
 
 def need_question(agent, ref, ignore=None):
@@ -47454,22 +47573,21 @@ TOOLS = [
                       "through after their yes, and say there that the owner presses the first option and runs "
                       "nothing themselves. Give options whose first one is the yes."},
         "door_host": {"type": "string", "description": "For a host's run that the door refused (its answer names "
-                      "full_access): that server, with the run's door_call. The card is then the door's card, which "
-                      "the owner approved: the title \"Run one root script on <server>?\", one or two sentences, the "
-                      "script in details, and the three answers Run it once, Full access on <server>, and No, which "
-                      "the hub writes itself. Leave options out. The owner reads the title of the task that asked "
-                      "after the card's title, and the hub adds it itself: give the title word for word, with nothing "
-                      "after it. The door's record says which call a hash is "
-                      "of: the hash of a host's run needs door_host, that host, and no other hash takes one."},
+                      "full_access): that server, with the run's door_call. The card is then the door's card: the "
+                      "title \"Run one root script on <server>?\", one or two sentences that name each thing that the "
+                      "script changes, and the answers Run it once, Full access on <server> and No, which the hub "
+                      "writes. Leave options out. The hub adds the asking task's title after the card's title: give "
+                      "the title word for word. Only the hash of a host's run takes door_host, and only that host."},
         "door_script": {"type": "string", "description": f"With door_host, always: the script of that run, character for "
-                        f"character as the agent sent it to the door, at most {DOOR_SCRIPT_CHARS} characters of "
-                        f"printable ASCII and line feeds (spaces for tabs), in at most {DOOR_SCRIPT_LINES} lines, "
-                        f"with no run of more than {DOOR_SCRIPT_GAP} spaces and at most {DOOR_SCRIPT_BLANK} blank "
-                        f"lines in a row. The card "
-                        f"then shows this script under Script, and nothing else there, so leave details out, and "
+                        f"character as the agent sent it to the door: at most {DOOR_SCRIPT_CHARS_LONG} characters in "
+                        f"{DOOR_SCRIPT_LINES_LONG} lines when the owner's Mac app takes them, else "
+                        f"{DOOR_SCRIPT_CHARS} in {DOOR_SCRIPT_LINES}, of printable ASCII in lines that a person reads "
+                        f"(a refusal names each rule and the bound). One job on one server is one card: a new card of "
+                        f"the same job takes replaces. A script of more than 6000 characters comes from the file in "
+                        f"the task's outputs. The card shows only this script under Script: leave details out, and "
                         f"put no backtick in why and what_to_do. The hub checks that it is the script of door_call, "
-                        f"and the owner's Mac computes that hash again from what its card shows before it signs Run "
-                        f"it once: a card with no door_script, or with another script, gets no signed Run it once."},
+                        f"and the owner's Mac hashes what its card shows before it signs Run it once: a card with no "
+                        f"door_script, or with another script, gets no signed Run it once."},
         "github_app": {"type": "string", "description": "The GitHub account, an organization or a user, that needs "
                        "a GitHub App of its own, because no App of the door reaches it (the hub tells you when): the "
                        "first option, which the owner presses in Founderizer on their Mac, then makes it with GitHub's "
@@ -75815,6 +75933,9 @@ class Handler(BaseHTTPRequestHandler):
         if query.get("early") == "1":       # this Mac app starts a round at once on a new grant (door_round_wait)
             DOOR_EARLY["at"] = now()
         with LOCK:
+            # this Mac app signs a door card of the long bounds (door_script_bounds); a read without the word is an
+            # older Mac's, which signs only the short ones
+            kv_set(DOOR_LONG_KEY, "1" if query.get("long") == "1" else None)
             view = door_view()
             # after the view: the round that read it holds each grant that it gives; held is the Mac's word of what
             # the door's file holds (owner API 1.234), and the answer gives this view's mark for it
