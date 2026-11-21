@@ -622,7 +622,6 @@ class Narrowed(Base):
                       f"{hub.CONVERSATION_NOT_NARROWED}", (lynx["id"], reply))
         self.assertEqual(sorted((r["id"], r["scope_person"]) for r in shown), [(lynx["id"], None), (reply, None)])
 
-    @unittest.expectedFailure       # the hole is late_permission_word's (lanes/fleet-awareness.md): its fix ends this
     def test_a_late_decision_on_a_narrowed_task_brings_no_words_of_its_decider(self):
         """The Chat area's privacy review: a decision that comes after a permission prompt of a narrowed task expired
         is written into that task (late_permission_word), and its locked window reads it. Its decider is the task's
@@ -637,6 +636,23 @@ class Narrowed(Base):
         said = [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='studio' AND kind='say' AND task=?",
                                           (t["id"],))]
         self.assertFalse([line for line in said if "alpaca" in line], said)
+        self.assertTrue([line for line in said if f"Your requester says allow on P-{prompt}, which had already "
+                         f"expired" in line], said)             # it came, from no name of the team
+        self.assertFalse([line for line in said if "manager" in line], said)
+
+    def test_another_agent_learns_nothing_of_a_narrowed_task_s_prompt(self):
+        """Fable 5.2's point on decide_permission: an agent that does not decide a prompt reads, in its refusal, who
+        requested the prompt's task and the task's id. For a narrowed pair's task, a session that is not that pair's
+        must not learn that the task exists (narrowed_from), so the refusal is the one for a prompt that does not
+        exist. The bug: vps reads the narrowed task's id and its requester."""
+        t = self.conversation_task(self.says(PAT, "Please fix the form of the CRM")["conversation"])
+        prompt = hub.ins("INSERT INTO prompts(task,agent,tool,input,key,created) VALUES(?,'studio','Bash','{}','k',?)",
+                         (t["id"], hub.now()))
+        _, own = self.normal_task(owner="vps", title="Check the logs")          # vps's own task session
+        text, error = self.tool("decide_permission", own, agent="vps", prompt_id=f"P-{prompt}", decision="allow")
+        self.assertTrue(error, text)
+        self.assertEqual(text, f"There is no permission prompt P-{prompt}.")
+        self.assertIsNone(hub.q1("SELECT decision FROM prompts WHERE id=?", (prompt,))["decision"])
 
     def test_no_session_waits_for_a_narrowed_persons_answer(self):
         theirs = self.says(KIM, "Hello", account="discord-studio")["conversation"]

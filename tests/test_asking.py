@@ -948,6 +948,21 @@ class PromptPolls(Tools, Runtime):
         self.assertEqual(tuple(hub.q1("SELECT state, waiting_on FROM tasks WHERE id=?", (tid,))), ("working", None))
         self.assertEqual(sum("expired" in t for t in self.said("studio") + self.said("manager")), 0)
 
+    def test_a_deny_s_reason_reaches_the_session_but_not_a_narrowed_pair_s(self):
+        """A deny in time tells the session why, so the agent does not try the same thing blindly. A narrowed pair's
+        task (tasks.scope_person) is read by its locked window, and its decider holds more than the pair's list, so it
+        gets the deny with none of the decider's words (Fable 5.2, with the late word's fix). The bugs: the reason
+        reaches the narrowed window, or no session gets a reason at all."""
+        for narrowed, words in ((False, "Denied by your requester: the alpaca budget is spent"),
+                                (True, "Denied by your requester.")):
+            tid = self.task()
+            hub.q("UPDATE tasks SET scope_person=? WHERE id=?", (7 if narrowed else None, tid))
+            prompt = self.ask(tid)["prompt"]
+            hub.call_tool("manager", "decide_permission", {"prompt_id": prompt, "decision": "deny",
+                                                           "reason": "the alpaca budget is spent"})
+            self.assertEqual(self.ask(tid, prompt)["hookSpecificOutput"]["decision"],
+                             {"behavior": "deny", "message": words})
+
     def test_a_stop_of_the_hub_answers_the_hooks_ask_pending_at_once_and_ends_no_prompt(self):
         """The owner's "Yes, build both" of 16 November 2026: a restart of the hub in its own process waits for the
         open requests, so a hook's ask answers `pending` as soon as the hub stops (hub.STOPPING), as at the end of

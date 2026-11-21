@@ -916,7 +916,7 @@ PAGES = {
     "vault": ("/ui/vault", "the central vault as the hub last read it, with no value and no title: the owner's signed "
                            "grants and pool, each server's pin and what each server's vault holds (held)"),
     "profiles": ("/ui/profiles", "every agent's profile at the hub revision"),
-    "knowledge": ("/ui/knowledge", "one owner knowledge file with its text (give path)"),
+    "knowledge": ("/ui/knowledge", "one knowledge file with its text (give path): the owner's, or an internal one"),
     "people": ("/ui/people", "the people the owner added, their roles and handles, and the unknown senders"),
     "roles": ("/ui/roles", "the roles a person can hold: each one's prompt, its tools switch and its daily limit"),
     "settings": ("/ui/settings", "the fleet's settings: each one's value, its default, and what it does"),

@@ -13320,10 +13320,15 @@ def late_permission_word(by, p, decision, reason):
                         f"A fix is a new task that follows it.")
     if p["reason"]:
         return plain + f" {p['reason']}"
-    said = (f"[hub] {by} says {decision} on P-{pid}, which had already expired, so the command did not run. " +
-            (f"Run the same thing again when the work needs it; it asks {by} once more."
+    who = "your requester" if t["scope_person"] else by     # a narrowed pair's task gets no name of the team
+    said = (f"[hub] {'Your requester' if t['scope_person'] else by} says {decision} on P-{pid}, which had already "
+            f"expired, so the command did not run. " +
+            (f"Run the same thing again when the work needs it; it asks {who} once more."
              if decision == "allow" else
-             f"Do not run it, and do not reach it another way.") + (f" {by}: {reason}" if reason else ""))
+             f"Do not run it, and do not reach it another way.") +
+            # a narrowed pair's task (tasks.scope_person): its locked window reads this line, and its decider holds
+            # more than the pair's list, so the line says that a late decision came and holds none of the decider's words
+            (f" {by}: {reason}" if reason and not t["scope_person"] else ""))
     note = f"{by} said {decision} after it expired, and {p['agent']} was told so in its session"
     filed = filed_under(p["agent"], "say", p["task"])
     with transaction():
@@ -13346,6 +13351,7 @@ def t_decide_permission(agent, a):
         always = always.strip().lower() in ("true", "yes", "1", "always")
     reason = str(a.get("reason") or "").strip()
     guard(agent, reason)
+    scope = session_scope(agent)
     with LOCK:
         p = q1("SELECT * FROM prompts WHERE id=?", (pid,))
         if not p:
@@ -13354,6 +13360,8 @@ def t_decide_permission(agent, a):
             raise ToolError(f"P-{pid} belongs to no task, so no one can decide it.")
         t = q1("SELECT * FROM tasks WHERE id=?", (p["task"],)) if p["task"] else None
         if t and not acts_for(agent, t):        # the manager decides for a lead that cannot
+            if narrowed_from(t, scope, agent):  # a narrowed pair's task: its requester and its id stay unknown
+                raise ToolError(f"There is no permission prompt P-{pid}.")
             raise ToolError(f"P-{pid} is for {t['requester']} to decide: it requested {tref(t['id'])}.")
         if t:
             in_scope(agent, t)
@@ -78930,7 +78938,10 @@ class Handler(BaseHTTPRequestHandler):
             return reply("deny", str(e))
         if row["decision"] not in ("allow", "deny"):    # it ended before a decision: replaced, or moved to the screen
             return reply("deny", row["reason"] or f"P-{pid} ended without a decision, so {tool} did not run.")
-        reply(row["decision"], "Denied by your requester" + (f": {row['reason']}" if row["reason"] else "."))
+        # a narrowed pair's task (tasks.scope_person) reads none of its decider's words, as late_permission_word
+        narrowed = t is not None and t["scope_person"] is not None
+        reply(row["decision"], "Denied by your requester" + (f": {row['reason']}" if row["reason"] and not narrowed
+                                                             else "."))
 
     def mcp(self, agent, context=None):
         if agent not in agents():
