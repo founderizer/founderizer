@@ -3872,14 +3872,17 @@ class PackageStops(unittest.TestCase):
 
 
 class ReleasesReach(unittest.TestCase):
-    """**A hub install stops on a server that can never take a release** (the case of 21 November 2026: a hub on a
-    server with IPv6 only installed, and then each release stopped at its fetch with "Failed to connect to github.com
-    port 443", because github.com answers over IPv4 only). hub.sh's `releases_reach` runs with a stand-in git and a
-    folder that stands in for /proc: the stop says the cause that the person can fix, git's own line stays above it,
-    and the address that it reaches is the one that the hub takes its releases from (releases.DEFAULT_UPSTREAM), with
-    no settings of root's own, no password prompt and a time limit (a stand-in `timeout`, which each Linux server has).
-    A hub that is there already goes on. Under sh, and under dash where this machine has it, as Ubuntu runs the
-    installers."""
+    """**A hub install stops on a server that can never take a release, and repairs one that lost its route** (the
+    case of 21 November 2026: the owner's test hub had an IPv4 address at its provider and lost it on the machine,
+    because systemd-networkd failed a DHCPv4 renewal, marked eth0 failed and never asked again; each release then
+    stopped at its fetch with "Failed to connect to github.com port 443", because github.com answers over IPv4 only,
+    and `networkctl reconfigure eth0` brought the route back). hub.sh's `releases_reach` runs with a stand-in git,
+    `networkctl` and `sleep`, and a folder that stands in for /proc: a link that networkd marks failed is set up again
+    and the route is read until 60 seconds before the stop, the stop says the cause that the person can fix and never
+    sends a person to buy an address that the server has, git's own line stays above it, and the address that it
+    reaches is the one that the hub takes its releases from (releases.DEFAULT_UPSTREAM), with no settings of root's
+    own, no password prompt and a time limit (a stand-in `timeout`, which each Linux server has). A hub that is there
+    already goes on. Under sh, and under dash where this machine has it, as Ubuntu runs the installers."""
 
     FAILED = ("fatal: unable to access 'https://github.com/founderizer/founderizer.git/': Failed to connect to "
               "github.com port 443 after 1 ms: Couldn't connect to server")
@@ -3887,6 +3890,16 @@ class ReleasesReach(unittest.TestCase):
     HEAD = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
     DEFAULT = "eth0\t00000000\t0101FEA9\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
     LOCAL = "eth0\t0000FEA9\t00000000\t0001\t0\t0\t100\t0000FFFF\t0\t0\t0\n"
+    # `networkctl list --no-legend --no-pager`, as systemd 255 prints it: links that work, and a server whose eth0
+    # networkd marks failed beside a working eth1 and a name that no link can have
+    WORKING = ("  1 lo         loopback carrier  unmanaged\n  2 eth0       ether    routable configured\n"
+               "  3 tailscale0 none     routable unmanaged\n")
+    ETH0_FAILED = ("  1 lo         loopback carrier  unmanaged\n  2 eth0       ether    routable failed\n"
+                   "  3 eth1       ether    routable configured\n  4 -x*       ether    off      failed\n"
+                   "  5 tailscale0 none     routable unmanaged\n")
+    LOST = ("This server lost its IPv4 route, which GitHub needs: its network service failed on {links}, and this "
+            "line could not bring the route back. Restart the server, then run the line again. If it still has no IPv4 "
+            "route, make sure that your provider gives it a public IPv4 address.")
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="releases-reach-"))
@@ -3897,53 +3910,89 @@ class ReleasesReach(unittest.TestCase):
         self.address = releases.DEFAULT_UPSTREAM
         self.host = urllib.parse.urlsplit(self.address).hostname
 
-    def run_reach(self, shell, git_status, route, present=False, words=True, tree=KIT):
+    def run_reach(self, shell, git_status, route, present=False, words=True, tree=KIT, links=WORKING, back_at=None,
+                  follows=False, refuses=None):
         """`releases_reach` of a real run (not --check), on a new hub or on one that is `present`: (exit status,
-        output, what `timeout` and git got)."""
+        output, what `timeout`, git, networkctl and sleep got). `links`: what networkctl lists; `back_at`: the read of
+        the route (1, 2 or 3, at 10, 30 and 60 seconds) at which the default route comes back; `follows`: git answers
+        once the server has a default route; `refuses`: a `case` pattern of the links whose `networkctl reconfigure`
+        fails."""
         log = self.tmp / "git.log"
+        route_file = self.tmp / "proc" / "net" / "route"
         git = self.tmp / "bin" / "git"
         git.write_text('#!/bin/sh\nprintf "GIT_TERMINAL_PROMPT=%s GIT_CONFIG_GLOBAL=%s %s\\n" "$GIT_TERMINAL_PROMPT" '
                        f'"$GIT_CONFIG_GLOBAL" "$*" >> {shlex.quote(str(log))}\n'
+                       + (f"awk 'NR > 1 && $2 == \"00000000\" {{f = 1}} END {{exit !f}}' "
+                          f"{shlex.quote(str(route_file))} && exit 0\n" if follows else "")
                        + (f"echo {shlex.quote(self.FAILED)} >&2\n" if git_status and words else "")
                        + f"exit {git_status}\n")
         git.chmod(0o755)
         limit = self.tmp / "bin" / "timeout"
         limit.write_text(f'#!/bin/sh\nprintf "timeout %s\\n" "$1" >> {shlex.quote(str(log))}\nshift\nexec "$@"\n')
         limit.chmod(0o755)
+        networkctl = self.tmp / "bin" / "networkctl"
+        networkctl.write_text(f'#!/bin/sh\nprintf "networkctl %s\\n" "$*" >> {shlex.quote(str(log))}\n'
+                              f'[ "$1" = list ] && printf %s {shlex.quote(links)}\n'
+                              + (f'[ "$1" != reconfigure ] || case "$2" in ({refuses}) echo "Failed to reconfigure '
+                                 'network interface $2: Access denied" >&2; exit 1;; esac\n' if refuses else "")
+                              + "exit 0\n")
+        networkctl.chmod(0o755)
+        count = self.tmp / "sleeps"
+        count.unlink(missing_ok=True)
+        sleep = self.tmp / "bin" / "sleep"
+        sleep.write_text(f'#!/bin/sh\nprintf "sleep %s\\n" "$1" >> {shlex.quote(str(log))}\n'
+                         f'n=$(($(cat {shlex.quote(str(count))} 2>/dev/null || echo 0) + 1))\n'
+                         f'echo "$n" > {shlex.quote(str(count))}\n'
+                         + (f'[ "$n" != {back_at} ] || printf %s {shlex.quote(self.DEFAULT)} >> '
+                            f'{shlex.quote(str(route_file))}\n' if back_at else "")
+                         + "exit 0\n")
+        sleep.chmod(0o755)
         bare = self.tmp / "fleet.git"
         if present:
             bare.mkdir(exist_ok=True)
         elif bare.exists():
             bare.rmdir()
-        (self.tmp / "proc" / "net" / "route").write_text(self.HEAD + route)
+        route_file.write_text(self.HEAD + route)
         text = ("set -eu\n"
                 "say() { printf 'Founderizer: %s\\n' \"$*\"; }\n"
                 "stop() { printf 'Founderizer install stopped: %s\\n' \"$*\" >&2; exit 1; }\n"
                 "plan() { [ \"$check\" = yes ] && printf 'Founderizer:   would %s\\n' \"$*\" || true; }\n"
                 f"check=no\nroot={shlex.quote(str(self.tmp))}\ntree={shlex.quote(str(tree))}\n"
                 f"bare={shlex.quote(str(bare))}\n"
-                + shell_function(SCRIPT, "releases_reach") + "releases_reach\n")
+                + "".join(shell_function(SCRIPT, name) for name in ("releases_reach", "releases_answer", "ipv4_route",
+                                                                    "failed_links", "relink"))
+                + "releases_reach\n")
         log.unlink(missing_ok=True)
         done = subprocess.run([shell, "-c", text], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
                               env=dict(os.environ, PATH=f"{self.tmp / 'bin'}:/usr/bin:/bin"))
         return done.returncode, done.stdout + done.stderr, log.read_text() if log.exists() else ""
 
     def test_a_server_that_cannot_reach_the_releases_stops_with_the_cause_that_it_can_fix(self):
+        """With no failed link, the stop for a server with no IPv4 route asks for a restart first, because a provider
+        can give a server an address that the server lost (the case of 21 November 2026). It asks for a new address
+        only for a provider that gives none."""
         for shell in PackageStops.shells():
-            status, out, _ = self.run_reach(shell, 128, self.LOCAL)
+            status, out, asked = self.run_reach(shell, 128, self.LOCAL)
             self.assertEqual(status, 1, (shell, out))
             self.assertIn("Founderizer install stopped: This server has no IPv4 route, and GitHub, where the hub "
-                          "takes its releases, answers over IPv4 only. Give it a public IPv4 address at your "
-                          "provider, then run the line again.", out, shell)
+                          "takes its releases, answers over IPv4 only. If your provider gives this server an IPv4 "
+                          "address, restart the server. If it gives none, add a public IPv4 address at your provider. "
+                          "Then run the line again.", out, shell)
             self.assertIn(f"Founderizer:   git: {self.FAILED}", out, shell)
+            # networkd marks no link failed: no link is set up again, and nothing waits.
+            self.assertIn("networkctl list --no-legend --no-pager\n", asked, shell)
+            self.assertNotIn("reconfigure", asked, shell)
+            self.assertNotIn("sleep", asked, shell)
             elsewhere = (f"Founderizer install stopped: This server could not use {self.host} over HTTPS, where the "
                          f"hub takes its releases: the line above says why. If it cannot connect to {self.host}, let "
                          f"it make outgoing HTTPS connections to {self.host}. Then run the line again.")
-            status, out, _ = self.run_reach(shell, 128, self.DEFAULT)
+            status, out, asked = self.run_reach(shell, 128, self.DEFAULT, links=self.ETH0_FAILED)
             self.assertEqual(status, 1, (shell, out))
             self.assertIn(f"Founderizer:   git: {self.FAILED}\n", out, shell)
             self.assertIn(elsewhere, out, shell)
             self.assertNotIn("IPv4", out, shell)
+            # A server that has its route is not set up again, whatever networkd says.
+            self.assertNotIn("networkctl", asked, shell)
             # `timeout` ends a git that got no answer with 124, and git said nothing: the line above says so.
             status, out, _ = self.run_reach(shell, 124, self.DEFAULT, words=False)
             self.assertEqual((status, out), (1, f"Founderizer:   git: no answer within 60 seconds\n{elsewhere}\n"),
@@ -3958,9 +4007,78 @@ class ReleasesReach(unittest.TestCase):
                           shell)
             self.assertNotIn("IPv4", out, shell)
 
+    def test_a_link_that_networkd_marks_failed_is_set_up_again_and_the_install_goes_on(self):
+        """The repair of 21 November 2026, by the line itself: only the failed link is set up again, the route is read
+        again at 10 and 30 seconds (the lease came after a read at 20 seconds that day), and git is asked again."""
+        for shell in PackageStops.shells():
+            for present in (False, True):
+                status, out, asked = self.run_reach(shell, 128, self.LOCAL, present=present, links=self.ETH0_FAILED,
+                                                    back_at=2, follows=True)
+                self.assertEqual((status, out), (0, f"Founderizer:   git: {self.FAILED}\n"
+                                                    "Founderizer:   systemd-networkd's setup of eth0 failed, so this "
+                                                    "line sets it up again (networkctl reconfigure eth0)\n"
+                                                    "Founderizer:   the IPv4 route is back, 30 seconds after the new "
+                                                    "setup\n"
+                                                    f"Founderizer:   this server reaches {self.host} now, where the hub "
+                                                    "takes its releases\n"), (shell, present))
+                self.assertEqual(asked.splitlines()[2:], ["networkctl list --no-legend --no-pager",
+                                                          "networkctl reconfigure eth0", "sleep 10", "sleep 20",
+                                                          "timeout 60", "GIT_TERMINAL_PROMPT=0 GIT_CONFIG_GLOBAL=/dev/null "
+                                                          f"ls-remote -q {self.address} HEAD"], (shell, present))
+            # The route is back and git still fails: the cause is no longer IPv4, so the HTTPS sentence stands.
+            status, out, _ = self.run_reach(shell, 128, self.LOCAL, links=self.ETH0_FAILED, back_at=1)
+            self.assertEqual(status, 1, (shell, out))
+            self.assertEqual(out.count(f"Founderizer:   git: {self.FAILED}\n"), 2, (shell, out))
+            self.assertIn(f"Founderizer install stopped: This server could not use {self.host} over HTTPS", out, shell)
+            self.assertNotIn("IPv4 address", out, shell)
+
+    def test_a_route_that_a_new_setup_does_not_bring_back_stops_with_a_restart(self):
+        """A server that lost its route is sent to restart, not to buy an address: the stop names the failed links,
+        after reads at 10, 30 and 60 seconds, and names the address only for a route that a restart did not bring
+        back. When networkd refuses each new setup, nothing waits. A hub that is there already goes on with the same
+        cause, and the restart comes after the line, because a --reclaim waits for its claim."""
+        two = self.ETH0_FAILED.replace("eth1       ether    routable configured", "eth1       ether    off      failed")
+        for shell in PackageStops.shells():
+            status, out, asked = self.run_reach(shell, 128, self.LOCAL, links=self.ETH0_FAILED)
+            self.assertEqual(status, 1, (shell, out))
+            self.assertTrue(out.endswith("Founderizer:   still no IPv4 route 60 seconds after the new setup\n"
+                                         "Founderizer install stopped: " + self.LOST.format(links="eth0") + "\n"),
+                            (shell, out))
+            self.assertEqual([line for line in asked.splitlines() if line.startswith(("sleep", "networkctl recon"))],
+                             ["networkctl reconfigure eth0", "sleep 10", "sleep 20", "sleep 30"], shell)
+            status, out, asked = self.run_reach(shell, 128, self.LOCAL, links=two)
+            self.assertIn(self.LOST.format(links="eth0, eth1"), out, shell)
+            self.assertEqual([line for line in asked.splitlines() if "reconfigure" in line],
+                             ["networkctl reconfigure eth0", "networkctl reconfigure eth1"], shell)
+            # networkd refuses the new setup: its own line stays, and nothing waits for a route that cannot come.
+            status, out, asked = self.run_reach(shell, 128, self.LOCAL, links=self.ETH0_FAILED, refuses="*")
+            self.assertEqual(status, 1, (shell, out))
+            self.assertIn("Founderizer:   networkctl reconfigure eth0 failed: Failed to reconfigure network interface "
+                          "eth0: Access denied\nFounderizer install stopped: " + self.LOST.format(links="eth0"), out,
+                          shell)
+            self.assertNotIn("sleep", asked, shell)
+            # One new setup of two is refused: the other one is still waited for.
+            status, out, asked = self.run_reach(shell, 128, self.LOCAL, links=two, refuses="eth1")
+            self.assertIn("Founderizer:   networkctl reconfigure eth1 failed: Failed to reconfigure network interface "
+                          "eth1: Access denied\n", out, shell)
+            self.assertTrue(out.endswith("Founderizer install stopped: " + self.LOST.format(links="eth0, eth1") + "\n"),
+                            (shell, out))
+            self.assertEqual([line for line in asked.splitlines() if line.startswith("sleep")],
+                             ["sleep 10", "sleep 20", "sleep 30"], shell)
+            status, out, _ = self.run_reach(shell, 128, self.LOCAL, present=True, links=self.ETH0_FAILED)
+            self.assertEqual(status, 0, (shell, out))
+            self.assertTrue(out.endswith("Founderizer:   this server lost its IPv4 route, which GitHub needs: its "
+                                         "network service failed on eth0, and this line could not bring the route "
+                                         "back; when this line has ended, restart the server; if it still has no IPv4 "
+                                         "route then, make sure that your provider gives it a public IPv4 address\n"
+                                         "Founderizer:   the hub is there already, so the install goes on; the hub "
+                                         f"takes no release until git on this server can use {self.host}\n"),
+                            (shell, out))
+
     def test_a_server_that_reaches_the_releases_goes_on_and_asks_the_hubs_own_address(self):
         for shell in PackageStops.shells():
-            status, out, asked = self.run_reach(shell, 0, self.LOCAL)
+            # networkd marks eth0 failed, but git answers: nothing is set up again, and nothing waits.
+            status, out, asked = self.run_reach(shell, 0, self.LOCAL, links=self.ETH0_FAILED)
             self.assertEqual((status, out), (0, f"Founderizer:   this server reaches {self.host}, where the hub takes "
                                                 "its releases\n"), shell)
             self.assertEqual(asked, f"timeout 60\nGIT_TERMINAL_PROMPT=0 GIT_CONFIG_GLOBAL=/dev/null ls-remote -q "
@@ -3973,7 +4091,9 @@ class ReleasesReach(unittest.TestCase):
             status, out, _ = self.run_reach(shell, 128, self.LOCAL, present=True)
             self.assertEqual(status, 0, (shell, out))
             self.assertEqual(out, f"Founderizer:   git: {self.FAILED}\nFounderizer:   this server has no IPv4 route, "
-                                  "and GitHub answers over IPv4 only\n"
+                                  "and GitHub answers over IPv4 only: when this line has ended, restart the server if "
+                                  "your provider gives it an IPv4 address; if your provider gives none, add a public "
+                                  "IPv4 address there\n"
                                   "Founderizer:   the hub is there already, so the install goes on; the hub takes "
                                   f"no release until git on this server can use {self.host}\n", shell)
 
@@ -5218,13 +5338,15 @@ class CheckMode(unittest.TestCase):
                                     f'; exit 0 ;; esac\nexec {shlex.quote(shutil.which("git"))} "$@"\n')
         (folder / "git").chmod(0o755)
         out = self.run_check(more_env={"PATH": f"{folder}:{os.environ['PATH']}"})
+        relink = ("Founderizer:   would set each link that systemd-networkd marks failed up again (networkctl "
+                  "reconfigure), if this server cannot reach the releases and has no IPv4 route\n")
         self.assertIn(f"Founderizer:   would check that this server reaches {host} over HTTPS, where the hub takes "
-                      "its releases\n", out)
+                      "its releases\n" + relink, out)
         # With --source the plan has no clone yet, so no releases.py to read: it names the check all the same.
         out = self.run_check("--source", "git://example.invalid/fleet.git",
                              more_env={"PATH": f"{folder}:{os.environ['PATH']}"})
         self.assertIn("Founderizer:   would check that this server reaches the address that the hub takes its releases "
-                      "from, over HTTPS\n", out)
+                      "from, over HTTPS\n" + relink, out)
         self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
 
     def test_the_plan_names_the_manager_only_when_a_name_is_given(self):

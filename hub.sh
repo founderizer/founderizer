@@ -314,6 +314,8 @@ fail for a moment: run the line again."
             # The clone is not made in check mode, so there is no copy yet to measure, and no releases.py to read.
             plan "check that the clone carries $NEEDED, and a commit"
             plan "check that this server reaches the address that the hub takes its releases from, over HTTPS"
+            plan "set each link that systemd-networkd marks failed up again (networkctl reconfigure), if this server \
+cannot reach the releases and has no IPv4 route"
             return 0
         fi
         fresh="/root/fleet-kit"
@@ -343,53 +345,133 @@ repository is made from this one, so it must carry its history: copy a git check
 
 releases_reach() {  # The hub takes each release from its upstream (hub.py release_upstream: releases.DEFAULT_UPSTREAM,
                     # read from this copy, on a hub that sets no other) over HTTPS, so a server that cannot reach it
-                    # installs and then takes no release: a hub on a server with IPv6 only stopped at each fetch with
-                    # "Failed to connect to github.com port 443" (the case of 21 November 2026), because github.com
-                    # answers over IPv4 only. This check is in each run of this line: the app's, install_hub's, the
-                    # install prompt's and a run by hand on a copy. One `git ls-remote`, the protocol of the hub's own
-                    # fetch, which changes nothing, with no settings of root's own (the hub fetches as its own user),
-                    # no password prompt and at most a minute; git's last line stays above the stop. A hub that is
-                    # there already (a second run, --reclaim) goes on, with a line that says so: a stop there keeps
-                    # nothing from happening, and the owner's reclaim of a lost Mac needs no GitHub.
+                    # installs and then takes no release. This check is in each run of this line: the app's,
+                    # install_hub's, the install prompt's and a run by hand on a copy. One `git ls-remote`, the
+                    # protocol of the hub's own fetch, which changes nothing, with no settings of root's own (the hub
+                    # fetches as its own user), no password prompt and at most a minute; git's last line stays above
+                    # the stop. github.com answers over IPv4 only. A server can have its IPv4 address at the provider
+                    # and lose it on the machine: the owner's test hub did, on 16 November 2026, after systemd-networkd
+                    # failed a DHCPv4 renewal, marked eth0 failed and did not try again (the lane record
+                    # lanes/install-reaches-releases.md).
+                    # So when git fails and there is no IPv4 route, the line sets each link that networkd marks failed
+                    # up again (relink), waits up to 60 seconds for the route, and asks git again when the route is
+                    # back. Its stop asks for a restart, and for an address only when the provider gives none, so that
+                    # nobody is sent to buy an address that the server has. A hub that is there already (a second run,
+                    # --reclaim) goes on, with a line that says so: a stop there keeps nothing from happening, and the
+                    # owner's reclaim of a lost Mac needs no GitHub.
     releases=$(sed -n 's/^DEFAULT_UPSTREAM = "\([^"]*\)".*/\1/p' "$tree/releases.py" 2>/dev/null)
     [ -n "$releases" ] || stop "$tree/releases.py gives no address of the releases. Copy the repository again."
     host=${releases#*://}
     host=${host%%/*}
     if [ "$check" = yes ]; then
         plan "check that this server reaches $host over HTTPS, where the hub takes its releases"
+        [ "$host" != github.com ] || plan "set each link that systemd-networkd marks failed up again (networkctl \
+reconfigure), if this server cannot reach the releases and has no IPv4 route"
         return 0
     fi
     limit=""
     if command -v timeout >/dev/null 2>&1; then limit="timeout 60"; fi
+    if releases_answer; then
+        say "  this server reaches $host, where the hub takes its releases"
+        return 0
+    fi
+    # github.com answers over IPv4 only, so a server with no default IPv4 route cannot reach it.
+    ipv4=yes
+    relinked=""
+    if [ "$host" = github.com ] && ! ipv4_route; then
+        ipv4=no
+        failed=$(failed_links)
+        if [ -n "$failed" ] && relink "$failed"; then
+            ipv4=yes
+            if releases_answer; then
+                say "  this server reaches $host now, where the hub takes its releases"
+                return 0
+            fi
+        fi
+    fi
+    if [ -e "$bare" ]; then
+        # The install goes on, and a --reclaim waits for its claim: so the restart comes when the line has ended.
+        if [ "$ipv4" = no ] && [ -n "$relinked" ]; then
+            say "  this server lost its IPv4 route, which GitHub needs: its network service failed on $relinked, and \
+this line could not bring the route back; when this line has ended, restart the server; if it still has no IPv4 \
+route then, make sure that your provider gives it a public IPv4 address"
+        elif [ "$ipv4" = no ]; then
+            say "  this server has no IPv4 route, and GitHub answers over IPv4 only: when this line has ended, restart \
+the server if your provider gives it an IPv4 address; if your provider gives none, add a public IPv4 address there"
+        fi
+        say "  the hub is there already, so the install goes on; the hub takes no release until git on this server \
+can use $host"
+        return 0
+    fi
+    if [ "$ipv4" = no ] && [ -n "$relinked" ]; then
+        stop "This server lost its IPv4 route, which GitHub needs: its network service failed on $relinked, and this \
+line could not bring the route back. Restart the server, then run the line again. If it still has no IPv4 route, make \
+sure that your provider gives it a public IPv4 address."
+    fi
+    [ "$ipv4" = yes ] || stop "This server has no IPv4 route, and GitHub, where the hub takes its releases, answers \
+over IPv4 only. If your provider gives this server an IPv4 address, restart the server. If it gives none, add a public \
+IPv4 address at your provider. Then run the line again."
+    stop "This server could not use $host over HTTPS, where the hub takes its releases: the line above says why. If it \
+cannot connect to $host, let it make outgoing HTTPS connections to $host. Then run the line again."
+}
+
+releases_answer() {  # One `git ls-remote` of $releases (releases_reach). It succeeds when the upstream answers; else
+                     # it says git's last line, or why there is none.
     got=0
     # shellcheck disable=SC2086
     said=$(GIT_TERMINAL_PROMPT=0 GIT_CONFIG_GLOBAL=/dev/null $limit git ls-remote -q "$releases" HEAD 2>&1 \
         >/dev/null </dev/null) || got=$?
-    if [ "$got" = 0 ]; then
-        say "  this server reaches $host, where the hub takes its releases"
-        return 0
-    fi
+    [ "$got" != 0 ] || return 0
     last=$(printf '%s\n' "$said" | sed '/^$/d' | tail -n 1)
     if [ -n "$last" ]; then say "  git: $last"
     elif [ "$got" = 124 ]; then say "  git: no answer within 60 seconds"
     else say "  git: it stopped with status $got and gave no reason"
     fi
-    # github.com answers over IPv4 only, so a server with no default IPv4 route cannot reach it.
-    ipv4=yes
-    if [ "$host" = github.com ] && ! awk 'NR > 1 && $2 == "00000000" {f = 1} END {exit !f}' "$root/proc/net/route" \
-            2>/dev/null; then
-        ipv4=no
-    fi
-    if [ -e "$bare" ]; then
-        [ "$ipv4" = yes ] || say "  this server has no IPv4 route, and GitHub answers over IPv4 only"
-        say "  the hub is there already, so the install goes on; the hub takes no release until git on this server \
-can use $host"
-        return 0
-    fi
-    [ "$ipv4" = yes ] || stop "This server has no IPv4 route, and GitHub, where the hub takes its releases, answers \
-over IPv4 only. Give it a public IPv4 address at your provider, then run the line again."
-    stop "This server could not use $host over HTTPS, where the hub takes its releases: the line above says why. If it \
-cannot connect to $host, let it make outgoing HTTPS connections to $host. Then run the line again."
+    return 1
+}
+
+ipv4_route() {  # This server has a default IPv4 route (as ServerCheck.script reads it).
+    awk 'NR > 1 && $2 == "00000000" {f = 1} END {exit !f}' "$root/proc/net/route" 2>/dev/null
+}
+
+failed_links() {  # The links whose setup systemd-networkd marks failed: the last of networkctl's five columns
+                  # (IDX LINK TYPE OPERATIONAL SETUP; read on systemd 255 and 259, and the same columns in the
+                  # source of 249, 252 and 257), read with no root. Only a plain name (letters, digits, `_`, `.` and
+                  # `-`); nothing where networkctl is not there, or where networkd manages no link.
+    command -v networkctl >/dev/null 2>&1 || return 0
+    networkctl list --no-legend --no-pager 2>/dev/null \
+        | awk 'NF == 5 && $5 == "failed" && $2 ~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/ {print $2}'
+}
+
+relink() {  # $1: the links that systemd-networkd marks failed (failed_links). Sets each up again with `networkctl
+            # reconfigure`, then reads the IPv4 route at 10, 30 and 60 seconds: the lease can come some time after the
+            # new setup (on 21 November 2026 a read 20 seconds after it still showed none). It succeeds when the route
+            # is there, and leaves the links' names in $relinked. Only for a failed link, and only when the IPv4 route
+            # is gone: `networkctl reconfigure` applies the whole setup of a link again, and while the DHCP server
+            # does not answer it takes the link's address away, also one that KeepConfiguration=dhcp keeps (measured
+            # on systemd 255, 21 November 2026).
+    taken=""
+    for link in $1; do
+        relinked="${relinked:+$relinked, }$link"
+        say "  systemd-networkd's setup of $link failed, so this line sets it up again (networkctl reconfigure $link)"
+        if said=$(networkctl reconfigure "$link" 2>&1); then
+            taken=yes
+        else
+            say "  networkctl reconfigure $link failed${said:+: $(printf '%s\n' "$said" | sed '/^$/d' | tail -n 1)}"
+        fi
+    done
+    [ -n "$taken" ] || return 1
+    waited=0
+    for pause in 10 20 30; do
+        sleep "$pause"
+        waited=$((waited + pause))
+        if ipv4_route; then
+            say "  the IPv4 route is back, $waited seconds after the new setup"
+            return 0
+        fi
+    done
+    say "  still no IPv4 route $waited seconds after the new setup"
+    return 1
 }
 
 packages() {

@@ -12485,6 +12485,38 @@ DELIVER_FILES = "deliver_files:"
 DELIVER_RUNNING = ("{task} is not delivered yet: your session has {calls} running in its background, and a delivery "
                    "now stops it with the session. Wait for its end notice, which comes to this session by itself, "
                    "then deliver. If you are done without it, call deliver_result again: it goes through.")
+# kv: "<attempt>:<id>,<id>": the requests that the last refusal of a delivery of that attempt named (lost_secret_cards)
+DELIVER_SECRET = "deliver_secret:"
+
+
+def lost_secret_cards(task_id):
+    """The requests for a secret that leave Needs you unanswered when this task ends (secret_waits_end): the owner has
+    not answered them, and no other task waits on them. (id, what it asks for), oldest first. The Needs-you area, 21
+    November 2026: three tasks whose done-when said not to wait delivered, and their five requests left Needs you
+    before the owner answered one."""
+    rows = q("SELECT n.id, n.kind, n.secret FROM needs n, json_each(n.secret, '$.tasks') j WHERE n.kind='secret' AND "
+             "n.answer IS NULL AND j.value=? ORDER BY n.id", (task_id,))
+    specs = [(r["id"], need_secret(r) or {}) for r in rows]
+    return [(i, secret_asked(spec)) for i, spec in specs if not [t for t in spec.get("tasks") or [] if t != task_id]]
+
+
+def lost_secret_names(lost):
+    """ "N-3 (a login for app.example.com) and N-4 (the API key STRIPE_SECRET_KEY)" """
+    names = [f"N-{i} ({what})" for i, what in lost]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def lost_secret_words(task_id, lost, told=True):
+    """The refusal of a delivery that would take requests of the task out of Needs you before the owner answers.
+    told: a requester reads the result (a line of a duty's watch has none: its case keeps the records)."""
+    one = len(lost) == 1
+    return (f"{tref(task_id)} is not delivered yet: {lost_secret_names(lost)}, which it asked the owner for, "
+            f"still wait{'s' if one else ''} for an answer, and {'it leaves' if one else 'they leave'} Needs you when "
+            f"this task ends: the owner could not answer {'it' if one else 'them'} any more. If the work or your "
+            f"requester needs {'it' if one else 'one of them'}, wait for the answer: end your turn. If the owner saves "
+            f"it, this session goes on once your machine's vault has it; if they decline, their words come here. If "
+            f"nobody needs {'it' if one else 'them'} any more, call deliver_result again: the "
+            f"request{' leaves' if one else 's leave'} Needs you" + (", and your requester is told." if told else "."))
 
 
 def t_deliver_result(agent, a):
@@ -12553,6 +12585,16 @@ def deliver_result(agent, a, files_said=None):
         raise ToolError(f"{tref(tid)} has subtask results that you have not checked: "
                         f"{', '.join(tref(r['id']) for r in unchecked)}. Check each with check_result first: after "
                         f"you deliver, nobody can.")
+    # A request for a secret that only this task waits on leaves Needs you unanswered when it ends (secret_waits_end),
+    # and the worker cannot close it itself (withdraw_need is the manager's): a delivery of any outcome is refused
+    # while those requests are not the ones that the last refusal of this attempt named, so one that the task asked
+    # after it, or one left when the owner answered another, is named too; the same ones again go through, as decision
+    # 41's refusal below (a wall would hold a task that the owner never answers), and its requester is told
+    lost = lost_secret_cards(tid) if files_said is None else []
+    mark = f"{t['attempt']}:" + ",".join(str(i) for i, _ in lost)
+    if lost and kv_get(DELIVER_SECRET + str(tid)) != mark:
+        kv_set(DELIVER_SECRET + str(tid), mark)
+        raise ToolError(lost_secret_words(tid, lost, told=not case_line_task(t)))
     # AUTONOMY.md decision 41: a completed delivery while a subagent or a workflow of the session runs is refused once
     # in each attempt, and the next one goes through: an end notice that never matches its call keeps it open until
     # the session ends, so a second refusal would be a wall (failed and rejected always go through)
@@ -12570,6 +12612,9 @@ def deliver_result(agent, a, files_said=None):
         reading = ci_reading(tid)
     except Exception:       # noqa: BLE001
         print_fault()
+    dropped = lost_secret_cards(tid)        # read before end_waits takes them out of Needs you
+    dropped = (f"{lost_secret_names(dropped)} left Needs you with no answer from the owner, because this task ended. "
+               if dropped else "")
     if note:
         ins("INSERT INTO notes(task,agent,ts,text) VALUES(?,?,?,?)", (tid, agent, now(), note))
     q("UPDATE tasks SET state=?, outcome=?, what=?, where_=?, how=?, plain=?, delivered=?, waiting_on=NULL WHERE id=?",
@@ -12610,7 +12655,8 @@ def deliver_result(agent, a, files_said=None):
     if case_line_task(t):       # support plan F2: no lead session for each case; its records are its result
         q("UPDATE tasks SET accepted=1, checked_at=?, check_note=? WHERE id=?",
           (now(), "taken by the hub: one line of a duty's watch, whose case keeps the records", tid))
-        return f"Delivered. {tref(tid)} is {outcome}.{said} You are done with it: stop now and end your turn."
+        return (f"Delivered. {tref(tid)} is {outcome}." + (f" {dropped.rstrip()}" if dropped else "") +
+                f"{said} You are done with it: stop now and end your turn.")
     left = case_left_open(case_id=t["duty_case"]) if t["duty_case"] else None
     left = case_left_open_text(left) + " " if left else ""
     stopped = f"Still running in its session when it delivered, so stopped with it: {'; '.join(running)}. " \
@@ -12618,12 +12664,13 @@ def deliver_result(agent, a, files_said=None):
     emit(t["requester"], "say", reading +       # the hub's reading first: before the title, an agent's first words
          f"[hub] Result for {tref(tid)} ({t['title']}) from {agent}: {outcome}. Done: {what.rstrip('.')}. "
          f"Output: {(where or '-').rstrip('.')}. " + (files_said + " " if files_said else "") +
-         f"Checked: {(how or '-').rstrip('.')}. " + stopped
+         f"Checked: {(how or '-').rstrip('.')}. " + stopped + dropped
          + went_on_with(tid) + step_stands_text(t["step"]) + left +
          f"-- Check it, then call check_result(task_id=\"{tref(tid)}\", accepted=true or false).", task=tid)
     return f"Delivered. {tref(tid)} is {outcome}." + (" " + files_said if files_said else "") + \
         (f" Still running, and it stops with your session: {'; '.join(running)}; your requester is told." if running
-         else "") + f"{said} You are done with it: stop now and end your turn; your session closes when it ends."
+         else "") + (f" {dropped.rstrip()} Your requester is told." if dropped else "") + \
+        f"{said} You are done with it: stop now and end your turn; your session closes when it ends."
 
 
 # set_duty and change_duty are here again by the owner's decision of 20 October 2026 ("manager should also act as a
@@ -42428,13 +42475,14 @@ def team_manager_refusal():
 
 
 def team_plan_effect(changes, name=None):
-    """What a plan does, from the fleet as it stands, with no write: a TeamPassing for a change that cannot be made
-    now but can later, a ToolError for one that cannot be made, else {team, files, job, after, details, options,
-    names, said, digest}. name: the name that the owner pressed for the new agent of an add, which is the one name
-    checked; without it every name is checked, and the first stands in. The digest is of the plan and of the facts that
-    the card shows (the agents, people, accounts, access and files that it touches, and the value before of each field
-    that it changes), never of the time, of the names' own state or of the rest of the fleet: a check at the press
-    finds the same digest exactly when nothing that the card showed changed."""
+    """What a plan does, from the fleet as it stands, with no write: a TeamPassing for a change that cannot be made now
+    but can later, a ToolError for one that cannot be made, else {team, files, job, after, details, options, names,
+    said, digest, sizes}; sizes: (role, characters before, after) of each profile that it changes. name: the name that
+    the owner pressed for the new agent of an add, which is the one name checked; without it every name is checked, and
+    the first stands in. The digest is of the plan and of the facts that the card shows (the agents, people, accounts,
+    access and files that it touches, and the value before of each field that it changes), never of the time, of the
+    names' own state or of the rest of the fleet: a check at the press finds the same digest exactly when nothing that
+    the card showed changed."""
     rev = kit_revision(fresh=True)
     passing = team_unread()
     if not rev:
@@ -42445,7 +42493,7 @@ def team_plan_effect(changes, name=None):
         raise passing from None
     before = json.loads(json.dumps(team))
     ctx = {"rev": rev, "team": team, "mgr": manager_name(), "name": name, "files": {}, "facts": [], "parts": [],
-           "access": [], "said": [], "job": None, "names": [], "phrases": [],
+           "access": [], "said": [], "job": None, "names": [], "phrases": [], "sizes": [],
            "after": {"profiles": False, "moved": [], "left": [], "removed": None, "added": None}}
     steps = {"add": team_add, "remove": team_remove, "profile": team_profile, "settings": team_settings,
              "lines": team_lines, "owner_file": team_owner_file}
@@ -42466,7 +42514,8 @@ def team_plan_effect(changes, name=None):
     digest = hashlib.sha256(json.dumps([changes, ctx["facts"]], sort_keys=True, ensure_ascii=False,
                                        default=str).encode()).hexdigest()
     return {"team": ctx["team"], "files": ctx["files"], "job": ctx["job"], "after": ctx["after"], "details": details,
-            "options": team_plan_options(ctx), "names": ctx["names"], "said": ctx["said"], "digest": digest}
+            "options": team_plan_options(ctx), "names": ctx["names"], "said": ctx["said"], "digest": digest,
+            "sizes": ctx["sizes"]}
 
 
 def team_plan_options(ctx):
@@ -42778,6 +42827,7 @@ def team_profile(ctx, c):
     ctx["files"][f"profiles/{n}.md"] = new
     ctx["after"]["profiles"] = True
     role = team_said_role(team, n)
+    ctx["sizes"].append((role, len(view["text"]), len(new.decode())))     # for the manager's answer (t_change_team)
     reads = [set(next((knowledge_list(x["text"]) for x in group if x["key"] == "knowledge_files"), []))
              for group in (old, sections)]
     if reads[1] - reads[0]:
@@ -42945,7 +42995,14 @@ def t_change_team(agent, a):
                 "PC, makes the change: the hub checks it again then, makes it, and tells you what it did. No, or an "
                 "answer in words, changes nothing, and its words come to you." +
                 (f" It replaces N-{old['id']}." if old else "") +
-                " A new plan replaces this card; withdraw_need closes it.")
+                " A new plan replaces this card; withdraw_need closes it." +
+                # the Founderizer team, 21 November 2026: a card "Shorten Marketing's profile" moved its method to a
+                # file and removed none of the seven sections that held it, so the profile grew from 16,507 to
+                # 19,025 characters, and the card showed only the sections that changed
+                "".join(f" The profile of {role} goes from {was:,} to {size:,} characters." +
+                        (" It grows. If this plan moves a section's words to a file, give that section again with "
+                         "an empty text, which removes it; a required section takes shorter words." if size > was
+                         else "") for role, was, size in effect["sizes"]))
         with transaction():
             DB.execute("INSERT INTO needs(id,title,why,todo,raised,by,options,details,team_plan,ask,recommended) "
                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (nid, title, why, "", t0, agent, options, details, kept,
@@ -47866,7 +47923,9 @@ TOOLS = [
      "sign_in says. Never ask the owner to type a password, a key or a card number, to use a passkey or to sign in "
      "(single sign-on, an AI provider's page), with this tool or in words: sign_in types a login that your vault "
      "holds, request_secret asks for a login or a key that it does not hold, and for a passkey, a card number or an "
-     "AI provider's page you stop and ask your requester. The owner opens your screen from the card, solves the "
+     "AI provider's page you stop and ask your requester. A fact that the owner gives, such as a date, a name or a "
+     "choice, goes to your requester with ask_my_requester, and you type the answer yourself: a take-over is only "
+     "for a step that a person must do on the screen. The owner opens your screen from the card, solves the "
      "CAPTCHA and answers. This task waits for the answer: end your turn. The answer comes to this session as a "
      "message: look at the screen before you go on, and do not do their step again. One open request for each task. "
      "After an answer that is not \"Done\", ask your requester (without a default) before you ask the owner again.",

@@ -85,6 +85,15 @@ vCPU, 4 GB): UI-API.md 1.171 says what it proved.
    reach github.com over HTTPS, where the hub takes its releases. GitHub answers over
    IPv4 only, so a server with IPv6 only needs a public IPv4 address. The install's
    first step checks it, and a first install stops on a server that cannot reach it.
+   A server can also lose the IPv4 address that its provider gives it, when systemd-networkd
+   cannot renew it (a hub did, on 16 November 2026). Then the first step sets each link that
+   systemd-networkd marks failed up again, and reads the route for up to 60 seconds. When the
+   route comes back, the step asks github.com again. When it does not come back, the stop
+   tells you to restart the server first, not to add an address. The app's install stops
+   earlier on any server with no IPv4 route, because it checks the server first. On a new
+   server, the install prompt also stops earlier, because it clones the code first. So this
+   repair runs when a person runs the line on the server, from a copy that is there already:
+   a second run, `--reclaim`, or a first run from a copy.
 2. **A Tailscale auth key** for the fleet's own tailnet, from its Tailscale admin
    console. One use is enough; a pre-authorized key saves a sign-in. The key goes to
    the installer on **standard input**, so run the line in a terminal on the server,
@@ -147,7 +156,10 @@ notification of a Needs-you item, the chat that opens first), so with those apps
 
 1. **This server and this copy of Founderizer.** Root, the system, systemd, that the
    copy is a Founderizer checkout with a commit, and that the server reaches the address
-   that the hub takes its releases from (github.com) over HTTPS.
+   that the hub takes its releases from (github.com) over HTTPS. When it does not, the address
+   is on github.com, and the server has no IPv4 route, the step sets each link that
+   systemd-networkd marks failed up again (`networkctl reconfigure`), reads the route at 10, 30
+   and 60 seconds, and asks github.com again when the route is back.
 2. **Base packages:** `git tmux python3 curl ca-certificates ufw unattended-upgrades sudo tzdata libatomic1`.
 3. **The user `fleet`:** created, password locked, out of `sudo`, `admin` and `wheel`,
    home mode 700, and lingering on, so its services run after logout and after a

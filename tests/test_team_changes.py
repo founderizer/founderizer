@@ -181,12 +181,17 @@ class TeamChanges(Remove):
     def test_the_card_shows_the_change_and_its_press_writes_exactly_that(self):
         """Bug: the manager's words describe one change, and the press makes another. And for a long section, the card
         showed it whole twice, past the card's limit, so the hub refused exactly the plan that makes a long profile
-        shorter (the design "An agent keeps its own rules", slice 1): the card shows the lines that change."""
-        self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"),
-                    "sections": [{"key": "responsible_for", "title": "Responsible for",
-                                  "text": "Deploys, and their checks."}]}],
-                  title="Make the VPS agent own the deploys?", why="It ran every deploy this month.",
-                  words="It ran 12 deploys in 30 days, and nobody else ran one.")
+        shorter (the design "An agent keeps its own rules", slice 1): the card shows the lines that change. And a plan
+        "Shorten ..." that moved words to a file and removed no section made the profile longer, and nobody told the
+        manager (the Founderizer team, 21 November 2026): its answer gives each profile's size before and after."""
+        def size():
+            return len(hub.profile_view("vps", hub.kit_revision(fresh=True))["text"])
+        was = size()
+        said = self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"),
+                           "sections": [{"key": "responsible_for", "title": "Responsible for",
+                                         "text": "Deploys, and their checks."}]}],
+                         title="Make the VPS agent own the deploys?", why="It ran every deploy this month.",
+                         words="It ran 12 deploys in 30 days, and nobody else ran one.")
         with hub.LOCK, hub.transaction():           # notes from before the plan: the press marks the profile newer
             hub.notes_save("vps", "Deploy on Fridays.", "what the work taught me", "vps", hub.now() - 3600)
         self.assertFalse(hub.notes_profile_newer("vps"))
@@ -198,6 +203,7 @@ class TeamChanges(Remove):
         status, answer = self.press(0)
         self.assertEqual(status, 200, answer)
         profile = self.show("profiles/vps.md")
+        self.assertIn(f"The profile of vps goes from {was:,} to {size():,} characters. It grows", said)
         self.assertIn("**Responsible for.** Deploys, and their checks.", profile)
         self.assertIn("**Must ask first.** Spending.", profile)            # the sections that the plan left stay
         self.assertTrue(hub.notes_profile_newer("vps"))     # the head of its notes says so (the design's 5.2)
@@ -211,9 +217,11 @@ class TeamChanges(Remove):
         hub.save_profile("vps", self.base_of("vps"), sections)
         self.assertGreater(int(hub.kv_get(hub.PROFILE_LONG + "vps")), 7800)
         leave, stay = lines[::2], lines[1::2]
-        self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"),
-                    "sections": [{"key": "responsible_for", "title": "Responsible for", "text": "\n".join(stay)}]}],
-                  title="Make the profile of vps shorter?", why="Half of its lines are in its duty's words.")
+        was = size()
+        said = self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"),
+                           "sections": [{"key": "responsible_for", "title": "Responsible for",
+                                         "text": "\n".join(stay)}]}],
+                         title="Make the profile of vps shorter?", why="Half of its lines are in its duty's words.")
         details = self.card()["details"]
         for line in leave:
             self.assertIn(line, details)
@@ -223,6 +231,8 @@ class TeamChanges(Remove):
         status, answer = self.press(0)
         self.assertEqual(status, 200, answer)
         profile = self.show("profiles/vps.md")
+        self.assertIn(f"The profile of vps goes from {was:,} to {size():,} characters.", said)
+        self.assertNotIn("It grows", said)
         self.assertIn(stay[-1], profile)
         self.assertNotIn(leave[0], profile)
         self.assertIsNone(hub.kv_get(hub.PROFILE_LONG + "vps"))        # the count starts from the plan's number

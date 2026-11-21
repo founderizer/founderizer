@@ -486,7 +486,7 @@ class Columns(unittest.TestCase):
         "check_after:": "a machine check", "check_probe:": "a machine check",
         "check_queued:": "a machine check", "chat_removed:": "a chat app account",
         "conversation_brief:": "a conversation",
-        "deliver_files:": "a task",
+        "deliver_files:": "a task", "deliver_secret:": "a task",
         "deliver_running:": "a task", "desktop_click:": "a Mac", "desktop_seen:": "a Mac", "desktop_told:": "a Mac",
         "desktop_linked:": "a Mac",
         "door_mode:": "a server of the door", "door_host:": "a host of the door", "door_untaken:": "a host of the door",
