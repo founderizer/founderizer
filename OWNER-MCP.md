@@ -146,7 +146,7 @@ links a WhatsApp account to the fleet: the owner reads that QR in the app, and `
 Since 14 November 2026 `call` also takes the setup tools `setup_state` and `setup_show` by
 name (below, "The link to the running app"), and the read `setup_diagnosis` on the same link.
 `write` takes each other tool that the
-program has: the nine below, the 55 of the table, and `save_bot_token`, `prepare_problem_report`,
+program has: the nine below, the 57 of the table, and `save_bot_token`, `prepare_problem_report`,
 `save_secret`, `grant_secret`, `share_secret` and `answer_secret_request` on the link. A read
 through `write` is refused, and a write through `call` is refused, each with words that name the
 right verb; a tool that the program does
@@ -183,7 +183,7 @@ Claude Code's own "always allow" button in its window, and Codex, which has no r
 
 **Its tools in this version.** The tools of this server, with the same names, words, fields and
 `readOnlyHint` (one exception: the program's words of `answer_needs_you` have its sentences about the
-door's card after the table's). 55 come from a table that this file prints, `python3 owner_mcp.py --dump-tools`,
+door's card after the table's). 57 come from a table that this file prints, `python3 owner_mcp.py --dump-tools`,
 from the same objects that its own tools are: `release.sh` and `run.sh` put it in the app as
 `Contents/Resources/owner-tools.json`, from the same revision as `onboard.py`. Thirteen are written
 again in Swift (the table's kind `swift`): four reads, `fleet_overview`, `fleet_read`,
@@ -203,7 +203,7 @@ program's own and are not
 in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
 the running app (below). Six more, `save_bot_token`, `prepare_problem_report`, `save_secret`,
 `grant_secret`, `share_secret` and `answer_secret_request`, write on the same link (below). So
-`tools/list` gives 77 tools: the 55 of the table, the thirteen, the three reads of the link and its
+`tools/list` gives 79 tools: the 57 of the table, the thirteen, the three reads of the link and its
 six writes. One request more writes on the link and is no tool of its own: `answer_needs_you`'s
 signed press of a door card.
 
@@ -1333,7 +1333,7 @@ hub came through the link. **Not proved:** Codex's own window (only `codex exec`
 provider's server, and the verbs `call` and `write` and the nine writes in a release build (they
 came after that build).
 
-**The parity check** holds the two programs to each other. Each tool that both have (the 55 of the
+**The parity check** holds the two programs to each other. Each tool that both have (the 57 of the
 table, the four reads and the nine writes) runs on one fixed script of arguments against a
 stand-in hub with fixed answers, with more cases for the shared part and the nine: a new
 generation read again once, a 409 with `sha256`, a bad request id and the agent's own, each kind
@@ -1521,9 +1521,9 @@ before character 2,048 (`test_owner_mcp.Table`).
 - `save_profile` is only for what the owner decides: what the agent is for, what it may do alone,
   what it must ask first, which person decides what, its logins and its knowledge files.
 - A policy for a whole team is a file of the owner's: `save_knowledge`.
-- What steers one agent is on the pages `profiles`, `responsibilities`, `standing`, `notes` and
-  `skills` of `fleet_read`. `end_standing` takes back a kept wish, `remove_skill` a skill and
-  `duty_state` a duty.
+- What steers one agent is on the pages `profiles`, `responsibilities`, `standing`, `notes`,
+  `lessons` and `skills` of `fleet_read`. `end_standing` takes back a kept wish, `restore_notes` its
+  notes, `forget_lesson` a lesson, `remove_skill` a skill and `duty_state` a duty.
 
 ### Read
 
@@ -1576,6 +1576,8 @@ What steers an agent.
 | `end_standing` | `/ui/standing/<id>/end` | End one standing instruction or target that an agent keeps, with why: the owner's way to take back a kept wish. `fleet_read(page="standing")` lists them. |
 | `duty_state` / `trigger_state` | `/ui/responsibilities/<id>/state`, `/ui/triggers/<id>/state` | Pause, resume, retire or reopen one duty; pause, resume, delete, run now or check now one wake-up rule. New words for a duty: `send_message` to the fleet manager. |
 | `remove_skill` | `/ui/skills/remove` | Remove one agent's own skill in one commit. The agents write their skills; `fleet_read(page="skills")` lists them. |
+| `restore_notes` | `/ui/notes/<a>/restore` | Take one agent's own notes back to an earlier version, as a new version: the hub keeps every version, and the agent's running task sessions are told. The owner writes no words in the notes, which are the agent's own (owner API 1.277, feature `memory_undo`). |
+| `forget_lesson` | `/ui/memory/<a>/<id>/forget` | Remove one lesson of one agent, with why: it leaves every start and every recall, its history keeps it, and the agent's running task sessions are told the why. `fleet_read(page="lessons")` lists the lessons that stand (owner API 1.277, feature `memory_undo`). |
 
 ### Team
 

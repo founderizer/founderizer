@@ -342,12 +342,6 @@ NOT_TOOLS = {
     "/ui/error-reports": "the owner's consent to send error reports to Founderizer's developers, which only the owner "
                          "gives, with the switch of Settings › General in the app, and never an agent (the owner's "
                          "yes of 16 November 2026, feedback-diagnostics-plan.md Phase 3)",
-    "/ui/notes/{}/restore": "the owner's restore of an agent's notes (owner API 1.277), until its tool restore_notes "
-                            "comes with slice 8b of the design \"An agent keeps its own rules\", which takes this "
-                            "line out",
-    "/ui/memory/{}/{}/forget": "the owner's removal of one lesson of an agent (owner API 1.277), until its tool "
-                               "forget_lesson comes with slice 8b of the design \"An agent keeps its own rules\", "
-                               "which takes this line out",
 }
 
 # What this file repeats from the hub because it cannot import it: this server runs on the owner's Mac with the
@@ -928,9 +922,12 @@ PAGES = {
     "artifacts": ("/ui/tasks/{id}/artifacts", "the checked output files of one accepted task"),
     "devices": ("/ui/owner/devices", "the owner's phones, their keys, and when each phone's open enrollment code "
                                      "ends (never a code itself)"),
+    "lessons": ("/ui/memory/{agent}", "one agent's own lessons that stand, each with the hub's evidence (give agent): "
+                                      "the newest 200, with the total. The agent writes these; forget_lesson removes "
+                                      "one"),
     "notes": ("/ui/notes/{agent}", "one agent's own working notes and every version of them (give agent). The agent "
                                    "writes these, never the owner: the profile is the owner's words and this is the "
-                                   "agent's own"),
+                                   "agent's own; restore_notes takes them back to an earlier version"),
     "skills": ("/ui/skills", "every agent's own skills, or one agent's (give agent): each one's name, description, "
                              "path and files, and its newest commit with the task it was written in and that task's "
                              "reads of outside text. The agents write them; remove_skill removes one"),
@@ -939,10 +936,11 @@ PAGES = {
 }
 PAGE_QUERY = ("path", "agent", "person", "expertise", "needs", "login",      # the words these routes narrow by
               "after", "before", "limit")                                    # and the cursors they page with
-# fleet_read's schema stays as it was in this release: `since`, which no page reads (it is refused as a word of no
-# page), and no `name` for chat_link. The program relay of a session that started before the release that brings this
-# rule compares a read's whole schema with the new program's, so a change of it ends fleet_read in each such session
-# until it starts again; the schema changes in a later release, with its test (the reviews of 20 November 2026).
+# fleet_read's schema keeps `since`, which no page reads (it is refused as a word of no page), and has no `name` for
+# chat_link: the program relay of a session that started on Founderizer 0.1.383 to 0.1.396 compared a read's whole
+# schema with the new program's, so a change of it ended fleet_read in each such session (the reviews of 20 November
+# 2026). Since 0.1.397 the relay compares a read's marks only, and slice 8b put the page `lessons` into the schema's
+# list of pages; `since` out and `name` in, with the test of the exact schema, are still to do.
 PAGE_WORDS = ("path", "agent", "person", "expertise", "needs", "login")
 PAGE_IN_PATH = ("{agent}", "{name}")        # a page whose subject is a path segment and not a query word
 # **The words of PAGE_QUERY that each page's own route reads**; a page that is not here reads none of them. A word that
@@ -2891,8 +2889,10 @@ def tools():
              {}, (), overview),
         tool("Read",
              "fleet_read", "One page of the owner API, by name. Not for a search by words: use search_history. "
-                           "Every check the owner's app reads is here: "
-                           + "; ".join(f"{k} — {v[1]}" for k, v in sorted(PAGES.items())),
+                           # the names first: a client's search reads only the first 4,096 characters of a tool's
+                           # words, and the words of the pages are longer than that
+                           "The pages: " + ", ".join(sorted(PAGES)) + ". Every check that the owner's app reads is "
+                           "one of them: " + "; ".join(f"{k} — {v[1]}" for k, v in sorted(PAGES.items())),
              {"page": {"type": "string", "enum": sorted(PAGES)},
               "id": {"type": "integer", "description": "The id, for a page about one goal, duty, rule, task or "
                                                        "conversation."},
@@ -3061,6 +3061,23 @@ def tools():
                              "agents write their skills themselves; fleet_read(page=\"skills\") lists them.",
              {"agent": S["text"], "name": S["text"], **rid}, ("agent", "name"),
              plain("/ui/skills/remove", ("agent", "name"), "the removal of this skill")),
+        tool("Behaviour",
+             "restore_notes", "Take one agent's own notes back to an earlier version: the hub writes that version's "
+                              "text as a new version, and keeps every version. fleet_read(page=\"notes\") with agent "
+                              "gives the versions. The agent's running task sessions are told. Not for new words in "
+                              "an agent's notes: they are the agent's own, so say what you want with send_message. "
+                              "revision: the number of an earlier version that the page lists. A version with the "
+                              "words of the notes now is refused.",
+             {"agent": S["text"], "revision": S["int"], **rid}, ("agent", "revision"),
+             plain("/ui/notes/{agent}/restore", ("revision",), "the restore of these notes")),
+        tool("Behaviour",
+             "forget_lesson", "Remove one lesson of one agent, with why: it leaves every start and every recall of "
+                              "that agent, and its history keeps it. fleet_read(page=\"lessons\") with agent lists "
+                              "them. The agent's running task sessions are told the why. lesson: the id of a lesson of "
+                              "that page. "
+                              "why: one line of 1 to 300 characters.",
+             {"agent": S["text"], "lesson": S["int"], "why": S["text"], **rid}, ("agent", "lesson", "why"),
+             plain("/ui/memory/{agent}/{lesson}/forget", ("why",), "the removal of this lesson")),
         tool("Team",
              "add_agent", "Put a new agent on an available server. Not for a new server: use add_machine, or Add "
                           "server in the Founderizer app. The hub writes the agent and its profile in one "
@@ -3630,7 +3647,7 @@ PLACES = ("Where a rule for an agent goes:\n"
           "- A policy for a whole team is a file of the owner's: save_knowledge.")
 # The pages that show what steers one agent, and the tools that take back what an agent keeps, in the order that the
 # rule of places names them. Each of the two lines names only the pages of PAGES and the tools of the list that the
-# client gets: the page `lessons` and the tools `restore_notes` and `forget_lesson` come with slice 8b.
+# client gets.
 STEERS_PAGES = ("profiles", "responsibilities", "standing", "notes", "lessons", "skills")
 TAKE_BACK = (("end_standing", "a kept wish"), ("restore_notes", "its notes"), ("forget_lesson", "a lesson"),
              ("remove_skill", "a skill"), ("duty_state", "a duty"))
@@ -3701,6 +3718,7 @@ FEATURES = {
     "steer_task": "task_steering", "goal_state": "goals", "duty_state": "responsibilities",
     "end_standing": "standing", "trigger_state": "triggers", "check_releases": "releases",
     "take_release": "releases", "automatic_releases": "releases", "clarify_needs_you": "need_clarify",
+    "restore_notes": "memory_undo", "forget_lesson": "memory_undo",
 }
 
 

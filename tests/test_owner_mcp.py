@@ -720,7 +720,9 @@ class Refusals(WithServer):
                 ("sign_in_machine", {"agent": "vps", "runtime": "grok"}, "no Grok sign-in"),
                 ("control_task", {"task": 999, "action": "pause"}, "no such task"),
                 ("answer_needs_you", {"need": 999, "answer": "x"}, "does not exist"),
-                ("clarify_needs_you", {"need": 999, "text": "x"}, "does not exist")):
+                ("clarify_needs_you", {"need": 999, "text": "x"}, "does not exist"),
+                ("restore_notes", {"agent": "vps", "revision": 999}, "vps's notes have no revision 999"),
+                ("forget_lesson", {"agent": "vps", "lesson": 999, "why": "x"}, "vps has no lesson M-999")):
             with self.assertRaises(Refused) as caught:
                 client.call(name, **args)
             self.assertIn(words, str(caught.exception), name)
@@ -5025,7 +5027,7 @@ class Parity(unittest.TestCase):
         named = {c["tool"] for c in parity_cases()}
         both = {t["name"] for t in owner_mcp.dump_tools()["tools"] if t["kind"] != "absent"}
         self.assertEqual(both - named, set())
-        self.assertEqual(len(both), 55 + 4 + 9)
+        self.assertEqual(len(both), 57 + 4 + 9)
 
     def test_the_older_hub_rule_is_what_hub_py_answers(self):
         """`parity_older` is read from the hub, not from the program: its dispatch answers an unknown route with 404
@@ -5108,7 +5110,7 @@ class Table(unittest.TestCase):
         built = sum(1 for t in owner_mcp.tools() if getattr(t["run"], "kind", None))
         self.assertEqual(sum(len(kinds.get(k, [])) for k in self.TABLE_KINDS), built)
         self.assertEqual((len(owner_mcp.SWIFT_READS), len(owner_mcp.SWIFT_WRITES), len(owner_mcp.ABSENT), built),
-                         (4, 9, 7, 55))
+                         (4, 9, 7, 57))
         # A tool of no kind stops the dump: somebody decides which it is. And a tool of no category stops the program:
         # it would stand in no line of the map, so a client with tool search would not learn of it.
         stray = owner_mcp.tool("Read", "stray", "A tool of no kind.", {}, (), lambda _args: {})
@@ -5142,7 +5144,7 @@ class Table(unittest.TestCase):
         self.assertEqual([t["name"] for t in table if t["annotations"]["readOnlyHint"] and t["kind"] in self.TABLE_KINDS],
                          [])
         writes = {t["name"] for t in table if not t["annotations"]["readOnlyHint"] and t["kind"] != "absent"}
-        self.assertEqual(len(writes), 55 + 9)
+        self.assertEqual(len(writes), 57 + 9)
         self.assertTrue(set(owner_mcp.SWIFT_WRITES) <= writes)
 
     def test_a_lost_error_answer_says_that_the_request_can_have_arrived(self):
