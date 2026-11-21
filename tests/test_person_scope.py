@@ -358,6 +358,25 @@ class Narrowed(Base):
         hub.q("UPDATE tasks SET follows=? WHERE id=?", (plain, mine))
         self.assertIn("The zebra report went out.", hub.start_text("studio", mine))
 
+    def test_the_locked_windows_reply_ends_a_task_that_has_its_person(self):
+        """Person access plan, section 5: the locked window's reply ends its conversation task and is its result, which
+        the owner reads on its card. The agent's other sessions read a task's result (see_earlier_work, the start of a
+        task that follows it, search_history), and they keep a narrowed pair's task apart by the task's person. The
+        bug: a conversation task with no person (a first list left the open one with none from 11 to 20 November
+        2026) gave the locked reply to every session of the agent."""
+        cid = self.says(PAT, "Where is the gecko form?")["conversation"]
+        said = hub.q1("SELECT id FROM conversation_messages WHERE who='person' ORDER BY id DESC LIMIT 1")["id"]
+        task = self.conversation_task(cid)["id"]
+        hub.q("UPDATE tasks SET scope_person=NULL WHERE id=?", (task,))        # as an old first list left it
+        self.answers(cid, said, "The gecko form is in the blue folder.")
+        ended = hub.q1("SELECT state, what, scope_person FROM tasks WHERE id=?", (task,))
+        self.assertEqual((ended["state"], ended["scope_person"]), ("completed", self.pat["id"]))
+        self.assertIn("gecko", ended["what"])                       # the owner's card keeps the reply
+        hub.history_catch_up(60)
+        _, other = self.normal_task(title="Tidy the folders")
+        self.assertNotIn("gecko", self.tool("see_earlier_work", other, task=hub.tref(task))[0])
+        self.assertIn("Nothing in your history matches", self.ok("search_history", other, query="gecko"))
+
     def test_its_window_opens_its_persons_own_files_only(self):
         """CHAT-APPS.md 8.1: a narrowed window opens the files of its own person's messages (read_attachment is in
         SCOPE_TOOLS), and a file of the owner's never."""
@@ -800,6 +819,45 @@ class Owner(Base):
         self.assertEqual((ended["state"], ended["waiting_on"]), ("working", None))
         self.assertTrue(hub.q1("SELECT 1 FROM events WHERE task=? AND kind='say' AND text LIKE '%dingo%'", (other,)))
 
+    def test_a_result_line_waits_for_no_list_that_came_while_it_was_made(self):
+        """Open work of a conversation ends, and its result goes back there (conversation_result), unless the pair is
+        narrowed now: a narrowed thread hears nothing of work from before its list. The check stood before the write's
+        transaction, and most callers of end_waits hold no lock, so a first list that committed between the two left
+        an unread result line with no mark for the locked window. Here the list comes between the two reads."""
+        cid = self.says(PAT, "Please rebuild the export for all of October.")["conversation"]
+        hub.conversation_start("studio", cid)
+        self.ok("read_messages", self.context(cid))
+        self.ok("open_work", self.context(cid), title="Rebuild the October export", details="All of October.")
+        work = hub.q1("SELECT * FROM tasks WHERE title='Rebuild the October export'")
+        hub.q("UPDATE tasks SET state='completed', what='The kiwi export is rebuilt.' WHERE id=?", (work["id"],))
+        real, calls = hub.person_scope, []
+
+        def late_list(pid, agent):          # the owner's first list commits right after the first check
+            calls.append(pid)
+            if len(calls) == 1:
+                self.narrow(self.pat["id"], {f"repo:{REPO}": "read"})
+                return None
+            return real(pid, agent)
+        with patch.object(hub, "person_scope", late_list):
+            hub.conversation_result(work["id"])
+        self.assertIsNone(hub.q1("SELECT 1 FROM conversation_messages WHERE conversation=? AND text LIKE '%kiwi%'",
+                                 (cid,)))
+        # and a pause that comes between the two reads: the line stays in the paused conversation and wakes nobody
+        hub.q("DELETE FROM person_scopes WHERE person=?", (self.pat["id"],))
+        hub.q("UPDATE tasks SET what='The emu export is rebuilt.' WHERE id=?", (work["id"],))
+        calls.clear()
+
+        def late_pause(pid, agent):
+            calls.append(pid)
+            if len(calls) == 1:
+                hub.q("UPDATE conversations SET state='paused' WHERE id=?", (cid,))
+            return real(pid, agent)
+        with patch.object(hub, "person_scope", late_pause):
+            hub.conversation_result(work["id"])
+        line = hub.q1("SELECT event FROM conversation_messages WHERE conversation=? AND text LIKE '%emu%'", (cid,))
+        self.assertIsNotNone(line)
+        self.assertIsNone(line["event"])
+
     def test_a_list_is_written_read_and_set_back_to_all(self):
         code, data = self.scopes({f"repo:{REPO}": "read", f"secret:{LOGIN}": "use"})
         self.assertEqual(code, 200, data)
@@ -995,6 +1053,42 @@ class Settle(Base):
 
     def marks(self, *ids):
         return [hub.q1("SELECT scope_person FROM conversation_messages WHERE id=?", (i,))["scope_person"] for i in ids]
+
+    def test_the_start_gives_an_old_narrowed_task_its_person_one_time(self):
+        """From 11 to 20 November 2026 a first list left the open conversation task with no person, so an ended one
+        gave its result, the locked reply, to each session of the agent. The start (one time) gives each conversation
+        task that the pair's marked reply ended that person; its result stays, for the owner reads all. A task of a
+        pair that never had a list keeps no person. The bugs: no such pass, so the old rows stay open; or one that
+        changes the owner's result or runs at each start."""
+        hub.q("DELETE FROM kv WHERE k=?", (hub.NARROWED_TASKS_SETTLED,))
+        pat_c = self.conversation(self.pat["id"])
+        lee = self.add(name="Lee", role="peer")
+        lee_c = self.conversation(lee["id"])
+        tasks = {}
+        for name, cid in (("pat", pat_c), ("lee", lee_c)):
+            tasks[name] = hub.ins("INSERT INTO tasks(title,owner,requester,state,created,source_conversation,"
+                                  "source_message,attempt,what,delivered) VALUES(?,?,?,?,?,?,?,1,?,?)",
+                                  (f"Answer {name}", "studio", "manager", "completed", 4000.0, cid, 1,
+                                   f"The {name} narwhal code is 4711.", 4100.0))
+            asked = self.said(cid, "person", 4000.0, task=tasks[name])
+            reply = self.said(cid, "agent", 4050.0, task=tasks[name], reply_to=asked)
+            if name == "pat":
+                hub.q("UPDATE conversation_messages SET scope_person=? WHERE id=?", (self.pat["id"], reply))
+        hub.settle_narrowed_rows()
+        pat_t, lee_t = (hub.q1("SELECT scope_person, what FROM tasks WHERE id=?", (tasks[n],)) for n in ("pat", "lee"))
+        self.assertEqual((pat_t["scope_person"], pat_t["what"]), (self.pat["id"], "The pat narwhal code is 4711."))
+        self.assertEqual((lee_t["scope_person"], lee_t["what"]), (None, "The lee narwhal code is 4711."))
+        hub.history_catch_up(60)
+        _, other = self.normal_task(title="Look for the codes")
+        found = self.ok("search_history", other, query="narwhal")
+        self.assertNotIn("pat narwhal", found)
+        self.assertIn("lee narwhal", found)
+        self.assertTrue([r for r in hub.history_found(None, {"query": "narwhal"}, True, 10)[0]
+                         if "pat narwhal" in (r["text"] or "")])      # the owner reads all
+        # one time: a task that a later start finds keeps no new person (rule 2 may mark a reply of a time at All)
+        hub.q("UPDATE tasks SET scope_person=NULL WHERE id=?", (tasks["pat"],))
+        hub.settle_narrowed_rows()
+        self.assertIsNone(hub.q1("SELECT scope_person FROM tasks WHERE id=?", (tasks["pat"],))["scope_person"])
 
     def test_the_start_marks_a_narrowed_pairs_rows_of_before_once_and_all_time_rows_never(self):
         """person-scope-row-mark-spec.md, section C: rows stored before the column (or by the release before, whose

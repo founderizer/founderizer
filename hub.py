@@ -10993,7 +10993,8 @@ def narrowed_from(p, scope, agent=None):
     (session_scope's, or task_scope's of a task that is starting), is not that pair's own: that session gets neither
     the task's words nor its result, and does not learn that it exists, by no count and no title (person access plan,
     sections 13 and 16 item 9; the history hides the same rows, history_scope_sql). A conversation task's what holds
-    the locked window's reply (conversation_task_end). agent: the reading session's agent, where it can be another
+    the locked window's reply (conversation_task_end), so such a task always has its person (narrowed_tasks_settle for
+    the old ones). agent: the reading session's agent, where it can be another
     agent than the task's owner (a lead, the manager): the pair is a person and an agent, as in history_scope_sql.
     Reads nothing."""
     pid = p["scope_person"] if p is not None and "scope_person" in p.keys() else None
@@ -22320,6 +22321,32 @@ def narrowed_rows_settle():
     return marked
 
 
+NARROWED_TASKS_SETTLED = "narrowed_tasks_settled"      # kv: narrowed_tasks_settle ran (one time)
+
+
+def narrowed_tasks_settle():
+    """Inside the caller's transaction, one time (kv NARROWED_TASKS_SETTLED, written in the same transaction): the
+    conversation tasks that the pair's marked reply ended but that have no person. From 11 to 20 November 2026 a first
+    list left the open conversation task with none (c8373b797 gives it one), and such a task's result, the locked
+    reply, then reached each session of the agent. Each gets the person of its reply's mark, and the readers that keep
+    a narrowed pair's task apart (narrowed_from, history_scope_sql) hide it; its result stays, for the owner reads all.
+    The messages come first (CROSS JOIN): conversation_messages.task has no index. After conversation_task_end gives
+    every such task its person, a later run would only find a task of a time at All that rule 2 marked. Returns how
+    many tasks it changed."""
+    in_transaction("narrowed_tasks_settle")
+    if read_row("SELECT v FROM kv WHERE k=?", (NARROWED_TASKS_SETTLED,)) is not None:
+        return 0
+    rows = DB.execute(
+        "SELECT DISTINCT t.id, m.scope_person FROM conversation_messages m CROSS JOIN tasks t ON t.id=m.task AND "
+        "t.source_conversation=m.conversation WHERE m.scope_person IS NOT NULL AND m.who='agent' AND m.reply_to IS NOT "
+        "NULL AND t.source_message IS NOT NULL AND t.state='completed' AND t.scope_person IS NULL").fetchall()
+    for r in rows:
+        DB.execute("UPDATE tasks SET scope_person=? WHERE id=? AND scope_person IS NULL", (r["scope_person"], r["id"]))
+    DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+               (NARROWED_TASKS_SETTLED, str(len(rows))))
+    return len(rows)
+
+
 def settle_narrowed_rows():
     """At the start, after the schema: the marks (narrowed_mark) of a narrowed pair's rows that were stored before
     the column came, or by a hub of the release before it during a restart or after a rollback, which stores NULL
@@ -22345,6 +22372,9 @@ def settle_narrowed_rows():
             if marked:
                 log_row("hub", f"marked {marked} row(s) of conversations of narrowed pairs (person access plan, "
                                f"section 5)")
+            tasks = narrowed_tasks_settle()             # after the marks: a reply that rule 2 marks counts
+            if tasks:
+                log_row("hub", f"gave {tasks} ended conversation task(s) of narrowed pairs their person")
     except Exception as e:
         print_fault()
         log("hub", f"the rows of narrowed pairs could not be marked at this start: {type(e).__name__}: {e}")
@@ -24970,17 +25000,23 @@ def conversation_task_rows(conv, person, cm, t0):
 
 def conversation_task_end(conv, person, reply, text, t0):
     """Inside t_reply's transaction: the reply CM-<reply> ends the conversation's open conversation task, with the
-    reply as its result, checked at the same moment because the person reads the answer. A message that reached the
+    reply as its result, checked at the same moment because the person reads the answer; a narrowed pair's task gets
+    its person, if it has none yet. A message that reached the
     task after the session's last read is not answered by this reply, so it opens the next conversation task.
     Returns the ended task's id, or None."""
     in_transaction("conversation_task_end")
     t = conversation_task(conv["id"])
     if not t:
         return None
+    # the reply is its result, which the owner reads on its card; a locked window's reply ends a task that has its
+    # person, so the readers that keep a narrowed pair's task apart (narrowed_from) hide it from the other sessions
+    scope = task_scope(t)
     DB.execute("UPDATE tasks SET state='completed', outcome='completed', what=?, where_=?, how=?, delivered=?, "
-               "accepted=1, checked_at=?, check_note=?, waiting_on=NULL, started=COALESCE(started,?) WHERE id=?",
+               "accepted=1, checked_at=?, check_note=?, waiting_on=NULL, started=COALESCE(started,?), "
+               "scope_person=COALESCE(scope_person,?) WHERE id=?",
                (clip(text, 2000), f"{cm_ref(reply)} in C-{conv['id']}", "sent to the person's chat", t0, t0,
-                "A conversation task: the person reads the answer, so nothing waits for a check.", t0, t["id"]))
+                "A conversation task: the person reads the answer, so nothing waits for a check.", t0,
+                scope["person"] if scope else None, t["id"]))
     DB.execute("UPDATE attempts SET ended=? WHERE task=? AND attempt=?", (t0, t["id"], t["attempt"]))
     DB.execute("UPDATE conversation_messages SET task=? WHERE id=?", (t["id"], reply))
     later = [r["id"] for r in read_rows("SELECT id FROM conversation_messages WHERE conversation=? AND task=? AND "
@@ -25037,8 +25073,16 @@ def conversation_result(task_id):
         said += (f" Its session already wrote to them ({', '.join(cm_ref(r['id']) for r in wrote)}): tell them only "
                  f"what that does not say, or nothing.")
     with transaction():
-        conversation_post_rows(conv, said, now(), task=task_id)
-    log(conv["agent"], f"the result of {tref(task_id)} went back into C-{conv['id']}")
+        # again inside the write: a first list that committed since the check above narrows the pair now, and an
+        # unread result line with no mark would reach its locked window (most callers of end_waits hold no lock);
+        # and the conversation as it is now (the owner may have paused it, or removed its person)
+        conv = read_row("SELECT * FROM conversations WHERE id=?", (conv["id"],))
+        narrowed = conv is not None and person_scope(conv["person"], conv["agent"]) is not None
+        if conv is not None and not narrowed:
+            conversation_post_rows(conv, said, now(), task=task_id)
+    if conv is not None:
+        log(conv["agent"], f"the result of {tref(task_id)} stays out of C-{conv['id']}, which is narrowed now"
+            if narrowed else f"the result of {tref(task_id)} went back into C-{conv['id']}")
 
 
 def start_task_source(t):
