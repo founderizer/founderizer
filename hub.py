@@ -598,7 +598,9 @@ CREATE TABLE IF NOT EXISTS resource_grants(id INTEGER PRIMARY KEY, ts REAL NOT N
 CREATE INDEX IF NOT EXISTS resource_grant_of ON resource_grants(resource, id);
 -- The release channel (PRODUCT.md 4.2 and 4.3 name both tables). `entitlement` holds one row: this fleet's
 -- subscription as the website issued it, carried and never enforced. `releases` holds one row for each release
--- this fleet learned about, with the update run that came of it.
+-- this fleet learned about, with the update run that came of it. Founderizer for Teams reads the row (teams_on), with
+-- three columns that migrate() adds: `ended` and `ended_word`, the channel's signed word that the licence of `token`
+-- ended, and `renews`, what the platform said last with that token.
 CREATE TABLE IF NOT EXISTS entitlement(id INTEGER PRIMARY KEY CHECK(id=1), fleet TEXT NOT NULL, token TEXT,
   plan TEXT, until REAL, machines INTEGER, agents INTEGER, verified INTEGER NOT NULL DEFAULT 0,
   stored REAL NOT NULL, channel_said TEXT, channel_at REAL);
@@ -7557,6 +7559,8 @@ def migrate():
         # the reliability plan of 21 November 2026, W11: the cause of a run that did not end done, one code of
         # releases.CAUSES or null (finish_release), which the automatic sweep acts on (release_again)
         "releases": {"cause": "TEXT"},
+        # Founderizer for Teams: the signed word that the licence ended, and whether it renews (teams_on, teams_state)
+        "entitlement": {"ended": "REAL", "ended_word": "TEXT", "renews": "INTEGER"},
     }.items():
         try:
             have = {r["name"] for r in q(f"PRAGMA table_info({table})")}
@@ -19453,13 +19457,13 @@ def ui_features():
     """The owner features this hub serves now: UI_FEATURES, central_vault only while central_ok(), secret_replace
     only while the central vault also says that it replaces a value (central_replaces), contact_roles only while
     contacts.v2 is on, connected_apps only while the hub's socket for them is open and the gate has forwarded to it
-    (capp_ready), and connect_offer only while the owner's Mac may turn connected apps on here or waits for them to be
-    ready (capp_offer)."""
+    (capp_ready), connect_offer only while the owner's Mac may turn connected apps on here or waits for them to be
+    ready (capp_offer), and the name of each Teams part that this hub serves now (teams_features)."""
     ok = central_ok()
     return list(UI_FEATURES) + (["central_vault"] if ok else []) + \
         (["secret_replace"] if central_replaces(ok=ok) else []) + \
         (["contact_roles"] if contacts_v2() else []) + (["connected_apps"] if capp_ready() else []) + \
-        (["connect_offer"] if capp_offer() else [])
+        (["connect_offer"] if capp_offer() else []) + teams_features()
 
 
 def central_due():
@@ -67439,11 +67443,14 @@ def expire_handovers(t0):
 # And what the copy *will* not carry, which is a decision and not a limit: four things in `~/.fleet` on the hub
 # machine. Three of them are the hub's own sign-ins — the Google refresh tokens with their client secret, the
 # GitHub App private key that mints every agent's token, and the credentials of the connected MCP servers. The
-# hub holds no credential in the clear anywhere else: every key in the records is a salt and a SHA-256, and
-# `team.json` holds names, which open nothing. That is what makes this copy a thing the owner can keep where he
-# keeps his own files, and a zip carrying a live private key would be a different object with a different home.
-# The owner decided it on 20 October 2026, on being shown the gap. The fourth is the attachments folder — his own
-# files, no credential in it — and it stays out for its own reasons (`hub_only_files`).
+# hub holds no credential in the clear anywhere else: every key in the records is a salt and a SHA-256, but one, and
+# `team.json` holds names, which open nothing. The one is the licence of Founderizer for Teams, the token of the
+# `entitlement` row (teams_licence): a bearer for our own paid services for this one fleet, which opens nothing on a
+# machine of the fleet and reads nothing of it. The copy keeps it on purpose, so that a restore brings Teams back
+# with no new claim (teams-design-1-shop-and-licence.md, 3.15). That is what makes this copy a thing the owner can
+# keep where they keep their own files, and a zip carrying a live private key would be a different object with a
+# different home. The owner decided it on 20 October 2026, on being shown the gap. The fourth is the attachments
+# folder — the owner's own files, no credential in it — and it stays out for its own reasons (`hub_only_files`).
 #
 # So the copy says what it has not got, and says it about *this* hub: `hub_only_files` records whether each one
 # is there and how much of it there is, in counts only, and RESTORE.md turns those counts into the paragraph that
@@ -69479,7 +69486,7 @@ def machine_rows():
 # The entitlement is carried, never enforced: when the fleet holds one, it goes to the channel as a bearer and
 # whatever comes back is kept. Nothing in this file refuses work when it expires. A fleet with none asks with no
 # Authorization header, because the channel answers every fleet (the website's docs/CONTRACTS.md, "A call with no
-# token").
+# token"). Founderizer for Teams reads the kept token (teams_on, below), and still no date turns anything off.
 #
 # A fleet takes each release by itself (the owner, 22 October 2026: "do they get the latest updates, improvements
 # and bug fixes automatically? it must be like that!"), with an entitlement and without one (release_sweep). An owner
@@ -69576,29 +69583,152 @@ def entitlement_view():
             "channel_said": row["channel_said"], "channel_at": row["channel_at"]}
 
 
-def store_entitlement(token):
+def store_entitlement(token, renews=None):
     """Keep the entitlement as the website issued it: the token byte for byte, and its claims so that the app can
     show the plan and the date. Nothing here acts on them.
 
     A fleet that has no id yet takes the one the token names, because the installer makes the id, sends it with the
     claim key and gets this token back (4.5). A token for another fleet is a paste in the wrong app, not an
-    enforcement question, so it is refused with that one line."""
+    enforcement question, so it is refused with that one line.
+
+    While the row holds a token that our key signed, a token that our key did not sign is refused and changes
+    nothing: nobody can check it, so it never takes the place of one that was checked, and never turns Founderizer
+    for Teams off by the way (teams_on; only the signed word does that). A token that is kept clears that word, which
+    names one token (take_ended_word), and wakes the threads of the Teams parts (teams_moved). `renews`: what the
+    platform said with this token, that the subscription renews at `until`; None when it is not known."""
     claims = releases.read_entitlement(token, entitlement_keys())
     held = kv_get("fleet_id")
     if held and claims["fleet"] != held:
         raise Refusal(409, f"this entitlement is for fleet {claims['fleet']}, and this fleet is {held}")
-    if not held:
-        kv_set("fleet_id", claims["fleet"])
-    q("INSERT INTO entitlement(id,fleet,token,plan,until,machines,agents,verified,stored) "
-      "VALUES(1,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET fleet=excluded.fleet, token=excluded.token, "
-      "plan=excluded.plan, until=excluded.until, machines=excluded.machines, agents=excluded.agents, "
-      "verified=excluded.verified, stored=excluded.stored",
-      (claims["fleet"], token, claims["plan"], claims["until"], claims["machines"], claims["agents"],
-       1 if claims["verified"] else 0, now()))
+    with LOCK:
+        kept = q1("SELECT verified FROM entitlement WHERE id=1")
+        if not claims["verified"] and kept and kept["verified"]:
+            raise Refusal(409, "this fleet keeps an entitlement that our entitlement key signed, and our entitlement "
+                               "key did not sign this one")
+        if not held:
+            kv_set("fleet_id", claims["fleet"])
+        q("INSERT INTO entitlement(id,fleet,token,plan,until,machines,agents,verified,stored,ended,ended_word,renews) "
+          "VALUES(1,?,?,?,?,?,?,?,?,NULL,NULL,?) ON CONFLICT(id) DO UPDATE SET fleet=excluded.fleet, "
+          "token=excluded.token, plan=excluded.plan, until=excluded.until, machines=excluded.machines, "
+          "agents=excluded.agents, verified=excluded.verified, stored=excluded.stored, ended=NULL, ended_word=NULL, "
+          "renews=excluded.renews",
+          (claims["fleet"], token, claims["plan"], claims["until"], claims["machines"], claims["agents"],
+           1 if claims["verified"] else 0, now(), None if renews is None else int(bool(renews))))
+    teams_moved()
     log("owner", f"entitlement kept for fleet {claims['fleet']}: plan {claims['plan']}, until "
                  f"{clock(claims['until'])}"
                  + ("" if claims["verified"] else ", not signed by our entitlement key"))
     return entitlement_view()
+
+
+# ---- Founderizer for Teams: the kept licence (teams-design-1-shop-and-licence.md, sections 3.8, 3.9 and 3.12)
+#
+# A licence of Founderizer for Teams is the entitlement's token with plan `teams`. teams_on() is the only way that
+# any code asks whether this fleet has Teams, and it keeps the launch's rule "silence changes nothing": it is true
+# from the moment that the hub keeps a token that our key signed for this fleet with that plan, until the channel's
+# signed word that the licence of that token ended (take_ended_word). No date, no failed call and no refusal of one
+# of our services makes it false: the token's `until` is for a person to read, and nothing compares it with a clock.
+# `verified` is written when the token is stored, so a release that replaces the key turns no fleet off.
+#
+# Nothing of Core asks teams_on() for its own work. Teams code stands in files of its own, which a later release
+# loads through one seam: only that seam writes TEAMS_PARTS, and it refuses through need_teams(), so the two
+# refusals of a Teams part come from one place. A fleet with no licence has no `teams` in its state, lists no Teams
+# part, and makes no new call.
+
+TEAMS_PLAN = "teams"
+TEAMS_PARTS = {}        # a part's feature name -> its own condition (a function with no argument), or None
+TEAMS_WAKE = threading.Condition()      # a part's thread that holds its calls waits on it (teams_moved)
+
+
+def teams_held(row):
+    """The rule of teams_on() for one read of the entitlement row (plan, verified, ended)."""
+    return bool(row and row["verified"] and row["plan"] == TEAMS_PLAN and row["ended"] is None)
+
+
+def teams_on():
+    """True from the moment that the hub keeps a token that our key signed for this fleet with plan `teams`, until
+    the channel's signed word that it ended. No date, no failed poll and no missing answer makes it False."""
+    return teams_held(q1("SELECT plan, verified, ended FROM entitlement WHERE id=1"))
+
+
+def teams_licence():
+    """The token, for a call to a paid service of ours (`Authorization: Bearer`), or None while teams_on() is false.
+    A part keeps no copy of it: it reads this for each call."""
+    row = q1("SELECT token, plan, verified, ended FROM entitlement WHERE id=1")
+    return row["token"] if teams_held(row) and row["token"] else None
+
+
+def need_teams(part_there=True):
+    """The one place that refuses for a Teams part. teams_off: this fleet does not have Teams. teams_part_missing:
+    it has Teams, and the caller says that this hub has not loaded the part."""
+    if not teams_on():
+        raise Refusal(409, code="teams_off")
+    if not part_there:
+        raise Refusal(409, code="teams_part_missing")
+
+
+def teams_moved():
+    """The kept licence changed (a token was stored, or the signed word was marked): wake each thread of a Teams part
+    that waits on TEAMS_WAKE, so that it reads teams_on() and teams_licence() again at once. Its caller can hold LOCK
+    (store_entitlement runs in the act of an owner command and in the release poll, which hold it), so a thread reads
+    those two after its wait, never while it holds TEAMS_WAKE."""
+    with TEAMS_WAKE:
+        TEAMS_WAKE.notify_all()
+
+
+def teams_features():
+    """The names of the Teams parts that this hub serves now, for ui_features(): only while teams_on(), only a name
+    that the seam wrote into TEAMS_PARTS (the part's code is loaded), and only while the part's own condition holds.
+    A condition that raises lists no name, and the read of the state goes on."""
+    if not TEAMS_PARTS or not teams_on():
+        return []
+    names = []
+    for name, own in sorted(TEAMS_PARTS.items()):
+        try:
+            if own is None or own():
+                names.append(name)
+        except Exception:               # a fault of a part must never break the state read of a fleet
+            print_fault()
+    return names
+
+
+def teams_state():
+    """The field `teams` of GET /ui/state and of its head, as {"teams": {...}}, or {} while the hub holds no token that
+    our key signed with plan `teams`: a fleet with no licence has no such key in its state. `on` is teams_on(),
+    `until` the end of the paid period that the token names, `renews` what the platform said last with this token
+    (None: not known), and `ended` the time of the signed word, or None. It says nothing of a part's own condition.
+    The two times are whole epoch seconds, never a float, so that a reader of a whole number (a C# long) takes them."""
+    row = q1("SELECT plan, verified, until, renews, ended FROM entitlement WHERE id=1")
+    if not (row and row["verified"] and row["plan"] == TEAMS_PLAN):
+        return {}
+    return {"teams": {"on": teams_held(row), "until": int(row["until"]),
+                      "renews": None if row["renews"] is None else bool(row["renews"]),
+                      "ended": None if row["ended"] is None else int(row["ended"])}}
+
+
+def take_ended_word(word):
+    """The channel's signed word that the licence of the token which this hub holds ended: the one way that teams_on()
+    goes false. releases.read_ended checks its shape, this fleet, the SHA-256 of the token held now and a key of
+    entitlement-key.pub. It is marked only while the row still holds the token that it names, so a token that a
+    claim stored in the meantime is not ended by it. Any other word changes nothing and leaves one log line. True
+    when the word was marked."""
+    row = q1("SELECT token FROM entitlement WHERE id=1")
+    token = row["token"] if row else None
+    try:
+        if not token:
+            raise releases.Untrusted("this fleet holds no licence")
+        word = releases.read_ended(word, kv_get("fleet_id"), token, entitlement_keys())
+    except releases.Untrusted as e:
+        log("hub", f"the word that this fleet's licence ended was not taken: {e}")
+        return False
+    with LOCK:
+        if not q1("SELECT 1 AS held FROM entitlement WHERE id=1 AND token=?", (token,)):
+            log("hub", "the word that this fleet's licence ended names a token that this fleet no longer holds")
+            return False
+        q("UPDATE entitlement SET ended=?, ended_word=? WHERE id=1", (word["at"], json.dumps(word, sort_keys=True)))
+    teams_moved()
+    log("hub", f"the release channel says, signed, that this fleet's licence ended at {clock(word['at'])}")
+    return True
 
 
 # ---- what the fleet knows about releases
@@ -71592,14 +71722,15 @@ def save_connect(on):
 
 def state_head(repository):
     """GET /ui/state?head=1 (owner API 1.256): the head of the state and none of its lists: the generation (`db`), the
-    hub's time, the change token, the features and the repository's address, with `head` true. A program that needs
+    hub's time, the change token, the features and the repository's address, with `head` true, and `teams` as the
+    state has it (teams_state: only on a fleet that holds a licence of Founderizer for Teams). A program that needs
     the generation or the features reads this, and no task: the owner's tools read the whole state before their first
     call for those two values, 8.9 MB on the first fleet on 20 November 2026. The values are of one moment, as the
     state's are (state_moment), and `repository` is read before it, as there (Handler.ui_state). A hub from before
     this version reads no such word and gives the state, which holds the same keys: one read serves both."""
     with state_moment() as (token, at):
         return {"schema_version": 1, "db": kv_get("db_id"), "time": at, "token": token, "ui_features": ui_features(),
-                "repository": repository, "head": True}
+                "repository": repository, "head": True, **teams_state()}
 
 
 def phone_mobile(query):
@@ -74376,7 +74507,7 @@ class Handler(BaseHTTPRequestHandler):
             result = {"schema_version": 1, "db": kv_get("db_id"), "time": at, "token": token,
                       "manager_flag": manager_flag_shown(),
                       "manager_warning": manager_warning(),
-                      "ui_features": ui_features(), "repository": repository}
+                      "ui_features": ui_features(), "repository": repository, **teams_state()}
             before = older_before() if window else None
             reads = {table: read for table, _, read in OLDER_TABLES}
             for table, key in (("tasks", "tasks"), ("notes", "notes"),

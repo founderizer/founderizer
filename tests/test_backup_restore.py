@@ -30,6 +30,7 @@ import zipfile
 from unittest.mock import patch
 
 import hub
+import releases
 from test_ui_api import OwnerAPI, parent_pipe
 from leftovers import ROOT
 
@@ -548,6 +549,16 @@ class Restore(Fixture):
         return opened
 
     def test_a_new_machine_becomes_the_fleet_that_was_saved(self):
+        # The fleet that was saved has Founderizer for Teams. Its licence is a bearer for our own services and comes
+        # with the copy, so the restore brings Teams back with no claim (teams-design-1-shop-and-licence.md, 3.15).
+        # The bug: a later change takes the token out of the copy "because it is a credential", and each restore of
+        # a paying fleet then loses Teams with no word.
+        seed = bytes(range(96, 128))
+        licence = releases.sign_entitlement(seed, {"fleet": hub.fleet_id(), "plan": "teams", "until": 2000000000,
+                                                   "machines": 0, "agents": 7})
+        with patch.object(hub, "entitlement_keys", return_value=(releases.public_key(seed),)):
+            hub.store_entitlement(licence)
+        self.assertTrue(hub.teams_on())
         fleet, data = self.copy_of_a_fleet()
         self.new_machine()
         code, answer = self.send(data)
@@ -590,6 +601,10 @@ class Restore(Fixture):
         proc.terminate()
         proc.wait(timeout=20)
         self.assertIn("Restored:", proc.stdout.read())
+        hub.DB.close()
+        hub.DB = sqlite3.connect(self.path, check_same_thread=False)     # the records of the hub that took the copy
+        hub.DB.row_factory = sqlite3.Row
+        self.assertEqual((hub.teams_on(), hub.teams_licence()), (True, licence))
 
     def test_a_new_machine_keeps_the_keys_of_its_own_server(self):
         """The copy's records name the key of the server service of the hub that is gone, the agent key that its

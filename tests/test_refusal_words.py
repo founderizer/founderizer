@@ -124,6 +124,9 @@ OLD = {
     # a message about a task or a job, to an agent whose chat cannot read it (owner feature message_about, UI-API.md
     # 1.279)
     "about_unreadable": "{agent} cannot read this work in its chat, so it cannot get a message about it",
+    # a Teams part, which hub.need_teams refuses (teams-design-1, 3.8)
+    "teams_off": "This needs Founderizer for Teams, which this fleet does not have.",
+    "teams_part_missing": "This fleet has Founderizer for Teams, but its hub has not loaded this part of it.",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
@@ -157,6 +160,7 @@ SITES = {
     'move_agent': {'agent_mid_turn': 1, 'agent_open_signin': 1, 'no_such_agent': 1, 'no_such_server': 1,
                    'server_no_service': 1, 'server_silent': 1, 'team_changed': 1},
     'need_give_press': {'request_answered': 1},  # the lane "Give on a card": a Give whose agent left the fleet
+    'need_teams': {'teams_off': 1, 'teams_part_missing': 1},     # a Teams part (teams-design-1, 3.8)
     'new_invite_code': {'agent_no_telegram_bot': 1, 'bot_name_unknown': 1, 'no_such_person': 1, 'person_blocked': 1,
                         'person_handles_most': 1},     # a person's Telegram invite
     'older_read': {'hub_changed': 1},              # GET /ui/tasks/older (owner API 1.254)
@@ -496,7 +500,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 212)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 214)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

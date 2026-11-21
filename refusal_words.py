@@ -147,6 +147,11 @@ WORDS = {
     # a message about a task or a job (POST /ui/messages `about`, UI-API.md 1.279) to an agent whose chat cannot read
     # that task: neither its agent nor its requester, or a task of a narrowed pair
     "about_unreadable": "{agent} cannot read this work in its chat, so it cannot get a message about it",
+    # a Teams part (hub.need_teams, the one place that raises both): the fleet has no Founderizer for Teams, or it
+    # has it and the hub has not loaded the part. The words are the design's proposal (teams-design-1, E3 and E4):
+    # no route raises them before the seam that loads a part, and their words wait for the owner's yes to them.
+    "teams_off": "This needs Founderizer for Teams, which this fleet does not have.",
+    "teams_part_missing": "This fleet has Founderizer for Teams, but its hub has not loaded this part of it.",
 }
 
 

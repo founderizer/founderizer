@@ -41,6 +41,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import hub
+import refusal_words
 import releases
 from test_ui_api import OwnerAPI
 from leftovers import ROOT
@@ -1642,11 +1643,15 @@ class HubRoutes(OwnerAPI):
 
     def test_an_expired_entitlement_changes_nothing_in_the_hub(self):
         """PRODUCT.md 4.2: nothing in the hub refuses work when it expires; only our side refuses. So it is kept,
-        it is shown as expired, and every route of this hub answers exactly as before."""
-        expired = self.token(until=1000000000)
+        it is shown as expired, and every route of this hub answers exactly as before. A licence of Founderizer for
+        Teams stays on too (its rule 5, silence changes nothing): no date, no poll that gets no answer and no refusal
+        of our side turns it off, only the signed word does. The bug: a paying fleet whose `until` passed, or whose
+        channel was away or said 402 for an hour, loses its Teams parts."""
+        expired = self.token(plan="teams", until=1000000000)
         code, answer = self.press("entitlement", token=expired)
         self.assertEqual((code, answer["expired"]), (200, True))
         self.assertEqual(hub.entitlement_token(), expired)
+        self.assertEqual((hub.teams_on(), hub.teams_licence()), (True, expired))
         self.assertEqual(self.request()[0], 200)                            # /ui/state still answers
         self.assertEqual(self.releases_state()["entitlement"]["expired"], True)
         with self.channel(manifest("a" * 40)):                              # and a poll still carries it
@@ -1657,6 +1662,12 @@ class HubRoutes(OwnerAPI):
                 (hub.now(),))
         self.assertEqual(self.request("/ui/state")[1]["tasks"][0]["state"], "working")
         self.assertEqual(hub.q1("SELECT count(*) n FROM log WHERE what LIKE '%refus%'")["n"], 0)
+        for status in (0, 401, 402, 403, 404, 500, 503):                    # no answer, and each refusal of our side
+            with self.channel({"error": "lapsed"}, status):
+                self.assertEqual(self.press("check")[0], 200)
+                self.finish()
+            self.assertEqual((hub.teams_on(), hub.teams_licence()), (True, expired), status)
+        self.assertEqual(self.request()[1]["teams"], {"on": True, "until": 1000000000, "renews": None, "ended": None})
 
     def test_the_entitlement_token_is_written_nowhere_a_reader_could_find_it(self):
         secret = self.token()
@@ -1677,19 +1688,27 @@ class HubRoutes(OwnerAPI):
     def test_the_hub_checks_the_entitlement_with_the_entitlement_key_and_not_the_release_key(self):
         """The one that was wrong until 18 October 2026: `store_entitlement` passed the release key, so every real
         entitlement — which the website signs with its entitlement key — would have landed as unverified. The
-        token is still kept and shown either way, because only our side refuses (4.2); it is marked, not refused."""
+        token is still kept and shown while the hub holds no token that our key signed, because only our side refuses
+        (4.2); it is marked, not refused. Once the hub holds one, a token that our key did not sign is refused and
+        changes nothing: it would take the place of a checked licence, and turn Founderizer for Teams off by the way.
+        The bug: anybody who can reach this route, or write into a poll's answer, ends a paying fleet's Teams."""
         self.assertEqual(hub.entitlement_keys(), (PLAN_KEY,))
         self.assertEqual(hub.release_keys(), (KEY,))
-        self.assertTrue(self.press("entitlement", token=self.token())[1]["verified"])
         signed_with_the_release_key = self.token(seed=SEED)
         code, answer = self.press("entitlement", token=signed_with_the_release_key)
         self.assertEqual((code, answer["verified"]), (200, False))
         self.assertEqual(hub.entitlement_token(), signed_with_the_release_key)
         said = hub.q1("SELECT what FROM log WHERE what LIKE 'entitlement kept%' ORDER BY id DESC")["what"]
         self.assertIn("not signed by our entitlement key", said)
+        ours = self.token()
+        self.assertTrue(self.press("entitlement", token=ours)[1]["verified"])
+        self.assertEqual(self.press("entitlement", token=signed_with_the_release_key)[0], 409)
+        self.assertEqual(hub.entitlement_token(), ours)
         (self.kit / releases.ENTITLEMENT_KEY_FILE).unlink()      # a checkout with no entitlement key verifies none
         self.assertEqual(hub.entitlement_keys(), ())
-        self.assertFalse(self.press("entitlement", token=self.token())[1]["verified"])
+        self.assertEqual(self.press("entitlement", token=self.token(until=2100000000))[0], 409)
+        self.assertEqual(hub.entitlement_token(), ours)          # and keeps the token that it checked when it could
+        self.assertTrue(self.releases_state()["entitlement"]["verified"])
 
     def test_a_fleet_with_no_id_takes_the_one_its_entitlement_names(self):
         hub.kv_set("fleet_id", None)
@@ -1716,6 +1735,139 @@ class HubRoutes(OwnerAPI):
         self.assertEqual(shown["channel_said"], "the release channel refused this fleet (403)")
         self.assertTrue(shown["channel_at"])
         self.assertTrue(shown["have_token"])            # and the token is still there, because nothing enforces
+
+    # ---- Founderizer for Teams: the kept licence (teams-design-1-shop-and-licence.md, 3.8, 3.9 and 3.12)
+
+    def word(self, token, seed=PLAN_SEED, **change):
+        """The channel's word that the licence of `token` ended, signed as the platform signs it (3.9)."""
+        said = dict({"state": "ended", "fleet": hub.fleet_id(), "at": 1797811200,
+                     "token_sha256": hashlib.sha256(token.encode()).hexdigest()}, **change)
+        return dict(said, signature=base64.b64encode(releases.sign(seed, releases.ended_text(said))).decode())
+
+    def part_waits(self):
+        """A thread of a Teams part that holds its calls, as design 4's threads do: it waits on TEAMS_WAKE with a time
+        of its own. woken() says whether something woke it before that time."""
+        waiting, woke = threading.Event(), threading.Event()
+
+        def hold():
+            with hub.TEAMS_WAKE:
+                waiting.set()
+                if hub.TEAMS_WAKE.wait(30):
+                    woke.set()
+        thread = threading.Thread(target=hold, daemon=True)
+        thread.start()
+        self.assertTrue(waiting.wait(10))
+        return thread, woke
+
+    @staticmethod
+    def woken(waiter):
+        thread, woke = waiter
+        thread.join(10)
+        return woke.is_set()
+
+    def test_teams_is_on_only_for_a_token_that_our_entitlement_key_signed_with_plan_teams(self):
+        """The hub keeps each token that it can read (4.2), and Founderizer for Teams reads one kind: our entitlement
+        key signed it for this fleet, with plan `teams`. Only then has the state `teams`, in the whole read and in its
+        head, with no token in it. The bugs: the `monthly` token of a fleet of the old shop, or a token that no key of
+        ours signed, turns Teams on; a free fleet's state gains a key; a time goes out as a float, which a C# long
+        refuses; a new token keeps what the platform said of the old one (`renews`)."""
+        def read():
+            return (hub.teams_on(), hub.teams_licence(), "teams" in self.request()[1],
+                    "teams" in self.request("/ui/state?head=1")[1])
+        self.assertEqual(read(), (False, None, False, False))
+        for token in (self.token(plan="teams", seed=SEED), self.token(plan="teams", seed=OTHER_SEED), self.token()):
+            self.assertEqual(self.press("entitlement", token=token)[0], 200)     # the release key, a stranger's, ours
+            self.assertEqual(hub.entitlement_token(), token)                     # with the old shop's plan: all kept
+            self.assertEqual(read(), (False, None, False, False), token[:24])
+        licence = self.token(plan="teams", agents=7, machines=0)
+        self.assertEqual(self.press("entitlement", token=licence)[0], 200)
+        self.assertEqual((hub.teams_on(), hub.teams_licence()), (True, licence))
+        state, head = self.request()[1], self.request("/ui/state?head=1")[1]
+        self.assertEqual(state["teams"], {"on": True, "until": 2000000000, "renews": None, "ended": None})
+        self.assertIs(type(state["teams"]["until"]), int)         # a whole number: a C# long refuses 2000000000.0
+        self.assertEqual(head["teams"], state["teams"])
+        self.assertNotIn(licence, json.dumps(state))
+        renewed = self.token(plan="teams", agents=7, machines=0, until=2100000000)
+        hub.store_entitlement(renewed, renews=False)            # what the licence's poll and the claim will pass
+        self.assertEqual(self.request()[1]["teams"], {"on": True, "until": 2100000000, "renews": False, "ended": None})
+        self.assertEqual(self.press("entitlement", token=licence)[0], 200)
+        self.assertIsNone(self.request()[1]["teams"]["renews"])
+
+    def test_only_the_signed_word_for_the_token_held_now_turns_teams_off_and_it_wakes_the_parts(self):
+        """Rule 5: Teams turns off only at the channel's word, signed with the entitlement key, and the word names one
+        token. The bugs: a word that our key did not sign, or that names another fleet or another token, turns a
+        paying fleet off; the two sides sign other bytes, so no word is ever taken; a word for the old token ends the
+        token that a claim stored meanwhile; a new purchase stays off because of an old word; a part's thread keeps
+        calling our services for its 15 minutes after the end, or waits them after a new payment (TEAMS_WAKE)."""
+        self.assertEqual(releases.ended_text({"fleet": "0123456789abcdef", "token_sha256": "a" * 64, "at": 1797811200}),
+                         b"founderizer-licence-1\nended\n0123456789abcdef\n" + b"a" * 64 + b"\n1797811200\n")
+        first = self.token(plan="teams")
+        self.assertEqual(self.press("entitlement", token=first)[0], 200)
+        right = self.word(first)
+        for wrong in (self.word(first, seed=SEED), self.word(first, seed=OTHER_SEED), self.word(first, fleet="f" * 16),
+                      self.word(self.token(plan="teams", until=2100000000)), dict(right, at=1797811201),
+                      dict(right, state="lapsed"), dict(right, at="1797811200"), {}, None, "ended"):
+            self.assertFalse(hub.take_ended_word(wrong), wrong)
+            self.assertTrue(hub.teams_on(), wrong)
+        waiter = self.part_waits()
+        self.assertTrue(hub.take_ended_word(right))
+        self.assertTrue(self.woken(waiter))
+        self.assertEqual((hub.teams_on(), hub.teams_licence(), hub.entitlement_token()), (False, None, first))
+        ended = self.request()[1]["teams"]
+        self.assertEqual(ended, {"on": False, "until": 2000000000, "renews": None, "ended": 1797811200})
+        self.assertEqual((type(ended["until"]), type(ended["ended"])), (int, int))
+        self.assertEqual(json.loads(hub.q1("SELECT ended_word FROM entitlement")["ended_word"]), right)
+        waiter = self.part_waits()
+        again = self.token(plan="teams", until=2100000000)
+        self.assertEqual(self.press("entitlement", token=again)[0], 200)
+        self.assertTrue(self.woken(waiter))
+        self.assertEqual((hub.teams_on(), hub.teams_licence()), (True, again))
+        self.assertIsNone(self.request()[1]["teams"]["ended"])
+        self.assertFalse(hub.take_ended_word(right))                # the old word names the old token
+        newer, read_ended = self.token(plan="teams", until=2200000000), releases.read_ended
+
+        def a_claim_meanwhile(*args):
+            checked = read_ended(*args)
+            hub.store_entitlement(newer)
+            return checked
+        with patch.object(releases, "read_ended", a_claim_meanwhile):
+            self.assertFalse(hub.take_ended_word(self.word(again)))
+        self.assertEqual((hub.teams_on(), hub.teams_licence()), (True, newer))
+
+    def test_a_teams_part_is_listed_only_while_teams_is_on_its_code_is_there_and_its_own_condition_holds(self):
+        """J2: a part's name is in ui_features only while all three hold, with the entries written as the seam writes
+        them: a function with no argument, or None. J1: need_teams gives the one refusal of each case. The bugs: a
+        part shows on a fleet with no Teams, or with its own condition off (role_sets while contacts.v2 is off); a
+        fault of a part breaks each read of the state; a fleet that paid reads "which this fleet does not have"; Core
+        writes an entry of its own."""
+        self.assertEqual(hub.TEAMS_PARTS, {})                       # only the seam writes an entry
+
+        def broken():
+            raise RuntimeError("a fault of the part")
+        own = {"holds": False}
+        parts = {"plain_part": None, "own_part": lambda: own["holds"], "broken_part": broken}
+
+        def refusal(**how):
+            with self.assertRaises(hub.Refusal) as caught:
+                hub.need_teams(**how)
+            return caught.exception.status, refusal_words.refusal_body(caught.exception)
+
+        def listed(path="/ui/state"):
+            code, state = self.request(path)
+            self.assertEqual(code, 200, state)
+            return [name for name in state["ui_features"] if name in parts]
+        off = (409, {"code": "teams_off", "error": refusal_words.WORDS["teams_off"]})
+        with patch.dict(hub.TEAMS_PARTS, parts), patch.object(hub, "print_fault") as fault:
+            self.assertEqual((listed(), refusal(), refusal(part_there=False)), ([], off, off))
+            self.assertEqual(self.press("entitlement", token=self.token(plan="teams"))[0], 200)
+            self.assertEqual(listed(), ["plain_part"])
+            self.assertTrue(fault.called)                           # the part's fault is recorded, and the read goes on
+            own["holds"] = True
+            self.assertEqual(listed("/ui/state?head=1"), ["own_part", "plain_part"])
+            self.assertIsNone(hub.need_teams())
+            self.assertEqual(refusal(part_there=False),
+                             (409, {"code": "teams_part_missing", "error": refusal_words.WORDS["teams_part_missing"]}))
+        self.assertEqual(listed(), [])                              # no code of the part: no name
 
     # ---- what the owner alone may do
 

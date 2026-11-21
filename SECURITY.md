@@ -88,6 +88,12 @@ alone: Founderizer says so in System status when it cannot register one, and a s
 [VAULT.md](VAULT.md) tells what the vault protects, how it protects it, what it does not protect, and what the owner
 of a fleet must do.
 
+## What a copy of the fleet holds
+
+A copy of the fleet holds the hub's records, and with them the licence of a fleet that has Founderizer for Teams: a
+bearer for Founderizer's own paid services for that one fleet, so that a restore needs no new claim. It opens nothing
+on the fleet's servers and reads nothing of the fleet.
+
 ## An agent's own browser on a Linux server
 
 Each agent with its Shell box and its Browser box on a Linux server has a Chrome of its own (build plan 04). The

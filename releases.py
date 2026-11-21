@@ -37,7 +37,8 @@ fleet's own settings say. It is signed with everything else, so it cannot be str
 
 **The entitlement is carried, never enforced.** A hub that holds one sends it as a bearer to the channel and keeps
 what comes back. Nothing here refuses work when it expires. A hub with none asks with no Authorization header, and
-the channel answers every fleet (the website's docs/CONTRACTS.md, "A call with no token").
+the channel answers every fleet (the website's docs/CONTRACTS.md, "A call with no token"). Founderizer for Teams
+reads the kept token in the hub (hub.teams_on), and only one signed word turns it off there (read_ended).
 
 No dependency: a hub is a bare Ubuntu server with python3, git and curl (hub.sh PACKAGES), so the Ed25519
 verification below is the reference implementation of RFC 8032. Where the machine has an OpenSSL that verifies Ed25519
@@ -503,6 +504,55 @@ def sign_entitlement(secret, claims):
     """The other half of read_entitlement, for our own side and for the tests. Never called on a hub."""
     body = base64.urlsafe_b64encode(json.dumps(claims, sort_keys=True, separators=(",", ":")).encode()).rstrip(b"=")
     return (body + b"." + base64.urlsafe_b64encode(sign(secret, body)).rstrip(b"=")).decode()
+
+
+# The word that a licence of Founderizer for Teams ended (teams-design-1-shop-and-licence.md, 3.9): the one signed
+# message that turns Teams off in a hub, because silence, a date or a refusal of one of our services changes nothing.
+# The entitlement key signs it, as it signs the token. One line for each field, in this order, with a first line of
+# its own, so that no release text and no other message of ours can be taken for it.
+LICENCE_PREFIX = b"founderizer-licence-1"
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def ended_text(word):
+    """The exact bytes that the signature of the word "ended" covers."""
+    return b"\n".join([LICENCE_PREFIX, b"ended", word["fleet"].encode(), word["token_sha256"].encode(),
+                       str(word["at"]).encode()]) + b"\n"
+
+
+def read_ended(raw, fleet, token, keys):
+    """The word that the licence of `token` ended, checked field by field: {"state": "ended", "fleet",
+    "token_sha256", "at", "signature"}. It must name `fleet` (this fleet's id) and the SHA-256 of `token` (the token
+    that the hub holds now), and one of `keys` (the **entitlement** keys) must have signed ended_text of it. `at` is
+    the time, in whole epoch seconds, at which our records say that the licence ended.
+
+    It raises Untrusted on anything else, so that a word which a hub cannot check changes nothing. A word names one
+    token: a new token is not ended by an old word."""
+    if not isinstance(raw, dict) or raw.get("state") != "ended":
+        raise Untrusted("the answer is not the word that a licence ended")
+    word_fleet, digest, at, signature = raw.get("fleet"), raw.get("token_sha256"), raw.get("at"), raw.get("signature")
+    if not (isinstance(word_fleet, str) and re.fullmatch(r"[0-9a-f]{16}", word_fleet)):
+        raise Untrusted("the word names no fleet")
+    if not (isinstance(digest, str) and SHA256_HEX.fullmatch(digest)):
+        raise Untrusted("the word names no token")
+    if isinstance(at, bool) or not isinstance(at, int) or not 0 < at < 2 ** 40:
+        raise Untrusted("the word has no time")
+    if not (isinstance(signature, str) and 0 < len(signature) <= 200):
+        raise Untrusted("the word carries no signature")
+    if word_fleet != fleet:
+        raise Untrusted("the word is for another fleet")
+    if not (isinstance(token, str) and digest == hashlib.sha256(token.encode()).hexdigest()):
+        raise Untrusted("the word names another token than the one this fleet holds")
+    if not trusted(keys):
+        raise Untrusted(f"this checkout carries no entitlement key ({ENTITLEMENT_KEY_FILE}), so no word can be checked")
+    try:
+        raw_signature = base64.b64decode(signature + "=" * (-len(signature) % 4), validate=True)
+    except (ValueError, TypeError):
+        raise Untrusted("the word's signature is not base64") from None
+    word = {"state": "ended", "fleet": word_fleet, "token_sha256": digest, "at": at, "signature": signature}
+    if not signed_by_any(keys, ended_text(word), raw_signature):
+        raise Untrusted("the word is not signed by an entitlement key that this checkout carries")
+    return word
 
 
 # ---------------------------------------------------------------- GET /releases/latest
