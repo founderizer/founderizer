@@ -413,7 +413,8 @@ class Remove(Servers):
 
         def owner_says(agent, text):
             with hub.LOCK, hub.transaction():
-                hub.owner_message_rows(f"m-{agent}", "message", None, text, "test", agent, None, hub.now())
+                hub.owner_message_rows(f"m-{agent}", "message", None, text, "founderizer-swift/1/test", agent, None,
+                                       hub.now())
             return hub.q1("SELECT rowid FROM ui_requests ORDER BY rowid DESC LIMIT 1")["rowid"]
 
         def reports(agent, text):

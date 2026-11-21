@@ -169,15 +169,21 @@ class Ran(RunCase):
         self.assertEqual(self.run_answer()[0], 200)
         self.assertEqual(self.run_answer()[0], 409)
 
-    def test_a_phone_or_a_connected_app_cannot_send_a_run(self):
+    def test_only_the_mac_app_sends_a_run(self):
+        app = "founderizer-swift/1/test"
         data = {"request_id": str(uuid.uuid4()), "db": "test-generation", "ran": {"status": 0, "output": ""}}
         with patch.object(hub, "owner_device_at", lambda address: "iphone" if address == "100.64.0.99" else None):
-            code, body = hub.phone_submit(data, "deterministic-test", need_id=1, address="100.64.0.99")
+            code, body = hub.phone_submit(data, app, need_id=1, address="100.64.0.99")
         self.assertEqual(code, 409, body)
         self.assertIn("on the Mac", body["error"])
-        code, body = hub.phone_submit(dict(data, request_id=str(uuid.uuid4())), "deterministic-test", need_id=1,
+        code, body = hub.phone_submit(dict(data, request_id=str(uuid.uuid4())), app, need_id=1,
                                       connection={"id": 1, "name": "Example app"})
         self.assertEqual(code, 409, body)
+        # Fable's check of 20 November 2026: nor an AI session's owner tools, nor a program of another label, whose
+        # `ran` would say that the Mac ran the command
+        for label in ("founderizer-cli/1/t", "curl/8.7.1"):
+            code, body = hub.phone_submit(dict(data, request_id=str(uuid.uuid4())), label, need_id=1)
+            self.assertEqual(code, 409, (label, body))
         self.assertIsNone(self.row()["answer"])
 
     def test_a_pc_that_cannot_run_sends_no_run_and_a_mac_runs_as_before(self):

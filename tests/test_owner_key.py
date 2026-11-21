@@ -139,7 +139,7 @@ class Rule(WithKeyFolder):
         self.assertEqual(status, 200)
         self.assertIn("owner_key", said["ui_features"])
         status, said = self.ask("/ui/messages", dict(self.command(), recipient="manager", text="An order."), token=KEY,
-                                headers={"X-Fleet-Client": "deterministic-test"})
+                                headers={"X-Fleet-Client": "founderizer-swift/1/test"})
         self.assertEqual(status, 200, said)
 
     def test_a_wrong_key_is_refused_and_never_taken_as_absent(self):

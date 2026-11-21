@@ -41,7 +41,8 @@ class Devices(test_ui_api.OwnerAPI):
 
     # ---- helpers
     def call(self, path, body=None, source=MAC, token=None, headers=None):
-        head = dict({"Content-Type": "application/json", "X-Fleet-Client": "deterministic-test"}, **(headers or {}))
+        head = dict({"Content-Type": "application/json", "X-Fleet-Client": "founderizer-swift/1/test"},
+                    **(headers or {}))
         if token is not None:
             head["Authorization"] = "Bearer " + token
         return self.request(path, body, headers=head, source=source)
@@ -83,7 +84,8 @@ class Devices(test_ui_api.OwnerAPI):
     def message(self, agent="manager", text="A goal"):
         event = hub.emit(agent, "chat", text)
         hub.ins("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,recipient) "
-                "VALUES(?,'message',?,?,?,'deterministic-test',?)", (str(uuid.uuid4()), text, event, hub.now(), agent))
+                "VALUES(?,'message',?,?,?,'founderizer-swift/1/test',?)",
+                (str(uuid.uuid4()), text, event, hub.now(), agent))
         return event
 
     def report(self, agent="manager", text="A reply"):
@@ -92,7 +94,7 @@ class Devices(test_ui_api.OwnerAPI):
 
     def upload(self, data=PNG, source=PHONE, token=None):
         """POST /ui/attachments with the raw bytes, as the phone's MobileClient.upload sends them."""
-        head = {"Content-Type": "image/png", "X-Fleet-Client": "deterministic-test", "X-Fleet-Name": "shot.png",
+        head = {"Content-Type": "image/png", "X-Fleet-Client": "founderizer-swift/1/test", "X-Fleet-Name": "shot.png",
                 "X-Fleet-Request-Id": str(uuid.uuid4()), "X-Test-Source": source}
         if token is not None:
             head["Authorization"] = "Bearer " + token
@@ -172,8 +174,36 @@ class Devices(test_ui_api.OwnerAPI):
         self.assertEqual({k: type(receipt.get(k)) for k in ("ok", "request_id", "client", "event_id", "created", "replayed")},
                          {"ok": bool, "request_id": str, "client": str, "event_id": int, "created": float, "replayed": bool})
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"], "Which account?")
+        # Fable's second check of 20 November 2026: the phone's own answer is its hand, whatever its label, and the
+        # agent reads the owner's words with no mark of a program
+        self.assertEqual(hub.q1("SELECT hand FROM ui_requests WHERE request_id=?", (body["request_id"],))["hand"],
+                         "device")
+        self.assertTrue(hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"].startswith(
+            f"[owner] Answer to Needs-you N-{nid} "))
         again = self.call(path, dict(body, clarify="Which account?"), source=PHONE, token=key)[1]
         self.assertEqual((again["replayed"], again["created"], again["event_id"]), (True, receipt["created"], receipt["event_id"]))
+        # an AI session's clarify (Fable's third check of 20 November 2026): its words are not the owner's, and the
+        # agent reads so in the mark and in the hub's line
+        other = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?)",
+                        ("Enter a login for crm.example", "The tickets.", hub.SECRET_TODO, hub.now(), "manager",
+                         "secret", json.dumps(spec)))
+        status, told = self.call(f"/ui/needs/{other}/secret", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                             "clarify": "The support one."},
+                                 headers={"X-Fleet-Client": "founderizer-cli/1/test"})
+        self.assertEqual(status, 200, told)
+        said = hub.q1("SELECT text FROM events WHERE id=?", (told["event_id"],))["text"]
+        self.assertTrue(said.startswith(f"[owner via ai-session] Answer to Needs-you N-{other} "), said)
+        self.assertIn("An AI session or a program wrote the words before this line for the owner", said)
+        third = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?)",
+                        ("Enter a login for mail.example", "The mail.", hub.SECRET_TODO, hub.now(), "manager",
+                         "secret", json.dumps(spec)))
+        status, told = self.call(f"/ui/needs/{third}/secret", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                             "clarify": "The shared one."},
+                                 headers={"X-Fleet-Client": "curl/8.7.1"})
+        self.assertEqual(status, 200, told)
+        said = hub.q1("SELECT text FROM events WHERE id=?", (told["event_id"],))["text"]
+        self.assertTrue(said.startswith(f"[owner via program] Answer to Needs-you N-{third} "), said)
+        self.assertIn("An AI session or a program wrote the words before this line for the owner", said)
 
     def test_a_code_works_once_and_only_from_its_device(self):
         status, made = self.code()
@@ -284,7 +314,7 @@ class Devices(test_ui_api.OwnerAPI):
         status, receipt = self.call("/ui/messages", self.command(text="A goal from the phone"), source=PHONE, token=key)
         self.assertEqual(status, 200, receipt)
         self.assertEqual(hub.q1("SELECT client FROM ui_requests WHERE request_id=?",
-                                (receipt["request_id"],))["client"], "deterministic-test")
+                                (receipt["request_id"],))["client"], "founderizer-swift/1/test")
         for path in ("/ui/owner/devices", "/ui/team/google", "/ui/knowledge"):
             with self.subTest(path=path):
                 status, body = self.call(path, {"request_id": str(uuid.uuid4()), "db": "test-generation"},
@@ -385,11 +415,15 @@ class Devices(test_ui_api.OwnerAPI):
         for said in (text(boss), text(worker)):
             self.assertNotIn("iPhone 2", said)
             self.assertNotIn("iphone-2", said)
-            self.assertNotIn("deterministic-test", said)
-        status, mac = self.call("/ui/messages", self.command(text="From the Mac"),
-                                headers={"X-Fleet-Client": "founderizer-ios/1/00000000-0000-4000-8000-000000000000"})
+            self.assertNotIn("founderizer-swift/1/test", said)
+        status, mac = self.call("/ui/messages", self.command(text="From the Mac"))
         self.assertEqual(status, 200, mac)
         self.assertEqual(text(mac), "[owner] From the Mac")
+        # the phone's label from the Mac's address gives no phone's mark: it is a program's claim (UI-API.md 1.291)
+        status, claimed = self.call("/ui/messages", self.command(text="Claimed"),
+                                    headers={"X-Fleet-Client": "founderizer-ios/1/00000000-0000-4000-8000-000000000000"})
+        self.assertEqual(status, 200, claimed)
+        self.assertEqual(text(claimed), "[owner via program] Claimed")
         nid = self.need()
         status, answer = self.call(f"/ui/needs/{nid}", {"request_id": str(uuid.uuid4()), "db": "test-generation", "answer": "Yes"}, source=PHONE, token=key)
         self.assertEqual(status, 200, answer)
@@ -652,7 +686,7 @@ class Devices(test_ui_api.OwnerAPI):
         need = self.need()
         self.message(text="An ordinary message")
         hub.ins("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient) "
-                "VALUES(?,'answer',?,'yes',?,?,'deterministic-test','manager')",
+                "VALUES(?,'answer',?,'yes',?,?,'founderizer-swift/1/test','manager')",
                 (str(uuid.uuid4()), need, hub.emit("manager", "say", "[owner] yes"), hub.now() + 1))
         items = self.call("/ui/mobile/chat/manager")[1]["items"]
         self.assertEqual([(i["kind"], i["text"], i["answer_to"]) for i in items],
@@ -935,7 +969,7 @@ class Devices(test_ui_api.OwnerAPI):
         def says(agent, at, kind="message"):
             rid = str(uuid.uuid4())
             hub.ins("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,recipient) "
-                    "VALUES(?,?,'Is it live?',?,?,'deterministic-test',?)",
+                    "VALUES(?,?,'Is it live?',?,?,'founderizer-swift/1/test',?)",
                     (rid, kind, hub.emit(agent, "chat", "Is it live?"), at, agent))
             return rid
 

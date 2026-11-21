@@ -151,6 +151,16 @@ class Dormant(Base):
         self.assertEqual(code, 200)
         self.assertNotIn("connection", state["messages"][0])
         self.assertEqual(state["messages"][0]["text"], "A goal")
+        # nor who sent it (the review of 20 November 2026, issue 4: UI-API.md 1.289 changes no answer field)
+        hub.q("UPDATE ui_requests SET hand='tool', session='claude-code/1'")
+        code, state = self.request()
+        self.assertTrue({"hand", "session"}.isdisjoint(state["messages"][0]), state["messages"][0])
+        # a request that names a connected app's label with no connection of the hub's is a program's claim: marked as
+        # one, in its header as everywhere else (the last check of 21 November 2026)
+        with hub.committed():
+            event = hub.owner_message_rows(str(uuid.uuid4()), "message", None, "A claim", "connected:9", "manager", None,
+                                           hub.now())
+        self.assertEqual(hub.q1("SELECT text FROM events WHERE id=?", (event,))["text"], "[owner via program] A claim")
 
 
 class OwnerRoutes(Base):
@@ -437,6 +447,19 @@ class MessageHeader(Base):
         self.assertEqual(self.request("/ui/messages", {"request_id": str(uuid.uuid4()), "db": "test-generation",
                                                        "text": "My other words", "replaces_request_id": own})[0], 200)
         self.assertEqual(self.words(own), ("[owner] My other words", None, "My other words"))
+        # The review of 20 November 2026, issue 4: an AI session's edit of an unread message of before the hand was
+        # kept (no hand: the owner's force) takes the session's hand, mark and session with its words
+        tool = {"Content-Type": "application/json", "X-Fleet-Client": "founderizer-cli/1/t"}
+        old = str(uuid.uuid4())
+        self.assertEqual(self.request("/ui/messages", {"request_id": old, "db": "test-generation",
+                                                       "text": "Old words"}, headers=tool)[0], 200)
+        hub.q("UPDATE ui_requests SET hand=NULL, session=NULL WHERE request_id=?", (old,))      # a row of before
+        self.assertEqual(self.request("/ui/messages", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                       "text": "Session words", "replaces_request_id": old},
+                                      headers=dict(tool, **{"X-Fleet-Session": "claude-code/s1"}))[0], 200)
+        self.assertEqual(self.words(old)[0], "[owner via ai-session] Session words")
+        self.assertEqual(tuple(hub.q1("SELECT hand, session FROM ui_requests WHERE request_id=?", (old,))),
+                         ("tool", "claude-code/s1"))
 
 
 # ---------------------------------------------------------------- the socket, the endpoints and the tools (commit 4)
@@ -1683,6 +1706,9 @@ class Tools(Socket):
                          ["steer_task", "control_task"])
         self.assertEqual({r["client"] for r in hub.q("SELECT client FROM ui_controls WHERE route NOT LIKE 'connect/%'")},
                          {f"connected:{connection}"})
+        # and their receipts keep the connected app's hand (request_hand): its label alone would be a program's claim
+        self.assertEqual({r["hand"] for r in hub.q("SELECT hand FROM ui_controls WHERE route NOT LIKE 'connect/%'")},
+                         {"connected"})
 
     def test_a_steer_of_a_connected_app_says_so_in_the_history_and_the_owners_own_does_not(self):
         _, connection, act, _ = self.signed_in("act")
@@ -1692,22 +1718,52 @@ class Tools(Socket):
         self.assertFalse(answer["result"]["isError"], answer)
         code, own = self.command(f"/ui/tasks/{task}/steer", text="Keep it short.")       # the owner's Mac
         self.assertEqual(code, 200, own)
-        self.assertEqual([(r["client"], r["connection"]) for r in hub.q("SELECT * FROM steers ORDER BY id")],
-                         [(f"connected:{connection}", connection), ("deterministic-test", None)])
+        # The review of 20 November 2026, issue 4: a steer that an AI session on the owner's Mac sent through the
+        # owner tools says so to the task, to its requester and in the history, and its row keeps the session
+        steer_id = str(uuid.uuid4())
+        code, tool = self.request(f"/ui/tasks/{task}/steer", {"request_id": steer_id, "db": "test-generation",
+                                                               "text": "Cancel the old one."},
+                                  headers={"Content-Type": "application/json", "X-Fleet-Client": "founderizer-cli/1/t",
+                                           "X-Fleet-Session": "claude-code/7e350cc6"})
+        self.assertEqual(code, 200, tool)
+        self.assertEqual([(r["client"], r["connection"], r["hand"], r["session"])
+                          for r in hub.q("SELECT * FROM steers ORDER BY id")],
+                         [(f"connected:{connection}", connection, "connected", None),
+                          ("founderizer-swift/1/test", None, "app", None),
+                          ("founderizer-cli/1/t", None, "tool", "claude-code/7e350cc6")])
+        said = [r["text"] for r in hub.q("SELECT text FROM events WHERE text LIKE '%Cancel the old one.%' ORDER BY id")]
+        self.assertTrue(said[0].startswith(f"[owner via ai-session] Steering from the owner's AI session for T-{task}: "
+                                           "Cancel the old one."), said)
+        self.assertIn(f"through their AI session: Cancel the old one.", said[1])
+        self.assertEqual(tuple(hub.q1("SELECT hand, session FROM ui_controls WHERE request_id=?", (steer_id,))),
+                         ("tool", "claude-code/7e350cc6"))         # and the command's receipt
+        # a program's steer (any other label, UI-API.md 1.291) says so too, with no device and no session
+        code, scripted = self.request(f"/ui/tasks/{task}/steer", {"request_id": str(uuid.uuid4()),
+                                                                   "db": "test-generation", "text": "Stop the export."},
+                                      headers={"Content-Type": "application/json", "X-Fleet-Client": "curl/8.7.1"})
+        self.assertEqual(code, 200, scripted)
+        said = [r["text"] for r in hub.q("SELECT text FROM events WHERE text LIKE '%Stop the export.%' ORDER BY id")]
+        self.assertTrue(said[0].startswith(f"[owner via program] Steering from the owner's program for T-{task}: "
+                                           "Stop the export."), said)
+        self.assertIn("through a program: Stop the export.", said[1])
         self.assertNotIn("connection", own["steer"])                # the apps read no new field of a steer
         hub.history_catch_up()
         rows = hub.q("SELECT * FROM history WHERE src='steer' ORDER BY src_id")
         self.assertEqual([r["text"] for r in rows],
                          [f"The owner (through the app Claude), on T-{task}: Use plain words.",
-                          f"The owner, on T-{task}: Keep it short."])
+                          f"The owner, on T-{task}: Keep it short.",
+                          f"The owner (through their AI session), on T-{task}: Cancel the old one.",
+                          f"The owner (through a program), on T-{task}: Stop the export."])
         # the search card shows the record's own words, with neither head (HISTORY_HEADS)
-        self.assertEqual([hub.history_own_words(r) for r in rows], ["Use plain words.", "Keep it short."])
+        self.assertEqual([hub.history_own_words(r) for r in rows],
+                         ["Use plain words.", "Keep it short.", "Cancel the old one.", "Stop the export."])
         # a database of a release before this column gets it at the start (migrate), and its steers read as his own
         hub.older_unwatch("steers")     # the marks' triggers name each column of the table (owner API 1.254)
         hub.q("ALTER TABLE steers DROP COLUMN connection")
         self.assertNotIn("connection", [c["name"] for c in hub.q("PRAGMA table_info(steers)")])
         hub.migrate()
-        self.assertEqual([r["connection"] for r in hub.q("SELECT connection FROM steers ORDER BY id")], [None, None])
+        self.assertEqual([r["connection"] for r in hub.q("SELECT connection FROM steers ORDER BY id")],
+                         [None, None, None, None])
 
     def test_a_registered_login_in_an_act_text_gets_422_as_on_the_phone(self):
         _, _, act, _ = self.signed_in("act")

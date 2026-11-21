@@ -64,7 +64,7 @@ class Attachments(test_ui_api.OwnerAPI):
 
     # ---- the helpers of these checks
 
-    def send_bytes(self, data, mime="image/png", name="shot.png", request_id=None, client="deterministic-test",
+    def send_bytes(self, data, mime="image/png", name="shot.png", request_id=None, client="founderizer-swift/1/test",
                    db="test-generation"):
         headers = {"Content-Type": mime, "X-Fleet-Client": client, "X-Fleet-Name": name,
                    "X-Fleet-Request-Id": request_id or str(uuid.uuid4())}

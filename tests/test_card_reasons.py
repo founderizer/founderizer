@@ -217,6 +217,19 @@ class Reasons(OwnerAPI):
               ("Ship nothing on Fridays without me.", hub.now()))
         hub.q("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,connection) VALUES('r2','message',"
               "?,2,?,'an AI client',7)", ("Refunds above 50 EUR are mine to approve.", hub.now()))
+        # the review of 20 November 2026, issue 4: words that an AI session sent through the owner tools, as a message
+        # and as a steer, and an owner's item kept from such a message
+        hub.q("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,hand) VALUES('r3','message',?,3,?,"
+              "'founderizer-cli/1/t','tool')", ("Every setting change is Leo's call from now on.", hub.now()))
+        hub.q("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created,hand) VALUES(1,1,?,4,'r4',"
+              "'founderizer-mcp/1/t',?,'tool')", ("Ask me only for money or an account.", hub.now()))
+        hub.q("INSERT INTO standing(agent,scope,kind,words,author_kind,author,message,created) VALUES('manager','team',"
+              "'instruction','Window changes are the lead''s call.','owner','owner',3,?)", (hub.now(),))
+        # and a program's (UI-API.md 1.291: any label that no app of the owner's gives), as a message and as a steer
+        hub.q("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,hand) VALUES('r5','message',?,5,?,"
+              "'curl/8.7.1','other')", ("Every release day is the lead's call.", hub.now()))
+        hub.q("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created,hand) VALUES(1,1,?,6,'r6',"
+              "'curl/8.7.1',?,'other')", ("Ask me only about new money.", hub.now()))
         for words in ("“A Friday release is mine to choose.”", "pricing is my call", "Contracts are mine, not yours",
                       "ship nothing on Fridays without me", "Never rotate STRIPE_SECRET_KEY without asking me."):
             with self.subTest(words=words):
@@ -236,7 +249,12 @@ class Reasons(OwnerAPI):
                       "The release weekday stays mine to choose",           # its recommended words, which he pressed
                       "Every release needs the owner's yes first.",         # nobody's
                       "published prices are mine",                          # a part of a word of theirs
-                      "Refunds above 50 EUR are mine to approve."):         # a connected app's words
+                      "Refunds above 50 EUR are mine to approve.",          # a connected app's words
+                      "Every setting change is Leo's call from now on.",    # an AI session's message
+                      "Ask me only for money or an account.",               # an AI session's steer
+                      "Window changes are the lead's call.",                # an item kept from a session's words
+                      "Every release day is the lead's call.",              # a program's message
+                      "Ask me only about new money."):                      # a program's steer
             with self.subTest(words=words):
                 self.refused("are not the owner's own words", reason="decision", owner_words=words)
         self.refused("at least 15 characters", reason="decision", owner_words="mine to choose")

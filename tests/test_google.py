@@ -603,7 +603,7 @@ class GoogleHub(OwnerAPI):
         # Whose Google app this is, and that Google has not verified it yet: the app then says how to pass the
         # warning page. The command fields keep their own client, the caller's label.
         self.assertEqual((first["app"], first["verified"], first["client"]),
-                         ("founderizer", False, "deterministic-test"))
+                         ("founderizer", False, "founderizer-swift/1/test"))
         row = hub.q1("SELECT body, result FROM ui_controls WHERE request_id=?", (first["request_id"],))
         self.assertEqual(json.loads(row["body"]), {"redirect_uri": REDIRECT, "account": None, "service": None})
         self.assertNotIn(APP_SECRET, row["body"] + row["result"])

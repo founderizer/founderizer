@@ -327,11 +327,40 @@ class Board(NeedsCase):
         self.assertEqual(self.row()["chosen"], 1)
         self.assertIn("Harbour", hub.t_read_messages("manager", {}))
 
-    def test_the_board_still_takes_a_written_answer(self):
+    def test_the_board_takes_a_written_answer_only_on_an_item_with_no_options(self):
+        """The review of 20 November 2026, issue 4: since the owner key, only a program posts to the board, so its
+        words close no card that has its own answers, as on /ui/needs/<id> (card_words_from_tool); a press still
+        goes, and words still answer an item with no options."""
+        # the board's hand: a program's on a hub that holds the Mac's key (no browser sends it), the owner's on one
+        # that holds none (this test hub holds none)
+        with mock.patch.object(hub, "owner_key", lambda: {"sha256": "0" * 64}):
+            self.assertEqual(hub.board_hand(), "other")
+        self.assertIsNone(hub.board_hand())
+        keyed = mock.patch.object(hub, "board_hand", lambda: "other")      # a hub that holds the Mac's key
+        keyed.start()
+        self.addCleanup(keyed.stop)
         self.raise_item(options=["Tide", "Harbour"])
         self.assertEqual(self.form("/needs/1", {"answer": "Call it Anchor"}), 303)
-        self.assertEqual(self.row()["answer"], "Call it Anchor")
-        self.assertIsNone(self.row()["chosen"])
+        self.assertIsNone(self.row()["answer"])
+        self.assertEqual(self.form("/needs/1", {"choice": "1"}), 303)
+        self.assertEqual((self.row()["answer"], self.row()["chosen"]), ("Harbour", 1))
+        said = hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC")["text"]
+        self.assertTrue(said.startswith("[owner via program] Answer to Needs-you N-1 (Which name?): Harbour"), said)
+        self.assertIn(hub.NEED_PROGRAM_PRESSED, said)
+        self.raise_item(title="Name?")
+        self.assertEqual(self.form("/needs/2", {"answer": "Call it Anchor"}), 303)
+        self.assertEqual(self.row(2)["answer"], "Call it Anchor")
+        self.assertIn(hub.NEED_PROGRAM_WORDS, hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC")["text"])
+        self.form("/say", {"text": "Ship it today."})
+        self.assertEqual(hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC")["text"],
+                         "[owner via program] Ship it today.")
+        # a hub that holds no owner key: the owner's own browser may use the board, so its words are his
+        keyed.stop()
+        self.raise_item(title="Colour?", options=["Blue", "Green"])
+        self.assertEqual(self.form("/needs/3", {"answer": "Red"}), 303)
+        self.assertEqual(self.row(3)["answer"], "Red")
+        self.assertTrue(hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC")["text"].startswith(
+            "[owner] Answer to Needs-you N-3"))
 
     def test_the_board_refuses_a_press_that_names_no_option(self):
         self.raise_item(options=["Tide", "Harbour"])
@@ -469,6 +498,61 @@ class Talk(NeedsCase):
         self.raise_item(options=["Tide", "Harbour"])
         self.assertEqual(self.request("/ui/needs/2", self.command(choice=1))[0], 200)
         self.assertNotIn("their own words", hub.t_read_messages("manager", {}))
+        # The review of 20 November 2026, issue 4: card N-230 was answered in the owner's voice by a Claude Code
+        # session through founderizer-cli, the hub said "The owner wrote this in their own words", and the manager kept
+        # the words as the owner's rule. Words that the owner tools send (their label, or a request that names its
+        # session) are an AI session's: the hub says so to the agent, and the row keeps who sent them.
+        tool = {"Content-Type": "application/json", "X-Fleet-Client": "founderizer-cli/1/test",
+                "X-Fleet-Session": "claude-code/0d8aa41c"}
+        self.raise_item(title="Add swap?")                      # N-3: no options, so words are its only answer
+        code, receipt = self.request("/ui/needs/3", self.command(answer="Not my decision: Leo's call from now on."),
+                                     headers=tool)
+        self.assertEqual(code, 200, receipt)
+        said = hub.t_read_messages("manager", {})
+        self.assertIn("[owner via ai-session] Answer to Needs-you N-3 (Add swap?): Not my decision: Leo's call from "
+                      "now on." + hub.NEED_TOOL_WORDS + hub.NEED_TOOL_RULE, said)
+        self.assertNotIn("their own words", said)
+        self.assertEqual([tuple(r) for r in hub.q("SELECT need_id, hand, session FROM ui_requests ORDER BY need_id")],
+                         [(1, "app", None), (2, "app", None), (3, "tool", "claude-code/0d8aa41c")])
+        # the program's label alone is enough, and a session's press says that a session pressed it
+        self.raise_item(title="Window?", options=["Go to 80", "Stay at 70"])        # N-4
+        code, receipt = self.request("/ui/needs/4", self.command(choice=0), headers={
+            "Content-Type": "application/json", "X-Fleet-Client": "founderizer-mcp/1/test"})
+        self.assertEqual(code, 200, receipt)
+        self.assertIn("[owner via ai-session] Answer to Needs-you N-4 (Window?): Go to 80" + hub.NEED_TOOL_PRESSED,
+                      hub.t_read_messages("manager", {}))
+        # and words to a card that has its own answers are refused: the card stays open for the owner (N-230 had three)
+        self.raise_item(title="Raise it?", options=["Go to 80", "Stay at 70"])      # N-5
+        code, refused = self.request("/ui/needs/5", self.command(answer="Not my decision: go ahead."), headers=tool)
+        self.assertEqual((code, refused.get("code"), self.row(5)["answer"]), (409, "card_words_from_tool", None))
+        self.assertEqual(self.request("/ui/needs/5", self.command(choice=1), headers=tool)[0], 200)
+        self.assertEqual(self.row(5)["answer"], "Stay at 70")
+        # a session that is no name is refused before anything is written
+        self.raise_item(title="Region?")                        # N-6
+        code, _ = self.request("/ui/needs/6", self.command(answer="West"), headers=dict(tool, **{
+            "X-Fleet-Session": "claude code/1"}))
+        self.assertEqual((code, self.row(6)["answer"]), (400, None))
+        # the hands of the labels: the Mac app's screen, the owner tools, a connected app, anything else
+        self.assertEqual([hub.request_hand(c) for c in ("founderizer-swift/1/a", "founderizer-cli/1/a",
+                                                        "founderizer-mcp/1/a", "connected:3", "deterministic-test")],
+                         ["app", "tool", "tool", "other", "other"])        # a connected app's label alone is a claim
+        self.assertEqual(hub.request_hand("connected:3", connection={"id": 3, "name": "Claude"}), "connected")
+        self.assertEqual(hub.request_hand("deterministic-test", session="claude-code/1"), "tool")
+        # a session that names itself is a tool from an enrolled device too, and the PC app's label is the owner's
+        self.assertEqual(hub.request_hand("founderizer-swift/1/a", device="Windows", session="claude-code/1"), "tool")
+        self.assertEqual(hub.request_hand("founderizer-windows/1/a"), "app")
+        # Fable's check of 20 November 2026, finding 1: a label that no app of the owner's gives (here curl's) has no
+        # owner's force either: its words close no card that has its own answers, and its words to an item with none
+        # are a program's, never the owner's own
+        curl = {"Content-Type": "application/json", "X-Fleet-Client": "curl/8.7.1"}
+        self.raise_item(title="Window again?", options=["Go to 80", "Stay at 70"])     # N-7
+        code, refused = self.request("/ui/needs/7", self.command(answer="Go ahead, Leo decides."), headers=curl)
+        self.assertEqual((code, refused.get("code"), self.row(7)["answer"]), (409, "card_words_from_tool", None))
+        self.raise_item(title="Disk?")                          # N-8
+        self.assertEqual(self.request("/ui/needs/8", self.command(answer="Add one."), headers=curl)[0], 200)
+        said = hub.t_read_messages("manager", {})
+        self.assertIn("[owner via program] Answer to Needs-you N-8 (Disk?): Add one." + hub.NEED_PROGRAM_WORDS, said)
+        self.assertNotIn("their own words", said)
 
     def test_an_item_of_another_agent_gets_no_word_about_a_new_item(self):
         """raise_needs_you is the manager's, so the words of an answer to another agent's item name no such step."""
@@ -508,6 +592,23 @@ class Talk(NeedsCase):
         self.assertEqual(self.row()["answer"], "Harbour")
         self.assertFalse(self.item()["clarify"])
         self.assertEqual(self.request("/ui/needs/1/talk", self.command(text="And now?"))[0], 409)
+        # The review of 20 November 2026, issue 4 (Fable's third check): an AI session's talk under a card says so in
+        # its header and in one sentence, as its answer does
+        self.raise_item(title="Which window?", options=["80", "70"])
+        code, _ = self.request("/ui/needs/2/talk", self.command(text="Is 80 safe?"), headers={
+            "Content-Type": "application/json", "X-Fleet-Client": "founderizer-cli/1/test"})
+        self.assertEqual(code, 200)
+        said = hub.t_read_messages("manager", {})
+        self.assertIn("[owner via ai-session] About Needs-you N-2 (Which window?), before answering it: Is 80 safe?",
+                      said)
+        self.assertIn(hub.NEED_TALK_NOT_HIS, said)
+        # and a program's (any label that no app of the owner's gives)
+        code, _ = self.request("/ui/needs/2/talk", self.command(text="And 75?"), headers={
+            "Content-Type": "application/json", "X-Fleet-Client": "curl/8.7.1"})
+        self.assertEqual(code, 200)
+        said = hub.t_read_messages("manager", {})
+        self.assertIn("[owner via program] About Needs-you N-2 (Which window?), before answering it: And 75?", said)
+        self.assertIn(hub.NEED_TALK_NOT_HIS, said)
         with self.assertRaisesRegex(hub.ToolError, "answered already"):
             hub.t_discuss_need("manager", {"need": "N-1", "text": "Late."})
 

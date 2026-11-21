@@ -1666,9 +1666,9 @@ class Conversations(Base):
         self.person("Kim", "manager", KIM, app="discord")
         named, real = [], hub.call_record
 
-        def record(agent, tid, attempt, name, ok, args, detail, window, own=None):
+        def record(agent, tid, attempt, name, ok, args, detail, window, own=None, mark=None):
             named.append((name, set(hub.CALL.heads)))
-            return real(agent, tid, attempt, name, ok, args, detail, window, own)
+            return real(agent, tid, attempt, name, ok, args, detail, window, own, mark)
         with patch.object(hub, "call_record", record):
             tid, here = self.normal_task(title="Plan the refunds")
             self.ok("message_contact", here, person="Kim", text="May I refund Ana?", request_id=str(uuid.uuid4()),

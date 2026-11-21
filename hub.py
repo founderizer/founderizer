@@ -23,6 +23,7 @@ private (Tailscale) network.
 import argparse
 import base64
 import builtins
+import codecs
 import collections
 import contextlib
 import datetime
@@ -265,7 +266,8 @@ CREATE TABLE IF NOT EXISTS cases(id TEXT PRIMARY KEY, test INTEGER, created REAL
 CREATE TABLE IF NOT EXISTS evidence(id INTEGER PRIMARY KEY, case_id TEXT, kind TEXT, ts REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS ui_requests(request_id TEXT PRIMARY KEY, kind TEXT, need_id INTEGER,
   text TEXT, event_id INTEGER NOT NULL, created REAL NOT NULL, client TEXT NOT NULL,
-  recipient TEXT NOT NULL DEFAULT 'manager', replaces_request_id TEXT, edits TEXT, connection INTEGER);
+  recipient TEXT NOT NULL DEFAULT 'manager', replaces_request_id TEXT, edits TEXT, connection INTEGER, hand TEXT,
+  session TEXT);
 CREATE TABLE IF NOT EXISTS attachments(id INTEGER PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
   mime TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, created REAL NOT NULL, client TEXT NOT NULL,
   message TEXT, kept REAL, knowledge TEXT);
@@ -283,7 +285,7 @@ CREATE TABLE IF NOT EXISTS outcomes(id INTEGER PRIMARY KEY, task INTEGER NOT NUL
 CREATE TABLE IF NOT EXISTS agent_limits(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, since REAL NOT NULL,
   until REAL NOT NULL, reset_known INTEGER NOT NULL, task INTEGER, ended REAL, resumed REAL);
 CREATE TABLE IF NOT EXISTS ui_controls(request_id TEXT PRIMARY KEY, route TEXT NOT NULL, body TEXT NOT NULL,
-  client TEXT NOT NULL, created REAL NOT NULL, result TEXT NOT NULL);
+  client TEXT NOT NULL, created REAL NOT NULL, result TEXT NOT NULL, hand TEXT, session TEXT);
 CREATE TABLE IF NOT EXISTS machine_status(agent TEXT PRIMARY KEY, data TEXT NOT NULL, reported REAL NOT NULL);
 -- C9 (package 6): a machine's first vault key, kept from its reports before the first session of any of its agents
 -- (keep_first_store), and when that keep ended (closed), also with no key when no report came first. Only the
@@ -323,7 +325,7 @@ CREATE TABLE IF NOT EXISTS model_changes(id INTEGER PRIMARY KEY, agent TEXT NOT 
   "to" TEXT, why TEXT, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS steers(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, attempt INTEGER NOT NULL,
   text TEXT NOT NULL, event_id INTEGER NOT NULL, request_id TEXT NOT NULL, client TEXT NOT NULL, created REAL NOT NULL,
-  connection INTEGER);
+  connection INTEGER, hand TEXT, session TEXT);
 CREATE TABLE IF NOT EXISTS triggers(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, state TEXT NOT NULL, paused_by TEXT,
   paused_reason TEXT, revision INTEGER NOT NULL, schedule TEXT NOT NULL, check_spec TEXT, task TEXT NOT NULL,
   late_minutes INTEGER NOT NULL, max_tasks_per_day INTEGER NOT NULL, anchor REAL NOT NULL, next_due REAL,
@@ -2191,6 +2193,70 @@ def owner_device_class(device):
         return None
     row = q1("SELECT kind FROM owner_devices WHERE device=?", (device,))
     return OWNER_DEVICE_KINDS.get((row["kind"] if row else None) or "iphone", OWNER_DEVICE_KINDS["iphone"])["via"]
+
+
+# The hand that sent an owner request (the review of the hand-over of 20 November 2026, issue 4). Card N-230 ("Raise
+# the Amazon UK check start window from 70 to 80?") was answered in the owner's voice by a Claude Code session on his
+# Mac, through founderizer-cli: the hub told the manager "The owner wrote this in their own words", the manager kept the
+# words as the owner's standing item I-98 for the whole fleet, and a production setting changed 78 seconds later. Each
+# program on the Mac that holds the Mac key is the owner to ui_allowed, so the hub keeps, with each owner message,
+# answer, steer and command, the kind of program that sent it, and the session that it names:
+#   "app"       the Mac app's own screen (its label, OWNER_APP_LABELS)
+#   "device"    an enrolled phone or PC, by its checked key (owner_device_at)
+#   "connected" a connected app (capp_connections), "chat" a chat app's message (its origin)
+#   "tool"      the owner tools that his AI sessions use (the MCP server and the shell forms of founderizer-cli and
+#               owner_mcp.py, OWNER_TOOL_LABELS), or any request that names a session (X-Fleet-Session)
+#   "other"     any other label: a script, a test
+# A label is the client's own claim (SECURITY.md): this tells an honest AI session from the owner's hand, never a
+# program that lies about itself.
+OWNER_TOOL_LABELS = ("founderizer-cli/", "founderizer-mcp/")
+OWNER_APP_LABELS = ("founderizer-swift/", "founderizer-windows/")     # the Mac app's screen, the PC app's
+OWNER_SESSION = re.compile(r"[A-Za-z0-9._:/-]{1,128}")      # X-Fleet-Session, e.g. claude-code/<session id>
+OWNER_TOOL_VIA = "ai-session"           # the mark of a tool's request in its header: [owner via ai-session]
+OWNER_PROGRAM_VIA = "program"           # and of an "other" request (any label that no app of the owner's gives)
+# The hands whose words are the owner's own (Fable's check of 20 November 2026, finding 1: a request with any label
+# that no client lists, `curl/8.7.1` for one, had the owner's force, so the whole chain of N-230 ran again): the Mac
+# app's own screen, an enrolled device and a chat app's message, and a row of before the hand was kept (None).
+OWNER_FORCE_HANDS = ("app", "device", "chat")
+
+
+def board_hand():
+    """The hand of a write of the hub's own board form (/needs/<id>, /say): a program's ("other") on a hub that holds
+    an owner key, which no browser sends, and the owner's (None) on a hub that holds none, where the owner's own
+    browser may use the board."""
+    return "other" if owner_key() else None
+
+
+def owner_force(hand):
+    """True when words with this hand (request_hand) are the owner's own: they can be the source of the owner's
+    standing item, the owner's words of a decision card, and the answer in words of a card that has its own answers.
+    A row of before the hand was kept has none, and keeps its force."""
+    return hand is None or hand in OWNER_FORCE_HANDS
+
+
+def request_via(hand):
+    """The mark of a request's header for its hand: ai-session for a tool, program for any other label that is no app
+    of the owner's, None for the owner's own hand (whose device or app the caller marks as before)."""
+    return OWNER_TOOL_VIA if hand == "tool" else OWNER_PROGRAM_VIA if hand == "other" else None
+
+
+def request_hand(client, device=None, connection=None, origin=None, session=None):
+    """The hand that sent an owner request (OWNER_TOOL_LABELS above): "app", "device", "connected", "chat", "tool" or
+    "other". client: its X-Fleet-Client; device: true when it came from an enrolled owner device whose key the route
+    checked; connection: the connected app that sent it; origin: the chat app message that brought it; session: its
+    X-Fleet-Session."""
+    label = str(client or "")
+    if connection is not None:      # the hub's own record of a connected app; its label alone is a program's claim
+        return "connected"
+    if origin:
+        return "chat"
+    if session:                 # a session names itself: an AI session's request, from any machine
+        return "tool"
+    if device:
+        return "device"
+    if label.startswith(OWNER_TOOL_LABELS):
+        return "tool"
+    return "app" if label.startswith(OWNER_APP_LABELS) else "other"
 
 
 def owner_device_key(device):
@@ -4593,8 +4659,9 @@ def message_views(rows, attached, conf, named=None):
     """The messages of GET /ui/state and of a block of them, from their rows (u.* with the read time of their event):
     attached is {request_id: [the views of its files]}, conf the chat apps of the moment (chat_apps), named the
     titles of the tasks that they are about, read in the moment of the rows (message_about_reads)."""
-    # ui_requests.connection is the hub's own record of a connected app's message: the apps do not read it
-    views = [{k: r[k] for k in r.keys() if k != "connection"} for r in rows]
+    # ui_requests.connection is the hub's own record of a connected app's message, and hand and session the record of
+    # who sent it (request_hand): the apps do not read them
+    views = [{k: r[k] for k in r.keys() if k not in ("connection", "hand", "session")} for r in rows]
     for m in views:                         # owner feature chat_apps: the chat app of a message, without its IDs
         o = json.loads(m["origin"]) if m.get("origin") else None
         m["origin"] = {"app": o["app"], "account": o["account"],
@@ -6664,6 +6731,101 @@ def hit_forms(text):
     return forms
 
 
+# A file's bytes that are not UTF-8 hold logins too. The delivery of a task's files searched only a file that decoded
+# as UTF-8 and committed every other one with no search, so a login in a UTF-16 file (what PowerShell's > writes, and
+# Notepad's and Excel's "Unicode"), in a UTF-32 file or in a text with one bad byte reached the configuration ref, which
+# every agent reads (a review of 20 November 2026). bytes_texts gives the search the texts of such bytes, and every file
+# is searched in them. A picture's bytes are nearly random: 42 in 100 of them are not UTF-8, and the search, which hashes
+# every window of each run for each login, would read most of them, since a run ends only at a space. So their text is
+# only their runs of printable ASCII (0.2 in 100 of the bytes of a picture), which a mask and bytes.find find: 37 ms for
+# 24 MiB of random bytes here, where a regex took 298 ms of the request's thread (and the three of the first design
+# 1.07 s). The count that tells a picture stops when it has found too many bad bytes, after about a third of them.
+BYTES_CHUNK = 1024 * 1024       # the bytes that one step of the count decodes (utf8_text)
+BYTES_BAD_MOST = 8              # a text: at most one byte in 8 is not UTF-8 (in a picture, 42 in 100 are not),
+BYTES_BAD_FEW = 256             # or at most 256 bytes, as in a short file of Latin letters in Windows-1252 (bytes
+                                # that are not text count as one only up to about 600 bytes, which cost little)
+BYTES_WIDE_BAD_MOST = 128       # a text in a BOM's code: at most one character in 128 (and one more) is U+FFFD, where
+                                # random bytes give one in 32 of UTF-16 and nearly all of UTF-32
+BYTES_RUNS_MOST = 65536         # the runs that ascii_runs takes one by one: then one translate of all the bytes, as a
+                                # file of short words with no space (b"abcdefgh\xff\xff" again and again) took 1.8 s
+BYTES_PRINTABLE = bytes(0x61 if 0x21 <= b <= 0x7E else 0x20 for b in range(256))    # "a" for each printable byte
+BYTES_LINES = bytes(b if 0x21 <= b <= 0x7E else 0x0A for b in range(256))           # a line break for every other one
+BYTES_BOMS = ((b"\xff\xfe\x00\x00", "utf-32"), (b"\x00\x00\xfe\xff", "utf-32"), (b"\xff\xfe", "utf-16"),
+              (b"\xfe\xff", "utf-16"))      # UTF-32's first: its little-endian mark starts as UTF-16's does
+
+
+def bytes_texts(data):
+    """The texts in which secret_hit finds the logins of a file's bytes: its text when the bytes are UTF-8, as always.
+    Other bytes are read without their zero bytes, which UTF-16 and UTF-32 put beside each ASCII character:
+
+    - bytes that are text (at most one in BYTES_BAD_MOST, or BYTES_BAD_FEW, is not UTF-8: utf8_text): their
+      Windows-1252 (Latin-1 and Windows text, and a Latin letter of UTF-16 or UTF-32, which is its own byte beside zero
+      bytes), and their UTF-8 with U+FFFD for each bad byte when it holds a letter outside ASCII (a UTF-8 text with a
+      bad byte; without such a letter, the Windows-1252 text holds the same ASCII characters in the same places, and
+      only the rest of a login whose final dots a name dropped is not found there right before a Latin letter);
+    - any other bytes (a picture): their runs of LOGIN_LEAST or more printable ASCII characters (ascii_runs), as no
+      registered login is shorter (fingerprint_items, POST /secrets);
+    - bytes with a zero byte: also their runs with each zero byte as the end of a run, for a login with no length,
+      which is a whole token of letters and digits: removed, a zero byte joins it to the next string (C strings);
+    - bytes that start with a byte order mark of UTF-16 or UTF-32: also the text of that code, when at most one
+      character in BYTES_WIDE_BAD_MOST of it is U+FFFD (Cyrillic, Chinese and the euro sign of UTF-16 and UTF-32).
+
+    Not found: a login with a letter outside ASCII in bytes that are not text (a picture), and with a letter beyond
+    Latin-1 in UTF-16 or UTF-32 with no byte order mark or in another code page (Windows-1251, Shift-JIS, GBK); a login
+    in packed text (a zip, an Office file, a PDF's compressed streams, a PNG's compressed text) or written in another
+    code (base64, hex, UTF-7); a login in bytes that are not text with a character inside it that is not printable ASCII
+    (a hidden character, such as a zero-width space)."""
+    try:
+        return [data.decode("utf-8")]
+    except UnicodeDecodeError:
+        pass
+    bare, texts = data.replace(b"\0", b""), []
+    text = utf8_text(bare, max(len(bare) // BYTES_BAD_MOST, BYTES_BAD_FEW))
+    if text is None:
+        texts.append(ascii_runs(bare))
+    else:
+        if not text.replace("\ufffd", "").isascii():
+            texts.append(text)
+        texts.append(bare.decode("cp1252", "replace"))
+    if b"\0" in data:
+        texts.append(ascii_runs(data))
+    for mark, code in BYTES_BOMS:
+        if data.startswith(mark):
+            wide = data.decode(code, "replace")
+            if wide.count("\ufffd") * BYTES_WIDE_BAD_MOST <= len(wide) + BYTES_WIDE_BAD_MOST:
+                texts.append(wide)
+            break
+    return texts
+
+
+def utf8_text(data, most):
+    """The bytes as UTF-8 with U+FFFD for each bad one, or None as soon as more than `most` of them are bad: the count
+    of a picture stops after about a third of its bytes, a step of BYTES_CHUNK at a time."""
+    decoder, parts, bad = codecs.getincrementaldecoder("utf-8")("replace"), [], 0
+    for at in range(0, len(data), BYTES_CHUNK):
+        parts.append(decoder.decode(data[at:at + BYTES_CHUNK], at + BYTES_CHUNK >= len(data)))
+        bad += parts[-1].count("\ufffd")
+        if bad > most:
+            return None
+    return "".join(parts)
+
+
+def ascii_runs(data):
+    """The runs of LOGIN_LEAST or more printable ASCII characters in bytes, one on each line: a mask of the bytes with
+    "a" for each printable one, in which bytes.find finds each run's start and its end (a space of the mask). Past
+    BYTES_RUNS_MOST runs, all the bytes with a line break for each one that is not printable, which reads the same."""
+    mask, least, runs = data.translate(BYTES_PRINTABLE), b"a" * LOGIN_LEAST, []
+    start = mask.find(least)
+    while start >= 0:
+        if len(runs) >= BYTES_RUNS_MOST:
+            return data.translate(BYTES_LINES).decode("ascii")
+        end = mask.find(b" ", start + LOGIN_LEAST)
+        end = len(mask) if end < 0 else end
+        runs.append(data[start:end])
+        start = mask.find(least, end)
+    return b"\n".join(runs).decode("ascii")
+
+
 # A helper's usage report, searched run by run (runs_hold_login). Each helper sends one every 30 seconds: the totals of
 # its newest sessions (usage.BY_SESSION, 500 at most), 70,000 to 95,000 characters of JSON on the owner's hub on 18
 # November 2026, which differ from the helper's report before in a few runs: the numbers of the sessions that spent
@@ -7103,7 +7265,10 @@ def migrate():
                                   "scope_person": "INTEGER"},
         # the conversation window that made the call, whose person's words its args and detail can hold: a person's
         # removal clears them (person_remove), also for read_messages and reply, which keep no task
-        "calls": {"conversation": "INTEGER"},
+        # scope_person (person-scope-call-mark.md): the person whose list held for the session that made the call, at
+        # the call's start (call_tool), and NULL for every other call. A plain nullable column, which the one INSERT
+        # (call_record) names, so a hub of the release before still writes its rows, with NULL
+        "calls": {"conversation": "INTEGER", "scope_person": "INTEGER"},
         "prompts": {"kind": "TEXT NOT NULL DEFAULT 'tool'", "subject": "TEXT", "used": "REAL",
                     "polls": "INTEGER"},        # plan C7: its asker asks again until a decision, so it never expires
         "sealed": {"bound_task": "INTEGER", "expired": "REAL", "login": "TEXT", "job": "INTEGER"},
@@ -7139,7 +7304,10 @@ def migrate():
                         "about": "TEXT",
                         # owner feature agent_tags: the tags of a message, as JSON ([{agent, start, length}]); NULL
                         # for none
-                        "mentions": "TEXT"},
+                        "mentions": "TEXT",
+                        # the review of 20 November 2026, issue 4: the hand that sent it (request_hand) and the AI
+                        # session that it names (X-Fleet-Session); null for a row of before
+                        "hand": "TEXT", "session": "TEXT"},
         # the resource that a blocked ask names (needs_access), the level of it that the task needs (needs_level:
         # null when any level does), and what the asker said it would go on with when it asked without stopping
         # (asking_and_waiting): the record of what was decided by default
@@ -7243,7 +7411,8 @@ def migrate():
         "triggers": {"failures": "INTEGER NOT NULL DEFAULT 0", "created_by": "TEXT NOT NULL DEFAULT 'owner'",
                      "responsibility": "INTEGER", "watch": "TEXT"},         # owner API 1.13: a duty's watch
         # the connected app that sent the steer (capp_connections.id), as ui_requests.connection: the history's mark
-        "steers": {"connection": "INTEGER"},
+        "steers": {"connection": "INTEGER", "hand": "TEXT", "session": "TEXT"},     # request_hand, as ui_requests
+        "ui_controls": {"hand": "TEXT", "session": "TEXT"},                         # request_hand, as ui_requests
         # the task that open_case opened the case in: a task that opened two carries neither (t_open_case)
         "duty_cases": {"opened_in": "INTEGER"},
         "owner_devices": {"kind": "TEXT"},      # owner API 1.149: the kind of app that took the device's key
@@ -11014,14 +11183,19 @@ def attempt_notes(task_id, attempt):
     return read_rows("SELECT * FROM notes WHERE task=? AND ts>=? AND ts<=? ORDER BY id", (task_id, w[0], w[1])) if w else []
 
 
-def outward_done(task_id, attempt=None):
+def outward_done(task_id, attempt=None, scope=None):
     """The calls of this task that left the building and did not fail, oldest first. Their record is the calls
-    table, which every fleet tool writes with its task and its attempt."""
+    table, which every fleet tool writes with its task and its attempt. scope: the list of the session that reads
+    (task_scope's, session_scope's, or OWNER_VIEW for the hub's own check): of the calls with a mark, only its own
+    person's (narrowed_calls_sql)."""
     marks = ",".join("?" * len(OUTWARD_TOOLS))
     sql = f"SELECT * FROM calls WHERE task=? AND ok=1 AND name IN ({marks})"
     args = [task_id, *OUTWARD_TOOLS]
     if attempt is not None:
         sql, args = sql + " AND attempt=?", args + [attempt]
+    cond, more = narrowed_calls_sql("calls", scope)
+    if cond:
+        sql, args = sql + f" AND {cond}", args + list(more)
     return read_rows(sql + " ORDER BY id", args)
 
 
@@ -11076,7 +11250,7 @@ def warm_follows(follows, closed=False, scope=None, owner=None):
     if notes:
         lines.append(f"What its agent wrote down ({len(notes)} note(s), the last {min(len(notes), WARM_NOTES)}):")
         lines += [f"  - {clip(n['text'])}" for n in notes[-WARM_NOTES:]]
-    sent = outward_done(p["id"])
+    sent = outward_done(p["id"], scope=scope)
     if sent:
         lines.append(f"What it already sent outside ({len(sent)}), so that you do not send it twice:")
         lines += [f"  - {outward_line(c)}" for c in sent[-WARM_ACTIONS:]]
@@ -11096,6 +11270,10 @@ def unknown_start_text(task_id, closed, note=""):
     other line with it. read_rows only: the start text is made inside the transaction that writes the attempt."""
     if closed:
         return ""
+    # A known hole (person-scope-call-mark.md): the mark of a narrowed session's calls (calls.scope_person) does not
+    # cover the outcomes. An unknown outcome of a task that a widening gave back keeps the title of the locked window's
+    # action ("call_api POST /path with <login>..."), and the next window, with the agent's tools, reads it here: rule
+    # 9 needs that session to check the action before it repeats it, so the title stays.
     rows = [r for r in read_rows("SELECT id, title FROM outcomes WHERE task=? AND state='unknown' ORDER BY id",
                                  (task_id,)) if f"O-{r['id']} " not in (note or "")]
     if not rows:
@@ -11146,7 +11324,7 @@ def warm_attempt(t):
     work = tool_work_line(t["id"], attempt)
     if work:
         lines.append(work)
-    sent = outward_done(t["id"], attempt)
+    sent = outward_done(t["id"], attempt, task_scope(t))
     if sent:
         lines.append(f"It already sent these outside ({len(sent)}). Never do one of them a second time (rule 9):")
         lines += [f"  - {outward_line(c)}" for c in sent[-WARM_ACTIONS:]]
@@ -11465,10 +11643,11 @@ def refusal_lines(task_id, agent):
     """What was refused to this agent in this task, collapsed by tool and reason, with a count.
 
     The calls table has held every refusal the fleet ever gave an agent, and nothing has ever read one back to the
-    agent it was given to. An agent that reads them stops asking the same impossible thing twice."""
+    agent it was given to. An agent that reads them stops asking the same impossible thing twice. No call with a mark
+    (calls.scope_person): its one caller is see_earlier_work, which no narrowed session has."""
     kept = {}
-    for r in read_rows("SELECT name, detail FROM calls WHERE task=? AND agent=? AND ok=0 ORDER BY id",
-                       (task_id, agent)):
+    for r in read_rows("SELECT name, detail FROM calls WHERE task=? AND agent=? AND ok=0 AND scope_person IS NULL "
+                       "ORDER BY id", (task_id, agent)):
         key = (r["name"], clip(mask_secrets(r["detail"] or "no detail"), 120))
         kept[key] = kept.get(key, 0) + 1
     if not kept:
@@ -13351,7 +13530,7 @@ def question_needs_close(where, args, why, t0):
                f"(SELECT id FROM questions WHERE {where})", (why, t0, NEED_CLOSED_BY, *args))
 
 
-def answer_rows(qu, t, text, by, t0, files=(), more=""):
+def answer_rows(qu, t, text, by, t0, files=(), more="", via=None):
     """Inside the caller's transaction, with DB.execute and read_rows only, because the owner's answer runs it inside
     his own (owner_message_rows): the first answer of question row `qu` about task row `t`, by `by`, an agent or
     "owner". None when the question had one already, because the first answer wins and an answer holds. Else
@@ -13359,6 +13538,9 @@ def answer_rows(qu, t, text, by, t0, files=(), more=""):
     that the owner's answer carries (need_question_rows), which the asker's words name, because that task's session
     opens them (owner_file_refused). more: the hub's own words after the answer, for the asker's message alone and
     never in the stored answer: which picture the owner's choice has (need_picture_note, owner API 1.285).
+    via: request_via of the owner's answer (an AI session's or a program's,
+    request_hand), which the asker reads: "answered by the owner's AI session" (the review of 20 November 2026: an
+    AI session's press of card N-232 reached Leo as "answered by the owner").
 
     The task that waited on it works again; its asker reads the answer in that task's session, with who gave it when
     that is not the agent it asked; the agent that holds it hears of it when another level answered first; an ask for
@@ -13369,7 +13551,7 @@ def answer_rows(qu, t, text, by, t0, files=(), more=""):
     if DB.execute("UPDATE questions SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
                   (text, t0, by, qid)).rowcount != 1:
         return None
-    who = "the owner" if by == "owner" else by
+    who = (QUESTION_VIA.get(via, "the owner") if by == "owner" else by)
     # Only the question the task actually waits on releases it. Answering one of two open questions used to set
     # the task working whichever one it was, so answering a question it was not waiting on let a paused session
     # be told to continue -- and a question asked with a default is never the one a task waits on at all.
@@ -13410,7 +13592,9 @@ def answer_rows(qu, t, text, by, t0, files=(), more=""):
         DB.execute(*event_row(to, "say", filed, said, t0, json.dumps(extra or {}), about))
     # the owner reads it on the card (NeedAnswerBox), so in his words: no code, an agent by its role, and the
     # answer's own words only when they are his, since an agent's answer is written for the agent that asked
-    question_needs_close("id=?", (qid,), f"Closed: you answered it: {clip(text, 300)}" if by == "owner" else
+    question_needs_close("id=?", (qid,), (f"Closed: {QUESTION_CLOSED_VIA[via]} answered it for you: {clip(text, 300)}"
+                                          if via in QUESTION_CLOSED_VIA else f"Closed: you answered it: {clip(text, 300)}")
+                         if by == "owner" else
                          f"Closed: {shown_role(by)} answered it, so it needs nothing from you.", t0)
     return {"held": held, "restarter": restarts if held else None}
 
@@ -15839,8 +16023,10 @@ CARD_PLAIN = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "–
                             "*": None, "`": None, "_": None})
 CARD_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\n]*\)")
 # a row of ui_requests that the owner typed: a message, or the answer in words of an item that is no key request and
-# no run, and no row that a connected app sent; the words of a pressed option are the manager's
-CARD_TYPED = ("u.connection IS NULL AND (u.need_id IS NULL OR (n.chosen IS NULL AND n.chose IS NULL AND "
+# no run, and no row that a connected app sent or an AI session sent through the owner tools (request_hand "tool": the
+# review of 20 November 2026, issue 4); the words of a pressed option are the manager's
+CARD_TYPED = ("u.connection IS NULL AND (u.hand IS NULL OR u.hand IN ('app', 'device', 'chat')) AND "
+              "(u.need_id IS NULL OR (n.chosen IS NULL AND n.chose IS NULL AND "
               "COALESCE(n.kind, '') != 'secret' AND n.run_command IS NULL AND (n.recommended IS NULL OR "
               "u.text IS NOT n.recommended)))")      # the press of an agent's recommended words is its words
 CARD_REASON_REFUSAL = (
@@ -15997,8 +16183,9 @@ def owner_words_source(quote):
                          f"u.text IS NOT NULL AND {CARD_TYPED}" + narrow[0].format("u.text"), narrow[1]):
         if card_has(card_plain(row["text"]), plain):
             return f"the owner's message M-{row['event_id']}"
-    for row in read_rows("SELECT task, text FROM steers WHERE connection IS NULL" + narrow[0].format("text"),
-                         narrow[1]):
+    for row in read_rows("SELECT task, text FROM steers WHERE connection IS NULL AND (hand IS NULL OR hand IN "
+                         "('app', 'device', 'chat'))"
+                         + narrow[0].format("text"), narrow[1]):
         if card_has(card_plain(row["text"]), plain):
             return f"the owner's steer of {tref(row['task'])}"
     return next((path for path, text in owner_file_texts() if card_has(text, plain)), None)
@@ -16826,10 +17013,12 @@ def t_withdraw_need(agent, a):
 # record of an item's talk (need_talk) stayed, and the talk moves to an item that replaces it (t_raise_needs_you).
 
 
-def need_talk_said(body, via=None):
+def need_talk_said(body, via=None, hand=None):
     """POST /ui/needs/<id>/talk, under LOCK: the owner's message under one open card goes to the manager, which replies
     there (discuss_need), and the item stays open. A refusal is the hub's line of need_unclarified. via: the shown name
-    of the connected app that sent it, which its header says as app:<name>."""
+    of the connected app that sent it, which its header says as app:<name>. hand: request_hand of the request; an AI
+    session's or a program's message says so in its header and in one sentence (the review of 20 November 2026,
+    issue 4, Fable's third check)."""
     need = q1("SELECT * FROM needs WHERE id=?", (body["need"],))
     if not need:
         raise Refusal(404, code="request_unknown")
@@ -16839,15 +17028,21 @@ def need_talk_said(body, via=None):
     if why:
         raise Refusal(409, why)
     t0 = now()
+    mark = capp_via(via) if via else request_via(hand)
     told = (need["by"], "say", filed_about(need["by"], "say", None),
-            f"[owner{f' via {capp_via(via)}' if via else ''}] About Needs-you N-{need['id']} ({need['title']}), "
-            f"before answering it: {body['text']}\n(The hub: the item stays open. Reply under the card with "
+            f"[owner{f' via {mark}' if mark else ''}] About Needs-you N-{need['id']} ({need['title']}), "
+            f"before answering it: {body['text']}\n(The hub: the item stays open."
+            + (NEED_TALK_NOT_HIS if not owner_force(hand) and not via else "") + " Reply under the card with "
             f"discuss_need(need=\"N-{need['id']}\", text=...), in plain words and in a few sentences.{need_again(need)} "
             f"Their answer to the item comes as its own message.)", {})
     with transaction():         # his message stands on the card only with its line to the manager
         DB.execute("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (need["id"], t0, "owner", body["text"]))
         event_rows([told], t0)
     return {"need": need["id"], "talk": need_talk(need["id"])}
+
+
+NEED_TALK_NOT_HIS = (" An AI session or a program on the owner's Mac wrote these words for the owner: the owner did not "
+                     "type them, and they are no rule of the owner's.")
 
 
 def need_again(need):
@@ -17236,6 +17431,9 @@ SECRET_TODO = ("Open this request in Founderizer on your Mac and type it into it
 SECRET_NO_WORDS = ("N-{id} asks for a secret, so it takes no answer in words: a key typed here would be in the "
                    "conversation of the agent that asked before anything could mask it. Answer it in Founderizer on "
                    "the owner's Mac, whose secure form puts the value into the vault.")
+# the same words for a clarify that an AI session or a program sent (request_hand): the words are not the owner's own
+SECRET_CLARIFIED_NOT_HIS = SECRET_CLARIFIED.replace(
+    "The words before this line are theirs", "An AI session or a program wrote the words before this line for the owner")
 
 
 def t_door_rollout(agent, a):
@@ -18476,7 +18674,7 @@ def answer_note(ref, need, spec, body):
     return f' The owner wrote its note: "{noted}".' if writer == "owner" and not carried else ""
 
 
-def answer_secret(body, request_id, client):
+def answer_secret(body, request_id, client, device=None, session=None):
     """POST /ui/needs/<id>/secret: the answer of one secret request, with a secret of the catalog or with a decline.
     The value was saved, registered and granted by the app's own steps before this one; this one says so to the
     agent that asked, in the hub's words, through the same rows as every owner answer (owner_message_rows)."""
@@ -18487,6 +18685,8 @@ def answer_secret(body, request_id, client):
         raise Refusal(409, "this owner request asks for no secret: answer it in words (POST /ui/needs/<id>)")
     if need["answer"] is not None:
         raise Refusal(409, code="request_answered")
+    hand = request_hand(client, device, None, None, session)
+    clarified = SECRET_CLARIFIED if owner_force(hand) else SECRET_CLARIFIED_NOT_HIS
     if q1("SELECT 1 FROM ui_requests WHERE request_id=?", (request_id,)):
         raise Refusal(409, code="command_reused_message")
     spec, ref = need_secret(need), body["login"]
@@ -18545,23 +18745,25 @@ def answer_secret(body, request_id, client):
             # A save that gives the asker the secret wakes its tasks once their machine's vault has it (secret_wakes):
             # until then one quiet line, which wakes nobody. A decline, or a save that gives it nothing, goes on now.
             # the next step of a task that goes on without it, in its own events and never in his bubble
-            note = "" if gave or (ref is not None and spec.get("door")) else SECRET_CLARIFIED if clarify is not None \
+            note = "" if gave or (ref is not None and spec.get("door")) else clarified if clarify is not None \
                 else (" Go on without it, or deliver what you can." if ref is None else
                       " The owner does not give it to you: go on without it, or deliver what you can.")
             event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0,
+                                          device=device, session=session,
                                           task=waiters[0] if waiters else None, quiet=gave or not waiters, note=note)
             if ref is not None:
                 DB.execute("UPDATE needs SET secret=? WHERE id=?",
                            (json.dumps(dict(spec, saved=ref, **({} if gave else {"woken": t0}))), need["id"]))
             if not gave:
                 for tid in waiters[1:]:
-                    event_rows([(need["by"], "say", tid, f"[owner] Answer to Needs-you N-{need['id']} "
+                    event_rows([(need["by"], "say", tid, f"[owner{f' via {request_via(hand)}' if request_via(hand) else ''}] Answer to Needs-you N-{need['id']} "
                                                          f"({need['title']}): {text}{note}", {})], t0)
                 for tid in waiters:
                     secret_wait_moved(tid)
         else:
             event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0,
-                                          note=SECRET_CLARIFIED if clarify is not None else "")
+                                          device=device, session=session,
+                                          note=clarified if clarify is not None else "")
             if ref is not None:
                 DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, saved=ref)), need["id"]))
         if clarify is not None:         # no decline: the asker may ask again at once (t_request_secret)
@@ -20719,7 +20921,7 @@ def message_about_reads(rows):
 
 
 def owner_message_text(request_id, value, recipient, origin, replaces, files, device=False, connection=None,
-                       about=None, mentions=(), unsure=()):
+                       about=None, mentions=(), unsure=(), hand=None):
     """The words of one owner chat message, as its reader gets them: the owner's text under the header that says who
     wrote it, and for a worker or a lead the request id that its reply names. A correction says what it corrects; a
     message that the owner edited before anything read it says nothing, because it is the same message with other
@@ -20732,8 +20934,11 @@ def owner_message_text(request_id, value, recipient, origin, replaces, files, de
     so that no app's name reads as a chat app or a device. about: the task or the job that the message is about (owner
     feature message_about), whose reader's line comes after the owner's words and before the correction line and the
     files, built at this moment (message_about_words). mentions, unsure: the tags of the message and the words that fit
-    two agents (owner feature agent_tags), whose line comes after that one, built at this moment (tag_words)."""
+    two agents (owner feature agent_tags), whose line comes after that one, built at this moment (tag_words). hand: request_hand of the request; a "tool" (an AI
+    session on the owner's Mac, through the owner tools) is marked via=ai-session, [owner via ai-session], so that its
+    reader knows that a session wrote these words for the owner, and the owner did not type them."""
     via = CHAT_APP_NAMES[origin["app"]] if origin else capp_via(connection) if connection else \
+        request_via(hand) if request_via(hand) else \
         (device if isinstance(device, str) else OWNER_DEVICE_VIA) if device else None
     if agents()[recipient].get("role") in ("worker", "lead"):
         text = f"[owner chat request_id={request_id}" + (f" via={via}" if via else "") + f"] {value}"
@@ -20766,7 +20971,8 @@ def message_unread(previous):
         "SELECT 1 FROM owner_reports WHERE in_reply_to=?", (previous["request_id"],)).fetchone() is None
 
 
-def owner_message_replace(previous, value, request_id, t0, device=False, mentions=(), unsure=()):
+def owner_message_replace(previous, value, request_id, t0, device=False, mentions=(), unsure=(), hand=None,
+                          session=None):
     """Inside a transaction: the owner edited a message that nothing had read, so the message itself changes. Its
     ui_requests row and its event keep their id and their time, which is why the bubble changes where it stands;
     their text becomes the new words with nothing appended, and the words they replace go into the log, so the
@@ -20776,8 +20982,12 @@ def owner_message_replace(previous, value, request_id, t0, device=False, mention
     edit names: the row says who sent it, and the header is built from the row. So is the reader's line of what the
     message is about (owner feature message_about): an edit keeps the row's `about`, and its line is built again. The
     tags of the new words are the message's tags now (owner feature agent_tags): the row takes them, and their line is
-    built again; the edits log keeps the words alone."""
+    built again; the edits log keeps the words alone. hand, session:
+    request_hand of the edit and its X-Fleet-Session, which the row takes with the new words (an AI session's edit of
+    a row of before the hand was kept is the session's words, not the owner's); None keeps the row's."""
     in_transaction("owner_message_replace")
+    hand = hand or previous["hand"]
+    session = session if hand != previous["hand"] or session else previous["session"]
     files = DB.execute("SELECT * FROM attachments WHERE message=? ORDER BY id", (previous["request_id"],)).fetchall()
     origin = json.loads(previous["origin"]) if previous["origin"] else None
     via = None
@@ -20785,11 +20995,13 @@ def owner_message_replace(previous, value, request_id, t0, device=False, mention
         app = DB.execute("SELECT name FROM capp_connections WHERE id=?", (previous["connection"],)).fetchone()
         via = app["name"] if app else "App"     # a connection's row stays as the record; "App" as shown_name's last name
     text = owner_message_text(previous["request_id"], value, previous["recipient"], origin, None, files, device, via,
-                              about=message_about_read(previous["about"]), mentions=mentions, unsure=unsure)
+                              about=message_about_read(previous["about"]), mentions=mentions, unsure=unsure,
+                              hand=hand)
     edits = json.loads(previous["edits"] or "[]") + [{"request_id": request_id, "text": value, "at": t0}]
     DB.execute("UPDATE events SET text=? WHERE id=?", (text, previous["event_id"]))
-    DB.execute("UPDATE ui_requests SET text=?,edits=?,mentions=? WHERE request_id=?",
-               (value, json.dumps(edits), json.dumps(list(mentions)) if mentions else None, previous["request_id"]))
+    DB.execute("UPDATE ui_requests SET text=?,edits=?,mentions=?,hand=?,session=? WHERE request_id=?",
+               (value, json.dumps(edits), json.dumps(list(mentions)) if mentions else None, hand, session,
+                previous["request_id"]))
     history_rewrite_message(previous["request_id"])     # AUTONOMY.md P6: the history reads it as it stands now
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI message {request_id} replaced the "
                f"words of {previous['request_id']} (M-{previous['event_id']} for {previous['recipient']}), which "
@@ -20798,7 +21010,7 @@ def owner_message_replace(previous, value, request_id, t0, device=False, mention
 
 def owner_message_rows(request_id, kind, need, value, client, recipient, replaces, t0, origin=None, files=(),
                        chosen=None, task=None, quiet=False, note="", device=False, connection=None, about=None,
-                       pictured="", mentions=(), unsure=()):
+                       pictured="", mentions=(), unsure=(), session=None):
     """Inside a transaction: one owner message or answer, from the app (POST /ui/messages, /ui/needs/<id>) or from a
     chat app (origin): the answer of the need, one event and one ui_requests row. The caller checked everything.
     Returns the event ID. task: the task whose session the answer of a secret request goes to (answer_secret), and
@@ -20812,8 +21024,11 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     ui_requests.about, and its reader's line into the event's words. pictured:
     which picture the option that the owner pressed has (need_picture_note, owner API 1.285), for the agent that raised
     the item and for the asker of its question, and never in the stored answer. mentions: the tags of a message (owner
-    feature agent_tags), which go into ui_requests.mentions, with unsure their reader's line (tag_words)."""
+    feature agent_tags), which go into ui_requests.mentions, with unsure their reader's line (tag_words). session: the
+    X-Fleet-Session of the request; the row keeps it with the hand that sent it (request_hand), and a tool's message and
+    answer say via ai-session in their header."""
     in_transaction("owner_message_rows")
+    hand = request_hand(client, device, connection, origin, session)
     worker_chat = need is None and agents()[recipient].get("role") in ("worker", "lead")
     # owner feature secret_requests: a worker or a lead asks in its owner chat, so his answer goes back there, read
     # once as an agent's message is: it is no message of his that waits for a reply. A request that tasks wait on
@@ -20825,9 +21040,9 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     via = connection["name"] if connection else None
     if need is None:
         text = owner_message_text(request_id, value, recipient, origin, replaces, files, device, via,
-                                  about=about, mentions=mentions, unsure=unsure) + (note or "")
+                                  about=about, mentions=mentions, unsure=unsure, hand=hand) + (note or "")
     else:
-        mark = f" via {capp_via(via)}" if via else ""
+        mark = f" via {capp_via(via)}" if via else f" via {request_via(hand)}" if request_via(hand) else ""
         text = f"[owner{mark}] Answer to Needs-you N-{need['id']} ({need['title']}): {value}"
         DB.execute("UPDATE needs SET answer=?,answered=?,chosen=? WHERE id=?", (value, t0, chosen, need["id"]))
         key_swap_answered_rows(need, chosen, t0)        # a press of an answer of a server's key swap item
@@ -20836,16 +21051,18 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
             # a question or a work request of a conversation: the answer goes back there, and nowhere else
             event_id = conversation_answer(need, value, t0)
             DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,"
-                       "connection) VALUES(?,?,?,?,?,?,?,?,?)",
+                       "connection,hand,session) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                        (request_id, kind, need["id"], value, event_id, t0, client, recipient,
-                        connection["id"] if connection else None))
+                        connection["id"] if connection else None, hand, session))
             DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} "
-                       f"accepted as the answer of N-{need['id']} in C-{need['conversation']}"))
+                       f"accepted as the answer of N-{need['id']} in C-{need['conversation']}"
+                       + request_hand_words(hand, session)))
             return event_id
         # (a note in a chat is the hub's words about his Needs clarification, which the agent acts on: SECRET_CLARIFIED)
         text = text.rstrip() + attachment_words(files) + (" It needs no reply." if secret_chat and not note else "") + \
             note + pictured
-        asker = need_question_rows(need, value, t0, files, pictured)    # a question the manager took to him
+        asker = need_question_rows(need, value, t0, files, more=pictured,     # a question the manager took to him
+                                   via=request_via(hand) or ("connected" if hand == "connected" else None))
         if asker:
             text += (f" The hub gave it to {asker}" + (", with its files," if files else "") +
                      f" as the answer to Q-{need['question']}: do not pass it on again.")
@@ -20871,15 +21088,17 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     if takeover:        # its next owner wait holds the task, else it works again
         secret_wait_moved(task)
     DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,"
-               "replaces_request_id,origin,connection,about,mentions) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               "replaces_request_id,origin,connection,about,mentions,hand,session) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (request_id, kind, need["id"] if need is not None else None, value, event_id, t0, client, recipient,
                 replaces, json.dumps(origin) if origin else None, connection["id"] if connection else None,
                 json.dumps(about) if about and need is None else None,
-                json.dumps(list(mentions)) if mentions and need is None else None))
+                json.dumps(list(mentions)) if mentions and need is None else None, hand, session))
     for f in files:
         DB.execute("UPDATE attachments SET message=? WHERE id=?", (request_id, f["id"]))
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} accepted as "
-               f"M-{event_id} for {recipient}" + (f" from {origin['account']}" if origin else "")))
+               f"M-{event_id} for {recipient}" + (f" from {origin['account']}" if origin else "") +
+               request_hand_words(hand, session)))
     return event_id
 
 
@@ -21224,7 +21443,21 @@ def tags_check(task_id):
     kv_set(TAGS_TOLD + head["request_id"], now())
 
 
-def need_question_rows(need, value, t0, files=(), more=""):
+def request_hand_words(hand, session):
+    """The end of the hub's log line of an owner request: who sent it (request_hand) and the session that it named."""
+    return f", sent by {hand}" + (f" session {session}" if session else "")
+
+
+# who answered a question for the owner, as the owner reads it on the question's other card (answer_rows)
+QUESTION_CLOSED_VIA = {OWNER_TOOL_VIA: "your AI session", OWNER_PROGRAM_VIA: "a program",
+                       "connected": "a connected app"}
+# who answered a question for the owner, as its asker reads it (answer_rows), by request_via
+QUESTION_VIA = {OWNER_TOOL_VIA: "the owner's AI session (for the owner; not the owner's own words)",
+                OWNER_PROGRAM_VIA: "a program that acts for the owner (not the owner's own words)",
+                "connected": "the owner through a connected app (not the owner's own words)"}
+
+
+def need_question_rows(need, value, t0, files=(), more="", via=None):
     """Inside the owner's answer (owner_message_rows, the legacy /needs route), with DB.execute and read_rows only:
     his answer to a Needs-you item that the manager raised for a question (raise_needs_you question_id) answers that
     question too, as his own, straight back to the agent that asked (the owner, 28 October 2026: "Agent -> Lead ->
@@ -21238,7 +21471,7 @@ def need_question_rows(need, value, t0, files=(), more=""):
     t = read_row("SELECT * FROM tasks WHERE id=?", (qu["task"],)) if qu else None
     if not qu or not t or qu["answer"] is not None:
         return None
-    return qu["asker"] if answer_rows(qu, t, value, "owner", t0, files, more) else None
+    return qu["asker"] if answer_rows(qu, t, value, "owner", t0, files, more, via) else None
 
 
 def need_door_task_rows(need, chosen, value, t0):
@@ -22955,6 +23188,18 @@ def narrowed_rows_sql(alias, scope):
     return f"({alias}.scope_person IS NULL OR IFNULL({alias}.scope_person=?, 0))", (scope["person"],)
 
 
+def narrowed_calls_sql(alias, scope):
+    """(condition, args) on calls rows `alias` for a session's read (person-scope-call-mark.md): the calls that it may
+    read. scope is session_scope's or task_scope's, or OWNER_VIEW: the owner reads all; a session with no list reads no
+    call with a mark (calls.scope_person, call_tool); a narrowed session reads only the calls of its own person's mark,
+    never a call with no mark, which a session with more made. Never NULL, so that its negation lets no row through."""
+    if scope == OWNER_VIEW:
+        return "", ()
+    if scope is None:
+        return f"{alias}.scope_person IS NULL", ()
+    return f"IFNULL({alias}.scope_person=?, 0)", (scope["person"],)
+
+
 NARROWED_SETTLED = "narrowed_rows_settled"      # kv: the newest message id that the one-time pass of the settle took
 NARROWED_LEAD = 60          # seconds before a pair's first log line of a list from which that pass marks its rows
 NARROWED_LINE = re.compile(r"P-([0-9]+)'s access with ([a-z][a-z0-9-]{1,30}): ")       # person_scope_rows' log line
@@ -23110,6 +23355,36 @@ def narrowed_ended_settle():
     return changed
 
 
+NARROWED_CALLS_SETTLED = "narrowed_calls_settled"      # kv: narrowed_calls_settle ran (one time)
+
+
+def narrowed_calls_settle():
+    """Inside the caller's transaction, one time (kv NARROWED_CALLS_SETTLED, written in the same transaction): the mark
+    (calls.scope_person) of the calls that a narrowed pair's sessions made before the column came. For each time in
+    which a pair had a list (narrowed_spans), each call of its conversation window (calls.conversation) and each call
+    of its conversation tasks gets the person. The second needs no window: calls.conversation came on 18 November
+    2026 (ed18fb230), and the lists on 11 November. It reads the log once, and of calls only each pair's rows, by the
+    indexes call_conversation and call_task_ok. Returns how many calls it marked."""
+    in_transaction("narrowed_calls_settle")
+    if read_row("SELECT v FROM kv WHERE k=?", (NARROWED_CALLS_SETTLED,)) is not None:
+        return 0
+    marked = 0
+    for (pid, agent), mine in sorted(narrowed_spans().items()):
+        conv = read_row("SELECT id FROM conversations WHERE person=? AND agent=?", (pid, agent))
+        if conv is None:
+            continue
+        for a, b in mine:
+            until, more = ("", ()) if b is None else (" AND ts<?", (b,))
+            marked += DB.execute("UPDATE calls SET scope_person=? WHERE conversation=? AND scope_person IS NULL AND "
+                                 "ts>=?" + until, (pid, conv["id"], a, *more)).rowcount
+            marked += DB.execute("UPDATE calls SET scope_person=? WHERE task IN (SELECT id FROM tasks WHERE "
+                                 "source_conversation=? AND source_message IS NOT NULL) AND scope_person IS NULL AND "
+                                 "ts>=?" + until, (pid, conv["id"], a, *more)).rowcount
+    DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+               (NARROWED_CALLS_SETTLED, str(marked)))
+    return marked
+
+
 def settle_narrowed_rows():
     """At the start, after the schema: the marks (narrowed_mark) of a narrowed pair's rows that were stored before
     the column came, or by a hub of the release before it during a restart or after a rollback, which stores NULL
@@ -23128,6 +23403,13 @@ def settle_narrowed_rows():
        ended, with no person, gets the reply's person (narrowed_tasks_settle).
     5. One time (kv NARROWED_ENDED_SETTLED), after the marks: an old conversation task with no person that ended while
        its pair had a list, or that is open while its pair has one now, gets the person (narrowed_ended_settle).
+    6. One time (kv NARROWED_CALLS_SETTLED), after narrowed_ended_settle: each call of a pair's conversation window,
+       and each call of its conversation tasks, made while the pair had a list, gets the person (narrowed_calls_settle).
+       Its limits: a call with no task from before 18 November 2026 keeps no mark, for nothing in its row names its
+       conversation; a hub of the release before, during a restart or after a rollback, writes calls with no mark,
+       and this pass does not run again for them; and of the old rows, a wide window's call that ended after a first
+       list gets the mark (a row keeps the time of its end only), so the locked window reads it, as it did before the
+       mark came.
 
     The hub kept no list of before, no time back at All and no writer of a reply, so rule 3 fails closed: the pair's
     words of a time at All after its first list stay hidden from the sessions with more, which is a loss, where a
@@ -23145,6 +23427,9 @@ def settle_narrowed_rows():
             ended = narrowed_ended_settle()             # after the marks and narrowed_tasks_settle
             if ended:
                 log_row("hub", f"gave {ended} old conversation task(s) of narrowed pairs their person")
+            calls = narrowed_calls_settle()             # after narrowed_ended_settle
+            if calls:
+                log_row("hub", f"marked {calls} call record(s) of narrowed pairs with their person")
     except Exception as e:
         print_fault()
         log("hub", f"the rows of narrowed pairs could not be marked at this start: {type(e).__name__}: {e}")
@@ -34945,7 +35230,8 @@ def memory_rework_tasks(agent, since):
            f"c.opened>?) AND {mine}")
     # came_back: the next case of the task's own case's duty and key, when that one is a case that came back
     rows = read_rows(
-        f"SELECT t.*, (SELECT MIN(f.id) FROM tasks f WHERE f.follows=t.id AND f.created>?) follow_up, "
+        f"SELECT t.*, (SELECT MIN(f.id) FROM tasks f WHERE f.follows=t.id AND f.created>? AND f.scope_person IS NULL) "
+        f"follow_up, "
         f"(SELECT n.id FROM duty_cases d JOIN duty_cases n ON n.id=(SELECT MIN(x.id) FROM duty_cases x WHERE "
         f"x.responsibility=d.responsibility AND x.key=d.key AND x.id>d.id) WHERE d.id=t.duty_case AND n.repeated=1 "
         f"AND n.opened>?) came_back FROM tasks t WHERE t.id IN ({ids}) ORDER BY t.id DESC",
@@ -34962,7 +35248,9 @@ def memory_rework_tasks(agent, since):
             why.append(f"{tref(t['follow_up'])} follows it")
         if t["came_back"]:
             why.append("its case's key came back")
-        if why:
+        # no narrowed pair's task (narrowed_from): a follow-up from before the checks of create_task and open_work
+        # would put its id into the review of a session with no list
+        if why and not narrowed_from(t, None):
             out.append((t, ", ".join(why)))
     return out
 
@@ -39222,10 +39510,24 @@ def history_conversation(m):
                         owner_chat=m["who"] == "owner") for a in history_who(agent)]
 
 
+HISTORY_TOOL_WHO = "The owner (through their AI session)"     # request_hand "tool": the review of 20 November 2026
+HISTORY_PROGRAM_WHO = "The owner (through a program)"          # request_hand "other"
+
+
+def history_owner_who(row):
+    """Who said an owner message, answer or steer, as its history record names them: a connected app's, an AI
+    session's (request_hand "tool", whose words the owner did not type), or the owner's."""
+    if row["cc_name"]:
+        return f"The owner (through the app {row['cc_name']})"
+    hand = row["hand"] if "hand" in row.keys() else None
+    return HISTORY_TOOL_WHO if hand == "tool" else HISTORY_PROGRAM_WHO if hand == "other" else "The owner"
+
+
 def history_owner_message(u):
     """The owner's message to an agent in its chat, or his answer to a Needs-you item the agent raised. One that a
-    connected app sent says so: "The owner (through the app Claude): ..." (HISTORY_HEADS takes that head too)."""
-    who = f"The owner (through the app {u['cc_name']})" if u["cc_name"] else "The owner"
+    connected app sent says so: "The owner (through the app Claude): ..." (HISTORY_HEADS takes that head too), and so
+    does one that an AI session on the owner's Mac sent (request_hand "tool"): "The owner (through their AI session)"."""
+    who = history_owner_who(u)
     if u["kind"] == "answer" and u["need_id"] is not None:
         if u["n_conversation"]:
             return []           # it went back into the conversation that asked, and that stream has it
@@ -39256,8 +39558,8 @@ def history_need(n):
 def history_steer(s):
     """The owner's guidance on a task, in the history of the agent that does it: his own words. One that a connected
     app sent says so, as history_owner_message does: "The owner (through the app Claude), on T-12: ..."
-    (HISTORY_HEADS takes that head too)."""
-    who = f"The owner (through the app {s['cc_name']})" if s["cc_name"] else "The owner"
+    (HISTORY_HEADS takes that head too); one that an AI session sent says so too (history_owner_who)."""
+    who = history_owner_who(s)
     return [history_rec(a, "owner_chat", tref(s["task"]), f"{who}, on {tref(s['task'])}: {s['text'] or ''}",
                         s["created"], person="owner", task=s["task"], owner_chat=True)
             for a in history_who(s["t_owner"])]
@@ -40213,17 +40515,23 @@ def history_scope_sql(agent, scope):
         return "", ()
     if scope is None:
         rows, args = narrowed_rows_sql("m", None)
+        # a call record with a mark (calls.scope_person) is a narrowed session's, also of a task that a widening gave
+        # back (person-scope-call-mark.md)
         return ("(h.task IS NULL OR h.task NOT IN (SELECT id FROM tasks WHERE scope_person IS NOT NULL)) AND "
                 f"(h.src<>'conversation' OR NOT EXISTS (SELECT 1 FROM conversation_messages m WHERE m.id=h.src_id AND "
-                f"NOT ({rows})))", args)
+                f"NOT ({rows}))) AND (h.src<>'call' OR NOT EXISTS (SELECT 1 FROM calls k WHERE k.id=h.src_id AND "
+                f"k.scope_person IS NOT NULL))", args)
+    # and of the call records of the time rule, only those of its own person's mark: a wide window's call that ended
+    # after the list began has none
     return ("h.task IN (SELECT t.id FROM tasks t JOIN conversations c ON c.id=t.source_conversation WHERE "
             "c.person=? AND c.agent=? AND t.source_message IS NOT NULL) AND ((h.src='conversation' AND EXISTS "
             "(SELECT 1 FROM conversation_messages m JOIN conversations c ON c.id=m.conversation WHERE m.id=h.src_id "
             "AND m.who IN ('person','agent') AND c.person=? AND c.agent=?)) OR (h.src<>'tool' AND h.task IN (SELECT id "
             "FROM tasks WHERE scope_person=?) AND h.at>=(SELECT updated FROM person_scopes WHERE person=? AND "
-            "agent=?)+?))",
+            "agent=?)+? AND (h.src<>'call' OR EXISTS (SELECT 1 FROM calls k WHERE k.id=h.src_id AND "
+            "k.scope_person=?))))",
             (scope["person"], agent, scope["person"], agent, scope["person"], scope["person"], agent,
-             CONVERSATION_RECORD_SKEW))
+             CONVERSATION_RECORD_SKEW, scope["person"]))
 
 
 def history_row_visible(agent, task_id, scope, at=None):
@@ -40406,6 +40714,10 @@ def history_records(agent, ref, owner_chats=True, scope=OWNER_VIEW):
     if prefix in ("TR", "CR"):
         s = HISTORY_BY_NAME["tool" if prefix == "TR" else "call"]
         row = read_row(f"{s.select} WHERE {s.key}=?" + (f" AND {s.where}" if s.where else ""), (int(number),))
+        mark = row["scope_person"] if prefix == "CR" and row else None      # history_scope_sql's rule of the mark
+        if prefix == "CR" and row and scope != OWNER_VIEW and \
+                (mark is not None if scope is None else mark != scope["person"]):
+            return []
         return [dict(r, ref=ref, owner_chat=0) for r in (s.build(row) if row else [])
                 if (agent is None or r["agent"] == agent) and history_row_visible(agent, r["task"], scope, r["at"])
                 and not (prefix == "TR" and scope not in (OWNER_VIEW, None))]     # history_scope_sql: no session record
@@ -40450,10 +40762,12 @@ HISTORY_MESSAGES = 20           # rows of one answer in this mode, by default
 # The words that the hub put before a record's own words, for each stream (history_streams): the app shows the
 # record's words and no code. Each one matches only at the start of the record.
 HISTORY_HEADS = {
-    "owner_message": re.compile(r"The owner(?: \(through the app [^\n()]*\))?(?: answered N-\d+(?: \([^\n]*?\))?)?: "),
+    "owner_message": re.compile(r"The owner(?: \((?:through the app [^\n()]*|through their AI session|"
+                               r"through a program)\))?(?: answered N-\d+(?: \([^\n]*?\))?)?: "),
     "owner_report": re.compile(r"\S+ to the owner(?: \([^\n]*?\))?: "),
     "need": re.compile(r"N-\d+ "),
-    "steer": re.compile(r"The owner(?: \(through the app [^\n()]*\))?, on T-\d+: "),
+    "steer": re.compile(r"The owner(?: \((?:through the app [^\n()]*|through their AI session|through a program)\))?"
+                       r", on T-\d+: "),
     "message": re.compile(r"\S+ to \S+(?: \(answering AM-\d+\))?: "),
     "task": re.compile(r"T-\d+ "),
     "result": re.compile(r"T-\d+ \S+: "),
@@ -43086,6 +43400,14 @@ def plain_words(text):
     return " ".join(str(text or "").translate(PLAIN_QUOTES).split()).casefold()
 
 
+# the review of 20 November 2026, issue 4: the manager kept the words that a Claude Code session wrote in the owner's
+# voice (N-230) as the owner's standing item I-98 for the whole fleet, and ended I-97 on another session's message
+STANDING_NOT_HIS = ("M-{n} came from an AI session or an app that acts for the owner (request_hand), not from the "
+                    "owner's own hand: it keeps no item as the owner's, and it changes or ends none of theirs. Keep "
+                    "these words as your own item, without source, or put the rule's words on a card: when the owner "
+                    "presses it, the answer is the source.")
+
+
 def standing_source(agent, source, words=None):
     """(author_kind, author, conversation, message) of what `agent` keeps or ends on the word of `source`, or a
     ToolError (AUTONOMY.md 6.2). No source: the agent itself. M-<n>: the owner's own words, a message of his or a
@@ -43093,7 +43415,9 @@ def standing_source(agent, source, words=None):
     that a person's message drives (contact_session), which must not learn what the owner said. CM-<n>: a person's
     message in this agent's own conversation, while contacts.v2 is on, from a person whose role has its tools on: a
     customer's role gives no item. Words, when given, must be part of that message: a line inside a customer's email
-    cannot pass for another person's wish."""
+    cannot pass for another person's wish. An M-<n> that an AI session sent through the owner tools, or a connected
+    app, is the owner's word for no item (STANDING_NOT_HIS): its row's hand says so (request_hand); a row of before
+    the hand was kept has none, and stays as it was."""
     if source in (None, ""):
         return "agent", agent, None, None
     m = SOURCE_REF.match(str(source))
@@ -43104,10 +43428,13 @@ def standing_source(agent, source, words=None):
     if prefix == "M":
         if contact_session(agent):
             raise ToolError("A session that a person's message drives keeps nothing on the owner's word.")
-        said = read_row("SELECT text, recipient FROM ui_requests WHERE event_id=?", (n,)) or read_row(
-            "SELECT s.text, t.owner recipient FROM steers s JOIN tasks t ON t.id=s.task WHERE s.event_id=?", (n,))
+        said = read_row("SELECT text, recipient, hand, connection FROM ui_requests WHERE event_id=?", (n,)) or \
+            read_row("SELECT s.text, t.owner recipient, s.hand, s.connection FROM steers s JOIN tasks t ON t.id=s.task "
+                     "WHERE s.event_id=?", (n,))
         if not said or said["recipient"] not in [agent] + line_above(agent):
             raise ToolError(f"M-{n} is no message of the owner's to you or to an agent above you in your line.")
+        if not owner_force(said["hand"]) or said["connection"] is not None:
+            raise ToolError(STANDING_NOT_HIS.format(n=n))
         found = ("owner", "owner", None, n, said["text"])
     else:
         if not people_items_on():
@@ -45383,9 +45710,13 @@ def history_questions(a, days, start, before):
     return out
 
 
-# The calls of no narrowed pair (narrowed_from), as a condition on `calls`: not of a narrowed pair's task, and not of a
-# locked window of a pair that has a list now, whose read_messages, reply and read_attachment carry no task.
-CALLS_NOT_NARROWED = ("NOT EXISTS (SELECT 1 FROM tasks n WHERE n.id=calls.task AND n.scope_person IS NOT NULL) AND "
+# The calls of no narrowed pair (narrowed_from), as a condition on `calls`: with no mark (calls.scope_person, which a
+# call of a locked window keeps also after a widening), not of a narrowed pair's task, and not of a locked window of a
+# pair that has a list now, whose read_messages, reply and read_attachment carry no task. The task part also hides the
+# task's ref for a wide window's calls under a task that has its person now; the last two parts cover a row that a hub
+# of the release before stores with no mark (person-scope-call-mark.md).
+CALLS_NOT_NARROWED = ("calls.scope_person IS NULL AND "
+                      "NOT EXISTS (SELECT 1 FROM tasks n WHERE n.id=calls.task AND n.scope_person IS NOT NULL) AND "
                       "NOT EXISTS (SELECT 1 FROM conversations c JOIN person_scopes s ON s.person=c.person AND "
                       "s.agent=c.agent WHERE c.id=calls.conversation)")
 
@@ -46001,8 +46332,9 @@ def circles(t0):
                       f"{tref(t['id'])} ({t['owner']}) lost {t['restarts']} sessions in a row that left nothing and is "
                       f"still {t['state']}: {clip(t['title'], 100)}"))
     # 4. one session asking for the same refused thing
-    for r in q("SELECT task, agent, name, detail, COUNT(*) n FROM calls WHERE ok=0 AND task IS NOT NULL "
-               "GROUP BY task, agent, name, SUBSTR(detail,1,?) HAVING n>=? ORDER BY task",
+    # (and no call with a mark: a locked window's, also of a task that a widening gave back)
+    for r in q("SELECT task, agent, name, detail, COUNT(*) n FROM calls WHERE ok=0 AND task IS NOT NULL AND "
+               "scope_person IS NULL GROUP BY task, agent, name, SUBSTR(detail,1,?) HAVING n>=? ORDER BY task",
                (HISTORY_DETAIL, CIRCLE_REFUSALS)):
         t = q1(f"SELECT * FROM tasks WHERE id=? AND {OPEN_TASK}", (r["task"],))
         if not t or narrowed_from(t, None):
@@ -48976,22 +49308,24 @@ def tool_reads_ahead(name, args):
         kit_reads_ahead(profile_paths(), starts=args["owner"])
 
 
-def call_record(agent, tid, attempt, name, ok, args, detail, window, own=None):
+def call_record(agent, tid, attempt, name, ok, args, detail, window, own=None, mark=None):
     """The row of `calls` of one call, with the args and the detail as they are, or with REMOVED_WORDS when the call
     came from a conversation window whose conversation the owner removed while the call ran (person_remove cleared
     that window's calls already, and a read_messages works without the lock), or from a session of a task of a
     removed person's conversations (removed_task: fence refuses each call of one, and the record of what the session
     tried to send keeps no word). `own` is the task of the session itself (context_task): a call that the hub refuses
     before it knows its task (a tool that the session has not), or that names another task of the agent, is recorded
-    under no task or under that other one, and is still a call of that session. The read and the write are one hold
-    of LOCK, so that no removal commits between them; the caller builds args and detail before it, because a mask of
-    large args takes long and every other call of the hub waits for LOCK."""
+    under no task or under that other one, and is still a call of that session. `mark` is the person whose list held
+    for that session at the call's start (call_tool), stored as calls.scope_person, which the readers of calls read
+    (narrowed_calls_sql). The read and the write are one hold of LOCK, so that no removal commits between them; the
+    caller builds args and detail before it, because a mask of large args takes long and every other call of the hub
+    waits for LOCK."""
     with area("activity"), LOCK:
         if (window is not None and not q1("SELECT 1 FROM conversations WHERE id=?", (window,))) or \
                 removed_task(tid) or removed_task(own) or conversation_heads_gone():
             args, detail = "{}", REMOVED_WORDS
-        ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail,conversation) VALUES(?,?,?,?,?,?,?,?,?)",
-            (now(), agent, tid, attempt, name, args, ok, detail, window))
+        ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail,conversation,scope_person) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)", (now(), agent, tid, attempt, name, args, ok, detail, window, mark))
 
 
 def conversation_head(cid):
@@ -49033,6 +49367,11 @@ def call_tool(agent, name, args, context=None):
     # and the task of a task session, whatever task the call names (call_record)
     window = int(context[2]) if conversation_context(agent, context) else None
     own = context_task(context)
+    # person-scope-call-mark.md: the person of the calling session's list, read at the call's start, which its record
+    # keeps (calls.scope_person). A locked window's call that ends after a widening keeps its mark, and a wide window's
+    # call that ends after a first list gets none. tools_for reads the same list for each call (read_row only)
+    scope = session_scope(agent, context)
+    mark = scope["person"] if scope else None
     try:
         conversation = conversation_context(agent, context)
         if conversation:
@@ -49129,7 +49468,7 @@ def call_tool(agent, name, args, context=None):
                             text.split("\n", 1)[0] if name == "read_attachment" else
                             text[:GOOGLE_CALL_KEEP] if name in GOOGLE_READS or name in ("read_knowledge", "repo_read",
                                                                                         "repo_files", "repo_search")
-                            else text, window, own)
+                            else text, window, own, mark)
                 return text, False
         raise ToolError(f"You have no tool named {name}.")
     except ToolError as e:
@@ -49139,7 +49478,8 @@ def call_tool(agent, name, args, context=None):
         said = mask_secrets(hidden_gone(str(e), agent, name))
         log(agent, f"{name} refused: {said}")
         call_record(agent, tid, attempt, name, 0,
-                    "[blocked]" if secret_hit(json.dumps(args)) else call_record_args(name, args), said, window, own)
+                    "[blocked]" if secret_hit(json.dumps(args)) else call_record_args(name, args), said, window, own,
+                    mark)
         return said, True
     finally:
         CALL.context = CALL.folder = None
@@ -53479,7 +53819,7 @@ def attempt_progress(t):
     if not w:
         return False
     since = w[0]
-    return bool(attempt_notes(t["id"], t["attempt"]) or outward_done(t["id"], t["attempt"]) or
+    return bool(attempt_notes(t["id"], t["attempt"]) or outward_done(t["id"], t["attempt"], OWNER_VIEW) or
                 q1("SELECT 1 FROM questions WHERE task=? AND asked>=? LIMIT 1", (t["id"], since)) or
                 q1("SELECT 1 FROM tasks WHERE parent=? AND created>=? LIMIT 1", (t["id"], since)) or
                 q1("SELECT 1 FROM duty_steps WHERE task=? AND ts>=? LIMIT 1", (t["id"], since)))
@@ -70360,7 +70700,8 @@ def command_kept(route, request_id, client, keep, result):
     return result
 
 
-def command_run(route, request_id, client, db, body, act, keep=None, outside=None, kit=False, unlocked=False):
+def command_run(route, request_id, client, db, body, act, keep=None, outside=None, kit=False, unlocked=False,
+                hand=None, session=None):
     """The receipt logic of one owner command (Handler.ui_command), after its caller checked who calls, the request's
     shape, its request_id (a UUID, lowercase) and its client, and read its body: (status, answer). An exact repeat
     returns the first result; a refused command leaves no record. keep(result): what the hub keeps of a result that
@@ -70368,7 +70709,9 @@ def command_run(route, request_id, client, db, body, act, keep=None, outside=Non
     (Handler.ui_command says how). kit: the act can write the hub's files (commit_kit_file) or move its checkout, so
     each part under LOCK runs in the turn of the hub's writes (kit_lock), after any write that runs now. unlocked: True,
     or a function of the body that says it, when the act lets the git work of its commit_kit_file run without LOCK
-    (Handler.ui_command says when); it is a kit command too."""
+    (Handler.ui_command says when); it is a kit command too. hand, session: request_hand of the command and its
+    X-Fleet-Session, which its receipt keeps (ui_controls); a caller that gives no hand gets the one of its label."""
+    hand = hand or request_hand(client, session=session)
     if secret_hit(json.dumps(body)):
         return 422, refusal_words.answer("login_as_text")
     canonical = json.dumps(body, sort_keys=True)
@@ -70384,8 +70727,8 @@ def command_run(route, request_id, client, db, body, act, keep=None, outside=Non
             if not old["result"]:
                 return 409, refusal_words.answer("command_interrupted")
             return 200, dict(json.loads(old["result"]), replayed=True)
-        ins("INSERT INTO ui_controls(request_id,route,body,client,created,result) VALUES(?,?,?,?,?,'')",
-            (request_id, route, canonical, client, now()))
+        ins("INSERT INTO ui_controls(request_id,route,body,client,created,result,hand,session) "
+            "VALUES(?,?,?,?,?,'',?,?)", (request_id, route, canonical, client, now(), hand, session))
         if outside is None:
             try:
                 result = act(body)
@@ -70448,11 +70791,20 @@ def task_steer_read(task_id, data):
     return body
 
 
-def task_steer_act(task_id, body, client, via=None, connection=None):
+STEER_WHO = {OWNER_TOOL_VIA: "'s AI session", OWNER_PROGRAM_VIA: "'s program"}     # who steered, by request_via
+STEER_THROUGH = {OWNER_TOOL_VIA: " through their AI session", OWNER_PROGRAM_VIA: " through a program"}
+
+
+def task_steer_act(task_id, body, client, via=None, connection=None, session=None, device=None):
     """POST /ui/tasks/<id>/steer, under LOCK (command_run): an inbox message to the task's session, with a copy to its
     requester. client: the X-Fleet-Client of the command; via: the shown name of the connected app that sent it
     (capp_act), which both messages say: [owner via app:<name>] and "through the app <name>"; connection: that app's
-    connection id, which the steer's row keeps (steers.connection), so that the history says it too (history_steer)."""
+    connection id, which the steer's row keeps (steers.connection), so that the history says it too (history_steer).
+    session: its X-Fleet-Session; the row keeps it with the hand (request_hand), and an AI session's steer says so in
+    both messages: [owner via ai-session] and "through their AI session". device: the enrolled owner device that it
+    came from (owner_device_at), for its hand."""
+    hand = request_hand(client, device, connection, None, session)
+    tool = request_via(hand) if not via else None
     t = q1("SELECT * FROM tasks WHERE id=?", (task_id,))
     if not t:
         raise Refusal(404, code="no_such_task")
@@ -70478,17 +70830,20 @@ def task_steer_act(task_id, body, client, via=None, connection=None):
     # steer links (read_attachment), and no steer stands without its messages. emit's rows, as event_rows writes them.
     with transaction():
         eid = DB.execute(EVENT, (t["owner"], "say", filed_under(t["owner"], "say", task_id),
-                                 f"[owner{f' via {capp_via(via)}' if via else ''}] Steering from the owner for "
+                                 f"[owner{f' via {capp_via(via)}' if via else f' via {tool}' if tool else ''}"
+                                 f"] Steering from the owner{STEER_WHO.get(tool, '')} for "
                                  f"{tref(task_id)}: {text}\n"
                                  f"Follow it within this task. Your requester ({t['requester']}) has a copy."
                                  + attachment_words(files), t0,
                                  json.dumps({"steer": True, "attempt": t["attempt"]}))).lastrowid
         event_rows([(t["requester"], "say", filed_about(t["requester"], "say", task_id),
                      f"[hub] The owner steered {tref(task_id)} ({t['title']}, owner {t['owner']})"
-                     f"{f' through the app {via}' if via else ''}: {text}" + attachment_names(files), None)], t0)
-        sid = DB.execute("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created,connection) "
-                         "VALUES(?,?,?,?,?,?,?,?)", (task_id, t["attempt"], text, eid, body["request_id"], client,
-                                                     t0, connection)).lastrowid
+                     f"{f' through the app {via}' if via else STEER_THROUGH.get(tool, '')}: {text}"
+                     + attachment_names(files), None)], t0)
+        sid = DB.execute("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created,connection,hand,"
+                         "session) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                         (task_id, t["attempt"], text, eid, body["request_id"], client, t0, connection, hand,
+                          session)).lastrowid
         for f in files:
             DB.execute("UPDATE attachments SET message=? WHERE id=?", (body["request_id"], f["id"]))
     log("owner", f"steered {tref(task_id)}")
@@ -70507,13 +70862,36 @@ def need_talk_read(need_id, data):
     return {"need": need_id, "text": text.strip()}
 
 
-def need_words_note(need, choice, ticked, value=None):
+# the review of 20 November 2026, issue 4: what an answer of an AI session on the owner's Mac is to the agent that
+# reads it (request_hand "tool"): the session acts for the owner, and its words are no words of the owner's own hand
+NEED_TOOL_PRESSED = " An AI session on the owner's Mac pressed this answer for the owner."
+NEED_TOOL_WORDS = (" An AI session on the owner's Mac wrote this for the owner: the owner did not type it. It settles "
+                   "this item only, and it is no rule of the owner's: keep nothing from it as the owner's standing item, "
+                   "and change or end no rule of the owner's because of it.")
+NEED_PROGRAM_PRESSED = " A program that acts for the owner pressed this answer, not the owner's own app."
+NEED_PROGRAM_WORDS = (" A program that acts for the owner sent these words, not the owner's own app: the owner did not "
+                      "type them. They settle this item only, and they are no rule of the owner's: keep nothing from "
+                      "them as the owner's standing item, and change or end no rule of the owner's because of them.")
+NEED_TOOL_RULE = (" If it asks for a rule, put the rule's words on a card, and the owner presses it in Founderizer. If it "
+                  "asks you something back or does not settle the item, reply with a new item (raise_needs_you) whose "
+                  "why answers what it asked.")
+
+
+def need_words_note(need, choice, ticked, value=None, hand=None):
     """The hub's words after an answer that the owner typed to a Needs-you item of the manager's: their own words are
     also their one reply on the card (the owner, 13 November 2026: "lets use the free-type text input as the general
     reply too, so we can remove the discuss option completely"). The words close the item as every answer does, so a
     question back gets its reply as a new item, where the owner answered. And words that say the item went the wrong
     way send the manager to the line that sent it (the owner, 17 November 2026: a card is the last step). "" for an option, ticked options, a person's
-    question and an item of another agent."""
+    question and an item of another agent. hand: request_hand of the answer; an AI session's answer ("tool") says so to
+    every agent's item, pressed or in words, and never "The owner wrote this in their own words" (NEED_TOOL_WORDS)."""
+    if not owner_force(hand) and need is not None and not need["conversation"]:
+        tool = hand == "tool"
+        if choice is not None or ticked is not None:
+            return NEED_TOOL_PRESSED if tool else NEED_PROGRAM_PRESSED
+        return (" Words give nothing on a card with Give: the access was not given."
+                if need_give_view(need) is not None else "") + (NEED_TOOL_WORDS if tool else NEED_PROGRAM_WORDS) + \
+            (NEED_TOOL_RULE if need["by"] == manager_name() else "")
     if need is None or choice is not None or ticked is not None or need["conversation"] or \
             need["by"] != manager_name():
         return ""
@@ -70547,14 +70925,16 @@ def door_signed_answer(need, text):
                 None)
 
 
-def phone_submit(data, client, need_id=None, address=None, connection=None):
+def phone_submit(data, client, need_id=None, address=None, connection=None, session=None):
     """POST /ui/messages and /ui/needs/<id> after the route's checks (ui_allowed, the body's type and size):
     (status, answer). data: the JSON body; client: its X-Fleet-Client, stripped; address: the source address of
     the request, whose enrolled owner device (owner_device_at) marks the message via=iPhone and decides what a
     signed yes needs, or None for a caller that is no device. connection: {id, name} of the connected app that
-    sends it (capp_act), which owner_message_rows writes; None for the owner's Mac and a phone."""
+    sends it (capp_act), which owner_message_rows writes; None for the owner's Mac and a phone. session: its
+    X-Fleet-Session (Handler.request_session), which marks it as an AI session's (request_hand)."""
     if not client or len(client) > 128:
         return (400, {"error": "X-Fleet-Client is required (at most 128 characters)"})
+    hand = request_hand(client, address and owner_device_at(address), connection, None, session)
     request_id = data.get("request_id")
     value = data.get("answer" if need_id is not None else "text")
     try:
@@ -70664,7 +71044,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
         GIVE_TURN.on = True
         try:
             with kit_lock():
-                return phone_submit(data, client, need_id, address, connection)
+                return phone_submit(data, client, need_id, address, connection, session)
         finally:
             GIVE_TURN.on = False
     gave = need_give_press(need_id, request_id, data.get("db"), connection, address,
@@ -70690,7 +71070,8 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
             if ran is not None:         # owner feature need_run: the hub writes the answer of his press of Run
                 if not ("run_command" in need.keys() and need["run_command"]):
                     return (409, {"error": "this owner request has no command to run: answer it in words"})
-                if connection is not None or (address and owner_device_at(address)):
+                if connection is not None or (address and owner_device_at(address)) or hand != "app":
+                    # Fable's check of 20 November 2026: a session's `ran` closed a Run card with no run of the Mac's
                     return (409, {"error": "Run is pressed in Founderizer on the Mac, which runs the command"})
                 if "run" not in owner_computer()["can"]:        # H2: a PC's app runs no command of a card
                     return (409, {"error": "Founderizer on this computer runs no command: answer this item in words"})
@@ -70779,6 +71160,12 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
             return (409, {"error": STEER_ID_WORDS})
         if need is not None and need["answer"] is not None:
             return (409, refusal_words.answer("request_answered"))
+        if need is not None and not owner_force(hand) and choice is None and ticked is None and ran is None and \
+                need_options(need):
+            # the review of 20 November 2026, issue 4: a session's words closed card N-230, which had three options,
+            # and approved a production change with a new rule of the owner's; its words are no answer of such a card,
+            # and the card stays open for the owner, while a message carries the session's words
+            return (409, refusal_words.answer("card_words_from_tool"))
         if need is not None and choice is None and ticked is None and isinstance(value, str):
             unsigned = door_signed_answer(need, value)
             if unsigned:        # the refusal of the unsigned press, and the item stays open
@@ -70859,16 +71246,17 @@ def phone_submit(data, client, need_id=None, address=None, connection=None):
             # the same moment wins and this edit falls back to a correction.
             edited = previous is not None and not files and message_unread(previous)
             if edited:
-                owner_message_replace(previous, value, request_id, created, device, mentions=mentions, unsure=unsure)
+                owner_message_replace(previous, value, request_id, created, device, mentions=mentions, unsure=unsure,
+                                      hand=hand, session=session)
                 event_id, created = previous["event_id"], previous["created"]
             else:
                 event_id = owner_message_rows(request_id, kind, need, value, client, recipient, replaces, created,
                                               files=rows, chosen=None if ticked is not None else choice,
-                                              device=device, connection=connection, about=about,
+                                              device=device, connection=connection, about=about, session=session,
                                               mentions=mentions, unsure=unsure,
                                               note=need_run_note(need, ran["status"], ran_output) if ran is not None
                                               else team_answer_note(need, choice) or given or
-                                              need_words_note(need, choice, ticked, value),
+                                              need_words_note(need, choice, ticked, value, hand),
                                               pictured=need_picture_note(need, choice, ticked))
                 if isinstance(pressed, dict):       # owner API 1.214: kept for the plan's steps after this transaction
                     team_plan_pressed_rows(need, pressed, created)
@@ -71067,13 +71455,13 @@ def capp_act(connection, tool, args):
         task_id = capp_task_arg(args.get("task"))
         body = task_control_read(task_id, {"action": args.get("action"), "note": args.get("note", "")})
         return request_id, command_run(f"tasks/{task_id}/control", request_id, client, db, body,
-                                       lambda b: task_control_act(task_id, b))
+                                       lambda b: task_control_act(task_id, b), hand="connected")
     if tool == "steer_task":
         task_id = capp_task_arg(args.get("task"))
         body = task_steer_read(task_id, {"request_id": request_id, "text": capp_text_arg(args, "text", 4000)})
         return request_id, command_run(f"tasks/{task_id}/steer", request_id, client, db, body,
                                        lambda b: task_steer_act(task_id, b, client, via=who["name"],
-                                                                connection=who["id"]))
+                                                                connection=who["id"]), hand="connected")
     raise ValueError("no such tool")
 
 
@@ -74121,8 +74509,13 @@ class Handler(BaseHTTPRequestHandler):
             except Refusal as e:
                 return self.json(e.status, refusal_body(e))
             result = dict(staged, ok=True, restarting=bool(CFG.get("hub_restart", HUB_RESTART)))
-            q("INSERT INTO ui_controls(request_id,route,body,client,created,result) VALUES(?,?,?,?,?,?)",
-              (request_id, "restore", asked, client, now(), json.dumps(result)))
+            session = (self.headers.get("X-Fleet-Session") or "").strip() or None
+            if session is not None and not OWNER_SESSION.fullmatch(session):
+                session = None          # the restore ran: its record keeps no session that is no name
+            q("INSERT INTO ui_controls(request_id,route,body,client,created,result,hand,session) "
+              "VALUES(?,?,?,?,?,?,?,?)", (request_id, "restore", asked, client, now(), json.dumps(result),
+                                          request_hand(client, owner_device_at(self.client_address[0]), None, None,
+                                                       session), session))
             log("owner", f"restored fleet {staged['fleet_id']} from a copy ({staged['records_bytes']} bytes of "
                          f"records, {len(staged['files'])} files)" + (" over this hub's own work" if replace else ""))
             restart_hub_soon(None, None, always=True)
@@ -75268,7 +75661,11 @@ class Handler(BaseHTTPRequestHandler):
         card, apart from his answer. The owner, 20 November 2026: "a button link, that then shows the extra text
         input", and "Keep Your answer too": it goes to the manager, which replies under the card (discuss_need), and
         the item stays open until he answers it (need_talk_said)."""
-        return self.ui_command(f"needs/{need_id}/talk", lambda data: need_talk_read(need_id, data), need_talk_said)
+        session = (self.headers.get("X-Fleet-Session") or "").strip() or None      # ui_command checks its form
+        hand = request_hand(self.headers.get("X-Fleet-Client", "").strip(), owner_device_at(self.client_address[0]),
+                            None, None, session)
+        return self.ui_command(f"needs/{need_id}/talk", lambda data: need_talk_read(need_id, data),
+                               lambda body: need_talk_said(body, hand=hand))
 
     def ui_need_secret(self, need_id):
         """POST /ui/needs/<id>/secret (owner feature secret_requests): the answer of one request_secret, from the app's
@@ -75314,8 +75711,12 @@ class Handler(BaseHTTPRequestHandler):
             return body
 
         def act(body):
+            # the hand of the answer (request_hand): the enrolled device that sent it, and its session, which
+            # ui_command checked (Fable's second check of 20 November 2026: a phone's clarify read [owner via program])
             return answer_secret(body, str(self.form()["request_id"]).lower(),
-                                 self.headers.get("X-Fleet-Client", "").strip())
+                                 self.headers.get("X-Fleet-Client", "").strip(),
+                                 owner_device_class(owner_device_at(self.client_address[0])),
+                                 (self.headers.get("X-Fleet-Session") or "").strip() or None)
         return self.ui_command(f"needs/{need_id}/secret", read, act, kit=True)
 
     def ui_secret_grant(self):
@@ -76133,6 +76534,9 @@ class Handler(BaseHTTPRequestHandler):
         client = self.headers.get("X-Fleet-Client", "").strip()
         if not client or len(client) > 128:
             return self.json(400, {"error": "X-Fleet-Client is required (at most 128 characters)"})
+        session = self.request_session()
+        if session is False:
+            return
         request_id = data.get("request_id")
         try:
             if not isinstance(request_id, str) or str(uuid.UUID(request_id)) != request_id.lower():
@@ -76147,7 +76551,9 @@ class Handler(BaseHTTPRequestHandler):
         except Refusal as e:
             return self.json(e.status, refusal_body(e))
         return self.json(*command_run(route, request_id, client, data.get("db"), body, act, keep, outside,
-                                      kit=kit, unlocked=unlocked))
+                                      kit=kit, unlocked=unlocked, session=session,
+                                      hand=request_hand(client, owner_device_at(self.client_address[0]), None, None,
+                                                      session)))
 
     def ui_control(self, task_id):
         return self.ui_command(f"tasks/{task_id}/control", lambda data: task_control_read(task_id, data),
@@ -76157,8 +76563,11 @@ class Handler(BaseHTTPRequestHandler):
         """Owner steering for one open task: an inbox message to its session, with its files (owner API 1.223), and a
         copy to its requester."""
         client = self.headers.get("X-Fleet-Client", "").strip()
+        # ui_command checks who calls first, and then the session's form, so this read stands behind both
+        session = (self.headers.get("X-Fleet-Session") or "").strip() or None
+        device = owner_device_at(self.client_address[0])
         return self.ui_command(f"tasks/{task_id}/steer", lambda data: task_steer_read(task_id, data),
-                               lambda body: task_steer_act(task_id, body, client))
+                               lambda body: task_steer_act(task_id, body, client, session=session, device=device))
 
     def ui_outcome(self, outcome_id):
         def read(data):
@@ -76186,8 +76595,23 @@ class Handler(BaseHTTPRequestHandler):
         if len(self.body()) > 65536:
             return self.json(413, {"error": "request is too large"})
         data = self.form()
+        session = self.request_session()
+        if session is False:
+            return
         return self.json(*phone_submit(data, self.headers.get("X-Fleet-Client", "").strip(), need_id,
-                                       self.client_address[0]))
+                                       self.client_address[0], session=session))
+
+    def request_session(self):
+        """X-Fleet-Session of an owner request: the AI session that sends it, as its program names it (the owner tools
+        send claude-code/<session id>), which the hub keeps with the request (request_hand). None when the request names
+        none; False after a 400 for a value that is no such name."""
+        raw = (self.headers.get("X-Fleet-Session") or "").strip()
+        if not raw:
+            return None
+        if not OWNER_SESSION.fullmatch(raw):
+            self.json(400, {"error": "X-Fleet-Session is 1 to 128 letters, digits and . _ : / -"})
+            return False
+        return raw
 
     # ---- chat apps (owner features chat_apps and people)
     def bridge_allowed(self):
@@ -78503,7 +78927,7 @@ class Handler(BaseHTTPRequestHandler):
             if text and secret_hit(text):
                 log("owner", "BLOCKED a message to the manager that contained a login")
             elif text:
-                emit(manager_name(), "say", f"[owner] {text}")
+                emit(manager_name(), "say", f"[owner via {OWNER_PROGRAM_VIA}] {text}" if board_hand() else f"[owner] {text}")
                 log("owner", f"said to the manager: {text}")
             return self.back()
         if parts[:1] == ["needs"] and len(parts) == 2:
@@ -78530,6 +78954,10 @@ class Handler(BaseHTTPRequestHandler):
                     # the board signs nothing: a press of Run it once or of Full access on <server> here, and their
                     # words, would close the door's card and give the door no statement of the owner's key
                     log("owner", f"REFUSED an answer on the board to N-{nid} that only the owner's app signs")
+                elif row and answer and row["answer"] is None and chosen is None and need_options(row) and board_hand():
+                    # the review of 20 November 2026, issue 4: words close no card that has its own answers here, as
+                    # on /ui/needs/<id> for a hand that is not the owner's own (card_words_from_tool)
+                    log("owner", f"REFUSED an answer in words on the board to N-{nid}, which has its own answers")
                 elif row and answer and row["answer"] is None and team_card(row) is not None:
                     # owner API 1.214: the board shows no Details, so a team card is answered in Founderizer (Mac, PC)
                     log("owner", f"REFUSED an answer on the board to the team card N-{nid}")
@@ -78552,7 +78980,7 @@ class Handler(BaseHTTPRequestHandler):
                         DB.execute("UPDATE needs SET answer=?, answered=?, chosen=? WHERE id=?",
                                    (answer, t0, chosen, nid))
                         pictured = need_picture_note(row, chosen)   # owner API 1.285: the picture of that option
-                        asker = need_question_rows(row, answer, t0, more=pictured)
+                        asker = need_question_rows(row, answer, t0, more=pictured, via=request_via(board_hand()))
                         passed = pictured + (f" The hub gave it to {asker} as the answer to Q-{row['question']}: do "
                                              f"not pass it on again." if asker else "") + \
                             need_door_task_rows(row, chosen, answer, t0)
@@ -78560,9 +78988,13 @@ class Handler(BaseHTTPRequestHandler):
                         # waits for it, and ends that wait, as owner_message_rows does it
                         takeover = row["takeover_task"] if row["kind"] == "takeover" else None
                         closing = takeover_close_rows(row["by"], nid, takeover, t0) if takeover is not None else None
-                        event_rows([(row["by"], "say", takeover, f"[owner] Answer to Needs-you N-{nid} "
-                                     f"({row['title']}): {answer}{passed}", {"takeover": nid} if closing else None)],
-                                   t0)
+                        # the review of 20 November 2026, issue 4: on a hub that holds an owner key only a program
+                        # reaches this form, so its answer is a program's (request_hand "other")
+                        board = board_hand()
+                        event_rows([(row["by"], "say", takeover, f"[owner{f' via {request_via(board)}' if board else ''}"
+                                     f"] Answer to Needs-you N-{nid} ({row['title']}): {answer}{passed}"
+                                     + (need_words_note(row, chosen, None, answer, board) if board else ""),
+                                     {"takeover": nid} if closing else None)], t0)
                         if takeover is not None:
                             secret_wait_moved(takeover)
                         key_swap_answered_rows(row, chosen, t0)     # a press of a server's key swap item
@@ -79292,7 +79724,7 @@ class Handler(BaseHTTPRequestHandler):
         # Every file's checks first, and then the search for logins of all of them at once, in one child when it is long
         # (searched_ahead): 100 files that each alone are searched here were 100 s of Python's interpreter lock, and the
         # hub waited meanwhile. A delivery that is refused is not searched. `pending` keeps the delivery's order: a skip
-        # (a dict), or a file that passed its checks (its path, its data, its text or None).
+        # (a dict), or a file that passed its checks (its path, its data, and the texts of its bytes: bytes_texts).
         pending = []
         for one in sent:
             path = one.get("path") if isinstance(one, dict) else None
@@ -79316,18 +79748,14 @@ class Handler(BaseHTTPRequestHandler):
             if len(data) > OUTPUTS_FILE_MAX or total > OUTPUTS_TOTAL_MAX:
                 return self.json(413, {"error": f"a file is at most {OUTPUTS_FILE_MAX // MIB} MiB and one delivery "
                                                 f"{OUTPUTS_TOTAL_MAX // MIB} MiB"})
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError:
-                text = None                 # an image: what the owner's app shows of it is checked there
-            pending.append((path, data, text))
-        with searched_ahead([one[2] for one in pending if isinstance(one, tuple) and one[2] is not None]):
+            pending.append((path, data, bytes_texts(data)))     # every file, also one that is not UTF-8
+        with searched_ahead([text for one in pending if isinstance(one, tuple) for text in one[2]]):
             for one in pending:
                 if isinstance(one, dict):
                     skipped.append(one)
                     continue
-                path, data, text = one
-                if text is not None and secret_hit(text):
+                path, data, texts = one
+                if secret_hit(*texts):
                     skipped.append({"path": path, "why": "it holds a registered secret"})
                     continue
                 files[path] = data

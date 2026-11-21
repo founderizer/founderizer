@@ -54,6 +54,9 @@ OLD = {
     "server_silent": "{server} sent no reading in the last 10 minutes: check that it is on",
     "server_no_service": "{server} has no server service: it did not join with a join code",
     "request_answered": "owner request is already answered",
+    "card_words_from_tool": "This card has its own answers: an AI session or a program answers it only with one of "
+                            "them, the one that the owner chose. Send other words to the agent as a message; the card "
+                            "stays open for the owner.",
     "request_unknown": "owner request does not exist",
     "request_unknown_ended": "owner request does not exist: a request whose task ended is gone with it",
     "not_owner_device": '{address} is not an owner device. See "owner_devices" in team.json.',
@@ -164,7 +167,8 @@ SITES = {
     'phone_ended': {'hub_changed': 1},
     'phone_knowledge': {'hub_changed': 1, 'knowledge_unread': 1},
     'phone_mobile': {'hub_changed': 1},
-    'phone_submit': {'about_unreadable': 1, 'command_reused_content': 2, 'hub_changed_sending': 1, 'login_as_text': 3,
+    'phone_submit': {'about_unreadable': 1, 'card_words_from_tool': 1, 'command_reused_content': 2,
+                     'hub_changed_sending': 1, 'login_as_text': 3,
                      'request_answered': 1, 'request_unknown': 1, 'signature_unchecked': 1},
     'phone_task': {'hub_changed': 1, 'no_such_task': 1},
     'prepare_server_agent': {'no_such_agent': 1, 'no_such_server': 1, 'server_no_service': 1, 'server_silent': 1},
@@ -492,7 +496,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 211)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 212)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

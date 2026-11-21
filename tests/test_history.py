@@ -110,7 +110,8 @@ class Base(OwnerAPI):
 
     def owner_says(self, text, agent="vps"):
         with hub.LOCK, hub.transaction():
-            hub.owner_message_rows(str(uuid.uuid4()), "message", None, text, "test", agent, None, self.clock)
+            hub.owner_message_rows(str(uuid.uuid4()), "message", None, text, "founderizer-swift/1/test", agent, None,
+                                   self.clock)
         return hub.q1("SELECT rowid FROM ui_requests ORDER BY rowid DESC LIMIT 1")["rowid"]
 
     def records(self, tid, events, agent="vps", source="127.0.0.3", attempt=1):

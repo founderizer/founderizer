@@ -669,7 +669,7 @@ class ReviewedNotices(test_responsibilities.Base):
                       ("Ana Ruiz asks for a refund", "a customer", "answer her", hub.now(), "vps", "question", cid))
         code, data = self.request(f"/needs/{nid}", {"answer": "Yes, refund her in full."},
                                   headers={"Content-Type": "application/json", "Accept": "application/json",
-                                           "X-Fleet-Client": "deterministic-test"}, source="127.0.0.1")
+                                           "X-Fleet-Client": "founderizer-swift/1/test"}, source="127.0.0.1")
         self.assertIn(code, (200, 303), data)
         said = hub.q("SELECT who, text FROM conversation_messages WHERE conversation=?", (cid,))
         self.assertEqual([(m["who"], m["text"]) for m in said], [("owner", "Yes, refund her in full.")])

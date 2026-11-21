@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import os
+import random
 import shutil
 import subprocess
 import tempfile
@@ -29,7 +30,7 @@ VPS = TEAM["addresses"]["vps"]
 
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
-    for cls in (HelperFiles, Checkout, Delivery, TaskNumbers, Revision):
+    for cls in (HelperFiles, Checkout, Delivery, BytesSearch, TaskNumbers, Revision):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -463,6 +464,27 @@ class Delivery(OwnerAPI):
                          sorted(parts) + [f"outputs/{self.ref}/report.md"])
         self.assertEqual(len(children), 1)
 
+    def test_a_file_that_is_not_utf_8_is_searched_too(self):
+        """A file whose bytes were not UTF-8 was committed with no search (a review of 20 November 2026): a UTF-16 file
+        with a registered login, as PowerShell's > writes one, reached the configuration ref, which every agent reads.
+        Now each file is searched in every text of its bytes (bytes_texts: the euro sign is only in the text of UTF-16,
+        the last one), and a picture with no login goes in."""
+        salt, euro, latin = "salt", "Pass\u20acword-Synthetic-9", "Contrase\u00f1a-Sint\u00e9tica-2026"
+        for label, one in (("Synthetic label", euro), ("Synthetic Latin label", latin)):
+            hub.ins("INSERT INTO secrets(label,salt,hash,len) VALUES(?,?,?,?)",
+                    (label, salt, hashlib.sha256((salt + one).encode()).hexdigest(), len(one)))
+        picture = b"\x89PNG\r\n\x1a\n" + random.Random(7).randbytes(300000)
+        write(self.checkout, {f"outputs/{self.ref}/wide.txt": b"\xff\xfe" + f"the key: {euro}\r\n".encode("utf-16-le"),
+                              f"outputs/{self.ref}/latin.csv": f"clave;{latin}\n".encode("cp1252"),
+                              f"outputs/{self.ref}/picture.png": picture})
+        self.helper()
+        text, error = self.deliver()
+        self.assertFalse(error, text)
+        self.assertIn(f"Not sent: outputs/{self.ref}/latin.csv (it holds a registered secret); outputs/{self.ref}/"
+                      f"wide.txt (it holds a registered secret).", text)
+        self.assertEqual(self.origin("ls-tree", "-r", "--name-only", hub.CONFIG_BRANCH, f"outputs/{self.ref}"),
+                         f"outputs/{self.ref}/picture.png")
+
     def test_the_route_takes_only_files_of_the_tasks_own_folder_from_the_agents_machine(self):
         token = "t" * 22
         hub.OUTPUTS[token] = {"agent": "vps", "task": self.task, "answer": None, "gave_up": False}
@@ -526,6 +548,109 @@ class Delivery(OwnerAPI):
         first = hub.commit_outputs("vps", t, files)
         self.assertEqual(hub.commit_outputs("vps", t, files), first)
         self.assertEqual(self.origin("rev-parse", hub.CONFIG_BRANCH), first)
+
+
+class BytesSearch(unittest.TestCase):
+    """The search for logins in a file's bytes that are not UTF-8 (bytes_texts), with synthetic logins only. Each test
+    names the bytes in which a login was not found before."""
+
+    LOGINS = ("Synthetic-Secret-Value-123", "Contrase\u00f1a-Sint\u00e9tica-2026", "Pass\u20acword-Synthetic-9",
+              "\u041f\u0430\u0440\u043e\u043b\u044c-Synthetic-77", "Zq7-Kp2x", "Tok_en.Syn+the=tic/1~{|}",
+              "\u00d1and\u00fa-S\u00ed-Est\u00e1-Aqu\u00ed-2026", "\u5bc6\u7801\u5408\u6210\u5bc6\u7801\u4e00\u4e8c")
+
+    def setUp(self):
+        key = tuple(("salt", hashlib.sha256(("salt" + value).encode()).hexdigest(), len(value)) for value in self.LOGINS)
+        key += (("salt", hashlib.sha256(b"saltSecretToken99").hexdigest(), None),)      # a login with no length
+        patcher = patch.object(hub, "secret_key", return_value=key)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def found(self, data):
+        return hub.secret_hit(*hub.bytes_texts(data))
+
+    def test_a_login_in_utf_16_of_either_byte_order_is_found(self):
+        """What PowerShell's > writes, and Notepad's and Excel's "Unicode": each character beside a zero byte, after a
+        byte order mark that is not UTF-8. Such a file was not searched at all."""
+        line = "the key: Synthetic-Secret-Value-123\r\n"
+        self.assertTrue(self.found(b"\xff\xfe" + line.encode("utf-16-le")))
+        self.assertTrue(self.found(b"\xfe\xff" + line.encode("utf-16-be")))
+        self.assertFalse(self.found(b"\xff\xfe" + "the key: none\r\n".encode("utf-16-le")))
+
+    def test_a_login_in_utf_32_with_a_byte_order_mark_is_found(self):
+        """Three zero bytes beside each ASCII character, which the search of the first design did not read; and a
+        Cyrillic letter, which only the text of UTF-32 holds (big-endian, whose mark is not UTF-16's)."""
+        line = "the key: Synthetic-Secret-Value-123\n"
+        self.assertTrue(self.found(b"\xff\xfe\x00\x00" + line.encode("utf-32-le")))
+        self.assertTrue(self.found(b"\x00\x00\xfe\xff" + line.encode("utf-32-be")))
+        self.assertTrue(self.found(b"\x00\x00\xfe\xff" + "key: \u041f\u0430\u0440\u043e\u043b\u044c-Synthetic-77\n"
+                                   .encode("utf-32-be")))
+
+    def test_a_login_in_a_utf_8_text_with_one_bad_byte_is_found_also_with_a_letter_outside_ascii(self):
+        """A text cut in the middle of a letter, or with one stray byte, is not UTF-8. Its runs of ASCII alone miss a
+        login with a letter outside ASCII and one with a hidden character inside, which the skeleton removes; and the
+        removal of its zero bytes joins a login with no length to the next string (C strings)."""
+        self.assertTrue(self.found("clave: Contrase\u00f1a-Sint\u00e9tica-2026 fin".encode() + b"\xff\n"))
+        self.assertTrue(self.found(b"\xe9 the key: Synthetic-Secret\xe2\x80\x8b-Value-123\n"))
+        self.assertTrue(self.found(b"\xff env: SecretToken99\x00name\x00\n"))
+
+    def test_a_letter_across_two_steps_of_the_count_keeps_its_login(self):
+        """utf8_text decodes a text a step of BYTES_CHUNK bytes at a time: each step decoded alone would make a bad
+        byte of each half of a letter that lies across two steps."""
+        with patch.object(hub, "BYTES_CHUNK", 3):
+            self.assertTrue(self.found("key: \u041f\u0430\u0440\u043e\u043b\u044c-Synthetic-77 ".encode() + b"\xff\n"))
+
+    def test_a_login_with_a_latin_letter_in_windows_1252_or_in_utf_16_without_a_mark_is_found(self):
+        """Latin-1 and Windows text holds a Latin letter as one byte, and UTF-16 as that byte beside a zero byte: also
+        in a short file with more bad bytes than one in 8, and after many bad bytes at the file's start."""
+        line = "clave: Contrase\u00f1a-Sint\u00e9tica-2026\n"
+        self.assertTrue(self.found(line.encode("cp1252")))
+        self.assertTrue(self.found(line.encode("utf-16-le")))
+        self.assertTrue(self.found("key: Pass\u20acword-Synthetic-9\n".encode("cp1252")))
+        self.assertTrue(self.found("\u00d1and\u00fa-S\u00ed-Est\u00e1-Aqu\u00ed-2026\n".encode("cp1252")))
+        self.assertTrue(self.found(b"\xe9" * 70000 + line.encode("cp1252") + b"a " * 400000))
+
+    def test_a_login_with_a_letter_beyond_latin_1_in_utf_16_or_utf_32_with_a_mark_is_found(self):
+        """The euro sign, Cyrillic and Chinese letters are two bytes of UTF-16 that are not zero: only the text of the
+        file's own code holds them, also with no ASCII around them."""
+        self.assertTrue(self.found(b"\xff\xfe" + "key: Pass\u20acword-Synthetic-9\r\n".encode("utf-16-le")))
+        line = "\u043a\u043b\u044e\u0447: \u041f\u0430\u0440\u043e\u043b\u044c-Synthetic-77 \u0438 \u0432\u0441\u0451\n"
+        self.assertTrue(self.found(b"\xfe\xff" + line.encode("utf-16-be")))
+        self.assertTrue(self.found(b"\xff\xfe\x00\x00" + line.encode("utf-32-le")))
+        self.assertTrue(self.found(b"\xff\xfe" + line.encode("utf-16-le") + b"\x00"))     # a byte too many: U+FFFD
+        prose = "\u8fd9\u662f\u6587\u4ef6\u7684\u5185\u5bb9\u3002" * 500
+        self.assertTrue(self.found(b"\xff\xfe" + (prose + "\u5bc6\u7801\u5408\u6210\u5bc6\u7801\u4e00\u4e8c" + prose)
+                                   .encode("utf-16-le")))
+
+    def test_a_login_in_the_bytes_of_a_picture_is_found_in_ascii_and_in_utf_16(self):
+        """A picture's text chunk, an old Word file's UTF-16 text, a login of 8 characters, one of punctuation, one at
+        the very end, and one with no length beside the next string (a C string) or after a byte that is not text."""
+        noise = random.Random(3).randbytes(200000)
+        self.assertTrue(self.found(noise + b"\x00Synthetic-Secret-Value-123\x00" + noise))
+        self.assertTrue(self.found(noise + "Synthetic-Secret-Value-123".encode("utf-16-le") + noise))
+        self.assertTrue(self.found(noise + b"\xffZq7-Kp2x\xff" + noise))
+        self.assertTrue(self.found(noise + b"\xffTok_en.Syn+the=tic/1~{|}\xff" + noise))
+        self.assertTrue(self.found(noise + b"\xffSynthetic-Secret-Value-123"))
+        self.assertTrue(self.found(b"Synthetic-Secret-Value-123\x80" + noise))
+        self.assertTrue(self.found(noise + b"\xff\x00SecretToken99\x00name\x00" + noise))
+        self.assertTrue(self.found(noise + b"\xffSecretToken99\x80name0123\x80" + noise))
+
+    def test_a_login_past_the_runs_that_are_read_one_by_one_is_found(self):
+        """A file of many short runs is read in one step past BYTES_RUNS_MOST runs (one at a time, 24 MiB of them held
+        the request's thread 1.8 s): that step still holds the runs after them, and their punctuation."""
+        with patch.object(hub, "BYTES_RUNS_MOST", 4):
+            self.assertTrue(self.found(b"\x80abcdefgh" * 10 + b"\x80Tok_en.Syn+the=tic/1~{|}\x80" + b"\xff" * 1000))
+
+    def test_a_picture_with_no_login_is_searched_in_a_short_text(self):
+        """A picture's bytes are nearly random: read as text, nearly all of them are one long run, and the search, which
+        hashes every window of a run for each login, would take minutes of a child and then leave the picture out.
+        Also when the picture starts with the bytes of a UTF-16 mark, or with a text longer than the bytes that tell
+        at once."""
+        noise = random.Random(5).randbytes(8 * 1024 * 1024)
+        for data in (b"\x89PNG\r\n\x1a\n" + noise, b"\xff\xfe" + noise[:1024 * 1024],
+                     b"%PDF-1.7\n" + b"<< /Type /Page >>\n" * 5000 + noise):        # a text before the bytes
+            texts = hub.bytes_texts(data)
+            self.assertLess(sum(map(len, texts)), len(data) // 100)
+            self.assertFalse(hub.secret_hit(*texts))
 
 
 class TaskNumbers(OwnerAPI):

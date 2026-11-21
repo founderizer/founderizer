@@ -413,7 +413,7 @@ class Conversations(People):
         self.assertIn("is not a file that Jordi sent in this conversation", text)
         # a file of the owner's message: never in a window
         owners = hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,message) "
-                         "VALUES('r-owner','plan.png','image/png',64,?,?,'deterministic-test','u-1')",
+                         "VALUES('r-owner','plan.png','image/png',64,?,?,'founderizer-swift/1/test','u-1')",
                          (hashlib.sha256(test_chat_apps.PICTURE).hexdigest(), hub.now()))
         text, error = self.tool("read_attachment", attachment_id=f"A-{owners}")
         self.assertTrue(error)

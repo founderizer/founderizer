@@ -598,7 +598,7 @@ class OwnerAPI(unittest.TestCase):
         self.tmp.cleanup()
 
     def request(self, path="/ui/state", body=None, headers=None, source=None):
-        headers = dict(headers or {"Content-Type": "application/json", "X-Fleet-Client": "deterministic-test"})
+        headers = dict(headers or {"Content-Type": "application/json", "X-Fleet-Client": "founderizer-swift/1/test"})
         if source:
             headers["X-Test-Source"] = source           # the caller's address (SourceHandler)
         req = urllib.request.Request(self.base + path,
@@ -1021,8 +1021,8 @@ class OwnerAPI(unittest.TestCase):
     def test_client_identity_is_recorded_and_cannot_change_on_replay(self):
         body = self.command()
         _, receipt = self.request("/ui/messages", body)
-        self.assertEqual(receipt["client"], "deterministic-test")
-        self.assertEqual(self.request()[1]["messages"][0]["client"], "deterministic-test")
+        self.assertEqual(receipt["client"], "founderizer-swift/1/test")
+        self.assertEqual(self.request()[1]["messages"][0]["client"], "founderizer-swift/1/test")
         headers = {"Content-Type": "application/json", "X-Fleet-Client": "another-client"}
         self.assertEqual(self.request("/ui/messages", body, headers)[0], 409)
         self.assertEqual(self.request("/ui/messages", self.command(), {"Content-Type": "application/json"})[0], 400)

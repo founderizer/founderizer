@@ -262,6 +262,48 @@ class Needs(Chain):
                                                                   "db": "test-generation", "choice": 1})
         self.assertEqual(code, 200)
         self.assertEqual(self.question(qid)["answer"], "Green")
+        self.assertIn("answered by the owner: Green", self.said("w", self.t3)[-1])
+        # The review of 20 November 2026: an AI session's press of card N-232 reached its asker as "answered by the
+        # owner"; now the asker reads that the owner's AI session pressed it
+        qid = self.up_to_manager()
+        need, _ = self.raised(qid, options=["Blue", "Green"])
+        code, _receipt = self.request(f"/ui/needs/{need['id']}", {"request_id": str(uuid.uuid4()),
+                                                                  "db": "test-generation", "choice": 0},
+                                      headers={"Content-Type": "application/json",
+                                               "X-Fleet-Client": "founderizer-cli/1/test"})
+        self.assertEqual(code, 200)
+        self.assertIn("answered by the owner's AI session (for the owner; not the owner's own words): Blue",
+                      self.said("w", self.t3)[-1])
+        # and a card of the question that is still open closes with words that name the session (answer_rows)
+        qid = self.up_to_manager()
+        need, _ = self.raised(qid)
+        qu, task = self.question(qid), hub.q1("SELECT * FROM tasks WHERE id=?", (self.t3,))
+        with hub.committed():
+            hub.answer_rows(qu, task, "Teal", "owner", hub.now(), (), via=hub.OWNER_TOOL_VIA)
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (need["id"],))["answer"],
+                         "Closed: your AI session answered it for you: Teal")
+        qid = self.up_to_manager()
+        need, _ = self.raised(qid)
+        qu, task = self.question(qid), hub.q1("SELECT * FROM tasks WHERE id=?", (self.t3,))
+        with hub.committed():
+            hub.answer_rows(qu, task, "Navy", "owner", hub.now(), (), via=hub.OWNER_PROGRAM_VIA)
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (need["id"],))["answer"],
+                         "Closed: a program answered it for you: Navy")
+        # a connected app's press says so to the asker too (Fable's fourth check of 20 November 2026, N1)
+        qid = self.up_to_manager()
+        need, _ = self.raised(qid, options=["Blue", "Green"])
+        code, body = hub.phone_submit({"request_id": str(uuid.uuid4()), "db": "test-generation", "choice": 1},
+                                      "connected:1", need["id"], None, {"id": 1, "name": "Example app"})
+        self.assertEqual(code, 200, body)
+        self.assertIn("answered by the owner through a connected app (not the owner's own words): Green",
+                      self.said("w", self.t3)[-1])
+        qid = self.up_to_manager()
+        need, _ = self.raised(qid)
+        qu, task = self.question(qid), hub.q1("SELECT * FROM tasks WHERE id=?", (self.t3,))
+        with hub.committed():
+            hub.answer_rows(qu, task, "Grey", "owner", hub.now(), (), via="connected")
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (need["id"],))["answer"],
+                         "Closed: a connected app answered it for you: Grey")
 
     def test_the_owner_answers_on_the_board_and_the_question_is_answered_too(self):
         qid = self.up_to_manager()
@@ -269,6 +311,13 @@ class Needs(Chain):
         self.assertEqual(self.form(f"/needs/{need['id']}", {"answer": "Blue."}), 303)
         self.assertEqual(self.question(qid)["answer"], "Blue.")
         self.assertIn("answered by the owner: Blue.", self.said("w", self.t3)[-1])
+        # on a hub that holds the Mac's key only a program reaches the board, and the asker reads so (issue 4)
+        qid = self.up_to_manager()
+        need, _ = self.raised(qid)
+        with patch.object(hub, "board_hand", lambda: "other"):
+            self.assertEqual(self.form(f"/needs/{need['id']}", {"answer": "Red."}), 303)
+        self.assertIn("answered by a program that acts for the owner (not the owner's own words): Red.",
+                      self.said("w", self.t3)[-1])
         self.assertIn(f"The hub gave it to w as the answer to Q-{qid}", self.said("manager")[-1])
 
     def test_the_item_closes_when_the_question_is_answered_another_way(self):

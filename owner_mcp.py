@@ -387,6 +387,19 @@ def next_step(what):
 # ---- where the hub is, and the one identity this server has
 
 
+SESSION_NAME = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
+
+
+def session_label():
+    """`X-Fleet-Session` for every command: the AI session that runs this server or this shell call, as the hub keeps
+    it with the request (hub.request_hand; the review of 20 November 2026, issue 4: the hub could not tell an AI
+    session's answer to the owner's card from the owner's own). Claude Code gives its session id to the processes that
+    it starts, an MCP server and a shell command alike. None outside such a session, or for an id that is no name."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    label = f"claude-code/{sid}" if sid else ""
+    return label if label and SESSION_NAME.fullmatch(label) else None
+
+
 def client_label():
     """`X-Fleet-Client` for every command: this installation's own public label, kept across runs as the app keeps
     its installation UUID. It is a record of the source, not authentication (UI-API.md, "Submit a goal or answer")."""
@@ -696,6 +709,9 @@ def _call(method, path, body, base, timeout, limit, mime, extra, total, key):
         data = body if mime else json.dumps(body).encode()
         headers["Content-Type"] = mime or "application/json"
         headers["X-Fleet-Client"] = client_label()
+        session = session_label()
+        if session:
+            headers["X-Fleet-Session"] = session
         headers.update(extra or {})
     if limit == READ_MAX and path.split("?", 1)[0] == STATE_ROUTE:
         limit = STATE_MAX           # the snapshot's own limit; a refusal's body below keeps READ_MAX
@@ -2972,8 +2988,9 @@ def tools():
              {"attachment": S["int"], "keep": S["bool"], **rid}, ("attachment", "keep"),
              plain("/ui/attachments/{attachment}/keep", ("keep",), "keeping this file")),
         tool("Needs you",
-             "answer_needs_you", "Answer one Needs-you item: the words, or choice, the index of one option the item "
-                                 "offers, or choices, the indexes of the options it lets the owner tick together "
+             "answer_needs_you", "Answer one Needs-you item: words only for an item with no options (the hub "
+                                 "refuses an AI session's words to an item that has them), or choice, the index of "
+                                 "one option the item offers, or choices, the indexes of the options it lets the owner tick together "
                                  "(its multi). Not for a secret's value, which never goes through a tool. When the "
                                  "item has pictures, see each one with read_attachment before you choose. Words "
                                  "that ask something back are an answer too: the item closes, "
@@ -2990,8 +3007,9 @@ def tools():
                                   "answering it: more context, or a question about it (Needs clarification). The "
                                   "item stays open, and the manager's reply joins its talk. fleet_read(page=\"state\") "
                                   "gives each item's talk and clarify in needs: an item whose clarify is false takes "
-                                  "no message. text: 1 to 2000 characters, only the owner's own words: the manager reads "
-                                  "them as the owner's. To answer the item, use answer_needs_you.",
+                                  "no message. text: 1 to 2000 characters, only the owner's own words: the manager "
+                                  "reads that an AI session sent them for the owner. To answer the item, use "
+                                  "answer_needs_you.",
              {"need": S["int"], "text": S["text"], **rid}, ("need", "text"),
              plain("/ui/needs/{need}/talk", ("text",), "the message")),
         tool("Needs you",

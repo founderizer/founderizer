@@ -74,7 +74,7 @@ def free_port():
 
 def get(url, timeout=30):
     """(status, JSON answer, the Connection header) of one GET on a new connection."""
-    req = urllib.request.Request(url, headers={"X-Fleet-Client": "deterministic-test"})
+    req = urllib.request.Request(url, headers={"X-Fleet-Client": "founderizer-swift/1/test"})
     try:
         with OPENER.open(req, timeout=timeout) as answer:
             return answer.status, json.load(answer), answer.headers.get("Connection")
@@ -484,7 +484,7 @@ class Serving(OwnerAPI):
             with self.subTest(path=path):
                 hub.STOPPING.clear()
                 got = []
-                req = urllib.request.Request(base + path, headers={"X-Fleet-Client": "deterministic-test"})
+                req = urllib.request.Request(base + path, headers={"X-Fleet-Client": "founderizer-swift/1/test"})
                 if path.startswith("/events/"):
                     req.add_header("X-Test-Source", "127.0.0.2")
                 threading.Thread(target=lambda: got.append(self.timed(req)), daemon=True).start()

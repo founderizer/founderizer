@@ -64,6 +64,10 @@ WORDS = {
     "server_no_service": "{server} has no server service: it did not join with a join code",
     # an owner request (a Needs-you item)
     "request_answered": "owner request is already answered",
+    # an AI session's words to a card that has its own answers (hub.request_hand "tool")
+    "card_words_from_tool": "This card has its own answers: an AI session or a program answers it only with one of "
+                            "them, the one that the owner chose. Send other words to the agent as a message; the card "
+                            "stays open for the owner.",
     "request_unknown": "owner request does not exist",
     "request_unknown_ended": "owner request does not exist: a request whose task ended is gone with it",
     # a phone that calls from an address that no owner device has

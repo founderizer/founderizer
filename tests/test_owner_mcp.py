@@ -76,11 +76,16 @@ class Client:
     the answer to one request. `every`: the seconds between two progress notifications of the server
     (owner_mcp.PROGRESS_EVERY), for a test that cannot wait 30 seconds."""
 
-    def __init__(self, test, hub_base=None, path=None, every=None):
+    def __init__(self, test, hub_base=None, path=None, every=None, session=None):
         self.home = pathlib.Path(tempfile.mkdtemp(prefix="fleet-owner-mcp-"))
         test.addCleanup(shutil.rmtree, str(self.home), True)
         env = dict(os.environ, HOME=str(self.home))
         env.pop("FOUNDERIZER_HUB", None)
+        # the AI session that runs the server (owner_mcp.session_label): the test's own, never the one of the Claude
+        # Code session that runs these tests
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        if session:
+            env["CLAUDE_CODE_SESSION_ID"] = session
         if hub_base:
             env["FOUNDERIZER_HUB"] = hub_base
         if path:
@@ -586,7 +591,19 @@ class FromNothing(WithServer):
         self.assertTrue(receipt["ok"])
         self.assertFalse(receipt["replayed"])
         self.assertIn("founderizer-mcp/1/", receipt["client"])
-        self.assertIn("one paying customer this month", hub.t_read_messages("manager", {}))
+        # The review of 20 November 2026, issue 4: the hub keeps that an AI session sent it through the owner tools,
+        # and the agent reads so
+        self.assertIn("[owner via ai-session] I want one paying customer this month.",
+                      hub.t_read_messages("manager", {}))
+        self.assertEqual(tuple(hub.q1("SELECT hand, session FROM ui_requests WHERE request_id=?",
+                                      (receipt["request_id"],))), ("tool", None))
+        # a server that runs in a Claude Code session names that session on each command (X-Fleet-Session)
+        named = self.started(session="0d8aa41c-95ba")
+        sent = named.call("send_message", text="Go on with the export.")
+        self.assertEqual(tuple(hub.q1("SELECT hand, session FROM ui_requests WHERE request_id=?",
+                                      (sent["request_id"],))), ("tool", "claude-code/0d8aa41c-95ba"))
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "not a name"}):
+            self.assertIsNone(owner_mcp.session_label())
 
         # The answer carries a file, as a file that the owner drops on the item in the app does.
         source = pathlib.Path(tempfile.mkdtemp(prefix="fleet-answer-")) / "card.txt"
@@ -598,6 +615,19 @@ class FromNothing(WithServer):
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (need,))["answer"], "The company card.")
         self.assertEqual(hub.q1("SELECT r.need_id FROM attachments a JOIN ui_requests r ON r.request_id = a.message "
                                 "WHERE a.id=?", (sent["id"],))["need_id"], need)
+        # The review of 20 November 2026, issue 4: words to an item that has options are the hub's refusal, word
+        # for word, and the item stays open; the option that the owner chose goes
+        raised, error = hub.call_tool("manager", "raise_needs_you", {
+            "title": "Window 80?", "why": "UK checks", "what_to_do": "press one", "reason": "money",
+            "options": ["Go to 80", "Stay at 70"]})
+        self.assertFalse(error, raised)
+        nid = hub.q1("SELECT id FROM needs ORDER BY id DESC")["id"]
+        with self.assertRaises(Refused) as caught:
+            client.call("answer_needs_you", need=nid, answer="Not my decision: go ahead.")
+        self.assertIn(hub.refusal_words.WORDS["card_words_from_tool"], str(caught.exception))
+        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"])
+        self.assertTrue(client.call("answer_needs_you", need=nid, choice=1)["ok"])
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"], "Stay at 70")
 
         self.assertEqual(client.call("goal_state", id=goal, action="pause", note="later")["goal"]["state"], "paused")
         self.assertEqual(client.call("duty_state", id=duty, action="pause")["responsibility"]["state"], "paused")

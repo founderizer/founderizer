@@ -292,6 +292,10 @@ class Narrowed(Base):
         self.assertNotIn("drawer", listed)
         self.assertNotIn(hub.tref(narrowed), listed)
         hub.q("UPDATE tasks SET follows=? WHERE id=?", (plain, narrowed))     # it followed the agent's own task
+        # nor in its review of lessons (memory_rework_tasks), where a task that another one follows needed doing again
+        rework = hub.memory_rework_tasks("studio", 0)
+        self.assertNotIn(narrowed, [t["id"] for t, _ in rework])
+        self.assertFalse([why for _, why in rework if hub.tref(narrowed) in why], rework)  # nor as a follow-up's id
         behind = self.ok("see_earlier_work", context, task_id=hub.tref(mine))
         self.assertIn(f"{hub.tref(mine)} follows 1 earlier task(s)", behind)    # the walk goes on behind it
         self.assertIn(hub.tref(plain), behind)
@@ -382,8 +386,11 @@ class Narrowed(Base):
         """The manager's circle notice (circles) and the refused calls of its history (history_refusals) quote each
         refusal and name its task: the locked window's refusals of a repository outside its list named the narrowed
         pair's task and the repository. Neither names either now, nor counts the window's own calls that carry no
-        task; the refusals of a task of the agent's own are there as before. Bug: the manager's circle notice and its
-        refused-calls page quote the locked window's refusal and name its task."""
+        task, also after the owner widened the pair, which gives the open task back with no person: each refused call
+        of the window keeps the person's mark (calls.scope_person, person-scope-call-mark.md, tests 1 and 2). The
+        refusals of a task of the agent's own are there as before. Bugs: the manager's circle notice and its
+        refused-calls page quote the locked window's refusal and name its task; they hide it by the task's person
+        only, or the calls with no task only while the pair has a list, and both stop at the widening."""
         cid = self.says(PAT, "Please read the vault notes")["conversation"]
         narrowed = self.conversation_task(cid)["id"]
         mine, context = self.normal_task(title="Prepare the next report")
@@ -394,21 +401,68 @@ class Narrowed(Base):
             self.assertTrue(error, text)
         text, error = self.tool("read_attachment", self.context(cid), attachment_id="A-999999")
         self.assertTrue(error, text)
-        # the window's refusals are its task's calls, and its read_attachment is a call of no task
+        text, error = self.tool("create_task", self.context(cid), owner="vps", title="Read the vault")
+        self.assertIn("You have no tool named create_task.", text)
+        # the window's refusals are its task's calls, and its read_attachment and the tool that it has not are calls of
+        # no task; each one has the person's mark, and the calls of the agent's own task have none
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM calls WHERE ok=0 AND task=?", (narrowed,))["n"],
                          hub.CIRCLE_REFUSALS)
-        self.assertIsNotNone(hub.q1("SELECT 1 FROM calls WHERE ok=0 AND task IS NULL AND conversation=? AND "
-                                    "name='read_attachment'", (cid,)))
-        t0 = hub.now()
-        circles = "\n".join(line for _, line in hub.circles(t0))
-        history = "\n".join(hub.history_refusals({}, 7, t0 - 7 * 86400, t0 - 14 * 86400))
-        for text in (circles, history):
-            self.assertNotRegex(text, rf"\b{hub.tref(narrowed)}\b")
-            self.assertNotIn("zebra-vault", text)
-        self.assertNotIn("read_attachment", history)
-        self.assertIn(f"studio called set_reminder on {hub.tref(mine)} {hub.CIRCLE_REFUSALS} times", circles)
-        line = next((x for x in history.splitlines() if "studio / set_reminder" in x), "")
-        self.assertIn(hub.tref(mine), line, history)
+        self.assertEqual([r["name"] for r in hub.q("SELECT name FROM calls WHERE ok=0 AND task IS NULL AND "
+                                                   "conversation=? ORDER BY id", (cid,))],
+                         ["read_attachment", "create_task"])
+        marks = hub.q("SELECT task, scope_person FROM calls WHERE ok=0")
+        self.assertEqual({r["scope_person"] for r in marks if r["task"] != mine}, {self.pat["id"]})
+        self.assertEqual({r["scope_person"] for r in marks if r["task"] == mine}, {None})
+        for when in ("narrowed", "widened"):
+            t0 = hub.now()
+            circles = "\n".join(line for _, line in hub.circles(t0))
+            history = "\n".join(hub.history_refusals({}, 7, t0 - 7 * 86400, t0 - 14 * 86400))
+            for text in (circles, history):
+                self.assertNotRegex(text, rf"\b{hub.tref(narrowed)}\b", when)
+                self.assertNotIn("zebra-vault", text, when)
+            self.assertNotIn("read_attachment", history, when)
+            self.assertNotIn("create_task", history, when)
+            self.assertIn(f"studio called set_reminder on {hub.tref(mine)} {hub.CIRCLE_REFUSALS} times", circles)
+            line = next((x for x in history.splitlines() if "studio / set_reminder" in x), "")
+            self.assertIn(hub.tref(mine), line, history)
+            if when == "narrowed":
+                code, data = self.change(self.pat["id"], scopes={"studio": None})       # the owner widens it
+                self.assertEqual(code, 200, data)
+                self.assertIsNone(self.task(narrowed)["scope_person"])          # its open task is given back
+
+    def test_a_task_that_a_widening_gave_back_keeps_the_locked_windows_calls_apart(self):
+        """person-scope-call-mark.md, test 1: each call of a locked window keeps its person (calls.scope_person), a
+        done one as a refused one, and a widening gives the window's open task back with no person. After the
+        widening and a reply at All, another session of the agent finds none of the locked window's calls in that
+        task: not its call_api in search_history or read_history, and neither that call nor the window's refusals in
+        see_earlier_work, which reads the task itself. The owner reads them. The bug: the readers hide a narrowed
+        session's calls by the task's person only, which the widening took away."""
+        said = self.says(PAT, "Please read the vault notes")
+        cid, narrowed, p = said["conversation"], said["task"], self.pat["id"]
+        for _ in range(2):
+            text, error = self.tool("repo_read", self.context(cid), repo="acme/zebra-vault", path="README.md")
+            self.assertTrue(error, text)
+        self.ok("search_history", self.context(cid), query="vault")
+        # the window's call_api, as call_tool records it (see_earlier_work shows its answer, the history its args too)
+        hub.call_record("studio", narrowed, 1, "call_api", 1, json.dumps({"method": "POST", "path": "/v1/jaguar"}),
+                        "201 Created: the jaguar order", cid, None, p)
+        self.assertEqual([(r["name"], r["scope_person"]) for r in hub.q("SELECT name, scope_person FROM calls WHERE "
+                                                                        "conversation=? ORDER BY id", (cid,))],
+                         [("repo_read", p), ("repo_read", p), ("search_history", p), ("call_api", p)])
+        call = hub.q1("SELECT id FROM calls WHERE name='call_api'")["id"]
+        code, data = self.change(p, scopes={"studio": None})        # the owner widens it
+        self.assertEqual(code, 200, data)
+        self.assertIsNone(self.task(narrowed)["scope_person"])
+        self.answers(cid, said["id"], "The vault notes are in the wiki.")         # a reply at All ends the task
+        self.assertEqual(self.task(narrowed)["state"], "completed")
+        _, other = self.normal_task(title="Look for the orders")
+        self.assertFalse(self.found(other, "jaguar"))
+        self.assertIn("is not in your history", self.ok("read_history", other, ref=f"CR-{call}"))
+        earlier = self.ok("see_earlier_work", other, task=hub.tref(narrowed))
+        self.assertIn("The vault notes are in the wiki.", earlier)          # the task, which is at All now
+        self.assertNotIn("jaguar", earlier)                                 # what it sent outside
+        self.assertNotIn("zebra-vault", earlier)                            # what was refused in it
+        self.assertTrue(hub.history_found(None, {"query": "jaguar"}, True, 10)[0])         # the owner's
 
     def test_the_managers_first_prompt_names_no_narrowed_pairs_task(self):
         """The manager's first prompt (manager_resume_text) lists the open tasks, the results that wait for its check
@@ -480,7 +534,7 @@ class Narrowed(Base):
         cid = hub.q1("SELECT conversation FROM conversation_messages WHERE msg_id='m-scope'")["conversation"]
         self.assertIn("The picture follows", self.ok("read_attachment", self.context(cid), attachment_id=f"A-{up['id']}"))
         owners = hub.ins("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client,message) "
-                         "VALUES('r-owner','plan.png','image/png',64,?,?,'deterministic-test','u-1')",
+                         "VALUES('r-owner','plan.png','image/png',64,?,?,'founderizer-swift/1/test','u-1')",
                          (up["id"] and hub.q1("SELECT sha256 FROM attachments WHERE id=?", (up["id"],))["sha256"],
                           hub.now()))
         text, error = self.tool("read_attachment", self.context(cid), attachment_id=f"A-{owners}")
@@ -1055,7 +1109,9 @@ class Owner(Base):
         reads for nobody the owner's steer of that task, which the window must follow; or it reads an agent's message
         there for nobody, and its sender never hears that nobody will; or it finds a late record of the revoked wide
         window's session, which the time rule lets through when it comes after the list (Fable's decision (a): no
-        session record of a conversation task is a narrowed session's)."""
+        session record of a conversation task is a narrowed session's), or a late call of that window, which has no
+        mark (calls.scope_person, person-scope-call-mark.md, test 4). A call of a task that ended at All stays the
+        agent's other sessions' to find, also after a widening."""
         hello = self.says(PAT, "Hi there")
         ended = hello["task"]
         self.answers(hello["conversation"], hello["id"], "Hello Pat.")          # a window with the agent's tools
@@ -1071,6 +1127,8 @@ class Owner(Base):
         t0 = hub.now()
         at_all = (record(ended, t0 - 100, "The launchpad plan is for Friday."),
                   record(open_one, t0 - 50, "The capybara budget is nine thousand."))
+        heron = hub.ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,'studio',?,1,'call_api',"
+                        "?,1,'200 OK')", (t0 - 90, ended, json.dumps({"url": "https://api.example.com/heron"})))
         conv = hub.q1("SELECT * FROM conversations WHERE id=?", (hello["conversation"],))
         with hub.LOCK, hub.transaction():           # a result of work of the time at All, which joins the open task
             line = hub.conversation_post_rows(conv, "T-99 (Prices) is completed: the ocelot prices are ready.", t0 - 40)
@@ -1097,16 +1155,22 @@ class Owner(Base):
         # a late record of the revoked wide window, filed under the task that now has the person: a locked window
         # sends no session record, so every one of a conversation task is a wide window's
         late = record(open_one, hub.now() + hub.CONVERSATION_RECORD_SKEW + 1, "The koala branch is ready.")
-        # and a call record of the list's own time, which the narrowed session made (its call_api)
-        call = hub.ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,'studio',?,1,"
-                       "'call_api',?,1,'200 OK')", (hub.now() + hub.CONVERSATION_RECORD_SKEW + 1, open_one,
-                                                    json.dumps({"url": "https://api.example.com/jaguar"})))
+        # and a call record of the list's own time, which the narrowed session made (its call_api, with the person's
+        # mark), and a late call of the wide window, which has none (person-scope-call-mark.md, test 4)
+        call, lemur = (hub.ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail,scope_person) VALUES(?,"
+                               "'studio',?,1,'call_api',?,1,'200 OK',?)",
+                               (hub.now() + hub.CONVERSATION_RECORD_SKEW + 1, open_one,
+                                json.dumps({"url": f"https://api.example.com/{word}"}), mark))
+                       for word, mark in (("jaguar", self.pat["id"]), ("lemur", None)))
         here = self.context(hello["conversation"])
         self.assertEqual([self.found(here, w) for w in ("launchpad", "capybara", "ocelot", "serval", "koala", "jaguar",
-                                                        "thing")], [False, False, False, False, False, True, True])
+                                                        "lemur", "heron", "thing")],
+                         [False, False, False, False, False, True, False, False, True])
         for ref in at_all + (late,):
             self.assertIn("is not in your history", self.ok("read_history", here, ref=f"TR-{ref}"))
         self.assertIn("jaguar", self.ok("read_history", here, ref=f"CR-{call}"))
+        for ref in (lemur, heron):
+            self.assertIn("is not in your history", self.ok("read_history", here, ref=f"CR-{ref}"))
         # the line of the hub's that nobody read, and the line filed under the open task, were read at the first list:
         # the locked window never gets them, and its answer to the person's message ends the open task, which no
         # unread line keeps open
@@ -1122,6 +1186,9 @@ class Owner(Base):
         self.assertIsNone(self.conversation_task(hello["conversation"]))
         _, task = self.normal_task(title="Look at the plans")
         self.assertTrue(self.found(task, "launchpad"))          # a session with the agent's tools: its own work
+        self.assertTrue(self.found(task, "heron"))              # and its call of the time at All, also after a widening
+        self.assertEqual(self.scopes(None)[0], 200)
+        self.assertTrue(self.found(task, "heron"))
 
 
 class Settle(Base):
@@ -1281,6 +1348,43 @@ class Settle(Base):
         late = task(pat_c, "canceled", 6500.0)              # a second start changes nothing
         hub.settle_narrowed_rows()
         self.assertIsNone(person(late))
+
+    def test_the_start_marks_the_calls_of_a_narrowed_pairs_times_once(self):
+        """person-scope-call-mark.md, test 3: the calls that a hub stored before calls.scope_person came (the INSERT of
+        the release before, which a hub of that release still runs) get the person's mark at the start, one time
+        (narrowed_calls_settle): each call of the pair's window (calls.conversation) and each call of its conversation
+        tasks (a call of before 18 November 2026 has no window), made while the pair had a list. A call before the
+        first list, between two lists, of a pair that never had a list, and of another session gets none. The bugs:
+        no such pass, so the readers show the old calls; a pass that marks the calls of a time at All; a pass at each
+        start, which marks the calls that a hub of the release before wrote after it."""
+        lee = self.add(name="Lee", role="peer")
+        hub.q("DELETE FROM kv WHERE k=?", (hub.NARROWED_CALLS_SETTLED,))
+        pat_c, lee_c = self.conversation(self.pat["id"]), self.conversation(lee["id"])
+        self.narrow(self.pat["id"], {f"repo:{REPO}": "write"})          # Pat has a list now, and had one before
+        for at, words in ((5000.0, "1 resource(s) of its own"), (7000.0, "all of it"),
+                          (9000.0, "1 resource(s) of its own")):
+            hub.ins("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
+                    (at, "owner", f"P-{self.pat['id']}'s access with studio: {words}"))
+        pat_t, lee_t = (hub.ins("INSERT INTO tasks(title,owner,requester,state,created,source_conversation,"
+                                "source_message) VALUES('Answer','studio','manager','working',3000,?,1)", (c,))
+                        for c in (pat_c, lee_c))
+        other, _ = self.normal_task(title="Look for the lists")
+
+        def call(at, task=None, conv=None):
+            return hub.ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail,conversation) VALUES(?,"
+                           "'studio',?,1,'repo_read','{}',0,'Refused.',?)", (at, task, conv))
+        marked = [call(6000.0, conv=pat_c), call(6000.0, task=pat_t), call(9500.0, conv=pat_c),
+                  call(9500.0, task=pat_t)]
+        unmarked = [call(4000.0, conv=pat_c), call(4000.0, task=pat_t), call(8000.0, conv=pat_c),
+                    call(8000.0, task=pat_t), call(6000.0, conv=lee_c), call(6000.0, task=lee_t),
+                    call(6000.0, task=other)]
+        hub.settle_narrowed_rows()
+        mark = lambda cid: hub.q1("SELECT scope_person FROM calls WHERE id=?", (cid,))["scope_person"]
+        self.assertEqual([mark(c) for c in marked], [self.pat["id"]] * 4)
+        self.assertEqual([mark(c) for c in unmarked], [None] * 7)
+        again = call(6100.0, conv=pat_c)                    # a second start marks nothing
+        hub.settle_narrowed_rows()
+        self.assertIsNone(mark(again))
 
 
 class Door(Base):

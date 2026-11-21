@@ -48,7 +48,8 @@ class Health(OwnerAPI):
         return data
 
     def download(self, db="test-generation"):
-        req = urllib.request.Request(self.base + "/ui/backup?db=" + db, headers={"X-Fleet-Client": "deterministic-test"})
+        req = urllib.request.Request(self.base + "/ui/backup?db=" + db,
+                                     headers={"X-Fleet-Client": "founderizer-swift/1/test"})
         try:
             with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=5) as r:
                 return r.status, dict(r.headers), r.read()

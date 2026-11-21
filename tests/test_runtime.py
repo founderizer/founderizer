@@ -55,7 +55,7 @@ class Runtime(unittest.TestCase):
         self.tmp.cleanup()
 
     # ---- helpers
-    def call(self, method, path, body=None, client="deterministic-test"):
+    def call(self, method, path, body=None, client="founderizer-swift/1/test"):
         headers = {"Content-Type": "application/json"}
         if client:
             headers["X-Fleet-Client"] = client

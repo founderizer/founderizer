@@ -62,7 +62,7 @@ class Routes(OwnerAPI):
 
     # ---- helpers
     def call(self, path, body=None, source=None, token=None, auth=None):
-        headers = {"Content-Type": "application/json", "X-Fleet-Client": "deterministic-test"}
+        headers = {"Content-Type": "application/json", "X-Fleet-Client": "founderizer-swift/1/test"}
         if token is not None:
             headers["Authorization"] = "Bearer " + token
         if auth is not None:

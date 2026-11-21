@@ -184,7 +184,7 @@ class Fixture(OwnerAPI):
 
     def download(self, db="test-generation"):
         req = urllib.request.Request(self.base + "/ui/backup?db=" + db,
-                                     headers={"X-Fleet-Client": "deterministic-test"})
+                                     headers={"X-Fleet-Client": "founderizer-swift/1/test"})
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
             with opener.open(req, timeout=10) as r:
@@ -193,7 +193,7 @@ class Fixture(OwnerAPI):
             with e:
                 return e.code, dict(e.headers), e.read()
 
-    def send(self, data, query="", request_id=None, client="deterministic-test"):
+    def send(self, data, query="", request_id=None, client="founderizer-swift/1/test"):
         req = urllib.request.Request(self.base + "/ui/restore?db=test-generation" + query, data=data, method="POST",
                                      headers={"Content-Type": "application/zip", "X-Fleet-Client": client,
                                               "X-Fleet-Request-Id": request_id or str(uuid.uuid4())})
