@@ -8008,7 +8008,7 @@ def chat_team_once(agent):
     if before == listed:
         return people.strip() + "\n\n" if people else ""
     kv_set(f"chat_team:{agent}", listed)
-    # a change of the owner's name or language in Settings (owner_lines_changed): the directory again, which opens
+    # a change of the owner's name or language in Settings (start_settings_changed): the directory again, which opens
     # with the new lines, and a word that they replace what this conversation read before
     lead = OWNER_LINES_CHANGED + "\n" if before == OWNER_LINES_MARK else ""
     # An agent whose Shell box is off has no team directory (support plan F1), and its chat still answers the owner
@@ -8280,34 +8280,68 @@ def language_said(tag):
     return f"{LANGUAGE_NAMES[base]} ({tag})" if base in LANGUAGE_NAMES else f"the language of the tag {tag}"
 
 
-# A change of the owner's name or language in Settings, for the sessions that run (owner_lines_changed). The owner, 21
-# November 2026: "I changed the user name and the agent kept calling me by the previous name".
+# A change of the owner's name or language in Settings, for the sessions that run (start_settings_changed). The
+# owner, 21 November 2026: "I changed the user name and the agent kept calling me by the previous name".
 OWNER_LINES_MARK = "owner-lines"            # chat_team:<agent> after such a change: the chat reads its directory again
 OWNER_LINES_CHANGED = ("[hub] The owner changed their name or language in Settings. The lines below are the new ones: "
                        "they replace what this conversation, your start and your notes said before. A name with no "
                        "line below is gone: use none. A language with no line below is English.")
 
 
-def owner_lines_changed(changed, before):
-    """After save_settings changed owner.name or owner.language: each session that read the owner's lines in its start
-    (owner_start_text) keeps those words, and a warm owner chat or standing session does not start again
-    (session_reuse), so the hub gives the new lines to the sessions that run, under the hood. Each owner chat reads its
-    directory again with its next read, which opens with them (chat_team_once); the fleet manager's standing session,
-    and each live task whose start had them, get them in a quiet say, which wakes nobody and comes with its next read.
-    No line for a task of a narrowed pair (task_scope) or of an agent whose Shell box is off: their starts hold no
-    owner's line. A later start reads the setting itself."""
-    name, tag = setting("owner.name"), setting("owner.language")
-    lines = []
-    if "owner.name" in changed:
-        lines.append(f"THE OWNER'S NAME is now {name}: use it where a colleague would use a name." if name else
-                     "The owner has no name in Settings now: use none for them.")
-    # before: the settings that team.json held before the write; an empty or English tag is English, so a first fill
-    # of an English Mac is no news for a session
-    if "owner.language" in changed and (str(before.get("owner.language") or "en").split("-")[0].lower() != "en" or
-                                        (tag or "en").split("-")[0].lower() != "en"):
-        base = tag.split("-")[0].lower()
-        lines.append(f"THE OWNER'S LANGUAGE is now {language_said(tag) if tag and base != 'en' else 'English'}: write "
-                     f"in it every text that the owner's apps show.")
+def owner_name_line(before):
+    """START_SETTINGS' line of owner.name for a session that runs: the new name, or that there is none."""
+    name = setting("owner.name")
+    return (f"THE OWNER'S NAME is now {name}: use it where a colleague would use a name." if name else
+            "The owner has no name in Settings now: use none for them.")
+
+
+def owner_language_line(before):
+    """START_SETTINGS' line of owner.language, or none. before: the settings that team.json held before the write. An
+    empty or English tag is English, so a first fill of an English Mac is no news for a session."""
+    tag = setting("owner.language")
+    base = (tag or "en").split("-")[0].lower()
+    if base == "en" and str(before.get("owner.language") or "en").split("-")[0].lower() == "en":
+        return ""
+    return (f"THE OWNER'S LANGUAGE is now {language_said(tag) if base != 'en' else 'English'}: write in it every text "
+            f"that the owner's apps show.")
+
+
+# Each fact of a session's start reaches the sessions that run (W7 of the reliability plan, 21 November 2026: an
+# agent kept calling the owner by the old name, and each other setting that a start reads had the same fault). The
+# starts are START_ROOTS and what they call. START_SETTINGS has a row for each setting that they read: the function
+# that gives a running session its new line, or the reason why a running session needs none. save_settings, the one
+# write of the owner's settings, calls start_settings_changed. test_invariants reads the settings that START_ROOTS reach
+# and compares them with this table, so a start that reads a new setting needs its row first.
+START_ROOTS = ("start_text", "manager_resume_text", "chat_team_once", "chat_recap_text", "conversation_prompt",
+               "conversation_brief", "conversation_start", "conversation_instructions", "tools_for")
+START_SETTINGS = {
+    "owner.name": owner_name_line,
+    "owner.language": owner_language_line,
+    "kpis": "a release gate, not the owner's choice: its one line in a start asks a parent for a KPI, and while it is "
+            "off, see_history refuses kpis in its own words",
+    "contacts.v2": "one switch for the whole fleet, on one time: contacts_v2_on ends each conversation's window and "
+                   "open request itself, so its next message starts with the new tools; an owner chat and the "
+                   "manager read their people again by themselves (people_once), and a task session's tools are "
+                   "fixed at its start",
+    "conversations.closed_runtime": "the runtime of a closed session's next start: a running session keeps the "
+                                    "runtime that it started with",
+    "conversations.closed_version": "the version of that runtime at a closed session's next start: a running session "
+                                    "keeps its own",
+    "memory.start_chars": "only the size of the lessons block of a task's start: a running session has its block",
+}
+
+
+def start_settings_changed(changed, before):
+    """After each write of save_settings: the line of each setting in START_SETTINGS that changed, for the sessions
+    that run. A session keeps the words of its start, and a warm owner chat or standing session does not start again
+    (session_reuse), so the hub gives them the new lines, under the hood. Each owner chat reads its directory again
+    with its next read, which opens with them (chat_team_once); the fleet manager's standing session, and each live
+    task whose start had them, get them in a quiet say, which wakes nobody and comes with its next read. No line for
+    a task of a narrowed pair (task_scope) or of an agent whose Shell box is off: their starts hold no owner's line,
+    and the lines of the table are the owner's so far (a row whose start part reaches those sessions widens this). A
+    later start reads the setting itself."""
+    lines = [line for key, row in START_SETTINGS.items() if key in changed and callable(row) for line in [row(before)]
+             if line]
     if not lines:
         return
     text = "[hub] The owner changed this in Settings, and it replaces what your start said: " + " ".join(lines)
@@ -56571,7 +56605,7 @@ def save_settings(changes, facts=None, only_unset=False):
     commit = commit_kit_file("team.json", data, f"Owner set {said}")
     apply_team(team)
     log("owner", f"set {said} in {commit[:12]}")
-    owner_lines_changed(changed, before)    # the owner, 21 November 2026: an agent kept calling him by his old name
+    start_settings_changed(changed, before)     # W7: each setting that a start reads reaches the sessions that run
     return {"settings": settings_view(), "runtime_facts": runtime_facts_view(), "changed": changed,
             "revision": commit, "sha256": hashlib.sha256(data).hexdigest()}
 

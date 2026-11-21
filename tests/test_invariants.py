@@ -11,6 +11,7 @@ here is that the provenance is there and says the truth.
 
 An in-process hub with a temporary database and a set clock. No AI call, no live hub, no helper, no network.
 """
+import ast
 import hashlib
 import json
 import unittest
@@ -29,7 +30,7 @@ def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
     for cls in (SecretAtRender, SecretThroughAnEscape, SecretOutOfTheBuilding,
                 SealedHandoverIdentityFirst, InstructionIsNotAPermission, MemoryIsNotAPermission,
-                WordsStayTheirOwn, InstructionIsNotAMemory):
+                WordsStayTheirOwn, InstructionIsNotAMemory, StartFactsReachRunningSessions):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -850,3 +851,29 @@ class InstructionIsNotAMemory(Base):
         self.assertNotIn("read of outside text", said)
         # read_messages is not counted, and the comment above UNTRUSTED_READS says why: every session calls it.
         self.assertNotIn("read_messages", hub.UNTRUSTED_READS)
+
+class StartFactsReachRunningSessions(unittest.TestCase):
+    """A session keeps the words of its start, so each fact that a start reads needs its way to the sessions that
+    run (W7 of the reliability plan, 21 November 2026). It is here because it reads the whole hub, as this file's
+    other checks do, so a change of hub.py plans no other file for it."""
+
+    def test_each_setting_that_a_start_reads_has_its_line_or_its_reason(self):
+        """W7 of the reliability plan (21 November 2026): each fact of a session's start reaches the sessions that run.
+        The bug: a start text reads a new setting, and nobody writes what a running session gets when the owner
+        changes it, so the session keeps the old value, as it kept the owner's old name. The settings that
+        hub.START_ROOTS reach are the rows of hub.START_SETTINGS, each a line or a reason; and each *_start_text is
+        reached from those roots, so a new part of a start is not left out of this reading."""
+        tree = ast.parse(open(hub.__file__).read())
+        defs = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+        seen, todo = set(), list(hub.START_ROOTS)
+        while todo:
+            name = todo.pop()
+            if name not in seen:
+                seen.add(name)
+                todo += [n.id for n in ast.walk(defs[name]) if isinstance(n, ast.Name) and n.id in defs]
+        read = {n.value for name in seen for n in ast.walk(defs[name])
+                if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in hub.SETTINGS}
+        self.assertEqual(read, set(hub.START_SETTINGS))
+        self.assertEqual([name for name in defs if name.endswith("_start_text") and name not in seen], [])
+        for key, row in hub.START_SETTINGS.items():
+            self.assertTrue(callable(row) or isinstance(row, str) and row.strip(), key)
