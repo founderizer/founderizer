@@ -29,7 +29,9 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -70,7 +72,7 @@ PROFILE = "# Profile: vps\n\n**Character.** Careful.\n"
 def load_tests(loader, _tests, _pattern):
     """Only the tests of this file: the fixture it borrows carries its own."""
     suite = unittest.TestSuite()
-    for cls in (Signature, Manifest, Entitlement, Channel, Updates, HubRoutes, HubUpdates):
+    for cls in (Signature, Manifest, Entitlement, Channel, Updates, Causes, HubRoutes, HubUpdates):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -624,6 +626,7 @@ class Repositories(unittest.TestCase):
             self.ran.append(argv)
             if argv[0] == "git":
                 return releases._run(argv, timeout=timeout or releases.GIT_WAIT, cwd=cwd, input=input)
+            argv = argv[argv.index(sys.executable):]        # a check's own words, after its limit (check_prefix)
             if argv[-1].endswith("selftest.py"):
                 return selftest
             if argv[-3:] == ["verify", "--no-selftest", "--json"]:
@@ -1041,6 +1044,129 @@ class Updates(Repositories):
             self.assertIn(answer["state"], releases.STATES)
             self.assertIn(answer["step"], releases.STEPS)
             self.assertTrue(answer["says"])
+
+
+class Causes(Repositories):
+    """The cause of a run that did not end done (W11 of the reliability plan of 21 November 2026), and the limit its
+    checks run under (W2)."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(releases._SCOPE.clear)
+
+    def test_each_run_that_did_not_end_done_names_its_cause_and_none_is_guessed(self):
+        """The hub acts on the kind of the cause: it probes the network for a fetch that could not connect, and rests
+        a release that failed its checks. A self-test that failed read as the network would be probed for at each
+        poll and run again, and a fetch read as the release's fault would rest for a day. Words that name no cause
+        give none."""
+        said = ("fatal: unable to access 'https://github.com/example/fleet.git/': Failed to connect to github.com port "
+                "443 after 1 ms: Couldn't connect to server")
+        inner = self.runner()
+
+        def offline(argv, timeout=None, cwd=None, input=None):
+            if argv[3:5] == ["fetch", "-q"]:
+                return 128, "", said
+            return inner(argv, timeout=timeout, cwd=cwd, input=input)
+        released = self.publish(self.code(2))
+        for route, cause in ((False, "no_ipv4_route"), (True, "connect"), (None, "connect")):
+            with patch.object(releases, "ipv4_default_route", lambda: route), \
+                    patch.object(releases, "ipv6_address", lambda host: False):
+                answer = releases.Update(str(self.kit), releases.check(manifest(released), KEY), origin=self.origin,
+                                         upstream="https://github.com/example/fleet.git", run=offline).apply()
+            self.assertEqual((answer["state"], answer["step"], answer["cause"]), (releases.KEPT, "fetch", cause))
+        for words, cause in (("fatal: unable to access 'x': Could not resolve host: github.com", "dns"),
+                             ("gnutls_handshake() failed: The TLS connection was non-properly terminated.", "tls"),
+                             ("Failed to connect to github.com port 443 after 130 s: Connection timed out", "timeout"),
+                             ("The requested URL returned error: 502", "http"),
+                             ("fatal: repository 'https://github.com/example/fleet.git/' not found", None)):
+            self.assertEqual(releases.network_cause(words, "github.com", route=lambda: True), cause, words)
+        failed = self.update(released, run=self.runner(selftest=(1, "110 of 121 checks passed. FAILED: ['x']", "")))
+        self.assertEqual((failed["step"], failed["cause"]), ("selftest", "check"))
+        ended = self.update(released, run=self.runner(selftest=(-9, "3 of 214 checks passed so far", "")))
+        self.assertEqual((ended["step"], ended["cause"]), ("selftest", releases.MEMORY))
+        # With no OOMPolicy (systemd before 253) the system can end one hub that the self-test started, which then
+        # fails as a broken release would: the scope's count says memory. A check that the hub's own limit ended
+        # says nothing of the release.
+        child = self.runner(selftest=(1, "120 of 214 checks passed. FAILED: ['the hub answers']",
+                                      releases.OOM_MARK + ": the system ended 1 process(es) of this check"))
+        self.assertEqual(self.update(released, run=child)["cause"], releases.MEMORY)
+        slow = self.runner(selftest=(1, "", "python3 " + releases.TIMED_OUT + " 300 seconds"))
+        self.assertEqual(self.update(released, run=slow)["cause"], None)
+        own = self.runner(selftest=(1, "", "subprocess.TimeoutExpired: Command '['git']' timed out after 30 seconds"))
+        self.assertEqual(self.update(released, run=own)["cause"], "check")     # the check's own time-out: its answer
+        full = self.update(released, run=self.runner(verify=(0, json.dumps([{"check": "disk", "state": "fail"}]), "")))
+        self.assertEqual((full["step"], full["cause"]), ("verify", releases.DISK))
+        self.assertEqual(self.update(released, hold=True)["cause"], "hold")
+        done = self.update(released)
+        self.assertEqual((done["state"], done["cause"]), (releases.DONE, None))
+        self.assertEqual(set(releases.CAUSES), {c for kind in releases.KINDS.values() for c in kind})
+
+    def test_the_checks_run_under_their_limit_and_git_does_not(self):
+        """A check that does not fit the server's memory ran for 300 s while the server swapped and the hub answered
+        nothing (15 November 2026). The four checks run under the limit, at the lowest priority and in a memory scope
+        with no swap where systemd gives one, so such a check ends in seconds; git's own steps run as before."""
+        limit = ["nice", "-n", "19"]
+        answer = releases.Update(str(self.kit), releases.check(manifest(self.publish(self.code(2))), KEY),
+                                 upstream=self.upstream, origin=self.origin, run=self.runner(), limit=limit,
+                                 database=str(self.kit / "team.json")).apply()
+        self.assertEqual(answer["state"], releases.DONE, answer["says"])
+        checks = [argv for argv in self.ran if argv[0] != "git"]
+        self.assertEqual(len(checks), 4)            # hubpieces, the schema, selftest.py and fleet.py verify
+        self.assertTrue(all(argv[:3] == limit and argv[3] == sys.executable for argv in checks), checks)
+        everywhere = lambda name: "/usr/bin/" + name
+        scope = lambda argv, timeout=None: (0, "536870912", "") if argv[0] == "systemd-run" else (1, "", "")
+        words, plain = releases.check_prefix({"ram": 2 << 30, "swap": 4 << 30}, run=scope, which=everywhere)
+        self.assertIsNone(plain)
+        self.assertEqual(words[:3], ["systemd-run", "--user", "--scope"])
+        self.assertIn(f"MemoryMax={2 << 30}", words)
+        self.assertIn(f"MemorySwapMax={releases.CHECK_NEED // 2}", words)     # a bounded swap, never all of it
+        self.assertEqual(words[words.index("--") + 1:], ["sh", "-c", releases.SCOPE_SCRIPT, "founderizer-check", "nice",
+                                                         "-n", "19", "ionice", "-c", "2", "-n", "7"])
+        words, _ = releases.check_prefix({"ram": 1, "swap": 100 << 20}, run=scope, which=everywhere)   # read once
+        self.assertIn(f"MemoryMax={releases.CHECK_NEED}", words)
+        self.assertIn(f"MemorySwapMax={100 << 20}", words)                    # no more swap than is free
+        releases._SCOPE.clear()
+        refused = lambda argv, timeout=None: (1, "", "Failed to connect to bus: No medium found")
+        words, plain = releases.check_prefix(None, run=refused, which=everywhere)
+        self.assertEqual(words, ["nice", "-n", "19", "ionice", "-c", "2", "-n", "7"])
+        self.assertIn("No medium found", plain)
+
+    def test_a_step_at_its_limit_ends_whole_and_the_scope_shell_keeps_the_checks_end(self):
+        """A probe or a fetch at its limit left git-remote-https behind it, which held the step's output open, and so
+        the step, past its limit; the probe's 20 s held nothing then. The step runs in a process group of its own,
+        which ends whole, and says so in its own words. The shell of a check's scope gives back the check's own exit
+        status and signal, so that a check that the system ended still reads SIGKILL."""
+        began = time.monotonic()
+        code, _, err = releases._run(["sh", "-c", "sleep 30 & sleep 30"], timeout=1)
+        self.assertLess(time.monotonic() - began, 8, "the group held the step past its limit")
+        self.assertEqual(code, 1)
+        self.assertTrue(releases.timed_out(err), err)
+        shell = ["sh", "-c", releases.SCOPE_SCRIPT, "founderizer-check"]
+        self.assertEqual(releases._run([*shell, "sh", "-c", "echo out; exit 3"])[:2], (3, "out"))
+        self.assertEqual(releases._run([*shell, "sh", "-c", "kill -9 $$"])[0], -signal.SIGKILL)
+
+    def test_the_machine_is_read_from_its_own_proc_files(self):
+        """no_ipv4_route and the memory budget rest on two readings of /proc. Read wrongly, a server with a route
+        would be told it has none, and a server with room would take no release (or one with none would)."""
+        folder = Path(tempfile.mkdtemp(prefix="fleet-proc-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        route = folder / "route"
+        head = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+        link = "eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n"
+        route.write_text(head + "eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n" + link)
+        self.assertIs(releases.ipv4_default_route(str(route)), True)
+        route.write_text(head + link)                       # the test hub of 15 November: only its link's route
+        self.assertIs(releases.ipv4_default_route(str(route)), False)
+        self.assertIsNone(releases.ipv4_default_route(str(folder / "none")))
+        info = folder / "meminfo"
+        info.write_text("MemTotal:         969644 kB\nMemFree:           81232 kB\nMemAvailable:     452336 kB\n"
+                        "Buffers:           23360 kB\nCached:           401720 kB\nSwapCached:            0 kB\n"
+                        "SwapTotal:        524284 kB\nSwapFree:         262140 kB\nHugePages_Total:       0\n")
+        self.assertEqual(releases.memory_room(str(info)),
+                         {"free": (452336 + 262140) * 1024, "ram": 452336 * 1024, "swap": 262140 * 1024,
+                          "total": (969644 + 524284) * 1024, "ram_total": 969644 * 1024})
+        info.write_text("MemTotal:         969644 kB\nMemFree:           81232 kB\n")   # a kernel with no MemAvailable
+        self.assertIsNone(releases.memory_room(str(info)))
 
 
 # ---------------------------------------------------------------- the hub's own state and routes
@@ -1475,6 +1601,34 @@ class HubRoutes(OwnerAPI):
             self.finish()
         self.assertIsNone(hub.kv_get("releases_found"))
 
+    def test_a_probe_counts_only_after_the_last_failure_and_runs_alone(self):
+        """W11: a passed probe makes the sweep take a release that its network stopped only when the probe came after
+        that release's last run ended; an older pass would run it again at once after each failure, with session
+        starts held. And one probe runs at a time: two would ask the network twice and write the same keys twice."""
+        row = {"revision": "a" * 40, "finished": 200.0, "version": "2026.10.2"}
+        hub.kv_set("release_reach", json.dumps({"revision": "a" * 40, "at": 100.0}))
+        self.assertFalse(hub.release_reached(row))
+        hub.kv_set("release_reach", json.dumps({"revision": "a" * 40, "at": 300.0}))
+        self.assertTrue(hub.release_reached(row))
+        self.assertFalse(hub.release_reached(dict(row, revision="b" * 40)))
+        began, go, asked = threading.Event(), threading.Event(), []
+
+        def slow(kit, url):
+            asked.append(url)
+            began.set()
+            go.wait(20)
+            return False
+        with patch.object(releases, "reaches", slow):
+            try:
+                self.assertTrue(hub.release_probe(row))
+                self.assertTrue(began.wait(10))
+                self.assertFalse(hub.release_probe(row), "a second probe started beside the first")
+            finally:
+                go.set()
+                hub._release_probe["thread"].join(30)
+                hub._release_probe["thread"] = None
+        self.assertEqual(len(asked), 1)
+
     # ---- the entitlement
 
     def test_the_entitlement_is_kept_as_it_was_issued_and_shown_to_the_owner(self):
@@ -1806,9 +1960,11 @@ class HubUpdates(Repositories, HubRoutes):
         self.assertEqual(self.ref(hub.CONFIG_BRANCH), self.pinned)
         self.assertIsNone(hub.q1("SELECT * FROM machine_updates WHERE agent='vps'"))
 
-    def sweep(self, fetch, run=None):
-        """One automatic sweep after the poll time, run to its end, and each release's (state, step) by version."""
-        hub.kv_set("releases_swept", None)
+    def sweep(self, fetch, run=None, poll=True):
+        """One automatic sweep after the poll time, or at the next tick with `poll` false, run to its end, and each
+        release's (state, step) by version."""
+        if poll:
+            hub.kv_set("releases_swept", None)
         with patch.object(releases, "latest", functools.partial(releases.latest, fetch=fetch)), \
                 patch.object(releases, "Update", functools.partial(releases.Update, run=run or self.runner())):
             hub.release_sweep(hub.now())
@@ -1884,6 +2040,197 @@ class HubUpdates(Repositories, HubRoutes):
         hub.q("UPDATE releases SET reached=? WHERE revision=?", (self.pinned, released))   # cut off after its push
         hub.kv_set("release_rolled", json.dumps({"revision": released, "runs": 9, "passed": 0}))
         self.assertEqual(self.sweep(fetch)["2026.10.2"], (releases.DONE, "follow"))    # no rest: the run goes on
+
+    def probed(self):
+        """The published repository's addresses that the probes of the sweep asked, and a call that waits for the
+        probe that runs (release_probe)."""
+        asked = []
+
+        def ended():
+            if hub._release_probe["thread"] is not None:
+                hub._release_probe["thread"].join(30)
+            hub._release_probe["thread"] = None
+        self.addCleanup(ended)
+        return asked, ended
+
+    def offline(self, step, said):
+        """The runner of the tests, with git's `step` (`fetch` or `push`) failing with git's words `said`."""
+        inner = self.runner()
+
+        def run(argv, timeout=None, cwd=None, input=None):
+            if argv[0] == "git" and argv[3:4] == [step]:
+                return 128, "", said
+            return inner(argv, timeout=timeout, cwd=cwd, input=input)
+        return run
+
+    def test_a_run_that_failed_for_the_network_does_not_rest(self):
+        """W11 of the reliability plan of 21 November 2026: a fetch that the network stopped says nothing about the
+        release, so it is not counted as a failure of it, and each poll probes the network; read as a failed
+        self-test, it would rest more polls each time after the network came back. A network cause at the push is the
+        fleet's own repository, which the probe does not ask (a probe that passed would run the whole checks again
+        at each poll, with session starts held): that one is counted and rests as before."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        released = self.publish(self.code(2), "a release that this hub cannot download")
+        fetch = channel_of({"latest": manifest(released)})
+        asked, ended = self.probed()
+        with patch.object(releases, "reaches", lambda kit, url: asked.append(url) or False):
+            down = self.offline("fetch", "fatal: unable to access 'https://example.invalid/fleet.git/': Could not "
+                                         "resolve host: example.invalid")
+            self.assertEqual(self.sweep(fetch, run=down), {"2026.10.2": (releases.KEPT, "fetch")})
+            self.assertEqual(self.newest()["cause"], "dns")
+            for _ in range(3):
+                self.sweep(fetch, run=down)
+                ended()
+            self.assertEqual(asked, [self.upstream] * 3)            # a probe at each poll, and no rest
+            self.assertIsNone(hub.release_rolled_said())            # not counted as a failure of the release
+            other = self.publish(self.code(3), "a release that this hub cannot push")
+            fetch = channel_of({"latest": manifest(other, "2026.10.3")})
+            refused = self.offline("push", "fatal: unable to access 'https://example.invalid/fleet.git/': The "
+                                           "requested URL returned error: 503")
+            runs = lambda: hub.q1("SELECT COUNT(*) n FROM log WHERE what LIKE 'release 2026.10.3 %rolled_back at "
+                                  "push%'")["n"]
+            for _ in range(3):
+                self.assertEqual(self.sweep(fetch, run=refused)["2026.10.3"], (releases.ROLLED_BACK, "push"))
+            ended()
+        self.assertEqual(self.newest()["cause"], "http")
+        self.assertEqual(runs(), 2)                                 # the third poll rested
+        self.assertEqual(len(asked), 3, "a push that the fleet's own repository refused was probed for")
+
+    def test_a_fetch_that_fails_again_while_the_probe_passes_rests_from_the_second_run(self):
+        """`ls-remote` can pass while the fetch fails each time (an early EOF, an RPC that failed, the fetch's own
+        limit). Each such run holds the start of sessions, at every poll. A run that a passed probe started and whose
+        fetch failed for the network again counts as a run that failed here, so from the second the release rests as
+        such a run does."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        released = self.publish(self.code(2))
+        fetch = channel_of({"latest": manifest(released)})
+        early = self.offline("fetch", "error: RPC failed; curl 18 transfer closed with outstanding read data "
+                                      "remaining\nfatal: early EOF")
+        asked, ended = self.probed()
+        runs = lambda: hub.q1("SELECT COUNT(*) n FROM log WHERE what LIKE 'release %: kept at fetch%'")["n"]
+        with patch.object(releases, "reaches", lambda kit, url: asked.append(url) or True):
+            self.sweep(fetch, run=early)
+            self.assertEqual((runs(), self.newest()["cause"]), (1, "http"))
+            for _ in range(3):
+                self.sweep(fetch, run=early)                        # the poll: the probe passes
+                ended()
+                self.sweep(fetch, run=early, poll=False)            # its next tick takes the release, and fails
+        self.assertEqual((runs(), len(asked)), (3, 2), "the third poll ran it again")
+        self.assertEqual(hub.release_rolled_said()["runs"], 2)
+
+    def test_under_the_memory_need_no_automatic_run_starts_and_the_row_says_memory(self):
+        """W2: on 15 November 2026 a release's self-test on a server with 1 GB ran out of memory and held the hub
+        for minutes at each try. Under the measured need of the checks, with free swap, no automatic run starts: the
+        row is kept at `room` with the cause `memory`, the owner's API says it, and the sweep takes the release once
+        the memory is free. A run that the owner pressed runs all the same, inside its scope."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        released = self.publish(self.code(2))
+        fetch = channel_of({"latest": manifest(released)})
+        short = {"free": releases.CHECK_NEED - (1 << 20), "ram": 200 << 20, "swap": 0, "total": 1 << 30,
+                 "ram_total": 1 << 30}
+        with patch.object(releases, "memory_room", lambda path=None: short):
+            self.assertEqual(self.sweep(fetch), {"2026.10.2": (releases.KEPT, "room")})
+            self.assertEqual(self.ran, [], "a run started under the memory need")
+            one = self.newest()
+            self.assertEqual((one["cause"], one["started_at"]), (releases.MEMORY, None))
+            self.assertIn(f"{(releases.CHECK_NEED >> 20) - 1} MB of memory and swap free", one["says"])
+            self.sweep(fetch)                                   # the sweep does not write the same row again
+            self.assertEqual(self.newest()["finished_at"], one["finished_at"])
+            self.assertEqual(self.ran, [])
+        with patch.object(releases, "memory_room", lambda path=None: dict(short, free=releases.CHECK_NEED)):
+            self.assertEqual(self.sweep(fetch), {"2026.10.2": (releases.DONE, "follow")})
+        with patch.object(releases, "memory_room", lambda path=None: short):
+            code, _ = self.run_update(self.publish(self.code(3)), version="2026.10.3")     # the owner's own Update
+            self.assertEqual((code, self.newest()["state"], self.newest()["cause"]), (200, releases.DONE, None))
+
+    def test_two_releases_kept_for_memory_tell_the_manager_once(self):
+        """The plan's 3.5 point 3: a hub with too little memory for the checks takes no release, and nobody was told.
+        When the two newest releases that a run ended both ended for `memory`, kept before a run or rolled back when
+        the system ended a check (a hub with 1 GB and swap passes the budget, and its scope ends the self-test at each
+        release), the fleet's manager is told once, in plain words for the owner, for each size of the server's
+        memory: not again at each release, nor after a kernel update that moves that size a little, and again when
+        the owner changed the server and it is still too small. A type with 2 GB is named only for a small server."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        short = {"free": 300 << 20, "ram": 300 << 20, "swap": 0, "total": 1 << 30, "ram_total": 1 << 30}
+        told = lambda: [e["text"] for e in hub.q("SELECT text FROM events WHERE agent='manager' AND kind='say' AND "
+                                                  "text LIKE '[hub] Two releases in a row%' ORDER BY id")]
+        with patch.object(releases, "memory_room", lambda path=None: short):
+            for number, revision in enumerate(("a", "b", "c"), 2):
+                self.sweep(channel_of({"latest": manifest(revision * 40, f"2026.10.{number}")}))
+                self.assertEqual(len(told()), 0 if revision == "a" else 1, revision)
+            short["ram_total"] = (1 << 30) - (40 << 20)         # a kernel update takes 40 MiB more for itself
+            self.sweep(channel_of({"latest": manifest("d" * 40, "2026.10.5")}))
+            self.assertEqual(len(told()), 1, "a kernel update told the manager again")
+        large = {"free": 8 << 30, "ram": 7 << 30, "swap": 0, "total": 8 << 30, "ram_total": 8 << 30}
+        killed = self.runner(selftest=(-9, "3 of 214 checks passed so far", ""))
+        with patch.object(releases, "memory_room", lambda path=None: large):
+            fetch = channel_of({"latest": manifest(self.publish(self.code(2)), "2026.10.6")})
+            self.assertEqual(self.sweep(fetch, run=killed)["2026.10.6"], (releases.ROLLED_BACK, "selftest"))
+        self.assertEqual(self.newest()["cause"], releases.MEMORY)
+        self.assertEqual(len(told()), 2, "a release rolled back for memory was not counted")
+        self.assertIn("\"Your fleet's server hub has 1024 MB of memory, and updates need more. Change it at its "
+                      "provider to a type with 2 GB. That is your own step, and it costs more each month.\"",
+                      told()[0])
+        self.assertIn("\"Your fleet's server hub has too little free memory for updates. A type with more memory, or "
+                      "less work beside the hub on that server, is your own step", told()[1])
+        self.assertNotIn("2 GB", told()[1])
+
+    def test_a_run_started_by_the_hub_runs_its_checks_under_their_limit_and_with_no_old_cause(self):
+        """The wiring of W2 and W11: release_work hands the words of check_prefix, made from the machine's memory, to
+        the update run, which would else run its checks unbounded; and a run that starts clears the cause of the
+        run before, which the app would else say while the release updates."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        released = self.publish(self.code(2))
+        room = {"free": 4 << 30, "ram": 3 << 30, "swap": 0, "total": 4 << 30, "ram_total": 4 << 30}
+        seen, during = [], []
+        inner = self.runner()
+
+        def run(argv, timeout=None, cwd=None, input=None):
+            if argv[-1].endswith("selftest.py"):
+                with hub.LOCK:
+                    during.append(tuple(hub.q1("SELECT state, cause FROM releases WHERE revision=?", (released,))))
+            return inner(argv, timeout=timeout, cwd=cwd, input=input)
+        hub.ins("INSERT INTO releases(seen,revision,version,state,step,cause,finished) VALUES(?,?,?,?,?,?,?)",
+                (hub.now(), released, "2026.10.2", releases.KEPT, "fetch", "connect", hub.now()))
+        with patch.object(releases, "memory_room", lambda path=None: room), \
+                patch.object(releases, "check_prefix",
+                             lambda given=None: seen.append(given) or (["env", "LIMIT=1"], None)):
+            code, _ = self.run_update(released, run=run)
+        self.assertEqual((code, self.newest()["state"]), (200, releases.DONE))
+        self.assertEqual(seen, [room])
+        checks = [argv for argv in self.ran if argv[0] != "git"]
+        self.assertEqual(len(checks), 4)
+        self.assertTrue(all(argv[:2] == ["env", "LIMIT=1"] for argv in checks), checks)
+        self.assertEqual(during, [("updating", None)])
+
+    def test_a_run_with_no_room_rests_the_rest_of_its_day(self):
+        """W11: a run whose check the system ended for lack of memory fails the same way at the next poll, and each
+        run holds the start of sessions while it runs. It rests the rest of that day, unless the server got more
+        memory since; the next day the release is taken as a new one. A machine that gives no memory scope says so
+        in the hub's log once, and its runs go on."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        released = self.publish(self.code(2), "a release whose self-test the system ends")
+        fetch = channel_of({"latest": manifest(released)})
+        killed = self.runner(selftest=(-9, "3 of 214 checks passed so far", ""))
+        runs = lambda: hub.q1("SELECT COUNT(*) n FROM log WHERE what LIKE 'release %: rolled_back at selftest%'")["n"]
+        hub._release.pop("said_scope", None)
+        room = {"free": 4 << 30, "ram": 3 << 30, "total": 4 << 30}
+        with patch.object(releases, "memory_room", lambda path=None: room):
+            self.assertEqual(self.sweep(fetch, run=killed), {"2026.10.2": (releases.ROLLED_BACK, "selftest")})
+            self.assertEqual(self.newest()["cause"], releases.MEMORY)
+            self.sweep(fetch, run=killed)
+            self.assertEqual(runs(), 1)                         # the same day: it rests
+            room["total"] = 8 << 30                             # the server was given more memory
+            self.sweep(fetch, run=killed)
+            self.assertEqual(runs(), 2)
+            self.sweep(fetch, run=killed)
+            self.assertEqual(runs(), 2)
+            with patch.object(hub, "release_day", lambda t: "2999-01-01"):     # the next day
+                self.assertEqual(self.sweep(fetch), {"2026.10.2": (releases.DONE, "follow")})
+        if not releases.check_prefix()[1]:
+            return                                              # this machine gives a memory scope: no line
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM log WHERE what LIKE 'The checks of a release run with no "
+                                "memory limit%'")["n"], 1)
 
     def marked(self):
         """The release before (2026.11.121) and the marked release (2026.11.122) that needs it, both published, and

@@ -51,6 +51,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -565,15 +566,42 @@ def latest(channel, keys, token=None, *, fetch=_fetch, timeout=CHANNEL_TIMEOUT, 
 
 # ---------------------------------------------------------------- the update
 
-def _run(argv, timeout=GIT_WAIT, cwd=None, input=None):
-    """One command, with `input` as its standard input when given. It never raises: a step that cannot run is a step
-    that failed, with its reason."""
+TIMED_OUT = "ended at the hub's time limit of"    # the words of _run for a step that its limit ended (timed_out)
+
+
+def _run(argv, timeout=GIT_WAIT, cwd=None, input=None, env=None):
+    """One command, with `input` as its standard input when given, and `env` added to this process's environment. It
+    never raises: a step that cannot run is a step that failed, with its reason.
+
+    The command runs in a process group of its own, and at its `timeout` the whole group is ended, not only the
+    command: a git fetch or `ls-remote` leaves git-remote-https behind it, and a check run under the scope's shell
+    (SCOPE_SCRIPT) leaves the check, and either would hold the step's output open, and so the step, past its limit.
+    Such a step says TIMED_OUT, which `timed_out` reads, and which no program's own words say (a check's own
+    "timed out after 30 seconds" is the check's answer)."""
     try:
-        done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-                              **({"input": input} if input is not None else {"stdin": subprocess.DEVNULL}))
-        return done.returncode, done.stdout.strip(), done.stderr.strip()
+        proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                                env=dict(os.environ, **env) if env else None, start_new_session=True)
     except (OSError, subprocess.SubprocessError) as e:
         return 1, "", str(e)[:300]
+    try:
+        out, err = proc.communicate(input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass                    # a process that left the group holds the output: the step ends all the same
+        return 1, "", f"{os.path.basename(str(argv[0]))} {TIMED_OUT} {timeout} seconds"
+    return proc.returncode, (out or "").strip(), (err or "").strip()
+
+
+def timed_out(err):
+    """True when `_run` ended the step at its own limit: its whole words, and no other."""
+    return re.fullmatch(r"\S+ " + re.escape(TIMED_OUT) + r" [0-9.]+ seconds", str(err or "")) is not None
 
 
 def _line(text):
@@ -597,6 +625,83 @@ def _ended(code, out, err):
         f" ({name})"
     tail = " ".join(str(out or err or "").split())[-120:]   # its progress, not a warning; short: _said cuts at 400
     return f"{ended}; the end of what it printed: {tail}" if tail else ended
+
+
+def ipv4_default_route(path="/proc/net/route"):
+    """True when this machine has an IPv4 default route that is up, False when it has none, None when that cannot be
+    read (a machine with no /proc, such as a Mac). The kernel's own table, which `ip -4 route show default` reads too
+    and which needs no root: a row whose destination and mask are 00000000 and whose flags carry RTF_UP (1)."""
+    try:
+        with open(path) as table:
+            rows = [line.split() for line in table.read().splitlines()[1:]]
+    except OSError:
+        return None
+    try:
+        return any(len(row) >= 8 and row[1] == "00000000" and row[7] == "00000000" and int(row[3], 16) & 1
+                   for row in rows)
+    except ValueError:
+        return None
+
+
+def ipv6_address(host):
+    """True when `host` has an IPv6 address, False when the resolver answers that it has none, None when the resolver
+    gives no answer (it cannot be read)."""
+    try:
+        return bool(socket.getaddrinfo(host, 443, socket.AF_INET6, socket.SOCK_STREAM))
+    except socket.gaierror as e:
+        none = {getattr(socket, name) for name in ("EAI_NONAME", "EAI_NODATA", "EAI_ADDRFAMILY") if hasattr(socket, name)}
+        return False if e.errno in none else None
+    except (OSError, UnicodeError):
+        return None
+
+
+# git's own words, as curl and ssh write them, for each network cause: read in this order, so that a connection that
+# timed out is `timeout` and not `connect`, and a TLS or HTTP failure says that a connection was made.
+NETWORK_WORDS = (
+    ("dns", r"could not resolve host|could not resolve hostname|name or service not known|temporary failure in name "
+            r"resolution|nodename nor servname"),
+    ("tls", r"\bssl\b|\btls\b|certificate|gnutls|openssl"),
+    ("timeout", r"timed out|\btimeout\b|hub's time limit"),
+    ("connect", r"failed to connect|could(?:n't| not) connect|connection refused|network is unreachable|no route to "
+                r"host|connection reset|connect to host"),
+    ("http", r"the requested url returned error|\bhttp/\d|rpc failed|remote end hung up|early eof|unexpected "
+             r"disconnect"),
+)
+
+
+def network_cause(err, host, route=None, ipv6=None):
+    """The network cause of a git step that failed, from git's own words `err`, or None when they name none.
+
+    A connection that failed or timed out is `no_ipv4_route` when the machine says so at that moment: `host` has no
+    IPv6 address, and this server has no IPv4 default route. That was the owner's test hub from 15 to 21 November
+    2026: its server lost its IPv4 route, and github.com answers over IPv4 only. A reading that cannot be made (no
+    /proc, a resolver that does not answer) leaves git's own word."""
+    text = str(err or "").lower()
+    cause = next((name for name, words in NETWORK_WORDS if re.search(words, text)), None)
+    if cause in ("connect", "timeout") and host and (route or ipv4_default_route)() is False \
+            and (ipv6 or ipv6_address)(host) is False:
+        return "no_ipv4_route"
+    return cause
+
+
+def room_cause(code, *texts):
+    """`memory` when the system ended the step with SIGKILL, as the kernel does when memory runs out (`_ended` says
+    it too), or when the check's scope says that the system ended one of its processes for lack of memory (OOM_MARK);
+    `disk` when its words say that the disk is full; else None."""
+    said = " ".join(str(text or "") for text in texts)
+    if isinstance(code, int) and code == -signal.SIGKILL or OOM_MARK in said:
+        return MEMORY
+    said = said.lower()
+    if re.search(r"no space left on device|disk quota exceeded|database or disk is full", said):
+        return DISK
+    return None
+
+
+def check_cause(code, out, err, said="check"):
+    """The cause of a check of a release that did not pass: the room's (room_cause) when the system ended it or one of
+    its processes, or the disk was full; none when `_run` ended it at its own limit, which says nothing of the release
+    and nothing that can be read of the machine; else `said`, the check said no."""
+    return room_cause(code, err, out) or (None if timed_out(err) else said)
 
 
 def _host(url):
@@ -654,8 +759,118 @@ def schema_summary(out):
 # What an update run says about itself. The app shows the state and the line; nothing else reads them.
 KEPT, ROLLED_BACK, DONE, FAILED = "kept", "rolled_back", "done", "failed"
 STATES = (KEPT, ROLLED_BACK, DONE, FAILED)
-STEPS = ("hold", "branch", "clean", "pinned", "fetch", "have", "already", "minimum", "clone", "merge", "keep",
+# `room` is the hub's own step before a run (hub.release_work): the machine had too little memory for the checks.
+STEPS = ("room", "hold", "branch", "clean", "pinned", "fetch", "have", "already", "minimum", "clone", "merge", "keep",
          "schema", "selftest", "verify", "take", "push", "follow")
+
+# **The cause of a run that did not end done** (the reliability plan of 21 November 2026, 3.2): one code of this fixed
+# list, read from git's own words and the machine's state at that moment, or None when nothing says which, never a
+# guess. The hub keeps it in the release's row and acts on its kind (hub.release_work): a network cause rests not at
+# all, and the hub probes the published repository at each poll until it answers (reaches); a lack of room rests the
+# rest of the day; a release that did not pass rests as before; the fleet's own causes are as before.
+MEMORY, DISK = "memory", "disk"
+KINDS = {"network": ("no_ipv4_route", "dns", "connect", "tls", "http", "timeout"), "room": (MEMORY, DISK),
+         "release": ("conflict", "check"), "fleet": ("busy", "hold", "branch", "own_changes")}
+CAUSES = tuple(cause for causes in KINDS.values() for cause in causes)
+
+
+def kind(cause):
+    """`network`, `room`, `release` or `fleet` for a cause of CAUSES, else None."""
+    return next((name for name, causes in KINDS.items() if cause in causes), None)
+
+
+# **What a release's checks need** (W2 of that plan). The peak of the memory that the self-test of a release took,
+# summed over its own process and the hubs it starts, was 497 MiB and 444 MiB in two runs on the owner's Mac on 21
+# November 2026 (macOS 27, Python 3.12, the code of commit 89eb5eddd, 214 of 214 checks passed in 47 s and 42 s): the
+# code exported into a folder of its own, its hub.py compiled in pieces first (`python3 -B -m hubpieces`), as a
+# release's run does, then `python3 selftest.py` there, with `ps -axo pid=,ppid=,rss=` read every 0.1 s and the RSS of
+# the process tree summed. `fleet.py verify --no-selftest --json` took 118 MiB, and the schema check is one hub. A
+# sum of RSS counts the pages that processes share once for each of them, so it is above what a Linux memory cgroup
+# counts. With a fifth more for a release that grows, CHECK_NEED: a hub whose server has less free memory and swap
+# than this starts no run (hub.release_work), and records `memory` as the cause.
+CHECK_NEED = 600 * 2 ** 20
+PROBE_WAIT = 20             # seconds for `git ls-remote` of the published repository (reaches)
+_SCOPE = {}                 # the memory scope that this machine gives, read once (check_prefix)
+
+
+def memory_room(path="/proc/meminfo"):
+    """{free, ram, swap, total, ram_total} in bytes from /proc/meminfo: the memory that can be given now with free swap
+    (MemAvailable + SwapFree), the memory that can be given now without swapping anything out (MemAvailable), the free
+    swap (SwapFree), all of it (MemTotal + SwapTotal), and the server's memory (MemTotal). None where it cannot be read
+    (no /proc, a kernel with no MemAvailable)."""
+    try:
+        with open(path) as info:
+            fields = {line.split(":")[0]: int(line.split()[1]) * 1024 for line in info if line.count(":") == 1
+                      and len(line.split()) >= 2 and line.split()[1].isdigit()}
+    except (OSError, ValueError):
+        return None
+    if "MemAvailable" not in fields or "MemTotal" not in fields:
+        return None
+    return {"free": fields["MemAvailable"] + fields.get("SwapFree", 0), "ram": fields["MemAvailable"],
+            "swap": fields.get("SwapFree", 0), "total": fields["MemTotal"] + fields.get("SwapTotal", 0),
+            "ram_total": fields["MemTotal"]}
+
+
+# The shell that each check runs under inside its scope. It runs the check, then reads `oom_kill` in the scope's own
+# memory.events, which a fresh scope starts at 0: where systemd cannot end the whole scope when the system ends one
+# of its processes (OOMPolicy, systemd before 253), a hub that the self-test starts can be the one that is ended,
+# and the self-test then fails as if the release were at fault. A count above 0 adds OOM_MARK to the check's error
+# output (room_cause reads it). A check that a signal ended ends this shell with the same signal, so that _ended and
+# room_cause read it as before.
+OOM_MARK = "founderizer-oom-kill"
+SCOPE_SCRIPT = ('"$@"; s=$?; k=$(sed -n "s/^oom_kill //p" "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup '
+                '2>/dev/null)/memory.events" 2>/dev/null); if [ "${k:-0}" -gt 0 ] 2>/dev/null; then echo '
+                '"' + OOM_MARK + ': the system ended $k process(es) of this check for lack of memory" >&2; fi; '
+                'if [ "$s" -gt 128 ]; then kill -$((s - 128)) $$ 2>/dev/null; fi; exit "$s"')
+
+
+def check_prefix(room=None, run=_run, which=shutil.which):
+    """(the words that each check of a release runs under, a sentence when they hold no memory limit, else None).
+
+    The checks run at the lowest CPU priority (`nice -n 19`) and at the lowest disk priority of the best-effort class
+    where `ionice` is there (`-c 2 -n 7`; the idle class could starve a check behind the hub's own steady writes), and,
+    where systemd's user manager gives it to this user, in a scope of their own with a memory limit and a bounded swap.
+    So a check that does not fit ends in seconds with SIGKILL (`memory`), and not after 300 s in which the server swaps
+    and the hub answers nothing (15 November 2026). The limit is the memory free now without swap (`ram`), and
+    CHECK_NEED where that is less. The swap is the free swap, and half of CHECK_NEED at most: the need was measured as
+    a sum of RSS on a Mac and never on Linux, and a check of a server with 1 GB that passed slowly with some swap must
+    not fail at every release. The scope ends whole when the system ends one of its processes, where systemd can say
+    so (OOMPolicy=kill), so that the check's own process reads SIGKILL too; where it cannot, SCOPE_SCRIPT reads the
+    scope's own count of such ends.
+
+    Whether a scope can be made is read once for each process, by a scope that prints its own limit: a machine with
+    no systemd, no user manager, or no memory controller for this user gives none, and the checks then run under nice
+    and ionice alone."""
+    words = ["nice", "-n", "19"] if which("nice") else []
+    words += ["ionice", "-c", "2", "-n", "7"] if which("ionice") else []
+    if "scope" not in _SCOPE:
+        _SCOPE["scope"], _SCOPE["says"] = None, "no systemd-run on this machine"
+        for extra in (["-p", "OOMPolicy=kill"], []) if which("systemd-run") else ():
+            code, out, err = run(["systemd-run", "--user", "--scope", "--quiet", "--collect", "-p",
+                                  "MemoryMax=536870912", "-p", "MemorySwapMax=0", *extra, "--", "sh", "-c",
+                                  'cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"'], timeout=30)
+            if code == 0 and out.strip().isdigit():
+                _SCOPE["scope"], _SCOPE["says"] = extra, None
+                break
+            _SCOPE["says"] = _line(err or out) or f"systemd-run ended with {code}"
+    if _SCOPE["scope"] is None:
+        return words, (f"The checks of a release run with no memory limit, because this machine gives no scope "
+                       f"with one: {_SCOPE['says']}.")
+    limit = max(CHECK_NEED, (room or {}).get("ram") or 0)
+    swap = min((room or {}).get("swap") or 0, CHECK_NEED // 2)
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "-p", f"MemoryMax={limit}", "-p",
+            f"MemorySwapMax={swap}", *_SCOPE["scope"], "--", "sh", "-c", SCOPE_SCRIPT, "founderizer-check",
+            *words], None
+
+
+def reaches(kit, url, run=_run):
+    """True when the published repository answers now: `git ls-remote` of it, PROBE_WAIT seconds at most, with no
+    prompt (GIT_TERMINAL_PROMPT=0, no standard input). It reads the address the fetch reads, with the checkout's own
+    configuration, and changes nothing: ls-remote writes no object and no ref. `_run` starts it in a process group of
+    its own and ends the whole group at PROBE_WAIT, so git-remote-https cannot hold the probe past it."""
+    code, _, _ = run(["git", "-C", kit, "ls-remote", "-q", url, "HEAD"], timeout=PROBE_WAIT,
+                     env={"GIT_TERMINAL_PROMPT": "0"})
+    return code == 0
 
 
 class Update:
@@ -683,15 +898,20 @@ class Update:
 
     `own` is called with a tip that the ref moved to under the push: true for a write of the hub's own whose push
     landed while the rest of it never ran (hub.KIT_PUSHED). The run does not merge onto that tip, which the hub
-    takes back; it ends rolled back at the push, and the next run takes the release."""
+    takes back; it ends rolled back at the push, and the next run takes the release.
+
+    `limit` is the words that each of the four checks runs under (check_prefix): its priority and its memory scope.
+
+    Each answer carries `cause`: one code of CAUSES for a run that did not end done, read from git's words, the
+    signal that ended a check and the machine's state, or None where nothing says which."""
 
     def __init__(self, kit, manifest, *, origin=None, upstream=None, branch=None, remote=REMOTE,
                  run=_run, python=None, database=None, selftest_wait=SELFTEST_WAIT, verify_wait=VERIFY_WAIT,
-                 schema_wait=SCHEMA_WAIT, floor=None, pushed=None, own=None):
+                 schema_wait=SCHEMA_WAIT, floor=None, pushed=None, own=None, limit=()):
         from lifecycle import CONFIG_BRANCH
         self.kit, self.manifest, self.origin, self.upstream = kit, manifest, origin, upstream
         self.branch, self.remote, self.run, self.database = branch or CONFIG_BRANCH, remote, run, database
-        self.floor, self.pushed, self.own = floor, pushed, own
+        self.floor, self.pushed, self.own, self.limit = floor, pushed, own, list(limit or ())
         self.python = python or sys.executable
         self.selftest_wait, self.verify_wait, self.schema_wait = selftest_wait, verify_wait, schema_wait
         # pinned: the revision this fleet runs and keeps. reached: the revision that got onto the configuration
@@ -703,9 +923,14 @@ class Update:
     def git(self, *args, cwd=None, timeout=GIT_WAIT):
         return self.run(["git", "-C", cwd or self.kit, *args], timeout=timeout)
 
-    def answer(self, state, step, says):
+    def answer(self, state, step, says, cause=None):
         return {"state": state, "step": step, "says": _said(says), "pinned": self.pinned, "reached": self.reached,
-                "revision": self.manifest["revision"], "version": self.manifest["version"]}
+                "revision": self.manifest["revision"], "version": self.manifest["version"],
+                "cause": cause if state != DONE and cause in CAUSES else None}
+
+    def check_run(self, argv, timeout):
+        """One of the four checks, under `limit`, in the clone."""
+        return self.run([*self.limit, *argv], timeout=timeout, cwd=self.clone)
 
     # ---- the run
 
@@ -727,13 +952,14 @@ class Update:
         """Everything that is read before a single object is written: the answer when the run stops here."""
         manifest = self.manifest
         if manifest["hold"]:
-            return self.answer(KEPT, "hold", f"release {manifest['version']} is held: no fleet takes it")
+            return self.answer(KEPT, "hold", f"release {manifest['version']} is held: no fleet takes it", "hold")
         code, branch, _ = self.git("symbolic-ref", "--short", "--quiet", "HEAD", timeout=60)
         if code != 0 or branch != self.branch:
             return self.answer(KEPT, "branch", f"this checkout is on {branch or 'no branch'}, not the configuration "
-                                               f"ref {self.branch}, so a release cannot be merged into it")
+                                               f"ref {self.branch}, so a release cannot be merged into it", "branch")
         if self.git("status", "--porcelain", "--untracked-files=no", timeout=60)[1]:
-            return self.answer(KEPT, "clean", "this checkout has its own changes; nothing is merged over them")
+            return self.answer(KEPT, "clean", "this checkout has its own changes; nothing is merged over them",
+                               "own_changes")
         code, head, _ = self.git("rev-parse", "HEAD", timeout=60)
         if code != 0 or not REVISION.fullmatch(head):
             return self.answer(KEPT, "pinned", "this checkout has no revision to pin")
@@ -759,27 +985,33 @@ class Update:
             if not self.upstream:
                 return self.answer(KEPT, "fetch", f"this checkout has no remote {self.remote} and no address was "
                                                   f"configured for it")
-            if self.git("remote", "add", self.remote, self.upstream, timeout=60)[0] != 0:
-                return self.answer(KEPT, "fetch", f"the remote {self.remote} could not be added")
+            code, _, err = self.git("remote", "add", self.remote, self.upstream, timeout=60)
+            if code != 0:
+                return self.answer(KEPT, "fetch", f"the remote {self.remote} could not be added", room_cause(code, err))
         elif self.upstream and url != self.upstream:
-            if self.git("remote", "set-url", self.remote, self.upstream, timeout=60)[0] != 0:
+            code, _, err = self.git("remote", "set-url", self.remote, self.upstream, timeout=60)
+            if code != 0:
                 return self.answer(KEPT, "fetch", f"the remote {self.remote} could not be pointed at the published "
-                                                  f"repository")
+                                                  f"repository", room_cause(code, err))
         code, _, err = self.git("fetch", "-q", "--no-write-fetch-head", self.remote)
         if code != 0:
             # First what a person reads in one go, then git's own line: a server with no route to github.com (the
             # owner's test fleet, 21 November 2026) said only "The fetch of upstream failed: fatal: unable to access…".
-            where = _host(self.upstream or url) or "the published repository"
+            where = _host(self.upstream or url)
             return self.answer(KEPT, "fetch", f"This server could not download release {self.manifest['version']} "
-                                              f"from {where}, so this fleet did not take it. The fetch of "
-                                              f"{self.remote} failed: {err[-200:]}")
+                                              f"from {where or 'the published repository'}, so this fleet did not "
+                                              f"take it. The fetch of {self.remote} failed: {err[-200:]}",
+                               room_cause(code, err) or network_cause(err, where))
         return None
 
     def in_clone(self):
         """The merge and the three checks, in a clone, then the push and this checkout's own fast-forward."""
         code, _, err = self.run(["git", "clone", "-q", "--shared", self.kit, self.clone])
-        if code != 0 or self.git("checkout", "-q", self.pinned, cwd=self.clone, timeout=60)[0] != 0:
-            return self.answer(ROLLED_BACK, "clone", f"the update could not be prepared: {err[-200:]}")
+        if code == 0:
+            code, _, err = self.git("checkout", "-q", self.pinned, cwd=self.clone, timeout=60)
+        if code != 0:
+            return self.answer(ROLLED_BACK, "clone", f"the update could not be prepared: {err[-200:]}",
+                               room_cause(code, err))
         answer = self.merge()
         if answer:
             return answer
@@ -817,7 +1049,7 @@ class Update:
             code, out, err = self.clone_git("ls-tree", "-r", "-z", "--full-tree", rev)
             if code != 0:
                 return self.answer(ROLLED_BACK, "merge", f"release {version} could not be read: {_line(err)}. The "
-                                                         f"fleet stays at {self.pinned[:12]}.")
+                                                         f"fleet stays at {self.pinned[:12]}.", room_cause(code, err))
             for line in out.split("\0"):
                 path = line.partition("\t")[2]
                 if path and path != lifecycle.RELEASE_FILE and lifecycle.data_path(path) == data:
@@ -826,7 +1058,8 @@ class Update:
             code, out, err = self.run(["git", "-C", self.clone, *args], timeout=60, input=given)
             if code != 0:
                 return self.answer(ROLLED_BACK, "merge", f"release {version} could not be put together: "
-                                                         f"{_line(err or out)}. The fleet stays at {self.pinned[:12]}.")
+                                                         f"{_line(err or out)}. The fleet stays at {self.pinned[:12]}.",
+                                   room_cause(code, err, out))
             if given is not None:
                 entries.append(f"{lifecycle.DATA_MODE} blob {out}\t{lifecycle.RELEASE_FILE}")
         code, out, err = self.run(["git", "-C", self.clone, "update-index", "-z", "--index-info"], timeout=60,
@@ -835,14 +1068,16 @@ class Update:
         commit = self.run(["git", "-C", self.clone, *author, "commit-tree", tree, "-p", base, "-p", revision, "-m",
                            f"Take release {version} ({revision[:12]})"], timeout=60)[1] if REVISION.fullmatch(tree) \
             else ""
-        if not REVISION.fullmatch(commit) or self.clone_git("reset", "-q", "--hard", commit)[0] != 0:
+        reset = self.clone_git("reset", "-q", "--hard", commit) if REVISION.fullmatch(commit) else (1, "", "")
+        if reset[0] != 0:
             return self.answer(ROLLED_BACK, "merge", f"release {version} could not be committed onto this fleet: "
                                                      f"{_line(err or out) or 'git made no commit'}. The fleet stays "
-                                                     f"at {self.pinned[:12]}.")
+                                                     f"at {self.pinned[:12]}.", room_cause(code, err, out, reset[2]))
         code, names, _ = self.clone_git("diff", "--no-renames", "--name-only", "-z", base, "HEAD")
         if code != 0 or any(lifecycle.data_path(one) for one in names.split("\0") if one):
             return self.answer(ROLLED_BACK, "keep", f"release {version} changes this fleet's own configuration, which "
-                                                    f"a release never does. The fleet stays at {self.pinned[:12]}.")
+                                                    f"a release never does. The fleet stays at {self.pinned[:12]}.",
+                               "conflict" if code == 0 else None)
         return None
 
     def release_text(self):
@@ -860,7 +1095,7 @@ class Update:
         if problem:
             return self.answer(ROLLED_BACK, "take", f"release {self.manifest['version']} passed every check, and the "
                                                     f"check of each machine refuses it: {_line(problem)}. The fleet "
-                                                    f"stays at {self.pinned[:12]}.")
+                                                    f"stays at {self.pinned[:12]}.", "check")
         return None
 
     def pieces(self):
@@ -871,7 +1106,7 @@ class Update:
         writer of its own hub.py, with -B, so that Python writes no compiled file of the writer itself. Its answer is
         not read, and it stops nothing: when it writes no file (a clone of a release from before it, a process that
         the system ended), the first check compiles the whole file, as before."""
-        self.run([self.python, "-B", "-m", "hubpieces"], timeout=PIECES_WAIT, cwd=self.clone)
+        self.check_run([self.python, "-B", "-m", "hubpieces"], PIECES_WAIT)
 
     def schema_check(self):
         """The released code's own schema against a copy of this fleet's database, in the clone.
@@ -900,22 +1135,23 @@ class Update:
             shutil.copyfile(self.database, copy)
         except OSError as e:
             return self.answer(ROLLED_BACK, "schema", f"this fleet's database could not be copied for the schema "
-                                                      f"check of release {version}: {e}. The fleet stays at {pinned}.")
-        code, out, err = self.run([self.python, "-m", "hub", "--check-schema", copy],
-                                  timeout=self.schema_wait, cwd=self.clone)
+                                                      f"check of release {version}: {e}. The fleet stays at {pinned}.",
+                               room_cause(None, os.strerror(e.errno) if e.errno else ""))
+        code, out, err = self.check_run([self.python, "-m", "hub", "--check-schema", copy], self.schema_wait)
         summary = schema_summary(out)
         if summary is None:
             return self.answer(ROLLED_BACK, "schema", f"release {version} could not read this fleet's database: "
                                                       f"{_ended(code, out, err)}. The fleet stays at "
-                                                      f"{pinned}.")
+                                                      f"{pinned}.", check_cause(code, out, err))
         refused, says = summary
         if refused:
             return self.answer(ROLLED_BACK, "schema", f"release {version} needs {refused} schema step(s) that this "
                                                       f"fleet's own records refuse ({_line('; '.join(says[:2]))}). "
-                                                      f"The fleet stays at {pinned}.")
+                                                      f"The fleet stays at {pinned}.", check_cause(code, out, err))
         if code != 0:
             return self.answer(ROLLED_BACK, "schema", f"the schema check of release {version} ended with {code} "
-                                                      f"and named nothing. The fleet stays at {pinned}.")
+                                                      f"and named nothing. The fleet stays at {pinned}.",
+                               check_cause(code, out, err))
         return None
 
     def checks(self):
@@ -928,29 +1164,29 @@ class Update:
         if answer:
             return answer
         version, pinned = self.manifest["version"], self.pinned[:12]
-        code, out, err = self.run([self.python, os.path.join(self.clone, "selftest.py")],
-                                  timeout=self.selftest_wait, cwd=self.clone)
+        code, out, err = self.check_run([self.python, os.path.join(self.clone, "selftest.py")], self.selftest_wait)
         summary = selftest_summary(out)
         if summary is None:
             return self.answer(ROLLED_BACK, "selftest", f"selftest.py did not answer for release {version}: "
                                                         f"{_ended(code, out, err)}. The fleet stays at "
-                                                        f"{pinned}.")
+                                                        f"{pinned}.", check_cause(code, out, err))
         passed, total, failed, new = summary
         if new:
             return self.answer(ROLLED_BACK, "selftest", f"release {version} fails {len(new)} check(s) that the "
                                                         f"baseline does not have ({', '.join(new[:4])}); "
-                                                        f"{passed} of {total} passed. The fleet stays at {pinned}.")
+                                                        f"{passed} of {total} passed. The fleet stays at {pinned}.",
+                               check_cause(code, out, err))
         if code != 0 and not failed:
             return self.answer(ROLLED_BACK, "selftest", f"selftest.py ended with {code} for release {version} and "
                                                         f"named no failure; {passed} of {total} passed. The fleet "
-                                                        f"stays at {pinned}.")
+                                                        f"stays at {pinned}.", check_cause(code, out, err))
         # **Without its own self-test** (verify.WITHOUT): selftest.py has just passed on this clone, and fleet.py verify
         # ran the same file in the same clone a second time. Each run waits for the hub's timers, so that second run
         # was a minute of the two that the owner waited on Updates for every release (14 November 2026: "clicked on
         # Update fleet, seems stuck, not a great ux"). The released fleet.py always knows the option: a release
         # comes after the code that runs this, which already has it.
-        code, out, err = self.run([self.python, os.path.join(self.clone, "fleet.py"), "verify", "--no-selftest",
-                                   "--json"], timeout=self.verify_wait, cwd=self.clone)
+        code, out, err = self.check_run([self.python, os.path.join(self.clone, "fleet.py"), "verify", "--no-selftest",
+                                         "--json"], self.verify_wait)
         try:
             results = json.loads(out)
             # A check the owner alone can pass says nothing about the release (verify.OWNER_STEPS): a fleet that has
@@ -960,10 +1196,11 @@ class Update:
         except (ValueError, TypeError, KeyError):
             return self.answer(ROLLED_BACK, "verify", f"fleet.py verify did not answer for release {version}: "
                                                       f"{_ended(code, out, err)}. The fleet stays at "
-                                                      f"{pinned}.")
+                                                      f"{pinned}.", check_cause(code, out, err))
         if bad:
             return self.answer(ROLLED_BACK, "verify", f"release {version} is not healthy: verify failed "
-                                                      f"{', '.join(bad)}. The fleet stays at {pinned}.")
+                                                      f"{', '.join(bad)}. The fleet stays at {pinned}.",
+                               check_cause(code, out, err, DISK if "disk" in bad else "check"))     # verify's disk check
         return None
 
     def publish(self, merged):
@@ -996,12 +1233,13 @@ class Update:
             if tip is None or not self.may_follow(tip, merged):
                 return self.answer(ROLLED_BACK, "push", f"release {version} passed every check and the push to "
                                                         f"{self.branch} was refused: {_line(err)}. The fleet stays "
-                                                        f"at {self.pinned[:12]}.")
+                                                        f"at {self.pinned[:12]}.",
+                                   room_cause(code, err) or network_cause(err, _host(self.origin)))
             if not left:
                 return self.answer(ROLLED_BACK, "push", f"release {version} passed every check, and {self.branch} "
                                                         f"moved under it {PUSH_TRIES} times while it was pushed, "
                                                         f"so the fleet stays at {self.pinned[:12]}. Press Update "
-                                                        f"again when this fleet is writing less.")
+                                                        f"again when this fleet is writing less.", "busy")
             answer, merged = self.catch_up(tip, merged)
             if answer:
                 return answer
@@ -1079,5 +1317,5 @@ class Update:
                                                     f"{', '.join(changed[:4])}, which is not this fleet's own "
                                                     f"configuration, so what passed the checks is no longer what "
                                                     f"would run. The fleet stays at {pinned}. Press Update again "
-                                                    f"to check the release against it."), checked
+                                                    f"to check the release against it.", "own_changes"), checked
         return self.take(tip, again), again

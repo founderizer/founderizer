@@ -7554,6 +7554,9 @@ def migrate():
         "agents": {"deleted": "REAL"},
         # the outgoing gate: the posts in a row whose gate did not answer, and whose gate had no table (egress_troubles)
         "egress_servers": {"down": "INTEGER NOT NULL DEFAULT 0", "unloaded": "INTEGER NOT NULL DEFAULT 0"},
+        # the reliability plan of 21 November 2026, W11: the cause of a run that did not end done, one code of
+        # releases.CAUSES or null (finish_release), which the automatic sweep acts on (release_again)
+        "releases": {"cause": "TEXT"},
     }.items():
         try:
             have = {r["name"] for r in q(f"PRAGMA table_info({table})")}
@@ -69782,10 +69785,40 @@ def release_rolled_said():
 
 def release_rolled(row):
     """Inside LOCK: one more run of this release failed on this hub before its push: it ended rolled back
-    (finish_release), or a stop of the hub or an error in it cut it off (settle_releases)."""
+    (finish_release), or a stop of the hub or an error in it cut it off (settle_releases).
+
+    By the kind of its cause (releases.CAUSES, the reliability plan of 21 November 2026, 3.2): a run that had no room
+    on this machine rests the rest of its day (release_room_rests), with the machine's memory of that moment, and the
+    count of the release's own failures starts from zero after it. A run that a network cause ended after its fetch
+    (a push that the fleet's own repository refused) counts as before: the probe asks the published repository, which
+    says nothing of that one. release_work also counts here a run that a passed probe started and whose fetch failed
+    for the network again (release_unreached)."""
+    kind = releases.kind(row["cause"])
+    if kind == "room":
+        room = releases.memory_room()
+        kv_set("release_rolled", json.dumps({"revision": row["revision"], "runs": 0, "passed": 0,
+                                             "room_day": release_day(now()), "room_total": room and room["total"]}))
+        return
     said = release_rolled_said()
     runs = said["runs"] + 1 if said and said.get("revision") == row["revision"] else 1
     kv_set("release_rolled", json.dumps({"revision": row["revision"], "runs": runs, "passed": 0}))
+
+
+def release_day(t):
+    """The day of time `t` on this hub's clock, as text: a room rest lasts until it changes (release_room_rests)."""
+    return time.strftime("%Y-%m-%d", time.localtime(t))
+
+
+def release_room_rests(row):
+    """Inside LOCK: True while the last run of this release, which had no room on this machine (the cause `memory` or
+    `disk`), rests: for the rest of the day of that run, unless this machine has more memory now than then (its
+    server was given more). A rest that ends starts the release from zero (release_again)."""
+    said = release_rolled_said()
+    if not said or said.get("revision") != row["revision"] or not said.get("room_day"):
+        return False
+    room, total = releases.memory_room(), said.get("room_total")
+    grew = bool(room) and isinstance(total, int) and room["total"] > total
+    return said["room_day"] == release_day(now()) and not grew
 
 
 def release_rests(row):
@@ -69811,6 +69844,92 @@ def release_rests(row):
     return True
 
 
+def release_again(row, room):
+    """Inside LOCK, for the automatic sweep: how it takes a release whose last run did not end done, by the kind of
+    that run's cause (releases.CAUSES; the reliability plan of 21 November 2026, 3.2). `room` is the machine's memory
+    now (releases.memory_room). One of:
+
+    - "probe": not now. Its last run could not reach the published repository, and nothing said since that it can:
+      the hub probes it (release_probe), and a probe that passes makes the sweep take the release at its next tick.
+    - "rests": not now, and counted, as before for a release whose run failed on this hub (release_rests), or for
+      the rest of the day for one that had no room here (release_room_rests).
+    - True: as a new release, which waits for the first moment no turn runs (release_wait): a release whose last run
+      failed for the network once a probe passed, one that had too little memory to start once the memory is free,
+      and one that had no room once its rest ended.
+    - False: as before: the sweep runs it at a poll at which no turn runs.
+
+    Until this, a release kept at its fetch was never "fresh", so on a fleet that worked at each poll it was never
+    taken, and nothing took it when the network came back (the owner's test hub, 15 to 21 November 2026, which lost
+    its IPv4 route: every release from 2026.11.714 on stopped `kept` at the fetch)."""
+    ended = row["state"] in (releases.KEPT, releases.ROLLED_BACK) or \
+        (row["state"] == releases.FAILED and not row["reached"])
+    kind = releases.kind(row["cause"]) if ended else None
+    if release_unreached(row):
+        # A fetch that fails again and again while the probe passes (an early EOF, an RPC that failed, the fetch's own
+        # limit) rests by the count of such runs, from the second (release_work counts them), and holds no start
+        # at every poll.
+        if release_rests(row):
+            return "rests"
+        return True if release_reached(row) else "probe"
+    if row["state"] == releases.KEPT and row["cause"] == releases.MEMORY:
+        return room is None or room["free"] >= releases.CHECK_NEED      # nothing ran: the room is read again now
+    if kind == "room" and row["state"] != releases.KEPT:
+        return "rests" if release_room_rests(row) else True
+    if row["state"] == releases.ROLLED_BACK or (row["state"] == releases.FAILED and not row["reached"]):
+        return "rests" if release_rests(row) else False
+    return False
+
+
+_release_probe = {"thread": None}       # the one probe of the published repository that may run at a time
+
+
+def release_unreached(row):
+    """True for a release whose last run stopped at its fetch for a network cause: the run that the probe of the
+    published repository is for (release_again). A network cause at a later step, such as a push that the fleet's
+    own repository refused, keeps its code and rests as before: the probe would say nothing of that repository."""
+    return row["state"] == releases.KEPT and row["step"] == "fetch" and releases.kind(row["cause"]) == "network"
+
+
+def release_reached(row):
+    """True when a probe of the published repository passed after the last run of this release ended
+    (release_probe_work)."""
+    try:
+        reach = json.loads(kv_get("release_reach") or "null")
+    except ValueError:
+        return False
+    return isinstance(reach, dict) and reach.get("revision") == row["revision"] and finite(reach.get("at")) \
+        and reach["at"] >= (row["finished"] or 0)
+
+
+def release_probe(row):
+    """The probe of the published repository for this release (releases.reaches), in a thread of its own, unless one
+    runs. It is no check and no run of the release channel (release_running, release_applying): it holds the start of
+    no session and no press of the owner's while it waits for the network, PROBE_WAIT seconds at most."""
+    with _release_lock:
+        if _release_probe["thread"] is not None and _release_probe["thread"].is_alive():
+            return False
+        thread = _release_probe["thread"] = threading.Thread(
+            target=release_probe_work, args=(row["revision"], row["version"]), name="release-probe", daemon=True)
+        thread.start()
+    return True
+
+
+def release_probe_work(revision, version):
+    """The thread of release_probe. A probe that passes writes `releases_found`, the key that makes the sweep poll at
+    its next tick (release_sweep), and `release_reach`, which makes that poll take the release as a new one
+    (release_again)."""
+    try:
+        if not releases.reaches(kit_dir(), release_upstream()):
+            return
+        with LOCK:
+            kv_set("release_reach", json.dumps({"revision": revision, "at": now()}))
+            kv_set("releases_found", now())
+            log("hub", f"the published repository answers again: release {version} is taken at the first moment no "
+                       f"turn runs")
+    except Exception:
+        print_fault()
+
+
 def release_holds_starts():
     """True while no new session starts, because the hub restarts soon (plan P0): for the whole update run
     (release_applying), and for the first RELEASE_POLL of a wait for the turns that run now (release_wait), so that
@@ -69828,7 +69947,7 @@ def release_row_view(row):
             "minimum": row["minimum"], "hold": bool(row["hold"]), "state": row["state"], "step": row["step"],
             "says": row["says"], "pinned": row["pinned"], "reached": row["reached"], "seen_at": row["seen"],
             "started_at": row["started"], "finished_at": row["finished"], "automatic": bool(row["automatic"]),
-            "applied": row["state"] == releases.DONE}
+            "applied": row["state"] == releases.DONE, "cause": row["cause"]}
 
 
 def release_view(limit=RELEASE_ROWS):
@@ -69997,27 +70116,45 @@ def release_work(applying, automatic=False, fetch=None, take=False):
         # A write of the hub's own that a cut left on the ref is taken back first: the run merges onto the ref's tip,
         # and would carry that write in without the steps it never ran. One cut during the run is not followed (own).
         settle_kit_push()
+        room = releases.memory_room()       # the machine's memory now, read outside the lock (W2)
         with LOCK:
             if row["state"] in (releases.DONE, PASSED):
                 return                                  # this fleet runs this release already, or one that holds it
-            if automatic and (row["state"] == releases.ROLLED_BACK or
-                              (row["state"] == releases.FAILED and not row["reached"])) and release_rests(row):
+            again = release_again(row, room) if automatic else False
+            if again in ("probe", "rests"):
                 kv_set("release_waits", None)
-                return                                  # its runs failed here: more polls pass before the next one
+                if again == "probe":
+                    release_probe(row)                  # its run could not reach the network: the probe first
+                return                                  # else its runs failed here: it rests at this poll
             idle, busy = fleet_idle()
-            fresh = automatic and row["state"] == "verified"        # no run has tried it yet
+            fresh = automatic and (row["state"] == "verified" or again is True)    # taken as a new release
+            probed = again is True and release_unreached(row)       # a run that a passed probe starts
             if not idle and not fresh:
                 if automatic:       # as before plan P0: the sweep tries it again when no turn runs at its poll
                     kv_set("release_waits", None)
                     return
                 finish_release(row["id"], releases.KEPT, "hold", "this fleet started working before the update "
-                               "did: " + (", ".join(tref(t) for t in busy[:6]) or "a check runs now"), automatic)
+                               "did: " + (", ".join(tref(t) for t in busy[:6]) or "a check runs now"), automatic,
+                               cause="busy")
+                return
+            # W2: under the memory that a release's checks need, with free swap, no automatic run starts. A run that
+            # did not fit ended after 300 s of a server that swapped, and the hub answered nothing meanwhile (15
+            # November 2026). A row that says so already is not written again at each poll. A run that the owner
+            # pressed (Update, take_release) runs all the same, inside its scope (releases.check_prefix).
+            if automatic and room is not None and room["free"] < releases.CHECK_NEED:
+                kv_set("release_waits", None)
+                if row["state"] != releases.KEPT or row["cause"] != releases.MEMORY:
+                    finish_release(row["id"], releases.KEPT, "room", f"this server has {room['free'] >> 20} MB of "
+                                   f"memory and swap free, and the checks of release {row['version']} need "
+                                   f"{releases.CHECK_NEED >> 20} MB, so this fleet did not take it; it takes it when "
+                                   f"the memory is free", automatic, cause=releases.MEMORY)
                 return
             if idle:
                 kv_set("release_waits", None)
                 pinned = kit_revision(fresh=True)
                 q("UPDATE releases SET state='updating', step=NULL, says=NULL, pinned=?, reached=NULL, started=?, "
-                  "finished=NULL, automatic=? WHERE id=?", (pinned, now(), 1 if automatic else 0, row["id"]))
+                  "finished=NULL, automatic=?, cause=NULL WHERE id=?",
+                  (pinned, now(), 1 if automatic else 0, row["id"]))
             origin = git_kit("remote", "get-url", "origin")[1] or None
         if not idle:
             # plan P0: a release that no run has tried yet waits for the turns that run now, and no new session starts
@@ -70028,7 +70165,8 @@ def release_work(applying, automatic=False, fetch=None, take=False):
             with LOCK:
                 if refused:
                     kv_set("release_waits", None)
-                    finish_release(row["id"], refused["state"], refused["step"], refused["says"], automatic, refused)
+                    release_count_unreached(probed, finish_release(row["id"], refused["state"], refused["step"],
+                                                                   refused["says"], automatic, refused))
                 else:
                     release_wait(row)
             return
@@ -70049,16 +70187,25 @@ def release_work(applying, automatic=False, fetch=None, take=False):
                 # release on a hub that cannot even read its own records. The fleet keeps what it runs.
                 with LOCK:
                     finish_release(row["id"], releases.KEPT, "schema", f"this fleet's records could not be copied "
-                                   f"for the schema check, so no release is taken: {e}", automatic)
+                                   f"for the schema check, so no release is taken: {e}", automatic,
+                                   cause=releases.room_cause(None, str(e)))
                 return
+            # W2: the checks run at the lowest priority and, where systemd gives it, in a scope with a memory limit
+            # and no swap. A machine that gives no scope says so in the hub's log once, and the run goes on.
+            limit, plain = releases.check_prefix(room)
+            if plain and not _release.get("said_scope"):
+                _release["said_scope"] = True
+                with LOCK:
+                    log("hub", plain)
             result = releases.Update(kit_dir(), manifest, origin=origin, upstream=release_upstream(),
                                      database=path, floor=kit_floor(),
                                      pushed=lambda merged: release_pushed(row["id"], merged),
-                                     own=kit_own).apply()
+                                     own=kit_own, limit=limit).apply()
         finally:
             shutil.rmtree(folder, ignore_errors=True)
         with LOCK:
-            finish_release(row["id"], result["state"], result["step"], result["says"], automatic, result)
+            release_count_unreached(probed, finish_release(row["id"], result["state"], result["step"], result["says"],
+                                                           automatic, result))
     except Exception:
         print_fault()
         with LOCK:
@@ -70066,6 +70213,15 @@ def release_work(applying, automatic=False, fetch=None, take=False):
                 # This process runs the code it started with. When its checkout followed the ref before the error, the
                 # next run stops at "already" and restarts nothing, so the restart of a run that ended is done here.
                 restart_hub_soon(row["pinned"], kit_revision(fresh=True))
+
+
+def release_count_unreached(probed, row):
+    """Inside LOCK: a run that a passed probe started (`probed`) whose fetch failed for the network again counts as a
+    run that failed here (release_rolled), so that the next ones rest by release_rests from the second: the probe's
+    `ls-remote` can pass while the fetch fails each time (an early EOF, an RPC that failed, the fetch's own limit), and
+    each such run held the start of sessions."""
+    if probed and release_unreached(row):
+        release_rolled(row)
 
 
 def release_pushed(rid, merged):
@@ -70108,26 +70264,72 @@ def settle_releases(says="the hub stopped before this update ended; the next upd
         return cut
 
 
-def finish_release(rid, state, step, says, automatic, result=None):
+RELEASE_SMALL_SERVER = 3 << 29     # 1.5 GiB of memory: under it, a type with 2 GB is the step (release_memory_told)
+
+
+def release_memory_told():
+    """Inside LOCK: when the two newest releases that a run ended both ended for `memory` (kept before a run, or
+    rolled back when the system ended a check: a hub with 1 GB and swap passes the budget, and its scope ends the
+    self-test at each release), the fleet's manager is told once, so that the owner hears it (the reliability plan of
+    21 November 2026, 3.5 point 3). A server under RELEASE_SMALL_SERVER is told to take a type with 2 GB; a larger
+    one has too little free memory, and a type with more memory or less work beside the hub is the step. Either is
+    the owner's own step, and a larger type costs more each month. Once for each size of the server's memory
+    (MemTotal, rounded to 256 MiB, so that a kernel update that changes it by a little tells nobody again), not for
+    each release: a server that the owner changed is told again if it is still too small. Returns True when it
+    told."""
+    rows = q("SELECT cause FROM releases WHERE finished IS NOT NULL ORDER BY id DESC LIMIT 2")
+    room, manager = releases.memory_room(), manager_name()
+    size = room and room.get("ram_total")
+    step = 256 << 20
+    size = size and max(step, (size + step // 2) // step * step)
+    if len(rows) < 2 or any(r["cause"] != releases.MEMORY for r in rows) or not size or not manager or \
+            kv_get("release_memory_told") == str(size):
+        return False
+    kv_set("release_memory_told", size)
+    server = (TEAM.get("hub") or {}).get("machine") or "the hub's server"
+    mb, need = size >> 20, releases.CHECK_NEED >> 20
+    if size < RELEASE_SMALL_SERVER:
+        words = (f"Your fleet's server {server} has {mb} MB of memory, and updates need more. Change it at its "
+                 f"provider to a type with 2 GB. That is your own step, and it costs more each month.")
+    else:
+        words = (f"Your fleet's server {server} has too little free memory for updates. A type with more memory, or "
+                 f"less work beside the hub on that server, is your own step; a larger type costs more each month.")
+    emit(manager, "say", f"[hub] Two releases in a row were not taken because this fleet's server {server}, with "
+                         f"{mb} MB of memory, had too little free for their checks, which need {need} MB. Tell the "
+                         f"owner once, in plain words: \"{words}\"")
+    log("hub", f"the manager was told that this server's {mb} MB of memory left too little free for updates")
+    return True
+
+
+def finish_release(rid, state, step, says, automatic, result=None, cause=None):
     """Inside LOCK: what came of one update run, and what the fleet does about it. A run that reached the released
     revision asks every machine for its idle update and restarts the hub's own service; any other state leaves the
     fleet exactly as it was. A run that failed after its push (releases.FAILED at the step follow) reached the ref but
     not this hub's own checkout: every machine takes that release at its next sync anyway, so each is asked for its
     idle update too, and its helper restarts onto what its checkout runs; the hub keeps its own process.
 
+    The row keeps the run's cause (`cause`, or the one releases.Update answered): one code of releases.CAUSES, or
+    null when nothing says which, and always null for a run that ended done.
+
     The machines are asked before the row ends: a stop or an error before then leaves it at updating, and
     settle_releases asks them again (request_update asks each one once)."""
     reached = (result or {}).get("reached")
+    cause = cause or (result or {}).get("cause")
+    cause = cause if state != releases.DONE and cause in releases.CAUSES else None
     # Every machine, the hub's own included: its agent's helper fast-forwards its own checkout and restarts its own
     # user service, exactly as a worker's does (request_update). The hub process is restart_hub_soon below.
     asked = [name for name in agents() if request_update(name, reached) == "requested"] if reached else []
-    q("UPDATE releases SET state=?, step=?, says=?, pinned=COALESCE(?,pinned), reached=?, finished=?, automatic=? "
-      "WHERE id=?", (state, step, says, (result or {}).get("pinned"), reached, now(), 1 if automatic else 0, rid))
+    q("UPDATE releases SET state=?, step=?, says=?, pinned=COALESCE(?,pinned), reached=?, finished=?, automatic=?, "
+      "cause=? WHERE id=?", (state, step, says, (result or {}).get("pinned"), reached, now(), 1 if automatic else 0,
+                             cause, rid))
     row = q1("SELECT * FROM releases WHERE id=?", (rid,))
     log("hub" if automatic else "owner",
-        f"release {row['version']} ({(row['revision'] or '')[:12]}): {state} at {step} — {says}")
+        f"release {row['version']} ({(row['revision'] or '')[:12]}): {state} at {step}"
+        + (f" (cause {cause})" if cause else "") + f" — {says}")
     if state == releases.ROLLED_BACK:
         release_rolled(row)     # the sweep runs it again after more polls each time (release_rests)
+    if cause == releases.MEMORY:
+        release_memory_told()
     if state != releases.DONE:
         return row
     kit_revision(fresh=True)
@@ -70955,7 +71157,12 @@ def release_sweep(t0):
     a release waited 6 minutes on average and 13 at most for this poll. The owner's own Check sends no `take`, and
     changes nothing here. The sweep's own poll writes no `releases_found`, and the sweep writes `releases_swept` past
     it, so a found release makes one poll and never a loop. While a check or an update runs, the sweep waits for its
-    end: a poll beside it would be refused, and would close the gate for RELEASE_POLL with nothing taken."""
+    end: a poll beside it would be refused, and would close the gate for RELEASE_POLL with nothing taken.
+
+    **A release whose last run could not reach the network is probed for, not run** (the reliability plan of 21
+    November 2026, W11): at each poll, `git ls-remote` of the published repository runs in a thread of its own that
+    holds nothing (release_probe), and a probe that passes writes `releases_found` too, so the next tick polls and
+    takes the release as a new one (release_again)."""
     token = entitlement_token()
     if not releases_automatic() or not (token or installed_hub()):
         if release_waiting():

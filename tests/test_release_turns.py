@@ -481,6 +481,93 @@ class Turns(test_releases.HubUpdates):
         self.assertFalse(hub.release_holds_starts())
         self.assertIn(hub.tref(later), self.delivered("task"))
 
+    def kept_for_the_network(self):
+        """A release whose run this fleet's server could not download (W11 of the reliability plan of 21 November
+        2026): the fleet is idle at the poll, and git's fetch says what it said on the owner's test hub. Gives the
+        release's revision."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+
+        def probe_ended():
+            if hub._release_probe["thread"] is not None:
+                hub._release_probe["thread"].join(30)
+            hub._release_probe["thread"] = None
+        self.addCleanup(probe_ended)
+        inner = self.runner()
+
+        def offline(argv, timeout=None, cwd=None, input=None):
+            if argv[3:5] == ["fetch", "-q"]:
+                return 128, "", ("fatal: unable to access 'https://github.com/example/fleet.git/': Failed to connect "
+                                 "to github.com port 443 after 1 ms: Couldn't connect to server")
+            return inner(argv, timeout=timeout, cwd=cwd, input=input)
+        released = self.publish(self.code(2))
+        self.release_tick(released, offline)
+        one = self.newest()
+        self.assertEqual((one["state"], one["step"], one["cause"]), (releases.KEPT, "fetch", "connect"))
+        return released
+
+    def release_tick(self, released, run=None, probe=None, swept=True):
+        """One tick of the automatic sweep, run to its end: at its poll time (`swept`), or at the next tick. A probe of
+        the published repository that it starts answers `probe`."""
+        if swept:
+            hub.kv_set("releases_swept", None)
+        with self.channel(manifest(released)), \
+                patch.object(releases, "Update", functools.partial(releases.Update, run=run or self.runner())), \
+                patch.object(releases, "reaches", probe or (lambda kit, url: False)):
+            hub.release_sweep(hub.now())
+            self.finish()
+            if hub._release_probe["thread"] is not None:
+                hub._release_probe["thread"].join(30)
+
+    def test_a_release_kept_for_the_network_is_taken_at_the_first_tick_after_a_probe_passes(self):
+        """The owner's test hub, 15 to 21 November 2026: its server lost its IPv4 route, and every release stopped
+        `kept` at the fetch. A kept row was never "fresh", so the sweep ran it only at a poll at which no turn ran,
+        which a fleet that works at each poll never has, and nothing ran it when the network came back. Now each poll
+        probes the published repository, and a probe that passes makes the next tick take the release as a new one:
+        it waits for the turns that run, and takes the first moment no turn runs."""
+        released = self.kept_for_the_network()
+        working = self.task_for()
+        windows("vps", hub.tref(working))
+        turn(working, running=True)                 # a turn runs at every tick from here on
+        asked = []
+        self.release_tick(released, probe=lambda kit, url: asked.append(url) or False)
+        self.assertEqual(asked, [self.upstream])    # the network is still down: nothing runs, nothing waits
+        self.assertEqual(self.newest()["state"], releases.KEPT)
+        self.assertIsNone(hub.release_waiting())
+        self.release_tick(released, probe=lambda kit, url: asked.append(url) or True)      # the network is back
+        self.assertEqual(len(asked), 2)
+        self.assertIsNone(hub.release_waiting(), "the probe itself takes nothing")
+        self.release_tick(released, swept=False)            # the next tick, past the poll's gate, while the turn runs
+        self.assertEqual(hub.release_waiting()["revision"], released)
+        self.assertTrue(hub.release_holds_starts())
+        turn(working, running=False)
+        self.release_tick(released, swept=False)            # the first moment no turn runs
+        self.assertEqual((self.newest()["state"], self.newest()["cause"]), (releases.DONE, None))
+        self.assertEqual((self.kit / "hub.py").read_text(), "# the hub\nVERSION = 2\n")
+
+    def test_the_probe_holds_no_session_start(self):
+        """The probe waits for the network, 20 seconds at most, at each poll of a hub whose network is down. Run inside
+        the update run, it would hold the start of every session meanwhile (release_applying), as the poll did for
+        days on the owner's test hub. It runs in a thread of its own that is no run: a task's start goes out."""
+        released = self.kept_for_the_network()
+        began, go = threading.Event(), threading.Event()
+
+        def slow(kit, url):
+            began.set()
+            go.wait(20)
+            return False
+        hub.kv_set("releases_swept", None)
+        with self.channel(manifest(released)), patch.object(releases, "reaches", slow):
+            try:
+                hub.release_sweep(hub.now())
+                self.assertTrue(began.wait(10))
+                hub._release["thread"].join(5)          # the poll's own run has ended, while the probe waits
+                self.assertFalse(hub.release_running() or hub.release_holds_starts())
+                later = self.task_for()
+                self.assertIn(hub.tref(later), self.delivered("task"))
+            finally:
+                go.set()
+                self.finish()
+
     def test_a_new_attempt_whose_start_a_release_holds_does_not_keep_that_release_waiting(self):
         """19 November 2026, the owner's fleet: while a release waited for a running turn and held new sessions, a
         message for a task whose session was cold started that task fresh (plan P9.10), in a new attempt whose start
