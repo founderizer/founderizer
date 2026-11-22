@@ -478,16 +478,19 @@ def download(url, timeout, headers=None):
             raise Missed("download", f"not done in {timeout:g} s")
         return rest
     cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
-    conn, r, watch, late = cls(host, port, timeout=timeout), None, None, threading.Event()
+    conn, r, watch, late, mirror = cls(host, port, timeout=timeout), None, None, threading.Event(), None
     conn._create_connection = connect_by(end)
     try:
         conn.connect()
         sock = conn.sock        # the response may take the connection's socket: each step gets the time that is left
+        # The watch shuts a copy of the descriptor that only it holds: an answer that ends its connection closes the
+        # socket inside the loop, and a shutdown by that number could then reach another socket that took it.
+        mirror = socket.socket(fileno=os.dup(sock.fileno()))
 
         def stop():             # a read's timeout is for that read: a peer that sends a byte at a time resets it
             late.set()
-            try:                # the plain socket's shutdown, under TLS too: a blocked read ends at once
-                socket.socket.shutdown(sock, socket.SHUT_RDWR)
+            try:                # a shutdown of the connection, under TLS too: a blocked read ends at once
+                mirror.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
         timer = threading.Timer(left(), stop)
@@ -520,11 +523,11 @@ def download(url, timeout, headers=None):
             raise Missed("download", f"not done in {timeout:g} s") from None
         raise Missed("download", type(e).__name__) from None
     finally:
-        if watch is not None:   # a stop() that started ends before close(): for an answer that keeps its connection
-            # open. One that ends it (no length, HTTP/1.0, close) closes the socket in the loop, so a watch that fires in
-            # the same microseconds can shut the socket that takes its number next: a known race, the cost one retry
+        if watch is not None:   # a stop() that started ends before its copy of the descriptor closes
             watch.cancel()
             watch.join()
+        if mirror is not None:
+            mirror.close()
         if r is not None:       # an answer that ends the connection holds its socket itself
             r.close()
         conn.close()

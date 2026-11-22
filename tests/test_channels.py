@@ -2568,7 +2568,7 @@ class Functions(unittest.TestCase):
         with patch.object(socket.socket, "settimeout", later), self.assertRaises(channels.Missed) as missed:
             channels.download(f"http://127.0.0.1:{port}/f", 1)
         self.assertEqual((missed.exception.code, missed.exception.why), ("download", "not done in 1 s"))
-        self.assertLess(time.monotonic() - at, 1.6, "the watch came late")
+        self.assertLess(time.monotonic() - at, 2.5, "the watch came late")    # each read's own end is at 4 s
 
     def test_split_parts(self):
         self.assertEqual(channels.split_parts("short", 2000), ["short"])

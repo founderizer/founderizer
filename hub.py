@@ -19119,9 +19119,10 @@ SECRET_CLARIFIED = ("\n(The hub: the owner saved nothing. The words before this 
                     "and they hold no value. When they settle what to ask for, ask again with request_secret, once "
                     "for each account or key that they name: with account for a login, and with note where a name "
                     "does not say which one it is. A task session writes the note of a secret that the fleet holds "
-                    "already with note_secret. Your next request_secret takes this card's place, and the owner sees "
-                    "their words over it: put the answer to their words in its why or its steps. Never ask for a "
-                    "value in words.)")
+                    "already with note_secret. In a task your next request_secret for the same key or site takes "
+                    "this card's place, and the owner sees their words over it: put the answer to their words in "
+                    "its why or its steps. Else answer their words where you answer the owner. Never ask for a value "
+                    "in words.)")
 SECRET_SITE = re.compile(r"https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:[/?#][^\s]*)?")
 SECRET_TODO = ("Open this request in Founderizer on your Mac and type it into its secure form: it goes straight into "
                "the vault, and no agent sees it. Never type the key or the password in a message.")
@@ -19494,9 +19495,9 @@ def t_door_fleet(agent, a):
 def t_door_gitops(agent, a):
     """door_gitops (the manager, DevOps plan X3): team.json door.gitops[repo] = {sync, agents}. The app writes each of
     these Operators' GitOps target in the door's file, {kind: gitops, sync}: the door reads the repository at HEAD
-    through its filter, commits the listed forms, rolls back, and syncs an app through the caller workflow `sync`, all
-    with its own App. No GitHub grant comes with it, so no token of the agent reads the repository and its committed
-    secrets. agents [] ends it."""
+    through its filter, commits the listed forms, rolls back, syncs an app through the caller workflow `sync`, and
+    uncordons a node through uncordon-node.yml, all with its own App. No GitHub grant comes with it, so no token of the
+    agent reads the repository and its committed secrets. agents [] ends it."""
     import door_targets
     repo = str(a.get("repo") or "").strip()
     sync = str(a.get("sync") or "").strip()
@@ -19546,7 +19547,8 @@ def t_door_gitops(agent, a):
     except Refusal as e:
         raise ToolError(f"The hub refused it: {e}") from None
     text = (f"{who} {'gets' if len(names) == 1 else 'get'} {repo} through the door: reads through its filter, commits "
-            f"of the listed forms, rollbacks, and syncs through {sync}." if names else
+            f"of the listed forms, rollbacks, syncs through {sync}, and uncordons of a node through "
+            f"{door_targets.UNCORDON_WORKFLOW}." if names else
             f"Nobody gets {repo} through the door.") + ("" if result["changed"] else " It was so already.") + \
         door_round_tail(invites=bool(names), tell=True)
     with transaction():
@@ -19874,24 +19876,33 @@ def key_failed(agent, a, worker, chat, tid):
     return ref, env, door
 
 
-def secret_clarified_card(agent, tid, chat):
-    """The key card that the owner's Needs clarification closed, which this agent's next request of the same place
+def secret_clarified_card(agent, tid, kind, env, site):
+    """The key card that the owner's Needs clarification closed, which this agent's next request of the same task
     takes the place of (the owner, 21 November 2026, of a question that he asked on a key card: "can't see the reply
-    and all I get is the same card again"), or None: the agent's newest secret request of this task, of its chat when
-    no task asks, or of its own session (the manager), that his clarify closed, that nothing took the place of, and
-    that no newer card of that place was raised after his clarify. So a card that he clarifies under two or three
-    open cards of the same place is taken too (on 21 November 2026 the manager raised N-269 to N-271 in 7 seconds),
-    and only the first new request takes it: that one is newer than his clarify. The newest such card goes first."""
-    since = []          # the raised times of the newer cards of the place
+    and all I get is the same card again"), or None: the agent's newest secret request of this task that his clarify
+    closed, that asks for the same thing as the request (secret_same with no account and no failed: the same API key,
+    or a login of the same site, of any account, because his words often say which account), that nothing took the
+    place of, and that no newer card of the task was raised after his clarify. So a card that he clarifies under two
+    or three open cards of the task is taken too (on 21 November 2026 the manager raised N-269 to N-271 in 7 seconds),
+    and only the first new request takes it: that one is newer than his clarify. The newest such card goes first. A
+    request for another thing takes none: the first build of H2 took the newest clarified card whatever the request
+    asked for, so his words could stand over a request for another key (the F13 analysis, piece A2).
+    A request with no task (a worker's chat, the manager's own session) takes no card, until the new model of a
+    clarified key card (the owner's feedback of 22 November 2026, F13; the Needs-you area's stop-loss): an agent asks
+    there for many things, and its next request took the card whatever it asked for (on 22 November 2026 the manager's
+    request for a login of platform.openai.com, N-283, took its clarified DataFast card N-270). Not even a request for
+    the same thing takes one there: such a place has no end, so a request for the same key can come days later for
+    other work and carry his old question, where a task is one piece of work."""
+    if not tid:
+        return None
+    since = []          # the raised times of the newer cards of the task
     for r in q("SELECT * FROM needs WHERE kind='secret' AND by=? ORDER BY id DESC", (agent,)):
         spec = need_secret(r) or {}
-        here = tid in (spec.get("tasks") or []) if tid else \
-            "tasks" not in spec and bool(spec.get("reply")) == bool(chat)
-        if not here:
+        if tid not in (spec.get("tasks") or []):
             continue
         clarified = spec.get("clarified")
         if clarified and r["answer"] is not None and r["replaced_by"] is None and \
-                all(t < clarified for t in since):
+                all(t < clarified for t in since) and secret_same(spec, kind, env, site):
             return r
         since.append(r["raised"] or 0)
     return None
@@ -20176,13 +20187,22 @@ def t_request_secret(agent, a):
         (f"Enter the API key {env}" + (f" for {host}" if host else "")) if kind == "api_key" else \
         f"Enter a login for {host}"
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
-        old = secret_clarified_card(agent, tid, chat)
-        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,kind,secret,details) VALUES(?,?,?,?,?,?,?,?,?)",
-                  (unused_id("needs"), title, why, SECRET_TODO, now(), agent, "secret", json.dumps(spec),
-                   details or None))
-        if old:     # his words stand over the new card, and the app shows no card that was replaced
-            q("UPDATE needs SET replaced_by=? WHERE id=? AND replaced_by IS NULL", (nid, old["id"]))
-            q("UPDATE need_talk SET need=? WHERE need=?", (nid, old["id"]))
+        old = secret_clarified_card(agent, tid, kind, env, site)
+        # one commit: a read of the state (state_moment) never shows the old card replaced and the new one without
+        # his words
+        with transaction():
+            nid = DB.execute("INSERT INTO needs(id,title,why,todo,raised,by,kind,secret,details) "
+                             "VALUES(?,?,?,?,?,?,?,?,?)", (unused_id("needs"), title, why, SECRET_TODO, now(), agent,
+                                                           "secret", json.dumps(spec), details or None)).lastrowid
+            if old:     # his words stand over the new card, and the app shows no card that was replaced
+                DB.execute("UPDATE needs SET replaced_by=? WHERE id=? AND replaced_by IS NULL", (nid, old["id"]))
+                DB.execute("UPDATE need_talk SET need=? WHERE need=?", (nid, old["id"]))    # the talk that it took
+                # his words of the clarify, which the closed card shows only as its answer: once, also where the
+                # clarify of the release before this one wrote them as its talk too, which came here with that talk
+                if not DB.execute("SELECT 1 FROM need_talk WHERE need=? AND who='owner' AND text=?",
+                                  (nid, old["answer"])).fetchone():
+                    DB.execute("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)",
+                               (nid, (need_secret(old) or {}).get("clarified") or now(), "owner", old["answer"]))
     if tid:
         secret_parked(tid, nid)
     emit("owner", "notify", f"Needs you: {title}")
@@ -20638,9 +20658,9 @@ def answer_secret(body, request_id, client, device=None, session=None):
             if ref is not None:
                 DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, saved=ref)), need["id"]))
         if clarify is not None:         # no decline: the asker may ask again at once (t_request_secret)
+            # his words are the card's answer only: the request that takes its place writes them as its talk
+            # (secret_clarified_card), so each card shows them once
             DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, clarified=t0)), need["id"]))
-            # his words as the card's talk too, which the agent's next request takes over (secret_clarified_card)
-            DB.execute("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (need["id"], t0, "owner", clarify))
     if gave and spec.get("tasks"):
         secret_wakes(t0)        # a vault that reads his project, or a delivery that finished before this answer
     # created: the time of the answer, as the receipt of every answer has it (the phone reads one shape of receipt)
@@ -20785,7 +20805,9 @@ def secret_wakes(t0=None):
 def secret_waits_end(task_id):
     """A task that ended waits on no secret request any more (end_waits): it leaves each request's tasks, and a request
     that no task waits on and that has no answer leaves Needs you, as a removed person's open items do, after the id
-    floor is raised, because unused_id would give its N-id again. Nothing of his is written."""
+    floor is raised, because unused_id would give its N-id again. The card whose place such a request took
+    (secret_clarified_card) shows again: the row of his words that the take wrote goes, and the card gets back the
+    talk that it had, so it shows his words once, as its answer. Nothing else of his is written."""
     with LOCK, transaction():
         rows = DB.execute("SELECT n.* FROM needs n, json_each(n.secret, '$.tasks') j WHERE n.kind='secret' AND "
                           "j.value=?", (task_id,)).fetchall()
@@ -20795,6 +20817,14 @@ def secret_waits_end(task_id):
             if left or r["answer"] is not None:
                 DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, tasks=left)), r["id"]))
                 continue
+            # the card whose place this request took (secret_clarified_card) shows again, with the talk that came
+            # here: else a task that ends before his answer takes his question off his screen with it. His words of
+            # its clarify stay its answer only, as before the take.
+            took = DB.execute("SELECT id, answer FROM needs WHERE replaced_by=?", (r["id"],)).fetchone()
+            DB.execute("UPDATE needs SET replaced_by=NULL WHERE replaced_by=?", (r["id"],))
+            if took:
+                DB.execute("DELETE FROM need_talk WHERE need=? AND who='owner' AND text=?", (r["id"], took["answer"]))
+                DB.execute("UPDATE need_talk SET need=? WHERE need=?", (took["id"], r["id"]))
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                        ("row_floor:needs", str(unused_id("needs") - 1)))
             DB.execute("DELETE FROM needs WHERE id=?", (r["id"],))
@@ -20810,6 +20840,90 @@ def secret_waits_end(task_id):
             DB.execute("DELETE FROM needs WHERE id=?", (r["id"],))
             DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
                        (now(), "hub", f"N-{r['id']} left Needs you: {tref(task_id)}, the task that asked, ended"))
+
+
+# kv: settle_key_takes ran (one time). A later repair takes a key of its own: a step added under this key runs on no
+# fleet where this one ran.
+KEY_TAKES_SETTLED = "key_takes_settled"
+KEY_WORDS_SETTLED = "key_words_settled"        # kv: settle_key_words ran (one time)
+
+
+def settle_key_takes():
+    """At the start, one time (kv KEY_TAKES_SETTLED, written in the same transaction), in every fleet: the takes of key
+    cards that his Needs clarification closed (secret_clarified_card) that the first build of H2 (owner API 1.295, 21
+    November 2026) left wrong. It only clears replaced_by and deletes a talk row: it writes no word of his into any
+    card. It logs each card that it changes, in one line with both card ids and none of his words.
+    1. A key card whose replaced_by names a card that is gone: the request that took its place left Needs you with
+       its task before his answer, and secret_waits_end did not give the card back then. The app shows no card that
+       was replaced, so his question was off his screen. The card loses replaced_by and shows his words again. Only
+       key cards: another item that a gone item replaced has "Replaced by ..." as its answer, and would come back with
+       nothing more to say.
+    2. A key card of a place with no task (a chat, the manager's own session) whose taker does not ask for the same
+       thing (secret_same with no account), open or answered: any next request of the place took it, so his words
+       stood over a request for another thing (on 22 November 2026 the manager's request for a login of
+       platform.openai.com, N-283, took its clarified DataFast card N-270). The card loses replaced_by, and the talk
+       row of his words that the take moved onto the taker goes: the card shows his words as its answer, and the taker
+       shows none of them. Also when he answered the taker: his words there were about another thing, and an answer
+       of his before this release reached his hub would leave the pair wrong for good.
+    What it leaves: a take in a task, which the rule of that time made; a talk row is his words only by its text, the
+    card's answer, so a row that came to the taker from an earlier take stays there; and of two cards of one site, it
+    cannot see which account his words were about. An error is logged, and the start goes on."""
+    try:
+        with transaction():
+            if read_row("SELECT v FROM kv WHERE k=?", (KEY_TAKES_SETTLED,)) is not None:
+                return
+            changed = 0
+            for old in DB.execute("SELECT * FROM needs WHERE kind='secret' AND replaced_by IS NOT NULL "
+                                  "ORDER BY id").fetchall():
+                taker = DB.execute("SELECT * FROM needs WHERE id=?", (old["replaced_by"],)).fetchone()
+                if taker is None:
+                    DB.execute("UPDATE needs SET replaced_by=NULL WHERE id=?", (old["id"],))
+                    log_row("hub", f"N-{old['id']} shows again: N-{old['replaced_by']}, which took its place, left "
+                                   f"Needs you with its task (a one-time repair of key cards)")
+                    changed += 1
+                    continue
+                spec, asks = need_secret(old) or {}, need_secret(taker) or {}
+                if "tasks" in spec or not spec.get("clarified") or taker["kind"] != "secret" or \
+                        secret_same(spec, asks.get("kind"), asks.get("env"), asks.get("site") or ""):
+                    continue
+                DB.execute("UPDATE needs SET replaced_by=NULL WHERE id=?", (old["id"],))
+                DB.execute("DELETE FROM need_talk WHERE need=? AND who='owner' AND text=?",
+                           (taker["id"], old["answer"]))
+                log_row("hub", f"N-{old['id']} shows again, and N-{taker['id']}, a request for another thing that took "
+                               f"its place, shows the owner's words of N-{old['id']} no more (a one-time repair of key "
+                               f"cards)")
+                changed += 1
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       (KEY_TAKES_SETTLED, str(changed)))
+    except Exception as e:
+        print_fault()
+        log("hub", f"the takes of clarified key cards could not be settled at this start: {type(e).__name__}: {e}")
+
+
+def settle_key_words():
+    """At the start, one time (kv KEY_WORDS_SETTLED, its own key, written in the same transaction), in every fleet,
+    after settle_key_takes: the first build of H2 wrote his words of Needs clarification as the key card's talk too,
+    and they are its answer, so a clarified card that nothing took the place of showed them twice, as talk and under
+    "Your answer". Since this release the clarify writes no talk row, and the take writes his words on the new card.
+    The owner's talk row whose text is the card's answer goes from each clarified key card that nothing replaced. It
+    deletes rows only, and writes no word of his. A row of the same words that he wrote under the card in another way
+    goes too: a talk row is his words of the clarify only by its text. An error is logged, and the start goes on."""
+    try:
+        with transaction():
+            if read_row("SELECT v FROM kv WHERE k=?", (KEY_WORDS_SETTLED,)) is not None:
+                return
+            once = DB.execute("DELETE FROM need_talk WHERE id IN (SELECT t.id FROM need_talk t JOIN needs n ON "
+                              "n.id=t.need WHERE n.kind='secret' AND n.replaced_by IS NULL AND n.answer IS NOT NULL "
+                              "AND json_extract(n.secret, '$.clarified') IS NOT NULL AND t.who='owner' AND "
+                              "t.text=n.answer)").rowcount
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       (KEY_WORDS_SETTLED, str(once)))
+            if once:
+                log_row("hub", f"{once} clarified key card(s) show the owner's words once, as their answer (a "
+                               f"one-time repair of key cards)")
+    except Exception as e:
+        print_fault()
+        log("hub", f"the words of clarified key cards could not be settled at this start: {type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------- a key into each machine's own vault
@@ -51595,9 +51709,10 @@ TOOLS = [
     ("manager", "door_gitops", t_door_gitops,
      "Give Operators a business's GitOps repository through the door, or end it. The door then reads it at HEAD "
      "through its filter (never a Secret, _config/ or a path of the exposure register), commits a checked image tag or "
-     "digest, a replica count or a restart annotation as rule calls, rolls back to the last good digest, and syncs an "
-     "app through the repository's caller workflow, which it dispatches with its own App. No GitHub grant comes with "
-     "it, so no token of the agent reads the repository: give a GitOps repository this way, never with grant_access. "
+     "digest, a replica count or a restart annotation as rule calls, rolls back to the last good digest, syncs an app "
+     "through the repository's caller workflow and uncordons a node through its uncordon-node.yml, which it dispatches "
+     "with its own App. No GitHub grant comes with it, so no token of the agent reads the repository: give a GitOps "
+     "repository this way, never with grant_access. "
      "Call it again with the whole list of agents to change it; agents [] ends it.",
      S({"request_id": REQUEST_ID,
         "repo": {"type": "string", "description": "The GitOps repository, owner/name"},
@@ -87134,6 +87249,8 @@ def main():
     settle_task_numbers()
     settle_people_names()
     settle_narrowed_rows()      # person access plan, section 5: the marks of rows of before, before the hub answers
+    settle_key_takes()          # once: the takes of clarified key cards that the first build of H2 left wrong
+    settle_key_words()          # once, after it: his words of a clarify that the first build of H2 wrote twice
     settle_history_index()      # once: the index holds only its rows' words (15 November 2026), before the hub answers
     settings_checked()          # the team that this hub starts with: a release that brings the check finds what is there
     key_swap_answered()         # an owner's press of a key swap item that a stop cut before it reached team.json

@@ -832,6 +832,12 @@ host.
 15. **The door's secrets.** The door keeps each secret that it opened, and each key that it made itself, in a file of
     its own OS user, not in an age store. The hub keeps an SHA-256 of each secret that the door opened, with no salt
     (`door.py`, `hub.py`).
+    The door keeps each copy that its own key opens, and nothing signs the copy: age does not say who sealed it, and
+    the hub knows the door's pinned key. So a hub that is broken into can put a value of its own under each name of
+    the door's file, with no step of the owner, and the door then works with that value, for example in the account
+    of another person at a provider (`fetch_sealed` in `door.py`). The same hub can also make the door delete a value
+    that it holds (the `keep` list). A signature of the central vault on each copy, which the door checks before it
+    keeps the copy, closes the first part; it is planned (22 November 2026), not built.
 16. **The links between the machines.** The hub serves HTTP, not HTTPS (`hub.py`). It depends on the fleet's private
     network, Tailscale, to protect these links (`HUB-INSTALL.md`, "The private network" and "The firewall"). Agent keys
     and job numbers go over them. A value of a secret goes over them only as a sealed copy, except a key that

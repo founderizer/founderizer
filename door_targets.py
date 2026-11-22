@@ -14,7 +14,8 @@ gives.
     <provider>:<name>   one provider account of the access file (door_providers.py)
     commit:<owner/repo> a commit that the door makes on a repository the access file gives the agent
     deploy:<owner/repo> that repository's documented deploy
-    gitops:<owner/repo> the GitOps repository: a read at HEAD through a filter, and commits of the listed forms
+    gitops:<owner/repo> the GitOps repository: a read at HEAD through a filter, commits of the listed forms, a sync,
+                        and an uncordon of a node through the repository's one fixed workflow
     door:self           the door's own server: fixed reads that the door runs as its own user (DOOR_SELF_READS)
 
 The host forms come from host/ops-root and host/ops-read themselves, so the door and the host check each form with
@@ -1317,10 +1318,26 @@ def gitops_path_refused(path, access):
     return None
 
 
+# ---------------------------------------------------------------- uncordon a node
+#
+# The owner's yes, 22 November 2026: "a narrow route to uncordon cordoned app nodes" of a business's k3s cluster, for
+# the agent that holds its GitOps target. No host of the door reaches the cluster's API, but a self-hosted runner of
+# the GitOps repository does. So the door dispatches one fixed workflow file of that repository, which a person commits
+# (no commit through the door writes .github/** of a GitOps repository: NEVER_PATHS), with one input, the node's name,
+# and waits for its run, as a sync does. A rule call: the owner's yes covers this one route. In a repository without
+# that file, GitHub refuses the dispatch, and the call fails with GitHub's answer. The ref of the dispatch is the one
+# of a sync: door.GitHub.dispatch takes the repository's default branch, as GitHub names it (door.GitHub.branch). The
+# plan holds no ref, and no word of the call reaches one, so the agent never chooses the version of the workflow that
+# runs.
+UNCORDON_WORKFLOW = "uncordon-node.yml"       # .github/workflows/uncordon-node.yml of the GitOps repository
+UNCORDON_INPUT = "node"                       # its one input
+NODE_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")      # a Kubernetes node's name of one label
+
+
 def decide_gitops(access, me, repo, op, args, content, lookups):
     """read <path> at HEAD through the filter; commit an image tag or digest, a replica count or a restart
     annotation as rule calls; rollback to the last good digest after a schema check; sync through the listed caller
-    workflow. Other manifests are the agent's own call."""
+    workflow; uncordon <node> through UNCORDON_WORKFLOW. Other manifests are the agent's own call."""
     entry = repo_entry(me, repo, ("gitops",))
     if entry is None:
         return refused(f"the door gives this agent nothing on {repo}", route="holder")
@@ -1344,8 +1361,18 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
         # the call waits for the run and answers with how it ended (door.GitHub.dispatch), so a failed sync fails
         return Decision("rule", "a sync through the listed caller", target=target, window="deploy",
                         plan={"repo": repo, "workflow": caller, "inputs": {"app": args[0]}, "wait": True})
+    if op == "uncordon":
+        if content is not None:
+            return refused("uncordon takes no content: only the name of the node", target=target)
+        if len(args) != 1 or not NODE_NAME.fullmatch(args[0]):
+            return refused("uncordon takes one argument, the name of the node: lower-case letters, digits and -, at "
+                           "most 63, with a letter or a digit at each end", target=target)
+        # as a sync: the call waits for the run and answers with how it ended, so an uncordon that fails fails
+        return Decision("rule", f"an uncordon of the node {args[0]} through {UNCORDON_WORKFLOW}", target=target,
+                        window="deploy", plan={"repo": repo, "workflow": UNCORDON_WORKFLOW,
+                                               "inputs": {UNCORDON_INPUT: args[0]}, "wait": True})
     if op not in ("push", "rollback"):
-        return refused("the GitOps repository takes read, push, rollback and sync", target=target)
+        return refused("the GitOps repository takes read, push, rollback, sync and uncordon", target=target)
     files, message = commit_files(content)
     if files is None:
         return refused(message, target=target)

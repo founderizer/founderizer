@@ -1063,6 +1063,48 @@ class Refusals(DoorCase):
                         lookups={"base_file": lambda p: alerts.encode()})
         self.assertEqual(d.kind, "own")
 
+    def test_an_uncordon_dispatches_only_the_fixed_workflow_with_the_node_s_name_alone(self):
+        """The owner's yes of 22 November 2026 is to one route: the door dispatches .github/workflows/uncordon-node.yml
+        of the agent's GitOps target, with the one input node, waits for its run, and keeps the owner's deploy window.
+        The bugs: a workflow or an input that the call names (an agent dispatches any workflow of the repository, or
+        sends it more inputs), a plan that does not wait (a failed uncordon reads as done), or no window."""
+        self.assertEqual((door_targets.UNCORDON_WORKFLOW, door_targets.UNCORDON_INPUT), ("uncordon-node.yml", "node"))
+        for node in ("app-node-2", "a", "0", "n" * 63, "9node-a0"):
+            with self.subTest(node=node):
+                d = self.decide("gitops:one-org/cluster", "uncordon", node)
+                self.assertEqual((d.kind, d.target, d.window, d.write), ("rule", "gitops:one-org/cluster", "deploy",
+                                                                        True))
+                self.assertEqual(d.plan, {"repo": "one-org/cluster", "workflow": "uncordon-node.yml",
+                                          "inputs": {"node": node}, "wait": True})
+
+    def test_an_uncordon_refuses_every_other_form_content_and_an_agent_without_the_target(self):
+        """A node's name is one label of lower-case letters, digits and -, which the workflow puts into a kubectl
+        command line: the bugs are a name that carries a flag, a second word, a shell character or another node's
+        domain into the run, a content that the call carries, and an uncordon for an agent that holds no GitOps target
+        of that repository, or holds it as another kind."""
+        form = ("uncordon takes one argument, the name of the node: lower-case letters, digits and -, at most 63, with "
+                "a letter or a digit at each end")
+        for args in ([], [""], ["Node-1"], ["node_1"], ["node-1.example.internal"], ["-node"], ["node-"], ["n" * 64],
+                     ["node 1"], ["node;id"], ["$(id)"], ["--all"], ["node-1\n"], ["node-1", "node-2"],
+                     ["node-1", "--force"], ["app-node-2", "app-node-2"],
+                     # a ref that the agent chooses: the dispatch is always on the repository's default branch
+                     ["app-node-2", "--ref", "dev"], ["app-node-2", "ref=dev"], ["refs/heads/dev"]):
+            with self.subTest(args=args):
+                d = self.decide("gitops:one-org/cluster", "uncordon", *args)
+                self.assertEqual((d.kind, d.why, d.plan), ("refused", form, None))
+        for content in (b"", b"{}", b'{"node": "app-node-2"}', b'{"ref": "dev"}'):
+            with self.subTest(content=content):
+                d = self.decide("gitops:one-org/cluster", "uncordon", "app-node-2", content=content)
+                self.assertEqual((d.kind, d.why, d.plan),
+                                 ("refused", "uncordon takes no content: only the name of the node", None))
+        for agent, target in (("ops-two", "gitops:one-org/cluster"), ("ops-one", "gitops:one-org/shop"),
+                              ("ops-one", "gitops:one-org/ops"), ("ops-one", "gitops:one-org/website")):
+            with self.subTest(agent=agent, target=target):
+                d = self.decide(target, "uncordon", "app-node-2", agent=agent)
+                self.assertEqual((d.kind, d.plan), ("refused", None))
+        d = self.decide("gitops:one-org/cluster", "drain", "app-node-2")
+        self.assertEqual(d.why, "the GitOps repository takes read, push, rollback, sync and uncordon")
+
     def test_provider_calls_that_are_never_the_door_s(self):
         self.assertEqual(self.decide("hetzner:one", "change", "POST", "/servers/1/actions/enable_rescue", "web-1",
                                      content=b"{}").kind, "refused")
@@ -2362,6 +2404,42 @@ class SyncRuns(DoorCase):
         self.assertEqual((last["action"], last["outcome"]), ("sync", "failed"))
         self.assertTrue(last["why"].startswith(why[:120]), last["why"])      # the record says how the run ended
         self.assertEqual(len([u for m, u, d in self.calls if u == self.RUN]), 3)
+
+    def test_an_uncordon_dispatches_its_one_workflow_and_waits_for_the_run(self):
+        """The whole path of an uncordon (the owner's yes of 22 November 2026): the door dispatches exactly
+        uncordon-node.yml with exactly {node}, on the default branch, and answers with how its run ended. The bugs: a
+        dispatch of another workflow or with other inputs, an answer before the run ends (a failed uncordon reads as
+        done), a repository without the file that reads as done, where GitHub refused the dispatch, and a dispatch on
+        the door file's branch, which is a commit's (the workflow file on that branch would be one that no person
+        read)."""
+        data = json.loads(json.dumps(ACCESS))
+        data["agents"]["ops-one"]["repos"]["one-org/cluster"]["branch"] = "release"   # a commit's branch, not a run's
+        self.write_access(data)
+        url = f"{self.API}/repos/one-org/cluster/actions/workflows/uncordon-node.yml/dispatches"
+        got = self.call(ONE, "gitops:one-org/cluster", "uncordon", "app-node-2")         # no such file: GitHub's 404
+        self.assertEqual((got["ok"], got["kind"], got["why"]), (False, "rule", "GitHub answered 404 for "
+                                                                               "uncordon-node.yml"))
+        self.answers[("POST", url)] = (200, {"workflow_run_id": 4242})
+        self.runs = [(200, {"status": "in_progress"}),
+                     (200, {"status": "completed", "conclusion": "success", "html_url": "https://github.com/x/4242"})]
+        stub = self.door.http
+
+        def http(method, u, headers, data):
+            if method == "GET" and u == self.RUN:
+                self.calls.append((method, u, None))
+                return self.runs.pop(0) if len(self.runs) > 1 else self.runs[0]
+            return stub(method, u, headers, data)
+        self.door.http = http
+        self.calls.clear()
+        got = self.call(ONE, "gitops:one-org/cluster", "uncordon", "app-node-2")
+        self.assertEqual((got["ok"], got["out"]), (True, "uncordon-node.yml of one-org/cluster: run 4242 passed "
+                                                         "(https://github.com/x/4242)"))
+        # the ref is the repository's default branch, as GitHub names it (master here), as a sync's: no word of the call
+        sent = [(u, d) for m, u, d in self.calls if m == "POST" and "/dispatches" in u]
+        self.assertEqual(sent, [(url, {"ref": "master", "inputs": {"node": "app-node-2"}, "return_run_details": True})])
+        self.assertEqual(len([u for m, u, d in self.calls if u == self.RUN]), 2)
+        last = self.door.record.after(0)[-1]
+        self.assertEqual((last["action"], last["kind"], last["outcome"]), ("uncordon", "rule", "done"))
 
     def test_a_log_that_cannot_be_read_leaves_the_failed_call_as_it_was(self):
         """The log lines only help: a log that GitHub does not give, a read that breaks and a log host that does not
