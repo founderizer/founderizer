@@ -128,6 +128,12 @@ WORDS = {
                       "24.04 or 26.04 that is not the hub's own server runs one",
     "browser_no_room": "{server} has no room for the browser of {agent} beside its other agents: turn its Browser box "
                        "off first, or move it to a server with more memory",
+    # the move's two cases of D6, each with its own words: a server whose room is full with the agent counted there,
+    # and one whose reading does not say its room (browser_no_room stays for the apps that know it)
+    "browser_no_place": "{server} has no room for the browser of {agent}: turn its Browser box off first, or move it "
+                        "to a server with more memory",
+    "browser_room_unknown": "{server} has not said how much memory it has for browsers: turn the Browser box of "
+                            "{agent} off first, or move it to another server",
     # a person and their handles: the people routes, and a person's Telegram invite (CHAT-APPS.md 19.4)
     "no_such_person": "no such person",
     "person_blocked": "you blocked this person",

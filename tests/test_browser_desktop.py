@@ -842,6 +842,25 @@ class LinuxPlaces(OwnerAPI):
         ref = f"T-{first}"
         code, answer = self.request(f"/events/ivy?delivery=1&after=0&wait=0&alive={ref}&browser_closed=")
         self.assertEqual((code, answer.get("waits"), hub.browser_holders("box")), (200, {ref: "limit"}, [first]), answer)
+        # D6: the same answer gives the helper its server's places now, for the setup check's item
+        # (lifecycle.browser_item); a server with no room says 0, and an agent with no Browser box gets none
+        self.assertEqual(answer.get("browser_places"), 1, answer)
+        self.room(dict(ONE_PLACE, memory_max=2000 * MIB))
+        self.assertEqual(self.request(f"/events/ivy?delivery=1&after=0&wait=0&alive={ref}")[1].get("browser_places"), 0)
+        # a reading that does not say the room (an older server service, a faulty one) is no count: 0 would make the
+        # item say "no room" for a server that only did not report yet. A room that is no object raised in every poll.
+        for room in ({}, dict(ONE_PLACE, memory_max=None), "full", [1]):
+            self.room(room)
+            self.assertEqual((hub.browser_room_known("box"), hub.browser_places("box")), (False, 0), room)
+            code, answer = self.request(f"/events/ivy?delivery=1&after=0&wait=0&alive={ref}")
+            self.assertEqual((code, answer["browser_places"]), (200, None), room)
+        hub.q("DELETE FROM server_status WHERE server='box'")
+        self.assertFalse(hub.browser_room_known("box"))
+        self.room(ONE_PLACE)
+        self.assertTrue(hub.browser_room_known("box"))
+        hub.TEAM["agents"]["ivy"]["can"] = ["shell", "web"]
+        self.assertIsNone(self.request(f"/events/ivy?delivery=1&after=0&wait=0&alive={ref}")[1]["browser_places"])
+        hub.TEAM["agents"]["ivy"]["can"] = ["shell", "web", "browser"]
         code, answer = self.request(f"/events/ivy?delivery=1&after=0&wait=0&alive={ref}&browser_closed={ref}")
         self.assertEqual((code, hub.browser_holders("box")), (200, []), answer)
 

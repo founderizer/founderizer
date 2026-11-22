@@ -108,6 +108,10 @@ OLD = {
                       "24.04 or 26.04 that is not the hub's own server runs one",
     "browser_no_room": "{server} has no room for the browser of {agent} beside its other agents: turn its Browser box "
                        "off first, or move it to a server with more memory",
+    "browser_no_place": "{server} has no room for the browser of {agent}: turn its Browser box off first, or move it "
+                        "to a server with more memory",
+    "browser_room_unknown": "{server} has not said how much memory it has for browsers: turn the Browser box of "
+                            "{agent} off first, or move it to another server",
     "no_such_person": "no such person",
     "person_blocked": "you blocked this person",
     "person_handles_most": "a person has at most {most} handles",
@@ -203,7 +207,7 @@ SITES = {
     'save_agent_settings': {'no_such_agent': 1, 'team_changed': 1},
     # build plan 04, S3 (UI-API.md 1.218)
     'browser_rule': {'browser_shell_off': 1, 'browser_server': 1}, 'browser_box_refusal': {'browser_server': 1},
-    'browser_move_refusal': {'browser_no_room': 1, 'browser_shell_off': 1},
+    'browser_move_refusal': {'browser_no_place': 1, 'browser_room_unknown': 1, 'browser_shell_off': 1},
     # build plan 04, S6 (UI-API.md 1.225)
     'takeover_open': {'takeover_closed': 2, 'takeover_no_screen': 1, 'takeover_late': 1, 'takeover_no_browser': 1,
                       'takeover_provider': 1, 'takeover_screen_failed': 1},
@@ -294,6 +298,10 @@ LEFT = {"a registered login cannot be sent as text": 1}
 PART_CODES = {"role_sets_contacts_off": "role_sets", "role_no_set": "role_sets",
               **{code: "person_links" for code in ("join_no_code", "join_two", "join_file", "link_no_agent",
                                                    "link_active", "link_channel", "link_file", "link_from_tool")}}
+# The codes that a release raised and that no place raises any more. Each stays in the table with its English, because
+# a hub of an older release still sends it and each app holds its own words for it. browser_no_room: the move's one
+# code until 20 November 2026, when its two cases got their own (browser_no_place, browser_room_unknown).
+RETIRED = {"browser_no_room"}
 # The names that a call's own parameters use, which a hole cannot take
 RESERVED = {"code", "names", "table", "extra", "status", "message", "self", "cls"}
 
@@ -523,7 +531,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 216)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 217)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one
@@ -538,9 +546,10 @@ class Places(unittest.TestCase):
 
     def test_each_code_of_the_table_is_named_by_a_place(self):
         """A code is added in the commit that raises it: a code that no place names says something that the hub
-        never says, and the apps would carry words for it."""
+        never says, and the apps would carry words for it. A code that a release raised stays when its place goes
+        (RETIRED), and a place never takes one of those again: its sentence was given for the old case."""
         used = {code for _, code, _, _, _ in self.places}
-        self.assertEqual(set(WORDS) - used - set(PART_CODES), set())
+        self.assertEqual(set(WORDS) - used - set(PART_CODES), RETIRED)
         # and a Teams part's own code is in the table, of a part that Core calls, and Core never raises it itself
         self.assertLessEqual(set(PART_CODES), set(WORDS))
         self.assertLessEqual(set(PART_CODES.values()), set(hub.TEAMS_CALLS))

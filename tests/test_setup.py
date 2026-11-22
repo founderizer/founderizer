@@ -522,6 +522,12 @@ class Helper(unittest.TestCase):
             with patch.object(lifecycle, "browser_proof_holds", lambda user, **k: False):
                 self.assertEqual(self.items(self.life(platform="linux", conf=conf))[("capability", "browser")][0],
                                  "failed")
+            # D6: the check reads the hub's count of the server's browser places, which the helper keeps
+            life = self.life(platform="linux", conf=conf)
+            life.places = lambda: 0
+            self.assertEqual(self.items(life)[("capability", "browser")], (
+                "not_verified", "This agent's own Chrome cannot start on this server yet: its server has no room for "
+                                "a browser now."))
 
     def test_a_browser_on_claude_needs_its_extension_on_in_chrome(self):
         def browser(life):

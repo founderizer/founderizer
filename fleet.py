@@ -5236,6 +5236,8 @@ class Helper:
         self.browser_at = None          # when sweep_browser last swept; None: not yet in this start of the helper
         self.browser_waiting = None     # browser_waits: the browser tasks that wait now; None before its first round
         self.browser_waits_seen = {}    # S3: the last poll's waits, which a task's start reads
+        self.browser_places = None      # D6: the places of this agent's server, from the hub's last poll; None from a
+        #                                 hub that does not say (the setup check reads it, lifecycle.browser_item)
         self.browser_fresh = None       # S3: the tasks whose session started with no Chrome, for a wait (run=False):
         #                                 kept in a file of its own (fresh_tasks), which a restart of the helper reads
         self.browser_retry, self.browser_told = {}, {}     # browser_try: {key: (wait, due)} and {key: the reason told}
@@ -6360,6 +6362,13 @@ class Helper:
         self.browser_retry.pop(key, None)
         self.browser_told.pop(key, None)
         return True
+
+    def keep_places(self, places):
+        """The poll's `browser_places` (D6): how many browsers this agent's Linux server can run at one time now, which
+        the setup check reads (lifecycle.browser_item). None from a hub that does not say or has no reading of the
+        server's room, and for any other agent:
+        the check then goes by the server's parts alone, as before."""
+        self.browser_places = places if type(places) is int else None
 
     def browser_waits(self, waits):
         """**A wait closes the browser, and its end opens it again** (D10): `waits` is the poll's {task: kind} of this
@@ -11458,6 +11467,7 @@ def cmd_run(args):
                             slow_file=os.path.join(HOME, "slow-%s.json" % agent),
                             floor=os.path.join(HOME, FLOOR_FILE),     # DevOps plan 0.1: every move under may_take
                             read_key=lambda: account_key(agent, conf),    # the key of a model account, for its check
+                            places=lambda: h.browser_places,    # D6: its server's browser places, by the hub
                             ended=collector.sign_in_ended)      # a sign-in that the provider ended is none
     collector.over_changed = h.lifecycle.report_soon    # and the account read's new word on it is reported at once
     threading.Thread(target=h.lifecycle.run_forever, name="machine-status", daemon=True).start()
@@ -11518,6 +11528,7 @@ def cmd_run(args):
                 h.close_held()      # one OS user for each agent: no window of it runs while the hub holds it
             h.sweep_browser()       # before this round's starts: a unit that no open task holds goes first
             h.browser_waits(data.get("waits"))      # build plan 04, D10: a wait closes the browser, its end opens it
+            h.keep_places(data.get("browser_places"))       # D6: the setup check says a server with no room
             h.handle_events(data.get("events", []))
             h.sweep_places()
             h.doing("screen watch")

@@ -5776,18 +5776,33 @@ def browser_room_places(server, room, team=None):
     return max(0, min((memory + swap - need - BROWSER_MARGIN) // BROWSER_PLACE, takers))
 
 
-def browser_places(server, team=None):
+def browser_room(server):
+    """The room of user.slice in this server's last reading (`room`, lifecycle.room_reading), or {} with no reading,
+    with a reading of an older server service that has none, or with a faulty one (a `room` that is no object).
+    read_row only: an admission reads it inside a transaction."""
+    row = read_row("SELECT data FROM server_status WHERE server=?", (server,))
+    try:
+        room = (json.loads(row["data"]) if row else {}).get("room")
+    except (ValueError, TypeError, AttributeError):
+        room = None
+    return room if isinstance(room, dict) else {}
+
+
+def browser_room_known(server, room=None):
+    """True where this server's reading says the room of its user.slice (an int `memory_max`). False: browser_places
+    is 0 there because nothing is known, not because the room is full, and no words say "no room" for it. `room`: a
+    reading that the caller made already (browser_room), so that it and browser_places decide by the same one."""
+    return type((browser_room(server) if room is None else room).get("memory_max")) is int
+
+
+def browser_places(server, team=None, room=None):
     """How many browsers can run at one time on this Linux server (D6): of the room of user.slice (its MemoryMax and
     its swap, min(memory.swap.max, SwapTotal)), the need of every agent on it and the margin, in places of BROWSER_PLACE,
     never more than its workers and leads with a shell (one browser task each, D9; only they can have a browser, D2),
     less what real shortages took (browser_room_seen). 0 without a reading of its room or a limit of the slice: no
-    browser runs before part 1 of the memory route is on a server. read_row only: an admission reads it inside a
-    transaction."""
-    row = read_row("SELECT data FROM server_status WHERE server=?", (server,))
-    try:
-        room = (json.loads(row["data"]) if row else {}).get("room") or {}
-    except (ValueError, TypeError, AttributeError):
-        room = {}
+    browser runs before part 1 of the memory route is on a server. `room`: a reading that the caller made already
+    (browser_room). read_row only: an admission reads it inside a transaction."""
+    room = browser_room(server) if room is None else room
     return max(0, browser_room_places(server, room, team) - browser_room_less(server))
 
 
@@ -5950,12 +5965,8 @@ def browser_refusal(owner, caller, keep=False, exact=False):
             BROWSER_RUN_NOT_NOW.format(agent=shown_role(owner), server=machine)
     if exact:
         # the agent tells the owner: the cause, and whether the place comes back by itself (two reviews, 21 November)
-        row = read_row("SELECT data FROM server_status WHERE server=?", (server,))
-        try:
-            room = (json.loads(row["data"]) if row else {}).get("room")
-        except (ValueError, TypeError, AttributeError):
-            room = None
-        if not isinstance(room, dict):
+        room = browser_room(server)
+        if not room:
             return f"{machine} has no place for a browser now: the hub has no reading of its memory yet."
         if type(room.get("memory_max")) is not int:
             return f"{machine} has no place for a browser now: the memory limit of its agents is not in place there yet."
@@ -10442,6 +10453,17 @@ def browser_waits(agent, closed=None, alive=None):
              (held or (r["state"] == "input-required" and str(r["waiting_on"] or "").startswith("N-")))}
     browser_places_turn(agent, rows, waits, closed, alive)      # S3: and on Linux, `place` for one that has none
     return waits
+
+
+def browser_poll_places(agent):
+    """The browser places of this agent's server now (browser_places, D6), for its helper's poll: only for an agent
+    with the Browser box on a Linux server whose reading says its room (browser_room_known), else None: a 0 says
+    that the room is full, never that no reading came. One reading of the room decides both."""
+    server = browser_server(agent)
+    if not server or "browser" not in ((agents().get(agent) or {}).get("can") or []):
+        return None
+    room = browser_room(server)
+    return browser_places(server, room=room) if browser_room_known(server, room) else None
 
 
 def browser_poll_sets(query):
@@ -60772,8 +60794,9 @@ def move_refusal(team, agent, a, server):
 
 def browser_move_refusal(team, agent, server):
     """Why `agent`, which has the Browser box, may not move to `server`, or None (build plan 04, S3): a Linux server
-    whose reading runs no browser (browser_box_refusal, D8), or one that has no place for its browser with it counted
-    there (D6: an agent that moves counts on its target), and before both its Shell box (D2, validate_team's rule,
+    whose reading runs no browser (browser_box_refusal, D8), one whose reading does not say its room, or one that
+    has no place for its browser with it counted there (D6: an agent that moves counts on its target; never for the
+    manager, which takes no place), and before all of them its Shell box (D2, validate_team's rule,
     whose sentence is the true reason). A wait for a place that is busy now is no reason: that place ends."""
     if server_kind_of(team, server) != "linux":
         return None
@@ -60783,10 +60806,15 @@ def browser_move_refusal(team, agent, server):
     refused = browser_box_refusal(team, agent, server)
     if refused:
         return refused
+    if a.get("role") == "manager":      # its box stays and runs no browser task (browser_breaches): it needs no place
+        return None
     moved = json.loads(json.dumps(team))
     moved["agents"][agent]["machine"] = server
-    if not browser_places(server, moved):
-        return Refusal(409, code="browser_no_room", names={"server": server, "agent": shown_role(agent)})
+    room = browser_room(server)             # one reading for both decisions
+    if not browser_room_known(server, room):    # it does not say its room: not the words of a full server
+        return Refusal(409, code="browser_room_unknown", names={"server": server, "agent": shown_role(agent)})
+    if not browser_places(server, moved, room):
+        return Refusal(409, code="browser_no_place", names={"server": server, "agent": shown_role(agent)})
     return None
 
 
@@ -84075,6 +84103,9 @@ class Handler(BaseHTTPRequestHandler):
                 # end of a usage limit; on Linux its helper closes a browser task's Chrome for such a wait, and starts
                 # it again with its pages at the wait's end (fleet.Helper.browser_waits)
                 "waits": browser_waits(agent, *browser_poll_sets(query)) if worker else None,
+                # D6: how many browsers its Linux server can run at one time now; at 0 its helper's setup check says
+                # that the agent's own Chrome cannot start (lifecycle.browser_item). None for any other agent.
+                "browser_places": browser_poll_places(agent) if worker else None,
                 # 4 November 2026: each task works in its own clones, which the helper deletes once the task is no
                 # longer open (fleet.Helper.sweep_places)
                 # (OPEN_TASK in the words of the statement: SQLite reads task_owner_open only for those words)

@@ -317,12 +317,24 @@ class Moves(Servers):
         self.assertEqual(status, 409, answer)
         self.assertIn("uses a Mac's browser and screen", answer["error"])
         self.write_can("desk", ["shell", "web", "browser"])
-        status, answer = self.move("desk", "box")           # box has sent no room yet: no place
+        status, answer = self.move("desk", "box")           # box has sent no room yet: not the words of a full server
         self.assertEqual((status, answer.get("code"), answer.get("names")),
-                         (409, "browser_no_room", {"server": "box", "agent": "Desk"}), answer)
+                         (409, "browser_room_unknown", {"server": "box", "agent": "Desk"}), answer)
+        self.assertEqual(answer["error"], "box has not said how much memory it has for browsers: turn the Browser "
+                                          "box of Desk off first, or move it to another server")
+        # the manager's box stays on Linux and runs no browser task, so its move asks for no room: no place counts
+        # a manager, and its move would be refused on a server of any size
+        managed = json.loads(json.dumps(hub.TEAM))
+        managed["agents"]["desk"]["role"] = "manager"
+        self.assertIsNone(hub.browser_move_refusal(managed, "desk", "box"))
         self.box_reads(memory=5000)                         # one place for scout alone, none with both (D6)
         status, answer = self.move("desk", "box")
-        self.assertEqual((status, answer.get("code")), (409, "browser_no_room"), answer)
+        self.assertEqual((status, answer.get("code"), answer.get("names")),
+                         (409, "browser_no_place", {"server": "box", "agent": "Desk"}), answer)
+        self.assertEqual(answer["error"], "box has no room for the browser of Desk: turn its Browser box off first, "
+                                          "or move it to a server with more memory")
+        self.assertEqual(hub.browser_move_refusal(hub.TEAM, "desk", "box").extra["code"], "browser_no_place")
+        self.assertIsNone(hub.browser_move_refusal(managed, "desk", "box"))
         self.write_can("desk", ["web", "browser"])          # a closed agent hears its true reason first (D2), also
         self.box_reads(memory=1500)                         # where its smaller need leaves no place either
         status, answer = self.move("desk", "box")

@@ -320,10 +320,10 @@ class SetupCheck(unittest.TestCase):
     """S3: the machine check's item of the Browser box on Linux reads the parts and the port's live proof, in place of a
     fixed failure (the helper's own refusals are BrowserStart's)."""
 
-    def item(self, conf=None, reading=None, port=9301, proof=True):
+    def item(self, conf=None, reading=None, port=9301, proof=True, places=None):
         reading = {"state": "ready", "chrome": "158.0.7400.1-1"} if reading is None else reading
         return fleet.lifecycle.browser_item(conf or CLAUDE, "fleet-ivy", reading, port=lambda user: port,
-                                            proof=lambda user: proof)
+                                            proof=lambda user: proof, places=places)
 
     def test_the_item_is_ok_only_where_a_browser_task_can_start_now(self):
         """An activation that the item passes gives a task that its helper starts (fleet.Helper.browser_start): an
@@ -341,10 +341,33 @@ class SetupCheck(unittest.TestCase):
                                (dict(reading={"state": "missing"}), "its browser parts there are not ready yet"),
                                (dict(reading={"state": "table_missing"}), "its browser parts there are not ready yet"),
                                (dict(port=None), "its browser parts there are not ready yet"),
-                               (dict(proof=False), "its browser parts there are not ready yet")):
+                               (dict(proof=False), "its browser parts there are not ready yet"),
+                               # D6: the parts' own fault stays the reason on a server with no room too
+                               (dict(places=0, proof=False), "its browser parts there are not ready yet")):
             self.assertEqual(self.item(**kwargs)[2:], ("failed", frame.format(reason)), kwargs)
+        self.assertEqual(self.item(places=1)[2], "ok")
+        # D6: a server whose room the hub counts at 0 starts no Chrome now. The item says so and is not_verified:
+        # failed would keep the owner from activating an agent whose Browser box is a default (D1, hub.item_required)
+        kind, ref, state, detail = self.item(places=0)
+        self.assertEqual((state, detail), ("not_verified", frame.format("its server has no room for a browser now")))
+        with patch.object(hub, "agents", lambda: {"ivy": CLAUDE}):
+            self.assertIn("browser", CLAUDE["can"])
+            self.assertFalse(hub.item_required("ivy", {"kind": kind, "ref": ref, "state": state}))
+            self.assertTrue(hub.item_required("ivy", {"kind": kind, "ref": ref, "state": "failed"}))
         self.assertEqual(fleet.lifecycle.browser_item(CLAUDE, "fleet-ivy", None)[2:],
                          ("failed", frame.format("its browser parts there are not ready yet")))
+
+    def test_the_helper_keeps_the_hub_s_count_of_places_for_the_check(self):
+        """D6: the poll's count reaches the setup check through the helper. A helper that kept a hub's old 0 after
+        the hub stopped saying, or took another value for a count, would fail the item on a server with room."""
+        h = helper()
+        h.keep_places(0)
+        self.assertEqual(h.browser_places, 0)
+        for none in (None, True, "0", {}):
+            h.keep_places(none)
+            self.assertIsNone(h.browser_places, none)
+        h.keep_places(2)
+        self.assertEqual(h.browser_places, 2)
 
 
 class BrowserStart(unittest.TestCase):

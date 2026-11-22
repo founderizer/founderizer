@@ -3742,14 +3742,17 @@ def browser_proof_holds(user, ports=BROWSER_PARTS["ports"], proof=BROWSER_PROOF,
     return bool(lines) and lines[0] == version and f"{user} holds" in lines[1:] and -60 <= age <= BROWSER_PROOF_AGE
 
 
-def browser_item(conf, user, reading, port=None, proof=None):
+def browser_item(conf, user, reading, port=None, proof=None, places=None):
     """The setup check's item of the Browser box on a Linux server (build plan 04, S3): ("capability", "browser",
     state, detail), ok where a browser task of this agent can start now by its helper's own rule
     (fleet.Helper.browser_start): a session that gets the browser (linux_browser_refusal), the server's browser parts
     in place (`reading`, browser_reading), a port of this agent's own user, and the server service's current live proof
-    `holds` for it. Else failed. The owner reads its detail behind the item's mark, so it has one sentence of two forms
-    and three reasons (his yes to them waits); the agents read the exact cause in the refusals of their browser
-    tasks."""
+    `holds` for it. Else failed. Where all of that holds and the server has no room for a browser now, the item is
+    not_verified with the same sentence, which blocks no activation (hub.item_required; D1: a browser that the owner
+    did not choose blocks nothing): `places` is the hub's count of the browsers that the server can run at one time
+    now (hub.browser_places, D6), and only a 0 does that; None, from a hub that does not say or has no reading of the
+    room, changes nothing. The owner reads its detail behind the item's mark, so it has one sentence of two forms and
+    four reasons (his yes to them waits); the agents read the exact cause in the refusals of their browser tasks."""
     port, proof = port or browser_port, proof or browser_proof_holds
 
     def failed(reason):
@@ -3760,6 +3763,8 @@ def browser_item(conf, user, reading, port=None, proof=None):
         return failed(BROWSER_SYSTEMS_ONLY)
     if (reading or {}).get("state") != "ready" or not port(user) or not proof(user):
         return failed(BROWSER_PARTS_NOT_READY)
+    if places is not None and places <= 0:
+        return "capability", "browser", "not_verified", BROWSER_NOT_YET.format(reason=BROWSER_NO_ROOM_NOW)
     return "capability", "browser", "ok", BROWSER_READY
 
 
@@ -3768,6 +3773,8 @@ BROWSER_NOT_YET = "This agent's own Chrome cannot start on this server yet: {rea
 BROWSER_NEEDS = "it needs Claude Code or Codex, with its Shell box on"
 BROWSER_SYSTEMS_ONLY = "only a server with x86 Ubuntu 24.04 or 26.04 runs one"
 BROWSER_PARTS_NOT_READY = "its browser parts there are not ready yet"
+BROWSER_NO_ROOM_NOW = "its server has no room for a browser now"       # Spanish, for the record: "su servidor no
+#                                                                        tiene espacio para un navegador ahora"
 
 def browser_reading(platform_name=sys.platform, root="", run=None, machine=lambda: os.uname().machine,
                     broker=lambda: pwd.getpwnam(BROWSER_BROKER).pw_uid):
@@ -4028,11 +4035,14 @@ class Lifecycle:
     def __init__(self, kit, agent, conf, post, busy, restart=None, run=_run, clock=time.time,
                  platform_name=sys.platform, home=None, vault=None, probe=None, models=codex_model_list, legacy=None,
                  switch=None, which=None, monotonic=time.monotonic, runtimes_busy=None, say=print, slow_file=None,
-                 floor=None, read_key=None, ended=None, releases=None):
+                 floor=None, read_key=None, ended=None, releases=None, places=None):
         self.kit, self.agent, self.conf, self.post, self.busy = kit, agent, conf, post, busy
         # () -> the vendor's own record of Codex's newest releases (codex_releases): its update takes the newest that is
         # onboard.RELEASE_AGE_DAYS old
         self.releases = releases or (lambda: codex_releases(self.home, self.clock()))
+        # () -> how many browsers this agent's Linux server can run at one time now, by the hub's last poll answer
+        # (hub.browser_places, D6), or None where the hub did not say. None: nothing here knows, as for a reading.
+        self.places = places
         # (runtime) -> True when that runtime's own account read said that its sign-in is over at the provider
         # (usage.Collector.sign_in_ended). None: nothing reads the account here, as for the server service's readings.
         self.ended = ended
@@ -4596,7 +4606,7 @@ class Lifecycle:
                 reading = browser_reading(self.platform, run=self.run)
             except Exception:       # noqa: BLE001 - one item of the check, which goes on
                 reading = None
-            add(*browser_item(self.conf, user, reading))
+            add(*browser_item(self.conf, user, reading, places=self.places() if self.places else None))
             add("capability", "screen", "failed", "A Linux worker has no desktop session.")
         items += self.login_items(probe_job)
         code, out, _ = self.run(["id", "-Gn"])
