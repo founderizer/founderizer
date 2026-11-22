@@ -49,8 +49,8 @@ import diagnostics
 
 PATH = "/api/errors"
 MANIFEST = "release.json"   # lifecycle.RELEASE_FILE: the signed manifest of the release on the configuration ref
-DAY = 86400             # seconds between two reports, and the hold after an answer that is not 2xx or 429
-RETRY = 3600            # seconds before a report that could not reach our side is tried again
+DAY = 86400             # seconds between two reports, and the hold after a 4xx answer that is not 429
+RETRY = 3600            # seconds before a report that could not reach our side, or got a 5xx or a 3xx, goes again
 RETRY_MOST = 6 * 3600   # the longest wait that our side's Retry-After may set
 TIMEOUT = 30            # seconds for one send
 MOST = 20               # faults, and refused calls, in one report (diagnostics.MAX_SHOWN)
@@ -126,8 +126,9 @@ class ReportError(Exception):
     """Nothing was sent, or our side refused it. The message is safe to log: it never holds a value of the report.
 
     `retry_after`: the seconds after which a report may go again: our side's Retry-After for a 429, DAY for any other
-    answer that is not 2xx (the same report would only be refused again) and for a channel that is not ours, and None
-    when our side was not reached."""
+    4xx (the same report would only be refused again) and for a channel that is not ours, RETRY for a 5xx or a 3xx
+    (our site, or a deploy of it, that is down for a moment: a DAY would put two reports 48 hours apart, and our side
+    counts a hub that sent nothing for 36 hours as silent), and None when our side was not reached."""
 
     def __init__(self, says, retry_after=None, status=None):
         super().__init__(says)
@@ -444,8 +445,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def send(url, body, timeout=None):
     """POST the report to `url` (endpoint(channel), or a test server's). Nothing when our side took it; ReportError
-    when it refused it (retry_after: Retry-After for a 429, DAY for any other answer), could not be reached or gave
-    no answer (retry_after None)."""
+    when it refused it (retry_after: Retry-After for a 429, DAY for any other 4xx, RETRY for a 5xx or a 3xx), could
+    not be reached or gave no answer (retry_after None)."""
     request = urllib.request.Request(url, data=json.dumps(body, separators=(",", ":")).encode(), method="POST",
                                      headers={"Accept": "application/json", "Content-Type": "application/json",
                                               "User-Agent": "founderizer-hub"})
@@ -458,7 +459,7 @@ def send(url, body, timeout=None):
             pass                    # a 2xx: our side took it (a 3xx is an HTTPError here, because no redirect is followed)
     except urllib.error.HTTPError as answer:
         with answer:
-            retry = DAY
+            retry = DAY if 400 <= answer.code < 500 else RETRY
             if answer.code == 429:
                 try:
                     retry = min(max(int(str(answer.headers.get("Retry-After") or "").strip()), 1), RETRY_MOST)

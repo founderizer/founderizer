@@ -427,11 +427,16 @@ class Send(unittest.TestCase):
         self.assertIsNone(caught.exception.retry_after)
 
     def test_a_refusal_and_no_site(self):
-        for status in (400, 404, 413, 503):
+        """A 4xx holds the next report a DAY: the same report would only be refused again. A 5xx or a 3xx (our site, or
+        a deploy of it, down for a moment) waits an hour, as a send that did not reach our side does. Until 22 November
+        2026 a 503 held a DAY too: one short fault of our site then put two reports 48 hours apart, and our side counts
+        a hub that sent nothing for 36 hours as silent (founderizer-web, fleet-health.ts, live_hours)."""
+        for status, retry in ((400, errorreports.DAY), (404, errorreports.DAY), (413, errorreports.DAY),
+                              (301, errorreports.RETRY), (500, errorreports.RETRY), (503, errorreports.RETRY)):
             self.site.answer = (status, {})
             with self.subTest(status=status), self.assertRaises(errorreports.ReportError) as caught:
                 errorreports.send(self.url, report({}))
-            self.assertEqual((caught.exception.status, caught.exception.retry_after), (status, errorreports.DAY))
+            self.assertEqual((caught.exception.status, caught.exception.retry_after), (status, retry))
             self.assertEqual(str(caught.exception), f"127.0.0.1 answered {status}")     # the host that it sent to
         with self.assertRaises(errorreports.ReportError) as caught:
             errorreports.send("http://127.0.0.1:1/api/errors", report({}), timeout=5)
@@ -466,8 +471,9 @@ class OnTheHub(OwnerAPI):
         channel = unittest.mock.patch.object(hub, "release_channel", lambda: "https://founderizer.com")
         channel.start()
         self.addCleanup(channel.stop)
-        hub._error_report.update(runs=None)         # no code of a restart that did not start, of an earlier test
-        self.addCleanup(hub._error_report.update, runs=None)
+        # no code of a restart, and no version read at HEAD, of an earlier test
+        hub._error_report.update(runs=None, code=None, head=None)
+        self.addCleanup(hub._error_report.update, runs=None, code=None, head=None)
 
     def sweep(self, t0):
         with hub.LOCK:
@@ -742,7 +748,7 @@ class HealthOnTheHub(OnTheHub):
         """A stand-in for git_kit whose checkout has release.json of `versions` ({revision: version}) at each revision:
         the checkout's HEAD at the new release, and the code that runs at another."""
         def git_kit(*args, **how):
-            if args[:2] == ("cat-file", "blob"):
+            if args[:2] == ("cat-file", "blob") and args[2].split(":")[0] in versions:
                 return 0, json.dumps({"revision": "0" * 40, "version": versions[args[2].split(":")[0]]}), ""
             return 128, "", "fatal"
         return unittest.mock.patch.object(hub, "git_kit", git_kit)
@@ -983,7 +989,8 @@ class HealthOnTheHub(OnTheHub):
         """The plan's 3.3 and the contract's behind_hours: the third run of a release that did not end done, and 6 hours
         behind the newest release after such a run, each ask for an early report once, so that a fleet that stops
         taking releases is seen within hours and not after a day. The block's tries count those runs, and its cause
-        is the last one's."""
+        is the last one's. A read of the version at HEAD that fails once (git's time, no memory for a process) asks
+        no more: with no row that it runs, the floor would read "none" and then the version again, two asks."""
         self.switch(True)
         t0 = hub.now()
         self.look(t0)                           # the first look: no release yet
@@ -998,15 +1005,18 @@ class HealthOnTheHub(OnTheHub):
         self.assertIsNotNone(self.look(t0 + 180))
         self.assertIsNone(self.look(t0 + 240))      # once
         self.assertIsNotNone(self.look(t0 + 60 + errorreports.BEHIND_WAIT))
-        self.assertIsNone(self.look(t0 + 120 + errorreports.BEHIND_WAIT))
+        with unittest.mock.patch.object(hub, "running_version", lambda: "unknown"):
+            self.assertIsNone(self.look(t0 + 120 + errorreports.BEHIND_WAIT))
+        self.assertIsNone(self.look(t0 + 180 + errorreports.BEHIND_WAIT))
         release = self.health()["release"]
         self.assertEqual((release["newest"], release["state"], release["tries"], release["cause"], release["since"]),
                          ("2026.11.710", "failed", 3, "timeout", round(t0 + 60, 3)))
 
     def test_six_hours_behind_ask_once_for_each_time_behind(self):
         """The 6-hour early report goes once for each time behind: new releases that come while the hub stays behind,
-        and a release behind that leaves the rows that the look reads, ask no second one; a new time behind, after the
-        hub ran the newest release, asks again."""
+        and a release behind that leaves the rows that the look reads, ask no second one; the end of that time behind,
+        when the hub runs the newest release, asks once more, because our side reads a hub's newest report and would
+        count it as behind until its next day's report; a new time behind asks again."""
         self.switch(True)
         t0 = hub.now()
         self.release("2026.11.700", "done", finished=t0 - 100)
@@ -1019,7 +1029,8 @@ class HealthOnTheHub(OnTheHub):
                 self.release(f"2026.11.70{n}", "verified")
                 self.assertIsNone(self.look(t0 + 120 * n + errorreports.BEHIND_WAIT), n)
         newest = self.release("2026.11.707", "done", finished=t0 + 2000)
-        self.look(t0 + 2000 + errorreports.BEHIND_WAIT)                # the hub runs the newest: no time behind
+        self.assertIsNotNone(self.look(t0 + 2000 + errorreports.BEHIND_WAIT))     # the hub runs the newest: once
+        self.assertIsNone(self.look(t0 + 2100 + errorreports.BEHIND_WAIT))
         self.release("2026.11.708", "kept", step="fetch", cause="dns", finished=t0 + 3000)
         self.look(t0 + 3000)
         self.assertIsNotNone(self.look(t0 + 3000 + 2 * errorreports.BEHIND_WAIT), newest["version"])
@@ -1064,6 +1075,37 @@ class HealthOnTheHub(OnTheHub):
         self.assertEqual({k: release[k] for k in ("state", "since", "tries", "cause", "behind")},
                          {"state": "done", "since": None, "tries": 0, "cause": "none", "behind": 0})
 
+    def test_a_release_that_the_channel_holds_starts_no_time_behind(self):
+        """A release that our side holds (its row `held`) cannot fail a run here, so it starts no time behind: its time
+        starts when the hub sees it no longer held. Else, after a hold of 6 hours, the first run of it that did not end
+        done would count each fleet as 6 hours behind at once. And when the hub runs a newer release than at its
+        6-hour report while a held one stays behind, that time behind ends with one more early report too: our side
+        would else count the fleet as behind until its next day's report."""
+        self.switch(True)
+        t0, hour = hub.now(), 3600
+        self.release("2026.11.700", "done", finished=t0 - 100)
+        self.look(t0)
+        one = self.release("2026.11.710", "held")
+        self.assertIsNone(self.look(t0 + 60))
+        with hub.LOCK:
+            hub.q("UPDATE releases SET state='verified' WHERE revision=?", (one["revision"],))
+        self.assertIsNone(self.look(t0 + 8 * hour))         # our side ends the hold
+        with hub.LOCK:
+            hub.q("UPDATE releases SET state='kept', step='hold', cause='busy', finished=? WHERE revision=?",
+                  (t0 + 8 * hour + 60, one["revision"]))
+        self.assertIsNone(self.look(t0 + 8 * hour + 120))
+        release = self.health()["release"]
+        self.assertEqual((release["since"], release["tries"], release["behind"]), (round(t0 + 8 * hour, 3), 1, 1))
+        self.assertIsNotNone(self.look(t0 + 8 * hour + errorreports.BEHIND_WAIT))
+        self.release("2026.11.720", "held")
+        self.assertIsNone(self.look(t0 + 15 * hour))
+        with hub.LOCK:
+            hub.q("UPDATE releases SET state='done', step='follow', cause=NULL WHERE revision=?", (one["revision"],))
+        self.assertIsNotNone(self.look(t0 + 16 * hour))     # it runs 2026.11.710, and only the held one is behind
+        self.assertIsNone(self.look(t0 + 17 * hour))
+        release = self.health()["release"]
+        self.assertEqual((release["state"], release["behind"], release["tries"]), ("held", 1, 0))
+
     def test_a_release_that_is_there_when_reports_start_has_its_time_behind(self):
         """A release that the hub does not run and that is there at the first look gets the first time that its row
         holds (its run's start), else the time of that look: a time later than the true one, so the wait reads
@@ -1095,23 +1137,26 @@ class HealthOnTheHub(OnTheHub):
         self.assertEqual(self.health()["release"], {"newest": "2026.11.710", "state": "verified", "step": None,
                                                     "cause": "dns", "tries": 1, "since": round(t0, 3), "behind": 2,
                                                     "channel": 200})
-        with hub.LOCK:
-            hub.q("UPDATE releases SET state='done', reached=? WHERE revision=?", ("d" * 40, newest["revision"]))
-        self.fault(canary())
-        versions = {"c" * 40: "2026.11.700", "HEAD": "2026.11.710"}
+        versions = {"c" * 40: "2026.11.700", "HEAD": "2026.11.710", "d" * 40: "2026.11.710"}
 
         def git(*args, **how):              # the checkout's HEAD is at the new release already
             if args[:2] == ("cat-file", "blob"):
                 return 0, json.dumps({"revision": "0" * 40, "version": versions[args[2].split(":")[0]]}), ""
             return 128, "", "fatal"
 
-        with unittest.mock.patch.object(hub, "git_kit", git), \
-                unittest.mock.patch.object(hub, "running_version", lambda: hub.version_at("HEAD")):
-            body = hub.error_report_before_restart("c" * 40, "d" * 40)
-        self.assertEqual(self.sent[-1][1], body)
-        self.assertEqual(body["version"], "2026.11.700")
-        self.assertEqual({k: body["health"]["release"][k] for k in ("newest", "state", "since", "behind")},
-                         {"newest": "2026.11.710", "state": "done", "since": None, "behind": 0})
+        # an error in the hub during the run leaves its row failed (settle_releases), and the restart goes to it
+        for state, step in (("failed", "merge"), ("done", "follow")):
+            with hub.LOCK:
+                hub.q("UPDATE releases SET state=?, step=?, reached=? WHERE revision=?",
+                      (state, step, "d" * 40, newest["revision"]))
+            self.fault(canary())
+            with unittest.mock.patch.object(hub, "git_kit", git), \
+                    unittest.mock.patch.object(hub, "running_version", lambda: hub.version_at("HEAD")):
+                body = hub.error_report_before_restart("c" * 40, "d" * 40)
+            self.assertEqual(self.sent[-1][1], body)
+            self.assertEqual(body["version"], "2026.11.700")
+            self.assertEqual({k: body["health"]["release"][k] for k in ("newest", "state", "tries", "since", "behind")},
+                             {"newest": "2026.11.710", "state": state, "tries": 0, "since": None, "behind": 0})
         self.assertEqual(hub.kv_json("error_reports_restart", dict)["to"], "d" * 40)
 
     def test_the_report_before_a_restart_goes_only_with_a_fault_of_the_code_that_runs(self):
@@ -1176,6 +1221,29 @@ class HealthOnTheHub(OnTheHub):
         self.assertEqual((hub.kv_get("error_reports_restart"), hub.kv_get("error_reports_starts"),
                           hub.kv_get("error_reports_early_at"), self.sent), (None, None, None, []))
 
+    def test_a_report_during_a_restart_onto_new_code_names_the_code_that_runs(self):
+        """From the start of a restart onto new code until the process ends (the compile in pieces, the report before
+        it, a bridge's restart, the drain: up to some minutes), the checkout's HEAD is at the new release while this
+        process runs the code before it. A report that the tick sends then names the release of that code, whose code
+        id and faults it holds: else our side would keep the old code's faults under the new release."""
+        self.switch(True)
+        t0 = hub.now()
+        self.sweep(t0)                          # the day's report
+        with unittest.mock.patch.object(hub, "same_code", lambda a, b: False), \
+                unittest.mock.patch.object(hub, "RESTART_DELAY", 0), \
+                unittest.mock.patch.object(hub, "error_report_before_restart", lambda *revs: None), \
+                unittest.mock.patch.dict(hub.CFG, hub_restart=["true"]), \
+                unittest.mock.patch.object(hub, "running_version", lambda: hub.version_at("HEAD")), \
+                self.git({"c" * 40: "2026.11.700", "HEAD": "2026.11.710"}):
+            hub.restart_hub_soon("c" * 40, "d" * 40)     # its command ended well, and this process has not ended yet
+            for thread in threading.enumerate():
+                if thread.name == "release-restart":
+                    thread.join(10)
+            with hub.LOCK:
+                hub.error_report_early("a test")
+            self.sweep(t0 + 60)
+        self.assertEqual([body["version"] for _, body in self.sent[1:]], ["2026.11.700"])
+
     def test_a_restart_sends_the_report_first_and_one_that_fails_asks_for_an_early_one(self):
         """restart_hub_soon gives the report before the restart its two revisions before the new code runs, and a
         restart command that fails, which leaves the hub on its old code, asks for an early report and ends the
@@ -1183,7 +1251,8 @@ class HealthOnTheHub(OnTheHub):
         report, and each one after it from this process, names the release of the code that still runs while the
         checkout's HEAD is at the new release, and its block counts the new release as behind, with the failed
         restart as a try of cause "other": else the faults of the old code would be kept under the new release, and
-        our side would read a hub that runs its newest release."""
+        our side would read a hub that runs its newest release. A restore's restart that fails goes onto no new code,
+        and asks for none."""
         t0 = hub.now()
         self.release("2026.11.700", "done", finished=t0 - 9000)
         new = self.release("2026.11.710", "done", step="follow", started=t0 - 200, finished=t0 - 100, reached="d" * 40)
@@ -1197,10 +1266,13 @@ class HealthOnTheHub(OnTheHub):
                 unittest.mock.patch.object(hub, "error_report_before_restart", lambda *revs: calls.append(revs)), \
                 unittest.mock.patch.dict(hub.CFG, hub_restart=["false"]), contextlib.redirect_stdout(io.StringIO()), \
                 self.git({"c" * 40: "2026.11.700", "HEAD": "2026.11.710"}):
-            hub.restart_hub_soon("c" * 40, "d" * 40)
-            for thread in threading.enumerate():
-                if thread.name == "release-restart":
-                    thread.join(10)
+            for revs, always in (((None, None), True), (("c" * 40, "d" * 40), False)):
+                hub.restart_hub_soon(*revs, always=always)
+                for thread in threading.enumerate():
+                    if thread.name == "release-restart":
+                        thread.join(10)
+                if always:
+                    self.assertIsNone(hub.kv_time("error_reports_early_at"))
         self.assertEqual(calls, [("c" * 40, "d" * 40)])
         self.assertIsNotNone(hub.kv_time("error_reports_early_at"))
         self.assertIsNone(hub.kv_get("error_reports_restart"))
@@ -1218,7 +1290,7 @@ class HealthOnTheHub(OnTheHub):
         # as stuck for a day.
         self.release("2026.11.720", "done", step="follow", started=t0 + 70, finished=t0 + 80, reached="e" * 40)
         self.fault(canary())
-        with self.git({"c" * 40: "2026.11.700", "HEAD": "2026.11.720"}):
+        with self.git({"c" * 40: "2026.11.700", "HEAD": "2026.11.720", "e" * 40: "2026.11.720"}):
             again = hub.error_report_before_restart("d" * 40, "e" * 40)
         self.assertEqual(again["version"], "2026.11.700")
         self.assertEqual(again["health"]["release"], {"newest": "2026.11.720", "state": "done", "step": "follow",
@@ -1266,12 +1338,17 @@ class HealthOnTheHub(OnTheHub):
 
     def test_a_hub_with_no_proc_sends_its_report_without_the_block(self):
         """A hub on a Mac has no /proc: its report goes as before, with no block, because every key of the block is
-        required and a memory or a count of kills made up there would be a false word."""
+        required and a memory or a count of kills made up there would be a false word. A check that turns bad on its
+        own server asks for no early report either: that report would hold nothing of it, and use one of the day's
+        four."""
         os.remove(os.path.join(self.proc, "vmstat"))
         self.switch(True)
-        self.sweep(hub.now())
+        t0 = hub.now()
+        self.sweep(t0)
         ((_, body),) = self.sent
         self.assertNotIn("health", body)
+        self.watch({"hub": {"told": ["memory"]}})
+        self.assertIsNone(self.look(t0 + 60))
 
 
 class StartAndStop(unittest.TestCase):
