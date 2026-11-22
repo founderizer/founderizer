@@ -120,11 +120,15 @@ message with `result` or `error` and no method). One thing more than this server
 an id and no method, a method that is no text, and an empty batch each get the JSON-RPC error
 `-32600`, so that no client waits for an answer that does not come. It does not start with no
 set, and `owner` is its only set in this version. Calls run one at a time, and a `ping` is
-answered while a call runs. No call sends progress, and the program takes no cancel. That is
-enough in this version because no call waits for long: each request to the hub has a limit of 60
-seconds, the one file of `attach_file`, `read_attachment` and `take_backup` a limit of 15 minutes
-(below), a tool makes a few requests, and the lock is held for one request at a time. That is
-under the 30 minutes after which Claude Code ends a call that sends no answer and no progress.
+answered while a call runs. No call sends progress. That is enough in this version because no
+call waits for long: each request to the hub has a limit of 60 seconds, the one file of
+`attach_file`, `read_attachment` and `take_backup` a limit of 15 minutes (below), a tool makes a
+few requests, and the lock is held for one request at a time. That is under the 30 minutes after
+which Claude Code ends a call that sends no answer and no progress. The one exception is the tools
+of a cloud (design 9), whose call runs a few commands of the cloud's own program of 120 seconds
+each. So the program takes a cancel (`notifications/cancelled`), as this server does: a call that
+waits and is cancelled never starts, a call that runs starts no other command of a cloud's program
+(the command that ran at the cancel goes on to its end), and a cancelled request gets no answer.
 (This server sends a progress notification every 30 seconds for a call whose client gave a
 `progressToken`; the program does not, because it would need a second thread that writes while a
 call runs, for calls that end in time without it.) `founderizer-cli tools` gives one line for each
@@ -185,11 +189,13 @@ Claude Code's own "always allow" button in its window, and Codex, which has no r
 `readOnlyHint` (one exception: the program's words of `answer_needs_you` have its sentences about the
 door's card after the table's). 57 come from a table that this file prints, `python3 owner_mcp.py --dump-tools`,
 from the same objects that its own tools are: `release.sh` and `run.sh` put it in the app as
-`Contents/Resources/owner-tools.json`, from the same revision as `onboard.py`. Thirteen are written
+`Contents/Resources/owner-tools.json`, from the same revision as `onboard.py`. Sixteen are written
 again in Swift (the table's kind `swift`): four reads, `fleet_overview`, `fleet_read`,
-`search_history` and `see_costs`, and since 14 November 2026 the nine that write: `save_profile`,
+`search_history` and `see_costs`, since 14 November 2026 the nine that write: `save_profile`,
 `attach_file`, `read_attachment`, `take_backup`, `grant_access`, `share_resource`, `send_message`,
-`answer_needs_you` and `decline_secret_request`. Each makes the same requests as its function here,
+`answer_needs_you` and `decline_secret_request`, and since 22 November 2026 the three tools of a server
+at a cloud, `cloud_look`, `cloud_step` and `cloud_remove` (design 9, piece B2; below, "A server at
+AWS, Azure or Google Cloud"). Each makes the same requests as its function here,
 in the same order, with the same refusals and the same result, with one exception since 17 November
 2026: `answer_needs_you` with a `choice` of 0 or 1 reads the hub's state first, and sends a door
 card's yes or Full access to the running app, which signs it (below, "`answer_needs_you` on the
@@ -198,15 +204,12 @@ of a newer version of this
 file can name a `swift` tool that an older program does not have: that program refuses it with
 "not in this version of the app yet" and does not list it. Never in the program, because the app's
 own pages do that work and its own setting says which hub it reads: `install_hub`, `install_log`,
-`claim_hub`, `add_machine`, `use_hub`, `which_hub` and `connect_google`. Until piece B2 of design 9,
-the three tools of a server at a cloud, `cloud_look`, `cloud_step` and `cloud_remove`, are `absent`
-too: the program does not list them, and the table carries their recipe as `cloud_recipes` for that
-piece (below, "A server at AWS, Azure or Google Cloud"). Three more are the
+`claim_hub`, `add_machine`, `use_hub`, `which_hub` and `connect_google`. Three more are the
 program's own and are not
 in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
 the running app (below). Six more, `save_bot_token`, `prepare_problem_report`, `save_secret`,
 `grant_secret`, `share_secret` and `answer_secret_request`, write on the same link (below). So
-`tools/list` gives 79 tools: the 57 of the table, the thirteen, the three reads of the link and its
+`tools/list` gives 82 tools: the 57 of the table, the sixteen, the three reads of the link and its
 six writes. One request more writes on the link and is no tool of its own: `answer_needs_you`'s
 signed press of a door card.
 
@@ -1381,7 +1384,7 @@ not by the program's code.
 (`app/Tests/FleetOwnerAPITests/Fixtures/owner-tools.json`) to this file's print; `selftest.py`
 section 0 holds the table to `tools()` too, the reads that `call` takes to the marked reads that the
 program wrote, and the media types to the hub's own. The Swift tests (`swift test --filter FleetOwnerAPITests` in `app/`) run each
-kind of tool, the thirteen written in Swift, the two verbs, the refusals, the MCP exchange and the
+kind of tool, the sixteen written in Swift, the two verbs, the refusals, the MCP exchange and the
 link's rules on a stand-in hub that opens no port. `OwnerChannelTests` runs the link to the app on a
 real socket in a temporary folder, with a stand-in check of the peer (and the real check against
 the test process itself), and `OwnerSetupToolsTests` and `OwnerSetupDiagnosisTests` the three
@@ -1477,19 +1480,19 @@ and its own refusals:
     command sent again with the same `request_id` after a lost answer carries the base of a new
     read, and the hub answers that the id was used for another command when team.json moved;
   - `grant_access` makes its map of the holders of a resource and its base from one read;
-  - not covered: `save_knowledge` with `{path, text}`, the lists of `save_person`, the `prompt` of
-    `save_role` and `token_weights` of `save_settings` replace a whole value on routes that take no
-    base at all, so the hub would need one first;
+  - not covered: `save_knowledge` with `{path, text}`, the lists of `save_person`, the `prompt` and
+    the `access` of `save_role` and `token_weights` of `save_settings` replace a whole value on
+    routes that take no base at all, so the hub would need one first;
 - the hub's refusal, given back whole — not only the reason but what came with it, because a
   refusal often carries what is still missing, and that is the part the agent must act on.
 
 This file validates nothing the hub validates. It passes the fields through and gives the hub's
 own words back, so the two cannot drift apart. A null goes through only for a field whose schema
 takes null (the table's `nulls`): there it is a value of the hub's, such as an agent's model that
-follows the default again, a chat app account removed or a role with no daily limit. Every other
-null is left out, and a field left out stays as it is. Until 20 November 2026 every null was left
-out, and none of those reached the hub. This file validates only what no hub sees: the SSH host
-and user it puts in a command line, and the mode of the auth key file.
+follows the default again, a chat app account removed, a role with no daily limit or a role's set of
+access taken away. Every other null is left out, and a field left out stays as it is. Until 20
+November 2026 every null was left out, and none of those reached the hub. This file validates only
+what no hub sees: the SSH host and user it puts in a command line, and the mode of the auth key file.
 
 `fleet_read` is the reads. Each of its pages is one `GET` route, and
 `test_owner_mcp.Shape.test_every_page_of_fleet_read_is_a_get_route_the_hub_really_serves` reads
@@ -1519,8 +1522,8 @@ before character 2,048 (`test_owner_mcp.Table`).
 **Where a rule for an agent goes** (the rule of places, in the instructions):
 
 - How an agent does its work (a step, a style, a workflow, "from now on ...") is the agent's own to
-  keep: `send_message`, in the owner's own words, to that agent, or to its lead or the fleet manager
-  when the agent's Shell box is off. They keep it and keep it in order. Never into a profile.
+  keep: `send_message`, in the owner's own words, to that agent. It keeps it and keeps it in order.
+  Never into a profile.
 - `save_profile` is only for what the owner decides: what the agent is for, what it may do alone,
   what it must ask first, which person decides what, its logins and its knowledge files.
 - A policy for a whole team is a file of the owner's: `save_knowledge`.
@@ -1545,7 +1548,7 @@ Give work, steer it, send and get files.
 
 | Tool | Route | What it does |
 | --- | --- | --- |
-| `send_message` | `/ui/messages` | Say something to an agent, with files from `attach_file`. **This is how a goal or a duty is set**, and how a lasting rule about how an agent works reaches the agent, which keeps it (or its lead or the fleet manager, when its Shell box is off). |
+| `send_message` | `/ui/messages` | Say something to an agent, with files from `attach_file`. **This is how a goal or a duty is set**, and how a lasting rule about how an agent works reaches the agent, which keeps it. |
 | `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task, with files from `attach_file` (owner API 1.223), which open in that task's session: when a person's conversation opened the task, that person's messages drive it, so they can get what a file says. |
 | `goal_state` | `/ui/goals/<id>/state` | Pause, resume, finish, drop or reopen one goal. A new goal: `send_message`. |
 | `settle_outcome` | `/ui/outcomes/<id>` | Record whether an unknown outcome took effect. |
@@ -1643,8 +1646,8 @@ People who write to agents, and chat apps.
 
 | Tool | Route | What it does |
 | --- | --- | --- |
-| `save_person` / `person_handle` | `/ui/people`, `/ui/people/<id>/handles` | The people who may write to an agent, and their chat handles. `scopes` gives a person All of an agent, or only some of its repositories and secrets (the person access plan). |
-| `save_role` | `/ui/roles` | The roles those people hold: a name, a prompt in the owner's words, tools on or off, a daily limit for a closed role. A held role is not deleted. |
+| `save_person` / `person_handle` | `/ui/people`, `/ui/people/<id>/handles` | The people who may write to an agent, and their chat handles. `scopes` gives a person All of an agent, or only some of its repositories and secrets (the person access plan). `role_access` true gives a person their role's set again (Founderizer for Teams; a fleet with no Teams answers `teams_off`). |
+| `save_role` | `/ui/roles` | The roles those people hold: a name, a prompt in the owner's words, tools on or off, a daily limit for a closed role. A held role is not deleted. `access` is the role's set of access (Founderizer for Teams), in the shape of `scopes`, which the hub writes into each person of the role who is as the role gave it; `null` takes the set away. A fleet with no Teams answers `teams_off`. |
 | `person_code` / `remove_owner_handle` | `/ui/people/codes`, `/ui/people/handles` | Link the owner's own chat account, or make a person's Telegram invite; remove one of the owner's handles. |
 | `control_conversation` | `/ui/conversations/<id>` | Pause one conversation with a person, or let it run again. |
 | `save_chat_account` | `/ui/team/chat-apps` | One chat app account. The account, never its bot token. |
@@ -1745,8 +1748,14 @@ hub; the join is the owner's.
   first.
 - **A cloud is offered only after its live proof** (piece B3): a recipe with no `proved` date is
   refused by each of the three tools before any program runs. On 21 November 2026 no cloud has a date.
-- The program inside the app gets the same three tools from the same data in piece B2; until then they
-  are `absent` there. Windows has no admin MCP; in WSL the Python copy is the Linux case.
+- **The program inside the app has the same three tools** (piece B2, `OwnerCloud.swift`): it reads the
+  recipe from the table (`cloud_recipes`) and makes the same commands in the same order, with the same
+  refusals and answers (the parity fixture holds each command with its files and its answer, and
+  `OwnerParityTests` replays them). Where the two differ, the data says the program's words
+  (`CLOUD_RECIPES["app"]`): the program has no `add_machine` and no `check`, because the app's own Add
+  server page (Other VPS) reads the server and joins it, so its `next` names that page where this
+  server's names the check. Its answers start with a sentence of their own: they came from the cloud's
+  program, not from the hub. Windows has no admin MCP; in WSL the Python copy is the Linux case.
 
 ## The three things it cannot do without the owner
 

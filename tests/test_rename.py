@@ -203,6 +203,10 @@ class Rename(Servers):
         base = self.team_sha()
         for table, column in hub.AGENT_COLUMNS:
             plant(table, column, "scout")
+        # a role's set of access (Founderizer for Teams, design 3), kept in Core while no Teams file is there: it moves
+        # with its list, or a new agent of the old name would get that role's access
+        listed = json.dumps({"repo:example/app": "read"})
+        hub.q("INSERT INTO role_sets(role,agent,grants,updated) VALUES('developer','scout',?,1)", (listed,))
         hub.q("INSERT INTO agent_keys(agent,sha256,created,source) VALUES('scout',?,0,'enrolled')", ("a" * 64,))
         hub.q("INSERT INTO agent_keys(agent,sha256,created,source) VALUES('nova',?,0,'owner')", ("b" * 64,))
         hub.q("INSERT INTO machine_status(agent,data,reported) VALUES('nova','{}',0)")   # left by an agent removed by hand
@@ -217,6 +221,8 @@ class Rename(Servers):
         for table, column in hub.AGENT_COLUMNS:
             self.assertEqual(hub.q1(f"SELECT COUNT(*) n FROM {table} WHERE {column}='scout'")["n"], 0, (table, column))
             self.assertGreater(hub.q1(f"SELECT COUNT(*) n FROM {table} WHERE {column}='nova'")["n"], 0, (table, column))
+        self.assertEqual([tuple(r) for r in hub.q("SELECT agent, grants FROM role_sets WHERE role='developer'")],
+                         [("nova", listed)])
         self.assertEqual(hub.q("SELECT agent FROM agent_keys WHERE agent IN ('scout','nova')"), [])
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM session_credentials WHERE agent='nova' AND revoked IS NULL")["n"], 0)
         self.assertEqual((hub.kv_get("tools:nova"), hub.kv_get("tools:scout")), ("contract", None))

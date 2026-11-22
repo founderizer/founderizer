@@ -157,6 +157,10 @@ WORDS = {
     "secret_value_asked": "This request asks for a new value of {name}: type it in the request's form.",
     # a new value of a door key of one setting of an app on a host (POST /ui/secrets/add, UI-API.md 1.295)
     "secret_app_setting": "{name} is a setting of an app on a host: its new value changes on that host, not here.",
+    # the Teams part role_sets, a role's set of access (teams-design-3, 3.7): its own two refusals, which only its
+    # Teams file raises (a part's other refusals are its own, teams-design-1, 3.8). The words are the design's proposal
+    "role_sets_contacts_off": "A role's access needs the setting contacts.v2, which is off.",
+    "role_no_set": "The role {role} has no access of its own.",
 }
 
 

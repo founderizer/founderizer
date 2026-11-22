@@ -3137,6 +3137,11 @@ class Admin(WithServer):
         self.assertEqual(self.team_file()["agents"]["vps"].get("title"), "Night shift")
         client.call("agent_settings", agent="vps", title=None)
         self.assertIsNone(self.team_file()["agents"]["vps"].get("title"))
+        # a role's set taken away (Founderizer for Teams, design 3): the null reaches the hub, which has no Teams here
+        # and so refuses it with teams_off; a null left out would be a write of nothing, refused with other words
+        with self.assertRaises(Refused) as caught:
+            client.call("save_role", name="peer", access=None)
+        self.assertIn("This needs Founderizer for Teams, which this fleet does not have.", str(caught.exception))
 
     def test_a_whole_value_made_from_an_older_read_of_the_team_is_the_hubs_refusal_and_the_change_stays(self):
         """with_base's `whole` (the review of 20 November 2026): the reporting lines and an agent's lists go with the
@@ -4290,16 +4295,19 @@ def parity_cases():
     shared part and the nine writes. `answer(state, request)` answers a request before the stand-in hub's own."""
     cases = []
 
-    def case(name, tool, arguments=None, answer=None, files=None, folders=(), links=None, app_lists=False):
+    def case(name, tool, arguments=None, answer=None, files=None, folders=(), links=None, app_lists=False,
+             programs=None):
         """`links`: a symbolic link of the work folder, by its path there, to a path there (made absolute).
         `app_lists`: the one place where the two programs read the hub differently. Before an answer with a choice
         of 0 or 1 the program inside the app reads the item of the state, to see whether it is a door card
         (`AnswerDoor.press`), and that read gives it the generation too; this server, which hands no press to the
         app, reads only the head of the state for the generation (owner API 1.256). The fixture of such a case holds
         the app's read, the state with its lists, and the stand-in hub's answer to it (parity_fixture). Only for a
-        case with no answer of its own: the stand-in's answer to that read is then the same at any moment."""
+        case with no answer of its own: the stand-in's answer to that read is then the same at any moment.
+        `programs`: a case of design 9's tools of a cloud, which call no hub but the cloud's own program
+        (`parity_cloud_cases`)."""
         cases.append({"name": name, "tool": tool, "arguments": arguments or {}, "answer": answer,
-                      "app_lists": app_lists,
+                      "app_lists": app_lists, "programs": programs,
                       "setup": {"files": files or {}, "folders": list(folders), "links": links or {}}})
 
     for t in owner_mcp.dump_tools()["tools"]:
@@ -4338,6 +4346,7 @@ def parity_cases():
          {"agent": "worker-1", "model": None, "effort": None, "title": None, "account": None})
     case("nulls: a chat app account removed", "save_chat_account", {"id": "discord-worker-1", "account": None})
     case("nulls: a role with no daily limit", "save_role", {"name": "supplier", "daily": None})
+    case("nulls: a role's set of access taken away", "save_role", {"name": "supplier", "access": None})
     case("nulls: a person's own note and limit taken away", "save_person", {"id": 3, "note": None, "daily": None})
     case("nulls: an agent that reports to the manager", "add_agent",
          {"server": "server-1", "agent": "scout", "runtime": "claude", "role": "worker", "reports_to": None})
@@ -4857,7 +4866,92 @@ def parity_cases():
          lambda s, r: parity_json(404, {"error": "not found"}) if r["path"] == "/ui/servers" else None)
     case("take_backup: the hub has no such route", "take_backup", {"path": "<tmp>/c.zip"},
          lambda s, r: parity_json(404, {"error": "no such route here"}) if r["path"] == "/ui/backup" else None)
+    parity_cloud_cases(case)
     return cases
+
+
+PARITY_KEY = "<tmp>/id_ed25519.pub"
+
+
+def parity_cloud_cases(case):
+    """**The cases of design 9's three tools of a cloud** (piece B2): the same calls of the two programs against the
+    same stand-in program of each cloud (`Cloud.STAND_IN`, with `Cloud.cloud_rules`), which answers by the commands
+    before it. `before`: the calls that make the cloud's state first, whose commands the fixture does not keep. Each
+    cloud has a `proved` date in these cases, but where a case says not."""
+    key = {"id_ed25519.pub": Cloud.KEY + " admin@example.invalid\n"}
+    for cloud, recipe in owner_mcp.CLOUD_RECIPES["clouds"].items():
+        account, place = Cloud.WHERE[cloud]
+        base = {"cloud": cloud, "name": Cloud.NAME, "account": account, "place": place}
+        rules = Cloud.cloud_rules(cloud)
+        journey = []
+        for step in recipe["steps"]:
+            if step["kind"] in ("make", "check", "close"):
+                more = {"server": {"ssh_public_key_file": PARITY_KEY},
+                        "open_ssh": {"ssh_from": "203.0.113.9"}}.get(step["id"], {})
+                journey.append(("cloud_step", dict(base, step=step["id"], **more)))
+        journey += [("cloud_remove", dict(base, step=removal["id"])) for removal in recipe["removals"]]
+
+        def cloud_case(name, tool, args, before=(), rules=rules, proved=True, missing=False):
+            case(f"{cloud}: {name}", tool, args, files=key,
+                 programs={"rules": rules, "before": [list(b) for b in before], "proved": proved, "missing": missing})
+        cloud_case("the recipe", "cloud_look", {"cloud": cloud})
+        cloud_case("a look before anything", "cloud_look", base)
+        for at, (tool, args) in enumerate(journey):
+            cloud_case(f"{tool} {args['step']}", tool, args, before=journey[:at])
+            cloud_case(f"{tool} {args['step']} again", tool, args, before=journey[:at + 1])
+        opened = [j for j in journey if j[0] == "cloud_step" and j[1]["step"] in ("group", "firewall", "server",
+                                                                                   "open_ssh")]
+        cloud_case("a look with SSH open", "cloud_look", base, before=opened)
+        cloud_case("an unproved cloud", "cloud_look", base, proved=False)
+        cloud_case("no program", "cloud_look", base, missing=True)
+        signed_out = {"aws": {"exit": 253, "err": "Unable to locate credentials."},
+                      "azure": {"exit": 1, "err": "ERROR: Please run 'az login' to setup account."},
+                      "google": {"out": []}}[cloud]
+        reads = {"aws": "sts get-caller-identity", "azure": "account show", "google": "auth list"}
+        cloud_case("signed out", "cloud_step", dict(base, step=journey[0][1]["step"]),
+                   rules=[dict(signed_out, has=[reads[cloud]])] + rules)
+        cloud_case("a value with a space", "cloud_step", dict(base, step="open_ssh", ssh_from="203.0.113.9 x"))
+        if cloud in ("aws", "azure"):
+            other = {"aws": {"Account": "999999999999", "Arn": "arn:aws:iam::999999999999:user/x"},
+                     "azure": {"id": "99999999-1111-2222-3333-444444444444", "user": {"name": "x"}}}[cloud]
+            cloud_case("another account", "cloud_step", dict(base, step=journey[0][1]["step"]),
+                       rules=Cloud.cloud_rules(cloud, identity=other))
+    aws = {"cloud": "aws", "name": Cloud.NAME, "account": Cloud.WHERE["aws"][0], "place": Cloud.WHERE["aws"][1]}
+    role = {"Reservations": [{"Instances": [{"State": {"Name": "running"}, "PublicIpAddress": "198.51.100.30",
+                                             "IamInstanceProfile": {"Arn": "arn:aws:iam::123456789012:x/web"}}]}]}
+    case("aws: a server that exists", "cloud_look", {"cloud": "aws", "instance": "i-0123456789abcdef0",
+                                                     "account": aws["account"], "place": aws["place"]},
+         programs={"rules": [{"has": ["--instance-ids i-0123456789abcdef0"], "out": role}] + Cloud.cloud_rules("aws"),
+                   "before": [], "proved": True, "missing": False})
+    group = {"GroupId": "sg-0a1b2c3d4e5f67890", "GroupName": f"founderizer-{Cloud.NAME}",
+             "Tags": [{"Key": "founderizer-server", "Value": Cloud.NAME}]}
+    case("aws: a read that fails after run-instances", "cloud_step",
+         dict(aws, step="server", ssh_public_key_file=PARITY_KEY), files={"id_ed25519.pub": Cloud.KEY + "\n"},
+         programs={"rules": Cloud.cloud_rules("aws", groups=[group], made={"exit": 254, "err": "Throttling"}),
+                   "before": [], "proved": True, "missing": False})
+    case("aws: an instance of the name with another token", "cloud_remove", dict(aws, step="server"),
+         programs={"rules": Cloud.cloud_rules("aws", reservations=[{"Instances": [{
+             "InstanceId": "i-0fedcba987654321f", "ClientToken": "someone-else", "State": {"Name": "running"}}]}]),
+             "before": [], "proved": True, "missing": False})
+    goog = {"cloud": "google", "name": Cloud.NAME, "account": Cloud.WHERE["google"][0],
+            "place": Cloud.WHERE["google"][1]}
+    opened = [["cloud_step", dict(goog, step="firewall")],
+              ["cloud_step", dict(goog, step="server", ssh_public_key_file=PARITY_KEY)],
+              ["cloud_step", dict(goog, step="open_ssh", ssh_from="203.0.113.9")]]
+    for at, (tool, step) in enumerate((("cloud_remove", "server"), ("cloud_step", "close_ssh"),
+                                       ("cloud_remove", "firewall"))):
+        chain = [["cloud_remove", dict(goog, step="server")], ["cloud_step", dict(goog, step="close_ssh")]][:at]
+        case(f"google: the removal with SSH open, {tool} {step}", tool, dict(goog, step=step),
+             files={"id_ed25519.pub": Cloud.KEY + "\n"},
+             programs={"rules": Cloud.cloud_rules("google"), "before": opened + chain, "proved": True,
+                       "missing": False})
+    parity_cloud_paths(case, aws, goog)
+    azure = {"cloud": "azure", "name": Cloud.NAME, "account": Cloud.WHERE["azure"][0],
+             "place": Cloud.WHERE["azure"][1]}
+    case("azure: a group that still shows after its delete", "cloud_remove", dict(azure, step="group"),
+         programs={"rules": Cloud.cloud_rules("azure", group_stays=True),
+                   "before": [["cloud_step", dict(azure, step="group")], ["cloud_step", dict(azure, step="firewall")]],
+                   "proved": True, "missing": False})
 
 
 class ParityHub:
@@ -4986,6 +5080,153 @@ def parity_after(work, home, places):
     return {"files": files, "folders": sorted(folders)}
 
 
+def parity_cloud_paths(case, aws, goog):
+    """More cases of design 9's tools, one for each path of the code that the journeys of `parity_cloud_cases` do not
+    walk (the second read of piece B2): a subnet, a profile, a size, a disk and a hub, the floor of memory, a memory
+    that is no whole number, a change that fails, reads that fail after close_ssh and after a removal, an answer that
+    is not JSON, two answers, an ended client token, no default VPC, close_ssh after the firewall is gone, Azure's
+    restriction of a place and of a zone, a foreign resource and an unmarked group at Azure, an unmarked rule and
+    instance at Google Cloud, and a server that exists at Azure and at Google Cloud."""
+    key = {"id_ed25519.pub": Cloud.KEY + " admin@example.invalid\n"}
+    azure = {"cloud": "azure", "name": Cloud.NAME, "account": Cloud.WHERE["azure"][0],
+             "place": Cloud.WHERE["azure"][1]}
+    group = {"GroupId": "sg-0a1b2c3d4e5f67890", "GroupName": f"founderizer-{Cloud.NAME}",
+             "Tags": [{"Key": "founderizer-server", "Value": Cloud.NAME}]}
+
+    def one(name, tool, args, rules, before=()):
+        case(name, tool, args, files=key,
+             programs={"rules": rules, "before": [list(b) for b in before], "proved": True, "missing": False})
+
+    def steps(base, ids, **more):
+        fields = {"server": {"ssh_public_key_file": PARITY_KEY}, "open_ssh": {"ssh_from": "203.0.113.9"}}
+        return [("cloud_step", dict(base, step=i, **fields.get(i, {}), **more)) for i in ids]
+    # AWS
+    sub = {"subnet": "subnet-0a1b2c3d4e5f67890"}
+    no_vpc = Cloud.cloud_rules("aws", vpcs={"Vpcs": []})
+    one("aws: firewall in a subnet", "cloud_step", dict(aws, step="firewall", **sub), no_vpc)
+    one("aws: server in a subnet", "cloud_step", dict(aws, step="server", ssh_public_key_file=PARITY_KEY, **sub),
+        no_vpc, steps(aws, ["firewall"], **sub))
+    one("aws: removal of a firewall in a subnet", "cloud_remove", dict(aws, step="firewall", **sub), no_vpc,
+        steps(aws, ["firewall", "server"], **sub) + [("cloud_remove", dict(aws, step="server", **sub))])
+    one("aws: no default VPC", "cloud_step", dict(aws, step="firewall"), no_vpc)
+    hub = {"profile": "admin", "size": "t4g.small", "disk_gb": 40, "use": "hub"}
+    one("aws: a profile, a size, a disk and a hub", "cloud_step",
+        dict(aws, step="server", ssh_public_key_file=PARITY_KEY, **hub), Cloud.cloud_rules("aws"),
+        steps(aws, ["firewall"], profile="admin"))
+    one("aws: the floor of memory", "cloud_step", dict(aws, step="server", ssh_public_key_file=PARITY_KEY),
+        Cloud.cloud_rules("aws", groups=[group], memory=1024))
+    one("aws: a memory that is no whole number", "cloud_step",
+        dict(aws, step="server", ssh_public_key_file=PARITY_KEY),
+        Cloud.cloud_rules("aws", groups=[group], memory="2048"))
+    one("aws: a change that fails", "cloud_step", dict(aws, step="firewall"),
+        [{"has": ["create-security-group"], "exit": 254, "err": "An error occurred (UnauthorizedOperation)"}] +
+        Cloud.cloud_rules("aws"))
+    one("aws: a read that fails after close_ssh", "cloud_step", dict(aws, step="close_ssh"),
+        [{"has": ["describe-security-group-rules"], "after": ["revoke-security-group-ingress"], "exit": 254,
+          "err": "Throttling"}] + Cloud.cloud_rules("aws"), steps(aws, ["firewall", "server", "open_ssh"]))
+    one("aws: a read that fails after a removal", "cloud_remove", dict(aws, step="server"),
+        [{"has": ["describe-instances"], "after": ["terminate-instances"], "exit": 254, "err": "Throttling"}] +
+        Cloud.cloud_rules("aws"), steps(aws, ["firewall", "server"]))
+    one("aws: an answer that is not JSON", "cloud_step", dict(aws, step="firewall"),
+        [{"has": ["describe-vpcs"], "out": "<html>Bad gateway</html>"}] + Cloud.cloud_rules("aws"))
+    two = [{"Instances": [{"InstanceId": f"i-0a1b2c3d4e5f6789{n}", "ClientToken": f"founderizer-{Cloud.NAME}"}]}
+           for n in (0, 1)]
+    one("aws: two instances of the name", "cloud_look", aws, Cloud.cloud_rules("aws", reservations=two))
+    one("aws: an ended client token", "cloud_step", dict(aws, step="server", ssh_public_key_file=PARITY_KEY),
+        [{"has": ["run-instances"], "out": {"Instances": [{"InstanceId": "i-0a1b2c3d4e5f67890",
+                                                           "State": {"Name": "terminated"}}]}}] +
+        Cloud.cloud_rules("aws", groups=[group]))
+    one("aws: close_ssh after the firewall is gone", "cloud_step", dict(aws, step="close_ssh"),
+        Cloud.cloud_rules("aws"), steps(aws, ["firewall", "server", "open_ssh"]) +
+        [("cloud_remove", dict(aws, step="server")), ("cloud_remove", dict(aws, step="firewall"))])
+    # Azure
+    for kind, stops in (("Location", "a place"), ("Zone", "a zone")):
+        one(f"azure: a restriction of {stops}", "cloud_step",
+            dict(azure, step="server", ssh_public_key_file=PARITY_KEY),
+            Cloud.cloud_rules("azure", restrictions=[{"type": kind, "reasonCode": "NotAvailableForSubscription"}]),
+            steps(azure, ["group", "firewall"]))
+    base = f"/subscriptions/{Cloud.WHERE['azure'][0]}/resourceGroups/founderizer-{Cloud.NAME}"
+    one("azure: a foreign resource in the group", "cloud_remove", dict(azure, step="group"),
+        Cloud.cloud_rules("azure", group_now={"id": base, "tags": {"founderizer-server": Cloud.NAME}},
+                          resources=[{"name": f"{Cloud.NAME}-nsg"}, {"name": "billing-db"}]))
+    one("azure: a group with no mark", "cloud_step", dict(azure, step="group"),
+        Cloud.cloud_rules("azure", group_now={"id": base, "tags": {}}))
+    vm = "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/apps/providers/Microsoft.Compute/" \
+         "virtualMachines/web-1"
+    one("azure: a server that exists", "cloud_look", {"cloud": "azure", "instance": vm, "account": azure["account"]},
+        [{"has": ["vm show --ids"], "out": {"powerState": "VM running", "publicIps": "198.51.100.40",
+                                            "osProfile": {"adminUsername": "web"},
+                                            "identity": {"type": "SystemAssigned"},
+                                            "hardwareProfile": {"vmSize": "Standard_B2s"}}}] +
+        Cloud.cloud_rules("azure"))
+    # Google Cloud
+    gsub = {"subnet": "servers"}
+    one("google: firewall in a subnet", "cloud_step", dict(goog, step="firewall", **gsub), Cloud.cloud_rules("google"))
+    one("google: server in a subnet", "cloud_step", dict(goog, step="server", ssh_public_key_file=PARITY_KEY, **gsub),
+        Cloud.cloud_rules("google"), steps(goog, ["firewall"], **gsub))
+    other = {"name": f"founderizer-{Cloud.NAME}-closed", "description": "the network team's rule"}
+    one("google: a rule with no mark", "cloud_step", dict(goog, step="firewall"),
+        Cloud.cloud_rules("google", rules_now=[other]))
+    one("google: an instance with no mark", "cloud_remove", dict(goog, step="server"),
+        Cloud.cloud_rules("google", instance_now={"name": Cloud.NAME, "labels": {}}))
+    one("google: a server that exists", "cloud_look", {"cloud": "google", "instance": "web-1",
+                                                       "account": goog["account"], "place": goog["place"]},
+        [{"has": ["instances describe web-1"], "out": {
+            "status": "RUNNING", "machineType": "https://www.googleapis.com/compute/v1/projects/p/zones/z/machineTypes/"
+                                                "e2-medium",
+            "networkInterfaces": [{"networkIP": "10.0.0.4", "accessConfigs": [{"natIP": "198.51.100.41"}]}],
+            "serviceAccounts": [{"email": "web@example-project-1.iam.gserviceaccount.com"}]}}] +
+        Cloud.cloud_rules("google"))
+
+
+# The folder of the files of one cloud command
+
+# The folder of the files of one cloud command (`CloudRun.change`: user data, a key file), as both programs make it in
+# the folder of temporary files: in the fixture it is <files>, for the Swift test makes its own.
+PARITY_CALL_FILES = re.compile(r"(?:/[^/\s\"']+)*/founderizer-cloud-[^/\s\"']+")
+
+
+def parity_cloud_placed(value):
+    """Each folder of the files of a cloud command in a value, as <files>."""
+    if isinstance(value, str):
+        return PARITY_CALL_FILES.sub("<files>", value)
+    if isinstance(value, list):
+        return [parity_cloud_placed(v) for v in value]
+    if isinstance(value, dict):
+        return {parity_cloud_placed(k): parity_cloud_placed(v) for k, v in value.items()}
+    return value
+
+
+@contextlib.contextmanager
+def parity_programs(programs, scratch, work):
+    """**The cloud's programs of one case of design 9** (`parity_cloud_cases`): a folder `bin` of the scratch with the
+    stand-in of each program and the case's rules, on the PATH alone; each cloud with a `proved` date unless the case
+    says not; the words of the program inside the app (`CLOUD_AS_APP`); and the calls of `before` run first. It gives
+    a function that reads the commands of the case's own call, each with the files that it named and the answer that
+    it got. A case with no `programs` gets None and changes nothing."""
+    if not programs:
+        yield None
+        return
+    folder = scratch / "bin"
+    folder.mkdir()
+    if not programs["missing"]:
+        for program in ("aws", "az", "gcloud"):
+            (folder / program).write_text(f"#!{sys.executable}\n" + Cloud.STAND_IN)
+            (folder / program).chmod(0o755)
+    (folder / "rules.json").write_text(json.dumps(programs["rules"]))
+    recipes = json.loads(json.dumps(owner_mcp.CLOUD_RECIPES))
+    for recipe in recipes["clouds"].values():
+        recipe["proved"] = "2026-12-01" if programs["proved"] else None
+    log = folder / "calls.jsonl"
+    lines = (lambda: log.read_text().splitlines() if log.exists() else [])
+    with patch.dict(os.environ, {"PATH": str(folder)}), patch.object(owner_mcp, "CLOUD_RECIPES", recipes), \
+            patch.object(owner_mcp, "CLOUD_AS_APP", True):
+        for tool, args in programs["before"]:
+            owner_mcp.call_tool(tool, json.loads(json.dumps(args).replace("<tmp>", str(work))))
+        mark = len(lines())
+        yield lambda: [json.loads(line) for line in lines()[mark:]]
+
+
 def parity_fixture():
     """Run each case on owner_mcp.py against the stand-in hub, and give the fixture that the Swift test replays."""
     owner_mcp.TOOLS.update({t["name"]: t for t in owner_mcp.tools()})
@@ -5013,15 +5254,18 @@ def parity_fixture():
                 hub_.requests = []
                 hub_.answer = lambda _i, req, c=c, state=state: (c["answer"] and c["answer"](state, req)) or \
                     parity_answer(state, req)
-                places = [(str(work), "<tmp>"), (str(home), "<home>"), (hub_.base, "<hub>")]
+                places = [(str(work), "<tmp>"), (str(home), "<home>"), (str(scratch / "bin"), "<bin>"),
+                          (hub_.base, "<hub>")]
                 args = json.loads(json.dumps(c["arguments"]).replace("<tmp>", str(work)))
                 owner_mcp.GENERATION["db"] = None
                 with patch.dict(os.environ, {"FOUNDERIZER_HUB": hub_.base, "HOME": str(home)}), \
                         patch.object(owner_mcp, "HOME", home / ".founderizer"), \
                         patch.object(owner_mcp, "CLIENT_FILE", home / ".founderizer" / "client"), \
                         patch.object(owner_mcp, "HUB_FILE", home / ".founderizer" / "hub"), \
-                        patch.object(owner_mcp.time, "time", lambda: float(PARITY_NOW)):
+                        patch.object(owner_mcp.time, "time", lambda: float(PARITY_NOW)), \
+                        parity_programs(c["programs"], scratch, work) as commands:
                     text, bad = owner_mcp.call_tool(c["tool"], args)
+                    called = commands() if commands else None
                 owner_mcp.GENERATION["db"] = None
                 if c["app_lists"]:
                     # the app's read in place of this server's read of the head, with the hub's answer to it (case())
@@ -5042,14 +5286,21 @@ def parity_fixture():
                     except UnicodeDecodeError:
                         body = {"base64": __import__("base64").b64encode(data).decode()}
                     answers.append(dict(body, status=status, headers=headers))
-                out.append({"name": c["name"], "tool": c["tool"], "arguments": c["arguments"], "setup": c["setup"],
-                            "answers": answers,
-                            "requests": parity_requests(hub_.requests, c["arguments"].get("request_id")),
-                            "outcome": {"refusal": parity_places(text, places)} if bad else
-                            {"result": parity_places(json.loads(text), places)},
-                            "older_hub": sum(parity_older(req["answer"]) for req in hub_.requests
-                                             if req["path"] not in PARITY_NO_REFUSAL),
-                            "after": parity_after(work, home, places)})
+                one = {"name": c["name"], "tool": c["tool"], "arguments": c["arguments"], "setup": c["setup"],
+                       "answers": answers,
+                       "requests": parity_requests(hub_.requests, c["arguments"].get("request_id")),
+                       "outcome": parity_cloud_placed({"refusal": parity_places(text, places)} if bad else
+                                                      {"result": parity_places(json.loads(text), places)}),
+                       "older_hub": sum(parity_older(req["answer"]) for req in hub_.requests
+                                        if req["path"] not in PARITY_NO_REFUSAL),
+                       "after": parity_after(work, home, places)}
+                if called is not None:      # design 9's tools of a cloud: each command, its files and its answer
+                    one["cloud"] = {"proved": c["programs"]["proved"], "missing": c["programs"]["missing"],
+                                    "commands": [parity_cloud_placed(parity_places(
+                                        {"argv": x["argv"], "files": x["files"], "exit": x["answer"]["exit"],
+                                         "out": x["answer"]["out"], "error": x["answer"]["err"]}, places))
+                                        for x in called]}
+                out.append(one)
             finally:
                 shutil.rmtree(scratch, True)
     finally:
@@ -5082,7 +5333,7 @@ class Parity(unittest.TestCase):
         named = {c["tool"] for c in parity_cases()}
         both = {t["name"] for t in owner_mcp.dump_tools()["tools"] if t["kind"] != "absent"}
         self.assertEqual(both - named, set())
-        self.assertEqual(len(both), 57 + 4 + 9)
+        self.assertEqual(len(both), 57 + 4 + 12)
 
     def test_the_older_hub_rule_is_what_hub_py_answers(self):
         """`parity_older` is read from the hub, not from the program: its dispatch answers an unknown route with 404
@@ -5165,7 +5416,7 @@ class Table(unittest.TestCase):
         built = sum(1 for t in owner_mcp.tools() if getattr(t["run"], "kind", None))
         self.assertEqual(sum(len(kinds.get(k, [])) for k in self.TABLE_KINDS), built)
         self.assertEqual((len(owner_mcp.SWIFT_READS), len(owner_mcp.SWIFT_WRITES), len(owner_mcp.ABSENT), built),
-                         (4, 9, 10, 57))
+                         (4, 12, 7, 57))
         # A tool of no kind stops the dump: somebody decides which it is. And a tool of no category stops the program:
         # it would stand in no line of the map, so a client with tool search would not learn of it.
         stray = owner_mcp.tool("Read", "stray", "A tool of no kind.", {}, (), lambda _args: {})
@@ -5199,7 +5450,7 @@ class Table(unittest.TestCase):
         self.assertEqual([t["name"] for t in table if t["annotations"]["readOnlyHint"] and t["kind"] in self.TABLE_KINDS],
                          [])
         writes = {t["name"] for t in table if not t["annotations"]["readOnlyHint"] and t["kind"] != "absent"}
-        self.assertEqual(len(writes), 57 + 9)
+        self.assertEqual(len(writes), 57 + 12)
         self.assertTrue(set(owner_mcp.SWIFT_WRITES) <= writes)
 
     def test_a_lost_error_answer_says_that_the_request_can_have_arrived(self):
@@ -5843,18 +6094,21 @@ class Cloud(unittest.TestCase):
         "        if word.startswith(start) and os.path.isfile(word[len(start):]):\n"
         "            files[word[len(start):]] = open(word[len(start):]).read()\n"
         "            break\n"
-        "with open(log, 'a') as out:\n"
-        "    out.write(json.dumps({'argv': argv, 'line': line, 'files': files, 'stdin': stdin}) + '\\n')\n"
+        "answer = {'exit': 99, 'out': '', 'err': 'no rule for: ' + line}\n"
         "for rule in json.load(open(os.path.join(where, 'rules.json'))):\n"
         "    if all(w in line for w in rule.get('has', [])) and \\\n"
         "            all(any(w in e for e in earlier) for w in rule.get('after', [])) and \\\n"
         "            not any(w in e for w in rule.get('before', []) for e in earlier):\n"
         "        out = rule.get('out', '')\n"
-        "        sys.stdout.write(out if isinstance(out, str) else json.dumps(out))\n"
-        "        sys.stderr.write(rule.get('err', ''))\n"
-        "        sys.exit(rule.get('exit', 0))\n"
-        "sys.stderr.write('no rule for: ' + line)\n"
-        "sys.exit(99)\n")
+        "        answer = {'exit': rule.get('exit', 0), 'out': out if isinstance(out, str) else json.dumps(out),\n"
+        "                  'err': rule.get('err', '')}\n"
+        "        break\n"
+        "with open(log, 'a') as out:\n"
+        "    out.write(json.dumps({'argv': argv, 'line': line, 'files': files, 'stdin': stdin,\n"
+        "                          'answer': answer}) + '\\n')\n"
+        "sys.stdout.write(answer['out'])\n"
+        "sys.stderr.write(answer['err'])\n"
+        "sys.exit(answer['exit'])\n")
 
     def setUp(self):
         self.folder = pathlib.Path(tempfile.mkdtemp(prefix="fleet-cloud-"))
@@ -5885,7 +6139,8 @@ class Cloud(unittest.TestCase):
         log = self.folder / "calls.jsonl"
         return [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
 
-    def cloud_rules(self, cloud, name=NAME, **changed):
+    @classmethod
+    def cloud_rules(cls, cloud, name=NAME, **changed):
         """The stand-in answers of one cloud for the server `name`, from nothing to a server and back: each read
         answers by the commands that came before it. `changed`: answers of the test in place of the usual ones."""
         if cloud == "aws":
@@ -5926,7 +6181,7 @@ class Cloud(unittest.TestCase):
                 {"has": ["terminate-instances"], "out": {"TerminatingInstances": []}},
                 {"has": ["delete-security-group"], "out": {"Return": True}}]
         if cloud == "azure":
-            sub = self.WHERE["azure"][0]
+            sub = cls.WHERE["azure"][0]
             base = f"/subscriptions/{sub}/resourceGroups/founderizer-{name}"
             group = {"id": base, "tags": {"founderizer-server": name, "founderizer": "agent"}}
             nsg = {"id": base + f"/providers/Microsoft.Network/networkSecurityGroups/{name}-nsg",
@@ -6022,7 +6277,7 @@ class Cloud(unittest.TestCase):
                 calls.append(("cloud_step", dict(self.base(cloud), step=step["id"], **fields, **more)))
             elif step["kind"] in ("check", "close"):
                 calls.append(("cloud_step", dict(self.base(cloud), step=step["id"], **more)))
-        calls += [("cloud_remove", dict(self.base(cloud), step=step, **more)) for step in recipe["removals"]]
+        calls += [("cloud_remove", dict(self.base(cloud), step=r["id"], **more)) for r in recipe["removals"]]
         return calls
 
     def walk(self, cloud, **more):
@@ -6042,7 +6297,7 @@ class Cloud(unittest.TestCase):
         recipe = self.recipes["clouds"][cloud]
         commands = [recipe["version"]["argv"]] + [r["argv"] for r in recipe["reads"].values() if r.get("argv")]
         commands += [s["argv"] for s in recipe["steps"] if s.get("argv")]
-        return commands + [r["argv"] for r in recipe["removals"].values()]
+        return commands + [r["argv"] for r in recipe["removals"]]
 
     # -- the tests
 
@@ -6058,6 +6313,13 @@ class Cloud(unittest.TestCase):
                 [w for s in recipe["steps"] for one in s.get("extra", ()) for w in one["argv"]]
             for argv in self.recipe_commands(cloud):
                 self.assertTrue(self.starts(argv, allowed, "{name}"), argv)
+            # Two reads of one fact exclude each other by a value (when / unless): a reader of the app's table, which
+            # keeps no order of its keys, then finds the same read as this one.
+            for fact in {f for r in recipe["reads"].values() for f in r["gives"]}:
+                givers = [r for r in recipe["reads"].values() if fact in r["gives"]]
+                for one, other in ((a, b) for a in givers for b in givers if a is not b):
+                    self.assertTrue(set(one.get("when", ())) & set(other.get("unless", ())) or
+                                    set(one.get("unless", ())) & set(other.get("when", ())), (cloud, fact))
             self.assertEqual([w for w in words if w.split("=")[0] in self.NEVER], [], cloud)
             for tool, args, _answer, sent in self.walk(cloud):
                 for one in sent:
@@ -6089,7 +6351,7 @@ class Cloud(unittest.TestCase):
                         self.assertIsNone(re.fullmatch(rule["pattern"], value), (cloud, field, value))
         for field, value in (("name", "-agents"), ("name", "agents 1"), ("name", "door"), ("account", "1234; rm"),
                              ("place", "eu-central-1\n"), ("size", "--t3.small"), ("subnet", "subnet-$x"),
-                             ("profile", "-p"), ("ssh_from", "0.0.0.0/0"), ("ssh_from", "203.0.112.0/23"),
+                             ("profile", "-p"), ("ssh_from", "0.0.0.0/0"), ("ssh_from", "198.51.100.0/23"),
                              ("ssh_from", "203.0.113.9/24"), ("ssh_from", "100.64.0.7"), ("ssh_from", "10.0.0.0/24"),
                              ("ssh_from", "192.168.1.5"), ("ssh_from", "172.20.0.0/24"), ("disk_gb", "30"),
                              ("disk_gb", 4096), ("use", "agent;")):
@@ -6099,8 +6361,8 @@ class Cloud(unittest.TestCase):
                 self.call("cloud_step", **args)
             self.assertIn("Nothing ran", str(caught.exception), (field, value))
         # The range has two guards, the pattern of the data and the code: each one alone refuses a range wider than /24.
-        self.assertIsNone(re.fullmatch(owner_mcp.CLOUD_RECIPES["values"]["ssh_from"]["pattern"], "203.0.112.0/23"))
-        for wide in ("203.0.112.0/23", "0.0.0.0/0", "100.64.0.0/24"):
+        self.assertIsNone(re.fullmatch(owner_mcp.CLOUD_RECIPES["values"]["ssh_from"]["pattern"], "198.51.100.0/23"))
+        for wide in ("198.51.100.0/23", "0.0.0.0/0", "100.64.0.0/24"):
             with self.assertRaises(owner_mcp.Refused, msg=wide):
                 owner_mcp.ssh_from_value(wide)
         self.assertEqual(owner_mcp.ssh_from_value("203.0.113.9"), "203.0.113.9/32")
@@ -6147,7 +6409,7 @@ class Cloud(unittest.TestCase):
                         "machine-types"))], (cloud, args))
                     self.assertEqual({s["tool"] for s in answer["steps"]}, {"cloud_remove"}, (cloud, args))
                 if tool == "cloud_remove":                  # never a step that makes the removed thing again
-                    order = list(self.recipes["clouds"][cloud]["removals"])
+                    order = [r["id"] for r in self.recipes["clouds"][cloud]["removals"]]
                     after = order[order.index(args["step"]) + 1:]
                     wanted = after[0] if after else None
                     self.assertEqual((answer["next"] or {}).get("arguments", {}).get("step"), wanted, (cloud, args))
@@ -6157,9 +6419,9 @@ class Cloud(unittest.TestCase):
         """An agent that follows `next` from the removal of a server ends with nothing of the recipe left, also when
         the SSH rule is still there (a check that stopped, a join that did not run): at Google Cloud the chain is
         cloud_remove server, cloud_step close_ssh, cloud_remove firewall, and then nothing; at AWS a close_ssh after the
-        server is gone gives the removal of the firewall as next; and an Azure group that still shows while Azure
-        deletes it gives cloud_look, not the same delete again. Bug: an agent that follows `next` rents the server
-        again and lets SSH in to it."""
+        server is gone gives the removal of the firewall as next, and one after the firewall has nothing to remove; and
+        an Azure group that still shows while Azure deletes it gives cloud_look, not the same delete again. Bug: an
+        agent that follows `next` rents the server again and lets SSH in to it, or is told to make a firewall."""
         for step in ("firewall", "server", "open_ssh"):
             self.call("cloud_step", **self.base("google"), step=step,
                       **{"server": {"ssh_public_key_file": str(self.key_file)},
@@ -6177,8 +6439,14 @@ class Cloud(unittest.TestCase):
                       **{"server": {"ssh_public_key_file": str(self.key_file)},
                          "open_ssh": {"ssh_from": "203.0.113.9"}}.get(step, {}))
         self.call("cloud_remove", **self.base("aws"), step="server")
-        after = self.call("cloud_step", **self.base("aws"), step="close_ssh")["next"]
-        self.assertEqual((after["tool"], after["arguments"]["step"]), ("cloud_remove", "firewall"))
+        closed = self.call("cloud_step", **self.base("aws"), step="close_ssh")
+        self.assertEqual((closed["next"]["tool"], closed["next"]["arguments"]["step"]), ("cloud_remove", "firewall"))
+        self.assertIn("call cloud_look before that removal", closed["did"])     # a server not shown yet
+        # After the firewall, a close_ssh has nothing to remove: the rule went with it, and no step makes the firewall.
+        self.call("cloud_remove", **self.base("aws"), step="firewall")
+        gone = self.call("cloud_step", **self.base("aws"), step="close_ssh")
+        self.assertIn("nothing to remove", gone["did"])
+        self.assertIsNone(gone["next"])
         self.rules(self.cloud_rules("azure", group_stays=True))
         for step in ("group", "firewall"):
             self.call("cloud_step", **self.base("azure"), step=step)
@@ -6289,10 +6557,10 @@ class Cloud(unittest.TestCase):
         for change, use, verdict in (({"os_id": "debian", "os_version": "11"}, "agent", "stop"),
                                      ({"sudo": "password"}, "agent", "stop"), ({"sudo": "none"}, "agent", "stop"),
                                      ({"memory_mb": "980"}, "agent", "stop"), ({"memory_mb": "980"}, "hub", "stop"),
-                                     ({"memory_mb": "1800"}, "hub", "ready"), ({"disk_free_mb": "9000"}, "agent", "stop"),
-                                     ({"arch": "armv7l"}, "agent", "stop"), ({"systemd": "no"}, "agent", "stop"),
-                                     ({"cloud_init": "running"}, "agent", "wait"), ({"dpkg_lock": "yes"}, "agent",
-                                                                                     "wait")):
+                                     ({"memory_mb": "1800"}, "hub", "ready"),
+                                     ({"disk_free_mb": "9000"}, "agent", "stop"), ({"arch": "armv7l"}, "agent", "stop"),
+                                     ({"systemd": "no"}, "agent", "stop"), ({"cloud_init": "running"}, "agent", "wait"),
+                                     ({"dpkg_lock": "yes"}, "agent", "wait")):
             text = self.READING
             for key, value in change.items():
                 text = re.sub(rf"^{key}=.*$", f"{key}={value}", text, flags=re.M)
@@ -6516,6 +6784,29 @@ class Cloud(unittest.TestCase):
                                                   subnet="subnet-0a1b2c3d4e5f67890")["did"])
         tool = next(t for t in owner_mcp.tools() if t["name"] == "cloud_remove")
         self.assertIn("Give the subnet that the server was made with", tool["description"])
+
+    def test_the_program_is_found_in_absolute_folders_only(self):
+        """`cloud_which` takes the cloud's program from an absolute folder of the PATH only: no PATH, an empty one, an
+        empty part and a relative part are not the working folder, where `shutil.which` would find it. Bug: a file named
+        aws in the AI client's working folder, which an agent or a cloned repository can write, runs with the admin's
+        cloud login."""
+        work = self.folder / "work"
+        work.mkdir()
+        (work / "aws").write_text("#!/bin/sh\necho x\n")
+        (work / "aws").chmod(0o755)
+        here = os.getcwd()
+        os.chdir(work)
+        self.addCleanup(os.chdir, here)
+        for path in ("", ":", ".", "bin", "./"):
+            with patch.dict(os.environ, {"PATH": path}):
+                self.assertIsNone(owner_mcp.cloud_which("aws"), path)
+        with patch.dict(os.environ, {"PATH": "."}):
+            self.assertIsNotNone(shutil.which("aws"))           # the place that cloud_which does not take
+        environment = {k: v for k, v in os.environ.items() if k != "PATH"}
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertIsNone(owner_mcp.cloud_which("aws"))
+        with patch.dict(os.environ, {"PATH": f"/no/such/folder::.:{self.folder}"}):
+            self.assertEqual(owner_mcp.cloud_which("aws"), os.path.join(str(self.folder), "aws"))
 
     def test_the_look_names_what_lets_any_cloud_program_in(self):
         """The notes of a look name what the recipe does not change and the admin must know: a Google Cloud rule that

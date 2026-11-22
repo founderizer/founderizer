@@ -480,6 +480,11 @@ CREATE TABLE IF NOT EXISTS person_scopes(person INTEGER NOT NULL, agent TEXT NOT
 -- messages a day of a closed role (NULL: no limit). Only the owner writes it.
 CREATE TABLE IF NOT EXISTS roles(name TEXT PRIMARY KEY, prompt TEXT NOT NULL, tools INTEGER NOT NULL, daily INTEGER,
   created REAL NOT NULL, updated REAL NOT NULL);
+-- The set of access of a role (Founderizer for Teams, design 3). No row: the role has no set. grants NULL is All.
+-- Teams data, dormant in Core (TEAMS_TABLES): Core only moves a role's or an agent's name in it and deletes by a
+-- name, and only the Teams part reads its rows and applies them into the people tables.
+CREATE TABLE IF NOT EXISTS role_sets(role TEXT NOT NULL, agent TEXT NOT NULL, grants TEXT, updated REAL NOT NULL,
+  PRIMARY KEY(role, agent));
 -- One conversation for each (person, agent) pair, and its whole record: the person's messages, the agent's replies,
 -- the questions and work requests it raised, and the owner's answers. `who` is person, agent, owner or action.
 CREATE TABLE IF NOT EXISTS conversations(id INTEGER PRIMARY KEY, person INTEGER NOT NULL, agent TEXT NOT NULL,
@@ -24285,6 +24290,9 @@ SCOPE_OUTSIDE = "outside the access of the person whose conversation this is"
 SCOPE_STOP = "Do not go on with this request: tell them which part of it needs access that they do not have."
 
 
+PERSON_OWN = object()       # the grants of person_agent_view and conversation_refusal: the person's own list
+
+
 def person_scope(pid, agent):
     """The list of one person's conversations with one agent, {resource id: level}, or None for All. A row that cannot
     be read is an empty list, never All. read_row only: safe inside a caller's transaction."""
@@ -24683,6 +24691,29 @@ def person_scope_body(value):
     return out
 
 
+def person_agents_rows(p, agents, t0):
+    """Inside the owner's write of a person (ui_person, and a role's set of Founderizer for Teams, design 3): the
+    agents that the person can talk to become `agents`, checked names (person_agent_names), each added at t0, and the
+    standing items that the person gave an agent that they lost end (AUTONOMY.md P3). A list of an agent that the
+    person lost stays in person_scopes, as after an untick by hand."""
+    in_transaction("person_agents_rows")
+    DB.execute("DELETE FROM person_agents WHERE person=?", (p["id"],))
+    for agent in agents:
+        DB.execute("INSERT INTO person_agents(person,agent,added) VALUES(?,?,?)", (p["id"], agent, t0))
+    standing_person_rows(p["id"], f"{p['name']} no longer writes to that agent", t0, agents)
+
+
+def person_scope_done(p, ended, dropped, said):
+    """After the commit of a write of a person's lists, with what person_scope_rows returned, as person_remove ends a
+    removed person's work: the open work that a newly narrowed conversation opened before its list ends, the tokens
+    that the hub kept for the changed conversations go, and the owner's log lines of each change are written (each
+    one a NARROWED_LINE, which narrowed_spans reads). Empty lists do nothing."""
+    removed_conversation_tasks_end(ended, f"{p['name']}'s access with this agent was narrowed")
+    thread_tokens_drop(dropped)
+    for line in said:
+        log("owner", line)
+
+
 def person_scope_rows(p, scopes, t0):
     """Inside ui_person's transaction: the person's lists as the owner wrote them, and what a change of each one does
     (plan, section 7). The pair's conversation sessions end (conversation_sessions_end, with their waits), so the next
@@ -25000,10 +25031,26 @@ def person_daily(person, agent=None):
     return person["daily"] if person["daily"] is not None else PERSON_DAILY[person_role(person["role"])]
 
 
+def role_sets():
+    """Founderizer for Teams, design 3 (teams-design-3-role-sets.md, 3.9): the part `role_sets` for an event (a new
+    person, a change of a person's role) or a view, or None. It is None while Teams is off, while this hub has not
+    loaded the part's code, and while the part's own condition (contacts.v2) does not hold, and with None Core does
+    what it did before Teams. Asked again at each event and each view, never kept: a kept part would still act after a
+    cancel. A field of a write asks teams_part("role_sets", need=True) instead, for design 1's refusal. Called before
+    a transaction() opens: teams_on() reads with q1, which commits."""
+    sets = teams_part("role_sets")
+    return sets if sets is not None and "role_sets" in teams_features() else None
+
+
 def role_view(r):
-    """One role for the owner (AUTONOMY.md 6.3)."""
-    return {"name": r["name"], "prompt": r["prompt"], "tools": bool(r["tools"]), "daily": r["daily"],
+    """One role for the owner (AUTONOMY.md 6.3). With Founderizer for Teams' part `role_sets` (role_sets()): also
+    the role's set `access`, its count of `people` and the people who `differ` from it (role_fields)."""
+    view = {"name": r["name"], "prompt": r["prompt"], "tools": bool(r["tools"]), "daily": r["daily"],
             "created": r["created"], "updated": r["updated"]}
+    sets = role_sets()
+    if sets is not None:
+        view.update(sets.role_fields(r["name"]))
+    return view
 
 
 def role_list():
@@ -25020,10 +25067,16 @@ def people_roles():
         return [{"role": r, "means": PERSON_ROLES[r], "daily": PERSON_DAILY[r], "tools": list(PERSON_TOOLS[r])}
                 for r in PERSON_ROLES]
     # AUTONOMY.md P2 (lane L2): a role with tools on gets the conversation tools beside the agent's own, and a closed
-    # one only its three
-    return [{"role": r["name"], "means": r["prompt"], "daily": PERSON_DAILY_MAX if r["daily"] is None else r["daily"],
-             "tools": list(CONVERSATION_WORK_TOOLS if r["tools"] else CONVERSATION_CLOSED_TOOLS)}
-            for r in read_rows("SELECT * FROM roles ORDER BY created, rowid")]
+    # one only its three. Founderizer for Teams, design 3: `agents`, the agents of a role's set, for a role with one
+    sets, out = role_sets(), []
+    for r in read_rows("SELECT * FROM roles ORDER BY created, rowid"):
+        entry = {"role": r["name"], "means": r["prompt"], "daily": PERSON_DAILY_MAX if r["daily"] is None else
+                 r["daily"], "tools": list(CONVERSATION_WORK_TOOLS if r["tools"] else CONVERSATION_CLOSED_TOOLS)}
+        names = sets.role_agents(r["name"]) if sets is not None else None
+        if names is not None:
+            entry["agents"] = names
+        out.append(entry)
+    return out
 
 
 def contacts_v2_on():
@@ -25100,13 +25153,14 @@ def contact_reach(agent, person=None):
     return shell_off(agent) or conversation_works(person)
 
 
-def conversation_refusal(agent, person=None):
+def conversation_refusal(agent, person=None, grants=PERSON_OWN):
     """Why this agent cannot talk with another person now, in words the person can read, or None. The fleet's manager
     is never reachable (CHAT-APPS.md decision D6). Before contacts.v2, neither is a runtime whose session the helper
     cannot lock down to the conversation tools (decision D5: Claude, until the lockdown test passes for another one).
     With it (AUTONOMY.md P10), a closed conversation runs on the runtime that conversations.closed_runtime names,
     whatever the agent's own is, and a conversation with tools runs on the agent's own runtime, which must run a
-    session of its own in a terminal (owner_chat)."""
+    session of its own in a terminal (owner_chat). grants is person_agent_view's: only that view gives one, in place of
+    the person's own list."""
     a = agents().get(agent) or {}
     if not a or not agent_active(agent) or a.get("role") not in ("worker", "lead"):
         return f"{agent_display(agent)} cannot chat now."
@@ -25116,7 +25170,8 @@ def conversation_refusal(agent, person=None):
         return f"{agent_display(agent)} cannot chat now."
     if not contacts_v2():
         return None if runtime_fact(a.get("runtime"), "conversation") else f"{agent_display(agent)} cannot chat now."
-    if person is not None and conversation_works(person, agent) and person_scope(person["id"], agent) is not None:
+    if person is not None and conversation_works(person, agent) and (
+            person_scope(person["id"], agent) if grants is PERSON_OWN else grants) is not None:
         # person access plan, section 6: a narrowed pair runs locked, so it asks for a runtime that can be locked on
         # the agent's own account (scope_ready), not for owner_chat. The reason is the owner's (person_agent_view);
         # the person reads the generic sentence.
@@ -26194,10 +26249,14 @@ def person_agent_names(value):
     return sorted(names)
 
 
-def person_agent_view(agent, person=None):
+def person_agent_view(agent, person=None, grants=PERSON_OWN):
     """One agent of a person's list for the app: whether it can hold a conversation now, and in plain words why not.
     The owner may keep an agent on the list that cannot chat today; the person still never reaches it. With
-    contacts.v2 the runtime question is the one conversation_refusal asks for this person's role."""
+    contacts.v2 the runtime question is the one conversation_refusal asks for this person's role. grants, when it is
+    given, takes the place of the person's own list on this agent ({resource: level}, or None for All): Founderizer
+    for Teams' role page (design 3) shows an agent of a role's set so, for a stand-in person who holds the role."""
+    def scope():
+        return person_scope(person["id"], agent) if grants is PERSON_OWN else grants
     a = agents().get(agent) or {}
     why = None
     if not a:
@@ -26211,19 +26270,19 @@ def person_agent_view(agent, person=None):
                f"down to a conversation yet, so other people never reach it.")
     elif not contact_reach(agent, person):      # DevOps D5, support plan F1
         why = f"{agent_display(agent)} has its Shell box on, so only a person whose role has tools on reaches it."
-    elif person is not None and conversation_works(person, agent) and person_scope(person["id"], agent) is not None \
+    elif person is not None and conversation_works(person, agent) and scope() is not None \
             and not scope_ready(person["id"], agent):       # person access plan, section 6: the owner's reason
         why = scope_refusal(agent)
-    elif contacts_v2() and conversation_refusal(agent, person):
+    elif contacts_v2() and conversation_refusal(agent, person, grants):
         why = (f"{agent_display(agent)} runs on {a.get('runtime')}, which cannot run a conversation with its tools, "
                f"so this person never reaches it.")
     out = {"agent": agent, "can_chat": why is None, "says": why}
     # person access plan, sections 2 and 8: the pair's list, only where a list can hold (a role with tools on, an
     # agent with its Shell box on); null is All. It stays while the pair waits, so the owner can always set All again.
     if person is not None and a.get("role") in ("worker", "lead"):
-        grants = person_scope(person["id"], agent)
-        if grants is not None or conversation_works(person, agent):     # a list stays visible, so it can go back to All
-            out["scope"] = None if grants is None else scope_view(agent, grants)
+        listed = scope()
+        if listed is not None or conversation_works(person, agent):     # a list stays visible, so it can go back to All
+            out["scope"] = None if listed is None else scope_view(agent, listed)
     return out
 
 
@@ -27014,7 +27073,7 @@ def person_view(p, t0):
     """One person for the owner's app. role_means is what the agent is told about them: with contacts.v2, their
     role's prompt."""
     means = person_access(p)["prompt"] if contacts_v2() else PERSON_ROLES[person_role(p["role"])]
-    return {"id": p["id"], "name": p["name"], "role": p["role"], "role_means": means,
+    view = {"id": p["id"], "name": p["name"], "role": p["role"], "role_means": means,
             "note": p["note"], "daily": person_daily(p), "daily_set": p["daily"], "blocked": p["blocked"],
             "added": p["added"], "today": person_today(p["id"], t0),
             "agents": [person_agent_view(a, p) for a in person_agents(p["id"])],
@@ -27023,6 +27082,10 @@ def person_view(p, t0):
                         for r in q("SELECT * FROM person_handles WHERE person=? ORDER BY app, handle", (p["id"],))],
             "conversations": [{"id": c["id"], "agent": c["agent"], "state": c["state"], "last": c["last"]}
                               for c in q("SELECT * FROM conversations WHERE person=? ORDER BY id", (p["id"],))]}
+    sets = role_sets()          # Founderizer for Teams, design 3: role_differs, for a person who differs from the role
+    if sets is not None:
+        view.update(sets.person_fields(p))
+    return view
 
 
 def conversation_view(c, last=True):
@@ -63527,6 +63590,9 @@ AGENT_COLUMNS = (
     ("knowledge_summaries", "agent"),
     ("memories", "dropped_by"), ("memory_folds", "by"), ("tool_commands", "agent"), ("agent_messages", "sender"),
     ("agent_messages", "recipient"), ("person_agents", "agent"), ("person_scopes", "agent"), ("conversations", "agent"),
+    # a role's set of access (Founderizer for Teams, design 3), also while no Teams file is there: a kept set never
+    # gives a new agent of an old name
+    ("role_sets", "agent"),
     ("server_jobs", "agent"),
     ("signin_jobs", "agent"), ("resource_grants", "agent"), ("resource_grants", "by"), ("deposits", "agent"),
     ("withdrawals", "agent"), ("placements", "agent"),
@@ -64017,6 +64083,7 @@ AGENT_REMOVAL = {
     ("signin_jobs", "agent"): "delete", ("agent_notes", "agent"): "delete", ("memories", "agent"): "delete",
     ("rules", "agent"): "delete", ("standing", "agent"): "delete", ("reminders", "agent"): "delete",
     ("resource_grants", "agent"): "delete", ("person_agents", "agent"): "delete", ("person_scopes", "agent"): "delete",
+    ("role_sets", "agent"): "delete",       # a role's set (Founderizer for Teams, design 3), as a person's list
     ("sealed", "recipient"): "delete",
     ("session_tokens", "agent"): "spent", ("model_changes", "agent"): "spent", ("triggers", "agent"): "spent",
     ("token_slots", "agent"): "spent",      # the lane "Tokens by day and model": its sessions' slots, with them
@@ -80251,11 +80318,17 @@ class Handler(BaseHTTPRequestHandler):
         return self.ui_command("people/codes", read, act, keep=hide_code)
 
     def ui_person(self):
-        """POST /ui/people: the owner adds a person, changes one, or removes one. This route is the only writer of
-        the people tables: no agent, no tool and no message of a person reaches them, so nothing a person says can
-        widen their own access."""
+        """POST /ui/people: the owner adds a person, changes one, or removes one. The owner's two routes, this one and
+        POST /ui/roles (a role's set of access, Founderizer for Teams), are the only writers of the people tables: no
+        agent, no tool and no message of a person reaches them, so nothing a person says can widen their own access.
+
+        Founderizer for Teams, design 3 (3.3, 3.7): a person who gets a role (a new person, a change of `role`) gets
+        the role's set whole, when it has one, before the other fields of the write (`agents`, `scopes`) are written
+        on top as by hand; `role_access: true` gives a person who is there their role's set again. With no part
+        (role_sets), each of these writes what it wrote before, and role_access is design 1's refusal."""
         def read(data):
-            self.only(data, ("id", "name", "role", "agents", "note", "daily", "blocked", "delete", "handles", "scopes"))
+            self.only(data, ("id", "name", "role", "agents", "note", "daily", "blocked", "delete", "handles", "scopes",
+                             "role_access"))
             pid = data.get("id")
             if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int) or pid < 1):
                 raise ValueError("id must be the number of a person on the People page")
@@ -80275,7 +80348,9 @@ class Handler(BaseHTTPRequestHandler):
                                      f"role must be {roles[0]}" if roles else "this fleet has no role yet")
                 body["role"] = data["role"]
             if new or "agents" in data:
-                body["agents"] = person_agent_names(data.get("agents"))
+                sets = role_sets() if new and "agents" not in data else None
+                if sets is None or sets.role_agents(body["role"]) is None:      # a role's set gives a new person's
+                    body["agents"] = person_agent_names(data.get("agents"))
             if "note" in data:
                 body["note"] = None if data["note"] is None else \
                     goal_text(data["note"], "the note about this person", PERSON_NOTE_MAX)
@@ -80299,17 +80374,28 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("a person's access with an agent is set once they are there: send scopes with "
                                      "their id")
                 body["scopes"] = person_scope_body(data["scopes"])
+            if "role_access" in data:   # Founderizer for Teams, design 3: their role's set again, whole
+                if data["role_access"] is not True or new or "agents" in data or "scopes" in data:
+                    raise ValueError("role_access is true, for a person who is there, with no agents and no scopes")
+                teams_part("role_sets", need=True)
+                body["role_access"] = True
             return body
 
         def act(body):
             t0 = now()
             if body.get("delete"):
                 return person_remove(body["id"], t0)
+            # Founderizer for Teams, design 3: the part for the field role_access (design 1's refusal while it is not
+            # there), and for the event of a person who gets a role (role_sets(): None while Teams is off)
+            need = teams_part("role_sets", need=True) if body.get("role_access") else None
+            sets = role_sets()
             try:
                 # Again, under the lock that writes them: `read` looked the names up before this command waited for
                 # the lock, and a delete or a rename can have come first. The person got an agent of a name that
-                # nobody had, for the next agent of that name.
-                person_agent_names(body.get("agents", []))
+                # nobody had, for the next agent of that name. A new person with no agents needs their role's set
+                # still, as read found it, else the same refusal as read's.
+                person_agent_names(body["agents"] if "agents" in body else [] if "id" in body or sets is not None and
+                                   sets.role_agents(body["role"]) is not None else None)
             except ValueError as e:
                 raise Refusal(400, str(e)) from None
             if "id" not in body:
@@ -80317,22 +80403,28 @@ class Handler(BaseHTTPRequestHandler):
                     raise Refusal(409, f"this fleet already has {PEOPLE_MAX} people")
                 for h in body.get("handles", ()):
                     person_handle_free(h, None)
+                done = ([], [], [])
                 with transaction():
                     pid = DB.execute("INSERT INTO people(id,name,role,note,daily,added) VALUES(?,?,?,?,?,?)",
                                      (unused_id("people"), body["name"], body["role"], body.get("note"),
                                       body.get("daily"), t0)).lastrowid
-                    for agent in body["agents"]:
-                        DB.execute("INSERT INTO person_agents(person,agent,added) VALUES(?,?,?)", (pid, agent, t0))
+                    person = DB.execute("SELECT * FROM people WHERE id=?", (pid,)).fetchone()
+                    if sets is not None:            # the role's set first, whole, and the owner's agents on top
+                        done = sets.apply(person, t0)
+                    if "agents" in body:
+                        person_agents_rows(person, body["agents"], t0)
                     for h in body.get("handles", ()):
                         DB.execute("INSERT INTO person_handles(app,handle,person,name,added) VALUES(?,?,?,?,?)",
                                    (h["app"], h["handle"], pid, h["name"], t0))
-                log("owner", f"added the {body['role']} P-{pid} with "
-                             f"{', '.join(body['agents']) if body['agents'] else 'no agent'}")
+                person_scope_done(person, *done)
+                given = body["agents"] if "agents" in body else person_agents(pid)
+                log("owner", f"added the {body['role']} P-{pid} with {', '.join(given) if given else 'no agent'}")
                 return {"person": person_view(q1("SELECT * FROM people WHERE id=?", (pid,)), t0)}
             p = q1("SELECT * FROM people WHERE id=?", (body["id"],))
             if not p:
                 raise Refusal(404, code="no_such_person")
             changed = sorted(set(body) - {"id"})
+            done = ([], [], [])
             with transaction():
                 for field in ("name", "role", "note", "daily"):
                     if field in body:
@@ -80340,24 +80432,22 @@ class Handler(BaseHTTPRequestHandler):
                 if "role" in body and conversation_mode(p) != conversation_mode(
                         DB.execute("SELECT * FROM people WHERE id=?", (p["id"],)).fetchone()):
                     conversation_sessions_end(t0, "their role changed", person=p["id"])     # lane L2
+                # Founderizer for Teams, design 3: the set of the role that the person gets now, whole, or of their
+                # role again (role_access); the other fields of this write go on top of it, as the owner's hand
+                if need is not None or sets is not None and body.get("role", p["role"]) != p["role"]:
+                    person = DB.execute("SELECT * FROM people WHERE id=?", (p["id"],)).fetchone()
+                    done = need.apply(person, t0, must=True) if need is not None else sets.apply(person, t0)
                 if "blocked" in body:
                     DB.execute("UPDATE people SET blocked=? WHERE id=?", (t0 if body["blocked"] else None, p["id"]))
                     if body["blocked"]:         # L3 (AUTONOMY.md P3): blocking a person ends their standing items
                         standing_person_rows(p["id"], f"{p['name']} is blocked", t0)
                 if "agents" in body:
-                    DB.execute("DELETE FROM person_agents WHERE person=?", (p["id"],))
-                    for agent in body["agents"]:
-                        DB.execute("INSERT INTO person_agents(person,agent,added) VALUES(?,?,?)", (p["id"], agent, t0))
-                    standing_person_rows(p["id"], f"{p['name']} no longer writes to that agent", t0, body["agents"])
+                    person_agents_rows(p, body["agents"], t0)
                 if "scopes" in body:        # person access plan, sections 2 and 7
-                    ended, dropped, said = person_scope_rows(p, body["scopes"], t0)
-            if "scopes" in body:
-                # after the commit, as person_remove ends a removed person's work: the open work that a newly narrowed
-                # conversation opened before its list, and the tokens that the hub kept for the changed conversations
-                removed_conversation_tasks_end(ended, f"{p['name']}'s access with this agent was narrowed")
-                thread_tokens_drop(dropped)
-                for line in said:
-                    log("owner", line)
+                    done = tuple(one + more for one, more in zip(done, person_scope_rows(p, body["scopes"], t0)))
+            # after the commit, as person_remove ends a removed person's work: the open work that a newly narrowed
+            # conversation opened before its list, and the tokens that the hub kept for the changed conversations
+            person_scope_done(p, *done)
             log("owner", f"changed P-{p['id']}: {', '.join(changed) or 'nothing'}")
             return {"person": person_view(q1("SELECT * FROM people WHERE id=?", (p["id"],)), t0), "changed": changed}
         return self.ui_command("people", read, act, keep=removed_receipt)
@@ -80419,9 +80509,13 @@ class Handler(BaseHTTPRequestHandler):
     def ui_role(self):
         """POST /ui/roles: the owner adds a role, changes one, renames one or deletes one (plan P1). A name that is not
         there is a new role; the fields of a change that are not in the body stay as they are. A rename takes the
-        people who hold the role with it."""
+        people who hold the role with it, and its set of access; a delete takes its set.
+
+        Founderizer for Teams, design 3 (3.3, 3.7): `access` is the role's set, {agent: null | {resource: level}}, {}
+        or null, which only the part role_sets checks and writes, into the records of each person who holds the role
+        (applied: how many changed). With no part it is design 1's refusal, and each other field is as before."""
         def read(data):
-            self.only(data, ("name", "prompt", "tools", "daily", "rename", "delete"))
+            self.only(data, ("name", "prompt", "tools", "daily", "rename", "delete", "access"))
             for field in ("name", "rename"):
                 value = data.get(field)
                 if (field == "name" or field in data) and not (isinstance(value, str) and ROLE_NAME.fullmatch(value)):
@@ -80446,6 +80540,8 @@ class Handler(BaseHTTPRequestHandler):
                                           not 0 <= daily <= PERSON_DAILY_MAX):
                     raise ValueError(f"daily must be 0 to {PERSON_DAILY_MAX} messages a day, or null for no limit")
                 body["daily"] = daily
+            if "access" in data:        # Founderizer for Teams, design 3: the part checks the set, or design 1 refuses
+                body["access"] = teams_part("role_sets", need=True).access_body(data["access"])
             if len(body) == 1:
                 raise ValueError("give prompt, tools, daily or rename to write, or delete: true")
             return body
@@ -80460,9 +80556,18 @@ class Handler(BaseHTTPRequestHandler):
                 if held:
                     raise Refusal(409, f"{held} {'person holds' if held == 1 else 'people hold'} the role {name}: "
                                        f"give them another role first")
-                q("DELETE FROM roles WHERE name=?", (name,))
+                with transaction():
+                    DB.execute("DELETE FROM roles WHERE name=?", (name,))
+                    DB.execute("DELETE FROM role_sets WHERE role=?", (name,))     # its set, with or without Teams
                 log("owner", f"deleted the role {name}")
                 return {"role": {"name": name}, "deleted": True}
+            # Founderizer for Teams, design 3: the set again under the lock that writes it, as ui_person checks its
+            # agents two times: an agent or a grant can have gone while this command waited
+            sets = teams_part("role_sets", need=True) if "access" in body else None
+            try:
+                access = sets.access_body(body["access"]) if sets is not None else None
+            except ValueError as e:
+                raise Refusal(400, str(e)) from None
             new = body.get("rename", name)
             if not old and new != name:
                 raise Refusal(404, "no such role")
@@ -80481,6 +80586,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise Refusal(400, "a role with tools has no daily limit: daily must be null")
             changed = sorted([k for k in ("prompt", "tools", "daily") if not old or
                               role[k] != (bool(old[k]) if k == "tools" else old[k])] + (["name"] if new != name else []))
+            wrote = {"changed": False, "people": []}
             with transaction():
                 if not old:
                     DB.execute("INSERT INTO roles(name,prompt,tools,daily,created,updated) VALUES(?,?,?,?,?,?)",
@@ -80488,15 +80594,24 @@ class Handler(BaseHTTPRequestHandler):
                 elif changed:
                     DB.execute("UPDATE roles SET name=?, prompt=?, tools=?, daily=?, updated=? WHERE name=?",
                                (new, role["prompt"], int(role["tools"]), role["daily"], t0, name))
-                if new != name:             # a rename keeps the people who hold the role
+                if new != name:             # a rename keeps the people who hold the role, and its set of access
                     DB.execute("UPDATE people SET role=? WHERE role=?", (new, name))
+                    DB.execute("UPDATE role_sets SET role=? WHERE role=?", (new, name))
                 if old and "tools" in changed and contacts_v2():
                     conversation_sessions_end(t0, "their role's tools changed", role=new)     # lane L2
+                if sets is not None:        # the set under the role's name of now, into its people's records
+                    wrote = sets.set_write(new, access, t0)
+                    if wrote["changed"]:
+                        changed = sorted(changed + ["access"])
                 log_row("owner", f"added the role {name}" if not old else
                         f"changed the role {name}{' to ' + new if new != name else ''}: "
                         f"{', '.join(changed) or 'nothing'}")
-            # as POST /ui/people answers: the role, and what a change changed
-            return dict({"role": role_view(role_row(new))}, **({"changed": changed} if old else {}))
+            for done in wrote["people"]:        # after the commit, as POST /ui/people does for each changed person
+                person_scope_done(*done)
+            # as POST /ui/people answers: the role, and what a change changed; and with access, how many people it
+            # changed
+            return dict({"role": role_view(role_row(new))}, **({"changed": changed} if old else {}),
+                        **({"applied": {"people": len(wrote["people"])}} if sets is not None else {}))
         return self.ui_command("roles", read, act)
 
     def ui_settings(self, query):
@@ -84107,8 +84222,11 @@ def stop_with_parent(fd):
 # TEAMS_CALLS is one plain statement at the top level of this file, because publish.py's gate 9 reads it with ast to
 # measure each part of a package against it, and test_publish.TeamsFiles holds that reading equal to the value here.
 
-TEAMS_CALLS = {}        # feature -> the names of the functions that Core calls of that part; each design adds its row
-TEAMS_TABLES = ()       # the tables of Teams data that stand in SCHEMA, dormant (teams-design-2-code-home.md, 3.2)
+TEAMS_CALLS = {         # feature -> the names of the functions that Core calls of that part; each design adds its row
+    # design 3, roles as sets of access (teams-design-3-role-sets.md, 3.9): a role's set into its people's records
+    "role_sets": ("access_body", "set_write", "apply", "role_fields", "person_fields", "role_agents"),
+}
+TEAMS_TABLES = ("role_sets",)       # the tables of Teams data that stand in SCHEMA, dormant (teams-design-2, 3.2)
 TEAMS_CODE = {}         # feature -> the module of a part that this process loaded (teams_take); empty in Core
 TEAMS_LOAD = {}         # the one load of this process (teams_load): "lines", what failed in it; "finder", its finder
 TEAMS_FOLDER = "teams"          # beside the records: the folder of an installed hub's packages (teams_folder)

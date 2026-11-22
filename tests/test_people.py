@@ -1283,6 +1283,60 @@ class Roles(People):
         line = hub.q1("SELECT what FROM log WHERE what LIKE 'changed the role peer%'")["what"]
         self.assertEqual(line, "changed the role peer to colleague: name, prompt")
 
+    # ---- Founderizer for Teams, design 3: a role's set of access (teams-design-3-role-sets.md, 3.2, 3.7 and 3.10)
+    def everything(self):
+        """Each row of each table of the hub's records, as text: what a refused command must leave as it was."""
+        tables = [r["name"] for r in hub.q("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        return {t: sorted(json.dumps([str(v) for v in row]) for row in hub.q(f"SELECT * FROM {t}")) for t in tables}
+
+    def test_a_fleet_with_no_teams_refuses_a_roles_access_and_writes_nothing(self):
+        """A fleet with no licence of Founderizer for Teams answers 409 teams_off to a role's `access` and to a
+        person's `role_access`, and writes nothing: not the set, not a person's records, and not the other fields of
+        the same write. Bug: Core writes or applies a role's set with no licence, or a route does not ask the part
+        with need=True and drops the field while it writes the rest."""
+        self.switch_on()
+        pid = self.add(name="Bruno", role="peer")["id"]
+        before = self.everything()
+        for code, refused in (self.role(name="peer", prompt="Changed.", access={"studio": None}),
+                              self.role(name="supplier", prompt="A supplier.", tools=False, access={}),
+                              self.role(name="peer", access=None),
+                              self.change(pid, note="Changed.", role_access=True)):
+            self.assertEqual((code, refused.get("code")), (409, "teams_off"), refused)
+            self.assertEqual(refused["error"], hub.refusal_words.WORDS["teams_off"])
+        self.assertEqual(self.everything(), before)
+        # the shape of role_access is checked as each field is, with or without Teams
+        for changes in ({"role_access": False}, {"role_access": True, "agents": ["studio"]},
+                        {"role_access": True, "scopes": {"studio": None}}):
+            self.assertEqual(self.change(pid, **changes)[0], 400, changes)
+        self.assertEqual(self.add(name="Ana", role="peer", role_access=True, status=400), None)
+        # and a new person still needs agents: no set gives them with no Teams
+        body = dict(self.command(), name="Ana", role="peer")
+        body.pop("text", None)
+        self.assertEqual(self.request("/ui/people", body)[0], 400)
+        self.assertEqual(self.everything(), before)
+
+    def test_a_rename_and_a_delete_of_a_role_take_its_kept_set(self):
+        """A role's set (the table role_sets) stays in Core's records while no Teams file is there, and Core keeps its
+        names right: a rename of the role moves its rows with its people, and a delete of the role deletes them; the
+        set of another role stays. Bug: a kept set stands under the old name, and a new role of that name later
+        gives each of its people the old role's agents."""
+        self.switch_on()
+        self.assertEqual(self.role(name="supplier", prompt="A supplier.", tools=False, daily=10)[0], 200)
+        for role, agent, grants in (("supplier", "studio", None), ("supplier", "vps", '{"repo:example/app": "read"}'),
+                                    ("peer", "studio", None)):
+            hub.q("INSERT INTO role_sets(role,agent,grants,updated) VALUES(?,?,?,1)", (role, agent, grants))
+
+        def kept():
+            return [tuple(r) for r in hub.q("SELECT role, agent, grants FROM role_sets ORDER BY role, agent")]
+        self.assertEqual(self.role(name="supplier", rename="vendor")[0], 200)
+        self.assertEqual(kept(), [("peer", "studio", None), ("vendor", "studio", None),
+                                  ("vendor", "vps", '{"repo:example/app": "read"}')])
+        self.assertEqual(self.role(name="vendor", delete=True)[0], 200)
+        self.assertEqual(kept(), [("peer", "studio", None)])
+        self.assertEqual(self.role(name="supplier", prompt="Another supplier.", tools=False)[0], 200)
+        self.assertEqual(self.role(name="vendor", prompt="Another vendor.", tools=False)[0], 200)
+        self.assertEqual(kept(), [("peer", "studio", None)])
+
     def test_staff_have_no_daily_limit_and_an_outsider_keeps_theirs(self):
         self.switch_on()
         person = self.person_with_handle(role="peer", daily=1)

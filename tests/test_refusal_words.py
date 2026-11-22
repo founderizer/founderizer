@@ -130,6 +130,9 @@ OLD = {
     # a request for a new value of a key that the fleet holds (the area "Vault, keys and access", UI-API.md 1.295)
     "secret_value_asked": "This request asks for a new value of {name}: type it in the request's form.",
     "secret_app_setting": "{name} is a setting of an app on a host: its new value changes on that host, not here.",
+    # the Teams part role_sets (teams-design-3, 3.7): its own two, which its Teams file raises (PART_CODES)
+    "role_sets_contacts_off": "A role's access needs the setting contacts.v2, which is off.",
+    "role_no_set": "The role {role} has no access of its own.",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
@@ -276,6 +279,10 @@ SITES = {
 # The one place that writes a sentence of the table and has no code yet: a registered login that a batch of the secrets
 # import refuses, which is an entry's `error` in an answer that succeeded, and no refusal of the whole command.
 LEFT = {"a registered login cannot be sent as text": 1}
+# The codes that a Teams part raises in its own file (teams-design-1, 3.8: "A part's other refusals are its own"), by
+# the part's feature. That file is not published, so no place of hub.py names them; the part's own test holds each one
+# to the place that raises it (test_teams_<feature>.py). The apps know them as the client side of the part.
+PART_CODES = {"role_sets_contacts_off": "role_sets", "role_no_set": "role_sets"}
 # The names that a call's own parameters use, which a hole cannot take
 RESERVED = {"code", "names", "table", "extra", "status", "message", "self", "cls"}
 
@@ -522,7 +529,11 @@ class Places(unittest.TestCase):
         """A code is added in the commit that raises it: a code that no place names says something that the hub
         never says, and the apps would carry words for it."""
         used = {code for _, code, _, _, _ in self.places}
-        self.assertEqual(set(WORDS) - used, set())
+        self.assertEqual(set(WORDS) - used - set(PART_CODES), set())
+        # and a Teams part's own code is in the table, of a part that Core calls, and Core never raises it itself
+        self.assertLessEqual(set(PART_CODES), set(WORDS))
+        self.assertLessEqual(set(PART_CODES.values()), set(hub.TEAMS_CALLS))
+        self.assertEqual(used & set(PART_CODES), set())
 
     def test_each_converted_error_is_the_old_text(self):
         """For each code, the text that a place gives is the old English with its names put in."""
