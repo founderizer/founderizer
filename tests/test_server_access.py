@@ -726,7 +726,7 @@ class DoorTokens(Access):
         team["agents"]["studio"]["repos"] = {"other/site": "read"}
         self.write_team(team)
         view = self.request("/ui/door?db=test-generation", source=OWNER)[1]
-        self.assertEqual((view["github_app"]["app_id"], view["linked"]), ("12345", False))
+        self.assertEqual((view["github_app"]["app_id"], view["linked"], view["door_secrets"]), ("12345", False, False))
         self.assertEqual(view["agents"]["vps"]["repos"], {"acme/web": "write", "founderizer/founderizer-apps": "read"})
         token, record = "t" * 43, "r" * 43
         StubDoor.answers["/github/token"] = (200, {"tokens": [], "errors": [{"repos": ["other/site"], "error": "no App"}]})
@@ -750,6 +750,51 @@ class DoorTokens(Access):
         self.assertTrue(stored and all(token not in b and record not in b for b in stored))
         github = self.request("/ui/team?db=test-generation", source=OWNER)[1]["github"]
         self.assertEqual((github["app"], github["door"], github["app_id"]), (True, True, "12345"))
+        view = self.request("/ui/door?db=test-generation", source=OWNER)[1]
+        self.assertEqual((view["github_app"], view["linked"], view["door_secrets"]), (None, True, True))
+        # a file of the two secrets that the hub cannot read is there all the same: the app does not link that hub
+        # again, which would stop the secrets that it has (the review of 22 November 2026)
+        secrets.write_text("not json")
+        view = self.request("/ui/door?db=test-generation", source=OWNER)[1]
+        self.assertEqual((view["linked"], view["door_secrets"]), (False, True))
+
+    def test_a_hub_put_back_with_no_key_of_its_own_is_linked_and_keeps_a_key_file_that_it_cannot_read(self):
+        """A hub put back from a backup holds no App key (it gave it to the door) and no file of the door's secrets:
+        the app links it again (DoorAccess.gitHubStep). Its check asks the door what its App reaches with the secrets
+        of this link, so an account that no App reaches holds no link (a bug that asked every owner to mint refused
+        the link at each round), and the hub keeps an App's ID only where the renewal of its old key names it, the one
+        record that the hub held that key (a bug that kept another App's ID asked the owner to renew a key that the hub
+        never held). A key file that the hub cannot read, as a restore can leave it with another mode, is no key of the
+        door's: the link puts it aside whole (a bug that removed every file at the path took a key that the door may not
+        hold, and one that left it made the readings of a linked hub fail)."""
+        secrets = self.root / "door.json"
+        secrets.unlink()
+        key = self.root / "github-app.pem"
+        key.write_text("app_id=12345\n-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----\n")
+        key.chmod(0o644)
+        hub.CFG["github_app"] = str(key)
+        self.addCleanup(hub.CFG.pop, "github_app", None)
+        team = self.origin_team()
+        team["agents"]["vps"]["repos"] = {"acme/web": "write", "other/site": "read"}
+        self.write_team(team)
+        view = self.request("/ui/door?db=test-generation", source=OWNER)[1]
+        self.assertEqual((view["github_app"], view["linked"], view["door_secrets"]), (None, False, False))
+        StubDoor.calls = []
+        StubDoor.answers["/github/reach"] = (200, {"pages": {"acme": "https://github.com/settings/installations/5"},
+                                                   "all": [], "repos": ["acme/web"], "install": None})
+        StubDoor.answers["/github/token"] = (200, {"tokens": [{"token": "ghs_" + "b" * 36, "access": "read",
+                                                               "repos": ["acme/web"]}], "errors": []})
+        status, answer = self.owner("/ui/door/secrets", token="t" * 43, record="r" * 43)
+        self.assertEqual((status, answer.get("owners"), answer.get("app_removed")), (200, ["acme"], False), answer)
+        self.assertEqual(StubDoor.calls[0][:3], ("GET", "/github/reach", "Bearer " + "t" * 43))
+        self.assertEqual(json.loads(secrets.read_text()), {"token": "t" * 43, "record": "r" * 43})
+        self.assertFalse(key.exists())          # aside, whole, so that the readings ask the door and not that file
+        self.assertTrue(key.with_name(key.name + ".unread").exists())
+        # a renewal of the hub's old key that the backup kept names its App: that one stays
+        hub.kv_set("door_github_renew", json.dumps({"owner": "acme", "app_id": "555", "step": "ask"}))
+        status, answer = self.owner("/ui/door/secrets", token="t" * 43, record="r" * 43)
+        self.assertEqual((status, json.loads(secrets.read_text()).get("app_id")), (200, "555"), answer)
+        hub.kv_set("door_github_renew", "null")
 
     def test_once_linked_the_marks_of_what_the_app_reaches_come_from_the_door(self):
         """The coordinator, 6 November 2026: the marks of "What the App reaches" must not go blank with the move. The

@@ -66322,11 +66322,12 @@ GITHUB_INSTALL_PAGE = re.compile(r"https://github\.com/apps/[a-z0-9][a-z0-9-]{0,
 GITHUB_FULL_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,38}/[a-z0-9._-]{1,100}")
 
 
-def door_reach_read():
+def door_reach_read(conf=None):
     """github_reach_read for a hub linked to its door, which holds the App key (DevOps plan 13, item 4): the door
     reads the App's installations, and the hub keeps a page only in one of GitHub's own forms, so the app's marks open
-    GitHub and nothing else. None while the hub has no door."""
-    conf = door_conf()
+    GitHub and nothing else. None while the hub has no door. `conf`: the door with the two secrets of a link that the
+    hub does not keep yet (door_mint_check)."""
+    conf = conf or door_conf()
     if conf is None:
         return None
     status, answer = door_call(conf, "GET", "/github/reach", conf["token"])
@@ -67993,6 +67994,10 @@ def door_view():
             # plan 13, item 4: the hub's own App key, which the app moves to the door, and whether the hub is linked
             "github_app": {"app_id": app[0], "path": os.path.abspath(app[1])} if app else None,
             "linked": door_conf() is not None,
+            # whether the hub's file of the door's two secrets is there at all: the app links a hub that holds no App
+            # key of its own again only when it is not (a hub put back from a backup), never a linked hub whose file
+            # it could not read for a moment, whose secrets a new link would stop (owner API 1.298)
+            "door_secrets": os.path.exists(CFG.get("door_secrets") or DOOR_SECRETS_FILE),
             # plan 13, item 4: the Apps that the app made with GitHub's manifest flow, whose keys the door holds
             "github_apps": dict(sorted((door.get("github_apps") or {}).items())),
             # plan 13, items 3 and 4: the key that the central vault holds pinned under the name door, to which alone
@@ -68055,6 +68060,12 @@ def door_mint_check(body):
             "record": pending[1]}
     # an owner that the hub's own App is not installed on gets no token today either, so it does not hold the move
     reach = github_reach()
+    own = None
+    with contextlib.suppress(GitHubError):
+        own = github_app()
+    if reach is None and own is None:   # a hub that holds no App key and is not linked yet, as one put back from a
+        with contextlib.suppress(GitHubError):      # backup: the door's own reading, with the secrets of this link
+            reach = door_reach_read(conf)
     installed = set(reach["pages"]) if reach else None
     first = {}
     for name, a in sorted(agents().items()):
@@ -68086,12 +68097,25 @@ def save_door_secrets(body, check):
     held = None
     with contextlib.suppress(GitHubError):
         held = github_app()
+    # the App's ID stays for the App rows and the key's renewal: the hub's own; else, for a hub with no key of its own,
+    # only the App of the key's renewal, the one record that the hub held that App's key. The door's file cannot tell
+    # a moved App from one that the owner saved on the App rows, so no other ID is kept (the review of 22 November 2026)
+    renewed = (door_renewal() or {}).get("app_id")
+    renewed = renewed if isinstance(renewed, str) and re.fullmatch(r"[1-9][0-9]{0,11}", renewed) else None
+    app_id = held[0] if held else renewed
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:     # the App's ID stays for the App rows: the door has its key
-        json.dump(dict({"token": pending[0], "record": pending[1]}, **({"app_id": held[0]} if held else {})), f)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:     # the door has the key
+        json.dump(dict({"token": pending[0], "record": pending[1]}, **({"app_id": app_id} if app_id else {})), f)
     os.replace(path + ".new", path)
-    removed = github_app_remove()["replaced"]
+    # only the key that the hub read is the one that the door holds now. A file that the hub could not read (another
+    # mode or owner, as a restore can leave it) is no key of the door's: it goes aside, whole, as <file>.unread, so that
+    # the hub's readings of what its Apps reach ask the door and not that file (the review of 22 November 2026)
+    removed = github_app_remove()["replaced"] if held else False
+    key_path = CFG.get("github_app") or GITHUB_APP
+    if not held and os.path.lexists(key_path):
+        os.replace(key_path, key_path + ".unread")
+        log("owner", "kept a GitHub App file that the hub could not read as github-app.pem.unread")
     log("owner", f"the door mints every GitHub token (owners: {', '.join(check['owners']) or 'none'})"
                  + ("; the hub no longer holds the GitHub App key" if removed else ""))
     return {"linked": True, "owners": check["owners"], "app_removed": removed}
