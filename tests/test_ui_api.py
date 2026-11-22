@@ -1186,7 +1186,7 @@ class OwnFiles(unittest.TestCase):
 
         with contextlib.ExitStack() as stack:
             stand_for_the_machine(stack, machine)
-            stack.enter_context(patch.dict(hub.GOOGLE_OPENED, {"last": None, "key": None, "vault": None}))
+            stack.enter_context(patch.dict(hub.GOOGLE_OPENED, {"last": None, "key": None, "vault": None, "before": {}}))
             with patch.dict(hub.CFG):       # a hub with no file of its own: each test's hub until 16 November 2026
                 for key in HUB_FILES:
                     hub.CFG.pop(key, None)

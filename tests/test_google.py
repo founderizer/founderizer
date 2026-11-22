@@ -342,7 +342,7 @@ class GoogleHub(OwnerAPI):
             hub.CFG[key] = value
             self.addCleanup(hub.CFG.pop, key, None)
         opened = patch.dict(hub.GOOGLE_OPENED, {"last": None, "key": None, "vault": None, "asked_for": None,
-                                                "said": None, "dropped_for": None})
+                                                "said": None, "dropped_for": None, "before": {}})
         opened.start()
         self.addCleanup(opened.stop)
         self.fake = FakeGoogle()
@@ -791,7 +791,8 @@ class GoogleHub(OwnerAPI):
     def restart(self):
         """What a restart of the hub forgets: the file that it read last, the key that it held, and the central
         vault's key."""
-        hub.GOOGLE_OPENED.update(last=None, key=None, vault=None, asked_for=None, said=None, dropped_for=None)
+        hub.GOOGLE_OPENED.update(last=None, key=None, vault=None, asked_for=None, said=None, dropped_for=None,
+                                 before={}, done_for=None)
 
     def vault(self, key=None, hub_keys=True):
         """A central vault that the hub's status read took as this fleet's: with hub_keys, a program that serves
@@ -876,6 +877,170 @@ class GoogleHub(OwnerAPI):
         self.assertEqual(self.holder(), ("vault", atrest.key_id(key)))
         self.assertEqual(set(hub.google_saved()[0]["accounts"]), {EMAIL})
         self.assertFalse(self.key_file.exists())
+
+    def part_file(self, data=None):
+        """A Teams part's sealed file (decision D10: links.key of teams_data_dir("person_links")), sealed with the key
+        that seals the hub's files now, in this test's own folder of the records. Its path."""
+        hub.CFG["db_path"] = self.path
+        self.addCleanup(hub.CFG.pop, "db_path", None)
+        path = os.path.join(hub.teams_data_dir("person_links"), "links.key")
+        hub.sealed_write(path, "links.key", data or {"links": {"0" * 32: "a key"}})
+        return path
+
+    def part_holder(self, path):
+        envelope = json.loads(open(path, "rb").read())
+        return envelope["key"], envelope["key_id"]
+
+    def test_a_parts_sealed_file_follows_each_key_of_the_vault_with_the_google_file_and_without_it(self):
+        """A Teams part's sealed file (links.key, decision D10) is sealed with the key of the Google file. When the
+        central vault takes that key, and when the vault makes its key again, the part's file is sealed again with the
+        new key in the same turn, before the old key goes from the disk and from memory; with no Google file at all,
+        the vault's key is asked for it and the key file goes too. So a restart opens it. Bugs: the key file goes and
+        the part's file no longer opens (each member's link ends); the vault's new key leaves the part's file on the
+        old one; a hub with no Google file keeps a key file for ever, or never asks the vault."""
+        self.connected(client_id=APP_ID)
+        path = self.part_file()
+        self.assertEqual(self.part_holder(path)[0], "file")
+        old, _ = self.vault()
+        self.assertTrue(hub.google_vault_turn())
+        self.assertEqual((self.holder(), self.part_holder(path)), (("vault", atrest.key_id(old)),) * 2)
+        self.assertFalse(self.key_file.exists())
+        new, _ = self.vault()                                   # the vault made its key again
+        self.assertTrue(hub.google_vault_turn())
+        self.assertEqual((self.holder(), self.part_holder(path)), (("vault", atrest.key_id(new)),) * 2)
+        self.restart()
+        hub.GOOGLE_OPENED["vault"] = new
+        self.assertEqual(hub.sealed_read(path, "links.key")[:2], ({"links": {"0" * 32: "a key"}}, None))
+        # no Google file: the part's file alone asks the vault for its key, and the key file goes
+        self.file.unlink()
+        os.remove(path)
+        self.restart()
+        path = self.part_file()
+        self.assertTrue(self.key_file.exists())
+        key, asked = self.vault()
+        self.assertFalse(hub.google_vault_turn())
+        self.assertEqual((asked, self.part_holder(path)), (["hub_key"], ("vault", atrest.key_id(key))))
+        self.assertFalse(self.key_file.exists())
+        self.restart()
+        hub.GOOGLE_OPENED["vault"] = key
+        self.assertIsNone(hub.sealed_read(path, "links.key")[1])
+        # a part's file that its key no longer opens is passed over, and the work is done until the next status read
+        with open(path, "w") as f:
+            json.dump({"sealed": hub.GOOGLE_SEALED, "v": 1, "key": "vault", "key_id": "0" * 16, "data": ""}, f)
+        os.chmod(path, 0o600)
+        hub.CENTRAL["read_at"] += 60
+        with patch.object(hub, "google_key_drop", wraps=hub.google_key_drop) as drop:
+            for _ in range(3):
+                self.assertFalse(hub.google_vault_turn())
+        self.assertEqual(drop.call_count, 1)
+
+    def test_a_move_that_stops_in_its_middle_keeps_each_key_that_a_file_still_needs(self):
+        """The turn of a key (the area Vault, keys and access): a write of a part's file that fails while it moves stops
+        no write of the Google file, and the key that the part's file needs stays (the key file, or the vault's key of
+        before, which still opens what it sealed), so a later pass moves it; a part's move changes no key that the hub
+        holds; each key of before stays in memory until no file names it, also when the vault makes its key again
+        twice before the file moves; and whether the files moved comes from their own headers, never from the key that
+        the hub used last. Bugs: a failed move leaves only the new key, the next pass says done, and after a restart
+        the part's file no longer opens (each member's link ends); or one part's file that cannot move stops each
+        Connect and Disconnect."""
+        self.connected(client_id=APP_ID)
+        path = self.part_file()
+        old, _ = self.vault()
+        real_put = hub.sealed_file_put
+
+        def failing(target, raw, prefix):
+            if target == path:
+                raise OSError(28, "No space left on device")
+            return real_put(target, raw, prefix)
+        with patch.object(hub, "sealed_file_put", failing):
+            self.assertTrue(hub.google_vault_turn())           # the Google file moves, the part's file does not
+        self.assertEqual((self.holder()[0], self.part_holder(path)[0]), ("vault", "file"))
+        self.assertTrue(self.key_file.exists())                 # which keeps the key file that it needs
+        hub.CENTRAL["read_at"] += 60
+        self.assertFalse(hub.google_vault_turn())
+        self.assertEqual((self.holder(), self.part_holder(path)), (("vault", atrest.key_id(old)),) * 2)
+        self.assertFalse(self.key_file.exists())
+        # the vault makes its key again two times, and the part's file moves in neither pass
+        new, _ = self.vault()
+        with patch.object(hub, "sealed_file_put", failing):
+            self.assertTrue(hub.google_vault_turn())
+            newer, _ = self.vault()
+            hub.CENTRAL["read_at"] += 60
+            self.assertTrue(hub.google_vault_turn())
+            hub.CENTRAL["read_at"] += 60
+            self.assertFalse(hub.google_vault_turn())       # a drop that is not done keeps each key of before
+        self.assertEqual((self.holder(), self.part_holder(path)), (("vault", atrest.key_id(newer)),
+                                                                   ("vault", atrest.key_id(old))))
+        hub.CENTRAL["read_at"] += 60
+        self.assertFalse(hub.google_vault_turn())       # the first key of before opens the part's file, and it moves
+        self.assertEqual((self.holder(), self.part_holder(path)), (("vault", atrest.key_id(newer)),) * 2)
+        self.assertEqual(hub.sealed_read(path, "links.key")[:2], ({"links": {"0" * 32: "a key"}}, None))
+        self.assertEqual(hub.GOOGLE_OPENED["before"], {})       # no file names a key of before now
+        new = newer
+        # the vault makes its key again, the part's file moves and the Google file's write fails: the key that the hub
+        # holds for the Google file stays the one that sealed it, and the next pass moves it
+        old, new = new, self.vault()[0]
+        google = str(self.file)
+
+        def failing_google(target, raw, prefix):
+            if target == google:
+                raise OSError(28, "No space left on device")
+            return real_put(target, raw, prefix)
+        with patch.object(hub, "sealed_file_put", failing_google):
+            self.assertFalse(hub.google_vault_turn())
+        self.assertEqual((self.holder(), self.part_holder(path)), (("vault", atrest.key_id(old)),
+                                                                   ("vault", atrest.key_id(new))))
+        self.assertEqual(hub.GOOGLE_OPENED["key"][:2], ("vault", atrest.key_id(old)))
+        hub.CENTRAL["read_at"] += 60
+        self.assertTrue(hub.google_vault_turn())
+        self.assertEqual((self.holder(), self.part_holder(path)), (("vault", atrest.key_id(new)),) * 2)
+        self.assertEqual(list(hub.GOOGLE_OPENED["before"]), [atrest.key_id(old)])
+        hub.CENTRAL["read_at"] += 60
+        self.assertFalse(hub.google_vault_turn())       # done: and the key of before goes from memory
+        self.assertEqual(hub.GOOGLE_OPENED["before"], {})
+        # a part's file that its own header shows on the key of before moves, whatever key the hub used last
+        hub.GOOGLE_OPENED["vault"], hub.GOOGLE_OPENED["before"] = old, {}
+        hub.sealed_write(path, "links.key", {"links": {"1" * 32: "a key"}})
+        self.assertEqual(self.part_holder(path), ("vault", atrest.key_id(old)))
+        hub.GOOGLE_OPENED["vault"], hub.GOOGLE_OPENED["before"] = new, {atrest.key_id(old): old}
+        hub.GOOGLE_OPENED["key"] = ("vault", atrest.key_id(new), new)
+        hub.CENTRAL["read_at"] += 60
+        self.assertFalse(hub.google_vault_turn())
+        self.assertEqual(self.part_holder(path), ("vault", atrest.key_id(new)))
+        self.restart()
+        hub.GOOGLE_OPENED["vault"] = new
+        self.assertEqual(hub.sealed_read(path, "links.key")[:2], ({"links": {"1" * 32: "a key"}}, None))
+        self.assertEqual(set(hub.google_saved()[0]["accounts"]), {EMAIL})
+
+    def test_a_parts_file_that_cannot_be_read_keeps_the_key_file(self):
+        """A file of a part's folder that cannot be listed, read, parsed or opened keeps the hub's own key file when the
+        central vault takes the key: the file may need that key. Only a file that its key no longer opens is passed
+        over. Bug: a part's file that the move did not read loses its key with the key file, and each link ends."""
+        self.connected(client_id=APP_ID)
+        path = self.part_file()
+        bad = os.path.join(os.path.dirname(path), "other.key")
+        with open(bad, "w") as f:
+            f.write("{not json")
+        self.vault()
+        self.assertTrue(hub.google_vault_turn())                 # the Google file moves
+        self.assertTrue(self.key_file.exists())                  # and the key file stays for the part's files
+        self.assertEqual((self.holder()[0], self.part_holder(path)[0]), ("vault", "file"))
+        self.assertTrue(any("other.key of the Teams part person_links does not parse" in r["what"]
+                            for r in hub.q("SELECT what FROM log")))
+        os.remove(bad)
+        hub.CENTRAL["read_at"] += 60                             # the next read of the vault's status
+        self.assertFalse(hub.google_vault_turn())
+        self.assertFalse(self.key_file.exists())
+        self.assertEqual((self.holder()[0], self.part_holder(path)[0]), ("vault", "vault"))
+        # a part's file that its key no longer opens is passed over, and the work is done until the next status read
+        with open(path, "w") as f:
+            json.dump({"sealed": hub.GOOGLE_SEALED, "v": 1, "key": "vault", "key_id": "0" * 16, "data": ""}, f)
+        os.chmod(path, 0o600)
+        hub.CENTRAL["read_at"] += 60
+        with patch.object(hub, "google_key_drop", wraps=hub.google_key_drop) as drop:
+            for _ in range(3):
+                self.assertFalse(hub.google_vault_turn())
+        self.assertEqual(drop.call_count, 1)
 
     def test_a_running_hub_follows_a_new_key_of_the_vault_and_asks_a_refusing_vault_once_a_minute(self):
         """The vault's status names the id of the key that it keeps (hub_key_ids): a running hub that holds another

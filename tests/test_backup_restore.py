@@ -157,7 +157,7 @@ class Fixture(OwnerAPI):
         hub.CFG["google_key"] = self.google_key
         self.addCleanup(hub.CFG.pop, "google_key", None)
         opened = patch.dict(hub.GOOGLE_OPENED, {"last": None, "key": None, "vault": None, "asked_for": None,
-                                                "said": None, "dropped_for": None})
+                                                "said": None, "dropped_for": None, "before": {}})
         opened.start()
         self.addCleanup(opened.stop)
 

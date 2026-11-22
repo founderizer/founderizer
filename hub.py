@@ -3760,6 +3760,8 @@ def need_unclarified(need):
         return "an item of a conversation is that person's question: answer it, or ask the manager in its chat"
     if need["kind"] == "secret":
         return "a key request takes the owner's words with its own Needs clarification, which answers it"
+    if need["kind"] == JOIN_KIND:       # Teams design 4, S9: the owner's code or Refuse, and nobody's talk
+        return JOIN_NO_TALK
     if need["by"] != manager_name():
         return f"only the manager replies under a card, and {shown_role(need['by'])} raised this one: answer it"
     return None
@@ -3874,6 +3876,9 @@ def need_view(row, reads=None):
     # owner feature need_clarify: the card takes the owner's message under it (POST /ui/needs/<id>/talk), and his
     # talk with the manager there is `talk` (owner API 1.272)
     view["clarify"] = need_unclarified(row) is None
+    if row["kind"] == JOIN_KIND:        # Teams design 4, D12: the person's name, from which an app writes the words
+        links = teams_part("person_links")
+        view["join"] = links.join_view(row) if links else None
     if view.get("door_call"):                       # what a phone's statement names
         view["door_fleet"] = kv_get("fleet_id") if reads is None else reads[1]
     else:
@@ -18553,6 +18558,8 @@ def need_replaced(agent, nid, door_host=None):
     need = q1("SELECT * FROM needs WHERE id=?", (nid,))
     if not need:
         raise ToolError(f"There is no Needs-you item N-{nid}.")
+    if need["kind"] == JOIN_KIND:       # Teams design 4, S9 (C28): for every agent, the manager too
+        raise ToolError(JOIN_HUB_ONLY.format(nid=nid))
     if need["by"] != agent:
         raise ToolError(f"N-{nid} is {need['by']}'s: you replace only an item that you raised.")
     if need["answer"] is not None:
@@ -18660,6 +18667,8 @@ def t_withdraw_need(agent, a):
         need = DB.execute("SELECT * FROM needs WHERE id=?", (nid,)).fetchone()
         if not need:
             raise ToolError(f"There is no Needs-you item N-{nid}.")
+        if need["kind"] == JOIN_KIND:   # Teams design 4, S9 (C28): for every agent, the manager too
+            raise ToolError(JOIN_HUB_ONLY.format(nid=nid))
         if need["by"] != agent and need["kind"] != "secret":
             raise ToolError(f"N-{nid} is {need['by']}'s: only the agent that raised an item withdraws it. The one "
                             f"exception is another agent's key or login request that no task waits on.")
@@ -19001,7 +19010,7 @@ def need_look_sweep(t0):
         seen = {}
     seen, held = seen if isinstance(seen, dict) else {}, {}
     for r in q("SELECT * FROM needs WHERE answer IS NULL AND conversation IS NULL AND github_key IS NULL AND "
-               "key_swap_server IS NULL AND COALESCE(add_device, 0)=0 ORDER BY id"):
+               "key_swap_server IS NULL AND COALESCE(add_device, 0)=0 AND kind IS NOT ? ORDER BY id", (JOIN_KIND,)):
         # the lane "Give on a card" (the owner's Close by itself, 19 November 2026): a card whose agent holds what its
         # Give gives closes too, NEED_GIVE_WAIT after the hub first saw it, which a press of Give answers well within
         gives = need_give_closes(r)
@@ -22600,15 +22609,24 @@ BUILT_IN_ACCOUNT = "founderizer:"
 # 5.4). It is not in CHAT_APP_NAMES: that list also gates the accounts of team.json and the owner's codes and handles,
 # and each of them must refuse this app.
 BUILT_IN_APP = "founderizer"
+# The kind of the Needs-you item that the Teams part person_links raises when a device asks to join a link (Teams
+# design 4, S9; agent-sharing-spec.md 5.7). Only the owner's answer, or the end of its invite, closes it: no agent
+# reads its answer, withdraws it, replaces it or talks under it.
+JOIN_KIND = "join"
+JOIN_ENDED = "Ended"            # the answer of a join item that the end of its invite or of its link closed (D68 c, d)
+JOIN_NO_TALK = "a join item takes the code or Refuse"      # need_unclarified's line of it (the area Needs-you)
+JOIN_HUB_ONLY = ("N-{nid} is the hub's own item of a device that asks to join: only the owner's answer, or the end of "
+                 "its invite, closes it.")
 
 
 def conversation_place(conv):
     """The place of a conversation's account: its entry of chat_apps(), or None when team.json no longer has that
     account. It is the one read of the place for the header of a person's message, for reply and for a reminder
-    (Teams design 4, S3), so that the place of the built-in account comes from this one function later. A read of
-    chat_apps() alone has no entry for that account: reply would refuse it, or raise a KeyError where it reads the
-    app, and a reminder would end at its first run."""
-    return chat_apps().get(conv["account"])
+    (Teams design 4, S3). A conversation of the built-in account has the place that the Teams part person_links gives
+    (its app, its agent, the place's name and the words that refuse a reply's files) while its person has an active
+    link, and None with no part: a read of chat_apps() alone has no entry for that account."""
+    links = teams_part("person_links") if conv["account"] == BUILT_IN_ACCOUNT else None
+    return links.place(conv) if links else chat_apps().get(conv["account"])
 
 
 def chat_enabled(acc):
@@ -22947,6 +22965,9 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     answer say via ai-session in their header."""
     in_transaction("owner_message_rows")
     hand = request_hand(client, device, connection, origin, session)
+    if need is not None and need["kind"] == JOIN_KIND:     # Teams design 4, S9 (C26): before any word goes to an agent
+        return join_answer_rows(request_id, kind, need, value, chosen, client, recipient, t0, connection, hand,
+                                session)
     worker_chat = need is None and agents()[recipient].get("role") in ("worker", "lead")
     # owner feature secret_requests: a worker or a lead asks in its owner chat, so his answer goes back there, read
     # once as an agent's message is: it is no message of his that waits for a reply. A request that tasks wait on
@@ -23017,6 +23038,28 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} accepted as "
                f"M-{event_id} for {recipient}" + (f" from {origin['account']}" if origin else "") +
                request_hand_words(hand, session)))
+    return event_id
+
+
+def join_answer_rows(request_id, kind, need, value, chosen, client, recipient, t0, connection, hand, session):
+    """Inside owner_message_rows' transaction: the owner's answer of a join item (Founderizer for Teams, design 4, S9).
+    The Teams part changes the link and gives the words that the item keeps, never the code that the owner typed (C26:
+    the answer reaches the state read, the history, the answered card and the iPhone); with no part, only a press of
+    Refuse came here (phone_submit), and the item keeps that. The event is the owner's own and read at once, so no
+    agent's session reads the answer, and the ui_requests row keeps the same words. Returns the event ID."""
+    in_transaction("join_answer_rows")
+    links = teams_part("person_links")
+    words = links.join_rows(need, value, chosen, t0) if links else value
+    DB.execute("UPDATE needs SET answer=?,answered=?,chosen=? WHERE id=?", (words, t0, chosen, need["id"]))
+    event_id = DB.execute("INSERT INTO events(agent,kind,task,text,created,extra,read_at) VALUES(?,?,?,?,?,?,?)",
+                          ("owner", "say", None, f"[owner] Answer to Needs-you N-{need['id']}: {words}", t0, "{}",
+                           t0)).lastrowid      # no title: it names the person, whose removal keeps no name (D69)
+    DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,connection,hand,"
+               "session) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+               (request_id, kind, need["id"], words, event_id, t0, client, recipient,
+                connection["id"] if connection else None, hand, session))
+    DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} accepted as the "
+               f"answer of N-{need['id']}" + request_hand_words(hand, session)))
     return event_id
 
 
@@ -26508,7 +26551,10 @@ def conversation_header(conv, person, row, files=None):
     (CHAT_UNOPENED, from the row's kind), so the agent can answer it: files, given by a reader that names the files
     after the words (conversation_read, conversation_files_line), takes the mark away when one came; a reader that
     gives none (a waiting task, open work) keeps it, because its session does not open them."""
-    app = CHAT_APP_NAMES.get((conversation_place(conv) or {}).get("app"), "a chat app")
+    place = conversation_place(conv) or {}
+    # the place's own name for the built-in account (Teams design 4, D1): "Ana · peer · Founderizer"
+    app = CHAT_APP_NAMES.get(place.get("app")) or (place.get("name") if conv["account"] == BUILT_IN_ACCOUNT else
+                                                   None) or "a chat app"
     who = (f"{person['name']} · {person['role']} · {app}" if row["who"] == "person" else
            "the owner of this fleet" if row["who"] == "owner" else "Fleet")
     what = chat_unopened(row["kind"]) if row["who"] == "person" and not files else None
@@ -27283,6 +27329,8 @@ def t_reply(agent, a):
         if place is None:
             raise ToolError("This conversation's chat app is gone, so nothing can be sent. The owner must add it "
                             "again.")
+        if ids and conv["account"] == BUILT_IN_ACCOUNT and place.get("no_files"):
+            raise ToolError(place["no_files"])      # Teams design 4, D2: the Founderizer app takes no file yet
         t0 = now()
         rows = chat_files_rows(agent, ids, place["app"], t0)
         with transaction():
@@ -27438,6 +27486,8 @@ def person_handle_fields(data):
     """{app, handle, name} of one chat handle, checked as an inbound sender is."""
     if not isinstance(data, dict):
         raise ValueError("a handle is {app, handle, name}")
+    if data.get("app") == BUILT_IN_APP:     # Teams design 4, S6: the place Founderizer is a field of the Teams part
+        return teams_part("person_links", need=True).handle(data)
     if data.get("app") not in CHAT_APP_NAMES:
         raise ValueError(PERSON_HANDLE_APPS)
     handle = data.get("handle")
@@ -27483,13 +27533,53 @@ def links_gone_rows(person=None, link=None):
     handle of its Founderizer row (the link's id), and a person's links also by their person's id, so no line of Core
     reads either table (test_publish.TeamsFiles)."""
     in_transaction("links_gone_rows")
+    # The join items, with no part too: a removed person's go whole, with the notice and the ping of each, so that no
+    # row keeps their name (decision D69, which corrects D68 c); the open item of a removed row closes, and the person
+    # keeps its record (D68 d). Core reads its own link table for it: the one read of it that test_publish.TeamsFiles
+    # lets through, in this function only (D68 c)
+    if link is None:
+        join_items_gone_rows([r["id"] for r in DB.execute(
+            "SELECT id FROM needs WHERE kind=? AND id IN "
+            "(SELECT need FROM person_links WHERE person=? OR link IN "      # (D68 c)
+            "(SELECT handle FROM person_handles WHERE app=? AND person=?))",
+            (JOIN_KIND, person, BUILT_IN_APP, person)).fetchall()])
+    else:
+        DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE kind=? AND answer IS NULL AND id IN "
+                   "(SELECT need FROM person_links WHERE link=?)",  # (D68 c)
+                   (JOIN_ENDED, now(), NEED_CLOSED_BY, JOIN_KIND, link))
     if link is None:
         DB.execute("DELETE FROM person_link_asks WHERE link IN (SELECT handle FROM person_handles WHERE app=? AND "
+                   "person=?)", (BUILT_IN_APP, person))
+        DB.execute("DELETE FROM person_links WHERE link IN (SELECT handle FROM person_handles WHERE app=? AND "
                    "person=?)", (BUILT_IN_APP, person))
         DB.execute("DELETE FROM person_links WHERE person=?", (person,))
     else:
         DB.execute("DELETE FROM person_link_asks WHERE link=?", (link,))
         DB.execute("DELETE FROM person_links WHERE link=?", (link,))
+
+
+def join_items_gone_rows(ids):
+    """Inside the caller's transaction: the join items `ids` go whole, each with the owner's notice of it ("Needs you:
+    <title>", written in the moment that it was raised) and its pings, so that no row keeps the name of the person
+    that its title names (decision D69); and the answer of each (its ui_requests row and its event, the owner's own,
+    which hold the hub's word and no word of the owner's), so that no read gives an answer of an item that is gone. An
+    id of no join item is passed over. The items' ids never come back: the floor of needs is raised first, as each
+    delete of an item raises it (unused_id). The Teams part person_links uses it for the items of an earlier invite,
+    which only its key file names."""
+    in_transaction("join_items_gone_rows")
+    items = [n for n in (DB.execute("SELECT id, title, raised FROM needs WHERE id=? AND kind=?", (nid, JOIN_KIND))
+                         .fetchone() for nid in ids) if n is not None]
+    if items:
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   ("row_floor:needs", str(unused_id("needs") - 1)))
+    for n in items:
+        DB.execute("DELETE FROM events WHERE agent='owner' AND kind='notify' AND text=? AND created>=? AND created<?",
+                   (f"Needs you: {n['title']}", n["raised"] or 0, (n["raised"] or 0) + 60))
+        DB.execute("DELETE FROM pings WHERE kind='needs' AND item=?", (n["id"],))
+        DB.execute("DELETE FROM events WHERE agent='owner' AND id IN (SELECT event_id FROM ui_requests WHERE need_id=? "
+                   "AND kind='answer')", (n["id"],))
+        DB.execute("DELETE FROM ui_requests WHERE need_id=? AND kind='answer'", (n["id"],))
+        DB.execute("DELETE FROM needs WHERE id=?", (n["id"],))
 
 
 def person_remove(pid, t0):
@@ -27644,6 +27734,9 @@ def person_remove(pid, t0):
             if accounts and senders:
                 DB.execute(f"DELETE FROM chat_ignored WHERE account IN ({','.join('?' * len(accounts))}) AND sender IN "
                            f"({','.join('?' * len(senders))})", (*accounts, *senders))
+        links = teams_part("person_links")          # Teams design 4, S8: the part ends their links first
+        if links:
+            links.person_rows(pid, t0)
         links_gone_rows(person=pid)     # D24: their links' rows, while their Founderizer rows name the links
         DB.execute("DELETE FROM person_handles WHERE person=?", (pid,))
         reminder_person_rows(convs, t0)         # WAKEUPS-INTERFACE.md 8: their reminders, with their words
@@ -28236,12 +28329,15 @@ def person_view(p, t0):
     """One person for the owner's app. role_means is what the agent is told about them: with contacts.v2, their
     role's prompt."""
     means = person_access(p)["prompt"] if contacts_v2() else PERSON_ROLES[person_role(p["role"])]
+    links = teams_part("person_links")
     view = {"id": p["id"], "name": p["name"], "role": p["role"], "role_means": means,
             "note": p["note"], "daily": person_daily(p), "daily_set": p["daily"], "blocked": p["blocked"],
             "added": p["added"], "today": person_today(p["id"], t0),
             "agents": [person_agent_view(a, p) for a in person_agents(p["id"])],
-            "handles": [{"app": r["app"], "handle": r["handle"], "alias": r["alias"], "name": r["name"],
-                         "added": r["added"]}
+            "handles": [dict({"app": r["app"], "handle": r["handle"], "alias": r["alias"], "name": r["name"],
+                              "added": r["added"]},
+                             # Teams design 4, S7: a Founderizer handle's state and expires, never its invite
+                             **(links.handle_view(r) if links and r["app"] == BUILT_IN_APP else {}))
                         for r in q("SELECT * FROM person_handles WHERE person=? ORDER BY app, handle", (p["id"],))],
             "conversations": [{"id": c["id"], "agent": c["agent"], "state": c["state"], "last": c["last"]}
                               for c in q("SELECT * FROM conversations WHERE person=? ORDER BY id", (p["id"],))]}
@@ -28940,11 +29036,14 @@ def t_open_work(agent, a):
                   f"{OPEN_TASK}", (conv["id"], title))
         if same:
             return f"{tref(same['id'])} with this title is already open for this conversation. Nothing new was opened."
+        links = teams_part("person_links")      # Teams design 4, S13: who reads the result line
+        note = links.work_note(person) if links else ""
         tid, requester = conversation_line_task(agent, conv, person, title, details + "\n\n" + (
             f"This work comes from conversation C-{conv['id']} with {person['name']} ({person['role']}). The "
             f"conversation's session passes on their later messages that concern it, as messages. Your result goes "
             f"back into the conversation by itself, and its session tells {person['name']}; write to them yourself "
-            f"only when the work needs them, with message_contact."), f"{WORK_OPENED}{title}",
+            f"only when the work needs them, with message_contact.") + (f"\n\n{note}" if note else ""),
+            f"{WORK_OPENED}{title}",
             f"{person['name']} asked for it in C-{conv['id']}.",
             follows=follows)
     return (f"Opened {tref(tid)} ({title}), with {requester} as its requester. It runs in its own task session, and "
@@ -32270,7 +32369,12 @@ GOOGLE_KEY_ID = re.compile(r"[0-9a-f]{16}")
 # it gave it (google_vault_fetch), the status read that the central vault's thread last asked for it with, the
 # last reason why that thread could not seal the file or remove the key file, and the status read of such a removal
 # that failed. Each value is replaced whole, so that no reader takes the bytes of one file with the contents of another.
-GOOGLE_OPENED = {"last": None, "key": None, "vault": None, "asked_for": None, "said": None, "dropped_for": None}
+GOOGLE_OPENED = {"last": None, "key": None, "vault": None, "asked_for": None, "said": None, "dropped_for": None,
+                 # each key that the vault gave before the one that it gave last, by its id, so that a file still sealed
+                 # with one of them moves at a later pass (google_vault_fetch): the one map that changes in place, each
+                 # of its values a whole key, never on a disk or in a log; and the status read for which the files were
+                 # last found moved
+                 "before": {}, "done_for": None}
 GOOGLE_LEVELS = {"drive": ("read", "write", "write_shared"), "gmail": ("read", "write", "send")}
 GOOGLE_NAMES = {"drive": "Drive", "gmail": "Gmail"}
 GOOGLE_SCOPES = {"drive": "drive", "gmail": "gmail.modify"}        # the short name of the scope of each service
@@ -32414,16 +32518,21 @@ def google_read():
 def google_aad(holder, kid):
     """The associated bytes of a sealed Google file: what the file is, the form's version, and its key's holder and
     id. The tag covers them, so a sealed text of another file, or a changed header, does not open."""
-    return f"founderizer google.json\x001\x00{holder}\x00{kid}".encode()
+    return sealed_aad("google.json", holder, kid)
 
 
-def google_opened(raw, envelope):
-    """(what a sealed Google file holds, problem): `raw` is the file's bytes and `envelope` their JSON. The file's own
-    key opens it (google_key_of). A file that its key does not open, also when the key is gone, is lost
-    (google_file_lost); a key that cannot be read now is google_file_key."""
-    last = GOOGLE_OPENED["last"]
-    if last is not None and last[0] == raw:
-        return json.loads(last[1]), None
+def sealed_aad(name, holder, kid):
+    """The associated bytes of one of the hub's sealed files: `name`, what the file is ("google.json", or the name of
+    a Teams part's file, "links.key"), the form's version, and its key's holder and id. The tag covers them, so a
+    sealed text of another file, or a changed header, does not open."""
+    return f"founderizer {name}\x001\x00{holder}\x00{kid}".encode()
+
+
+def sealed_plain(envelope, name):
+    """(the plain bytes of a sealed file of the hub, problem): `envelope` is the file's JSON and `name` what the file is
+    (sealed_aad). The file's own key opens it (google_key_of: the key of the Google file, in its key file or in the
+    central vault). A file that its key does not open, also when the key is gone, is lost (google_file_lost); a key
+    that cannot be read now is google_file_key; a header of another form is google_file_unreadable."""
     holder, kid, blob = envelope.get("key"), envelope.get("key_id"), envelope.get("data")
     if envelope.get("sealed") != GOOGLE_SEALED or envelope.get("v") != 1 or holder not in GOOGLE_HOLDERS or \
             not (isinstance(kid, str) and GOOGLE_KEY_ID.fullmatch(kid)) or not isinstance(blob, str):
@@ -32436,9 +32545,21 @@ def google_opened(raw, envelope):
     if problem:
         return None, problem
     try:
-        plain = atrest.decrypt(key, sealed, google_aad(holder, kid))
+        return atrest.decrypt(key, sealed, sealed_aad(name, holder, kid)), None
     except atrest.Unopened:
         return None, refusal_words.words("google_file_lost")
+
+
+def google_opened(raw, envelope):
+    """(what a sealed Google file holds, problem): `raw` is the file's bytes and `envelope` their JSON. The file's own
+    key opens it (google_key_of). A file that its key does not open, also when the key is gone, is lost
+    (google_file_lost); a key that cannot be read now is google_file_key."""
+    last = GOOGLE_OPENED["last"]
+    if last is not None and last[0] == raw:
+        return json.loads(last[1]), None
+    plain, problem = sealed_plain(envelope, "google.json")
+    if problem:
+        return None, problem
     try:
         data = json.loads(plain)
     except ValueError:
@@ -32580,9 +32701,11 @@ def google_key_of(holder, kid):
         # Only the key that the central vault gave this process: the vault is never asked under a lock
         # (central_call), so a hub that has not had its answer yet (its start, a vault that is down) waits for the
         # central vault's thread (google_vault_turn). A vault that gives another key lost the one of this file.
-        vault = GOOGLE_OPENED["vault"]
+        vault, before = GOOGLE_OPENED["vault"], GOOGLE_OPENED["before"].get(kid)
         if vault is None:
             return None, refusal_words.words("google_file_key")
+        if before is not None:
+            return before, None         # a file that a key of before of the vault sealed, until it moved
         if atrest.key_id(vault) != kid:
             return None, refusal_words.words("google_file_lost")
         GOOGLE_OPENED["key"] = ("vault", kid, vault)
@@ -32802,10 +32925,34 @@ def google_store(data):
     The key is the key file's as it is now, not the one in memory, so a write after the key file was lost seals the
     file with a key that is on the disk. `accounts` is null in the sealed form, so that a hub from before 1.202 reads
     the file as one that it cannot use, and writes nothing over it, rather than as a file with no account."""
-    import tempfile
     path = CFG.get("google_file") or GOOGLE_FILE
     folder = os.path.dirname(path)
     os.makedirs(folder, mode=0o700, exist_ok=True)
+    plain = json.dumps(data).encode()
+    envelope, (holder, kid, key) = sealed_envelope("google.json", plain, "the Google file")
+    raw = (json.dumps(dict(envelope, accounts=None)) + "\n").encode()
+    # a Teams part's sealed file (decision D10) on another key moves to this one first, while the key that sealed it
+    # still opens it. A file that did not move stops no write of the Google file: each key of before of the vault stays
+    # in memory (GOOGLE_OPENED["before"]) and the key file stays (google_key_drop), so a later pass moves it
+    moved = sealed_parts_moved((holder, kid))
+    if moved and GOOGLE_OPENED["said"] != moved:
+        GOOGLE_OPENED["said"] = moved
+        log("hub", moved)
+    sealed_file_put(path, raw, ".google.")
+    GOOGLE_OPENED["key"] = (holder, kid, key)
+    GOOGLE_OPENED["last"] = (raw, plain)
+    if holder == "vault":   # once the new file is on the disk, the key file opens nothing: google_key_drop
+        google_key_drop()
+    else:
+        with contextlib.suppress(OSError):  # the rename is done: a folder not synced loses only its order on a power cut
+            google_folder_sync(folder)
+
+
+def sealed_envelope(name, plain, what):
+    """(the JSON of a sealed file of the hub, (holder, key id, key)): `plain` sealed for the file `name` (sealed_aad)
+    with the key that seals the hub's files now: the central vault's while the hub holds it, else the key of the key
+    file, made when there is none (google_key_make). A GoogleKeyError, with `what` (the file's words) in it, when no key
+    can be used: the caller then writes nothing, and its file stays as it was."""
     holder, key = "vault", GOOGLE_OPENED["vault"]
     if key is None:
         holder = "file"
@@ -32818,13 +32965,18 @@ def google_store(data):
             # memory.
             google_folder_sync(os.path.dirname(google_key_path()))
         except OSError as e:
-            raise GoogleKeyError(f"the key of the Google file cannot be used ({e.strerror or e})") from None
+            raise GoogleKeyError(f"the key of {what} cannot be used ({e.strerror or e})") from None
     kid = atrest.key_id(key)
-    plain = json.dumps(data).encode()
-    sealed = atrest.encrypt(key, plain, google_aad(holder, kid))
-    raw = (json.dumps({"sealed": GOOGLE_SEALED, "v": 1, "key": holder, "key_id": kid,
-                       "data": base64.b64encode(sealed).decode("ascii"), "accounts": None}) + "\n").encode()
-    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".google.", suffix=".tmp")      # mode 600
+    sealed = atrest.encrypt(key, plain, sealed_aad(name, holder, kid))
+    return ({"sealed": GOOGLE_SEALED, "v": 1, "key": holder, "key_id": kid,
+             "data": base64.b64encode(sealed).decode("ascii")}, (holder, kid, key))
+
+
+def sealed_file_put(path, raw, prefix):
+    """The bytes `raw` as the file `path`, whole or not at all: a temporary file (`prefix`, mode 600) beside it, synced,
+    then renamed over it."""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=prefix, suffix=".tmp")      # mode 600
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(raw)
@@ -32836,13 +32988,155 @@ def google_store(data):
         with contextlib.suppress(OSError):
             os.remove(tmp)
         raise
-    GOOGLE_OPENED["key"] = (holder, kid, key)
-    GOOGLE_OPENED["last"] = (raw, plain)
-    if holder == "vault":   # once the new file is on the disk, the key file opens nothing: google_key_drop
-        google_key_drop()
-    else:
-        with contextlib.suppress(OSError):  # the rename is done: a folder not synced loses only its order on a power cut
-            google_folder_sync(folder)
+
+
+# ---------------------------------------------------------------- a Teams part's sealed files (decision D10)
+#
+# Founderizer for Teams, design 4: the key file of the members' links (teams_person_links.py, links.key in
+# teams_data_dir("person_links")) holds the secrets of each invite and each link, and no copy of the fleet holds them.
+# The area "Vault, keys and access" decided (D10) that it is sealed at rest as the Google file is, with the same key and
+# the same two holders: the central vault while it keeps the key, else the hub's own key file. These two functions are
+# the one way to it, with the file's own name in the associated bytes, so a sealed text of the Google file does not
+# open as a part's file, nor the other way. A file that does not open is never written over with a new key: the caller
+# gets the problem and writes nothing (a new key would end every link that was given). When the central vault takes the
+# key, each such file is sealed again with the vault's key before the key file goes (google_key_drop).
+SEALED_PREFIX = ".sealed."      # the temporary files of a write of a part's sealed file (sealed_file_put)
+
+
+def sealed_read(path, name):
+    """(what a part's sealed file holds, problem, form): {} with no problem and form None when there is no file; the
+    data and "sealed"; the data and "plain" for a plain JSON object (a file of an earlier build, which its part seals
+    at its start); or None and the problem: google_file_mode (not a regular file of the hub's user with mode 600),
+    google_file_unreadable, google_file_key (its key cannot be read now) or google_file_lost (its key does not open
+    it). `name` is what the file is, in its associated bytes (sealed_aad). It writes nothing."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return {}, None, None
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        return None, refusal_words.words("google_file_mode"), None
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        envelope = json.loads(raw)
+    except (OSError, ValueError, RecursionError):
+        return None, refusal_words.words("google_file_unreadable"), None
+    if not isinstance(envelope, dict):
+        return None, refusal_words.words("google_file_unreadable"), None
+    if "sealed" not in envelope:
+        return envelope, None, "plain"
+    plain, problem = sealed_plain(envelope, name)
+    if problem:
+        return None, problem, "sealed"
+    try:
+        data = json.loads(plain)
+    except (ValueError, RecursionError):
+        data = None
+    if not isinstance(data, dict):
+        return None, refusal_words.words("google_file_unreadable"), "sealed"
+    return data, None, "sealed"
+
+
+def sealed_write(path, name, data, strict=False):
+    """A part's file `path` written sealed (sealed_envelope), whole, mode 600, in its folder: the JSON object `data`
+    under the name `name`. A GoogleKeyError when no key can be used, and an OSError when the disk refuses: the file
+    stays as it was. strict: the folder's sync after the rename is part of the write (its OSError too), as a move of
+    the key needs it before the old key goes (sealed_parts_moved)."""
+    envelope, _held = sealed_envelope(name, json.dumps(data, sort_keys=True).encode(), name)
+    sealed_file_put(path, (json.dumps(envelope) + "\n").encode(), SEALED_PREFIX)
+    # GOOGLE_OPENED["key"] stays as it was: only a write of the Google file itself changes it (google_store), so that a
+    # move that stops in its middle leaves the key that the files not moved yet need
+    if strict:
+        google_folder_sync(os.path.dirname(path))
+        return
+    with contextlib.suppress(OSError):  # the rename is done: a folder not synced loses only its order at a power cut
+        google_folder_sync(os.path.dirname(path))
+
+
+def sealed_part_files(headers=True):
+    """([(path, name, (holder, key id))], reason): each sealed file of a Teams part, each regular file of a folder of
+    teams-data/ beside the records (teams_data_dir) whose JSON is a sealed envelope, by its own file name, with the key
+    that its header names; and None, or the reason why the list may lack a file: a folder or a file that cannot be
+    listed, checked or read, or a file that does not parse whole. With a reason, no key that a file can need goes
+    (google_key_drop). With headers false, no file is read: each regular file of those folders, with no header, which
+    is enough to know that a part has a file (google_vault_turn's check at each tick). No folder is made, and no folder
+    there is no file. Empty for a process that keeps no records in a folder."""
+    records = CFG.get("db_path")
+    if not records:
+        return [], None
+    root = os.path.join(os.path.dirname(os.path.abspath(os.path.expanduser(records))), TEAMS_DATA)
+
+    def kind(path):         # the stat of a path, None when it is not there; an OSError for each other fault
+        try:
+            return os.lstat(path).st_mode
+        except FileNotFoundError:
+            return None
+    found = []
+    try:
+        features = sorted(os.listdir(root))
+    except FileNotFoundError:
+        return [], None
+    except OSError as e:
+        return [], f"could not list the folder of the Teams parts' files: {e.strerror or e}"
+    for feature in features:
+        folder = os.path.join(root, feature)
+        try:
+            mode = kind(folder)
+            if mode is None or not stat.S_ISDIR(mode):
+                continue
+            names = sorted(os.listdir(folder))
+        except OSError as e:
+            return found, f"could not list the files of the Teams part {feature}: {e.strerror or e}"
+        for name in names:
+            path = os.path.join(folder, name)
+            if name.startswith("."):
+                continue
+            try:
+                mode = kind(path)
+                if mode is None or not stat.S_ISREG(mode):
+                    continue
+                if not headers:
+                    found.append((path, name, None))
+                    continue
+                with open(path, "rb") as f:
+                    envelope = json.loads(f.read())
+            except OSError as e:
+                return found, f"could not read {name} of the Teams part {feature}: {e.strerror or e}"
+            except (ValueError, RecursionError):
+                return found, f"{name} of the Teams part {feature} does not parse"
+            if isinstance(envelope, dict) and "sealed" in envelope:
+                found.append((path, name, (envelope.get("key"), envelope.get("key_id"))))
+    return found, None
+
+
+def sealed_parts_moved(target):
+    """Under LOCK, before the key in memory or the key file changes (google_store, google_key_drop): each part's sealed
+    file whose header names another key than `target` ((holder, key id): the key that seals the hub's files from now
+    on) is sealed again with that key. Each such file is read first, while its own key still opens it (google_key_of:
+    the key that the hub used last, or the key file), and only then written, so that the first write does not take
+    the key that the others need. None when each one is done (a file that its key does not open is lost already, and
+    is passed over); else the reason why a file could not be listed, read, opened or written, and the caller keeps
+    each key that it would let go."""
+    found, reason = sealed_part_files()
+    if reason:
+        return reason
+    moving = []
+    for path, name, header in found:
+        if header == target:
+            continue
+        data, problem, _ = sealed_read(path, name)
+        if problem == refusal_words.words("google_file_lost"):
+            continue
+        if problem:
+            return f"could not open {name} of a Teams part: {problem}"
+        moving.append((path, name, data))
+    for path, name, data in moving:
+        try:
+            sealed_write(path, name, data, strict=True)
+        except OSError as e:
+            return f"could not seal {name} of a Teams part with the hub's key of now: {e.strerror or e}"
+        log("hub", f"sealed {name} of a Teams part with the {'central vault' if target[0] == 'vault' else 'hub'}'s key")
+    return None
 
 
 def google_vault_fetch():
@@ -32857,7 +33151,13 @@ def google_vault_fetch():
     if not (isinstance(text, str) and re.fullmatch(r"[0-9a-f]{64}", text)):
         return None
     key = bytes.fromhex(text)
-    GOOGLE_OPENED["vault"] = key
+    with LOCK:                      # the key of now and the keys of before change together (google_vault_turn)
+        old = GOOGLE_OPENED["vault"]
+        if old is not None and old != key:
+            # it still opens each file that it sealed, until no file names it (google_before_forget): one key of before
+            # is not enough when the vault makes its key again twice while a file cannot move
+            GOOGLE_OPENED["before"][atrest.key_id(old)] = old
+        GOOGLE_OPENED["vault"] = key
     return key
 
 
@@ -32879,7 +33179,9 @@ def google_vault_turn():
     or wrote is the vault's current key's and no key file is left. True when it wrote the file."""
     with CENTRAL_LOCK:
         status, read_at = CENTRAL["status"], CENTRAL["read_at"]
-    if not os.path.lexists(CFG.get("google_file") or GOOGLE_FILE):
+    there = os.path.lexists(CFG.get("google_file") or GOOGLE_FILE)
+    listed, unlisted = sealed_part_files(headers=False)     # a listing at each tick, no read of a file
+    if not there and not listed and not unlisted:
         return False                # nothing to move yet: a Connect asks the vault first (google_vault_ask)
     if google_vault_due(status) and GOOGLE_OPENED["asked_for"] != read_at:
         # Once for each status that the hub read (every CENTRAL_READ_EVERY seconds), not at each tick: a vault that
@@ -32889,11 +33191,31 @@ def google_vault_turn():
     vault = GOOGLE_OPENED["vault"]
     if vault is None or not central_ok() or (status or {}).get("hub_keys") is not True:
         return False
-    held = GOOGLE_OPENED["key"]
-    if held is not None and held[:2] == ("vault", atrest.key_id(vault)) and (
-            not os.path.lexists(google_key_path()) or GOOGLE_OPENED["dropped_for"] == read_at):
-        return False                # done; or a key file that would not go, tried again at the next status read
+    # Done comes from what the files say, at most once for each status read: the Google file's own header (the bytes
+    # that the hub read or wrote last) and each part's file's header name the vault's key, and no key file is left; a
+    # key file that would not go is tried again at the next status read
+    if GOOGLE_OPENED["dropped_for"] == read_at or (GOOGLE_OPENED["done_for"] == read_at and
+                                                   not os.path.lexists(google_key_path())):
+        return False
+    target = ("vault", atrest.key_id(vault))
     with LOCK:
+        # the files' headers are read under LOCK, as each sealed write runs under it: no file is sealed with another key
+        # of the vault between this check and the forget
+        last = GOOGLE_OPENED["last"]
+        try:
+            google_moved = not there or (last is not None and (lambda e: (e.get("key"), e.get("key_id")))(
+                json.loads(last[0])) == target)
+        except (ValueError, AttributeError):
+            google_moved = False
+        parts, reason = sealed_part_files()
+        if google_moved and not reason and all(header == target for _, _, header in parts) and \
+                not os.path.lexists(google_key_path()):
+            GOOGLE_OPENED["done_for"] = read_at
+            google_before_forget(target)        # each file moved: no file names a key of before of the vault
+            return False
+        if not there:               # only a Teams part's sealed file (decision D10): it moves, and the key file goes
+            google_turn_drop(target, read_at)
+            return False
         saved, bad, form = google_read()
         if bad or form is None:
             return False            # a file that the hub cannot use now stays as it is
@@ -32911,9 +33233,32 @@ def google_vault_turn():
                 return False
             GOOGLE_OPENED["said"], wrote = None, True
             log("hub", "sealed the Google file with the central vault's key (UI-API.md 1.202)")
-        elif not google_key_drop():     # (google_store does the same after its write)
-            GOOGLE_OPENED["dropped_for"] = read_at
+        else:                           # (google_store does the same after its write)
+            google_turn_drop(target, read_at)
     return wrote
+
+
+def google_turn_drop(target, read_at):
+    """google_vault_turn's drop of the key file (google_key_drop). A drop that is done found each part's file on the
+    vault's key of now, or passed over it as a file that its key no longer opens: the work is done until the next status
+    read, and no file names a key of before of the vault. A drop that is not done is tried again at the next status
+    read."""
+    if google_key_drop():
+        GOOGLE_OPENED["done_for"] = read_at
+        google_before_forget(target)
+    else:
+        GOOGLE_OPENED["dropped_for"] = read_at
+
+
+def google_before_forget(target):
+    """Each key of before of the central vault (GOOGLE_OPENED["before"]) goes from memory, once the central vault's
+    thread found that no file names it. The key of now that the thread read first (`target`) stays: when the vault gave
+    a new key while the thread looked, that key is a key of before, and files can name it. In place, so that a key that
+    google_vault_fetch adds at the same time stays."""
+    before = GOOGLE_OPENED["before"]
+    for kid in list(before):
+        if kid != target[1]:
+            before.pop(kid, None)
 
 
 def google_vault_ask():
@@ -32933,7 +33278,15 @@ def google_key_drop():
     try:
         step = "sync the folder of the Google file"
         google_folder_sync(os.path.dirname(CFG.get("google_file") or GOOGLE_FILE))
+        # a Teams part's sealed file (decision D10) on another key moves to the vault's key first: without it, the key
+        # file's going would leave that file with no key, and end each link of its part. A file that cannot be listed,
+        # read, opened or written keeps the key file
         step = "remove its own key file of the Google file"
+        vault = GOOGLE_OPENED["vault"]
+        moved = sealed_parts_moved(("vault", atrest.key_id(vault))) if vault is not None else \
+            "the hub holds no key of the central vault"
+        if moved:
+            raise OSError(moved)
         google_key_remove()
     except OSError as e:
         said = f"could not {step}: {e.strerror or e}"
@@ -32959,7 +33312,8 @@ def google_start():
     when the vault gave it. What google_seal_plain answers."""
     google_file_sweep()
     google_key_sweep()
-    if os.path.lexists(CFG.get("google_file") or GOOGLE_FILE):
+    # a Teams part's sealed file needs the vault's key as the Google file does (decision D10)
+    if os.path.lexists(CFG.get("google_file") or GOOGLE_FILE) or sealed_part_files()[0]:
         try:
             if central_read() is None:
                 central_due()       # a vault that starts after the hub is read again at the first tick
@@ -42202,6 +42556,8 @@ def history_owner_message(u):
     if u["kind"] == "answer" and u["need_id"] is not None:
         if u["n_conversation"]:
             return []           # it went back into the conversation that asked, and that stream has it
+        if u["n_kind"] == JOIN_KIND:
+            return []           # the owner's own (decision D9): no agent reads a join item's answer (UI-API.md 1.302)
         text = f"{who} answered N-{u['need_id']}" + (f" ({u['n_title']})" if u["n_title"] else "") + \
             f": {u['text'] or ''}"
         return [history_rec(a, "owner_chat", f"N-{u['need_id']}", text, u["created"], person="owner",
@@ -42219,8 +42575,8 @@ def history_owner_report(r):
 
 def history_need(n):
     """A Needs-you item an agent raised for the owner. One that a conversation raised is that conversation's."""
-    if n["conversation"]:
-        return []
+    if n["conversation"] or n["kind"] == JOIN_KIND:
+        return []               # a join item is the owner's own (decision D9), and its title names the person (D69)
     text = f"N-{n['id']} {n['title'] or ''}: {n['why'] or ''}" + (f" To do: {n['todo']}" if n["todo"] else "")
     return [history_rec(a, "owner_chat", f"N-{n['id']}", text, n["raised"], person="owner", owner_chat=True)
             for a in history_who(n["by"])]
@@ -42477,7 +42833,7 @@ def history_streams():
                       "LEFT JOIN people p ON p.id=c.person", "cm.id", history_conversation),
         HistoryStream("owner_message", "ui_requests",
                       "SELECT u.*, u.rowid AS _id, n.conversation AS n_conversation, n.title AS n_title, "
-                      "cc.name AS cc_name FROM ui_requests u LEFT JOIN needs n ON n.id=u.need_id "
+                      "n.kind AS n_kind, cc.name AS cc_name FROM ui_requests u LEFT JOIN needs n ON n.id=u.need_id "
                       "LEFT JOIN capp_connections cc ON cc.id=u.connection", "u.rowid", history_owner_message),
         HistoryStream("owner_report", "owner_reports", "SELECT r.*, r.id AS _id FROM owner_reports r", "r.id",
                       history_owner_report),
@@ -50373,7 +50729,8 @@ def resume_lines(t0):
         out.append(f"Reports waiting for your decision ({len(reports)}):")
         out += [report_line(r) for r in reports[:RESUME_ROWS]]
         out.append("  decide_report.")
-    needs = q("SELECT * FROM needs WHERE answer IS NULL ORDER BY id")
+    # a join item (Teams design 4, S9) is the hub's own, and the owner's alone: the manager has nothing to do with it
+    needs = q("SELECT * FROM needs WHERE answer IS NULL AND kind IS NOT ? ORDER BY id", (JOIN_KIND,))
     if needs:
         # an item that another agent raised (its secret request, its conversation's question) is answered to it alone,
         # so the manager raises its own when its work needs the same (t_request_secret)
@@ -70581,6 +70938,16 @@ def hub_only_files():
         found["attachments"].update(kept=mine["n"], kept_bytes=mine["b"])
         if mine["a"]:
             found["attachments"].update(kept_alone=mine["a"], kept_alone_bytes=mine["ab"])
+    # Teams design 4, S11: the links of the members' Founderizer app, as a count, only while the part is loaded: their
+    # keys are in a file of the hub's own, which no copy carries. A fault of the count gives no count, and the copy is
+    # made all the same.
+    try:
+        links = teams_part("person_links")
+        if links:
+            found["links"] = {"present": True}
+            found["links"]["links"] = int(links.count())
+    except Exception:
+        print_fault()
     return found
 
 
@@ -70713,6 +71080,14 @@ def hub_only_notes(found):
             "**Put the attachments back**, if you took a copy of that folder: write it to `~/.fleet/attachments` "
             "on the new hub machine, owned by the hub user, mode 700. Nothing breaks if you do not. The messages "
             "keep their text, and an attachment that will not open is the whole of the loss.")
+    shares = found.get("links") or {}
+    if shares.get("present") and shares.get("links") != 0:
+        # Teams design 4, S11: one line, only with the part loaded and a link or an invite to end
+        said.append(
+            "**Your shared chats in the Founderizer app.** A restore ends each share of your agents with the people "
+            "on your People list, also on the same machine: the keys of their devices are not in this copy, and the "
+            "hub's own key file names the records of before. Send each of them a new invite from their page in "
+            "People.")
     if not said:
         said.append(
             "**Nothing else.** When this copy was made your hub had no GitHub App, no Google account, no "
@@ -76052,7 +76427,8 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
         if old:
             had = [r["id"] for r in DB.execute("SELECT id FROM attachments WHERE message=? ORDER BY id",
                                                (request_id,)).fetchall()]
-            if (old["kind"], old["need_id"], old["text"], old["client"], old["recipient"], old["replaces_request_id"]) != (kind, need_id, value, client, recipient, replaces) or had != sorted(files):
+            said = old["text"] if need is not None and need["kind"] == JOIN_KIND else value     # S9: never the code
+            if (old["kind"], old["need_id"], old["text"], old["client"], old["recipient"], old["replaces_request_id"]) != (kind, need_id, said, client, recipient, replaces) or had != sorted(files):
                 return (409, refusal_words.answer("command_reused_content"))
             read_at = DB.execute("SELECT read_at FROM events WHERE id=?", (old["event_id"],)).fetchone()[0]
             return (200, dict(ok=True, request_id=request_id, event_id=old["event_id"],
@@ -76066,6 +76442,17 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
             return (409, {"error": STEER_ID_WORDS})
         if need is not None and need["answer"] is not None:
             return (409, refusal_words.answer("request_answered"))
+        if need is not None and need["kind"] == JOIN_KIND:
+            # Teams design 4, S9: Refuse, or the code that the owner types (never a session's words: C27), and never a
+            # file; with no part, Refuse only (design 1's refusal for a code)
+            try:
+                links = teams_part("person_links")
+                if links:
+                    links.join_check(need, value, choice, files, owner_force(hand))
+                elif choice is None or files:
+                    need_teams(part_there=False)
+            except Refusal as e:
+                return (e.status, refusal_body(e))
         if need is not None and not owner_force(hand) and choice is None and ticked is None and ran is None and \
                 need_options(need):
             # the review of 20 November 2026, issue 4: a session's words closed card N-230, which had three options,
@@ -82334,6 +82721,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise Refusal(409, f"this fleet already has {PEOPLE_MAX} people")
                 for h in body.get("handles", ()):
                     person_handle_free(h, None)
+                # Teams design 4, S6: the part makes the link of a Founderizer place (design 1's refusal without it)
+                links = teams_part("person_links", need=True) if any(
+                    h["app"] == BUILT_IN_APP for h in body.get("handles", ())) else None
                 done = ([], [], [])
                 with transaction():
                     pid = DB.execute("INSERT INTO people(id,name,role,note,daily,added) VALUES(?,?,?,?,?,?)",
@@ -82345,6 +82735,8 @@ class Handler(BaseHTTPRequestHandler):
                     if "agents" in body:
                         person_agents_rows(person, body["agents"], t0)
                     for h in body.get("handles", ()):
+                        if h["app"] == BUILT_IN_APP:
+                            h = links.handle(h, pid, t0)
                         DB.execute("INSERT INTO person_handles(app,handle,person,name,added) VALUES(?,?,?,?,?)",
                                    (h["app"], h["handle"], pid, h["name"], t0))
                 person_scope_done(person, *done)
@@ -82417,6 +82809,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise Refusal(404, "this person has no such handle")
                 with transaction():
                     if body["app"] == BUILT_IN_APP:         # D24: its link's rows, also with no Teams file
+                        links = teams_part("person_links")  # Teams design 4, S8: the part ends the link first
+                        if links:
+                            links.link_rows(body["handle"], pid, t0)
                         links_gone_rows(link=body["handle"])
                     DB.execute("DELETE FROM person_handles WHERE app=? AND handle=?", (body["app"], body["handle"]))
                 log("owner", f"removed a {CHAT_APP_NAMES.get(body['app'], body['app'])} handle of P-{pid}")
@@ -82424,8 +82819,15 @@ class Handler(BaseHTTPRequestHandler):
             person_handle_free(body, pid)
             if q1("SELECT COUNT(*) n FROM person_handles WHERE person=?", (pid,))["n"] >= PERSON_HANDLES_MAX:
                 raise Refusal(409, code="person_handles_most", names={"most": PERSON_HANDLES_MAX})
-            q("INSERT INTO person_handles(app,handle,person,name,added) VALUES(?,?,?,?,?)",
-              (body["app"], body["handle"], pid, body["name"], t0))
+            if body["app"] == BUILT_IN_APP:         # Teams design 4, S6: the part makes the row's link, in one write
+                links = teams_part("person_links", need=True)
+                with transaction():
+                    body = dict(body, **links.handle(body, pid, t0))
+                    DB.execute("INSERT INTO person_handles(app,handle,person,name,added) VALUES(?,?,?,?,?)",
+                               (body["app"], body["handle"], pid, body["name"], t0))
+            else:
+                q("INSERT INTO person_handles(app,handle,person,name,added) VALUES(?,?,?,?,?)",
+                  (body["app"], body["handle"], pid, body["name"], t0))
             log("owner", f"gave P-{pid} a {CHAT_APP_NAMES.get(body['app'], body['app'])} handle")
             return {"person": person_view(p, t0)}
         return self.ui_command(f"people/{pid}/handles", read, act)
@@ -83760,6 +84162,13 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["ui", "people"] and parts[3] == "handles" and \
                 re.fullmatch(r"[1-9][0-9]*", parts[2]):
             return self.ui_person_handles(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["ui", "people"] and parts[3] == "links" and \
+                re.fullmatch(r"[1-9][0-9]*", parts[2]):
+            links = teams_part("person_links")      # Teams design 4, S10: an invite; with no part, an unknown route
+            if links:
+                return links.ui_links(self, int(parts[2]))
+            if not self.ui_allowed():       # behind the gate of each owner route all the same: address, key, device
+                return
         if len(parts) == 3 and parts[:2] == ["ui", "conversations"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
             return self.ui_conversation_control(int(parts[2]))
         if parts == ["ui", "people", "codes"]:
@@ -84059,6 +84468,10 @@ class Handler(BaseHTTPRequestHandler):
                     log("owner", "BLOCKED an answer that contained a login")
                 elif row and answer and row["answer"] is None and row["kind"] == "secret":
                     log("owner", f"REFUSED an answer in words to the secret request N-{nid}")      # never the words
+                elif row and answer and row["answer"] is None and row["kind"] == JOIN_KIND:
+                    # Teams design 4, S9 (agent-sharing-spec.md 5.7): the code or Refuse, in Founderizer only, so that
+                    # no form of the board writes a typed code into the item or to an agent
+                    log("owner", f"REFUSED an answer on the board to the join item N-{nid}")      # never the words
                 elif row and answer and row["answer"] is None and door_signed_answer(row, answer):
                     # the board signs nothing: a press of Run it once or of Full access on <server> here, and their
                     # words, would close the door's card and give the door no statement of the owner's key
@@ -86260,6 +86673,11 @@ def stop_with_parent(fd):
 TEAMS_CALLS = {         # feature -> the names of the functions that Core calls of that part; each design adds its row
     # design 3, roles as sets of access (teams-design-3-role-sets.md, 3.9): a role's set into its people's records
     "role_sets": ("access_body", "set_write", "apply", "role_fields", "person_fields", "role_agents"),
+    # design 4, the members' links (teams-design-4-members.md, 3.5): S1 start, S3 place, S6 handle, S7 handle_view,
+    # S8 person_rows and link_rows, S9 join_check, join_rows and join_view (the item's `join`, D12), S10 ui_links,
+    # S11 count, S13 work_note
+    "person_links": ("start", "place", "handle", "handle_view", "person_rows", "link_rows", "join_check", "join_rows",
+                     "join_view", "ui_links", "count", "work_note"),
 }
 # the tables of Teams data that stand in SCHEMA, dormant (teams-design-2, 3.2)
 TEAMS_TABLES = ("role_sets", "person_links", "person_link_asks")
@@ -86344,6 +86762,19 @@ def teams_part(feature, need=False):
     if need:
         need_teams(part_there=False)
     return None
+
+
+def links_start():
+    """main()'s one line of the Teams part person_links (design 4, S1): the part read now, never a copy, starts its two
+    daemon threads and returns at once; with no part, nothing. Each fault of it goes to print_fault() and one line, so
+    the hub's start never stops or waits for a part."""
+    try:
+        links = teams_part("person_links")
+        if links:
+            links.start()
+    except Exception:           # a fault of a part never stops or holds the hub's start
+        print_fault()
+        print("WARNING: the Teams part person_links did not start its threads; the hub runs without them.", flush=True)
 
 
 def teams_dir():
@@ -86724,6 +87155,7 @@ def main():
     threading.Thread(target=door_timer, name="door-record", daemon=True).start()       # DevOps plan C4
     threading.Thread(target=knowledge_refresher, name="knowledge-pages", daemon=True).start()
     threading.Thread(target=ping_sender, name="pings", daemon=True).start()
+    links_start()       # Teams design 4, S1: the members' links start their own two threads, and the start goes on
     threading.Thread(target=ci_watcher, name="ci-waits", daemon=True).start()       # set_reminder ci
     threading.Thread(target=read_watcher, name="read-checks", daemon=True).start()  # a read check of a wake-up rule
     # AUTONOMY.md P6: the records written before this start, into the history, a short step at a time (the backfill)

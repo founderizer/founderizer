@@ -1434,8 +1434,11 @@ In or out: no password, no API key, no provider token, no entitlement, no Tailsc
 `test_owner_mcp.NoSecret` holds the server to it two ways: no tool takes an argument whose name is
 one of those things, and the owner routes that do carry a credential are **not tools of this
 server at all** — the subscription token, the GitHub App's private key, a chat bot token, the
-secret catalog's fingerprints and the restore of a copy. Google's Connect carries none since owner
-API 1.185 (the hub's release has the ID of Founderizer's own Google app, and founderizer.com gives the hub its
+secret catalog's fingerprints and the restore of a copy. The invite of a member's Founderizer app
+(`POST /ui/people/<id>/links`, Founderizer for Teams, UI-API.md 1.302) is no tool either: its one line
+lets a device ask to join, a tool's answer stays in a model's transcript, and the hub gives that line
+once, to the owner's app, which writes it into the file that the owner sends. Google's Connect carries none since
+owner API 1.185 (the hub's release has the ID of Founderizer's own Google app, and founderizer.com gives the hub its
 secret), so `connect_google` is a tool:
 Google's code goes to the tool's own listener and on to the hub, never into a field or an answer. Those stay the app's,
 because this server would be the thing that carried the value.

@@ -333,6 +333,9 @@ NOT_TOOLS = {
     "/ui/owner/devices/{}/certify": "a statement signed with the owner's own key, which only their app on their Mac "
                                     "holds, once the phone's key matches the one-time value of that app's QR",
     "/ui/restore": "a whole fleet restored over this one, from a file this server would have to carry",
+    "/ui/people/{}/links": "an invite to a member's Founderizer app (Founderizer for Teams), whose one line lets a "
+                           "device ask to join: a tool's answer stays in a model's transcript, and an invite must not; "
+                           "the owner's app writes it into the file that the owner sends",
     "/ui/owner/devices/{}/push": "the phone's own push token, which the route takes from the phone only",
     "/ui/owner/devices/{}/recovery": "the recovery code, sealed on the owner's own Mac to a phone's own key once that key "
                                      "matches the one-time value of that app's QR",

@@ -161,6 +161,21 @@ WORDS = {
     # Teams file raises (a part's other refusals are its own, teams-design-1, 3.8). The words are the design's proposal
     "role_sets_contacts_off": "A role's access needs the setting contacts.v2, which is off.",
     "role_no_set": "The role {role} has no access of its own.",
+    # the Teams part person_links, a member's Founderizer app (teams-design-4, 4.4): the join item's answer (a typed
+    # code that no ask has or that two asks have, a file with it), and the owner's invite (a person with no agent, a row
+    # whose device joined, a fleet on another release channel). The words are the design's; they wait for the owner's
+    # yes to them and to their Spanish. link_file is the area Vault, keys and access's (decision D10): the key file of
+    # the links does not open, and the hub never makes a new key in its place
+    "join_no_code": "No device shows this code.",
+    "join_two": "Two devices show this code. Send a new invite.",
+    "join_file": "An answer to this item carries no file.",
+    "link_no_agent": "This person can talk to no agent yet.",
+    "link_active": "A device already joined. Remove the row to share again.",
+    "link_channel": "This fleet's release channel is not Founderizer's own, so it makes no invite.",
+    "link_file": "The hub cannot open the key file of the Founderizer app's links.",
+    # an invite asked by an AI session or a program (teams-design-4, section 6; decision D68 e): its line never reaches
+    # a transcript
+    "link_from_tool": "An invite is made in Founderizer on the Mac, never by an AI session or a program.",
 }
 
 

@@ -133,6 +133,15 @@ OLD = {
     # the Teams part role_sets (teams-design-3, 3.7): its own two, which its Teams file raises (PART_CODES)
     "role_sets_contacts_off": "A role's access needs the setting contacts.v2, which is off.",
     "role_no_set": "The role {role} has no access of its own.",
+    # the Teams part person_links (teams-design-4, 4.4, and the area Vault's link_file): its own seven (PART_CODES)
+    "join_no_code": "No device shows this code.",
+    "join_two": "Two devices show this code. Send a new invite.",
+    "join_file": "An answer to this item carries no file.",
+    "link_no_agent": "This person can talk to no agent yet.",
+    "link_active": "A device already joined. Remove the row to share again.",
+    "link_channel": "This fleet's release channel is not Founderizer's own, so it makes no invite.",
+    "link_file": "The hub cannot open the key file of the Founderizer app's links.",
+    "link_from_tool": "An invite is made in Founderizer on the Mac, never by an AI session or a program.",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
@@ -282,7 +291,9 @@ LEFT = {"a registered login cannot be sent as text": 1}
 # The codes that a Teams part raises in its own file (teams-design-1, 3.8: "A part's other refusals are its own"), by
 # the part's feature. That file is not published, so no place of hub.py names them; the part's own test holds each one
 # to the place that raises it (test_teams_<feature>.py). The apps know them as the client side of the part.
-PART_CODES = {"role_sets_contacts_off": "role_sets", "role_no_set": "role_sets"}
+PART_CODES = {"role_sets_contacts_off": "role_sets", "role_no_set": "role_sets",
+              **{code: "person_links" for code in ("join_no_code", "join_two", "join_file", "link_no_agent",
+                                                   "link_active", "link_channel", "link_file", "link_from_tool")}}
 # The names that a call's own parameters use, which a hole cannot take
 RESERVED = {"code", "names", "table", "extra", "status", "message", "self", "cls"}
 
