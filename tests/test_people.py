@@ -94,6 +94,25 @@ class People(test_chat_apps.ChatApps):
     def wrote(self, text="Hello, can you help me?", account="whatsapp-studio", sender=ANA, **changes):
         return self.inbound(text=text, account=account, sender=sender, chat=sender, **changes)[0]
 
+    def link_rows(self, pid, link, *devices, handle=True):
+        """The rows that the Teams part person_links keeps of one link of a person (agent-sharing-spec.md 5.3 and
+        5.4): with handle, its Founderizer row of person_handles, whose handle is the link's id; its row; and the ask
+        of each device. The test writes them itself, because no Teams file is on this hub."""
+        self.assertIsNone(hub.teams_part("person_links"))
+        if handle:
+            hub.q("INSERT INTO person_handles(app,handle,person,name,added) VALUES('founderizer',?,?,'Founderizer',?)",
+                  (link, pid, hub.now()))
+        hub.q("INSERT INTO person_links(link,person,state,created,invited,expires) VALUES(?,?,'invited',?,?,?)",
+              (link, pid, hub.now(), hub.now(), hub.now() + 86400))
+        for key in devices:
+            hub.q("INSERT INTO person_link_asks(link,device_key,device,code,state,asked) VALUES(?,?,?,?,'asks',?)",
+                  (link, key, "Example MacBook", "4821-7730", hub.now()))
+
+    def links(self):
+        """Each row of the two tables of person_links: [(link, person)] and [(link, device key)]."""
+        return ([tuple(r) for r in hub.q("SELECT link, person FROM person_links ORDER BY link")],
+                [tuple(r) for r in hub.q("SELECT link, device_key FROM person_link_asks ORDER BY link, device_key")])
+
     def conversation(self):
         return hub.q1("SELECT * FROM conversations ORDER BY id DESC LIMIT 1")
 
@@ -139,7 +158,9 @@ class People(test_chat_apps.ChatApps):
     def test_a_handle_belongs_to_one_person_and_never_to_the_owner(self):
         """A handle is one person's, and never the owner's. Each row that the People page lists can be removed, also a
         row of an app that is no chat app of this hub (a place that another part of the hub writes, Teams design 4,
-        S6): until then its delete was refused, and past that check its log line raised."""
+        S6): until then its delete was refused, and past that check its log line raised. The removal of a Founderizer
+        row deletes its link's rows of the Teams part person_links, also on a hub with no Teams file (D24). Bug: a
+        device whose row the owner removed while Teams was off has a live link again when Teams comes back."""
         person = self.person_with_handle()
         self.assertEqual([h["handle"] for h in person["handles"]], [ANA])
         self.assertEqual(self.handle(person["id"])[0], 409)                     # the same handle again
@@ -159,9 +180,11 @@ class People(test_chat_apps.ChatApps):
         code, data = self.handle(person["id"], delete=True)
         self.assertEqual((code, data["deleted"]), (200, True), data)
         self.assertEqual(self.count("person_handles"), 0)
-        # a row of an app that the hub does not know: listed, and removed by the app and the handle that it lists
-        hub.q("INSERT INTO person_handles(app,handle,person,name,added) VALUES(?,?,?,?,?)",
-              ("founderizer", "link-1", person["id"], "Founderizer", hub.now()))
+        # a row of an app that the hub does not know: listed, and removed by the app and the handle that it lists. A
+        # Founderizer row takes its link's rows of person_links with it, also on a hub with no Teams file (Teams design
+        # 4, D24), and no other link's rows: the person's second link, with no Founderizer row here, keeps its rows
+        self.link_rows(person["id"], "link-1", "device-a", "device-b")
+        self.link_rows(person["id"], "link-2", "device-c", handle=False)
         page = self.request("/ui/people?db=test-generation")[1]
         listed = [p["handles"] for p in page["people"] if p["id"] == person["id"]][0]
         self.assertEqual([(h["app"], h["handle"]) for h in listed], [("founderizer", "link-1")])
@@ -170,13 +193,20 @@ class People(test_chat_apps.ChatApps):
         code, data = self.request(f"/ui/people/{person['id']}/handles", gone)
         self.assertEqual((code, data.get("deleted"), data.get("person", {}).get("handles")), (200, True, []), data)
         self.assertEqual(self.count("person_handles"), 0)
+        self.assertEqual(self.links(), ([("link-2", person["id"])], [("link-2", "device-c")]))
         # a repeat of the same command (a call that was cut off) gets the first answer: read reads no row
         self.assertEqual(self.request(f"/ui/people/{person['id']}/handles", gone), (200, dict(data, replayed=True)))
-        # with no such row, the delete of such an app gets the words that it got before, and no person's row goes
+        # with no such row, the delete of such an app gets the words that it got before, and no person's row goes: not
+        # the row of the same app and handle that another person has, and not its link's rows
+        self.link_rows(person["id"], "link-1", "device-a")
+        kept = ([tuple(r) for r in hub.q("SELECT app, handle, person FROM person_handles")], self.links())
+        self.assertEqual(kept[0], [("founderizer", "link-1", person["id"])])
         self.assertEqual(self.handle(other["id"], app="founderizer", handle="link-1", delete=True),
                          (400, {"error": "app must be discord, telegram or whatsapp"}))
         self.assertEqual(self.handle(other["id"], app="signal", handle=ANA, delete=True),
                          (400, {"error": "app must be discord, telegram or whatsapp"}))
+        self.assertEqual(([tuple(r) for r in hub.q("SELECT app, handle, person FROM person_handles")], self.links()),
+                         kept)
 
     # ---- the inbound path
     def test_a_person_reaches_the_agent_they_were_given_and_no_other(self):
@@ -235,7 +265,9 @@ class People(test_chat_apps.ChatApps):
 
     def test_a_removal_takes_only_the_removed_persons_files(self):
         """A person's removal deletes the files of their own messages and of nobody else's (CHAT-APPS.md 8.1), and a
-        person whom the owner did not give the account's agent gets no byte stored."""
+        person whom the owner did not give the account's agent gets no byte stored. It deletes the rows of their links
+        of the Teams part person_links too, and of nobody else's, also on a hub with no Teams file (Teams design 4,
+        D24). Bug: a person whom the owner removed while Teams was off has a live link when Teams comes back."""
         ana = self.person_with_handle()
         jordi = self.add(name="Jordi")
         self.assertEqual(self.handle(jordi["id"], app="discord", handle=JORDI)[0], 200)
@@ -249,10 +281,14 @@ class People(test_chat_apps.ChatApps):
                                     sender="34600222333@s.whatsapp.net")
         self.assertEqual((code, refused["error"]), (403, "not taken: the sender may not write to this account's agent"))
         self.assertEqual(self.count("attachments"), 2)
+        for pid, link in ((ana["id"], "link-ana-1"), (ana["id"], "link-ana-2"), (jordi["id"], "link-jordi")):
+            self.link_rows(pid, link, f"{link}-mac", f"{link}-phone")
         self.assertEqual(self.change(ana["id"], delete=True)[0], 200)
         kept = hub.q("SELECT a.id FROM attachments a JOIN conversation_messages m ON m.id=a.cm JOIN conversations c "
                      "ON c.id=m.conversation WHERE c.person=?", (jordi["id"],))
         self.assertEqual((self.count("attachments"), len(kept)), (1, 1))
+        self.assertEqual(self.links(), ([("link-jordi", jordi["id"])],
+                                        [("link-jordi", "link-jordi-mac"), ("link-jordi", "link-jordi-phone")]))
 
     def test_only_an_active_claude_worker_talks_with_a_person(self):
         person = self.add(agents=["vps"])                   # vps runs on Codex: no locked session yet

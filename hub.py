@@ -485,6 +485,16 @@ CREATE TABLE IF NOT EXISTS roles(name TEXT PRIMARY KEY, prompt TEXT NOT NULL, to
 -- name, and only the Teams part reads its rows and applies them into the people tables.
 CREATE TABLE IF NOT EXISTS role_sets(role TEXT NOT NULL, agent TEXT NOT NULL, grants TEXT, updated REAL NOT NULL,
   PRIMARY KEY(role, agent));
+-- A person's links to the Founderizer app (Founderizer for Teams, design 4; agent-sharing-spec.md 5.3): one for each
+-- Founderizer row of person_handles, whose handle is the link's id, and the asks of the devices that want to join it.
+-- Teams data, dormant in Core (TEAMS_TABLES): only the Teams part person_links writes them and reads them. Core only
+-- deletes the rows of a person whom the owner removes and of a Founderizer row that the owner removes, also when no
+-- Teams file is there (links_gone_rows, decision D24). No key and no invite is in them: the part's key file has those.
+CREATE TABLE IF NOT EXISTS person_links(link TEXT PRIMARY KEY, person INTEGER NOT NULL, state TEXT NOT NULL,
+  from_name TEXT, created REAL NOT NULL, invited REAL, expires REAL, device_key TEXT, device TEXT, joined REAL,
+  count INTEGER NOT NULL DEFAULT 0, held REAL, need INTEGER, ended REAL);
+CREATE TABLE IF NOT EXISTS person_link_asks(link TEXT NOT NULL, device_key TEXT NOT NULL, device TEXT,
+  code TEXT NOT NULL, state TEXT NOT NULL, asked REAL NOT NULL, PRIMARY KEY(link, device_key));
 -- One conversation for each (person, agent) pair, and its whole record: the person's messages, the agent's replies,
 -- the questions and work requests it raised, and the owner's answers. `who` is person, agent, owner or action.
 CREATE TABLE IF NOT EXISTS conversations(id INTEGER PRIMARY KEY, person INTEGER NOT NULL, agent TEXT NOT NULL,
@@ -22002,6 +22012,10 @@ def chat_apps():
 # The account of the conversations that the Teams part person_links writes (Teams design 4, S5). No account of
 # team.json can have this ID (CHAT_ACCOUNT has no colon), so no item of a chat app's account is ever one of it.
 BUILT_IN_ACCOUNT = "founderizer:"
+# The app of a person's Founderizer row of person_handles, whose handle is the id of its link (agent-sharing-spec.md
+# 5.4). It is not in CHAT_APP_NAMES: that list also gates the accounts of team.json and the owner's codes and handles,
+# and each of them must refuse this app.
+BUILT_IN_APP = "founderizer"
 
 
 def conversation_place(conv):
@@ -25853,17 +25867,19 @@ def person_route(account, acc, person, m, t0, hit):
         DB.execute("UPDATE person_handles SET alias=? WHERE app=? AND person=? AND alias IS NULL AND handle<>? AND "
                    "(handle=? OR handle=?)",
                    (m["sender_alt"], acc["app"], person["id"], m["sender_alt"], m["sender"], m["sender_alt"]))
-    # the day's count of messages in and its number: all chat apps' together, or the count that the account names (an
-    # account that the hub makes itself: no account of team.json can hold these keys, validate_chat_apps)
-    counted, most = acc.get("day_count", "*"), acc.get("day_most", CHAT_INBOUND_DAY)
-    if chat_count(counted, "inbound", t0) >= most:
+    # the day's count of messages in and its number: all chat apps' together, or, for the built-in account that the
+    # hub makes itself, the count that its entry names. An account of team.json never names one: validate_chat_apps
+    # refuses these keys, and a team.json written by hand that does not validate must not move the count of all.
+    day_count, most = (acc.get("day_count", "*"), acc.get("day_most", CHAT_INBOUND_DAY)) \
+        if account == BUILT_IN_ACCOUNT else ("*", CHAT_INBOUND_DAY)
+    if chat_count(day_count, "inbound", t0) >= most:
         return "ignored"
     daily = person_daily(person, agent)     # None: no limit, which only contacts.v2 gives (staff, plan P1)
     if daily is not None and person_today(person["id"], t0) >= daily:
         m["refusal"] = PERSON_DAY_LIMIT
         fixed_once(account, m["chat"], PERSON_DAY_LIMIT, t0, person["id"])
         return "ignored"
-    chat_count(counted, "inbound", t0, 1)
+    chat_count(day_count, "inbound", t0, 1)
     conv, first = conversation_of(person, agent, m, account, t0)
     if first:
         chat_reply(account, m["chat"], CONVERSATION_NOTICE.format(agent=agent_display(agent)), t0,       # EU AI Act 50
@@ -26874,6 +26890,24 @@ def person_handle_free(h, pid):
                       f"another person already has that {CHAT_APP_NAMES.get(h['app'], h['app'])} handle")
 
 
+def links_gone_rows(person=None, link=None):
+    """Inside the caller's transaction, before the rows of person_handles go (Founderizer for Teams, design 4, S8;
+    decision D24): Core's own delete of the rows of the Teams part person_links, of each link of the `person` whom the
+    owner removes, or of the one `link` whose Founderizer row the owner removes. It runs also when no Teams file is on
+    this hub, so that a person or a device that the owner removed while Teams was off never has a live link when Teams
+    comes back: at the part's next start, a key whose link row is gone becomes an ended link. A link is named by the
+    handle of its Founderizer row (the link's id), and a person's links also by their person's id, so no line of Core
+    reads either table (test_publish.TeamsFiles)."""
+    in_transaction("links_gone_rows")
+    if link is None:
+        DB.execute("DELETE FROM person_link_asks WHERE link IN (SELECT handle FROM person_handles WHERE app=? AND "
+                   "person=?)", (BUILT_IN_APP, person))
+        DB.execute("DELETE FROM person_links WHERE person=?", (person,))
+    else:
+        DB.execute("DELETE FROM person_link_asks WHERE link=?", (link,))
+        DB.execute("DELETE FROM person_links WHERE link=?", (link,))
+
+
 def person_remove(pid, t0):
     """The owner removes a person: their handles, their agents, their conversations with every message, and the
     questions of those conversations that nobody answered. A running window of theirs stops at its next call, because
@@ -26882,7 +26916,8 @@ def person_remove(pid, t0):
     and their words (removed_words_rows), their history records leave the index, and the open ones end
     (removed_conversation_tasks_end). The person's own rows go, as before: the person, their handles, their
     conversations and messages, their open questions, their reminders' history, their ignored messages, their wrong link
-    codes, their Telegram invites (telegram_person_rows), and the history's rows of their records. No other record is
+    codes, their Telegram invites (telegram_person_rows), the rows of their links to the Founderizer app, also with no
+    Teams file (links_gone_rows), and the history's rows of their records. No other record is
     deleted: each row stays, with its times and its own id, and its words go, with the other values of the same field
     (the owner, 18 November 2026: "I dont want to be missing info").
 
@@ -27025,6 +27060,7 @@ def person_remove(pid, t0):
             if accounts and senders:
                 DB.execute(f"DELETE FROM chat_ignored WHERE account IN ({','.join('?' * len(accounts))}) AND sender IN "
                            f"({','.join('?' * len(senders))})", (*accounts, *senders))
+        links_gone_rows(person=pid)     # D24: their links' rows, while their Founderizer rows name the links
         DB.execute("DELETE FROM person_handles WHERE person=?", (pid,))
         reminder_person_rows(convs, t0)         # WAKEUPS-INTERFACE.md 8: their reminders, with their words
         removed_commands_rows(pid, convs, cleared, items)   # and the owner's own commands about all of these
@@ -81534,7 +81570,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not q1("SELECT 1 FROM person_handles WHERE app=? AND handle=? AND person=?",
                           (body["app"], body["handle"], pid)):
                     raise Refusal(404, "this person has no such handle")
-                q("DELETE FROM person_handles WHERE app=? AND handle=?", (body["app"], body["handle"]))
+                with transaction():
+                    if body["app"] == BUILT_IN_APP:         # D24: its link's rows, also with no Teams file
+                        links_gone_rows(link=body["handle"])
+                    DB.execute("DELETE FROM person_handles WHERE app=? AND handle=?", (body["app"], body["handle"]))
                 log("owner", f"removed a {CHAT_APP_NAMES.get(body['app'], body['app'])} handle of P-{pid}")
                 return {"person": person_view(p, t0), "deleted": True}
             person_handle_free(body, pid)
@@ -85276,7 +85315,8 @@ TEAMS_CALLS = {         # feature -> the names of the functions that Core calls 
     # design 3, roles as sets of access (teams-design-3-role-sets.md, 3.9): a role's set into its people's records
     "role_sets": ("access_body", "set_write", "apply", "role_fields", "person_fields", "role_agents"),
 }
-TEAMS_TABLES = ("role_sets",)       # the tables of Teams data that stand in SCHEMA, dormant (teams-design-2, 3.2)
+# the tables of Teams data that stand in SCHEMA, dormant (teams-design-2, 3.2)
+TEAMS_TABLES = ("role_sets", "person_links", "person_link_asks")
 TEAMS_CODE = {}         # feature -> the module of a part that this process loaded (teams_take); empty in Core
 TEAMS_LOAD = {}         # the one load of this process (teams_load): "lines", what failed in it; "finder", its finder
 TEAMS_FOLDER = "teams"          # beside the records: the folder of an installed hub's packages (teams_folder)
