@@ -19,7 +19,9 @@ What it proves, in the order of the package's own check:
   - a key can be replaced: every key of the key file is trusted, and a rotation strands no fleet;
   - an entitlement is checked with the entitlement key and a release with the release key, never the other way;
   - a licence of Founderizer for Teams polls its own route each hour and keeps only what our key signed, and the
-    bearer goes to no address of a redirect.
+    bearer goes to no address of a redirect;
+  - a hub with Founderizer for Teams on gets the package that the lock of its code, or of the release that it takes,
+    names, and a fleet with no licence asks for none (TeamsCode).
 """
 import base64
 import binascii
@@ -33,6 +35,7 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -49,6 +52,7 @@ from unittest.mock import patch
 import hub
 import refusal_words
 import releases
+import teamspack
 from test_ui_api import OwnerAPI
 from leftovers import ROOT
 
@@ -80,7 +84,7 @@ PROFILE = "# Profile: vps\n\n**Character.** Careful.\n"
 def load_tests(loader, _tests, _pattern):
     """Only the tests of this file: the fixture it borrows carries its own."""
     suite = unittest.TestSuite()
-    for cls in (Signature, Manifest, Entitlement, Channel, Updates, Causes, HubRoutes, HubUpdates):
+    for cls in (Signature, Manifest, Entitlement, Channel, Updates, Causes, HubRoutes, HubUpdates, TeamsCode):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -3277,6 +3281,551 @@ class HubUpdates(Repositories, HubRoutes):
         self.assertEqual(state["releases"], [])
         self.assertIn("no release key", state["last_check"]["says"])
         self.assertEqual(self.head(), self.pinned)
+
+
+# ---------------------------------------------------------------- Founderizer for Teams: the hub gets its package
+
+def part(name="demo", body="def start(H):\n    return 1\n"):
+    """The package of one Teams part, and its lock: (the bytes, the lock)."""
+    data = teamspack.pack({f"teams_{name}.py": f'FEATURE = "{name}"\n\n\n{body}'})
+    return data, teamspack.lock_of(data)
+
+
+class TeamsCode(HubUpdates):
+    """Design 2's P3 (teams-design-2-code-home.md, 3.5 and 3.11): a hub with a live licence gets the package that the
+    lock of its code names (hub.teams_sweep), and an update gets the package of its release before its checks
+    (hub.teams_package_for). The channel's route is a stand-in of teamspack.fetch, which records each call; git and
+    the folder of packages are real. The code that runs is the lock that each test gives (hub.TEAMS_LOCK), and a
+    package that this process loaded is a finder of the seam's (hub.TEAMS_LOAD)."""
+
+    def setUp(self):
+        config = patch.dict(hub.CFG)            # before the fixture's own keys, which its tearDown takes away
+        config.start()
+        self.addCleanup(config.stop)
+        super().setUp()
+        self.teams = Path(self.path).parent / "teams"       # beside the records, as an installed hub's, and teams-data
+        hub.CFG.update(teams_dir=str(self.teams), db_path=self.path)
+        self.fetched, self.answers, self.checked, self.restarted = [], {}, [], []
+        self.real_check = hub.teams_check
+
+        def fetch(address, lock, token, wait=teamspack.FETCH_WAIT):
+            self.fetched.append((address, lock["sha256"], token))
+            return self.answers.get(lock["sha256"], (503, "the channel answered 503"))
+
+        def check(root, folder=None):
+            self.checked.append((root, sorted(os.listdir(self.teams)) if self.teams.exists() else []))
+            return None
+        for patcher in (patch.object(teamspack, "fetch", fetch), patch.object(hub, "teams_check", check),
+                        patch.object(hub, "TEAMS_LOCK", None), patch.dict(hub.TEAMS_LOAD),
+                        patch.dict(hub._teams, {"thread": None, "later": None, "ready": None})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self.swept_out()
+        super().tearDown()
+
+    def swept_out(self):
+        thread = hub._teams["thread"]
+        if thread is not None:
+            thread.join(120)
+            self.assertFalse(thread.is_alive(), "the sweep's thread did not end")
+
+    def sweep_teams(self, t0=None):
+        """One step of the tick (teams_sweep), and its thread to its end."""
+        with hub.LOCK:
+            hub.teams_sweep(t0 or hub.now())
+        self.swept_out()
+
+    def ticked(self):
+        """One whole tick, with a channel that offers a held release, and the threads that it started to their end."""
+        held = answers(manifest("a" * 40, hold=True))
+        with patch.object(releases, "latest", functools.partial(releases.latest, fetch=held)), \
+                patch.dict(hub.CFG, {"silence": 0, "question_wait": 120, "manager_silence": 120, "stop_after": 60,
+                                     "offline_after": 90, "tick": 5}):
+            hub.tick()
+            self.finish()
+            self.swept_out()
+
+    def licence(self, **change):
+        token = self.token(plan="teams", **change)
+        self.assertEqual(self.press("entitlement", token=token)[0], 200)
+        return token
+
+    def runs(self, lock, loaded=False):
+        """The code that runs names the package of `lock`; with `loaded`, this process loaded it at its start."""
+        hub.TEAMS_LOCK = lock
+        if loaded:
+            hub.TEAMS_LOAD["finder"] = hub.TeamsFiles(str(self.teams / lock["sha256"]), {})
+        else:
+            hub.TEAMS_LOAD.pop("finder", None)
+
+    def with_lock(self, lock, number=None):
+        """A release whose tree holds `lock` as its teams.lock, and with `number` a new hub.py too."""
+        def write(work):
+            (work / "teams.lock").write_text(teamspack.lock_text(lock))
+            if number is not None:
+                self.code(number)(work)
+        return write
+
+    def packages(self):
+        return sorted(name for name in os.listdir(self.teams)) if self.teams.exists() else []
+
+    def logged(self, like):
+        return [r["what"] for r in hub.q("SELECT what FROM log WHERE what LIKE ? ORDER BY id", (like,))]
+
+    def test_a_fleet_with_no_licence_never_asks_for_a_package(self):
+        """3.11: a fleet with no licence of Founderizer for Teams gets the lock in each release and does nothing with
+        it. Read the calls themselves: at a tick, at an update of a release that names a part, at the restart after a
+        release that changes only the lock, with no token and with the old shop's token: no GET of a package, no read
+        of a lock, one fetch of the published repository for each update as before, no thread and no line of the
+        Teams code. The bug: a free fleet makes a new call to the network, makes a folder in the hub's home, restarts
+        for a lock, or reads a new key."""
+        _data, lock = part()
+        self.runs(lock)
+        locks, git_kit = [], hub.git_kit
+
+        def watched(*args, **how):
+            if any(hub.TEAMS_LOCK_FILE in str(one) for one in args):
+                locks.append(args)
+            return git_kit(*args, **how)
+        with patch.object(hub, "git_kit", watched):
+            for token in (None, self.token()):
+                if token:
+                    self.assertEqual(self.press("entitlement", token=token)[0], 200)
+                self.sweep_teams()
+                self.ticked()
+                self.assertNotIn("teams_code", self.releases_state())
+            code, _ = self.run_update(self.publish(self.with_lock(lock, 2)))
+            self.assertEqual((code, self.newest()["state"]), (200, releases.DONE))
+            self.assertEqual(len([argv for argv in self.ran if argv[-2:] == ["--no-write-fetch-head", "upstream"]]), 1)
+            self.pinned = self.newest()["reached"]
+            self.assertEqual(self.run_update(self.publish(self.with_lock(part("other")[1])))[0], 200)
+            one = self.newest()
+            self.assertEqual(one["state"], releases.DONE)
+            self.assertIsNone(hub.restart_hub_soon(one["pinned"], one["reached"]))
+        self.assertEqual((self.fetched, locks, self.checked, hub._teams["thread"]), ([], [], [], None))
+        self.assertEqual(self.logged("%Teams%"), [])
+        self.assertFalse(self.teams.exists())
+        time.sleep(hub.RESTART_DELAY + 0.5)         # the restart threads of the updates end before the database does
+
+    def test_an_update_waits_for_its_package_96_runs_in_a_row_at_most_and_only_while_parts_run(self):
+        """With Teams on, a run takes the package of its release before its checks, so that the schema check in the
+        clone loads it. While the channel gives it not, the run ends kept with design 2's sentence, and the hub counts
+        such runs in a row, across releases: after 96 of them the next run goes on, and a taken release sets the
+        count to zero. A hub that runs no part has none to keep on, and takes the release at once. The bugs: a fleet
+        with Teams never takes Core again; a new release starts the wait again, so a fleet with a release each hour
+        waits for ever; a fleet with parts on turns them off at an update whose package did not come; a release's
+        check never loads the part that it ships; with Teams on, a release that the release file brought while the
+        published repository does not answer (W12) stops at a fetch of it."""
+        licence = self.licence()
+        _data, running = part("running")
+        _data, waits = part("waits")
+        self.runs(running, loaded=True)
+        first = self.publish(self.with_lock(waits, 2))
+        self.assertEqual(self.run_update(first)[0], 200)
+        one = self.newest()
+        self.assertEqual((one["state"], one["step"], one["cause"]), (releases.KEPT, "hold", None))
+        self.assertEqual(one["says"], f"Release 2026.10.2 waits for its Teams code, which this server could not get "
+                                      f"from channel.invalid (the channel answered 503). This fleet stays at "
+                                      f"{self.pinned[:12]}.")
+        self.assertEqual(self.fetched, [(f"https://channel.invalid/releases/teams/{waits['sha256']}", waits["sha256"],
+                                         licence)])
+        self.assertEqual(self.head(), self.pinned)
+        self.assertEqual(self.releases_state()["teams_code"],
+                         {"lock": running["sha256"], "loaded": running["sha256"], "waited": 1})
+        second = self.publish(self.with_lock(waits, 3))             # a new release does not start the count again
+        self.assertEqual(self.run_update(second, version="2026.10.3")[0], 200)
+        self.assertEqual((self.newest()["state"], hub.teams_waited()), (releases.KEPT, 2))
+        hub.kv_set("teams_waited", 95)
+        self.run_update(second, version="2026.10.3")
+        self.assertEqual((self.newest()["state"], hub.teams_waited()), (releases.KEPT, 96))
+        self.run_update(second, version="2026.10.3")                # the 97th goes on without its package
+        self.assertEqual((self.newest()["state"], self.newest()["step"]), (releases.DONE, "follow"))
+        self.assertEqual((hub.teams_waited(), self.releases_state()["teams_code"]["waited"]), (0, 0))
+        self.assertEqual(len(self.logged("release 2026.10.3 goes on without its Teams code after 96 runs%")), 1)
+        self.assertEqual(self.packages(), [])
+        # The package comes: it is in its place when the release's schema check runs, and the run goes on.
+        self.pinned = self.newest()["reached"]
+        data, ships = part("ships")
+        self.answers[ships["sha256"]] = (200, data)
+        at_check, inner = [], self.runner()
+
+        def run(argv, timeout=None, cwd=None, input=None):
+            if "--check-schema" in argv:
+                at_check.append(teamspack.have(ships, str(self.teams)))
+            return inner(argv, timeout=timeout, cwd=cwd, input=input)
+        self.assertEqual(self.run_update(self.publish(self.with_lock(ships, 4)), run=run, version="2026.10.4")[0], 200)
+        self.assertEqual(self.newest()["state"], releases.DONE)
+        self.assertEqual(at_check, [str(self.teams / ships["sha256"])])
+        self.assertEqual(hub.kv_get("teams_fetched"), ships["sha256"])
+        # A hub that runs no part: no wait, and no count.
+        self.pinned = self.newest()["reached"]
+        self.runs(running)
+        self.assertEqual(self.run_update(self.publish(self.with_lock(waits, 5)), version="2026.10.5")[0], 200)
+        self.assertEqual((self.newest()["state"], hub.teams_waited()), (releases.DONE, 0))
+        # A run whose commit the second route took (W12, `bundled`) asks the published repository nothing here either.
+        came = self.publish(self.with_lock(waits, 6))
+        git("fetch", "-q", self.upstream, "main", cwd=self.kit)         # the commit, as the release file gives it
+        self.runs(running, loaded=True)
+        down = self.offline("fetch", "fatal: unable to access 'https://example.invalid/fleet.git/': Could not resolve "
+                                     "host: example.invalid")
+        with patch.object(releases, "Update", functools.partial(releases.Update, run=down)):
+            said = hub.teams_package_for(manifest(came, "2026.10.6"), self.origin, bundled=True)
+        self.assertEqual((said["state"], said["step"]), (releases.KEPT, "hold"), said["says"])
+        time.sleep(hub.RESTART_DELAY + 0.5)
+
+    def test_the_package_arrives_and_the_hub_restarts_one_time_when_no_turn_runs(self):
+        """The first licence on a fleet that runs: the sweep gets the package of the code that runs, checks it before
+        it puts it where a start of the hub loads it, and restarts the hub in its own process at the first tick with
+        no running turn. One time for a package: a process whose load of it failed restarts no more, and a restored
+        hub, whose records are another generation, gets its one restart. The bugs: a restart at each tick; a restart
+        in the middle of a turn; a restored hub never loads its package."""
+        licence = self.licence()
+        data, lock = part()
+        self.runs(lock)
+        self.answers[lock["sha256"]] = (200, data)
+        busy = (False, [7])
+        hub.kv_set("releases_swept", hub.now())         # the tick's poll of the channel is not due
+        with patch.object(hub, "restart_hub_soon", lambda *args, **how: self.restarted.append((args, how))), \
+                patch.object(hub, "fleet_idle", lambda: busy):
+            self.ticked()                               # the sweep is a step of each tick
+            self.assertEqual(self.fetched, [(f"https://channel.invalid/releases/teams/{lock['sha256']}",
+                                             lock["sha256"], licence)])
+            (checked_in, there), = self.checked
+            self.assertNotEqual(checked_in, str(self.teams))        # from a folder of its own, where no start reads
+            self.assertEqual([one for one in there if not one.startswith(teamspack.PART)], [])
+            self.assertEqual((self.packages(), self.restarted), ([lock["sha256"]], []))
+            self.sweep_teams()
+            self.assertEqual((len(self.fetched), len(self.checked), self.restarted), (1, 1, []))
+            busy = (True, [])
+            self.sweep_teams()
+            self.assertEqual(self.restarted, [((None, None), {"always": True})])
+            self.sweep_teams()
+            self.assertEqual(len(self.restarted), 1)
+            hub._teams.update(ready=None)               # the next process, whose load of the package failed
+            self.sweep_teams()
+            self.assertEqual((len(self.fetched), len(self.checked), len(self.restarted)), (1, 1, 1))
+            self.assertEqual(self.releases_state()["teams_code"], {"lock": lock["sha256"], "loaded": None, "waited": 0})
+            hub.kv_set("db_id", "a-restored-generation")
+            hub._teams.update(ready=None)
+            self.sweep_teams()
+            self.assertEqual((len(self.fetched), len(self.checked), len(self.restarted)), (1, 2, 2))
+        self.assertEqual(len(self.logged("the Teams code of the release that this hub runs%restarts%")), 2)
+
+    def test_after_the_signed_word_the_sweep_removes_each_package_and_never_a_part_s_own_files(self):
+        """While a package runs, the sweep keeps it and the one that an update fetched last, and removes the others;
+        so it does while the lock of the code that runs names no part. After the signed word that the licence ended it
+        removes each package, with one line in the hub's log, and nothing of teams-data/, where a part keeps its own
+        files. The bugs: a cancel takes a customer's key file; packages pile up on the server, also after a release
+        whose Teams files are gone; the sweep removes the package that the next update needs."""
+        licence = self.licence()
+        _data, lock = part()
+        names = {}
+        for name in ("next", "old", "older"):
+            data, its = part(name)
+            teamspack.place(data, its, str(self.teams))
+            names[name] = its["sha256"]
+        hub.kv_set("teams_fetched", names["next"])
+        draft = teamspack.pack({"TEAMS-LICENSE.md": "DRAFT. Not in force.\n"})
+        self.runs(teamspack.lock_of(draft))                             # a lock that names no part
+        self.sweep_teams()
+        self.assertEqual(self.packages(), [names["next"]])
+        teamspack.place(*part(), str(self.teams))
+        names["demo"] = lock["sha256"]
+        teamspack.place(*part("old"), str(self.teams))
+        self.runs(lock, loaded=True)
+        (self.teams / (teamspack.PART + "left")).mkdir()
+        (self.teams / "notes").write_text("not a package")
+        key = Path(hub.teams_data_dir("person_links")) / "links.key"
+        key.write_text("a key of the part's own")
+        self.sweep_teams()
+        self.assertEqual(self.packages(), sorted([names["demo"], names["next"], "notes"]))
+        self.assertTrue(hub.take_ended_word(self.word(licence)))
+        self.sweep_teams()
+        self.assertEqual((self.packages(), key.read_text()), (["notes"], "a key of the part's own"))
+        self.assertIsNone(hub.kv_get("teams_fetched"))
+        self.assertEqual(len(self.logged("Founderizer for Teams is off: the hub removed its Teams code%(2 package(s))%")),
+                         1)
+        last = hub._teams["thread"]
+        self.sweep_teams()
+        self.assertIs(hub._teams["thread"], last)           # nothing more to remove: no thread
+        self.assertEqual((self.fetched, self.checked), ([], []))
+        self.assertNotIn("teams_code", self.releases_state())
+
+    def test_a_402_a_401_a_503_or_no_answer_changes_nothing_of_the_licence_and_removes_nothing(self):
+        """Rule 5: only the signed word ends a licence, and silence or a refusal of one of our services changes
+        nothing. The sweep holds its calls for one poll after a failure, and asks at once for a new token. The bugs:
+        our own fault turns a part off or removes its code; the hub asks the channel at each tick of an outage."""
+        self.licence()
+        _data, lock = part()
+        self.runs(lock)
+        data, kept = part("next")
+        teamspack.place(data, kept, str(self.teams))
+        hub.kv_set("teams_fetched", kept["sha256"])
+        key = Path(hub.teams_data_dir("person_links")) / "links.key"
+        key.write_text("a key")
+        clock = [hub.now()]
+        with patch.object(hub, "now", lambda: clock[0]):
+            for at, (status, words) in enumerate(((402, "the channel answered 402"), (401, "the channel answered 401"),
+                                                  (503, "the channel answered 503"),
+                                                  (0, "the channel did not answer: timed out"))):
+                with self.subTest(status=status):
+                    self.answers[lock["sha256"]] = (status, words)
+                    if status == 401:
+                        renewed = self.licence(until=2100000000)    # a new token is asked at once, within the poll
+                    elif at:
+                        clock[0] += hub.RELEASE_POLL + 1
+                    self.sweep_teams(clock[0])
+                    self.assertEqual(len(self.fetched), at + 1)
+                    clock[0] += 1
+                    self.sweep_teams(clock[0])                            # within the poll: no call
+                    self.assertEqual(len(self.fetched), at + 1)
+                    row = hub.q1("SELECT token, ended FROM entitlement")
+                    self.assertEqual((hub.teams_on(), row["ended"]), (True, None))
+                    self.assertEqual(self.packages(), [kept["sha256"]])
+                    self.assertEqual(key.read_text(), "a key")
+        self.assertEqual(row["token"], renewed)
+        self.assertEqual([one[2] for one in self.fetched][1:], [renewed] * 3)
+        self.assertEqual((self.checked, self.restarted), ([], []))
+        self.assertEqual(len(self.logged("the Teams code of the release that this hub runs%is not on this server%")), 4)
+
+    def test_a_release_that_changes_only_the_lock_restarts_a_hub_with_teams_on_and_no_other(self):
+        """A release that changes only Teams files changes only the lock of the public tree, which is no Fleet file.
+        The bug: the hub runs the old package under the new lock, or a free fleet restarts at each Teams release."""
+        _data, lock = part("next")
+        self.assertEqual(self.run_update(self.publish(self.with_lock(lock)))[0], 200)
+        one = self.newest()
+        self.assertEqual(one["state"], releases.DONE)
+        self.assertIsNone(hub.restart_hub_soon(one["pinned"], one["reached"]))
+        self.licence()
+        self.assertEqual(hub.restart_hub_soon(one["pinned"], one["reached"]), ["true"])
+        self.assertIsNone(hub.restart_hub_soon(one["reached"], one["reached"]))
+        time.sleep(hub.RESTART_DELAY + 0.5)
+
+    def test_a_restart_onto_a_package_whose_part_never_ends_its_import_does_not_come(self):
+        """The hub's start loads its parts before it serves, so a part whose import does not end would hold the port
+        that a restart in place keeps open, with no answer. A release meets such a part in its schema check, which
+        ends at its limit; the sweep's package gets the same check, for real here (the code of this checkout, run as
+        a child in a folder of links with the package's lock), and the hub does not restart onto a package whose check
+        did not end, keeps no copy of it where a start loads it, and does not try it again. The bug: a fleet's first
+        licence, or a restore, hangs its hub.
+
+        The child compiles the hub before it reaches the part, which a slow machine does in more than the check's
+        limit: so the test compiles it first, untimed, and runs only where an import of the compiled hub then takes
+        at most WARM_MOST seconds."""
+        marker = self.root / "imported"
+        data, lock = part(body=f"open({str(marker)!r}, 'w').close()\nimport time\ntime.sleep(90)\n\n\n"
+                               f"def start(H):\n    return 1\n")
+        self.licence()
+        self.runs(lock)
+        self.answers[lock["sha256"]] = (200, data)
+        folder = self.code_folder(lock)
+        for warm in range(2):           # the first compiles and keeps the compiled files; the second is timed
+            began = time.monotonic()
+            done = subprocess.run([sys.executable, "-c", "import hub"], cwd=folder, capture_output=True, timeout=900)
+            self.assertEqual(done.returncode, 0, done.stderr[-500:])
+        if time.monotonic() - began > self.WARM_MOST:
+            self.skipTest(f"an import of the compiled hub took {time.monotonic() - began:.0f} s here")
+        began = time.monotonic()
+        with patch.object(hub, "teams_check", functools.partial(self.real_check, folder=str(folder))), \
+                patch.object(hub, "TEAMS_CHECK_WAIT", 30), \
+                patch.object(hub, "restart_hub_soon", lambda *args, **how: self.restarted.append((args, how))):
+            self.sweep_teams()
+            self.assertTrue(marker.exists(), "the check never reached the part's import")
+            self.assertLess(time.monotonic() - began, 30 + 20)
+            self.assertEqual((self.restarted, self.packages()), ([], []))
+            (said,) = self.logged("the Teams code of the release that this hub runs%did not pass its check%")
+            self.assertIn("ended at the hub's time limit of 30 seconds", said)
+            self.sweep_teams()
+        self.assertEqual((len(self.fetched), self.restarted), (1, []))
+
+    def test_records_that_cannot_answer_for_the_licence_stop_no_release(self):
+        """migrate() can fail to add a column of the entitlement, and then each read of teams_on() raises
+        sqlite3.OperationalError (P2's teams_schema catches the same). The bugs: each release run of that hub ends in
+        an error, also on a fleet with no licence, so the release that would repair its records never lands; the read
+        of GET /ui/releases fails; the sweep takes such records for the signed word, and removes each package, the
+        mark of a refused one and the record of the one that an update fetched (rule 5: only the word does that)."""
+        data, lock = part()
+        self.runs(lock)
+        teamspack.place(data, lock, str(self.teams))
+        (self.teams / (teamspack.PART + "left")).mkdir()
+        hub.teams_once_set("d" * 64, refused=True)
+        hub.kv_set("teams_fetched", lock["sha256"])
+        before = (self.packages(), hub.kv_get("teams_once"), hub.kv_get("teams_fetched"))
+
+        def broken():
+            raise sqlite3.OperationalError("no such column: ended")
+        with patch.object(hub, "teams_on", broken):
+            self.sweep_teams()
+            hub.teams_remove(str(self.teams))       # and the removal itself, should a sweep have started it
+            self.assertEqual((self.packages(), hub.kv_get("teams_once"), hub.kv_get("teams_fetched")), before)
+            self.assertEqual(self.logged("%Teams%"), [])
+            self.assertNotIn("teams_code", self.releases_state())
+            self.assertEqual(self.run_update(self.publish(self.with_lock(lock, 2)))[0], 200)
+            self.assertEqual(self.newest()["state"], releases.DONE)
+            self.pinned = self.newest()["reached"]
+            self.assertEqual(self.run_update(self.publish(self.with_lock(part("other")[1])))[0], 200)
+            one = self.newest()
+            self.assertEqual(one["state"], releases.DONE)
+            self.assertIsNone(hub.restart_hub_soon(one["pinned"], one["reached"]))
+        self.assertEqual((self.fetched, hub._teams["thread"]), ([], None))
+        time.sleep(hub.RESTART_DELAY + 0.5)
+
+    def test_a_fault_of_the_sweep_s_thread_waits_one_poll(self):
+        """A full disk at the sweep's folder of its own ended its thread with no record of the try. The bug: the next
+        tick starts it again, with a GET of up to 4 MiB with the licence every 5 seconds, while the disk is full."""
+        self.licence()
+        data, lock = part()
+        self.runs(lock)
+        self.answers[lock["sha256"]] = (200, data)
+
+        def full(*args, **how):
+            raise OSError(28, "No space left on device")
+        with patch.object(tempfile, "mkdtemp", full), patch.object(hub, "print_fault"):
+            self.sweep_teams()
+            self.sweep_teams()
+        self.assertEqual(len(self.fetched), 1)
+        self.assertIn("No space left on device", hub._teams["later"]["says"])
+        self.assertFalse(hub.teams_once(lock["sha256"]))
+        with patch.object(hub, "restart_hub_soon", lambda *args, **how: self.restarted.append(args)):
+            self.sweep_teams(hub.now() + hub.RELEASE_POLL + 1)          # one poll later, with room on the disk
+        self.assertEqual((len(self.fetched), self.packages(), self.restarted), (2, [lock["sha256"]], [(None, None)]))
+
+    def test_a_package_that_its_check_refused_is_never_fetched_again(self):
+        """The sweep keeps no copy of a package whose check did not end, and asks for it no more. The bug: a later
+        update whose release names the same lock fetches it again into the folder that a start loads, and the next
+        start of the hub hangs on it."""
+        self.licence()
+        data, lock = part()
+        self.runs(lock)
+        self.answers[lock["sha256"]] = (200, data)
+        with patch.object(hub, "teams_check", lambda root, folder=None: ("refused", "python3 ended at the hub's time "
+                                                                               "limit of 120 seconds")):
+            self.sweep_teams()
+        self.assertTrue(hub.teams_once(lock["sha256"], refused=True))
+        self.assertEqual((len(self.fetched), self.packages()), (1, []))
+        self.assertEqual(self.run_update(self.publish(self.with_lock(lock, 2)))[0], 200)       # no part runs: Core
+        self.assertEqual((self.newest()["state"], len(self.fetched), self.packages()), (releases.DONE, 1, []))
+        self.pinned = self.newest()["reached"]
+        self.runs(part("running")[1], loaded=True)                      # parts run: the release waits for it
+        self.assertEqual(self.run_update(self.publish(self.with_lock(lock, 3)), version="2026.10.3")[0], 200)
+        one = self.newest()
+        self.assertEqual((one["state"], one["step"], len(self.fetched), self.packages()),
+                         (releases.KEPT, "hold", 1, []))
+        self.assertIn("does not take it again", one["says"])
+        time.sleep(hub.RESTART_DELAY + 0.5)
+
+    def test_a_lack_of_room_is_no_refusal_of_a_package_and_the_copy_of_the_records_stays_beside_it(self):
+        """The check of a package runs in a child, on a copy of the records. A server short of memory, a child that the
+        system ended for lack of it, or a full disk say nothing of the package. The copy stands in the folder of
+        packages, as a write's leftover that the next sweep removes. The bugs: such a server refuses its package for
+        ever, so its parts never load; a stop of the hub during the check leaves the records, with their tokens, in
+        the system's temporary folder."""
+        self.teams.mkdir()
+        ran, answer = [], [None]
+
+        def run(argv, timeout=None, cwd=None, input=None, env=None):
+            ran.append((argv[-1], os.path.isfile(argv[-1]), env))
+            return answer[0]
+        small = {"free": 1 << 20, "ram": 1 << 20, "swap": 0, "total": 1 << 30, "ram_total": 1 << 30}
+        with patch.object(releases, "_run", run):
+            with patch.object(releases, "memory_room", lambda: small):
+                self.assertEqual(self.real_check(str(self.teams))[0], "later")
+            self.assertEqual(ran, [])                                   # no check starts
+            with patch.object(releases, "memory_room", lambda: None):
+                for answer[0], said in (((-signal.SIGKILL, "", ""), "later"),
+                                        ((1, "", "sqlite3.OperationalError: database or disk is full"), "later"),
+                                        ((1, "", "python3 ended at the hub's time limit of 120 seconds"), "refused"),
+                                        ((0, "schema check: 0 steps refused.", ""), None)):
+                    found = self.real_check(str(self.teams))
+                    self.assertEqual(found and found[0], said, answer[0])
+        for copy, there, env in ran:
+            self.assertEqual((Path(copy).parent.parent, there, env), (self.teams, True, {hub.TEAMS_DIR_VAR:
+                                                                                         str(self.teams)}))
+            self.assertTrue(Path(copy).parent.name.startswith(teamspack.PART))
+        self.assertEqual(os.listdir(self.teams), [])
+        left = self.teams / (teamspack.PART + "a-stop-of-the-hub")
+        left.mkdir()
+        (left / "pilot.db").write_text("the records of an earlier check")
+        self.licence()
+        self.runs(part()[1])
+        self.sweep_teams()                                              # the GET fails: the leftover goes all the same
+        self.assertEqual((len(self.fetched), os.listdir(self.teams)), (1, []))
+
+    def test_an_update_waits_for_the_check_of_a_package_and_never_runs_beside_it(self):
+        """The sweep's check of a package runs up to two minutes in a child, with a copy of the records. The bugs: an
+        update runs its own check beside it, and the update's restart of the hub leaves that child running and the
+        copy on the disk; the sweep restarts the hub under the update; each automatic poll of a fleet with Teams
+        waits for that check, and no task session starts meanwhile."""
+        self.licence()
+        data, lock = part()
+        self.runs(lock)
+        self.answers[lock["sha256"]] = (200, data)
+        inside, go = threading.Event(), threading.Event()
+
+        def check(root, folder=None):
+            inside.set()
+            go.wait(60)
+            return None
+        fetch, nothing = answers(manifest(self.publish(self.code(2)))), answers({"error": "no release"}, status=404)
+        with patch.object(hub, "teams_check", check), \
+                patch.object(hub, "restart_hub_soon", lambda *args, **how: self.restarted.append(args)), \
+                patch.object(releases, "Update", functools.partial(releases.Update, run=self.runner())):
+            with hub.LOCK:
+                hub.teams_sweep(hub.now())
+            self.assertTrue(inside.wait(30))
+            began = time.monotonic()                                    # a poll that takes nothing waits for nothing
+            with patch.object(releases, "latest", functools.partial(releases.latest, fetch=nothing)):
+                hub.kv_set("releases_swept", None)
+                with hub.LOCK:
+                    hub.release_sweep(hub.now())
+                self.finish()
+            self.assertLess(time.monotonic() - began, 20)
+            self.assertEqual(len(nothing.seen), 1)
+            with patch.object(releases, "latest", functools.partial(releases.latest, fetch=fetch)):
+                self.assertEqual(self.press("update")[0], 200)
+                time.sleep(1)
+                self.assertEqual((self.newest()["state"], self.ran), ("updating", []))     # the run waits for the check
+                go.set()
+                self.finish()
+            self.swept_out()
+        self.assertEqual((len(fetch.seen), self.newest()["state"]), (1, releases.DONE))
+        self.assertNotIn((None, None), self.restarted)                  # the sweep's restart did not come under it
+
+    def test_a_signed_word_during_the_check_makes_no_restart(self):
+        """The check of a package takes up to two minutes, and the signed word that the licence ended can come in it.
+        The bug: the hub restarts for Teams code that it will not run."""
+        licence = self.licence()
+        data, lock = part()
+        self.runs(lock)
+        self.answers[lock["sha256"]] = (200, data)
+
+        ended = []
+
+        def check(root, folder=None):
+            ended.append(hub.take_ended_word(self.word(licence)))      # read in the test's own thread, below
+            return None
+        with patch.object(hub, "teams_check", check), \
+                patch.object(hub, "restart_hub_soon", lambda *args, **how: self.restarted.append(args)):
+            self.sweep_teams()
+        self.assertEqual((ended, self.restarted, hub.teams_once(lock["sha256"])), ([True], [], False))
+
+    WARM_MOST = 10      # seconds that an import of the compiled hub may take for the check's limit of 30 seconds
+
+    def code_folder(self, lock):
+        """The code of this checkout as a folder of links, with `lock` as its teams.lock: the code of a release that
+        names the package, for the check that runs it as a child (hub.teams_check). Its path is the same at each run,
+        so the child reads the compiled files of the run before (PYTHONPYCACHEPREFIX keeps them by the path)."""
+        folder = Path(tempfile.gettempdir()) / ("fleet-teams-code-" + hashlib.sha256(str(ROOT).encode()).hexdigest()[:12])
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir()
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        for name in os.listdir(ROOT):
+            if name not in (".git", hub.TEAMS_LOCK_FILE):
+                (folder / name).symlink_to(Path(ROOT) / name)
+        (folder / hub.TEAMS_LOCK_FILE).write_text(teamspack.lock_text(lock))
+        return folder
 
 
 if __name__ == "__main__":

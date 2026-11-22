@@ -40,7 +40,9 @@ Please keep the problem private until we publish the advisory.
 ## Which versions get fixes
 
 We fix only the newest release. A hub takes a new release from this repository, and only a release whose manifest
-has a valid signature (`releases.py`). A fleet gets a fix when it takes the release that has it. [VAULT.md](VAULT.md),
+has a valid signature (`releases.py`). A fleet gets a fix when it takes the release that has it. A hub with a licence
+of Founderizer for Teams also downloads one package of Teams code from our release channel, and keeps and runs it only
+when its SHA-256 is the one that the file `teams.lock` of the signed release's tree names. [VAULT.md](VAULT.md),
 "How the vault's code is updated", tells how a release reaches the vault on each server.
 
 ## What this policy covers

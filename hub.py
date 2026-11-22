@@ -57342,6 +57342,7 @@ def tick():
         step(settle_checks, t0)
         step(attachment_sweep, t0)          # owner feature attachments: the files that the hub may let go
         step(release_sweep, t0)             # owner feature releases: the automatic poll, when the owner opted in
+        step(teams_sweep, t0)               # Founderizer for Teams: the package of the code that runs (design 2, 3.5)
         step(names_sweep, t0)               # devops task 1.1: the Tailscale names, when the start found none
         step(history_sweep, t0)             # AUTONOMY.md P6: what was written since the last pass, into the history
         step(default_access_sweep, t0)      # the owner, 28 October 2026: every agent's vault, and a Mac's desktop
@@ -72590,7 +72591,8 @@ def release_view(limit=RELEASE_ROWS):
             "last_check": {"at": float(checked) if checked else None, "says": kv_get("releases_said") or None,
                            "status": int(kv_get("releases_status") or 0) or None},
             "entitlement": entitlement_view(),
-            "releases": [release_row_view(r) for r in q("SELECT * FROM releases ORDER BY id DESC LIMIT ?", (limit,))]}
+            "releases": [release_row_view(r) for r in q("SELECT * FROM releases ORDER BY id DESC LIMIT ?", (limit,))],
+            **teams_code_view()}
 
 
 def record_manifest(manifest, t0=None):
@@ -72807,6 +72809,13 @@ def release_work(applying, automatic=False, fetch=None, take=False):
                 else:
                     release_wait(row)
             return
+        teams_sweep_ends()      # Founderizer for Teams: a run that starts waits for the check of a package, if one runs
+        waits = teams_package_for(manifest, origin, bundled)    # Founderizer for Teams: the release's package first
+        if waits:
+            with LOCK:
+                release_count_unreached(probed, finish_release(row["id"], waits["state"], waits["step"],
+                                                               waits["says"], automatic, waits))
+            return
         import shutil
         import tempfile
         # The copy the released code's schema is checked against. It is a copy that this hub writes on its own
@@ -72969,6 +72978,8 @@ def finish_release(rid, state, step, says, automatic, result=None, cause=None):
         release_memory_told()
     if state != releases.DONE:
         return row
+    if kv_get("teams_waited"):
+        kv_set("teams_waited", None)    # a taken release ends the count of the runs that waited for their Teams code
     kit_revision(fresh=True)
     pass_held_releases()        # the releases that came while the fleet worked, and that this one holds
     # Quiet (QUIET_SAY): it comes with the manager's next read. It woke the manager at every release, ten a day, to
@@ -73058,7 +73069,8 @@ def restart_hub_soon(pinned, reached, always=False):
     (releases.Update step `schema`), so the one thing selftest cannot see — a migration step that only these rows
     refuse — was met while the fleet could still keep its revision. Under both of those the hub's own start takes
     what it can and records what it cannot (build_schema), so the worst a schema surprise costs is a warning on a
-    hub that still answers. A release that changed no Fleet file restarts nothing.
+    hub that still answers. A release that changed no Fleet file restarts nothing, but on a hub with Founderizer for
+    Teams on a release whose lock differs (teams_lock_moved): its Teams code is another package.
 
     `always` is the restore's restart: there is no revision to compare, and the records only change at a start.
 
@@ -73066,7 +73078,7 @@ def restart_hub_soon(pinned, reached, always=False):
     that the port stays open; else, and for a fleet's own restart command, it runs the command as before. Before the
     restart of the hub's own service onto new code, the new hub.py is compiled in pieces (pieces_written), so that its
     start reads that file and does not compile the whole file in this server's memory."""
-    if not always and same_code(pinned, reached):
+    if not always and same_code(pinned, reached) and not teams_lock_moved(pinned, reached):
         return None
     argv = CFG.get("hub_restart", HUB_RESTART)
     if not argv:
@@ -73838,6 +73850,460 @@ def release_sweep(t0):
         start_release_work(True, automatic=True)
     except Refusal:
         pass            # a run is going, or the fleet is working: the next sweep asks again
+
+
+# ---- Founderizer for Teams: the hub gets its package (teams-design-2-code-home.md, 3.5 and 3.11)
+#
+# A hub with a live licence runs the Teams parts of one package: the one that the lock of its code names (TEAMS_LOCK),
+# in teams_dir()/<sha256>/, which the seam loads at the hub's start (teams_schema). This block gets that package and
+# keeps the folder in order:
+#
+# - teams_sweep, a step of tick(), for the package of the code that runs. Under LOCK it only decides; a thread of its
+#   own makes the call of the network, the check and the writes.
+# - teams_package_for, a step of release_work before the records are copied, for the package of the release that the
+#   run takes: the release's schema check loads it in the clone (TEAMS_DIR_VAR), and the restart onto the release finds
+#   it. A run whose package is not there waits for it, TEAMS_WAIT_MOST runs in a row at most, and then takes Core.
+# - restart_hub_soon restarts a hub with Teams on for a release that changes only the lock (teams_lock_moved), and
+#   release_view has the key teams_code while teams_on().
+#
+# A fleet with no licence makes no new call, has no folder of packages, gets no new key and restarts as before
+# (3.11): each of these asks teams_up() first. The token goes only into the Authorization header of teamspack.fetch,
+# never into an address, a file, a log or the arguments of a process. A 401, a 402, a 503 or no answer changes nothing
+# of the licence (only the signed word does: take_ended_word) and removes nothing.
+#
+# Two known limits (the second read of P3, 22 November 2026):
+# - Records that cannot answer teams_on() (sqlite3.Error) are taken as Teams off by teams_up(): teams_package_for then
+#   lets the release go on without its package, and the parts are off after its restart until the sweep gets the
+#   package again. The sweep and teams_remove read such records as no answer, and remove nothing (rule 5).
+# - A package for the lock of the code that runs, which an update placed in teams_dir() and whose release check hung,
+#   stays there unchecked until the sweep's next look at it, one RELEASE_POLL at most; a start of the hub in that
+#   time loads it with no limit.
+#
+# A part reads no file of its package by a path (its __file__ or the folder's name): the load checked those bytes one
+# time and runs the texts that it checked (TeamsFiles), and this block removes the folder at a cancel and after a
+# release whose lock names another package. Data that a part needs stands in a Teams .py file, and its own files in
+# teams_data_dir(), which nothing here touches.
+
+TEAMS_LOCK_FILE = "teams.lock"      # publish.TEAMS_LOCK: the file of each published tree that holds the lock
+TEAMS_WAIT_MOST = 96                # runs of an update in a row that wait for their package (a day of polls); then Core
+TEAMS_CHECK_WAIT = releases.SCHEMA_WAIT     # seconds for the check of a package before the hub restarts onto it
+# The sweep's one thread; the last try of this code's package that failed for a cause that can pass (a GET, a write, a
+# copy of the records), with the SHA-256 of the token that it was made with; and the package that passed its check in
+# this process, for which the hub restarts at the first moment no turn runs.
+_teams = {"thread": None, "later": None, "ready": None}
+_teams_disk = threading.Lock()      # each change of teams_dir()'s folder, and each read whose answer it depends on
+
+
+def teams_loaded():
+    """The SHA-256 of the package whose files this process loaded at its start (teams_load), or None: no load (Teams was
+    off, or the hub has no teams_dir()), a load that found no whole package, or a rig's own folder (--teams-source). A
+    load whose parts failed loaded the package all the same, and the health warning says why."""
+    finder = TEAMS_LOAD.get("finder")
+    name = os.path.basename(getattr(finder, "folder", None) or "")
+    return name if finder is not None and re.fullmatch(r"[0-9a-f]{64}", name) else None
+
+
+def teams_up():
+    """teams_on() for this block, and False when the records cannot answer it: a column of the entitlement that
+    migrate() could not add raises sqlite3.OperationalError there (teams_schema catches the same). Without this, such
+    records would end each release run in an error, also on a fleet with no licence, and the release that would
+    repair them could not land."""
+    try:
+        return teams_on()
+    except sqlite3.Error:
+        return False
+
+
+def teams_waited():
+    """The runs of an update in a row that waited for their package (teams_package_for), 0 when none."""
+    try:
+        return max(0, int(kv_get("teams_waited") or 0))
+    except ValueError:
+        return 0
+
+
+def teams_once(sha256, refused=False):
+    """True when this hub restarted for the package `sha256`, or its check refused it (teams_sweep_work), in this
+    generation of the records: the sweep does nothing more for it. With `refused`, only for a package whose check
+    refused it: an update then takes it as not there, and fetches it not again (teams_package_for). A restore is
+    another generation (kv db_id), so the record of the copy's hub does not keep a restored hub from its package."""
+    try:
+        once = json.loads(kv_get("teams_once") or "null")
+    except ValueError:
+        return False
+    return isinstance(once, dict) and once.get("sha256") == sha256 and once.get("db") == kv_get("db_id") and \
+        (not refused or once.get("refused") is True)
+
+
+def teams_once_set(sha256, refused=False):
+    """Inside LOCK: the record of teams_once."""
+    kv_set("teams_once", json.dumps({"sha256": sha256, "db": kv_get("db_id"), "refused": bool(refused)}))
+
+
+def teams_digest(token):
+    return hashlib.sha256(token.encode()).hexdigest() if token else None
+
+
+def teams_address(sha256):
+    """The channel's address of one package (design 2, 3.8), on the release channel of this fleet."""
+    return release_channel().rstrip("/") + "/releases/teams/" + sha256
+
+
+def teams_fetch(lock):
+    """Outside LOCK: one GET of the package that `lock` names, with the licence as its bearer (teamspack.fetch). (the
+    bytes, None), or (None, the reason in words that hold no token). Whatever the channel answers, it changes nothing
+    of the licence."""
+    import teamspack
+    token = teams_licence()
+    if not token:
+        return None, "this fleet holds no licence of Founderizer for Teams now"
+    status, body = teamspack.fetch(teams_address(lock["sha256"]), lock, token)
+    if status == 200 and isinstance(body, bytes):
+        return body, None
+    return None, body if isinstance(body, str) else f"the channel answered {status}"
+
+
+def teams_place(data, lock, root):
+    """The package `data` in `root`/<sha256>/ (teamspack.place, which checks its size and its SHA-256 against `lock`
+    before it writes a byte). None, or the reason."""
+    import teamspack
+    try:
+        teamspack.place(data, lock, root)
+    except ValueError as e:
+        return f"the channel gave other bytes than the package that the lock names ({e})"
+    except OSError as e:
+        return f"this server could not write the package ({e})"
+    return None
+
+
+def teams_check(root, folder=None):
+    """Outside LOCK: the limit of the hub's restart onto a package that the sweep got. The hub's start loads its Teams
+    parts before it serves (teams_schema): a part whose import does not end holds the port that the restart keeps open,
+    with no answer, and one that ends the process stops the hub at each start. A release meets such a part in the
+    schema check of its run, which ends after releases.SCHEMA_WAIT seconds; a restart for a package of the sweep has no
+    such run, so this is its check: `python3 -m hub --check-schema` of the code in `folder` (the code that runs, which
+    the restart runs again), on a copy of the records, with the packages of `root` (TEAMS_DIR_VAR), under the limits of
+    a release's checks (releases.check_prefix) and TEAMS_CHECK_WAIT seconds at most. Where `timeout` is there, the
+    child also ends by itself a little later, so that no stop of the hub leaves it running.
+
+    The copy of the records, with their tokens, stands in a folder of teams_dir() whose name begins as a write's
+    leftover (teamspack.PART), so that the next sweep removes it when a stop of the hub left it (teams_sweep_work).
+
+    None when the check ended with its line, with refused steps or with none: the restart is safe, and the warning of
+    the steps that the records refused says why after it. ("refused", why) for a check that did not end with its line:
+    no start of this code can take the package. ("later", why) when no check could be made, or this server's room
+    ended it (releases.room_cause: no memory, or a full disk), which says nothing of the package: and with less free
+    memory than a release's checks need (releases.CHECK_NEED), no check starts."""
+    import tempfile
+    import teamspack
+    room = releases.memory_room()
+    if room is not None and room["free"] < releases.CHECK_NEED:
+        return "later", (f"this server has {room['free'] >> 20} MB of memory and swap free, and the check of the "
+                         f"package needs {releases.CHECK_NEED >> 20} MB")
+    folder = folder or os.path.dirname(os.path.abspath(__file__))
+    work = tempfile.mkdtemp(prefix=teamspack.PART, dir=teams_dir() or None)
+    try:
+        path = os.path.join(work, "pilot.db")
+        try:
+            records_copy(path)
+        except sqlite3.Error as e:
+            return "later", f"the records could not be copied for its check ({e})"
+        limit, _ = releases.check_prefix(room)
+        # --foreground: GNU timeout puts itself in a process group of its own otherwise, which _run's kill of the
+        # check's group at TEAMS_CHECK_WAIT does not reach, and the child would live 30 s more beside an update
+        bound = ["timeout", "--foreground", "-s", "KILL", str(TEAMS_CHECK_WAIT + 30)] if shutil.which("timeout") else []
+        code, out, err = releases._run([*limit, *bound, sys.executable, "-m", "hub", "--check-schema", path],
+                                       timeout=TEAMS_CHECK_WAIT, cwd=folder, env={TEAMS_DIR_VAR: root})
+        if releases.schema_summary(out) is None:
+            words = releases._ended(code, out, err)
+            return ("later" if releases.room_cause(code, out, err) else "refused"), words
+        return None
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def teams_sweep_ends():
+    """Outside LOCK, in the thread of an update run that starts (its row says updating, so a poll that takes nothing
+    waits for nothing): the end of the sweep's thread, when one runs. Its
+    check of a package takes up to TEAMS_CHECK_WAIT seconds, in a child with a copy of the records, and an update
+    beside it would run a second check at once and restart the hub under it, which leaves the child and the copy.
+    The sweep starts no thread while a check or an update runs (teams_sweep), so after this none runs beside the
+    update."""
+    thread = _teams["thread"]
+    if thread is not None and thread is not threading.current_thread():
+        thread.join()
+
+
+def teams_restarts():
+    """True while a restart of the hub that restart_hub_soon asked for has not run yet: its thread waits RESTART_DELAY
+    first, and a second restart beside it would run the restart twice."""
+    return any(thread.name == "release-restart" and thread.is_alive() for thread in threading.enumerate())
+
+
+def teams_restart(sha256):
+    """Inside LOCK: the hub's restart in its own process (restart_hub_soon, as for a restore) onto the package
+    `sha256`, which passed its check in this process, when no turn runs, no check or update of a release runs and no
+    restart is under way; and its record (teams_once), written first, so that it is one time for that package. True
+    when it asked for the restart. A signed word that ended the licence during the check ends it here too."""
+    if not teams_up() or not fleet_idle()[0] or release_running() or teams_restarts():
+        return False
+    teams_once_set(sha256)
+    log("hub", f"the Teams code of the release that this hub runs ({sha256[:12]}) is on this server: the hub restarts "
+               f"in its own process to load it")
+    restart_hub_soon(None, None, always=True)
+    return True
+
+
+def teams_later(lock, digest, why):
+    """Inside LOCK: a try of the package of this code failed for a cause that can pass. The sweep tries again one
+    RELEASE_POLL later, or at once for a new token or a new lock; a reason that is new goes into the hub's log."""
+    said = (_teams["later"] or {}).get("says") if (_teams["later"] or {}).get("sha256") == lock["sha256"] else None
+    _teams["later"] = {"sha256": lock["sha256"], "token": digest, "at": now(), "says": why}
+    if why != said:
+        log("hub", f"the Teams code of the release that this hub runs ({lock['sha256'][:12]}) is not on this server: "
+                   f"{why}. The hub runs Core, and tries again in {RELEASE_POLL // 60} minutes.")
+
+
+def teams_sweep(t0):
+    """A step of tick(), inside LOCK: the package of the code that runs (design 2, the table of 3.5). Here it reads the
+    licence, the names of the folder and this process's memory, and starts at most one thread of its own, which makes
+    each call of the network, each check and each write. In order:
+
+    - a hub with no teams_dir() (each hub of a test, of selftest.py and of a scratch run): nothing;
+    - Teams off: nothing while the folder holds no package (a fleet with no licence stops here, with no call and no
+      folder made); else each package goes, with one line in the hub's log (teams_remove). The parts that this process
+      loaded stay until its next restart, and teams_part gives None for them;
+    - Teams on, and a check or an update of a release runs: nothing;
+    - Teams on, and this process loaded this code's package, or the lock of this code names no part: each other
+      package goes, but the one that an update fetched last (teams_fetched);
+    - Teams on, and this code's package is not loaded: the thread gets it with one GET and teams_licence() as its
+      bearer, checks it and puts it in its place (teams_sweep_work); after a failure the next try is one RELEASE_POLL
+      later, and at once for a new token or a new lock. Then the hub restarts in its own process when no turn runs
+      (teams_restart). One time for a package: after that restart, or after its check refused it, the sweep does
+      nothing more for it (teams_once), and the health warning or the hub's log says why it did not load."""
+    root = teams_dir()
+    if not root or (_teams["thread"] is not None and _teams["thread"].is_alive()):
+        return
+    import teamspack
+    try:
+        on = teams_on()
+    except sqlite3.Error:
+        return              # records that cannot answer are no signed word: rule 5, nothing is removed
+    if not on:
+        if any(teamspack.SHA256.fullmatch(name) or name.startswith(teamspack.PART) for name in teams_names(root)):
+            teams_thread(teams_remove, root)
+        return
+    if release_running():
+        return
+    lock = TEAMS_LOCK
+    sha = lock["sha256"] if lock is not None and lock["files"] else None
+    if sha is None or teams_loaded() == sha:
+        keep = {sha, kv_get("teams_fetched")}
+        if any(teamspack.SHA256.fullmatch(name) and name not in keep or name.startswith(teamspack.PART)
+               for name in teams_names(root)):
+            teams_thread(teams_prune, root, sha)
+        return
+    if teams_once(sha):
+        return
+    if _teams["ready"] == sha:
+        teams_restart(sha)
+        return
+    digest, later = teams_digest(teams_licence()), _teams["later"]
+    if later and later["sha256"] == sha and later["token"] == digest and 0 <= t0 - later["at"] < RELEASE_POLL:
+        return
+    teams_thread(teams_sweep_work, lock, root, digest)
+
+
+def teams_names(root):
+    try:
+        return os.listdir(root)
+    except OSError:
+        return []
+
+
+def teams_thread(target, *args):
+    """Inside LOCK: the sweep's one thread, which prints a fault of its own and stops nothing else."""
+    def run():
+        try:
+            target(*args)
+        except Exception:
+            print_fault()
+    thread = _teams["thread"] = threading.Thread(target=run, name="teams-sweep", daemon=True)
+    thread.start()
+
+
+def teams_remove(root):
+    """The sweep's thread, after the signed word that the licence ended: each package of `root` goes, and the leftovers
+    of a write, and the records of the sweep with them. Nothing else of `root`, and nothing of teams-data/ beside it,
+    where a part keeps its own files (teams_data_dir): a cancel takes no key file of a customer's. Only the signed
+    word does this (design 2, 3.5): records that cannot answer teams_on() remove nothing and clear no record."""
+    import teamspack
+    with _teams_disk:
+        try:
+            if teams_on():
+                return              # a new licence came in the meantime: its code is the same
+        except sqlite3.Error:
+            return                  # records that cannot answer are no signed word: rule 5, nothing is removed
+        gone = [name for name in teamspack.prune(root, set()) if teamspack.SHA256.fullmatch(name)]
+    with LOCK:
+        for key in ("teams_once", "teams_fetched"):
+            kv_set(key, None)
+        _teams.update(later=None, ready=None)
+        if gone:
+            log("hub", f"Founderizer for Teams is off: the hub removed its Teams code from this server ({len(gone)} "
+                       f"package(s)). The parts that this process loaded stay until its next restart, and Core calls "
+                       f"none of them.")
+
+
+def teams_prune(root, sha256):
+    """The sweep's thread, while this process runs the package `sha256`, or None while the lock of its code names no
+    part: each other package of `root` goes, but the one that an update fetched last (teams_fetched: the code of a
+    release that waits or that its checks refused), and the leftovers of a write."""
+    import teamspack
+    with _teams_disk:
+        teamspack.prune(root, {sha256, kv_get("teams_fetched")})
+
+
+def teams_sweep_work(lock, root, digest):
+    """The sweep's thread, for the package of this code (`lock`), which this process did not load: from `root` when it
+    is whole there, else one GET of it into a folder of its own; then its check (teams_check), from that folder, and
+    only then its place in `root`, where a start of the hub loads it. So no start of this code meets a package whose
+    load does not end: a refused package is not kept in `root`, the sweep does nothing more for it, and an update does
+    not fetch it again (teams_once). `digest` is the SHA-256 of the token of the sweep's decision (teams_later).
+
+    First the leftovers of a process that a stop ended in such a step (a folder of its own, a copy of the records)
+    go. Any fault of this thread (a full disk at a folder of its own, a write) is a try that failed for a cause that
+    can pass: so the next try comes one RELEASE_POLL later, and not with a GET at each tick."""
+    import tempfile
+    import teamspack
+    sha, data, staging = lock["sha256"], None, None
+    try:
+        with _teams_disk:
+            teamspack.prune(root, {name for name in teams_names(root) if teamspack.SHA256.fullmatch(name)})
+            there = teamspack.have(lock, root) is not None
+        if not there:
+            data, why = teams_fetch(lock)
+            if why is None:
+                os.makedirs(root, mode=0o700, exist_ok=True)
+                staging = tempfile.mkdtemp(prefix=teamspack.PART, dir=root)
+                why = teams_place(data, lock, staging)
+            if why is not None:
+                with LOCK:
+                    teams_later(lock, digest, why)
+                return
+        said = teams_check(staging or root)
+        if said is not None and said[0] == "later":
+            with LOCK:
+                teams_later(lock, digest, said[1])
+            return
+        if said is not None:
+            with _teams_disk:
+                if there:
+                    shutil.rmtree(os.path.join(root, sha), ignore_errors=True)
+            with LOCK:
+                teams_once_set(sha, refused=True)
+                log("hub", f"the Teams code of the release that this hub runs ({sha[:12]}) did not pass its check "
+                           f"before a restart onto it: {said[1]}. The hub runs Core, keeps no copy of that code, and "
+                           f"does not try it again.")
+            return
+        if data is not None:
+            with _teams_disk:
+                why = teams_place(data, lock, root)
+            if why is not None:
+                with LOCK:
+                    teams_later(lock, digest, why)
+                return
+        with LOCK:
+            _teams.update(ready=sha, later=None)
+            teams_restart(sha)
+    except Exception as e:
+        print_fault()
+        with LOCK:
+            teams_later(lock, digest, f"this server could not take it in ({type(e).__name__}: {e})"[:400])
+    finally:
+        if staging:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def teams_package_for(manifest, origin, bundled=False):
+    """A step of release_work, outside LOCK, after the row says updating and before the records are copied: the
+    package that the lock of the release's revision names, for a fleet with Teams on. None: the run goes on. Else the
+    answer that the run ends with:
+
+    - what releases.Update.before() refuses (it fetches `upstream`, but for a run whose commit the second route took
+      already: `bundled`, release_bundled), as the run would refuse it;
+    - KEPT at `hold`, with the sentence of design 2's section 4, while the package is neither in teams_dir() nor given
+      by the channel, and this process runs Teams parts (teams_loaded): the wait keeps them on. The sweep runs the
+      release again at its next poll. These runs are counted in a row (teams_waited), across releases, and after
+      TEAMS_WAIT_MOST of them the next run goes on without the package: the fleet takes Core, its parts are not
+      listed, and the sweep gets the package when the channel gives it. A taken release sets the count to zero
+      (finish_release). A process that runs no part has none to keep on, so its run goes on at once, and the sweep
+      gets the package after the restart.
+
+    The package goes into teams_dir() itself, where the release's schema check loads it from the clone, and that
+    check ends a part whose import does not end. A package whose check the sweep refused (teams_once) is taken as not
+    there: no fetch and no write of it, so no start of this hub meets it again. A fleet with no licence, and a hub
+    with no teams_dir(), returns at once, with no fetch and no call."""
+    root = teams_dir()
+    if not root or not teams_up():
+        return None
+    run = releases.Update(kit_dir(), manifest, origin=origin, upstream=release_upstream(), floor=kit_floor(),
+                          bundled=bundled)
+    refused = run.before()
+    if refused:
+        return refused
+    import teamspack
+    code, text, _ = git_kit("show", f"{manifest['revision']}:{TEAMS_LOCK_FILE}")
+    lock = teamspack.read_lock(text) if code == 0 else None
+    if lock is None or not lock["files"]:
+        return None
+    with LOCK:
+        refused = teams_once(lock["sha256"], refused=True)
+    with _teams_disk:
+        there = not refused and teamspack.have(lock, root) is not None
+    why = "its check before a restart onto it did not end, so this hub does not take it again" if refused else None
+    if not there and not refused:
+        data, why = teams_fetch(lock)
+        if why is None:
+            with _teams_disk:
+                why = teams_place(data, lock, root)
+    if why is None:
+        with _teams_disk, LOCK:
+            kv_set("teams_fetched", lock["sha256"])
+        return None
+    if teams_loaded() is None:
+        return None         # this process runs no Teams part, so the release turns none off: no wait, only Core later
+    with LOCK:
+        waited = teams_waited()
+        if waited >= TEAMS_WAIT_MOST:
+            log("hub", f"release {manifest['version']} goes on without its Teams code after {waited} runs in a row "
+                       f"that waited for it ({why}): this fleet takes Core, and its Teams parts are listed again when "
+                       f"the hub gets that code")
+            return None
+        kv_set("teams_waited", waited + 1)
+    host = releases._host(release_channel()) or "the release channel"
+    return run.answer(releases.KEPT, "hold", f"Release {manifest['version']} waits for its Teams code, which this "
+                                             f"server could not get from {host} ({why}). This fleet stays at "
+                                             f"{run.pinned[:12]}.")
+
+
+def teams_lock_moved(old, new):
+    """For restart_hub_soon: True when Teams is on and the lock differs between the revisions `old` and `new`. A
+    release that changes only Teams files changes only the lock of the public tree, which is no Fleet file, so
+    same_code says "the same", and the hub would run the old package under the new lock. A fleet with no licence asks
+    nothing of git here, and restarts as before."""
+    return bool(old and new and teams_up()) and git_kit("diff", "--quiet", old, new, "--", TEAMS_LOCK_FILE)[0] == 1
+
+
+def teams_code_view():
+    """The key teams_code of GET /ui/releases, only while teams_on(), as {"teams_code": {...}}; else {}, so a fleet with
+    no licence reads no new key. `lock`: the SHA-256 that the lock of the code that runs names (TEAMS_LOCK), or None
+    for a tree with no lock; `loaded`: the one of the package that this process loaded (teams_loaded), or None;
+    `waited`: the runs of an update in a row that waited for their package (teams_package_for). No screen shows it."""
+    if not teams_up():
+        return {}
+    return {"teams_code": {"lock": TEAMS_LOCK["sha256"] if TEAMS_LOCK else None, "loaded": teams_loaded(),
+                           "waited": teams_waited()}}
 
 
 class HubServer(ThreadingHTTPServer):

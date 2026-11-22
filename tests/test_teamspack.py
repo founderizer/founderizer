@@ -23,10 +23,13 @@ import py_compile
 import shutil
 import socket
 import sqlite3
+import ssl
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -70,7 +73,8 @@ class PackAndLock(Folders):
         """The lock in a release's tree is made on the Mac, and a hub checks the package against it on a server, so
         two machines that pack the same files must make the same bytes, and a hub reads only a lock whose every field
         is one that a release writes. Bug: each hub with Teams refuses its package, or reads a lock whose size is
-        larger than any package."""
+        larger than any package, or a lock too deep for the parser raises RecursionError at the hub's import
+        (teams_lock_here), where "no lock" is the answer."""
         data = teamspack.pack(FILES)
         self.assertEqual(teamspack.pack(dict(reversed(list(FILES.items())))), data)
         self.assertTrue(data.isascii() and data.endswith(b"}\n") and data.count(b"\n") == 1, data)
@@ -83,14 +87,15 @@ class PackAndLock(Folders):
         for wrong in ("", "[]", "{}", "not json", dict(lock, files=True), dict(lock, files=-1), dict(lock, format=2),
                       dict(lock, sha256=lock["sha256"].upper()), dict(lock, sha256=lock["sha256"][:63]),
                       dict(lock, size=0), dict(lock, size=teamspack.MOST_BYTES + 1), dict(lock, size=1.5),
-                      dict(lock, more=1)):
+                      dict(lock, more=1), "[" * 100000 + "]" * 100000):     # too deep for the parser: no lock
             with self.subTest(wrong=wrong):
                 self.assertIsNone(teamspack.read_lock(wrong if isinstance(wrong, str) else json.dumps(wrong)))
 
     def test_a_package_that_no_release_could_name_is_refused(self):
         """A name with a folder in it would write a file outside the package's folder, and bytes that are not the
         one form of their files would let one lock name two sets of files. Bug: a hub writes a file outside its
-        folder, or loads bytes that no release named."""
+        folder, or loads bytes that no release named, or bytes too deep for the parser raise RecursionError where a
+        caller reads ValueError."""
         data = teamspack.pack(FILES)
         many = {f"teams_{n}.py": "" for n in range(teamspack.MOST_FILES + 1)}
         for name, wrong in [
@@ -108,6 +113,7 @@ class PackAndLock(Folders):
                 ("not its one form", data.replace(b'":', b'": ', 1)),
                 ("no line end", data[:-1]),
                 ("no JSON", b"\x00" + data),
+                ("JSON too deep for the parser", b"[" * 100000 + b"]" * 100000 + b"\n"),
                 ("no bytes", data.decode("ascii"))]:
             with self.subTest(name):
                 with self.assertRaises(ValueError):
@@ -190,6 +196,30 @@ class StandIn(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class Drip(http.server.BaseHTTPRequestHandler):
+    """A channel that answers one byte each 50 ms, for 20 seconds: in its head (/head) or in the body of a package of
+    `server.size` bytes after a whole head (/body). It ends when the client goes or the test ends (`server.stop`)."""
+
+    def do_GET(self):
+        self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+        rest = b"X-Slow: " + b"y" * 400 + b"\r\n" if self.path == "/head" else b""
+        rest += b"Content-Length: %d\r\n\r\n" % self.server.size
+        if self.path == "/body":
+            self.wfile.write(rest)
+            rest = b"x" * 400
+        for at in range(len(rest)):
+            if self.server.stop.wait(0.05):
+                return
+            try:
+                self.wfile.write(rest[at:at + 1])
+                self.wfile.flush()
+            except OSError:
+                return
+
+    def log_message(self, *_args):
+        pass
+
+
 class Fetch(unittest.TestCase):
     def test_one_get_sends_the_token_only_as_its_bearer_and_takes_no_more_than_the_lock(self):
         """The licence's token is a login of the fleet (RULES.md, "Logins"). Bug: it reaches a proxy that the
@@ -216,10 +246,104 @@ class Fetch(unittest.TestCase):
         status, why = teamspack.fetch(dead + "/p", lock, "the-token", wait=5)
         self.assertEqual(status, 0)
         self.assertTrue(why.startswith("the channel did not answer: "), why)
-        self.assertEqual(teamspack.fetch(base + "/p", lock, "a\nsecret"),
-                         (0, "no request could be made of that address and token"))
         self.assertEqual(teamspack.fetch(base + "/p", "no lock", "the-token"), (0, "no lock"))
+        # An answer, and never an exception, for what makes no request: a token that no header carries (its words
+        # would quote it), an address that is no text, a port that is no number, a token that is no text.
+        for address, token in ((base + "/p", "a\nsecret"), (None, "the-token"), (base.encode() + b"/p", "the-token"),
+                               (base + ":x/p", "the-token"), (base + "/p", None), (base + "/p", b"the-token")):
+            with self.subTest(address=address, token=token):
+                self.assertEqual(teamspack.fetch(address, lock, token), (0, teamspack.NO_REQUEST))
+        # The bearer goes only over https, and in clear only to this machine's loopback address: no other scheme and no
+        # other host over http is asked at all, a name of this machine (localhost) not either.
+        port = server.server_address[1]
+        for address in (f"http://localhost:{port}/p", "http://192.0.2.1/p", "file:///etc/hosts", "data:,x",
+                        f"ftp://127.0.0.1:{port}/p", "channel.invalid/p"):
+            with self.subTest(address=address):
+                self.assertEqual(teamspack.fetch(address, lock, "the-token"), (0, teamspack.ONLY_HTTPS))
         self.assertEqual(len(server.seen), 4)
+
+    def test_the_whole_get_ends_at_its_limit_however_slowly_the_channel_answers(self):
+        """The one GET of a package runs in the release thread of the hub, the one thread of each check and update.
+        A socket's own timeout limits each read only, so a channel that sends one byte at a time, in the TLS handshake,
+        in the head or in the body, held that thread for as long as it sent, and the fleet took no release meanwhile.
+        Bug: a channel that is slow, or that was taken over, stops a fleet's updates."""
+        data = teamspack.pack(FILES)
+        lock = teamspack.lock_of(data)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Drip)
+        server.size, server.stop = len(data), threading.Event()
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.stop.set)
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        self.addCleanup(listener.close)
+
+        def handshake():
+            """A TLS record of 16 KiB after the client's hello, one byte each 50 ms."""
+            while not server.stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                with conn:
+                    try:
+                        conn.settimeout(5)
+                        conn.recv(4096)
+                        conn.sendall(b"\x16\x03\x03\x40\x00")
+                        for _ in range(400):
+                            if server.stop.wait(0.05):
+                                return
+                            conn.sendall(b"\x02")
+                    except OSError:
+                        pass
+        threading.Thread(target=handshake, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        for address in (base + "/head", base + "/body", f"https://127.0.0.1:{listener.getsockname()[1]}/p"):
+            with self.subTest(address=address):
+                began = time.monotonic()
+                self.assertEqual(teamspack.fetch(address, lock, "the-token", wait=1.5),
+                                 (0, "the channel did not answer whole in 1.5 seconds"))
+                self.assertLess(time.monotonic() - began, 5)        # the drip alone takes 20 seconds
+        # The timer can come while no socket is there to shut (a slow connection, or the moment that a socket becomes
+        # a TLS one): the GET stops there, and does not go on with no limit at all.
+        connect = socket.create_connection
+
+        def slow(*args, **how):
+            time.sleep(1.7)
+            return connect(*args, **how)
+        with patch.object(teamspack.socket, "create_connection", slow):
+            began = time.monotonic()
+            self.assertEqual(teamspack.fetch(base + "/head", lock, "the-token", wait=1.5),
+                             (0, "the channel did not answer whole in 1.5 seconds"))
+            self.assertLess(time.monotonic() - began, 5)
+
+    def test_a_certificate_that_does_not_verify_is_said_in_its_own_words(self):
+        """ssl.SSLCertVerificationError is a ValueError too, so a channel whose certificate does not verify (a proxy
+        that reads TLS, a wrong name) read as a request that no address and token could make. The bug: the hub's log
+        sends support to the token and the address, and away from the certificate."""
+        if not shutil.which("openssl"):
+            self.skipTest("no openssl here to make a certificate")
+        folder = Path(tempfile.mkdtemp(prefix="fleet-teamspack-tls-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        certificate, key = folder / "certificate.pem", folder / "key.pem"
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj",
+                        "/CN=127.0.0.1", "-keyout", str(key), "-out", str(certificate)], check=True, capture_output=True)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StandIn)
+        server.seen, server.answers = [], {}
+        serving = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        serving.load_cert_chain(str(certificate), str(key))
+        server.socket = serving.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        data = teamspack.pack(FILES)
+        status, why = teamspack.fetch(f"https://127.0.0.1:{server.server_address[1]}/p", teamspack.lock_of(data),
+                                      "the-token", wait=5)
+        self.assertEqual(status, 0)
+        self.assertTrue(why.startswith("the channel's certificate did not verify: "), why)
+        self.assertEqual(server.seen, [])
 
 
 
