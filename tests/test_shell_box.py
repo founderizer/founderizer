@@ -65,12 +65,14 @@ H1_ANSWER = [name for name in H1_TASK if name != "set_reminder"]
 H1_CONTACT = ["message_contact"]        # with contacts.v2, which TEAM turns on: its words go to a person (the owner,
                                         # 3 November 2026)
 # read_attachment: the owner's own file to it, as data in the answer, which gives no reach (17 November 2026)
-H1_CHAT = ["message_agent", "message_owner", "read_attachment", "read_messages", "recall", "see_responsibilities",
-           "tell_owner"]
+# keep_instruction and end_standing: the owner's own wish, the owner's whole message as one item (the design "An
+# agent keeps its own rules", slice 4; test_standing.Provenance)
+H1_CHAT = ["end_standing", "keep_instruction", "message_agent", "message_owner", "read_attachment", "read_messages",
+           "recall", "see_responsibilities", "tell_owner"]
 REVIEW_EXTRAS = ["remember", "write_notes"]
 # What no session of an agent whose Shell box is off holds; remember and write_notes only in a duty that names them,
 # recall only in its owner chat, and keep_instruction only in a task that a colleague's question opened, for that
-# colleague's own wish (test_contacts_v2.ShellOffRule)
+# colleague's own wish (test_contacts_v2.ShellOffRule), and in its owner chat, for the owner's own wish
 FORBIDDEN = {"call_api", "report_up", "ask_my_requester", "ask_reporter", "keep_instruction",
              "write_skill",
              "write_knowledge", "recall", "search_history", "read_history", "see_earlier_work",
@@ -835,7 +837,7 @@ class Tools(Fleet):
                         set(self.names("ops", ops)))
         chat = (hub.kv_get("db_id"), "owner-chat", 1)
         self.assertEqual(sorted(self.names("desk", chat)), H1_CHAT)
-        self.assertEqual(set(self.names("desk", chat)) & (FORBIDDEN - {"recall"}), set())
+        self.assertEqual(set(self.names("desk", chat)) & (FORBIDDEN - {"recall", "keep_instruction"}), set())
         for name in ("start_task", "request_secret", "search_history", "read_history"):
             self.assertIn(name, self.names("ops", chat))
             self.assertNotIn(name, self.names("desk", chat))

@@ -410,6 +410,22 @@ class Sender(PushCase):
                 self.assertEqual(ping["error"], f"127.0.0.1 answered {status}: the {error} line")
                 self.assertIsNotNone(hub.q1("SELECT 1 FROM owner_device_push"))
                 self.assertEqual(hub._ping_hold["until"], 0.0)              # and nothing holds the next ping back
+        # a redirect is an answer of its own, and no request goes to the host that it names, which would get the
+        # entitlement's bearer and could answer for Apple (urllib's own handler followed a 302 as a GET)
+        other = ThreadingHTTPServer(("127.0.0.1", 0), OurSide)
+        other.got, other.answer = [], (200, {"status": 200, "reason": ""})
+        threading.Thread(target=other.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+        try:
+            with self.assertRaises(push.PushError) as refused:
+                with patch.object(OurSide, "do_POST", lambda handler: (handler.send_response(302),
+                        handler.send_header("Location", f"http://127.0.0.1:{other.server_port}/api/push"),
+                        handler.send_header("Content-Length", "0"), handler.end_headers())):
+                    push.send(hub.CFG["release_channel"], "an-entitlement", "a" * 64, {"aps": {}}, "production")
+            self.assertEqual(str(refused.exception), "127.0.0.1 answered 302")
+            self.assertEqual(other.got, [])
+        finally:
+            other.shutdown()
+            other.server_close()
 
     def test_a_ping_that_our_side_holds_back_goes_again_after_its_time_and_reaches_apple_once(self):
         """A count of our side's that is full answers 429 with Retry-After (docs/CONTRACTS.md, "The limits"). Our side

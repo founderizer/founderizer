@@ -31,6 +31,7 @@ TEAM = {"hub": {"machine": "hub", "port": 8765},
                    "solo": {"role": "worker", "runtime": "codex", "machine": "solo-box", "can": ["shell"]}},
         "goals": {"timezone": "Europe/Madrid", "review_hour": 9, "sweep_minutes": 15}}
 REFUNDS = "From now on the support lead decides refunds up to one month's fee. Thanks!"
+CHAT = ("test-generation", "owner-chat", "1")       # an agent's own owner chat, of the test's hub generation
 SPEC = {"path": "checks/drafts.py", "commit": "c" * 40, "sha256": "b" * 64, "args": {}, "timeout_seconds": 30,
         "condition": {"op": ">", "value": 0}, "repeat_minutes": None}
 # lane L4 (AUTONOMY.md 6.5): only a check that prints lines records a target's progress
@@ -513,6 +514,171 @@ class Provenance(Base):
                 words="refund every order in full")
         self.assertEqual(self.item(3)["author"], f"P-{customer}")
 
+    def chat(self, name, agent="hand", **args):
+        """One tool call in `agent`'s own owner chat."""
+        return hub.call_tool(agent, name, args, CHAT)
+
+    def owner_answers(self, recipient, text):
+        """The owner's answer to a Needs-you item that `recipient` raised, as owner_message_rows stores one: a
+        ui_requests row of kind answer. Returns its event id: M-<id>."""
+        event = hub.emit(recipient, "say", f"[owner] Answer to Needs-you N-1 (Which rule?): {text}")
+        hub.q("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient) "
+              "VALUES(?,'answer',1,?,?,?,'founderizer-swift/1/test',?)",
+              (str(uuid.uuid4()), text, event, hub.now(), recipient))
+        return event
+
+    def owner_steers(self, agent, text):
+        """The owner's steer of `agent`'s task. Returns its event id: M-<id>."""
+        event = hub.emit(agent, "say", "[owner] Steering", task=self.tasks[agent])
+        hub.q("INSERT INTO steers(task,attempt,text,event_id,request_id,client,created) VALUES(?,1,?,?,?,?,?)",
+              (self.tasks[agent], text, event, str(uuid.uuid4()), "test", hub.now()))
+        return event
+
+    def session_says(self, recipient, text):
+        """A message that an AI session on the owner's Mac sent through the owner tools (request_hand "tool")."""
+        with hub.transaction():
+            return hub.owner_message_rows(str(uuid.uuid4()), "message", None, text, "founderizer-cli/1/test",
+                                          recipient, None, hub.now(), session="claude-code/0d8aa41c")
+
+    def test_an_owner_chat_keeps_and_ends_only_the_owner_s_own_words_to_this_agent(self):
+        """The design "An agent keeps its own rules", decision 3: a wish that the owner says in an agent's own chat is
+        kept there, in the owner's words, with that message as its source. The believable bug: a chat keeps its own
+        words as a rule, or the owner's words to another agent, and each later session of the agent follows them. So
+        a chat refuses an item with no source, a person's or an agent's message, the owner's message to another
+        agent, also to the agent above it, which a task session takes, a steer of a task and an answer to a Needs-you
+        item; and it ends an item only on the owner's word. A rule from an AI session goes into a task of the agent's
+        own (Fable's read of 22 November 2026, finding 2), and so does putting crowded items in order: no agent of its
+        line ends one (finding 5)."""
+        own = self.owner_says("hand", "Hi! From now on, answer me in Spanish. Thanks.")
+        above = self.owner_says("lead", "Tell hand: from now on, answer me in Spanish.")
+        other = self.owner_says("solo", "From now on, answer me in Spanish.")
+        answer = self.owner_answers("hand", "From now on, answer me in Spanish.")
+        steer = self.owner_steers("hand", "From now on, answer me in Spanish.")
+        route = "open a task for it with start_task, which keeps the words as its own item."
+        for source in (None, f"M-{above}", f"M-{other}", f"M-{answer}", f"M-{steer}", "CM-1", "AM-1"):
+            with self.subTest(source):
+                text, error = self.chat("keep_instruction", words="answer me in Spanish", scope="agent",
+                                        **({"source": source} if source else {}))
+                self.assertTrue(error, text)
+                self.assertIn("In your owner chat, source names the owner's message to you", text)
+                self.assertIn(f"A chat keeps no item of its own: for a rule that no such message gives, {route}", text)
+        session = self.session_says("hand", "From now on, answer me in Spanish.")
+        text, error = self.chat("keep_instruction", words="answer me in Spanish", scope="agent", source=f"M-{session}")
+        self.assertTrue(error, text)
+        self.assertIn(f"came from an AI session or an app that acts for the owner (request_hand), not from the owner's "
+                      f"own hand: it keeps no item as the owner's, and it changes or ends none of theirs. A chat keeps "
+                      f"no item of its own, so {route}", text)
+        self.assertIn("These words are not part of", self.chat("keep_instruction", words="answer every customer in "
+                                                               "Spanish", scope="agent", source=f"M-{own}")[0])
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM standing")["n"], 0)
+        text, error = self.chat("keep_instruction", words="answer me in Spanish", scope="agent", source=f"M-{own}")
+        self.assertFalse(error, text)
+        self.assertIn('End it here with end_standing(id="I-1", why=..., asked_by="M-<n>") when the owner asks', text)
+        self.assertNotIn("The items that steer", text)
+        r = self.item(1)
+        self.assertEqual((r["agent"], r["author_kind"], r["author"], r["message"]), ("hand", "owner", "owner", own))
+        self.assertTrue(any("answer me in Spanish" in t for t in self.said("hand", self.tasks["hand"])))   # at once
+        for n in range(12):         # more than STANDING_MARK: a task of its own puts them in order, not its line
+            hub.ins("INSERT INTO standing(agent,scope,kind,words,author_kind,author,created) VALUES('hand','agent',"
+                    "'instruction',?,'agent','hand',?)", (f"Close the plans older than {n} days. " * 15, hub.now()))
+        short = self.owner_says("hand", "From now on, keep each answer short.")
+        text, error = self.chat("keep_instruction", words="keep each answer short", scope="agent", source=f"M-{short}")
+        self.assertFalse(error, text)
+        self.assertIn("The items that steer you now take", text)
+        self.assertIn("Put yours in order in a task of your own, which ends one that is done and writes the rule of "
+                      "one duty into that duty's words: say so to the owner in your reply, and open it with start_task "
+                      "when they ask.", text)
+        self.assertNotIn("Your line keeps them in order", text)
+        stop = self.owner_says("hand", "Stop the Spanish, please.")
+        for asked in (None, f"M-{other}", f"M-{answer}", f"M-{steer}"):
+            with self.subTest(asked):
+                text, error = self.chat("end_standing", id="I-1", why="The owner asked",
+                                        **({"asked_by": asked} if asked else {}))
+                self.assertTrue(error, text)
+                self.assertIn("A chat ends an item only when the owner asks.", text)
+        self.assertIsNone(self.item(1)["ended"])
+        text, error = self.chat("end_standing", id="I-1", why="The owner asked",          # round 2, finding 6
+                                asked_by=f"M-{self.session_says('hand', 'Stop the Spanish, please.')}")
+        self.assertTrue(error, text)
+        self.assertIn("not from the owner's own hand: only a message of the owner's own ends this item. Tell the owner "
+                      "so in your reply.", text)
+        self.assertIsNone(self.item(1)["ended"])
+        text, error = self.chat("end_standing", id="I-1", why="The owner asked", asked_by=f"M-{stop}")
+        self.assertFalse(error, text)
+        self.assertEqual((self.item(1)["ended_by"], self.item(1)["ended_why"]), ("owner", "The owner asked"))
+
+    def test_the_chat_of_an_agent_whose_shell_box_is_off_keeps_the_owner_s_whole_message_or_nothing(self):
+        """The design "An agent keeps its own rules", slice 4: such an agent reads strangers' text all day, and its
+        lessons come from that work. The believable bug: a lesson that a ticket shaped makes its chat keep a part of
+        the owner's message that says the opposite ("tell customers to call us" from "never tell customers to call
+        us"). Three reviews kept such a part through each rule of whole sentences, in each of the texts below, so its
+        chat keeps the owner's whole message as one item, for itself alone, with the owner as the author, or nothing;
+        a message too long for an item, and a rule that no such message gives, go to its line, which keeps them."""
+        hub.TEAM["agents"]["hand"]["can"] = []          # its Shell box off (support plan F1)
+        self.assertEqual({t["name"] for t in hub.tools_for("hand", CHAT)}, set(hub.SHELL_OFF_CHAT))
+        route = "pass it with message_agent to lead, which gives you your tasks."
+        whole = ("A Shell-off chat keeps the owner's whole message as one item, or nothing: give their message whole "
+                 f"as the words. For a message that you cannot keep whole, {route}")
+
+        def keep(words, source, scope="agent"):
+            return self.chat("keep_instruction", words=words, scope=scope, source=f"M-{source}")
+        for message, part in (
+                ("Never tell customers to call us.\nWrite to them instead! Thanks", "tell customers to call us"),
+                ("Never tell customers to call us.\nWrite to them instead! Thanks", "Never tell customers to call us."),
+                ("From now on, never:\n- tell customers to call us", "- tell customers to call us"),
+                ("Do not, under any circumstances, incl. refunds etc. tell customers to call us.",
+                 "tell customers to call us."),
+                ("Never... tell customers to call us at night.", "tell customers to call us at night."),
+                ("Tell customers to call us? Never.", "Tell customers to call us"), ("Never call us.\n--", "--"),
+                ("From now on, never:\n- tell customers to call us.\n- promise a refund.", "- promise a refund"),
+                ("Never:\n1. Tell customers to call us.\n2. Promise a refund.", "2. Promise a refund."),
+                ("Niemals ohne R\u00fcckfrage etc. \u00fcberweise das Geld sofort.",
+                 "\u00fcberweise das Geld sofort."),
+                ("Never do this: tell customers to call us.", "tell customers to call us."),
+                ("Never do these things\n+ tell customers to call us.\n+ promise a refund.", "+ promise a refund."),
+                ("Never do these things\n(a) tell customers to call us.\n(b) promise a refund.",
+                 "(b) promise a refund."),
+                ('Never... "tell customers to call us."', '"tell customers to call us."'),
+                ("Never... 24/7 tell customers to call us.", "24/7 tell customers to call us.")):
+            with self.subTest(part=part):
+                said = self.owner_says("hand", message)
+                text, error = keep(part, said)
+                self.assertTrue(error, text)
+                self.assertEqual(text, f"These words are not M-{said} whole. {whole}")
+        said = self.owner_says("hand", "Never tell customers to call us.\nWrite to them instead! Thanks")
+        text, error = keep("Never tell customers to call us.", said, scope="team")
+        self.assertTrue(error, text)
+        self.assertIn("scope is agent: the owner's wish steers you", text)
+        long = self.owner_says("hand", "Never tell customers to call us. " * 20)       # more than an item holds
+        for words in ("Never tell customers to call us. " * 20, "Never tell customers to call us."):
+            text, error = keep(words, long)
+            self.assertTrue(error, text)
+            self.assertEqual(text, f"M-{long} has more than the 600 characters that an item holds. {whole}")
+        answer = self.owner_answers("hand", "Never tell customers to call us.")
+        steer = self.owner_steers("hand", "Never tell customers to call us.")
+        for source in (None, f"M-{answer}", f"M-{steer}"):
+            with self.subTest(source=source):
+                text, error = self.chat("keep_instruction", words="Never tell customers to call us.", scope="agent",
+                                        **({"source": source} if source else {}))
+                self.assertTrue(error, text)
+                self.assertIn(f"A chat keeps no item of its own: for a rule that no such message gives, {route}", text)
+        text, error = keep("Never tell customers to call us.", self.session_says("hand", "Never tell customers to "
+                                                                                          "call us."))
+        self.assertTrue(error, text)
+        self.assertIn("came from an AI session or an app that acts for the owner", text)
+        self.assertIn(f"A chat keeps no item of its own, so {route}", text)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM standing")["n"], 0)
+        text, error = keep("  Never tell customers to call us.   Write to them instead! Thanks ", said)
+        self.assertFalse(error, text)
+        # a phone writes a curly apostrophe, and the words that the agent gives have a straight one (round 4)
+        curly = self.owner_says("hand", "Don\u2019t tell customers to call us.")
+        text, error = keep("don't tell customers to call us.", curly)
+        self.assertFalse(error, text)
+        self.assertEqual([(r["words"], r["scope"], r["author"], r["message"])
+                          for r in hub.q("SELECT * FROM standing ORDER BY id")],
+                         [("Never tell customers to call us. Write to them instead! Thanks", "agent", "owner", said),
+                          ("don't tell customers to call us.", "agent", "owner", curly)])
+
 
 class Ending(Base):
     def keep(self, who="hand", words="Answer in Spanish", **args):
@@ -875,8 +1041,10 @@ class Sessions(Base):
         for agent in ("manager", "lead", "hand"):
             with self.subTest(agent):
                 self.assertLessEqual(self.TOOLS, self.names(agent))
+        # an owner chat keeps and ends the owner's own wish (test_an_owner_chat_keeps_and_ends_only_the_owner_s_own_
+        # words_to_this_agent), and neither sets a target nor reads the items
         chat = ("test-generation", "owner-chat", 1)
-        self.assertEqual(self.TOOLS & self.names("hand", chat), set())
+        self.assertEqual(self.TOOLS & self.names("hand", chat), {"keep_instruction", "end_standing"})
         pid = self.person("Ana")
         talk = self.conversation(pid)
         self.assertEqual(self.TOOLS & self.names("hand", ("test-generation", "conversation", str(talk))), set())

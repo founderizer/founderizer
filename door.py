@@ -260,7 +260,7 @@ FULL_NOTE = (" Its second answer, Full access on {host} (raise_needs_you door_ho
 # changes. ask: the host is rule-only, and the door's file does not say why: it is no server of the fleet's own keys,
 # and agents of two businesses do not hold it at Fix, so the manager's hold, the host's own install or a second
 # business tag made it so; the hub knows the hold (needs names the host as needs_access takes it).
-ROUTES = ("yes", "holder", "window", "again", "none", "ask")
+ROUTES = ("yes", "holder", "window", "again", "none", "ask", "key")
 TIMER_TRIES = 6             # times that the door asks a host to end its rollback countdown after a script or a run
 TIMER_PAUSE = 10            # seconds between them, while the host does not answer
 RUN_WAIT = 50 * 60          # how long a GitOps sync's call waits for its run to end: less than an agent's ops call waits

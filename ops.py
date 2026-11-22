@@ -95,6 +95,9 @@ def route_line(answer, target):
         return (f"route: ask why. Ask your requester with ask_my_requester and needs_access {needs}: the hub says "
                 f"what keeps {target} at rule-only, and who can change that. Until then, only the rule forms run "
                 f"there.")
+    if route == "key":          # a provider account that the door holds no key for (door_providers.no_key)
+        return (f"route: a key of the owner's. Ask the owner for it with request_secret, with door {target} and the "
+                f"steps above in its details. Once the owner saves it, send this same call again.")
     if route == "window":
         return "route: the owner's window. Send the same call again when the window allows it."
     if route == "again":

@@ -310,14 +310,17 @@ class ChatApps(OwnerAPI):
         """Owner feature agent_tags (CHAT-APPS.md 21): a chat app sends the owner's words as they are, so the hub finds
         the @ tags itself: a whole role (spaces as one run, the longest role first), a name, one word that starts the
         role or the name of one other agent. Words that fit two agents are no tag, and the line names both; an email, a
-        URL, a "." before a letter, code, a fenced block, the chat's own agent and an unknown word are never tags, so a
-        tag never opens work for the wrong agent. The table of rules 1 and 2 is the same as the one of FleetCore's
-        AgentTagsTests, by hand."""
+        URL, a "." before a letter, code, a fenced block, the chat's own agent (also by a role that it shares with
+        another agent) and an unknown word are never tags, so a tag never opens work for the wrong agent. A role that is
+        another agent's name is that agent's name, as its label says, so the Mac draws the badge of the agent that the
+        hub tagged. The table of rules 1 and 2 is the same as the one of FleetCore's AgentTagsTests
+        (`theTagsAreTheHubsRulesOneAndTwo`), by hand."""
         self.own()
         for name, title in (("nova", "Customer Support"), ("kai", "Customer Support Lead"),
-                            ("atlas", "Growth Marketing Lead")):
+                            ("atlas", "Growth Marketing Lead"), ("juno", "Grok"), ("mia", "Studio Ops")):
             hub.TEAM["agents"][name] = {"role": "worker", "runtime": "codex", "machine": "vps-host", "can": ["shell"],
                                         "title": title}
+        hub.TEAM["agents"]["studio"]["title"] = "Studio Ops"    # a hand-written team.json: the chat's agent shares it
         for text, tags in (("@Customer Support, look at it", [("nova", 0, 17)]),
                            ("Ask @Customer Support Lead?", [("kai", 4, 22)]),
                            ("@Growth  Marketing\tLead now", [("atlas", 0, 23)]),
@@ -326,7 +329,7 @@ class ChatApps(OwnerAPI):
                            ("pat@marketing.example", []), ("https://example.com/@marketing", []),
                            ("see @marketing.example", []), ("run `@marketing` now", []),
                            ("```\n@marketing\n```\nok", []), ("@studio, you", []), ("@nobody here", []),
-                           ("@support, then", [])):
+                           ("@Grok, then", [("grok", 0, 5)]), ("@Studio Ops now", []), ("@support, then", [])):
             self.assertEqual(self.inbound(text)[0], "stored", text)
             req = self.last_request()
             self.assertEqual([(m["agent"], m["start"], m["length"]) for m in hub.mentions_read(req["mentions"])],

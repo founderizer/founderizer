@@ -3,22 +3,36 @@
 A hub with a live licence runs the files of one package beside its checkout: the package whose hash the lock of its
 release names, and no other. What is held here: the same files give the same bytes; a lock is read field by field; a
 package that no release could name is refused before any byte of it is written; a folder counts as the package only
-while its files are that package; and the one GET of a package sends the token only as its bearer. No hub, and no
-network but a stand-in of this module on the loopback address."""
+while its files are that package; and the one GET of a package sends the token only as its bearer. No network but a
+stand-in of this module on the loopback address.
+
+The seam's half (Seam) holds hub.py's region "Teams parts: the one seam of Core" (design 2, 3.4), with stand-in parts in
+a package that each test writes: a fleet with no licence reads and imports nothing of it, a part loads only from the
+bytes whose hash the lock of the code names, and a fault of a part is a line of build_schema, and no stop of the
+hub."""
+import contextlib
 import hashlib
 import http.server
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import py_compile
 import shutil
 import socket
+import sqlite3
 import stat
+import sys
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 
+import hub
+import refusal_words
 import teamspack
+from test_ui_api import quick
 
 LICENCE = "TEAMS-LICENSE.md"
 FILES = {LICENCE: "DRAFT. Not in force.\n", "teams_demo.py": "FEATURE = 'demo'\r\n\n\ndef start(H):\n    return H\n",
@@ -205,6 +219,261 @@ class Fetch(unittest.TestCase):
                          (0, "no request could be made of that address and token"))
         self.assertEqual(teamspack.fetch(base + "/p", "no lock", "the-token"), (0, "no lock"))
         self.assertEqual(len(server.seen), 4)
+
+
+
+# ---- the seam of Core (hub.py, "Teams parts: the one seam of Core")
+
+DEMO = ('FEATURE = "demo"\nHEARD = []\n\n\ndef start(H, *args):\n    return H, args\n\n\n'
+        'def listed(H):\n    HEARD.append(H)\n    return H.CFG.get("demo_listed", True)\n\n\n'
+        'def secret(H):\n    return "a function that Core does not declare"\n')       # a part, as a package holds it
+ROWS = ('FEATURE = "rows"\nSCHEMA = ("CREATE TABLE IF NOT EXISTS teams_rows(id INTEGER PRIMARY KEY)",)\n\n\n'
+        'def start(H):\n    return 1\n')                                                 # a part that makes its table
+LIVE, ENDED = {}, {"ended": 1797811200}         # the entitlement rows of a live licence and of one that the word ended
+
+
+class Seam(Folders):
+    """The seam with stand-in parts and records of the test's own. Each test leaves the seam as it found it: no part,
+    no load, no module teams_*, no finder, no folder of packages and no TEAMS_DIR_VAR."""
+
+    def setUp(self):
+        self.path = str(self.folder() / "test.db")
+        had, db = hub.DB, quick(sqlite3.connect(self.path, check_same_thread=False))
+        db.row_factory = sqlite3.Row
+        hub.DB = db
+        self.addCleanup(setattr, hub, "DB", had)
+        self.addCleanup(db.close)
+        db.executescript(hub.SCHEMA)
+        hub.migrate()
+        for patcher in (patch.dict(hub.CFG, {"teams_dir": None, "teams_source": False, "db_path": self.path}),
+                        patch.dict(hub.TEAMS_CALLS, {"demo": ("start",), "other": ("start",), "rows": ("start",)}),
+                        patch.dict(hub.TEAMS_CODE), patch.dict(hub.TEAMS_PARTS), patch.dict(hub.TEAMS_LOAD),
+                        patch.object(hub, "TEAMS_LOCK", None), patch.object(sys, "meta_path", list(sys.meta_path)),
+                        patch.dict(os.environ)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(lambda: [sys.modules.pop(one) for one in list(sys.modules) if one.startswith("teams_")])
+
+    def package(self, files):
+        """`files` as a package in the test's folder of packages, which teams_dir() names, and its lock as the lock of
+        the code that runs (TEAMS_LOCK): what a hub with Teams holds after the release step got its package."""
+        root, data = self.folder() / "teams", teamspack.pack(files)
+        hub.CFG["teams_dir"], hub.TEAMS_LOCK = str(root), teamspack.lock_of(data)
+        return Path(teamspack.place(data, hub.TEAMS_LOCK, str(root)))
+
+    def licence(self, row):
+        """The entitlement row as store_entitlement and take_ended_word leave it: `row` changes a live licence of
+        Founderizer for Teams (LIVE), and None is no row."""
+        hub.q("DELETE FROM entitlement")
+        if row is not None:
+            row = dict({"plan": "teams", "verified": 1, "ended": None}, **row)
+            hub.q("INSERT INTO entitlement(id, fleet, token, plan, until, verified, stored, ended) "
+                  "VALUES(1, 'fleet', 'a-token', ?, 2000000000, ?, 1, ?)", (row["plan"], row["verified"], row["ended"]))
+
+    def refused(self, feature):
+        with self.assertRaises(hub.Refusal) as caught:
+            hub.teams_part(feature, need=True)
+        return caught.exception.status, refusal_words.refusal_body(caught.exception)["code"]
+
+    def test_a_fleet_with_no_licence_or_an_old_token_reads_no_package_and_imports_no_teams_file(self):
+        """Rule 1 of the launch: a fleet with no licence behaves as today in each path. No package exists before P4
+        and P5, so nothing loads on any fleet in this piece; here a whole package waits, and the one thing between it
+        and its load is the licence, which each case lacks: no row, the `monthly` token of the old shop, a `teams`
+        token that our key did not sign, a licence that the signed word ended. A hub with no teams_dir() (each hub of
+        a test) and the lock of each release from P1 on (it names no Python file) read nothing either, also with a
+        live licence. The bugs: a free fleet or a test's hub reads or runs Teams code, or build_schema gives it a line
+        that it did not give before the seam."""
+        whole = self.package({"teams_demo.py": DEMO, "teams_boom.py": "raise RuntimeError('imported')\n"})
+        root, lock = hub.CFG["teams_dir"], hub.TEAMS_LOCK
+        draft = teamspack.pack({LICENCE: FILES[LICENCE]})
+        teamspack.place(draft, teamspack.lock_of(draft), root)
+        with patch.object(teamspack, "folder_pack", wraps=teamspack.folder_pack) as reads:
+            for case, row, folder, code in (
+                    ("no licence", None, root, lock), ("the old shop's token", {"plan": "monthly"}, root, lock),
+                    ("a teams token that our key did not sign", {"verified": 0}, root, lock),
+                    ("a licence that the signed word ended", ENDED, root, lock),
+                    ("a hub with no folder of packages", LIVE, None, lock),
+                    ("the lock of each release from P1 on", LIVE, root, teamspack.lock_of(draft)),
+                    ("a tree with no lock", LIVE, root, None)):
+                self.licence(row)
+                hub.CFG["teams_dir"], hub.TEAMS_LOCK = folder, code
+                self.assertEqual(hub.build_schema(), [], case)
+                self.assertEqual((hub.teams_part("demo"), hub.teams_features(), hub.TEAMS_CODE, hub.TEAMS_PARTS),
+                                 (None, [], {}, {}), case)
+                self.assertEqual(([one for one in sys.modules if one.startswith("teams_")], reads.call_count), ([], 0),
+                                 case)
+                self.assertNotIn("finder", hub.TEAMS_LOAD, case)
+                hub.TEAMS_LOAD.clear()
+            hub.CFG["teams_dir"], hub.TEAMS_LOCK = root, lock
+            said = hub.build_schema()       # the same package with a live licence: the licence was the one gate
+        self.assertEqual((said, sorted(hub.TEAMS_CODE), reads.call_count),
+                         (["The Teams part teams_boom.py did not load: RuntimeError: imported"], ["demo"], 1))
+        self.assertEqual(sys.modules["teams_demo"].__file__, str(whole / "teams_demo.py"))
+
+    def test_teams_part_is_none_while_teams_is_off_or_its_code_is_not_here_and_need_gives_design_1_s_refusal(self):
+        """With None, Core does what it did before Teams; where only a part can do the work, need=True gives design 1's
+        refusal from its one place (need_teams). The bugs: a fleet that canceled keeps a paid part; a part refuses
+        with its own words; a fleet that pays reads "which this fleet does not have"."""
+        off, missing = (409, "teams_off"), (409, "teams_part_missing")
+        self.assertEqual((hub.teams_part("demo"), self.refused("demo")), (None, off))
+        self.package({"teams_demo.py": DEMO})
+        self.licence(LIVE)
+        self.assertEqual(hub.build_schema(), [])
+        self.assertIsInstance(hub.teams_part("demo", need=True), hub.TeamsPart)
+        self.assertEqual((hub.teams_part("other"), self.refused("other")), (None, missing))
+        self.licence(ENDED)                 # the signed word, after the load: the part stays in the process
+        self.assertEqual((hub.teams_part("demo"), self.refused("demo"), self.refused("other")), (None, off, off))
+
+    def test_a_call_gives_the_part_the_hub_s_names_first_and_only_for_a_name_that_core_declares(self):
+        """part.<name>(...) calls <name>(H, ...); H reads the hub's names as they are at the call and writes none; Core
+        reaches only the names of TEAMS_CALLS. The bugs: Core calls a function that it does not declare, and the
+        fault shows only on a customer's hub; a part puts a function of its own in the place of the hub's."""
+        self.package({"teams_demo.py": DEMO})
+        self.licence(LIVE)
+        self.assertEqual(hub.build_schema(), [])
+        part = hub.teams_part("demo")
+        names, args = part.start(1, 2)
+        self.assertEqual((names, args), (hub.TEAMS_H, (1, 2)))
+        self.assertIs(names.q, hub.q)
+        with patch.object(hub, "kv_get", lambda key: "patched"):
+            self.assertEqual(names.kv_get("x"), "patched")
+        for wrong in (lambda: part.secret, lambda: part.place, lambda: names.no_such_name,
+                      lambda: setattr(part, "x", 1), lambda: setattr(names, "q", print), lambda: delattr(names, "q")):
+            self.assertRaises(AttributeError, wrong)
+        self.assertIs(names.q, hub.q)
+
+    def test_a_fault_of_one_teams_file_is_a_line_of_build_schema_and_the_other_parts_load(self):
+        """build_schema raises nothing, so the hub starts on Core whatever a Teams file does: an import that raises or
+        ends the process, a part of a feature that Core does not call, one that lacks a function of its row, a second
+        file of one part, a table that the records refuse. Each is a line (the warning `schema`, and a refused step of a
+        release's check), and the other files load, also one that a part imports. The bug: one Teams fault stops a
+        hub, or leaves a part listed whose table is not there."""
+        self.package({"teams_demo.py": "import teams_util\n" + DEMO, "teams_util.py": "NAMES = ('util',)\n",
+                      "teams_boom.py": "raise RuntimeError('a fault at the import')\n",
+                      "teams_exit.py": "import sys\nsys.exit(3)\n", "teams_stray.py": 'FEATURE = "stray"\n',
+                      "teams_thin.py": 'FEATURE = "other"\n', "teams_twin.py": DEMO,
+                      "teams_rows.py": ROWS.replace("TABLE IF NOT EXISTS teams_rows(id INTEGER PRIMARY KEY)",
+                                                    "INDEX IF NOT EXISTS rows_x ON no_such_table(x)"),
+                      "teams_zz.py": DEMO.replace('"demo"', '"other"')})
+        sys.modules["teams_zz"] = type(sys)("teams_zz")     # a module of that name that is not the package's
+        self.licence(LIVE)
+        said = hub.build_schema()
+        self.assertEqual(said[:6], [
+            "The Teams part teams_boom.py did not load: RuntimeError: a fault at the import",
+            "The Teams part teams_exit.py did not load: SystemExit: 3",
+            "The Teams part teams_stray.py did not load: its FEATURE 'stray' is no part that this code calls "
+            "(TEAMS_CALLS)",
+            "The Teams part teams_thin.py did not load: no function start, which Core calls of the part other "
+            "(TEAMS_CALLS)",
+            "The Teams part teams_twin.py did not load: the part demo again, which teams_demo is already",
+            "The Teams part teams_zz.py did not load: this process holds another module of that name"])
+        self.assertEqual(len(said), 7, said)
+        self.assertTrue(said[6].startswith("The Teams part teams_rows.py did not load: CREATE INDEX IF NOT EXISTS "
+                                           "rows_x ON no_such_table(x): no such table"), said[6])
+        self.assertEqual((sorted(hub.TEAMS_CODE), sorted(hub.TEAMS_PARTS)), (["demo"], ["demo"]))
+        self.assertIs(sys.modules["teams_demo"].teams_util, sys.modules["teams_util"])
+        self.assertEqual(hub.teams_features(), ["demo"])
+
+    def test_a_part_s_own_condition_is_the_condition_of_its_entry(self):
+        """J2: a part's name is listed while Teams is on, its code is loaded and its own condition holds, which the
+        part gives as listed(H) and the seam writes into TEAMS_PARTS. The bug: role_sets shows on a fleet whose
+        contacts.v2 is off."""
+        self.package({"teams_demo.py": DEMO})
+        self.licence(LIVE)
+        self.assertEqual(hub.build_schema(), [])
+        hub.CFG["demo_listed"] = False
+        self.assertEqual(hub.teams_features(), [])
+        hub.CFG["demo_listed"] = True
+        self.assertEqual(hub.teams_features(), ["demo"])
+        self.assertIs(sys.modules["teams_demo"].HEARD[-1], hub.TEAMS_H)
+
+    def test_a_release_s_schema_check_runs_a_part_s_schema_on_a_copy_with_a_live_licence_and_not_on_one_with_none(self):
+        """The check of a release runs the new code on a copy of the fleet's records, in a child of the hub, and finds
+        the hub's packages by TEAMS_DIR_VAR. The bugs: a release meets a customer's rows for the first time at the
+        restart, because its check never ran the part; the check of a fleet with no licence says another thing than
+        before the seam."""
+        self.package({"teams_rows.py": ROWS})
+        os.environ[hub.TEAMS_DIR_VAR], hub.CFG["teams_dir"] = hub.CFG["teams_dir"], None
+
+        def checked(row):
+            self.licence(row)
+            copy, out, db = str(self.folder() / "copy.db"), io.StringIO(), hub.DB
+            with contextlib.closing(sqlite3.connect(copy)) as into:
+                db.backup(into)
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = hub.check_schema(copy)
+            finally:
+                hub.DB.close()
+                hub.DB = db
+            with contextlib.closing(sqlite3.connect(copy)) as read:
+                made = read.execute("SELECT count(*) FROM sqlite_master WHERE name='teams_rows'").fetchone()[0]
+            return code, out.getvalue(), made
+        self.assertEqual(checked(None), (0, "schema check: 0 steps refused.\n", 0))
+        self.assertEqual(checked(LIVE), (0, "schema check: 0 steps refused.\n", 1))
+
+    def test_the_load_runs_the_checked_text_and_never_a_compiled_file_of_the_package_s_folder(self):
+        """teamspack.have and folder_pack leave __pycache__ out, so no hash covers a compiled file there, and Python's
+        own import runs one whose source's time and size match in place of the source. The bugs: a file that no
+        release named runs as a part, while the check of the package says that it is whole; a changed file of the
+        package runs. The load compiles the text whose hash it checked, and writes no file into the package's
+        folder."""
+        source = 'FEATURE = "demo"\nFROM = "the package"\n\n\ndef start(H):\n    return FROM\n'
+        folder = self.package({"teams_demo.py": source})
+        other, real = self.folder() / "teams_demo.py", folder / "teams_demo.py"
+        self.licence(LIVE)
+        real.write_text(source.replace("the package", "a change   "))
+        self.assertEqual((hub.build_schema(), hub.TEAMS_CODE), ([], {}))     # no package that the lock names
+        hub.TEAMS_LOAD.clear()
+        real.write_text(source)
+        other.write_text(source.replace("the package", "a pyc file "))
+        os.utime(other, ns=(real.stat().st_atime_ns, real.stat().st_mtime_ns))
+        self.assertEqual(other.stat().st_size, real.stat().st_size)
+        py_compile.compile(str(other), cfile=importlib.util.cache_from_source(str(real)), doraise=True,
+                           invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+        self.assertEqual(teamspack.have(hub.TEAMS_LOCK, hub.CFG["teams_dir"]), str(folder))
+        there = sorted(folder.rglob("*"))
+        self.assertEqual(hub.build_schema(), [])
+        self.assertEqual((hub.teams_part("demo").start(), sorted(folder.rglob("*"))), ("the package", there))
+
+    def test_only_an_installed_hub_or_one_given_a_folder_has_a_folder_of_packages(self):
+        """main()'s teams_dir() (teams_folder): an installed hub's is `teams` beside its records; a hub of a test, of
+        selftest.py or of a scratch run has none, so it loads nothing. A release's check gets the folder through
+        TEAMS_DIR_VAR, and a hub with none takes another hub's out of it for its own children. The package that the
+        seam takes is the one of the lock of the code's own folder. The bugs: a test's hub loads the package of the
+        machine's own hub; a hub with Teams never reads the lock of its code, and so loads no part."""
+        code = self.folder()
+        self.assertIsNone(hub.teams_lock_here(str(code)))           # the source repository's tree has no lock
+        data = teamspack.pack(FILES)
+        (code / "teams.lock").write_text(teamspack.lock_text(teamspack.lock_of(data)))
+        self.assertEqual(hub.teams_lock_here(str(code)), teamspack.lock_of(data))
+        (code / "teams.lock").write_text('{"files": 1}\n')
+        self.assertIsNone(hub.teams_lock_here(str(code)))
+        given = str(self.folder() / "packages")
+        os.environ[hub.TEAMS_DIR_VAR] = "/the/folder/of/another/hub"
+        with patch.dict(hub.CFG, {"team_path": str(self.folder() / "team.json")}):
+            self.assertEqual((hub.teams_folder(None), hub.teams_dir(), os.environ.get(hub.TEAMS_DIR_VAR)),
+                             (None, None, None))
+            self.assertEqual((hub.teams_folder(given), hub.teams_dir(), os.environ[hub.TEAMS_DIR_VAR]),
+                             (given, given, given))
+        with patch.dict(hub.CFG, {"team_path": hub.TEAM_DEFAULT, "db_path": hub.DB_DEFAULT}):
+            self.assertTrue(hub.installed_hub())
+            self.assertEqual(hub.teams_folder(None), os.path.expanduser(os.path.join("~", ".fleet", "teams")))
+
+    def test_a_part_s_own_folder_stands_beside_the_records_with_mode_700(self):
+        """teams_data_dir is where design 4's key file stands: beside the records, so a test's hub writes in its own
+        folder, mode 700 also when the folder was there with another mode, and never outside teams-data. The bug:
+        other users of the server read a part's key file."""
+        made = Path(hub.teams_data_dir("person_links"))
+        self.assertEqual(made, Path(self.path).parent / "teams-data" / "person_links")
+        for one in (made, made.parent):
+            one.chmod(0o755)
+        self.assertEqual(hub.teams_data_dir("person_links"), str(made))
+        self.assertEqual({stat.S_IMODE(one.stat().st_mode) for one in (made, made.parent)}, {0o700})
+        for wrong in ("../x", "a/b", "", "Person", None):
+            self.assertRaises(ValueError, hub.teams_data_dir, wrong)
+        hub.CFG["db_path"] = None
+        self.assertRaises(RuntimeError, hub.teams_data_dir, "person_links")
 
 
 if __name__ == "__main__":

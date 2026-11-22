@@ -3976,6 +3976,14 @@ class Routes(Served):
                          "route: the agent that holds it. Ask your requester with ask_my_requester: the manager gives "
                          "this part of the work to the agent that holds cloudflare:one.")
 
+    def test_an_account_that_the_door_holds_no_key_for_is_a_key_of_the_owner_s(self):
+        """A provider account with no key in the door's file has no holder: the route says to ask the owner for the
+        key with request_secret (a bug that gave the holder's route sent the manager to look for an agent that does
+        not exist)."""
+        self.assertEqual(self.route("hetzner:two", "servers"),
+                         "route: a key of the owner's. Ask the owner for it with request_secret, with door hetzner:two "
+                         "and the steps above in its details. Once the owner saves it, send this same call again.")
+
     def test_none_the_owner_s_window_and_again(self):
         none = ("route: none. No grant and no yes of the owner lets this call through: change the call, or plan "
                 "another way.")

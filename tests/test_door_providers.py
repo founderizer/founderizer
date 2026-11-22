@@ -76,6 +76,36 @@ class Backblaze(Provider):
             (200, {"accountId": "acct1", "authorizationToken": "tok-b2",
                    "apiInfo": {"storageApi": {"apiUrl": "https://api005.example.com"}}}))
 
+    def test_an_account_with_no_key_of_the_door_says_how_the_owner_makes_one(self):
+        """An agent that calls a provider account that the door holds no key for reads how the owner makes the key,
+        for its request_secret card. For Backblaze, a separate key made with the b2 tool and the master key, never a
+        new master key, which would stop the old one wherever the owner uses it (the owner's delegate, 22 November
+        2026). An account that the door holds a key for is decided as before."""
+        for target, words in (("backblaze:two", ("b2 account authorize", "b2 key create --all-capabilities",
+                                                 "b2 account clear", "a colon and the key, with no space",
+                                                 "Never ask for a new master application key")),
+                              ("hetzner:two", ("https://console.hetzner.com/", "Read & Write")),
+                              ("tailscale:other", ("https://console.tailscale.com/admin/settings/trust-credentials",
+                                                   "devices:core and oauth_keys", "tag")),
+                              ("cloudflare:three", ("request_secret",))):
+            with self.subTest(target=target):
+                d = self.decide("buckets" if target.startswith("backblaze") else "servers", target=target)
+                self.assertEqual((d.kind, d.route), ("refused", "key"), d)
+                self.assertTrue(d.why.startswith(f"the door holds no key for {target}: ask the owner for it with "
+                                                 f"request_secret, with door {target}"), d.why)
+                for word in words:
+                    self.assertIn(word, d.why)
+        # an azure key alone cannot work, so no card asks the owner for one (a bug that sent the owner a card for a
+        # key that the door cannot use)
+        d = self.decide("servers", target="azure:two")
+        self.assertEqual((d.kind, d.route), ("refused", "none"), d)
+        self.assertIn("not possible yet", d.why)
+        self.assertNotIn("request_secret", d.why)
+        self.assertEqual(self.decide("buckets").kind, "read")
+        for target in ("hetzner:Two", "hetzner:two.example", "hetzner:two_x"):    # names that the hub never takes
+            with self.subTest(target=target):
+                self.assertEqual(self.decide("servers", target=target).route, "holder")
+
     def test_a_listed_read(self):
         d = self.decide("buckets")
         self.assertEqual(d.kind, "read")

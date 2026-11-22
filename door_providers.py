@@ -897,6 +897,56 @@ TS_NEVER = ((r"/keys(/|$)", "a key's answer is its secret: the door's oauth-clie
 PROVIDERS = {"backblaze": backblaze, "cloudflare": cloudflare, "github": github, "hetzner": hetzner, "aws": aws,
              "azure": azure, "tailscale": tailscale}
 
+# What an agent reads when it calls a provider account that the door holds no key for: how the owner makes that key, for
+# the details of its request_secret card, here and not in the tool's text, which has no room (the area "Door and
+# security", 22 November 2026). The pages and the steps are the providers' own documentation of 21 and 22 November
+# 2026. Backblaze: the owner's delegate chose a separate key that the owner makes with the b2 tool and the master key,
+# which stays valid, because Backblaze's web form gives no key the rights to make, list and delete keys; a new master key
+# would stop the old one wherever it is used, so the words never ask for one.
+KEY_WORDS = {
+    "backblaze": ("A backblaze key of the door must make, list and delete keys, and Backblaze's web form gives those "
+                  "rights to no key but the account's master application key. So the owner makes a separate key for "
+                  "the door in a terminal, with Backblaze's command-line tool b2 "
+                  "(https://www.backblaze.com/docs/cloud-storage-command-line-tools), signed in with the master "
+                  "application key: first `b2 account authorize`, which asks for the master key's id and the key, then "
+                  "`b2 key create --all-capabilities founderizer-door`, which prints the new key's id and the key, "
+                  "and last `b2 account clear`, so that the master key does not stay in b2's file on that computer. "
+                  "The owner types into the card the new key's id, a colon and the key, with no space. The master key "
+                  "stays valid, and the owner can delete the door's key alone at any time. Never ask for a new master "
+                  "application key: it stops "
+                  "the old one wherever the owner uses it. If the owner does not have the master key at hand, the door "
+                  "has no Backblaze account for now: tell your requester so, and plan another way."),
+    "hetzner": ("A hetzner key is an API token of one Hetzner Cloud project, with Read & Write. The owner opens "
+                "https://console.hetzner.com/, opens the project, clicks Security in the left menu, then API tokens "
+                "at the top, then Generate API token, gives it a name, chooses Read & Write, and copies the token into "
+                "the card: Hetzner shows it one time."),
+    "tailscale": ("A tailscale key is the secret of an OAuth client. The owner opens "
+                  "https://console.tailscale.com/admin/settings/trust-credentials, clicks Credential, then OAuth, "
+                  "chooses Write for the scopes devices:core and oauth_keys, selects each tag that the door is to make "
+                  "clients for, clicks Generate credential, and copies the client secret into the card: Tailscale "
+                  "shows it one time. The door makes clients only for those tags, so name them in the card."),
+    "azure": None,      # no key alone: the door also needs the tenant and the client id in its file (AZURE_NO_KEY)
+    "cloudflare": "The words of request_secret's door field say how the owner makes a cloudflare key.",
+}
+
+
+AZURE_NO_KEY = ("an azure account of the door is not possible yet: beside its client secret, the door needs the tenant "
+                "and the client id in its file, and no route writes them. Plan another way.")
+
+
+def no_key(target):
+    """The refusal of a call to a provider account that the door's file names no key for, as (why, route): what to
+    ask the owner for, with the steps of KEY_WORDS, and route key; for azure, that it is not possible yet, and route
+    none; None for a kind with no words, and for a name that the hub never takes for a door key (hub.DOOR_CREDENTIAL),
+    which keeps the refusal of an account that the caller holds no grant on."""
+    kind, _, name = target.partition(":")
+    if kind not in KEY_WORDS or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
+        return None
+    if KEY_WORDS[kind] is None:
+        return f"the door holds no key for {target}: {AZURE_NO_KEY}", "none"
+    return (f"the door holds no key for {target}: ask the owner for it with request_secret, with door {target}, and "
+            f"write these steps in its details, in your own words. {KEY_WORDS[kind]}", "key")
+
 
 def decide(access, agent, kind, name, op, args, content, lookups):
     for a in args:

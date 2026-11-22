@@ -7427,11 +7427,14 @@ def build_schema():
 
     The release's own check runs exactly this against a copy of the customer's database inside the clone, before
     anything moves (`hub.py --check-schema`, releases.Update step `schema`), so this floor should never be
-    reached. It is here because it is the floor."""
+    reached. It is here because it is the floor.
+
+    Its last term is the Teams parts' (teams_schema), after Core's own tables: it gives nothing on a fleet with no
+    licence, and it raises nothing either."""
     problems = []
     for statement in sql_steps(SCHEMA):
         sql_step(statement, problems)
-    return problems + migrate()
+    return problems + migrate() + teams_schema()
 
 
 def check_schema(path):
@@ -7444,8 +7447,11 @@ def check_schema(path):
 
         schema check: 1 step refused.
 
-    Ends with 1 when any step was refused, so a run by hand says the same thing as the update's own reading."""
+    Ends with 1 when any step was refused, so a run by hand says the same thing as the update's own reading. The
+    Teams parts come from the folder of the hub whose update runs this (TEAMS_DIR_VAR, teams_folder), so that a
+    release whose part does not load on a fleet with Teams is a refused step there."""
     global DB
+    CFG["teams_dir"] = os.environ.get(TEAMS_DIR_VAR) or None
     DB = sqlite3.connect(path)
     DB.row_factory = sqlite3.Row
     problems = build_schema()
@@ -21102,21 +21108,33 @@ OWNER_CHAT_RECAP = (
 
 def chat_recap_text(agent):
     """The owner chat of a worker or lead as the hub recorded it, for a session that starts without its conversation
-    (fleet.chat_recap): a first chat, or the first chat after a runtime switch. "" when nothing was said yet. The
-    owner's messages are the ui_requests of this agent, its own replies are its owner_reports, and the two caps are a
-    person window's, which starts without a memory for the same reason: CONVERSATION_RECAP messages, inside
-    CONVERSATION_PROMPT_MAX characters. It is built newest first and turned round, so a long conversation loses its
-    oldest messages and never its newest. Each message is one line, its own line breaks flattened, so one message is
-    one line of it whoever wrote it, which begins with the writer's name (the helper gives the recap whole, from a
-    file, since 16 November 2026: fleet.chat_command). Each message is
-    masked on the way out, as start_text is: these are real messages, and a login registered after one of them was
-    stored was never masked at the write. Each on its own, so a message that mask_secrets can only hold back whole
-    does not take the rest of the chat with it, and so the budget counts what really goes out."""
+    (fleet.chat_recap): a first chat, or the first chat after a runtime switch. "" when nothing was said yet and no
+    standing item steers the agent. The owner's messages are the ui_requests of this agent, its own replies are its
+    owner_reports, and the two caps are a person window's, which starts without a memory for the same reason:
+    CONVERSATION_RECAP messages, inside CONVERSATION_PROMPT_MAX characters. It is built newest first and turned round,
+    so a long conversation loses its oldest messages and never its newest. Each message is one line, its own line breaks
+    flattened, so one message is one line of it whoever wrote it, which begins with the writer's name (the helper gives
+    the recap whole, from a file, since 16 November 2026: fleet.chat_command). Each message is masked on the way out, as
+    start_text is: these are real messages, and a login registered after one of them was stored was never masked at the
+    write. Each on its own, so a message that mask_secrets can only hold back whole does not take the rest of the chat
+    with it, and so the budget counts what really goes out.
+
+    The standing items that steer the agent come first, each one whole and with no limit, as a Shell-off task's
+    start has them, and no KPI, which measures task work: a wish that the owner said in this chat, which the chat
+    kept (CHAT_TOOLS), reaches its next conversation, and so does each other item (the design "An agent keeps its own
+    rules", slice 4). A chat has no see_standing, and the items come oldest first, so a limit cut the newest one, often
+    the chat's own, to its id (the coordinator, 22 November 2026: no limit; usage is no reason to cut). They come also
+    when nothing was said yet, so that a first chat knows them too. The messages get the room that the items leave
+    inside CONVERSATION_PROMPT_MAX, and never less than CHAT_RECAP_FLOOR: so the whole stays inside that cap while the
+    items leave the floor, and passes it by what they take beyond that, and the owner's newest words are always in it
+    (Fable's read of 22 November 2026, finding 3: a chat whose Shell box is off has no search_history to find them)."""
+    items = standing_start_text(agent, None, kpis=False, closed=True).strip("\n")
     rows = q("SELECT created, text, 'owner' AS side FROM ui_requests WHERE recipient=? AND kind='message' "
              "UNION ALL SELECT created, text, 'agent' AS side FROM owner_reports WHERE agent=? "
              "ORDER BY created DESC, side LIMIT ?", (agent, agent, CONVERSATION_RECAP))
     said = {"owner": "The owner", "agent": agent_display(agent)}
-    lines, budget = [], CONVERSATION_PROMPT_MAX - len(OWNER_CHAT_RECAP) - 1
+    lines, budget = [], max(CHAT_RECAP_FLOOR, CONVERSATION_PROMPT_MAX - len(OWNER_CHAT_RECAP) - 1 -
+                            (len(items) + 2 if items else 0))
     for r in rows:
         line = mask_secrets(f"{said[r['side']]}: {' '.join((r['text'] or '').split())}")
         if len(line) + 1 > budget:
@@ -21125,8 +21143,10 @@ def chat_recap_text(agent):
             line = line[:budget]    # one message longer than the whole recap: its own start is what is left of it
         lines.append(line)
         budget -= len(line) + 1
-    # OWNER_CHAT_RECAP is the hub's own line, not a message, so only the messages go through the mask.
-    return OWNER_CHAT_RECAP + "\n" + "\n".join(reversed(lines)) if lines else ""
+    # OWNER_CHAT_RECAP is the hub's own line, not a message, so only the messages go through the mask. The items are
+    # masked each on its own (standing_line).
+    recap = OWNER_CHAT_RECAP + "\n" + "\n".join(reversed(lines)) if lines else ""
+    return "\n\n".join(part for part in (items, recap) if part)
 
 
 # ---------------------------------------------------------------- chat apps (owner features chat_apps and people)
@@ -21699,17 +21719,22 @@ def tag_roles(team):
 def tag_at(text, at, recipient, team, roles):
     """What the words after the "@" at `at` name, by the three rules of the hub's reading, the first rule that finds an
     agent deciding: (end, [agent]) for a tag, (end, [two agents or more]) for words that fit more than one, or None.
-    1: a whole role (tag_roles), the longest match first; a role that two agents hold fits both. 2: a name, without
-    regard to case. 3: one word of at least TAG_WORD_MIN letters, digits, "-" or "_" that starts a word of the role or
-    the name of the other agents, counted together. After the words a tag ends (tag_end). The chat's own agent is no
-    tag: words that name it by rule 1 or 2 name nobody, and it does not count in rule 3."""
+    1: a whole role (tag_roles), the longest match first; a role that two agents hold fits both; **a role that is also
+    an agent's name is read by rule 2**, as that agent's label is its name (tag_label). 2: a name, without regard to
+    case. 3: one word of at least TAG_WORD_MIN letters, digits, "-" or "_" that starts a word of the role or the name of
+    the other agents, counted together. After the words a tag ends (tag_end). The chat's own agent is no tag: words that
+    name it by rule 1 or 2 name nobody, also a role that it shares with another agent, and it does not count in rule 3.
+    So the hub reads a chat app's words as the Mac and the iPhone read the words that they send (FleetCore's
+    `AgentTags.mentions`, whose test holds the same table as test_chat_apps'), and the bubble's badge is the tagged
+    agent's."""
     longest = None
     for pattern, holders in roles:
         m = pattern.match(text, at + 1)
         if m and tag_end(text, m.end()) and (longest is None or m.end() > longest[0]):
-            longest = (m.end(), [n for n in holders if n != recipient])
-    if longest:
-        return longest if longest[1] else None
+            longest = (m.end(), holders)
+    names = {n.casefold() for n in team}
+    if longest and agent_words(text[at + 1:longest[0]]) not in names:
+        return None if recipient in longest[1] else longest
     named = [n for n in team if text[at + 1:at + 1 + len(n)].lower() == n and tag_end(text, at + 1 + len(n))]
     if named:
         name = max(named, key=len)
@@ -23885,6 +23910,7 @@ CONVERSATION_ASK_MAX = 2000     # one question or work request
 CONVERSATION_RECAP = 20         # messages of the recap that a new window's prompt carries
 CONVERSATION_OPEN_ASKS = 3      # questions and work requests of one conversation that wait for the owner
 CONVERSATION_PROMPT_MAX = 16000
+CHAT_RECAP_FLOOR = CONVERSATION_PROMPT_MAX // 4     # the least room of the messages of an owner chat's recap
 CLOSED_STANDING_CHARS = 4000    # the most that standing items add to a colleague's closed window (conversation_prompt)
 CONVERSATION_ID = re.compile(r"[1-9][0-9]{0,11}")
 CONVERSATION_WINDOW = re.compile(r"C-[1-9][0-9]{0,11}")     # the window of a conversation's session (fleet.py)
@@ -44714,9 +44740,33 @@ STANDING_NOT_HIS = ("M-{n} came from an AI session or an app that acts for the o
                     "owner's own hand: it keeps no item as the owner's, and it changes or ends none of theirs. Keep "
                     "these words as your own item, without source, or put the rule's words on a card: when the owner "
                     "presses it, the answer is the source.")
+# The same in an owner chat, which keeps no item of its own (standing_chat): it routes the rule (Fable's read of 22
+# November 2026, finding 2: before slice 4 the chat opened a task for it, and the owner server sends a rule so)
+STANDING_NOT_HIS_CHAT = ("M-{n} came from an AI session or an app that acts for the owner (request_hand), not from "
+                         "the owner's own hand: it keeps no item as the owner's, and it changes or ends none of "
+                         "theirs. A chat keeps no item of its own, so {route}.")
+# and for an end in a chat (end_standing's asked_by), which no task makes either (Fable's read of 22 November 2026,
+# round 2, finding 6)
+STANDING_NOT_HIS_END = ("M-{n} came from an AI session or an app that acts for the owner (request_hand), not from "
+                        "the owner's own hand: only a message of the owner's own ends this item. Tell the owner so in "
+                        "your reply.")
 
 
-def standing_source(agent, source, words=None):
+# The one rule of the owner chat of an agent whose Shell box is off (standing_source's whole, standing_chat)
+STANDING_WHOLE = ("A Shell-off chat keeps the owner's whole message as one item, or nothing: give their message whole "
+                  "as the words. For a message that you cannot keep whole, {route}.")
+
+
+def chat_wish_route(agent):
+    """Where an owner chat sends a rule that no message of the owner's own gives (standing_chat, STANDING_NOT_HIS_CHAT):
+    a task of the agent's own keeps it as its own item; the chat of an agent whose Shell box is off opens no task, so
+    its line keeps it (rules/wishes.md)."""
+    if shell_off(agent):
+        return f"pass it with message_agent to {task_giver(agent)}, which gives you your tasks"
+    return "open a task for it with start_task, which keeps the words as its own item"
+
+
+def standing_source(agent, source, words=None, whole=False, ending=False):
     """(author_kind, author, conversation, message) of what `agent` keeps or ends on the word of `source`, or a
     ToolError (AUTONOMY.md 6.2). No source: the agent itself. M-<n>: the owner's own words, a message of his or a
     steer, that went to this agent or to an agent above it in its line, which passes his words on; never in a session
@@ -44725,7 +44775,16 @@ def standing_source(agent, source, words=None):
     customer's role gives no item. Words, when given, must be part of that message: a line inside a customer's email
     cannot pass for another person's wish. An M-<n> that an AI session sent through the owner tools, or a connected
     app, is the owner's word for no item (STANDING_NOT_HIS): its row's hand says so (request_hand); a row of before
-    the hand was kept has none, and stays as it was."""
+    the hand was kept has none, and stays as it was.
+
+    whole: the words must be that whole message and nothing else, as the chat read it (no hidden character) and as
+    plain_words compares (straight quotes, one space, no case: a phone writes curly marks), for the owner chat of an
+    agent whose Shell box is off (STANDING_WHOLE; the design "An agent keeps its own rules", slice 4): a part of a
+    sentence can say the opposite of it ("tell customers to call us" from "never tell customers to call us"), and a
+    lesson that a ticket shaped must not make that chat keep it. Three reviews found such a part in each rule of whole
+    sentences (a list, a head line, "etc.", a colon, a quote), so the coordinator of the area closed it by construction
+    on 22 November 2026: the whole message as one item, or nothing.
+    ending: the source is end_standing's asked_by, for the words of a chat's refusal (STANDING_NOT_HIS_END)."""
     if source in (None, ""):
         return "agent", agent, None, None
     m = SOURCE_REF.match(str(source))
@@ -44742,7 +44801,9 @@ def standing_source(agent, source, words=None):
         if not said or said["recipient"] not in [agent] + line_above(agent):
             raise ToolError(f"M-{n} is no message of the owner's to you or to an agent above you in your line.")
         if not owner_force(said["hand"]) or said["connection"] is not None:
-            raise ToolError(STANDING_NOT_HIS.format(n=n))
+            raise ToolError(STANDING_NOT_HIS.format(n=n) if not chat_context(agent) else
+                            STANDING_NOT_HIS_END.format(n=n) if ending else
+                            STANDING_NOT_HIS_CHAT.format(n=n, route=chat_wish_route(agent)))
         found = ("owner", "owner", None, n, said["text"])
     else:
         if not people_items_on():
@@ -44761,7 +44822,11 @@ def standing_source(agent, source, words=None):
             raise ToolError(f"CM-{n} is from {person['name']}, whose role ({person['role']}) has its tools off: a "
                             f"person in a closed role gives no standing item, changes none and ends none.")
         found = ("person", f"P-{person['id']}", said["conversation"], n, said["text"])
-    if words is not None:
+    if words is not None and whole:         # as the chat read it: no hidden character, and as the part check compares
+        if plain_words(words) != plain_words(hidden.strip_hidden(str(found[4] or ""))[0]):
+            raise ToolError(f"These words are not {prefix}-{n} whole. " + STANDING_WHOLE.format(
+                route=chat_wish_route(agent)))
+    elif words is not None:
         quoted = plain_words(words).strip(" .,;:!?\"'()")
         if not quoted or quoted not in plain_words(found[4]):
             raise ToolError(f"These words are not part of {prefix}-{n}. Give the author's own words as they are "
@@ -44851,14 +44916,24 @@ def standing_fit(agent):
 def standing_crowded(agent, names):
     """The words of a keep's answer for the agents of `names` whose items now pass STANDING_MARK, or "": the
     keeper can put its own in order before a start of one of them names one by its id alone. A keeper whose Shell
-    box is off keeps only a colleague's own wish, so its line keeps the rest in order (shell_tools)."""
+    box is off keeps only a colleague's own wish, so its line keeps the rest in order (shell_tools), also for its
+    owner chat. Any other owner chat ends an item only on the owner's word (standing_chat), and no agent of its line
+    ends one of its items but the fleet manager (t_end_standing), so a task of its own puts them in order (Fable's
+    read of 22 November 2026, finding 5)."""
     crowded = [(n, fit) for n, fit in ((n, standing_fit(n)) for n in names) if fit > STANDING_MARK]
     if not crowded:
         return ""
     whose = "; ".join(f"{'you' if n == agent else shown_role(n)} {fit:,}" for n, fit in crowded)
-    if shell_off(agent):
-        return (f" The items that steer you now take {crowded[0][1]:,} characters at each start. Your line keeps "
-                f"them in order: tell {task_giver(agent)} with message_agent.")
+    if shell_off(agent) or chat_context(agent):     # a chat ends an item only on the owner's word (standing_chat)
+        head = (f" The items that steer you now take {crowded[0][1]:,} characters at each start."
+                if [n for n, _ in crowded] == [agent] else
+                f" The items that steer each of these agents now take more than {STANDING_MARK:,} characters at each "
+                f"start: {whose}.")
+        if shell_off(agent):
+            return head + f" Your line keeps them in order: tell {task_giver(agent)} with message_agent."
+        return head + (" Put yours in order in a task of your own, which ends one that is done and writes the rule of "
+                       "one duty into that duty's words: say so to the owner in your reply, and open it with "
+                       "start_task when they ask.")
     if len(crowded) == 1:
         n, fit = crowded[0]
         head = (f" The items that steer {'you' if n == agent else shown_role(n)} now take {fit:,} of the 8,000 "
@@ -44870,12 +44945,15 @@ def standing_crowded(agent, names):
             "write the rule of one duty into that duty's words, and end the item with that place in why.")
 
 
-def standing_start_text(agent, limit=None, kpis=True):
+def standing_start_text(agent, limit=None, kpis=True, closed=None):
     """L3's part of the per-task block (AUTONOMY.md 6.4): the active items that steer `agent`, each one whole, for
-    every new session of it (start_text, manager_resume_text), and for the closed conversation of a person whose role
-    has its tools on (conversation_prompt, with a smaller limit). The nearest come first and the first always comes;
-    one that does not fit is named, for see_standing. When an item came from a person, one sentence says whom it is
-    for: an agent that kept "links for next time" for one colleague had asked for it for two (19 November 2026).
+    every new session of it (start_text, manager_resume_text), for the closed conversation of a person whose role
+    has its tools on (conversation_prompt, with a smaller limit), and for a new conversation of its owner chat
+    (chat_recap_text, closed: a chat has no see_standing, so it shows each item whole with no limit, and it ends an
+    item only on the owner's word, as its instructions say, so no sentence here names either). The nearest come
+    first and the first always comes; one that does not fit is named, for see_standing. When an item came from a
+    person, one sentence says whom it is for: an agent that kept "links for next time" for one colleague had asked
+    for it for two (19 November 2026).
 
     A session of an agent whose Shell box is off has no see_standing, so its start shows each item whole, with no
     limit: an item that it named by its id alone was lost to it. On 20 November 2026 each start of a support agent
@@ -44886,7 +44964,8 @@ def standing_start_text(agent, limit=None, kpis=True):
     rows = steering_items(agent, kpis)
     if not rows:
         return ""
-    closed = shell_off(agent)       # support plan F1: no see_standing and no end_standing on its fixed list
+    if closed is None:              # support plan F1: no see_standing, and end_standing only for another's wish
+        closed = shell_off(agent)
     if limit is None:               # read at the call: a setting or a test may change it
         limit = None if closed else STANDING_CHARS
     t0, kept, left, people, kpi = now(), [], [], False, False
@@ -46047,9 +46126,11 @@ def standing_keep(agent, task, fields):
     return (f"Kept as {iref(item)}. It steers your work from now on" + (", and the work of your team" if team else "")
             + ": every new session starts with it, and every other running session gets it as a message."
             + (" The owner reads one line about it." if fields["author_kind"] == "person" else "")
-            + f" End it with end_standing(id=\"{iref(item)}\", why=...) when its author, a person whose role allows it "
-              "or the owner asks" + (", when it is reached" if fields["kind"] == "target" else "")
-            + ", or when you wrote it whole into the place that its work reads, with that place in why."
+            + (f" End it here with end_standing(id=\"{iref(item)}\", why=..., asked_by=\"M-<n>\") when the owner asks "
+               f"in a message to you." if chat_context(agent) else      # a chat ends one on the owner's word alone
+               f" End it with end_standing(id=\"{iref(item)}\", why=...) when its author, a person whose role allows "
+               "it or the owner asks" + (", when it is reached" if fields["kind"] == "target" else "")
+               + ", or when you wrote it whole into the place that its work reads, with that place in why.")
             + (f" It now reaches {len(team)} agent{'s' if len(team) != 1 else ''}: "
                f"{', '.join(shown_role(n) for n in team)}. An item for fewer of them goes to those agents, which keep "
                f"it." if team else "")
@@ -46078,18 +46159,49 @@ def standing_asked(agent, a, field):
     return conv, person
 
 
+def standing_chat(agent, a, field):
+    """For keep_instruction or end_standing in an owner chat (CHAT_TOOLS): `field` must name a message of the owner's
+    to this agent, M-<n>, or a ToolError. So a chat keeps and ends only the owner's own wish, on the owner's word
+    (the design "An agent keeps its own rules", decision 3), and never an item of its own: a chat's own words, or an
+    agent's words in it, would steer each later session as a rule. Nor a person's message, the owner's words to
+    another agent, a steer of a task, or an answer to a Needs-you item. standing_source then checks the hand that sent
+    the message and the words: that whole message in the chat of an agent whose Shell box is off. Returns the
+    message's number and its text."""
+    m = SOURCE_REF.match(str(a.get(field) or ""))
+    said = q1("SELECT text FROM ui_requests WHERE event_id=? AND recipient=? AND kind='message'",
+              (int(m.group(2)), agent)) if m and m.group(1).upper() == "M" else None
+    if not said:
+        raise ToolError(f"In your owner chat, {field} names the owner's message to you that this comes from: M-<n>, "
+                        f"as read_messages gives it. "
+                        + (f"A chat keeps no item of its own: for a rule that no such message gives, "
+                           f"{chat_wish_route(agent)}." if field == "source" else
+                           "A chat ends an item only when the owner asks."))
+    return int(m.group(2)), said["text"] or ""
+
+
 def t_keep_instruction(agent, a):
+    chat = chat_context(agent)
+    whole = chat and shell_off(agent)       # the owner's whole message as one item, or nothing (STANDING_WHOLE)
+    if whole:                               # before item_words, whose size refusal would name no route
+        n, said = standing_chat(agent, a, "source")
+        if len(" ".join(said.split())) > STANDING_WORDS_MAX:
+            raise ToolError(f"M-{n} has more than the {STANDING_WORDS_MAX:,} characters that an item holds. "
+                            + STANDING_WHOLE.format(route=chat_wish_route(agent)))
     words = item_words(a.get("words"))
     # before item_scope, whose "nobody is in your team" would have a worker keep a wish for its whole team for itself
     if shell_off(agent) and str(a.get("scope") or "").strip().lower() == "team":
-        raise ToolError(f"scope is agent: a colleague's wish steers you, and a wish for the whole team goes with "
-                        f"message_agent to {task_giver(agent)}, which gives you your tasks.")
+        raise ToolError(f"scope is agent: {'the owner' if chat else 'a colleague'}'s wish steers you, and a wish for "
+                        f"the whole team goes with message_agent to {task_giver(agent)}, which gives you your tasks.")
     scope = item_scope(agent, a.get("scope"))
-    task = session_task(agent, a)
-    if shell_off(agent):            # a colleague's question task alone has the tool (shell_tools)
-        standing_asked(agent, a, "source")
+    if chat:                        # the owner's own wish alone, before the branch of a colleague's question task
+        task = None
+        standing_chat(agent, a, "source")
+    else:
+        task = session_task(agent, a)
+        if shell_off(agent):        # a colleague's question task alone has the tool (shell_tools)
+            standing_asked(agent, a, "source")
     guard(agent, words)
-    kind, author, conversation, message = standing_source(agent, a.get("source"), words)
+    kind, author, conversation, message = standing_source(agent, a.get("source"), words, whole=whole)
     return standing_keep(agent, task, {"scope": scope, "kind": "instruction", "words": words, "author_kind": kind,
                                        "author": author, "conversation": conversation, "message": message})
 
@@ -46245,13 +46357,17 @@ def t_end_standing(agent, a):
     if r["ended"]:
         return (f"{iref(item)} already ended {ago(r['ended'])} ago, as {standing_who(r['ended_by'], agent)} asked. "
                 f"Nothing changed.")
-    if shell_off(agent):            # a colleague's question task alone has the tool (shell_tools)
+    chat = chat_context(agent)
+    if chat:                        # on the owner's own word alone, before the branch of a colleague's question task
+        standing_chat(agent, a, "asked_by")
+    elif shell_off(agent):          # a colleague's question task alone has the tool (shell_tools)
         person = standing_asked(agent, a, "asked_by")[1]
         if r["author"] != f"P-{person['id']}":
             raise ToolError(f"{iref(item)} is not a wish of {person['name']}'s: this task ends only theirs.")
     guard(agent, why)
-    task = session_task(agent, a)
-    asked_by = standing_source(agent, a.get("asked_by"))[1] if a.get("asked_by") not in (None, "") else agent
+    task = None if chat else session_task(agent, a)
+    asked_by = standing_source(agent, a.get("asked_by"), ending=True)[1] if a.get("asked_by") not in (None, "") \
+        else agent
     t0, reads = now(), save_provenance(agent)[1] if r["kind"] == "kpi" else None    # it commits: before
     with transaction():
         standing_end_rows(r, agent, asked_by, why, t0, task)
@@ -49395,7 +49511,8 @@ TOOLS = [
         "action": {"type": "string", "description": "pause, resume, retire or reopen"}, "note": {"type": "string"},
         "task_id": TASK_ID}, ["request_id", "responsibility", "action"])),
     # Standing items (AUTONOMY.md P3): every session with the agent's tools has them, and tools_for keeps them out of
-    # an owner chat and of a conversation with a person.
+    # a conversation with a person. An owner chat has keep_instruction and end_standing, for the owner's own wish
+    # alone (CHAT_TOOLS, standing_chat).
     ("all", "keep_instruction", t_keep_instruction,
      "Keep a standing instruction: a lasting wish about how you work or what you decide, from now on until it is "
      "ended (\"send every refund request to the billing manager\"). Keep one when the owner, a person whose role allows it "
@@ -49554,8 +49671,7 @@ TOOLS = [
      "the task cannot get it later. The hub refuses one that you do not hold, and one while that desktop is busy "
      "with another such task. Its result comes back into this chat by itself when it ends: "
      "tell them then with message_owner. Give in_reply_to, the request UUID of the owner's message: one message is "
-     "one task, and a message from another agent starts nothing. A lasting wish of the owner's goes into such a "
-     "task too, which keeps it with keep_instruction.",
+     "one task, and a message from another agent starts nothing.",
      S({"title": STR, "done_when": {"type": "string", "description": "The line a stranger could test the result "
                                                                    "against"},
         "needs": {"type": "string", "enum": ["none", "browser", "screen"],
@@ -49689,9 +49805,14 @@ TOOLS = [
 # records, the owner's chats with it included, when the owner asks where it said something (contact_session is False
 # in an owner chat, and a session that a contact drives keeps its own limit). read_attachment shows the file that
 # the owner sends with a message, a picture or a text in its answer (the owner, 17 November 2026: "how come the agent
-# can't read attachments!"): a chat has no shell, so it reads nothing else.
+# can't read attachments!"): a chat has no shell, so it reads nothing else. keep_instruction and end_standing keep and
+# end the owner's own lasting wish in the agent's own chat, with that message of the owner's as its source, and
+# nothing else (standing_chat): the design "An agent keeps its own rules", decision 3 ("A wish that you say in an
+# agent's own chat is kept there, in your words, with no task"), slice 4, release two. Release one gave
+# fleet.CHAT_TOOLS the two names first, so that no helper refuses them.
 CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall",
-              "start_task", "request_secret", "search_history", "read_history", "read_attachment")
+              "start_task", "request_secret", "search_history", "read_history", "read_attachment",
+              "keep_instruction", "end_standing")
 
 
 # ---------------------------------------------------------------- the Shell box (support plan F1, H1, H7, H8)
@@ -49735,9 +49856,11 @@ SHELL_OFF_DUTY_TOOLS = ("remember", "write_notes")
 SHELL_OFF_BUILT_INS = ("WebSearch",)
 # The owner chat of such an agent: CHAT_TOOLS without a way to new work or to a key, and with message_agent to its
 # reporting line alone (shell_line). The owner's own file to it is data in the answer of read_attachment, and gives
-# no reach.
+# no reach. Its chat reads no ticket, so it keeps and ends the owner's own lasting wish as each chat does, for itself
+# alone (scope agent), and keeps the owner's whole message as one item, or nothing, never a part that says the
+# opposite (standing_chat, STANDING_WHOLE): the design "An agent keeps its own rules", slice 4, release two.
 SHELL_OFF_CHAT = ("read_messages", "tell_owner", "message_owner", "see_responsibilities", "recall",
-                  "read_attachment", "message_agent")
+                  "read_attachment", "message_agent", "keep_instruction", "end_standing")
 TYPED_WORD = re.compile(r"[a-z0-9_]{1,40}")                     # one word of a list (H7: report_defect's words too)
 TYPED_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")      # an id: a ticket, an order, a draft; no address
 TYPED_IDS, TYPED_VALUES = 20, 8
@@ -82796,6 +82919,324 @@ def stop_with_parent(fd):
     os.kill(os.getpid(), signal.SIGTERM)        # the same stop as the test's own
 
 
+# ---------------------------------------------------------------- Teams parts: the one seam of Core
+#
+# Founderizer for Teams (teams-design-2-code-home.md, 3.2 and 3.4). The code of a paid part stands in Teams files of its
+# own, teams_<name>.py, which are never published. A hub with a live licence gets them as one package beside its
+# checkout, teams_dir()/<sha256>/, whose hash the lock of the running code names (TEAMS_LOCK, the file teams.lock of
+# each published tree). This region is the one way from Core into that code:
+#
+# - Core asks for a part with teams_part("<feature>"). It is None while Teams is off (teams_on) or while this process
+#   has not loaded the part's code, and with None Core does what it did before Teams.
+# - Core calls a function of the part as part.<name>(...), only for a name of TEAMS_CALLS["<feature>"]. The Teams
+#   function is <name>(H, ...): H is TEAMS_H, the hub's own names, read only. A Teams file never imports hub.
+# - A call runs in the caller's thread, under the caller's lock and inside the caller's transaction. A Teams function
+#   that writes there calls H.in_transaction first, takes no lock and commits nothing. A Refusal of a part is answered
+#   as Core's. A function that reaches the network or waits is never called under LOCK.
+# - Only this region writes TEAMS_CODE and TEAMS_PARTS. teams_schema, the last term of build_schema, loads the Teams
+#   files one time in a process, and only while teams_on(): so a fleet with no licence imports no Teams file, reads
+#   no package and makes no new call.
+#
+# TEAMS_CALLS is one plain statement at the top level of this file, because publish.py's gate 9 reads it with ast to
+# measure each part of a package against it, and test_publish.TeamsFiles holds that reading equal to the value here.
+
+TEAMS_CALLS = {}        # feature -> the names of the functions that Core calls of that part; each design adds its row
+TEAMS_TABLES = ()       # the tables of Teams data that stand in SCHEMA, dormant (teams-design-2-code-home.md, 3.2)
+TEAMS_CODE = {}         # feature -> the module of a part that this process loaded (teams_take); empty in Core
+TEAMS_LOAD = {}         # the one load of this process (teams_load): "lines", what failed in it; "finder", its finder
+TEAMS_FOLDER = "teams"          # beside the records: the folder of an installed hub's packages (teams_folder)
+TEAMS_DATA = "teams-data"       # beside the records: a part's own files, one folder for each feature (teams_data_dir)
+TEAMS_DIR_VAR = "FLEET_TEAMS_DIR"       # main() writes teams_dir() into it, and only check_schema() reads it
+TEAMS_FEATURE = re.compile(r"[a-z0-9_]{1,40}")      # the name of a part (J2), as its file's name holds it
+# a statement of a part's SCHEMA: a table or an index that the part makes itself (publish.TEAMS_SCHEMA, the same rule)
+TEAMS_STEP = re.compile(r"\s*CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX)\s+IF\s+NOT\s+EXISTS\s", re.I)
+
+
+def teams_lock_here(folder=None):
+    """The lock of this code, from the file teams.lock of its own folder (or of `folder`), or None: a tree with no lock
+    (the source repository's), or a text that teamspack.read_lock refuses. It is read one time, at the import: a release
+    moves the files of the folder before the hub restarts onto them, and the lock that counts is the one of the code
+    that runs."""
+    try:
+        import teamspack
+        with open(os.path.join(folder or os.path.dirname(os.path.abspath(__file__)), "teams.lock"),
+                  encoding="utf-8") as f:
+            return teamspack.read_lock(f.read(4096))
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+TEAMS_LOCK = teams_lock_here()
+
+
+class _HubNames:
+    """The hub's own names, as a Teams function gets them (H, its first argument): H.<name> is the hub's global <name>
+    at the moment of the read, so also a name that a test patched, and AttributeError for a name that the hub does not
+    have. H is read only: a Teams function changes no global of the hub and puts no function in the place of another,
+    so H.<name> = ... and del H.<name> raise."""
+    __slots__ = ()
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(f"the hub has no name {name}") from None
+
+    def __setattr__(self, name, value):
+        raise AttributeError(f"H is read only: a Teams part changes no name of the hub ({name})")
+
+    def __delattr__(self, name):
+        raise AttributeError(f"H is read only: a Teams part changes no name of the hub ({name})")
+
+    def __repr__(self):
+        return "<the hub's names>"
+
+
+TEAMS_H = _HubNames()
+
+
+class TeamsPart:
+    """One loaded part, as Core calls it (teams_part): part.<name>(a, b) calls the part's own <name>(H, a, b), with
+    TEAMS_H as H, and only for a name of TEAMS_CALLS[feature]. Any other name raises AttributeError, also when the
+    part's file has a function of that name, so a call that Core does not declare fails in the tests of Core and not
+    first on a customer's hub (gate 9 of publish.py measures each part against TEAMS_CALLS)."""
+    __slots__ = ("_feature", "_module")
+
+    def __init__(self, feature, module):
+        self._feature, self._module = feature, module
+
+    def __getattr__(self, name):
+        if name not in TEAMS_CALLS.get(self._feature, ()):
+            raise AttributeError(f"{name} is no call of the Teams part {self._feature} (TEAMS_CALLS)")
+        return functools.partial(getattr(self._module, name), TEAMS_H)
+
+
+def teams_part(feature, need=False):
+    """The Teams part `feature`, a TeamsPart, or None while Teams is off (teams_on) or while this process has not
+    loaded the part's code: with None, Core does what it did before Teams. need=True is for a place where only the
+    part can do the work (a Teams field of a write): in place of None, design 1's refusal, teams_off while the fleet
+    has no Teams and teams_part_missing while it has Teams and this hub has not loaded the part (need_teams). With no
+    loaded part and no need, it reads nothing."""
+    module = TEAMS_CODE.get(feature)
+    if module is not None and teams_on():
+        return TeamsPart(feature, module)
+    if need:
+        need_teams(part_there=False)
+    return None
+
+
+def teams_dir():
+    """The folder of this hub's Teams packages, or None. main() gives one only to a hub that installed_hub() knows
+    (`teams` beside its records: ~/.fleet/teams) or that was started with --teams-dir (teams_folder), and
+    check_schema() takes the one of the hub whose update runs it, from TEAMS_DIR_VAR. A hub with none (each hub of a
+    test, of selftest.py and of a scratch run) loads no Teams code (teams_schema)."""
+    return CFG.get("teams_dir") or None
+
+
+def teams_folder(given):
+    """main()'s teams_dir(): the folder `given` (--teams-dir); else `teams` beside the records of a hub that
+    installed_hub() knows; else None. It writes the folder into TEAMS_DIR_VAR, for the schema check of a release, which
+    runs the new code in a child of this hub; and it takes the folder of another hub out of it, so that no child of
+    this hub finds a folder that is not this hub's."""
+    if given:
+        folder = os.path.abspath(os.path.expanduser(given))
+    elif installed_hub():
+        folder = os.path.join(os.path.dirname(os.path.abspath(os.path.expanduser(CFG["db_path"]))), TEAMS_FOLDER)
+    else:
+        folder = None
+    CFG["teams_dir"] = folder
+    if folder:
+        os.environ[TEAMS_DIR_VAR] = folder
+    else:
+        os.environ.pop(TEAMS_DIR_VAR, None)
+    return folder
+
+
+def teams_data_dir(feature):
+    """The folder of the part `feature`'s own files (a key file of design 4): `teams-data/<feature>/` beside the hub's
+    records, mode 700, made when it is not there. It is no folder of a package: no release, no cancel and no step of
+    the seam removes it. ValueError for a name that is no part's name; RuntimeError for a process that keeps no records
+    in a folder (CFG["db_path"]: the schema check of a release has none, so a part's migrate does not use it)."""
+    if not isinstance(feature, str) or not TEAMS_FEATURE.fullmatch(feature):
+        raise ValueError(f"{feature!r} is no name of a Teams part")
+    records = CFG.get("db_path")
+    if not records:
+        raise RuntimeError("this process keeps no records in a folder, so a Teams part has no folder of its own here")
+    root = os.path.join(os.path.dirname(os.path.abspath(os.path.expanduser(records))), TEAMS_DATA)
+    folder = os.path.join(root, feature)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    for one in (root, folder):
+        os.chmod(one, 0o700)
+    return folder
+
+
+def teams_take(module):
+    """One imported Teams file into the seam. None when it is taken, or when it is a file that a part imports (no
+    FEATURE); else the line that says why it is no part, and it gets no entry. A part's FEATURE is a key of TEAMS_CALLS,
+    the file has a function for each name of that row, `listed` (J2's own condition of the part, called with H) is a
+    function when the file has one, SCHEMA is a tuple of CREATE TABLE or CREATE INDEX IF NOT EXISTS when it has one,
+    `migrate` (its later steps, migrate(H)) is a function when it has one, and no other file is that part already. A
+    taken part gets its entry in TEAMS_CODE and in design 1's TEAMS_PARTS: its condition, or None for none."""
+    feature = getattr(module, "FEATURE", None)
+    if feature is None:
+        return None
+    name = getattr(module, "__file__", None) or f"{getattr(module, '__name__', 'a module')}.py"
+    listed, schema, steps = (getattr(module, one, None) for one in ("listed", "SCHEMA", "migrate"))
+    if not isinstance(feature, str) or feature not in TEAMS_CALLS:
+        why = f"its FEATURE {feature!r} is no part that this code calls (TEAMS_CALLS)"
+    elif TEAMS_CODE.get(feature, module) is not module:
+        why = f"the part {feature} again, which {TEAMS_CODE[feature].__name__} is already"
+    elif any(not callable(getattr(module, one, None)) for one in TEAMS_CALLS[feature]):
+        lacks = [one for one in TEAMS_CALLS[feature] if not callable(getattr(module, one, None))]
+        why = f"no function {', '.join(lacks)}, which Core calls of the part {feature} (TEAMS_CALLS)"
+    elif listed is not None and not callable(listed):
+        why = "its listed is no function"
+    elif schema is not None and not (isinstance(schema, (tuple, list)) and all(
+            isinstance(one, str) and TEAMS_STEP.match(one) for one in schema)):
+        why = "its SCHEMA is no tuple of CREATE TABLE or CREATE INDEX IF NOT EXISTS"
+    elif steps is not None and not callable(steps):
+        why = "its migrate is no function"
+    else:
+        TEAMS_CODE[feature] = module
+        TEAMS_PARTS[feature] = (lambda: bool(listed(TEAMS_H))) if listed is not None else None
+        return None
+    return f"The Teams part {os.path.basename(name)} did not load: {why}"
+
+
+class TeamsFiles:
+    """The finder and the loader of the Teams files of one load (teams_load), at the front of sys.meta_path. A name of
+    those files gets a module made from its text, compiled here; no other name is found here. So a Teams file can
+    import another one, the code that runs is the text whose hash was checked, and Python reads and writes no compiled
+    file in the package's folder: teamspack.folder_pack leaves __pycache__ out, so no hash covers it."""
+
+    def __init__(self, folder, texts):
+        self.folder, self.texts = folder, dict(texts)
+
+    def find_spec(self, name, path=None, target=None):
+        if path is not None or name not in self.texts:
+            return None
+        import importlib.util
+        return importlib.util.spec_from_loader(name, self, origin=os.path.join(self.folder, name + ".py"))
+
+    def create_module(self, spec):
+        return None                     # Python's own module
+
+    def exec_module(self, module):
+        module.__file__ = os.path.join(self.folder, module.__name__ + ".py")
+        exec(compile(self.texts[module.__name__], module.__file__, "exec", dont_inherit=True), module.__dict__)
+
+    def get_source(self, name):
+        return self.texts.get(name)     # the lines of a traceback, also after the folder is gone
+
+
+def teams_files():
+    """(the folder, {module name: text}) of the Teams Python files that this process may load, or None (teams_load).
+    They are the files of the package that TEAMS_LOCK names, in teams_dir(), read one time: the bytes must have the
+    lock's SHA-256, and the texts are those of the bytes that were checked. A rig of the source repository that was
+    started with --teams-source takes the Teams files of this code's own folder instead, while that folder holds no
+    lock. None for no folder, a lock that names no Python file (each release from P1 on, until a part ships), and a
+    package that is not on the disk or not whole."""
+    import teamspack
+    if CFG.get("teams_source"):
+        if TEAMS_LOCK is not None:
+            return None                 # a published tree: its Teams code comes only as the package of its lock
+        folder, texts = os.path.dirname(os.path.abspath(__file__)), {}
+        for name in sorted(os.listdir(folder)):
+            if name.endswith(".py") and teamspack.NAME.fullmatch(name):
+                with open(os.path.join(folder, name), encoding="utf-8") as f:
+                    texts[name[:-3]] = f.read()
+        return folder, texts
+    root, lock = teams_dir(), TEAMS_LOCK
+    if not root or lock is None or not lock["files"]:
+        return None
+    folder = os.path.join(root, lock["sha256"])
+    if os.path.islink(folder) or not os.path.isdir(folder):
+        return None
+    try:
+        data = teamspack.folder_pack(folder)
+        if hashlib.sha256(data).hexdigest() != lock["sha256"]:
+            return None
+        files = teamspack.unpacked(data)
+    except (OSError, ValueError):
+        return None
+    return folder, {name[:-3]: text for name, text in files.items() if name.endswith(".py")}
+
+
+def teams_load():
+    """The Teams files of this process, imported one time in the order of their names (teams_files, TeamsFiles), each
+    given to teams_take; and the lines of what failed: a file whose import raised, and a line of teams_take. The other
+    files load on. No files: nothing, and no line, so a fleet whose package is not there runs Core."""
+    if "lines" in TEAMS_LOAD:
+        return TEAMS_LOAD["lines"]
+    lines = TEAMS_LOAD["lines"] = []
+    found = teams_files()
+    if not found:
+        return lines
+    import importlib
+    finder = TEAMS_LOAD["finder"] = TeamsFiles(*found)
+    sys.meta_path.insert(0, finder)
+    for name in sorted(finder.texts):
+        try:
+            module = importlib.import_module(name)
+        except (Exception, SystemExit) as e:        # a part that ends its own import stops no start either
+            lines.append(f"The Teams part {name}.py did not load: {type(e).__name__}: {e}"[:400])
+            continue
+        if getattr(module, "__loader__", None) is not finder:
+            lines.append(f"The Teams part {name}.py did not load: this process holds another module of that name")
+            continue
+        said = teams_take(module)
+        if said:
+            lines.append(said)
+    return lines
+
+
+def teams_steps():
+    """The schema steps of each loaded part, after Core's own: its SCHEMA, each statement with sql_step, then its
+    migrate(H), which gives the lines of what the records refused. The lines of what failed. A part with a line leaves
+    TEAMS_CODE and TEAMS_PARTS, so that Core does what it did before Teams in its place, and its table is never read
+    in a form that the records refused."""
+    problems = []
+    for feature, module in sorted(TEAMS_CODE.items()):
+        own = []
+        for statement in getattr(module, "SCHEMA", None) or ():
+            sql_step(statement, own)
+        steps = getattr(module, "migrate", None)
+        if steps is not None:
+            try:
+                said = steps(TEAMS_H)
+                own += [str(one) for one in said] if isinstance(said, (list, tuple)) else \
+                    [f"its migrate gave {type(said).__name__}, and no list of lines"]
+            except Exception as e:
+                own.append(f"its migrate raised {type(e).__name__}: {e}"[:300])
+        if own:
+            TEAMS_CODE.pop(feature, None)
+            TEAMS_PARTS.pop(feature, None)
+            name = os.path.basename(getattr(module, "__file__", None) or f"{module.__name__}.py")
+            problems += [f"The Teams part {name} did not load: {one}" for one in own]
+    return problems
+
+
+def teams_schema():
+    """The last term of build_schema(): the Teams parts of this code and their steps, and the lines of what failed
+    (teams_load, teams_steps), which /ui/health shows in its warning `schema` and which refuse a release in its schema
+    check. It raises nothing. A hub with no teams_dir() and no --teams-source (each hub of a test, of selftest.py and
+    of a scratch run) does nothing here, and so does a hub while teams_on() is false: a fleet with no licence, with a
+    token of the old shop or with a licence that the signed word ended reads no package and imports no Teams file, and
+    build_schema gives it what it gave before the seam."""
+    if not (teams_dir() or CFG.get("teams_source")):
+        return []
+    try:
+        if not teams_on():
+            return []
+    except sqlite3.Error:               # the entitlement's table or column that the records refused: migrate's line
+        return []
+    try:
+        return list(teams_load()) + teams_steps()
+    except Exception as e:              # a fault of the seam itself stops no start, and the hub runs Core
+        print_fault()
+        return [f"The Teams parts did not load: {type(e).__name__}: {e}"[:400]]
+
+
 def main():
     global DB
     for name in compiled_checked(code_started()):   # first: the next start reads what this one compiled and kept
@@ -82832,6 +83273,10 @@ def main():
                                                       "hub service takes it at its next start")
     ap.add_argument("--parent-pipe", type=int, metavar="FD", help="for a test: the read end of a pipe from the test "
                                                                   "that started this hub; the hub stops when it closes")
+    ap.add_argument("--teams-dir", help="the folder of this hub's Teams packages; default: teams beside the records "
+                                        "of a hub as hub.sh installs one, and none for any other hub")
+    ap.add_argument("--teams-source", action="store_true", help="for a rig of the source repository: the Teams files "
+                                                                "of this code's own folder, which holds no teams.lock")
     args = ap.parse_args()
     if args.parent_pipe is not None:        # first, before this hub takes its records
         threading.Thread(target=stop_with_parent, args=(args.parent_pipe,), name="parent-pipe", daemon=True).start()
@@ -82855,6 +83300,8 @@ def main():
     CFG["db_path"] = db_path
     if os.path.dirname(db_path):
         os.makedirs(os.path.dirname(db_path), mode=0o700, exist_ok=True)
+    CFG["teams_source"] = args.teams_source
+    teams_folder(args.teams_dir)        # before build_schema, whose last term loads the Teams parts (teams_schema)
     if args.restore:
         return restore_by_hand(args.restore, db_path)
     unit_says = unit_follows_code()     # before the hub takes its records: systemd can start the hub again here

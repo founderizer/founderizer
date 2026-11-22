@@ -231,6 +231,9 @@ def decide(access, agent, target, op, args, content=None, lookups=None):
         return refused(f"{kind} is no kind of target")
     if f"{kind}:{name}" in (never.get("accounts") or []):
         return refused(f"{target} is never a target of the door")
+    missing = None if target in (access.get("credentials") or {}) else door_providers.no_key(target)
+    if missing:
+        return refused(missing[0], route=missing[1])
     if target not in (me.get("providers") or []):
         return refused(f"{agent} holds no grant on {target}", route="holder")
     return door_providers.decide(access, agent, kind, name, op, args, content, lookups or {})

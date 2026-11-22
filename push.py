@@ -106,6 +106,14 @@ def _refusal(status, text, side):
     return f"{side} answered {status}" + (f": {str(says)[:200]}" if says else "")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A ping follows no redirect: urllib's own handler took a 301, 302 or 303 of our side's push route to the host that
+    it named, as a GET, with the entitlement's bearer in its Authorization, and took that host's answer for Apple's (the
+    review of 22 November 2026). The redirect stays an answer of its own, refused with its status (_refusal)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def send(channel, entitlement, device_token, payload, environment, collapse=None, expires=None, timeout=None):
     """One ping through our side. (status, reason): Apple's HTTP status and its reason, or (0, why) when no answer
     came, so that the ping may or may not have arrived. PushError when nothing left: our side refused the ping or
@@ -125,7 +133,7 @@ def send(channel, entitlement, device_token, payload, environment, collapse=None
         headers["Authorization"] = "Bearer " + entitlement
     request = urllib.request.Request(channel.rstrip("/") + "/api/push", data=json.dumps(body).encode(), method="POST",
                                      headers=headers)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     try:
         with opener.open(request, timeout=timeout or TIMEOUT) as answer:
             text = answer.read(65536).decode("utf-8", "replace")
