@@ -314,6 +314,7 @@ class LinuxPlaces(OwnerAPI):
         # **Calm windows give a place back** (21 November 2026: one stall took the only place of a server for hours).
         # Each section starts fresh at new limits; a reading is a window only at BROWSER_WINDOW seconds or more.
         clock = [t0 + 3000]
+        room_of = lambda: json.loads(hub.kv_get(hub.BROWSER_ROOM + "box"))      # noqa: E731
 
         def at(gap, mib, **room):
             clock[0] += gap
@@ -321,64 +322,196 @@ class LinuxPlaces(OwnerAPI):
             return hub.browser_places("box")
 
         calm = lambda n, mib, **room: [at(300, mib, **room) for _ in range(n)][-1]      # noqa: E731
-        at(300, 7200)                                                    # new limits: fresh
-        self.assertEqual(at(300, 7200, oom=1), 1)                        # a sign takes one
-        self.assertEqual([at(20, 7200, oom=1) for _ in range(12)][-1], 1)    # 12 short readings are one window
-        self.assertEqual(calm(hub.BROWSER_QUIET - 2, 7200, oom=1), 1)
-        self.assertEqual(at(300, 7200, oom=1), 2)                        # the sixth calm window gives it back
-        # a stall in pieces of short readings is still a stall, over its window
+        Q = hub.BROWSER_QUIET
+        # short readings are one window; the sixth calm window gives the place back; with no browser, a quick sign
+        # does not double the wait
+        at(300, 7200)
+        self.assertEqual(at(300, 7200, oom=1), 1)
+        self.assertEqual([at(20, 7200, oom=1) for _ in range(12)][-1], 1)
+        self.assertEqual(calm(Q - 2, 7200, oom=1), 1)
+        self.assertEqual(at(300, 7200, oom=1), 2)
+        lone = self.task("kai")                                          # one browser of two places: not the returned one
+        self.assertIsInstance(lone, int, lone)
+        self.closed(lone)
+        self.assertEqual(at(300, 7200, oom=2), 1)
+        self.assertEqual(room_of()["need"], Q)
+        self.assertEqual(calm(Q, 7200, oom=2), 2)
+        # a stall in pieces of short readings is still a stall; a window between the bounds does not count, and three
+        # in a row start the count again
         at(300, 7300)
         for i in range(1, 13):
             at(20, 7300, full_us=i * 600_000)                            # 7.2 s in 240 s: 9 s in 300 s
         self.assertEqual(hub.browser_places("box"), 1)
-        # a window between the bounds neither counts nor starts the count again
-        self.assertEqual(calm(hub.BROWSER_QUIET - 1, 7300, full_us=7_200_000), 1)
-        self.assertEqual(at(300, 7300, full_us=7_200_000 + 3_000_000), 1)    # 3 s in 300 s: between
-        self.assertEqual(at(300, 7300, full_us=10_200_000), 2)               # the sixth calm one
-        # a sign soon after a place came back doubles the wait (windows between the bounds do not count toward it);
-        # signs never take more than the room gives
-        full = 10_200_000
-        for _ in range(hub.BROWSER_QUIET):
-            full += 3_000_000
-            at(300, 7300, full_us=full)                                   # between: no step toward the reset
+        full = 7_200_000
+        self.assertEqual(calm(Q - 1, 7300, full_us=full), 1)
+        full += 3_000_000
+        self.assertEqual(at(300, 7300, full_us=full), 1)                 # 3 s in 300 s: between
+        self.assertEqual(at(300, 7300, full_us=full), 2)                 # the sixth calm one
         self.assertEqual(at(300, 7300, full_us=full, swap_fail=1), 1)
-        self.assertEqual(at(300, 7300, full_us=full, swap_fail=2), 0)
-        self.assertEqual(at(300, 7300, full_us=full, swap_fail=3), 0)
-        self.assertEqual(json.loads(hub.kv_get(hub.BROWSER_ROOM + "box"))["less"], 2)
-        self.assertEqual(calm(2 * hub.BROWSER_QUIET - 1, 7300, full_us=full, swap_fail=3), 0)
-        self.assertEqual(at(300, 7300, full_us=full, swap_fail=3), 1)     # twelve calm windows now
-        self.assertEqual(calm(2 * hub.BROWSER_QUIET, 7300, full_us=full, swap_fail=3), 2)
-        # a long calm after it sets the wait back
-        calm(4 * hub.BROWSER_QUIET, 7300, full_us=full, swap_fail=3)
+        self.assertEqual(calm(Q - 1, 7300, full_us=full, swap_fail=1), 1)
+        for _ in range(3):
+            full += 3_000_000
+            at(300, 7300, full_us=full, swap_fail=1)
+        self.assertEqual(calm(Q - 1, 7300, full_us=full, swap_fail=1), 1)    # the count started again
+        self.assertEqual(at(300, 7300, full_us=full, swap_fail=1), 2)
+        # a calm window between them starts the run of between windows again
+        self.assertEqual(at(300, 7300, full_us=full, swap_fail=2), 1)
+        calm(Q - 3, 7300, full_us=full, swap_fail=2)
+        for _ in range(2):
+            full += 3_000_000
+            at(300, 7300, full_us=full, swap_fail=2)                     # between
+            at(300, 7300, full_us=full, swap_fail=2)                     # calm
+        full += 3_000_000
+        at(300, 7300, full_us=full, swap_fail=2)                         # between: the third, but not in a row
+        self.assertEqual(at(300, 7300, full_us=full, swap_fail=2), 2)    # the sixth calm one in the count
+        # calm that comes only in short runs still brings it back: twice `need` calm windows in any order
+        self.assertEqual(at(300, 7300, full_us=full, swap_fail=3), 1)
+        for run in range(3):
+            calm(4, 7300, full_us=full, swap_fail=3)
+            if run < 2:
+                for _ in range(3):
+                    full += 3_000_000
+                    self.assertEqual(at(300, 7300, full_us=full, swap_fail=3), 1)
+        self.assertEqual(hub.browser_places("box"), 2)                   # the twelfth calm window
+        # a sign starts the slow count again: calm windows from before a new shortage do not bring its place back
         self.assertEqual(at(300, 7300, full_us=full, swap_fail=4), 1)
-        self.assertEqual(calm(hub.BROWSER_QUIET, 7300, full_us=full, swap_fail=4), 2)
-        # an older reading that comes late, within a window, changes nothing; counters that start again later, with
-        # no new boot id, are the new base
-        before = hub.kv_get(hub.BROWSER_ROOM + "box")
-        seen(dict(reading(memory_max=7300 * MIB, full_us=full, swap_fail=3), os={"boot": "b2"}), clock[0] + 60)
-        self.assertEqual(hub.kv_get(hub.BROWSER_ROOM + "box"), before)
-        self.assertEqual(at(300, 7300, full_us=0, swap_fail=0), 2)
-        self.assertEqual(at(300, 7300, full_us=0, swap_fail=1), 1)          # a sign from the new base
+        for run in range(2):
+            calm(4, 7300, full_us=full, swap_fail=4)
+            for _ in range(3):
+                full += 3_000_000
+                at(300, 7300, full_us=full, swap_fail=4)
+        self.assertEqual(at(300, 7300, full_us=full, swap_fail=5), 0)    # eight calm windows, then a sign
+        self.assertEqual(calm(4, 7300, full_us=full, swap_fail=5), 0)
+        # a sign at the reading that closes the sixth calm window: no place comes back
+        at(300, 7400)
+        self.assertEqual(at(300, 7400, oom=1), 1)
+        self.assertEqual(calm(Q - 1, 7400, oom=1), 1)
+        self.assertEqual(at(300, 7400, oom=2), 0)
+        self.assertEqual(calm(Q, 7400, oom=2), 1)
         # a window that had a sign at a short reading is no calm window when it closes
-        at(300, 7350)
-        self.assertEqual(at(60, 7350, oom=1), 1)
-        self.assertEqual(at(240, 7350, oom=1), 1)
-        self.assertEqual(calm(hub.BROWSER_QUIET - 2, 7350, oom=1), 1)
-        # a reading whose stall counter failed once: the two windows that it ends and starts are not calm
-        self.assertEqual(at(300, 7350, oom=1, full_us=None), 1)
-        self.assertEqual(at(300, 7350, oom=1), 1)
-        self.assertEqual(at(300, 7350, oom=1), 1)
-        self.assertEqual(at(300, 7350, oom=1), 2)                          # the sixth calm window
-        # a kernel with no stall counter: its windows close on their length, calm while no counter grows
-        at(300, 7400, full_us=None)
-        self.assertEqual(at(300, 7400, full_us=None, oom=1), 1)
-        self.assertEqual(calm(hub.BROWSER_QUIET, 7400, full_us=None, oom=1), 2)
-        # an agent more leaves the room no place: the places that shortages took go down with it
-        self.assertEqual(at(300, 7400, full_us=None, oom=2), 1)
+        at(300, 7450)
+        self.assertEqual(at(60, 7450, oom=1), 1)
+        self.assertEqual(at(240, 7450, oom=1), 1)
+        self.assertEqual(calm(Q - 1, 7450, oom=1), 1)
+        self.assertEqual(at(300, 7450, oom=1), 2)
+        # a reading that could not read a counter changes nothing of it; one that could not read a limit is skipped;
+        # a value of before this rule, with none of its keys, goes on
+        at(300, 7500)
+        self.assertEqual(at(300, 7500, oom=1), 1)
+        self.assertEqual(calm(Q - 2, 7500, oom=1), 1)
+        for _ in range(3):
+            self.assertEqual(at(300, 7500, oom=1, full_us=None), 1)      # three reads of it failed: no window closes
+        self.assertEqual(room_of()["quiet"], Q - 2)
+        self.assertEqual(at(300, 7500, oom=1), 1)                        # one window of 1200 s, calm
+        self.assertEqual(at(300, 7500, oom=1), 2)
+        self.assertEqual(at(300, 7500, oom=2), 1)
+        for _ in range(2):                                               # a limit unread twice: nothing changes
+            clock[0] += 300
+            seen(dict(reading(memory_max=None, oom=2), os={"boot": "b2"}), clock[0])
+        self.assertEqual((room_of()["less"], room_of()["memory_max"]), (1, 7500 * MIB))
+        clock[0] += 300
+        seen(dict(reading(memory_max=None, oom=2), os={"boot": "b2"}), clock[0])
+        self.assertEqual((room_of()["less"], room_of()["memory_max"]), (0, None))    # the third: the limit is gone
+        self.assertEqual(at(300, 7500, oom=2), 2)
+        old = {k: v for k, v in room_of().items() if k in ("boot", "memory_max", "swap_max", "swap_total", "oom",
+                                                            "swap_fail", "full_us", "at")}
+        hub.kv_set(hub.BROWSER_ROOM + "box", json.dumps(dict(old, less=1)))
+        self.assertEqual(calm(Q - 1, 7500, oom=2), 1)
+        self.assertEqual(at(300, 7500, oom=2), 2)
+        # a lost oom count makes no calm window; a counter lost for three windows' time is gone
+        at(300, 7550)
+        self.assertEqual(at(300, 7550, oom=1), 1)
+        self.assertEqual(calm(Q - 1, 7550, oom=1), 1)
+        self.assertEqual(at(300, 7550, oom=None), 1)
+        self.assertEqual(at(300, 7550, oom=1), 2)
+        self.assertEqual(at(300, 7550, oom=2), 1)
+        backs = [at(300, 7550, oom=2, full_us=None) for _ in range(Q + 3)]
+        self.assertEqual(backs[:3], [1, 1, 1])                           # lost: no window closes
+        self.assertEqual(backs[-1], 2)                                   # gone: its windows close on their length
+        self.assertEqual(at(300, 7550, oom=3, full_us=None), 1)
+        backs = [at(300, 7550, oom=None, full_us=None) for _ in range(Q + 3)]
+        self.assertEqual(backs[:3], [1, 1, 1])                           # an oom count lost: no calm window
+        self.assertEqual(backs[-1], 2)                                   # gone too: calm windows again
+        # a good reading starts the count of unread limits again; three unread within seconds are no new limit
+        for gaps in ((300, 0, 300, 300), (20, 20, 20)):
+            for gap in gaps:
+                clock[0] += max(gap, 1)
+                limit = None if gap else 7550 * MIB
+                seen(dict(reading(memory_max=limit, oom=2), os={"boot": "b2"}), clock[0])
+            self.assertEqual(room_of()["memory_max"], 7550 * MIB)
+            at(300, 7550, oom=2)                                         # a good reading between the two
+        # a kernel that never gave a stall counter: its windows close on their length, calm while no count grows
+        at(300, 7600, full_us=None)
+        self.assertEqual(at(300, 7600, full_us=None, oom=1), 1)
+        self.assertEqual(calm(Q, 7600, full_us=None, oom=1), 2)
+        # an older reading that comes late, within a window, changes nothing; counters that start again later, with no
+        # new boot id, are the new base
+        at(300, 7700, oom=3)
+        before = hub.kv_get(hub.BROWSER_ROOM + "box")
+        seen(dict(reading(memory_max=7700 * MIB, oom=2), os={"boot": "b2"}), clock[0] + 60)
+        self.assertEqual(hub.kv_get(hub.BROWSER_ROOM + "box"), before)
+        self.assertEqual(at(300, 7700, oom=0), 2)
+        self.assertEqual(at(300, 7700, oom=1), 1)                        # a sign from the new base
+        # an agent more leaves the room no place; the shortage stays with it, and comes back by calm windows
         hub.TEAM["agents"]["gus"] = {"role": "worker", "runtime": "claude", "machine": "box", "can": ["shell"]}
-        at(300, 7400, full_us=None, oom=2)
-        self.assertEqual(json.loads(hub.kv_get(hub.BROWSER_ROOM + "box"))["less"], 0)
+        at(300, 7700, oom=1)
+        self.assertEqual(room_of()["less"], 1)
         del hub.TEAM["agents"]["gus"]
+        self.assertEqual(at(300, 7700, oom=1), 1)
+        self.assertEqual(calm(Q, 7700, oom=1), 2)
+        # **the wait doubles only for a browser that brings the shortage back**: up to 48 calm windows, and a long calm
+        # since the last sign sets it back. Helpers that acknowledge a stop (agent_key) free a desktop at a confirmed end.
+        for name in ("ivy", "kai"):
+            hub.q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET "
+                  "data=excluded.data", (name, json.dumps({"features": ["agent_key"]}), hub.now()))
+        at(300, 7800)
+        first = self.task("ivy")
+        self.assertIsInstance(first, int, first)
+        self.assertEqual(at(300, 7800, oom=1), 1)
+        self.assertEqual(calm(Q, 7800, oom=1), 2)
+        self.assertEqual(at(300, 7800, oom=2), 1)                        # its browser held the other place all along
+        self.assertEqual(room_of()["need"], Q)
+        self.assertEqual(calm(Q, 7800, oom=2), 2)
+        second = self.task("kai")                                        # a browser in the place that came back
+        self.assertIsInstance(second, int, second)
+        full = 0
+        for _ in range(2):
+            full += 3_000_000
+            at(300, 7800, oom=2, full_us=full)                           # between: no step since it came back
+        calm(2, 7800, oom=2, full_us=full)
+        needs, oom = [], 3
+        at(300, 7800, oom=oom, full_us=full)                             # a sign two calm windows after it came back
+        needs.append(room_of()["need"])
+        for _ in range(3):
+            self.assertEqual(calm(room_of()["need"], 7800, oom=oom, full_us=full), 2)
+            oom += 1
+            at(300, 7800, oom=oom, full_us=full)                         # the shortage came back at once
+            needs.append(room_of()["need"])
+        self.assertEqual(needs, [2 * Q, 4 * Q, 8 * Q, 8 * Q])
+        calm(8 * Q, 7800, oom=oom, full_us=full)
+        self.assertEqual((hub.browser_places("box"), room_of()["need"]), (2, 8 * Q))
+        calm(8 * Q, 7800, oom=oom, full_us=full)
+        self.assertEqual(room_of()["need"], Q)                           # 2 · need calm windows since the last sign
+        self.closed(first)
+        self.closed(second)
+        # a browser task that starts and ends between two readings still counts as one that ran (a room of one place);
+        # a sign Q calm windows after the place came back doubles nothing
+        at(300, 5900)
+        self.assertEqual(at(300, 5900, oom=1), 0)
+        self.assertEqual(calm(Q, 5900, oom=1), 1)
+        quick = self.task("kai")
+        self.assertIsInstance(quick, int, quick)
+        self.closed(quick)
+        self.assertEqual(hub.browser_holders("box"), [])
+        at(300, 5900, oom=2)
+        self.assertEqual(room_of()["need"], 2 * Q)
+        self.assertEqual(calm(2 * Q, 5900, oom=2), 1)
+        late = self.task("kai")
+        self.assertIsInstance(late, int, late)
+        self.closed(late)
+        calm(Q, 5900, oom=2)
+        at(300, 5900, oom=3)
+        self.assertEqual(room_of()["need"], 2 * Q)
 
     def test_a_browser_task_takes_its_place_and_the_next_one_hears_when_one_is_free(self):
         first = self.task("ivy")
@@ -573,6 +706,10 @@ class LinuxPlaces(OwnerAPI):
         data["browser"].update(proof_kept=False)
         hub.q("UPDATE server_status SET data=? WHERE server='box'", (json.dumps(data),))
         self.assertIn("You get no browser on box: its server service cannot keep the live proof", ask("Open the page."))
+        data = self.room(ONE_PLACE)
+        del data["room"]                                                  # parts in place, and no reading of its room
+        hub.q("UPDATE server_status SET data=? WHERE server='box'", (json.dumps(data),))
+        self.assertIn("box has no place for a browser now: the hub has no reading of its memory yet.", ask("Open it, now."))
         self.room(dict(ONE_PLACE, memory_max=None))
         self.assertIn("box has no place for a browser now: the memory limit of its agents is not in place there yet",
                       ask("Open the page now."))
@@ -589,7 +726,8 @@ class LinuxPlaces(OwnerAPI):
         hub.kv_set(hub.BROWSER_ROOM + "box", json.dumps({"less": 0}))
         self.assertIsInstance(self.task("kai"), int)                      # kai's task holds the one place
         said = ask("And open it once more.")
-        self.assertIn("box has no free place for a browser now: other browser tasks there hold its places.", said)
+        self.assertIn("box has no free place for a browser now: other browser tasks there hold its places or wait for "
+                      "them.", said)
         self.assertNotIn("T-", said)                                      # only the manager sees another task's ID
         self.assertIsNone(hub.kv_get(hub.BROWSER_REFUSED + "box"))        # and no promise of a notice
 

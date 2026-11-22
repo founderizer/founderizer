@@ -544,6 +544,39 @@ class Turns(test_releases.HubUpdates):
         self.assertEqual((self.newest()["state"], self.newest()["cause"]), (releases.DONE, None))
         self.assertEqual((self.kit / "hub.py").read_text(), "# the hub\nVERSION = 2\n")
 
+    def test_a_release_that_the_published_repository_does_not_give_comes_from_the_release_channel_s_file(self):
+        """W12 of the reliability plan of 21 November 2026: the owner's test hub could not reach github.com for six
+        days, while the release channel's host answered all along. After a fetch that the network stopped, a probe
+        that fails too takes the release's commit from the channel's file, in the probe's thread; the next tick takes
+        the release as a new one, which waits for the turn that runs and then takes the first moment no turn runs, and
+        its run fetches nothing: every fetch from the published repository still fails here, and the release is done.
+        Bug: a run after the file that fetches from the published repository again ends kept at the fetch, at each
+        poll, as before the file."""
+        released = self.kept_for_the_network()
+        working = self.task_for()
+        windows("vps", hub.tref(working))
+        turn(working, running=True)
+        inner = self.runner()
+
+        def offline(argv, timeout=None, cwd=None, input=None):
+            if argv[0] == "git" and argv[3:4] == ["fetch"] and argv[-1] == releases.REMOTE:
+                return 128, "", ("fatal: unable to access 'https://github.com/example/fleet.git/': Failed to connect "
+                                 "to github.com port 443 after 1 ms: Couldn't connect to server")
+            return inner(argv, timeout=timeout, cwd=cwd, input=input)
+        with self.served_file():
+            self.release_tick(released, offline)        # the poll: the probe fails, and the file gives the commit
+        self.assertEqual(self.file_asked, ["https://channel.invalid" + releases.BUNDLE_PATH])
+        self.assertEqual(hub.git_kit("rev-parse", releases.BUNDLE_REF)[1], released)
+        self.assertEqual(self.newest()["state"], releases.KEPT)
+        self.assertIsNone(hub.release_waiting(), "the file itself takes nothing")
+        self.release_tick(released, offline, swept=False)       # the next tick, past the poll's gate, while it runs
+        self.assertEqual(hub.release_waiting()["revision"], released)
+        turn(working, running=False)
+        self.release_tick(released, offline, swept=False)       # the first moment no turn runs
+        self.assertEqual((self.newest()["state"], self.newest()["cause"]), (releases.DONE, None), self.newest()["says"])
+        self.assertEqual((self.kit / "hub.py").read_text(), "# the hub\nVERSION = 2\n")
+        self.assertEqual(len(self.file_asked), 1)
+
     def test_the_probe_holds_no_session_start(self):
         """The probe waits for the network, 20 seconds at most, at each poll of a hub whose network is down. Run inside
         the update run, it would hold the start of every session meanwhile (release_applying), as the poll did for

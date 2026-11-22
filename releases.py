@@ -46,7 +46,9 @@ verification below is the reference implementation of RFC 8032. Where the machin
 only when both say yes (openssl_agrees).
 """
 import base64
+import contextlib
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -56,6 +58,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import urllib.error
 import urllib.request
@@ -923,6 +926,133 @@ def reaches(kit, url, run=_run):
     return code == 0
 
 
+# ---------------------------------------------------------------- the second route of a release's code (W12)
+
+# **A second route for a release's code** (the reliability plan of 21 November 2026, 3.2 and W12). The owner's test
+# hub lost its IPv4 route for six days, and github.com, its only upstream, answers over IPv4 only; the channel's host
+# answers over IPv4 and IPv6. So the publisher makes one git bundle of the published repository at each release
+# (autopublish.make_bundle), and it is served at one fixed address of the channel (BUNDLE_PATH, step 2 of W12). A hub
+# whose fetch failed for the network, while the probe of the published repository fails too, takes the release's
+# commit from that file (take_bundle, hub.release_bundle_work). The file needs no trust: the signed manifest names
+# the commit, a commit id is the hash of its content, the hub fetches that one commit by its id, and the run refuses a
+# checkout that does not hold it (Update.before, the step `have`). Until step 2 the channel answers 404 there, and the
+# row stays as the network left it.
+BUNDLE_PATH = "/releases/latest.bundle"
+# The file is a bundle of the whole published main, about 6 to 29 MiB on 22 November 2026 (autopublish.BUNDLE says
+# how that was measured), and it grows by about 13 KiB for each release: BUNDLE_MOST leaves room for more than a year.
+BUNDLE_MOST = 256 << 20     # bytes: a larger file is refused, before its first byte when it says its length
+BUNDLE_WAIT = 300           # seconds for the whole download; the hub's probe thread waits for it, and holds nothing
+BUNDLE_READ = 30            # seconds that one read of it waits at most, so that the download ends near BUNDLE_WAIT
+BUNDLE_REF = "refs/founderizer/bundle"      # where the hub's checkout keeps the commit that it took from the file
+BUNDLE_HEADS = (b"# v2 git bundle\n", b"# v3 git bundle\n")      # the first line of a git bundle, and of nothing else
+
+
+def bundle_address(channel):
+    """The one address of the release file on the release channel `channel`."""
+    return (channel or DEFAULT_CHANNEL).rstrip("/") + BUNDLE_PATH
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The file is at one fixed address of the channel: a redirect is an answer that is not the file."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def download(url, path, *, most=BUNDLE_MOST, wait=BUNDLE_WAIT, read_wait=BUNDLE_READ, opener=None,
+             clock=time.monotonic):
+    """The file at `url` into `path`: None when it is there whole, else the one line that says why, and then no file
+    is left at `path`. It never raises.
+
+    Over HTTPS only, with no proxy and no redirect, and inside two limits. `most` bytes: a Content-Length above it is
+    refused before a byte is read, and a body that grows past it is cut and refused. `wait` seconds: each read is one
+    `read1`, which gives what the next receive brings, up to 64 KiB, and waits `read_wait` seconds at most for it (the
+    socket's timeout); the clock, which starts before the connection, is read again before each read, so a server
+    that sends a byte of the body now and then ends the download `wait` + `read_wait` seconds after it began. Before
+    the body, the connection, the TLS handshake and the headers wait `read_wait` seconds at most for each receive,
+    and nothing limits them as a whole; the name lookup is the system's own, with the resolver's limits."""
+    if not str(url).lower().startswith("https://"):
+        return f"the address of the release file is not an https address: {str(url)[:100]}"
+    opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+    deadline, got, why = clock() + wait, 0, None
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "founderizer-hub"})
+        with opener.open(request, timeout=min(read_wait, wait)) as answer, open(path, "wb") as out:
+            length = str(answer.headers.get("Content-Length") or "").strip()
+            if length.isdigit() and int(length) > most:
+                why = f"the release file is {length} bytes, more than the {most} that this hub takes"
+            while why is None:
+                if clock() > deadline:
+                    why = f"the release file did not come whole in {wait} seconds"
+                    break
+                chunk = answer.read1(1 << 16)       # what one receive brings: read() waits for all 64 KiB
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got > most:
+                    why = f"the release file is more than the {most} bytes that this hub takes"
+                    break
+                out.write(chunk)
+            if why is None and length.isdigit() and got != int(length):
+                why = f"the release file came with {got} of its {length} bytes"
+    except urllib.error.HTTPError as answer:
+        with contextlib.suppress(Exception):
+            answer.close()
+        why = f"the release channel answered {answer.code} for the release file"
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
+        why = "the release file could not be downloaded: " + _line(getattr(e, "reason", None) or e)[:200]
+    if why is not None:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+    return why
+
+
+def take_bundle(kit, channel, revision, *, run=None, fetch=None):
+    """The second route: the release file of the channel `channel` (download), and from it the one commit `revision`,
+    by its id, into the checkout `kit` at BUNDLE_REF. None when `kit` holds that commit now, else the one line that
+    says why, and then nothing of the file reaches `kit`.
+
+    Everything of the file stays in a folder of its own, which is gone when this returns. A file whose first line is
+    not a git bundle's (BUNDLE_HEADS) is refused before git reads it: git reads a file that says `gitdir: <path>` as
+    a pointer to another repository of this machine. git then unpacks the file into a bare repository of that folder,
+    never into `kit`, and asks it for that one commit, with no tag: a file that does not hold it fails there ("bad
+    object"), as does a file of a range whose start that repository lacks. Only then does `kit` fetch BUNDLE_REF from
+    that repository, which sends the objects that `kit` lacks and nothing else, and checks that they are whole: a
+    file filtered of its blobs (`--filter`) gives a commit that cannot be sent whole, and fails there. `kit` then holds
+    that commit, which `cat-file` reads again, as the run reads it at its step `have`."""
+    run, fetch = run or _run, fetch or download
+    if not REVISION.fullmatch(str(revision or "")):
+        return "the release names no full commit id"
+    folder = tempfile.mkdtemp(prefix="founderizer-bundle-")
+    try:
+        path, own = os.path.join(folder, "release.bundle"), os.path.join(folder, "taken.git")
+        why = fetch(bundle_address(channel), path)
+        if why:
+            return why
+        try:
+            with open(path, "rb") as file:
+                first = file.readline(64)
+        except OSError as e:
+            return f"the release file could not be read: {_line(e)}"
+        if first not in BUNDLE_HEADS:
+            return "the release file is not a git bundle"
+        quiet = {"GIT_TERMINAL_PROMPT": "0"}
+        code, _, err = run(["git", "init", "-q", "--bare", own], timeout=60, env=quiet)
+        if code != 0:
+            return f"no repository could be made for the release file: {_line(err)[-200:] or 'git said nothing'}"
+        for into, source, wanted in ((own, path, revision), (kit, own, BUNDLE_REF)):
+            code, _, err = run(["git", "-C", into, "fetch", "-q", "--no-write-fetch-head", "--no-tags", source,
+                                f"+{wanted}:{BUNDLE_REF}"], timeout=GIT_WAIT, env=quiet)
+            if code != 0:
+                said = _line(str(err or "").replace(path, "the file").replace(own, "its repository"))[-200:]
+                return f"the release file does not give release {revision[:12]}: {said or 'git said nothing'}"
+        if run(["git", "-C", kit, "cat-file", "-e", revision + "^{commit}"], timeout=60)[0] != 0:
+            return f"this checkout does not hold release {revision[:12]} after the fetch from the release file"
+        return None
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 class Update:
     """One update run of one fleet.
 
@@ -952,16 +1082,21 @@ class Update:
 
     `limit` is the words that each of the four checks runs under (check_prefix): its priority and its memory scope.
 
+    `bundled` is true for a run whose release commit the second route took already, from the release file of the
+    channel, while the published repository did not answer (take_bundle, hub.release_bundle_work): the run then
+    fetches nothing from the network, and the step `have` still refuses a checkout that does not hold that commit.
+
     Each answer carries `cause`: one code of CAUSES for a run that did not end done, read from git's words, the
     signal that ended a check and the machine's state, or None where nothing says which."""
 
     def __init__(self, kit, manifest, *, origin=None, upstream=None, branch=None, remote=REMOTE,
                  run=_run, python=None, database=None, selftest_wait=SELFTEST_WAIT, verify_wait=VERIFY_WAIT,
-                 schema_wait=SCHEMA_WAIT, floor=None, pushed=None, own=None, limit=()):
+                 schema_wait=SCHEMA_WAIT, floor=None, pushed=None, own=None, limit=(), bundled=False):
         from lifecycle import CONFIG_BRANCH
         self.kit, self.manifest, self.origin, self.upstream = kit, manifest, origin, upstream
         self.branch, self.remote, self.run, self.database = branch or CONFIG_BRANCH, remote, run, database
         self.floor, self.pushed, self.own, self.limit = floor, pushed, own, list(limit or ())
+        self.bundled = bool(bundled)
         self.python = python or sys.executable
         self.selftest_wait, self.verify_wait, self.schema_wait = selftest_wait, verify_wait, schema_wait
         # pinned: the revision this fleet runs and keeps. reached: the revision that got onto the configuration
@@ -1029,7 +1164,8 @@ class Update:
         return None
 
     def fetch(self):
-        """`git fetch upstream`, with the remote added when the repository does not carry it yet."""
+        """`git fetch upstream`, with the remote added when the repository does not carry it yet. A `bundled` run
+        fetches nothing."""
         code, url, _ = self.git("remote", "get-url", self.remote, timeout=60)
         if code != 0:
             if not self.upstream:
@@ -1043,6 +1179,8 @@ class Update:
             if code != 0:
                 return self.answer(KEPT, "fetch", f"the remote {self.remote} could not be pointed at the published "
                                                   f"repository", room_cause(code, err))
+        if self.bundled:
+            return None             # the second route holds the commit already: the step `have` reads it
         code, _, err = self.git("fetch", "-q", "--no-write-fetch-head", self.remote)
         if code != 0:
             # First what a person reads in one go, then git's own line: a server with no route to github.com (the

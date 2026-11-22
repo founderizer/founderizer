@@ -104,7 +104,11 @@ agent's use of a login clears the sites of that sign-in in that browser within a
 next start. The agent's screen offers no shared memory (Xvfb's MIT-SHM is off, and x11vnc runs with `-noshm`).
 Before 21 November 2026 it did, and Chrome kept its window's picture in a memory segment that another OS user of
 the same server (another agent with a shell) could read and write (measured on a throwaway server); a browser
-that ran when the change arrived keeps its old screen until its next start. What the agent's own programs
+that ran when the change arrived keeps its old screen until its next start. The screen keeps its abstract socket
+name, which X clients try first: another OS user that binds the name of a display before the agent's screen starts
+does not get its clients, because Xvfb (21.1.12, `-displayfd`) takes no display whose name another user holds and
+chooses the next one (measured on 21 November 2026 on a throwaway server: with the names of displays 0 and 1 held by
+another user, it took display 2, and nothing reached that user). What the agent's own programs
 can still reach in its own browser (a filled field, the vault's script, the browser's cookies) is item 26 of
 [VAULT.md](VAULT.md), "What the vault does not protect": a copied session works until the site ends it, so after a
 grant's end the owner's step is the site's "sign out everywhere" or a new password.

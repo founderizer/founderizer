@@ -30,12 +30,15 @@ import os
 import re
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -532,6 +535,117 @@ class Channel(unittest.TestCase):
         self.assertIsNone(releases.latest("https://platform.founderizer.com", KEY, None,
                                           fetch=answers(dict(manifest("a" * 40), entitlement="nonsense")))["entitlement"])
 
+    def test_the_release_file_comes_whole_inside_its_size_and_time_limits_or_not_at_all(self):
+        """W12: the hub downloads the release file of the channel over HTTPS only, and inside two limits, here on
+        a stand-in of the answer and of the clock. A Content-Length above the limit is refused before a read, and a
+        body that grows past it is cut; the clock is read before each read, and the download stops once it is past
+        its time. A file that breaks a limit, comes short, or comes with an answer that is not the file leaves no file.
+        Bugs: a file larger than the limit fills the hub's disk; a body that never ends holds the probe's thread, and
+        with it every later probe."""
+        clock = [0.0]
+
+        class Answer:
+            def __init__(self, chunks, length=None, each=0.0):
+                self.chunks, self.each, self.reads = list(chunks), each, 0
+                self.headers = {} if length is None else {"Content-Length": str(length)}
+
+            def read1(self, size):
+                self.reads += 1
+                clock[0] += self.each
+                return self.chunks.pop(0) if self.chunks else b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        class Opener:
+            def __init__(self, answer):
+                self.answer, self.waits = answer, []
+
+            def open(self, request, timeout=None):
+                self.waits.append(timeout)
+                if isinstance(self.answer, Exception):
+                    raise self.answer
+                return self.answer
+
+        folder = Path(tempfile.mkdtemp(prefix="fleet-release-file-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        path, url = str(folder / "release.bundle"), "https://platform.founderizer.com" + releases.BUNDLE_PATH
+
+        def get(answer, address=url, **limits):
+            opener = Opener(answer)
+            why = releases.download(address, path, opener=opener, clock=lambda: clock[0], **limits)
+            return why, opener
+        why, opener = get(Answer([b"0123456789", b"abcde"], length=15))
+        self.assertIsNone(why)
+        self.assertEqual((Path(path).read_bytes(), opener.waits), (b"0123456789abcde", [releases.BUNDLE_READ]))
+        cases = ((Answer([b"x"], length=11), {"most": 10}, "is 11 bytes, more than the 10"),
+                 (Answer([b"x" * 8, b"x" * 8]), {"most": 10}, "more than the 10 bytes"),
+                 (Answer([b"x"] * 50, each=100.0), {"wait": 300}, "did not come whole in 300 seconds"),
+                 (Answer([b"x" * 5], length=20), {}, "came with 5 of its 20 bytes"),
+                 (urllib.error.HTTPError(url, 404, "Not Found", {}, None), {}, "answered 404"),
+                 (urllib.error.URLError("Network is unreachable"), {}, "could not be downloaded: Network is unreachable"))
+        for answer, limits, said in cases:
+            Path(path).write_bytes(b"an older file")
+            why, _ = get(answer, **limits)
+            self.assertIn(said, why or "", limits)
+            self.assertFalse(os.path.exists(path), said)
+        self.assertEqual(cases[0][0].reads, 0, "a file that says it is too large was read")
+        self.assertLessEqual(cases[2][0].reads, 4, "a slow file was read past its time")
+        why, opener = get(Answer([b"x"]), address="http://platform.founderizer.com" + releases.BUNDLE_PATH)
+        self.assertIn("not an https address", why)
+        self.assertEqual(opener.waits, [])
+
+    def test_a_release_file_that_comes_a_byte_at_a_time_ends_at_its_time(self):
+        """W12, on a real HTTPS answer of a server of this test: its body comes one byte each 0.2 seconds, so each
+        receive is well inside the wait of one read. A read that waits for all of its 64 KiB (`read`) returns only
+        when they came, which at one byte each 29 seconds is days, and the probe's thread, with every later probe, waits
+        that long. `read1` gives what each receive brings, so the clock is read between them and the download ends at
+        its time, with no file left."""
+        folder = Path(tempfile.mkdtemp(prefix="fleet-release-trickle-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        certificate, key = folder / "certificate.pem", folder / "key.pem"
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj",
+                        "/CN=127.0.0.1", "-keyout", str(key), "-out", str(certificate)], check=True, capture_output=True)
+        stop = threading.Event()
+
+        class Trickle(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(1 << 20))
+                self.end_headers()
+                until = time.monotonic() + 15           # a read that waits for 64 KiB ends here, at the latest
+                while time.monotonic() < until and not stop.wait(0.2):
+                    try:
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                    except OSError:
+                        return
+
+            def log_message(self, *_):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+        serving = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        serving.load_cert_chain(str(certificate), str(key))
+        server.socket = serving.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(stop.set)
+        client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client.check_hostname, client.verify_mode = False, ssl.CERT_NONE      # the reading is the test, not TLS
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(
+            context=client), releases._NoRedirect)
+        path, began = str(folder / "release.bundle"), time.monotonic()
+        why = releases.download(f"https://127.0.0.1:{server.server_address[1]}{releases.BUNDLE_PATH}", path, wait=2,
+                                read_wait=1, opener=opener)
+        took = time.monotonic() - began
+        self.assertIn("did not come whole in 2 seconds", why or "")
+        self.assertLess(took, 5, "the download did not end at its time")
+        self.assertFalse(os.path.exists(path))
+
 
 # ---------------------------------------------------------------- the update, with real repositories
 
@@ -785,6 +899,67 @@ class Updates(Repositories):
                                                   "so this fleet did not take it. "), answer["says"])
         self.assertTrue(answer["says"].endswith("failed: " + said), answer["says"])
         self.unchanged(answer)
+
+    def test_a_run_whose_commit_the_release_file_gave_fetches_nothing_and_keeps_the_checks_before_the_merge(self):
+        """W12: a run that the second route started (`bundled`) reaches no network, because the published repository
+        did not answer, and it still refuses what every run refuses before the merge: a checkout that does not hold the
+        signed commit (the step `have`), and a release whose minimum this fleet does not run. Bug: a bundled run that
+        skips those steps merges whatever the checkout holds, or a release that needs another one first."""
+        released = self.publish(self.code(2))
+
+        def bundled(**how):
+            return releases.Update(str(self.kit), releases.check(manifest(released, **how), KEY), origin=self.origin,
+                                   upstream=self.upstream, run=self.runner(), bundled=True).apply()
+        answer = bundled()
+        self.assertEqual((answer["state"], answer["step"]), (releases.KEPT, "have"))
+        self.unchanged(answer)
+        git("fetch", "-q", self.upstream, f"{released}:{releases.BUNDLE_REF}", cwd=self.kit)   # what the file gives
+        answer = bundled(minimum=released)
+        self.assertEqual((answer["state"], answer["step"]), (releases.KEPT, "minimum"))
+        self.unchanged(answer)
+        answer = bundled()
+        self.assertEqual((answer["state"], answer["step"]), (releases.DONE, "follow"), answer["says"])
+        self.assertEqual((self.kit / "hub.py").read_text(), "# the hub\nVERSION = 2\n")
+        self.assertFalse([argv for argv in self.ran if argv[0] == "git" and argv[3] in ("fetch", "ls-remote") and
+                          {releases.REMOTE, self.upstream} & set(argv)], "a bundled run asked the published repository")
+
+    def test_the_release_file_is_read_in_a_repository_of_its_own_and_only_the_release_reaches_the_checkout(self):
+        """W12: git unpacks a bundle whole before it knows whether the file gives the commit that it was asked for.
+        Fetched into the hub's checkout, a file without that commit left its pack there, a file filtered of its blobs
+        left a pack and a commit with no blobs, and each release brought all of main again; and a file that says
+        `gitdir: <path>` made git read another repository of this machine. A file that is no bundle is refused before
+        git reads it, the others are read in a repository of their own, and the checkout gets the release's own
+        objects alone, from the one file that gives them whole."""
+        released = self.publish(self.code(2))
+        git("branch", "before", "main~1", cwd=self.upstream)             # the release before
+        folder = self.root / "files"
+        folder.mkdir()
+        files = {name: folder / f"{name}.bundle" for name in ("gitdir", "filtered", "before", "whole")}
+        files["gitdir"].write_text(f"gitdir: {self.upstream}\n")
+        git("bundle", "create", str(files["filtered"]), "--filter=blob:none", "main", cwd=self.upstream)
+        git("bundle", "create", str(files["before"]), "before", cwd=self.upstream)
+        git("bundle", "create", str(files["whole"]), "main", cwd=self.upstream)
+
+        def objects():
+            counted = dict(line.split(": ") for line in git("count-objects", "-v", cwd=self.kit).splitlines())
+            return int(counted["count"]) + int(counted["in-pack"])
+
+        def take(name):
+            def given(url, path):
+                shutil.copyfile(files[name], path)
+            return releases.take_bundle(str(self.kit), "https://channel.invalid", released, fetch=given)
+        own = len(git("rev-list", "--objects", released, "--not", self.seeded, cwd=self.upstream).splitlines())
+        start = objects()
+        for name, said in (("gitdir", "the release file is not a git bundle"),
+                           ("filtered", "the release file does not give release"),
+                           ("before", "the release file does not give release")):
+            self.assertIn(said, take(name) or "", name)
+            self.assertEqual(objects(), start, f"the {name} file left objects in the checkout")
+        self.assertEqual(git("for-each-ref", "refs/founderizer/", cwd=self.kit), "")
+        self.assertFalse(list((self.kit / ".git/objects/pack").glob("*.promisor")))
+        self.assertIsNone(take("whole"))
+        self.assertEqual(git("rev-parse", releases.BUNDLE_REF, cwd=self.kit), released)
+        self.assertEqual(objects() - start, own, "the checkout got more than the release's own objects")
 
     def test_code_that_reached_the_ref_without_a_release_does_not_survive_one(self):
         """DevOps plan 0.1: a release takes its own tree outside the fleet's data, so a line of code that reached the
@@ -1194,6 +1369,7 @@ class HubRoutes(OwnerAPI):
         hub.CFG["hub_restart"] = []
         hub._revision_cache.update(at=0.0, value=None)
         hub._release["thread"] = None
+        self.no_release_file()
 
     def tearDown(self):
         super().tearDown()
@@ -1203,6 +1379,16 @@ class HubRoutes(OwnerAPI):
         hub._release["thread"] = None
 
     # ---- helpers
+
+    def no_release_file(self):
+        """The release channel of these tests has no release file (W12): it answers 404 there, as the platform does
+        until step 2, so a probe that fails takes nothing from it, and no test reaches the network for it. A test
+        that serves one patches releases.download again (served_file). `self.file_asked` is what it was asked."""
+        self.file_asked = []
+        none = patch.object(releases, "download", lambda url, path, **limits: self.file_asked.append(url) or
+                            "the release channel answered 404 for the release file")
+        none.start()
+        self.addCleanup(none.stop)
 
     def releases_state(self):
         code, data = self.request("/ui/releases?db=test-generation")
@@ -1897,6 +2083,7 @@ class HubUpdates(Repositories, HubRoutes):
         hub._code_diffs.clear()
         hub._release["thread"] = None
         git("remote", "set-url", "origin", self.origin, cwd=self.kit)
+        self.no_release_file()
 
     def tearDown(self):
         HubRoutes.tearDown(self)
@@ -2269,6 +2456,100 @@ class HubUpdates(Repositories, HubRoutes):
                 self.sweep(fetch, run=early, poll=False)            # its next tick takes the release, and fails
         self.assertEqual((runs(), len(asked)), (3, 2), "the third poll ran it again")
         self.assertEqual(hub.release_rolled_said()["runs"], 2)
+
+    def served_file(self, at="main", repository=None):
+        """The release channel of step 2 of W12, which serves its release file: a stand-in of releases.download that
+        gives a git bundle of `at` in the published repository, or in `repository`, as the publisher makes it
+        (autopublish.make_bundle). It counts what it was asked in `self.file_asked`, as no_release_file does."""
+        made = self.root / f"release-file-{len(list(self.root.iterdir()))}.bundle"
+        git("bundle", "create", str(made), at, cwd=repository or self.upstream)
+
+        def download(url, path, **limits):
+            self.file_asked.append(url)
+            shutil.copyfile(made, path)
+        return patch.object(releases, "download", download)
+
+    def test_the_release_file_gives_only_the_commit_that_the_signed_manifest_names(self):
+        """W12: after a fetch that the network stopped, a probe that fails asks the release channel for its file, and
+        takes from it the commit that the signed manifest names, by its id. A file that holds another commit (one that
+        no manifest names, or the release before) gives nothing: that commit is never merged, nothing is written for
+        the sweep, the row stays as the network left it, and the next poll probes and asks for the file again. A 404,
+        as the platform answers until step 2, does the same. Bug: a file whose own refs are taken, or a fetch from it
+        whose result is not read, sends the run to a commit that nobody signed."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        released = self.publish(self.code(2))
+        fetch = channel_of({"latest": manifest(released)})
+        unsigned = self.root / "unsigned"
+        git("clone", "-q", "-b", "main", self.upstream, str(unsigned))
+        git("reset", "-q", "--hard", "HEAD~1", cwd=unsigned)
+        git("branch", "before", cwd=unsigned)                   # the release before
+        (unsigned / "hub.py").write_text("# the hub\nVERSION = 99\n")
+        git("commit", "-qam", "code that no manifest names", cwd=unsigned)
+        down = self.offline("fetch", "fatal: unable to access 'https://example.invalid/fleet.git/': Could not "
+                                     "resolve host: example.invalid")
+        asked, ended = self.probed()
+        row = lambda: {k: self.newest()[k] for k in ("state", "step", "says", "cause", "started_at", "finished_at")}
+        with patch.object(releases, "reaches", lambda kit, url: asked.append(url) or False):
+            self.assertEqual(self.sweep(fetch, run=down), {"2026.10.2": (releases.KEPT, "fetch")})
+            kept = row()
+            for served in (self.served_file(repository=str(unsigned)), self.served_file("before", str(unsigned)),
+                           contextlib.nullcontext()):
+                with served:
+                    self.sweep(fetch, run=down)                 # the poll: the probe fails, and the file is asked for
+                    ended()
+                    self.sweep(fetch, run=down, poll=False)     # the next tick
+                self.assertEqual(row(), kept)
+        self.assertEqual(self.file_asked, ["https://channel.invalid" + releases.BUNDLE_PATH] * 3)
+        self.assertEqual(len(asked), 3)
+        self.assertIsNone(hub.kv_get("release_reach"))
+        self.assertEqual(git("for-each-ref", "--format=%(refname)", "refs/founderizer/", cwd=self.kit), "")
+        self.unchanged(self.newest())
+
+    def test_the_second_route_is_never_tried_for_a_failure_that_no_route_repairs(self):
+        """W12: the release file helps only a run that the network kept from the published repository. A release that
+        failed its merge or its checks, that had no room here, or that the fleet itself held, is the same release from
+        any route, and a push that the fleet's own repository refused is not the published repository's: asking the
+        channel for the file at each poll would download it for nothing."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        released = self.publish(self.code(2))
+        fetch = channel_of({"latest": manifest(released)})
+        broken = self.runner(selftest=(1, "110 of 121 checks passed. FAILED: ['the hub answers nothing']", ""))
+        asked, ended = self.probed()
+        with patch.object(releases, "reaches", lambda kit, url: asked.append(url) or False):
+            self.assertEqual(self.sweep(fetch, run=broken), {"2026.10.2": (releases.ROLLED_BACK, "selftest")})
+            for state, step, cause in ((releases.ROLLED_BACK, "keep", "conflict"), (releases.ROLLED_BACK, "selftest",
+                                       "check"), (releases.KEPT, "room", releases.MEMORY), (releases.KEPT, "fetch",
+                                       releases.DISK), (releases.KEPT, "hold", "busy"), (releases.ROLLED_BACK, "push",
+                                       "http")):
+                hub.q("UPDATE releases SET state=?, step=?, cause=? WHERE revision=?", (state, step, cause, released))
+                self.sweep(fetch, run=broken)
+                ended()
+        self.assertEqual((asked, self.file_asked), ([], []))
+
+    def test_the_release_file_is_asked_for_only_while_this_fleet_s_own_repository_answers(self):
+        """W12: a run from the file ends at its push to this fleet's own repository. Where that repository is a network
+        address that does not answer either, each file would run the whole checks of the release and fail at the
+        push, about seven times on the first day; the file is asked for once that repository answers again. A
+        repository that is a folder of this machine, as hub.sh installs it, needs no probe."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        fetch = channel_of({"latest": manifest(self.publish(self.code(2)))})
+        down = self.offline("fetch", "fatal: unable to access 'https://example.invalid/fleet.git/': Could not "
+                                     "resolve host: example.invalid")
+        asked, ended = self.probed()
+        mine, answering = "https://git.example.invalid/fleet.git", set()
+        with patch.object(releases, "reaches", lambda kit, url: asked.append(url) or url in answering):
+            self.assertEqual(self.sweep(fetch, run=down), {"2026.10.2": (releases.KEPT, "fetch")})
+            self.sweep(fetch, run=down)
+            ended()
+            self.assertEqual((asked, len(self.file_asked)), ([self.upstream], 1))      # a folder: no probe of it
+            git("remote", "set-url", "origin", mine, cwd=self.kit)
+            self.sweep(fetch, run=down)
+            ended()
+            self.assertEqual((asked[-2:], len(self.file_asked)), ([self.upstream, mine], 1))
+            answering.add(mine)
+            self.sweep(fetch, run=down)
+            ended()
+        self.assertEqual(len(self.file_asked), 2)
 
     def test_under_the_memory_need_no_automatic_run_starts_and_the_row_says_memory(self):
         """W2: on 15 November 2026 a release's self-test on a server with 1 GB ran out of memory and held the hub

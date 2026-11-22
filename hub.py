@@ -5113,86 +5113,128 @@ def browser_room_seen(server, reading, t0):
     """At each reading of a server's service (Handler.server_status): the places that a real shortage takes away
     (D6), and the ones that come back. A new `oom` count of user.slice (an end at its own limit; a browser's end at its
     own cap is not counted there), a new `fail` count of its swap, or more than BROWSER_STALL microseconds of `full`
-    stall for each 300 seconds of a window is a sign, and each reading with a sign takes one place, never more than the
-    room gives (browser_room_places). A boot of the server (its boot id, when both counters start again at 0) or a
-    change of its limits or its swap gives all of them back.
+    stall for each 300 seconds of a window is a sign, and each reading with a sign takes one place. A boot of the
+    server (its boot id, when both counters start again at 0) or a change of its limits or its swap gives all back.
 
     **Calm windows give one back** (21 November 2026: one stall of an agent's own work took the only place of
-    worker-4, and every browser task of its agent was refused for hours, because only a boot or new limits gave it back;
-    two reviews). A stall is judged over a window of at least BROWSER_WINDOW seconds of readings, so the short readings
-    of a job, an update or a restart neither hide a stall in pieces nor count as calm. A window under BROWSER_CALM is
-    calm; one between the two bounds neither counts nor starts the count again. `need` calm windows in a row give back
-    one place; a sign within BROWSER_QUIET calm windows of a place that came back doubles `need`, up to eight times
-    BROWSER_QUIET, so a server whose browser brings the shortage back is not tried again every half an hour; 2 · `need`
-    calm windows after a place came back set it back to BROWSER_QUIET. These are counts of readings' windows, never a
-    clock. A kernel with no stall counter closes its windows on their length, calm while no counter grew; a window
-    with the counter at one end only (a read that failed once) is neither calm nor a sign. Every reading
-    takes `less` down to the places that the room gives now (an agent more there can leave none). A window with a sign
-    at any of its readings is no calm window (`window_sign`). A reading whose
-    counters went down within a window of the last one (an older one that came late) changes nothing; later, its
-    counters are the new base (a boot with no boot id). A reading with no room changes nothing. One reading at a time
-    (LOCK): two posts at once could each drop the other's sign. BROWSER_CALM: worker-4's `full` stall was 0.33 s for each
-    300 s over 30 hours of its agent's work, and a build's burst about 7 s (21 November 2026)."""
+    worker-4, and every browser task of its agent was refused for hours, because only a boot or new limits gave it
+    back; two Opus reviews, then Fable's). A stall is judged over a window of at least BROWSER_WINDOW seconds of
+    readings, so the short readings of a job, an update or a restart neither hide a stall in pieces nor count as calm.
+    A window under BROWSER_CALM is calm, and `need` calm windows in a row give back one place; a window between the two
+    bounds does not count, and three of them in a row start the count again; a window with a sign at any of its
+    readings (`window_sign`) is no calm window.
+
+    **The wait doubles only for a browser that brings the shortage back** (Fable's review): a sign within BROWSER_QUIET
+    calm windows of a place that came back doubles `need`, up to eight times BROWSER_QUIET, only when a browser task
+    held a place on this server since it came back (`ran`); a build's stall with no browser keeps the wait at
+    BROWSER_QUIET. 2 · `need` calm windows since the last sign (`steady`) set it back. These are counts of readings'
+    windows, never a clock.
+
+    **A reading that could not read a counter changes nothing of it**: a counter that the server had and this reading
+    lacks (a read that failed) keeps its last value, closes no window and makes no window calm; a limit that it could
+    not read (memory.max, memory.swap.max, SwapTotal) is no new limit, and the reading is skipped. Only a kernel that
+    never gave a stall counter closes its windows on their length, calm while no count grew. A reading whose counters
+    went down within a window of the last one (an older one that came late) changes nothing; later, its counters are the
+    new base (a boot with no boot id). `less` never passes the places that the room gives, nor goes under one while a
+    shortage holds one (an agent more can leave the room no place for a while, and the shortage stays). Three readings
+    in a row with a limit unread, over a window at least, are a limit that is gone (the kernel's "max" reads as none); a
+    counter lost for three windows' time is gone. A browser task that takes a place while one has come back sets `ran`
+    at once (browser_room_ran_rows, browser_room_ran), also when it ends before the next reading, and only when the
+    browsers then hold all the places (browser_uses_all): a browser that held another place all along brought no
+    shortage. 2 · `need` calm windows in any order since the last sign or give-back (`loose`) also give one back, so
+    calm that comes only in short runs still brings it. A reading with no room changes nothing. One reading at a time
+    (LOCK): two posts at once could each drop the other's sign. BROWSER_CALM: worker-4's `full` stall was 0.33 s for
+    each 300 s over 30 hours of its agent's work, and a build's burst about 7 s (21 November 2026)."""
     room = reading.get("room")
     if not isinstance(room, dict):
         return
     number = lambda v: v if type(v) is int else None       # noqa: E731
     now_ = {k: number(room.get(k)) for k in ("memory_max", "swap_max", "swap_total", "oom", "swap_fail", "full_us")}
     now_["boot"] = (reading.get("os") or {}).get("boot")
+    counters = ("oom", "swap_fail", "full_us")
     with LOCK:
         try:
             old = json.loads(kv_get(BROWSER_ROOM + server) or "null")
         except ValueError:
             old = None
+        if isinstance(old, dict) and old.get("boot") == now_["boot"] and any(
+                type(old.get(k)) is int and now_[k] is None for k in ("memory_max", "swap_max", "swap_total")):
+            unread = (old.get("unread") if type(old.get("unread")) is int else 0) + 1
+            span = t0 - old["at"] if isinstance(old.get("at"), (int, float)) else 0
+            if unread < 3 or span < BROWSER_WINDOW:      # a limit that this reading could not read: no new limit
+                browser_kv(BROWSER_ROOM + server, json.dumps(dict(old, unread=unread), sort_keys=True))
+                return
+            # the third reading in a row with no such limit: it is gone (the kernel's "max"), and that is a new limit
         same = isinstance(old, dict) and all(old.get(k) == now_[k] for k in ("boot", "memory_max", "swap_max",
                                                                                "swap_total"))
         if not same:
-            state = dict(now_, at=t0, less=0, quiet=0, need=BROWSER_QUIET, since_back=None, base_at=t0,
-                         base_full=now_["full_us"])
+            state = dict(now_, at=t0, less=0, quiet=0, need=BROWSER_QUIET, since_back=None, steady=0, between=0,
+                         ran=False, base_at=t0, base_full=now_["full_us"], window_sign=False)
             browser_kv(BROWSER_ROOM + server, json.dumps(state, sort_keys=True))
             return
         state = dict(old)
-        down = any(now_[k] is not None and type(old.get(k)) is int and now_[k] < old[k] for k in ("oom", "swap_fail",
-                                                                                                    "full_us"))
+        lost_at = dict(old.get("lost_at")) if isinstance(old.get("lost_at"), dict) else {}
+        for k in counters:
+            if now_[k] is not None or type(old.get(k)) is not int:
+                lost_at.pop(k, None)
+            elif not isinstance(lost_at.get(k), (int, float)):
+                lost_at[k] = t0
+            elif t0 - lost_at[k] >= 3 * BROWSER_WINDOW:  # lost for three windows' time: the counter is gone
+                old = dict(old, **{k: None}, **({"base_full": None} if k == "full_us" else {}))
+                lost_at.pop(k)
+        lost = [k for k in counters if now_[k] is None and type(old.get(k)) is int]
+        down = any(now_[k] is not None and type(old.get(k)) is int and now_[k] < old[k] for k in counters)
         if down and isinstance(old.get("at"), (int, float)) and t0 - old["at"] < BROWSER_WINDOW:
             return                                       # an older reading that came late: the counters only grow
         if down:                                         # counters that started again with no new boot id: a new base
-            old = dict(old, oom=now_["oom"], swap_fail=now_["swap_fail"], base_at=t0, base_full=now_["full_us"])
+            old = dict(old, oom=now_["oom"], swap_fail=now_["swap_fail"], full_us=now_["full_us"], base_at=t0,
+                       base_full=now_["full_us"])
         grew = lambda k: now_[k] is not None and type(old.get(k)) is int and now_[k] > old[k]     # noqa: E731
         whole = lambda k: old.get(k) if type(old.get(k)) is int else 0                            # noqa: E731
         room_places = browser_room_places(server, room)
-        less, quiet, need = min(whole("less"), room_places), whole("quiet"), max(whole("need"), BROWSER_QUIET)
+        top = max(room_places, 1)
+        less = min(whole("less"), top)
+        quiet, need = whole("quiet"), max(whole("need"), BROWSER_QUIET)
+        steady, between, loose = whole("steady"), whole("between"), whole("loose")
         since = old.get("since_back") if type(old.get("since_back")) is int else None
+        ran = old.get("ran") is True or (since is not None and browser_uses_all(server))
         sign = grew("oom") or grew("swap_fail")
         held = old.get("window_sign") is True             # a sign at a short reading of this window: no calm window
         calm = closed = False
         base_at = old.get("base_at") if isinstance(old.get("base_at"), (int, float)) else old.get("at")
         base_full = old.get("base_full") if type(old.get("base_full")) is int else old.get("full_us")
-        if isinstance(base_at, (int, float)) and t0 - base_at >= BROWSER_WINDOW:
+        if isinstance(base_at, (int, float)) and t0 - base_at >= BROWSER_WINDOW and "full_us" not in lost:
             if now_["full_us"] is not None and type(base_full) is int:
                 stall = (now_["full_us"] - base_full) * 300 / (t0 - base_at)
                 sign, calm = sign or stall > BROWSER_STALL, stall <= BROWSER_CALM
-            elif now_["full_us"] is None and base_full is None:  # a kernel with no stall counter: its counts alone
+            elif now_["full_us"] is None and base_full is None:      # a kernel that never gave a stall counter
                 calm = True
-            # one end of the window with no stall counter (a read that failed once): its stall is unknown, not calm
-            closed, calm = True, calm and not held and not sign
+            closed, calm = True, calm and not held and not sign and not lost
             base_at, base_full, held = t0, now_["full_us"], False
         held = held or (sign and not closed)
         if sign:
-            if since is not None and since < BROWSER_QUIET:
-                need = min(2 * need, 8 * BROWSER_QUIET)      # the place came back, and so did the shortage
-            less, quiet, since = min(less + 1, room_places), 0, None
+            if since is not None and since < BROWSER_QUIET and ran:
+                need = min(2 * need, 8 * BROWSER_QUIET)      # the browser came back, and so did the shortage
+            less, quiet, since, steady, between, ran, loose = min(less + 1, top), 0, None, 0, 0, False, 0
         elif closed and calm:
+            steady, between = steady + 1, 0
+            if steady >= 2 * need:
+                need = BROWSER_QUIET                     # a long calm since the last sign
             if since is not None:
                 since += 1
-                if since >= 2 * need:
-                    need, since = BROWSER_QUIET, None
             if less > 0:
-                quiet += 1
-                if quiet >= need:
-                    less, quiet, since = less - 1, 0, 0
-        state.update(now_, at=t0, less=less, quiet=quiet, need=need, since_back=since, base_at=base_at,
-                     base_full=base_full, window_sign=held)
+                quiet, loose = quiet + 1, loose + 1
+                # `need` in a row, or twice as many in any order: a server whose calm comes in short runs still gets it
+                if quiet >= need or loose >= 2 * need:
+                    less, quiet, since, ran, loose = less - 1, 0, 0, False, 0
+        elif closed:                                     # a window between the bounds, or one with an unknown count
+            between += 1
+            if between >= 3:
+                quiet, between = 0, 0
+        kept = {k: now_[k] if now_[k] is not None else old.get(k) for k in counters}
+        state.update(now_, **kept, at=t0, less=less, quiet=quiet, need=need, since_back=since, steady=steady,
+                     between=between, ran=ran, base_at=base_at, base_full=base_full, window_sign=held, unread=0,
+                     loose=loose, lost_at=lost_at)
         browser_kv(BROWSER_ROOM + server, json.dumps(state, sort_keys=True))
 
 
@@ -5390,9 +5432,11 @@ def browser_refusal(owner, caller, keep=False, exact=False):
         # the agent tells the owner: the cause, and whether the place comes back by itself (two reviews, 21 November)
         row = read_row("SELECT data FROM server_status WHERE server=?", (server,))
         try:
-            room = (json.loads(row["data"]) if row else {}).get("room") or {}
+            room = (json.loads(row["data"]) if row else {}).get("room")
         except (ValueError, TypeError, AttributeError):
-            room = {}
+            room = None
+        if not isinstance(room, dict):
+            return f"{machine} has no place for a browser now: the hub has no reading of its memory yet."
         if type(room.get("memory_max")) is not int:
             return f"{machine} has no place for a browser now: the memory limit of its agents is not in place there yet."
         if not browser_room_places(server, room):
@@ -5401,7 +5445,8 @@ def browser_refusal(owner, caller, keep=False, exact=False):
         if not browser_places(server):
             return (f"{machine} has no place for a browser now: a shortage of memory there took it, and it comes back "
                     f"by itself once its memory is calm again.")
-        return f"{machine} has no free place for a browser now: other browser tasks there hold its places."
+        return (f"{machine} has no free place for a browser now: other browser tasks there hold its places or wait "
+                f"for them.")
     if not browser_places(server):
         return (f"{machine} has no place for a browser now: the memory of its agents, or a shortage of it, leaves none. "
                 f"The hub tells you when a browser place is free there.")
@@ -5414,6 +5459,46 @@ def browser_hold_rows(tid, server, t0):
     in_transaction("browser_hold_rows")
     DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                (BROWSER_HOLD + str(tid), json.dumps({"server": server, "since": t0}, sort_keys=True)))
+    browser_room_ran_rows(server)
+
+
+def browser_uses_all(server):
+    """Whether the browser tasks of this server hold all its places now, the one that came back too (`ran`: a browser
+    that held another place all along brings no shortage of the place that came back). read_rows only."""
+    holders = browser_holders(server)
+    return bool(holders) and len(holders) >= browser_places(server)
+
+
+def browser_room_ran_value(server):
+    """The room's record of this server with `ran` set, or None where nothing changes: a browser task took a place of
+    this server (browser_hold_rows, browser_places_turn) while a place that a shortage took has come back
+    (`since_back`) and the browsers now hold all its places, so a quick sign doubles the wait (browser_room_seen), also
+    for a task that starts and ends between two readings (Fable's review of 21 November 2026). read_rows only."""
+    try:
+        room = json.loads(kv_read(BROWSER_ROOM + server) or "null")
+    except ValueError:
+        return None
+    if not isinstance(room, dict) or type(room.get("since_back")) is not int or room.get("ran") is True \
+            or not browser_uses_all(server):
+        return None
+    return json.dumps(dict(room, ran=True), sort_keys=True)
+
+
+def browser_room_ran_rows(server):
+    """browser_room_ran_value, inside the caller's transaction."""
+    in_transaction("browser_room_ran_rows")
+    value = browser_room_ran_value(server)
+    if value is not None:
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   (BROWSER_ROOM + server, value))
+
+
+def browser_room_ran(server):
+    """browser_room_ran_value, outside a transaction, one record at a time with the readings (LOCK)."""
+    with LOCK:
+        value = browser_room_ran_value(server)
+        if value is not None:
+            browser_kv(BROWSER_ROOM + server, value)
 
 
 def browser_admit_rows(tid, owner, t0):
@@ -5514,6 +5599,7 @@ def browser_places_turn(agent, rows, waits, closed, alive=None):
                 continue
             if browser_places(server) - len(browser_holders(server)) > 0:
                 browser_kv(BROWSER_HOLD + str(tid), json.dumps({"server": server, "since": t0}, sort_keys=True))
+                browser_room_ran(server)
                 holds[tid] = {"server": server, "since": t0}
                 if kv_get(BROWSER_WAIT_TOLD + str(tid)):
                     browser_kv(BROWSER_WAIT_TOLD + str(tid), None)
@@ -45125,8 +45211,9 @@ KPI_CODE = re.compile(r"\b[A-Za-z]{1,3}-[0-9]+\b")          # a code such as I-1
 KPI_DAY = 86400
 KPIS_OFF = "KPIs are not on in this fleet yet (the setting kpis), so nothing changed."
 # R2, whole, for the setup task (spec 7.1) and set_kpi's description
-KPI_DATA_RULE = ("A value comes from the check, which reads records that others write (staff's sent text, CI results, "
-                 "a customer's reply). A field that the measured agent writes may select which records count, never "
+KPI_DATA_RULE = ("A value comes from the check, which reads records that others write in a business system (staff's "
+                 "sent text, CI results, a customer's reply), never a hub record such as a task, a case or a typed "
+                 "report: a check cannot read those. A field that the measured agent writes may select which records count, never "
                  "the outcome. A record that the measured agent wrote counts only as the source's own history shows "
                  "it at the time of the outcome (the draft as it was when staff sent it); when the source keeps no "
                  "such history, that record cannot decide the outcome. No tool takes a value in words.")
@@ -49350,11 +49437,12 @@ TOOLS = [
         "progress": {"type": "number", "description": "Where it stands now, for a target with no check"},
         "task_id": TASK_ID})),
     ("all", "set_kpi", t_set_kpi,
-     "Set, change or link a KPI of an agent whose tasks you give: one to three each, from its duties and the results "
-     "that the business needs. Pair a speed or volume KPI with a quality KPI, and count all the work that arrived. No "
-     "KPI counts asking, reporting, cost, or an outcome that the agent records itself: a value comes from a check that "
-     "reads what others write. New: agent, name, words, direction, number, unit, window_days, metric, measured_by "
-     "(who writes the check; the agent itself by default), and the hub gives that agent a setup task. Link: id, check, "
+     "Set, change or link a KPI of an agent whose tasks you give: one to three each, from its duties and the "
+     "business's needs. Pair a speed or volume KPI with a quality KPI, and count all work that arrived. No KPI counts "
+     "asking, reporting, cost, or an outcome that the agent records itself: a value comes from a check that reads "
+     "what others write in a business system, never a hub record. New: agent, name, words, direction, number, unit, "
+     "window_days, metric, measured_by (who writes the check; by default the agent), and the hub gives that agent a "
+     "setup task. Link: id, check, "
      "how, agent_part, once you read the check and who can write its inputs. Change: id and its fields; new words, "
      "window_days, metric or measured_by clear the link. Never lower a level only because it is not met. The agent "
      "reads the words and its part, never the number.",
@@ -70454,7 +70542,8 @@ def release_again(row, room):
     now (releases.memory_room). One of:
 
     - "probe": not now. Its last run could not reach the published repository, and nothing said since that it can:
-      the hub probes it (release_probe), and a probe that passes makes the sweep take the release at its next tick.
+      the hub probes it (release_probe), and a probe that passes makes the sweep take the release at its next tick,
+      as does a probe that fails while the release channel's file gives the release's commit (release_bundle_work).
     - "rests": not now, and counted, as before for a release whose run failed on this hub (release_rests), or for
       the rest of the day for one that had no room here (release_room_rests).
     - True: as a new release, which waits for the first moment no turn runs (release_wait): a release whose last run
@@ -70521,9 +70610,10 @@ def release_probe(row):
 def release_probe_work(revision, version):
     """The thread of release_probe. A probe that passes writes `releases_found`, the key that makes the sweep poll at
     its next tick (release_sweep), and `release_reach`, which makes that poll take the release as a new one
-    (release_again)."""
+    (release_again). A probe that fails tries the second route (release_bundle_work), in this thread too."""
     try:
         if not releases.reaches(kit_dir(), release_upstream()):
+            release_bundle_work(revision, version)
             return
         with LOCK:
             kv_set("release_reach", json.dumps({"revision": revision, "at": now()}))
@@ -70532,6 +70622,49 @@ def release_probe_work(revision, version):
                        f"turn runs")
     except Exception:
         print_fault()
+
+
+def release_bundle_work(revision, version):
+    """The second route of a release's code (W12 of the reliability plan of 21 November 2026), for a release whose
+    fetch failed for the network while the probe of the published repository fails too: the release file of this
+    fleet's own release channel (releases.take_bundle), and from it the one commit that the signed manifest names.
+    When this checkout holds that commit, `release_reach` says so with the route `bundle`, and the next tick takes the
+    release as a new one (release_again), with a run that fetches nothing (release_bundled). A 404, a file that does
+    not give that commit, or any other failure writes nothing: the row stays as the network left it, and the next poll
+    probes, and tries this again. It runs in the probe's thread, so its download holds no session start either.
+
+    The file is asked for only when this fleet's own repository, where the run pushes, is a folder of this machine
+    (a hub that hub.sh installed) or answers a probe now (releases.reaches). A fleet whose own repository is a network
+    address that does not answer either would run the whole checks of the release from the file and end at the push,
+    about seven times on the first day before its rests (release_rests)."""
+    code, origin, _ = git_kit("remote", "get-url", "origin")
+    origin = origin if code == 0 else ""
+    if not origin or (releases._host(origin) and not releases.reaches(kit_dir(), origin)):
+        why = f"this fleet's own repository {'does not answer either' if origin else 'is not set'}, so no release " \
+              f"could be pushed"
+    else:
+        why = releases.take_bundle(kit_dir(), release_channel(), revision)
+    if why:
+        if _release_probe.get("said") != why:       # the hub's own log once, not at each poll of a day without it
+            _release_probe["said"] = why
+            print(f"the second route of release {version} gave nothing: {why}", flush=True)
+        return
+    _release_probe["said"] = None
+    with LOCK:
+        kv_set("release_reach", json.dumps({"revision": revision, "at": now(), "route": "bundle"}))
+        kv_set("releases_found", now())
+        log("hub", f"the published repository does not answer, and release {version} came from the release channel's "
+                   f"file instead: it is taken at the first moment no turn runs")
+
+
+def release_bundled(row):
+    """True when the reach that makes the sweep take this release now came from the second route
+    (release_bundle_work): its run then fetches nothing (releases.Update's `bundled`)."""
+    try:
+        reach = json.loads(kv_get("release_reach") or "null")
+    except ValueError:
+        return False
+    return release_reached(row) and isinstance(reach, dict) and reach.get("route") == "bundle"
 
 
 def release_holds_starts():
@@ -70733,6 +70866,7 @@ def release_work(applying, automatic=False, fetch=None, take=False):
             idle, busy = fleet_idle()
             fresh = automatic and (row["state"] == "verified" or again is True)    # taken as a new release
             probed = again is True and release_unreached(row)       # a run that a passed probe starts
+            bundled = release_unreached(row) and release_bundled(row)   # or the second route took its commit (W12)
             if not idle and not fresh:
                 if automatic:       # as before plan P0: the sweep tries it again when no turn runs at its poll
                     kv_set("release_waits", None)
@@ -70765,7 +70899,7 @@ def release_work(applying, automatic=False, fetch=None, take=False):
             # meanwhile (release_holds_starts). One that the run would refuse before it touches anything is answered
             # now instead, as the run would answer it, so that nothing waits for it.
             refused = releases.Update(kit_dir(), manifest, origin=origin, upstream=release_upstream(),
-                                      floor=kit_floor()).before()
+                                      floor=kit_floor(), bundled=bundled).before()
             with LOCK:
                 if refused:
                     kv_set("release_waits", None)
@@ -70804,7 +70938,7 @@ def release_work(applying, automatic=False, fetch=None, take=False):
             result = releases.Update(kit_dir(), manifest, origin=origin, upstream=release_upstream(),
                                      database=path, floor=kit_floor(),
                                      pushed=lambda merged: release_pushed(row["id"], merged),
-                                     own=kit_own, limit=limit).apply()
+                                     own=kit_own, limit=limit, bundled=bundled).apply()
         finally:
             shutil.rmtree(folder, ignore_errors=True)
         with LOCK:
@@ -71766,7 +71900,9 @@ def release_sweep(t0):
     **A release whose last run could not reach the network is probed for, not run** (the reliability plan of 21
     November 2026, W11): at each poll, `git ls-remote` of the published repository runs in a thread of its own that
     holds nothing (release_probe), and a probe that passes writes `releases_found` too, so the next tick polls and
-    takes the release as a new one (release_again)."""
+    takes the release as a new one (release_again). A probe that fails tries the second route in the same thread
+    (W12, release_bundle_work): the release's commit from the release channel's file, which writes `releases_found`
+    in the same way when it gives that commit."""
     token = entitlement_token()
     if not releases_automatic() or not (token or installed_hub()):
         if release_waiting():
