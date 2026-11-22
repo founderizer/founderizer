@@ -210,6 +210,16 @@ class Rename(Servers):
         hub.q("INSERT INTO agent_keys(agent,sha256,created,source) VALUES('scout',?,0,'enrolled')", ("a" * 64,))
         hub.q("INSERT INTO agent_keys(agent,sha256,created,source) VALUES('nova',?,0,'owner')", ("b" * 64,))
         hub.q("INSERT INTO machine_status(agent,data,reported) VALUES('nova','{}',0)")   # left by an agent removed by hand
+        # what a person's list and a role's set kept of an earlier nova with no row in `agents`: a pair that scout has
+        # too (person 0 of plant, role developer), and a person and a role that only nova had. Bugs: the rename stops
+        # at PRIMARY KEY(person, agent) or (role, agent); or person 7 and role customer get the renamed agent, which
+        # the owner never gave them
+        for sql in ("INSERT INTO person_agents(person,agent,added) VALUES(?,'nova',1)",
+                    "INSERT INTO person_scopes(person,agent,grants,updated) VALUES(?,'nova','{}',1)"):
+            for person in (0, 7):
+                hub.q(sql, (person,))
+        for role in ("developer", "customer"):
+            hub.q("INSERT INTO role_sets(role,agent,grants,updated) VALUES(?,'nova',NULL,1)", (role,))
         hub.kv_set("tools:scout", "contract")
         hub.kv_set("tools:nova", "an old one")
         hub.kv_set("default_vault:scout", 1)                # the owner's word on its defaults: a rename keeps it
@@ -221,8 +231,13 @@ class Rename(Servers):
         for table, column in hub.AGENT_COLUMNS:
             self.assertEqual(hub.q1(f"SELECT COUNT(*) n FROM {table} WHERE {column}='scout'")["n"], 0, (table, column))
             self.assertGreater(hub.q1(f"SELECT COUNT(*) n FROM {table} WHERE {column}='nova'")["n"], 0, (table, column))
-        self.assertEqual([tuple(r) for r in hub.q("SELECT agent, grants FROM role_sets WHERE role='developer'")],
-                         [("nova", listed)])
+        self.assertEqual([tuple(r) for r in hub.q("SELECT role, agent, grants FROM role_sets WHERE role IN "
+                                                  "('developer','customer') ORDER BY role")],
+                         [("developer", "nova", listed)])
+        for table in ("person_agents", "person_scopes"):        # scout's own pair only, under its new name
+            self.assertEqual([tuple(r) for r in hub.q(f"SELECT person, agent FROM {table} WHERE agent IN "
+                                                      f"('scout','nova') ORDER BY person")], [(0, "nova")], table)
+        self.assertEqual(hub.q1("SELECT grants FROM person_scopes WHERE person=0 AND agent='nova'")["grants"][:2], "x-")
         self.assertEqual(hub.q("SELECT agent FROM agent_keys WHERE agent IN ('scout','nova')"), [])
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM session_credentials WHERE agent='nova' AND revoked IS NULL")["n"], 0)
         self.assertEqual((hub.kv_get("tools:nova"), hub.kv_get("tools:scout")), ("contract", None))

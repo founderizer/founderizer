@@ -309,9 +309,11 @@ CREATE TABLE IF NOT EXISTS spends(id INTEGER PRIMARY KEY, goal INTEGER NOT NULL,
 -- state: requested, stopped or not_confirmed (CHAT_STOP_OVER). A press again after not_confirmed changes
 -- the row, so a message has one row at most. cut is 1 once an answer of its helper cut a turn (helper_chat_stop),
 -- and reads holds the ids that such answers named (a JSON list), which the end of the press makes unread again.
+-- since: for a worker's or a lead's press, the first read of the cut turn as the hub knows it at the press
+-- (chat_stop_since); NULL for the manager's and for a row of an earlier build.
 CREATE TABLE IF NOT EXISTS chat_stops(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, request TEXT NOT NULL,
   state TEXT NOT NULL, created REAL NOT NULL, settled REAL, detail TEXT, line INTEGER, event INTEGER, hand TEXT,
-  cut INTEGER NOT NULL DEFAULT 0, reads TEXT);
+  cut INTEGER NOT NULL DEFAULT 0, reads TEXT, since REAL);
 CREATE TABLE IF NOT EXISTS goal_holds(hold INTEGER PRIMARY KEY, goal INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS parent_holds(hold INTEGER PRIMARY KEY, parent INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS restart_holds(hold INTEGER PRIMARY KEY, by TEXT NOT NULL, reason TEXT, created REAL NOT NULL,
@@ -4171,10 +4173,11 @@ def chat_stop_line(asked, tasks, older=()):
 
 CHAT_STOP_LATE = "its turn ended before the interrupt"        # the detail of a press that no interrupt needs
 CHAT_STOP_TURN_END = "its turn ended after an interrupt that was not confirmed"
+CHAT_STOP_READ_ON = "its running turn read a newer message of the owner's"     # the manager's: its turn end decides
 # The invariant of Stop in the chat box, which chat_stop_end_rows keeps on each path:
 CHAT_STOP_INVARIANT = ("For a worker or a lead, whose chat reports no turn end, the read of a newer row of the "
                        "owner's counts as the cut of the turn, and so does a confirmed answer after an earlier "
-                       "answer of the press that cut. When a press ends, by any path (a confirmed answer, a late answer, its settle at the read of a newer row of the owner's, a turn end, normal or not), each row that the cut turn read and did not answer becomes unread again, except the owner's messages that the press closed or that have a report; and nothing that a turn which ended normally handled comes again.")
+                       "answer of the press that cut. When a press ends, by any path (a confirmed answer, a late answer, its settle at the read of a newer row of the owner's, a turn end, normal or not), each row that the cut turn read and did not answer becomes unread again, except the owner's messages that the press closed or that have a report; and nothing that a turn which ended normally handled comes again. Open for a worker or a lead: an earlier turn on the same message that ended with no reply, and then a new turn that reads it again, can make that earlier turn's rows come twice; and a cut turn that reads a message and a task's result, reads again with nothing new, then reads the owner's correction can leave that result read at a press for the correction, because the hub cannot tell that quiet read from the closing read of an earlier turn.")
 
 
 def chat_stop_due(agent, event_id, extra, t0):
@@ -4183,7 +4186,8 @@ def chat_stop_due(agent, event_id, extra, t0):
     is newer than the stopped message: the owner's correction can come before the press, unread while the turn runs,
     and its read is a turn of the correction, which a late interrupt must never cut,
     so the hub settles the row itself as stopped (CHAT_STOP_LATE) and interrupts nothing: a helper that was away at
-    the press polls again when it comes back. An event that is not given now is done for good, and the hub marks it
+    the press polls again when it comes back. Not so the manager's press whose earlier answer cut a turn: its Esc did
+    not take, the same running turn read the correction, and its turn end decides (chat_stop_wait_turn_end). An event that is not given now is done for good, and the hub marks it
     as taken (helper_ack), so that the poll's read never reads it again."""
     row = q1("SELECT * FROM chat_stops WHERE id=?", (extra.get("stop"),))
     live = row is not None and row["state"] == "requested" and row["agent"] == agent and row["event"] == event_id
@@ -4195,6 +4199,13 @@ def chat_stop_due(agent, event_id, extra, t0):
     if newer is None:   # a press that is settled, or an event of a press before this one: nothing the owner sees
         with area("quiet"):
             q("UPDATE events SET helper_ack=COALESCE(helper_ack,?) WHERE id=?", (t0, event_id))
+        return False
+    if row["cut"] and role_of(agent) == "manager":
+        # The manager's press again, after an Esc that did not take: the same running turn read the correction, and
+        # no read ends the manager's press (chat_stop_read_end). Its turn end does (chat_stop_turn_end), and does it now
+        # when that end came while the press waited for its helper; the event goes, as above.
+        chat_stop_wait_turn_end(agent, row, CHAT_STOP_READ_ON, t0, event_id)
+        log(agent, f"S-{row['id']}: its running turn read a newer message of the owner's; its turn end ends the press")
         return False
     with transaction():         # the end of the stop wakes the apps: a write of the area "state"
         # settled: the read of the correction, where the cut turn's rows end (chat_stop_unread's until)
@@ -4223,7 +4234,9 @@ def chat_stop_unread(agent, reads, stop, until=None):
     reads: the ids that its helper read in the session's own conversation file, after its last turn that ended
     normally (fleet.unfinished_turn_reads). A worker's or a lead's chat read names no ids that its helper can find
     there (fleet.read_ids reads only the manager's first line), so for it the hub takes its own rows: each chat of the
-    agent that was read at or after the read of the stopped message (stop: its row of chat_stops). An id counts when
+    agent that was read at or after the first read of the cut turn as the hub knew it at the press (chat_stops.since,
+    chat_stop_since), or, for a row of an earlier build, the read of the stopped message (stop: its row of
+    chat_stops). An id counts when
     it is this agent's message, is read, is no stopped message and no stop line (CHAT_STOPPED: the flag of each), comes
     again once it is unread (the manager's "say"; a worker's or a lead's chat with a flag of CHAT_FLAGS: a task's
     result, an agent's message; an owner's chat message comes again by itself until its reply), and no session of another runtime read it last (read_by, as handover_ids), which finished it since.
@@ -4243,10 +4256,12 @@ def chat_stop_unread(agent, reads, stop, until=None):
                          f"e.id IN ({','.join('?' * len(wanted))}) AND {owners} ORDER BY e.id",
                          (agent, *wanted)) if wanted else []
     else:
-        rows = read_rows("SELECT e.id, e.kind, e.extra FROM events e WHERE e.agent=? AND e.kind='chat' AND "
-                         "e.read_at>=(SELECT m.read_at FROM ui_requests u JOIN events m ON m.id=u.event_id WHERE "
-                         f"u.request_id=?) AND {owners}" + (" AND e.read_at<?" if until is not None else "") +
-                         " ORDER BY e.id", (agent, stop["request"]) + ((until,) if until is not None else ()))
+        start = ("?", stop["since"]) if stop["since"] is not None else (
+            "(SELECT m.read_at FROM ui_requests u JOIN events m ON m.id=u.event_id WHERE u.request_id=?)",
+            stop["request"])
+        rows = read_rows(f"SELECT e.id, e.kind, e.extra FROM events e WHERE e.agent=? AND e.kind='chat' AND "
+                         f"e.read_at>={start[0]} AND {owners}" + (" AND e.read_at<?" if until is not None else "") +
+                         " ORDER BY e.id", (agent, start[1]) + ((until,) if until is not None else ()))
     out = []
     for r in rows:
         extra = json.loads(r["extra"] or "{}")
@@ -4259,6 +4274,31 @@ def chat_stop_unread(agent, reads, stop, until=None):
         if r["kind"] == "say" if manager else r["kind"] == "chat" and any(extra.get(k) for k in CHAT_FLAGS):
             out.append(r["id"])
     return out
+
+
+def chat_stop_since(asked, closed):
+    """For a press of a worker or a lead: the first read of the cut turn as the hub knows it (chat_stops.since), from
+    which chat_stop_unread counts the rows of the cut turn. asked: the pressed message's row of ui_requests, with the
+    extra of its event; closed: those rows, with read_at, of the owner's messages that the press closes (its own and
+    the older ones, chat_stop_act). One read can give a message of the owner's and a task's result together, and the
+    turn can read his correction after that: the press is for the correction, so its own read is too late a start,
+    and the result would stay read for good. So the start is the earliest read of those messages, but never before
+    the newest read of the chat that gave nothing new before the first read of the pressed message (its event's
+    quiet_before, which t_read_messages writes at that read from kv chat_quiet:<agent>): the hub counts such a read as
+    the closing read of a turn (result_reads), and a message of an earlier turn that ended with no reply is closed
+    too, from whose read rows that a later turn handled would come twice. A read with nothing new after the pressed
+    message's first read is inside the cut turn (each read of a worker's chat gives that message again until its
+    reply) and bounds nothing. Open: a turn that ended with no closing read is not bounded so, and neither is an
+    earlier turn on the same message that ended with no reply, before a new turn read it again (CHAT_STOP_INVARIANT).
+    No read."""
+    first = min((r["read_at"] for r in closed if r["read_at"] is not None), default=None)
+    try:
+        extra = json.loads(asked["extra"] or "{}")
+    except (TypeError, ValueError):
+        extra = {}
+    quiet = extra.get("quiet_before") if isinstance(extra, dict) else None
+    quiet = quiet if type(quiet) in (int, float) else 0.0
+    return None if first is None else max(first, quiet)
 
 
 def chat_stop_kept(row):
@@ -4285,29 +4325,61 @@ def chat_stop_end_rows(agent, row, reads, until=None, kept=True):
     return again
 
 
+def chat_stop_wait_turn_end(agent, row, detail, t0, event_id=None, reads=None):
+    """The manager's press whose helper cut a turn and that no read ends (chat_stop_due, a late answer of
+    helper_chat_stop): not_confirmed, so that its turn end ends it by the rule of that end (chat_stop_turn_end); or
+    stopped now, by that rule, when the turn end came after the press already, as an answer that is not confirmed does
+    then. `reads`, a late answer's ids, are kept with the row (cut). The event, when it is given, is taken
+    (helper_ack). Committing; the ids made unread."""
+    ended = turn_ended(agent) > row["created"]
+    kept = sorted(set(chat_stop_kept(row)) | set(reads or ()))
+    cut = chat_stop_cut_turn(agent, row) if ended else None
+    with transaction():
+        DB.execute("UPDATE chat_stops SET state=?, settled=?, detail=?, cut=1, reads=? WHERE id=?",
+                   ("stopped" if ended else "not_confirmed", t0, CHAT_STOP_TURN_END if ended else detail,
+                    json.dumps(kept), row["id"]))
+        if event_id is not None:
+            DB.execute("UPDATE events SET helper_ack=COALESCE(helper_ack,?) WHERE id=?", (t0, event_id))
+        return chat_stop_end_rows(agent, row, kept + cut) if cut is not None else []
+
+
 def chat_stop_turn_end(agent, end, t0):
     """The manager's turn ended (Handler.helper_turn): a press whose helper said not_confirmed ends now, as stopped:
     the turn end takes away Stop, so no press again comes for it. What the cut turn read comes again only when its
-    helper cut it and a turn end that was not normal came after the press (chat_stop_cut_after: kv turn_cut:<agent>,
-    the time of the newest end whose stop reason was not end_turn, as the helper reports it); a turn that ended
-    normally handled what it read. Only a press before that turn end (end). Committing; the ids made unread."""
+    helper cut it and a turn end that was not normal came after the press (chat_stop_cut_turn: kv turn_cut:<agent>,
+    the time of the newest end whose stop reason was not end_turn, as the helper reports it, with what that turn
+    read); a turn that ended normally handled what it read. Only a press before that turn end (end). Committing; the
+    ids made unread."""
     again = []
     for row in read_rows("SELECT * FROM chat_stops WHERE agent=? AND state='not_confirmed' AND created<?",
                          (agent, end)):
         with transaction():
             DB.execute("UPDATE chat_stops SET state='stopped', settled=?, detail=? WHERE id=? AND "
                        "state='not_confirmed'", (t0, CHAT_STOP_TURN_END, row["id"]))
-            if row["cut"] and chat_stop_cut_after(agent, row):
-                again += chat_stop_end_rows(agent, row, [])
+            cut = chat_stop_cut_turn(agent, row) if row["cut"] else None
+            if cut is not None:
+                again += chat_stop_end_rows(agent, row, cut)
         log(agent, f"S-{row['id']}: its turn ended after an interrupt that was not confirmed")
     return again
 
 
-def chat_stop_cut_after(agent, row):
-    """True when a turn end of the manager's that was not normal (kv turn_cut:<agent>, the newest such end) came after
-    this press: the turn that the press cut ended so, also when a normal end came after it."""
-    kept = read_row("SELECT v FROM kv WHERE k=?", (f"turn_cut:{agent}",))     # read_row: also inside a transaction
-    return float(kept["v"] if kept else 0) > row["created"]
+def chat_stop_cut_turn(agent, row):
+    """When a turn end of the manager's that was not normal (kv turn_cut:<agent>, the newest such end) came after this
+    press, the ids of the messages that its turn read after the last normal turn end before it (kv
+    turn_cut_reads:<agent>, fleet unfinished_turn_reads up to that end, as its helper reports them; [] from a helper
+    that reports none), which the end of the press gives again with the ids that its answers named: the turn can read
+    on after an answer that was not confirmed. None when no such end came after the press: the turn that the press
+    cut ended normally, or not yet. A cut end after a normal one counts too. read_row only: also inside a
+    transaction."""
+    kept = read_row("SELECT v FROM kv WHERE k=?", (f"turn_cut:{agent}",))
+    if float(kept["v"] if kept else 0) <= row["created"]:
+        return None
+    reads = read_row("SELECT v FROM kv WHERE k=?", (f"turn_cut_reads:{agent}",))
+    try:
+        ids = json.loads(reads["v"]) if reads else []
+    except (TypeError, ValueError):
+        return []
+    return [i for i in ids if type(i) is int] if isinstance(ids, list) else []
 
 
 def chat_stop_read_end(agent, ids, t):
@@ -4356,7 +4428,7 @@ def chat_stop_asks(agent, requests):
 
 
 # The owner's row of ui_requests with its event, as a press reads it: then the WHERE of the read
-CHAT_STOP_ROWS = ("SELECT u.request_id, u.kind, u.text, u.created, u.event_id, e.extra FROM ui_requests u "
+CHAT_STOP_ROWS = ("SELECT u.request_id, u.kind, u.text, u.created, u.event_id, e.extra, e.read_at FROM ui_requests u "
                   "JOIN events e ON e.id=u.event_id WHERE ")
 
 
@@ -4421,8 +4493,9 @@ def chat_stop_act(agent, body, hand):
                                        (agent, r["request_id"], t0, t0, f"closed with the press of Stop for "
                                         f"M-{asked['event_id']}", hand)).lastrowid)
                 closed(r, shut[-1])
-            sid = DB.execute("INSERT INTO chat_stops(agent,request,state,created,hand) VALUES(?,?,'requested',?,?)",
-                             (agent, request, t0, hand)).lastrowid
+            sid = DB.execute("INSERT INTO chat_stops(agent,request,state,created,hand,since) VALUES(?,?,'requested',"
+                             "?,?,?)", (agent, request, t0, hand,
+                                        None if manager else chat_stop_since(asked, [asked] + older))).lastrowid
             closed(asked, sid)
             line = DB.execute(*event_row(agent, "say" if manager else "chat", None,
                                          chat_stop_line(asked, tasks, older), t0,
@@ -8619,7 +8692,7 @@ def migrate():
         # counts as no next step, exactly as a single ended task does.
         "goals": {"next_step_id": "INTEGER"},
         # owner feature chat_stop: a database of an earlier build of Stop in the chat box has its table without them
-        "chat_stops": {"cut": "INTEGER NOT NULL DEFAULT 0", "reads": "TEXT"},
+        "chat_stops": {"cut": "INTEGER NOT NULL DEFAULT 0", "reads": "TEXT", "since": "REAL"},
         # support plan F1: the optional tools of the sessions of a duty's cases, for a Shell-off holder (JSON list);
         # F4: the owner's file of the lists of its typed values, and the duties that its sessions report to (JSON)
         "responsibilities": {"tools": "TEXT", "servers": "TEXT", "lists": "TEXT", "report_to": "TEXT"},
@@ -9219,7 +9292,7 @@ def t_read_messages(agent, a):
         if chat_context(agent):
             chat_fence(agent)
             # (owner feature chat_stop: a message that the owner stopped comes no more, NOT_STOPPED)
-            rows = q("SELECT e.* FROM events e JOIN ui_requests u ON u.event_id=e.id "
+            owned = rows = q("SELECT e.* FROM events e JOIN ui_requests u ON u.event_id=e.id "
                      "WHERE e.agent=? AND e.kind='chat' AND u.kind IS NOT 'answer' AND NOT EXISTS "
                      "(SELECT 1 FROM owner_reports r WHERE r.agent=? AND r.in_reply_to=u.request_id) AND "
                      f"{NOT_STOPPED} ORDER BY e.id", (agent, agent))
@@ -9252,6 +9325,16 @@ def t_read_messages(agent, a):
         first = [r["id"] for r in rows if r["read_at"] is None]
         if chat_context(agent):             # a task result that this read gives waits for its message_owner
             result_reads(agent, [r for r in rows if r["read_at"] is None])
+            if role_of(agent) in ("worker", "lead"):
+                # owner feature chat_stop (chat_stop_since): the newest read that gave nothing new, the closing read of
+                # a turn, and at the first read of each message of the owner's the one before it
+                quiet, new = kv_get(f"chat_quiet:{agent}"), [r["id"] for r in owned if r["read_at"] is None]
+                with area("quiet"):
+                    if not first:
+                        kv_set(f"chat_quiet:{agent}", now())
+                    elif new and quiet:
+                        q(f"UPDATE events SET extra=json_set(COALESCE(extra,'{{}}'), '$.quiet_before', ?) WHERE id IN "
+                          f"({','.join('?' * len(new))})", (float(quiet), *new))
         read_at = now()         # one read is one moment: what a cut turn read is found by it (chat_stop_unread)
         for r in rows:
             q("UPDATE events SET read_at=COALESCE(read_at,?) WHERE id=?", (read_at, r["id"]))
@@ -26369,7 +26452,10 @@ def role_view(r):
             "created": r["created"], "updated": r["updated"]}
     sets = role_sets()
     if sets is not None:
-        view.update(sets.role_fields(r["name"]))
+        try:
+            view.update(sets.role_fields(r["name"]))
+        except Exception:       # a fault of the part on this fleet's rows: the Core view, so that the page answers
+            print_fault()
     return view
 
 
@@ -26392,7 +26478,12 @@ def people_roles():
     for r in read_rows("SELECT * FROM roles ORDER BY created, rowid"):
         entry = {"role": r["name"], "means": r["prompt"], "daily": PERSON_DAILY_MAX if r["daily"] is None else
                  r["daily"], "tools": list(CONVERSATION_WORK_TOOLS if r["tools"] else CONVERSATION_CLOSED_TOOLS)}
-        names = sets.role_agents(r["name"]) if sets is not None else None
+        names = None
+        if sets is not None:
+            try:
+                names = sets.role_agents(r["name"])
+            except Exception:   # a fault of the part on this fleet's rows: the Core entry, as role_view
+                print_fault()
         if names is not None:
             entry["agents"] = names
         out.append(entry)
@@ -28479,7 +28570,10 @@ def person_view(p, t0):
                               for c in q("SELECT * FROM conversations WHERE person=? ORDER BY id", (p["id"],))]}
     sets = role_sets()          # Founderizer for Teams, design 3: role_differs, for a person who differs from the role
     if sets is not None:
-        view.update(sets.person_fields(p))
+        try:
+            view.update(sets.person_fields(p))
+        except Exception:       # a fault of the part on this person's rows: the Core view, as role_view; also in
+            print_fault()       # the answer of POST /ui/people, after its commit
     return view
 
 
@@ -65395,12 +65489,18 @@ AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent"
               # the outgoing gate's records: rows under the new name are an earlier agent's of that name, and they go
               "egress_hosts": "agent", "egress_names": "agent",
               # the home reading: rows under the new name are of an earlier agent of that name, and they go
-              "home_items": "agent", "home_readings": "agent"}
+              "home_items": "agent", "home_readings": "agent",
+              # a person's list and a role's set (design 3) that a reload of team.json left for an earlier agent of
+              # that name: they go, so that no person and no role gets the renamed agent, which the owner never gave
+              # them, and a pair that both agents name does not stop the rename (PRIMARY KEY). rename_agent refuses a
+              # name of the team and a name with a row in `agents`, so these are rows of a gone agent only.
+              "person_agents": "agent", "person_scopes": "agent", "role_sets": "agent"}
 # The hub's own notes about one agent in kv, each kept under a prefix and the agent's name. test_rename reads every
 # kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
 AGENT_KV = ("tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
             "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:",
-            "turn_cut:",
+            "turn_cut:", "turn_cut_reads:",
+            "chat_quiet:",          # the newest read of an owner chat that gave nothing new (chat_stop_since)
             "people_told:",        # the people that a standing session was told of (people_once)
             "first_message:", "settings_finding:", "chat_undelivered:", "read_missing:", "read_told:",
             "service_user:", "caller_user:",       # one OS user for each agent: SERVICE_USER and CALLER_USER
@@ -73241,6 +73341,15 @@ def teams_token(token):
     return claims if ours else None
 
 
+def teams_kept():
+    """Inside LOCK: True while the entitlement row holds a licence of Founderizer for Teams that our key signed. Then
+    only a licence (teams_token) takes its place (the coordinator's decision of 22 November 2026): a token of another
+    plan would turn Teams off with no signed word, and the sweep would then remove each package (teams_sweep). The
+    release poll (poll_release) and the owner's route (ui_release_entitlement) ask it."""
+    kept = q1("SELECT plan, verified FROM entitlement WHERE id=1")
+    return bool(kept and kept["verified"] and kept["plan"] == TEAMS_PLAN)
+
+
 def need_teams(part_there=True):
     """The one place that refuses for a Teams part. teams_off: this fleet does not have Teams. teams_part_missing:
     it has Teams, and the caller says that this hub has not loaded the part."""
@@ -73989,9 +74098,8 @@ def poll_release(fetch=None):
         kv_set("releases_status", answer["status"])
         kv_set("releases_said", answer["says"] or None)
         q("UPDATE entitlement SET channel_said=?, channel_at=? WHERE id=1", (answer["says"], t0))
-        kept = q1("SELECT plan, verified FROM entitlement WHERE id=1")
-        if answer["entitlement"] and answer["entitlement"] != token and kept and kept["verified"] and \
-                kept["plan"] == TEAMS_PLAN and not teams_token(answer["entitlement"]):
+        if answer["entitlement"] and answer["entitlement"] != token and teams_kept() and \
+                not teams_token(answer["entitlement"]):
             # While the row holds a licence of Founderizer for Teams, only a licence takes its place (the
             # coordinator's decision of 22 November 2026): a token of another plan would turn Teams off with no word.
             log("hub", "the release channel sent a token that is not this fleet's licence of Founderizer for Teams, "
@@ -75218,6 +75326,7 @@ def release_sweep(t0):
 TEAMS_LOCK_FILE = "teams.lock"      # publish.TEAMS_LOCK: the file of each published tree that holds the lock
 TEAMS_WAIT_MOST = 96                # runs of an update in a row that wait for their package (a day of polls); then Core
 TEAMS_CHECK_WAIT = releases.SCHEMA_WAIT     # seconds for the check of a package before the hub restarts onto it
+TEAMS_TIMEOUTS_MOST = 3             # checks of a package in a row that end at TEAMS_CHECK_WAIT; then it is refused
 # The sweep's one thread; the last try of this code's package that failed for a cause that can pass (a GET, a write, a
 # copy of the records), with the SHA-256 of the token that it was made with; and the package that passed its check in
 # this process, for which the hub restarts at the first moment no turn runs.
@@ -75271,6 +75380,26 @@ def teams_once_set(sha256, refused=False):
     kv_set("teams_once", json.dumps({"sha256": sha256, "db": kv_get("db_id"), "refused": bool(refused)}))
 
 
+def teams_timeouts(sha256):
+    """The checks in a row of the package `sha256` that ended at TEAMS_CHECK_WAIT (teams_sweep_work), in this
+    generation of the records; 0 for another package or none. A count, kept in the records, so that a restart of the
+    hub between two checks does not start it again."""
+    try:
+        kept = json.loads(kv_get("teams_check_timeouts") or "null")
+    except ValueError:
+        return 0
+    if not (isinstance(kept, dict) and kept.get("sha256") == sha256 and kept.get("db") == kv_get("db_id")):
+        return 0
+    count = kept.get("count")
+    return count if isinstance(count, int) and count > 0 else 0
+
+
+def teams_timeouts_set(sha256, count):
+    """Inside LOCK: the record of teams_timeouts; None for no count."""
+    kv_set("teams_check_timeouts", json.dumps({"sha256": sha256, "db": kv_get("db_id"), "count": count})
+           if count else None)
+
+
 def teams_digest(token):
     return hashlib.sha256(token.encode()).hexdigest() if token else None
 
@@ -75322,9 +75451,11 @@ def teams_check(root, folder=None):
 
     None when the check ended with its line, with refused steps or with none: the restart is safe, and the warning of
     the steps that the records refused says why after it. ("refused", why) for a check that did not end with its line:
-    no start of this code can take the package. ("later", why) when no check could be made, or this server's room
-    ended it (releases.room_cause: no memory, or a full disk), which says nothing of the package: and with less free
-    memory than a release's checks need (releases.CHECK_NEED), no check starts."""
+    no start of this code can take the package. ("timeout", why) for a check that the limit ended (releases.timed_out):
+    a part whose import never ends, or a server that was busy at that moment, which the sweep tells apart by a count
+    (TEAMS_TIMEOUTS_MOST). ("later", why) when no check could be made, or this server's room ended it
+    (releases.room_cause: no memory, or a full disk), which says nothing of the package: and with less free memory
+    than a release's checks need (releases.CHECK_NEED), no check starts."""
     import tempfile
     import teamspack
     room = releases.memory_room()
@@ -75347,7 +75478,8 @@ def teams_check(root, folder=None):
                                        timeout=TEAMS_CHECK_WAIT, cwd=folder, env={TEAMS_DIR_VAR: root})
         if releases.schema_summary(out) is None:
             words = releases._ended(code, out, err)
-            return ("later" if releases.room_cause(code, out, err) else "refused"), words
+            return ("later" if releases.room_cause(code, out, err) else "timeout" if releases.timed_out(err) else
+                    "refused"), words
         return None
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -75477,7 +75609,7 @@ def teams_remove(root):
             return                  # records that cannot answer are no signed word: rule 5, nothing is removed
         gone = [name for name in teamspack.prune(root, set()) if teamspack.SHA256.fullmatch(name)]
     with LOCK:
-        for key in ("teams_once", "teams_fetched"):
+        for key in ("teams_once", "teams_fetched", "teams_check_timeouts"):
             kv_set(key, None)
         _teams.update(later=None, ready=None)
         if gone:
@@ -75523,6 +75655,24 @@ def teams_sweep_work(lock, root, digest):
                     teams_later(lock, digest, why)
                 return
         said = teams_check(staging or root)
+        if said is not None and said[0] == "timeout":
+            # The check runs at nice 19 on a copy of the whole records: a server that is busy at that moment ends it
+            # at its limit as a part whose import never ends does (the second read of P3 and H1, 22 November 2026).
+            # So only the TEAMS_TIMEOUTS_MOST-th such check in a row refuses the package; the others come again one
+            # RELEASE_POLL later, as a try that failed for a cause that can pass. A copy that was already in `root`
+            # goes at each such check, as a refused one does, so that no start of the hub loads a package whose check
+            # did not end: the next try gets it again with its GET.
+            if there:
+                with _teams_disk:
+                    shutil.rmtree(os.path.join(root, sha), ignore_errors=True)
+            with LOCK:
+                count = teams_timeouts(sha) + 1
+                teams_timeouts_set(sha, count)
+                if count < TEAMS_TIMEOUTS_MOST:
+                    teams_later(lock, digest, f"its check did not end in time ({said[1]}), {count} of "
+                                              f"{TEAMS_TIMEOUTS_MOST} checks in a row; this server may have been busy")
+                    return
+            said = ("refused", f"{said[1]}, in {count} check{'s' if count != 1 else ''} in a row")
         if said is not None and said[0] == "later":
             with LOCK:
                 teams_later(lock, digest, said[1])
@@ -75546,6 +75696,7 @@ def teams_sweep_work(lock, root, digest):
                 return
         with LOCK:
             _teams.update(ready=sha, later=None)
+            teams_timeouts_set(sha, None)
             teams_restart(sha)
     except Exception as e:
         print_fault()
@@ -79079,7 +79230,10 @@ class Handler(BaseHTTPRequestHandler):
         keeps it as given and sends it to the channel as a bearer; nothing here refuses work when it expires.
 
         The token is a credential, so what the owner-command record keeps of this call is its SHA-256, as the
-        sign-in code route does: the token itself is in no row of ui_controls, no result and no log line."""
+        sign-in code route does: the token itself is in no row of ui_controls, no result and no log line.
+
+        While the row holds a licence of Founderizer for Teams (teams_kept), only such a licence of this fleet takes
+        its place, as in the release poll: a token of another plan would turn Teams off with no signed word, a 409."""
         passing = {}
 
         def read(data):
@@ -79090,6 +79244,9 @@ class Handler(BaseHTTPRequestHandler):
             return {"token_sha256": hashlib.sha256(token.strip().encode()).hexdigest()}
 
         def act(body):
+            if teams_kept() and not teams_token(passing["token"]):
+                raise Refusal(409, "this fleet keeps its licence of Founderizer for Teams, and this token is not that "
+                                   "licence, so the hub did not keep it")
             try:
                 return store_entitlement(passing["token"])
             except releases.Untrusted as e:
@@ -86238,8 +86395,11 @@ class Handler(BaseHTTPRequestHandler):
         if all(v is None for v in marks.values()) or any(v is not None and not finite(v) for v in marks.values()):
             return self.json(400, {"error": "started or ended must be a time in seconds"})
         t0 = now()
-        # owner feature chat_stop: the time of the newest end of the batch whose stop reason was no end_turn
+        # owner feature chat_stop: the time of the newest end of the batch whose stop reason was no end_turn, and the
+        # ids of the messages that its turn read (cut_reads, fleet unfinished_turn_reads up to that end)
         cut_end = f.get("cut_end") if finite(f.get("cut_end")) else None
+        cut_reads = f.get("cut_reads") if isinstance(f.get("cut_reads"), list) else []
+        cut_reads = sorted({i for i in cut_reads if type(i) is int and 0 < i < 2 ** 63})[-HANDOVER_MAX:]
         with LOCK, area("quiet"):
             end = None if marks["ended"] is None else min(marks["ended"], t0)
             news = end is not None and end > turn_ended(agent) and \
@@ -86249,8 +86409,9 @@ class Handler(BaseHTTPRequestHandler):
                     with area("state" if news and k == "ended" else "quiet"):
                         kv_set(f"turn_{k}:{agent}", min(v, t0))
             if cut_end is not None and min(cut_end, t0) > float(kv_get(f"turn_cut:{agent}") or 0):
-                with area("quiet"):     # for a press's end at this or a later turn end (chat_stop_cut_after)
+                with area("quiet"):     # for a press's end at this or a later turn end (chat_stop_cut_turn)
                     kv_set(f"turn_cut:{agent}", min(cut_end, t0))
+                    kv_set(f"turn_cut_reads:{agent}", json.dumps(cut_reads))
             if end is not None:         # owner feature chat_stop: a press that cut the turn that ended now
                 with area("state"):
                     chat_stop_turn_end(agent, end, t0)
@@ -86346,6 +86507,13 @@ class Handler(BaseHTTPRequestHandler):
             row = q1("SELECT * FROM chat_stops WHERE id=?", (stop,))
             if not row or row["agent"] != agent:
                 return self.json(404, {"error": "no such press of Stop for this agent"})
+            # An answer names the time of its event (`created`): one that the helper kept for an earlier event of this
+            # row (the hub took it and its reply was lost, then the owner pressed again) is no answer to the press
+            # now, whose event must still reach the helper. An answer with no time is of a helper of an earlier build.
+            event = q1("SELECT extra FROM events WHERE id=?", (row["event"],)) if row["event"] else None
+            current = json.loads(event["extra"] or "{}").get("created") if event else None
+            if "created" in f and current is not None and f.get("created") != current:
+                return self.json(409, {"error": "this answer is of an earlier event of this press of Stop"})
             # A press that the hub settled at the read of the owner's correction before this answer came (the
             # answer's send failed, and its helper typed the correction's signal): an answer that cut gives the cut
             # turn's reads now, up to that read, and changes nothing else
@@ -86358,18 +86526,27 @@ class Handler(BaseHTTPRequestHandler):
             # (chat_stops.reads) for each end of the press.
             cut_any = cut or bool(row["cut"])
             kept = sorted(set(chat_stop_kept(row)) | (set(reads) if cut else set()))
+            if late and not confirmed and role_of(agent) == "manager":
+                # The manager's Esc did not take, and the hub settled the press at the read of the correction: the
+                # same running turn read it, and no read ends the manager's press. Its turn end does.
+                again = chat_stop_wait_turn_end(agent, row, detail, now(), reads=reads)
+                log(agent, f"S-{stop}: Stop NOT confirmed after the read of a newer message: {detail}" +
+                    (f"; {', '.join(f'M-{i}' for i in again)} unread again" if again else ""))
+                state = q1("SELECT state FROM chat_stops WHERE id=?", (stop,))["state"]
+                return self.json(200, {"ok": True, "state": state, "unread": again})
             state = "stopped" if confirmed or late else "not_confirmed"
             # An answer that is not confirmed, after the end of its press came: a worker's newer row of the owner's
             # that is read already (the correction that the running turn read before the Esc landed), or the
             # manager's turn end after the press (one that came while the press waited for its helper). The press
             # ends now, by the rule of that end, as chat_stop_read_end and chat_stop_turn_end end it.
-            ended, until, gives = None, None, False
+            ended, until, gives, also = None, None, False, []
             if not confirmed and not late:
                 if role_of(agent) in ("worker", "lead"):
                     until = chat_stop_newer_read(agent, row)
                     ended, gives = (CHAT_STOP_LATE, cut_any) if until is not None else (None, False)
                 elif turn_ended(agent) > row["created"]:
-                    ended, gives = CHAT_STOP_TURN_END, cut_any and chat_stop_cut_after(agent, row)
+                    also = chat_stop_cut_turn(agent, row) if cut_any else None
+                    ended, gives, also = CHAT_STOP_TURN_END, also is not None, also or []
                 state = "stopped" if ended else state
             with transaction():
                 if late:
@@ -86381,7 +86558,7 @@ class Handler(BaseHTTPRequestHandler):
                                                      int(cut_any), json.dumps(kept), stop))
                     again = chat_stop_end_rows(agent, row, reads, kept=role_of(agent) != "manager") \
                         if confirmed and cut_any else \
-                        chat_stop_end_rows(agent, row, kept, until=until) if gives else []
+                        chat_stop_end_rows(agent, row, kept + also, until=until) if gives else []
             log(agent, f"S-{stop}: Stop {'confirmed' if confirmed or late else 'NOT confirmed'}: {detail}" +
                 (f"; {', '.join(f'M-{i}' for i in again)} unread again" if again else ""))
         return self.json(200, {"ok": True, "state": state, "unread": again})

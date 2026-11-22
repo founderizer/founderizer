@@ -67,7 +67,7 @@ import zipfile
 from http.client import HTTPException       # only the name: `http` is this module's own call to the hub
 
 from threads import (CLAUDE_TASK_TOOLS, MARKER, MAX_LINE, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows,
-                     manager_transcript, text_of)
+                     manager_transcript, text_of, when as row_when)
 from usage import Collector, local_model, timestamp
 import acp_programs
 import lifecycle
@@ -4643,11 +4643,13 @@ def turn_reads(runtime, rows):
     return ended, ids
 
 
-def unfinished_turn_reads(runtime, path):
+def unfinished_turn_reads(runtime, path, until=None):
     """The ids of the manager's messages that its session read after its last turn that ended normally (turn_reads),
     from its conversation file: a turn that its usage limit stopped, for example, did not finish them. A switch hands
     them to the new runtime's session (hub record_status). [] when every read was finished, or the file cannot be
-    read. Only the end of a long file is read, unless a normal turn end is not in it."""
+    read. Only the end of a long file is read, unless a normal turn end is not in it. until: only the rows up to that
+    time (owner feature chat_stop: the reads of the turn that a cut end at that time ended, Helper.report_limit), and
+    none after it, which are of a later turn."""
     if not path or runtime not in MANAGER_RUNTIMES:
         return []
     step = HANDOVER_TAIL
@@ -4656,7 +4658,10 @@ def unfinished_turn_reads(runtime, path):
         while True:
             with open(path, "rb") as stream:
                 stream.seek(max(0, size - step))
-                ended, ids = turn_reads(runtime, complete_rows(stream.read(min(size, step))))
+                rows = complete_rows(stream.read(min(size, step)))
+                if until is not None:       # a row with no time is kept: it is no later turn's start
+                    rows = [r for r in rows if not isinstance(r, dict) or (row_when(r.get("timestamp")) or 0) <= until]
+                ended, ids = turn_reads(runtime, rows)
             if ended or step >= size:
                 return sorted(set(ids))[-HANDOVER_MAX:]
             step *= 4
@@ -8522,21 +8527,30 @@ class Helper:
                 self.say(f"manager: usage limit reported to the hub, reset {r.get('resets_at')}")
         turn = {"session": batch.get("session"), "running": self.manager_turn.get("session") == batch.get("session")
                 and self.manager_turn.get("running", False)}
-        marks = {}
+        marks, read = {}, time.time()
         for r in batch["events"]:
-            if "parent" in r or not r.get("ts"):        # a subagent's record starts and ends no turn of the session
+            if "parent" in r:           # a subagent's record starts and ends no turn of the session
+                continue
+            # The end of a turn that a read found whole, with no line after it (threads.Translator.idle), has no time
+            # of its own: about one turn end in ten. It ended by the time of this read, which is its time here; only
+            # in the session that runs now: an earlier session's last end can be read late, after the new one began.
+            ts = r.get("ts") or (read if r["type"] == "result" and batch.get("session") == self.manager_session
+                                 else None)
+            if not ts:
                 continue
             if r["type"] == "result":
-                turn["running"], marks["ended"] = False, r["ts"]
+                turn["running"], marks["ended"] = False, ts
                 # owner feature chat_stop: the time of the newest end that was not normal (cancelled or error, not
                 # end_turn), so that the hub gives a cut turn's reads again only after such an end that came after the
-                # press (hub.chat_stop_cut_after)
+                # press (hub.chat_stop_cut_turn), with what that turn read
                 if r.get("stop_reason") != "end_turn":
-                    marks["cut_end"] = r["ts"]
+                    marks["cut_end"] = ts
             elif r["type"] not in ("session", "model", "error") and not turn["running"]:
                 turn["running"], marks["started"] = True, r["ts"]
         if "ended" in marks:        # owner feature chat_stop: a turn that ended after a press is not the press's turn
             self.manager_turn_end = max(self.manager_turn_end, marks["ended"])
+        if "cut_end" in marks:      # owner feature chat_stop: what the cut turn read, up to its end
+            marks["cut_reads"] = self.cut_reads("manager", "", until=marks["cut_end"])
         if marks:
             code, _ = http("POST", f"/helper/turn/{self.agent}", marks, timeout=10)
             if code not in (200, 404):
@@ -9572,6 +9586,8 @@ class Helper:
         if answer is None:
             confirmed, detail, cut = self.chat_turn_stop(window, extra)
             answer = {"stop": stop, "confirmed": confirmed, "detail": detail, "cut": cut,
+                      # the time of its event: the hub takes no answer of an earlier event of the same row
+                      "created": extra.get("created"),
                       # whenever confirmed or cut: the hub keeps those of an answer that cut (chat_stops.reads) and
                       # gives them again only at the end of a press that cut, by any path; a turn that ended
                       # normally gives none
@@ -9666,19 +9682,19 @@ class Helper:
             time.sleep(0.5)
         return False, "its conversation file still changes after the interrupt"
 
-    def cut_reads(self, window, generation):
+    def cut_reads(self, window, generation, until=None):
         """The ids of the messages that the cut turn of `window` had read (unfinished_turn_reads), from the session's
         own conversation file: the manager's by its window's @fleet_session (manager_binding), an owner chat's by its
         record (chat_binding). Only a read whose first line names its messages counts (read_ids), and only the
         manager's read begins so (hub.t_read_messages): a worker's or a lead's chat names none, so its list is empty
-        here."""
+        here. until: only its reads up to that time (unfinished_turn_reads)."""
         runtime = self.conf.get("runtime")
         if window == "manager":
             state = self.manager_state()
             path = manager_binding(self.agent, runtime, state[0]) if state and state[0] else None
         else:
             path = self.chat_binding(runtime, generation)
-        return unfinished_turn_reads(runtime, path)
+        return unfinished_turn_reads(runtime, path, until)
 
     def deposit(self, extra):
         """A key or a login that the central vault sealed for this machine's vault (owner feature

@@ -168,7 +168,7 @@ Say in each part's `why` why that agent suits that part.
   of these servers. Money is the owner's there: a new or a bigger server is one item with the reason `money`, the
   server's type, its price a month as the provider lists it, and its exact steps in the app.
 - **A provider account of the door goes the same way.** The door uses a key of its own (a Cloudflare, Hetzner,
-  Backblaze, Azure or Tailscale account, or one setting of an app on a host) only for an agent that holds servers
+  Backblaze or Tailscale account, or one setting of an app on a host) only for an agent that holds servers
   through it, because it knows no other agent. A key that you ask for with `request_secret` and `door` is for you when
   you hold the servers, and else for the one agent that holds them. When several agents hold servers, name in
   `give_to` the one whose servers the key is for. The same call gives a key that the door holds for no agent to the

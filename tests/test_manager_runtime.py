@@ -1224,6 +1224,13 @@ class Handover(StandIn):
         self.assertEqual(fleet.unfinished_turn_reads("claude", self.write(later)), [])     # a later turn finished them
         self.assertEqual(fleet.unfinished_turn_reads("claude", self.write([*claude_read("r1", 3), CLAUDE_LIMIT,
                                                                            *claude_read("r2", 4, 5)])), [3, 4, 5])
+        # owner feature chat_stop: up to the time of a cut end, the reads of the turn that it ended, and not those
+        # of a later turn (Helper.report_limit's cut_reads)
+        timed = [dict(r, timestamp=f"2026-11-22T10:00:0{n}Z") for n, r in
+                 enumerate([*claude_read("r1", 3), CLAUDE_LIMIT, *claude_read("r2", 4)])]
+        self.assertEqual(fleet.unfinished_turn_reads("claude", self.write(timed),
+                                                     until=fleet.row_when("2026-11-22T10:00:02Z")), [3])
+        self.assertEqual(fleet.unfinished_turn_reads("claude", self.write(timed)), [3, 4])
 
     def test_odd_rows_never_stop_a_start(self):
         """A conversation file is the runtime's: an id of another type there gives no hand-over and no exception."""

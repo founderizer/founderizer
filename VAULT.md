@@ -838,6 +838,14 @@ host.
     of another person at a provider (`fetch_sealed` in `door.py`). The same hub can also make the door delete a value
     that it holds (the `keep` list). A signature of the central vault on each copy, which the door checks before it
     keeps the copy, closes the first part; it is planned (22 November 2026), not built.
+    The names in the door's file are the hub's word too. The Mac writes each card credential's name, the reference of
+    the secret behind it, and the providers of each agent as the hub's view gives them (`DoorAccess.swift`). So the
+    same hub can drop a credential, and the door then deletes its value. It can also point a credential of an app's
+    setting (`app:<app>:<NAME>`) at the reference of a provider's key, give that credential to an agent that it
+    steers, and the door then writes the provider's key into that app's settings on a host. A signature on the copy
+    does not stop this, because the value is the right one. The fix is planned with the signed copies: the owner's
+    grant to the door names its credential, and the door keeps and gives a value only under that name. Until then the
+    Mac is to refuse a reference that moves to another credential name (22 November 2026), not built.
 16. **The links between the machines.** The hub serves HTTP, not HTTPS (`hub.py`). It depends on the fleet's private
     network, Tailscale, to protect these links (`HUB-INSTALL.md`, "The private network" and "The firewall"). Agent keys
     and job numbers go over them. A value of a secret goes over them only as a sealed copy, except a key that

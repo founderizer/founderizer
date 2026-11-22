@@ -5501,7 +5501,7 @@ def tools():
                           "holds) or to a list as scopes of save_person. It replaces the whole set. Each person who "
                           "holds the role takes the change, but for a pair that the owner changed by hand: "
                           "fleet_read(page=\"roles\") names who differs. {} takes from them what the set gave. "
-                          "null takes the set away and changes nobody.",
+                          "null takes the set away and changes nobody. Leave access out unless you change the set.",
              {"name": S["text"], "prompt": S["text"], "tools": S["bool"], "daily": {"type": ["integer", "null"]},
               "rename": S["text"], "delete": S["bool"],
               "access": {"type": ["object", "null"], "additionalProperties": {"type": ["object", "null"]}}, **rid},

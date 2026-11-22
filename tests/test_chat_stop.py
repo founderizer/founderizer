@@ -591,7 +591,7 @@ class ChatStop(test_ui_api.OwnerAPI):
         helper = fleet.Helper(agent, conf)
         steps = iter(outcomes)
         helper.chat_turn_stop = lambda window, extra: next(steps)
-        helper.cut_reads = lambda window, generation: list(reads)
+        helper.cut_reads = lambda window, generation, until=None: list(reads)
         self.fails = fails
         return helper
 
@@ -616,7 +616,7 @@ class ChatStop(test_ui_api.OwnerAPI):
         again. The bugs: a task's result, an agent's report, the owner's correction or his answer to a secret
         request that the cut turn read is lost; or a row that a turn which ended normally handled comes twice."""
         self.assertIn("nothing that a turn which ended normally handled comes again", hub.CHAT_STOP_INVARIANT)
-        for n in range(1, 6):           # five workers, each on a machine of its own
+        for n in range(1, 9):           # eight workers, each on a machine of its own
             hub.TEAM["addresses"][f"w{n}-host"] = f"127.0.0.{10 + n}"
             hub.TEAM["agents"][f"w{n}"] = dict(hub.TEAM["agents"]["leo"], machine=f"w{n}-host")
             self.features(f"w{n}")
@@ -781,19 +781,150 @@ class ChatStop(test_ui_api.OwnerAPI):
         self.press(m["request_id"], "manager")
         events = [e for e in self.polled("manager") if e["kind"] == "chat_stop"]
         turn_end(helper, "s8", "end_turn")
-        helper.cut_reads = lambda window, generation: []        # its records since that normal end read nothing
+        helper.cut_reads = lambda window, generation, until=None: []    # its records since that normal end read nothing
         helper.handle_events(events)
         self.assertEqual(self.read_at(report), [True])
+        # 12. a worker: one read gives the owner's message and a task's result, and the same turn reads his correction
+        # after it; the press is for the correction and closes the first message too; confirmed: the cut turn's
+        # result comes again (its rows count from the earliest read of the messages that the press closed)
+        result = hub.emit("w6", "chat", "[hub] T-7 (Count), which you opened from the owner's message, is completed.",
+                          extra={"generation": "test-generation", "task_result": 7})
+        first = self.send("Sort the photos of the year.", "w6")
+        self.assertIn("T-7 (Count)", self.read("w6"))
+        hub.q("UPDATE events SET read_at=read_at-1 WHERE id IN (?,?)", (result, first["event_id"]))   # a read before
+        fixed = self.send("No, only the photos of November.", "w6")
+        self.read("w6")                                         # the same turn reads the correction
+        helper = self.stand_in("w6", [cutting], [])
+        self.press(fixed["request_id"], "w6")
+        self.helper_pass(helper, "w6")
+        self.assertEqual(self.read_at(result, first["event_id"], fixed["event_id"]), [False, True, True])
+        # 13. a worker: an earlier turn read the owner's message, left it with no reply, read an agent's note and
+        # ended with a read that gave nothing new; the cut turn reads a result and his new message, whose press closes
+        # the old message too: the cut turn's result comes again, and the note that the earlier turn handled does not
+        # (the closing read bounds the span that an old message adds)
+        old = self.send("Count the photos.", "w7")
+        note = hub.emit("w7", "chat", "[agent manager] The disk is full.",
+                        extra={"generation": "test-generation", "agent_message": True})
+        self.read("w7")                                         # the earlier turn: the message and the note
+        hub.q("UPDATE events SET read_at=(SELECT read_at FROM events WHERE id=?) WHERE id=?", (old["event_id"], note))
+        self.read("w7")                                         # its closing read gives nothing new
+        result = hub.emit("w7", "chat", "[hub] T-8 (Sort), which you opened from the owner's message, is completed.",
+                          extra={"generation": "test-generation", "task_result": 8})
+        asked = self.send("Now the photos of November.", "w7")
+        self.read("w7")                                         # the cut turn
+        helper = self.stand_in("w7", [cutting], [])
+        self.press(asked["request_id"], "w7")
+        self.helper_pass(helper, "w7")
+        self.assertEqual(self.read_at(note, result, old["event_id"]), [True, False, True])
+        # 19. a worker: one read gives the owner's message and a task's result; a second read of the same turn gives
+        # the message again and nothing new; the press is for that message, confirmed: the result comes again (a read
+        # with nothing new after the first read of the pressed message is inside the cut turn, and bounds nothing)
+        result = hub.emit("w8", "chat", "[hub] T-9 (Count), which you opened from the owner's message, is completed.",
+                          extra={"generation": "test-generation", "task_result": 9})
+        asked = self.send("Now the photos.", "w8")
+        self.assertIn("T-9 (Count)", self.read("w8"))
+        self.assertIn("Now the photos.", self.read("w8"))       # the same turn reads again: nothing new
+        helper = self.stand_in("w8", [cutting], [])
+        self.press(asked["request_id"], "w8")
+        self.helper_pass(helper, "w8")
+        self.assertEqual(self.read_at(result, asked["event_id"]), [False, True])
+        # 14. the manager: the Esc did not take; the owner presses again; the same running turn reads his correction
+        # before the helper's poll, which gives no event; the turn ends normally: what it handled does not come again
+        report, m = manager_press("the photos")
+        helper = self.stand_in("manager", [not_confirmed], [report])
+        self.press(m["request_id"], "manager")
+        self.helper_pass(helper, "manager")
+        self.assertTrue(self.press(m["request_id"], "manager")[1]["changed"])          # a press again
+        self.send("No, only one line.", "manager")
+        self.read("manager")                                    # the same running turn reads the correction
+        self.assertEqual([e for e in self.polled("manager") if e["kind"] == "chat_stop"], [])
+        turn_end(helper, "s10", "end_turn")
+        self.assertEqual(self.read_at(report), [True])
+        # 15. the manager: the Esc does not take and its answer is lost; the same running turn reads the correction,
+        # and the poll settles the press; the kept answer comes then, and the turn ends normally: nothing again
+        report, m = manager_press("the invoices")
+        helper = self.stand_in("manager", [not_confirmed], [report], fails=1)
+        self.press(m["request_id"], "manager")
+        self.helper_pass(helper, "manager")                     # the Esc; its answer is kept
+        self.send("No, only those of November.", "manager")
+        self.read("manager")
+        self.assertEqual([e for e in self.polled("manager") if e["kind"] == "chat_stop"], [])
+        self.helper_pass(helper, "manager")                     # the kept answer goes
+        turn_end(helper, "s11", "end_turn")
+        self.assertEqual(self.read_at(report), [True])
+        # 16. the manager: the answer is not confirmed; the turn runs on and reads another report; then it ends cut:
+        # both reports come again, the one read after the answer too (the cut end's reads, cut_reads)
+        r1, m = manager_press("the domain")
+        helper = self.stand_in("manager", [not_confirmed], [r1])
+        self.press(m["request_id"], "manager")
+        self.helper_pass(helper, "manager")
+        r2 = hub.emit("manager", "say", "[agent leo] The certificate expires tomorrow.")
+        self.read("manager")                                    # the turn that still runs reads it
+        helper.cut_reads = lambda window, generation, until=None: [r1, r2]
+        turn_end(helper, "s12", "cancelled")
+        self.assertEqual(self.read_at(r1, r2), [False, False])
+        # 17. the manager: the turn reads on and ends cut while the press waits for its helper; the answer that comes
+        # after it is not confirmed: the reads of that cut end come again with the answer's own
+        r1, m = manager_press("the newsletter")
+        helper = self.stand_in("manager", [not_confirmed], [r1])
+        self.press(m["request_id"], "manager")
+        events = [e for e in self.polled("manager") if e["kind"] == "chat_stop"]
+        r2 = hub.emit("manager", "say", "[agent leo] The list has 40 new names.")
+        self.read("manager")
+        helper.cut_reads = lambda window, generation, until=None: [r1, r2] if until else [r1]
+        turn_end(helper, "s13", "cancelled")
+        helper.handle_events(events)
+        self.assertEqual(self.read_at(r1, r2), [False, False])
+        # 18. the manager: the Esc did not take; a press again; the same running turn reads the correction and ends
+        # cut before the helper's poll: that poll ends the press at once, by the cut end, with its reads
+        r1, m = manager_press("the prices")
+        helper = self.stand_in("manager", [not_confirmed], [r1])
+        self.press(m["request_id"], "manager")
+        self.helper_pass(helper, "manager")
+        self.press(m["request_id"], "manager")
+        self.send("No, only the prices of the shop.", "manager")
+        self.read("manager")
+        turn_end(helper, "s14", "cancelled")
+        self.assertEqual(self.read_at(r1), [True])                  # the press waited for its helper at that end
+        self.assertEqual([e for e in self.polled("manager") if e["kind"] == "chat_stop"], [])
+        self.assertEqual(self.read_at(r1), [False])
+
+    def test_a_kept_answer_of_an_earlier_event_never_takes_the_press_again(self):
+        """The hub takes an answer that is not confirmed and its reply is lost, so the helper keeps it; the owner
+        presses again; a pass of the helper whose poll came before that press sends the kept answer. The bug: that
+        answer of the first event made the row not_confirmed again, the new event was never given, and the press
+        again sent no Esc."""
+        asked = self.send("Now the photos.")
+        self.read()
+        helper = self.stand_in("leo", [(False, "the session still shows a running turn after three interrupts", True),
+                                       (True, "interrupted; the session is idle", True)], [])
+        lose = [1]
+
+        def http(method, path, data=None, timeout=40):
+            answer = self.request(path, data)
+            if path.startswith("/helper/chat-stop/") and lose[0]:
+                lose[0] -= 1
+                raise urllib.error.URLError("the reply of the hub is lost")
+            return answer
+        with unittest.mock.patch.object(fleet, "http", http):
+            stop = self.press(asked["request_id"])[1]["stop"]
+            self.helper_pass(helper, "leo")
+            self.assertTrue(fleet.load_chat_stop_answers("leo"))            # kept: its reply was lost
+            self.assertTrue(self.press(asked["request_id"])[1]["changed"])  # the owner presses again
+            helper.handle_events([])                # a pass whose poll the hub answered before that press
+            self.assertEqual(fleet.load_chat_stop_answers("leo"), {})       # refused (409), and dropped
+            self.helper_pass(helper, "leo")         # the poll gives the new event: the Esc goes
+        self.assertEqual(hub.q1("SELECT state FROM chat_stops WHERE id=?", (stop["id"],))["state"], "stopped")
 
     def test_a_database_of_an_earlier_build_gets_the_new_columns(self):
-        """A hub that ran an earlier build of Stop has chat_stops without cut and reads; migrate() adds them. The bug:
+        """A hub that ran an earlier build of Stop has chat_stops without cut, reads and since; migrate() adds them. The bug:
         the helper's answer fails at each try on such a database."""
         hub.q("DROP TABLE chat_stops")
         hub.q("CREATE TABLE chat_stops(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, request TEXT NOT NULL, "
               "state TEXT NOT NULL, created REAL NOT NULL, settled REAL, detail TEXT, line INTEGER, event INTEGER, "
               "hand TEXT)")
         hub.build_schema()
-        self.assertLessEqual({"cut", "reads"}, {r["name"] for r in hub.q("PRAGMA table_info(chat_stops)")})
+        self.assertLessEqual({"cut", "reads", "since"}, {r["name"] for r in hub.q("PRAGMA table_info(chat_stops)")})
 
     def test_after_an_interrupt_that_did_not_take_a_press_again_makes_one_new_event(self):
         """An interrupt that did not take leaves the press not_confirmed: chat_stop names the message again, and a

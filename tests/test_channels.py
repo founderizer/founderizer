@@ -570,13 +570,18 @@ else:
 def inject():
     folder = os.path.join(ctl, "inject")
     while True:
-        for name in sorted(os.listdir(folder)):
-            if not name.endswith(".json"):
-                continue
-            path = os.path.join(folder, name)
-            with open(path) as f:
-                obj = json.load(f)
-            os.unlink(path)
+        try:
+            objs = []
+            for name in sorted(os.listdir(folder)):
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(folder, name)
+                with open(path) as f:
+                    objs.append(json.load(f))
+                os.unlink(path)
+        except FileNotFoundError:       # the test that made this stub removed its folder: the stub ends with it
+            os._exit(0)
+        for obj in objs:
             if obj.get("crash"):
                 os._exit(3)
             emit(obj)
@@ -2159,13 +2164,22 @@ class WhatsAppTests(Base):
         self.assertEqual((self.mark(), self.commands("logout")), ("1700000000.5", []))
 
     def test_wa_link_restarts_after_a_crash(self):
+        # The bridge reports each account's state of now, so a short error state between the crash and the next start
+        # may never reach the hub on a busy machine: the test records each state that the bridge sets.
+        seen, real = [], channels.Account.set_state
+
+        def record(account, state, error=None):
+            seen.append((account.id, state, error))
+            return real(account, state, error)
+        change = patch.object(channels.Account, "set_state", record)
+        change.start()
+        self.addCleanup(change.stop)
         self.linked()
         first = self.commands("start")[0]["pid"]
         self.inject({"crash": True})
         self.wait_for(lambda: len(self.commands("start")) == 2, "a second wa-link")
         self.assertNotEqual(self.commands("start")[1]["pid"], first)
-        error = self.has_state("whatsapp-main", "error")[-1]
-        self.assertEqual(error["error"], "wa-link stopped (exit 3).")
+        self.assertIn(("whatsapp-main", "error", "wa-link stopped (exit 3)."), seen)
         self.wait_for(lambda: self.states("whatsapp-main")[-1]["state"] == "connected", "connected again")
         self.hub.queue({"id": 90, "kind": "message", "account": "whatsapp-main", "chat": WA_CHAT, "text": "after",
                         "reply_to": None, "prefix": None})

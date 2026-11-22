@@ -2571,11 +2571,12 @@ class HubRoutes(OwnerAPI):
         self.assertEqual((hub.teams_on(), hub.teams_licence()), (True, claimed))
         self.assertEqual(len(self.logged("the licence's poll came back after%")), 2)
 
-    def test_while_the_hub_holds_a_licence_the_release_poll_keeps_only_a_licence(self):
-        """The release poll keeps a token that its answer carries (4.5). While the row holds a licence of Founderizer
-        for Teams, it keeps only a licence of this fleet that our key signed, as the licence's poll does (the
-        coordinator's decision of 22 November 2026). The bug: a token of another plan that our key signed, in an
-        answer of the release channel, takes the licence's place and turns Teams off with no word."""
+    def test_while_the_hub_holds_a_licence_only_a_licence_takes_its_place(self):
+        """The release poll keeps a token that its answer carries (4.5), and the owner's route keeps the token that it
+        is given. While the row holds a licence of Founderizer for Teams, each keeps only a licence of this fleet that
+        our key signed, as the licence's poll does (the coordinator's decision of 22 November 2026). The bug: a token
+        of another plan that our key signed, in an answer of the release channel or pasted by the owner, takes the
+        licence's place and turns Teams off with no word, and the sweep then removes each package."""
         licence, renewed = self.licence(), self.licence(until=2100000000)
         self.assertEqual(self.press("entitlement", token=licence)[0], 200)
         for fresh, held in ((self.token(until=2100000000), licence), (renewed, renewed)):
@@ -2583,6 +2584,10 @@ class HubRoutes(OwnerAPI):
                 self.assertEqual(self.press("check")[0], 200)
                 self.finish()
             self.assertEqual((hub.entitlement_token(), hub.teams_on()), (held, True))
+        status, answer = self.press("entitlement", token=self.token(until=2100000001))     # the owner's route
+        self.assertEqual(status, 409, answer)
+        self.assertIn("this token is not that licence", json.dumps(answer))
+        self.assertEqual((hub.entitlement_token(), hub.teams_on()), (renewed, True))
 
     def test_a_fleet_with_no_licence_makes_no_licence_call(self):
         """3.14: a fleet with no licence sends nothing new, and a test's hub asks nothing. The bugs: a free fleet, a
@@ -3857,7 +3862,8 @@ class TeamsCode(HubUpdates):
         that a restart in place keeps open, with no answer. A release meets such a part in its schema check, which
         ends at its limit; the sweep's package gets the same check, for real here (the code of this checkout, run as
         a child in a folder of links with the package's lock), and the hub does not restart onto a package whose check
-        did not end, keeps no copy of it where a start loads it, and does not try it again. The bug: a fleet's first
+        did not end, keeps no copy of it where a start loads it, and, once such checks reach their count in a row
+        (TEAMS_TIMEOUTS_MOST, one here: the count has its own test), does not try it again. The bug: a fleet's first
         licence, or a restore, hangs its hub.
 
         The child compiles the hub before it reaches the part, which a slow machine does in more than the check's
@@ -3878,14 +3884,14 @@ class TeamsCode(HubUpdates):
             self.skipTest(f"an import of the compiled hub took {time.monotonic() - began:.0f} s here")
         began = time.monotonic()
         with patch.object(hub, "teams_check", functools.partial(self.real_check, folder=str(folder))), \
-                patch.object(hub, "TEAMS_CHECK_WAIT", 30), \
+                patch.object(hub, "TEAMS_CHECK_WAIT", 30), patch.object(hub, "TEAMS_TIMEOUTS_MOST", 1), \
                 patch.object(hub, "restart_hub_soon", lambda *args, **how: self.restarted.append((args, how))):
             self.sweep_teams()
             self.assertTrue(marker.exists(), "the check never reached the part's import")
             self.assertLess(time.monotonic() - began, 30 + 20)
             self.assertEqual((self.restarted, self.packages()), ([], []))
             (said,) = self.logged("the Teams code of the release that this hub runs%did not pass its check%")
-            self.assertIn("ended at the hub's time limit of 30 seconds", said)
+            self.assertIn("ended at the hub's time limit of 30 seconds, in 1 check in a row", said)
             self.sweep_teams()
         self.assertEqual((len(self.fetched), self.restarted), (1, []))
 
@@ -3949,8 +3955,8 @@ class TeamsCode(HubUpdates):
         data, lock = part()
         self.runs(lock)
         self.answers[lock["sha256"]] = (200, data)
-        with patch.object(hub, "teams_check", lambda root, folder=None: ("refused", "python3 ended at the hub's time "
-                                                                               "limit of 120 seconds")):
+        with patch.object(hub, "teams_check", lambda root, folder=None: ("refused", "python3 ended with code 1: "
+                                                                               "ImportError: no module named x")):
             self.sweep_teams()
         self.assertTrue(hub.teams_once(lock["sha256"], refused=True))
         self.assertEqual((len(self.fetched), self.packages()), (1, []))
@@ -3964,6 +3970,44 @@ class TeamsCode(HubUpdates):
                          (releases.KEPT, "hold", 1, []))
         self.assertIn("does not take it again", one["says"])
         time.sleep(hub.RESTART_DELAY + 0.5)
+
+    def test_a_check_that_ends_at_its_limit_is_tried_again_and_only_the_third_in_a_row_refuses_the_package(self):
+        """The check of a package runs at nice 19 on a copy of the whole records, so a server that is busy at that
+        moment ends it at its limit as a part whose import never ends does (the second read of P3 and H1, 22 November
+        2026). Such a check is a try that failed for a cause that can pass, one RELEASE_POLL later, and also after a
+        restart of the hub (the count is in the records); only the TEAMS_TIMEOUTS_MOST-th in a row refuses the
+        package, and a copy that was already in the folder of packages goes at the first such check, so that no start
+        of the hub loads it unchecked. A cancel clears the count. The bugs: a paying fleet whose server was busy at the
+        moment of its one check gets one line in the hub's log and no Teams part until a release changes a Teams file;
+        a new licence after a cancel refuses its package at its first slow check."""
+        self.licence()
+        data, lock = part()
+        self.runs(lock)
+        self.answers[lock["sha256"]] = (200, data)
+        teamspack.place(data, lock, str(self.teams))                    # an update put it there
+        slow = "python3 ended at the hub's time limit of 120 seconds"
+        with patch.object(hub, "teams_check", lambda root, folder=None: ("timeout", slow)), \
+                patch.object(hub, "restart_hub_soon", lambda *args, **how: self.restarted.append(args)):
+            self.sweep_teams()
+            self.assertEqual((hub.teams_once(lock["sha256"]), len(self.fetched), self.packages()), (False, 0, []))
+            (said,) = self.logged("the Teams code of the release that this hub runs%is not on this server%")
+            self.assertIn(f"its check did not end in time ({slow}), 1 of 3 checks in a row", said)
+            self.sweep_teams()                                          # within one RELEASE_POLL: no try
+            self.assertEqual(len(self.fetched), 0)
+            self.sweep_teams(hub._teams["later"]["at"] + hub.RELEASE_POLL)  # one RELEASE_POLL later: its GET
+            self.assertEqual((hub.teams_once(lock["sha256"]), len(self.fetched), self.packages()), (False, 1, []))
+            hub._teams["later"] = None                                  # a restart of the hub keeps the count
+            self.sweep_teams()
+            self.assertEqual((hub.teams_once(lock["sha256"], refused=True), len(self.fetched)), (True, 2))
+            (said,) = self.logged("the Teams code of the release that this hub runs%did not pass its check%")
+            self.assertIn(f"{slow}, in 3 checks in a row", said)
+            hub._teams["later"] = None
+            self.sweep_teams()
+            self.assertEqual((len(self.fetched), self.restarted, self.packages()), (2, [], []))
+            hub.teams_timeouts_set(lock["sha256"], 2)
+            with patch.object(hub, "teams_on", lambda: False):          # the signed word: a cancel clears the count
+                hub.teams_remove(str(self.teams))
+            self.assertEqual(hub.teams_timeouts(lock["sha256"]), 0)
 
     def test_a_lack_of_room_is_no_refusal_of_a_package_and_the_copy_of_the_records_stays_beside_it(self):
         """The check of a package runs in a child, on a copy of the records. A server short of memory, a child that the
@@ -3985,7 +4029,8 @@ class TeamsCode(HubUpdates):
             with patch.object(releases, "memory_room", lambda: None):
                 for answer[0], said in (((-signal.SIGKILL, "", ""), "later"),
                                         ((1, "", "sqlite3.OperationalError: database or disk is full"), "later"),
-                                        ((1, "", "python3 ended at the hub's time limit of 120 seconds"), "refused"),
+                                        ((1, "", "python3 ended at the hub's time limit of 120 seconds"), "timeout"),
+                                        ((1, "", "ImportError: no module named x"), "refused"),
                                         ((0, "schema check: 0 steps refused.", ""), None)):
                     found = self.real_check(str(self.teams))
                     self.assertEqual(found and found[0], said, answer[0])
