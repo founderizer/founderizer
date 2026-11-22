@@ -2155,7 +2155,7 @@ echo READY
             user, mac, sent = args["ssh_user"], args.get("kind") == "mac", []
             uid = "0" if user == "root" else "501" if mac else "1000"
 
-            def run(line, stdin=None, capture_output=False, text=False, timeout=None, stop=stop, user=user, uid=uid,
+            def run(line, stdin=None, capture_output=False, text=False, timeout=None, env=None, stop=stop, user=user, uid=uid,
                     mac=mac, off="authkey_file" in args):
                 remote = line[-1]
                 sent.append(remote)
@@ -2220,7 +2220,7 @@ echo READY
             user, mac, sent = args["ssh_user"], args.get("kind") == "mac", []
             uid = "0" if user == "root" else "501" if mac else "1000"
 
-            def run(line, stdin=None, capture_output=False, text=False, timeout=None, stop=stop, user=user, uid=uid,
+            def run(line, stdin=None, capture_output=False, text=False, timeout=None, env=None, stop=stop, user=user, uid=uid,
                     mac=mac, off="authkey_file" in args):
                 remote = line[-1]
                 sent.append(remote)
@@ -2524,7 +2524,7 @@ exec /bin/cat "$FILES/install.log"
             return options.get("stricthostkeychecking") == "yes" and any(
                 line.split()[:3] == [name, *self.HOST_KEY.split()[:2]] for line in lines)
 
-        def run(line, stdin=None, capture_output=False, text=False, timeout=None):
+        def run(line, stdin=None, capture_output=False, text=False, timeout=None, env=None):
             options, at = {}, 1
             while line[at].startswith("-"):
                 if line[at] == "-o":
@@ -2679,7 +2679,7 @@ exec /bin/cat "$FILES/install.log"
                 ("no address kept for the host", "198.51.100.7", (255, timed_out), (0, ""), ["host"], None)):
             lines = []
 
-            def run(line, stdin=None, capture_output=False, text=False, timeout=None, at_host=at_host,
+            def run(line, stdin=None, capture_output=False, text=False, timeout=None, env=None, at_host=at_host,
                     at_private=at_private, lines=lines):
                 lines.append(" ".join(line))
                 status, error = at_private if f"HostName={private}" in line else at_host
@@ -2721,7 +2721,7 @@ exec /bin/cat "$FILES/install.log"
                    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
                    "Host key verification failed.\n")
 
-        def run(line, stdin=None, capture_output=False, text=False, timeout=None):
+        def run(line, stdin=None, capture_output=False, text=False, timeout=None, env=None):
             options, at = {}, 1
             while line[at].startswith("-"):
                 if line[at] == "-o":
@@ -6807,6 +6807,43 @@ class Cloud(unittest.TestCase):
             self.assertIsNone(owner_mcp.cloud_which("aws"))
         with patch.dict(os.environ, {"PATH": f"/no/such/folder::.:{self.folder}"}):
             self.assertEqual(owner_mcp.cloud_which("aws"), os.path.join(str(self.folder), "aws"))
+
+    def test_ssh_is_found_in_absolute_folders_only(self):
+        """`ssh` starts the ssh of an absolute folder of the PATH (`cloud_which`): an empty or a relative part before it
+        is not the working folder, and with no absolute folder that holds ssh nothing starts. ssh gets the absolute
+        folders of the PATH only (`absolute_path`). Bug: an empty or a relative part of the PATH before /usr/bin, and a
+        program named ssh in the AI client's working folder, which an agent or a cloned repository can write, gets
+        add_machine's Tailscale key on its standard input; or ssh gets that PATH, and the shell of a ProxyCommand of
+        the owner's SSH configuration runs a program of that folder."""
+        work = self.folder / "work"
+        work.mkdir()
+        took = work / "took"
+        (work / "ssh").write_text(f"#!/bin/sh\ncat > '{took}'\n")
+        (work / "ssh").chmod(0o755)
+        secret = self.folder / "auth-key"
+        secret.write_text("tskey-auth-example-only\n")
+        here = os.getcwd()
+        os.chdir(work)
+        self.addCleanup(os.chdir, here)
+        for path in (f":{self.folder}", f".:{self.folder}", f"./:{self.folder}"):
+            with patch.dict(os.environ, {"PATH": path}), open(secret) as stdin:
+                owner_mcp.ssh("server.example.invalid", "admin", "sh -s", stdin=stdin)
+        for path in ("", ":", ".", "./"):
+            with patch.dict(os.environ, {"PATH": path}), open(secret) as stdin, \
+                    self.assertRaises(owner_mcp.Refused) as said:
+                owner_mcp.ssh("server.example.invalid", "admin", "sh -s", stdin=stdin)
+            self.assertIn("ssh is in no folder of the PATH", str(said.exception), path)
+        self.assertFalse(took.exists(), "the ssh of the working folder got the key")
+        calls = [json.loads(line) for line in open(self.folder / "calls.jsonl")]
+        self.assertEqual([call["stdin"] for call in calls], ["tskey-auth-example-only\n"] * 3)
+        # ssh's own PATH, which its shell searches for a ProxyCommand or a Match exec: the absolute folders only
+        seen = self.folder / "seen"
+        seen.mkdir()
+        (seen / "ssh").write_text(f"#!/bin/sh\nprintf '%s' \"$PATH\" > '{seen / 'path'}'\n")
+        (seen / "ssh").chmod(0o755)
+        with patch.dict(os.environ, {"PATH": f":.:./bin:{seen}::{self.folder}:"}):
+            owner_mcp.ssh("server.example.invalid", "admin", "sh -s")
+        self.assertEqual((seen / "path").read_text(), f"{seen}:{self.folder}")
 
     def test_the_look_names_what_lets_any_cloud_program_in(self):
         """The notes of a look name what the recipe does not change and the admin must know: a Google Cloud rule that

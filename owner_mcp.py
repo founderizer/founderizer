@@ -1843,10 +1843,22 @@ def ssh(host, user, remote, stdin=None, timeout=120, late="", lost=False, via=No
     own known_hosts, and it refuses a key that changed later (`key_changed`). Until 12 November 2026 SSH in BatchMode
     refused each new server with "Host key verification failed.", so install_hub and add_machine stopped at their
     first read, and the agent could give the owner only that error. A command with `via` whose keys this server does
-    not keep gets no such option: the network step read no keys there, and its caller says so."""
+    not keep gets no such option: the network step read no keys there, and its caller says so.
+
+    SSH is found in the absolute folders of the PATH only (`cloud_which`), and it gets a PATH of those folders only
+    (`absolute_path`). The bare word "ssh" let the system take an empty or a relative part of the PATH as the working
+    folder, which is the AI client's, often a project that an agent or a cloned repository can write: a program named
+    ssh there would get add_machine's Tailscale key on its standard input. And ssh runs a ProxyCommand, a Match exec, a
+    KnownHostsCommand or a LocalCommand of the owner's own configuration through a shell, which searches the PATH that
+    ssh got."""
     next_step(f"the command on {host}")
     where = f"{host} at {via}" if via else host
-    line = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30"]
+    program = cloud_which("ssh")
+    if program is None:
+        raise Refused("ssh is in no folder of the PATH that this tool got from the AI client that started it, so "
+                      "nothing was sent. An empty or a relative part of the PATH is not searched. Start the AI client "
+                      "with a PATH that holds the folder of ssh (on a Mac, /usr/bin).")
+    line = [program, "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30"]
     if via:
         line += ["-o", f"HostName={via}", "-o", "ProxyJump=none", "-o", "ProxyCommand=none"]
     found = kept(name=f"{host}@{via}") if via else kept(address=host)
@@ -1857,7 +1869,8 @@ def ssh(host, user, remote, stdin=None, timeout=120, late="", lost=False, via=No
         line += ["-o", "StrictHostKeyChecking=accept-new"]
     line += [f"{user}@{host}", remote]
     try:
-        done = subprocess.run(line, stdin=stdin or subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        done = subprocess.run(line, stdin=stdin or subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
+                              env=dict(os.environ, PATH=absolute_path()))
     except subprocess.TimeoutExpired:
         raise Refused(f"the command on {where} did not finish in {timeout} seconds, and it can still run there. "
                       f"Nothing was repeated. {late}".rstrip()) from None
@@ -3485,15 +3498,23 @@ def cloud_program(path, argv, timeout=CLOUD_LIMIT):
 
 
 def cloud_which(name):
-    """**The cloud's program on the PATH, in absolute folders only.** `shutil.which` takes an empty part of the PATH
-    ("/usr/bin:") and a relative one (".") as the working folder, which is the AI client's, often a project that an
-    agent or a cloned repository can write: a file named aws there would run with the admin's cloud login. With no PATH
-    or an empty one, nothing. The program inside the app finds it the same way (`CloudPrograms.find`)."""
+    """**The cloud's program, or ssh, on the PATH, in absolute folders only.** `shutil.which` takes an empty part of
+    the PATH ("/usr/bin:") and a relative one (".") as the working folder, which is the AI client's, often a project
+    that an agent or a cloned repository can write: a file named aws there would run with the admin's cloud login, and
+    one named ssh would get add_machine's Tailscale key (`ssh`). With no PATH or an empty one, nothing. The program
+    inside the app finds a cloud's program the same way (`CloudPrograms.find`), and starts /usr/bin/ssh."""
     for folder in os.environ.get("PATH", "").split(os.pathsep):
         candidate = os.path.join(folder, name)
         if os.path.isabs(folder) and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     return None
+
+
+def absolute_path():
+    """**This process's PATH with its absolute folders only**, in their order, for a program that this server starts
+    and that starts others by name (`ssh`): an empty or a relative part of the PATH is the working folder, as in
+    `cloud_which`."""
+    return os.pathsep.join(folder for folder in os.environ.get("PATH", "").split(os.pathsep) if os.path.isabs(folder))
 
 
 def cloud_same(have, want):
