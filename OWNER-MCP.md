@@ -198,7 +198,10 @@ of a newer version of this
 file can name a `swift` tool that an older program does not have: that program refuses it with
 "not in this version of the app yet" and does not list it. Never in the program, because the app's
 own pages do that work and its own setting says which hub it reads: `install_hub`, `install_log`,
-`claim_hub`, `add_machine`, `use_hub`, `which_hub` and `connect_google`. Three more are the
+`claim_hub`, `add_machine`, `use_hub`, `which_hub` and `connect_google`. Until piece B2 of design 9,
+the three tools of a server at a cloud, `cloud_look`, `cloud_step` and `cloud_remove`, are `absent`
+too: the program does not list them, and the table carries their recipe as `cloud_recipes` for that
+piece (below, "A server at AWS, Azure or Google Cloud"). Three more are the
 program's own and are not
 in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
 the running app (below). Six more, `save_bot_token`, `prepare_problem_report`, `save_secret`,
@@ -1610,6 +1613,9 @@ Machines, accounts and sign-ins.
 | `sign_in_machine` / `sign_in_code` | `/ui/machines/<a>/signin[/code]` | Start a machine's own provider sign-in, and carry the code back. The install job of a new or moved agent opens its sign-in by itself: the job's prompt on the page `servers` has the link and the code (Codex), or names a login of the page `machines` (Claude Code). |
 | `save_account` | `/ui/team/accounts` | One runtime account: its provider and the owner's title for it. With `kind`: `key`, an API key by its `login` reference (`bws://<uuid>`, never the key; the hub's field `secret`), or `server`, the owner's own model server by its `address`, each with its `model` as the program names it (owner API 1.165). Each write is the whole entry. |
 | `agent_key` | `/ui/team/agents/<a>/key` | Register, replace or remove an agent's key, by its SHA-256. Never a key. A key that a server service registered is replaced, never removed. |
+| `cloud_look` | none: the cloud's own program (`aws`, `az`, `gcloud`) on this computer | Where a new server at AWS, Azure or Google Cloud stands, and the call of the step that comes next, with its command, what it changes, what it costs and how it is undone. With `cloud` alone, the recipe. With `instance`, a server that the company has already. Only reads; no call to the hub. |
+| `cloud_step` | none: the cloud's own program, and `ssh` for `check` | One step of a new server: `group` (Azure), `firewall`, `server`, `open_ssh`, `check`, `close_ssh`. At most one command that changes the cloud. A step whose thing is there with the recipe's mark runs nothing that changes. |
+| `cloud_remove` | none: the cloud's own program | One removal of what the recipe made for a server: `server`, then `firewall`; at Azure, `group`. Only a thing with the recipe's mark for that name. A server made with `subnet` is removed with the same `subnet`, because its firewall is in that network. `next` is the next removal, never a step that makes. |
 | `server_key_swap` | `/ui/servers/<s>/key-swap` | The owner's yes (`on`) or off (`off`) for the key swap of a Linux server (`VAULT.md`), or neither (`rule`): the owner's Mac app switches the server's vault on or off at its next round, and off costs each session there that holds a placeholder its key until its next start. The word that a server swaps comes only from the app's own reading (`/ui/servers/<s>/key-swap-reading`, which is no tool). |
 
 ### Access
@@ -1700,6 +1706,47 @@ manager is named `manager`. The name counts at a hub's first install: a hub that
 manager has, and when that hub's own copy of Founderizer is older than the option, the install stops and its log
 says so (then `install_hub` again, without `manager_name`). From then on, each tool that takes an agent takes the
 manager by that name.
+
+## A server at AWS, Azure or Google Cloud
+
+Many companies have their servers there already (the owner, 21 November 2026: "we need this for launch
+too"), so three tools make one new server at one of the three clouds, or read one that the company has
+(`~/dev/founderizer-plans/teams-design-9-cloud-recipes.md`). They run the cloud's own program on the
+computer of this server, with the login that the admin made there in a terminal (`aws login` or
+`aws sso login`, `az login`, `gcloud auth login`). They never start a sign-in, they have no field for a
+credential, and they make no call to the hub, to the release channel or to founderizer.com. So a
+company's cloud admin who is not the owner runs them on their own computer with no authority at the
+hub; the join is the owner's.
+
+- **The recipe is data** in `owner_mcp.py` (`CLOUD_RECIPES`): each command as a list of words with
+  places for values, the pattern of each value, the path of each fact in the program's JSON, the mark
+  of each thing that the recipe makes, the words, the list prices and the vendors' pages. `CloudRun`
+  reads it. Each value matches its whole pattern before it stands in a command, no command goes
+  through a shell, and a fact that a later command needs (an ID of the cloud) is read from the cloud
+  and checked against its pattern, never taken from a field.
+- **The steps of a new server**: `cloud_look`; `group` (Azure); `firewall` (the server's own, with
+  nothing let in); `server` (Ubuntu 24.04, about 2 GB, a disk of 30 GB, the one public key, no identity
+  of the cloud; it costs money from that moment); `open_ssh` (TCP 22 from `ssh_from` alone, at most a
+  `/24`); `check` (the Mac app's `ServerCheck` script over the admin's own SSH: stop, wait or ready);
+  the join (`add_machine`, or `install_hub` for a hub; or the app's Add server, VPS, Other VPS);
+  `close_ssh`. After the join, the server's own firewall lets SSH in over the fleet's private network
+  only. The Tailscale key never goes to the cloud: it travels as today, in `add_machine`'s
+  `authkey_file`.
+- **A server that exists**: `cloud_look` with `instance` (it says when the server has a role, a
+  managed identity or a service account of the cloud), `check` with `host` and `ssh_user`, the join.
+  No step changes such a server in the cloud.
+- **The mark**: each thing that the recipe makes carries its name and a tag or label
+  `founderizer-server=<name>` (at AWS also the client token `founderizer-<name>`). A thing of that
+  name with no mark is refused by name, and `cloud_remove` removes only a thing with the mark. A step
+  whose thing is there with the mark runs nothing that changes, so a call that is sent again after a
+  lost answer makes no second server.
+- **The confirmation is the client's own question** before each call (OWNER-MCP-BOUNDARY.md, section
+  7): `cloud_look`'s `next` gives the command, the change and the cost, which the agent tells the admin
+  first.
+- **A cloud is offered only after its live proof** (piece B3): a recipe with no `proved` date is
+  refused by each of the three tools before any program runs. On 21 November 2026 no cloud has a date.
+- The program inside the app gets the same three tools from the same data in piece B2; until then they
+  are `absent` there. Windows has no admin MCP; in WSL the Python copy is the Linux case.
 
 ## The three things it cannot do without the owner
 

@@ -162,6 +162,13 @@ class Reasons(OwnerAPI):
                                                              reason="person", options=["Done", "Not now"], **fields))
 
     def test_access_that_an_agent_holds_or_the_manager_can_grant_never_reaches_the_owner(self):
+        # the fleet's GitHub App reaches acme's repositories, so dev can use acme/web: with no App, a repository's
+        # card goes to the owner, who connects GitHub first (team_repo_owner_step)
+        for held in (patch.object(hub, "github_app", lambda: ("7", "key")),
+                     patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reading": False, "reach": {
+                         "pages": {}, "all": {"acme"}, "repos": set(), "install": None}})):
+            held.start()
+            self.addCleanup(held.stop)
         said = self.refused("dev (write) holds the GitHub repository acme/web", reason="access",
                             needs_access="repo:acme/web")
         self.assertIn("create_task", said)

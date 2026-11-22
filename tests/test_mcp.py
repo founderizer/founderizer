@@ -277,10 +277,17 @@ class HubSide(OwnerAPI):
         registered = body(self.stand.find("POST", "/oauth/register")[0])
         self.assertEqual(registered["redirect_uris"], ["http://127.0.0.1:53111/"])
 
-        code, done = self.post("/ui/mcp/finish", state=start["state"], code=CODE)
+        # in a fleet whose one agent is the manager, which holds no app, the Connect says the next step (a customer
+        # of 21 November 2026): the save of a server that signs in leaves it to this line
+        with patch.object(hub, "grant_fits", lambda agent, entry, team=None: False):
+            code, done = self.post("/ui/mcp/finish", state=start["state"], code=CODE)
         self.assertEqual(code, 200, done)
         self.assertEqual((done["connected"], done["replaced"], done["server"], done["tools"]),
                          (True, False, "crm-mcp", ["crm_orders"]))
+        said = hub.q1("SELECT text FROM events WHERE agent='manager' AND kind='say' ORDER BY id DESC")["text"]
+        self.assertIn("connected the MCP server crm. An agent that has it gets it in its next task session. You cannot "
+                      "use it, and the fleet has no agent yet that can: propose an agent for its work with change_team, "
+                      "with what the work needs of tool:crm in the new agent's access.", said)
         self.assertEqual(form(self.stand.find("POST", "/oauth/token")[0])["code"], CODE)
         kept = json.loads(self.file.read_text())["servers"]["crm"]
         self.assertEqual((kept["refresh_token"], kept["client_id"], kept["client_secret"]), (REFRESH, CLIENT, SECRET))
@@ -1094,8 +1101,15 @@ class ProgramRoutes(HubSide):
         self.assertEqual(len(said()), 2)
 
     def test_a_server_with_no_oauth_answers_connect_with_its_code(self):
+        """And the app's save of it again with no sign-in, after that code, says the next step to the manager of a
+        fleet whose one agent is the manager, which holds no app: the first save with oauth left it to a Connect that
+        never comes (a customer of 21 November 2026)."""
         public = {"title": "Docs", "url": self.stand.url + "/mcp", "auth": "oauth"}
-        self.assertEqual(self.crm(public, name="docs")[0], 200)
+        nobody = patch.object(hub, "grant_fits", lambda agent, entry, team=None: False)
+        with nobody:
+            self.assertEqual(self.crm(public, name="docs")[0], 200)
+        said = "SELECT text FROM events WHERE agent='manager' AND kind='say' ORDER BY id DESC"
+        self.assertNotIn("You cannot use it", hub.q1(said)["text"])
         code, data = self.post("/ui/mcp/connect", name="docs", redirect_uri="http://127.0.0.1:47123/")
         self.assertEqual((code, data.get("why"), data.get("code"), data["names"]["server"]),
                          (502, ["no_oauth"], "mcp_no_endpoints", "docs"), data)
@@ -1111,6 +1125,9 @@ class ProgramRoutes(HubSide):
         code, data = self.post("/ui/mcp/connect", name="docs", redirect_uri="http://127.0.0.1:47123/")
         self.assertEqual((code, data.get("why")), (502, None), data)
         self.assertIn("cannot be read now", data["error"])
+        with nobody:            # the app's save again with no sign-in, after no_oauth
+            self.assertEqual(self.crm(dict(public, auth="none"), name="docs")[0], 200)
+        self.assertIn("with what the work needs of tool:docs in the new agent's access", hub.q1(said)["text"])
 
     def test_only_a_definite_refusal_of_the_saved_access_is_an_end(self):
         code, _ = self.crm()

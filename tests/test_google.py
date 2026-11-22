@@ -698,8 +698,17 @@ class GoogleHub(OwnerAPI):
         hub.GOOGLE["tokens"][EMAIL2] = {"access": "old", "for": "x", "expires": time.time() + 3600}
         hub.GOOGLE["problems"][EMAIL2] = hub.GOOGLE_PROBLEM
         code, start = self.begin()
-        code, data = self.finish(start["state"])
+        # In a fleet whose one agent is the manager, which holds no app, the line says the next step, with the
+        # account's own services (a customer of 21 November 2026); the reconnect below repeats none of it.
+        nobody = patch.object(hub, "grant_fits", lambda agent, entry, team=None: False)
+        with nobody:
+            code, data = self.finish(start["state"])
         self.assertEqual((code, data["email"], data["replaced"]), (200, EMAIL2, False))
+        said = hub.q1("SELECT text FROM events WHERE agent='manager' AND kind='say' ORDER BY id DESC")["text"]
+        self.assertEqual(said, f"[hub] The owner connected the Google account {EMAIL2}. You cannot use it, and the "
+                               f"fleet has no agent yet that can: propose an agent for its work with change_team, with "
+                               f"what the work needs of drive:{EMAIL2} and gmail:{EMAIL2} in the new agent's access. "
+                               f"Ask the owner what the work is first only when the owner's words do not say it.")
         saved = self.opened()
         self.assertEqual(saved, {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
                                  "clients": {APP_ID: APP_SECRET}, "accounts": {
@@ -713,8 +722,11 @@ class GoogleHub(OwnerAPI):
         # because Google's revoke would take the whole grant to the project, the new token's too.
         self.fake.email, self.fake.refresh_token = EMAIL, REFRESH + "x"
         code, start = self.begin(account=EMAIL)
-        code, data = self.finish(start["state"])
+        with nobody:
+            code, data = self.finish(start["state"])
         self.assertEqual((code, data["replaced"]), (200, True))
+        said = hub.q1("SELECT text FROM events WHERE agent='manager' AND kind='say' ORDER BY id DESC")["text"]
+        self.assertEqual(said, f"[hub] The owner connected the Google account {EMAIL}.")
         entry = self.opened()["accounts"][EMAIL]
         self.assertEqual((entry["refresh_token"], entry["client_id"]), (REFRESH + "x", APP_ID))
         self.assertNotIn("revoke", self.fake.names())
@@ -1423,19 +1435,31 @@ class GoogleHub(OwnerAPI):
         """Every hub signs in to the same Founderizer app, and Google gives a token every service that the person
         granted to that app, also at another fleet (include_granted_scopes). A fleet keeps the service that its
         Connect named and what that account's own entry had: never the Drive that a person gave only to another
-        fleet."""
+        fleet. In a fleet whose one agent is the manager, which holds no app, each Connect that adds a service says the
+        next step with that service alone (a customer of 21 November 2026), and one that adds none repeats nothing."""
+        def said():
+            return hub.q1("SELECT text FROM events WHERE agent='manager' AND kind='say' ORDER BY id DESC")["text"]
+        step = "You cannot use it, and the fleet has no agent yet that can: propose an agent for its work with " \
+               "change_team, with what the work needs of {} in the new agent's access."
+        nobody = patch.object(hub, "grant_fits", lambda agent, entry, team=None: False)
         self.fake.scopes = list(SCOPES)                             # Drive at another fleet, Gmail here
         code, start = self.begin(service="gmail")
-        code, data = self.finish(start["state"])
+        with nobody:
+            code, data = self.finish(start["state"])
         self.assertEqual((code, data["scopes"]), (200, ["gmail.modify"]))
         self.assertEqual(self.opened()["accounts"][EMAIL]["scopes"], [SCOPES[1]])
+        self.assertIn(step.format(f"gmail:{EMAIL}"), said())
         code, start = self.begin(service="drive")                  # Drive here too: the entry keeps its Gmail
-        code, data = self.finish(start["state"])
+        with nobody:
+            code, data = self.finish(start["state"])
         self.assertEqual((code, data["scopes"], data["dropped"]), (200, ["drive", "gmail.modify"], []))
+        self.assertIn(step.format(f"drive:{EMAIL}"), said())
         self.fake.scopes = [SCOPES[0]]                              # nothing that Google did not give
         code, start = self.begin()
-        code, data = self.finish(start["state"])
+        with nobody:
+            code, data = self.finish(start["state"])
         self.assertEqual((data["scopes"], data["dropped"]), (["drive"], ["gmail"]))
+        self.assertEqual(said(), f"[hub] The owner connected the Google account {EMAIL}.")
 
     def test_a_new_secret_of_founderizers_app_is_read_again_when_google_refuses_the_old_one(self):
         """Founderizer can change its app's secret and turn the old one off. Google then refuses the old one

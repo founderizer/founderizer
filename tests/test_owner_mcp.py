@@ -54,7 +54,7 @@ def load_tests(loader, _tests, _pattern):
                                                     Install, Progress, RootThroughSudo, NoSecret, Shape, Table,
                                                     Parity, SecretGive, ShareStanding, ShareStandingNoWorker,
                                                     SignedGrantWords, SignedPoolWords, VaultReading, GoogleConnect,
-                                                    FolderGrant)
+                                                    FolderGrant, Cloud)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -5165,7 +5165,7 @@ class Table(unittest.TestCase):
         built = sum(1 for t in owner_mcp.tools() if getattr(t["run"], "kind", None))
         self.assertEqual(sum(len(kinds.get(k, [])) for k in self.TABLE_KINDS), built)
         self.assertEqual((len(owner_mcp.SWIFT_READS), len(owner_mcp.SWIFT_WRITES), len(owner_mcp.ABSENT), built),
-                         (4, 9, 7, 57))
+                         (4, 9, 10, 57))
         # A tool of no kind stops the dump: somebody decides which it is. And a tool of no category stops the program:
         # it would stand in no line of the map, so a client with tool search would not learn of it.
         stray = owner_mcp.tool("Read", "stray", "A tool of no kind.", {}, (), lambda _args: {})
@@ -5781,6 +5781,764 @@ class GoogleConnect(unittest.TestCase):
             self.assertIn(f'"{words}"', tool["description"], service)
             self.assertIn(f'String(l10n: "{words}")', swift, service)       # the app's words, not a copy that drifts
         self.assertIn("call this tool when the owner says to go on", tool["description"])
+
+
+class Cloud(unittest.TestCase):
+    """**Servers at AWS, Azure and Google Cloud** (design 9, piece B1): `cloud_look`, `cloud_step` and `cloud_remove`,
+    with stand-in programs `aws`, `az`, `gcloud` and `ssh` on the test's own PATH, which answer as the clouds do by a
+    table of the test and write down each command with the files that it names. No cloud account and no network: what
+    is proved is which commands the tools send, in which order, with which words, and which they never send."""
+
+    NAME = "agents-1"
+    KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEhvc3RLZXlPZlRoZUh1Yg"
+    WHERE = {"aws": ("123456789012", "eu-central-1"), "azure": ("00000000-1111-2222-3333-444444444444", "westeurope"),
+             "google": ("example-project-1", "europe-west1-b")}
+    # **The closed list of commands** (design 9, 6.1), the test's own second copy: the first words of each command
+    # that the tools may run. `{name}` is the server's name.
+    READS = (("aws", "--version"), ("aws", "sts", "get-caller-identity"), ("aws", "ssm", "get-parameters"),
+             ("aws", "ec2", "describe-instance-types"), ("aws", "ec2", "describe-images"),
+             ("aws", "ec2", "describe-vpcs"), ("aws", "ec2", "describe-subnets"),
+             ("aws", "ec2", "describe-security-groups"), ("aws", "ec2", "describe-security-group-rules"),
+             ("aws", "ec2", "describe-instances"), ("aws", "ec2", "describe-instance-status"),
+             ("az", "version"), ("az", "account", "show"), ("az", "vm", "list-skus"), ("az", "group", "show"),
+             ("az", "network", "nsg", "show"), ("az", "vm", "show"), ("az", "resource", "list"),
+             ("gcloud", "version"), ("gcloud", "auth", "list"), ("gcloud", "compute", "machine-types", "describe"),
+             ("gcloud", "compute", "networks", "subnets", "describe"), ("gcloud", "compute", "firewall-rules", "list"),
+             ("gcloud", "compute", "instances", "describe"))
+    CHANGES = (("aws", "ec2", "create-security-group"), ("aws", "ec2", "run-instances"),
+               ("aws", "ec2", "authorize-security-group-ingress"), ("aws", "ec2", "revoke-security-group-ingress"),
+               ("az", "group", "create"), ("az", "network", "nsg", "create"), ("az", "vm", "create"),
+               ("az", "network", "nsg", "rule", "create"), ("az", "network", "nsg", "rule", "delete"),
+               ("gcloud", "compute", "firewall-rules", "create"), ("gcloud", "compute", "instances", "create"),
+               ("gcloud", "compute", "firewall-rules", "delete", "founderizer-{name}-ssh"))
+    DELETES = (("aws", "ec2", "terminate-instances"), ("aws", "ec2", "delete-security-group"),
+               ("az", "group", "delete"), ("gcloud", "compute", "instances", "delete"),
+               ("gcloud", "compute", "firewall-rules", "delete", "founderizer-{name}-closed"))
+    # Words that no command of a recipe has (design 9, 6.2): an identity, a role, a key or a setting of the cloud, a
+    # sign-in, a credential printed, a key pair made.
+    NEVER = ("iam", "configure", "login", "logout", "sso", "set", "role", "assignment", "get-access-token",
+             "print-access-token", "print-identity-token", "export-credentials", "--assign-identity",
+             "--iam-instance-profile", "--service-account", "--scopes", "create-key-pair", "--key-name",
+             "--generate-ssh-keys", "billing", "budget")
+    READING = ("user=ubuntu\nuid=1000\nsudo=nopasswd\nos_id=ubuntu\nos_version=24.04\nos_name=Ubuntu\narch=x86_64\n"
+               "memory_mb=1967\ndisk_free_mb=27000\nsystemd=yes\nipv4_route=yes\nreach=github.com yes\n"
+               "reach=tailscale.com yes\nreach=claude.ai yes\nreach=chatgpt.com yes\ncloud_init=done\ndpkg_lock=no\n"
+               "listen=tcp/22/sshd\nlisten=tcp/80/nginx\nlisten=tcp/443/nginx\nufw=inactive\ntailscale=none\n"
+               "end=yes\n")
+    # The stand-in of each program: the first rule of rules.json whose `has` words are all in the command, whose
+    # `after` words were each in an earlier command and whose `before` words were in none, gives its exit status, its
+    # output and its words on standard error. Each command goes into calls.jsonl, with the text of each file that it
+    # names (`file://<path>`, `ssh-keys=<path>`, or a path as a word) and its standard input.
+    STAND_IN = (
+        "import json, os, sys\n"
+        "where = os.path.dirname(os.path.abspath(__file__))\n"
+        "argv = [os.path.basename(sys.argv[0])] + sys.argv[1:]\n"
+        "line = ' '.join(argv)\n"
+        "stdin = sys.stdin.read() if argv[0] == 'ssh' else ''\n"
+        "log = os.path.join(where, 'calls.jsonl')\n"
+        "earlier = [json.loads(x)['line'] for x in open(log)] if os.path.exists(log) else []\n"
+        "files = {}\n"
+        "for word in argv[1:]:\n"
+        "    for start in ('file://', 'ssh-keys=', ''):\n"
+        "        if word.startswith(start) and os.path.isfile(word[len(start):]):\n"
+        "            files[word[len(start):]] = open(word[len(start):]).read()\n"
+        "            break\n"
+        "with open(log, 'a') as out:\n"
+        "    out.write(json.dumps({'argv': argv, 'line': line, 'files': files, 'stdin': stdin}) + '\\n')\n"
+        "for rule in json.load(open(os.path.join(where, 'rules.json'))):\n"
+        "    if all(w in line for w in rule.get('has', [])) and \\\n"
+        "            all(any(w in e for e in earlier) for w in rule.get('after', [])) and \\\n"
+        "            not any(w in e for w in rule.get('before', []) for e in earlier):\n"
+        "        out = rule.get('out', '')\n"
+        "        sys.stdout.write(out if isinstance(out, str) else json.dumps(out))\n"
+        "        sys.stderr.write(rule.get('err', ''))\n"
+        "        sys.exit(rule.get('exit', 0))\n"
+        "sys.stderr.write('no rule for: ' + line)\n"
+        "sys.exit(99)\n")
+
+    def setUp(self):
+        self.folder = pathlib.Path(tempfile.mkdtemp(prefix="fleet-cloud-"))
+        self.addCleanup(shutil.rmtree, str(self.folder), True)
+        for program in ("aws", "az", "gcloud", "ssh"):
+            path = self.folder / program
+            path.write_text(f"#!{sys.executable}\n" + self.STAND_IN)
+            path.chmod(0o755)
+        self.key_file = self.folder / "id_ed25519.pub"
+        self.key_file.write_text(self.KEY + " admin@example.invalid\n")
+        self.recipes = json.loads(json.dumps(owner_mcp.CLOUD_RECIPES))
+        for recipe in self.recipes["clouds"].values():
+            recipe["proved"] = "2026-12-01"                 # a proved cloud; test 7 holds what an unproved one does
+        for patcher in (patch.dict(os.environ, {"PATH": str(self.folder)}),
+                        patch.object(owner_mcp, "CLOUD_RECIPES", self.recipes),
+                        patch.object(owner_mcp, "KNOWN_HOSTS", self.folder / "known_hosts")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.rules(self.cloud_rules("aws") + self.cloud_rules("azure") + self.cloud_rules("google") +
+                   [{"has": ["sh -s"], "out": self.READING}])
+
+    # -- the stand-ins
+
+    def rules(self, rules):
+        (self.folder / "rules.json").write_text(json.dumps(rules))
+
+    def sent(self):
+        log = self.folder / "calls.jsonl"
+        return [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+
+    def cloud_rules(self, cloud, name=NAME, **changed):
+        """The stand-in answers of one cloud for the server `name`, from nothing to a server and back: each read
+        answers by the commands that came before it. `changed`: answers of the test in place of the usual ones."""
+        if cloud == "aws":
+            group = {"GroupId": "sg-0a1b2c3d4e5f67890", "GroupName": f"founderizer-{name}",
+                     "Tags": [{"Key": "founderizer-server", "Value": name}, {"Key": "founderizer", "Value": "agent"}]}
+            instance = {"InstanceId": "i-0a1b2c3d4e5f67890", "ClientToken": f"founderizer-{name}",
+                        "State": {"Name": "running"}, "PublicIpAddress": "198.51.100.7"}
+            egress = {"SecurityGroupRuleId": "sgr-0000000000000000a", "IsEgress": True, "IpProtocol": "-1",
+                      "FromPort": -1, "ToPort": -1, "CidrIpv4": "0.0.0.0/0"}
+            ssh_rule = {"SecurityGroupRuleId": "sgr-0a1b2c3d4e5f67890", "IsEgress": False, "IpProtocol": "tcp",
+                        "FromPort": 22, "ToPort": 22, "CidrIpv4": "203.0.113.9/32"}
+            return [
+                {"has": ["aws --version"], "out": "aws-cli/2.42.1 Python/3.13.9 Darwin/25.1.0 source/arm64\n"},
+                {"has": ["sts get-caller-identity"], "out": changed.get("identity", {
+                    "Account": "123456789012", "Arn": "arn:aws:sts::123456789012:assumed-role/Admin/pat"})},
+                {"has": ["describe-instance-types"], "out": {"InstanceTypes": [
+                    {"MemoryInfo": {"SizeInMiB": changed.get("memory", 2048)},
+                     "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]}}]}},
+                {"has": ["ssm get-parameters"], "out": {"Parameters": [{"Value": "ami-0a1b2c3d4e5f67890"}]}},
+                {"has": ["describe-images"], "out": {"Images": [changed.get("image", {
+                    "RootDeviceName": "/dev/sda1", "OwnerId": "099720109477"})]}},
+                {"has": ["describe-subnets"], "out": {"Subnets": [{"VpcId": "vpc-0fedcba987654321f"}]}},
+                {"has": ["describe-vpcs"], "out": changed.get("vpcs", {"Vpcs": [{"VpcId": "vpc-0a1b2c3d4e5f67890"}]})},
+                {"has": ["describe-security-groups"], "after": ["create-security-group"],
+                 "before": ["delete-security-group"], "out": {"SecurityGroups": [changed.get("group", group)]}},
+                {"has": ["describe-security-groups"], "out": {"SecurityGroups": changed.get("groups", [])}},
+                {"has": ["describe-security-group-rules"], "after": ["authorize-security-group-ingress"],
+                 "before": ["revoke-security-group-ingress"], "out": {"SecurityGroupRules": [egress, ssh_rule]}},
+                {"has": ["describe-security-group-rules"], "out": {"SecurityGroupRules": [egress]}},
+                dict({"has": ["describe-instances"], "after": ["run-instances"], "before": ["terminate-instances"]},
+                     **changed.get("made", {"out": {"Reservations": [{"Instances": [instance]}]}})),
+                {"has": ["describe-instances"], "out": {"Reservations": changed.get("reservations", [])}},
+                {"has": ["create-security-group"], "out": {"GroupId": group["GroupId"]}},
+                {"has": ["run-instances"], "out": {"Instances": [{"InstanceId": instance["InstanceId"],
+                                                                  "State": {"Name": "pending"}}]}},
+                {"has": ["authorize-security-group-ingress"], "out": {"Return": True}},
+                {"has": ["revoke-security-group-ingress"], "out": {"Return": True}},
+                {"has": ["terminate-instances"], "out": {"TerminatingInstances": []}},
+                {"has": ["delete-security-group"], "out": {"Return": True}}]
+        if cloud == "azure":
+            sub = self.WHERE["azure"][0]
+            base = f"/subscriptions/{sub}/resourceGroups/founderizer-{name}"
+            group = {"id": base, "tags": {"founderizer-server": name, "founderizer": "agent"}}
+            nsg = {"id": base + f"/providers/Microsoft.Network/networkSecurityGroups/{name}-nsg",
+                   "tags": {"founderizer-server": name}, "securityRules": []}
+            rule = {"name": "founderizer-ssh", "direction": "Inbound", "access": "Allow", "protocol": "Tcp",
+                    "priority": 1000, "sourceAddressPrefix": "203.0.113.9/32", "destinationPortRange": "22"}
+            vm = {"id": base + f"/providers/Microsoft.Compute/virtualMachines/{name}", "powerState": "VM running",
+                  "tags": {"founderizer-server": name, "founderizer": "agent"}, "publicIps": "198.51.100.8"}
+            gone = {"exit": 3, "err": "ERROR: (ResourceNotFound) The Resource was not found."}
+            return [
+                {"has": ["az version"], "out": {"azure-cli": "2.93.0"}},
+                {"has": ["az account show"], "out": changed.get("identity", {"id": sub,
+                                                                              "user": {"name": "pat@example.com"}})},
+                {"has": ["vm list-skus"], "out": [{"name": "Standard_B2als_v2",
+                                                   "restrictions": changed.get("restrictions", []), "capabilities": [
+                    {"name": "MemoryGB", "value": "4"}, {"name": "CpuArchitectureType", "value": "x64"}]}]},
+                {"has": ["group show"], "after": ["group create"],
+                 "before": [] if changed.get("group_stays") else ["group delete"], "out": group},
+                {"has": ["group show"], "out": changed["group_now"]} if "group_now" in changed else
+                dict(gone, has=["group show"]),
+                {"has": ["nsg show"], "after": ["nsg rule create"], "before": ["nsg rule delete"],
+                 "out": dict(nsg, securityRules=[rule])},
+                {"has": ["nsg show"], "after": ["nsg create"], "before": ["group delete"], "out": nsg},
+                dict(gone, has=["nsg show"]),
+                {"has": ["vm show"], "after": ["vm create"], "before": ["group delete"], "out": vm},
+                dict(gone, has=["vm show"]),
+                {"has": ["resource list"], "out": changed.get("resources", [
+                    {"name": f"{name}-nsg"}, {"name": name}, {"name": f"{name}VMNic"}, {"name": f"{name}PublicIP"},
+                    {"name": f"{name}VNET"}, {"name": f"{name}_OsDisk_1_0a1b2c3d"}])},
+                {"has": ["group create"], "out": group}, {"has": ["nsg rule create"], "out": rule},
+                {"has": ["nsg rule delete"], "out": ""}, {"has": ["nsg create"], "out": {"NewNSG": nsg}},
+                {"has": ["vm create"], "out": ""}, {"has": ["group delete"], "out": ""}]
+        closed = {"name": f"founderizer-{name}-closed", "description": f"founderizer-server={name}",
+                  "direction": "INGRESS", "priority": 1000, "sourceRanges": ["0.0.0.0/0"],
+                  "denied": [{"IPProtocol": "all"}], "targetTags": [f"founderizer-{name}"]}
+        ssh_rule = {"name": f"founderizer-{name}-ssh", "description": f"founderizer-server={name}",
+                    "direction": "INGRESS", "priority": 900, "sourceRanges": ["203.0.113.9/32"],
+                    "allowed": [{"IPProtocol": "tcp", "ports": ["22"]}], "targetTags": [f"founderizer-{name}"]}
+        default = {"name": "default-allow-ssh", "direction": "INGRESS", "priority": 65534,
+                   "sourceRanges": ["0.0.0.0/0"], "allowed": [{"IPProtocol": "tcp", "ports": ["22"]}]}
+        instance = {"name": name, "status": "RUNNING", "labels": {"founderizer-server": name, "founderizer": "agent"},
+                    "networkInterfaces": [{"networkIP": "10.128.0.5", "accessConfigs": [{"natIP": "198.51.100.9"}]}]}
+        made = {"closed": f"firewall-rules create founderizer-{name}-closed",
+                "ssh": f"firewall-rules create founderizer-{name}-ssh"}
+        ended = {"closed": f"firewall-rules delete founderizer-{name}-closed",
+                 "ssh": f"firewall-rules delete founderizer-{name}-ssh"}
+        lists = []
+        for kinds in (("closed", "ssh"), ("closed",), ("ssh",)):    # in this order, the first that holds answers
+            lists.append({"has": ["firewall-rules list"], "after": [made[k] for k in kinds],
+                          "before": [ended[k] for k in kinds],
+                          "out": [default] + [{"closed": closed, "ssh": ssh_rule}[k] for k in kinds]})
+        lists.append({"has": ["firewall-rules list"], "out": changed.get("rules_now", [default])})
+        return [
+            {"has": ["gcloud version"], "out": {"Google Cloud SDK": "594.0.0"}},
+            {"has": ["auth list"], "out": changed.get("identity", [{"account": "pat@example.com",
+                                                                     "status": "ACTIVE"}])},
+            {"has": ["machine-types describe"], "out": {"memoryMb": 2048, "guestCpus": 2}},
+            {"has": ["subnets describe"],
+             "out": {"network": "https://www.googleapis.com/compute/v1/projects/p/global/networks/company-net"}}] + \
+            lists + [
+            {"has": ["instances describe"], "after": ["instances create"], "before": ["instances delete"],
+             "out": instance},
+            {"has": ["instances describe"], "out": changed["instance_now"]} if "instance_now" in changed else
+            {"has": ["instances describe"], "exit": 1,
+             "err": "ERROR: (gcloud.compute.instances.describe) Could not fetch resource:\n - The resource "
+                    f"'projects/p/zones/z/instances/{name}' was not found\n"},
+            {"has": ["firewall-rules create"], "out": []}, {"has": ["instances create"], "out": []},
+            {"has": ["firewall-rules delete"], "out": []}, {"has": ["instances delete"], "out": []}]
+
+    # -- the calls
+
+    def call(self, tool, **args):
+        """One call of a tool, as the server gives it to the client: its answer, or Refused with its words."""
+        with patch.dict(owner_mcp.TOOLS, {t["name"]: t for t in owner_mcp.tools()}):
+            text, error = owner_mcp.call_tool(tool, args)
+        if error:
+            raise Refused(text)
+        return json.loads(text)
+
+    def base(self, cloud):
+        account, place = self.WHERE[cloud]
+        return {"cloud": cloud, "name": self.NAME, "account": account, "place": place}
+
+    def journey(self, cloud, **more):
+        """The calls of one new server at `cloud`, from the look to its removal, in the recipe's order. `more`: fields
+        of each call."""
+        recipe = self.recipes["clouds"][cloud]
+        calls = [("cloud_look", dict(self.base(cloud), **more))]
+        for step in recipe["steps"]:
+            if step["kind"] == "make":
+                fields = {"server": {"ssh_public_key_file": str(self.key_file)},
+                          "open_ssh": {"ssh_from": "203.0.113.9"}}.get(step["id"], {})
+                calls.append(("cloud_step", dict(self.base(cloud), step=step["id"], **fields, **more)))
+            elif step["kind"] in ("check", "close"):
+                calls.append(("cloud_step", dict(self.base(cloud), step=step["id"], **more)))
+        calls += [("cloud_remove", dict(self.base(cloud), step=step, **more)) for step in recipe["removals"]]
+        return calls
+
+    def walk(self, cloud, **more):
+        """Each call of `journey`, run, with its answer and the commands that it sent."""
+        done = []
+        for tool, args in self.journey(cloud, **more):
+            before = len(self.sent())
+            done.append((tool, args, self.call(tool, **args), self.sent()[before:]))
+        return done
+
+    @staticmethod
+    def starts(argv, prefixes, name):
+        return any(tuple(argv[:len(p)]) == tuple(w.replace("{name}", name) for w in p) for p in prefixes)
+
+    def recipe_commands(self, cloud):
+        """Each command of the data of one cloud: its reads, the version, its steps and its removals."""
+        recipe = self.recipes["clouds"][cloud]
+        commands = [recipe["version"]["argv"]] + [r["argv"] for r in recipe["reads"].values() if r.get("argv")]
+        commands += [s["argv"] for s in recipe["steps"] if s.get("argv")]
+        return commands + [r["argv"] for r in recipe["removals"].values()]
+
+    # -- the tests
+
+    def test_each_command_is_in_the_closed_list(self):
+        """Test 1 of design 9: each command of the data, and each command that a run of each step sends, starts with
+        the words of the closed list that this test holds itself, and no word of a command is one of NEVER. Bug: a new
+        step runs `aws iam ...`, a delete of another kind, or a server command that gives the server a role."""
+        allowed = self.READS + self.CHANGES + self.DELETES
+        for cloud in self.recipes["clouds"]:
+            recipe = self.recipes["clouds"][cloud]
+            words = [w for c in self.recipe_commands(cloud) for w in c] + list(recipe["tail"]) + \
+                [w for one in recipe.get("tail_if", ()) for w in one["argv"]] + list(recipe["tail_change"]) + \
+                [w for s in recipe["steps"] for one in s.get("extra", ()) for w in one["argv"]]
+            for argv in self.recipe_commands(cloud):
+                self.assertTrue(self.starts(argv, allowed, "{name}"), argv)
+            self.assertEqual([w for w in words if w.split("=")[0] in self.NEVER], [], cloud)
+            for tool, args, _answer, sent in self.walk(cloud):
+                for one in sent:
+                    argv = one["argv"]
+                    if argv[0] == "ssh":
+                        self.assertEqual((argv[-1], one["stdin"]), ("sh -s", owner_mcp.SERVER_CHECK), args)
+                    else:
+                        self.assertTrue(self.starts(argv, allowed, self.NAME), (tool, args, argv))
+                        self.assertEqual([w for w in argv if w.split("=")[0] in self.NEVER], [], argv)
+        # A read that the data gains outside the list is found too: the test reads the data, not a list of its own.
+        self.recipes["clouds"]["aws"]["reads"]["roles"] = {"argv": ["aws", "iam", "list-roles"], "gives": {}}
+        self.assertFalse(all(self.starts(c, allowed, "{name}") for c in self.recipe_commands("aws")))
+
+    def test_a_value_cannot_become_an_option_or_a_second_command(self):
+        """Test 2 of design 9: for each field, a value with a first "-", a space, a quote, "$", ";", "|", "&", a
+        backslash or a new line is refused before a program runs; ssh_from 0.0.0.0/0 and a /23 are refused; a private
+        key file is refused. And a fact of the cloud that does not match its pattern stops the step before its change
+        (rule 3). Bug: a pattern that was made wider, or a fact that reaches a command unchecked."""
+        bad = ("-", " ", "'", '"', "$", ";", "|", "&", "\\", "\n", "`")
+        for cloud, recipe in self.recipes["clouds"].items():
+            for field, rule in owner_mcp.cloud_value_rules(recipe).items():
+                if "pattern" not in rule:
+                    continue
+                example = rule["example"]
+                self.assertRegex(example, f"^(?:{rule['pattern']})$", (cloud, field))
+                self.assertIsNone(re.fullmatch(rule["pattern"], "-" + example), (cloud, field))
+                for mark in bad[1:]:
+                    for value in (mark + example, example[:1] + mark + example[1:], example + mark):
+                        self.assertIsNone(re.fullmatch(rule["pattern"], value), (cloud, field, value))
+        for field, value in (("name", "-agents"), ("name", "agents 1"), ("name", "door"), ("account", "1234; rm"),
+                             ("place", "eu-central-1\n"), ("size", "--t3.small"), ("subnet", "subnet-$x"),
+                             ("profile", "-p"), ("ssh_from", "0.0.0.0/0"), ("ssh_from", "203.0.112.0/23"),
+                             ("ssh_from", "203.0.113.9/24"), ("ssh_from", "100.64.0.7"), ("ssh_from", "10.0.0.0/24"),
+                             ("ssh_from", "192.168.1.5"), ("ssh_from", "172.20.0.0/24"), ("disk_gb", "30"),
+                             ("disk_gb", 4096), ("use", "agent;")):
+            args = dict(self.base("aws"), step="open_ssh", ssh_from="203.0.113.9")
+            args[field] = value
+            with self.assertRaises(Refused, msg=(field, value)) as caught:
+                self.call("cloud_step", **args)
+            self.assertIn("Nothing ran", str(caught.exception), (field, value))
+        # The range has two guards, the pattern of the data and the code: each one alone refuses a range wider than /24.
+        self.assertIsNone(re.fullmatch(owner_mcp.CLOUD_RECIPES["values"]["ssh_from"]["pattern"], "203.0.112.0/23"))
+        for wide in ("203.0.112.0/23", "0.0.0.0/0", "100.64.0.0/24"):
+            with self.assertRaises(owner_mcp.Refused, msg=wide):
+                owner_mcp.ssh_from_value(wide)
+        self.assertEqual(owner_mcp.ssh_from_value("203.0.113.9"), "203.0.113.9/32")
+        private = self.folder / "id_ed25519"
+        private.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n"
+                           "-----END OPENSSH PRIVATE KEY-----\n")
+        two = self.folder / "two.pub"
+        two.write_text(self.KEY + "\n" + self.KEY + "\n")
+        for path, said in ((private, "holds a private key"), (two, "not one line"),
+                           (self.folder / "none.pub", "not a public key file")):
+            with self.assertRaisesRegex(Refused, said):
+                self.call("cloud_step", **self.base("aws"), step="server", ssh_public_key_file=str(path))
+        with self.assertRaisesRegex(Refused, "has no field"):
+            self.call("cloud_step", **self.base("aws"), step="firewall", command="aws iam list-roles")
+        self.assertEqual(self.sent(), [])
+        # rule 3: a VPC ID that is no VPC ID stops the firewall step before create-security-group
+        self.rules(self.cloud_rules("aws", vpcs={"Vpcs": [{"VpcId": "vpc-0a1b2c3d; rm -rf /"}]}))
+        with self.assertRaisesRegex(Refused, "not a value that the recipe takes"):
+            self.call("cloud_step", **self.base("aws"), step="firewall")
+        self.assertFalse(any("create-security-group" in one["line"] for one in self.sent()))
+        # an image with no owner in AWS's answer is no image of Canonical's: a fact that must be there
+        group = {"GroupId": "sg-0a1b2c3d4e5f67890", "GroupName": f"founderizer-{self.NAME}",
+                 "Tags": [{"Key": "founderizer-server", "Value": self.NAME}]}
+        self.rules(self.cloud_rules("aws", groups=[group], image={"RootDeviceName": "/dev/sda1"}))
+        with self.assertRaisesRegex(Refused, "did not give the owner of the image"):
+            self.call("cloud_step", **self.base("aws"), step="server", ssh_public_key_file=str(self.key_file))
+        self.assertFalse(any("run-instances" in one["line"] for one in self.sent()))
+
+    def test_one_step_sends_at_most_one_change(self):
+        """Test 3 of design 9: each call of a whole new server and its removal, at each cloud, sends at most one
+        command that changes or deletes, and the steps that change send exactly one. Bug: a step that makes two
+        things."""
+        for cloud in self.recipes["clouds"]:
+            for tool, args, answer, sent in self.walk(cloud):
+                changes = [one["argv"][:5] for one in sent if self.starts(one["argv"], self.CHANGES + self.DELETES,
+                                                                          self.NAME)]
+                expected = 0 if tool == "cloud_look" or args.get("step") == "check" else 1
+                self.assertEqual(len(changes), expected, (cloud, tool, args, changes))
+                if tool != "cloud_look" and args.get("step") != "check":
+                    self.assertIn("did", answer, (cloud, args))
+                if tool == "cloud_remove":                  # no read of a step that makes in a removal's answer
+                    self.assertFalse([one["line"] for one in sent if any(w in one["line"] for w in (
+                        "describe-instance-types", "ssm get-parameters", "describe-images", "list-skus",
+                        "machine-types"))], (cloud, args))
+                    self.assertEqual({s["tool"] for s in answer["steps"]}, {"cloud_remove"}, (cloud, args))
+                if tool == "cloud_remove":                  # never a step that makes the removed thing again
+                    order = list(self.recipes["clouds"][cloud]["removals"])
+                    after = order[order.index(args["step"]) + 1:]
+                    wanted = after[0] if after else None
+                    self.assertEqual((answer["next"] or {}).get("arguments", {}).get("step"), wanted, (cloud, args))
+                    self.assertNotIn("after_join", answer, (cloud, args))
+
+    def test_the_next_of_a_removal_never_makes_the_server_again(self):
+        """An agent that follows `next` from the removal of a server ends with nothing of the recipe left, also when
+        the SSH rule is still there (a check that stopped, a join that did not run): at Google Cloud the chain is
+        cloud_remove server, cloud_step close_ssh, cloud_remove firewall, and then nothing; at AWS a close_ssh after the
+        server is gone gives the removal of the firewall as next; and an Azure group that still shows while Azure
+        deletes it gives cloud_look, not the same delete again. Bug: an agent that follows `next` rents the server
+        again and lets SSH in to it."""
+        for step in ("firewall", "server", "open_ssh"):
+            self.call("cloud_step", **self.base("google"), step=step,
+                      **{"server": {"ssh_public_key_file": str(self.key_file)},
+                         "open_ssh": {"ssh_from": "203.0.113.9"}}.get(step, {}))
+        chain, call = [], {"tool": "cloud_remove", "arguments": dict(self.base("google"), step="server")}
+        while call:
+            chain.append((call["tool"], call["arguments"]["step"]))
+            self.assertLess(len(chain), 6, chain)
+            call = self.call(call["tool"], **call["arguments"])["next"]
+        self.assertEqual(chain, [("cloud_remove", "server"), ("cloud_step", "close_ssh"), ("cloud_remove", "firewall")])
+        found = self.call("cloud_look", **self.base("google"))["found"]
+        self.assertEqual([k for k, v in found.items() if v["there"]], [])
+        for step in ("firewall", "server", "open_ssh"):
+            self.call("cloud_step", **self.base("aws"), step=step,
+                      **{"server": {"ssh_public_key_file": str(self.key_file)},
+                         "open_ssh": {"ssh_from": "203.0.113.9"}}.get(step, {}))
+        self.call("cloud_remove", **self.base("aws"), step="server")
+        after = self.call("cloud_step", **self.base("aws"), step="close_ssh")["next"]
+        self.assertEqual((after["tool"], after["arguments"]["step"]), ("cloud_remove", "firewall"))
+        self.rules(self.cloud_rules("azure", group_stays=True))
+        for step in ("group", "firewall"):
+            self.call("cloud_step", **self.base("azure"), step=step)
+        gone = self.call("cloud_remove", **self.base("azure"), step="group")
+        self.assertIn("still shows", gone["did"])
+        self.assertEqual((gone["next"]["tool"], gone["next"]["arguments"].get("step")), ("cloud_look", None))
+
+    def test_a_repeat_makes_no_second_server(self):
+        """Test 4 of design 9: `server` twice (a retry after a lost answer) sends the command that makes a server
+        once, and the second call says that it is there already; so does each other step. Bug: a retry rents
+        twice."""
+        makes = {"aws": "run-instances", "azure": "vm create", "google": "instances create"}
+        for cloud, recipe in self.recipes["clouds"].items():
+            for tool, args in self.journey(cloud)[1:]:
+                if args.get("step") == "check":
+                    break
+                first = self.call(tool, **args)
+                again = self.call(tool, **args)
+                self.assertIn("there already", again["did"], (cloud, args))
+                self.assertNotIn("there already", first["did"], (cloud, args))
+            self.assertEqual(sum(makes[cloud] in one["line"] for one in self.sent()), 1, cloud)
+
+    def test_a_removal_takes_only_a_marked_thing(self):
+        """Test 5 of design 9: an AWS instance with the name's tag and another client token, an AWS security group
+        with no tag of the recipe, an Azure resource group that holds one resource of another name or has no tag, a
+        Google Cloud rule with another description, and a Google Cloud instance with no label: each removal is refused
+        by name, and no delete is sent. Bug: a delete by name."""
+        other = {"InstanceId": "i-0fedcba987654321f", "ClientToken": "someone-else", "State": {"Name": "running"}}
+        untagged = {"GroupId": "sg-0fedcba987654321f", "GroupName": f"founderizer-{self.NAME}", "Tags": []}
+        group = {"id": f"/subscriptions/{self.WHERE['azure'][0]}/resourceGroups/founderizer-{self.NAME}",
+                 "tags": {"founderizer-server": self.NAME}}
+        rule = {"name": f"founderizer-{self.NAME}-closed", "description": "the network team's rule"}
+        for cloud, step, changed, said in (
+                ("aws", "server", {"reservations": [{"Instances": [other]}]}, "i-0fedcba987654321f"),
+                ("aws", "firewall", {"groups": [untagged]}, "sg-0fedcba987654321f"),
+                ("azure", "group", {"group_now": group, "resources": [{"name": f"{self.NAME}-nsg"},
+                                                                      {"name": "billing-db"}]}, "billing-db"),
+                ("azure", "group", {"group_now": dict(group, tags={})}, "without this recipe's mark"),
+                ("google", "firewall", {"rules_now": [rule]}, "without this recipe's mark"),
+                ("google", "server", {"instance_now": {"name": self.NAME, "labels": {}}},
+                 "without this recipe's mark")):
+            self.rules(self.cloud_rules(cloud, **changed))
+            (self.folder / "calls.jsonl").unlink(missing_ok=True)
+            with self.assertRaisesRegex(Refused, said, msg=(cloud, step)):
+                self.call("cloud_remove", **self.base(cloud), step=step)
+            self.assertFalse([one["argv"] for one in self.sent() if self.starts(one["argv"], self.DELETES, self.NAME)],
+                             (cloud, step))
+
+    def test_a_missing_program_a_sign_out_and_another_account_stop_before_any_change(self):
+        """Test 6 of design 9: the program is not there, its sign-in ended (AWS's status 253, Azure's words, an empty
+        list of gcloud), or it is signed in to another account: the refusal has the admin's own step, no later
+        command is sent, and no refusal asks for a key or a token. Bug: the step goes on."""
+        for cloud, program in (("aws", "aws"), ("azure", "az"), ("google", "gcloud")):
+            recipe = self.recipes["clouds"][cloud]
+            cases = [({"identity": None}, "signed_out")]
+            if cloud == "aws":
+                cases.append(({"identity": {"Account": "999999999999", "Arn": "arn:aws:iam::999999999999:user/x"}},
+                              "999999999999"))
+            if cloud == "azure":
+                cases.append(({"identity": {"id": "99999999-1111-2222-3333-444444444444", "user": {"name": "x"}}},
+                              "99999999-1111-2222-3333-444444444444"))
+            for changed, said in cases:
+                rules = self.cloud_rules(cloud, **({k: v for k, v in changed.items() if v is not None}))
+                if changed["identity"] is None:                 # the program's own sign-out
+                    signed_out = {"aws": {"exit": 253, "err": "Unable to locate credentials."},
+                                  "azure": {"exit": 1, "err": "ERROR: Please run 'az login' to setup account."},
+                                  "google": {"out": []}}[cloud]
+                    rules.insert(1, dict(signed_out, has=[{"aws": "sts get-caller-identity", "azure": "account show",
+                                                           "google": "auth list"}[cloud]]))
+                self.rules(rules)
+                (self.folder / "calls.jsonl").unlink(missing_ok=True)
+                with self.assertRaises(Refused) as caught:
+                    self.call("cloud_step", **self.base(cloud), step=recipe["steps"][0]["id"])
+                words = str(caught.exception)
+                self.assertIn(recipe["signed_out"] if said == "signed_out" else said, words, cloud)
+                self.assertIsNone(re.search(r"access key|secret|token|password", words, re.I), words)
+                self.assertEqual(len(self.sent()), 2, (cloud, [one["line"] for one in self.sent()]))
+            (self.folder / program).unlink()
+            (self.folder / "calls.jsonl").unlink(missing_ok=True)
+            with self.assertRaises(Refused) as caught:
+                self.call("cloud_look", **self.base(cloud))
+            self.assertIn(recipe["missing"], str(caught.exception))
+            self.assertEqual(self.sent(), [])
+
+    def test_an_unproved_cloud_is_refused_and_a_proved_one_is_not(self):
+        """Test 7 of design 9: a cloud with no `proved` date is refused by each tool before any program runs, and the
+        same cloud with a date is read. Bug: a recipe reaches the admins before its live proof."""
+        for cloud in self.recipes["clouds"]:
+            (self.folder / "calls.jsonl").unlink(missing_ok=True)
+            self.recipes["clouds"][cloud]["proved"] = None
+            for tool, args in self.journey(cloud) + [("cloud_look", {"cloud": cloud})]:
+                with self.assertRaisesRegex(Refused, "does not offer servers", msg=(cloud, tool)):
+                    self.call(tool, **args)
+            self.assertEqual(self.sent(), [])
+            self.recipes["clouds"][cloud]["proved"] = "2026-12-01"
+            self.assertEqual(self.call("cloud_look", cloud=cloud)["recipe"]["proved"], "2026-12-01")
+            self.assertEqual(self.call("cloud_look", **self.base(cloud))["next"]["arguments"]["step"],
+                             self.recipes["clouds"][cloud]["steps"][0]["id"])
+
+    def test_the_check_gives_stop_wait_or_ready_as_the_apps_check_does(self):
+        """Test 8 of design 9: readings give stop (Debian 11, a sudo that asks for a password, 1 GB for agents),
+        wait (cloud-init runs) or ready, by the rules of the app's `ServerCheck.verdict`; the check runs the script on
+        standard input over the admin's own SSH; and a ready server is joined next by add_machine, or install_hub for
+        a hub. Bug: the two checks say different things of one server, or the check sends the agent to a wrong
+        tool."""
+        good = owner_mcp.server_reading(self.READING)
+        self.assertEqual(owner_mcp.server_verdict(good), ("ready", "Ubuntu 24.04 · 2 GB · x86"))
+        for change, use, verdict in (({"os_id": "debian", "os_version": "11"}, "agent", "stop"),
+                                     ({"sudo": "password"}, "agent", "stop"), ({"sudo": "none"}, "agent", "stop"),
+                                     ({"memory_mb": "980"}, "agent", "stop"), ({"memory_mb": "980"}, "hub", "stop"),
+                                     ({"memory_mb": "1800"}, "hub", "ready"), ({"disk_free_mb": "9000"}, "agent", "stop"),
+                                     ({"arch": "armv7l"}, "agent", "stop"), ({"systemd": "no"}, "agent", "stop"),
+                                     ({"cloud_init": "running"}, "agent", "wait"), ({"dpkg_lock": "yes"}, "agent",
+                                                                                     "wait")):
+            text = self.READING
+            for key, value in change.items():
+                text = re.sub(rf"^{key}=.*$", f"{key}={value}", text, flags=re.M)
+            self.assertEqual(owner_mcp.server_verdict(owner_mcp.server_reading(text), use)[0], verdict, (change, use))
+        unreached = self.READING.replace("reach=claude.ai yes", "reach=claude.ai no").replace(
+            "reach=chatgpt.com yes", "reach=chatgpt.com no")
+        self.assertEqual(owner_mcp.server_verdict(owner_mcp.server_reading(unreached), "agent")[0], "stop")
+        self.assertEqual(owner_mcp.server_verdict(owner_mcp.server_reading(unreached), "hub")[0], "ready")
+        self.assertIsNone(owner_mcp.server_reading(self.READING.replace("end=yes", "")))
+        done = self.call("cloud_step", cloud="aws", step="check", host="203.0.113.20", ssh_user="ubuntu")
+        self.assertEqual((done["verdict"], done["next"]["tool"], done["next"]["arguments"]["host"]),
+                         ("ready", "add_machine", "203.0.113.20"))
+        self.assertIn("Ports 80 and 443 stay open as they are.", done["changes"])
+        self.assertIn("EC2 Instance Connect", done["changes"])          # a server that the company has already
+        hub_check = self.call("cloud_step", cloud="aws", step="check", host="203.0.113.20", ssh_user="ubuntu",
+                              use="hub")
+        self.assertEqual(hub_check["next"]["tool"], "install_hub")
+        sent = self.sent()[-1]
+        self.assertEqual((sent["argv"][0], sent["argv"][-2:], sent["stdin"]),
+                         ("ssh", ["ubuntu@203.0.113.20", "sh -s"], owner_mcp.SERVER_CHECK))
+        self.rules([{"has": ["sh -s"], "out": self.READING.replace("cloud_init=done", "cloud_init=running")}])
+        waits = self.call("cloud_step", cloud="aws", step="check", host="203.0.113.20", ssh_user="ubuntu")
+        self.assertEqual((waits["verdict"], waits["next"]["arguments"]["step"]), ("wait", "check"))
+        # The same floor stops the step server before it rents a size that the check would stop later.
+        self.rules(self.cloud_rules("aws", memory=1024, groups=[{
+            "GroupId": "sg-0a1b2c3d4e5f67890", "GroupName": f"founderizer-{self.NAME}",
+            "Tags": [{"Key": "founderizer-server", "Value": self.NAME}]}]))
+        with self.assertRaisesRegex(Refused, "1024 MB of memory, and a server for agents needs about 2 GB"):
+            self.call("cloud_step", **self.base("aws"), step="server", size="t3.micro",
+                      ssh_public_key_file=str(self.key_file))
+        self.assertFalse(any("run-instances" in one["line"] for one in self.sent()))
+        # At Azure a restriction of the place stops the step server before its cost; one of a zone does not, because
+        # the recipe's VM has no zone (Microsoft's list-skus with --all shows both).
+        for restrictions, stops in (([{"type": "Location", "reasonCode": "NotAvailableForSubscription"}], True),
+                                    ([{"type": "Zone", "reasonCode": "NotAvailableForSubscription"}], False)):
+            (self.folder / "calls.jsonl").unlink(missing_ok=True)
+            self.rules(self.cloud_rules("azure", restrictions=restrictions))
+            for step in ("group", "firewall"):
+                self.call("cloud_step", **self.base("azure"), step=step)
+            server = dict(self.base("azure"), step="server", ssh_public_key_file=str(self.key_file))
+            if stops:
+                with self.assertRaisesRegex(Refused, "NotAvailableForSubscription"):
+                    self.call("cloud_step", **server)
+            else:
+                self.call("cloud_step", **server)
+            self.assertEqual(any("vm create" in one["line"] for one in self.sent()), not stops, restrictions)
+            self.assertTrue(all("--all" in one["argv"] for one in self.sent() if "list-skus" in one["line"]))
+
+    @needs_the_apps
+    def test_the_check_script_is_the_apps_word_for_word(self):
+        """Test 8 of design 9, its second half: SERVER_CHECK is `ServerCheck.script` of the Mac app, so that the
+        check before a join through these tools and the app's own check read a server with the same script. Bug: one
+        of the two changes and the other does not."""
+        swift = (HERE / "app" / "Sources" / "FleetCore" / "ServerCheck.swift").read_text()
+        start = swift.index('public static let script = #"""\n') + len('public static let script = #"""\n')
+        body = swift[start:swift.index('\n    """#', start)]
+        self.assertEqual("\n".join(line[4:] if line.startswith("    ") else line.strip()
+                                   for line in body.split("\n")), owner_mcp.SERVER_CHECK)
+        self.assertEqual(tuple(re.findall(r'"([a-z]+\.(?:com|ai))"', swift.split("static let hosts =")[1]
+                                          .split("\n")[0])), owner_mcp.CHECK_HOSTS)
+        # and the rules of the verdict that stand as values in Swift: the floors, the machines and the systems
+        floors = {name: (int(eval(mb, {})), words) for name, mb, words in re.findall(
+            r'static let (\w+) = \(megabytes: ([0-9 *]+), words: "([^"]+)"\)', swift)}
+        self.assertEqual(floors, {"hubMemory": owner_mcp.CHECK_MEMORY["hub"],
+                                  "agentMemory": owner_mcp.CHECK_MEMORY["agent"], "freeDisk": owner_mcp.CHECK_DISK})
+        self.assertEqual(dict(re.findall(r'"(\w+)": "(\w+)"', swift.split("static let architectures =")[1]
+                                         .split("\n")[0])), owner_mcp.CHECK_ARCHITECTURES)
+        install = (HERE / "app" / "Sources" / "FleetCore" / "MachineInstall.swift").read_text()
+        takes = install.split("public static let joinTakes =")[1].split("public static let hubTakes")[0]
+        self.assertEqual(tuple(re.findall(r'System\(id: "(\w+)", version: "([0-9.]+)", name: "(\w+)"\)', takes)),
+                         owner_mcp.CHECK_SYSTEMS)
+        self.assertIn("public static let hubTakes = joinTakes", install)
+
+    def test_no_secret_goes_into_a_cloud_command(self):
+        """Test 9 of design 9: no tool of the three has a field for the Tailscale key or any other credential, and the
+        file of each server command holds only the server's name and the type and the key of the one public key (not
+        its comment); the file is gone after the command. Bug: the key in the cloud's metadata, or a key's comment
+        (often a person's address) sent to the cloud."""
+        for t in owner_mcp.tools():
+            if t["name"].startswith("cloud_"):
+                fields = set(t["inputSchema"]["properties"])
+                self.assertEqual({f for f in fields if re.search(r"key|token|secret|password|auth", f)},
+                                 {"ssh_public_key_file"} & fields, t["name"])
+        expected = {"aws": f"#cloud-config\nhostname: {self.NAME}\nssh_authorized_keys:\n  - {self.KEY}\n",
+                    "azure": f"{self.KEY}\n", "google": f"ubuntu:{self.KEY}\n"}
+        for cloud in self.recipes["clouds"]:
+            for _tool, args, _answer, sent in self.walk(cloud):
+                for one in sent:
+                    self.assertNotIn("admin@example.invalid", json.dumps(one), cloud)
+                    self.assertNotIn(str(self.key_file), one["argv"], cloud)
+                    if args.get("step") == "server" and one["files"]:
+                        self.assertEqual(list(one["files"].values()), [expected[cloud]], cloud)
+                        self.assertFalse(any(os.path.exists(path) for path in one["files"]), cloud)
+            self.assertTrue(any(one["files"] for one in self.sent()), cloud)
+
+    def test_the_new_server_has_no_identity_and_no_open_ssh(self):
+        """Test 10 of design 9: the server command of Azure has --nsg-rule NONE, of Google Cloud --no-service-account
+        and --no-scopes, and of AWS no instance profile; the one rule that lets anything in is TCP 22 from ssh_from,
+        and the only rule for 0.0.0.0/0 denies. Bug: a flag lost in an edit, which leaves SSH open to every address or
+        gives each program on the server the cloud's credentials."""
+        servers = {c: next(s["argv"] for s in r["steps"] if s["id"] == "server")
+                   for c, r in self.recipes["clouds"].items()}
+        self.assertNotIn("--iam-instance-profile", servers["aws"])
+        self.assertIn("HttpTokens=required,HttpEndpoint=enabled", servers["aws"])
+        nsg = servers["azure"].index("--nsg-rule")
+        self.assertEqual(servers["azure"][nsg + 1], "NONE")
+        self.assertNotIn("--assign-identity", servers["azure"])
+        self.assertTrue({"--no-service-account", "--no-scopes"} <= set(servers["google"]))
+        for cloud in self.recipes["clouds"]:
+            for argv in self.recipe_commands(cloud):
+                if "0.0.0.0/0" in " ".join(argv):
+                    self.assertIn("--action=DENY", argv, argv)
+            lets_in = 0
+            for _tool, args, _answer, sent in self.walk(cloud):
+                for one in sent:
+                    argv, line = one["argv"], one["line"]
+                    if argv[:3] == ["aws", "ec2", "authorize-security-group-ingress"] or \
+                            argv[:5] == ["az", "network", "nsg", "rule", "create"] or "--action=ALLOW" in argv:
+                        lets_in += 1
+                        self.assertIn("203.0.113.9/32", line)
+                        self.assertNotIn("0.0.0.0/0", line)
+                        self.assertTrue({"22", "--rules=tcp:22"} & set(argv), argv)
+                    if args.get("step") == "server" and self.starts(argv, self.CHANGES, self.NAME):
+                        literal = {w for w in servers[cloud] if not owner_mcp.CLOUD_PLACE.search(w)}
+                        self.assertEqual(literal - set(argv), set(), cloud)
+            self.assertEqual(lets_in, 1, cloud)
+
+    def test_the_look_shows_the_state_and_next_and_runs_no_change(self):
+        """cloud_look with cloud alone needs no program; with name it gives next the call of the first step that is
+        not done, with its command as it would run; and after the SSH rule, next is the check and after_join is
+        close_ssh. Bug: the look sends a command that changes, or next skips a step."""
+        recipe = self.call("cloud_look", cloud="azure")
+        self.assertEqual([s["id"] for s in recipe["steps"]], ["group", "firewall", "server", "open_ssh", "check",
+                                                              "join", "close_ssh"])
+        self.assertEqual(self.sent(), [])
+        for cloud in self.recipes["clouds"]:
+            for tool, args, answer, sent in self.walk(cloud):
+                if tool == "cloud_look":
+                    first = self.recipes["clouds"][cloud]["steps"][0]
+                    self.assertEqual(answer["next"]["arguments"]["step"], first["id"])
+                    self.assertTrue(self.starts(answer["next"]["command"], self.CHANGES, self.NAME), answer["next"])
+                    self.assertFalse([1 for one in sent if self.starts(one["argv"], self.CHANGES + self.DELETES,
+                                                                       self.NAME)], cloud)
+                if args.get("step") == "open_ssh":
+                    self.assertEqual(answer["next"]["arguments"]["step"], "check", cloud)
+                    self.assertEqual(answer["after_join"]["arguments"]["step"], "close_ssh", cloud)
+
+    def test_a_read_that_fails_after_a_change_says_that_the_change_was_sent(self):
+        """When the step's command ended with 0 and a read after it fails, the answer says that the cloud took the
+        change, gives the read's words, and for a server that it costs money; and a make command whose thing the cloud
+        does not show yet sends the agent to cloud_look, not to the same step. Bug: a server runs and costs money, and
+        the agent reads "Nothing was changed" or sends the step again."""
+        group = {"GroupId": "sg-0a1b2c3d4e5f67890", "GroupName": f"founderizer-{self.NAME}",
+                 "Tags": [{"Key": "founderizer-server", "Value": self.NAME}]}
+        server = dict(self.base("aws"), step="server", ssh_public_key_file=str(self.key_file))
+        self.rules(self.cloud_rules("aws", groups=[group], made={"exit": 254, "err": "RequestLimitExceeded"}))
+        with self.assertRaises(Refused) as caught:
+            self.call("cloud_step", **server)
+        words = str(caught.exception)
+        for said in ("ran and ended with 0", "RequestLimitExceeded", "costs money", "Call cloud_look"):
+            self.assertIn(said, words)
+        self.assertNotIn("Nothing was changed", words)
+        (self.folder / "calls.jsonl").unlink()
+        self.rules(self.cloud_rules("aws", groups=[group], made={"out": "<html>Bad gateway</html>"}))
+        with self.assertRaises(Refused) as caught:
+            self.call("cloud_step", **server)
+        self.assertIn("not JSON", str(caught.exception))
+        self.assertNotIn("nothing was changed", str(caught.exception).lower())
+        (self.folder / "calls.jsonl").unlink()
+        self.rules(self.cloud_rules("aws", groups=[group], made={"out": {"Reservations": []}}))
+        answer = self.call("cloud_step", **server)
+        self.assertIn("does not show", answer["did"])
+        self.assertEqual((answer["next"]["tool"], answer["next"]["arguments"].get("step")), ("cloud_look", None))
+        # close_ssh and cloud_remove: a read after their command fails
+        (self.folder / "calls.jsonl").unlink()
+        self.rules(self.cloud_rules("aws"))
+        for step in ("firewall", "server", "open_ssh"):
+            self.call("cloud_step", **self.base("aws"), step=step,
+                      **{"server": {"ssh_public_key_file": str(self.key_file)},
+                         "open_ssh": {"ssh_from": "203.0.113.9"}}.get(step, {}))
+        failing = [{"has": [read], "after": [command], "exit": 254, "err": "ThrottlingException"}
+                   for read, command in (("describe-security-group-rules", "revoke-security-group-ingress"),
+                                         ("describe-instances", "terminate-instances"))]
+        self.rules(failing + self.cloud_rules("aws"))
+        for tool, step in (("cloud_step", "close_ssh"), ("cloud_remove", "server")):
+            with self.assertRaises(Refused, msg=step) as caught:
+                self.call(tool, **self.base("aws"), step=step)
+            self.assertIn("ran and ended with 0", str(caught.exception), step)
+            self.assertNotIn("nothing was changed", str(caught.exception).lower(), step)
+        # a removal whose command fails: the same removal again when its cause is gone
+        self.rules([{"has": ["delete-security-group"], "exit": 254, "err": "DependencyViolation"}] +
+                   self.cloud_rules("aws"))
+        with self.assertRaisesRegex(Refused, "DependencyViolation.*When the cause is gone, send the same "
+                                             "cloud_remove again\\.$"):
+            self.call("cloud_remove", **self.base("aws"), step="firewall")
+
+    def test_a_server_in_a_subnet_is_read_and_removed_in_that_subnet(self):
+        """A server made with subnet has its firewall in the subnet's network, so each call, cloud_remove too, reads
+        that network and not the default one. Bug: the firewall in the company's network is "not there" for its
+        removal and stays, or a region with no default VPC refuses each removal."""
+        self.rules(self.cloud_rules("aws", vpcs={"Vpcs": []}) + self.cloud_rules("google") +
+                   [{"has": ["sh -s"], "out": self.READING}])
+        for cloud, subnet, network in (("aws", "subnet-0a1b2c3d4e5f67890", "Values=vpc-0fedcba987654321f"),
+                                       ("google", "servers", "network~/company-net$")):
+            done = self.walk(cloud, subnet=subnet)
+            sent = [one for _t, _a, _r, calls in done for one in calls]
+            self.assertFalse([one["line"] for one in sent if "describe-vpcs" in one["line"]], cloud)
+            reads = [one for one in sent if "describe-security-groups" in one["line"] or "rules list" in one["line"]]
+            self.assertTrue(reads and all(network in one["line"] for one in reads), cloud)
+            self.assertTrue(any(self.starts(one["argv"], self.DELETES, self.NAME) and
+                                ("delete-security-group" in one["line"] or "-closed" in one["line"]) for one in sent),
+                            cloud)
+            make = next(one["argv"] for one in sent if self.starts(one["argv"], self.CHANGES, self.NAME) and
+                        ("run-instances" in one["line"] or "instances create" in one["line"]))
+            self.assertIn(subnet, make, cloud)
+        # a removal with no subnet finds nothing in the default network, and says to give the server's subnet
+        self.rules(self.cloud_rules("aws"))
+        self.assertIn("with the same subnet",
+                      self.call("cloud_remove", **self.base("aws"), step="firewall")["did"])
+        self.assertNotIn("same subnet", self.call("cloud_remove", **self.base("aws"), step="firewall",
+                                                  subnet="subnet-0a1b2c3d4e5f67890")["did"])
+        tool = next(t for t in owner_mcp.tools() if t["name"] == "cloud_remove")
+        self.assertIn("Give the subnet that the server was made with", tool["description"])
+
+    def test_the_look_names_what_lets_any_cloud_program_in(self):
+        """The notes of a look name what the recipe does not change and the admin must know: a Google Cloud rule that
+        lets SSH in from every address before the recipe's rule that denies, and a role of AWS on a server that the
+        company has already, which each program there can use. Bug: the server is open to everybody, or an agent there
+        reaches the company's cloud, and nothing says so."""
+        closed = {"name": f"founderizer-{self.NAME}-closed", "description": f"founderizer-server={self.NAME}"}
+        wide = {"name": "allow-ssh-all", "direction": "INGRESS", "priority": 100, "sourceRanges": ["0.0.0.0/0"],
+                "allowed": [{"IPProtocol": "tcp", "ports": ["20-25"]}]}
+        self.rules(self.cloud_rules("google", rules_now=[closed, wide]))
+        notes = self.call("cloud_look", **self.base("google"))["notes"]
+        self.assertTrue([n for n in notes if "allow-ssh-all" in n and "It wins over" in n], notes)
+        role = "arn:aws:iam::123456789012:instance-profile/web"
+        self.rules([{"has": ["describe-instances --instance-ids i-0123456789abcdef0"], "out": {"Reservations": [
+            {"Instances": [{"State": {"Name": "running"}, "PublicIpAddress": "198.51.100.30",
+                            "IamInstanceProfile": {"Arn": role}}]}]}}] + self.cloud_rules("aws"))
+        seen = self.call("cloud_look", cloud="aws", instance="i-0123456789abcdef0", account="123456789012",
+                         place="eu-central-1")
+        self.assertTrue(any(role in n for n in seen["notes"]), seen["notes"])
+        self.assertEqual((seen["next"]["arguments"]["step"], seen["next"]["arguments"]["host"]),
+                         ("check", "198.51.100.30"))
+        self.assertFalse([1 for one in self.sent() if self.starts(one["argv"], self.CHANGES + self.DELETES,
+                                                                   self.NAME)])
 
 
 if __name__ == "__main__":

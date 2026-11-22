@@ -118,6 +118,19 @@ python3 worker_install.py --agent <worker-name> --start
 Open Founderizer → Team to check the worker's fresh helper reading. A running helper
 does not prove a browser or desktop task; check one real task after onboarding.
 
+### A server at AWS, Azure or Google Cloud
+
+The owner's admin MCP has three tools that make one with the cloud's own program on the admin's
+computer (`cloud_look`, `cloud_step`, `cloud_remove`; OWNER-MCP.md, "A server at AWS, Azure or Google
+Cloud"), and the join is the one above. No cloud is on yet: each tool refuses a cloud until its recipe
+has passed its live proof on a real account. Until then, make the server at the cloud in your own way
+and join it as any Linux VPS. The login user of a server of the recipe is `ubuntu` at AWS and Google
+Cloud, and `azureuser` at Azure; the check before the join reads whether its `sudo` asks for a
+password. The join changes SSH
+for each person who uses the server: after it, SSH reaches the server over the fleet's private network
+only, and only with a key. So EC2 Instance Connect, Azure Bastion and `gcloud compute ssh` stop for a
+server that the company had already. A new server of the recipe has no inbound rule after the join.
+
 ## Update and remove
 
 Finish the worker's tasks, run `git pull --rebase` in its existing checkout, and

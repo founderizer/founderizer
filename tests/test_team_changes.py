@@ -3,6 +3,7 @@
 and Details are the hub's own words, and only the owner's press of a yes option, on the Mac or a PC, makes it, after a
 second check. Each test names the bug that it catches. In-process hub with a local server and temporary Git
 repositories; no helper, vault, fleet or AI calls."""
+import contextlib
 import json
 import os
 import unittest
@@ -12,10 +13,11 @@ import urllib.request
 import uuid
 from unittest.mock import patch
 
+import door_targets
 import hub
 from test_agent_remove import Remove
 from test_needs_options import NoRedirect
-from test_servers import NEW, OWNER, git
+from test_servers import NEW, OTHER, OWNER, git
 
 
 def load_tests(loader, _tests, _pattern):
@@ -94,8 +96,8 @@ class TeamChanges(Remove):
         person = hub.ins("INSERT INTO people(name,role,added) VALUES('Bruno','peer',?)", (hub.now(),))
         hub.q("INSERT INTO person_agents(person,agent,added) VALUES(?,?,?)", (person, agent, hub.now()))
 
-    def box2(self, free=7 << 30):
-        """A second Linux server with no agent, whose reading shows this much memory free."""
+    def box2(self, free=7 << 30, total=8 << 30):
+        """A second Linux server with no agent, whose reading shows this much memory free, of this much in all."""
         if "box2" not in hub.server_names():
             answer = self.code("box2", "linux")
             status, result = self.join(answer["code"], source=NEW, key=BOX2_KEY, kind="linux", user="fleet")
@@ -103,7 +105,7 @@ class TeamChanges(Remove):
         status, said = self.service("/server/box2/status", {
             "revision": hub.kit_revision(fresh=True), "os": {"name": "Ubuntu 24.04.1 LTS"},
             "runtimes": {"codex": {"version": "1.0.0", "signed_in": None}}, "access": {"user": "fleet"},
-            "load": {"cpu_percent": 5.0, "memory_used": (8 << 30) - free, "memory_total": 8 << 30, "disk_used": 1,
+            "load": {"cpu_percent": 5.0, "memory_used": total - free, "memory_total": total, "disk_used": 1,
                      "disk_total": 2}}, key=BOX2_KEY, source=NEW)
         self.assertEqual(status, 200, said)
 
@@ -298,7 +300,10 @@ class TeamChanges(Remove):
         self.assertIsNone(self.card()["answer"])
 
     def test_a_busy_server_keeps_an_add_card_for_a_later_press(self):
-        """Bug: an add card closes for good because its server had too little memory free for a minute."""
+        """Bug: an add card closes for good because its server had too little memory free for a minute. And the other
+        way: a plan for a server that can never have the room, a 2 GB server that runs an agent already (a customer
+        of 21 November 2026, whose one team server ran the manager), waits for ever, and nobody hears that the owner
+        must choose a bigger server or another one."""
         self.add_plan()
         self.box2(free=1 << 29)
         hub.kv_set(hub.TEAM_PLAN_SWEEP, None)
@@ -308,6 +313,212 @@ class TeamChanges(Remove):
         self.assertEqual(status, 409, answer)
         self.assertIn("box2 has too little free memory now", answer["error"])
         self.assertIsNone(self.card()["answer"])
+
+        def box(total, free):           # scout runs on box
+            status, said = self.service("/server/box/status", {
+                "revision": hub.kit_revision(fresh=True), "os": {"name": "Ubuntu 24.04.1 LTS"},
+                "runtimes": {"codex": {"version": "1.0.0", "signed_in": True}}, "access": {"user": "fleet"},
+                "load": {"cpu_percent": 5.0, "memory_used": total - free, "memory_total": total, "disk_used": 1,
+                         "disk_total": 2}}, source=OTHER)
+            self.assertEqual(status, 200, said)
+        add = {"kind": "add", "server": "box", "names": ["nova"], "title": "Customer Support 2", "runtime": "codex",
+               "profile": SECTIONS}
+        box(1946 << 20, 1 << 30)        # what a server of 2 GB shows in all
+        with self.assertRaises(hub.ToolError) as refused:
+            self.plan([add])
+        self.assertNotIsInstance(refused.exception, hub.TeamPassing)
+        self.assertIn("box can never take one more agent", str(refused.exception))
+        self.assertIn("raise_needs_you (reason money)", str(refused.exception))
+        box(2048 << 20, 1 << 30)        # exactly 2 GiB in all, as a container can show it: no room either
+        with self.assertRaises(hub.ToolError) as refused:
+            self.plan([add])
+        self.assertIn("box can never take one more agent", str(refused.exception))
+        self.box2(free=1 << 30, total=1946 << 20)     # a server of 2 GB that runs no agent yet can have the room
+        with self.assertRaises(hub.TeamPassing) as waits:
+            self.plan([dict(add, server="box2")])
+        self.assertEqual(waits.exception.owner, "box2 has too little free memory now")
+        box(3820 << 20, 1 << 30)        # 4 GB: it can have the room later, so it waits as before
+        with self.assertRaises(hub.TeamPassing) as waits:
+            self.plan([add])
+        self.assertEqual(waits.exception.owner, "box has too little free memory now")
+        box(1946 << 20, 1640 << 20)     # a reading that shows the room now: its free memory decides, as before
+        try:
+            self.plan([add])
+        except hub.ToolError as e:
+            self.assertNotIn("memory", str(e))
+
+    MAIL = "support@example.com"
+
+    def allows(self, services=("gmail", "drive"), bad=None):
+        """The Google file as the hub reads it now: the mailbox's account allows these services."""
+        return patch.object(hub, "google_services_now", lambda: ({self.MAIL: tuple(services)}, bad))
+
+    @contextlib.contextmanager
+    def reaches(self, *repos, read=True):
+        """The fleet's GitHub App, and its reading now (none yet, with read False): it reaches these repositories of
+        acme, whose installation page is the one that a refusal names."""
+        reach = {"pages": {"acme": "https://github.com/organizations/acme/settings/installations/7"}, "all": set(),
+                 "repos": set(repos), "install": "https://github.com/apps/fleet/installations/new"}
+        with patch.object(hub, "github_app", lambda: ("7", "key")), \
+                patch.dict(hub.GITHUB_REACH, {"at": hub.now(), "reach": reach if read else None, "reading": False}):
+            yield
+
+    def mailbox_plan(self):
+        """An add whose new agent gets, with the press, each kind that a plan gives: a Gmail mailbox, a Drive, an MCP
+        server that needs no sign-in and no key, and a repository at deploy, which the App reaches."""
+        self.box2()
+        crm = {"title": "Acme CRM", "url": "https://mcp.example.org/", "auth": "none"}
+        status, answer = self.owner("/ui/team/mcp", base_sha256=self.team_sha(), name="crm", server=crm)
+        self.assertEqual(status, 200, answer)
+        with self.allows(), self.reaches("acme/web"):
+            self.plan([{"kind": "add", "server": "box2", "names": ["nova"], "title": "Customer Support 2",
+                        "runtime": "codex", "profile": SECTIONS,
+                        "access": [{"resource": f"gmail:{self.MAIL}", "level": "send"},
+                                   {"resource": f"drive:{self.MAIL}", "level": "read"},
+                                   {"resource": "tool:crm", "level": "use"},
+                                   {"resource": "repo:acme/web", "level": "deploy"}]}],
+                      title="Add Support for the mailbox?")
+
+    def test_an_add_gives_its_new_agent_the_access_of_its_plan_with_the_press(self):
+        """Bug: the owner presses yes on an agent for a mailbox, and the agent comes without it, so the owner must find
+        the Access card again (a customer of 21 November 2026, whose one agent was the manager); or the card and its
+        yes do not show that the press gives it; or the grant lands in a second commit, or with no record that names
+        the owner's press and the plan's commit, so the owner's Access page cannot say who gave it; or a second run of
+        the steps after the commit writes a grant's record again, also after the owner took the grant back."""
+        mail = self.MAIL
+        self.mailbox_plan()
+        card = self.card()
+        self.assertEqual(json.loads(card["options"])[0], "Yes: add nova, Customer Support 2, on box2, with Gmail, "
+                                                         "Drive, an MCP server and a repository")
+        for line in (f"Gmail of {mail} (send)", f"Google Drive of {mail} (read)", "the MCP server Acme CRM (use)",
+                     "the GitHub repository acme/web (write and deploy)"):
+            self.assertIn(f"- The new agent gets {line}, which your yes gives it.", card["details"])
+        before = self.head()
+        with self.allows(), self.reaches("acme/web"), patch.object(hub, "team_plan_end"):   # its mark stays: the
+            # steps after the commit run again below
+            status, answer = self.press(0)
+        self.assertEqual(status, 200, answer)
+        nova = self.origin_team()["agents"]["nova"]
+        self.assertEqual((nova["google"], nova["repos"], nova["tools"]),
+                         ({"drive": {"account": mail, "level": "read"}, "gmail": {"account": mail, "level": "send"}},
+                          {"acme/web": "deploy"}, ["crm"]))
+        self.assertEqual(git("--git-dir", str(self.root / "origin.git"), "rev-list", "--count", f"{before}..main"), "1")
+        commit = self.commits_of(card["id"])[0]
+        given = [(f"gmail:{mail}", "send", "owner", commit), (f"drive:{mail}", "read", "owner", commit),
+                 ("tool:crm", "use", "owner", commit), ("repo:acme/web", "deploy", "owner", commit)]
+        rows = "SELECT resource, level, by, revision FROM resource_grants WHERE agent='nova' ORDER BY id"
+        self.assertEqual([tuple(r) for r in hub.q(rows)], given)
+        made = self.told("made your plan")["text"]
+        self.assertIn(f"It holds Gmail of {mail}, Google Drive of {mail}, the MCP server Acme CRM, the GitHub "
+                      f"repository acme/web from its first task session", made)
+        self.assertIn(hub.DEPLOY_APP_NOTE[1:], made)       # deploy also needs the owner's step on GitHub
+        status, answer = self.owner("/ui/resources/take", resource=f"gmail:{mail}", agent="nova")
+        self.assertEqual(status, 200, answer)
+        hub.team_plans_pressed()            # the steps after the commit once more, as after a stop
+        self.assertEqual([tuple(r) for r in hub.q(rows)],
+                         given + [(f"gmail:{mail}", None, "owner", answer["revision"])])
+        self.assertEqual(self.stands(), (hub.TEAM_MADE, None))
+
+    def test_no_access_lands_when_the_press_cannot_make_the_plan(self):
+        """Bug: the press gives the new agent's mailbox although the account no longer allows Gmail, or although the
+        add itself is not made, so an agent holds what no card of the owner's made, or a grant's record stands for a
+        hold that nobody has. And a Google file that the hub cannot read for a minute closes the owner's card for
+        good, as if the account had gone."""
+        self.mailbox_plan()
+        before = self.head()
+        with self.allows(bad="unreadable"), self.reaches("acme/web"):
+            status, answer = self.press(0)
+        self.assertEqual(status, 409, answer)
+        self.assertIn("cannot make this change now: the hub cannot read its Google file now", answer["error"])
+        self.assertIsNone(self.card()["answer"])
+        with self.allows(services=("drive",)), self.reaches("acme/web"):
+            status, answer = self.press(0)
+        self.assertEqual(status, 409, answer)
+        self.assertEqual(self.head(), before)
+        self.assertNotIn("nova", self.origin_team()["agents"])
+        self.assertIsNone(hub.q1("SELECT 1 FROM resource_grants WHERE agent='nova'"))
+        self.assertEqual(self.card()["answer"], hub.TEAM_CLOSED_WORDS)
+
+    def test_the_manager_hears_what_to_do_with_an_app_only_while_no_agent_can_hold_it(self):
+        """Bug: the hub's line of a Connect says nothing in a fleet whose one agent is the manager, which holds no app,
+        so a connected mailbox waits for nobody (a customer of 21 November 2026); or it tells the manager to add an
+        agent although a worker could hold it; or it repeats at each change of a server. And the same dead end at the
+        other doors: a grant to the manager, the owner's standing of a resource, and an access card that the owner
+        could give to nobody, also one in plain words, end with no step; or a step names what a plan then refuses
+        (one of the product's own repositories, a repository with no App that reaches it), so the manager is sent
+        between two refusals; or a login or an MCP server with a key, which no plan gives, gets no step at all."""
+        alone = {"agents": {"manager": {"role": "manager"}}}
+        said = hub.team_no_holder_words(["gmail:a@example.com", "drive:a@example.com"], alone)
+        self.assertEqual(said, " You cannot use it, and the fleet has no agent yet that can: propose an agent for its "
+                               "work with change_team, with what the work needs of gmail:a@example.com and "
+                               "drive:a@example.com in the new agent's access. Ask the owner what the work is first "
+                               "only when the owner's words do not say it.")
+        login = "secret:bws://11111111-2222-4333-8444-55555555555d"
+        self.assertIn(f"change_team; once it is there, give it {login} with grant_access, or, when the pool does not "
+                      f"hold it, ask the owner with raise_needs_you (needs_access {login}), whose Mac signs that grant.",
+                      hub.team_no_holder_for(login, dict(alone, logins={login[7:]: {"title": "Shop"}})))
+        self.assertEqual(hub.team_no_holder_words(["gmail:a@example.com"]), "")      # scout and vps are workers
+        # the owner's own route of a new MCP server says it once, with the access that a plan can give; a server that
+        # signs in says it at its Connect instead, and a change of a server repeats nothing
+        nobody = patch.object(hub, "grant_fits", lambda agent, entry, team=None: False)
+        local = {"title": "Notes", "command": "notes-mcp", "runtimes": ["codex"]}
+        oauth = {"title": "Acme CRM", "url": "https://mcp.example.org/", "auth": "oauth"}
+        with nobody:
+            for name, server in (("notes", local), ("crm", oauth), ("notes", dict(local, title="Notes 2"))):
+                status, answer = self.owner("/ui/team/mcp", base_sha256=self.team_sha(), name=name, server=server)
+                self.assertEqual(status, 200, answer)
+        lines = [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND text LIKE "
+                                          "'%changed the MCP server%' ORDER BY id")]
+        self.assertEqual([("You cannot use it" in x, "with what the work needs of tool:notes in" in x) for x in lines],
+                         [(True, True), (False, False), (False, False)])
+        step = "You cannot use it, and the fleet has no agent yet that can: propose an agent for its work with " \
+               "change_team, with what the work needs of {} in the new agent's access."
+        with nobody, self.allows(services=("gmail",)), self.reaches("acme/new"):
+            # a grant to the manager, an access card that nobody could take, in plain words too, and the standing
+            with self.assertRaises(hub.ToolError) as refused:
+                hub.grant_check("manager", f"gmail:{self.MAIL}", "read")
+            self.assertIn("You never grant to yourself. " + step.format(f"gmail:{self.MAIL}"), str(refused.exception))
+            self.assertIn("Not raised: no agent of the fleet can hold the GitHub repository acme/new (repo:acme/new). "
+                          + step.format("repo:acme/new"), hub.card_access("repo:acme/new", "write") or "")
+            self.assertIn(f"needs_access names gmail:{self.MAIL} in words. Give it as gmail:{self.MAIL}",
+                          hub.card_access(f"Gmail of {self.MAIL} for the support work", None) or "")
+            # the service that the words say, though the account allows only the other one: card_dead then sends it
+            # to the owner, who connects that service
+            self.assertIn(f"needs_access names drive:{self.MAIL} in words",
+                          hub.card_access(f"the Drive of {self.MAIL}", None) or "")
+            status, answer = self.owner("/ui/resources", base_sha256=self.team_sha(),
+                                        resource=f"gmail:{self.MAIL}", policy={"max": "read"})
+            self.assertEqual(status, 200, answer)
+            self.assertIn(step.format(f"gmail:{self.MAIL}"), self.told("changed the standing")["text"])
+            # what a plan refuses names no step: the product's own repository; and a repository that the App does
+            # not reach sends its card up, the owner's step first
+            with self.assertRaises(hub.ToolError) as refused:
+                hub.grant_check("manager", f"repo:{door_targets.VENDOR_REPOS[0]}", "read")
+            self.assertNotIn("You cannot use it", str(refused.exception))
+            self.assertIsNone(hub.card_access("repo:acme/other", "write"))
+        with nobody:                    # no GitHub App: the card goes up, for the owner to connect GitHub
+            self.assertIsNone(hub.card_access("repo:acme/new", "write"))
+        with nobody, patch.object(hub, "google_services_now", lambda: ({"drive@example.com": ("gmail",)}, None)):
+            self.assertIn("needs_access names gmail:drive@example.com in words",       # "drive" in the address
+                          hub.card_access("the inbox of drive@example.com", None) or "")
+        # with workers too: a repository that the App's reading does not reach goes up, though the pool would let
+        # the manager give it, because no holder could use it
+        status, answer = self.owner("/ui/resources", base_sha256=self.team_sha(), resource="repo:acme/other",
+                                    policy={"max": "write"})
+        self.assertEqual(status, 200, answer)
+        with self.reaches("acme/other"):
+            self.assertIn("is yours to give", hub.card_access("repo:acme/other", "write") or "")
+        with self.reaches("acme/new"):
+            self.assertIsNone(hub.card_access("repo:acme/other", "write"))
+        self.assertIsNone(hub.card_access("repo:acme/other", "write"))     # and with no GitHub App at all
+        # a GitHub App file that the hub cannot read never breaks a card or a grant of a fleet with workers
+        def broken():
+            raise hub.GitHubError("the App's file has the wrong mode")
+        with patch.object(hub, "github_app", broken):
+            self.assertIn("is yours to give", hub.card_access("repo:acme/other", "write") or "")
+            with self.assertRaises(hub.ToolError) as refused:
+                hub.grant_check("manager", "repo:acme/other", "read")
+            self.assertNotIn("You cannot use it", str(refused.exception))
 
     def test_a_fold_names_its_removal_and_lands_in_one_commit(self):
         """Bug: the yes of a fold reads as a line change while it removes an agent, or the removal comes before the
@@ -565,7 +776,11 @@ class TeamChanges(Remove):
 
     def test_no_plan_gives_access_around_the_owner(self):
         """Bug: access that goes around the owner: a login in a changed profile or in a new agent's, which skips
-        the owner's pool, or a new agent on a key account, whose key's grant only the owner's Mac signs."""
+        the owner's pool, or a new agent on a key account, whose key's grant only the owner's Mac signs. And a new
+        agent's access (team_add_access) that gives what the fleet does not hold: a mailbox that nobody connected for
+        Gmail, an MCP server that the fleet does not have, one whose key only the owner's Mac grants, a login or a
+        server, which only the owner's own routes give, one of the product's own repositories, or a level that its
+        kind has not."""
         login = {"key": "logins", "title": "Logins it may use", "text": "`bws://11111111-2222-4333-8444-55555555555b`"}
         with self.assertRaises(hub.ToolError) as refused:
             self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"), "sections": [login]}])
@@ -580,6 +795,71 @@ class TeamChanges(Remove):
             self.plan([{"kind": "add", "server": "box2", "names": ["nova"], "title": "Customer Support 2",
                         "runtime": keyed, "profile": SECTIONS}])
         self.assertIn("the owner adds in Founderizer", str(refused.exception))
+
+        def refused_access(access):
+            with self.assertRaises(hub.ToolError) as refused:
+                self.plan([{"kind": "add", "server": "box2", "names": ["nova"], "title": "Customer Support 2",
+                            "runtime": "codex", "profile": SECTIONS, "access": access}])
+            self.assertNotIsInstance(refused.exception, hub.TeamPassing)
+            return str(refused.exception)
+        with patch.object(hub, "google_services_now", lambda: ({"support@example.com": ("drive",)}, None)):
+            self.assertIn("The Google account support@example.com does not allow Gmail now",
+                          refused_access([{"resource": "gmail:support@example.com", "level": "read"}]))
+        self.assertIn("The fleet does not hold the MCP server ghost",
+                      refused_access([{"resource": "tool:ghost", "level": "use"}]))
+        # a key server, also before the catalog holds its key: its holder would start without the server
+        shop = {"title": "Shop", "url": "https://shop.example.com/mcp", "auth": "key", "key": "SHOP_KEY"}
+        status, answer = self.owner("/ui/team/mcp", base_sha256=self.team_sha(), name="shop", server=shop)
+        self.assertEqual(status, 200, answer)
+        self.assertIn("The MCP server Shop needs a key, whose grant the owner's Mac signs",
+                      refused_access([{"resource": "tool:shop", "level": "use"}]))
+        for rid in ("secret:bws://11111111-2222-4333-8444-55555555555b", "server:box"):
+            self.assertIn("Give a login with grant_access once the agent is there",
+                          refused_access([{"resource": rid, "level": "use"}]))
+        self.assertIn("The door refuses", refused_access([{"resource": f"repo:{door_targets.VENDOR_REPOS[0]}",
+                                                           "level": "read"}]))
+        self.assertIn("The fleet has no GitHub App, so no agent can use acme/web",
+                      refused_access([{"resource": "repo:acme/web", "level": "read"}]))
+        with self.reaches("acme/web"):
+            self.assertIn("The fleet's GitHub App does not reach acme/typo. Ask the owner with raise_needs_you "
+                          "(needs_access repo:acme/typo) to add it at "
+                          "https://github.com/organizations/acme/settings/installations/7",
+                          refused_access([{"resource": "repo:acme/typo", "level": "read"}]))
+        with self.reaches(read=False), self.assertRaises(hub.TeamPassing) as waits:     # before its first reading
+            self.plan([{"kind": "add", "server": "box2", "names": ["nova"], "title": "Customer Support 2",
+                        "runtime": "codex", "profile": SECTIONS,
+                        "access": [{"resource": "repo:acme/web", "level": "read"}]}])
+        self.assertEqual(waits.exception.owner, "the hub has not read its GitHub App yet")
+        crm = {"title": "Acme CRM", "url": "https://mcp.example.org/", "auth": "oauth"}
+        status, answer = self.owner("/ui/team/mcp", base_sha256=self.team_sha(), name="crm", server=crm)
+        self.assertEqual(status, 200, answer)
+        self.assertIn("The MCP server Acme CRM is not connected, so no session gets it",
+                      refused_access([{"resource": "tool:crm", "level": "use"}]))
+        # what the hub cannot read now passes by itself, and keeps a card: its file of MCP connections, and a GitHub
+        # App file that it cannot read
+        def broken():
+            raise hub.GitHubError("the App's file has the wrong mode")
+        for patched, owner in ((patch.object(hub, "mcp_saved", lambda: ({}, "unreadable")), "tool:crm"),
+                               (patch.object(hub, "github_app", broken), "repo:acme/web"),
+                               (patch.dict(hub.TEAM, {"door": {"address": "100.64.0.9"}}), "repo:acme/web")):
+            with patched, self.assertRaises(hub.TeamPassing):
+                self.plan([{"kind": "add", "server": "box2", "names": ["nova"], "title": "Customer Support 2",
+                            "runtime": "codex", "profile": SECTIONS, "access": [{"resource": owner, "level":
+                                                                                  "use" if owner[0] == "t" else "read"}]}])
+        with patch.object(hub, "google_services_now", lambda: ({"a@example.com": ("gmail",),
+                                                                "b@example.com": ("gmail",)}, None)):
+            self.assertIn("access names two accounts for Gmail", refused_access(
+                [{"resource": "gmail:a@example.com", "level": "read"},
+                 {"resource": "gmail:b@example.com", "level": "read"}]))
+        catalog = {"minted": {"custom": True, "auth": "mint"}, "program": {"custom": True, "auth": "none",
+                                                                           "env": {"API_KEY": "SHOP_KEY"}},
+                   "plain": {"custom": True, "auth": "none"}, "fleet": {"custom": False, "auth": "none"}}
+        with patch.object(hub, "tool_catalog", lambda team, refused=None: catalog):
+            self.assertEqual([hub.team_tool_keyed(n) for n in catalog], [True, True, False, False])
+        self.assertIn("is one of read, write", refused_access([{"resource": "repo:acme/web", "level": "admin"}]))
+        with self.reaches("acme/web"):
+            self.assertIn("access names repo:acme/web twice", refused_access(
+                [{"resource": "repo:acme/web", "level": "read"}, {"resource": "repo:acme/web", "level": "write"}]))
         self.assertIsNone(self.card())
 
     def test_a_plan_meets_the_owner_profile_saves_own_checks(self):
