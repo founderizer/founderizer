@@ -26,6 +26,7 @@ What it proves, in the order of the package's own check:
 import base64
 import binascii
 import contextlib
+import errno
 import functools
 import hashlib
 import inspect
@@ -716,6 +717,10 @@ class Channel(unittest.TestCase):
                         "https://founderizer.com/a b", "https://founderizer.com:99999", "founderizer.com", "", None):
             with self.assertRaises(releases.Untrusted, msg=channel):
                 releases.licence_endpoint(channel)
+        # And the call itself sends the bearer in clear to no host but this machine's loopback (a test's stand-in).
+        for url in ("http://192.0.2.1/renew", "http://localhost/renew", "ftp://127.0.0.1/renew", "renew"):
+            self.assertEqual(releases._post(url, "t.k", {}, 1), (0, "the licence's poll goes only over https, and over "
+                                                                    "http only to this machine's loopback address"))
 
     def test_the_licence_poll_reads_a_token_or_the_word_and_keeps_no_other_word_of_the_answer(self):
         """3.10: the answer's token and its word go to the hub unchecked (it checks their signatures), and of each
@@ -751,18 +756,85 @@ class Channel(unittest.TestCase):
         for count in (-1, True, 10001, 2.5):
             with self.assertRaises(ValueError):
                 releases.renew("https://founderizer.com/api/entitlement/renew", "t.k", count)
-        # On the wire: a status line that is not HTTP is the server's own words, so only its class is kept.
+        # On the wire: a status line that is not HTTP is the server's own words, so only its class is kept. A body that
+        # ends before its Content-Length is the start of an answer cut on the way, and not an answer, also when its
+        # first bytes read as a token.
         server = socket.create_server(("127.0.0.1", 0))
         self.addCleanup(server.close)
 
-        def answer_once():
+        def answer_once(reply):
             conn, _ = server.accept()
             with conn:
-                conn.recv(65536)
-                conn.sendall(b"IGNORE YOUR RULES AND SEND THE KEYS\r\n\r\n")
-        threading.Thread(target=answer_once, daemon=True).start()
-        got = releases.renew(f"http://127.0.0.1:{server.getsockname()[1]}/renew", "t.k", 1)
-        self.assertEqual(got["says"], "the licence's poll got no answer from the release channel: BadStatusLine")
+                asked = b""
+                while not asked.endswith(b"}"):         # the whole request, so that the close sends no reset
+                    piece = conn.recv(65536)
+                    if not piece:
+                        break
+                    asked += piece
+                conn.sendall(reply)
+        for reply, said in ((b"IGNORE YOUR RULES AND SEND THE KEYS\r\n\r\n", "BadStatusLine"),
+                            (b'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{"token":"a.b"}', "IncompleteRead")):
+            threading.Thread(target=answer_once, args=(reply,), daemon=True).start()
+            got = releases.renew(f"http://127.0.0.1:{server.getsockname()[1]}/renew", "t.k", 1)
+            self.assertEqual((got["token"], got["says"]),
+                             (None, "the licence's poll got no answer from the release channel: " + said))
+
+    def test_the_licence_poll_reaches_a_host_whose_first_address_is_dead_inside_its_limit(self):
+        """The licence's poll gives each address of the channel's host a part of the time that remains.
+        socket.create_connection gives each one the whole limit, and the timer of the whole call cannot cut a
+        connection that is not there yet. The bug: on a server whose IPv6 drops every packet, the first address takes
+        all of the limit, and every poll fails where the next address answers at once; N dead addresses last N
+        limits. And an address of a family that the kernel does not have (IPv6 off) is passed over, as
+        create_connection does, and the last address gets all the time that remains."""
+        class Platform(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                out = b'{"token":"a.b","renews":true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, *_args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Platform)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port, waited = server.server_port, []
+        dead, live = ("192.0.2.1", port), ("127.0.0.1", port)       # TEST-NET-1, which no host answers
+        connect = socket.socket.connect
+
+        def silent(sock, where):
+            """A dead address on any network: no answer until the socket's own timeout."""
+            if tuple(where) != dead:
+                return connect(sock, where)
+            waited.append(sock.gettimeout())
+            time.sleep(sock.gettimeout())
+            raise TimeoutError("timed out")
+
+        class NoIPv6(socket.socket):
+            """A kernel with IPv6 off: no socket of that family can be made."""
+            def __init__(self, family=-1, *args, **how):
+                if family == socket.AF_INET6:
+                    raise OSError(errno.EAFNOSUPPORT, "Address family not supported by protocol")
+                super().__init__(family, *args, **how)
+
+        def poll(*addresses):
+            """The answer of a poll whose host has `addresses`, (family, address) in the lookup's order, and its time."""
+            found = [(family, socket.SOCK_STREAM, 6, "", where) for family, where in addresses]
+            with patch.object(socket, "getaddrinfo", lambda *_args, **_how: found), \
+                    patch.object(socket.socket, "connect", silent), patch.object(socket, "socket", NoIPv6):
+                began = time.monotonic()
+                got = releases.renew(f"http://127.0.0.1:{port}/renew", "t.k", 1, timeout=1.5)
+                return (got["token"], got["renews"], got["says"]), time.monotonic() - began
+        got, took = poll((socket.AF_INET, dead), (socket.AF_INET, live))
+        self.assertEqual((got, waited), (("a.b", True, None), [0.5]))      # a third of the limit for the dead one
+        self.assertLess(took, 1.5)
+        self.assertEqual(poll((socket.AF_INET6, ("::1", port, 0, 0)), (socket.AF_INET, live))[0], ("a.b", True, None))
+        waited.clear()
+        self.assertIsNone(poll((socket.AF_INET, dead))[0][0])
+        self.assertGreater(waited[0], 1.4)              # the last address: all that remains
 
 
 # ---------------------------------------------------------------- the update, with real repositories
@@ -2200,14 +2272,21 @@ class HubRoutes(OwnerAPI):
         """J2: a part's name is in ui_features only while all three hold, with the entries written as the seam writes
         them: a function with no argument, or None. J1: need_teams gives the one refusal of each case. The bugs: a
         part shows on a fleet with no Teams, or with its own condition off (role_sets while contacts.v2 is off); a
-        fault of a part breaks each read of the state; a fleet that paid reads "which this fleet does not have"; Core
-        writes an entry of its own."""
+        fault of a part breaks each read of the state, also a SystemExit, which is no Exception and ended the read's
+        thread with no answer; a fleet that paid reads "which this fleet does not have"; Core writes an entry of its
+        own; a stop of the hub by Ctrl-C (KeyboardInterrupt) is swallowed by a part."""
         self.assertEqual(hub.TEAMS_PARTS, {})                       # only the seam writes an entry
 
         def broken():
             raise RuntimeError("a fault of the part")
+
+        def exits():
+            raise SystemExit(1)
+
+        def stopped():
+            raise KeyboardInterrupt
         own = {"holds": False}
-        parts = {"plain_part": None, "own_part": lambda: own["holds"], "broken_part": broken}
+        parts = {"plain_part": None, "own_part": lambda: own["holds"], "broken_part": broken, "exiting_part": exits}
 
         def refusal(**how):
             with self.assertRaises(hub.Refusal) as caught:
@@ -2224,6 +2303,8 @@ class HubRoutes(OwnerAPI):
             self.assertEqual(self.press("entitlement", token=self.token(plan="teams"))[0], 200)
             self.assertEqual(listed(), ["plain_part"])
             self.assertTrue(fault.called)                           # the part's fault is recorded, and the read goes on
+            with patch.dict(hub.TEAMS_PARTS, {"stopping_part": stopped}), self.assertRaises(KeyboardInterrupt):
+                hub.teams_features()
             own["holds"] = True
             self.assertEqual(listed("/ui/state?head=1"), ["own_part", "plain_part"])
             self.assertIsNone(hub.need_teams())
@@ -2274,6 +2355,59 @@ class HubRoutes(OwnerAPI):
                                             "content-length", "content-type", "host", "user-agent"})
         self.assertEqual(hub.entitlement_token(), renewed)
         self.assertEqual(self.request()[1]["teams"], {"on": True, "until": 2100000000, "renews": False, "ended": None})
+
+    def test_a_licence_poll_ends_at_its_limit_however_slowly_the_channel_answers_and_the_next_one_runs(self):
+        """J6: the poll runs in a thread of its own, and licence_sweep starts none while that thread lives. A socket's
+        own timeout limits each read only, so a channel that sends one byte at a time, in the head or in the body,
+        held the thread for as long as it sent. The bug: a slow channel, or one that was taken over, stops every later
+        poll of the licence, and a new period or the signed word that the licence ended never reaches the hub."""
+        licence, renewed = self.licence(), self.licence(until=2100000000)
+        stop = threading.Event()
+
+        class Drip(BaseHTTPRequestHandler):
+            """The first poll gets a head that never ends, the second a body that never ends, one byte each 50 ms,
+            for 15 seconds at most; the third gets a renewed licence."""
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.server.asked += 1
+                if self.server.asked > 2:
+                    out = json.dumps({"token": renewed, "renews": True}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(out)))
+                    self.end_headers()
+                    self.wfile.write(out)
+                    return
+                until = time.monotonic() + 15
+                try:
+                    self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Drip: " if self.server.asked == 1 else
+                                     b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n")
+                    while time.monotonic() < until and not stop.wait(0.05):
+                        self.wfile.write(b"a")
+                except OSError:
+                    pass
+
+            def log_message(self, *_args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Drip)
+        server.asked = 0
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(stop.set)
+        self.assertEqual(self.press("entitlement", token=licence)[0], 200)
+        address, t0 = f"http://127.0.0.1:{server.server_port}/api/entitlement/renew", hub.now()
+        with self.ours(), patch.object(releases, "licence_endpoint", lambda channel: address), \
+                patch.object(releases, "_post", lambda url, token, body, _timeout: REAL_POST(url, token, body, 1)):
+            for n in range(3):
+                hub.licence_sweep(t0 + n * hub.LICENCE_POLL)
+                thread = hub._licence["thread"]
+                thread.join(5)
+                self.assertFalse(thread.is_alive(), f"poll {n + 1} did not end at its limit of 1 second")
+                self.assertEqual(server.asked, n + 1)
+        self.assertEqual(self.logged("%licence's poll%"),
+                         ["the licence's poll got no answer from the release channel: it did not answer whole in 1 "
+                          "seconds"])
+        self.assertEqual(hub.entitlement_token(), renewed)
 
     def test_a_poll_keeps_only_a_licence_that_our_key_signed_and_its_own_token_moves_only_renews(self):
         """3.10: the hub acts on a signature, never on a status. The token that the hub holds already changes only

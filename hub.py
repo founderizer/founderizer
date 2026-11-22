@@ -72001,7 +72001,8 @@ def teams_moved():
 def teams_features():
     """The names of the Teams parts that this hub serves now, for ui_features(): only while teams_on(), only a name
     that the seam wrote into TEAMS_PARTS (the part's code is loaded), and only while the part's own condition holds.
-    A condition that raises lists no name, and the read of the state goes on."""
+    A condition that raises lists no name, and the read of the state goes on: also one that raises SystemExit, which
+    is no Exception and would end the thread of the read. Only a KeyboardInterrupt goes on up, to stop the hub."""
     if not TEAMS_PARTS or not teams_on():
         return []
     names = []
@@ -72009,7 +72010,9 @@ def teams_features():
         try:
             if own is None or own():
                 names.append(name)
-        except Exception:               # a fault of a part must never break the state read of a fleet
+        except KeyboardInterrupt:
+            raise
+        except BaseException:           # a fault of a part must never break the state read of a fleet
             print_fault()
     return names
 

@@ -1159,10 +1159,12 @@ def sensitive(docs):
     return out
 
 
-def block_tree(text):
+def block_tree(text, strict=False):
     """A text that unread reads as block style, as the tree of mappings, lists and texts that it says, for sensitive:
     a value is the text of its line with no comment and no quotes, and a block scalar's value its lines. Each
-    document of the text is one item of the list that it gives."""
+    document of the text is one item of the list that it gives. strict: a key that one mapping holds twice is a
+    ValueError, as in no_key_twice, where this reader would take its last value and a cluster's reader may take
+    another or refuse the file (door.store_docs)."""
     def split(text):
         colon = re.search(r":(?=[ \t]|$)", text)
         return (text[:colon.start()].rstrip(" \t"), text[colon.end():].strip(" \t")) if colon else (None, text)
@@ -1217,6 +1219,8 @@ def block_tree(text):
         out = {}
         while i < len(rows) and rows[i][0] == col and rows[i][1] != "-":
             key, said = split(rows[i][1])
+            if strict and key in out:
+                raise ValueError("a key is there twice")
             lines, i = rows[i][2], i + 1
             if lines is not None:
                 out[key] = "\n".join(lines)

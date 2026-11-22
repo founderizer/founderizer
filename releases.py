@@ -49,15 +49,18 @@ import base64
 import contextlib
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -72,8 +75,9 @@ import urllib.request
 
 # Where a release comes from, and where the manifest is asked for. Both are defaults: the hub overrides them from
 # its own configuration (hub.releases region), because P7 settles the host of the channel and the address of the
-# published repository.
-DEFAULT_CHANNEL = "https://founderizer.com"
+# published repository. The channel is the platform: founderizer.com is the marketing site, and no program reads from
+# it (the owner, 21 November 2026).
+DEFAULT_CHANNEL = "https://platform.founderizer.com"
 DEFAULT_UPSTREAM = "https://github.com/founderizer/founderizer.git"
 REMOTE = "upstream"                 # PRODUCT.md 4.3: "every hub carries [it] as the git remote `upstream`"
 MOVED = "refs/founderizer/moved"    # where the clone keeps the ref's own tip when a push lost to it
@@ -572,6 +576,7 @@ CHANNEL_PATH = re.compile(r"(?:/[A-Za-z0-9._~-]+)*")
 # an answer that the hub's log keeps, and only one of these, so that no sender writes a word of its own there.
 ERROR_CODES = frozenset(("ended", "lapsed", "unbound", "no_licence", "unavailable", "too_many"))
 COUNT_MOST = 10000                               # the agents that one count may name, as a token's `agents`
+ANSWER_MOST = 65536                              # bytes of an answer that the poll reads; a token is far less
 
 
 def licence_endpoint(channel):
@@ -593,31 +598,128 @@ def licence_endpoint(channel):
     return urllib.parse.urlunsplit(("https", netloc, parts.path.rstrip("/") + LICENCE_PATH, "", ""))
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """A redirect is an answer, never a second request: the licence goes to the one address that licence_endpoint
-    checked."""
+def _loopback(host):
+    """True for a literal address of this machine's loopback (127.0.0.0/8, ::1): the one host that _post asks over
+    http, a test's stand-in of the channel. A name is no such address."""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except (TypeError, ValueError):
+        return False
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+
+def _connect(host, port, deadline, timeout):
+    """A socket connected to `host`: each address that the system's lookup gives, in its order, with a part of the time
+    that remains before `deadline` (a third of `timeout` at most, and the last address all that remains), and not each
+    address with the whole limit, as socket.create_connection gives it. So a host whose first address drops every
+    packet (IPv6 on many servers) is reached on its next one inside the limit, and N dead addresses do not last N
+    limits. The lookup itself is the system's own, with the system's limits. The OSError of the last address that
+    failed, or TimeoutError when no time remained. Its twin is teamspack.connect, for the package's GET: that module
+    imports no module of the hub, so the two are kept alike by hand."""
+    found = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    error = None
+    for n, (family, kind, proto, _name, where) in enumerate(found):
+        rest = deadline - time.monotonic()
+        if rest <= 0:
+            break
+        sock = None
+        try:                        # a family that the kernel does not have (IPv6 off) raises here: the next address
+            sock = socket.socket(family, kind, proto)
+            sock.settimeout(rest if n == len(found) - 1 else min(rest, timeout / 3))
+            sock.connect(where)
+        except OSError as e:
+            if sock is not None:
+                sock.close()
+            error = e
+            continue
+        sock.settimeout(timeout)
+        return sock
+    raise error or TimeoutError("timed out")
 
 
 def _post(url, token, body, timeout=CHANNEL_TIMEOUT):
-    """(status, text) of one POST of `body` as JSON, with the token as the bearer, following no redirect: a 3xx is
-    its own status. status 0 and the reason when no answer came."""
-    request = urllib.request.Request(url, data=json.dumps(body, separators=(",", ":")).encode(), method="POST",
-                                     headers={"Accept": "application/json", "Authorization": "Bearer " + token,
-                                              "Content-Type": "application/json", "User-Agent": "founderizer-hub"})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    """(status, text) of one POST of `body` as JSON, with the token as the bearer. status 0 and the reason when no
+    whole answer came: also a body that ends before its Content-Length ("IncompleteRead"), which is the start of an
+    answer and not an answer.
+
+    - **No proxy and no redirect.** http.client reads no proxy that the environment names and follows nothing, so the
+      licence goes only to the address that licence_endpoint checked. A 3xx is its own status.
+    - **`timeout` seconds for the whole call**: the connection, the TLS handshake, the request, the head and the body
+      together, and not only each read of the socket (its own timeout). The connection gives each address of the
+      host a part of the time that remains (_connect). From the connection on, a timer shuts the socket down at the
+      limit, and the body is read in pieces (`read1`) with the clock read before each one, so a channel that sends
+      one byte at a time holds the licence's poll no longer than that: until 22 November 2026 it held it for as long
+      as the channel sent, and hub.licence_sweep starts no poll while one runs. This code makes the TLS socket
+      itself, before its handshake, so that the timer reaches it. Only the lookup of the host's name is the system's
+      own, with the system's limits.
+    - At most ANSWER_MOST bytes of the body are read.
+    - **https**, with the certificate and the name checked, and http only to a literal loopback address (a test's
+      stand-in), so that the bearer never goes in clear over a network. licence_endpoint gives an https address
+      only."""
     try:
-        with opener.open(request, timeout=timeout) as answer:
-            return answer.status, answer.read(65536).decode("utf-8", "replace")
-    except urllib.error.HTTPError as answer:
-        with answer:
-            return answer.code, answer.read(65536).decode("utf-8", "replace")
-    except (http.client.HTTPException, ValueError) as e:     # a status line or a header that is not HTTP: its class
-        return 0, type(e).__name__                          # only, because its text is the server's own line
-    except (urllib.error.URLError, OSError) as e:           # this machine's reason: no route, no name, no TLS, time
-        return 0, str(getattr(e, "reason", e))[:300]
+        parts = urllib.parse.urlsplit(url)
+        host, port = parts.hostname, parts.port         # .port: ValueError for a port that is no number
+        if not (parts.scheme == "https" and host or parts.scheme == "http" and _loopback(host)):
+            return 0, "the licence's poll goes only over https, and over http only to this machine's loopback address"
+        if parts.scheme == "https":
+            context = ssl.create_default_context()
+            conn = http.client.HTTPSConnection(host, port or 443, timeout=timeout, context=context)
+        else:
+            context, conn = None, http.client.HTTPConnection(host, port or 80, timeout=timeout)
+        target = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+    except ValueError as e:
+        return 0, type(e).__name__
+    except OSError as e:            # this machine's certificates for TLS
+        return 0, str(e)[:300]
+    payload = json.dumps(body, separators=(",", ":")).encode()
+    headers = {"Accept": "application/json", "Authorization": "Bearer " + token,
+               "Content-Type": "application/json", "User-Agent": "founderizer-hub"}
+    ended, late = threading.Event(), f"it did not answer whole in {timeout:g} seconds"
+
+    def cut():
+        """The limit of the whole call: a read or a write that waits on the socket ends at once."""
+        ended.set()
+        sock = conn.sock
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                socket.socket.shutdown(sock, socket.SHUT_RDWR)
+    deadline = time.monotonic() + timeout
+    timer = threading.Timer(timeout, cut)
+    timer.daemon = True
+    timer.start()
+    try:
+        conn.sock = _connect(conn.host, conn.port, deadline, timeout)
+        if ended.is_set():          # the timer came at the end of the connection, when no socket was there to shut
+            return 0, late
+        if context is not None:
+            conn.sock = context.wrap_socket(conn.sock, server_hostname=host, do_handshake_on_connect=False)
+            if ended.is_set():      # the timer came while the socket changed hands: the handshake has no limit
+                return 0, late
+            conn.sock.do_handshake()
+        conn.request("POST", target, body=payload, headers=headers)
+        answer = conn.getresponse()
+        status, text = answer.status, b""
+        while len(text) < ANSWER_MOST:
+            if time.monotonic() >= deadline:
+                return 0, late
+            piece = answer.read1(ANSWER_MOST - len(text))       # what one receive brings
+            if not piece and answer.length:     # read1 gives b"" for a body that ends before its Content-Length
+                raise http.client.IncompleteRead(text, answer.length)
+            if not piece:
+                break
+            text += piece
+        if ended.is_set():          # the timer's cut reads as the end of the head or of the body: not a whole answer
+            return 0, late
+        return status, text.decode("utf-8", "replace")
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        if ended.is_set() or time.monotonic() >= deadline:      # the timer's cut, or a socket's own end at the limit
+            return 0, late
+        if isinstance(e, ssl.SSLError) or not isinstance(e, (http.client.HTTPException, ValueError)):
+            return 0, str(e)[:300]          # this machine's reason: no route, no name, no TLS, a certificate
+        return 0, type(e).__name__          # a status line or a header that is not HTTP, or a header that no request
+                                            # carries: its class only, because its text is the server's or the token's
+    finally:
+        timer.cancel()
+        conn.close()
 
 
 def renew(url, token, agents=None, *, timeout=CHANNEL_TIMEOUT):

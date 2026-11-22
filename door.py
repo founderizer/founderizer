@@ -17,7 +17,9 @@ through `door.py access`, and it refuses an address that two agents share, so th
 grant or pool. The hub has two rights of its own, each with its own secret: ask for a GitHub token (POST /github/token)
 for a grant that it names, which the door makes inside the agent's business pool or its own grants only, with the
 reading of what the door's App reaches (GET /github/reach) and the state of one App key (POST /github/key: its
-fingerprint and whether GitHub takes it, never the key) for the same secret, and read the record (GET /record).
+fingerprint and whether GitHub takes it, never the key) for the same secret, and read the record (GET /record). With
+the same secret it asks what one secret store in an agent's GitOps repository is (POST /store): fixed words and ids,
+never a text of the manifest.
 
 What it does. A call is a rule call (code passes it at once), the agent's own call (code does not list it as a rule,
 but the agent's grant covers it: it runs, and the agent answers for it), a call that the next mode allows (a host's
@@ -790,6 +792,137 @@ def window_refusal(access, host, window, t=None):
             return f"a {window} on {host} runs only inside its window ({', '.join('-'.join(s) for s in w['only'])} " \
                    f"UTC)"
     return None
+
+
+# ---------------------------------------------------------------- the store of a key for a cluster (POST /store)
+#
+# Before the hub asks the owner for a key that goes into a cluster's secret store, it asks the door what that store
+# is: the Vault area's design of 22 November 2026, "The door's stage B", section 3, piece D1. The agent names the file
+# of the store's manifest in its GitOps repository. The door checks the body's form and the agent's GitOps target
+# first, so a name that no target gives makes it read nothing of GitHub. Then it reads that one file at the head of
+# the target's branch, with its own readers of a manifest, and answers two fixed words and two lower-case UUIDs, or
+# one word of STORE_ERRORS. No text of the manifest goes into an answer, so no text of the repository reaches an
+# address that the owner's Mac calls, or a card.
+
+# The forms of the body and of the answer are the owner's Mac's own (app/Sources/FleetCore/StoreKeys.swift:
+# StoreForm.agent, .repo, .path, .kubernetes, .kinds, .provider, .regions, and StoreUUID.valid), so that the hub, the
+# Mac and the door take the same fields. A test reads that file and holds the two sides equal.
+STORE_FIELDS = ("agent", "repo", "path", "store_kind", "store", "namespace")
+STORE_KINDS = ("ClusterSecretStore", "SecretStore")                     # StoreForm.kinds
+STORE_PROVIDER = "bitwardensecretsmanager"      # StoreForm.provider: the operator's own name of the provider, too
+STORE_AGENT = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")                     # StoreForm.agent
+STORE_PATH = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\.(?:yaml|yml|json)")    # StoreForm.path,
+STORE_PATH_MOST = 200       # with no ".." in it and this many characters at most
+KUBE_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")         # StoreForm.kubernetes: a store, a namespace
+STORE_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")     # StoreUUID.valid
+STORE_ERRORS = ("no_target", "no_file", "not_one", "rendered", "other_provider", "not_own_address", "no_namespace")
+# Bitwarden's own two clouds, (apiURL, identityURL) by the region (StoreForm.regions)
+BITWARDEN = {"us": ("https://api.bitwarden.com", "https://identity.bitwarden.com"),
+             "eu": ("https://api.bitwarden.eu", "https://identity.bitwarden.eu")}
+FOLDER_MARKS = ("Chart.yaml",) + door_render.KUSTOMIZATIONS     # a folder whose files Helm or Kustomize make objects of
+GITHUB_LISTED = 1000        # entries of one folder that GitHub's contents API lists, at most
+# YAML's null, which the block reader gives as its text, and JSON's. A quoted "null" (and a JSON text "null") reads as
+# null too: a cluster refuses a store with a text in the place of its conditions, so it makes no store that serves more.
+YAML_NULL = (None, "null", "Null", "NULL", "~")
+
+
+def store_form(data):
+    """The six fields of a POST /store body, each in its form, or Refused. The hub checks the same form before it
+    asks, so this refusal is a fault of the hub's, and no word of STORE_ERRORS."""
+    if set(data) != set(STORE_FIELDS):
+        raise Refused("the body is {agent, repo, path, store_kind, store, namespace}, and nothing else")
+    agent, repo, path, kind, store, namespace = (data[k] for k in STORE_FIELDS)
+    # door_targets.REPO is StoreForm.repo
+    for field, value, pattern in (("agent", agent, STORE_AGENT), ("repo", repo, door_targets.REPO),
+                                  ("path", path, STORE_PATH), ("store", store, KUBE_NAME),
+                                  ("namespace", namespace, KUBE_NAME)):
+        if not isinstance(value, str) or not pattern.fullmatch(value):
+            raise Refused(f"{field} is not in its form")
+    if len(path) > STORE_PATH_MOST or ".." in path:
+        raise Refused(f"path is a file of the repository: at most {STORE_PATH_MOST} characters, with no ..")
+    if kind not in STORE_KINDS:
+        raise Refused("store_kind is ClusterSecretStore or SecretStore")
+    return agent, repo, path, kind, store, namespace
+
+
+# The operator's own versions of a store: an apiVersion with no version ("external-secrets.io") or another one makes no
+# object of the cluster, and a decoy of that form must never name a project (the review of 22 November 2026)
+STORE_VERSIONS = ("external-secrets.io/v1", "external-secrets.io/v1beta1")
+# A document mark or an end mark with space before it: the block reader skips such a line, and YAML reads it as text
+INDENTED_MARK = re.compile(r"^[ \t]+(?:---|\.\.\.)", re.M)       # also before a "#", a CR, or more text
+
+
+def store_docs(path, data):
+    """The documents of a store's file as the door's own readers of a manifest read them, or None for a file that
+    none of them reads: a YAML file that is not block style (door_targets.unread: no anchor, alias, merge key, tag,
+    flow mapping or template), one whose stream a cluster's readers do not all split alike (door_render.split_docs),
+    one document that the block reader reads as more than one, a key twice in one mapping (YAML's readers differ on
+    which value counts), and a JSON file that is not JSON with each key once. The block reader reads one document at a
+    time, because it reads no document mark: two documents of one text would come back as one mapping."""
+    text, why = door_targets.manifest_text(path, data)
+    if why or INDENTED_MARK.search(text):
+        return None
+    if path.endswith(".json"):
+        return [json.loads(data.decode("utf-8"), object_pairs_hook=door_targets.no_key_twice)]
+    try:
+        docs = [door_targets.block_tree(part, strict=True) for part in door_render.split_docs(text)]
+    except (door_render.Failed, RecursionError, ValueError):
+        return None
+    return [doc[0] for doc in docs] if all(len(doc) == 1 for doc in docs) else None
+
+
+def store_items(value):
+    """A list of a store's manifest as a list, or None: a list as it is, and a flow sequence of plain or quoted values
+    on one line ([a, "b"]), which the block reader gives as one text, as its values. A quoted text that looks like
+    such a sequence reads as one too: a cluster refuses a store with such a text in the place of a list, so it makes
+    no store that serves more than its manifest says."""
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, str) or not door_targets.FLOW_LIST.fullmatch(value):
+        return None
+    items = [m.group() for m in re.finditer(door_targets.FLOW_ONE, value[1:-1])]
+    return [x[1:-1] if len(x) >= 2 and x[0] == x[-1] and x[0] in "\"'" else x for x in items]
+
+
+def store_answer(docs, kind, store, namespace):
+    """The door's answer for one store in the documents of its file: {provider, region, organization, project}, or
+    {error: <word>}. Only an object of the operator's own group (external-secrets.io) of that kind and name is the
+    store. A namespace is served when a condition of a ClusterSecretStore names it in its namespaces, or when it has
+    none (the operator's own rule); a SecretStore serves only the namespace of its manifest. A condition by labels or
+    by a pattern is no answer that the door can read, so only its namespaces count. A document with an items key
+    is rendered: kubectl and Argo CD apply any such document as a list of its items, whatever its kind, and an item
+    with no kind takes the list's kind."""
+    if any(isinstance(doc, dict) and any(str(key).lower() == "items" for key in doc) for doc in docs):
+        return {"error": "rendered"}
+    found = [o for o in door_targets.objects_in(docs) if o["kind"] == kind
+             and o["apiVersion"] in STORE_VERSIONS
+             and isinstance(o.get("metadata"), dict) and o["metadata"].get("name") == store]
+    if len(found) != 1:
+        return {"error": "not_one"}
+    spec = found[0].get("spec") if isinstance(found[0].get("spec"), dict) else {}
+    provider = spec.get("provider")
+    # the operator takes one provider in a store: one more beside Bitwarden is a store that Founderizer does not know
+    bitwarden = provider.get(STORE_PROVIDER) if isinstance(provider, dict) and len(provider) == 1 else None
+    if not isinstance(bitwarden, dict):
+        return {"error": "other_provider"}
+    organization, project = bitwarden.get("organizationID"), bitwarden.get("projectID")
+    if not all(isinstance(v, str) and STORE_UUID.fullmatch(v) for v in (organization, project)):
+        return {"error": "other_provider"}
+    pair = (bitwarden.get("apiURL"), bitwarden.get("identityURL"))
+    region = next((name for name, own in BITWARDEN.items() if pair == own), None)
+    if region is None:
+        return {"error": "not_own_address"}
+    if kind == "SecretStore":
+        served = found[0]["metadata"].get("namespace") == namespace
+    elif spec.get("conditions") in YAML_NULL:
+        served = True
+    else:
+        conditions = store_items(spec["conditions"])
+        served = conditions == [] or any(isinstance(c, dict) and namespace in (store_items(c.get("namespaces")) or [])
+                                         for c in conditions or [])
+    if not served:
+        return {"error": "no_namespace"}
+    return {"provider": STORE_PROVIDER, "region": region, "organization": organization, "project": project}
 
 
 # ---------------------------------------------------------------- the record
@@ -1816,6 +1949,41 @@ class Door:
         where = f"organizations/{login}/settings" if owner.get("type") == "Organization" else "settings"
         return dict(out, signs=True, owner=login, page=f"https://github.com/{where}/apps/{slug}")
 
+    def store_facts(self, data):
+        """POST /store: what one store of an agent's GitOps repository is, for the hub's request of a key for it.
+        (200, {provider, region, organization, project}) or (422, {error: <a word of STORE_ERRORS>}); Refused for a
+        body that is not in its form, and Stop when GitHub does not answer. The form and the agent's GitOps target are
+        checked before any read of GitHub. The file is read at the head of the branch that the door commits to for
+        that target (its own branch, else the repository's default one), and each read names that one commit."""
+        agent, repo, path, kind, store, namespace = store_form(data)
+        access = self.access()
+        me = (access.get("agents") or {}).get(agent)
+        never = {r.lower() for r in (access.get("never") or {}).get("repos") or [] if isinstance(r, str)}
+        entry = door_targets.repo_entry(me, repo, ("gitops",)) if isinstance(me, dict) else None
+        if entry is None or door_targets.vendor(repo) or repo.lower() in never:
+            return 422, {"error": "no_target"}
+        if door_targets.gitops_path_refused(path, access):         # a secret path, or one of the exposure register
+            return 422, {"error": "no_file"}
+        hub = GitHub(self, access, repo)
+        try:
+            branch = entry["branch"] if isinstance(entry.get("branch"), str) and entry["branch"] else hub.branch()
+            ref = hub.head(branch)          # one commit for each read below: a push between them changes none
+            raw = hub.file_at_head(path, ref, sure=True)
+            if raw is None:
+                hub.listing("", ref)        # GitHub's 404 for the whole repository at that commit is no missing file
+                return 422, {"error": "no_file"}
+            if hub.folder_mark(path, ref):
+                return 422, {"error": "rendered"}
+        except Refused as e:            # the door has no App of the repository's owner
+            raise door_providers.Stop(str(e)) from None
+        except (KeyError, TypeError, ValueError):
+            raise door_providers.Stop(f"GitHub gave an answer about {repo} that the door cannot read") from None
+        docs = store_docs(path, raw)
+        if docs is None:
+            return 422, {"error": "rendered"}
+        answer = store_answer(docs, kind, store, namespace)
+        return 422 if "error" in answer else 200, answer
+
     def github_reach(self):
         """What the door's GitHub Apps reach, for the hub's marks of "What the App reaches" once the hub holds no App
         key (DevOps plan 13, item 4): each installation's settings page, built here from its account and its id and
@@ -1906,12 +2074,60 @@ class GitHub:
             None if body is None else json.dumps(body).encode())
         return status, answer
 
-    def file_at_head(self, path, branch=None):
+    def file_at_head(self, path, branch=None, sure=False):
+        """The bytes of one file at the head of a branch (the default one when none is named), or None. sure: only
+        GitHub's 404 and a path that holds no file's own bytes (a folder, a symlink, a file of over 1 MB) are None,
+        and each other answer is Stop, so that a GitHub that does not answer is no missing file."""
         ref = urllib.parse.quote(branch or self.branch(), safe="")
         status, answer = self.call("GET", f"/repos/{self.repo}/contents/{urllib.parse.quote(path)}?ref={ref}")
+        if sure and status != 404 and (status != 200 or not isinstance(answer, (dict, list))):
+            raise door_providers.Stop(f"GitHub answered {status} for {path} of {self.repo}")
+        if sure and isinstance(answer, dict) and (answer.get("type") != "file" or answer.get("path") != path):
+            return None             # a symlink: the contents API answers with the file that it points to
         if status != 200 or not isinstance(answer, dict) or answer.get("encoding") != "base64":
             return None
         return base64.b64decode(answer["content"])
+
+    def head(self, branch):
+        """The commit at the head of a branch. A branch that GitHub does not give (none of that name, or a repository
+        that the door's token does not reach) is Stop, and no missing file."""
+        status, got = self.call("GET", f"/repos/{self.repo}/git/ref/heads/{urllib.parse.quote(branch)}")
+        found = got.get("object") if status == 200 and isinstance(got, dict) else None
+        sha = found.get("sha") if isinstance(found, dict) else None
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+            raise door_providers.Stop(f"GitHub gave no head of {branch} in {self.repo} ({status})")
+        return sha
+
+    def listing(self, folder, ref):
+        "The entries of one folder at ref (the top of the repository for \"\"), as GitHub's contents API lists them."
+        where = f"/repos/{self.repo}/contents" + (f"/{urllib.parse.quote(folder)}" if folder else "")
+        status, listing = self.call("GET", f"{where}?ref={urllib.parse.quote(ref, safe='')}")
+        if status != 200 or not isinstance(listing, list):
+            raise door_providers.Stop(f"GitHub answered {status} for the folder {folder or '/'} of {self.repo}")
+        return listing
+
+    def folder_mark(self, path, ref):
+        """The first name of FOLDER_MARKS (a chart's Chart.yaml, a kustomization) that a folder above this path holds
+        at the head of ref: its own folder, each one above it, and the top of the repository. Or None. Each folder
+        is one listing of its names, and no file's text is read. GitHub lists 1000 entries of a folder at most: in a
+        folder of that many, each name of FOLDER_MARKS is asked alone."""
+        parts, at = path.split("/")[:-1], urllib.parse.quote(ref, safe="")
+        for n in range(len(parts), -1, -1):
+            folder = "/".join(parts[:n])
+            listing = self.listing(folder, ref)
+            names = {e.get("name") for e in listing if isinstance(e, dict)}
+            if len(listing) >= GITHUB_LISTED:
+                names = set()
+                for mark in FOLDER_MARKS:
+                    name = f"{folder}/{mark}" if folder else mark
+                    status, _ = self.call("GET", f"/repos/{self.repo}/contents/{urllib.parse.quote(name)}?ref={at}")
+                    if status not in (200, 404):
+                        raise door_providers.Stop(f"GitHub answered {status} for {name} of {self.repo}")
+                    names |= {mark} if status == 200 else set()
+            found = next((mark for mark in FOLDER_MARKS if mark in names), None)
+            if found:
+                return found
+        return None
 
     def read(self, path, access):
         """A read at HEAD of the GitOps repository, through the filter: no Secret object leaves the door."""
@@ -2527,6 +2743,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.answer(403, {"error": str(e)})
             except door_providers.Stop as e:
                 return self.answer(502, {"error": str(e)})
+        if self.path == "/store":
+            if not self.door.hub_allowed(self.source(), self.bearer(), "token_sha256"):
+                return self.answer(403, {"error": "what a store is, is the hub's to ask, with its token secret"})
+            try:
+                status, answer = self.door.store_facts(data)
+            except Refused as e:
+                return self.answer(400, {"error": str(e)})
+            except door_providers.Stop as e:
+                return self.answer(502, {"error": str(e)})
+            return self.answer(status, answer)
         self.answer(404, {"error": "no such route"})
 
 

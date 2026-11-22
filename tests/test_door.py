@@ -121,7 +121,7 @@ def load_tests(loader, _tests, _pattern):
                                                     WorkKeys,
                                                     Workflows, RunnerNew, Probe, CallerGone, Rendered, RenderPath,
                                                     GeneratedFiles, GeneratedPath, OwnerFiles, OwnerPath,
-                                                    SecretReferences, SecretReferencePath,
+                                                    SecretReferences, SecretReferencePath, StoreFacts,
                                                     YamlTags, RenderBoxUnit, RenderBoxLive)
                               for name in cls.__dict__ if name.startswith("test_"))
 
@@ -8552,6 +8552,327 @@ class SecretReferencePath(SignedRenderDoor):
         self.assertEqual(paths, [API_PATH])
         got = self.call(ONE, GITOPS, "push", content=content)          # the owner's yes was used once
         self.assertEqual((got["ok"], got["route"]), (False, "yes"), got)
+
+
+BW_PATH = "platform/external-secrets/clustersecretstore.yaml"
+BW_ORG, BW_PROJECT = "1a2b3c4d-2222-4333-8444-5e5e5e5e5e5e", "66666666-7777-4888-9999-aaaaaaaaaaaa"
+BW_US = "      apiURL: https://api.bitwarden.com\n      identityURL: https://identity.bitwarden.com\n"
+BW_STORE = f"""# The cluster's one store: Bitwarden Secrets Manager, through the SDK server in the cluster.
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: bitwarden-example
+spec:
+  conditions:
+    - namespaces:
+        - shop
+        - shop-jobs
+        - browsers
+  provider:
+    bitwardensecretsmanager:
+{BW_US}      bitwardenServerSDKURL: https://bitwarden-sdk-server.external-secrets.svc.cluster.local:9998
+      caProvider:
+        type: Secret
+        name: bitwarden-tls-certs
+        namespace: external-secrets
+        key: ca.crt
+      organizationID: {BW_ORG}
+      projectID: {BW_PROJECT}
+      auth:
+        secretRef:
+          credentials:
+            name: bitwarden-access-token
+            namespace: external-secrets
+            key: token
+"""
+BW_FACTS = {"provider": "bitwardensecretsmanager", "region": "us", "organization": BW_ORG, "project": BW_PROJECT}
+
+
+class StoreFacts(Served):
+    """POST /store, piece D1 of stage B (the Vault area's design of 22 November 2026, section 3): what one secret
+    store in an agent's GitOps repository is, read by the door at the head of the target's branch, in two fixed words
+    and two ids, or one word of door.STORE_ERRORS."""
+    API = "https://api.github.com"
+
+    def setUp(self):
+        super().setUp()
+        with patch("sys.stdout", io.StringIO()) as out:
+            door.cmd_hub_secrets(None)
+        self.secrets = json.loads(out.getvalue())
+        github_stubs(self)
+        self.files({BW_PATH: BW_STORE})
+
+    @staticmethod
+    def head(branch="master"):
+        return hashlib.sha1(branch.encode()).hexdigest()
+
+    def url(self, path, branch="master"):
+        "The contents API's address of a path of one-org/cluster (the top for \"\") at the head of a branch."
+        return f"{self.API}/repos/one-org/cluster/contents{'/' if path else ''}{path}?ref={self.head(branch)}"
+
+    def files(self, files, ref="master"):
+        """one-org/cluster at the head of the branch ref, as GitHub answers: the branch's commit, and at that commit
+        each file and each folder's names."""
+        self.answers[("GET", f"{self.API}/repos/one-org/cluster/git/ref/heads/{ref}")] = (
+            200, {"object": {"sha": self.head(ref)}})
+        folders = {}
+        for path in files:
+            parts = path.split("/")
+            for n in range(len(parts)):
+                folders.setdefault("/".join(parts[:n]), set()).add(parts[n])
+        for folder, names in folders.items():
+            self.answers[("GET", self.url(folder, ref))] = (200, [{"name": n} for n in names])
+        for path, text in files.items():
+            content = base64.b64encode(text.encode()).decode()
+            self.answers[("GET", self.url(path, ref))] = (
+                200, {"type": "file", "path": path, "encoding": "base64", "content": content})
+
+    def body(self, **fields):
+        return dict({"agent": "ops-one", "repo": "one-org/cluster", "path": BW_PATH, "store_kind": "ClusterSecretStore",
+                     "store": "bitwarden-example", "namespace": "shop"}, **fields)
+
+    def ask(self, text=None, **fields):
+        "The door's answer for the store file with this text (or the one of the stand-in), and these fields."
+        if text is not None:
+            self.files({BW_PATH: text})
+        return self.door.store_facts(self.body(**fields))
+
+    def post(self, body, token, source=HUB):
+        return HubRights.post(self, "/store", body, token, source)
+
+    def test_only_the_hub_with_its_token_secret_asks(self):
+        """An agent's machine, and the hub with the secret of the record, get 403 and make the door read nothing of
+        GitHub; the hub with its token secret gets the store's facts. A route without the hub's check would let any
+        caller of the private network make the door read an agent's GitOps repository."""
+        self.assertEqual(self.post(self.body(), self.secrets["token"], source=ONE)[0], 403)
+        self.assertEqual(self.post(self.body(), self.secrets["record"])[0], 403)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.post(self.body(), self.secrets["token"]), (200, BW_FACTS))
+
+    def test_a_wrong_form_or_no_gitops_target_reads_nothing_of_github(self):
+        """The form and the GitOps target come before any read: a body with a field more (a project that the agent
+        names), one less, or one out of its form is 400; an agent with no GitOps target for the repository is
+        no_target, and a secret path or one of the exposure register is no_file. A check after the first read of
+        GitHub would make the door read a repository for a stranger's name."""
+        data = json.loads(json.dumps(ACCESS))
+        data["agents"]["ops-one"]["repos"].update({"one-org/website": {"kind": "gitops"},       # on the never list
+                                                   "founderizer/founderizer": {"kind": "gitops"}})
+        self.write_access(data)
+        less = self.body()
+        del less["namespace"]
+        self.assertEqual(self.post(less, self.secrets["token"])[0], 400)
+        for wrong in ({"project": BW_PROJECT}, {"path": "../store.yaml"}, {"path": "platform/a..b.yaml"},
+                      {"path": "/store.yaml"}, {"path": "store.txt"}, {"path": "a/" * 99 + "s.yaml"},
+                      {"store_kind": "Store"}, {"store": "Bitwarden"}, {"store": "bitwarden.example"},
+                      {"namespace": "shop/web"}, {"agent": "Ops-One"}, {"repo": "one-org"}, {"namespace": 7}):
+            with self.subTest(wrong=wrong), self.assertRaises(door.Refused):
+                self.ask(**wrong)
+        for no in ({"agent": "ops-two"}, {"agent": "nobody"}, {"repo": "one-org/shop"}, {"repo": "one-org/website"},
+                   {"repo": "founderizer/founderizer"}):
+            with self.subTest(no=no):
+                self.assertEqual(self.ask(**no), (422, {"error": "no_target"}))
+        for path in ("platform/Secrets/store.yaml", "apps/legacy/store.yaml"):
+            self.assertEqual(self.ask(path=path), (422, {"error": "no_file"}))
+        self.assertEqual(self.calls, [])
+
+    def test_the_store_of_the_first_case_gives_two_words_and_two_ids(self):
+        """A ClusterSecretStore shaped like the first real case (a plain manifest, Bitwarden's US pair, three namespaces
+        in its conditions, the SDK server, a CA and the token's Secret) answers exactly provider, region, organization
+        and project, for each namespace that it serves; so do its JSON copy and its file with a second document. An
+        answer with a field of the manifest (an address, the SDK server, the token's Secret) would bring the
+        repository's text to the hub, and from there to an address that the owner's Mac calls. The block reader
+        alone reads two documents as one mapping, and the second one's kind and name would hide the store."""
+        for namespace in ("shop", "shop-jobs", "browsers"):
+            self.assertEqual(self.ask(namespace=namespace), (200, BW_FACTS))
+        store = door.store_docs(BW_PATH, BW_STORE.encode())[0]
+        self.files({"platform/store.json": json.dumps(store)})
+        self.assertEqual(self.ask(path="platform/store.json"), (200, BW_FACTS))
+        store["spec"]["provider"]["bitwardensecretsmanager"]["projectID"] += " #x"     # in JSON, no comment
+        self.files({"platform/store.json": json.dumps(store)})
+        self.assertEqual(self.ask(path="platform/store.json"), (422, {"error": "other_provider"}))
+        status, got = self.ask(BW_STORE.replace("        - browsers\n", "") + "---\napiVersion: v1\nkind: ConfigMap\n"
+                               "metadata:\n  name: other\n")
+        self.assertEqual((status, got), (200, BW_FACTS))
+        self.assertEqual(sorted(got), ["organization", "project", "provider", "region"])
+
+    def test_the_file_is_read_at_the_head_of_the_target_s_branch(self):
+        """A GitOps target that names its branch: the door reads the store at that branch's head, the branch that its
+        commits go to, and each read (the file, each folder's names) names that head's one commit. A read of the
+        default branch would answer for a store that the cluster of the target does not apply; reads by the branch's
+        name could each see another push."""
+        data = json.loads(json.dumps(ACCESS))
+        data["agents"]["ops-one"]["repos"]["one-org/cluster"]["branch"] = "live"
+        self.write_access(data)
+        self.files({BW_PATH: BW_STORE.replace(BW_PROJECT, "77777777-7777-4777-8777-777777777777")}, ref="live")
+        self.assertEqual(self.ask()[1]["project"], "77777777-7777-4777-8777-777777777777")
+        self.assertFalse([u for _m, u, _b in self.calls if "master" in u or u.endswith("/one-org/cluster")])
+        # each read names the branch's one commit, so a push between two reads changes none of them
+        reads = [u for _m, u, _b in self.calls if "/contents" in u]
+        self.assertEqual(len(reads), 4)
+        self.assertTrue(all(u.endswith("?ref=" + self.head("live")) for u in reads), reads)
+
+    def test_only_bitwarden_s_own_pairs_give_a_region(self):
+        """The US pair is us and the EU pair eu. Each other pair is not_own_address: the two clouds crossed, a slash at
+        the end, a server of its own, an address left out. A check of one address alone, or of a prefix, would let the
+        owner's Mac write a key into a Bitwarden cloud that the store does not read."""
+        eu = "      apiURL: https://api.bitwarden.eu\n      identityURL: https://identity.bitwarden.eu\n"
+        self.assertEqual(self.ask(BW_STORE.replace(BW_US, eu)), (200, dict(BW_FACTS, region="eu")))
+        for pair in ("      apiURL: https://api.bitwarden.com\n      identityURL: https://identity.bitwarden.eu\n",
+                     "      apiURL: https://api.bitwarden.com/\n      identityURL: https://identity.bitwarden.com\n",
+                     "      apiURL: https://api.bitwarden.com.example\n"
+                     "      identityURL: https://identity.bitwarden.com\n",
+                     "      apiURL: https://vault.example/api\n      identityURL: https://vault.example/identity\n",
+                     "      identityURL: https://identity.bitwarden.com\n", ""):
+            with self.subTest(pair=pair):
+                self.assertEqual(self.ask(BW_STORE.replace(BW_US, pair)), (422, {"error": "not_own_address"}))
+
+    def test_each_error_word_alone(self):
+        """No file, not exactly one store of that kind and name, another provider (also beside Bitwarden), an id that
+        is no lower-case UUID, a namespace that the store does not serve: each is its word, and the answer holds that
+        word alone. A store that the door counts wrong, or an id with a text of the manifest, reaches the card. YAML's
+        null as the conditions serves each namespace, as no conditions do: the block reader gives it as a text."""
+        aws = "    aws:\n      service: SecretsManager\n      region: eu-central-1\n"
+        link = dict(self.answers[("GET", self.url(BW_PATH))][1], type="symlink", path="platform/link.yaml")
+        self.answers[("GET", self.url("platform/link.yaml"))] = (200, link)       # a symlink, with its own path
+        for path in ("platform/other.yaml", "platform/./other.yaml"):          # one that GitHub reads as BW_PATH
+            self.answers[("GET", self.url(path))] = self.answers[("GET", self.url(BW_PATH))]
+        cases = [("no_file", {"path": path}, None) for path in ("platform/none.yaml", "platform/link.yaml",
+                                                                "platform/other.yaml", "platform/./other.yaml")]
+        cases += [
+            ("not_one", {"store": "another"}, BW_STORE),
+            ("not_one", {}, BW_STORE + "---\n" + BW_STORE),
+            ("not_one", {"store_kind": "SecretStore"}, BW_STORE),
+            ("not_one", {}, BW_STORE.replace("external-secrets.io/v1", "stores.example/v1")),
+            # the group with no version, or another version, makes no store of the cluster: a decoy names no project
+            ("not_one", {}, BW_STORE.replace("external-secrets.io/v1", "external-secrets.io")),
+            ("not_one", {}, BW_STORE.replace("external-secrets.io/v1", "external-secrets.io/v9")),
+            ("other_provider", {}, BW_STORE.replace("    bitwardensecretsmanager:\n",
+                                                    aws + "    bitwardensecretsmanager:\n")),
+            ("other_provider", {}, BW_STORE.replace("    bitwardensecretsmanager:\n", "    aws:\n")),
+            ("other_provider", {}, BW_STORE.replace(BW_ORG, BW_ORG.upper())),
+            ("other_provider", {}, BW_STORE.replace(BW_PROJECT, "project-of-the-shop")),
+            ("no_namespace", {"namespace": "web"}, BW_STORE),
+            ("no_namespace", {"namespace": "web"}, BW_STORE.replace(
+                "    - namespaces:\n", "    - namespaceSelector:\n        matchLabels:\n          team: web\n"
+                "      namespaces:\n")),
+            ("no_namespace", {"store_kind": "SecretStore"}, BW_STORE.replace(
+                "kind: ClusterSecretStore\nmetadata:\n", "kind: SecretStore\nmetadata:\n  namespace: web\n")),
+            ("no_namespace", {"store_kind": "SecretStore"}, BW_STORE.replace("kind: Cluster", "kind: "))]
+        for word, fields, text in cases:
+            with self.subTest(word=word, fields=fields):
+                self.assertEqual(self.ask(text, **fields), (422, {"error": word}))
+        # served: a ClusterSecretStore with no conditions, a condition's flow list, a SecretStore's own namespace
+        conditions = "  conditions:\n    - namespaces:\n        - shop\n        - shop-jobs\n        - browsers\n"
+        for kind, text in (("ClusterSecretStore", BW_STORE.replace(conditions, "")),
+                           ("ClusterSecretStore", BW_STORE.replace(conditions, "  conditions: []\n")),
+                           *(("ClusterSecretStore", BW_STORE.replace(conditions, f"  conditions: {null}\n"))
+                             for null in ("null", "~", "Null", "NULL")),
+                           ("ClusterSecretStore", BW_STORE.replace(
+                               "    - namespaces:\n", "    - namespaces: [x, 'web']\n    - namespaces:\n")),
+                           ("SecretStore", BW_STORE.replace("kind: ClusterSecretStore\nmetadata:\n",
+                                                            "kind: SecretStore\nmetadata:\n  namespace: web\n"))):
+            with self.subTest(kind=kind, text=text[:300]):
+                self.assertEqual(self.ask(text, namespace="web", store_kind=kind), (200, BW_FACTS))
+
+    def test_a_file_that_helm_or_kustomize_renders_is_rendered(self):
+        """A store file in a chart's folder (Chart.yaml in its folder or one above it, up to the top) or a Kustomize
+        folder (kustomization.yaml, kustomization.yml, Kustomization) is rendered, also where GitHub lists the folder
+        only in part; a chart beside it is not. A file that no reader of the door reads (an anchor, a tag, a flow
+        mapping, a template, a line that ends a document, a key twice, in YAML or JSON) is rendered too, and so is a
+        document with an items key, which kubectl and Argo CD apply as a list of its items, whatever its kind.
+        Kustomize can patch the project of a plain file, so a reading of its text would name a project that the
+        cluster's store does not read; the block reader alone takes a key's last value, where a cluster's reader may
+        take another."""
+        for mark in ("platform/external-secrets/Chart.yaml", "platform/Chart.yaml", "Chart.yaml",
+                     "platform/kustomization.yaml", "platform/external-secrets/kustomization.yml", "Kustomization"):
+            github_stubs(self)
+            self.files({BW_PATH: BW_STORE, mark: "x: 1\n"})
+            with self.subTest(mark=mark):
+                self.assertEqual(self.ask(), (422, {"error": "rendered"}))
+        github_stubs(self)
+        self.files({BW_PATH: BW_STORE, "platform/other/Chart.yaml": "x: 1\n", "platform/kustomization.json": "{}"})
+        self.assertEqual(self.ask(), (200, BW_FACTS))
+        self.answers[("GET", self.url("platform"))] = (200, [{"name": f"f{n}.yaml"} for n in range(1000)])
+        self.answers[("GET", self.url("platform/Chart.yaml"))] = (200, {})
+        self.assertEqual(self.ask(), (422, {"error": "rendered"}))
+        github_stubs(self)
+        for text in (BW_STORE.replace("name: bitwarden-example", "name: &store bitwarden-example"),
+                     BW_STORE.replace(f"projectID: {BW_PROJECT}", f"projectID: !!str {BW_PROJECT}"),
+                     BW_STORE.replace("  name: bitwarden-example\n", "  {name: bitwarden-example}\n"),
+                     BW_STORE.replace(f"projectID: {BW_PROJECT}", "projectID: {{ .Values.project }}"),
+                     BW_STORE + "...\n", "  spec: {}\n" + BW_STORE,
+                     BW_STORE.replace(f"      projectID: {BW_PROJECT}\n",
+                                      f"      projectID: {BW_ORG}\n      projectID: {BW_PROJECT}\n"),
+                     "apiVersion: v1\nkind: List\nitems:\n  - kind: ClusterSecretStore\n",
+                     BW_STORE + "Items: []\n",
+                     # a mark with space before it, which the block reader skips and YAML reads as a text
+                     BW_STORE.replace("  name: bitwarden-example\n", "  name: bitwarden-example\n  ---\n"),
+                     BW_STORE.replace("kind: ClusterSecretStore\n", "kind: ClusterSecretStore\n  ...\n"),
+                     BW_STORE.replace("kind: ClusterSecretStore\n", "kind: ClusterSecretStore\n  ---#x\n"),
+                     BW_STORE.replace("\n", "\r\n").replace("kind: ClusterSecretStore\r\n",
+                                                             "kind: ClusterSecretStore\r\n  ...\r\n")):
+            with self.subTest(text=text[-200:]):
+                self.assertEqual(self.ask(text), (422, {"error": "rendered"}))
+        self.files({"platform/store.json": '{"kind": "ClusterSecretStore", "kind": "Secret"}'})
+        self.assertEqual(self.ask(path="platform/store.json"), (422, {"error": "rendered"}))
+
+    def test_a_github_that_does_not_answer_is_no_missing_file(self):
+        """GitHub's 500 for the file or for a folder above it is 502, with no word of the list, so that the hub says
+        that the door does not answer and the agent asks again; so is a 404 that is not of the file alone: of the whole
+        repository at the commit, of a target's branch that GitHub does not have, of a repository that the door's App
+        does not reach while it holds a token of the same owner. With the plain reader, which gives no file for each
+        answer that is not 200, the agent would read that its path names no file."""
+        self.answers[("GET", self.url(BW_PATH))] = (500, {})
+        status, got = self.post(self.body(), self.secrets["token"])
+        self.assertEqual(status, 502, got)
+        self.assertNotIn(got["error"], door.STORE_ERRORS)
+        self.files({BW_PATH: BW_STORE})
+        self.answers[("GET", self.url("platform"))] = (500, {})
+        self.assertEqual(self.post(self.body(), self.secrets["token"])[0], 502)
+        self.files({BW_PATH: BW_STORE})
+        self.answers[("GET", self.url(""))] = (404, {})         # a 404 of the whole repository at that commit
+        self.assertEqual(self.post(self.body(path="platform/none.yaml"), self.secrets["token"])[0], 502)
+        data = json.loads(json.dumps(ACCESS))
+        data["agents"]["ops-one"]["repos"]["one-org/cluster"]["branch"] = "gone"     # GitHub has no such branch
+        data["agents"]["ops-one"]["repos"]["one-org/hidden"] = {"kind": "gitops", "branch": "main"}    # not reached
+        self.write_access(data)
+        for body in (self.body(path="platform/none.yaml"), self.body(repo="one-org/hidden", path="platform/none.yaml")):
+            self.assertEqual(self.post(body, self.secrets["token"])[0], 502)
+        data = json.loads(json.dumps(ACCESS))               # a target of an owner for whom the door has no App
+        data["agents"]["ops-one"]["repos"]["other-org/cluster"] = {"kind": "gitops"}
+        self.write_access(data)
+        self.assertEqual(self.post(self.body(repo="other-org/cluster"), self.secrets["token"])[0], 502)
+
+    def test_the_forms_are_the_mac_s(self):
+        """The forms of the body and of the answer are the owner's Mac's own (StoreForm and StoreUUID in
+        app/Sources/FleetCore/StoreKeys.swift), which the hub's form follows too. Bug: the door refuses a store or a
+        path that the Mac and the hub take, or answers a word or an id that the Mac's NeedSecret.store refuses, so the
+        owner gets no card for a store that the door read."""
+        import pathlib
+        app = pathlib.Path(door.__file__).parent / "app"
+        if not app.is_dir():
+            self.skipTest("the apps' folder app/ is not in this tree (the published repository has none)")
+        text = (app / "Sources" / "FleetCore" / "StoreKeys.swift").read_text()
+        literal = r'"((?:[^"\\]|\\.)*)"'
+        limit = r"(?:text\.count <= \d+ && !text\.contains\(\"\.\.\"\) && )?"     # StoreForm.path's own checks
+        forms = {name: pattern.replace("\\\\", "\\") for name, pattern in re.findall(
+            r"static func (\w+)\(_ text: String\) -> Bool \{\s*" + limit + r"whole\(text, " + literal + r"\)", text)}
+        forms["uuid"] = re.search(r"enum StoreUUID \{.*?StoreForm\.whole\(text, " + literal, text, re.S).group(1)
+        self.assertEqual({k: forms[k] for k in ("agent", "repo", "path", "kubernetes", "uuid")},
+                         {"agent": door.STORE_AGENT.pattern, "repo": door_targets.REPO.pattern,
+                          "path": door.STORE_PATH.pattern, "kubernetes": door.KUBE_NAME.pattern,
+                          "uuid": door.STORE_UUID.pattern})
+        self.assertIn(f'text.count <= {door.STORE_PATH_MOST} && !text.contains("..")', text)
+        words = {name: json.loads(value) for name, value in re.findall(
+            r"static let (kinds|provider|regions)(?:: Set<String>)? = ([^\n]+)", text)}
+        self.assertEqual((set(words["kinds"]), words["provider"], set(words["regions"])),
+                         (set(door.STORE_KINDS), door.STORE_PROVIDER, set(door.BITWARDEN)))
+
+    def test_door_py_holds_no_text_that_the_mac_reads_as_the_pass(self):
+        """The owner's Mac looks in door.py for the text store_keys to learn that the door checks key records (the
+        design's section 7). Until the pass (piece D2) brings that text, door.py must not hold it, also not in a
+        comment, or the Mac writes records that this door does not check. D2 removes this test."""
+        self.assertNotIn("store_keys", slurp(door.__file__, "r"))
 
 
 class YamlTags(RenderCase):

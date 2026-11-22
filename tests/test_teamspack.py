@@ -11,6 +11,7 @@ a package that each test writes: a fleet with no licence reads and imports nothi
 bytes whose hash the lock of the code names, and a fault of a part is a line of build_schema, and no stop of the
 hub."""
 import contextlib
+import errno
 import hashlib
 import http.server
 import importlib.util
@@ -308,16 +309,65 @@ class Fetch(unittest.TestCase):
                 self.assertLess(time.monotonic() - began, 5)        # the drip alone takes 20 seconds
         # The timer can come while no socket is there to shut (a slow connection, or the moment that a socket becomes
         # a TLS one): the GET stops there, and does not go on with no limit at all.
-        connect = socket.create_connection
+        connect = teamspack.connect
 
         def slow(*args, **how):
             time.sleep(1.7)
             return connect(*args, **how)
-        with patch.object(teamspack.socket, "create_connection", slow):
+        with patch.object(teamspack, "connect", slow):
             began = time.monotonic()
             self.assertEqual(teamspack.fetch(base + "/head", lock, "the-token", wait=1.5),
                              (0, "the channel did not answer whole in 1.5 seconds"))
             self.assertLess(time.monotonic() - began, 5)
+
+    def test_a_host_whose_first_address_is_dead_is_answered_on_the_next_inside_the_limit(self):
+        """The GET gives each address of the channel's host a part of the time that remains. socket.create_connection
+        gives each one the whole limit, and the timer of the whole GET cannot cut a connection that is not there yet.
+        Bug: on a server whose IPv6 drops every packet, the first address takes all of the limit, and every GET of a
+        package fails where the next address answers at once; N dead addresses last N limits. And an address of a
+        family that the kernel does not have (IPv6 off) is passed over, as create_connection does, and the last
+        address gets all the time that remains."""
+        data = teamspack.pack(FILES)
+        lock = teamspack.lock_of(data)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StandIn)
+        server.seen, server.answers = [], {"/p": (200, data, None)}
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port, waited = server.server_address[1], []
+        dead, live = ("192.0.2.1", port), ("127.0.0.1", port)       # TEST-NET-1, which no host answers
+        connect = socket.socket.connect
+
+        def silent(sock, where):
+            """A dead address on any network: no answer until the socket's own timeout."""
+            if tuple(where) != dead:
+                return connect(sock, where)
+            waited.append(sock.gettimeout())
+            time.sleep(sock.gettimeout())
+            raise TimeoutError("timed out")
+
+        class NoIPv6(socket.socket):
+            """A kernel with IPv6 off: no socket of that family can be made."""
+            def __init__(self, family=-1, *args, **how):
+                if family == socket.AF_INET6:
+                    raise OSError(errno.EAFNOSUPPORT, "Address family not supported by protocol")
+                super().__init__(family, *args, **how)
+
+        def get(*addresses):
+            """The answer of a GET whose host has `addresses`, (family, address) in the lookup's order, and its time."""
+            found = [(family, socket.SOCK_STREAM, 6, "", where) for family, where in addresses]
+            with patch.object(socket, "getaddrinfo", lambda *_args, **_how: found), \
+                    patch.object(socket.socket, "connect", silent), patch.object(socket, "socket", NoIPv6):
+                began = time.monotonic()
+                return teamspack.fetch(f"http://127.0.0.1:{port}/p", lock, "the-token", wait=1.5), \
+                    time.monotonic() - began
+        got, took = get((socket.AF_INET, dead), (socket.AF_INET, live))
+        self.assertEqual((got, waited), ((200, data), [0.5]))      # a third of the limit for the dead address
+        self.assertLess(took, 1.5)
+        self.assertEqual(get((socket.AF_INET6, ("::1", port, 0, 0)), (socket.AF_INET, live))[0], (200, data))
+        waited.clear()
+        self.assertEqual(get((socket.AF_INET, dead))[0][0], 0)
+        self.assertGreater(waited[0], 1.4)              # the last address: all that remains
 
     def test_a_certificate_that_does_not_verify_is_said_in_its_own_words(self):
         """ssl.SSLCertVerificationError is a ValueError too, so a channel whose certificate does not verify (a proxy

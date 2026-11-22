@@ -224,6 +224,35 @@ def loopback(host):
         return False
 
 
+def connect(host, port, deadline, wait):
+    """A socket connected to `host`: each address that the system's lookup gives, in its order, with a part of the time
+    that remains before `deadline` (a third of `wait` at most, and the last address all that remains), and not each
+    address with the whole limit, as socket.create_connection gives it. So a host whose first address drops every
+    packet (IPv6 on many servers) is reached on its next one inside the limit, and N dead addresses do not last N
+    limits. The lookup itself is the system's own, with the system's limits. The OSError of the last address that
+    failed, or TimeoutError when no time remained. Its twin is releases._connect, for the licence's poll: this module
+    imports no module of the hub, so the two are kept alike by hand."""
+    found = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    error = None
+    for n, (family, kind, proto, _name, where) in enumerate(found):
+        rest = deadline - time.monotonic()
+        if rest <= 0:
+            break
+        sock = None
+        try:                        # a family that the kernel does not have (IPv6 off) raises here: the next address
+            sock = socket.socket(family, kind, proto)
+            sock.settimeout(rest if n == len(found) - 1 else min(rest, wait / 3))
+            sock.connect(where)
+        except OSError as e:
+            if sock is not None:
+                sock.close()
+            error = e
+            continue
+        sock.settimeout(wait)
+        return sock
+    raise error or TimeoutError("timed out")
+
+
 NO_REQUEST = "no request could be made of that address and token"
 ONLY_HTTPS = "a package is asked for only over https, and over http only of this machine's loopback address"
 
@@ -240,10 +269,11 @@ def fetch(address, lock, token, wait=FETCH_WAIT):
       token reaches only the host of `address`. A redirect is an answer: its status.
     - **`wait` seconds for the whole GET**: the connection, the TLS handshake, the request, the head and the body
       together, and not only each read of the socket (its own timeout): at the limit a timer shuts the socket down,
-      so a channel that sends one byte at a time holds the one release thread no longer than that. This code makes
-      the connection and the TLS socket itself, before its handshake, so that the timer reaches the socket of each
-      step (http.client's own connect wraps a socket that the timer still names, and that socket is detached then).
-      Only the lookup of the host's name before the connection is the system's own, with the system's limits.
+      so a channel that sends one byte at a time holds the one release thread no longer than that. The connection
+      gives each address of the host a part of the time that remains (connect), and the timer reaches each socket
+      after it: this code makes the TLS socket itself, before its handshake (http.client's own connect wraps a
+      socket that the timer still names, and that socket is detached then). Only the lookup of the host's name
+      before the connection is the system's own, with the system's limits.
     - A certificate that does not verify is said in its own words (ssl.SSLCertVerificationError is a ValueError
       too, and is no request that could not be made).
     - At most the lock's size and one byte of the body are read, in pieces.
@@ -290,8 +320,8 @@ def fetch(address, lock, token, wait=FETCH_WAIT):
     timer.daemon = True
     timer.start()
     try:
-        conn.sock = socket.create_connection((conn.host, conn.port), timeout=wait)
-        if ended.is_set():          # the timer came during the connection, when no socket was there to shut
+        conn.sock = connect(conn.host, conn.port, deadline, wait)
+        if ended.is_set():          # the timer came at the end of the connection, when no socket was there to shut
             raise TimeoutError()
         if context is not None:
             conn.sock = context.wrap_socket(conn.sock, server_hostname=host, do_handshake_on_connect=False)
