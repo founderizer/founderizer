@@ -89,6 +89,16 @@ class Lines(OwnerAPI):
         self.assertEqual((code, result["changed"]), (200, []))
         self.assertEqual(git("rev-list", "--count", "HEAD", cwd=self.kit), "1")
 
+    def test_open_tasks_name_only_agents_of_the_lines(self):
+        """Every released Mac app refuses the whole GET /ui/team when `open_tasks` names an agent that is not in
+        `lines` (TeamSnapshot.validate, since owner API 1.6), and its Team page stays empty. An open task of an agent
+        that team.json does not hold (a database restored beside another team.json, or the later lanes' rows of
+        test_release_turns) must not reach the answer."""
+        self.assertFalse(self.task("vps")[1])
+        hub.ins("INSERT INTO tasks(title,details,done_when,needs,owner,requester,state,created,attempt) "
+                "VALUES('Read the report','','read','none','gone','manager','input-required',?,1)", (hub.now(),))
+        self.assertEqual(self.team()["open_tasks"], {"vps": 1})
+
     def test_the_lead_role_can_be_switched_off(self):
         self.assertIn("leads", self.request()[1]["ui_features"])
         with patch("hub.LEADS_READY", False):

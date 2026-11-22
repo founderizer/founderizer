@@ -1052,7 +1052,11 @@ def kv_get(k, default=None):
 # Times the hub keeps for itself, which no screen of the owner's shows: their writes are quiet (live_changes).
 QUIET_KEYS = ("tick_ok", "releases_swept", "releases_found", "bridge_seen", "bridge_code",
               "error_reports_tried", "error_reports_sent", "error_reports_hold", "error_reports_on_at", "door_grants",
-              "door_changes", "door_long_script")     # the last: the Mac's word long=1 (door_script_bounds)
+              "door_changes", "door_long_script",     # the Mac's word long=1 (door_script_bounds)
+              # the health block of the error report (W15): its records, counts, holds and marks of a start
+              "error_reports_release", "error_reports_watch", "error_reports_early_at", "error_reports_earlies",
+              "error_reports_health_hold", "error_reports_starts", "error_reports_oom", "error_reports_running",
+              "error_reports_restart")
 
 
 def kv_set(k, v):
@@ -6150,7 +6154,16 @@ def fault_rows():
 # before it and after the owner turned reports on, and the fleet's id, the release's version, the code's id, the
 # system and two counts. Only the owner turns it on: the route is an owner route of the app, and no tool of the
 # owner's MCP server (owner_mcp.NOT_TOOLS) and no fleet tool reaches it.
-_error_report = {"thread": None}        # the one send that may run at a time
+#
+# Since W15 of the reliability plan (21 November 2026, inside the owner's yes to "codes, versions and counts"), the
+# report carries the fleet's health too (error_report_health): the newest release and how this hub stays behind it,
+# the server watch's checks, and the size of the hub's own server. And it goes sooner than a day when something breaks
+# (error_report_early), and before the hub restarts onto new code when it holds a fault of the code that runs now
+# (error_report_before_restart).
+# the one send that may run at a time; the last error_report_look; and, after a restart onto new code that did not
+# start, the code that this process still runs: {"revision", "version", "at"} (error_report_runs_old)
+_error_report = {"thread": None, "looked": None, "runs": None}
+RESTART_REPORT_WAIT = 10        # seconds that the restart onto new code waits for the report before it
 
 
 def error_reports_on():
@@ -6160,9 +6173,11 @@ def error_reports_on():
 
 def set_error_reports(on):
     """The owner's switch. Turning it on keeps the moment (error_reports_on_at): a report holds only what came after
-    it, as the Mac drops a crash that came while it was off."""
+    it, as the Mac drops a crash that came while it was off. The counts and records of the health block start at that
+    moment too (error_reports_counts_start)."""
     if on and not error_reports_on():
         kv_set("error_reports_on_at", repr(now()))
+        error_reports_counts_start()
     kv_set("error_reports", "1" if on else "0")
     log("owner", f"error reports are {'on' if on else 'off'}")
     return {"send": bool(on)}
@@ -6176,34 +6191,80 @@ def kv_time(key):
         return None
 
 
-def running_version():
-    """The version of the release that this checkout runs, from its signed manifest at HEAD of the configuration ref
+def kv_count(key):
+    """A whole count that the hub keeps in kv, or 0."""
+    try:
+        return max(int(kv_get(key) or 0), 0)
+    except ValueError:
+        return 0
+
+
+def kv_json(key, kind):
+    """A value that the hub keeps in kv as JSON, when it is of `kind` (dict or list), else None."""
+    try:
+        value = json.loads(kv_get(key) or "null")
+    except ValueError:
+        return None
+    return value if isinstance(value, kind) else None
+
+
+def version_at(revision):
+    """The version of the release at `revision` of the configuration ref, from its signed manifest there
     (lifecycle.RELEASE_FILE), else "unknown". Never a commit of the configuration ref: that one is this fleet's own,
     and it changes with each delivery (the review of 16 November 2026)."""
-    code, out, _ = git_kit("cat-file", "blob", f"HEAD:{errorreports.MANIFEST}")
+    code, out, _ = git_kit("cat-file", "blob", f"{revision}:{errorreports.MANIFEST}")
     return errorreports.version_of(out) if code == 0 else "unknown"
 
 
-def error_report_body(since):
+def running_version():
+    """The version of the release that this checkout runs: the one at its HEAD (version_at)."""
+    return version_at("HEAD")
+
+
+def error_report_body(since, version=None, taken=None, restarting=False):
     """The day's report (errorreports.report), from the faults of the code that runs now whose last time is after
-    `since`. Under LOCK."""
+    `since`, with the fleet's health where it can go (error_report_health). `version`: the release of the code that
+    runs now, where it is not the one at HEAD (the report before a restart onto new code), and after a restart that
+    did not start the one that this process still runs (error_report_runs_old); `taken`: a dict that gets
+    what the block counts, for error_report_send; `restarting`: the report before a restart onto new code
+    (error_health_release). A fault of the health block is a fault of the hub, and the report goes without the
+    block. Under LOCK."""
     try:
         rows = fault_rows()
     except sqlite3.Error:       # a database that refused the table at the start: the facts go alone
         rows = []
     view = diagnostics.view(rows, tools={tool[1] for tool in TOOLS})
-    return errorreports.report(fleet_id(), running_version(), errorreports.system_words(), diagnostics.code_id(),
-                               len(TEAM.get("agents") or {}), len(server_names()), view, since)
+    version = version or (_error_report["runs"]["version"] if _error_report["runs"] else running_version())
+    try:
+        health = error_report_health(now(), version, taken, restarting)
+    except Exception:
+        print_fault()
+        health = None
+    return errorreports.report(fleet_id(), version, errorreports.system_words(), diagnostics.code_id(),
+                               len(TEAM.get("agents") or {}), len(server_names()), view, since, health=health)
+
+
+def error_report_since(sent, t0):
+    """Since when a report holds faults: the report before it, and never before the owner's yes. A time ahead of t0
+    (a clock that was ahead) is none for the report before, and now for the yes: so nothing from before his yes goes,
+    and nothing is lost."""
+    on_at = kv_time("error_reports_on_at")
+    return max(sent if sent and sent <= t0 else 0, min(on_at, t0) if on_at else 0)
 
 
 def error_report_sweep(t0):
-    """Once a pass of the tick (under LOCK): when error reports are on and the day's report is due
+    """Once a pass of the tick (under LOCK): when error reports are on and the day's report is due, or an early one
     (errorreports.due), start its send in a thread of its own, because a call over the network must not hold the
     tick. The try is written before anything else, so a step below that raises, or a hub that stops during the send,
-    tries again after errorreports.RETRY and not at each pass. A channel that is not ours holds the reports a DAY."""
+    tries again after errorreports.RETRY and not at each pass. A channel that is not ours holds the reports a DAY.
+    First the look that keeps what the health block needs over time, and that asks for the early reports
+    (error_report_look). The send gets the early ask that it answers, read after its body is made
+    (error_report_send)."""
+    error_report_look(t0)
     sent = kv_time("error_reports_sent")
-    if not errorreports.due(error_reports_on(), sent, kv_time("error_reports_tried"), kv_time("error_reports_hold"),
-                            t0):
+    when = errorreports.due(error_reports_on(), sent, kv_time("error_reports_tried"), kv_time("error_reports_hold"),
+                            t0, kv_time("error_reports_early_at"), error_report_earlies())
+    if not when:
         return
     if _error_report["thread"] is not None and _error_report["thread"].is_alive():
         return
@@ -6215,39 +6276,519 @@ def error_report_sweep(t0):
         kv_set("error_reports_hold", repr(t0 + e.retry_after))
         log("hub", f"the error report did not go: {e}")
         return
-    # Since the report before it, and never before the owner's yes. A time ahead of t0 (a clock that was ahead) is
-    # none for the report before, and now for the yes: so nothing from before his yes goes, and nothing is lost.
-    on_at = kv_time("error_reports_on_at")
-    body = error_report_body(max(sent if sent and sent <= t0 else 0, min(on_at, t0) if on_at else 0))
+    taken = {}
+    body = error_report_body(error_report_since(sent, t0), taken=taken)
     if body is None:            # a fact out of shape (the fleet's id): nothing goes, and it is tried again later
         log("hub", "the error report did not go: a fact of this fleet is out of shape")
         return
-    thread = threading.Thread(target=error_report_send, args=(url, body, stamp), name="error-report", daemon=True)
+    thread = threading.Thread(target=error_report_send, args=(url, body, stamp), name="error-report", daemon=True,
+                              kwargs={"early": when == "early", "asked": kv_get("error_reports_early_at"),
+                                      "taken": taken})
     _error_report["thread"] = thread
     thread.start()
 
 
-def error_report_send(url, body, stamp):
+def error_report_send(url, body, stamp, early=False, timeout=None, asked=None, taken=None):
     """The send of one report, outside LOCK. The switch is read again just before it, so a report that the owner
     turned off meanwhile does not go. Our side's hold is kept (a 429's Retry-After, a DAY for any other refusal); a
-    report that went marks its day."""
+    report that went marks its day, and an early one (`early`) counts as one of the day's errorreports.EARLY_MOST.
+    `asked`: the early ask that this report answers (error_reports_early_at when its body was made), which a report
+    that went ends while the key still holds it: an event that came during the send wrote a new value
+    (error_report_early), which waits for the next report.
+
+    The contract's "The health of a fleet": after a 400 to a report with the health block, for any reason (a site
+    that does not take the block yet, or a word that it does not take yet), the same report goes again at once
+    without the block, while the switch is still on, and the block waits a DAY from the report's stamp
+    (error_reports_health_hold). When our side took a report with the block, the block's counts start again from what
+    it carried (`taken`, error_reports_counted); a report that went without it resets none of them."""
     with LOCK:
         if not error_reports_on():
             return
-    try:
-        errorreports.send(url, body)
-    except errorreports.ReportError as e:
-        with LOCK:
-            if e.retry_after:
-                kv_set("error_reports_hold", repr(now() + e.retry_after))
-            log("hub", f"the error report did not go: {e}")
-        return
-    except Exception:
-        print_fault()
-        return
+    while True:
+        try:
+            errorreports.send(url, body, timeout=timeout)
+            break
+        except errorreports.ReportError as e:
+            if e.status == 400 and "health" in body:
+                body = {key: value for key, value in body.items() if key != "health"}
+                with LOCK:
+                    kv_set("error_reports_health_hold", repr(float(stamp) + errorreports.DAY))
+                    log("hub", f"{e} to the error report with the fleet's health: it goes again now without the "
+                               f"health, and the health goes again in a day")
+                    if not error_reports_on():      # the owner turned reports off during the first send
+                        return
+                continue
+            with LOCK:
+                if e.retry_after:
+                    kv_set("error_reports_hold", repr(now() + e.retry_after))
+                log("hub", f"the error report did not go: {e}")
+            return
+        except Exception:
+            print_fault()
+            return
     with LOCK:
         kv_set("error_reports_sent", stamp)
-        log("hub", f"sent the day's error report: {len(body['faults'])} errors, {len(body['refusals'])} refused calls")
+        if "health" in body and taken:
+            error_reports_counted(taken)
+        if early:
+            error_report_earlies(add=float(stamp))
+        if asked is not None and kv_get("error_reports_early_at") == asked:
+            kv_set("error_reports_early_at", None)      # this report holds what the early one was asked for
+        which = "an early" if early else "the day's"
+        log("hub", f"sent {which} error report: {len(body['faults'])} errors, {len(body['refusals'])} refused calls"
+                   + (", and the fleet's health" if "health" in body else ""))
+
+
+# ---- W15: the fleet's health in the report (the reliability plan of 21 November 2026, 3.3; the website's
+# docs/CONTRACTS.md, "The health of a fleet")
+#
+# Every value of the block is a word of a copy of our side's lists (errorreports.STATES, STEPS, CAUSES, CHECKS), a
+# version, a whole number or a time, never a word that a machine or a program made: no host, link name, address, path,
+# provider's name or git line. So the block takes from each source only a word of its fixed list, which the copy
+# checks again (errorreports.health), and the counts and times that the hub keeps itself.
+
+def error_reports_counts_start():
+    """Inside LOCK, when the owner turns error reports on: the counts and records of the health block start now, so
+    that a report holds only what came after his yes, as its faults do."""
+    reading = errorreports.machine_reading()
+    kv_set("error_reports_oom", json.dumps({"boot": reading["boot"], "kills": reading["kills"]}) if reading else None)
+    for key in ("error_reports_starts", "error_reports_release", "error_reports_watch", "error_reports_early_at"):
+        kv_set(key, None)
+
+
+def error_report_early(why):
+    """Inside LOCK: an early report goes at the next pass of the tick (errorreports.due), while error reports are on:
+    the plan's 3.3, when something breaks. An ask that waits is not asked again, and the next report that goes, early
+    or not, ends it; but while a send runs, an ask gets a new value, so that the send, which ends only the ask that it
+    answers (error_report_send), leaves this one for the next report. In the DAY after our side refused the health
+    block (error_reports_health_hold), an early report carries the faults of the code and no block. `why` is for the
+    hub's log only."""
+    sending = _error_report["thread"] is not None and _error_report["thread"].is_alive()
+    if not error_reports_on() or (kv_time("error_reports_early_at") and not sending):
+        return
+    kv_set("error_reports_early_at", repr(now()))
+    log("hub", f"an error report goes early: {why}")
+
+
+def error_report_earlies(add=None):
+    """Inside LOCK: the times of the early reports that went in the last DAY (errorreports.due), and with `add` one
+    more, which is kept. A time ahead of the clock by a DAY or less stays counted: a clock that went back gives no
+    more early reports."""
+    t0 = now()
+    kept = [t for t in kv_json("error_reports_earlies", list) or []
+            if finite(t) and t0 - t < errorreports.DAY and t - t0 <= errorreports.DAY]
+    if add is not None:
+        kept.append(add)
+        kv_set("error_reports_earlies", json.dumps(kept))
+    return kept
+
+
+def error_report_look(t0, force=False):
+    """Inside LOCK, at most once a WATCH_EVERY while error reports are on, and before each report (`force`): what the
+    health block keeps over time, because the release rows and the server watch keep only what holds now, and the
+    early reports that come of it (error_look_release, error_look_watch)."""
+    if not error_reports_on():
+        return
+    looked = _error_report["looked"]
+    if not force and looked is not None and 0 <= t0 - looked < WATCH_EVERY:
+        return
+    _error_report["looked"] = t0
+    error_look_release(t0)
+    error_look_watch(t0)
+
+
+def error_newest(rows):
+    """The newest release of `rows` (of the table releases), by the numbers of its version (errorreports.version_key),
+    else None: the ids of two tracks do not order their releases."""
+    known = [r for r in rows if errorreports.version_key(r["version"]) is not None]
+    return max(known, key=lambda r: (errorreports.version_key(r["version"]), r["id"])) if known else None
+
+
+def error_release_runs(row, cap=None):
+    """True for a release that this hub runs: done, passed (a later one holds it, pass_held_releases), or kept at the
+    step `already` (releases.Update: this fleet runs it already). `cap`: the version key of the code that this process
+    still runs after a restart onto new code that did not start (error_report_runs_old): a release above it is done in
+    its row and does not run."""
+    runs = row["state"] in (releases.DONE, PASSED) or row["state"] == releases.KEPT and row["step"] == "already"
+    key = errorreports.version_key(row["version"])
+    return runs and (cap is None or key is not None and key <= cap)
+
+
+def error_floor(rows, floors=(), cap=None):
+    """The version key of the newest release that this hub runs: of `floors` (the release of the code that runs) and
+    of the rows that it runs (error_release_runs), else None."""
+    keys = [k for k in floors if k] + [errorreports.version_key(r["version"]) for r in rows
+                                         if error_release_runs(r, cap)]
+    return max((k for k in keys if k), default=None)
+
+
+def error_behind(rows, floors=(), cap=None):
+    """The rows of `rows` that this hub knows of and does not run (error_release_runs): those newer, by the numbers of
+    their versions, than the newest release that it runs (error_floor).
+
+    A known limit: the rows do not say their track, so a fleet that turns the early track off keeps the early
+    releases that it did not take as releases that it does not run, in `newest`, `behind` and `since`, until it runs a
+    release with a higher version (UI-API.md 1.204)."""
+    floor = error_floor(rows, floors, cap)
+    return [r for r in rows if not error_release_runs(r, cap) and errorreports.version_key(r["version"]) is not None
+            and (floor is None or errorreports.version_key(r["version"]) > floor)]
+
+
+def error_runs_cap():
+    """(the version key of the code that this process still runs, when a restart onto new code did not start, and
+    the time of that restart when its command failed, else None), else (None, None) (error_report_runs_old)."""
+    runs = _error_report["runs"]
+    return (errorreports.version_key(runs["version"]), runs["at"]) if runs else (None, None)
+
+
+def error_behind_facts(behind, revs, t0, failed=None):
+    """(since, tries, cause) of the time that this hub is behind (the contract's `since`, `tries` and `cause`), from
+    the rows of the releases that it does not run (error_behind) and the look's record of each (`revs`,
+    error_look_release): `since`, when the hub first learned of one of them, so that a new release does not start the
+    time again; `tries`, their runs that did not end done, which all came after that; `cause`, the cause of the last
+    of those runs (None: none). (None, 0, None) when the hub runs the newest release that it knows of. A release that
+    the look has no record of (more than its rows back) counts from its own first time in the row. `failed`: the time
+    of a restart onto new code that did not start (error_runs_cap): it is one more try of a release that ended done in
+    its row and does not run, with the cause "other"."""
+    if not behind:
+        return None, 0, None
+    marks = []
+    for row in behind:
+        mark = revs.get(row["revision"])
+        if not isinstance(mark, dict) or not finite(mark.get("learned")):
+            mark = {"learned": min(t for t in (row["started"], row["finished"], t0) if finite(t)), "tries": 0}
+        marks.append(mark)
+    last = max((m for m in marks if finite(m.get("last"))), key=lambda m: m["last"], default=None)
+    tries, cause = sum(int(m.get("tries") or 0) for m in marks), last.get("cause") if last else None
+    if failed is not None and any(error_release_runs(row) for row in behind):
+        tries += 1
+        cause = "other" if last is None or failed >= last["last"] else cause
+    return min(m["learned"] for m in marks), tries, cause
+
+
+def error_look_release(t0):
+    """Inside LOCK: what the health block needs over time of the releases that the channel named, in
+    error_reports_release: for each release of the newest rows, `learned` (when a look first saw its row; for a row
+    that was there at the first look, the first of its run's start, its end and that look, a time later than the true
+    one, so that a wait reads shorter and never longer), `tries` (its runs that did not end done, each one counted
+    once by its end, `last`) and `cause` (the cause of the last of them).
+
+    The early reports of the plan's 3.3 come of it: a release's third run that did not end done, once for each
+    release, and a time behind (error_behind_facts) of errorreports.BEHIND_WAIT with a run since then that did not end
+    done, as our side counts `behind` (the contract's behind_hours), once for each time behind: `late` keeps the
+    newest release that the hub runs (error_floor) at the ask, so that a new release that comes, or a `since` that
+    moves because its release left the rows that the look reads, asks no second report, and the time behind ends when
+    the hub runs the newest release. Neither comes for a run that the fleet holds on purpose (errorreports.NO_ALARM),
+    which our side does not count either."""
+    rows = q("SELECT id, revision, version, state, step, cause, started, finished FROM releases ORDER BY id DESC "
+             "LIMIT ?", (4 * RELEASE_WALK,))
+    was = kv_json("error_reports_release", dict)
+    first_look = was is None or not isinstance(was.get("revs"), dict)
+    before, revs = ({} if first_look else was["revs"]), {}
+    for row in rows:
+        if errorreports.version_key(row["version"]) is None:
+            continue
+        mark = before.get(row["revision"])
+        mark = dict(mark) if isinstance(mark, dict) and finite(mark.get("learned")) else {
+            "learned": min(t for t in (row["started"], row["finished"], t0) if finite(t)) if first_look else t0,
+            "tries": 0, "last": None, "cause": None}
+        ended = row["state"] in (releases.KEPT, releases.ROLLED_BACK, releases.FAILED) and \
+            not error_release_runs(row) and finite(row["finished"])
+        if ended and row["finished"] != mark.get("last"):
+            mark.update(tries=int(mark.get("tries") or 0) + 1, last=row["finished"], cause=row["cause"])
+            if mark["tries"] >= errorreports.THIRD_RUN and not mark.get("third") and \
+                    row["cause"] not in errorreports.NO_ALARM:
+                mark["third"] = True
+                error_report_early(f"release {row['version']} ended a run that was not done for the third time")
+        revs[row["revision"]] = mark
+    cap, failed = error_runs_cap()
+    runs = _error_report["runs"]
+    floors = (errorreports.version_key(runs["version"] if runs else error_head_version()),)
+    behind, floor = error_behind(rows, floors, cap), error_floor(rows, floors, cap)
+    since, tries, cause = error_behind_facts(behind, revs, t0, failed)
+    floor = ".".join(str(n) for n in floor) if floor else "none"
+    late = None if first_look or not behind else was.get("late")
+    if since is not None and tries and cause not in errorreports.NO_ALARM and late != floor and \
+            t0 - since >= errorreports.BEHIND_WAIT:
+        late = floor
+        error_report_early("this fleet has stayed 6 hours behind its newest release after a run that was not done")
+    kept = {"revs": revs, "late": late}
+    if kept != was:
+        kv_set("error_reports_release", json.dumps(kept, sort_keys=True))
+
+
+def error_head_version():
+    """Inside LOCK: running_version(), read again only when the checkout's HEAD moved (kit_revision keeps its reading 30
+    seconds and reads the checkout's files), so that the look once a minute starts no git process while HEAD stays."""
+    head, kept = kit_revision(), _error_report.get("head")
+    if head is not None and kept and kept[0] == head:
+        return kept[1]
+    version = running_version()
+    _error_report["head"] = (head, version)
+    return version
+
+
+def error_look_watch(t0):
+    """Inside LOCK: since when each server fails each fact of the server watch (its kv server_watch keeps only what
+    fails now), in error_reports_watch, as the health block's `since` needs it: the time of the look that first saw
+    it, or None for one that failed at the first look (no time says since when). A fact that turns bad on the hub's
+    own server asks for an early report (the plan's 3.3)."""
+    watch, was = kv_json("server_watch", dict) or {}, kv_json("error_reports_watch", dict)
+    hub_machine, marks, bad = (TEAM.get("hub") or {}).get("machine"), {}, []
+    for server, said in watch.items():
+        told = [k for k in (said.get("told") or []) if k in WATCH_WORDS] if isinstance(said, dict) else []
+        before = (was or {}).get(server)
+        before = before if isinstance(before, dict) else {}
+        if told:
+            marks[server] = {k: before[k] if k in before else None if was is None else t0 for k in told}
+        if server == hub_machine and was is not None:
+            bad += [k for k in told if k not in before]
+    if bad:
+        error_report_early(f"the hub's own server needs care ({', '.join(sorted(bad))})")
+    if marks != was:            # also an empty record at the first look: the next look is not the first
+        kv_set("error_reports_watch", json.dumps(marks, sort_keys=True))
+
+
+def error_reports_ooms(reading):
+    """Inside LOCK: the processes that the kernel ended for lack of memory since the last report with the health block
+    that our side took (error_reports_oom: the count of the machine's start that report held, and the id of that
+    start), or since the machine started, when it started again since then (the kills of the start before are lost
+    with it). With no count kept yet (a hub whose reports were on before W15), the count starts now."""
+    base = kv_json("error_reports_oom", dict)
+    if base is None:
+        kv_set("error_reports_oom", json.dumps({"boot": reading["boot"], "kills": reading["kills"]}))
+        return 0
+    kills = base.get("kills")
+    if base.get("boot") == reading["boot"] and isinstance(kills, int) and 0 <= kills <= reading["kills"]:
+        return reading["kills"] - kills
+    return reading["kills"]
+
+
+def error_reports_counted(taken):
+    """Inside LOCK, when our side took a report with the health block: its `ooms` and `starts` count from what that
+    report held (`taken`: the machine's start and its count of kills, and the starts, as the report was made; the
+    contract's "Since the last report"), so that no read of /proc after the send is needed, and the starts that came
+    after the report was made stay counted. A report that our side took and whose answer the hub never got is counted
+    again in the next one: the hub cannot know it."""
+    kv_set("error_reports_oom", json.dumps({"boot": taken["boot"], "kills": taken["kills"]}))
+    kv_set("error_reports_starts", max(kv_count("error_reports_starts") - taken["starts"], 0))
+
+
+def error_hub_judged(t0):
+    """The keys of WATCH_WORDS whose state the server watch can say for the hub's own server now (server_watch_sweep),
+    on Linux, the one system with the block's /proc: its disk and memory, which the hub measures itself (server_load),
+    while that measurement has its figures; its SSH and npm by the hub's own read (hub_hardening_troubles), while that
+    read counts and has the fact; each fact that a fresh reading of its own server service carries; and a macOS
+    update, which a Linux server never waits for. The block sends null for any other one, unless the watch says that
+    it fails. W8's one table of checks replaces this copy of the watch's reading."""
+    hub_machine = (TEAM.get("hub") or {}).get("machine")
+    if HUB_KIND != "linux" or not hub_machine:
+        return set()
+    load, judged = HUB_LOAD["load"] or {}, {"macos_update"}
+    judged |= {k for k in ("disk", "memory") if load.get(f"{k}_used") is not None and load.get(f"{k}_total")}
+    read, claimed = HUB_HARDENING["read"], hub_claimed(t0)
+    if read is not None and 0 <= t0 - read["at"] < MACHINE_STALE and claimed is not None and t0 - claimed >= JOIN_GRACE:
+        judged |= {k for k, fact in MENDED_FACTS.items() if read.get(fact) is not None}
+    joined = q1("SELECT created FROM server_keys WHERE server=?", (hub_machine,))
+    reading = server_reading(hub_machine, server_agents(hub_machine)) \
+        if joined and t0 - joined["created"] >= JOIN_GRACE else None
+    if reading and reading["source"] == "server" and t0 - max(reading["reported_at"], STARTED) <= SERVER_QUIET:
+        sec = reading.get("security") or {}
+        judged |= {"quiet"} | {k for k, fact in (("firewall", "firewall"), ("network", "tailscale"),
+                                                 ("updates_off", "unattended_upgrades"), ("restart", "reboot_required"))
+                               if sec.get(fact) is not None}
+        if sec.get("unattended_upgrades") and "upgraded_at" in sec:
+            judged.add("updates")
+        gate = q1("SELECT reported FROM egress_servers WHERE server=?", (hub_machine,))
+        if gate is None or gate["reported"] > t0 - SERVER_QUIET:
+            judged |= {"egress", "egress_table"}
+    return judged
+
+
+def error_health_checks(t0):
+    """Inside LOCK: the checks of the health block. W8 (one table of health checks, lifecycle.health_reading) is not
+    built, so these are only the facts that the hub reads today and can say truly: the server watch's (WATCH_WORDS,
+    server_watch_sweep), each key once, the passing ones too. `hub` is true while the watch says that the hub's own
+    server fails it, false while it can say that it does not (error_hub_judged), else null; `servers`, the other
+    servers that the watch says fail it now; `since`, the earliest time that one of them turned bad (error_look_watch),
+    null when that cannot be said for one of them. W8 adds the rest of the contract's codes (uplink, ipv4_route,
+    ipv6_route, dns, channel, upstream, tailnet, clock, oom, release_lag), and W9 the repairs."""
+    watch, marks = kv_json("server_watch", dict) or {}, kv_json("error_reports_watch", dict) or {}
+    hub_machine, judged, checks = (TEAM.get("hub") or {}).get("machine"), error_hub_judged(t0), {}
+    for key in WATCH_WORDS:
+        failing = {s for s, said in watch.items() if isinstance(said, dict) and key in (said.get("told") or [])}
+        entry = checks.setdefault(errorreports.word(key, errorreports.CHECKS), {"hub": set(), "servers": set(),
+                                                                                "since": []})
+        entry["hub"].add(True if hub_machine in failing else False if key in judged else None)
+        entry["servers"] |= failing - {hub_machine}
+        entry["since"] += [(marks.get(s) if isinstance(marks.get(s), dict) else {}).get(key) for s in failing]
+    return [{"code": code, "hub": True if True in e["hub"] else None if None in e["hub"] else False,
+             "servers": len(e["servers"]),
+             "since": min(e["since"]) if e["since"] and all(finite(t) for t in e["since"]) else None}
+            for code, e in checks.items()]
+
+
+def error_health_release(version, t0, restarting=False):
+    """Inside LOCK: the release of the health block. `newest` is the newest release that the channel named to this hub
+    (error_newest), and this hub's own version (`version`) while the channel named none; `state` and `step` are its
+    row's, and with no row the state is "none"; `behind` the releases that the hub knows of and does not run
+    (error_behind); `since`, `tries` and `cause` are those of the time that the hub is behind (error_behind_facts:
+    null, 0 and "none" while it runs the newest release that it knows of); `channel` the status of the hub's last poll
+    of the channel (0: no answer). The release that the hub restarts onto counts as run in the report before the
+    restart (the contract: state done, and behind does not count it), because finish_release writes its row done
+    before the restart; and that report (`restarting`) takes no cap of an earlier restart that did not start, so it
+    counts that release and each one under it as run also from the old code of such a restart. After a restart onto
+    new code that did not start
+    (error_report_runs_old), the releases above the code that still runs do not run, though their rows are done: they
+    are behind, and after a failed command the newest of them is `failed` and the restart is one try with the cause
+    "other" (error_behind_facts)."""
+    channel = kv_count("releases_status")
+    rows = q("SELECT id, revision, version, state, step, cause, started, finished FROM releases")
+    newest = error_newest(rows)
+    if newest is None:
+        return {"newest": version, "state": "none", "step": None, "cause": None, "tries": 0, "since": None,
+                "behind": 0, "channel": channel}
+    cap, failed = (None, None) if restarting else error_runs_cap()
+    behind = error_behind(rows, (errorreports.version_key(version),), cap)
+    revs = (kv_json("error_reports_release", dict) or {}).get("revs")
+    since, tries, cause = error_behind_facts(behind, revs if isinstance(revs, dict) else {}, t0, failed)
+    # done, but its restart's command failed
+    stuck = failed is not None and error_release_runs(newest) and not error_release_runs(newest, cap)
+    return {"newest": newest["version"], "state": releases.FAILED if stuck else newest["state"], "step": newest["step"],
+            "cause": cause, "tries": tries, "since": since, "behind": len(behind), "channel": channel}
+
+
+def error_report_health(t0, version, taken=None, restarting=False):
+    """Inside LOCK: the report's `health` block (errorreports.health), or None: for a DAY after our side refused a
+    report with it (error_report_send), and on a machine with no /proc (errorreports.machine_reading). `machine` is
+    the hub's own server, with the kills for lack of memory (error_reports_ooms) and the hub's starts
+    (error_reports_started) since the last report with the block that our side took. `taken`, when given, gets what
+    the block counts (error_reports_counted); `restarting`: the report before a restart (error_health_release)."""
+    hold = kv_time("error_reports_health_hold")
+    if hold and t0 < hold <= t0 + errorreports.DAY:     # a hold from a clock that was ahead counts as none
+        return None
+    reading = errorreports.machine_reading()
+    if reading is None:
+        return None
+    error_report_look(t0, force=True)
+    starts = kv_count("error_reports_starts")
+    machine = dict(reading, ooms=error_reports_ooms(reading), starts=starts)
+    block = errorreports.health(error_health_release(version, t0, restarting), error_health_checks(t0), machine)
+    if block is not None and taken is not None:
+        taken.update(boot=reading["boot"], kills=reading["kills"], starts=starts)
+    return block
+
+
+def error_reports_started(restored=False):
+    """main(), at each start of the hub, before its timers: the start counts in the health block's `starts` while
+    error reports are on, and an early report goes (the plan's 3.3) when the hub starts on other code than the
+    revision that its last restart onto new code went to (error_reports_restart; same_code: a delivery or another
+    write of the configuration ref moves its HEAD and no program file), or after a stop that it did not plan
+    (error_reports_running is still there: no stop of the service and no restart in place ended the process before
+    it, error_reports_stopping; a start by exec is the restart in place itself, also when its stop could not take
+    LOCK to clear the mark, SERVING["execed"]). The mark that the hub runs is set again only once
+    the stop signal has its handler (error_reports_serving), so that a stop in the start's own seconds reads as
+    planned; a crash in those seconds is then not seen. A start on restored records sends none: their marks are the
+    copy's."""
+    with LOCK:
+        unplanned, restart = bool(kv_get("error_reports_running")), kv_json("error_reports_restart", dict)
+        kv_set("error_reports_running", None)
+        kv_set("error_reports_restart", None)
+        if not error_reports_on():
+            return
+        kv_set("error_reports_starts", kv_count("error_reports_starts") + 1)
+        if restored:
+            return
+        runs = kit_revision(fresh=True) if restart is not None else None
+        if runs and restart.get("to") and runs != restart["to"] and not same_code(restart["to"], runs):
+            error_report_early("the hub started again on its old code after a restart onto new code")
+        elif unplanned and not SERVING["execed"]:
+            error_report_early("the hub started after a stop that it did not plan")
+
+
+def error_reports_serving():
+    """main(), once SIGTERM has its handler: the hub runs, so a start that finds this mark again follows a stop that
+    the hub did not plan (error_reports_started). A fault here stops no start."""
+    try:
+        with LOCK:
+            kv_set("error_reports_running", "1")
+    except Exception:
+        print_fault()
+
+
+def error_reports_stopping():
+    """after_serving, with LOCK held, and main() after a KeyboardInterrupt: a stop of the service and a restart in
+    place are stops that the hub planned, so its next start sends no early report for them (error_reports_started). A
+    fault here stops no stop."""
+    try:
+        kv_set("error_reports_running", None)
+    except Exception:
+        print_fault()
+
+
+def error_report_runs_old(pinned, failed=True):
+    """Inside LOCK, when a restart onto new code did not start (restart_hub_soon): its command failed (`failed`), or
+    the fleet has no restart command (CFG hub_restart []). This process goes on with the code of `pinned`, while its
+    checkout's HEAD is at the new release, so each report that it sends names the release at `pinned`
+    (error_report_body, error_report_before_restart), and its block counts the releases above it as behind
+    (error_health_release). That is a fact of this process, kept in its memory also while error reports are off, so
+    that reports that the owner turns on later still say it. A second one keeps the first: that is still the code
+    that runs. A failed command is one try of the release that did not start (`at`, error_behind_facts), asks for an
+    early report while reports are on (the plan's 3.3), and ends the mark of the restart (error_reports_restart):
+    that failure is said, and a later start by hand onto the new code is no start on old code. A fleet with no
+    restart command chose it: no try, so no early report, now or 6 hours later."""
+    if pinned and not _error_report["runs"]:
+        _error_report["runs"] = {"revision": pinned, "version": version_at(pinned), "at": now() if failed else None}
+    if failed:
+        kv_set("error_reports_restart", None)
+        error_report_early("the hub runs its old code after a failed restart onto new code")     # reads the switch
+
+
+def error_report_before_restart(pinned, reached):
+    """The restart's own thread (restart_hub_soon), outside LOCK, before the hub restarts from `pinned` onto new code
+    at `reached`, while error reports are on: the revision that the restart goes to is kept (error_reports_restart),
+    so that a start on other code sends its report early; and the report goes now, when it holds a fault (an exception
+    or a stall) of the code that runs now, fewer than errorreports.EARLY_MOST early reports went in the last DAY, and
+    our side holds nothing back, so that the faults of this code, which the next code does not keep (fault_rows), are
+    not lost (the plan's 3.3, the open point "Faults of a replaced code"). It counts as one of the day's early reports.
+    A report with refused calls alone waits for its day, as the privacy page says ("about once a day"). The report
+    names the release of the code that runs now (version_at `pinned`, or the code of an earlier restart that did not
+    start, error_report_runs_old: the checkout's HEAD is at `reached` already), and the one that the hub restarts onto
+    counts as run with each one under it, because its row is done already, also from such old code
+    (error_health_release).
+    The restart
+    waits RESTART_REPORT_WAIT seconds at most for its send, which goes on in its thread; one that did not end is tried
+    again after RETRY. The report's body, else None."""
+    t0 = now()
+    with LOCK:
+        if not error_reports_on():      # nothing is kept or sent while the owner has error reports off
+            return None
+        kv_set("error_reports_restart", json.dumps({"to": reached, "at": t0}))
+        hold, thread = kv_time("error_reports_hold"), _error_report["thread"]
+        if (hold and t0 < hold <= t0 + errorreports.DAY) or (thread is not None and thread.is_alive()) or \
+                len(error_report_earlies()) >= errorreports.EARLY_MOST:
+            return None
+        try:
+            url = errorreports.endpoint(release_channel())
+        except errorreports.ReportError:
+            return None
+        fault_flush(t0)         # what diagnostics.py counted since the last pass of the tick
+        taken = {}
+        runs = _error_report["runs"]                # this process's code, also after a restart of it that did not start
+        version = runs["version"] if runs else version_at(pinned) if pinned else None
+        body = error_report_body(error_report_since(kv_time("error_reports_sent"), t0), version, taken,
+                                 restarting=True)
+        if body is None or not body["faults"]:
+            return None
+        stamp = repr(float(t0))
+        kv_set("error_reports_tried", stamp)
+        thread = _error_report["thread"] = threading.Thread(
+            target=error_report_send, args=(url, body, stamp), name="error-report", daemon=True,
+            kwargs={"timeout": RESTART_REPORT_WAIT, "asked": kv_get("error_reports_early_at"), "taken": taken,
+                    "early": True})
+        thread.start()
+    thread.join(RESTART_REPORT_WAIT)
+    return body
 
 
 # ---------------------------------------------------------------- seatbelt
@@ -6334,10 +6875,11 @@ def spans_bytes(memory):
 #   the state: the texts that the next read of the state asks for stay, as the last asked. An entry keeps its text,
 #   and the text's bytes (sys.getsizeof) and SPAN_ENTRY_BYTES of its own count against SCRUB_SPANS_BYTES: the 9,849
 #   texts that the live state put in it held 5.3 MB, 537 bytes a text, and their entries 142 bytes more each. The
-#   bound is 128 MB, and a sixteenth of the machine's memory where that is less: the app takes a hub's server of 1 GB
-#   (ServerCheck.hubMemory), and there it is some 60 MB. So the cache holds some 195,000 texts of the state's mean size
-#   (about six months of the growth above), some 90,000 on a hub of 1 GB, and fewer longer ones, where 262,144 texts
-#   of 4,000 characters with one emoji in each would have been about 4 GB.
+#   bound is 128 MB, and a sixteenth of the machine's memory where that is less: the app takes a new hub's server of
+#   2 GB since W3 (ServerCheck.hubMemory), and hubs of 1 GB remain: there it is some 60 MB. So the cache holds some
+#   195,000 texts of the state's mean size (about six months of the growth above), some 180,000 on a hub of 2 GB (a
+#   plan of 2 GB gives its system some 1,900 MB), some 90,000 on a hub of 1 GB, and fewer longer ones, where 262,144
+#   texts of 4,000 characters with one emoji in each would have been about 4 GB.
 SECRET_SPANS_KEPT = 8192
 SCRUB_SPANS_KEPT = 262144
 SCRUB_SPANS_BYTES = spans_bytes(machine_memory())
@@ -72528,6 +73070,9 @@ def restart_hub_soon(pinned, reached, always=False):
         return None
     argv = CFG.get("hub_restart", HUB_RESTART)
     if not argv:
+        if not always:
+            with LOCK:
+                error_report_runs_old(pinned, failed=False)     # W15: the old code runs on, and its reports say so
         return None
     # A bridge that never sent its code (POST /bridge/status) is older than its own code check, so it runs the code it
     # started with until its server restarts. The hub's own restart takes it to the new code first, once: a bridge
@@ -72539,6 +73084,11 @@ def restart_hub_soon(pinned, reached, always=False):
             try:
                 pieces_written()        # the new hub.py's compiled file, in pieces, before the start that reads it
             except Exception:           # this step never stops the restart onto the new code
+                print_fault()
+        if not always:
+            try:
+                error_report_before_restart(pinned, reached)    # W15: the error report goes before the new code
+            except Exception:           # and never stops the restart either
                 print_fault()
         time.sleep(RESTART_DELAY)        # this run's row and the owner's answer are written before the process goes
         if old_bridge:
@@ -72555,6 +73105,7 @@ def restart_hub_soon(pinned, reached, always=False):
             with LOCK:
                 log("hub", f"the hub could not restart itself onto the new release: {says[:200]}. Restart "
                            f"{' '.join(argv)} by hand.")
+                error_report_runs_old(pinned)       # W15: its reports name the code that still runs
     threading.Thread(target=run, name="release-restart", daemon=True).start()
     return argv
 
@@ -72582,7 +73133,8 @@ DRAIN_MOST = 5          # seconds that a stop waits for the open requests, and t
 FRESH_MOST = 1          # seconds that it waits for a connection that it accepted and that has sent no request yet
 REAP_EVERY = 5          # seconds between two looks at the child processes of the code before (reap_children)
 STOPPING = threading.Event()                # the hub takes no new connection: a long wait answers now
-SERVING = {"server": None, "exec": False, "exit": False}    # main()'s server; a restart in place; a stop (SIGTERM)
+# main()'s server; a restart in place; a stop (SIGTERM); and whether this process's code began by exec (code_started)
+SERVING = {"server": None, "exec": False, "exit": False, "execed": False}
 CALLS = threading.Condition()
 CALLS_OPEN = [0]        # the requests that a Handler reads or answers now (Handler.parse_request)
 CALLS_FRESH = [0]       # the connections that the hub's server accepted and that sent no request yet (Handler.setup)
@@ -72596,9 +73148,11 @@ def code_started():
     the process and its start time, so without it the new code would read back every file that the process had
     compiled since its first start, and keep their memory. The name leaves the environment."""
     try:
-        return float(os.environ.pop(EXEC_AT))
+        at = float(os.environ.pop(EXEC_AT))
     except (KeyError, ValueError):
         return process_started()
+    SERVING["execed"] = True        # the restart in place started this code: a planned stop (error_reports_started)
+    return at
 
 
 def calls_begin(fresh=False):
@@ -72832,7 +73386,8 @@ def after_serving(server):
     with CALLS:
         CLOSING.set()                   # a connection whose thread comes to its Handler after this ends there
     quiet_connections_end(fresh=True)
-    LOCK.acquire(timeout=DRAIN_MOST)
+    if LOCK.acquire(timeout=DRAIN_MOST):
+        error_reports_stopping()        # a stop that the hub planned: its next start sends no early report for it
     if SERVING["exit"]:
         server.socket.close()           # a stop that came during the wait for LOCK
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
@@ -77633,7 +78188,11 @@ class Handler(BaseHTTPRequestHandler):
                 _, digest, lines = team_view(rev)
             except Refusal as e:
                 return self.json(e.status, refusal_body(e))
-            busy = {r["owner"]: r["c"] for r in q(f"SELECT owner, COUNT(*) c FROM tasks WHERE {OPEN_TASK} GROUP BY owner")}
+            # only the agents of these lines: every released app refuses the whole answer for another name in
+            # open_tasks (TeamSnapshot.validate since 1.6), such as an open task of an agent that team.json lost
+            named = {line["agent"] for line in lines}
+            busy = {r["owner"]: r["c"] for r in q(f"SELECT owner, COUNT(*) c FROM tasks WHERE {OPEN_TASK} GROUP BY owner")
+                    if r["owner"] in named}
             team = json.loads(git_blob(rev, "team.json"))
             for line in lines:              # owner API 1.9: the settings at this revision, and what the runtime reported
                 a = team["agents"].get(line["agent"]) or {}
@@ -84663,6 +85222,7 @@ def main():
     settle_releases(ask=not restored)
     with LOCK:
         pass_held_releases()    # the rows from before the state `passed`, or from a run that this start ended
+    error_reports_started(restored)     # W15: this start in the error report's health, and an early one after a fault
     settle_task_numbers()
     settle_people_names()
     settle_narrowed_rows()      # person access plan, section 5: the marks of rows of before, before the hub answers
@@ -84731,9 +85291,12 @@ def main():
     memory_given_back()         # what the compile of this file and the start's own steps no longer use
     SERVING["server"] = server
     signal.signal(signal.SIGTERM, on_stop_signal)       # a stop of the service ends the open requests first
+    error_reports_serving()     # W15: from here a stop is planned, and a start that finds the mark follows a crash
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        with LOCK:
+            error_reports_stopping()
         print("\nstopped")
         return
     after_serving(server)       # the new code in this process, or the end of it (stop_serving)

@@ -13,17 +13,27 @@ import http.server
 import io
 import json
 import os
+from pathlib import Path
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
 import threading
+import time
 import unittest
 import unittest.mock
+import uuid
 
 import diagnostics
 import errorreports
 import hub
 import owner_mcp
+import releases
 from test_diagnostics import canary, fail_with, strings
 from test_ui_api import OwnerAPI
-from leftovers import ROOT, TEST_DIR
+from leftovers import ROOT, TEST_DIR, parent_pipe
 
 HERE = os.path.relpath(os.path.join(TEST_DIR, os.path.basename(__file__)), ROOT)     # as diagnostics names it
 FOLDER = os.path.relpath(TEST_DIR, ROOT)          # "." here, "tests" in a clone of the published repository
@@ -41,11 +51,11 @@ def a_refusal(**changes):
                  "last": NOW - 5}, **changes)
 
 
-def report(view, since=0, **facts):
+def report(view, since=0, health=None, **facts):
     given = dict(fleet=FLEET, version="2026.11.538", system="Ubuntu 24.04", code="ab12cd", agents=3, servers=2)
     given.update(facts)
     return errorreports.report(given["fleet"], given["version"], given["system"], given["code"], given["agents"],
-                               given["servers"], view, since)
+                               given["servers"], view, since, health=health)
 
 
 class Report(unittest.TestCase):
@@ -223,6 +233,9 @@ class Endpoint(unittest.TestCase):
         self.assertEqual(errorreports.endpoint("https://founderizer.com"), "https://founderizer.com/api/errors")
         self.assertEqual(errorreports.endpoint("https://Staging.Founderizer.com/"),
                          "https://staging.founderizer.com/api/errors")
+        # the platform's own host since 21 November 2026: a channel there must not stop the fleet's reports
+        self.assertEqual(errorreports.endpoint("https://platform.founderizer.com"),
+                         "https://platform.founderizer.com/api/errors")
 
     def test_any_other_channel_sends_nothing(self):
         self.assertEqual(errorreports.endpoint("https://staging.founderizer.com:8443"),
@@ -259,6 +272,100 @@ class Due(unittest.TestCase):
     def test_our_sides_hold(self):
         self.assertFalse(errorreports.due(True, None, None, NOW + 60, NOW))
         self.assertTrue(errorreports.due(True, None, None, NOW - 1, NOW))
+
+    def test_an_early_report_goes_at_once_and_at_most_four_times_a_day(self):
+        """The plan's 3.3: a report goes early when the hub asks for one, at most EARLY_MOST in a DAY, and never past
+        our side's hold or a try that just failed. A check that turns bad and good again each minute would else send a
+        report each minute, and our side's count of one fleet would refuse its reports for the hour."""
+        sent, day = NOW - 3600, errorreports.DAY
+        self.assertEqual(errorreports.due(True, sent, sent, None, NOW), None)
+        self.assertEqual(errorreports.due(True, sent, sent, None, NOW, NOW - 5), "early")
+        four = [NOW - 60 * i for i in range(1, errorreports.EARLY_MOST + 1)]
+        self.assertIsNone(errorreports.due(True, sent, sent, None, NOW, NOW - 5, four))
+        self.assertEqual(errorreports.due(True, sent, sent, None, NOW, NOW - 5, [NOW - day - 1] + four[1:]), "early")
+        self.assertIsNone(errorreports.due(True, sent, sent, NOW + 60, NOW, NOW - 5))
+        self.assertIsNone(errorreports.due(True, sent, NOW - 60, None, NOW, NOW - 5))
+        self.assertIsNone(errorreports.due(False, sent, sent, None, NOW, NOW - 5))
+        self.assertEqual(errorreports.due(True, NOW - day, NOW - day, None, NOW, NOW - 5, four), "day")
+        # a clock that went back an hour after four early reports: they are ahead of it, and still count
+        self.assertIsNone(errorreports.due(True, sent, sent, None, NOW - 3600, NOW - 3605, four))
+
+
+# The keys of the health block, as our side requires each one (founderizer-web, tests/fixtures/error-reports/
+# hub-health-w16.json and docs/CONTRACTS.md, "The health of a fleet").
+HEALTH_KEYS = {"release": {"newest", "state", "step", "cause", "tries", "since", "behind", "channel"},
+               "check": {"code", "hub", "servers", "since", "repairs", "repaired"},
+               "machine": {"memory", "swap", "cores", "ooms", "starts"}}
+
+
+def a_release(**changes):
+    return dict({"newest": "2026.11.762", "state": "failed", "step": "fetch", "cause": "no_ipv4_route", "tries": 3,
+                 "since": NOW - 600, "behind": 2, "channel": 200}, **changes)
+
+
+def a_machine(**changes):
+    return dict({"memory": 1907, "swap": 2047, "cores": 1, "ooms": 3, "starts": 2}, **changes)
+
+
+class HealthBlock(unittest.TestCase):
+    def test_the_block_has_the_contracts_keys_and_words_and_nothing_else(self):
+        """Our side requires every key of the block and takes only the words of its lists (W16): a key left out, or a
+        word that the copy did not check, is a 400, and the block then waits a day. A word of no list goes as "other",
+        a count above our side's bound as the bound, a second check of one code is left out, and a version that is not
+        one holds the whole block back."""
+        block = errorreports.health(
+            a_release(state="downloading", step="unpack", cause="cosmic_ray", tries=10 ** 9),
+            [{"code": "disk", "hub": False, "servers": 1, "since": NOW - 60}, {"code": "disk", "hub": True,
+                                                                               "servers": 0, "since": None},
+             {"code": "eth0_link", "hub": None, "servers": 0, "since": None}, {"code": "ssh", "hub": "yes",
+                                                                               "servers": 0, "since": None}],
+            a_machine(memory=10 ** 8))
+        self.assertEqual(set(block), {"release", "checks", "machine"})
+        self.assertEqual(set(block["release"]), HEALTH_KEYS["release"])
+        self.assertEqual([set(c) for c in block["checks"]], [HEALTH_KEYS["check"]] * 2)
+        self.assertEqual(set(block["machine"]), HEALTH_KEYS["machine"])
+        self.assertEqual((block["release"]["state"], block["release"]["step"], block["release"]["cause"],
+                          block["release"]["tries"]), ("other", "other", "other", errorreports.NUMBER_MOST))
+        self.assertEqual([(c["code"], c["hub"], c["repairs"], c["repaired"]) for c in block["checks"]],
+                         [("disk", False, 0, 0), ("other", None, 0, 0)])
+        self.assertEqual(block["machine"]["memory"], errorreports.MB_MOST)
+        self.assertEqual(errorreports.health(a_release(step=None, cause=None), [], a_machine())["release"]
+                         ["cause"], "none")
+        for wrong in (a_release(newest="2026.11.762 (abc)"), a_release(tries=-1), a_release(newest=None)):
+            with self.subTest(release=wrong):
+                self.assertIsNone(errorreports.health(wrong, [], a_machine()))
+        self.assertIsNone(errorreports.health(a_release(), [], a_machine(cores=0)))
+        body = report({}, health=errorreports.health(a_release(), [], a_machine()))
+        self.assertEqual(body["health"]["release"]["newest"], "2026.11.762")
+
+    def test_each_copy_is_our_sides_list_as_it_is_today(self):
+        """Each copy is our side's list (founderizer-web, src/lib/errors.ts, HEALTH_WORDS of 21 November 2026), word
+        for word. A word comes to our side first, and only then into a copy and here: a hub whose copy took a word that
+        our side does not have would have each report with the block refused, at each fleet, each day. A new word of
+        the hub's own goes as "other" until both sides take it."""
+        theirs = {
+            "state": "verified held updating passed kept rolled_back done failed none other",
+            "step": "room hold branch clean pinned fetch have already minimum clone merge keep schema selftest verify "
+                    "take push follow other",
+            "cause": "none no_ipv4_route dns connect tls http timeout memory disk conflict check busy hold branch "
+                     "own_changes other",
+            "check": "uplink ipv4_route ipv6_route dns channel upstream tailnet clock disk memory oom release_lag "
+                     "firewall updates restart quiet egress network ssh npm updates_off macos_update egress_table "
+                     "other"}
+        for name, copy in (("state", errorreports.STATES), ("step", errorreports.STEPS),
+                           ("cause", errorreports.CAUSES), ("check", errorreports.CHECKS)):
+            self.assertEqual(copy, tuple(theirs[name].split()), f"{name}: put a new word on our side first")
+
+    def test_each_word_of_the_hubs_sources_is_in_our_sides_copy(self):
+        """A new release state, step or cause, or a new key of the server watch, must reach our side's lists, and so
+        these copies, before a release sends it: else it goes as "other", and nobody on our side reads what broke. Each
+        copy ends with "other" and holds each word once, as our side's lists do."""
+        for copy, source in ((errorreports.STATES, hub.RELEASE_STATES + ("none",)),
+                             (errorreports.STEPS, releases.STEPS), (errorreports.CAUSES, releases.CAUSES + ("none",)),
+                             (errorreports.CHECKS, tuple(hub.WATCH_WORDS))):
+            with self.subTest(copy=copy[:2]):
+                self.assertEqual([w for w in source if w not in copy], [])
+                self.assertEqual((copy[-1], len(set(copy))), ("other", len(copy)))
 
 
 class Site(http.server.BaseHTTPRequestHandler):
@@ -325,6 +432,7 @@ class Send(unittest.TestCase):
             with self.subTest(status=status), self.assertRaises(errorreports.ReportError) as caught:
                 errorreports.send(self.url, report({}))
             self.assertEqual((caught.exception.status, caught.exception.retry_after), (status, errorreports.DAY))
+            self.assertEqual(str(caught.exception), f"127.0.0.1 answered {status}")     # the host that it sent to
         with self.assertRaises(errorreports.ReportError) as caught:
             errorreports.send("http://127.0.0.1:1/api/errors", report({}), timeout=5)
         self.assertIsNone(caught.exception.retry_after)         # not reached: tried again after RETRY
@@ -332,9 +440,10 @@ class Send(unittest.TestCase):
 
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
-    for case in (Report, Endpoint, Due, Send):
+    for case in (Report, Endpoint, Due, HealthBlock, Send, StartAndStop):
         suite.addTests(loader.loadTestsFromTestCase(case))
-    suite.addTests(OnTheHub(name) for name in OnTheHub.__dict__ if name.startswith("test_"))
+    for case in (OnTheHub, HealthOnTheHub):
+        suite.addTests(case(name) for name in case.__dict__ if name.startswith("test_"))
     return suite
 
 
@@ -357,6 +466,8 @@ class OnTheHub(OwnerAPI):
         channel = unittest.mock.patch.object(hub, "release_channel", lambda: "https://founderizer.com")
         channel.start()
         self.addCleanup(channel.stop)
+        hub._error_report.update(runs=None)         # no code of a restart that did not start, of an earlier test
+        self.addCleanup(hub._error_report.update, runs=None)
 
     def sweep(self, t0):
         with hub.LOCK:
@@ -491,7 +602,8 @@ class OnTheHub(OwnerAPI):
         body = hub.error_report_body
         t0 = hub.now()
         with unittest.mock.patch.object(hub, "release_channel", lambda: "https://example.net"), \
-                unittest.mock.patch.object(hub, "error_report_body", lambda since: built.append(since) or body(since)), \
+                unittest.mock.patch.object(hub, "error_report_body",
+                                           lambda since, **how: built.append(since) or body(since, **how)), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.sweep(t0)
             self.sweep(t0 + errorreports.RETRY + 1)
@@ -525,7 +637,7 @@ class OnTheHub(OwnerAPI):
         self.switch(True)
         calls = []
 
-        def broken(since):
+        def broken(since, **how):
             calls.append(since)
             raise RuntimeError("a step of the body raised")
 
@@ -538,7 +650,10 @@ class OnTheHub(OwnerAPI):
         self.assertEqual(hub.kv_time("error_reports_tried"), t0)
 
     def test_the_hubs_own_times_wake_no_app(self):
-        for key in ("error_reports_tried", "error_reports_sent", "error_reports_hold", "error_reports_on_at"):
+        for key in ("error_reports_tried", "error_reports_sent", "error_reports_hold", "error_reports_on_at",
+                    "error_reports_release", "error_reports_watch", "error_reports_early_at", "error_reports_earlies",
+                    "error_reports_health_hold", "error_reports_starts", "error_reports_oom", "error_reports_running",
+                    "error_reports_restart"):
             self.assertIn(key, hub.QUIET_KEYS)
         self.assertNotIn("error_reports", hub.QUIET_KEYS)       # the owner's switch is news for every app
 
@@ -559,3 +674,666 @@ class OnTheHub(OwnerAPI):
         self.assertIsNone(hub.kv_time("error_reports_sent"))
         self.sweep(hub.kv_time("error_reports_hold") + 1)
         self.assertEqual(len(self.sent), 1)
+
+
+class HealthOnTheHub(OnTheHub):
+    """The health block on the test hub (W15), with a /proc of the test's own: this Mac has none, and the block goes
+    only where one is."""
+
+    def setUp(self):
+        super().setUp()
+        self.proc = os.path.join(self.tmp.name, "proc")
+        os.makedirs(self.proc)
+        self.machine(kills=3)
+        for name in ("MEMINFO", "VMSTAT", "BOOT_ID"):
+            patcher = unittest.mock.patch.object(errorreports, name, os.path.join(self.proc, name.lower()))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for patcher in (unittest.mock.patch.object(hub, "HUB_KIND", "linux"),
+                        unittest.mock.patch.dict(hub.HUB_LOAD, at=None, load={"disk_used": 1, "disk_total": 10,
+                                                                              "memory_used": 1, "memory_total": 10}),
+                        unittest.mock.patch.dict(hub.HUB_HARDENING, read=None),
+                        unittest.mock.patch.object(hub, "running_version", lambda: "2026.11.700")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        hub.TEAM["hub"] = {"machine": "hub"}
+        hub._error_report.update(looked=None)
+
+    def machine(self, kills, boot="5d0c9a4e-1f2b-4c3d-8e9f-0a1b2c3d4e5f", extra=""):
+        files = {"meminfo": f"MemTotal:        1953124 kB\nMemAvailable:     900000 kB\n{extra}SwapTotal:       "
+                            f"2097148 kB\n", "vmstat": f"nr_free_pages 12\noom_kill {kills}\n", "boot_id": boot + "\n"}
+        for name, text in files.items():
+            with open(os.path.join(self.proc, name), "w") as f:
+                f.write(text)
+
+    def release(self, version, state, **columns):
+        row = dict({"seen": hub.now(), "revision": uuid.uuid4().hex + uuid.uuid4().hex[:8], "version": version,
+                    "state": state}, **columns)
+        with hub.LOCK:
+            hub.q(f"INSERT INTO releases({','.join(row)}) VALUES({','.join('?' * len(row))})", tuple(row.values()))
+        return row
+
+    def look(self, t0):
+        with hub.LOCK:
+            hub.error_report_look(t0, force=True)
+            asked = hub.kv_time("error_reports_early_at")
+            hub.kv_set("error_reports_early_at", None)
+        return asked
+
+    def health(self):
+        with hub.LOCK:
+            return hub.error_report_body(0).get("health")
+
+    def watch(self, said):
+        with hub.LOCK:
+            hub.kv_set("server_watch", json.dumps(said))
+
+    def refusal(self):
+        """A refused call of one of the hub's own tools (diagnostics.view keeps no other)."""
+        try:
+            fail_with(hub.ToolError("a refused call"))
+        except hub.ToolError:
+            diagnostics.refused("read_messages")
+        with hub.LOCK:
+            hub.fault_flush(hub.now())
+
+    @staticmethod
+    def git(versions):
+        """A stand-in for git_kit whose checkout has release.json of `versions` ({revision: version}) at each revision:
+        the checkout's HEAD at the new release, and the code that runs at another."""
+        def git_kit(*args, **how):
+            if args[:2] == ("cat-file", "blob"):
+                return 0, json.dumps({"revision": "0" * 40, "version": versions[args[2].split(":")[0]]}), ""
+            return 128, "", "fatal"
+        return unittest.mock.patch.object(hub, "git_kit", git_kit)
+
+    def test_no_word_of_a_machine_rides_in_the_health(self):
+        """The plan's W15 bug (1): every value of the block is a word of a list, a version, a number or a time. A canary
+        in each source that the block reads (git's own line and made-up words in a release's row, a host as a server's
+        name and its address, words in the server watch's record, the machine's start id and a line of its memory
+        file) never reaches the body: a source passed on as it is would carry it to our side, where an agent reads
+        what is kept."""
+        host, link, address = f"cnry{uuid.uuid4().hex[:8]}.example.net", f"enp{uuid.uuid4().hex[:6]}s0", "203.0.113.77"
+        said = f"fatal: unable to access 'https://{host}/x.git/': Could not resolve host: {host}"
+        hub.TEAM["addresses"][host] = address
+        self.machine(kills=4, boot=f"{host}-{link}", extra=f"{link}: 5 kB\n")
+        row = self.release("2026.11.900", link, step=f"step-{host}", cause=link, says=said, pinned="f" * 40,
+                           reached="e" * 40, finished=hub.now())
+        self.release(host, "kept", says=said)       # a version that is not one is no release of the block
+        with hub.LOCK:
+            hub.kv_set("releases_status", f"503 {host}")
+        self.watch({host: {"told": ["disk", link], "restart": None}, "hub": {"told": ["firewall", said]}})
+        self.switch(True)
+        self.sweep(hub.now())
+        ((_, body),) = self.sent
+        health = body["health"]
+        self.assertEqual((health["release"]["newest"], health["release"]["state"], health["release"]["step"],
+                          health["release"]["channel"]), ("2026.11.900", "other", "other", 0))
+        checks = {c["code"]: c for c in health["checks"]}
+        self.assertEqual((checks["disk"]["servers"], checks["firewall"]["hub"]), (1, True))
+        text = json.dumps(body)
+        for piece in (host, link, address, "unable to access", "resolve", row["revision"], "f" * 40, "e" * 40):
+            self.assertNotIn(piece, text)
+
+    def test_a_refused_block_sends_the_report_again_at_once_without_it(self):
+        """The plan's W15 bug (2): our side answers 400 to a report with the block (a site that does not take it yet,
+        or a word that it does not take yet). The same report goes again at once without the block, our side holds
+        nothing back, and the block waits a day from the report's stamp: a hub that waited a day would send no faults
+        for a day, one that sent the block again at the next report would be refused again, and one whose hold began
+        after the stamp would hold the block back from the next day's report too."""
+        self.switch(True)
+        sends = []
+
+        def site(url, body, timeout=None):
+            sends.append(body)
+            if "health" in body:
+                raise errorreports.ReportError("founderizer.com answered 400", retry_after=errorreports.DAY, status=400)
+
+        t0 = hub.now()
+        with unittest.mock.patch.object(errorreports, "send", site), contextlib.redirect_stdout(io.StringIO()):
+            self.sweep(t0)
+            self.assertEqual(len(sends), 2)
+            self.assertIn("health", sends[0])
+            self.assertEqual(sends[1], {k: v for k, v in sends[0].items() if k != "health"})
+            self.assertEqual((hub.kv_time("error_reports_sent"), hub.kv_time("error_reports_hold"),
+                              hub.kv_time("error_reports_health_hold")), (t0, None, t0 + errorreports.DAY))
+            with hub.LOCK:
+                hub.error_report_early("a test")
+            self.sweep(t0 + 60)                 # the next report, early, goes without the block
+            self.assertEqual((len(sends), "health" in sends[2]), (3, False))
+        with hub.LOCK:
+            hub.kv_set("error_reports_health_hold", repr(hub.now() - 1))
+        self.assertIsNotNone(self.health())     # a day later the block goes again
+
+    def test_an_owner_who_turns_reports_off_during_the_first_send_gets_no_second(self):
+        """The switch is read again before the report goes again without the block: an owner who turned error reports
+        off while the first send waited for our side must not get a report that goes after his no."""
+        self.switch(True)
+        sends = []
+
+        def site(url, body, timeout=None):
+            sends.append(body)
+            with hub.LOCK:
+                hub.set_error_reports(False)
+            raise errorreports.ReportError("founderizer.com answered 400", retry_after=errorreports.DAY, status=400)
+
+        with unittest.mock.patch.object(errorreports, "send", site), contextlib.redirect_stdout(io.StringIO()):
+            self.sweep(hub.now())
+        self.assertEqual([("health" in body) for body in sends], [True])
+
+    def test_a_second_send_that_does_not_go_waits_as_any_send(self):
+        """After a 400 to the block, the second send meets our side's answer as any send does: a 429 holds the next
+        try for its Retry-After, and a send that does not reach our side is tried again after an hour. Neither marks
+        the day as sent, and neither starts the block's counts again: their report was not taken."""
+        self.switch(True)
+        answers = iter([(400, errorreports.DAY), (429, 120), (400, errorreports.DAY), (None, None)])
+        calls = []
+
+        def site(url, body, timeout=None):
+            calls.append("health" in body)
+            status, retry = next(answers)
+            raise errorreports.ReportError("answered", retry_after=retry, status=status)
+
+        counts = hub.kv_get("error_reports_oom")
+        t0 = hub.now()
+        with unittest.mock.patch.object(errorreports, "send", site), contextlib.redirect_stdout(io.StringIO()):
+            self.sweep(t0)
+            self.assertTrue(t0 + 100 < hub.kv_time("error_reports_hold") <= hub.now() + 120)
+            with hub.LOCK:
+                hub.kv_set("error_reports_hold", None)
+                hub.kv_set("error_reports_health_hold", None)
+            self.sweep(t0 + errorreports.RETRY + 1)
+            self.assertIsNone(hub.kv_time("error_reports_hold"))
+            self.sweep(t0 + errorreports.RETRY + 60)        # not reached: tried again only after an hour
+        self.assertEqual(calls, [True, False, True, False])
+        self.assertEqual((hub.kv_time("error_reports_sent"), hub.kv_get("error_reports_oom")), (None, counts))
+
+    def test_one_event_sends_one_early_report(self):
+        """At the real clock: the look of a pass asks for an early report after the pass's stamp, and the report that
+        answers it ends the ask, so the next pass sends nothing. A report that kept the ask would send a second early
+        report 5 seconds later for the same event, and use two of the day's four."""
+        self.switch(True)
+        self.sweep(hub.now())                   # the day's report, and the first look
+        self.watch({"hub": {"told": ["memory"]}})
+        hub._error_report["looked"] = None      # the pass's own look, as a minute later
+        self.sweep(hub.now())
+        self.sweep(hub.now())
+        self.assertEqual(len(self.sent), 2)
+        self.assertIsNone(hub.kv_time("error_reports_early_at"))
+
+    def test_an_event_during_a_send_keeps_its_ask(self):
+        """An event that comes while a report is on its way asks with a new value, so the send ends only the ask that it
+        answered, and the event gets its own report. A slow send is most likely when the network breaks, and an ask
+        that the send ended would wait for the day's report, up to a day later."""
+        self.switch(True)
+        self.sweep(hub.now())                   # the day's report
+        sends = []
+
+        def site(url, body, timeout=None):
+            sends.append(body)
+            if len(sends) == 1:
+                with hub.LOCK:
+                    hub.error_report_early("an event during the send")
+
+        with hub.LOCK:
+            hub.error_report_early("a test")
+        with unittest.mock.patch.object(errorreports, "send", site):
+            self.sweep(hub.now())
+            self.assertIsNotNone(hub.kv_time("error_reports_early_at"))
+            self.sweep(hub.now())
+        self.assertEqual(len(sends), 2)
+        self.assertIsNone(hub.kv_time("error_reports_early_at"))
+
+    def test_at_most_four_early_reports_go_in_a_day(self):
+        """The plan's cap on the hub: each early report that went counts, so a fifth ask in the day waits. A hub that
+        did not count them would send a report for each event, and a check that comes and goes would fill our side's
+        count of one fleet."""
+        self.switch(True)
+        self.sweep(hub.now())
+        for _ in range(errorreports.EARLY_MOST + 1):
+            with hub.LOCK:
+                hub.error_report_early("a test")
+            self.sweep(hub.now())
+        self.assertEqual(len(self.sent), 1 + errorreports.EARLY_MOST)
+        self.assertIsNotNone(hub.kv_time("error_reports_early_at"))      # the fifth waits for its day
+
+    def test_kills_and_starts_count_from_the_last_report_with_the_block_that_our_side_took(self):
+        """ooms and starts count since the last report with the block that our side took (the contract's "Since the
+        last report"), from what that report held, and from the owner's yes: a hub that sent the kills since the
+        machine's start at each report would count each one again every day, one that read /proc again after the send
+        would count them again when that read failed, and one that counted from a report that went without the block
+        would lose those that it carried. A new start of the machine counts from its own start."""
+        self.switch(True)                       # 3 kills before his yes
+        self.machine(kills=5)
+        for _ in range(2):                      # two starts, each after a stop that the hub planned
+            with hub.LOCK:
+                hub.error_reports_stopping()
+            hub.error_reports_started()
+
+        def site(url, body, timeout=None):
+            self.sent.append((url, body))
+            os.remove(os.path.join(self.proc, "vmstat"))        # /proc cannot be read once the send is done
+
+        t0 = hub.now()
+        with unittest.mock.patch.object(errorreports, "send", site):
+            self.sweep(t0)
+        self.assertEqual(self.sent[-1][1]["health"]["machine"], {"memory": 1907, "swap": 2047, "cores": os.cpu_count(),
+                                                                  "ooms": 2, "starts": 2})
+        self.machine(kills=6)
+
+        def refused(url, body, timeout=None):
+            if "health" in body:
+                raise errorreports.ReportError("answered 400", retry_after=errorreports.DAY, status=400)
+            self.sent.append((url, body))
+
+        with unittest.mock.patch.object(errorreports, "send", refused), contextlib.redirect_stdout(io.StringIO()):
+            self.sweep(t0 + errorreports.DAY + 1)
+        self.assertNotIn("health", self.sent[-1][1])
+        with hub.LOCK:
+            hub.kv_set("error_reports_health_hold", None)
+        self.machine(kills=8)
+        self.assertEqual(self.health()["machine"]["ooms"], 3)       # 5 to 8: the report without the block took none
+        self.machine(kills=1, boot="0f0e0d0c-1f2b-4c3d-8e9f-0a1b2c3d4e5f")
+        self.assertEqual(self.health()["machine"]["ooms"], 1)
+
+    def test_a_report_goes_early_when_the_hubs_server_or_the_hub_breaks(self):
+        """The plan's 3.3: a check that turns bad on the hub's own server, a start after a stop that the hub did not
+        plan and a start on other code than its restart onto new code went to each send a report before its day; a
+        fault that was there before the first look, a fault of another server, a planned stop, a restart that went
+        where it was to go, a delivery that moved HEAD after it, and a start by the exec of a restart in place do
+        not."""
+        self.switch(True)
+        t0 = hub.now()
+        self.sweep(t0)                          # the day's report, and the first look: its faults were there
+        self.watch({"web-1": {"told": ["disk"]}})
+        self.assertIsNone(self.look(t0 + 60))
+        self.watch({"web-1": {"told": ["disk"]}, "hub": {"told": ["memory"]}})
+        self.assertIsNotNone(self.look(t0 + 120))
+        hub.error_reports_started()             # main(): the start, and then its stop signal's handler
+        hub.error_reports_serving()
+        self.assertIsNone(self.look(t0 + 150))
+        with hub.LOCK:
+            hub.error_reports_stopping()
+        hub.error_reports_started()
+        hub.error_reports_serving()
+        self.assertIsNone(self.look(t0 + 180))  # a planned stop
+        hub.error_reports_started()             # no stop came between: the process ended by itself
+        self.assertIsNotNone(self.look(t0 + 240))
+        # the code that runs after a restart onto "e": other code; the same code after a delivery moved HEAD; "e"
+        for runs, same, early in (("d" * 40, False, True), ("d" * 40, True, False), ("e" * 40, False, False)):
+            with hub.LOCK:
+                hub.kv_set("error_reports_restart", json.dumps({"to": "e" * 40, "at": t0}))
+            with unittest.mock.patch.object(hub, "kit_revision", lambda fresh=False: runs), \
+                    unittest.mock.patch.object(hub, "same_code", lambda a, b: same):
+                hub.error_reports_started()
+            self.assertEqual(self.look(t0 + 300) is not None, early, (runs, same))
+        with hub.LOCK:
+            hub.kv_set("error_reports_running", "1")        # a restart in place whose stop could not take LOCK
+        with unittest.mock.patch.dict(hub.SERVING, execed=False), \
+                unittest.mock.patch.dict(os.environ, {hub.EXEC_AT: repr(time.time())}):
+            hub.code_started()                              # main()'s first step reads the exec
+            hub.error_reports_started()
+        self.assertIsNone(self.look(t0 + 330))
+        with hub.LOCK:
+            hub.error_report_early("a test")
+        self.sweep(t0 + 360)
+        self.assertEqual(len(self.sent), 2)     # the early one went, before the day
+
+    def test_a_release_that_does_not_end_done_sends_the_report_early(self):
+        """The plan's 3.3 and the contract's behind_hours: the third run of a release that did not end done, and 6 hours
+        behind the newest release after such a run, each ask for an early report once, so that a fleet that stops
+        taking releases is seen within hours and not after a day. The block's tries count those runs, and its cause
+        is the last one's."""
+        self.switch(True)
+        t0 = hub.now()
+        self.look(t0)                           # the first look: no release yet
+        row = self.release("2026.11.710", "kept", step="fetch", cause="dns", finished=t0 + 10)
+        self.assertIsNone(self.look(t0 + 60))
+        with hub.LOCK:
+            hub.q("UPDATE releases SET state='rolled_back', finished=? WHERE revision=?", (t0 + 70, row["revision"]))
+        self.assertIsNone(self.look(t0 + 120))
+        with hub.LOCK:
+            hub.q("UPDATE releases SET state='failed', cause='timeout', finished=? WHERE revision=?",
+                  (t0 + 130, row["revision"]))
+        self.assertIsNotNone(self.look(t0 + 180))
+        self.assertIsNone(self.look(t0 + 240))      # once
+        self.assertIsNotNone(self.look(t0 + 60 + errorreports.BEHIND_WAIT))
+        self.assertIsNone(self.look(t0 + 120 + errorreports.BEHIND_WAIT))
+        release = self.health()["release"]
+        self.assertEqual((release["newest"], release["state"], release["tries"], release["cause"], release["since"]),
+                         ("2026.11.710", "failed", 3, "timeout", round(t0 + 60, 3)))
+
+    def test_six_hours_behind_ask_once_for_each_time_behind(self):
+        """The 6-hour early report goes once for each time behind: new releases that come while the hub stays behind,
+        and a release behind that leaves the rows that the look reads, ask no second one; a new time behind, after the
+        hub ran the newest release, asks again."""
+        self.switch(True)
+        t0 = hub.now()
+        self.release("2026.11.700", "done", finished=t0 - 100)
+        self.look(t0)
+        self.release("2026.11.701", "kept", step="fetch", cause="dns", finished=t0 + 10)
+        self.look(t0 + 60)
+        self.assertIsNotNone(self.look(t0 + 60 + errorreports.BEHIND_WAIT))
+        with unittest.mock.patch.object(hub, "RELEASE_WALK", 1):        # the look reads the 4 newest rows
+            for n in range(2, 7):
+                self.release(f"2026.11.70{n}", "verified")
+                self.assertIsNone(self.look(t0 + 120 * n + errorreports.BEHIND_WAIT), n)
+        newest = self.release("2026.11.707", "done", finished=t0 + 2000)
+        self.look(t0 + 2000 + errorreports.BEHIND_WAIT)                # the hub runs the newest: no time behind
+        self.release("2026.11.708", "kept", step="fetch", cause="dns", finished=t0 + 3000)
+        self.look(t0 + 3000)
+        self.assertIsNotNone(self.look(t0 + 3000 + 2 * errorreports.BEHIND_WAIT), newest["version"])
+
+    def test_a_run_that_the_fleet_holds_on_purpose_asks_for_no_early_report(self):
+        """A fleet on a branch of its own, or with changes of its own, ends each release kept at that cause, and our
+        side counts no fleet behind for those causes (fleet-health.ts). Its third run and its 6 hours behind ask for
+        no early report, which would only use the day's four; the runs still count."""
+        self.switch(True)
+        t0 = hub.now()
+        self.look(t0)
+        row = self.release("2026.11.710", "kept", step="branch", cause="branch", finished=t0 + 10)
+        self.look(t0 + 60)
+        for t in (t0 + 70, t0 + 130):
+            with hub.LOCK:
+                hub.q("UPDATE releases SET finished=? WHERE revision=?", (t, row["revision"]))
+            self.assertIsNone(self.look(t + 50))
+        self.assertIsNone(self.look(t0 + 60 + errorreports.BEHIND_WAIT))
+        self.assertEqual(self.health()["release"]["tries"], 3)
+
+    def test_a_newer_release_does_not_start_the_time_behind_again(self):
+        """`since` is when the hub first learned of a release newer than the one that it runs, `tries` its runs that did
+        not end done since then, and `cause` the last one's, so a fleet that stays behind while new releases come is
+        behind for that whole time, and not again from zero at each release, where our side would never see it 6
+        hours behind. When it runs the newest release, the time behind ends."""
+        self.switch(True)
+        t0 = hub.now()
+        self.release("2026.11.700", "done", finished=t0 - 100)
+        self.look(t0)
+        self.release("2026.11.701", "kept", step="fetch", cause="dns", finished=t0 + 50)
+        self.look(t0 + 60)
+        two = self.release("2026.11.702", "kept", step="fetch", cause="timeout", finished=t0 + 110)
+        self.look(t0 + 120)
+        release = self.health()["release"]
+        self.assertEqual({k: release[k] for k in ("newest", "since", "tries", "cause", "behind")},
+                         {"newest": "2026.11.702", "since": round(t0 + 60, 3), "tries": 2, "cause": "timeout",
+                          "behind": 2})
+        self.assertIsNotNone(self.look(t0 + 60 + errorreports.BEHIND_WAIT))     # 6 hours from the first one
+        with hub.LOCK:
+            hub.q("UPDATE releases SET state='done', step='follow', cause=NULL WHERE revision=?", (two["revision"],))
+        release = self.health()["release"]
+        self.assertEqual({k: release[k] for k in ("state", "since", "tries", "cause", "behind")},
+                         {"state": "done", "since": None, "tries": 0, "cause": "none", "behind": 0})
+
+    def test_a_release_that_is_there_when_reports_start_has_its_time_behind(self):
+        """A release that the hub does not run and that is there at the first look gets the first time that its row
+        holds (its run's start), else the time of that look: a time later than the true one, so the wait reads
+        shorter and never longer. With no time our side would never count that fleet as behind."""
+        t0 = hub.now()
+        self.release("2026.11.700", "done", finished=t0 - 9000)
+        self.release("2026.11.710", "kept", step="fetch", cause="dns", started=t0 - 7200, finished=t0 - 7100)
+        self.switch(True)
+        release = self.health()["release"]
+        self.assertEqual((release["since"], release["tries"], release["cause"]), (round(t0 - 7200, 3), 1, "dns"))
+
+    def test_the_newest_release_is_by_its_version_and_the_one_the_hub_restarts_onto_counts_as_run(self):
+        """`newest` is the newest version that the channel named, not the newest row (a fleet that changed its track
+        records an older release after a newer one); `behind` counts the releases newer than the one that runs that it
+        did not take, and a release kept at `already` is one that it runs; and the report just before the restart
+        onto a release names the release of the code that runs now and counts the new one as run (state done, not
+        behind): else the faults of the old code would be kept under the new release, and a hub about to be in order
+        would read as stuck for a day."""
+        self.switch(True)
+        t0 = hub.now()
+        self.release("2026.11.700", "done", finished=t0 - 100)
+        self.look(t0 - 50)
+        newest = self.release("2026.11.710", "verified")
+        self.look(t0)
+        self.release("2026.11.703", "kept", step="already", finished=t0)
+        self.release("2026.11.705", "kept", step="fetch", cause="dns", finished=t0 + 1)
+        with hub.LOCK:
+            hub.kv_set("releases_status", 200)
+        self.assertEqual(self.health()["release"], {"newest": "2026.11.710", "state": "verified", "step": None,
+                                                    "cause": "dns", "tries": 1, "since": round(t0, 3), "behind": 2,
+                                                    "channel": 200})
+        with hub.LOCK:
+            hub.q("UPDATE releases SET state='done', reached=? WHERE revision=?", ("d" * 40, newest["revision"]))
+        self.fault(canary())
+        versions = {"c" * 40: "2026.11.700", "HEAD": "2026.11.710"}
+
+        def git(*args, **how):              # the checkout's HEAD is at the new release already
+            if args[:2] == ("cat-file", "blob"):
+                return 0, json.dumps({"revision": "0" * 40, "version": versions[args[2].split(":")[0]]}), ""
+            return 128, "", "fatal"
+
+        with unittest.mock.patch.object(hub, "git_kit", git), \
+                unittest.mock.patch.object(hub, "running_version", lambda: hub.version_at("HEAD")):
+            body = hub.error_report_before_restart("c" * 40, "d" * 40)
+        self.assertEqual(self.sent[-1][1], body)
+        self.assertEqual(body["version"], "2026.11.700")
+        self.assertEqual({k: body["health"]["release"][k] for k in ("newest", "state", "since", "behind")},
+                         {"newest": "2026.11.710", "state": "done", "since": None, "behind": 0})
+        self.assertEqual(hub.kv_json("error_reports_restart", dict)["to"], "d" * 40)
+
+    def test_the_report_before_a_restart_goes_only_with_a_fault_of_the_code_that_runs(self):
+        """The report before a restart onto new code is for the faults (exceptions and stalls) of the code that the
+        restart replaces, and it is one of the day's four early reports. With no fault, also with refused calls
+        alone, it waits for its day, as the privacy page says ("about once a day"), and so it does when four early
+        reports went: a fleet that takes releases by itself would else send a report at each release. The restart's
+        revision is kept all the same."""
+        self.switch(True)
+        self.sweep(hub.now())       # the day's report
+        self.refusal()
+        with hub.LOCK:
+            self.assertEqual(len(hub.error_report_body(hub.kv_time("error_reports_sent"))["refusals"]), 1)
+        self.assertIsNone(hub.error_report_before_restart("c" * 40, "d" * 40))
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(hub.kv_json("error_reports_restart", dict)["to"], "d" * 40)
+        self.fault(canary())
+        self.assertIsNotNone(hub.error_report_before_restart("c" * 40, "d" * 40))
+        self.assertEqual((len(self.sent), len(hub.error_report_earlies())), (2, 1))
+        with hub.LOCK:
+            for _ in range(errorreports.EARLY_MOST - 1):
+                hub.error_report_earlies(add=hub.now())
+        self.fault(canary())
+        self.assertIsNone(hub.error_report_before_restart("c" * 40, "d" * 40))
+        self.assertEqual(len(self.sent), 2)
+
+    def test_the_restart_waits_for_the_report_before_it_only_so_long(self):
+        """The restart onto new code waits RESTART_REPORT_WAIT for the report before it, whatever the network does: a
+        send that hangs (packets that are dropped, a resolver that does not answer) goes on in its thread, and the
+        new code is not held back while the release's row says done."""
+        self.switch(True)
+        self.fault(canary())
+        go = threading.Event()
+        self.addCleanup(go.set)
+
+        def slow(url, body, timeout=None):
+            go.wait(4)
+            self.sent.append((url, body))
+
+        with unittest.mock.patch.object(hub, "RESTART_REPORT_WAIT", 0.2), \
+                unittest.mock.patch.object(errorreports, "send", slow):
+            began = time.monotonic()
+            body = hub.error_report_before_restart("c" * 40, "d" * 40)
+            waited = time.monotonic() - began
+            go.set()
+            hub._error_report["thread"].join(10)
+        self.assertIsNotNone(body)
+        self.assertLess(waited, 2)
+        self.assertEqual(len(self.sent), 1)     # it went in its thread
+
+    def test_nothing_is_kept_or_sent_for_a_restart_or_a_start_while_reports_are_off(self):
+        """The owner's switch: with error reports off, a restart onto new code keeps no mark and sends no report, a
+        restart whose command failed asks for no early report, and a start counts in no report and asks for none, also
+        after a stop that the hub did not plan."""
+        self.fault(canary())
+        self.assertIsNone(hub.error_report_before_restart("c" * 40, "d" * 40))
+        with hub.LOCK:
+            hub.error_report_runs_old("c" * 40)
+        with hub.LOCK:
+            hub.kv_set("error_reports_running", "1")
+        hub.error_reports_started()
+        self.assertEqual((hub.kv_get("error_reports_restart"), hub.kv_get("error_reports_starts"),
+                          hub.kv_get("error_reports_early_at"), self.sent), (None, None, None, []))
+
+    def test_a_restart_sends_the_report_first_and_one_that_fails_asks_for_an_early_one(self):
+        """restart_hub_soon gives the report before the restart its two revisions before the new code runs, and a
+        restart command that fails, which leaves the hub on its old code, asks for an early report and ends the
+        restart's mark (that failure is said: a later start by hand onto the new code is no start on old code). That
+        report, and each one after it from this process, names the release of the code that still runs while the
+        checkout's HEAD is at the new release, and its block counts the new release as behind, with the failed
+        restart as a try of cause "other": else the faults of the old code would be kept under the new release, and
+        our side would read a hub that runs its newest release."""
+        t0 = hub.now()
+        self.release("2026.11.700", "done", finished=t0 - 9000)
+        new = self.release("2026.11.710", "done", step="follow", started=t0 - 200, finished=t0 - 100, reached="d" * 40)
+        self.switch(True)
+        self.sweep(t0)                          # the day's report, and the first look
+        with hub.LOCK:
+            hub.kv_set("error_reports_restart", json.dumps({"to": "d" * 40, "at": t0}))
+        calls = []
+        with unittest.mock.patch.object(hub, "same_code", lambda a, b: False), \
+                unittest.mock.patch.object(hub, "RESTART_DELAY", 0), \
+                unittest.mock.patch.object(hub, "error_report_before_restart", lambda *revs: calls.append(revs)), \
+                unittest.mock.patch.dict(hub.CFG, hub_restart=["false"]), contextlib.redirect_stdout(io.StringIO()), \
+                self.git({"c" * 40: "2026.11.700", "HEAD": "2026.11.710"}):
+            hub.restart_hub_soon("c" * 40, "d" * 40)
+            for thread in threading.enumerate():
+                if thread.name == "release-restart":
+                    thread.join(10)
+        self.assertEqual(calls, [("c" * 40, "d" * 40)])
+        self.assertIsNotNone(hub.kv_time("error_reports_early_at"))
+        self.assertIsNone(hub.kv_get("error_reports_restart"))
+        with self.git({"c" * 40: "2026.11.700", "HEAD": "2026.11.710"}), \
+                unittest.mock.patch.object(hub, "running_version", lambda: hub.version_at("HEAD")):
+            self.sweep(t0 + 60)
+        ((_, body),) = self.sent[1:]
+        self.assertEqual(body["version"], "2026.11.700")
+        self.assertEqual(body["health"]["release"], {"newest": "2026.11.710", "state": "failed", "step": "follow",
+                                                     "cause": "other", "tries": 1, "since": round(t0 - 200, 3),
+                                                     "behind": 1, "channel": 0})
+        self.assertEqual(new["version"], body["health"]["release"]["newest"])
+        # A second release, and a restart onto it from this same old code: that report counts the release that it
+        # restarts onto, and each one under it, as run, so that a hub about to run its newest release does not read
+        # as stuck for a day.
+        self.release("2026.11.720", "done", step="follow", started=t0 + 70, finished=t0 + 80, reached="e" * 40)
+        self.fault(canary())
+        with self.git({"c" * 40: "2026.11.700", "HEAD": "2026.11.720"}):
+            again = hub.error_report_before_restart("d" * 40, "e" * 40)
+        self.assertEqual(again["version"], "2026.11.700")
+        self.assertEqual(again["health"]["release"], {"newest": "2026.11.720", "state": "done", "step": "follow",
+                                                      "cause": "none", "tries": 0, "since": None, "behind": 0,
+                                                      "channel": 0})
+
+    def test_a_fleet_with_no_restart_command_reports_the_code_that_runs(self):
+        """With no restart command (CFG hub_restart []), the hub goes on with its old code after a release: its reports
+        name that code's release, and the new one is behind, also when the owner turns error reports on after that
+        release (the code that runs is a fact of the process, and no record). Such a fleet chose it: no try counts and
+        no early report goes, now or 6 hours later."""
+        t0 = hub.now()
+        self.release("2026.11.700", "done", finished=t0 - 9000)
+        self.release("2026.11.710", "done", step="follow", started=t0 - 200, finished=t0 - 100, reached="d" * 40)
+        with unittest.mock.patch.object(hub, "same_code", lambda a, b: False), \
+                unittest.mock.patch.dict(hub.CFG, hub_restart=[]), \
+                self.git({"c" * 40: "2026.11.700", "HEAD": "2026.11.710"}):
+            self.assertIsNone(hub.restart_hub_soon("c" * 40, "d" * 40))
+            self.switch(True)
+            with unittest.mock.patch.object(hub, "running_version", lambda: hub.version_at("HEAD")):
+                self.sweep(t0)
+                self.assertIsNone(self.look(t0 + 2 * errorreports.BEHIND_WAIT))
+        ((_, body),) = self.sent
+        release = body["health"]["release"]
+        self.assertEqual((body["version"], release["state"], release["behind"], release["tries"], release["cause"]),
+                         ("2026.11.700", "done", 1, 0, "none"))
+
+    def test_each_check_of_the_server_watch_goes_once_and_says_whom_it_fails(self):
+        """The checks are the server watch's facts, each code once and the passing ones too: `hub` true while the hub's
+        own server fails it, false while the watch can say that it does not, null else; `servers` the other servers
+        that fail it; `since` the earliest look that saw one of them fail, null when one failed before the first look.
+        A hub that counted its own server among the servers, or left the passing checks out, would read to our side
+        as a fleet that is wrong, or as one that reads nothing."""
+        self.watch({"web-1": {"told": ["disk"]}})
+        self.switch(True)
+        t0 = hub.now()
+        self.look(t0)
+        self.watch({"hub": {"told": ["memory"]}, "web-1": {"told": ["disk"]}, "web-2": {"told": ["disk", "memory"]}})
+        self.look(t0 + 60)
+        checks = self.health()["checks"]
+        self.assertEqual(sorted(c["code"] for c in checks), sorted(hub.WATCH_WORDS))
+        found = {c["code"]: (c["hub"], c["servers"], c["since"]) for c in checks}
+        self.assertEqual((found["memory"], found["disk"], found["firewall"], found["macos_update"]),
+                         ((True, 1, round(t0 + 60, 3)), (False, 2, None), (None, 0, None), (False, 0, None)))
+
+    def test_a_hub_with_no_proc_sends_its_report_without_the_block(self):
+        """A hub on a Mac has no /proc: its report goes as before, with no block, because every key of the block is
+        required and a memory or a count of kills made up there would be a false word."""
+        os.remove(os.path.join(self.proc, "vmstat"))
+        self.switch(True)
+        self.sweep(hub.now())
+        ((_, body),) = self.sent
+        self.assertNotIn("health", body)
+
+
+class StartAndStop(unittest.TestCase):
+    """A real hub process, as its service starts and stops it (main and after_serving)."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="fleet-error-starts-"))
+        self.addCleanup(shutil.rmtree, str(self.root), ignore_errors=True)
+        (self.root / "team.json").write_text(json.dumps({
+            "hub": {"machine": "hub", "port": 8765}, "addresses": {"owner": "127.0.0.1", "hub": "127.0.0.2"},
+            "agents": {"manager": {"role": "manager", "runtime": "claude", "machine": "hub", "can": []}}}))
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.port = s.getsockname()[1]
+
+    def kv(self, key):
+        try:
+            with contextlib.closing(sqlite3.connect(f"file:{self.root / 'hub.db'}?mode=ro", uri=True)) as db:
+                row = db.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+        except sqlite3.Error:
+            return None
+        return row[0] if row else None
+
+    def start(self):
+        """A hub of these records, whose first pass of the tick is 10 minutes away: it sends nothing. It is up once its
+        start line is out (error_reports_started runs before it) and its mark says that it runs (after its handler of
+        SIGTERM): a hub that was killed left the mark of its own."""
+        self.starts = getattr(self, "starts", 0) + 1
+        pipe, fds = parent_pipe(self.root)
+        with open(self.root / "out.txt", "a") as out:
+            proc = subprocess.Popen([sys.executable, "-m", "hub", "--host", "127.0.0.1", "--port", str(self.port),
+                                     "--db", str(self.root / "hub.db"), "--team", str(self.root / "team.json"),
+                                     "--tick", "600", "--parent-pipe", str(pipe)],
+                                    pass_fds=fds, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    cwd=ROOT, env=dict(os.environ, HOME=str(self.root)))
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
+        deadline = time.monotonic() + 90     # as test_hub_keeps_port gives a start on this Mac
+        while (self.root / "out.txt").read_text().count("Founderizer hub on") < self.starts or \
+                self.kv("error_reports_running") != "1":
+            self.assertIsNone(proc.poll(), (self.root / "out.txt").read_text())
+            self.assertLess(time.monotonic(), deadline, (self.root / "out.txt").read_text())
+            time.sleep(0.1)
+        return proc
+
+    def test_a_hub_marks_that_it_runs_and_the_stop_of_its_service_clears_the_mark(self):
+        """main() counts each start and sets the mark that the hub runs, and the stop of its service (SIGTERM,
+        after_serving) clears the mark, so the start after a crash (SIGKILL, a kill for lack of memory) is the one
+        that asks for an early report. Without the calls in main the starts would stay 0 and a crash would read as
+        planned; without the one in after_serving each restart would send an early report."""
+        proc = self.start()
+        proc.terminate()
+        proc.wait(30)
+        self.assertIsNone(self.kv("error_reports_running"))
+        with contextlib.closing(sqlite3.connect(self.root / "hub.db")) as db, db:
+            db.executemany("INSERT OR REPLACE INTO kv(k, v) VALUES(?, ?)",
+                           [("error_reports", "1"), ("release_channel", "https://example.invalid")])
+        proc = self.start()
+        self.assertEqual((self.kv("error_reports_starts"), self.kv("error_reports_early_at")), ("1", None))
+        proc.kill()                             # a stop that the hub did not plan
+        proc.wait(30)
+        proc = self.start()
+        self.assertEqual(self.kv("error_reports_starts"), "2")
+        self.assertIsNotNone(self.kv("error_reports_early_at"))
+        proc.terminate()
+        proc.wait(30)
