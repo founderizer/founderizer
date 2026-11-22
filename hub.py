@@ -25578,8 +25578,9 @@ def role_sets():
     person, a change of a person's role) or a view, or None. It is None while Teams is off, while this hub has not
     loaded the part's code, and while the part's own condition (contacts.v2) does not hold, and with None Core does
     what it did before Teams. Asked again at each event and each view, never kept: a kept part would still act after a
-    cancel. A field of a write asks teams_part("role_sets", need=True) instead, for design 1's refusal. Called before
-    a transaction() opens: teams_on() reads with q1, which commits."""
+    cancel. A field of a write asks teams_part("role_sets", need=True) instead, for design 1's refusal. Each caller of
+    today asks it before its transaction() opens; since P2's follow-up, teams_on() commits nothing, so a call inside
+    one is safe too."""
     sets = teams_part("role_sets")
     return sets if sets is not None and "role_sets" in teams_features() else None
 
