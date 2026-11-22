@@ -456,7 +456,8 @@ def connect_by(end):
 def download(url, timeout, headers=None):
     """The bytes of a GET of a file that a message brings, in `timeout` seconds in all, not only for each read: a slow
     chat app holds the other accounts' messages no longer. The name lookup and each address of the host get the time
-    that is left, and so does each read; the head of the answer must come in that time too. It reads at most
+    that is left, and so does each read; past that time a watch shuts the socket, so that no step, the head of the
+    answer and a read of the body too, holds the fetch longer, however slowly a peer sends. It reads at most
     FILE_MOST + 1 bytes, so that a larger file is `size`, also one whose answer gives no length; anything else that
     fails is `download`, a redirect too (NoRedirect's rule). No reason holds the address: a Telegram file's address
     holds the bot's token."""
@@ -477,17 +478,28 @@ def download(url, timeout, headers=None):
             raise Missed("download", f"not done in {timeout:g} s")
         return rest
     cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
-    conn, r = cls(host, port, timeout=timeout), None
+    conn, r, watch, late = cls(host, port, timeout=timeout), None, None, threading.Event()
     conn._create_connection = connect_by(end)
     try:
         conn.connect()
         sock = conn.sock        # the response may take the connection's socket: each step gets the time that is left
+
+        def stop():             # a read's timeout is for that read: a peer that sends a byte at a time resets it
+            late.set()
+            try:                # the plain socket's shutdown, under TLS too: a blocked read ends at once
+                socket.socket.shutdown(sock, socket.SHUT_RDWR)
+            except OSError:
+                pass
+        timer = threading.Timer(left(), stop)
+        timer.daemon = True
+        timer.start()
+        watch = timer           # only a timer that started: a join of one that did not would raise in finally
         sock.settimeout(left())
         conn.request("GET", (parts.path or "/") + ("?" + parts.query if parts.query else ""),
                      headers={"Accept": "*/*", **(headers or {})})
         sock.settimeout(left())
         r = conn.getresponse()
-        left()                  # each read of the head had the time that was left, but not the head in all
+        left()
         if r.status != 200:
             raise Missed("download", f"HTTP {r.status}")
         if r.length is not None and r.length > FILE_MOST:
@@ -499,11 +511,20 @@ def download(url, timeout, headers=None):
             if not chunk:
                 break
             data += chunk
+        if late.is_set():       # the watch's shutdown ends a body that has no length as its peer's close would
+            raise Missed("download", f"not done in {timeout:g} s")
         if r.length:            # the answer ended before the length that it gave
             raise Missed("download", "cut off")
     except (OSError, http.client.HTTPException, ValueError) as e:
+        if late.is_set():
+            raise Missed("download", f"not done in {timeout:g} s") from None
         raise Missed("download", type(e).__name__) from None
     finally:
+        if watch is not None:   # a stop() that started ends before close(): for an answer that keeps its connection
+            # open. One that ends it (no length, HTTP/1.0, close) closes the socket in the loop, so a watch that fires in
+            # the same microseconds can shut the socket that takes its number next: a known race, the cost one retry
+            watch.cancel()
+            watch.join()
         if r is not None:       # an answer that ends the connection holds its socket itself
             r.close()
         conn.close()

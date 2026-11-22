@@ -888,9 +888,13 @@ class Channel(unittest.TestCase):
         self.assertEqual(releases.claim(base + "/moved", "k", "0" * 16)["status"], 302)
         self.assertEqual([seen[0] for seen in server.seen], ["/token", "/refused", "/long", "/strange", "/moved"])
         began = time.monotonic()
-        silent = releases.claim(base + "/silent", "k", "0" * 16, timeout=10, wait=1)
+        silent = releases.claim(base + "/silent", "k", "0" * 16, timeout=1)
         self.assertLess(time.monotonic() - began, 2.5, "the claim did not end at its limit for the whole call")
         self.assertEqual((silent["status"], silent["token"]), (0, None))
+        # The claim's limit is CLAIM_WAIT for the whole call: the platform may take its time, and the Mac waits 45 s.
+        with patch.object(releases, "_post", return_value=(0, "timed out")) as post:
+            releases.claim(base + "/token", "k", "0" * 16)
+        self.assertEqual(post.call_args.args[3], releases.CLAIM_WAIT)
         self.assertEqual(releases.licence_endpoint("https://founderizer.com", releases.CLAIM_PATH),
                          "https://founderizer.com/api/entitlement/claim")
 
@@ -2610,13 +2614,14 @@ class HubRoutes(OwnerAPI):
         purchase sits in the hub's records or log for anybody who reads them; a token of another plan or key turns
         the hub's licence over; a claim that failed keeps its request id, so the app's next give is refused; the key
         goes to a channel that is not founderizer.com."""
-        key, asked = "FZ-A1B2-C3D4-E5F6", []
+        key, asked, given_limits = "FZ-A1B2-C3D4-E5F6", [], []
         hub.CFG["release_channel"] = "https://founderizer.com"
         licence = self.token(plan="teams", agents=5, machines=0)
 
         def platform(*answers):
-            def claim(url, given, fleet, **_limits):
+            def claim(url, given, fleet, **limits):
                 asked.append((url, given, fleet))
+                given_limits.append(limits)
                 return dict({"status": 200, "token": None, "renews": None, "error": None, "says": None},
                             **answers[len(asked) - 1])
             return patch.object(releases, "claim", claim)
@@ -2643,6 +2648,7 @@ class HubRoutes(OwnerAPI):
         self.assertEqual(data["teams"], {"on": True, "until": 2000000000, "renews": True, "ended": None})
         self.assertEqual((row["token"], hub.teams_on(), records), (licence, True, 1))
         self.assertEqual(asked[-1], ("https://founderizer.com/api/entitlement/claim", key, hub.fleet_id()))
+        self.assertEqual(given_limits[-1], {"timeout": releases.CLAIM_WAIT}, "the hub's claim waits CLAIM_WAIT")
         self.assertIn("teams_claim", self.request()[1]["ui_features"])
         for table, column in (("ui_controls", "body"), ("ui_controls", "result"), ("log", "what")):
             for got in hub.q(f"SELECT {column} AS value FROM {table}"):

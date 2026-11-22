@@ -468,10 +468,10 @@ class CDNHandler(JSONHandler):
             data, how = cdn.files.get(path, (None, None))
         if data is None:
             return self.answer(404, {"message": "404: Not Found", "code": 0})
-        if how == "slow-head":          # the head of the answer in 1 s, a line each 50 ms, with a length of 100 GB
+        if how == "slow-head":          # a head of 200 lines, one each 50 ms (http.client stops at line 101, ~5 s)
             try:
                 self.wfile.write(b"HTTP/1.0 200 OK\r\n")
-                for i in range(20):
+                for i in range(200):
                     self.wfile.write(b"X-Wait: %d\r\n" % i)
                     time.sleep(0.05)
                 self.wfile.write(b"Content-Length: 100000000000\r\n\r\n")
@@ -995,7 +995,9 @@ class DiscordTests(Base):
     def test_the_limit_of_a_fetch_holds_before_its_body_too(self):
         """FILE_FETCH_TIMEOUT is the fetch's time in all, before the body too: a name lookup that takes longer (the
         system's has no limit of its own) is `download` in about that time, and so is an answer whose head comes after
-        it, whatever length the head gives."""
+        it, whatever length the head gives, also when each line of the head comes quickly: a read's timeout is for
+        that read, so a head that came a line at a time held the fetch until http.client's limit of 100 lines (about
+        5 s here)."""
         limit = patch.object(channels, "FILE_FETCH_TIMEOUT", 0.5)
         limit.start()
         self.addCleanup(limit.stop)
@@ -1019,8 +1021,10 @@ class DiscordTests(Base):
         peer.dispatch("MESSAGE_CREATE", dm(1681, "", attachments=[named]))
         self.wait_for(lambda: self.hub.inbound, "the message whose file's name was not found in time", timeout=8)
         self.assertLess(time.monotonic() - at, 2, "the lookup's 3 seconds held the message")
+        at = time.monotonic()
         peer.dispatch("MESSAGE_CREATE", dm(1682, "", attachments=[head]))
         self.wait_for(lambda: len(self.hub.inbound) == 2, "the message whose answer's head came late", timeout=8)
+        self.assertLess(time.monotonic() - at, 2, "the head's slow lines held the message")
         self.assertEqual([e.get("missed") for e in self.hub.inbound], [["download"], ["download"]])
         self.assertEqual(self.hub.uploads, [])
 
@@ -2536,6 +2540,35 @@ class Functions(unittest.TestCase):
         took = time.monotonic() - at
         self.assertEqual(missed.exception.code, "download")
         self.assertLess(took, 2.75, f"the fetch took {took:.2f} s for a limit of 2 s")
+
+    def test_a_body_with_no_length_that_the_watch_ends_is_no_whole_file(self):
+        """With no length, the end of the connection ends the answer, and the watch's shutdown at the fetch's limit
+        looks the same to http.client: the bytes that came until then are `download`, never a whole file. Each read's
+        own timeout is made longer here, so that the watch, and not the read, ends this fetch."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        done = threading.Event()
+        self.addCleanup(done.set)
+
+        def serve():                        # a part of a file, then nothing more and no end, for 10 s
+            peer, _ = listener.accept()
+            with peer:
+                peer.recv(65536)
+                peer.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: image/png\r\n\r\n\x89PNG part")
+                done.wait(10)
+        threading.Thread(target=serve, daemon=True).start()
+        real = socket.socket.settimeout
+
+        def later(sock, seconds):
+            return real(sock, None if seconds is None else seconds + 3)
+        at = time.monotonic()
+        with patch.object(socket.socket, "settimeout", later), self.assertRaises(channels.Missed) as missed:
+            channels.download(f"http://127.0.0.1:{port}/f", 1)
+        self.assertEqual((missed.exception.code, missed.exception.why), ("download", "not done in 1 s"))
+        self.assertLess(time.monotonic() - at, 1.6, "the watch came late")
 
     def test_split_parts(self):
         self.assertEqual(channels.split_parts("short", 2000), ["short"])

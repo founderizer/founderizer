@@ -772,7 +772,7 @@ CLAIM_ERRORS = frozenset(("unknown_key", "expired_key", "not_live", "test_shop",
 SAYS_MOST = 300         # characters of a `says` line, as the platform writes it at most
 
 
-def claim(url, key, fleet, *, timeout=CHANNEL_TIMEOUT, wait=CLAIM_WAIT):
+def claim(url, key, fleet, *, timeout=CLAIM_WAIT):
     """One claim: POST `url` (licence_endpoint of the channel with CLAIM_PATH) with {"claim_key": key, "fleet":
     fleet} and nothing else of the fleet.
 
@@ -780,15 +780,11 @@ def claim(url, key, fleet, *, timeout=CHANNEL_TIMEOUT, wait=CLAIM_WAIT):
     unchecked (the hub keeps it only if our key signed it for this fleet with plan `teams`), with `renews` (None when
     the answer does not say it). Else `error`, the answer's code when it is one of CLAIM_ERRORS, and `says`: that
     refusal's own line, on one line and cut to SAYS_MOST characters, or the hub's line with the status alone. status 0:
-    no answer, also when the whole call took more than `wait` seconds; the call that went on then is left behind, and
-    a claim again with the same key gets the same token (the platform's "A hub that lost the answer asks again")."""
-    out = {}
-    worker = threading.Thread(target=lambda: out.update(answer=_post(url, None, {"claim_key": key, "fleet": fleet},
-                                                                     min(timeout, wait))),
-                              name="licence-claim", daemon=True)
-    worker.start()
-    worker.join(wait)
-    status, text = out.get("answer") or (0, f"no whole answer in {wait} seconds")
+    no answer, also when the whole call took more than `timeout` seconds (CLAIM_WAIT: _post's limit for the whole
+    call, from the connection to the last byte); a claim again with the same key gets the same token (the platform's
+    "A hub that lost the answer asks again"). Until 22 November 2026 the claim gave _post min(10, 30) seconds, so a
+    platform that answered after 10 seconds was no answer."""
+    status, text = _post(url, None, {"claim_key": key, "fleet": fleet}, timeout)
     answer = {"status": status, "token": None, "renews": None, "error": None, "says": None}
     if status == 0:
         return dict(answer, says="the claim got no answer from the release channel: " + text)

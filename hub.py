@@ -78047,7 +78047,7 @@ class Handler(BaseHTTPRequestHandler):
                 url = releases.licence_endpoint(channel, releases.CLAIM_PATH)
             except releases.Untrusted as e:
                 raise Refusal(502, str(e)) from None
-            answer = releases.claim(url, passing["key"], fleet)
+            answer = releases.claim(url, passing["key"], fleet, timeout=releases.CLAIM_WAIT)
             if answer["token"] is None:
                 log("owner", f"the claim of Founderizer for Teams was not taken: the release channel answered "
                              f"{answer['status']}" + (f" ({answer['error']})" if answer["error"] else ""))
