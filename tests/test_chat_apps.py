@@ -458,6 +458,10 @@ class ChatApps(OwnerAPI):
         crc = office_file(f"KEY={value}", [("a.xml", "<a>first part</a>")])
         entry = crc.find(b"a.xml", crc.find(b"a.xml") + 1) - 46          # a.xml's entry in the central directory
         crc = crc[:entry + 16] + bytes(4) + crc[entry + 20:]              # a wrong CRC-32 of a.xml
+        moved = office_file(f"KEY={value}", [("a.xml", "<a>first part</a>")])
+        entry = central_entry(moved, "a.xml")                             # a.xml's entry names no local header
+        moved = moved[:entry + 42] + (int.from_bytes(moved[entry + 42:entry + 46], "little") + 1).to_bytes(4, "little") + \
+            moved[entry + 46:]
         page, packed = f"BT /F1 12 Tf 72 720 Td ({line}) Tj ET".encode(), zlib.compress(line.encode())
         sheet = office_file(f"KEY={value}", [("xl/workbook.xml", "<workbook/>")], part="xl/sharedStrings.xml")
         stored = office_file("Budget", [("word/notes.txt", line)], stored=True)
@@ -507,6 +511,7 @@ class ChatApps(OwnerAPI):
                                  (hub.DOCX, "broken.docx", broken),
                                  (hub.DOCX, "stored.docx", stored),
                                  (hub.DOCX, "crc.docx", crc),
+                                 (hub.DOCX, "moved.docx", moved),
                                  ("application/pdf", "raw.pdf", raw),
                                  ("image/png", "private.png", private),
                                  ("image/png", "after.png", png_with((b"tEXt", b"Comment\x00a")) + line.encode()),
@@ -521,6 +526,13 @@ class ChatApps(OwnerAPI):
                                  ("image/jpeg", "comment.jpg", comment)):
             code, refused = self.bridge_upload(data, f"m-{name}", mime=mime, name=name)
             self.assertEqual((code, refused.get("code")), (422, "login_as_file"), name)
+        # a person's Office file with a part of bzip2 or LZMA is refused before a part is unpacked: zipfile unpacks such
+        # a part whole at its first read (a few KB held GB), and no Office app writes one
+        for method in (zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA, ZSTANDARD):
+            for mime in (hub.XLSX, "application/octet-stream"):
+                code, refused = self.bridge_upload(office_packed(method), f"m-packed-{method}-{mime[-4:]}", mime=mime,
+                                                   name="packed.xlsx")
+                self.assertEqual((code, refused.get("error")), (415, "these bytes are not a spreadsheet"), (method, mime))
         # a piece of a file's text ends at a space or a line break, never inside a login: here pieces of 16 bytes, where
         # pieces of a fixed size would cut the login in two
         with patch.object(hub, "CHAT_FILE_CHUNK", 16), patch.object(hub, "BYTES_CHUNK", 16):
@@ -1686,6 +1698,55 @@ def office(parts=None, main="xl/workbook.xml"):
     return buf.getvalue()
 
 
+ZSTANDARD = 93      # Python 3.14's zipfile unpacks it whole too; an older one cannot write it
+
+
+def office_packed(method):
+    """A spreadsheet whose main part is packed with `method` (bzip2, LZMA, or Zstandard, whose number is written into
+    the headers of a stored part, so that each Python makes it), of 2 MiB of zeros: small to keep, so a test never
+    unpacks hundreds of MiB."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as package:
+        package.writestr("[Content_Types].xml", "<Types/>")
+        package.writestr("xl/workbook.xml", "<workbook/>" + "\0" * (2 << 20),
+                         compress_type=zipfile.ZIP_STORED if method == ZSTANDARD else method)
+    data = buf.getvalue()
+    if method == ZSTANDARD:
+        return entry_says(data, "xl/workbook.xml", method=ZSTANDARD)
+    return data
+
+
+def central_entry(data, name):
+    """Where the central directory of the ZIP `data` holds its entry `name`."""
+    at = data.find(b"PK\x01\x02")
+    while data[at + 46:at + 46 + int.from_bytes(data[at + 28:at + 30], "little")] != name.encode():
+        assert at >= 0, name
+        at = data.find(b"PK\x01\x02", at + 4)
+    return at
+
+
+def entry_says(data, name, **fields):
+    """The ZIP `data` with fields of its entry `name` (flags, method, crc, csize, usize) changed in its local header and
+    in the central directory, which zipfile reads."""
+    out, at = bytearray(data), central_entry(data, name)
+    local = int.from_bytes(out[at + 42:at + 46], "little")
+    for field, value in fields.items():
+        offset, size = {"flags": (6, 2), "method": (8, 2), "crc": (14, 4), "csize": (18, 4), "usize": (22, 4)}[field]
+        for head in (local + offset, at + 2 + offset):      # each field is 2 bytes further in the central directory
+            out[head:head + size] = value.to_bytes(size, "little")
+    return bytes(out)
+
+
+def entry_again(data, name, times=1):
+    """The ZIP `data` whose central directory names the packed bytes of its entry `name` `times` times more."""
+    out, at = bytearray(data), central_entry(data, name)
+    entry = bytes(out[at:at + 46 + sum(struct.unpack_from("<HHH", out, at + 28))])
+    end = out.rfind(b"PK\x05\x06")
+    count, size = struct.unpack_from("<HI", out, end + 10)
+    struct.pack_into("<HHI", out, end + 8, count + times, count + times, size + len(entry) * times)
+    return bytes(out[:at] + entry * times + out[at:])
+
+
 def png(*chunks):
     def chunk(kind, body):
         return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
@@ -1835,6 +1896,79 @@ class AgentFiles(ChatApps):
             self.assertTrue(error, name)
             self.assertIn("with one of these extensions: .pdf, .png, .jpg, .xlsx, .docx, .pptx, .csv or .txt", text)
 
+    def test_an_office_part_is_read_no_further_than_its_stated_size(self):
+        """zipfile unpacks up to the size that a read asks and cuts the result to the part's stated size, so a part that
+        states 0 bytes and holds MiB of zeros made the hub unpack up to all of CHAT_FILE_UNPACK for nothing, at each
+        part (a review of 22 November 2026: 1.4 MiB with 24 such parts, 1,440 MiB unpacked), and its text was never
+        searched. The budget counts the stated sizes, a part is unpacked no further than its stated size and one byte,
+        and a part that states less than it holds is refused: a person's login after the stated size was in no text."""
+        name, long = "xl/sharedStrings.xml", "<sst>" + "x " * (2 << 20) + "</sst>"
+        file = office({name: long})
+        self.assertIn("x x x", " ".join(hub.ooxml_texts(file, hub.XLSX, "spreadsheet")))
+        body = ("<sst>" + "<si><t>ordinary words</t></si>\n" * 4000 + "<si><t>KEY=at-the-end</t></si></sst>").encode()
+        honest = office({name: body.decode()})
+        info = zipfile.ZipFile(io.BytesIO(honest)).getinfo(name)
+        packed, start = info.compress_size, info.header_offset + 30 + len(name)    # zipfile writes no extra field here
+        cut = packed // 2                                       # the stream goes on after its stated packed bytes
+        begun = zlib.decompressobj(-15).decompress(honest[start:start + cut])
+        lies = {"states 0 bytes": entry_says(file, name, usize=0),
+                "stored, states 0 bytes": entry_says(office_file("x" * 99, stored=True), "word/document.xml", usize=0),
+                "states one byte less": entry_says(honest, name, usize=len(body) - 1, crc=zlib.crc32(body[:-1])),
+                "states 1,000 bytes past its packed size": entry_says(honest, name, usize=packed + 1000,
+                                                                      crc=zlib.crc32(body[:packed + 1000])),
+                "packs less than its stream": entry_says(honest, name, csize=cut, usize=len(begun),
+                                                         crc=zlib.crc32(begun)),
+                # 5,000 entries that name the same packed bytes would make the hub read them 5,000 times
+                "names its packed bytes twice": entry_again(office({name: "".join(
+                    hashlib.sha256(b"%d" % n).hexdigest() for n in range(1000))}), name),
+                # zipfile's constructor holds some 500 bytes for each entry, and an agent's file had no count before it
+                "has 50,000 entries": entry_again(office({name: "<sst/>"}), "[Content_Types].xml", 50_000),
+                # zipfile's open refuses these flags, and ooxml_part does not call it: an encrypted part (ZipCrypto) was
+                # read as plain deflate, and its bytes can be a stream of their own
+                **{f"flags {bit:#x}": entry_says(honest, name, flags=bit) for bit in (0x01, 0x20, 0x40)}}
+        for lie, data in lies.items():
+            mime, kind = (hub.DOCX, "Word document") if lie.startswith("stored") else (hub.XLSX, "spreadsheet")
+            for inbound in (False, True):
+                tracemalloc.start()
+                try:
+                    with self.assertRaises(hub.Refusal, msg=(lie, inbound)) as refused:
+                        list(hub.ooxml_texts(data, mime, kind, inbound=inbound))
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+                self.assertEqual((refused.exception.status, str(refused.exception)),
+                                 (415, f"these bytes are not a {kind}"), (lie, inbound))
+                self.assertLess(peak, 1 << 20, (lie, inbound))        # 4 MiB unpacked would be the budget's read
+        with patch.object(hub, "CHAT_FILE_UNPACK", 1000):           # a part that states more than is left
+            with self.assertRaises(hub.Refusal) as refused:
+                list(hub.ooxml_texts(file, hub.XLSX, "spreadsheet", inbound=True))
+        self.assertEqual(refused.exception.status, 413)
+
+    def test_an_office_part_that_packs_larger_than_it_states_is_read(self):
+        """Writers pack in their own ways: .NET's old deflater starts each stream with a tree of 98 bytes (a part of 139
+        bytes of an Office theme that Office ships packs to 229), and a writer that flushes at each write adds an empty
+        block of 5 bytes each time. A limit on the packed size (the second round of 22 November 2026) refused 120 of
+        the 32,323 XML parts of 365 Office files that programs ship; the test of the stream itself reads
+        each of them. And a writer may pack a part of 0 bytes as deflate of 0 bytes, which zipfile reads as empty."""
+        xml = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<a:themeManager xmlns:a="http://schemas.'
+               b'openxmlformats.org/drawingml/2006/main"/>')
+        pack = zlib.compressobj(9, zlib.DEFLATED, -15)
+        packed = b"\x00\x00\x00\xff\xff" * 20 + pack.compress(xml) + pack.flush()     # 20 empty stored blocks first
+        self.assertGreater(len(packed), len(xml) + 5 * 1 + 16)                      # past the second round's limit
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as package:     # written stored, and then its headers say deflate
+            package.writestr("[Content_Types].xml", "<Types/>")
+            package.writestr("xl/workbook.xml", "<workbook/>")
+            package.writestr("xl/theme/themeManager.xml", packed)
+            package.writestr("xl/empty.xml", b"")    # and a part of 0 bytes, packed as deflate of no bytes
+        file = entry_says(buf.getvalue(), "xl/theme/themeManager.xml", method=zipfile.ZIP_DEFLATED, usize=len(xml),
+                          crc=zlib.crc32(xml))
+        file = entry_says(file, "xl/empty.xml", method=zipfile.ZIP_DEFLATED)
+        self.assertEqual(zipfile.ZipFile(io.BytesIO(file)).read("xl/theme/themeManager.xml"), xml)
+        self.assertEqual(zipfile.ZipFile(io.BytesIO(file)).read("xl/empty.xml"), b"")
+        for inbound in (False, True):
+            self.assertIn("a:themeManager", " ".join(hub.ooxml_texts(file, hub.XLSX, "spreadsheet", inbound=inbound)))
+
     def test_the_upload_checks_the_bytes_before_the_hub_keeps_them(self):
         self.canary()
         secret = CANARY.encode()
@@ -1851,6 +1985,12 @@ class AgentFiles(ChatApps):
             ("a.xlsx", b"PK\x03\x04 nothing", 415, "these bytes are not a spreadsheet"),
             ("a.xlsx", office(main=None), 415, "these bytes are not a spreadsheet"),
             ("a.xlsx", office(main="word/document.xml"), 415, "these bytes are not a spreadsheet"),
+            # a part of bzip2 or LZMA is unpacked whole at its first read, whatever the limit (no Office app writes one)
+            ("a.xlsx", office_packed(zipfile.ZIP_BZIP2), 415, "these bytes are not a spreadsheet"),
+            ("a.xlsx", office_packed(zipfile.ZIP_LZMA), 415, "these bytes are not a spreadsheet"),
+            ("a.xlsx", office_packed(ZSTANDARD), 415, "these bytes are not a spreadsheet"),     # an allow-list
+            ("a.docx", entry_says(office({"word/document.xml": "<w:t>x</w:t>"}, main=None), "word/document.xml", crc=0),
+             415, "these bytes are not a Word document"),                       # a part with a wrong CRC-32
             ("a.xlsx", office({"xl/vbaProject.bin": "x"}), 415, "a spreadsheet with a macro, an ActiveX control"),
             ("a.docx", office({"word/document.xml": "<w:t>x</w:t>", "word/embeddings/oleObject1.bin": "x",
                                "word/_rels/document.xml.rels": '<Relationships><Relationship Id="r1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="embeddings/oleObject1.bin"/></Relationships>'}, main=None), 415,

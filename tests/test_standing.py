@@ -316,7 +316,10 @@ class Keeping(Base):
         the rest by their ids. Bug: a keep takes the items that steer a team member past three quarters of that, and
         the keeper hears nothing, so that member's starts lose the newest wishes to an id (the state of 20 November
         2026); or every keep says it, also one that stays under the mark; or a keeper whose Shell box is off, whose
-        start shows each item whole, reads of a limit that it does not have."""
+        start shows each item whole, reads of a limit that it does not have. And the next task session of an agent
+        that keeps items itself puts them in order (F15, piece 4): bug, no start says so, so the crowded items stay;
+        or each start says so, also below the mark, in a person's window, to a Shell-off agent, or to an agent whose
+        items are all its lead's, which it may not end."""
         def words(n):
             return (f"Rule {n}: " + "answer each ticket in full and in the customer's own language, " * 10)[:590]
         for n in range(1, 5):                                           # hand's own items
@@ -335,11 +338,38 @@ class Keeping(Base):
                       f"8,000 characters that a start shows whole. Put yours in order: end one that is done; pass one "
                       f"that is for one agent to that agent; write the rule of one duty into that duty's words, and "
                       f"end the item with that place in why.", said)
+        # the lead's own chat: only a member passes the mark, so the words name each of them, not the lead's session
+        with patch.object(hub, "chat_context", lambda name: name == "lead"):
+            chat = hub.standing_crowded("lead", team)
+        self.assertIn("The next task session of each of them that keeps items itself puts its own in order: say "
+                      "nothing of it to the owner.", chat)
+        self.assertNotIn("Your next task session", chat)
         with patch.object(hub, "shell_off", lambda name: name == "hand"):   # a keeper whose start shows them all
             closed = hub.standing_crowded("hand", ["hand"])
         self.assertEqual(closed, f" The items that steer you now take {hub.standing_fit('hand'):,} characters at each "
                                  f"start. Your line keeps them in order: tell {hub.task_giver('hand')} with "
                                  f"message_agent.")
+        # F15, piece 4: above the mark, a task's own session of an agent that keeps items itself is told to put them in
+        # order when its work is done, the work that its owner chat leaves to it (standing_crowded)
+        tidy = (f" They take {hub.standing_fit('hand'):,} of the 8,000 characters that a start shows whole. When the "
+                "work of this session is done and before you deliver it, put yours in order: end one that is done, "
+                "and write the rule of one duty into that duty's words or the steps of a job into a skill, then end "
+                "its item with that place in why.\n")
+        self.assertIn(tidy, hub.start_text("hand", self.tasks["hand"]))
+        cid = self.window("hand")               # a person's conversation window: its session ends at its reply
+        self.person_writes(cid, "One more question")
+        hub.kv_set(f"conversation_brief:{cid}", str(hub.now()))
+        brief = self.read(cid)
+        self.assertIn("STANDING ITEMS", brief)
+        self.assertNotIn("When the work of this session is done", brief)
+        with patch.object(hub, "shell_off", lambda name: name == "hand"):   # its line keeps them in order
+            self.assertNotIn("When the work of this session is done", hub.standing_start_text("hand", tidy=True))
+        with patch.object(hub, "STANDING_MARK", 100):   # crowded, but its lead's items are not deep's to end
+            self.assertNotIn("When the work of this session is done", hub.start_text("deep", self.tasks["deep"]))
+        for item in ("I-1", "I-2"):
+            self.ok("hand", "end_standing", id=item, why="Written into the words of the duty Tickets.")
+        self.assertLessEqual(hub.standing_fit("hand"), hub.STANDING_MARK)
+        self.assertNotIn("When the work of this session is done", hub.start_text("hand", self.tasks["hand"]))
 
 
 class Provenance(Base):
@@ -548,7 +578,8 @@ class Provenance(Base):
         agent, also to the agent above it, which a task session takes, a steer of a task and an answer to a Needs-you
         item; and it ends an item only on the owner's word. A rule from an AI session goes into a task of the agent's
         own (Fable's read of 22 November 2026, finding 2), and so does putting crowded items in order: no agent of its
-        line ends one (finding 5)."""
+        line ends one (finding 5). That task is the agent's next task session, whose start says so, and the chat asks
+        the owner for nothing: bug, the chat asks the owner to open that task (F15, piece 4)."""
         own = self.owner_says("hand", "Hi! From now on, answer me in Spanish. Thanks.")
         above = self.owner_says("lead", "Tell hand: from now on, answer me in Spanish.")
         other = self.owner_says("solo", "From now on, answer me in Spanish.")
@@ -584,11 +615,12 @@ class Provenance(Base):
         short = self.owner_says("hand", "From now on, keep each answer short.")
         text, error = self.chat("keep_instruction", words="keep each answer short", scope="agent", source=f"M-{short}")
         self.assertFalse(error, text)
-        self.assertIn("The items that steer you now take", text)
-        self.assertIn("Put yours in order in a task of your own, which ends one that is done and writes the rule of "
-                      "one duty into that duty's words: say so to the owner in your reply, and open it with start_task "
-                      "when they ask.", text)
+        self.assertIn(f"The items that steer you now take {hub.standing_fit('hand'):,} characters at each start. Your "
+                      "next task session puts them in order: say nothing of it to the owner.", text)
+        self.assertNotIn("start_task", text)            # F15, piece 4: the owner is asked for no task
         self.assertNotIn("Your line keeps them in order", text)
+        self.assertIn("When the work of this session is done and before you deliver it, put yours in order",  # told
+                      hub.start_text("hand", self.tasks["hand"]))
         stop = self.owner_says("hand", "Stop the Spanish, please.")
         for asked in (None, f"M-{other}", f"M-{answer}", f"M-{steer}"):
             with self.subTest(asked):

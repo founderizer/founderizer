@@ -150,7 +150,7 @@ links a WhatsApp account to the fleet: the owner reads that QR in the app, and `
 Since 14 November 2026 `call` also takes the setup tools `setup_state` and `setup_show` by
 name (below, "The link to the running app"), and the read `setup_diagnosis` on the same link.
 `write` takes each other tool that the
-program has: the nine below, the 57 of the table, and `save_bot_token`, `prepare_problem_report`,
+program has: the nine below, the 58 of the table, and `save_bot_token`, `prepare_problem_report`,
 `save_secret`, `grant_secret`, `share_secret` and `answer_secret_request` on the link. A read
 through `write` is refused, and a write through `call` is refused, each with words that name the
 right verb; a tool that the program does
@@ -187,7 +187,7 @@ Claude Code's own "always allow" button in its window, and Codex, which has no r
 
 **Its tools in this version.** The tools of this server, with the same names, words, fields and
 `readOnlyHint` (one exception: the program's words of `answer_needs_you` have its sentences about the
-door's card after the table's). 57 come from a table that this file prints, `python3 owner_mcp.py --dump-tools`,
+door's card after the table's). 58 come from a table that this file prints, `python3 owner_mcp.py --dump-tools`,
 from the same objects that its own tools are: `release.sh` and `run.sh` put it in the app as
 `Contents/Resources/owner-tools.json`, from the same revision as `onboard.py`. Sixteen are written
 again in Swift (the table's kind `swift`): four reads, `fleet_overview`, `fleet_read`,
@@ -209,7 +209,7 @@ program's own and are not
 in the table or in this server: `setup_state`, `setup_show` and `setup_diagnosis`, on the link to
 the running app (below). Six more, `save_bot_token`, `prepare_problem_report`, `save_secret`,
 `grant_secret`, `share_secret` and `answer_secret_request`, write on the same link (below). So
-`tools/list` gives 82 tools: the 57 of the table, the sixteen, the three reads of the link and its
+`tools/list` gives 83 tools: the 58 of the table, the sixteen, the three reads of the link and its
 six writes. One request more writes on the link and is no tool of its own: `answer_needs_you`'s
 signed press of a door card.
 
@@ -1339,7 +1339,7 @@ hub came through the link. **Not proved:** Codex's own window (only `codex exec`
 provider's server, and the verbs `call` and `write` and the nine writes in a release build (they
 came after that build).
 
-**The parity check** holds the two programs to each other. Each tool that both have (the 57 of the
+**The parity check** holds the two programs to each other. Each tool that both have (the 58 of the
 table, the four reads and the nine writes) runs on one fixed script of arguments against a
 stand-in hub with fixed answers, with more cases for the shared part and the nine: a new
 generation read again once, a 409 with `sha256`, a bad request id and the agent's own, each kind
@@ -1663,6 +1663,7 @@ Updates and backup.
 | Tool | Route | What it does |
 | --- | --- | --- |
 | `check_releases` / `take_release` / `automatic_releases` | `/ui/releases/*` | Ask the channel; take the release; turn automatic updates off or on (on by default). |
+| `claim_teams` | `/ui/teams/claim` | Turn Founderizer for Teams on with the key of its purchase, for an owner with no app on this computer: the hub trades the key (feature `teams_claim`). |
 | `take_backup` | `/ui/backup`, `/ui/backups/confirm` | A copy of the fleet into a file on this Mac, checked. |
 
 ### Setup

@@ -1714,6 +1714,29 @@ class Conversations(Base):
             kept = tuple(hub.q1("SELECT args, detail FROM calls ORDER BY id DESC LIMIT 1"))
             self.assertEqual(kept, ("{}", hub.REMOVED_WORDS) if gone else ('{"text": "Hi"}', detail), (heads, detail))
 
+    def test_a_calls_record_keeps_the_start_of_a_reads_answer_and_a_send_or_a_standing_item_whole(self):
+        """F14 piece 7: the record of a done call keeps the first GOOGLE_CALL_KEEP characters of a read's answer, so
+        that the owner's database and their copy of it do not grow with each read (with the whole answers, `calls`
+        was 157 of the 446 MiB of the owner's hub database). What left the building stays whole, because a new session reads it
+        before it repeats a send (outward_done), and so does the answer about a standing item, which a removal finds by
+        its start (removed_standing_rows). Each answer here is the tool's own, with a long end added."""
+        end = "\n" + "w " * hub.GOOGLE_CALL_KEEP
+        longer = [(r, n, (lambda fn: lambda agent, a: fn(agent, a) + end)(fn)
+                   if n in ("read_messages", "message_contact", "keep_instruction") else fn, d, s)
+                  for r, n, fn, d, s in hub.TOOLS]
+        self.person("Kim", "manager", KIM, app="discord")
+        _, here = self.normal_task(title="Plan the refunds")
+        with patch.object(hub, "TOOLS", longer):
+            said = {"read_messages": self.ok("read_messages", here),
+                    "message_contact": self.ok("message_contact", here, person="Kim", text="May I refund Ana?",
+                                               request_id=str(uuid.uuid4())),
+                    "keep_instruction": self.ok("keep_instruction", here, words="Refunds wait for Kim", scope="agent")}
+        kept = {r["name"]: r["detail"] for r in hub.q("SELECT name, detail FROM calls WHERE ok=1 ORDER BY id")}
+        self.assertEqual(kept["read_messages"], said["read_messages"][:hub.GOOGLE_CALL_KEEP])
+        for name in ("message_contact", "keep_instruction"):
+            self.assertGreater(len(said[name]), hub.GOOGLE_CALL_KEEP)
+            self.assertEqual(kept[name], said[name], name)
+
     def test_a_windows_read_reads_the_records_under_its_lock_only(self):
         """A conversation's own read marks its messages read under the lock and masks them after it: a read of the
         records after the lock takes the lock again, which raises Left for an agent that was renamed or removed

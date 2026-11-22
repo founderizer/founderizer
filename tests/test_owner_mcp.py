@@ -713,6 +713,29 @@ class FromNothing(WithServer):
         self.assertEqual([c.args[0] for c in channel.call_args_list], [False, True])
         self.assertTrue(client.call("automatic_releases", automatic=True)["automatic"])
 
+    def test_claim_teams_gives_the_key_to_the_hubs_claim_and_says_the_platforms_refusal(self):
+        """claim_teams (Teams design 1, piece A1) gives the key of a purchase of Founderizer for Teams to the hub's
+        POST /ui/teams/claim, which trades it with this fleet's id (here a stand-in of releases.claim: no account at
+        the platform) and keeps the token; a refusal of the platform comes back in the platform's words, and the key is
+        in no answer. Bug: an owner with no app on this computer has no way to turn Teams on, or the agent cannot tell
+        a used key from a hub that does not answer."""
+        client = self.started()
+        key = "FZ-7QK2-M9XP-4RTB"
+        refusal = {"token": None, "renews": None, "status": 409, "error": "used_key",
+                   "says": "This key was used for another fleet."}
+        with patch("hub.releases.claim", return_value=refusal) as claim, self.assertRaises(Refused) as said:
+            client.call("claim_teams", claim_key=key)
+        self.assertIn("This key was used for another fleet.", str(said.exception))
+        self.assertEqual(claim.call_args.args[1:], (key, hub.fleet_id()))
+        taken = dict(refusal, token="a.token", status=200, error=None, says=None)
+        on = {"teams": {"on": True, "until": 1795000000, "renews": None, "ended": None}}
+        with patch("hub.releases.claim", return_value=taken), patch("hub.teams_token", return_value=True), \
+                patch("hub.store_entitlement") as stored, patch("hub.teams_state", return_value=on):
+            answer = client.call("claim_teams", claim_key=key)
+        stored.assert_called_once_with("a.token", None)
+        self.assertEqual(answer["teams"], on["teams"])
+        self.assertNotIn(key, json.dumps(answer))
+
 
 class Refusals(WithServer):
     """What the server does when the hub refuses: the hub's own words, and never a way round them."""
@@ -5333,7 +5356,7 @@ class Parity(unittest.TestCase):
         named = {c["tool"] for c in parity_cases()}
         both = {t["name"] for t in owner_mcp.dump_tools()["tools"] if t["kind"] != "absent"}
         self.assertEqual(both - named, set())
-        self.assertEqual(len(both), 57 + 4 + 12)
+        self.assertEqual(len(both), 58 + 4 + 12)
 
     def test_the_older_hub_rule_is_what_hub_py_answers(self):
         """`parity_older` is read from the hub, not from the program: its dispatch answers an unknown route with 404
@@ -5416,7 +5439,7 @@ class Table(unittest.TestCase):
         built = sum(1 for t in owner_mcp.tools() if getattr(t["run"], "kind", None))
         self.assertEqual(sum(len(kinds.get(k, [])) for k in self.TABLE_KINDS), built)
         self.assertEqual((len(owner_mcp.SWIFT_READS), len(owner_mcp.SWIFT_WRITES), len(owner_mcp.ABSENT), built),
-                         (4, 12, 7, 57))
+                         (4, 12, 7, 58))
         # A tool of no kind stops the dump: somebody decides which it is. And a tool of no category stops the program:
         # it would stand in no line of the map, so a client with tool search would not learn of it.
         stray = owner_mcp.tool("Read", "stray", "A tool of no kind.", {}, (), lambda _args: {})
@@ -5450,7 +5473,7 @@ class Table(unittest.TestCase):
         self.assertEqual([t["name"] for t in table if t["annotations"]["readOnlyHint"] and t["kind"] in self.TABLE_KINDS],
                          [])
         writes = {t["name"] for t in table if not t["annotations"]["readOnlyHint"] and t["kind"] != "absent"}
-        self.assertEqual(len(writes), 57 + 12)
+        self.assertEqual(len(writes), 58 + 12)
         self.assertTrue(set(owner_mcp.SWIFT_WRITES) <= writes)
 
     def test_a_lost_error_answer_says_that_the_request_can_have_arrived(self):

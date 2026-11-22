@@ -77,6 +77,8 @@ OWNER_KEY_HEADER = "X-Fleet-Owner-Key-Sha256"       # hubsetup.py: the key's SHA
 OWNER_KEY_KEPT = "X-Fleet-Owner-Key"                # hubsetup.py: the claim's answer says "kept"
 PORT = 8765
 TIMEOUT = 30                            # seconds for one owner-API call
+CLAIM_TIMEOUT = 45                      # claim_teams: above the hub's own 30 s for the platform (releases.CLAIM_WAIT),
+                                        # so the tool does not end while the hub still keeps the licence (D65)
 READ_MAX = 8 * 1024 * 1024              # the largest answer this server reads from the hub
 # The whole snapshot (/ui/state) is an answer that holds a fleet's whole history, and a process of this server
 # reads it before its first call, for the hub's generation (a process of one call, as founderizer-cli call, each
@@ -1193,7 +1195,7 @@ def one_part(key, value):
         raise Refused(f"{key} cannot be \"{value}\": a part of a route is never \".\" or \"..\".")
 
 
-def table_tool(run, kind, route, fields, what, revision_page=None, rid_from_args=True, whole=()):
+def table_tool(run, kind, route, fields, what, revision_page=None, rid_from_args=True, whole=(), wait=None):
     """**The facts of a tool that the table carries** (`dump_tools`): the function that `plain`, `with_base` or
     `with_revision` returns carries its kind, its route, its fields, its words and, for `with_revision`, the page whose
     thing gives its revision. The program inside the Founderizer app builds the same request from these facts, so the
@@ -1202,6 +1204,9 @@ def table_tool(run, kind, route, fields, what, revision_page=None, rid_from_args
     # For `with_base`: the fields that replace a whole value, which go only with the base of the client's own read.
     run.revision_page, run.rid_from_args, run.whole = revision_page, rid_from_args, tuple(whole)
     run.nulls = ()          # the fields whose null is a value (`sent`); `tool` sets them from the schema
+    # The seconds of its request when they are not TIMEOUT (claim_teams: CLAIM_TIMEOUT), which the program inside the
+    # app gives its request too (`wait` in the table).
+    run.wait = wait
     return run
 
 
@@ -1215,12 +1220,18 @@ def sent(run, fields, args):
             if args.get(name) is not None or (name in args and name in getattr(run, "nulls", ()))}
 
 
-def plain(route, fields, what, rid_from_args=True):
-    """A tool that passes its fields to one command route as they are. The hub checks each one."""
+def plain(route, fields, what, rid_from_args=True, timeout=TIMEOUT):
+    """A tool that passes its fields to one command route as they are. The hub checks each one. `timeout`: the seconds
+    of its request, for a route that waits for another service itself (claim_teams)."""
+    # Only a tool with its own seconds passes them: each other one calls `command` as it always did.
+    limits = {} if timeout == TIMEOUT else {"timeout": timeout}
+
     def run(args):
         body = sent(run, fields, args)
-        return command(route_for(route, args), body, what, args.get("request_id") if rid_from_args else None)
-    return table_tool(run, "plain", route, fields, what, rid_from_args=rid_from_args)
+        return command(route_for(route, args), body, what, args.get("request_id") if rid_from_args else None,
+                       **limits)
+    return table_tool(run, "plain", route, fields, what, rid_from_args=rid_from_args,
+                      wait=limits.get("timeout"))
 
 
 def team_base_needed(replaced):
@@ -5551,6 +5562,17 @@ def tools():
              {"automatic": S["bool"], **rid}, ("automatic",),
              plain("/ui/releases/auto", ("automatic",), "the automatic-update setting")),
         tool("Releases",
+             "claim_teams", "Turn Founderizer for Teams on for this fleet with the key of its purchase "
+                            "(FZ-XXXX-XXXX-XXXX), when the Founderizer app is not on this computer: the app gives the "
+                            "key itself. The hub trades the key at founderizer.com for this fleet's licence. The key is "
+                            "for one use, and the hub keeps only its SHA-256. A refusal (a key that is unknown, used "
+                            "or older than 30 days) says why, and changes nothing.",
+             {"claim_key": {"type": "string", "description": "The key of the purchase: the part after key= in the "
+                                                             "link of the button Open Founderizer, on the thanks "
+                                                             "page or the account page."},
+              **rid}, ("claim_key",),
+             plain("/ui/teams/claim", ("claim_key",), "the claim of Founderizer for Teams", timeout=CLAIM_TIMEOUT)),
+        tool("Releases",
              "take_backup", "Take one copy of this fleet into a file on this Mac — the records, the owner's own "
                             "configuration, a manifest and RESTORE.md — check its SHA-256 and tell the hub it is "
                             "saved. Nothing is written on the hub machine.",
@@ -5736,6 +5758,7 @@ FEATURES = {
     "steer_task": "task_steering", "goal_state": "goals", "duty_state": "responsibilities",
     "end_standing": "standing", "trigger_state": "triggers", "check_releases": "releases",
     "take_release": "releases", "automatic_releases": "releases", "clarify_needs_you": "need_clarify",
+    "claim_teams": "teams_claim",
     "restore_notes": "memory_undo", "forget_lesson": "memory_undo",
 }
 
@@ -5759,6 +5782,8 @@ def dump_tools(listed=None):
             entry.update(kind=kind, route=run.route, fields=list(run.fields), what=run.what,
                          revision_page=run.revision_page, request_id_from_args=run.rid_from_args,
                          feature=FEATURES.get(name), whole=list(run.whole), nulls=list(run.nulls))
+            if run.wait is not None:
+                entry["wait"] = run.wait
         elif name in SWIFT_READS or name in SWIFT_WRITES:
             entry["kind"] = "swift"
         elif name in ABSENT:

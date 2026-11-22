@@ -579,11 +579,11 @@ COUNT_MOST = 10000                               # the agents that one count may
 ANSWER_MOST = 65536                              # bytes of an answer that the poll reads; a token is far less
 
 
-def licence_endpoint(channel):
+def licence_endpoint(channel, path=LICENCE_PATH):
     """The address of the licence's poll on the fleet's release channel, which must be HTTPS at founderizer.com or a
     host below it (each label letters, digits and hyphens), with no user name, query, fragment or odd path: never
     `xfounderizer.com`. Untrusted for any other channel, so that a hub whose channel names another site sends its
-    licence nowhere."""
+    licence nowhere. `path`: LICENCE_PATH, or CLAIM_PATH for the claim (claim), whose key goes by the same rule."""
     refused = Untrusted("the fleet's channel is not founderizer.com, so the licence's poll goes nowhere")
     try:
         parts = urllib.parse.urlsplit(str(channel or "").strip())
@@ -595,7 +595,7 @@ def licence_endpoint(channel):
             or not CHANNEL_PATH.fullmatch(parts.path.rstrip("/")):
         raise refused
     netloc = host if port is None else f"{host}:{port}"
-    return urllib.parse.urlunsplit(("https", netloc, parts.path.rstrip("/") + LICENCE_PATH, "", ""))
+    return urllib.parse.urlunsplit(("https", netloc, parts.path.rstrip("/") + path, "", ""))
 
 
 def _loopback(host):
@@ -637,9 +637,9 @@ def _connect(host, port, deadline, timeout):
 
 
 def _post(url, token, body, timeout=CHANNEL_TIMEOUT):
-    """(status, text) of one POST of `body` as JSON, with the token as the bearer. status 0 and the reason when no
-    whole answer came: also a body that ends before its Content-Length ("IncompleteRead"), which is the start of an
-    answer and not an answer.
+    """(status, text) of one POST of `body` as JSON, with the token as the bearer, or none when it is None (the claim,
+    `claim`, carries its key in the body). status 0 and the reason when no whole answer came: also a body that ends
+    before its Content-Length ("IncompleteRead"), which is the start of an answer and not an answer.
 
     - **No proxy and no redirect.** http.client reads no proxy that the environment names and follows nothing, so the
       licence goes only to the address that licence_endpoint checked. A 3xx is its own status.
@@ -671,8 +671,9 @@ def _post(url, token, body, timeout=CHANNEL_TIMEOUT):
     except OSError as e:            # this machine's certificates for TLS
         return 0, str(e)[:300]
     payload = json.dumps(body, separators=(",", ":")).encode()
-    headers = {"Accept": "application/json", "Authorization": "Bearer " + token,
-               "Content-Type": "application/json", "User-Agent": "founderizer-hub"}
+    headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "founderizer-hub"}
+    if token is not None:       # the claim (claim) carries its key in the body and sends no bearer
+        headers["Authorization"] = "Bearer " + token
     ended, late = threading.Event(), f"it did not answer whole in {timeout:g} seconds"
 
     def cut():
@@ -753,6 +754,57 @@ def renew(url, token, agents=None, *, timeout=CHANNEL_TIMEOUT):
     code = f" ({error})" if isinstance(error, str) and error in ERROR_CODES else ""
     return dict(answer, says=f"the licence's poll got {status}{code} from the release channel")
 
+
+
+# ---------------------------------------------------------------- POST /api/entitlement/claim: the claim
+#
+# teams-design-1-shop-and-licence.md, 3.11. The owner's app gives the hub the key of a purchase (POST
+# /ui/teams/claim), and the hub trades it here, with its own fleet id, for the licence's token. The key goes only to
+# the address that licence_endpoint checked (HTTPS at founderizer.com), in the body, with no bearer, no proxy and no
+# redirect, and the whole call ends within CLAIM_WAIT seconds, because the owner's app waits for its answer.
+CLAIM_PATH = "/api/entitlement/claim"
+CLAIM_WAIT = 30         # seconds for the whole claim, from the connection to the last byte of the answer
+# The `error` codes of the claim's refusals (the platform's docs/CONTRACTS.md, "The claim"), and `gone`, the answer of
+# a shop that is closed: only with one of these is the answer's `says` line passed on, for the app's words of a
+# refused claim (E2); each other answer gets the hub's own line.
+CLAIM_ERRORS = frozenset(("unknown_key", "expired_key", "not_live", "test_shop", "used_key", "fleet_taken",
+                          "too_many", "unavailable", "gone", "incomplete", "unreadable"))
+SAYS_MOST = 300         # characters of a `says` line, as the platform writes it at most
+
+
+def claim(url, key, fleet, *, timeout=CHANNEL_TIMEOUT, wait=CLAIM_WAIT):
+    """One claim: POST `url` (licence_endpoint of the channel with CLAIM_PATH) with {"claim_key": key, "fleet":
+    fleet} and nothing else of the fleet.
+
+    Returns {"status", "token", "renews", "error", "says"}, and no answer makes it raise. `token`: the token of a 200,
+    unchecked (the hub keeps it only if our key signed it for this fleet with plan `teams`), with `renews` (None when
+    the answer does not say it). Else `error`, the answer's code when it is one of CLAIM_ERRORS, and `says`: that
+    refusal's own line, on one line and cut to SAYS_MOST characters, or the hub's line with the status alone. status 0:
+    no answer, also when the whole call took more than `wait` seconds; the call that went on then is left behind, and
+    a claim again with the same key gets the same token (the platform's "A hub that lost the answer asks again")."""
+    out = {}
+    worker = threading.Thread(target=lambda: out.update(answer=_post(url, None, {"claim_key": key, "fleet": fleet},
+                                                                     min(timeout, wait))),
+                              name="licence-claim", daemon=True)
+    worker.start()
+    worker.join(wait)
+    status, text = out.get("answer") or (0, f"no whole answer in {wait} seconds")
+    answer = {"status": status, "token": None, "renews": None, "error": None, "says": None}
+    if status == 0:
+        return dict(answer, says="the claim got no answer from the release channel: " + text)
+    try:
+        raw = json.loads(text)
+    except (ValueError, RecursionError):        # RecursionError: JSON nested deeper than Python's stack takes
+        raw = None
+    raw = raw if isinstance(raw, dict) else {}
+    fresh, renews, error, says = raw.get("token"), raw.get("renews"), raw.get("error"), raw.get("says")
+    if status == 200 and isinstance(fresh, str) and TOKEN.fullmatch(fresh):
+        return dict(answer, token=fresh, renews=renews if isinstance(renews, bool) else None)
+    if status != 200 and isinstance(error, str) and error in CLAIM_ERRORS:
+        line = " ".join(says.split()) if isinstance(says, str) else ""
+        line = line if len(line) <= SAYS_MOST else line[:SAYS_MOST - 1] + "\u2026"
+        return dict(answer, error=error, says=line or f"the claim got {status} ({error}) from the release channel")
+    return dict(answer, says=f"the claim got {status} from the release channel")
 
 # ---------------------------------------------------------------- GET /releases/latest
 

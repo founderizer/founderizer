@@ -439,6 +439,11 @@ def connect_by(end):
                 sock = socket.socket(family, kind, proto)
                 sock.settimeout(rest)
                 sock.connect(where)
+                left = end - time.monotonic()
+                if left <= 0:
+                    sock.close()
+                    raise Missed("download", "not connected in its time")
+                sock.settimeout(left)   # HTTPSConnection's TLS handshake on this socket gets only the time that is left
                 return sock
             except OSError as e:
                 error = e

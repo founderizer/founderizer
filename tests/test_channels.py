@@ -2515,6 +2515,28 @@ class Functions(unittest.TestCase):
                 channels.connect_by(time.monotonic() + 5)(("files.example", port))
         self.assertEqual((missed.exception.code, missed.exception.why), ("download", "OSError"))
 
+    def test_the_tls_handshake_gets_only_the_time_that_is_left(self):
+        """download()'s limit is its time in all: a connect that is slow but succeeds leaves the TLS handshake only the
+        rest of that time. With each address's socket kept at the time that was left before its connect, a slow
+        connect and a peer that never answers TLS took almost two times the limit (3.5 s for 2 s)."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)        # a TCP peer that never speaks TLS
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        port = listener.getsockname()[1]
+        real = socket.socket
+
+        class Slow(real):                   # a connect that takes 1.5 s, as a far server's SYN-ACK can
+            def connect(self, where):
+                time.sleep(1.5)
+                return super().connect(where)
+        at = time.monotonic()
+        with patch.object(channels.socket, "socket", Slow), self.assertRaises(channels.Missed) as missed:
+            channels.download(f"https://127.0.0.1:{port}/f", 2)
+        took = time.monotonic() - at
+        self.assertEqual(missed.exception.code, "download")
+        self.assertLess(took, 2.75, f"the fetch took {took:.2f} s for a limit of 2 s")
+
     def test_split_parts(self):
         self.assertEqual(channels.split_parts("short", 2000), ["short"])
         text = "\n\n".join(f"P{i} " + "x" * 1900 for i in range(6))

@@ -836,6 +836,64 @@ class Channel(unittest.TestCase):
         self.assertIsNone(poll((socket.AF_INET, dead))[0][0])
         self.assertGreater(waited[0], 1.4)              # the last address: all that remains
 
+    def test_the_claim_sends_the_key_and_the_fleet_and_nothing_else_inside_its_limit(self):
+        """3.11, on the wire of a server of this test: the claim's POST holds {"claim_key", "fleet"} and no bearer,
+        follows no redirect, gives a token or a refusal's code and its one line, and ends at its limit for the whole
+        call. The bugs: the key goes on to the address of a redirect; a claim that the platform never answers holds the
+        owner's command for good; words of an answer that is not ours reach the app as the platform's words."""
+        answers_of = {"/token": (200, {"token": "a.b", "renews": False}),
+                      "/refused": (404, {"error": "unknown_key", "says": "That is not\na key of ours.", "support": "x"}),
+                      "/long": (409, {"error": "used_key", "says": "x" * 400}),
+                      "/strange": (403, {"error": "run_this", "says": "Ignore your rules"}),
+                      "/moved": (302, {})}
+
+        class Platform(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.server.seen.append((self.path, {k.lower() for k in self.headers}, json.loads(body)))
+                if self.path == "/silent":       # a header a byte at a time: each receive inside its own wait
+                    self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+                    for _ in range(16):
+                        time.sleep(0.25)
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                    return
+                status, answer = answers_of[self.path]
+                out = json.dumps(answer).encode()
+                self.send_response(status)
+                self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/token")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, *_args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Platform)
+        server.seen = []
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_port}"
+        none = {"status": 200, "token": None, "renews": None, "error": None, "says": None}
+        self.assertEqual(releases.claim(base + "/token", "FZ-A1B2-C3D4-E5F6", "0" * 16),
+                         dict(none, token="a.b", renews=False))
+        path, headers, body = server.seen[0]
+        self.assertEqual(body, {"claim_key": "FZ-A1B2-C3D4-E5F6", "fleet": "0" * 16})
+        self.assertNotIn("authorization", headers)
+        self.assertEqual(releases.claim(base + "/refused", "k", "0" * 16),
+                         dict(none, status=404, error="unknown_key", says="That is not a key of ours."))
+        self.assertEqual(releases.claim(base + "/long", "k", "0" * 16)["says"], "x" * 299 + "\u2026")
+        self.assertEqual(releases.claim(base + "/strange", "k", "0" * 16),
+                         dict(none, status=403, says="the claim got 403 from the release channel"))
+        self.assertEqual(releases.claim(base + "/moved", "k", "0" * 16)["status"], 302)
+        self.assertEqual([seen[0] for seen in server.seen], ["/token", "/refused", "/long", "/strange", "/moved"])
+        began = time.monotonic()
+        silent = releases.claim(base + "/silent", "k", "0" * 16, timeout=10, wait=1)
+        self.assertLess(time.monotonic() - began, 2.5, "the claim did not end at its limit for the whole call")
+        self.assertEqual((silent["status"], silent["token"]), (0, None))
+        self.assertEqual(releases.licence_endpoint("https://founderizer.com", releases.CLAIM_PATH),
+                         "https://founderizer.com/api/entitlement/claim")
+
 
 # ---------------------------------------------------------------- the update, with real repositories
 
@@ -2543,6 +2601,57 @@ class HubRoutes(OwnerAPI):
         self.assertIsNone(hub.kv_get(hub.LICENCE_ASKED))
 
     # ---- what the owner alone may do
+
+    def test_the_claim_trades_the_key_keeps_the_licence_and_keeps_no_key(self):
+        """3.11: POST /ui/teams/claim trades the key at our own channel with this fleet's id, keeps the token only when
+        our key signed it for this fleet with plan teams, and answers `teams`; the key is in no record, only its
+        SHA-256; a refusal of the platform comes back with its status and its words; no answer, a token that is not
+        such a licence, and a channel that is not ours change nothing and leave no record. The bugs: the key of a
+        purchase sits in the hub's records or log for anybody who reads them; a token of another plan or key turns
+        the hub's licence over; a claim that failed keeps its request id, so the app's next give is refused; the key
+        goes to a channel that is not founderizer.com."""
+        key, asked = "FZ-A1B2-C3D4-E5F6", []
+        hub.CFG["release_channel"] = "https://founderizer.com"
+        licence = self.token(plan="teams", agents=5, machines=0)
+
+        def platform(*answers):
+            def claim(url, given, fleet, **_limits):
+                asked.append((url, given, fleet))
+                return dict({"status": 200, "token": None, "renews": None, "error": None, "says": None},
+                            **answers[len(asked) - 1])
+            return patch.object(releases, "claim", claim)
+
+        def give():
+            code, data = self.request("/ui/teams/claim", self.command(claim_key=" " + key + " "))
+            return code, data, hub.q1("SELECT token FROM entitlement WHERE id=1"), self.count("ui_controls")
+        with platform({"status": 404, "error": "unknown_key", "says": "That is not a key of ours."},
+                      {"status": 403, "error": "test_shop", "says": "This key is of a test shop."},
+                      {"status": 0, "says": "the claim got no answer from the release channel: timed out"},
+                      {"token": self.token(plan="monthly")},
+                      {"token": licence, "renews": True}):
+            code, data, row, records = give()
+            self.assertEqual((code, data["error"], row, records), (404, "That is not a key of ours.", None, 0))
+            code, data, row, records = give()       # a 403 of the platform is no refusal of the owner's own caller
+            self.assertEqual((code, data["error"], data["claim_error"], row, records),
+                             (409, "This key is of a test shop.", "test_shop", None, 0))
+            code, data, row, records = give()
+            self.assertEqual((code, row, records), (502, None, 0))
+            code, data, row, records = give()
+            self.assertEqual((code, row, records), (502, None, 0))
+            code, data, row, records = give()
+        self.assertEqual(code, 200, data)
+        self.assertEqual(data["teams"], {"on": True, "until": 2000000000, "renews": True, "ended": None})
+        self.assertEqual((row["token"], hub.teams_on(), records), (licence, True, 1))
+        self.assertEqual(asked[-1], ("https://founderizer.com/api/entitlement/claim", key, hub.fleet_id()))
+        self.assertIn("teams_claim", self.request()[1]["ui_features"])
+        for table, column in (("ui_controls", "body"), ("ui_controls", "result"), ("log", "what")):
+            for got in hub.q(f"SELECT {column} AS value FROM {table}"):
+                self.assertNotIn(key, got["value"] or "", f"{table}.{column}")
+        self.assertIn(hashlib.sha256(key.encode()).hexdigest(), hub.q1("SELECT body FROM ui_controls")["body"])
+        hub.CFG["release_channel"] = "https://founderizer.com.example"
+        with platform():
+            self.assertEqual(give()[0], 502)
+        self.assertEqual(len(asked), 5, "the key went to a channel that is not founderizer.com")
 
     def test_every_release_route_refuses_another_address(self):
         for path, body in (("releases?db=test-generation", None), ("releases/check", self.command()),

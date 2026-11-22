@@ -1985,7 +1985,10 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "ended_blocks",      # owner API 1.270: GET /ui/mobile/ended takes window, blocks and block: the heads
                                     # of the newest ids, and the older ones in blocks with marks (ended_read); a
                                     # reader goes by `older` of the window's answer, as by `older_tasks`
-               "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
+               "releases", "entitlement",
+               "teams_claim",       # teams-design-1-shop-and-licence.md 3.11 (H1 step 3): POST /ui/teams/claim takes
+                                    # the key of a purchase of Founderizer for Teams, and the hub trades it itself
+               "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
                "signed_grants", "agent_rename", "agent_memory", "live_changes",
@@ -9527,7 +9530,8 @@ def start_text(agent, task_id, resume=False, note="", row=None, opening=None, fi
             (first if first is not None else
              task_start_text(agent, task_id, resume, note, row, opening))   # 1. the task or wake (L8)
             + holdings_team_text(agent, task_id)                            # 2. holdings and the team directory (L8)
-            + ("" if narrowed else standing_start_text(agent, kpis=kpis))   # 3. standing items (L3)
+            # 3. standing items (L3), with the sentence that puts crowded ones in order in a task's own session
+            + ("" if narrowed else standing_start_text(agent, kpis=kpis, tidy=first is None))
             + (kpi_parent_text(agent) if team_results_task(own) and first is None else "")  # and the KPI parent's line
             # (person access plan, section 5: a narrowed task reads none of the agent's notes, skills, lessons or
             # knowledge, which speak of everything the agent holds, not of the person's list)
@@ -31666,8 +31670,8 @@ def long_texts_seed(t0):
                     + f". You keep {mine} active item{'s' if mine != 1 else ''} yourself. Put yours in order: end one "
                     "that is done; pass one that is for one agent to that agent; write the rule of one duty into that "
                     "duty's words, and end the item with that place in why. Tell each lead that keeps items for others "
-                    "to do the same. Then ask the owner one time, in one message, which of the owner's older wishes "
-                    "still stand.")
+                    "to do the same. Ask the owner nothing about it: a wish of the owner's that still stands moves "
+                    "whole into the place that its work reads, and its item ends with that place in why.")
     if not due:
         return
     with transaction():
@@ -31750,7 +31754,7 @@ GOOGLE_EMAIL = re.compile(r"[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+")
 GOOGLE_PENDING = 900            # seconds that a Connect waits for its finish
 GOOGLE_REFRESH = 300            # seconds: an access token with less time left is refreshed first
 GOOGLE_TEXT_MAX = 50000         # characters of a text in a read's result
-GOOGLE_CALL_KEEP = 4000         # characters of a read's result in the calls record
+GOOGLE_CALL_KEEP = 4000         # characters of a done call's answer in the calls record (CALLS_KEPT_WHOLE)
 GOOGLE_LINK_LIFE = 600          # seconds of a one-time download or upload link
 GOOGLE_UPLOAD_MAX = 50 * 1024 * 1024
 GMAIL_SYSTEM = ("INBOX", "UNREAD", "STARRED", "IMPORTANT")
@@ -34340,13 +34344,43 @@ ATTACH_OFFICE = {"application/vnd.openxmlformats-officedocument.spreadsheetml.sh
                  "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx"}
 
 
+def zip_entries(data):
+    """How many entries the central directory of the ZIP `data` can hold, counted before zipfile opens it: each entry
+    starts with its signature, so zipfile reads no more entries than this, and its constructor holds some 500 bytes
+    for each one (400,000 entries in 32 MiB held 198 MiB)."""
+    return data.count(b"PK\x01\x02")
+
+
+def zip_directory_bytes(data):
+    """The size of the central directory of the ZIP `data`, read before zipfile opens it, from the end record that
+    zipfile reads (its _EndRecData, whose private name a later Python may change): the last 22 bytes when they are an
+    end record that states no comment, else the last end record in the last 64 KiB and 22 bytes. A search alone found
+    a later "PK\x05\x06" inside a record whose two counts write it, and read 0 bytes where zipfile read 31.3 MiB.
+
+    0xFFFFFFFF, which is no copy's, for a found record whose comment does not fit in the bytes, and for one with a
+    Zip64 locator before it, whose record zipfile reads in place of the end record's (the Mac app refuses Zip64, and
+    the hub never writes it: at most 20,000 entries and 256 MiB). 0 for bytes with no end record, which zipfile then
+    refuses itself."""
+    if len(data) >= 22 and data[-22:-18] == b"PK\x05\x06" and data[-2:] == b"\0\0":
+        end = len(data) - 22
+    else:
+        end = data.rfind(b"PK\x05\x06", max(0, len(data) - 65535 - 22))
+        if end < 0 or end + 22 > len(data):
+            return 0
+        if end + 22 + int.from_bytes(data[end + 20:end + 22], "little") > len(data):
+            return 0xFFFFFFFF
+    if end >= 20 and data[end - 20:end - 16] == b"PK\x06\x07":
+        return 0xFFFFFFFF
+    return int.from_bytes(data[end + 12:end + 16], "little")
+
+
 def office_package(data, mime):
     """True when these bytes are a package of this Office type: a ZIP that holds its content types and its type's main
     part (OOXML_MAIN), the first check of an agent's Office file (ooxml_texts). Nothing inside is unpacked: the owner's
     own file goes to his agents, who open it with their own tools, as a ZIP of his does."""
     import io
     import zipfile
-    if data.count(b"PK\x01\x02") > 5000:     # each entry of the central directory: zipfile would read all of them
+    if zip_entries(data) > 5000:             # each entry of the central directory: zipfile would read all of them
         return False
     try:
         names = zipfile.ZipFile(io.BytesIO(data)).namelist()
@@ -35700,6 +35734,10 @@ OOXML_TEMPLATE = re.compile(rb'(?i)Type\s*=\s*"[^"]{0,512}/attachedTemplate"')
 OOXML_REMOTE = re.compile(rb'(?i)Target\s*=\s*"\s*(?:(?:https?|ftp|smb|webdav):|//|\\\\|file://[^/])')
 OOXML_DDE = re.compile(rb"(?i)\bDDE(?:AUTO)?\b")
 OOXML_SPACES = bytes.maketrans(b"<>", b"  ")
+# The flags of a ZIP entry that the hub never reads (an Office part, an entry of a copy of a fleet): encrypted (bit 0),
+# compressed patched data (bit 5) and strong encryption (bit 6). zipfile's open raises an error that is no refusal for
+# each; ooxml_part, which does not call it, would read the bytes as they stand.
+ZIP_FLAGS_UNREAD = 0x61
 
 
 def ooxml_fields(raw):
@@ -35725,6 +35763,36 @@ def ooxml_relations(raw):
         yield piece[:stop if stop >= 0 else 4096]
 
 
+def ooxml_part(data, info, kind):
+    """The bytes of one stored or deflate part of an Office file (ooxml_texts), unpacked from the file's own bytes at
+    its local header, never further than the size that the directory states and one byte. A deflate part that holds
+    more than it states, or whose stream does not end in its packed bytes, is refused (415): the rest of its text would
+    be searched by no one, and a reader that unpacks the stream to its end gets that rest. The test is of the stream
+    itself, because writers pack in their own ways: .NET's old deflater starts each stream with a tree of 98 bytes (a
+    part of 139 bytes packs to 229), and a limit on the packed size refused real parts. A part that does not unpack (no
+    local header, a broken stream, a wrong CRC-32) raises zipfile.BadZipFile."""
+    import zipfile
+    at = info.header_offset
+    if not 0 <= at <= len(data) - 30 or data[at:at + 4] != b"PK\x03\x04":
+        raise zipfile.BadZipFile(f"no local header for {info.filename!r}")
+    start = at + 30 + int.from_bytes(data[at + 26:at + 28], "little") + int.from_bytes(data[at + 28:at + 30], "little")
+    packed = memoryview(data)[start:start + info.compress_size]
+    # stored bytes, or a deflate part of no packed bytes that states none: empty, as zipfile reads it
+    if info.compress_type == zipfile.ZIP_STORED or not info.compress_size and not info.file_size:
+        raw = bytes(packed)
+    else:
+        unpack = zlib.decompressobj(-15)
+        try:
+            raw = unpack.decompress(packed, info.file_size + 1)
+        except zlib.error:
+            raise zipfile.BadZipFile(f"a broken stream in {info.filename!r}") from None
+        if len(raw) > info.file_size or not unpack.eof:
+            raise Refusal(415, f"these bytes are not a {kind}")
+    if zlib.crc32(raw) != info.CRC:
+        raise zipfile.BadZipFile(f"a wrong CRC-32 of {info.filename!r}")
+    return raw
+
+
 def ooxml_texts(data, mime, kind, inbound=False):
     """The XML parts of an Office file, for the search, after its checks (the OOXML rules above). A part's markup
     goes (< and > are never inside a value) and its entities are read as the characters that they write (&amp; is
@@ -35736,32 +35804,53 @@ def ooxml_texts(data, mime, kind, inbound=False):
     as in every Office file. CHAT_FILE_UNPACK stays a refusal."""
     import io
     import zipfile
+    if zip_entries(data) > 5000:            # before the open, as office_package: an agent's file has none before it
+        raise Refusal(415, f"these bytes are not a {kind}")
     try:
         package = zipfile.ZipFile(io.BytesIO(data))
         names = package.namelist()
     except (zipfile.BadZipFile, zipfile.LargeZipFile, ValueError, OSError, EOFError, NotImplementedError):
         raise Refusal(415, f"these bytes are not a {kind}") from None
-    if len(names) > 5000 or "[Content_Types].xml" not in names or OOXML_MAIN[mime] not in names:
+    if "[Content_Types].xml" not in names or OOXML_MAIN[mime] not in names:
         raise Refusal(415, f"these bytes are not a {kind}")
     code = Refusal(415, f"a {kind} with a macro, an ActiveX control, an OLE object, a template from another computer "
                         f"or a DDE field cannot go to a chat")
     if not inbound and any("vbaproject" in n.lower() or "/activex/" in "/" + n.lower() for n in names):
         raise code
-    left = CHAT_FILE_UNPACK
+    left, room = CHAT_FILE_UNPACK, len(data)
     for info in package.infolist():
         name = info.filename.lower()
         if not name.endswith((".xml", ".rels", ".vml")):
             continue
+        if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED) or info.flag_bits & ZIP_FLAGS_UNREAD:
+            # Python's zipfile gives its unpacker a limit only for deflate: a part of bzip2 or LZMA is unpacked whole at
+            # its first read, and a few kilobytes of it held gigabytes, past CHAT_FILE_UNPACK (a review of 22 November
+            # 2026: 308 bytes, 192 MiB of zeros, 195 MiB more memory). An Office app packs its parts in neither way,
+            # so such a part is a file that is not of the kind, for a person's file and an agent's alike. An encrypted
+            # part is one too: ooxml_part, which does not call zipfile's open, would read its bytes as plain deflate.
+            raise Refusal(415, f"these bytes are not a {kind}")
+        # The budget counts each part's size as the directory states it, before the part is unpacked, and the part is
+        # unpacked no further (ooxml_part): zipfile unpacks up to the size that a read asks and cuts the result to the
+        # stated size, so a part that states 0 bytes made the hub unpack up to all of the budget for nothing, at each
+        # part (a review of 22 November 2026: 1.4 MiB with 24 such parts made it unpack 1,440 MiB). Stored bytes are
+        # their own size.
+        if info.compress_type == zipfile.ZIP_STORED and info.compress_size != info.file_size:
+            raise Refusal(415, f"these bytes are not a {kind}")
+        left -= info.file_size
+        if left < 0:
+            raise Refusal(413, f"the {kind} packs more than {CHAT_FILE_UNPACK >> 20} MB of text")
+        # Each part's packed bytes lie in the file once: 5,000 entries that name the same 25 MB of empty deflate blocks
+        # would make the hub read those bytes 5,000 times (zipfile's own test of entries that overlap is in its open,
+        # which ooxml_part does not call).
+        room -= info.compress_size
+        if room < 0:
+            raise Refusal(415, f"these bytes are not a {kind}")
         try:
-            with package.open(info) as part:
-                raw = part.read(left + 1)
-        except Exception:       # noqa: BLE001 -- a part that does not unpack: the bytes' fault, never the hub's
+            raw = ooxml_part(data, info, kind)
+        except zipfile.BadZipFile:  # a part that does not unpack: the bytes' fault, never the hub's
             if not inbound:
                 raise
             continue            # a person's file: its other parts are read (a wrong CRC of one part hid the next)
-        left -= len(raw)
-        if left < 0:
-            raise Refusal(413, f"the {kind} packs more than {CHAT_FILE_UNPACK >> 20} MB of text")
         if not inbound:                             # the OOXML rules, for an agent's own file
             if name == "[content_types].xml" and OOXML_RISKY_TYPES.search(raw):
                 raise code
@@ -46591,7 +46680,9 @@ def standing_crowded(agent, names):
     box is off keeps only a colleague's own wish, so its line keeps the rest in order (shell_tools), also for its
     owner chat. Any other owner chat ends an item only on the owner's word (standing_chat), and no agent of its line
     ends one of its items but the fleet manager (t_end_standing), so a task of its own puts them in order (Fable's
-    read of 22 November 2026, finding 5)."""
+    read of 22 November 2026, finding 5): its next task session, whose start says so above the mark
+    (standing_start_text, tidy). The chat no longer asks the owner to open that task: "This should happen
+    autoamtically under the hood with no impact at all for the user" (the owner, 22 November 2026; F15, piece 4)."""
     crowded = [(n, fit) for n, fit in ((n, standing_fit(n)) for n in names) if fit > STANDING_MARK]
     if not crowded:
         return ""
@@ -46603,9 +46694,11 @@ def standing_crowded(agent, names):
                 f"start: {whose}.")
         if shell_off(agent):
             return head + f" Your line keeps them in order: tell {task_giver(agent)} with message_agent."
-        return head + (" Put yours in order in a task of your own, which ends one that is done and writes the rule of "
-                       "one duty into that duty's words: say so to the owner in your reply, and open it with "
-                       "start_task when they ask.")
+        # the agent's own items: its next task session tidies them; a team's: each of them that keeps items itself
+        return head + (" Your next task session puts them in order: say nothing of it to the owner."
+                       if [n for n, _ in crowded] == [agent] else
+                       " The next task session of each of them that keeps items itself puts its own in order: say "
+                       "nothing of it to the owner.")
     if len(crowded) == 1:
         n, fit = crowded[0]
         head = (f" The items that steer {'you' if n == agent else shown_role(n)} now take {fit:,} of the 8,000 "
@@ -46617,7 +46710,7 @@ def standing_crowded(agent, names):
             "write the rule of one duty into that duty's words, and end the item with that place in why.")
 
 
-def standing_start_text(agent, limit=None, kpis=True, closed=None):
+def standing_start_text(agent, limit=None, kpis=True, closed=None, tidy=False):
     """L3's part of the per-task block (AUTONOMY.md 6.4): the active items that steer `agent`, each one whole, for
     every new session of it (start_text, manager_resume_text), for the closed conversation of a person whose role
     has its tools on (conversation_prompt, with a smaller limit), and for a new conversation of its owner chat
@@ -46632,7 +46725,11 @@ def standing_start_text(agent, limit=None, kpis=True, closed=None):
     named 5 of the owner's wishes so (design "An agent keeps its own rules", slice 2, item 0). An item's words hold
     at most STANDING_WORDS_MAX characters, and a target's measure and how STANDING_FIELD_MAX each, so their number
     bounds the block. A colleague's closed window keeps its own limit
-    (conversation_prompt gives CLOSED_STANDING_CHARS), so that its recap keeps its room."""
+    (conversation_prompt gives CLOSED_STANDING_CHARS), so that its recap keeps its room.
+
+    tidy: a task's own session (start_text). When the items that steer the agent pass STANDING_MARK (standing_fit)
+    and it keeps one itself that it may end, one sentence more tells it to put its own in order when its work is
+    done: the work that its owner chat leaves to its next task session (standing_crowded; F15, piece 4)."""
     rows = steering_items(agent, kpis)
     if not rows:
         return ""
@@ -46651,16 +46748,23 @@ def standing_start_text(agent, limit=None, kpis=True, closed=None):
             left.append(iref(r["id"]))
     # spec 7.4: an agent ends no KPI of its own, so the end sentence leaves KPIs out, and goes with only KPIs
     ends = not closed and any(r["kind"] != "kpi" for r in rows)
+    fit = standing_fit(agent) if tidy and not closed and any(r["agent"] == agent and r["kind"] != "kpi"
+                                                             for r in rows) else 0
     return ("\nSTANDING ITEMS, lasting wishes that steer your work from now on, inside your access and never beyond it: "
             + " | ".join(kept) + (f" | and {', '.join(left)}, which do not fit here"
                                   + ("" if closed else ": read them with see_standing") if left else "")
             + "." + (" " + STANDING_PERSON if people else "") + (" " + kpi_rule_sentence(agent) if kpi else "")
             + (" Keep yours in order: end one with end_standing, never a KPI, when its author, a person whose role "
                "allows it or the owner asks, when a target is reached, or when you wrote it whole into the place that "
-               "its work reads.\n" if ends and kpi else
+               "its work reads." if ends and kpi else
                " Keep yours in order: end one with end_standing when its author, a person whose role allows it or the "
-               "owner asks, when a target is reached, or when you wrote it whole into the place that its work reads.\n"
-               if ends else "\n"))
+               "owner asks, when a target is reached, or when you wrote it whole into the place that its work reads."
+               if ends else "")
+            + (f" They take {fit:,} of the {STANDING_CHARS:,} characters that a start shows whole. When the work of "
+               "this session is done and before you deliver it, put yours in order: end one that is done, and write "
+               "the rule of one duty into that duty's words or the steps of a job into a skill, then end its item with "
+               "that place in why."
+               if fit > STANDING_MARK else "") + "\n")
 
 
 # The sentence beside the items when one of them came from a person (standing_start_text)
@@ -52416,6 +52520,16 @@ def tool_reads_ahead(name, args):
         kit_reads_ahead(profile_paths(), starts=args["owner"])
 
 
+# The tools whose answer the record of a done call keeps whole (call_tool). Of each other done call, the record keeps
+# the first GOOGLE_CALL_KEEP characters of the answer: no reader reads more (F14 piece 7, 22 November 2026: with the whole
+# answers of reads, `calls` was 157 of the 446 MiB of the owner's hub database). What left the building is the record that a
+# new session reads before it repeats a send (outward_done), and a removal finds the record of a standing item by the
+# start of its answer (removed_standing_rows). The history keeps 600 characters of a call (history_call), and a
+# removal finds a read of a person's words by the head of their conversation (removed_other_work_rows): a head that
+# the cut removed is in no record, and neither are the words after it. A refusal keeps all its words.
+CALLS_KEPT_WHOLE = OUTWARD_TOOLS + ("keep_instruction", "set_target", "end_standing")
+
+
 def call_record(agent, tid, attempt, name, ok, args, detail, window, own=None, mark=None):
     """The row of `calls` of one call, with the args and the detail as they are, or with REMOVED_WORDS when the call
     came from a conversation window whose conversation the owner removed while the call ran (person_remove cleared
@@ -52572,14 +52686,13 @@ def call_tool(agent, name, args, context=None):
                         task_started(t)
                 call_record(agent, tid, attempt, name, 1,
                             "[blocked]" if secret_hit(json.dumps(args)) else call_record_args(name, args),
-                            # a file's text is in the configuration ref already, and a repository's stays in GitHub
-                            # (person access plan, section 3): the record keeps its start only. An owner's file keeps
-                            # its first line only (which file, and what the session got): the hub removes the file
-                            # after attachment_keep, and no copy of its text or of a one-time line stays here
+                            # the record keeps the start of the answer only (CALLS_KEPT_WHOLE): a file's text is in
+                            # the configuration ref already, and a repository's stays in GitHub (person access plan,
+                            # section 3). An owner's file keeps its first line only (which file, and what the session
+                            # got): the hub removes the file after attachment_keep, and no copy of its text or of a
+                            # one-time line stays here
                             text.split("\n", 1)[0] if name == "read_attachment" else
-                            text[:GOOGLE_CALL_KEEP] if name in GOOGLE_READS or name in ("read_knowledge", "repo_read",
-                                                                                        "repo_files", "repo_search")
-                            else text, window, own, mark)
+                            text if name in CALLS_KEPT_WHOLE else text[:GOOGLE_CALL_KEEP], window, own, mark)
                 return text, False
         raise ToolError(f"You have no tool named {name}.")
     except ToolError as e:
@@ -69817,6 +69930,16 @@ BACKUP_DB = "fleet.sqlite3"         # the members of the copy, by name
 BACKUP_MANIFEST = "fleet.json"
 BACKUP_CONFIG = "config/"           # the owner's own files, under the paths CONFIG_FILES allows
 RESTORE_SUFFIX = ".restore"         # a copy waiting beside the database for the next start to take it
+# What a restore takes of a copy (read_bundle), whatever the copy states, and the backup serves no copy that is more
+# (ui_backup), so each copy that the hub serves restores. The Mac app's restore reads a copy before it sends it, with
+# the first three limits (app/Sources/FleetCore/FleetRestore.swift: the central directory at lines 484-485, fleet.json
+# at line 661), and the hub's follow the app's. A restore holds about two times RESTORE_UNPACK at its peak, because
+# zlib joins its output blocks at the end of a read: a later piece streams each file to the staging file with a
+# running SHA-256.
+BACKUP_ENTRIES_MAX = 20_000
+BACKUP_DIRECTORY_MAX = 4 * 1024 * 1024
+BACKUP_MANIFEST_MAX = 1024 * 1024
+RESTORE_UNPACK = 8 * BACKUP_MAX
 REPLACED_SUFFIX = ".replaced"       # the records a deliberate replacement put aside, which the owner asked for
 SQLITE_SIDE = ("-journal", "-wal", "-shm")      # what SQLite keeps beside a database file, under that file's name
 WORK_TABLES = ("tasks", "goals", "needs", "owner_reports", "conversations", "responsibilities", "triggers")
@@ -70305,21 +70428,45 @@ def read_bundle(data):
     the copy carries it, or None: it is never a file a restore writes, and the hub never opens it."""
     import io
     import zipfile
+    # before zipfile opens the copy, whose constructor holds some 500 bytes for each entry
+    if zip_entries(data) > BACKUP_ENTRIES_MAX or zip_directory_bytes(data) > BACKUP_DIRECTORY_MAX:
+        raise Refusal(422, "this file is not a copy of a fleet")
     with contextlib.ExitStack() as stack:
         try:
             zf = stack.enter_context(zipfile.ZipFile(io.BytesIO(data)))
             names = set(zf.namelist())
             if BACKUP_MANIFEST not in names:
                 raise Refusal(422, f"this file carries no {BACKUP_MANIFEST}, so it is not a copy of a fleet")
-            manifest = json.loads(zf.read(BACKUP_MANIFEST))
-        except (zipfile.BadZipFile, ValueError, OSError):
+            # zipfile unpacks an entry of bzip2 or LZMA whole at its first read, whatever its size (a few KB held GB,
+            # 22 November 2026); a copy that this hub writes packs each file with deflate (backup_zip), and encrypts none
+            if any(info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED) or
+                   info.flag_bits & ZIP_FLAGS_UNREAD for info in zf.infolist()):
+                raise Refusal(422, "this file is not a copy of a fleet")
+            # the manifest no further than BACKUP_MANIFEST_MAX, where a longer one is cut: 64 MiB of spaces before its
+            # object held 141 MiB
+            with zf.open(BACKUP_MANIFEST) as entry:
+                manifest = json.loads(entry.read(BACKUP_MANIFEST_MAX))
+        except (zipfile.BadZipFile, zlib.error, EOFError, ValueError, OSError, RecursionError, NotImplementedError):
+            # RecursionError: json's own, for a fleet.json of 200,000 [ (a copy of 435 bytes); NotImplementedError:
+            # zipfile's constructor, for an entry that needs a version above 6.3
             raise Refusal(422, "this file is not a copy of a fleet") from None
-        if not isinstance(manifest, dict) or manifest.get("format") != BACKUP_FORMAT:
-            raise Refusal(422, f"this copy is format {(manifest or {}).get('format')!r} and this hub reads "
-                               f"format {BACKUP_FORMAT}")
+        if not isinstance(manifest, dict):          # [1], 7 or NaN
+            raise Refusal(422, "this file is not a copy of a fleet")
+        if manifest.get("format") != BACKUP_FORMAT:
+            raise Refusal(422, f"this copy is format {manifest.get('format')!r} and this hub reads format "
+                               f"{BACKUP_FORMAT}")
         listed = manifest.get("files")
         if not isinstance(listed, dict) or BACKUP_DB not in listed:
             raise Refusal(422, f"this copy does not list its own {BACKUP_DB}")
+        # The sizes that the manifest states are the copy's own word: a copy of 65,523 bytes that stated 64 MiB of
+        # records made the hub unpack them and held 128 MiB. Together they stay inside RESTORE_UNPACK, so each read
+        # below, of its stated size and one byte, is inside it too.
+        stated = {name: says["bytes"] if isinstance(says, dict) and type(says.get("bytes")) is int else 0
+                  for name, says in listed.items()}
+        files = sum(max(0, size) for size in stated.values())
+        if files > RESTORE_UNPACK:
+            raise Refusal(422, f"this copy states {-(-files // MIB):,} MiB of files; a restore unpacks at most "
+                               f"{RESTORE_UNPACK // MIB:,} MiB")
         read = {}
         for name, says in listed.items():
             if name not in (BACKUP_DB, CENTRAL_MEMBER) and not (name.startswith(BACKUP_CONFIG) and
@@ -70327,7 +70474,14 @@ def read_bundle(data):
                 raise Refusal(422, f"this copy carries {name}, which is not a file a restore may write")
             if name not in names:
                 raise Refusal(422, f"this copy lists {name} and does not carry it")
-            read[name] = zf.read(name)
+            # at most the bytes that the manifest states, and one more: a deflate entry is unpacked only that far. A
+            # file that does not unpack (a wrong CRC-32) is no copy, nor one whose local name says that it is UTF-8 and
+            # is not: zipfile's open raises UnicodeDecodeError (a copy of 286 bytes)
+            try:
+                with zf.open(name) as entry:
+                    read[name] = entry.read(max(0, stated[name]) + 1)
+            except (zipfile.BadZipFile, zlib.error, EOFError, ValueError):
+                raise Refusal(422, "this file is not a copy of a fleet") from None
             if not isinstance(says, dict) or hashlib.sha256(read[name]).hexdigest() != says.get("sha256"):
                 raise Refusal(422, f"{name} in this copy is not the file its own manifest describes")
     records, central = read.pop(BACKUP_DB), read.pop(CENTRAL_MEMBER, None)
@@ -77865,6 +78019,63 @@ class Handler(BaseHTTPRequestHandler):
 
         return self.ui_command("releases/entitlement", read, act)
 
+    def ui_teams_claim(self):
+        """POST /ui/teams/claim {"claim_key"}: the key of a purchase of Founderizer for Teams, which the owner's app
+        gives its hub (teams-design-1-shop-and-licence.md 3.11). The hub trades it at the release channel with its own
+        fleet id (releases.claim, the command's `outside` call, so no network call runs under LOCK), keeps the token
+        only when our entitlement key signed it for this fleet with plan `teams` (teams_token, then store_entitlement),
+        and answers the field `teams` as GET /ui/state has it. A refusal of the platform comes back with its status and
+        its `says` line; no answer, or an answer that is not such a token, is a 502. Either leaves no record and
+        changes nothing, and the key that waits on the owner's computer is given again later.
+
+        The key is a credential for one use, so what the owner-command record keeps of this call is its SHA-256, as
+        the token's route keeps of the token: the key is in no row of ui_controls, no result and no log line. The route
+        is the owner's computer's alone: no device reaches it (device_may)."""
+        passing = {}
+
+        def read(data):
+            key = data.get("claim_key")
+            if not (isinstance(key, str) and 0 < len(key.strip()) <= 64):
+                raise ValueError("claim_key must be the key of a purchase of Founderizer for Teams")
+            passing["key"] = key.strip()
+            return {"claim_key_sha256": hashlib.sha256(passing["key"].encode()).hexdigest()}
+
+        def outside(body):
+            with LOCK:
+                channel, fleet = release_channel(), fleet_id()
+            try:
+                url = releases.licence_endpoint(channel, releases.CLAIM_PATH)
+            except releases.Untrusted as e:
+                raise Refusal(502, str(e)) from None
+            answer = releases.claim(url, passing["key"], fleet)
+            if answer["token"] is None:
+                log("owner", f"the claim of Founderizer for Teams was not taken: the release channel answered "
+                             f"{answer['status']}" + (f" ({answer['error']})" if answer["error"] else ""))
+                status = answer["status"]
+                # A 401 or 403 of the platform (test_shop, or something in front of the site) is a 409 here: the
+                # owner's tools read the hub's own 401 and 403 as a refusal of their caller (owner_mcp `call`,
+                # OwnerHub), and would send the agent to the owner-machine setup (the coordinator's D65 read).
+                status = 409 if status in (401, 403) else status
+                # The platform's code goes with its words (`claim_error`, one of releases.CLAIM_ERRORS), so that the
+                # app counts a refusal of the key apart from the hub's own refusals and from an outage (D65).
+                raise Refusal(status if 400 <= status < 500 or status == 503 else 502, answer["says"],
+                              extra={"claim_error": answer["error"]} if answer["error"] else None)
+            return answer
+
+        def act(body, answer):
+            if not teams_token(answer["token"]):
+                log("owner", "the claim of Founderizer for Teams got a token that is not this fleet's licence signed "
+                             "by our entitlement key, so the hub did not keep it")
+                raise Refusal(502, "the release channel answered with a token that is not this fleet's licence of "
+                                   "Founderizer for Teams")
+            try:
+                store_entitlement(answer["token"], answer["renews"])
+            except releases.Untrusted as e:
+                raise Refusal(502, str(e)) from None
+            return {"teams": teams_state()["teams"]}
+
+        return self.ui_command("teams/claim", read, act, outside=outside)
+
     # ---- servers (owner feature servers)
     def ui_servers(self, query):
         """The servers with their readings, availability and newest job, and the state of the newest join code."""
@@ -78668,6 +78879,26 @@ class Handler(BaseHTTPRequestHandler):
             del read                                # the records' image: not kept while the answer goes out
         if len(data) > BACKUP_MAX:
             return self.json(413, {"error": "the copy is larger than 256 MiB; take it on the hub's server"})
+        # Each copy that the hub serves is one that a restore takes (read_bundle), on the Mac app and on the hub.
+        # Records of a raw image with secure_delete and no VACUUM pack 8:1 to 30:1, so a fleet can state more than
+        # RESTORE_UNPACK inside BACKUP_MAX, and its copy would be refused only at the restore, when the old machine is
+        # gone. No command makes a copy on the hub's server that a restore takes, so these words name no way round.
+        import io
+        import zipfile
+        files = sum(entry["bytes"] for entry in manifest["files"].values())
+        for over, words in (
+                (files > RESTORE_UNPACK, f"the copy holds {-(-files // MIB):,} MiB of files, and a restore unpacks "
+                                         f"at most {RESTORE_UNPACK // MIB:,} MiB"),
+                (zip_entries(data) > BACKUP_ENTRIES_MAX, f"the copy holds more than {BACKUP_ENTRIES_MAX:,} files, and "
+                                                         f"a restore takes at most {BACKUP_ENTRIES_MAX:,}"),
+                (zip_directory_bytes(data) > BACKUP_DIRECTORY_MAX,
+                 f"the copy's list of files is larger than {BACKUP_DIRECTORY_MAX // MIB} MiB, and a restore reads at "
+                 f"most {BACKUP_DIRECTORY_MAX // MIB} MiB"),
+                (zipfile.ZipFile(io.BytesIO(data)).getinfo(BACKUP_MANIFEST).file_size > BACKUP_MANIFEST_MAX,
+                 f"the copy's {BACKUP_MANIFEST} is larger than {BACKUP_MANIFEST_MAX // MIB} MiB, and a restore reads "
+                 f"at most {BACKUP_MANIFEST_MAX // MIB} MiB")):
+            if over:
+                return self.json(413, {"error": words})
         digest, t0 = hashlib.sha256(data).hexdigest(), now()
         with LOCK:
             kv_set("backup_served", json.dumps({"sha256": digest, "bytes": len(data), "at": t0}))
@@ -83077,6 +83308,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_release_auto()
         if parts == ["ui", "releases", "entitlement"]:      # owner feature entitlement
             return self.ui_release_entitlement()
+        if parts == ["ui", "teams", "claim"]:               # owner feature teams_claim
+            return self.ui_teams_claim()
         if parts == ["ui", "error-reports"]:                # owner feature error_reports
             return self.ui_error_reports_set()
         if parts == ["ui", "servers", "join"]:

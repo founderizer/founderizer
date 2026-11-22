@@ -16,12 +16,15 @@ import inspect
 import io
 import json
 import os
+import re
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
 import urllib.error
 import urllib.request
@@ -90,6 +93,29 @@ def make_checkout(root, name, team, profiles=(("vps", PROFILE),), brand=BRAND):
     git("clone", "-q", "--bare", seed, bare)
     git("clone", "-q", "-b", hub.CONFIG_BRANCH, bare, kit)
     return kit
+
+
+def many_entries(count, comment=0, counts=None, zip64=False):
+    """A ZIP of a fleet.json of {} whose central directory names it `count` times more, each entry with `comment`
+    bytes of comment: entries that zipfile's constructor reads one by one, for some 500 bytes of memory each. counts:
+    the two entry counts of its end record. zip64: a Zip64 end record and its locator before an end record that states
+    a directory of 46 bytes; zipfile reads the Zip64 one."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as package:
+        package.writestr("fleet.json", "{}")
+    head = buffer.getvalue()
+    at, end = head.find(b"PK\x01\x02"), head.rfind(b"PK\x05\x06")
+    entry = bytearray(head[at:end])
+    struct.pack_into("<H", entry, 32, comment)
+    directory = (bytes(entry) + bytes(comment)) * (count + 1)
+    record = bytearray(head[end:])
+    struct.pack_into("<HHII", record, 8, *(counts or (min(count + 1, 65535),) * 2), len(directory), at)
+    if not zip64:
+        return head[:at] + directory + bytes(record)
+    struct.pack_into("<HHI", record, 8, 1, 1, 46)
+    record64 = struct.pack("<IQHHIIQQQQ", 0x06064B50, 44, 45, 45, 0, 0, count + 1, count + 1, len(directory), at)
+    locator = struct.pack("<IIQI", 0x07064B50, 0, at + len(directory), 1)
+    return head[:at] + directory + record64 + locator + bytes(record)
 
 
 def read(*parts):
@@ -250,6 +276,54 @@ class Copy(Fixture):
         nothing about the hub machine's time zone."""
         zf = zipfile.ZipFile(io.BytesIO(self.download()[2]))
         self.assertEqual({one.date_time for one in zf.infolist()}, {(1980, 1, 1, 0, 0, 0)})
+
+    def test_each_copy_that_the_hub_serves_is_one_that_a_restore_takes(self):
+        """A restore unpacks at most RESTORE_UNPACK of a copy's files, takes at most BACKUP_ENTRIES_MAX entries and
+        BACKUP_DIRECTORY_MAX of central directory, and reads at most BACKUP_MANIFEST_MAX of its fleet.json. Records of
+        a raw image with secure_delete and no VACUUM pack 8:1 to 30:1, so a fleet could state more inside the BACKUP_MAX
+        of a copy, and the owner would learn it only at the restore, when the old machine is gone. So the backup
+        refuses such a copy at once (413), with the limits of the restore, which refuses it too."""
+        self.work()
+        code, _headers, data = self.download()
+        self.assertEqual(code, 200)
+        package = zipfile.ZipFile(io.BytesIO(data))
+        files = sum(entry["bytes"] for entry in json.loads(package.read("fleet.json"))["files"].values())
+        hub.read_bundle(data)
+        for limit, value, words in (
+                ("BACKUP_MAX", len(data) // 2, r"^the copy is larger than 256 MiB; take it on the hub's server$"),
+                ("RESTORE_UNPACK", files // 2, r"^the copy holds [\d,]+ MiB of files, and a restore unpacks at most "
+                                               r"[\d,]+ MiB$"),
+                ("BACKUP_ENTRIES_MAX", len(package.infolist()) - 1,
+                 r"^the copy holds more than [\d,]+ files, and a restore takes at most [\d,]+$"),
+                ("BACKUP_DIRECTORY_MAX", hub.zip_directory_bytes(data) - 1,
+                 r"^the copy's list of files is larger than \d+ MiB, and a restore reads at most \d+ MiB$"),
+                ("BACKUP_MANIFEST_MAX", package.getinfo("fleet.json").file_size // 2,
+                 r"^the copy's fleet.json is larger than \d+ MiB, and a restore reads at most \d+ MiB$")):
+            with self.subTest(limit), patch.object(hub, limit, value):
+                code, _headers, body = self.download()
+                self.assertEqual(code, 413)
+                self.assertRegex(json.loads(body)["error"], words)
+                if limit != "BACKUP_MAX":                   # the restore route's own limit of the bytes that come
+                    with self.assertRaises(hub.Refusal):
+                        hub.read_bundle(data)
+
+    @unittest.skipUnless(os.path.isdir(os.path.join(ROOT, "app")),
+                         "the apps' folder app/ is not in this tree (the published repository has none)")
+    def test_the_hub_takes_what_the_mac_app_takes_of_a_copy(self):
+        """The Mac app reads a copy before it sends it to a restore (FleetRestore.swift), and refuses one of more
+        entries or more bytes of central directory than its limits, or with a larger fleet.json. The hub's backup and
+        restore have the same three limits, so that each copy that the hub serves is one that both restore: a limit
+        that changed on one side alone would serve copies that the other refuses."""
+        with open(os.path.join(ROOT, "app", "Sources", "FleetCore", "FleetRestore.swift"), encoding="utf-8") as f:
+            source = f.read()
+        found = {limit: re.findall(pattern, source) for limit, pattern in (
+            ("BACKUP_ENTRIES_MAX", r"size != 0xFFFF_FFFF, count <= ([\d_]+),"),
+            ("BACKUP_DIRECTORY_MAX", r"size <= (\d+ << \d+), offset \+ size <= total"),
+            ("BACKUP_MANIFEST_MAX", r"FleetManifest\.manifestMember, in: file, limit: (\d+ << \d+)\)"))}
+        for limit, values in found.items():
+            self.assertEqual(len(values), 1, (limit, values))           # one place in the app's source says it
+            first, _, shift = values[0].replace("_", "").partition(" << ")
+            self.assertEqual(int(first) << int(shift or 0), getattr(hub, limit), limit)
 
     def test_the_hub_holds_its_lock_while_it_reads_a_copy_and_not_while_it_packs_it(self):
         """While LOCK is held the hub answers nobody, and the sums and the compression of a copy take seconds: 7.4
@@ -930,10 +1004,22 @@ class Restore(Fixture):
     def test_a_copy_that_is_not_what_it_says_is_refused_and_nothing_is_staged(self):
         _fleet, data = self.copy_of_a_fleet()
         self.new_machine()
-        for name, broken in self.damaged(data):
+        for name, broken, *words in self.damaged(data):
             with self.subTest(name):
                 code, answer = self.send(broken)
                 self.assertEqual(code, 422, answer)
+                if words:           # the words that the owner reads, where they are more than "not a copy"
+                    self.assertEqual(answer["error"], words[0])
+                if name in ("50,000 entries", "a central directory of 5 MiB", "an end record whose counts write its "
+                            "signature", "a Zip64 record before an end record of 46 bytes"):  # before zipfile reads one
+                    tracemalloc.start()
+                    try:
+                        with self.assertRaises(hub.Refusal):
+                            hub.read_bundle(broken)
+                        peak = tracemalloc.get_traced_memory()[1]
+                    finally:
+                        tracemalloc.stop()
+                    self.assertLess(peak, 1 << 20, name)
                 self.assertFalse(os.path.exists(self.path + hub.RESTORE_SUFFIX), name)
                 self.assertEqual(json.loads(read(self.kit, "team.json"))["addresses"]["hub"], "127.0.0.9")
                 self.assertEqual(hub.q1("SELECT count(*) n FROM ui_controls")["n"], 0)
@@ -941,15 +1027,25 @@ class Restore(Fixture):
     @staticmethod
     def damaged(data):
         """Every way a copy can be wrong that a restore must catch before it writes anything."""
-        def rebuilt(change):
+        def rebuilt(change, method=zipfile.ZIP_DEFLATED):
             old = zipfile.ZipFile(io.BytesIO(data))
             members = {name: old.read(name) for name in old.namelist()}
             change(members)
             buffer = io.BytesIO()
-            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            with zipfile.ZipFile(buffer, "w", method) as zf:
                 for name, body in members.items():
                     zf.writestr(name, body)
             return buffer.getvalue()
+
+        def zstandard(data):
+            """The copy with the method of each entry set to Zstandard (93) in each header, which zipfile reads."""
+            out = bytearray(data)
+            for mark, field in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
+                at = out.find(mark)
+                while at >= 0:
+                    out[at + field:at + field + 2] = (93).to_bytes(2, "little")
+                    at = out.find(mark, at + 4)
+            return bytes(out)
 
         def changed(members, **fields):
             members["fleet.json"] = json.dumps(dict(json.loads(members["fleet.json"]), **fields)).encode()
@@ -967,6 +1063,35 @@ class Restore(Fixture):
         def no_records(members):
             members.pop("fleet.sqlite3")
 
+        def records_stated_as(size):
+            def change(members):
+                files = json.loads(members["fleet.json"])["files"]
+                changed(members, files=dict(files, **{"fleet.sqlite3": dict(files["fleet.sqlite3"], bytes=size)}))
+            return change
+
+        def entry_says(name, offset, value):
+            """The copy with the bytes at `offset` of the entry `name` in the central directory, which zipfile reads,
+            set to `value`: 8 the flags, 16 the CRC-32."""
+            out = bytearray(data)
+            at = out.find(b"PK\x01\x02")
+            while out[at + 46:at + 46 + len(name)] != name.encode():
+                at = out.find(b"PK\x01\x02", at + 4)
+            out[at + offset:at + offset + len(value)] = value
+            return bytes(out)
+
+        def a_local_name_that_is_not_utf8():
+            out = bytearray(data)
+            at = zipfile.ZipFile(io.BytesIO(data)).getinfo("fleet.sqlite3").header_offset
+            out[at + 6:at + 8] = (int.from_bytes(out[at + 6:at + 8], "little") | 0x800).to_bytes(2, "little")
+            out[at + 30] = 0xFF                             # the first byte of the records' local name, said to be UTF-8
+            return bytes(out)
+
+        def a_broken_manifest_stream():
+            out = bytearray(data)
+            at = zipfile.ZipFile(io.BytesIO(data)).getinfo("fleet.json").header_offset
+            out[at + 30 + sum(struct.unpack_from("<HH", out, at + 26))] = 0xFF    # a block of the reserved type 3
+            return bytes(out)
+
         def records_that_are_not_a_database(members):
             body = b"not a database" + b"\x00" * 200
             members["fleet.sqlite3"] = body
@@ -978,7 +1103,40 @@ class Restore(Fixture):
                 ("records that do not match the manifest", rebuilt(records_not_as_described)),
                 ("a path outside the owner's own files", rebuilt(a_path_a_restore_may_not_write)),
                 ("no records at all", rebuilt(no_records)),
-                ("records that are not a database", rebuilt(records_that_are_not_a_database))]
+                ("records that are not a database", rebuilt(records_that_are_not_a_database)),
+                # zipfile unpacks an entry of bzip2 whole at its first read, whatever its size: refused before a read
+                ("an entry of bzip2", rebuilt(lambda m: None, zipfile.ZIP_BZIP2)),
+                ("an entry of Zstandard", zstandard(rebuilt(lambda m: None, zipfile.ZIP_STORED))),
+                # the copy's own manifest gave the bound of each read: 65 KB of copy held 128 MiB (a read of 2^63 bytes
+                # raised OverflowError), and a manifest of 64 MiB of spaces held 141 MiB
+                ("a stated size that no read can ask", rebuilt(records_stated_as(2 ** 63 - 1))),
+                ("records stated as more than a restore unpacks", rebuilt(records_stated_as(hub.RESTORE_UNPACK + 1)),
+                 "this copy states 2,049 MiB of files; a restore unpacks at most 2,048 MiB"),
+                ("a manifest after 1 MiB of spaces",
+                 rebuilt(lambda m: m.update({"fleet.json": b" " * hub.BACKUP_MANIFEST_MAX + m["fleet.json"]}))),
+                # zipfile's errors, which were no 422: a wrong CRC-32, a broken stream, an encrypted entry (bit 0),
+                # compressed patched data (bit 5) and strong encryption (bit 6)
+                ("records with a wrong CRC-32", entry_says("fleet.sqlite3", 16, bytes(4))),
+                ("a manifest whose stream is broken", a_broken_manifest_stream()),
+                ("an encrypted manifest", entry_says("fleet.json", 8, b"\x01\x00")),
+                ("records of compressed patched data", entry_says("fleet.sqlite3", 8, b"\x20\x00")),
+                ("records of strong encryption", entry_says("fleet.sqlite3", 8, b"\x40\x00")),
+                # and errors that are not zipfile's own: UnicodeDecodeError of a local name, RecursionError of json
+                ("records whose local name is not UTF-8", a_local_name_that_is_not_utf8()),
+                ("a manifest of 200,000 [", rebuilt(lambda m: m.update({"fleet.json": b"[" * 200_000}))),
+                # NotImplementedError of zipfile's constructor, and AttributeError of a manifest that is no object
+                ("an entry that needs version 6.4", entry_says("fleet.sqlite3", 6, (64).to_bytes(2, "little"))),
+                ("a manifest that is [1]", rebuilt(lambda m: m.update({"fleet.json": b"[1]"}))),
+                ("a manifest that is NaN", rebuilt(lambda m: m.update({"fleet.json": b"NaN"}))),
+                # zipfile's constructor holds some 500 bytes for each entry (400,000 entries in 32 MiB held 198 MiB)
+                ("50,000 entries", many_entries(50_000)),
+                ("a central directory of 5 MiB", many_entries(15_000, comment=300)),
+                # the end record that zipfile reads: a search for its signature found a later one inside a record
+                # whose counts write it, and read no Zip64 record; zipfile read 31.3 MiB of directory (63 MiB held)
+                ("an end record whose counts write its signature",
+                 many_entries(160, comment=32 * 1024, counts=(0x4B50, 0x0605))),
+                ("a Zip64 record before an end record of 46 bytes", many_entries(160, comment=32 * 1024, zip64=True)),
+                ("an end record whose comment is not there", data[:-2] + (5).to_bytes(2, "little"))]
 
 
 class ThroughAFile(Restore):
