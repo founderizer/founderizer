@@ -218,7 +218,7 @@ The vault protects the value of each secret. The design gives these results:
 
 | Key | Kind | Where it is | Who uses it |
 | --- | --- | --- | --- |
-| Owner key | ECDSA P-256 | The owner's Mac. In the Secure Enclave when the Mac has one, else a software key. One item of the login Keychain for each fleet: "when unlocked, this device only", not synchronized. | Founderizer for Mac, to sign the owner's statements (`Sources/FleetCore/OwnerKey.swift`) |
+| Owner key | ECDSA P-256 | The owner's Mac. In the Secure Enclave when the Mac has one, else a software key. One item of the login Keychain for each fleet, not synchronized. The app writes it with "when unlocked, this device only", but into the file-based login keychain (it does not ask for the data-protection keychain), where that rule has no effect: see limit 13. | Founderizer for Mac, to sign the owner's statements (`Sources/FleetCore/OwnerKey.swift`) |
 | Central vault key | age (X25519) | `/var/lib/fleet-vault-central/age.key`, mode 600, user `founderizer-vault` | The central vault, to open what the owner sealed (`hubsetup.py`, `vault.py`) |
 | Central store key | age (X25519) | `/var/lib/fleet-vault-central/store.key` | The central vault (`hubsetup.py`) |
 | Broker store key | age (X25519) | Linux: `/var/lib/fleet-vault/store.key`, mode 600, user `fleet-vault`. Mac: the Keychain item `store`. | The broker (`hubsetup.py`, `Sources/FleetVaultCore/VaultLocalStore.swift`) |
@@ -798,6 +798,14 @@ host.
    central vault seals it to each machine whose key the owner pinned (`Sources/FleetCore/OwnerKey.swift`, `vault.py`).
 10. **Agents of one Mac.** All agents of a Mac run as one OS user, and the hub key of each agent is a file of that user
     (`fleet.py`). So an agent can use the grants of another agent of the same Mac.
+    It can also get its own key pinned as that Mac's vault key. The owner's Mac reads a Mac server's vault key by
+    asking Fleet Vault's socket as the agents' user (`CentralVaultRemote.readMacVaultKey`), and the key that the hub
+    reports comes from that Mac's helper, a process of the same user. So an agent of that Mac can answer in Fleet
+    Vault's place with a key of its own before the owner's Mac reads it, and the owner's Mac then pins that key. The
+    central vault then seals each copy for that Mac to the agent's key: the values of each agent there, "Uses it"
+    values and logins too, and the pool. A fix is planned (22 November 2026), not built: the read checks that the
+    socket's peer is Fleet Vault's own signed code, or the key comes signed by a key that only Fleet Vault's code can
+    use.
 11. **The release key.** Releases change the vault's code on each server and in the central vault without a step from
     the owner (see "How the vault's code is updated"). So the holder of a release key can change every broker and the
     central vault (`hubsetup.py`, `hub.py`). On a Mac, a build with the team's Apple signature can replace Fleet Vault
@@ -821,6 +829,12 @@ host.
     knows the owner's computer"). So a program that runs on the Mac as the owner uses every owner route. A VM or a
     container on the Mac has the Mac's address and not that file, and the hub refuses it, unless the owner gives it
     the folder `~/.founderizer`.
+    The app's own Keychain items are in the file-based login keychain (`login.keychain-db`), not in the
+    data-protection keychain (`FleetKeychainItem` in `Sources/FleetCore/OwnerKey.swift` sets no
+    `kSecUseDataProtectionKeychain`; checked on the owner's Mac on 22 November 2026 for the recovery code). There,
+    "this device only" has no effect. So the recovery code, the access key, the software form of the owner key and
+    the app's other items are in each Time Machine backup of the Mac, locked by the Mac's login password. A key in
+    the Secure Enclave is not: only a reference to it is in the file, and it opens on no other Mac.
 14. **The hub's own sign-ins.** The Google refresh tokens and their client secret, the GitHub App private key, the
     credentials of the MCP servers and the Discord and Telegram bot tokens are not in the vault. They are files of the hub's OS user
     on the hub's server, so a person who controls that user has them (`hub.py`, `channels.py`). The Google file is

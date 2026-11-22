@@ -2334,7 +2334,10 @@ def device_may(path, method):
 
 def new_device_code(device):
     """POST /ui/owner/devices/<device>/code: one code, ten minutes, once. The hub keeps only its SHA-256, and a new
-    code replaces the device's open one. A repeat of the command gives code null: make a new code."""
+    code replaces the device's open one. A repeat of the command gives code null: make a new code. A new code also
+    clears the device's count of wrong codes, so that after too many the device can use the new code at once (F7 A3
+    of the owner's feedback of 22 November 2026; UI-API.md and the apps say "Wait an hour, or make a new code"). A
+    guesser still gets five tries for each code that the owner's computer makes."""
     if device not in owner_devices():
         raise Refusal(404, "no such owner device")
     t0, raw = now(), "".join(secrets.choice(LINK_ALPHABET) for _ in range(8))
@@ -2342,19 +2345,24 @@ def new_device_code(device):
         DB.execute("DELETE FROM owner_device_codes WHERE device=? AND used IS NULL", (device,))
         DB.execute("INSERT INTO owner_device_codes(device,sha256,created,expires) VALUES(?,?,?,?)",
                    (device, hashlib.sha256(raw.encode()).hexdigest(), t0, t0 + DEVICE_CODE_LIFE))
+        DB.execute("DELETE FROM owner_device_tries WHERE device=?", (device,))     # a new code ends the wait (F7 A3)
     log("owner", f"made an enrollment code for the owner device {device}")
     return {"device": device, "label": owner_devices()[device]["label"], "code": f"{raw[:4]}-{raw[4:]}",
             "expires": t0 + DEVICE_CODE_LIFE}
 
 
-NEW_DEVICE = ""                 # owner_device_codes.device of a code for a phone that team.json does not hold yet
+# owner_device_codes.device of the open code of Add device: for a phone that team.json does not hold yet
+# (enroll_new_device), or for one that it holds, which takes the code for itself (enroll_device)
+NEW_DEVICE = ""
 
 
 def new_phone_code():
     """POST /ui/owner/devices/code (owner feature device_by_code; the owner, 3 November 2026: Add device shows the QR
     at once, with no fields): one code for a phone that team.json does not hold yet, ten minutes, once. The phone that
     brings it to POST /ui/owner/enroll is added with the address it calls from (enroll_new_device). One such code is
-    open at a time, and the hub keeps only its SHA-256."""
+    open at a time, and the hub keeps only its SHA-256. A phone whose address is a device already takes it for that
+    device (enroll_device). A new code clears the wrong codes of every address that may bring it: each address that is
+    no device, and each device (F7 A3; as new_device_code does for its one device)."""
     if len(owner_devices()) >= OWNER_DEVICE_LIMIT:
         raise Refusal(409, f"a fleet has at most {OWNER_DEVICE_LIMIT} devices; remove one first")
     t0, raw = now(), "".join(secrets.choice(LINK_ALPHABET) for _ in range(8))
@@ -2362,6 +2370,7 @@ def new_phone_code():
         DB.execute("DELETE FROM owner_device_codes WHERE device=? AND used IS NULL", (NEW_DEVICE,))
         DB.execute("INSERT INTO owner_device_codes(device,sha256,created,expires) VALUES(?,?,?,?)",
                    (NEW_DEVICE, hashlib.sha256(raw.encode()).hexdigest(), t0, t0 + DEVICE_CODE_LIFE))
+        DB.execute("DELETE FROM owner_device_tries")      # each address and each device may bring it (F7 A3)
     log("owner", "made an enrollment code for a new owner device")
     return {"device": None, "code": f"{raw[:4]}-{raw[4:]}", "expires": t0 + DEVICE_CODE_LIFE}
 
@@ -2449,41 +2458,66 @@ def phone_signed(device, statement, signature, ask=True):
     return said
 
 
-def enroll_device(device, code, signing=None, kind="iphone"):
+def enroll_device(device, code, signing=None, kind="iphone", address=None):
     """POST /ui/owner/enroll, from the device's own address: one unused code gives one key, once. The hub keeps only
     the SHA-256, and a new key replaces the device's old one. A lost answer burns the code: make another one. A phone's
     own signing key (device_signing) replaces its old one, which loses its certificate; an enrollment with none drops
-    it. kind (device_kind): the kind of app that takes the key, which the header of its messages says."""
+    it. kind (device_kind): the kind of app that takes the key, which the header of its messages says.
+
+    The code is the device's own (new_device_code) or the open code for a new phone (new_phone_code), which the owner's
+    Mac shows at Add device: a phone that was linked before has an address that is a device already, and Add device is
+    what its owner presses (F7 A2 of the owner's feedback of 22 November 2026). That code then gives this device what
+    its own code gives, with no second device and no change of team.json. Only the owner's computer makes either
+    code, the device is at its own address already, and a wrong code counts against the device as before.
+
+    One take of LOCK holds the count of wrong codes, the code and the record of a wrong one: with a take for each,
+    parallel wrong codes from one address all met a count of less than five (enroll_new_device holds kit_lock for the
+    same steps). The handler reads the device from the address with no lock, so a device that the owner removed since
+    then is refused here, under LOCK, where TEAM is current (apply_team): else Add device's code, which a removal
+    leaves open, gave a removed device a key and rows. address: the calling address, for the words of that refusal.
+    A key ends the device's other open codes: its row's code gave one more key at that address."""
     raw = re.sub(r"[^A-Z0-9]", "", code.upper()) if isinstance(code, str) else ""
     t0, key = now(), None
-    if q1("SELECT COUNT(*) n FROM owner_device_tries WHERE device=? AND ts>?", (device, t0 - 3600))["n"] >= DEVICE_TRIES:
-        raise Refusal(429, "too many wrong codes; wait an hour, then make a new code on the owner's Mac")
-    with transaction():
-        row = DB.execute("SELECT id FROM owner_device_codes WHERE device=? AND sha256=? AND used IS NULL AND expires>?",
-                         (device, hashlib.sha256(raw.encode()).hexdigest(), t0)).fetchone() if raw else None
-        if row:
-            key = secrets.token_urlsafe(32)
-            DB.execute("UPDATE owner_device_codes SET used=? WHERE id=?", (t0, row["id"]))
-            DB.execute("INSERT INTO owner_devices(device,sha256,created,last_seen,kind) VALUES(?,?,?,NULL,?) "
-                       "ON CONFLICT(device) DO UPDATE SET sha256=excluded.sha256, created=excluded.created, "
-                       "last_seen=NULL, kind=excluded.kind", (device, hashlib.sha256(key.encode()).hexdigest(), t0,
-                                                              kind))
-            DB.execute("DELETE FROM owner_device_tries WHERE device=?", (device,))
-            if signing:
-                DB.execute("INSERT INTO owner_device_signing(device,key,binding,created,recovery_key,recovery_binding) "
-                           "VALUES(?,?,?,?,?,?) ON CONFLICT(device) DO UPDATE SET key=excluded.key, "
-                           "binding=excluded.binding, created=excluded.created, statement=NULL, signature=NULL, "
-                           "recovery_key=excluded.recovery_key, recovery_binding=excluded.recovery_binding",
-                           (device, signing["key"], signing["binding"], t0, signing.get("recovery_key"),
-                            signing.get("recovery_binding")))
-            else:
-                DB.execute("DELETE FROM owner_device_signing WHERE device=?", (device,))
-            DB.execute("DELETE FROM owner_device_recovery WHERE device=?", (device,))   # a new key holds no copy yet
-    if key is None:                   # the record of a wrong code comes after the transaction, which rolls back
-        ins("INSERT INTO owner_device_tries(device,ts) VALUES(?,?)", (device, t0))
-        raise Refusal(403, "that code is not valid")
-    log("owner", f"the owner device {device} took its key")       # never the key itself
-    return {"device": device, "label": owner_devices()[device]["label"], "key": key, "since": t0}
+    with LOCK:
+        if q1("SELECT COUNT(*) n FROM owner_device_tries WHERE device=? AND ts>?",
+              (device, t0 - 3600))["n"] >= DEVICE_TRIES:
+            raise Refusal(429, "too many wrong codes; wait an hour, or make a new code on the owner's Mac")
+        with transaction():
+            if device not in owner_devices():       # the owner removed it after the handler read the address
+                raise Refusal(403, code="not_owner_device", names={"address": address or device})
+            label = owner_devices()[device]["label"]
+            row = DB.execute("SELECT id, device FROM owner_device_codes WHERE device IN (?,?) AND sha256=? AND "
+                             "used IS NULL AND expires>?",
+                             (device, NEW_DEVICE, hashlib.sha256(raw.encode()).hexdigest(), t0)).fetchone() \
+                if raw else None
+            if row:
+                key, added = secrets.token_urlsafe(32), row["device"] == NEW_DEVICE
+                DB.execute("DELETE FROM owner_device_codes WHERE device=? AND used IS NULL AND id<>?",
+                           (device, row["id"]))
+                # the code for a new phone is this device's from now on, as enroll_new_device makes it for a new one
+                DB.execute("UPDATE owner_device_codes SET used=?, device=? WHERE id=?", (t0, device, row["id"]))
+                DB.execute("INSERT INTO owner_devices(device,sha256,created,last_seen,kind) VALUES(?,?,?,NULL,?) "
+                           "ON CONFLICT(device) DO UPDATE SET sha256=excluded.sha256, created=excluded.created, "
+                           "last_seen=NULL, kind=excluded.kind", (device, hashlib.sha256(key.encode()).hexdigest(), t0,
+                                                                  kind))
+                DB.execute("DELETE FROM owner_device_tries WHERE device=?", (device,))
+                if signing:
+                    DB.execute("INSERT INTO owner_device_signing(device,key,binding,created,recovery_key,"
+                               "recovery_binding) VALUES(?,?,?,?,?,?) ON CONFLICT(device) DO UPDATE SET "
+                               "key=excluded.key, binding=excluded.binding, created=excluded.created, statement=NULL, "
+                               "signature=NULL, recovery_key=excluded.recovery_key, "
+                               "recovery_binding=excluded.recovery_binding",
+                               (device, signing["key"], signing["binding"], t0, signing.get("recovery_key"),
+                                signing.get("recovery_binding")))
+                else:
+                    DB.execute("DELETE FROM owner_device_signing WHERE device=?", (device,))
+                DB.execute("DELETE FROM owner_device_recovery WHERE device=?", (device,))  # a new key: no copy yet
+        if key is None:               # the record of a wrong code comes after the transaction, which rolls back
+            ins("INSERT INTO owner_device_tries(device,ts) VALUES(?,?)", (device, t0))
+            raise Refusal(403, "that code is not valid")
+    # never the key itself; and which code gave it, since the used row of Add device's code has this device's name now
+    log("owner", f"the owner device {device} took its key" + (" with the code of Add device" if added else ""))
+    return {"device": device, "label": label, "key": key, "since": t0}
 
 
 def enroll_new_device(address, code, signing=None, kind="iphone"):
@@ -2495,7 +2529,7 @@ def enroll_new_device(address, code, signing=None, kind="iphone"):
     raw = re.sub(r"[^A-Z0-9]", "", code.upper()) if isinstance(code, str) else ""
     t0, tries = now(), "@" + address
     if q1("SELECT COUNT(*) n FROM owner_device_tries WHERE device=? AND ts>?", (tries, t0 - 3600))["n"] >= DEVICE_TRIES:
-        raise Refusal(429, "too many wrong codes; wait an hour, then make a new code on the owner's Mac")
+        raise Refusal(429, "too many wrong codes; wait an hour, or make a new code on the owner's Mac")
     row = q1("SELECT id FROM owner_device_codes WHERE device=? AND sha256=? AND used IS NULL AND expires>?",
              (NEW_DEVICE, hashlib.sha256(raw.encode()).hexdigest(), t0)) if raw else None
     if not row:
@@ -2514,7 +2548,7 @@ def enroll_new_device(address, code, signing=None, kind="iphone"):
     save_integration(None, change, f"Owner added the device {device} with a code")
     q("UPDATE owner_device_codes SET device=? WHERE id=?", (device, row["id"]))
     q("DELETE FROM owner_device_tries WHERE device=?", (tries,))
-    return enroll_device(device, code, signing, kind)
+    return enroll_device(device, code, signing, kind, address)
 
 
 def save_owner_device(body):
@@ -78699,7 +78733,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def ui_owner_enroll(self):
         """POST /ui/owner/enroll: the device takes its key with the one-time code that the owner read on the Mac. It
-        comes from the device's own address, before that device has a key, so the owner rule above cannot apply."""
+        comes from the device's own address, before that device has a key, so the owner rule above cannot apply. From
+        a device's address the code is that device's own or the open code for a new phone (enroll_device); from an
+        address that no device has, only the open code for a new phone (enroll_new_device)."""
         if self.headers.get("Origin"):
             return self.json(403, {"error": "browser origins are not accepted"})
         device = owner_device_at(self.client_address[0])
@@ -78717,7 +78753,7 @@ class Handler(BaseHTTPRequestHandler):
                 with kit_lock():        # it commits team.json, in the turn of the hub's writes (KIT)
                     result = enroll_new_device(self.client_address[0], self.form().get("code"), signing, kind)
             else:
-                result = enroll_device(device, self.form().get("code"), signing, kind)
+                result = enroll_device(device, self.form().get("code"), signing, kind, self.client_address[0])
         except Refusal as e:
             return self.json(e.status, refusal_body(e))
         return self.json(200, result, {"Cache-Control": "no-store"})

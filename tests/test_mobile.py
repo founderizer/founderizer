@@ -7,6 +7,7 @@ The compact read builds its answer from its own moment of the records since 11 N
 (hub.state_moment): MobileMoment holds it with the records in WAL mode, as the hub opens them. The other checks keep
 their records in MEMORY journal mode, so they read the phone's page under the hub's lock, as before."""
 import ast
+import base64
 import hashlib
 import inspect
 import json
@@ -75,6 +76,27 @@ class Devices(test_ui_api.OwnerAPI):
         status, got = self.enroll(made["code"], source=source)
         self.assertEqual(status, 200, got)
         return got["key"]
+
+    def burst(self, code, count=8):
+        """The statuses of `count` enrollments with one code from the phone at one moment. Each one waits in
+        enroll_device's transaction until all have come, or 0.2 s, so that all of them meet a gap between the count of
+        wrong codes and the record of a try, where there is one."""
+        real, came, everyone, statuses = hub.transaction, [], threading.Event(), []
+
+        def held():
+            if inspect.currentframe().f_back.f_code.co_name == "enroll_device":
+                came.append(1)
+                if len(came) >= count:
+                    everyone.set()
+                everyone.wait(0.2)
+            return real()
+        threads = [threading.Thread(target=lambda: statuses.append(self.enroll(code)[0])) for _ in range(count)]
+        with patch.object(hub, "transaction", held):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        return sorted(statuses)
 
     def task(self, title="Work", state="working", owner="manager", details="d" * 2000):
         return hub.ins("INSERT INTO tasks(title,details,done_when,owner,requester,state,created,needs,attempt) "
@@ -231,12 +253,27 @@ class Devices(test_ui_api.OwnerAPI):
         self.assertEqual((status, body["error"]), (403, "browser origins are not accepted"))
 
     def test_five_wrong_codes_stop_the_device_for_an_hour(self):
-        self.code()
-        for _ in range(5):
-            self.assertEqual(self.enroll("AAAA-BBBB")[0], 403)
-        status, body = self.enroll("AAAA-BBBB")
-        self.assertEqual(status, 429, body)
-        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM owner_device_tries")["n"], 5)
+        """Five wrong codes from one device in an hour, then 429 before the hub reads a code: also the code of Add
+        device, which a device may bring now (F7 A2 of the owner's feedback of 22 November 2026, safety claim 5: a wrong
+        code counts as before). A new code ends the wait, as UI-API.md and the apps say ("Wait an hour, or make a new
+        code"): the row's New code and Add device's code each clear the count (F7 A3). Before, the device waited the
+        hour after a new code too. The wrong codes come at one moment, eight of them: the count, the code and the record
+        of a try are one step. Before, each read the count under a take of the lock of its own and wrote its try after
+        the transaction, so all eight met a count of less than five, and the code of Add device had eight tries."""
+        for new in (self.code, self.new_code):
+            with self.subTest(new=new.__name__):
+                made = self.code()[1]["code"]
+                added = self.new_code()[1]["code"]                      # Add device's code is open too
+                self.assertEqual(self.burst("AAAA-BBBB"), [403] * 5 + [429] * 3)
+                for code in ("AAAA-BBBB", made, added):                 # stopped before the hub reads the code
+                    status, body = self.enroll(code)
+                    self.assertEqual(status, 429, body)
+                self.assertEqual(hub.q1("SELECT COUNT(*) n FROM owner_device_tries WHERE device='iphone'")["n"], 5)
+                self.assertEqual(hub.q1("SELECT COUNT(*) n FROM owner_device_tries")["n"], 5)
+                status, again = new()
+                self.assertEqual(status, 200, again)
+                status, got = self.enroll(again["code"])
+                self.assertEqual((status, got.get("device")), (200, "iphone"), got)
 
     def test_the_hub_keeps_no_code_and_no_key(self):
         status, made = self.code()
@@ -489,6 +526,99 @@ class Devices(test_ui_api.OwnerAPI):
             self.assertEqual((status, got["device"], got["label"]), (200, "iphone-2", "iPhone 2"), got)
             self.assertEqual(hub.TEAM["owner_devices"]["iphone-2"], {"label": "iPhone 2", "address": OTHER})
 
+    def test_a_phone_that_is_a_device_takes_the_code_for_a_new_phone(self):
+        """F7 A2 of the owner's feedback of 22 November 2026: a phone that was linked before (a new install, a lost
+        key) calls from an address that is a device of team.json, and its owner presses Add device. The phone takes
+        that code for its own device: a new key, the old key ends, no second device and no save of team.json (safety
+        claim 4: validate_team stays the one way for an address to become a device). Only the device at the calling
+        address changes (claim 2): the other device keeps its key, and the new key works from no other address. The
+        code works once. Before, the hub looked for the code under the device's name only: "that code is not valid".
+        The key also ends the open code of the device's own row, which gave one more key at that address in its ten
+        minutes, and the log says which code gave the key: the code's row has the device's name now. Another device's
+        row code is that device's alone: from this phone's address it is not valid, from that device's own it is."""
+        with self.team_saves({"iphone": {"label": "iPhone", "address": PHONE},
+                              "tab": {"label": "Tab", "address": OTHER}}):
+            old, tab = self.enrolled(), self.enrolled("tab", source=OTHER)
+            team = hub.TEAM
+            own, tabs = self.code()[1]["code"], self.code("tab")[1]["code"]     # each row's code is open too
+            made = self.new_code()[1]["code"]
+            status, got = self.enroll(made)
+            self.assertEqual((status, got["device"], got["label"]), (200, "iphone", "iPhone"), got)
+            self.assertIs(hub.TEAM, team)                                   # no save of team.json
+            self.assertEqual(sorted(hub.TEAM["owner_devices"]), ["iphone", "tab"])
+            self.assertEqual(self.call("/ui/mobile", source=PHONE, token=old)[1]["auth"], "device_key_mismatch")
+            self.assertEqual(self.call("/ui/mobile", source=PHONE, token=got["key"])[0], 200)
+            self.assertEqual(self.call("/ui/mobile", source=OTHER, token=tab)[0], 200)
+            self.assertEqual(self.call("/ui/mobile", source=OTHER, token=got["key"])[1]["auth"], "device_key_mismatch")
+            for source in (PHONE, OTHER, "127.0.0.7"):                     # the code went with the phone
+                with self.subTest(source=source):
+                    status, again = self.enroll(made, source=source)
+                    self.assertEqual(status, 403, again)
+            self.assertEqual(self.enroll(own)[0], 403)                      # the key ended the row's own code
+            rows = {d["device"]: d for d in self.call("/ui/owner/devices")[1]["devices"]}
+            self.assertEqual((rows["iphone"]["code_expires"], rows["tab"]["code_expires"] > 0), (None, True))
+            self.assertIn("the owner device iphone took its key with the code of Add device",
+                          [r["what"] for r in hub.q("SELECT what FROM log")])
+            self.assertEqual(self.enroll(tabs)[0], 403)                     # Tab's code is not this phone's
+            status, took = self.enroll(tabs, source=OTHER)
+            self.assertEqual((status, took.get("device")), (200, "tab"), took)
+            self.assertIs(hub.TEAM, team)
+
+    def test_a_device_that_the_owner_removes_while_it_enrolls_gets_no_key(self):
+        """The handler reads the device from the calling address with no lock. When the owner removes that device before
+        enroll_device runs, the open code of Add device, which a removal leaves, gave the removed device a key and rows
+        of a device that team.json no longer holds, and then a 500 (its label was gone). Before F7 A2 the same moment
+        gave a 403. Now enroll_device asks team.json under the lock: the phone gets the 403 of an address that is no
+        device, the hub writes nothing, and the code stays open, so the same phone is added as a new one."""
+        with self.team_saves({"iphone": {"label": "iPhone", "address": PHONE}}):
+            self.enrolled()
+            made = self.new_code()[1]["code"]
+            kind = hub.device_kind
+
+            def removed(form):          # the owner presses Remove between the handler's read and enroll_device
+                hub.save_owner_device({"device": "iphone", "delete": True, "base_sha256": None})
+                return kind(form)
+            with patch.object(hub, "device_kind", removed):
+                status, body = self.enroll(made)
+            self.assertEqual((status, body.get("code")), (403, "not_owner_device"), body)
+            self.assertEqual(hub.owner_devices(), {})
+            for table in ("owner_devices", "owner_device_codes", "owner_device_tries", "owner_device_signing"):
+                self.assertIsNone(hub.q1(f"SELECT 1 FROM {table} WHERE device='iphone'"), table)
+            status, got = self.enroll(made)
+            self.assertEqual((status, got.get("device")), (200, "iphone"), got)
+            self.assertEqual(hub.owner_devices(), {"iphone": {"label": "iPhone", "address": PHONE}})
+
+    def test_the_code_for_a_new_phone_gives_a_device_what_its_own_code_gives(self):
+        """F7 A2, safety claim 3: from a device's address the code of Add device has the result of the row's New code
+        (new_device_code), and no more: the new signing key replaces the certified one and has no certificate, the
+        copy of the recovery code goes, the device's wrong codes go, and its kind is the newest enrollment's. The same
+        steps, once with each code, give the same row."""
+        signing = {"signing_key": base64.b64encode(b"\x04" + b"\x11" * 64).decode(),
+                   "binding": base64.b64encode(b"\x22" * 32).decode(), "kind": "windows"}
+
+        def taken(code):
+            self.enrolled()                         # linked before: a key, a certified signing key, a recovery copy
+            hub.q("INSERT OR REPLACE INTO owner_device_signing(device,key,binding,created,statement,signature) "
+                  "VALUES('iphone','b2xk','b2xk',1,'{}','c2ln')")
+            hub.q("INSERT OR REPLACE INTO owner_device_recovery(device,sealed,created,held) "
+                  "VALUES('iphone','c2Vh',1,2)")
+            made = code()[1]["code"]
+            hub.ins("INSERT INTO owner_device_tries(device,ts) VALUES('iphone',?)", (hub.now(),))
+            status, got = self.call("/ui/owner/enroll", dict(signing, code=made), source=PHONE)
+            self.assertEqual((status, got.get("device")), (200, "iphone"), got)
+            row = next(d for d in self.call("/ui/owner/devices")[1]["devices"] if d["device"] == "iphone")
+            tries = hub.q1("SELECT COUNT(*) n FROM owner_device_tries WHERE device='iphone'")["n"]
+            devices = json.loads(json.dumps(hub.TEAM["owner_devices"]))
+            return {k: v for k, v in row.items() if k != "since"}, tries, devices
+
+        with self.team_saves({"iphone": {"label": "iPhone", "address": PHONE}}):
+            own, added = taken(self.code), taken(self.new_code)
+        self.assertEqual(added, own)
+        row, tries, devices = added
+        self.assertEqual((row["signing_key"], row["certified"], row["recovery"], row["kind"], tries),
+                         (signing["signing_key"], False, None, "windows", 0))
+        self.assertEqual(devices, {"iphone": {"label": "iPhone", "address": PHONE}})
+
     def test_a_pc_enrolls_as_pc_and_its_messages_say_via_windows(self):
         """Owner API 1.149: the app sends its kind at its enrollment. A PC is "PC" where a phone is "iPhone", its
         message says via=Windows, and a device that names no kind stays an iPhone, as every phone of before the kind."""
@@ -553,13 +683,17 @@ class Devices(test_ui_api.OwnerAPI):
             self.assertEqual(self.enroll(made["code"])[0], 200)             # the phone still can
 
     def test_five_wrong_codes_stop_an_unknown_address_for_an_hour(self):
+        """And a new code of Add device ends the wait (F7 A3 of the owner's feedback of 22 November 2026)."""
         with self.team_saves({}):
-            self.new_code()
+            made = self.new_code()[1]["code"]
             for _ in range(5):
                 self.assertEqual(self.enroll("AAAA-BBBB", source=OTHER)[0], 403)
-            status, body = self.enroll("AAAA-BBBB", source=OTHER)
-            self.assertEqual(status, 429, body)
+            for code in ("AAAA-BBBB", made):
+                status, body = self.enroll(code, source=OTHER)
+                self.assertEqual(status, 429, body)
             self.assertEqual(hub.TEAM["owner_devices"], {})
+            status, got = self.enroll(self.new_code()[1]["code"], source=OTHER)
+            self.assertEqual((status, got.get("device")), (200, "iphone"), got)
 
     def test_the_hub_keeps_no_new_code_and_a_new_one_replaces_it(self):
         with self.team_saves({}):
@@ -570,9 +704,14 @@ class Devices(test_ui_api.OwnerAPI):
             self.assertEqual(self.enroll(second)[0], 200)
 
     def test_only_the_mac_makes_a_code_for_a_new_phone_and_at_most_four_devices(self):
+        """Since F7 A2 (22 November 2026) the code of Add device also gives a device that exists a new key (safety
+        claim 1): so a phone never makes it, with its key or without one, as after a new install."""
+        status, body = self.new_code(source=PHONE)
+        self.assertEqual((status, body.get("auth")), (403, "device_not_enrolled"), body)
         key = self.enrolled()
         status, body = self.new_code(source=PHONE, token=key)
         self.assertEqual((status, body["auth"]), (403, "device_not_allowed"))
+        self.assertIsNone(hub.q1("SELECT 1 FROM owner_device_codes WHERE device=?", (hub.NEW_DEVICE,)))
         hub.TEAM["owner_devices"].update({f"tab-{n}": {"label": f"Tab {n}", "address": f"127.0.0.{20 + n}"}
                                           for n in range(3)})
         status, body = self.new_code()
