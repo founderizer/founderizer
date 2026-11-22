@@ -127,6 +127,9 @@ OLD = {
     # a Teams part, which hub.need_teams refuses (teams-design-1, 3.8)
     "teams_off": "This needs Founderizer for Teams, which this fleet does not have.",
     "teams_part_missing": "This fleet has Founderizer for Teams, but its hub has not loaded this part of it.",
+    # a request for a new value of a key that the fleet holds (the area "Vault, keys and access", UI-API.md 1.295)
+    "secret_value_asked": "This request asks for a new value of {name}: type it in the request's form.",
+    "secret_app_setting": "{name} is a setting of an app on a host: its new value changes on that host, not here.",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
@@ -135,7 +138,8 @@ OLD = {
 SITES = {
     'add_server_agent': {'profile_unread': 1, 'team_changed': 1},
     'add_server_refusal': {'no_such_server': 1, 'server_no_service': 1, 'server_silent': 1},
-    'answer_secret': {'command_reused_message': 1, 'request_answered': 1, 'request_unknown_ended': 1},
+    'answer_secret': {'command_reused_message': 1, 'request_answered': 1, 'request_unknown_ended': 1,
+                      'secret_value_asked': 1},
     'attachment_check': {'login_as_file': 1},
     'command_run': {'command_interrupted': 1, 'command_reused': 1, 'hub_changed_sending': 1, 'login_as_text': 1},
     'enroll_new_device': {'not_owner_device_no_code': 1},
@@ -198,6 +202,7 @@ SITES = {
     'save_profile': {'profile_unread': 1, 'revision_unreadable': 1},
     'save_resource': {'repo_vendor': 1},
     'save_runtime': {'no_such_agent': 1, 'team_changed': 1},
+    'save_secret': {'secret_app_setting': 1},       # a new value of an app's setting on a host (UI-API.md 1.295)
     'save_team_entry': {'team_changed': 1},
     'save_vault': {'no_such_agent': 1, 'team_changed': 1},
     'save_vault_create': {'no_such_agent': 1, 'team_changed': 1},
@@ -500,7 +505,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 214)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 216)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

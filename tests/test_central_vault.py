@@ -819,14 +819,22 @@ class Central(WithCentral, OwnerAPI):
         self.assertEqual(hub.q("SELECT * FROM ui_controls WHERE route='vault/intake'"), [])
 
     def test_a_replace_passes_the_owner_s_statement_as_it_came_and_the_hub_records_the_value_of_now(self):
+        """The owner's replace reaches the central vault as he signed it, and each copy of the old value goes: the
+        copies that wait, and the door's copy also when the door fetched it already, so that the door's next pass
+        seals the new value (the Door area: a change to "only the copies not fetched" leaves the old value in the
+        door until a later replace)."""
         old = [{"kind": "password", "hash": "a" * 64, "len": 51}]
         hub.register_fingerprints(LOGIN_A, old)
         self.deliver_and_keep()                             # vps holds LOGIN_A and LOGIN_B
-        self.vault.pins["studio"] = STORE_B
+        self.vault.pins.update(studio=STORE_B, door=OTHER)
+        self.vault.grants.append({"login": LOGIN_A, "agent": "door", "machine": "door"})    # the door holds LOGIN_A
+        hub.TEAM["door"] = {"address": "127.0.0.20", "secrets": [LOGIN_A]}
         hub.central_read()
         waits = hub.central_reconcile()["delivered"]        # a copy of LOGIN_A waits for studio
         self.assertEqual(len(waits), 1)
-        hub.q("INSERT INTO door_copies(login,sealed,created) VALUES(?,?,?)", (LOGIN_A, armored(b"for the door"), hub.now()))
+        fetched = hub.door_reconcile()                      # the door's copy of LOGIN_A, which the door fetched
+        self.assertEqual(len(fetched), 1)
+        hub.q("UPDATE door_copies SET fetched=? WHERE id=?", (hub.now(), fetched[0]))
         hub.q("INSERT INTO door_copies(login,sealed,created) VALUES(?,?,?)", (LOGIN_B, armored(b"for the door"), hub.now()))
         hub.register_fingerprints(LOGIN_A, self.NEW)        # the app's hub step for the new value
         self.vault.prints = self.NEW
@@ -842,6 +850,9 @@ class Central(WithCentral, OwnerAPI):
         ended = hub.q1("SELECT * FROM deposits WHERE id=?", (waits[0],))
         self.assertEqual((ended["ok"], ended["ciphertext"]), (0, None))             # the copy that waited ends
         self.assertEqual([r["login"] for r in hub.q("SELECT login FROM door_copies")], [LOGIN_B])   # the door's goes
+        again = hub.door_reconcile()                        # and the door's next pass seals the new value
+        self.assertEqual([(r["id"] in again, r["login"], r["fetched"]) for r in hub.q("SELECT * FROM door_copies")],
+                         [(True, LOGIN_A, None)])
         self.assertTrue(hub.CENTRAL["due"])
         kept = hub.q1("SELECT body, result FROM ui_controls WHERE route='vault/intake'")
         self.assertNotIn(body["ciphertext"].split("\n")[1], kept["body"] + kept["result"])

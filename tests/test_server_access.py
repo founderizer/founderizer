@@ -1089,6 +1089,37 @@ class DoorCalls(Access):
         with self.assertRaisesRegex(ValueError, "a secret that the door holds"):
             hub.validate_door(team)
 
+    def test_a_new_value_of_a_door_key_keeps_the_door_s_rules_and_its_answer_promises_no_time(self):
+        """The owner types a new value of a door key that the door uses (request_secret with failed): it goes in the
+        place of the old one under the same reference, and the door's rules keep the same name and the same agents,
+        so no agent gets a key through the answer. The door takes the new value at its next fetch of its keys, so the
+        answer never says "now": a call that the door refuses before then must not read as a fault of the value."""
+        team = self.origin_team()
+        team["logins"][self.ref]["env"] = "DOOR_BACKBLAZE_ACME_KEY"
+        self.write_team(team)
+        self.owner("/ui/secrets/grant", login=self.ref, agent="door", grant="use")
+        self.grant(level="fix")
+        with hub.LOCK:
+            hub.save_door_credential("backblaze:acme", self.ref, "vps")
+        rules = self.origin_team()["door"]
+        read = {"replaces": True, "pins": {"door": {"recipient": "age1" + "q" * 58}},
+                "grants": [{"login": self.ref, "agent": "door", "machine": "door"}]}
+        with patch.dict(hub.CENTRAL, {"status": read, "read_at": hub.now(), "error": None}), \
+                patch.object(hub, "save_door_credential", side_effect=AssertionError("a new value names nobody")):
+            said = hub.t_request_secret("manager", {"failed": self.ref, "why": "Backblaze refuses the key"})
+            nid = hub.q1("SELECT max(id) AS id FROM needs WHERE kind='secret'")["id"]
+            self.assertIn(f"a new value of the API key DOOR_BACKBLAZE_ACME_KEY as N-{nid}", said)
+            with hub.LOCK:
+                self.assertTrue(hub.value_replaced(self.ref, "a" * 64, {"saved": "replaced"}))
+            status, answer = self.owner(f"/ui/needs/{nid}/secret", login=self.ref)
+        self.assertEqual(status, 200, answer)
+        self.assertEqual(self.origin_team()["door"], rules)
+        self.assertEqual(self.request("/ui/door?db=test-generation", source=OWNER)[1]["credentials"],
+                         {"backblaze:acme": {"secret": self.ref, "agents": ["vps"]}})
+        self.assertIn(f"Replaced the value of the door's key backblaze:acme ({self.ref}): the door holds it, and no "
+                      f"agent holds it. The door takes the new value at its next fetch of its keys", answer["answer"])
+        self.assertNotRegex(answer["answer"], r"\bnow\b")
+
     def test_door_gitops_gives_operators_a_gitops_repository_through_the_door_and_no_grant(self):
         """DevOps plan X3: the manager's door_gitops names a GitOps repository, its caller workflow and the Operators
         that get it; GET /ui/door gives it to the app, which writes their targets. No GitHub grant comes with it."""
@@ -1395,6 +1426,8 @@ class DoorCalls(Access):
                           "door acts on this from the owner's Mac's next door round after the change",
                           str(held.exception))
             self.assertIn(hub.DOOR_EARLY_REFUSAL, str(held.exception))
+            self.assertIn(f'If the provider refuses its value, ask again with failed="{self.ref}".',
+                          str(held.exception))
             with self.assertRaisesRegex(hub.ToolError, "for vps: ask your requester to give that part of the work to "
                                                        "vps"):
                 hub.t_request_secret("studio", dict(ask))

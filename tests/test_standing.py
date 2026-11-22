@@ -674,10 +674,17 @@ class Provenance(Base):
         curly = self.owner_says("hand", "Don\u2019t tell customers to call us.")
         text, error = keep("don't tell customers to call us.", curly)
         self.assertFalse(error, text)
+        # a zero-width space in the owner's message, which the chat's read takes out (hidden_counted): the words as
+        # the read shows them are the whole message
+        spaced = self.owner_says("hand", "Answer every cus\u200btomer within one day.")
+        self.assertIn("Answer every customer within one day.", self.chat("read_messages")[0])
+        text, error = keep("Answer every customer within one day.", spaced)
+        self.assertFalse(error, text)
         self.assertEqual([(r["words"], r["scope"], r["author"], r["message"])
                           for r in hub.q("SELECT * FROM standing ORDER BY id")],
                          [("Never tell customers to call us. Write to them instead! Thanks", "agent", "owner", said),
-                          ("don't tell customers to call us.", "agent", "owner", curly)])
+                          ("don't tell customers to call us.", "agent", "owner", curly),
+                          ("Answer every customer within one day.", "agent", "owner", spaced)])
 
 
 class Ending(Base):

@@ -3409,6 +3409,19 @@ DOOR_CLOUDFLARE_KEY = (
     "Write those steps in details, in your own words, with that full address and the account to choose. Ask for no "
     "other permission: the door makes its own work key from this key each day, with the permissions that its "
     "Cloudflare forms need")
+# How the owner makes a door key at its provider, by the provider part of its door name: the words that an agent writes
+# into its request's details, for its first ask (the door field of request_secret, DOOR_KEY_STEPS) and for its ask for
+# a new value of the key (failed, key_failed) alike. The Door area adds a row for each provider whose key needs steps
+# that the owner takes at the provider.
+DOOR_KEY_WORDS = {"cloudflare": DOOR_CLOUDFLARE_KEY}
+DOOR_KEY_STEPS = ". ".join(DOOR_KEY_WORDS.values())
+
+
+def door_key_words(name):
+    """The words of DOOR_KEY_WORDS for a door name (cloudflare:acme gives DOOR_CLOUDFLARE_KEY), or "" for a provider
+    that has none."""
+    return DOOR_KEY_WORDS.get(str(name or "").partition(":")[0].strip().lower(), "")
+
 
 DOOR_SCRIPT_CHARS = 4000        # characters of the script of a door card: what the card shows whole, as details
 DOOR_CARD_TITLE = "Run one root script on {host}?"         # the title of the door's card, as the owner approved it
@@ -3812,7 +3825,15 @@ def need_view(row, reads=None):
     except (ValueError, TypeError):
         view["chose"] = None
     if view["secret"]:          # a login request's failed login is the hub's: its why names it
-        view["secret"] = {k: v for k, v in view["secret"].items() if k not in SECRET_HUB_ONLY}
+        asked = view["secret"]
+        view["secret"] = {k: v for k, v in asked.items() if k not in SECRET_HUB_ONLY}
+        # owner API 1.295: a key request for a new value of a key that the fleet holds names that key's reference,
+        # which the owner's form saves the new value under
+        if asked.get("kind") == "api_key" and asked.get("failed"):
+            view["secret"]["replaces"] = asked["failed"]
+            # and no site: the key keeps its stored address, which an address in the new value would take the place
+            # of (vault.kept_address), and request_secret refuses an agent's site for it (key_failed)
+            view["secret"].pop("site", None)
     view["talk"] = need_talk(row["id"]) if reads is None else reads[0].get(row["id"], [])
     # owner API 1.285: one picture for each option, in the order of `options`, or null: never the row's own text
     view["pictures"] = need_pictures_view(row, None if reads is None else reads[3].get(row["id"], []))
@@ -17704,11 +17725,13 @@ def need_key_held(r):
     in the app, and the manager's request is for other agents. request_secret refuses a request for what the agent
     holds already, so a fitting secret that it holds now came after the request: a login fits by its site and the
     account that the request names (catalog_logins), and nothing fits a request for a new password (failed): only
-    the owner's answer brings one.
+    the owner's answer brings one. A request for a new value of a key (failed, owner API 1.295) is of a key that the
+    agent holds already, so nothing fits it either.
     The grants of team.json only: the logins of a profile need a read of the hub's checkout, which a sweep of every
     minute does not make."""
     spec = need_secret(r)
-    if not spec or "tasks" in spec or spec.get("door") or role_of(r["by"]) not in ("worker", "lead"):
+    if not spec or "tasks" in spec or spec.get("door") or spec.get("failed") or \
+            role_of(r["by"]) not in ("worker", "lead"):
         return None
     catalog = logins()
     fits = {ref for ref, _ in catalog_logins(spec["site"], spec.get("account", ""))} \
@@ -17739,9 +17762,10 @@ def need_look_hints(r):
         elif r["by"] != manager_name():
             hints.append(f"no task waits on it: ask {r['by']} with message_agent whether its work still needs it, and "
                          f"if not, withdraw_need closes it")
+        # (a request for a new value of a key that the list holds, failed, is answered only with the new value)
         have = next((ref for ref, e in sorted(logins().items())
                      if e.get("kind") == "api_key" and spec.get("env") and e.get("env") == spec["env"]), None) \
-            if spec.get("kind") == "api_key" else None
+            if spec.get("kind") == "api_key" and not spec.get("failed") else None
         # a grant releases no task that waits on the card: only the owner's answer, or the task's end, does
         top = (resource_pool().get(f"secret:{have}") or {}).get("max") \
             if have and not spec.get("door") and not waiters else None
@@ -17895,8 +17919,9 @@ SECRET_CLARIFIED = ("\n(The hub: the owner saved nothing. The words before this 
                     "and they hold no value. When they settle what to ask for, ask again with request_secret, once "
                     "for each account or key that they name: with account for a login, and with note where a name "
                     "does not say which one it is. A task session writes the note of a secret that the fleet holds "
-                    "already with note_secret. When their words ask you something, answer it where you answer the "
-                    "owner. Never ask for a value in words.)")
+                    "already with note_secret. Your next request_secret takes this card's place, and the owner sees "
+                    "their words over it: put the answer to their words in its why or its steps. Never ask for a "
+                    "value in words.)")
 SECRET_SITE = re.compile(r"https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:[/?#][^\s]*)?")
 SECRET_TODO = ("Open this request in Founderizer on your Mac and type it into its secure form: it goes straight into "
                "the vault, and no agent sees it. Never type the key or the password in a message.")
@@ -18336,9 +18361,10 @@ def secret_site_host(site):
 
 
 def secret_asked(spec):
-    """A request's secret in a sentence: "the API key STRIPE_SECRET_KEY", "a login for stripe.com"."""
+    """A request's secret in a sentence: "the API key STRIPE_SECRET_KEY", "a new value of the API key
+    STRIPE_SECRET_KEY" (a key of the fleet whose value no longer works, failed), "a login for stripe.com"."""
     if spec.get("kind") == "api_key":
-        return f"the API key {spec.get('env')}"
+        return f"{'a new value of ' if spec.get('failed') else ''}the API key {spec.get('env')}"
     return f"a login for {secret_site_host(spec['site'])}" if spec.get("site") else "a login"
 
 
@@ -18389,10 +18415,19 @@ LOGIN_ACCOUNT = ("For a login: the user name or email of the account at the site
                  "owner reads why. A login that the fleet already holds for that account, or for any account when "
                  "you name none, is refused while an agent can give it, with how: name the account when the work "
                  "needs another one")
-LOGIN_FAILED = ("For a login of the fleet whose password no longer works: its reference (bws://...), as the hub named "
-                "it. The request then goes to the owner, who types the new password in the secure form, and the hub "
-                "names the old login no more")
-LOGIN_FAILED_OWN = LOGIN_FAILED.replace("a login of the fleet whose", "a login that you hold whose")
+# Since owner API 1.295 failed also names an API key or a door key that the fleet holds and whose value no longer
+# works (the owner's "Yes, both" of 21 November 2026, ~/dev/founderizer-plans/key-replace-design-2026-11-21.md, piece
+# H1): the owner types the new value into the same secure form, and it goes in the place of the old one under the same
+# reference, so the agents stop sending him into the vault with steps (key_failed). The card gets that reference as
+# secret.replaces (need_view); failed stays the hub's own.
+SECRET_FAILED = ("The reference (bws://...) of a key or a login of the fleet whose value no longer works: the owner "
+                 "types a new one. A key keeps its name and holders (leave env, door and give_to out); details say "
+                 "only how to make it. The old login is named no more")
+# request_secret's own sentence for a key whose value no longer works, the manager's and the worker's
+SECRET_RENEW = "For a wrong or expired key, use failed, never steps that send the owner into the vault."
+SECRET_FAILED_OWN = SECRET_FAILED.replace(
+    "of the fleet", "that you hold, or of a door key that the door uses for you,").replace("env, door and give_to",
+                                                                                         "env and door")
 
 
 def login_host(text):
@@ -18535,6 +18570,133 @@ def secret_parked(task_id, nid):
                    "('submitted','working')", (f"N-{nid}", task_id))
 
 
+def door_value_waits(ref):
+    """What a new value of the door's key `ref` waits for before the door can fetch it, in words, or "" when the door
+    takes it at its next fetch of its keys (the Door area, 21 November 2026). The central vault seals a copy for the
+    door only while it answers, for a grant of the key to the door that the owner signed, and to the door's key that
+    the owner pinned (door_reconcile); with no signed grant the door removes its file of the key and holds no value of
+    it at all (door_sealed `keep`)."""
+    if not central_ok():
+        return "the central vault, which does not answer now"
+    with CENTRAL_LOCK:
+        status = CENTRAL["status"]
+    if (ref.lower(), DOOR_PIN) not in central_signatures(status)[0]:
+        return ("the owner's signature of its grant to the door in Founderizer on their Mac, and until then the door "
+                "holds no value of it at all")
+    if not central_pins(status).get(DOOR_PIN):
+        return "the door's own key in the central vault, which Founderizer on the owner's Mac pins"
+    return ""
+
+
+def door_key_of(team, ref):
+    """The name in the door's rules of the key `ref` (cloudflare:acme, app:shop:STRIPE_SECRET_KEY), or "" for a key
+    that no door credential names. When two credentials name one key (a token that the door uses and that an app's
+    setting holds too), the app's setting comes first: its app keeps the old value in its own settings file, so each
+    check of a new value (key_failed, save_secret, save_secrets) must see it, whatever the order of the names."""
+    credentials = (team.get("door") or {}).get("credentials") or {}
+    names = [n for n, c in sorted(credentials.items()) if c.get("secret") == ref]
+    return next((n for n in names if n.startswith("app:")), names[0] if names else "")
+
+
+def key_failed(agent, a, worker, chat, tid):
+    """The API key or the door key of the fleet whose value no longer works, which request_secret asks the owner a new
+    value of (failed, owner API 1.295): (its reference as the catalog writes it, its variable name, its door name or
+    ""), or a ToolError. The owner's form puts the new value under the same reference, so the same agents keep it and
+    nothing of the door's rules changes: no give_to, no other name, and no site (the key keeps its stored address).
+    Only an agent that holds the key asks: a worker or a lead that holds it by a grant, or that the door uses it for;
+    the manager for any key of the fleet. A GitHub App's key comes from GitHub through the app, and a setting of an
+    app on a host (app:<app>:<NAME>) cannot take a new value yet. While the owner's last new value of the key has not reached its user (the door has not fetched it, or
+    the newest delivery to the asker's machine waits), a new ask is refused with what it waits for, so that a call
+    that fails in the minutes before then rings the owner for nothing."""
+    given = a.get("failed")
+    ref = next((r for r, e in sorted(logins().items()) if isinstance(given, str) and e.get("kind") == "api_key" and
+                r.lower() == given.strip().lower()), None)
+    if not ref:
+        if isinstance(given, str) and any(r.lower() == given.strip().lower() and e.get("kind") != "api_key"
+                                          for r, e in logins().items()):
+            raise ToolError('failed names a login of the fleet: ask again with kind "login" and its site.')
+        raise ToolError("failed names no API key of the fleet: give the reference (bws://...) of the key whose value "
+                        "no longer works, as the hub named it.")
+    env, said = logins()[ref].get("env") or "", str(a.get("env") or "").strip()
+    if said and said != env:
+        raise ToolError(f"failed names the API key {env}, not {said}: leave env out.")
+    if GITHUB_APP_KEY_NAME.fullmatch(env):
+        raise ToolError(f"{env} is a GitHub App's key: the owner's app makes it with GitHub, and nobody types it.")
+    if a.get("give_to"):
+        raise ToolError(f"A new value of {env} keeps its holders, so leave give_to out.")
+    # The app's form puts a card's site into the new value as its address, and the vault sends the key to an address
+    # of the new value from then on (vault.kept_address): an agent that holds the key could name its own host
+    if str(a.get("site") or "").strip():
+        raise ToolError(f"A new value of {env} keeps its service address, so leave site out.")
+    credentials = (TEAM.get("door") or {}).get("credentials") or {}
+    door = door_key_of(TEAM, ref)
+    named = door_key_name(a.get("door"))
+    if named and named != door:
+        raise ToolError(f"failed names {'the door key ' + door if door else 'a key that the door does not use'}, not "
+                        f"{named}: leave door out.")
+    route = "ask your requester with ask_my_requester." if tid else "ask the manager with message_agent."
+    if door.startswith("app:"):
+        raise ToolError(f"{door} is a setting of an app on a host, and its app keeps the value that it has in its own "
+                        f"settings file: `ops <host> env-new` writes only a setting that the app does not have, so a "
+                        f"new value of it cannot be given yet. " +
+                        (f"Go on without it, and {route}" if worker else "Tell the owner which setting it is."))
+    if worker:
+        users = (credentials.get(door) or {}).get("agents") or []
+        if door and agent not in users:
+            raise ToolError(f"The door uses {door} for {', '.join(users) or 'no agent'}, not for you: {route}")
+        if not door and not any(h["agent"] == agent for h in resource_holders("secret", ref)):
+            raise ToolError(f"failed names no API key that you hold: {route}")
+    if not central_replaces():
+        raise ToolError("The central vault does not replace a value now, so the owner's form could not save one: ask "
+                        "again when it answers.")
+    if secret_value(ref) is not None:
+        tell = ("ask your requester with ask_my_requester" if tid else "tell the owner in this chat" if chat else
+                "tell the owner")
+        if door and not q1("SELECT 1 FROM door_copies WHERE login=? AND fetched IS NOT NULL", (ref,)):
+            waits = door_value_waits(ref)
+            if not waits:
+                raise ToolError(f"The owner replaced the value of {env} already, and the door has not taken the new "
+                                f"value yet: it takes it at its next fetch of its keys, usually within a few minutes. "
+                                f"Try the call again after that, and ask again only when the door refuses the new "
+                                f"value too.")
+            raise ToolError(f"The owner replaced the value of {env} already, and the door has not taken the new value: "
+                            f"it waits for {waits}. A new value changes nothing there: {tell}.")
+        machine = (agents().get(agent) or {}).get("machine")
+        row = latest_deposits(ref).get(machine) if worker and not door else None
+        if row is not None and deposit_view(row)["state"] == "waiting":
+            raise ToolError(f"The owner replaced the value of {env} already, and the vault of your machine has not "
+                            f"taken the new value yet: it takes it with its next delivery, usually within a few "
+                            f"minutes. Try the call again after that, and ask again only when the new value is refused "
+                            f"too.")
+    if door and door_key_words(door) and not str(a.get("details") or "").strip():
+        raise ToolError(f"Write in details how the owner makes the new key at its provider, as for the first ask of "
+                        f"{door}: {door_key_words(door)}.")
+    return ref, env, door
+
+
+def secret_clarified_card(agent, tid, chat):
+    """The key card that the owner's Needs clarification closed, which this agent's next request of the same place
+    takes the place of (the owner, 21 November 2026, of a question that he asked on a key card: "can't see the reply
+    and all I get is the same card again"), or None: the agent's newest secret request of this task, of its chat when
+    no task asks, or of its own session (the manager), that his clarify closed, that nothing took the place of, and
+    that no newer card of that place was raised after his clarify. So a card that he clarifies under two or three
+    open cards of the same place is taken too (on 21 November 2026 the manager raised N-269 to N-271 in 7 seconds),
+    and only the first new request takes it: that one is newer than his clarify. The newest such card goes first."""
+    since = []          # the raised times of the newer cards of the place
+    for r in q("SELECT * FROM needs WHERE kind='secret' AND by=? ORDER BY id DESC", (agent,)):
+        spec = need_secret(r) or {}
+        here = tid in (spec.get("tasks") or []) if tid else \
+            "tasks" not in spec and bool(spec.get("reply")) == bool(chat)
+        if not here:
+            continue
+        clarified = spec.get("clarified")
+        if clarified and r["answer"] is not None and r["replaced_by"] is None and \
+                all(t < clarified for t in since):
+            return r
+        since.append(r["raised"] or 0)
+    return None
+
+
 def t_request_secret(agent, a):
     """The manager asks wherever it works. A worker or a lead asks in its owner chat, in reply to his newest message
     (secret_reply), or in a task session that no contact drives, and then that task waits for his answer
@@ -18551,8 +18713,11 @@ def t_request_secret(agent, a):
     if kind not in SECRET_KINDS:
         raise ToolError('kind is "api_key", a key that an agent reads as a variable or that its vault sends with '
                         'call_api, or "login", a user name and a password that its vault signs in with.')
-    door = door_key_name(a.get("door"))
-    if door:                # DevOps plan 13, item 3: a key that the door uses for the agent that asks, as its holder
+    # a new value of an API key or a door key that the fleet holds (owner API 1.295): its reference names the key, its
+    # name and its door name, and the door's rules and the holders stay as they are
+    renew = key_failed(agent, a, worker, chat, tid) if kind == "api_key" and a.get("failed") not in (None, "") else None
+    door = renew[2] if renew else door_key_name(a.get("door"))
+    if door and not renew:  # DevOps plan 13, item 3: a key that the door uses for the agent that asks, as its holder
         lacks = owner_cannot("door")        # H2: no key for a door that the owner's app cannot keep
         if lacks:
             raise ToolError(f"{lacks}, so the hub offers no door: agents work on the fleet's own servers. Leave door "
@@ -18594,7 +18759,9 @@ def t_request_secret(agent, a):
             if door_user in users:      # often asked right after the door refused a call of that agent
                 raise ToolError(f"The door already holds {door} for {'you' if door_user == agent else door_user}, so "
                                 f"there is nothing to type: `ops` takes it." +
-                                door_round_tail(invites=True, tell=door_user != agent))
+                                door_round_tail(invites=True, tell=door_user != agent) +
+                                ("" if door.startswith("app:") else f" If the provider refuses its value, ask again "
+                                                                    f"with failed=\"{held['secret']}\"."))
             if users:
                 raise ToolError(f"The door already holds {door}, for {', '.join(users)}: "
                                 f"{'ask your requester to give' if worker else 'give'} that part of the work to "
@@ -18614,7 +18781,7 @@ def t_request_secret(agent, a):
                     f"{'you' if door_user == agent else door_user} from {door_round_due()}, with nothing to type; "
                     f"then `ops` takes it. {DOOR_EARLY_REFUSAL}" +
                     ("" if door_user == agent else f" {DOOR_EARLY_TASK}"))
-    env = str(a.get("env") or "").strip() or (door_env(door) if door else "")
+    env = renew[1] if renew else str(a.get("env") or "").strip() or (door_env(door) if door else "")
     if kind == "api_key" and not env_name(env):
         if door:
             raise ToolError(f"The vault's name for this door key would be longer than a variable name may be: give "
@@ -18637,26 +18804,27 @@ def t_request_secret(agent, a):
     if kind == "login" and not site:
         raise ToolError("A login needs site: the address of its sign-in page, with https://, so the owner knows "
                         "which account you mean and the vault knows where to sign in.")
-    if kind == "api_key" and worker and not site:
+    if kind == "api_key" and worker and not site and not renew:
         raise ToolError("An API key that your vault uses needs site: the address of the API that it is sent to.")
     if kind == "login" and provider_site(urllib.parse.urlsplit(site).hostname):
         raise ToolError("Fleet keeps no login of a model provider: " + ", ".join(PROVIDER_SITES) + ". The owner "
                         "signs in to their own account in their own session, through the provider's own flow.")
-    for field in ("account", "failed"):
+    for field in ("account",) + (() if renew else ("failed",)):
         if a.get(field) not in (None, "") and (not isinstance(a[field], str) or kind != "login"):
             raise ToolError(f"{field} is for a login, as a string: " +
                             ("the user name or email of the account at its site." if field == "account" else
                              "the reference of the fleet's login whose password no longer works.") +
                             " An API key has its name in env.")
-    account, failed = str(a.get("account") or "").strip(), str(a.get("failed") or "").strip().lower()
+    account = str(a.get("account") or "").strip()
+    failed = renew[0] if renew else str(a.get("failed") or "").strip().lower()
     if len(account) > SECRET_ACCOUNT_MAX or "\n" in account:
         raise ToolError(f"account is one line of at most {SECRET_ACCOUNT_MAX} characters: the user name or email of "
                         f"the account at the site.")
-    replaced = retired_logins().get(failed) if failed else None
+    replaced = retired_logins().get(failed) if failed and not renew else None
     if replaced:
         raise ToolError(f"The owner gave a new password for {failed} already, as {replaced}: ask again without "
                         f"failed, and the hub names your way to it.")
-    if failed and (failed not in {ref.lower() for ref, _ in catalog_logins(site, account)} or
+    if failed and not renew and (failed not in {ref.lower() for ref, _ in catalog_logins(site, account)} or
                    (worker and failed not in {ref.lower() for ref in granted_logins(agent)})):
         raise ToolError(f"failed names no login for {secret_site_host(site)}" + (f" as {account}" if account else "")
                         + (" that you hold" if worker else " of the fleet") + ": give the reference of the one whose "
@@ -18675,7 +18843,8 @@ def t_request_secret(agent, a):
         note = note_text(a.get("note"))         # the secret's note, which the owner reads on the card and can change
     except ValueError as e:
         raise ToolError(str(e)) from None
-    give = {"door": "use"} if door else {agent: "use"} if worker else a.get("give_to") or {}
+    # a new value keeps the holders of the old one, and the door's rules too: no grant, and no name more
+    give = {} if renew else {"door": "use"} if door else {agent: "use"} if worker else a.get("give_to") or {}
     if not isinstance(give, dict) or len(give) > SECRET_GIVE_MAX:
         raise ToolError(f'give_to maps up to {SECRET_GIVE_MAX} agents to "use" or "read", for example '
                         f'{{"studio": "read"}}.')
@@ -18692,26 +18861,30 @@ def t_request_secret(agent, a):
             **({"account": account} if account else {}), **({"failed": failed} if failed else {}),
             **({"note": note} if note else {}),
             **({"give": dict(sorted(give.items()))} if give else {}), **({"door": door} if door else {}),
-            **({"door_user": door_user} if door and door_user else {}),     # the holder that the door uses it for
+            **({"door_user": door_user} if door and not renew and door_user else {}),   # the door's user of it
             **({"reply": reply["request_id"]} if chat else {}),         # the owner message it answers
             **({"tasks": [tid]} if tid else {})}                        # the task that waits on it
-    if kind == "api_key":
+    if kind == "api_key" and not renew:
         have = next((ref for ref, e in sorted(logins().items())
                      if e.get("kind") == "api_key" and e.get("env") == env), None)
+        # a key whose new value the owner can type (key_failed): not a GitHub App's key, nor an app's setting
+        renewable = have and not GITHUB_APP_KEY_NAME.fullmatch(env) and not any(
+            c.get("secret") == have and n.startswith("app:")
+            for n, c in ((TEAM.get("door") or {}).get("credentials") or {}).items())
         if have and worker:
             mine = any(h["agent"] == agent for h in resource_holders("secret", have))
             raise ToolError(f"The fleet already holds the API key {env}, as {have}, so there is nothing to type: "
-                            + ("you hold it already." if mine else
+                            + ("you hold it already." + (f' If its value is wrong, expired or revoked, ask again with '
+                                                         f'failed="{have}".' if renewable else "") if mine else
                                f'ask your requester for it with ask_my_requester and needs_access="secret:{have}".'
                                if tid else f"ask the manager for it with message_agent, naming secret:{have}."))
         if have:
-            rid = f"secret:{have}"
             route = secret_route(have, [h["agent"] for h in card_holders("secret", have)])
             raise ToolError(f"The fleet already holds the API key {env}, as {have}, so there is nothing to type: "
-                            f"{route}. If its value is wrong or was revoked, tell the owner with raise_needs_you "
-                            f'(reason access, needs_access "{rid}", needs_level "value") to save the new value with '
-                            f"Add secret under the name {env}: it goes in the place of the old one, and each agent "
-                            f"that holds {have} keeps it.")
+                            f"{route}." + (f' If its value is wrong, expired or revoked, ask again with '
+                                           f'failed="{have}": the owner types the new value into the secure form, it '
+                                           f"goes in the place of the old one, and each agent that holds {have} keeps "
+                                           f"it." if renewable else ""))
     waits = ("This task waits for the owner's answer: end your turn. If they save it, this session goes on once your "
              "machine's vault has it; if they decline, their words come here.")
     if tid:
@@ -18799,12 +18972,17 @@ def t_request_secret(agent, a):
                         f"can, and say in the result what else it needs.")
     guard(agent, why, details, site, note)
     host = secret_site_host(site) if site else ""
-    title = (f"Enter the API key {env}" + (f" for {host}" if host else "")) if kind == "api_key" else \
+    title = f"New value for {env}" if renew else \
+        (f"Enter the API key {env}" + (f" for {host}" if host else "")) if kind == "api_key" else \
         f"Enter a login for {host}"
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
+        old = secret_clarified_card(agent, tid, chat)
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,kind,secret,details) VALUES(?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, SECRET_TODO, now(), agent, "secret", json.dumps(spec),
                    details or None))
+        if old:     # his words stand over the new card, and the app shows no card that was replaced
+            q("UPDATE needs SET replaced_by=? WHERE id=? AND replaced_by IS NULL", (nid, old["id"]))
+            q("UPDATE need_talk SET need=? WHERE need=?", (nid, old["id"]))
     if tid:
         secret_parked(tid, nid)
     emit("owner", "notify", f"Needs you: {title}")
@@ -19073,12 +19251,16 @@ def secret_answer_text(ref, entry, spec, worker=False, task=False):
     """The words that answer a secret request, read from the catalog and team.json at the moment of the answer: the
     secret's name, its reference and who holds it. Never a value: the hub has none. A worker's or a lead's answer
     names no grant tool, which only the manager has, and no delivery notice, which only the manager gets. task: tasks
-    wait on it, and their wake says when their session can use it (secret_wakes)."""
+    wait on it, and their wake says when their session can use it (secret_wakes). A request for a new value of a key
+    (failed, owner API 1.295) says that the value under the same reference is new: deposit_view says "on its way" for
+    a copy from before it."""
     api = entry.get("kind") == "api_key"
     name = entry.get("env") or entry.get("title") or ref
     held = resource_holders("secret", ref)
     top = (resource_pool().get(f"secret:{ref}") or {}).get("max")
-    words = [f"Saved {'the API key' if api else 'the login'} {name} in the vault, as {ref}."]
+    words = [f"Replaced the value of the API key {name} in the vault, under the same reference, {ref}."
+             if api and spec.get("failed") == ref else
+             f"Saved {'the API key' if api else 'the login'} {name} in the vault, as {ref}."]
     if api and spec.get("env") and entry.get("env") != spec["env"]:
         words.append(f"Its variable is {entry.get('env')}, not {spec['env']}.")
     words.append(("Held now by " + ", ".join(
@@ -19162,6 +19344,7 @@ def answer_secret(body, request_id, client, device=None, session=None):
     if q1("SELECT 1 FROM ui_requests WHERE request_id=?", (request_id,)):
         raise Refusal(409, code="command_reused_message")
     spec, ref = need_secret(need), body["login"]
+    renew = spec.get("kind", "api_key") == "api_key" and bool(spec.get("failed"))      # a new value (key_failed)
     clarify = body.get("clarify")
     # the tasks that wait on it, when a task session asked: his answer goes to them, not to a chat
     waiters = [t for t in spec.get("tasks") or [] if q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (t,))]
@@ -19179,16 +19362,31 @@ def answer_secret(body, request_id, client, device=None, session=None):
                            new == entry.get("title") else
                            f"answer with {new}, which replaced it." if new else
                            "type its new password in this form."))      # its replacement left the list
-        if spec.get("failed") and ref == spec["failed"]:
+        if spec.get("kind", "api_key") == "login" and spec.get("failed") and ref == spec["failed"]:
             raise Refusal(409, f"The password of {name} no longer works, and this request asks for its new one: type "
                                f"it in this form.")
+        # owner API 1.295: a request for a new value of a key that the fleet holds takes only that key, once the owner
+        # replaced its value after the request was raised (value_replaced), so that "Answer with it" never tells the
+        # agent that the old value is new
+        if renew:
+            value = secret_value(ref) if ref == spec["failed"] else None
+            if value is None or value["at"] < need["raised"]:
+                raise Refusal(409, code="secret_value_asked", names={"name": spec.get("env") or spec["failed"]})
         if (entry.get("kind") or "login") != spec.get("kind", "api_key"):
             raise Refusal(409, f"this request asks for {secret_asked(spec)}, and {ref} is "
                                f"{'an API key' if entry.get('kind') == 'api_key' else 'a login'}")
         text = secret_answer_text(ref, entry, spec, worker=role_of(need["by"]) in ("worker", "lead"),
                                   task=bool(spec.get("tasks")))
         gave = any(h["agent"] == need["by"] for h in resource_holders("secret", ref))
-        if spec.get("door"):    # DevOps plan 13, item 3: the door holds it, and its rules name it for the asker
+        if spec.get("door") and renew:      # the same name and reference: the door's rules do not change
+            waits = door_value_waits(ref)
+            text = (f"Replaced the value of the door's key {spec['door']} ({ref}): the door holds it, and no agent "
+                    f"holds it. " +
+                    ("The door takes the new value at its next fetch of its keys, usually within a few minutes, and "
+                     "uses the old one until then." if not waits else
+                     f"The door does not take the new value yet: it waits for {waits}.") +
+                    " A call that the door refuses before then says nothing about the new value.")
+        elif spec.get("door"):  # DevOps plan 13, item 3: the door holds it, and its rules name it for the asker
             save_door_credential(spec["door"], ref, spec.get("door_user") or need["by"],
                                  named=bool(spec.get("door_user")))
             app_key = spec["door"].split(":") if spec["door"].startswith("app:") else None
@@ -19212,13 +19410,14 @@ def answer_secret(body, request_id, client, device=None, session=None):
         text = "Not given" + (f": {body['decline']}" if body["decline"] else ".") + \
             " Do not ask for it in words instead."
     t0 = now()
+    kept = " The key keeps the value that it had." if renew else ""      # after his decline of a new value
     with transaction():
         if spec.get("tasks"):
             # A save that gives the asker the secret wakes its tasks once their machine's vault has it (secret_wakes):
             # until then one quiet line, which wakes nobody. A decline, or a save that gives it nothing, goes on now.
             # the next step of a task that goes on without it, in its own events and never in his bubble
             note = "" if gave or (ref is not None and spec.get("door")) else clarified if clarify is not None \
-                else (" Go on without it, or deliver what you can." if ref is None else
+                else (" Go on without it, or deliver what you can." + kept if ref is None else
                       " The owner does not give it to you: go on without it, or deliver what you can.")
             event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0,
                                           device=device, session=session,
@@ -19235,11 +19434,13 @@ def answer_secret(body, request_id, client, device=None, session=None):
         else:
             event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0,
                                           device=device, session=session,
-                                          note=clarified if clarify is not None else "")
+                                          note=clarified if clarify is not None else kept if ref is None else "")
             if ref is not None:
                 DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, saved=ref)), need["id"]))
         if clarify is not None:         # no decline: the asker may ask again at once (t_request_secret)
             DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, clarified=t0)), need["id"]))
+            # his words as the card's talk too, which the agent's next request takes over (secret_clarified_card)
+            DB.execute("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (need["id"], t0, "owner", clarify))
     if gave and spec.get("tasks"):
         secret_wakes(t0)        # a vault that reads his project, or a delivery that finished before this answer
     # created: the time of the answer, as the receipt of every answer has it (the phone reads one shape of receipt)
@@ -19299,7 +19500,9 @@ def secret_wait_moved(task_id):
 
 
 def secret_woken_words(r, spec):
-    """What a waiting task reads when the secret that the owner saved for it can reach it now."""
+    """What a waiting task reads when the secret that the owner saved for it can reach it now. A new value of a key
+    that the task holds (failed, owner API 1.295) is the new value: a session that reads the key as a variable has
+    the old one."""
     ref = spec["saved"]
     entry, level = logins().get(ref) or {}, secret_grants(r["by"]).get(ref)
     name = entry.get("env") or entry.get("title") or ref
@@ -19307,6 +19510,12 @@ def secret_woken_words(r, spec):
         f"{name} as {ref}"
     if not level:
         return head + ", and they do not give it to you: go on without it, or ask your requester."
+    if entry.get("kind") == "api_key" and spec.get("failed") == ref:
+        head = f"[hub] N-{r['id']}: the owner replaced the value of the API key {name} ({ref})"
+        return head + (f", and your machine's vault has the new value. A session reads ${name} when it starts, so "
+                       f"this one has the old value: ask your requester with ask_my_requester to start this task "
+                       f"again." if level == "read" else
+                       ", and your machine's vault has the new value now: call_api uses it in this session.")
     if level == "read":
         return head + (f", and your machine's vault has it. A session reads ${name} when it starts, so this one does "
                        f"not have it: ask your requester with ask_my_requester to start this task again.")
@@ -44823,7 +45032,7 @@ def standing_source(agent, source, words=None, whole=False, ending=False):
                             f"person in a closed role gives no standing item, changes none and ends none.")
         found = ("person", f"P-{person['id']}", said["conversation"], n, said["text"])
     if words is not None and whole:         # as the chat read it: no hidden character, and as the part check compares
-        if plain_words(words) != plain_words(hidden.strip_hidden(str(found[4] or ""))[0]):
+        if plain_words(words) != plain_words(hidden_counted(found[4], "keep_instruction")[0]):
             raise ToolError(f"These words are not {prefix}-{n} whole. " + STANDING_WHOLE.format(
                 route=chat_wish_route(agent)))
     elif words is not None:
@@ -48941,13 +49150,10 @@ TOOLS = [
         "why": {"type": "string", "description": "The plan step, or the reason, in a line"}},
        ["request_id", "repo", "sync", "agents", "why"])),
     ("manager", "request_secret", t_request_secret,
-     "Ask the owner for a secret that the fleet does not hold: an API key or a login. It is a Needs-you item that they "
-     "answer in a secure form in Founderizer on their Mac, so the value goes straight into the vault and never "
-     "passes you, your runtime or a chat: a key they typed in words would be in your conversation before anything "
-     "could mask it, so never ask for one in words. The owner's answer arrives as a message in this session with the "
-     "secret's name, its reference (bws://...) and the agents that hold it now, never the value. Propose in "
-     "give_to the agents the work needs it for; the owner chooses. A key or a login that the catalog already has is "
-     "refused, with how to give it instead.",
+     "Ask the owner for an API key or a login that the fleet does not hold. They type it into a secure form in "
+     "Founderizer, straight into the vault: never ask for one in words. Their answer comes here with its name, "
+     "reference (bws://...) and holders, never the value. Propose in give_to the agents the work needs it for; the "
+     "owner chooses. A key or a login that the catalog has is refused, with how to give it. " + SECRET_RENEW,
      S({"kind": {"type": "string", "enum": list(SECRET_KINDS),
                  "description": "api_key (the default): a key an agent reads as a variable or its vault sends with "
                                 "call_api. login: a user name and a password the vault signs in with."},
@@ -48957,7 +49163,7 @@ TOOLS = [
         "site": {"type": "string", "description": "The address where it is used, with https://: a login's sign-in "
                                                   "page (required for a login), or the API an agent calls with it"},
         "account": {"type": "string", "description": LOGIN_ACCOUNT},
-        "failed": {"type": "string", "description": LOGIN_FAILED},
+        "failed": {"type": "string", "description": SECRET_FAILED},
         "note": {"type": "string", "description": SECRET_NOTE_FIELD},
         "why": {"type": "string", "description": f"What the work needs it for, in a sentence or two, at most "
                                                  f"{NEED_WHY_CHARS} characters: the owner reads it before they type "
@@ -48974,7 +49180,7 @@ TOOLS = [
                                                   "rules, <provider>:<account> (cloudflare, hetzner, backblaze, "
                                                   "azure or tailscale), or "
                                                   "app:<app>:<NAME> for one setting of an app on a host. The card "
-                                                  "gives it to the door alone. " + DOOR_CLOUDFLARE_KEY + ". The "
+                                                  "gives it to the door alone. " + DOOR_KEY_STEPS + ". The "
                                                   "door uses such a key for one agent "
                                                   "that holds servers through it: you when you hold them, else the "
                                                   "one agent that does; with several such agents, name the one in "
@@ -48986,12 +49192,12 @@ TOOLS = [
     ("worker", "request_secret", t_request_secret,
      "Ask the owner for a key or a login that the fleet does not hold: one that they want you to use, in your owner "
      "chat in reply to their newest message to you, or one that your task needs, in its session. The owner types it "
-     "into a secure form, so the value goes straight into the vault and never passes you, your runtime or a chat: "
-     "never ask them for one in words. Your request proposes only you as its holder, and the owner chooses in their "
-     "form. The owner's answer names it, its reference (bws://...) and who holds it, never the value. In your chat it "
-     "comes as a message that needs no reply, and you open the work that needs it with start_task only after it. In a "
+     "into a secure form, straight into the vault: never ask for one in words. Your request proposes only you as its "
+     "holder; the owner chooses. Their answer names it, its reference (bws://...) and holders, never the value. In "
+     "your chat it comes as a message that needs no reply, and you open the work that needs it with start_task only "
+     "after it. In a "
      "task, the task waits for it: end your turn, and if the owner saves it, this session goes on once your machine's "
-     "vault has it.",
+     "vault has it. A task's request leaves Needs you when that task ends. " + SECRET_RENEW,
      S({"kind": {"type": "string", "enum": list(SECRET_KINDS),
                  "description": "api_key (the default): a key that your vault sends with call_api. login: a user name "
                                 "and a password that your vault signs in with."},
@@ -48999,9 +49205,10 @@ TOOLS = [
                                                  "key needs none: the hub names it DOOR_<its door name>_KEY in the "
                                                  "vault"},
         "site": {"type": "string", "description": "The address where it is used, with https://: a login's sign-in "
-                                                  "page, or the API that your vault sends the key to (required)"},
+                                                  "page, or the API that your vault sends the key to (required, "
+                                                  "except with failed)"},
         "account": {"type": "string", "description": LOGIN_ACCOUNT},
-        "failed": {"type": "string", "description": LOGIN_FAILED_OWN},
+        "failed": {"type": "string", "description": SECRET_FAILED_OWN},
         "note": {"type": "string", "description": SECRET_NOTE_FIELD},
         "why": {"type": "string", "description": f"What the work needs it for, in a sentence or two, at most "
                                                  f"{NEED_WHY_CHARS} characters: the owner reads it before they type "
@@ -49019,10 +49226,10 @@ TOOLS = [
                                                   "of an app on a host, for example app:shop:STRIPE_SECRET_KEY, "
                                                   "which `ops <host> env-new <app> <NAME> key` puts in the app's "
                                                   "settings. The card gives it to the door, not to you, and you "
-                                                  "never hold it. " + DOOR_CLOUDFLARE_KEY + ". Only an agent "
+                                                  "never hold it. " + DOOR_KEY_STEPS + ". Only an agent "
                                                   "that holds servers through the door asks for one: the door knows "
                                                   "no other agent."}},
-       ["why", "site"])),
+       ["why"])),          # site: required in code, except for a new value of a key that the fleet holds (failed)
     # owner feature secret_notes: the note of a secret, which each agent that holds it reads beside its name
     ("all", "note_secret", t_note_secret,
      "Write the note of a secret that you hold (the manager: of any secret), or change it: which account or key "
@@ -55780,6 +55987,7 @@ def tick():
         step(manager_flag_update, t0)
         step(fault_flush, t0)               # the lane "Bug reports": what diagnostics.py counted in this pass
         step(error_report_sweep, t0)        # the lane "Error reports": the day's report, while the owner has it on
+        step(licence_sweep, t0)             # Founderizer for Teams: the licence's own poll, only with a licence
         step(tick_changes, t0)
         # The last line of the pass, and the only thing that says the pass reached it (tick_heartbeat). It moves
         # unless a step that restarts work raised: the warning it holds up says "no stuck task or session is
@@ -63704,6 +63912,11 @@ def save_secret(body):
     # A reference that is saved again keeps its site, and an API key its form (the key swap): without them the key
     # would be a variable in the sessions again, with no sign.
     before = (team.get("logins") or {}).get(ref) or {}
+    if before and body["fingerprints"] and door_key_of(team, ref).startswith("app:"):
+        # A setting of an app on a host keeps the value that it has in the app's own settings file, which no route of
+        # the door writes again (env-new writes only a setting that the app does not have): a new value here would
+        # reach the vault and never the app (the Door area, 21 November 2026). key_failed refuses its ask too.
+        raise Refusal(409, code="secret_app_setting", names={"name": before.get("env") or ref})
     if entry.get("kind") == "api_key" and before.get("env") != entry["env"] and key_named(team, entry["env"], ref):
         # The owner, 13 November 2026: "having 2 keys named the same should not be possible". This is the one write
         # of a key's variable name, so each path ends here: Add secret, a request's card, an import, the GitHub App
@@ -63747,7 +63960,8 @@ def save_secrets(body):
     in: a field that is not valid, a reference that is in the list twice (400, from the route), a title or a variable
     that holds a value, of the catalog or of the same list (422, from the route's read, before the hub keeps the
     command), a new API key whose variable name the catalog has, or an entry before it that the hub took (409,
-    key_named), and an entry that the catalog has no room for (400). An entry is registered as save_secret registers
+    key_named), a new value of a setting of an app on a host (409, the words of secret_app_setting), and an entry that
+    the catalog has no room for (400). An entry is registered as save_secret registers
     one: its fingerprints first, so a commit that fails leaves them, and the same step again finds them. Only a refusal
     of team.json itself (validate_team) refuses the whole list, with 400, and a profile that git does not give now while
     an entry has a row of the table (key_hold_index), with 503 profile_unread, before anything is written. No value
@@ -63773,6 +63987,11 @@ def save_secrets(body):
             results.append({"login": ref, "status": 409, "error": f"The list already has an API key named "
                                                                    f"{entry['env']}, and it takes no second key of that "
                                                                    f"name."})
+            continue
+        if was and item["fingerprints"] and door_key_of(team, ref).startswith("app:"):
+            # a new value of an app's setting on a host, as save_secret refuses it: the app keeps the old one
+            results.append({"login": ref, "status": 409, "error": refusal_words.words(
+                "secret_app_setting", {"name": was.get("env") or ref})})
             continue
         stored, known = register_fingerprints(ref, item["fingerprints"], newest=True) if item["fingerprints"] else (0, 0)
         entry.update({k: was[k] for k in key_kept_fields(was, entry) if k in was})
@@ -70302,6 +70521,18 @@ def teams_licence():
     return row["token"] if teams_held(row) and row["token"] else None
 
 
+def teams_token(token):
+    """The claims of `token` when it is a licence of Founderizer for Teams for this fleet that our entitlement key
+    signed, else None: the only token that may take the place of one, because only the signed word turns Teams off
+    (the licence's poll, licence_take, and the release poll, poll_release)."""
+    try:
+        claims = releases.read_entitlement(token, entitlement_keys())
+    except releases.Untrusted:
+        return None
+    ours = claims["verified"] and claims["fleet"] == kv_get("fleet_id") and claims["plan"] == TEAMS_PLAN
+    return claims if ours else None
+
+
 def need_teams(part_there=True):
     """The one place that refuses for a Teams part. teams_off: this fleet does not have Teams. teams_part_missing:
     it has Teams, and the caller says that this hub has not loaded the part."""
@@ -70314,8 +70545,8 @@ def need_teams(part_there=True):
 def teams_moved():
     """The kept licence changed (a token was stored, or the signed word was marked): wake each thread of a Teams part
     that waits on TEAMS_WAKE, so that it reads teams_on() and teams_licence() again at once. Its caller can hold LOCK
-    (store_entitlement runs in the act of an owner command and in the release poll, which hold it), so a thread reads
-    those two after its wait, never while it holds TEAMS_WAKE."""
+    (store_entitlement runs in the act of an owner command, in the release poll and in the licence's poll, which hold
+    it), so a thread reads those two after its wait, never while it holds TEAMS_WAKE."""
     with TEAMS_WAKE:
         TEAMS_WAKE.notify_all()
 
@@ -70350,29 +70581,182 @@ def teams_state():
                       "ended": None if row["ended"] is None else int(row["ended"])}}
 
 
-def take_ended_word(word):
+def take_ended_word(word, say=None):
     """The channel's signed word that the licence of the token which this hub holds ended: the one way that teams_on()
     goes false. releases.read_ended checks its shape, this fleet, the SHA-256 of the token held now and a key of
-    entitlement-key.pub. It is marked only while the row still holds the token that it names, so a token that a
-    claim stored in the meantime is not ended by it. Any other word changes nothing and leaves one log line. True
-    when the word was marked."""
-    row = q1("SELECT token FROM entitlement WHERE id=1")
-    token = row["token"] if row else None
+    entitlement-key.pub. It is marked only while the row still holds the token that it names, as that token was
+    stored, so a token that a claim stored in the meantime is not ended by it. Any other word changes nothing and
+    gives one line to `say` (the hub's log; the licence's poll passes licence_said, so that a word which comes again
+    each hour is said once). True when the word was marked.
+
+    A word whose `at` is before the second in which the hub stored its token is refused too (the coordinator's
+    decisions D45 a and D53, 21 and 22 November 2026): a licence that moves to another fleet and back in the same
+    period comes back as a token of the same bytes, for which the word of the first move is still signed. The two are
+    compared in whole seconds, because our side writes `at` as whole seconds: a real end in the same second as the
+    store is taken. The licence's poll keeps `stored` where the token first came (licence_take), so the word of an end
+    after that moment is taken."""
+    say = say or (lambda line: log("hub", line))
+    row = q1("SELECT token, stored FROM entitlement WHERE id=1")
+    token, stored = (row["token"], row["stored"]) if row else (None, None)
     try:
         if not token:
             raise releases.Untrusted("this fleet holds no licence")
         word = releases.read_ended(word, kv_get("fleet_id"), token, entitlement_keys())
+        if word["at"] < int(stored):
+            raise releases.Untrusted(f"it is older than the token that this fleet stored at {clock(stored)}")
     except releases.Untrusted as e:
-        log("hub", f"the word that this fleet's licence ended was not taken: {e}")
+        say(f"the word that this fleet's licence ended was not taken: {e}")
         return False
     with LOCK:
-        if not q1("SELECT 1 AS held FROM entitlement WHERE id=1 AND token=?", (token,)):
-            log("hub", "the word that this fleet's licence ended names a token that this fleet no longer holds")
+        if not q1("SELECT 1 AS held FROM entitlement WHERE id=1 AND token=? AND stored=?", (token, stored)):
+            say("the word that this fleet's licence ended names a token that this fleet no longer holds")
             return False
         q("UPDATE entitlement SET ended=?, ended_word=? WHERE id=1", (word["at"], json.dumps(word, sort_keys=True)))
     teams_moved()
     log("hub", f"the release channel says, signed, that this fleet's licence ended at {clock(word['at'])}")
     return True
+
+
+# ---- Founderizer for Teams: the licence's own poll (teams-design-1-shop-and-licence.md, 3.10; J6)
+#
+# While this fleet holds a licence, the hub asks the release channel for it one time each LICENCE_POLL, at the hub's
+# start and right after a new token, with the count of its active agents (POST /api/entitlement/renew,
+# releases.renew). It keeps what comes back by its signature, never by its status: a token that our key signed for
+# this fleet with plan `teams` (a new period, a new count of agents), or the signed word that the licence ended
+# (take_ended_word). Each other answer, and no answer, changes nothing: the launch's rule 5, silence changes nothing.
+# After the word it asks one time a LICENCE_DAY, LICENCE_ASKS times, with no count, and then makes no call: the way
+# back with no step of the owner, when our records have this fleet bound and live again. A fleet with no licence
+# makes no call at all.
+#
+# It runs only on a hub that hub.sh installed (installed_hub), so no hub of a test asks, and only to founderizer.com
+# or a host below it (releases.licence_endpoint). The switch of automatic updates does not hold it. The call runs in
+# a thread of its own, as the error report's does, because a call over the network must not hold the tick.
+
+LICENCE_POLL = 3600             # seconds between two polls while Teams is on
+LICENCE_DAY = 86400             # seconds between two asks after the word "ended"
+LICENCE_ASKS = 30               # the asks after the word; then no call
+LICENCE_ASKED = "licence_sweep_at"      # kv, quiet: the asks after the word, {"token": <its SHA-256>, "asks", "at"}
+# The one poll that may run at a time; the SHA-256 of the token that the last poll sent, and when, which a start of
+# the hub forgets, so that the first tick polls; and the line that the poll wrote last to the log.
+_licence = {"thread": None, "token": None, "at": 0.0, "said": None}
+
+
+def licence_sweep(t0):
+    """Once a pass of the tick (under LOCK): start the licence's poll when it is due, in a thread of its own. With a
+    licence that did not end, the poll is due when the hub holds another token than the last poll sent (the hub's
+    start, a claim, the owner's route) or LICENCE_POLL after it, and it sends the count of the agents of team.json
+    that are active: the manager is one of them, and an agent in setup is not. After the word, one ask is due a
+    LICENCE_DAY after the one before, with no count, until LICENCE_ASKS asks went; an ask is counted before it goes,
+    so that a fault or a stop of the hub cannot make it go again and again."""
+    if not installed_hub():
+        return
+    thread = _licence["thread"]
+    if thread is not None and thread.is_alive():
+        return
+    row = q1("SELECT token, plan, verified, ended, stored FROM entitlement WHERE id=1")
+    if not (row and row["token"] and row["verified"] and row["plan"] == TEAMS_PLAN):
+        return                  # no licence that our key signed: no call
+    try:
+        url = releases.licence_endpoint(release_channel())
+    except releases.Untrusted as e:
+        licence_said(str(e))
+        return
+    digest = hashlib.sha256(row["token"].encode()).hexdigest()
+    if row["ended"] is None:
+        if digest == _licence["token"] and 0 <= t0 - _licence["at"] < LICENCE_POLL:
+            return
+        _licence.update(token=digest, at=t0)
+        count = sum(1 for name in agents() if agent_active(name))
+    else:
+        asked = licence_asked(digest)
+        if asked["asks"] >= LICENCE_ASKS or 0 <= t0 - asked["at"] < LICENCE_DAY:
+            return
+        kv_set(LICENCE_ASKED, json.dumps(dict(asked, asks=asked["asks"] + 1, at=t0)))
+        count = None
+    thread = threading.Thread(target=licence_poll, args=(url, row["token"], row["stored"], count, t0),
+                              name="licence-poll", daemon=True)
+    _licence["thread"] = thread
+    thread.start()
+
+
+def licence_asked(digest):
+    """The asks after the word for the token whose SHA-256 is `digest`, as {"token", "asks", "at"}. The asks that the
+    end of another token counted, or a value out of shape, are none."""
+    try:
+        asked = json.loads(kv_get(LICENCE_ASKED) or "null")
+    except ValueError:
+        asked = None
+    if not (isinstance(asked, dict) and asked.get("token") == digest and isinstance(asked.get("asks"), int)
+            and isinstance(asked.get("at"), (int, float))):
+        return {"token": digest, "asks": 0, "at": 0.0}
+    return asked
+
+
+def licence_poll(url, token, stored, count, t0):
+    """One licence's poll, outside LOCK (releases.renew), and then what the hub keeps of its answer, under LOCK."""
+    try:
+        answer = releases.renew(url, token, count)
+        with LOCK:
+            licence_take(answer, token, stored, t0)
+    except Exception:
+        print_fault()
+
+
+def licence_take(answer, token, stored, t0):
+    """What the hub keeps of one answer of the licence's poll that went at `t0`, under LOCK, and only while the row
+    still holds the token that the poll sent, as it was stored then: a token that a claim or the owner's route stored
+    during the poll wins, also one of the same bytes.
+
+    - The token that the row holds already, while its licence did not end, changes only `renews`, by one small write
+      when it differs (the coordinator's note on H1 step 1): a full store each hour would write a log line, wake the
+      apps and the parts' threads, and move `stored`, after which take_ended_word would refuse the word of an end that
+      came before the last poll. Its signature is not checked again, because the row's was at its store: so the
+      hourly answer costs no check of a signature under LOCK, and a release that replaced the key refuses nothing.
+    - Each other token is kept only when our key signed it for this fleet with plan `teams` (teams_token), and then
+      it takes the row's place through store_entitlement: a new period, a new count of agents, or a licence that is
+      live again after the word. Another key's, another fleet's or another plan's token is not kept, because only the
+      word turns Teams off.
+    - The word "ended" goes to take_ended_word, which checks it, and the asks after it start from none.
+    - Each other answer changes nothing. Each line of this goes to the log once while it comes again (licence_said)."""
+    row = q1("SELECT token, stored, ended FROM entitlement WHERE id=1")
+    if not (row and row["token"] == token and row["stored"] == stored):
+        log("hub", "the licence's poll came back after this fleet stored another token, so its answer is not kept")
+        return
+    if answer["token"] and answer["token"] == token and row["ended"] is None:
+        licence_said(None)
+        if answer["renews"] is not None:
+            renews = int(answer["renews"])
+            q("UPDATE entitlement SET renews=? WHERE id=1 AND renews IS NOT ?", (renews, renews))
+        return
+    if answer["token"]:
+        if not teams_token(answer["token"]):
+            licence_said("the licence's poll got a token that is not this fleet's licence signed by our entitlement "
+                         "key, so the hub did not keep it")
+            return
+        try:
+            store_entitlement(answer["token"], answer["renews"])
+        except (Refusal, releases.Untrusted) as e:
+            licence_said(f"the licence's poll got a token that the hub did not keep: {e}")
+            return
+        licence_said(None)
+        _licence.update(token=hashlib.sha256(answer["token"].encode()).hexdigest(), at=t0)      # its poll went
+        return
+    if answer["ended"] is not None:
+        if row["ended"] is None and take_ended_word(answer["ended"], say=licence_said):
+            licence_said(None)
+            kv_set(LICENCE_ASKED, json.dumps({"token": hashlib.sha256(token.encode()).hexdigest(), "asks": 0,
+                                              "at": t0}))
+        return
+    licence_said(answer["says"])
+
+
+def licence_said(line):
+    """A line of the licence's poll for the log, written only when it is not the line that it wrote last: a channel
+    that refuses for weeks writes one line, not one each hour. None: the poll went well, so the next refusal is
+    written again."""
+    if line and line != _licence["said"]:
+        log("hub", line)
+    _licence["said"] = line
 
 
 # ---- what the fleet knows about releases
@@ -70893,7 +71277,14 @@ def poll_release(fetch=None):
         kv_set("releases_status", answer["status"])
         kv_set("releases_said", answer["says"] or None)
         q("UPDATE entitlement SET channel_said=?, channel_at=? WHERE id=1", (answer["says"], t0))
-        if answer["entitlement"] and answer["entitlement"] != token:
+        kept = q1("SELECT plan, verified FROM entitlement WHERE id=1")
+        if answer["entitlement"] and answer["entitlement"] != token and kept and kept["verified"] and \
+                kept["plan"] == TEAMS_PLAN and not teams_token(answer["entitlement"]):
+            # While the row holds a licence of Founderizer for Teams, only a licence takes its place (the
+            # coordinator's decision of 22 November 2026): a token of another plan would turn Teams off with no word.
+            log("hub", "the release channel sent a token that is not this fleet's licence of Founderizer for Teams, "
+                       "so the hub did not keep it")
+        elif answer["entitlement"] and answer["entitlement"] != token:
             try:
                 store_entitlement(answer["entitlement"])        # 4.5: a fresh one for the old one, near expiry
             except (Refusal, releases.Untrusted) as e:

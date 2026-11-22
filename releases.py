@@ -61,6 +61,7 @@ import tempfile
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # The configuration ref and the baseline of selftest.py belong to other packages; this module reads them and
@@ -558,18 +559,117 @@ def read_ended(raw, fleet, token, keys):
     return word
 
 
+# ---------------------------------------------------------------- POST /api/entitlement/renew: the licence's poll
+#
+# teams-design-1-shop-and-licence.md, 3.10 (J6). A hub that holds a licence of Founderizer for Teams asks the
+# channel for it one time each hour, with the count of its active agents, and keeps what comes back only by its
+# signature (hub.licence_take): a token that our key signed, or the signed word "ended". The licence goes only to our
+# own site over HTTPS, by the rule of errorreports.endpoint, and never to the address of a redirect.
+LICENCE_PATH = "/api/entitlement/renew"
+OUR_HOST = re.compile(r"(?:[a-z0-9-]+\.)*founderizer\.com")
+CHANNEL_PATH = re.compile(r"(?:/[A-Za-z0-9._~-]+)*")
+# The `error` codes of the route's answers (the platform's docs/CONTRACTS.md, "The licence poll"): the only word of
+# an answer that the hub's log keeps, and only one of these, so that no sender writes a word of its own there.
+ERROR_CODES = frozenset(("ended", "lapsed", "unbound", "no_licence", "unavailable", "too_many"))
+COUNT_MOST = 10000                               # the agents that one count may name, as a token's `agents`
+
+
+def licence_endpoint(channel):
+    """The address of the licence's poll on the fleet's release channel, which must be HTTPS at founderizer.com or a
+    host below it (each label letters, digits and hyphens), with no user name, query, fragment or odd path: never
+    `xfounderizer.com`. Untrusted for any other channel, so that a hub whose channel names another site sends its
+    licence nowhere."""
+    refused = Untrusted("the fleet's channel is not founderizer.com, so the licence's poll goes nowhere")
+    try:
+        parts = urllib.parse.urlsplit(str(channel or "").strip())
+        host, port = (parts.hostname or "").lower(), parts.port
+    except ValueError:
+        raise refused from None
+    if parts.scheme.lower() != "https" or not OUR_HOST.fullmatch(host) or parts.username is not None \
+            or parts.password is not None or parts.query or parts.fragment \
+            or not CHANNEL_PATH.fullmatch(parts.path.rstrip("/")):
+        raise refused
+    netloc = host if port is None else f"{host}:{port}"
+    return urllib.parse.urlunsplit(("https", netloc, parts.path.rstrip("/") + LICENCE_PATH, "", ""))
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an answer, never a second request: the licence goes to the one address that licence_endpoint
+    checked."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _post(url, token, body, timeout=CHANNEL_TIMEOUT):
+    """(status, text) of one POST of `body` as JSON, with the token as the bearer, following no redirect: a 3xx is
+    its own status. status 0 and the reason when no answer came."""
+    request = urllib.request.Request(url, data=json.dumps(body, separators=(",", ":")).encode(), method="POST",
+                                     headers={"Accept": "application/json", "Authorization": "Bearer " + token,
+                                              "Content-Type": "application/json", "User-Agent": "founderizer-hub"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    try:
+        with opener.open(request, timeout=timeout) as answer:
+            return answer.status, answer.read(65536).decode("utf-8", "replace")
+    except urllib.error.HTTPError as answer:
+        with answer:
+            return answer.code, answer.read(65536).decode("utf-8", "replace")
+    except (http.client.HTTPException, ValueError) as e:     # a status line or a header that is not HTTP: its class
+        return 0, type(e).__name__                          # only, because its text is the server's own line
+    except (urllib.error.URLError, OSError) as e:           # this machine's reason: no route, no name, no TLS, time
+        return 0, str(getattr(e, "reason", e))[:300]
+
+
+def renew(url, token, agents=None, *, timeout=CHANNEL_TIMEOUT):
+    """One licence's poll: POST `url` (licence_endpoint of the channel) with `token` as the bearer and the body
+    {"agents": <the count of the fleet's active agents>}, or {} with `agents` None (the asks after the word "ended"),
+    and nothing else of the fleet.
+
+    Returns {"status", "token", "renews", "ended", "says"}, and no answer makes it raise. `token`: the token of a 200,
+    unchecked (the hub keeps it only if our key signed it for this fleet), with `renews`, what the platform says of it
+    (None when the answer does not say it). `ended`: the word of a 410 `ended`, unchecked (hub.take_ended_word checks
+    it). `says`: one line for the hub's log, which holds the status and the answer's `error` code, never other words
+    of the answer. A status or a body that is none of these gives only `says`, and the hub changes nothing for it."""
+    if agents is not None and (isinstance(agents, bool) or not isinstance(agents, int)
+                               or not 0 <= agents <= COUNT_MOST):
+        raise ValueError("a count of agents is a whole number from 0 to 10000")
+    status, text = _post(url, token, {} if agents is None else {"agents": agents}, timeout)
+    answer = {"status": status, "token": None, "renews": None, "ended": None, "says": None}
+    if status == 0:
+        return dict(answer, says="the licence's poll got no answer from the release channel: " + text)
+    try:
+        raw = json.loads(text)
+    except (ValueError, RecursionError):        # RecursionError: JSON nested deeper than Python's stack takes
+        raw = None
+    raw = raw if isinstance(raw, dict) else {}
+    fresh, renews = raw.get("token"), raw.get("renews")
+    if status == 200 and isinstance(fresh, str) and TOKEN.fullmatch(fresh):
+        return dict(answer, token=fresh, renews=renews if isinstance(renews, bool) else None)
+    if status == 410 and raw.get("error") == "ended" and isinstance(raw.get("ended"), dict):
+        return dict(answer, ended=raw["ended"])
+    error = raw.get("error")
+    code = f" ({error})" if isinstance(error, str) and error in ERROR_CODES else ""
+    return dict(answer, says=f"the licence's poll got {status}{code} from the release channel")
+
+
 # ---------------------------------------------------------------- GET /releases/latest
 
 def _fetch(url, token=None, timeout=CHANNEL_TIMEOUT):
     """(status, body, headers). status 0 and the reason in the body when the channel did not answer. The
     entitlement goes as a bearer when this fleet holds one, and nothing else of this fleet goes with it; a fleet with
-    none sends no Authorization header."""
-    headers = {"Accept": "application/json", "User-Agent": "founderizer-hub"}
+    none sends no Authorization header.
+
+    The bearer goes to the channel's own address only, never to the address of a redirect: urllib copies each header
+    of a request into the request that follows a redirect, so until 22 November 2026 a channel that answered 302 sent
+    the licence to wherever it pointed. The release still follows a redirect, without the bearer, because the
+    channel answers every fleet with no token and the signature is the whole trust of a release: a fleet that holds
+    a token keeps its releases if the channel ever moves to another address."""
+    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "founderizer-hub"})
     if token:
-        headers["Authorization"] = "Bearer " + token
+        request.add_unredirected_header("Authorization", "Bearer " + token)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(urllib.request.Request(url, headers=headers), timeout=timeout) as answer:
+        with opener.open(request, timeout=timeout) as answer:
             return answer.status, answer.read(65536).decode("utf-8", "replace"), dict(answer.headers)
     except urllib.error.HTTPError as answer:
         with answer:
@@ -602,7 +702,7 @@ def latest(channel, keys, token=None, *, fetch=_fetch, timeout=CHANNEL_TIMEOUT, 
                 "says": f"the release channel answered {status}"}
     try:
         raw = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):        # RecursionError: JSON nested deeper than Python's stack takes
         return {"status": status, "manifest": None, "entitlement": None,
                 "says": "the release channel did not answer with JSON"}
     fresh = raw.get("entitlement") if isinstance(raw, dict) else None

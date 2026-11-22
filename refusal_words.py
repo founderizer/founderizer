@@ -152,6 +152,11 @@ WORDS = {
     # no route raises them before the seam that loads a part, and their words wait for the owner's yes to them.
     "teams_off": "This needs Founderizer for Teams, which this fleet does not have.",
     "teams_part_missing": "This fleet has Founderizer for Teams, but its hub has not loaded this part of it.",
+    # an answer of a request for a new value of a key that the fleet holds with another key, or with that key before
+    # the owner replaced its value (POST /ui/needs/<id>/secret, UI-API.md 1.295)
+    "secret_value_asked": "This request asks for a new value of {name}: type it in the request's form.",
+    # a new value of a door key of one setting of an app on a host (POST /ui/secrets/add, UI-API.md 1.295)
+    "secret_app_setting": "{name} is a setting of an app on a host: its new value changes on that host, not here.",
 }
 
 

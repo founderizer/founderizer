@@ -75,6 +75,50 @@ class Grants(VaultAccess):
         salt = self.request(f"/ui/secrets/salts?db=test-generation&login={login}")[1]["password"]
         return [{"kind": "password", "hash": hashlib.sha256((salt + value).encode()).hexdigest(), "len": len(value)}]
 
+    def test_a_new_value_of_an_app_s_setting_on_a_host_is_refused_and_a_plain_key_s_passes(self):
+        """A door key of one setting of an app on a host (app:<app>:<NAME>) keeps its old value in the app's own
+        settings file, which no route writes again. A new value saved here would reach the vault and never the app,
+        so the owner would believe that he replaced it while the agent's next call fails with the old one. The
+        replace is refused before anything is registered or committed, also for a token that the door uses under a
+        provider's name too (a check of only one name of the key lets it through), and also in an import (which had
+        no such check: the app's Replace was refused, and an import of the same reference passed); a replace of a
+        plain API key still passes."""
+        setting, other = "bws://71111111-2222-4333-8444-55555555555b", "sk-test-0ther-V4lue-2026"
+        token = "bws://71111111-2222-4333-8444-55555555555c"
+        team = self.committed()
+        team["logins"][setting] = {"title": "DOOR_APP_SHOP_STRIPE_SECRET_KEY", "kind": "api_key",
+                                   "env": "DOOR_APP_SHOP_STRIPE_SECRET_KEY"}
+        team["logins"][token] = {"title": "DOOR_CLOUDFLARE_ACME_KEY", "kind": "api_key",
+                                 "env": "DOOR_CLOUDFLARE_ACME_KEY"}
+        team["door"] = {"address": "127.0.0.20", "secrets": [setting, token],
+                        "credentials": {"app:shop:STRIPE_SECRET_KEY": {"secret": setting},
+                                        "cloudflare:acme": {"secret": token},
+                                        "app:shop:CLOUDFLARE_API_TOKEN": {"secret": token}}}
+        (self.root / "kit" / "team.json").write_text(json.dumps(team, indent=2) + "\n")
+        git("commit", "-q", "-am", "the door holds a setting of an app", cwd=self.root / "kit")
+        git("push", "-q", "origin", "HEAD", cwd=self.root / "kit")
+        hub._revision_cache.update(at=0.0, value=None)
+        before = self.commits()
+        code, answer = self.add(login=setting, title="DOOR_APP_SHOP_STRIPE_SECRET_KEY", kind="api_key",
+                                env="DOOR_APP_SHOP_STRIPE_SECRET_KEY", fingerprints=self.prints(setting, other))
+        self.assertEqual((code, answer.get("code"), answer.get("names")),
+                         (409, "secret_app_setting", {"name": "DOOR_APP_SHOP_STRIPE_SECRET_KEY"}), answer)
+        code, answer = self.add(login=token, title="DOOR_CLOUDFLARE_ACME_KEY", kind="api_key",
+                                env="DOOR_CLOUDFLARE_ACME_KEY", fingerprints=self.prints(token, other))
+        self.assertEqual((code, answer.get("names")), (409, {"name": "DOOR_CLOUDFLARE_ACME_KEY"}), answer)
+        entries = [{"login": ref, "title": env, "kind": "api_key", "env": env, "fingerprints": self.prints(ref, other)}
+                   for ref, env in ((setting, "DOOR_APP_SHOP_STRIPE_SECRET_KEY"), (token, "DOOR_CLOUDFLARE_ACME_KEY"))]
+        code, receipt = self.importing(entries)
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual([(r["status"], r["error"]) for r in receipt["results"]],
+                         [(409, hub.refusal_words.words("secret_app_setting", {"name": env}))
+                          for env in ("DOOR_APP_SHOP_STRIPE_SECRET_KEY", "DOOR_CLOUDFLARE_ACME_KEY")])
+        self.assertEqual(self.commits(), before)
+        self.assertFalse(hub.secret_hit("the key is " + other))         # nothing was registered for them
+        code, receipt = self.add(login=KEY, title="OPENAI_API_KEY", kind="api_key", env="OPENAI_API_KEY",
+                                 fingerprints=self.prints(KEY, other))
+        self.assertEqual((code, receipt["stored"]), (200, 1), receipt)
+
     def test_add_registers_the_fingerprints_and_the_catalog_entry_in_one_commit(self):
         self.assertIn("secret_grants", self.request()[1]["ui_features"])
         before = self.commits()

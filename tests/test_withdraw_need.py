@@ -346,7 +346,9 @@ class SecondLook(Withdraw):
 
     def test_a_chat_request_closes_when_its_agent_has_held_what_it_asks_for_a_while(self):
         """An hour, because the owner's own answer in the app gives the key a moment before it answers the card, and
-        that answer must not find the card closed (both reviews of 17 November 2026)."""
+        that answer must not find the card closed (both reviews of 17 November 2026). A chat request for a new value
+        of a key that the agent holds (failed) never closes so: the agent holds the old value, which fails, and a
+        close "given another way" an hour later drops the owner's card for it."""
         ref, other, login = ("bws://22222222-3333-4444-5555-666666666666", "bws://22222222-3333-4444-5555-777777777777",
                              "bws://22222222-3333-4444-5555-888888888888")
         spec = {"kind": "api_key", "env": "ACME_TOKEN"}
@@ -362,11 +364,13 @@ class SecondLook(Withdraw):
         named, failed = (self.item(nid, by="vps", kind="secret", raised=self.T, secret=json.dumps(
             dict({"kind": "login", "site": "https://shop.example.com/login", "reply": str(uuid.uuid4())}, **more)))
             for nid, more in ((64, {"account": "kim"}), (65, {"account": "Sam", "failed": login})))
+        renew = self.item(66, by="vps", kind="secret", raised=self.T,
+                          secret=json.dumps(dict(spec, failed=ref, reply=str(uuid.uuid4()))))
         hub.TEAM["logins"] = {ref: {"kind": "api_key", "env": "ACME_TOKEN", "title": "ACME_TOKEN"},
                               other: {"kind": "api_key", "env": "ACME_OTHER_TOKEN", "title": "ACME_OTHER_TOKEN"},
                               login: {"kind": "login", "title": "admin.example.com · sam"}}
         hub.TEAM["agents"]["vps"]["secrets"] = {other: "use", login: "use"}     # another name, another site
-        mine = (chat, waited, door, site, named, failed)
+        mine = (chat, waited, door, site, named, failed, renew)
         for t0 in (self.T + 60, self.T + 60 + 2 * hub.NEED_HELD_WAIT):
             hub.need_look_sweep(t0)
             self.assertEqual([n for n in self.open_ids() if n in mine], list(mine))
@@ -386,7 +390,7 @@ class SecondLook(Withdraw):
                           hub.NEED_CLOSED_BY))
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (site,))["answer"],
                          f"Closed by the hub: {hub.shown_role('vps')} holds a login for shop.example.com now, given another way.")
-        self.assertEqual([n for n in self.open_ids() if n in mine], [waited, door, named, failed])
+        self.assertEqual([n for n in self.open_ids() if n in mine], [waited, door, named, failed, renew])
         self.assertEqual(self.notices(), told)
         self.assertIsNone(hub.kv_get("need_held"))
         self.assertIn(f"[hub] The hub closed N-{chat} (vps: the API key ACME_TOKEN), N-{site} (vps: a login for "
