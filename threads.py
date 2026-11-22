@@ -783,15 +783,33 @@ class Translator:
         before = plan_entries(self.tasks, "content")
         self.task_calls.add(call)
         if name == "TaskCreate" and str(args.get("subject") or "").strip():
+            if self.tasks and all(task["status"] == "completed" for task in self.tasks):
+                # The program cleared a list whose steps were all done, and this task starts its next list: kept, the
+                # done steps of each earlier list stood in the plan, five and a new plan of two read "6 of 7" while
+                # the session stood at "1 of 2", and past 50 entries the newest steps fell off (plan_entries)
+                self.tasks.clear()
             self.tasks.append({"id": None, "call": call, "content": args["subject"], "status": "pending"})
             self.plan_count += 1
             self.plan_order[call] = self.plan_count
         elif name == "TaskUpdate":
             if len(self.task_waits) >= TASK_WAITS:      # the oldest wait, whose result never came (a session stopped)
                 self.task_waits.pop(next(iter(self.task_waits)))
-            self.task_waits[call] = args
+            # with the list as it stands at this call: the program runs the update before a later TaskCreate of the
+            # same message, whose call this translator reads before the update's result (claude_list_ended)
+            self.task_waits[call] = (args, list(self.tasks))
         after = plan_entries(self.tasks, "content")
         return [{"type": "plan", "entries": after}] if after != before else []
+
+    def claude_list_ended(self, listed):
+        """An update's result made each task of the list as it stood at the update's call done (`listed`), and a
+        TaskCreate came after that call: one message holds both, the program runs them in order and so cleared that
+        list before the new task, while their results come later. The new tasks are then the next list, as at a
+        TaskCreate after a list whose steps are all done (claude_task). `listed` holds the tasks themselves, so no id
+        of an object is used again while it is read."""
+        held = {id(task) for task in listed}
+        older = [task for task in self.tasks if id(task) in held]
+        if older and len(older) < len(self.tasks) and all(task["status"] == "completed" for task in older):
+            self.tasks[:] = [task for task in self.tasks if id(task) not in held]
 
     def claude_task_update(self, task, args):
         """One TaskUpdate on its task: its status, its subject, or its end ("deleted")."""
@@ -819,7 +837,7 @@ class Translator:
             # a task tool that the program refused (one that this session does not have) makes it no task session
             self.tasked = self.tasked or not block.get("is_error")
         if call in self.task_waits:     # an update, decided by its own result
-            args = self.task_waits.pop(call)
+            args, listed = self.task_waits.pop(call)
             # the program's own record of it (toolUseResult: success and taskId) in a session's file, and its words
             # only where a file has no such record (a sub-agent's): new words in a later release must not stop each step
             result = row.get("toolUseResult") if isinstance(row.get("toolUseResult"), dict) else None
@@ -835,6 +853,7 @@ class Translator:
                 return []
             before = plan_entries(self.tasks, "content")
             self.claude_task_update(task, args)
+            self.claude_list_ended(listed)
             after = plan_entries(self.tasks, "content")
             return [{"type": "plan", "entries": after}] if after != before else []
         task = next((t for t in self.tasks if t["call"] == call and t["id"] is None), None)

@@ -250,6 +250,28 @@ class Translation(unittest.TestCase):
                          [["Kept"], ["Refused"], ["Kept"], ["No such tool here"], ["Kept"], ["Refused too"], ["Kept"],
                           ["Wrong"], ["Taken"], ["Taken"], ["Never answered"], ["Refused again"], ["Taken"],
                           ["Not here either"], ["Next"], ["Next"], ["First"], ["Second"], ["Third"], ["Third"]])
+        # the program clears a list whose steps are all done, and the next TaskCreate starts a new list: a list with one
+        # step left keeps its done steps
+        rows = [use("n1", "TaskCreate", subject="First step", description="x"), result("n1", "", made="1"),
+                use("n2", "TaskCreate", subject="Second step", description="x"), result("n2", "", made="2"),
+                use("n3", "TaskUpdate", taskId="1", status="completed"), result("n3", "Updated task #1 status"),
+                use("n4", "TaskCreate", subject="Third step", description="x"), result("n4", "", made="3"),
+                use("n5", "TaskUpdate", taskId="2", status="completed"), result("n5", "Updated task #2 status"),
+                use("n6", "TaskUpdate", taskId="3", status="completed"), result("n6", "Updated task #3 status"),
+                use("n7", "TaskCreate", subject="A new plan", description="x"), result("n7", "", made="4")]
+        out, _ = translate("claude", rows)
+        three = ["First step", "Second step", "Third step"]
+        self.assertEqual([[e["content"] for e in r["entries"]] for r in out[1:]],
+                         [["First step"], ["First step", "Second step"], ["First step", "Second step"],
+                          three, three, three, ["A new plan"]])     # one step left at n4: the list goes on
+        # and when one message holds the update that ends the list and the next TaskCreate: the program runs the update
+        # first, while the create's call comes before the update's result here
+        rows = [use("m1", "TaskCreate", subject="Only step", description="x"), result("m1", "", made="1"),
+                use("m2", "TaskUpdate", taskId="1", status="completed"),
+                use("m3", "TaskCreate", subject="The next plan", description="x"),
+                result("m2", "Updated task #1 status"), result("m3", "", made="2")]
+        out, _ = translate("claude", rows)
+        self.assertEqual([[e["content"] for e in r["entries"]] for r in out[1:]][-1], ["The next plan"])
 
     def test_an_update_in_the_message_that_creates_its_task_reaches_the_plan(self):
         """The model often creates a task and marks it in progress in one message, whose calls all come before their
