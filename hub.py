@@ -304,6 +304,14 @@ CREATE TABLE IF NOT EXISTS goal_steps(id INTEGER PRIMARY KEY, goal INTEGER NOT N
   text TEXT NOT NULL, task INTEGER, state TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS spends(id INTEGER PRIMARY KEY, goal INTEGER NOT NULL, cents INTEGER NOT NULL,
   currency TEXT NOT NULL, what TEXT NOT NULL, task INTEGER, by TEXT NOT NULL, created REAL NOT NULL);
+-- owner feature chat_stop: each press of Stop in the chat box (chat_stop_act). request is the stopped row of
+-- ui_requests; line is the event of the hub's stop line, event the helper's event; hand is who pressed (request_hand).
+-- state: requested, stopped or not_confirmed (CHAT_STOP_OVER). A press again after not_confirmed changes
+-- the row, so a message has one row at most. cut is 1 once an answer of its helper cut a turn (helper_chat_stop),
+-- and reads holds the ids that such answers named (a JSON list), which the end of the press makes unread again.
+CREATE TABLE IF NOT EXISTS chat_stops(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, request TEXT NOT NULL,
+  state TEXT NOT NULL, created REAL NOT NULL, settled REAL, detail TEXT, line INTEGER, event INTEGER, hand TEXT,
+  cut INTEGER NOT NULL DEFAULT 0, reads TEXT);
 CREATE TABLE IF NOT EXISTS goal_holds(hold INTEGER PRIMARY KEY, goal INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS parent_holds(hold INTEGER PRIMARY KEY, parent INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS restart_holds(hold INTEGER PRIMARY KEY, by TEXT NOT NULL, reason TEXT, created REAL NOT NULL,
@@ -2128,9 +2136,13 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "need_pictures",     # the owner, 20 November 2026 ("the idea would be that Needs You shows multiple
                                     # options as images too"): this hub reads X-Fleet-Draws, and an item can have
                                     # `pictures`, one for each option (UI-API.md 1.285)
-               "agent_tags"]        # the owner, 20 November 2026 ("Name a helper", "Yes, as drawn", "Build tags
+               "agent_tags",        # the owner, 20 November 2026 ("Name a helper", "Yes, as drawn", "Build tags
                                     # now"): POST /ui/messages takes `mentions`, the @ tags of a message, and
                                     # messages[].mentions of GET /ui/state gives them (UI-API.md 1.288)
+               "chat_stop"]         # the owner, 21 November 2026 ("Yes, add Stop (Recommended)": "While the agent
+                                    # works on your message or your answer, Stop stands where Send stands. A press
+                                    # interrupts that turn, as Pause does for a task."): agents[].chat_stop of GET
+                                    # /ui/state and GET /ui/mobile, and POST /ui/chats/<agent>/stop (UI-API.md 1.301)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -3956,13 +3968,12 @@ def chat_waited_kinds(name, alias=""):
         f"{kind}='message'"
 
 
-def chat_waits_since(name):
-    """When the owner sent the newest chat message to this agent that still waits for its answer (owner feature
-    chat_waits), or None. It is the apps' own rule for the line "Thinking" under that message, on the rows that the
-    phone's list of chats does not read: the message is the newest that the line waits on (chat_waited_kinds: of kind
-    message, and for the manager his answer to a Needs-you item too), no report of the agent names it, and the agent
-    has written no report without a name at or after it. A report that the agent wrote first (pushed, message_owner)
-    is no reply. The end of a turn is not in it: turn_ended_after says that, and the app puts the two together."""
+def chat_waited(name):
+    """The owner's newest row in ui_requests that this agent's chat waits on, {request_id, created}, or None: the rule
+    of chat_waits_since without the end of a stop. The row is the newest that the line "Thinking" waits on
+    (chat_waited_kinds: of kind message, and for the manager his answer to a Needs-you item too), no report of the
+    agent names it, and the agent has written no report without a name at or after it. A report that the agent wrote
+    first (pushed, message_owner) is no reply."""
     asked = q1(f"SELECT request_id, created FROM ui_requests WHERE recipient=? AND {chat_waited_kinds(name)} "
                "ORDER BY created DESC, rowid DESC LIMIT 1", (name,))
     if not asked:
@@ -3970,13 +3981,470 @@ def chat_waits_since(name):
     said = q1("SELECT 1 FROM owner_reports WHERE agent=? AND pushed=0 AND "
               "(in_reply_to=? OR (in_reply_to IS NULL AND created>=?)) LIMIT 1",
               (name, asked["request_id"], asked["created"]))
-    return None if said else asked["created"]
+    return None if said else asked
 
 
-def mobile_agent(name, config):
+NOT_READ = object()         # a value that the caller did not read (chat_waits_since, chat_stoppable): they read it
+
+
+def chat_waits_since(name, stops=None, asked=NOT_READ):
+    """When the owner sent the newest chat message to this agent that still waits for its answer (owner feature
+    chat_waits), or None. It is the apps' own rule for the line "Thinking" under that message, on the rows that the
+    phone's list of chats does not read (chat_waited). A message whose press of Stop is over waits for nothing (owner
+    feature chat_stop, chat_stop_over). The end of a turn is not in it: turn_ended_after says that, and the app puts
+    the two together. stops: chat_stops_newest() of every agent, read once for a read of the state; asked: the
+    caller's chat_waited(name)."""
+    asked = chat_waited(name) if asked is NOT_READ else asked
+    if not asked:
+        return None
+    stop = (chat_stops_newest(name) if stops is None else stops).get(name)
+    return None if stop and stop["request"] == asked["request_id"] and chat_stop_over(stop) else asked["created"]
+
+
+# ---------------------------------------------------------------- owner feature chat_stop: Stop in the chat box
+#
+# The owner, 21 November 2026: "Yes, add Stop (Recommended)": "While the agent works on your message or your answer,
+# Stop stands where Send stands. A press interrupts that turn, as Pause does for a task. The chat stays open and you
+# write the correction." (~/dev/founderizer-plans/chat-stop-design-2026-11-21.md.) The hub decides when a press can
+# stop a turn (chat_stoppable: agents[].chat_stop of GET /ui/state and GET /ui/mobile). A press (POST
+# /ui/chats/<agent>/stop, chat_stop_act) keeps one row of chat_stops, closes the stopped message for each reader that
+# waits for its reply (NOT_STOPPED, and the flag `stopped` of its event for the helper's poll), writes one quiet line
+# for the agent (chat_stop_line) and asks its helper to interrupt the turn (the event chat_stop). Only a message that
+# the agent read can be stopped: the turn that runs works on it, and a newer message that it has not read yet, often the
+# owner's correction, stays open for the next read. No task is paused, and the hub makes no outcome: a worker's chat calls only the fleet's tools, each
+# one a write of the hub with its receipt, and the manager's records stay on its machine. The stop line tells the
+# agent to check a step that the stop cut.
+CHAT_STOP = "chat_stop"             # the feature of the hub (UI_FEATURES) and of the helper (lifecycle.FEATURES)
+# The state of a row of chat_stops that ends its work: stopped (the helper confirmed the interrupt, or the turn ended
+# before it). The others: requested (the helper interrupts the turn) and not_confirmed (the interrupt did not take: a
+# press again makes the row requested again).
+CHAT_STOP_OVER = ("stopped",)
+# The SQL test that no press of Stop names the owner's row `u` of ui_requests. Each reader that waits for the reply of a
+# chat message has it, so that nothing gives a stopped message to its session again, links a report to it, keeps a
+# switch waiting on it or says that it is late.
+NOT_STOPPED = "NOT EXISTS (SELECT 1 FROM chat_stops s WHERE s.request=u.request_id)"
+# The SQL test that the press of Stop of the row `u` is over (chat_stop_over): its helper confirmed it, or the agent
+# read the stop line. A press whose interrupt waits or did not take ends no wait (chat_late).
+STOP_OVER = ("EXISTS (SELECT 1 FROM chat_stops s LEFT JOIN events l ON l.id=s.line WHERE s.request=u.request_id AND "
+             "(s.state IN ('stopped') OR l.read_at IS NOT NULL))")
+CHAT_STOP_QUOTE = 120               # characters of the stopped message that the stop line quotes
+CHAT_STOP_OLDER_QUOTE = 60          # characters of each older message that the press closes, in the stop line
+CHAT_STOP_OLDER_NAMED = 10          # older messages that the stop line names with their words; the rest as a count
+# The newest row of chat_stops of each agent, with the time of its message and the read of its stop line: the index
+# chat_stop_agent gives each agent's newest id. "{}" is empty for every agent, or the test of one agent.
+CHAT_STOP_NEWEST = ("SELECT s.id, s.agent, s.request, s.state, u.created AS asked, e.read_at AS line_read "
+                    "FROM chat_stops s JOIN ui_requests u ON u.request_id=s.request LEFT JOIN events e ON e.id=s.line "
+                    "WHERE s.id IN (SELECT MAX(id) FROM chat_stops {}GROUP BY agent)")
+
+
+def chat_stops_newest(agent=None):
+    """{agent: its newest row of chat_stops (CHAT_STOP_NEWEST)}, of every agent in one read, or of one agent. A read
+    of the state reads it once for all the agents (AgentReads.stops, mobile_state). Only the newest row counts: a press
+    is only for the agent's newest message that waits (chat_stoppable), so a row of an older message is about a
+    message that no line waits on any more. read_rows only."""
+    rows = read_rows(CHAT_STOP_NEWEST.format("WHERE agent=? " if agent else ""), (agent,) if agent else ())
+    return {r["agent"]: r for r in rows}
+
+
+def chat_stop_over(stop):
+    """True when this press of Stop needs no more work: the helper confirmed the interrupt or the turn ended before it
+    (stopped), or the agent read the stop line. stop: a row of chat_stops_newest. STOP_OVER is the same test in SQL."""
+    return stop["state"] in CHAT_STOP_OVER or stop["line_read"] is not None
+
+
+# The newest row of the owner's that each named agent read, with whether a report took it (CHAT_READ_WAITING): one
+# statement for all of them, whatever their number. For each agent the index ui_request_recipient walks from its newest
+# message back to the first that it read: its messages that it has not read are the newest ones, and they are few. The
+# reports go through owner_reply_identity and owner_report_unnamed. "{}" holds one (name, manager) pair for each agent.
+CHAT_READ_WAITING = (
+    "WITH a(name, manager) AS (VALUES {}) SELECT a.name, u.request_id, u.created, "
+    "EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=a.name AND r.in_reply_to=u.request_id AND r.pushed=0) "
+    "OR EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=a.name AND r.in_reply_to IS NULL AND r.pushed=0 AND "
+    "r.created>=u.created) AS said FROM a JOIN ui_requests u ON u.rowid=(SELECT x.rowid FROM ui_requests x "
+    "JOIN events y ON y.id=x.event_id WHERE x.recipient=a.name AND (x.kind='message' OR a.manager AND x.kind='answer') "
+    "AND y.read_at IS NOT NULL ORDER BY x.created DESC, x.rowid DESC LIMIT 1)")
+
+
+def chat_read_waiting(names):
+    """{agent: {request_id, created}} of the newest row of the owner's that each of these agents read, when that row
+    still waits: no report of the agent names it, and it wrote no report without a name at or after it (the rule of
+    chat_waited, on the newest read row). Of kind message, and for the manager his answer to a Needs-you item too
+    (chat_waited_kinds). A row that it has not read yet is no turn of its. One read for all of them (CHAT_READ_WAITING),
+    and none for no name. read_rows only."""
+    names = list(names)
+    if not names:
+        return {}
+    rows = read_rows(CHAT_READ_WAITING.format(",".join(["(?,?)"] * len(names))),
+                     tuple(v for n in names for v in (n, int(role_of(n) == "manager"))))
+    return {r["name"]: {"request_id": r["request_id"], "created": r["created"]} for r in rows if not r["said"]}
+
+
+def chat_stoppers(reads):
+    """The agents whose press of Stop chat_stoppable can give now, by what agent_reads() read: an owner chat, active,
+    a helper that names chat_stop, no usage limit and no late message."""
+    return [name for name, conf in agents().items() if owner_chat(conf) and agent_active(name) and
+            CHAT_STOP in reads.features(name) and not reads.limits.get(name) and not reads.undelivered.get(name)]
+
+
+def chat_stoppable(name, reads=None, stops=None, asked=NOT_READ, turn=NOT_READ):
+    """The request_id of the owner's message or answer whose turn a press of Stop stops now (agents[].chat_stop), or
+    None. All of these are true: the agent has an owner chat, is active and its helper names the feature chat_stop;
+    no usage limit holds it and its newest message is not late (chat_undelivered); the message is the newest that it
+    read, and it still waits (chat_read_waiting): a newer message that it has not read, as the owner's correction, is
+    no turn of its and stays open; the turn that read it is not over (turn_ended_after is None or before the
+    message); no press of the agent waits for its helper (requested); and no press names that message, or that press
+    did not take (not_confirmed). The app shows Stop only while its own line moves, so a wait that is not the agent's
+    work shows no Stop. reads: agent_reads(); stops: chat_stops_newest() of every agent, for a read with no reads;
+    asked: the caller's chat_read_waiting of this agent (None for none), turn: its turn_ended_after."""
+    if not owner_chat(agents().get(name) or {}) or not agent_active(name) or \
+            CHAT_STOP not in (helper_features(name) if reads is None else reads.features(name)):
+        return None
+    if (active_limit(name) if reads is None else reads.limits.get(name)) or \
+            (kv_get(f"chat_undelivered:{name}") if reads is None else reads.undelivered.get(name)):
+        return None
+    if asked is NOT_READ:
+        asked = reads.waiting.get(name) if reads is not None else chat_read_waiting([name]).get(name)
+    if not asked:
+        return None
+    turn = turn_ended_after(name, reads=reads, stops=stops) if turn is NOT_READ else turn
+    if turn is not None and turn >= asked["created"]:
+        return None
+    stop = (reads.stops if reads is not None else stops if stops is not None else chat_stops_newest(name)).get(name)
+    if stop and (stop["state"] == "requested" or stop["request"] == asked["request_id"] and
+                 stop["state"] != "not_confirmed"):
+        return None
+    return asked["request_id"]
+
+
+def chat_stop_read(agent, data):
+    """The body of POST /ui/chats/<agent>/stop: `message`, the chat_stop that the app read. ValueError."""
+    message = data.get("message")
+    try:
+        if not isinstance(message, str) or str(uuid.UUID(message)) != message.lower():
+            raise ValueError()
+    except (ValueError, AttributeError):
+        raise ValueError("message must be the request_id that agents[].chat_stop names") from None
+    return {"agent": agent, "message": message.lower()}
+
+
+def chat_stop_quote(row, most):
+    """M-<its event id> ("its first words") of an owner's row of ui_requests, as the stop line names it."""
+    words = " ".join(str(row["text"] or "").split())
+    quote = cut_whole(words, most)
+    return f'M-{row["event_id"]} ("{quote}{"..." if len(quote) < len(words) else ""}")'
+
+
+def chat_stop_line(asked, tasks, older=()):
+    """The hub's one line to the agent about a press of Stop (owner feature chat_stop), in the words of read_messages:
+    a message is M-<its event id>. asked: the stopped row of ui_requests with its event_id, kind and text; older: the
+    rows of the owner's older messages that the agent read and did not answer, which the press closes with it (a press
+    stops the whole turn, as a pause does for a task: such a message would come again and start a turn by itself);
+    tasks: the open tasks that the agent opened or gave for them, which run on. The words say what a cut turn leaves,
+    because the hub records no outcome of a chat turn: the agent finds out what a cut step did before it does it again
+    (rule 9), and says so in its reply to the next message."""
+    what = "answer" if asked["kind"] == "answer" else "message"
+    text = (f"[hub] The owner pressed Stop in this chat for their {what} {chat_stop_quote(asked, CHAT_STOP_QUOTE)}: "
+            f"the hub interrupts the turn that works on it.")
+    if older:
+        named = [chat_stop_quote(r, CHAT_STOP_OLDER_QUOTE) for r in older[:CHAT_STOP_OLDER_NAMED]]
+        more = len(older) - len(named)
+        named += [f"{more} more"] if more else []
+        text += (f" The press closes their older {'messages' if len(older) > 1 else 'message'} that you read and did "
+                 f"not answer too: {', '.join(named[:-1]) + ' and ' if len(named) > 1 else ''}{named[-1]}.")
+    which = "those messages" if older else f"that {what}"
+    text += (f" Do not go on with that work, and do not answer {which}. The owner's next message says what they "
+             f"want: act on that. What the turn did before the stop stays done. If it stopped in the middle of a "
+             f"step that changes something outside the hub (a command, a file, a send), find out what that step did "
+             f"before you do it again, and say in your reply to their next message what state it is in.")
+    if tasks:
+        named = [f"T-{t['id']} ({cut_whole(' '.join(str(t['title'] or '').split()), 80)})" for t in tasks]
+        text += (f" Before the stop you opened or gave {', '.join(named[:-1]) + ' and ' if len(named) > 1 else ''}"
+                 f"{named[-1]} for {which}. {'They still run' if len(named) > 1 else 'It still runs'}. Do not "
+                 f"cancel or change {'them' if len(named) > 1 else 'it'} unless the owner says so.")
+    return text
+
+
+CHAT_STOP_LATE = "its turn ended before the interrupt"        # the detail of a press that no interrupt needs
+CHAT_STOP_TURN_END = "its turn ended after an interrupt that was not confirmed"
+# The invariant of Stop in the chat box, which chat_stop_end_rows keeps on each path:
+CHAT_STOP_INVARIANT = ("For a worker or a lead, whose chat reports no turn end, the read of a newer row of the "
+                       "owner's counts as the cut of the turn, and so does a confirmed answer after an earlier "
+                       "answer of the press that cut. When a press ends, by any path (a confirmed answer, a late answer, its settle at the read of a newer row of the owner's, a turn end, normal or not), each row that the cut turn read and did not answer becomes unread again, except the owner's messages that the press closed or that have a report; and nothing that a turn which ended normally handled comes again.")
+
+
+def chat_stop_due(agent, event_id, extra, t0):
+    """Whether the helper's delivery poll gives the event chat_stop of a press (Handler.events): only the event of
+    the press now, only while its row is requested, and only while the agent has read no message of the owner's that
+    is newer than the stopped message: the owner's correction can come before the press, unread while the turn runs,
+    and its read is a turn of the correction, which a late interrupt must never cut,
+    so the hub settles the row itself as stopped (CHAT_STOP_LATE) and interrupts nothing: a helper that was away at
+    the press polls again when it comes back. An event that is not given now is done for good, and the hub marks it
+    as taken (helper_ack), so that the poll's read never reads it again."""
+    row = q1("SELECT * FROM chat_stops WHERE id=?", (extra.get("stop"),))
+    live = row is not None and row["state"] == "requested" and row["agent"] == agent and row["event"] == event_id
+    newer = q1(f"SELECT MIN(e.read_at) AS t FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.recipient=? "
+               f"AND {chat_waited_kinds(agent, 'u.')} AND u.created>(SELECT created FROM ui_requests WHERE request_id=?) "
+               f"AND e.read_at IS NOT NULL AND {NOT_STOPPED}", (agent, row["request"]))["t"] if live else None
+    if live and newer is None:
+        return True
+    if newer is None:   # a press that is settled, or an event of a press before this one: nothing the owner sees
+        with area("quiet"):
+            q("UPDATE events SET helper_ack=COALESCE(helper_ack,?) WHERE id=?", (t0, event_id))
+        return False
+    with transaction():         # the end of the stop wakes the apps: a write of the area "state"
+        # settled: the read of the correction, where the cut turn's rows end (chat_stop_unread's until)
+        DB.execute("UPDATE chat_stops SET state='stopped', settled=?, detail=? WHERE id=? AND state='requested'",
+                   (newer, CHAT_STOP_LATE, row["id"]))
+        DB.execute("UPDATE events SET helper_ack=COALESCE(helper_ack,?) WHERE id=?", (t0, event_id))
+        if row["cut"]:          # an earlier answer of this press cut the turn
+            chat_stop_end_rows(agent, row, [], until=newer)
+    log(agent, f"S-{row['id']}: the agent read a newer message of the owner's before the interrupt, so the press is "
+               f"settled with no interrupt")
+    return False
+
+
+def chat_stop_newer_read(agent, stop):
+    """The first read of a row of the owner's to `agent` (of the kinds that its chat waits on) that is newer than the
+    message of this press and not stopped itself, or None: the read of the correction (chat_stop_due)."""
+    return read_row(f"SELECT MIN(e.read_at) AS t FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE "
+                    f"u.recipient=? AND {chat_waited_kinds(agent, 'u.')} AND u.created>(SELECT created FROM "
+                    f"ui_requests WHERE request_id=?) AND e.read_at IS NOT NULL AND {NOT_STOPPED}",
+                    (agent, stop["request"]))["t"]
+
+
+def chat_stop_unread(agent, reads, stop, until=None):
+    """The messages of a cut turn that a confirmed press of Stop makes unread again (Handler.helper_chat_stop), so
+    that the poll gives them again and the session reads them in a new turn, with the stop line. For the manager,
+    reads: the ids that its helper read in the session's own conversation file, after its last turn that ended
+    normally (fleet.unfinished_turn_reads). A worker's or a lead's chat read names no ids that its helper can find
+    there (fleet.read_ids reads only the manager's first line), so for it the hub takes its own rows: each chat of the
+    agent that was read at or after the read of the stopped message (stop: its row of chat_stops). An id counts when
+    it is this agent's message, is read, is no stopped message and no stop line (CHAT_STOPPED: the flag of each), comes
+    again once it is unread (the manager's "say"; a worker's or a lead's chat with a flag of CHAT_FLAGS: a task's
+    result, an agent's message; an owner's chat message comes again by itself until its reply), and no session of another runtime read it last (read_by, as handover_ids), which finished it since.
+    A row of the owner's own (one that a row of ui_requests names) only when no report names it or took its turn:
+    one that has a report is answered, and a second read of it would answer it twice; one that the press closed has
+    its flag (CHAT_STOPPED); and another one, as the correction that the cut turn read or the owner's answer to a
+    secret request of the chat, waits for its turn. until: the time up to which a worker's
+    rows count, when the press ended at the read of the owner's correction (chat_stop_due): the rows of the
+    correction's turn are no rows of the cut turn. read_rows only."""
+    runtime, manager = (agents().get(agent) or {}).get("runtime"), role_of(agent) == "manager"
+    owners = ("NOT EXISTS (SELECT 1 FROM ui_requests o WHERE o.event_id=e.id AND (EXISTS (SELECT 1 FROM "
+              "owner_reports r WHERE r.agent=o.recipient AND r.in_reply_to=o.request_id) OR EXISTS (SELECT 1 FROM "
+              "owner_reports r WHERE r.turn=o.request_id)))")
+    if manager:
+        wanted = sorted({i for i in reads if 0 < i < 2 ** 63})
+        rows = read_rows(f"SELECT e.id, e.kind, e.extra FROM events e WHERE e.agent=? AND e.read_at IS NOT NULL AND "
+                         f"e.id IN ({','.join('?' * len(wanted))}) AND {owners} ORDER BY e.id",
+                         (agent, *wanted)) if wanted else []
+    else:
+        rows = read_rows("SELECT e.id, e.kind, e.extra FROM events e WHERE e.agent=? AND e.kind='chat' AND "
+                         "e.read_at>=(SELECT m.read_at FROM ui_requests u JOIN events m ON m.id=u.event_id WHERE "
+                         f"u.request_id=?) AND {owners}" + (" AND e.read_at<?" if until is not None else "") +
+                         " ORDER BY e.id", (agent, stop["request"]) + ((until,) if until is not None else ()))
+    out = []
+    for r in rows:
+        extra = json.loads(r["extra"] or "{}")
+        extra = extra if isinstance(extra, dict) else {}
+        if any(extra.get(k) is not None for k in CHAT_STOPPED) or extra.get("read_by") not in (None, runtime):
+            continue
+        told = extra.get("told")
+        if extra.get("task_result") is not None and type(told) is int and told > 0:
+            continue        # a result that the agent told the owner already (message_owner, owner_reports.id)
+        if r["kind"] == "say" if manager else r["kind"] == "chat" and any(extra.get(k) for k in CHAT_FLAGS):
+            out.append(r["id"])
+    return out
+
+
+def chat_stop_kept(row):
+    """The ids that the answers of this press that cut a turn named (chat_stops.reads)."""
+    try:
+        kept = json.loads(row["reads"] or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [i for i in kept if type(i) is int] if isinstance(kept, list) else []
+
+
+def chat_stop_end_rows(agent, row, reads, until=None, kept=True):
+    """Inside the caller's transaction: the end of a press whose helper cut a turn, by each path (its confirmed
+    answer, a late answer, its settle at the read of a newer row of the owner's, the manager's turn end): the
+    messages that the cut turn read are unread again (chat_stop_unread), with the ids that its answers named
+    (chat_stops.reads, unless kept is false) and `reads`. The manager's confirmed answer names its reads now, from its
+    records since the last normal turn end, and the kept ones would be of a turn that ended normally since: so that
+    answer gives only its own (kept false). The ids made unread. Each path calls it, and only for a press that cut, so it
+    keeps the invariant of Stop in the chat box: When a press ends, by any path (a confirmed answer, a late answer, its settle at the read of a newer row of the owner's, a turn end, normal or not), each row that the cut turn read and did not answer becomes unread again, except the owner's messages that the press closed or that have a report; and nothing that a turn which ended normally handled comes again."""
+    in_transaction("chat_stop_end_rows")
+    again = chat_stop_unread(agent, sorted(set(chat_stop_kept(row) if kept else ()) | set(reads)), row, until)
+    if again:           # read by the cut turn: unread again, in their own order
+        DB.execute(f"UPDATE events SET read_at=NULL WHERE id IN ({','.join('?' * len(again))})", tuple(again))
+    return again
+
+
+def chat_stop_turn_end(agent, end, t0):
+    """The manager's turn ended (Handler.helper_turn): a press whose helper said not_confirmed ends now, as stopped:
+    the turn end takes away Stop, so no press again comes for it. What the cut turn read comes again only when its
+    helper cut it and a turn end that was not normal came after the press (chat_stop_cut_after: kv turn_cut:<agent>,
+    the time of the newest end whose stop reason was not end_turn, as the helper reports it); a turn that ended
+    normally handled what it read. Only a press before that turn end (end). Committing; the ids made unread."""
+    again = []
+    for row in read_rows("SELECT * FROM chat_stops WHERE agent=? AND state='not_confirmed' AND created<?",
+                         (agent, end)):
+        with transaction():
+            DB.execute("UPDATE chat_stops SET state='stopped', settled=?, detail=? WHERE id=? AND "
+                       "state='not_confirmed'", (t0, CHAT_STOP_TURN_END, row["id"]))
+            if row["cut"] and chat_stop_cut_after(agent, row):
+                again += chat_stop_end_rows(agent, row, [])
+        log(agent, f"S-{row['id']}: its turn ended after an interrupt that was not confirmed")
+    return again
+
+
+def chat_stop_cut_after(agent, row):
+    """True when a turn end of the manager's that was not normal (kv turn_cut:<agent>, the newest such end) came after
+    this press: the turn that the press cut ended so, also when a normal end came after it."""
+    kept = read_row("SELECT v FROM kv WHERE k=?", (f"turn_cut:{agent}",))     # read_row: also inside a transaction
+    return float(kept["v"] if kept else 0) > row["created"]
+
+
+def chat_stop_read_end(agent, ids, t):
+    """Under LOCK, in a read_messages of a worker or a lead that marked `ids` read at `t`: a press of this agent whose
+    helper's interrupt cut and was not confirmed ends at the read of a newer row of the owner's (the correction's turn
+    reads it), as stopped, with that read as the end of the cut turn's rows: such a chat reports no turn end, so that
+    read counts as the cut. Never the manager's press: its turn end always comes and says whether it was normal
+    (chat_stop_turn_end), and the same running turn can read the correction after an Esc that did not take. A requested press ends so at the helper's next poll
+    (chat_stop_due). Committing; the ids made unread."""
+    if not ids:
+        return []
+    newer = read_row(f"SELECT MIN(u.created) AS c FROM ui_requests u WHERE u.recipient=? AND "
+                     f"{chat_waited_kinds(agent, 'u.')} AND u.event_id IN ({','.join('?' * len(ids))})",
+                     (agent, *ids))["c"]
+    again = []
+    if newer is None:
+        return again
+    for row in read_rows("SELECT s.* FROM chat_stops s JOIN ui_requests u ON u.request_id=s.request WHERE s.agent=? "
+                         "AND s.state='not_confirmed' AND s.cut=1 AND u.created<?", (agent, newer)):
+        with transaction():
+            DB.execute("UPDATE chat_stops SET state='stopped', settled=?, detail=? WHERE id=? AND "
+                       "state='not_confirmed'", (t, CHAT_STOP_LATE, row["id"]))
+            again += chat_stop_end_rows(agent, row, [], until=t)
+    return again
+
+
+def chat_stop_refusal(asked):
+    """The words of a tool that the agent calls for a message that a press of Stop closed (start_task, and an ask of
+    create_task): those of the stop line. asked: its row of ui_requests with its event_id."""
+    return (f"The owner pressed Stop in this chat, and that closed their message M-{asked['event_id']}: do not go on "
+            f"with that work, and do not answer that message. The owner's next message says what they want: act on "
+            f"that. No task was opened.")
+
+
+def chat_stop_asks(agent, requests):
+    """The asks under which the tasks of these owner's messages are filed (ask_message): a correction's tasks have the
+    first message of its chain as their ask, and the manager's answer to an item the message that the item asked
+    about. Each message itself too."""
+    out = set(requests)
+    for request in requests:
+        try:
+            out.add(ask_message(agent, request)["request_id"])
+        except ToolError:
+            pass
+    return sorted(out)
+
+
+# The owner's row of ui_requests with its event, as a press reads it: then the WHERE of the read
+CHAT_STOP_ROWS = ("SELECT u.request_id, u.kind, u.text, u.created, u.event_id, e.extra FROM ui_requests u "
+                  "JOIN events e ON e.id=u.event_id WHERE ")
+
+
+def chat_stop_view(row):
+    """A row of chat_stops as the answer of POST /ui/chats/<agent>/stop gives it, or None."""
+    return {"id": row["id"], "agent": row["agent"], "message": row["request"], "state": row["state"],
+            "created": row["created"]} if row else None
+
+
+def chat_stop_act(agent, body, hand):
+    """POST /ui/chats/<agent>/stop, under LOCK (command_run): the owner's press of Stop in the chat of `agent` for
+    `body["message"]` (owner feature chat_stop). A press that came too late is no error: when chat_stoppable does not
+    give that message (its reply came, its turn ended, or a press of it stands), the answer is changed false and
+    nothing is written. Else, in one transaction, the record first, then the events, as request_hold: the row of
+    chat_stops; the flag `stopped` on the message's event, so that no reader gives it again; the stop line (for a
+    worker or a lead an owner chat event, for the manager a quiet "say"), which wakes no session and comes with the
+    agent's next read; and the helper's event chat_stop. chat_stoppable gives only a message that the agent read, so
+    a press never takes back an unread one. A press again after not_confirmed makes the same row requested, with a
+    new event and no second line. hand: who pressed (request_hand)."""
+    if agent not in agents():
+        raise Refusal(404, code="no_such_agent")
+    request = body["message"]
+    row = read_row("SELECT * FROM chat_stops WHERE request=? AND agent=?", (request, agent))
+    if chat_stoppable(agent) != request:
+        return {"stop": chat_stop_view(row), "changed": False}
+    asked = read_row(CHAT_STOP_ROWS + "u.request_id=?", (request,))
+    manager, generation, t0 = role_of(agent) == "manager", kv_get("db_id"), now()
+    # A press stops the whole turn: it closes too the owner's older messages that the turn works on, each with a row
+    # of its own before the press's own, so that the newest row of the agent is the press's (chat_stops_newest).
+    # A worker's or a lead's chat gives each message that has no reply again at each read, and its poll signals it:
+    # so each one that it read and that no report names. A sentence before a task (before_task, owner_reports.turn)
+    # is no reply: with no task the message comes again. The manager reads a message once, and handles many with its
+    # tools or create_task and no report that names them: so only those that its running turn read, after its last
+    # turn end (turn_ended), and that no report names or took the turn of (unanswered_owner_message).
+    manager_turn = turn_ended(agent) if manager else None
+    older = [] if row else read_rows(
+        CHAT_STOP_ROWS + f"u.recipient=? AND {chat_waited_kinds(agent, 'u.')} AND e.read_at IS NOT NULL AND "
+        f"u.request_id<>? AND u.created<=? AND {NOT_STOPPED} AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE "
+        "r.agent=u.recipient AND (r.in_reply_to=u.request_id" + (" OR r.turn=u.request_id" if manager else "") +
+        "))" + (" AND e.read_at>?" if manager else "") + " ORDER BY u.created, u.rowid",
+        (agent, request, asked["created"]) + ((manager_turn,) if manager else ()))
+    asks = [] if row else chat_stop_asks(agent, [r["request_id"] for r in [asked] + older])
+    tasks = [] if row else read_rows(
+        f"SELECT id, title FROM tasks WHERE ask IN ({','.join('?' * len(asks))}) AND {OPEN_TASK} AND "
+        "(owner=? OR requester=?) ORDER BY id", (*asks, agent, agent))
+
+    def closed(r, stop_id):
+        in_transaction("chat_stop_act closed")       # each caller is inside the transaction below
+        extra = json.loads(r["extra"] or "{}")
+        DB.execute("UPDATE events SET extra=? WHERE id=?",
+                   (json.dumps(dict(extra if isinstance(extra, dict) else {}, stopped=stop_id)), r["event_id"]))
+    with transaction():
+        if row:
+            sid = row["id"]
+            DB.execute("UPDATE chat_stops SET state='requested', settled=NULL, detail=NULL, hand=? WHERE id=?",
+                       (hand, sid))
+        else:
+            shut = []
+            for r in older:
+                shut.append(DB.execute("INSERT INTO chat_stops(agent,request,state,created,settled,detail,hand) "
+                                       "VALUES(?,?,'stopped',?,?,?,?)",
+                                       (agent, r["request_id"], t0, t0, f"closed with the press of Stop for "
+                                        f"M-{asked['event_id']}", hand)).lastrowid)
+                closed(r, shut[-1])
+            sid = DB.execute("INSERT INTO chat_stops(agent,request,state,created,hand) VALUES(?,?,'requested',?,?)",
+                             (agent, request, t0, hand)).lastrowid
+            closed(asked, sid)
+            line = DB.execute(*event_row(agent, "say" if manager else "chat", None,
+                                         chat_stop_line(asked, tasks, older), t0,
+                                         json.dumps(dict(QUIET_SAY, stop=sid) if manager else
+                                                    {"generation": generation, "stop": sid}), None)).lastrowid
+            DB.execute(f"UPDATE chat_stops SET line=? WHERE id IN ({','.join('?' * (len(shut) + 1))})",
+                       (line, *shut, sid))
+        event = DB.execute(*event_row(agent, "chat_stop", None, f"interrupt the turn of M-{asked['event_id']}", t0,
+                                      json.dumps({"stop": sid, "window": "manager" if manager else "owner-chat",
+                                                  "generation": generation, "created": t0}), None)).lastrowid
+        DB.execute("UPDATE chat_stops SET event=? WHERE id=?", (event, sid))
+    shut_words = f"; it closes {', '.join('M-' + str(r['event_id']) for r in older)} too" if older else ""
+    log("owner", f"Stop in the chat of {agent} for M-{asked['event_id']} saved as S-{sid}: its helper interrupts the "
+                 f"turn{shut_words}" + request_hand_words(hand, None))
+    return {"stop": chat_stop_view(read_row("SELECT * FROM chat_stops WHERE id=?", (sid,))), "changed": True}
+
+
+def mobile_agent(name, config, stops=None, waiting=None):
     """One agent for the phone: what its row, its chat header and its page show, without the whole usage record.
     `machine` is the server it runs on (its team.json `machine`), which its page names under Runs on. The preview of
-    its newest message is the whole text here: Handler.ui_mobile cuts it after scrub (mobile_cut)."""
+    its newest message is the whole text here: Handler.ui_mobile cuts it after scrub (mobile_cut). stops:
+    chat_stops_newest() of every agent, and waiting: chat_read_waiting() of every agent with an owner chat, which
+    mobile_state reads once; without them, the agent reads its own."""
+    stops = chat_stops_newest(name) if stops is None else stops
+    waiting = chat_read_waiting([name] if owner_chat(config) else []) if waiting is None else waiting
+    asked, turn = chat_waited(name), turn_ended_after(name, stops=stops)
+    stop = chat_stoppable(name, stops=stops, asked=waiting.get(name), turn=turn) if waiting.get(name) else None
     row = q1("SELECT last_seen,alive,alive_ts FROM agents WHERE name=?", (name,))
     usage = q1("SELECT data FROM agent_usage WHERE name=?", (name,))
     lim = active_limit(name)
@@ -3993,8 +4461,10 @@ def mobile_agent(name, config):
             "open_tasks": q1("SELECT COUNT(*) n FROM tasks WHERE owner=? AND state NOT IN "
                              "('completed','failed','rejected','canceled')", (name,))["n"],
             "limit": dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"])) if lim else None,
-            "usage": windows, "turn_ended_after": turn_ended_after(name), "waits_since": chat_waits_since(name),
+            "usage": windows, "turn_ended_after": turn, "waits_since": chat_waits_since(name, stops, asked),
             "chat_undelivered": bool(kv_get(f"chat_undelivered:{name}")),
+            # owner feature chat_stop: the message whose turn a press of Stop stops now, only while there is one
+            **({"chat_stop": stop} if stop else {}),
             "last": {"ts": last["created"], "side": last["side"], "preview": last["text"] or ""} if last else None}
 
 
@@ -4025,9 +4495,11 @@ def mobile_state(generation, at=None):
     # answered items too, oldest first. `needs` stays the open ones, which every phone already reads.
     answered = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NOT NULL ORDER BY id DESC LIMIT ?",
                                         (MOBILE_ANSWERED,))]
+    stops = chat_stops_newest()             # owner feature chat_stop: one read for all the agents
+    waiting = chat_read_waiting(n for n, c in agents().items() if owner_chat(c) and agent_active(n))
     return {"schema_version": 1, "db": generation, "time": now() if at is None else at,
             "manager_flag": manager_flag_shown(), "manager_warning": manager_warning(), "ui_features": ui_features(),
-            "agents": [mobile_agent(name, config) for name, config in agents().items()],
+            "agents": [mobile_agent(name, config, stops, waiting) for name, config in agents().items()],
             "needs": needs, "answered_needs": list(reversed(answered)), "tasks": tasks,
             "recent": list(reversed(recent)), "ended_mark": mark, "asked": asked,
             "holds": [dict(r) for r in q("SELECT * FROM holds WHERE released IS NULL ORDER BY id")],
@@ -5981,7 +6453,8 @@ def questions_under(lead, task_id):
 
 def emit(agent, kind, text, task=None, extra=None):
     """Queue a message for one agent's helper. Kinds: task, say, chat, stop, control, signin, handover, create,
-    capture, request, deposit, withdraw, notify, mcp_program, manager_start, outputs, forget."""
+    capture, request, deposit, withdraw, notify, mcp_program, manager_start, outputs, forget, chat_stop (written by
+    chat_stop_act in its transaction, with event_row)."""
     filed, about = filed_about(agent, kind, task)
     return ins(*event_row(agent, kind, filed, str(text), now(), json.dumps(extra or {}), about))
 
@@ -8129,6 +8602,8 @@ def migrate():
         # manager_as_lead: which step of the plan next_step came from, so a split step whose parts have all ended
         # counts as no next step, exactly as a single ended task does.
         "goals": {"next_step_id": "INTEGER"},
+        # owner feature chat_stop: a database of an earlier build of Stop in the chat box has its table without them
+        "chat_stops": {"cut": "INTEGER NOT NULL DEFAULT 0", "reads": "TEXT"},
         # support plan F1: the optional tools of the sessions of a duty's cases, for a Shell-off holder (JSON list);
         # F4: the owner's file of the lists of its typed values, and the duties that its sessions report to (JSON)
         "responsibilities": {"tools": "TEXT", "servers": "TEXT", "lists": "TEXT", "report_to": "TEXT"},
@@ -8407,6 +8882,9 @@ def migrate():
     for statement in [
         "CREATE UNIQUE INDEX IF NOT EXISTS owner_reply_identity ON owner_reports(agent,in_reply_to) WHERE in_reply_to IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS owner_report_turn ON owner_reports(turn) WHERE turn IS NOT NULL",
+        # owner feature chat_stop: an agent's reports that name no message, newest last (chat_read_waiting, at each read
+        # of the state for each agent whose press of Stop can be given)
+        "CREATE INDEX IF NOT EXISTS owner_report_unnamed ON owner_reports(agent, created) WHERE in_reply_to IS NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS task_trigger_run ON tasks(trigger_run) WHERE trigger_run IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS sealed_job ON sealed(job) WHERE job IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS jobs_request ON jobs(agent, request_id) WHERE request_id IS NOT NULL",
@@ -8461,6 +8939,11 @@ def migrate():
         # ... for each open task, its holds, its questions and the usage limits of its agent (liveness, and the
         # delivery poll's limit at each round) ...
         "CREATE INDEX IF NOT EXISTS hold_task ON holds(task)",
+        # owner feature chat_stop: the press of one message (NOT_STOPPED in each reader of a chat message's reply, and
+        # the press itself), and the newest press of each agent, which each read of the state reads for all the
+        # agents (chat_stops_newest)
+        "CREATE UNIQUE INDEX IF NOT EXISTS chat_stop_request ON chat_stops(request)",
+        "CREATE INDEX IF NOT EXISTS chat_stop_agent ON chat_stops(agent, id)",
         "CREATE INDEX IF NOT EXISTS question_task ON questions(task)",
         # (and the questions that wait for an answer, which the manager's read_messages joins to their open tasks)
         "CREATE INDEX IF NOT EXISTS question_open ON questions(id) WHERE answer IS NULL",
@@ -8719,18 +9202,22 @@ def t_read_messages(agent, a):
     with LOCK:
         if chat_context(agent):
             chat_fence(agent)
+            # (owner feature chat_stop: a message that the owner stopped comes no more, NOT_STOPPED)
             rows = q("SELECT e.* FROM events e JOIN ui_requests u ON u.event_id=e.id "
                      "WHERE e.agent=? AND e.kind='chat' AND u.kind IS NOT 'answer' AND NOT EXISTS "
-                     "(SELECT 1 FROM owner_reports r WHERE r.agent=? AND r.in_reply_to=u.request_id) ORDER BY e.id", (agent, agent))
+                     "(SELECT 1 FROM owner_reports r WHERE r.agent=? AND r.in_reply_to=u.request_id) AND "
+                     f"{NOT_STOPPED} ORDER BY e.id", (agent, agent))
             # chat apps round 2: an agent's message comes until it is read; it needs no reply. So does the owner's
             # answer to a secret request of this chat (secret_requests): tell_owner cannot name it, so it never clears
             rows = sorted(rows + q("SELECT e.* FROM events e JOIN agent_messages m ON m.event_id=e.id WHERE e.agent=? "
                                    "AND e.kind='chat' AND e.read_at IS NULL", (agent,))
                           + q("SELECT e.* FROM events e JOIN ui_requests u ON u.event_id=e.id WHERE e.agent=? "
                               "AND e.kind='chat' AND u.kind='answer' AND e.read_at IS NULL", (agent,))
-                          # and so does the result of a task that this chat opened (chat_result)
+                          # and so does the result of a task that this chat opened (chat_result), and the hub's line
+                          # about a press of Stop (owner feature chat_stop, chat_stop_line), which wakes no session
                           + q("SELECT * FROM events WHERE agent=? AND kind='chat' AND read_at IS NULL AND "
-                              "json_extract(extra, '$.task_result') IS NOT NULL", (agent,)),
+                              "(json_extract(extra, '$.task_result') IS NOT NULL OR "
+                              "json_extract(extra, '$.stop') IS NOT NULL)", (agent,)),
                           key=lambda r: r["id"])
         elif agents()[agent].get("role") in ("worker", "lead"):
             tid = parse_task(a.get("task_id"))
@@ -8749,8 +9236,9 @@ def t_read_messages(agent, a):
         first = [r["id"] for r in rows if r["read_at"] is None]
         if chat_context(agent):             # a task result that this read gives waits for its message_owner
             result_reads(agent, [r for r in rows if r["read_at"] is None])
+        read_at = now()         # one read is one moment: what a cut turn read is found by it (chat_stop_unread)
         for r in rows:
-            q("UPDATE events SET read_at=COALESCE(read_at,?) WHERE id=?", (now(), r["id"]))
+            q("UPDATE events SET read_at=COALESCE(read_at,?) WHERE id=?", (read_at, r["id"]))
             if reader:
                 extra = json.loads(r["extra"] or "{}")
                 q("UPDATE events SET extra=? WHERE id=?",
@@ -8759,6 +9247,8 @@ def t_read_messages(agent, a):
             q(f"UPDATE agent_messages SET read_at=COALESCE(read_at,?) WHERE event_id IN ({','.join('?' * len(first))})",
               (now(), *first))
         chat_read_signals(first, now())         # owner feature chat_apps: typing, and read on WhatsApp
+        if role_of(agent) in ("worker", "lead"):    # owner feature chat_stop: the end of a press at a newer read
+            chat_stop_read_end(agent, first, read_at)
         if agents()[agent].get("role") == "manager":
             kv_set("mgr_screen", None)
             kv_set("mgr_screen_shown", None)        # a session that reads has no question in front of it
@@ -10275,7 +10765,7 @@ def turn_ended(agent):
     return float(row["v"]) if row else 0.0
 
 
-def turn_ended_after(agent, ended=None, reads=None):
+def turn_ended_after(agent, ended=None, reads=None, stops=None):
     """When the owner sent the newest chat message that this agent had read at the last turn end of its standing
     session, or None: its helper reported no turn end (only the manager's reports them, helper_turn), or it had read no
     chat message of the owner's by then. A chat message is a row that the apps' "Thinking" waits on
@@ -10286,15 +10776,25 @@ def turn_ended_after(agent, ended=None, reads=None):
     limit holds the agent: a turn that the limit cut ends as every turn does, with its work not done, so its end says
     nothing, and the apps go on saying "Usage limit" under the message. `ended` asks the same of a turn end that is not
     kept yet. A read that commits nothing. reads: agent_reads(), for the turn end and the open limits of every agent;
-    without it, the agent reads its own."""
+    without it, the agent reads its own.
+
+    A press of Stop that is over (owner feature chat_stop, chat_stop_over) ends the turn of its message too, also for
+    a worker or a lead, whose chat reports no turn ends: the value is then at least the time of the stopped message, so
+    every app, also one from before chat_stop, stops its line under it. A usage limit keeps it None, as above. stops:
+    chat_stops_newest() of every agent, for a read with no reads."""
     if ended is None:
         ended = turn_ended(agent) if reads is None else reads.turn_ended(agent)
-    if not ended or (read_row("SELECT 1 FROM agent_limits WHERE agent=? AND ended IS NULL LIMIT 1", (agent,))
-                     if reads is None else agent in reads.limits):
+    stop = (reads.stops if reads is not None else stops if stops is not None else chat_stops_newest(agent)).get(agent)
+    stopped = stop["asked"] if stop and chat_stop_over(stop) else None
+    if not ended and stopped is None or (
+            read_row("SELECT 1 FROM agent_limits WHERE agent=? AND ended IS NULL LIMIT 1", (agent,))
+            if reads is None else agent in reads.limits):
         return None
     row = read_row("SELECT MAX(u.created) AS created FROM ui_requests u JOIN events e ON e.id=u.event_id "
-                   f"WHERE u.recipient=? AND {chat_waited_kinds(agent, 'u.')} AND e.read_at<=?", (agent, ended))
-    return row["created"] if row else None
+                   f"WHERE u.recipient=? AND {chat_waited_kinds(agent, 'u.')} AND e.read_at<=?",
+                   (agent, ended)) if ended else None
+    turn = row["created"] if row else None
+    return stopped if turn is None else turn if stopped is None else max(turn, stopped)
 
 
 # Seconds after which an owner's chat message is late: with no read that long after it came, or with no reply that
@@ -10317,11 +10817,13 @@ def chat_late(name, t0):
     counted from before the last one ended. A reply is a report of the agent that names the message, which is what
     the helper's poll gives the message for (Handler.events) and what read_messages gives it again for: a report
     with no such name at or after it does not end the wait here, as it ends the apps' own line (chat_waits_since),
-    so a chat that said a first word and then opened no task is late too."""
-    e = q1("SELECT e.id, e.read_at, u.created, u.request_id FROM ui_requests u JOIN events e ON e.id=u.event_id "
-           "WHERE u.recipient=? AND u.kind='message' AND e.kind='chat' ORDER BY u.created DESC, u.rowid DESC LIMIT 1",
-           (name,))
-    if not e or active_limit(name) or \
+    so a chat that said a first word and then opened no task is late too. A message whose press of Stop is over is
+    never late (owner feature chat_stop, STOP_OVER): nothing waits for its reply. While the interrupt waits, or after
+    one that did not take, the turn can hang, and the message can be late as any other."""
+    e = q1(f"SELECT e.id, e.read_at, u.created, u.request_id, {STOP_OVER} AS over FROM ui_requests u "
+           "JOIN events e ON e.id=u.event_id WHERE u.recipient=? AND u.kind='message' AND e.kind='chat' "
+           "ORDER BY u.created DESC, u.rowid DESC LIMIT 1", (name,))
+    if not e or e["over"] or active_limit(name) or \
             q1("SELECT 1 FROM owner_reports WHERE agent=? AND in_reply_to=? LIMIT 1", (name, e["request_id"])):
         return None
     return e["id"] if t0 - max(e["read_at"] or e["created"], limit_ended(name)) >= CHAT_LATE else None
@@ -10365,7 +10867,10 @@ class AgentReads:
     read at the first chat_ready().
     turns: {agent: its stored turn end}.
     undelivered: {agent: the owner's chat message to it that is late} (chat_late_sweep).
-    kpis: {agent: its active KPIs} (lanes/agent-kpis.md)."""
+    kpis: {agent: its active KPIs} (lanes/agent-kpis.md).
+    stops: {agent: its newest press of Stop} (owner feature chat_stop, chat_stops_newest).
+    waiting: {agent: its newest read message that waits}, only of the agents whose press of Stop can be given
+    (chat_stoppers, chat_read_waiting): one read for all of them, and none while no helper names chat_stop."""
     def __init__(self):
         self.rows = {r["name"]: {k: r[k] for k in AGENT_SEEN}
                      for r in q(f"SELECT name,{','.join(AGENT_SEEN)} FROM agents")}
@@ -10385,6 +10890,8 @@ class AgentReads:
             "SELECT k, v FROM kv WHERE k >= 'chat_undelivered:' AND k < 'chat_undelivered;'")}
         self.kpis = {r["agent"]: r["n"] for r in q(
             "SELECT agent, COUNT(*) n FROM standing WHERE kind='kpi' AND ended IS NULL GROUP BY agent")}
+        self.stops = chat_stops_newest()
+        self.waiting = chat_read_waiting(chat_stoppers(self))
 
     def data(self, agent):
         if agent not in self.parsed:
@@ -10428,6 +10935,8 @@ def agent_view(name, config, reads=None):
         seen = reads.rows.get(name)
         used = json.loads(reads.usage[name]) if name in reads.usage else None
         lim = reads.limits.get(name)
+    turn = turn_ended_after(name, reads=reads)
+    stop = chat_stoppable(name, reads, turn=turn)
     return dict(name=name, role=config["role"], runtime=config["runtime"],
                 title=config.get("title"), active=agent_active(name),
                 can=config.get("can", []), usage=used,
@@ -10449,7 +10958,10 @@ def agent_view(name, config, reads=None):
                 placed=not unplaced(name),
                 # When the owner sent the newest chat message that it had read at its last turn end: its turn that took
                 # a message up to then is over, so the chat stops saying that it works on it (turn_ended_after).
-                turn_ended_after=turn_ended_after(name, reads=reads),
+                turn_ended_after=turn,
+                # Owner feature chat_stop: the message whose turn a press of Stop stops now, only while there is one
+                # (chat_stoppable). The app shows Stop in the place of Send only while its own line moves too.
+                **({"chat_stop": stop} if stop else {}),
                 # True while the owner's newest chat message to it is late: the chat says "Not answering" under it,
                 # in place of "Thinking" (chat_late_sweep).
                 chat_undelivered=bool(reads.undelivered.get(name) if reads is not None else read_row(
@@ -13986,6 +14498,22 @@ def task_ask(agent, a, follows, parent, goal_id=None, job=None):
             if goal_id is not None else None
         return (row["ask"] if row else None), None
     message = ask_message(agent, ref)
+    # owner feature chat_stop: the message that `ask` names itself, before a correction's walk to the first of its
+    # chain, opens no work once a press of Stop closed it; an ask from follows, a job or a correction stays
+    named = ASK_REF.match(str(ref))
+    try:            # a request UUID in each form that ask_message takes: upper case, braces, no hyphens
+        key = (int(named.group(1)),) if named else (str(uuid.UUID(str(ref).strip())),)
+    except (ValueError, AttributeError, TypeError):
+        key = None
+    stopped = read_row("SELECT u.event_id FROM ui_requests u JOIN chat_stops s ON s.request=u.request_id WHERE " +
+                       ("u.event_id=?" if named else "u.request_id=?"), key) \
+        if key and not ASK_NEED_REF.match(str(ref)) else None
+    card = ASK_NEED_REF.match(str(ref))
+    if card:            # the owner's answer to that card, which a press closed
+        stopped = read_row("SELECT u.event_id FROM ui_requests u JOIN chat_stops s ON s.request=u.request_id WHERE "
+                           "u.need_id=? AND u.kind='answer' ORDER BY u.created DESC LIMIT 1", (int(card.group(1)),))
+    if stopped:
+        raise ToolError(chat_stop_refusal(stopped))
     if message["asked"]:
         return message["request_id"], None      # the name that its first task gave it stays
     if not name:
@@ -21610,12 +22138,13 @@ def unanswered_owner_message(agent):
     gone or whose handle the owner removed, nor, after the owner links that handle again, one from before that link.
     A report that names no message is then for the next one that waits, which can be the owner's first message from
     a new number. With the turn kept, that report was the answer to an old message, and the owner's newest one got
-    its answer one report late."""
+    its answer one report late. A message that the owner stopped has no turn (owner feature chat_stop, NOT_STOPPED):
+    the next report is for his correction."""
     for row in q("SELECT u.request_id, u.origin, u.created, e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id "
                  "WHERE u.recipient=? AND u.kind='message' AND u.need_id IS NULL AND e.read_at IS NOT NULL "
                  "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.in_reply_to=u.request_id) "
                  "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.turn=u.request_id) "
-                 "ORDER BY u.created, u.event_id", (agent,)):
+                 f"AND {NOT_STOPPED} ORDER BY u.created, u.event_id", (agent,)):
         o = json.loads(row["origin"]) if row["origin"] else None
         since = owner_since(o) if o else None
         if o is None or (o.get("account") in chat_apps() and since is not None and since <= row["created"]):
@@ -21683,10 +22212,10 @@ def after_task_words(agent, request_id):
         return ("Your sentence before this call is now the reply to the owner's message: write nothing more to them "
                 "about this task now. ")
     replied = DB.execute("SELECT 1 FROM owner_reports WHERE agent=? AND in_reply_to=?", (agent, request_id)).fetchone()
-    waits = DB.execute(
+    waits = DB.execute(         # (a message that the owner stopped waits for nothing: NOT_STOPPED)
         "SELECT 1 FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.recipient=? AND u.kind='message' AND "
         "u.need_id IS NULL AND e.read_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE "
-        "r.agent=u.recipient AND r.in_reply_to=u.request_id) LIMIT 1", (agent,)).fetchone()
+        f"r.agent=u.recipient AND r.in_reply_to=u.request_id) AND {NOT_STOPPED} LIMIT 1", (agent,)).fetchone()
     if replied and not waits:
         return "The owner's message has its reply already: write nothing more to them about this task now. "
     return "Tell the owner with tell_owner that it started. "
@@ -21726,6 +22255,11 @@ def t_start_task(agent, a):
     "none" (lead_batch_rows)."""
     chat_fence(agent)
     source = owner_message(agent, a.get("in_reply_to"))
+    # owner feature chat_stop: a message that the owner stopped opens no task, also when the press came between its
+    # read and this call; a task that it opened before the press stays, and a repeat of that call gets its receipt
+    if read_row("SELECT 1 FROM chat_stops WHERE request=?", (source["request_id"],)) and \
+            not task_of_message(agent, source["request_id"]):
+        raise ToolError(chat_stop_refusal(source))
     title, done_when = str(a.get("title") or "").strip(), str(a.get("done_when") or "").strip()
     asked = " ".join(str(a.get("asked") or "").split())     # owner feature asks: the name of this work for the owner
     needs = str(a.get("needs") or "none").strip().lower()
@@ -52526,7 +53060,9 @@ def tool_reads_ahead(name, args):
 # new session reads before it repeats a send (outward_done), and a removal finds the record of a standing item by the
 # start of its answer (removed_standing_rows). The history keeps 600 characters of a call (history_call), and a
 # removal finds a read of a person's words by the head of their conversation (removed_other_work_rows): a head that
-# the cut removed is in no record, and neither are the words after it. A refusal keeps all its words.
+# the cut removed is in no record, and neither are the words after it. A refusal keeps all its words. The cut is
+# cut_whole's: leak_scan reads calls and finds a login only whole, so a login that the owner registers after the call
+# must not stay there in part (F14, the validator's finding N1).
 CALLS_KEPT_WHOLE = OUTWARD_TOOLS + ("keep_instruction", "set_target", "end_standing")
 
 
@@ -52692,7 +53228,8 @@ def call_tool(agent, name, args, context=None):
                             # got): the hub removes the file after attachment_keep, and no copy of its text or of a
                             # one-time line stays here
                             text.split("\n", 1)[0] if name == "read_attachment" else
-                            text if name in CALLS_KEPT_WHOLE else text[:GOOGLE_CALL_KEEP], window, own, mark)
+                            text if name in CALLS_KEPT_WHOLE else cut_whole(text, GOOGLE_CALL_KEEP), window, own,
+                            mark)
                 return text, False
         raise ToolError(f"You have no tool named {name}.")
     except ToolError as e:
@@ -55496,7 +56033,10 @@ def handover_ids(name, reported):
 
     def unfinished(r):
         extra = json.loads(r["extra"] or "{}")
-        reader = extra.get("read_by") if isinstance(extra, dict) else None
+        extra = extra if isinstance(extra, dict) else {}
+        if any(extra.get(k) is not None for k in CHAT_STOPPED):
+            return False        # owner feature chat_stop: a message that the owner stopped, and the hub's line about it
+        reader = extra.get("read_by")
         return r["id"] in lists.get(reader, ()) if reader else r["read_at"] > since
     return [r["id"] for r in q(f"SELECT id, read_at, extra FROM events WHERE agent=? AND kind='say' AND read_at IS NOT "
                                f"NULL AND id IN ({','.join('?' * len(wanted))}) ORDER BY id", (name, *wanted))
@@ -55525,10 +56065,10 @@ def switch_busy(name):
     unknown when a switch loses its late report, and that is true. Only a report finishes such a job, so it kept
     its agent busy for a switch with no end."""
     tasks = [tref(i) for i in running_turns(owner=name)]
-    chats = 0 if role_of(name) == "manager" else q1(
+    chats = 0 if role_of(name) == "manager" else q1(     # (a message that the owner stopped keeps none: NOT_STOPPED)
         "SELECT COUNT(*) c FROM ui_requests u WHERE u.kind='message' AND u.recipient=? AND NOT EXISTS "
         "(SELECT 1 FROM owner_reports r WHERE r.in_reply_to=u.request_id) AND NOT EXISTS "
-        "(SELECT 1 FROM ui_requests n WHERE n.replaces_request_id=u.request_id)", (name,))["c"]
+        f"(SELECT 1 FROM ui_requests n WHERE n.replaces_request_id=u.request_id) AND {NOT_STOPPED}", (name,))["c"]
     desk = desktop_busy(name)
     desk = tref(desk["id"]) if desk and desk["owner"] == name else None
     checks = checks_running(runner=name, online=False)
@@ -64318,6 +64858,7 @@ AGENT_COLUMNS = (
     ("signin_records", "agent"),        # plan 04, S5: the sign-ins of the vault in the agent's own browser
     ("agent_usage", "name"), ("calls", "agent"), ("ui_requests", "recipient"), ("owner_reports", "agent"),
     ("holds", "by"), ("holds", "released_by"), ("outcomes", "by"), ("agent_limits", "agent"),
+    ("chat_stops", "agent"),            # owner feature chat_stop: the presses of Stop in its chat
     ("machine_status", "agent"), ("machine_updates", "agent"), ("goals", "paused_by"), ("goal_history", "by"),
     ("spends", "by"), ("restart_holds", "by"), ("machine_checks", "agent"), ("session_tokens", "agent"),
     ("token_slots", "agent"),           # the lane "Tokens by day and model": its sessions' slots, as its sessions
@@ -64359,6 +64900,7 @@ AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent"
 # kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
 AGENT_KV = ("tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
             "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:",
+            "turn_cut:",
             "people_told:",        # the people that a standing session was told of (people_once)
             "first_message:", "settings_finding:", "chat_undelivered:", "read_missing:", "read_told:",
             "service_user:", "caller_user:",       # one OS user for each agent: SERVICE_USER and CALLER_USER
@@ -64819,6 +65361,7 @@ AGENT_REMOVAL = {
     ("agent_usage", "name"): "delete", ("agent_limits", "agent"): "delete", ("machine_checks", "agent"): "delete",
     ("mac_setups", "agent"): "delete", ("session_credentials", "agent"): "delete",
     ("ui_requests", "recipient"): "delete", ("owner_reports", "agent"): "delete", ("events", "agent"): "delete",
+    ("chat_stops", "agent"): "delete",      # with the messages that they stopped and their lines
     ("signin_jobs", "agent"): "delete", ("agent_notes", "agent"): "delete", ("memories", "agent"): "delete",
     ("rules", "agent"): "delete", ("standing", "agent"): "delete", ("reminders", "agent"): "delete",
     ("resource_grants", "agent"): "delete", ("person_agents", "agent"): "delete", ("person_scopes", "agent"): "delete",
@@ -76707,8 +77250,13 @@ CHAT_TRUE = ("(COALESCE(json_type(extra, '$.{0}'), 'null') IN ('true', 'integer'
              "json_extract(extra, '$.{0}') NOT IN (0, ''))")              # a value that Python reads as true
 CHAT_REPLY = ("EXISTS (SELECT 1 FROM ui_requests u CROSS JOIN owner_reports r ON r.in_reply_to=u.request_id "
               "WHERE u.event_id=events.id AND r.agent=events.agent)")    # CROSS: u first, by its event, on any SQLite
+# A chat with `stopped` or `stop` in its extra (owner feature chat_stop: a message that the owner stopped, and the
+# hub's line about the press, chat_stop_act) never comes: its session reads the line with its next read.
+CHAT_STOPPED = ("stopped", "stop")
 CHAT_OPEN = ("(CASE WHEN read_at IS NOT NULL AND " + CHAT_REPLY + " THEN 0 "      # read and answered: done
              "WHEN json_valid(extra) IS NOT 1 THEN 1 "                          # no extra, or no JSON: the rule decides
+             "WHEN " + " OR ".join(CHAT_SET.format(k) for k in CHAT_STOPPED) +  # stopped, or the line of a stop
+             " THEN 0 "
              "WHEN read_at IS NOT NULL THEN NOT (" +                            # read, with no reply
              " OR ".join(CHAT_TRUE.format(k) for k in CHAT_FLAGS) + ") "
              "WHEN " + " OR ".join(CHAT_SET.format(k) for k in CHAT_FLAGS) +    # unread, with a flag of the hub's own
@@ -81027,6 +81575,17 @@ class Handler(BaseHTTPRequestHandler):
         return self.ui_command(f"tasks/{task_id}/steer", lambda data: task_steer_read(task_id, data),
                                lambda body: task_steer_act(task_id, body, client, session=session, device=device))
 
+    def ui_chat_stop(self, agent):
+        """POST /ui/chats/<agent>/stop (owner feature chat_stop): the owner's press of Stop in the chat box while the
+        agent works on his message (chat_stop_act), by the rules of a task's control: an exact repeat gives its first
+        answer with replayed true."""
+        client = self.headers.get("X-Fleet-Client", "").strip()
+        # ui_command checks who calls first, and then the session's form, so this read stands behind both
+        session = (self.headers.get("X-Fleet-Session") or "").strip() or None
+        hand = request_hand(client, owner_device_at(self.client_address[0]), None, None, session)
+        return self.ui_command(f"chats/{agent}/stop", lambda data: chat_stop_read(agent, data),
+                               lambda body: chat_stop_act(agent, body, hand))
+
     def ui_outcome(self, outcome_id):
         def read(data):
             finding, note = data.get("finding"), data.get("note", "")
@@ -82870,6 +83429,11 @@ class Handler(BaseHTTPRequestHandler):
                         h = q1("SELECT state, kind FROM holds WHERE id=?", (extra.get("hold"),))
                         if not h or h["state"] != "requested" or h["kind"] != extra.get("action"):
                             continue
+                    if r["kind"] == "chat_stop" and not chat_stop_due(agent, r["id"], extra, now()):
+                        continue        # owner feature chat_stop: no late interrupt (chat_stop_due)
+                    if r["kind"] == "chat" and any(extra.get(k) is not None for k in CHAT_STOPPED):
+                        continue        # owner feature chat_stop: a stopped message, and the hub's line about it,
+                                        # which the chat's next read gives (CHAT_OPEN)
                     if r["kind"] == "chat" and (r["read_at"] is not None
                                                 if any(extra.get(k) for k in CHAT_FLAGS) else q1(
                         "SELECT r.id FROM owner_reports r JOIN ui_requests u ON r.in_reply_to=u.request_id "
@@ -83372,12 +83936,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_control(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["ui", "tasks"] and parts[3] == "steer" and re.fullmatch(r"[1-9][0-9]*", parts[2]):
             return self.ui_steer(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["ui", "chats"] and parts[3] == "stop" and AGENT_NAME.match(parts[2]):
+            return self.ui_chat_stop(parts[2])          # owner feature chat_stop
         if len(parts) == 3 and parts[:2] == ["ui", "outcomes"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
             return self.ui_outcome(int(parts[2]))
         if parts[:2] == ["helper", "events"] and len(parts) == 3:
             return self.helper_events(parts[2])
         if parts[:2] == ["helper", "control"] and len(parts) == 3:
             return self.helper_control(parts[2])
+        if parts[:2] == ["helper", "chat-stop"] and len(parts) == 3:        # owner feature chat_stop
+            return self.helper_chat_stop(parts[2])
         if parts[:2] == ["helper", "limit"] and len(parts) == 3:
             return self.helper_limit(parts[2])
         if parts[:2] == ["helper", "presence"] and len(parts) == 3:         # plan C2: a helper inside one step
@@ -85111,6 +85679,8 @@ class Handler(BaseHTTPRequestHandler):
         if all(v is None for v in marks.values()) or any(v is not None and not finite(v) for v in marks.values()):
             return self.json(400, {"error": "started or ended must be a time in seconds"})
         t0 = now()
+        # owner feature chat_stop: the time of the newest end of the batch whose stop reason was no end_turn
+        cut_end = f.get("cut_end") if finite(f.get("cut_end")) else None
         with LOCK, area("quiet"):
             end = None if marks["ended"] is None else min(marks["ended"], t0)
             news = end is not None and end > turn_ended(agent) and \
@@ -85119,6 +85689,12 @@ class Handler(BaseHTTPRequestHandler):
                 if v is not None and min(v, t0) > float(kv_get(f"turn_{k}:{agent}") or 0):
                     with area("state" if news and k == "ended" else "quiet"):
                         kv_set(f"turn_{k}:{agent}", min(v, t0))
+            if cut_end is not None and min(cut_end, t0) > float(kv_get(f"turn_cut:{agent}") or 0):
+                with area("quiet"):     # for a press's end at this or a later turn end (chat_stop_cut_after)
+                    kv_set(f"turn_cut:{agent}", min(cut_end, t0))
+            if end is not None:         # owner feature chat_stop: a press that cut the turn that ended now
+                with area("state"):
+                    chat_stop_turn_end(agent, end, t0)
         return self.json(200, {"ok": True})
 
     def helper_presence(self, agent):
@@ -85187,6 +85763,69 @@ class Handler(BaseHTTPRequestHandler):
             state = settle_hold(h, confirmed, detail, f.get("ran") is True, ended)
             restart_continue(hold_id)       # restart_task: a confirmed stop is followed by one new attempt
         return self.json(200, {"ok": True, "state": state})
+
+    def helper_chat_stop(self, agent):
+        """The helper's answer to the event chat_stop (owner feature chat_stop, fleet.Helper.chat_stop): whether the
+        interrupt took (`confirmed`), its words (`detail`) and the messages that the cut turn had read (`reads`). 404
+        for a press of another agent, 409 for a press that does not wait for the helper. A confirmed answer settles
+        the press as stopped and makes those messages unread again (chat_stop_unread), in one transaction; else it is
+        not_confirmed, and a press again can try once more (chat_stoppable). Either write is a change that the apps
+        see: a stop that is over ends the line "Thinking" (turn_ended_after), and one that is not gives Stop again."""
+        if agent not in agents():
+            return self.json(404, {"error": "unknown agent"})
+        if not self.allowed(agent):
+            return
+        f = self.form()
+        stop, reads, cut = f.get("stop"), f.get("reads", []), f.get("cut") is True
+        if isinstance(stop, bool) or not isinstance(stop, int) or not isinstance(reads, list) or \
+                len(reads) > HANDOVER_MAX or any(isinstance(i, bool) or not isinstance(i, int) for i in reads):
+            return self.json(400, {"error": f"stop is the number of the press, and reads a list of at most "
+                                            f"{HANDOVER_MAX} message ids"})
+        confirmed = f.get("confirmed") is True
+        detail = text_field(f.get("detail"), 300, False) or ("stopped" if confirmed else "not confirmed")
+        with LOCK:
+            row = q1("SELECT * FROM chat_stops WHERE id=?", (stop,))
+            if not row or row["agent"] != agent:
+                return self.json(404, {"error": "no such press of Stop for this agent"})
+            # A press that the hub settled at the read of the owner's correction before this answer came (the
+            # answer's send failed, and its helper typed the correction's signal): an answer that cut gives the cut
+            # turn's reads now, up to that read, and changes nothing else
+            late = row["state"] == "stopped" and row["detail"] == CHAT_STOP_LATE and not row["cut"] and cut
+            if row["state"] != "requested" and not late:
+                return self.json(409, {"error": "this press of Stop does not wait for the helper"})
+            # only a turn that the helper cut (`cut`: a key of it went to a turn that ran), by this answer or by an
+            # earlier one of the same press (an interrupt that took after its answer said not_confirmed): a turn
+            # that ended by itself, or no turn, finished what it read. The ids of each answer that cut are kept
+            # (chat_stops.reads) for each end of the press.
+            cut_any = cut or bool(row["cut"])
+            kept = sorted(set(chat_stop_kept(row)) | (set(reads) if cut else set()))
+            state = "stopped" if confirmed or late else "not_confirmed"
+            # An answer that is not confirmed, after the end of its press came: a worker's newer row of the owner's
+            # that is read already (the correction that the running turn read before the Esc landed), or the
+            # manager's turn end after the press (one that came while the press waited for its helper). The press
+            # ends now, by the rule of that end, as chat_stop_read_end and chat_stop_turn_end end it.
+            ended, until, gives = None, None, False
+            if not confirmed and not late:
+                if role_of(agent) in ("worker", "lead"):
+                    until = chat_stop_newer_read(agent, row)
+                    ended, gives = (CHAT_STOP_LATE, cut_any) if until is not None else (None, False)
+                elif turn_ended(agent) > row["created"]:
+                    ended, gives = CHAT_STOP_TURN_END, cut_any and chat_stop_cut_after(agent, row)
+                state = "stopped" if ended else state
+            with transaction():
+                if late:
+                    DB.execute("UPDATE chat_stops SET cut=1, reads=? WHERE id=?", (json.dumps(kept), stop))
+                    again = chat_stop_end_rows(agent, row, kept, until=row["settled"])
+                else:
+                    DB.execute("UPDATE chat_stops SET state=?, settled=?, detail=?, cut=?, reads=? WHERE id=? AND "
+                               "state='requested'", (state, until if until is not None else now(), ended or detail,
+                                                     int(cut_any), json.dumps(kept), stop))
+                    again = chat_stop_end_rows(agent, row, reads, kept=role_of(agent) != "manager") \
+                        if confirmed and cut_any else \
+                        chat_stop_end_rows(agent, row, kept, until=until) if gives else []
+            log(agent, f"S-{stop}: Stop {'confirmed' if confirmed or late else 'NOT confirmed'}: {detail}" +
+                (f"; {', '.join(f'M-{i}' for i in again)} unread again" if again else ""))
+        return self.json(200, {"ok": True, "state": state, "unread": again})
 
     def hook_activity(self, agent, task):
         if agent not in agents():
@@ -85474,14 +86113,25 @@ def rpc(agent, m, headers, context=None, credential=None):
     return {"jsonrpc": "2.0", "id": mid, "result": result}
 
 
+LEAK_PIECE = 256        # rows of one table that leak_scan reads in one hold of LOCK
+
+
 def leak_scan():
-    """Look for any registered login in everything the hub has stored."""
+    """Look for any registered login in everything the hub has stored.
+
+    It reads each table in pieces of LEAK_PIECE rows, in the order of their rowid, and holds LOCK only for the read of
+    one piece: the search of the texts runs with no lock held. On the owner's hub (22 November 2026) calls had 157 MiB,
+    and thread_events, events and history had 187 MiB together. One read of a whole table held LOCK until SQLite gave
+    its last row, and every other caller of the hub waited, with all the rows of that table in memory."""
     found = []
     tables = {"tasks": ("title", "details", "done_when", "goal", "what", "where_", "how", "check_note", "job_name",
                         "plain"),
               "notes": ("text",), "questions": ("text", "answer"), "prompts": ("input", "reason"),
               "rules": ("input",), "needs": ("title", "why", "todo", "answer"), "events": ("text", "extra"),
               "reminders": ("note", "ci"), "outbox": ("text",), "log": ("what",),
+              # each tool call: its arguments and the start of its answer. call_tool keeps no login there that was
+              # registered when the call came, but a login that the owner registers after the call stays
+              "calls": ("args", "detail"),
               # a job: also the texts of create_login and save_key, and the request and the answer of call_api
               "jobs": ("login", "result", "label", "username", "url", "selector", "source_url", "path", "body", "auth",
                        "headers", "response"),
@@ -85499,9 +86149,17 @@ def leak_scan():
               # owner registered after that
               "history": ("text",)}
     for table, cols in tables.items():
-        for row in q(f"SELECT rowid AS rid, {', '.join(cols)} FROM {table}"):
-            if secret_hit(*[row[c] for c in cols]):
-                found.append(f"{table} row {row['rid']}")
+        after = None            # the rowid of the last row of the piece before, or None for the first piece
+        while True:
+            rows = q(f"SELECT rowid AS rid, {', '.join(cols)} FROM {table}"
+                     f"{'' if after is None else ' WHERE rowid > ?'} ORDER BY rowid LIMIT ?",
+                     (() if after is None else (after,)) + (LEAK_PIECE,))
+            for row in rows:
+                if secret_hit(*[row[c] for c in cols]):
+                    found.append(f"{table} row {row['rid']}")
+            if len(rows) < LEAK_PIECE:
+                break
+            after = rows[-1]["rid"]
     return found
 
 

@@ -302,6 +302,9 @@ NOT_TOOLS = {
     "/ui/secrets/import": "the values of an import's logins, as /ui/secrets/add",
     "/ui/needs/{}/takeover": "the one-time password of an agent's screen on a Linux server, which only the owner's "
                              "app puts in Screen Sharing's address (build plan 04, S6)",
+    "/ui/chats/{}/stop": "Stop in the chat box of the owner's app: it interrupts the turn that works on the owner's "
+                         "newest message in that chat, while the app's own line shows that the agent works on it; the "
+                         "owner's agent sends a correction with send_message, and pauses a task with control_task",
     "/ui/secrets/fingerprints": "the owner's own secret catalog",
     "/ui/needs/{}/secret": "a secret request's answer with a login, which the app's secure form gives once the value "
                            "is in a vault, and for a secret that the fleet's list has, the app's program on the "

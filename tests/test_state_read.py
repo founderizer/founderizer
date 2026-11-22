@@ -346,12 +346,14 @@ class StateCase(OwnerAPI):
           ("leo", T0 - 900, T0 - 600, 1, None, "usage", T0 - 600))
         for name, reported, data in (
                 ("manager", T0 - 20, {"runtime": {"name": "claude", "signed_in": True}, "reading_age": 3}),
-                ("mia", T0 - 100, {"features": ["agent_key", "chat_warm"], "runtimes": {"claude": {"signed_in": False}}}),
-                ("leo", T0 - hub.MACHINE_STALE - 100, {"features": ["agent_key", "chat_warm"],
+                ("mia", T0 - 100, {"features": ["agent_key", "chat_warm", "chat_stop"],
+                                   "runtimes": {"claude": {"signed_in": False}}}),
+                ("leo", T0 - hub.MACHINE_STALE - 100, {"features": ["agent_key", "chat_warm", "chat_stop"],
                                                        "runtimes": {"codex": {"signed_in": False}}}),
-                ("oli", T0 - 10, {"features": ["chat_warm"], "runtimes": {"codex": {"signed_in": True}}}),
-                ("kai", T0 - 50, {"features": ["agent_key", "chat_warm"], "runtimes": {"claude": {"signed_in": False}}}),
-                ("zoe", T0 - 40, {"features": ["agent_key"], "runtimes": {"claude": {"signed_in": True}}})):
+                ("oli", T0 - 10, {"features": ["chat_warm", "chat_stop"], "runtimes": {"codex": {"signed_in": True}}}),
+                ("kai", T0 - 50, {"features": ["agent_key", "chat_warm", "chat_stop"],
+                                  "runtimes": {"claude": {"signed_in": False}}}),
+                ("zoe", T0 - 40, {"features": ["agent_key", "chat_stop"], "runtimes": {"claude": {"signed_in": True}}})):
             x("INSERT OR REPLACE INTO machine_status(agent,data,reported) VALUES(?,?,?)", (name, json.dumps(data), reported))
         for name, runtime, state, kind, step, at in (("mia", "claude", "done", "install", "sign_in", T0 - 50),
                                                      ("mia", "claude", "done", "prepare", "sign_in", T0 - 70),
@@ -490,7 +492,9 @@ class SameBytes(StateCase):
                                                     "kpis",                                 # UI-API.md 1.275
                                                     *hub.AGENT_SEEN])
         self.assertEqual(hub.AGENT_SEEN, ("last_seen", "alive", "alive_ts", "client", "client_seen"))
-        self.assertEqual({tuple(a) for a in state["agents"]}, {tuple(state["agents"][0])})    # also with no agents row
+        # also with no agents row; chat_stop only where a press of Stop can stop a turn now (UI-API.md 1.301)
+        self.assertEqual({tuple(k for k in a if k != "chat_stop") for a in state["agents"]}, {tuple(state["agents"][0])})
+        self.assertEqual([a["name"] for a in state["agents"] if "chat_stop" in a], ["leo"])
         self.assertEqual(state["reports"][0]["delivery"]["state"], "sent")
         self.assertEqual([(r["pushed"], r["turn"], r["delivery"] and r["delivery"]["outbound"])
                           for r in state["reports"]],
@@ -621,8 +625,9 @@ class Reads(StateCase):
             views, seen = self.traced(lambda: [hub.agent_view(name, config, reads) for name, config in team])
         self.assertEqual(views, own)
         # agents, usage, limits, machine readings, server sign-ins, sign-ins, keys, turn ends, late chat messages,
-        # and the active KPIs of each agent (one GROUP BY)
-        self.assertEqual(len([s for s in before if s.startswith("SELECT")]), 10)
+        # the active KPIs of each agent (one GROUP BY), the newest press of Stop of each agent, and the newest read
+        # message that waits of each agent whose helper names chat_stop (one WITH, chat_read_waiting)
+        self.assertEqual(len([s for s in before if s.startswith(("SELECT", "WITH"))]), 12)
         self.assertEqual(sorted(s.split(" WHERE")[0] for s in seen),
                          ["SELECT MAX(u.created) AS created FROM ui_requests u JOIN events e ON e.id=u.event_id",
                           "SELECT agent, ready FROM session_credentials", "SELECT v FROM kv"])
@@ -631,6 +636,8 @@ class Reads(StateCase):
                          {"manager": (None, True, T0 - 399), "mia": (True, True, None), "leo": (False, True, None),
                           "ivy": (None, None, None), "oli": (False, None, None), "kai": (None, False, None),
                           "zoe": (None, True, None), "eve": (None, None, None)})
+        # owner feature chat_stop: leo read its message, which waits; mia has a usage limit, and the others no message
+        self.assertEqual({n: v["chat_stop"] for n, v in by.items() if "chat_stop" in v}, {"leo": "req-leo"})
         self.assertEqual((by["mia"]["limit"]["since"], by["leo"]["limit"], by["leo"]["usage"]), (T0 - 100, None, {"limits": {}}))
         self.assertEqual((by["ivy"]["alive"], by["ivy"]["last_seen"], by["oli"]["reports_to"]), (None, None, "leo"))
 
@@ -640,18 +647,20 @@ class Reads(StateCase):
         _, seen = self.traced(self.state_bytes)
         _, before = self.traced(lambda: self.run_with(each_part_alone(), self.state_bytes))
         tables = ("agent_usage", "agent_limits", "machine_status", "server_jobs", "signin_jobs", "agent_keys",
-                  "session_credentials", "kv WHERE k%turn_ended")
+                  "session_credentials", "kv WHERE k%turn_ended", "chat_stops")
         count = lambda statements: {t: sum(bool(re.search("FROM " + t.replace("%", ".*"), s)) for s in statements)
                                     for t in tables}
         self.assertEqual(count(seen), dict.fromkeys(tables, 1))
         # Before, for the 8 agents: usage and turn end of each; an open limit of each, and again for the 2 with a turn
         # end, and the limits once for the times of the open tasks (task_since, owner API 1.237); the machine reading
-        # of the 7 that have no local model, and again for the 6 that can have an owner chat;
-        # the two kinds of sign-in of those 7; the key of the 4 whose helper starts its chat; the chat of the 2 with a
-        # key whose chat window runs.
-        self.assertEqual(count(before), {"agent_usage": 8, "agent_limits": 8 + 2 + 1, "machine_status": 7 + 6,
+        # of the 7 that have no local model, again for the 6 that can have an owner chat, and again for the 7 with an
+        # owner chat that are active, whose helper can name chat_stop (chat_stoppable), and an open limit again for
+        # the 5 whose helper names it; the two kinds of sign-in of those 7; the key of the 4 whose helper starts its
+        # chat; the chat of the 2 with a key whose chat window runs; the newest press of Stop of each, for its turn end
+        # (turn_ended_after), and again for the one with a read message that waits.
+        self.assertEqual(count(before), {"agent_usage": 8, "agent_limits": 8 + 2 + 1 + 5, "machine_status": 7 + 6 + 7,
                                          "server_jobs": 7, "signin_jobs": 7, "agent_keys": 4,
-                                         "session_credentials": 2, "kv WHERE k%turn_ended": 8})
+                                         "session_credentials": 2, "kv WHERE k%turn_ended": 8, "chat_stops": 8 + 1})
 
     def test_the_goals_read_their_tokens_once(self):
         """One read for the tokens of all the goals, where each goal read its own; a goal reads them once for itself."""

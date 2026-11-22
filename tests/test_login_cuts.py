@@ -9,6 +9,7 @@ import hashlib
 import json
 import unittest
 import uuid
+from unittest.mock import patch
 
 import hub
 from test_blocked_access import BlockedAccess
@@ -249,6 +250,40 @@ class Cuts(BlockedAccess):
         short = "w " * 199 + "abcdefg hij"                              # a run of 7 across the cut is cut as before
         hub.log("dev", short)
         self.assertEqual(hub.q1("SELECT what FROM log ORDER BY id DESC LIMIT 1")["what"], short[:hub.LOG_MOST])
+
+    def answering(self, answer):
+        """search_history answers answer(args): an answer that the test writes, through call_tool."""
+        return patch.object(hub, "TOOLS", [(r, n, (lambda agent, a: answer(a)) if n == "search_history" else fn, d, s)
+                                           for r, n, fn, d, s in hub.TOOLS])
+
+    def test_the_calls_record_of_an_answer_keeps_no_part_of_a_login(self):
+        """calls keeps the first GOOGLE_CALL_KEEP characters of a read's answer (F14 piece 7), and leak_scan reads it
+        and finds a login only whole: a login across the cut that the owner registers after the call leaves no part
+        of it there."""
+        login = "LqCalls-7f3e9a01b2"
+        with self.answering(lambda a: across(hub.GOOGLE_CALL_KEEP, login)):
+            self.ok("manager", "search_history", {"query": "refunds"})
+        self.register(login)
+        detail = hub.q1("SELECT detail FROM calls WHERE name='search_history' ORDER BY id DESC LIMIT 1")["detail"]
+        self.no_part(detail, login)
+        self.assertTrue(detail.endswith(" w"), detail[-20:])
+
+    def test_the_leak_scan_names_a_call_that_holds_a_login_in_its_arguments_or_its_answer(self):
+        """GET /leakcheck names each stored row that holds a registered login. call_tool masks a call's arguments and
+        answer only for the logins of that moment, so a login that the owner registers after the call stays in its
+        row of calls. The scan reads a table in pieces (LEAK_PIECE), and names each row once: with pieces of two rows,
+        the second row with the login is in the second piece."""
+        login = "LqScan-7f3e9a01b2"
+        with self.answering(lambda a: f"The shop key is {login}." if a["query"] == "shop key" else "No record."):
+            for query in (login, "refunds", "shop key"):
+                self.ok("manager", "search_history", {"query": query})
+        calls = [(r["id"], r["name"]) for r in hub.q("SELECT id, name FROM calls ORDER BY id")]
+        self.assertEqual(([name for _, name in calls], hub.leak_scan()), (["search_history"] * 3, []))
+        self.register(login)
+        rows = [f"calls row {calls[0][0]}", f"calls row {calls[2][0]}"]
+        self.assertEqual(hub.leak_scan(), rows)
+        with patch.object(hub, "LEAK_PIECE", 2):
+            self.assertEqual(hub.leak_scan(), rows)
 
     def test_a_goal_change_keeps_no_part_of_a_login(self):
         login = "LqGoalLog-7f3e9a01b2"

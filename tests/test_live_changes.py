@@ -6,6 +6,7 @@ import json
 import threading
 import time
 import unittest
+import uuid
 from unittest.mock import patch
 
 import hub
@@ -192,6 +193,34 @@ class LiveChanges(ManagerSwitch):
         self.turn(ended=hub.now())                                      # the turn that read the answer ends
         self.assertEqual((hub.CHANGE["state"], self.turn_ended_after()), (before + 1, answer["created"]))
         self.assertEqual(waits_since(), answer["created"])              # no report: the turn end alone ends the motion
+
+    def test_a_confirmed_stop_ends_the_wait_of_a_worker_and_wakes_the_apps(self):
+        """Stop in the chat box (UI-API.md 1.301, chat_stop): a worker's chat reports no turn ends, so nothing ended a
+        wait under its stopped message. The helper's confirmed interrupt ends the stop, turn_ended_after then covers
+        the stopped message, and that write wakes the apps, so each app, also one from before chat_stop, stops its
+        line "Thinking" under it. The bug: "Thinking" turns under the stopped message with no end."""
+        hub.q("INSERT INTO machine_status(agent,data,reported) VALUES('vps',?,?)",
+              (json.dumps({"features": ["chat_stop"]}), hub.now()))
+        _, sent = self.request("/ui/messages", self.command(recipient="vps", text="Rename every file."))
+        hub.call_tool("vps", "read_messages", {}, ("test-generation", "owner-chat", "1"))
+        code, pressed = self.request("/ui/chats/vps/stop", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                            "message": sent["request_id"]})
+        self.assertEqual((code, pressed["stop"]["state"]), (200, "requested"), pressed)
+        self.assertIsNone(self.turn_ended_after("vps"))                 # the interrupt waits: the turn still runs
+        token = self.request("/ui/state")[1]["token"]
+        got = {}
+        waiter = threading.Thread(target=lambda: got.update(answer=self.wait(token, 5)))
+        start = time.monotonic()
+        waiter.start()
+        time.sleep(0.3)
+        code, _ = self.request("/helper/chat-stop/vps", {"stop": pressed["stop"]["id"], "confirmed": True,
+                                                         "detail": "interrupted; the session is idle", "reads": []})
+        waiter.join(5)
+        self.assertEqual(code, 200)
+        self.assertLess(time.monotonic() - start, 3)                    # the apps read at once
+        self.assertNotEqual(got["answer"][1]["token"], token)
+        self.assertEqual(self.turn_ended_after("vps"),
+                         hub.q1("SELECT created FROM ui_requests WHERE request_id=?", (sent["request_id"],))["created"])
 
     def test_a_turn_that_a_usage_limit_cut_ends_no_wait_while_the_limit_holds(self):
         """A turn that stops at a usage limit ends as every turn does (threads: a result with the stop reason

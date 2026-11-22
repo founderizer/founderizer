@@ -2456,7 +2456,7 @@ class GoogleHub(OwnerAPI):
         self.assertIn("[Cut: this text has", text)
         self.assertLessEqual(len(text), 50200)
         detail = hub.q1("SELECT detail FROM calls WHERE name='drive_search' ORDER BY id DESC")["detail"]
-        self.assertEqual(detail, text[:4000])
+        self.assertEqual(detail, text[:4000].rsplit(" ", 1)[0])   # no part of the run of n across the cut (cut_whole)
         self.fake.search_files = []
         self.assertTrue(self.ok("drive_search", {"words": "none"}).endswith("No files found.\nMore: page=page-2"))
         self.assertTrue(self.refused("drive_search", {"words": "x"}, context=("test-generation", "owner-chat", 1)))
@@ -2482,7 +2482,8 @@ class GoogleHub(OwnerAPI):
         text = self.ok("drive_read", {"file_id": "doc1"})
         self.assertIn("x" * 50000 + "\n[Cut: this text has 60,000 characters. You see the first 50,000.]", text)
         self.assertIn("curl -sfo 'Plan.md' ", text)
-        self.assertEqual(len(hub.q1("SELECT detail FROM calls WHERE name='drive_read' ORDER BY id DESC")["detail"]), 4000)
+        self.assertEqual(hub.q1("SELECT detail FROM calls WHERE name='drive_read' ORDER BY id DESC")["detail"],
+                         text[:text.index("x" * 50000)].rstrip())    # a run across the cut is not kept in part
         self.assertEqual(self.refused("drive_read", {"file_id": "nothing"}), "Not done: notFound.")
         self.fake.files["odd"] = drive("odd", "../../.bashrc ' ; rm -rf ~ '")
         self.assertIn("curl -sfo '__.._.bashrc _ _ rm -rf _ _' ", self.ok("drive_read", {"file_id": "odd"}))

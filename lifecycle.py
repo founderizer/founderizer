@@ -405,7 +405,10 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "forget_sessions",
             # a task in the screen runner takes the parts of the rules that the hub names for it (hub.stable_extra,
             # FLEET_RULES of screen_runner.py): its thread has them after RULES.md as its developer instructions
-            "runner_rules"]
+            "runner_rules",
+            # owner feature chat_stop: it interrupts the turn of its standing window for the owner's press of Stop in
+            # the chat box, and keeps the session (the event chat_stop, fleet.Helper.chat_stop)
+            "chat_stop"]
 # ---------------------------------------------------------------- the host list
 #
 # The host list of an agent whose Shell box is off and whose Web box is on (team.json "web_hosts"): the hosts on which

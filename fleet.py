@@ -1003,6 +1003,11 @@ OWN_WINDOW = re.compile(r"manager|owner-chat|T-\d+|C-\d+")
 # Seconds between two looks at whether the idle owner chat would start fresh at its next message (Helper.chat_cold):
 # each look reads the chat's screen and its conversation file.
 CHAT_COLD_EVERY = 60
+# Owner feature chat_stop: an owner chat has no record feed (task_windows), so after an interrupt that its screen
+# confirms, its conversation file stays unchanged for CHAT_STOP_QUIET seconds, at one of CHAT_STOP_LOOKS looks half a
+# second apart, before the helper confirms the stop (Helper.chat_file_quiet).
+CHAT_STOP_QUIET = 5
+CHAT_STOP_LOOKS = 20
 # The helper's loop between two polls (Helper.pause): no pause after a poll that the hub held with no event, and
 # LOOP_PAUSE otherwise. A poll that the hub held lasted at least POLL_HELD seconds; one that came back sooner with no
 # event keeps the whole pause, so no loop runs hot.
@@ -4681,6 +4686,34 @@ def start_handover(agent, generation):
     return out
 
 
+def chat_stop_file(agent):
+    return os.path.join(HOME, f"chat-stop-{agent}.json")
+
+
+def load_chat_stop_answers(agent):
+    """{"<press>:<its created>": the helper's answer} that the hub did not take yet (Helper.chat_stop), from the file
+    that keeps them across a restart of the helper; {} when there is none or it cannot be read."""
+    try:
+        with open(chat_stop_file(agent), encoding="utf-8") as f:
+            kept = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return kept if isinstance(kept, dict) else {}
+
+
+def save_chat_stop_answers(agent, answers):
+    """Keep these answers of presses of Stop until the hub takes them (load_chat_stop_answers). {} removes the file."""
+    path = chat_stop_file(agent)
+    if not answers:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
+        return
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    new = f"{path}.{secrets.token_hex(4)}.new"
+    write_private(new, json.dumps(answers, sort_keys=True) + "\n")
+    os.replace(new, path)
+
+
 def handover_file(agent):
     return os.path.join(HOME, f"manager-{agent}.handover.json")
 
@@ -5161,6 +5194,7 @@ class Helper:
         self.hub_turns = None
         self.manager_session = None
         self.manager_turn = {}    # {"session", "running"}: the manager's own turn, as its records go by (report_limit)
+        self.manager_turn_end = 0.0     # the time of the newest turn end in those records (report_limit, chat_stop)
         self.retiring = None      # (first quiet reading, its marks) of the previous runtime's chat (runtime_switch)
         self.retired_left = {}    # {pid: args} of that chat's processes that did not end when it closed
         self.manager_lock = None        # the start lock while the previous runtime's manager session closes
@@ -7235,6 +7269,7 @@ class Helper:
                         self.report_start(ev.get("task"), str(e)[:200] if isinstance(e, Refused) else type(e).__name__)
                 self.say(f"event {ev['id']} remains pending: {type(e).__name__}" +
                          (f"; next try in {wait} s" if ev.get("kind") == "task" else ""))
+        self.chat_stop_flush(events)
         for window in [w for w in self.lines if w not in self.wanted]:
             self.lines.pop(window)
         if self.manager_untaken is not None and not self.manager_untaken & self.wanted.get("manager", set()):
@@ -7621,6 +7656,8 @@ class Helper:
             self.withdraw(extra)
         elif kind == "control":
             self.control(task, extra)
+        elif kind == "chat_stop":       # owner feature chat_stop: the owner pressed Stop in the chat box
+            self.chat_stop(extra)
         elif kind == "manager_start":
             # Owner feature manager_start: the control that the hub's manager_down warning carries. The loop's own
             # watch starts a missing session by itself (manager_gone); this is the owner's hand on the same switch,
@@ -8482,8 +8519,15 @@ class Helper:
                 continue
             if r["type"] == "result":
                 turn["running"], marks["ended"] = False, r["ts"]
+                # owner feature chat_stop: the time of the newest end that was not normal (cancelled or error, not
+                # end_turn), so that the hub gives a cut turn's reads again only after such an end that came after the
+                # press (hub.chat_stop_cut_after)
+                if r.get("stop_reason") != "end_turn":
+                    marks["cut_end"] = r["ts"]
             elif r["type"] not in ("session", "model", "error") and not turn["running"]:
                 turn["running"], marks["started"] = True, r["ts"]
+        if "ended" in marks:        # owner feature chat_stop: a turn that ended after a press is not the press's turn
+            self.manager_turn_end = max(self.manager_turn_end, marks["ended"])
         if marks:
             code, _ = http("POST", f"/helper/turn/{self.agent}", marks, timeout=10)
             if code not in (200, 404):
@@ -9233,8 +9277,11 @@ class Helper:
     def interrupt(self, window):
         """Stop the running turn with Esc, at most three times. Confirmed at once for a session with no running turn,
         and for a Claude session when its records show the turn's end after the Esc (plan C5); for another runtime
-        when the screen shows no running turn and its record file has been quiet for 5 seconds."""
+        when the screen shows no running turn and its record file has been quiet for 5 seconds. interrupt_keys: the
+        keys that this call sent to the session (owner feature chat_stop: a press of Stop cut a turn only when one
+        went)."""
         target = f"={self.session}:={window}"
+        self.interrupt_keys = 0
         if window not in self.look_sure():      # before any key: a tmux with no answer is no "no session"
             return True, "no session was running"
         if tmux("display-message", "-p", "-t", target, "#{pane_in_mode}").stdout.strip() not in ("", "0"):
@@ -9243,6 +9290,7 @@ class Helper:
             # Ctrl-C: the runner interrupts its Codex turn, ends its own process group and exits.
             for _ in range(2):
                 tmux("send-keys", "-t", target, "C-c")
+                self.interrupt_keys += 1
                 deadline = time.monotonic() + 15
                 while time.monotonic() < deadline:
                     time.sleep(1)
@@ -9259,6 +9307,7 @@ class Helper:
         for _ in range(3):
             if self.working(target):
                 tmux("send-keys", "-t", target, "Escape")
+                self.interrupt_keys += 1
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 time.sleep(1)
@@ -9490,6 +9539,137 @@ class Helper:
         if code not in (200, 409):          # 409: the hold was released or settled meanwhile
             raise Refused(f"the hub did not take the {extra.get('action')} result ({code})")
         self.say(f"{task}: {extra.get('action')} {'confirmed' if confirmed else 'NOT confirmed'}: {detail}")
+
+    def chat_stop(self, extra):
+        """The owner pressed Stop in the chat box (owner feature chat_stop, hub.chat_stop_act): interrupt the turn of
+        the standing window that works on the owner's message, as a pause does for a task, and keep the session. Only
+        Esc, and only at a screen that shows a running turn at that moment (interrupt): never a key at a question,
+        never Enter, a digit or a text. Nothing of control's other parts: no end of the vault's requests, of the
+        session's processes or of its background commands, and no close of the window (the hub's line tells the agent
+        to check what the stop cut). After a confirmed interrupt, the ids of the messages that the cut turn had read
+        go to the hub, which gives them again (cut_reads), and the window's told line is forgotten, so that the owner's
+        correction is told as new. The answer says whether the helper cut a turn (`cut`): only then does the hub
+        give the messages of the turn again. An answer that the hub does not take (not 200, and not 409, which says
+        that the press is settled), or a hub that does not answer, leaves the event pending: its next try sends the
+        same answer and touches no window, also after a restart of this helper, because the answer is kept in a file
+        (save_chat_stop_answers) before it is sent. Its key is the press and its time: a press again of the same row
+        (after an interrupt that did not take) is a press of its own."""
+        stop = extra.get("stop")
+        if isinstance(stop, bool) or not isinstance(stop, int) or stop < 1:
+            raise Refused("a press of Stop without its number")
+        window = "manager" if self.conf.get("role") == "manager" else "owner-chat"
+        key = f"{stop}:{extra.get('created')}"
+        answer = load_chat_stop_answers(self.agent).get(key)
+        if answer is None:
+            confirmed, detail, cut = self.chat_turn_stop(window, extra)
+            answer = {"stop": stop, "confirmed": confirmed, "detail": detail, "cut": cut,
+                      # whenever confirmed or cut: the hub keeps those of an answer that cut (chat_stops.reads) and
+                      # gives them again only at the end of a press that cut, by any path; a turn that ended
+                      # normally gives none
+                      "reads": self.cut_reads(window, str(extra.get("generation") or ""))
+                      if confirmed or cut else []}
+            if cut:
+                self.lines.pop(window, None)
+            # kept before the send: a hub that gives no answer at all (a release restarts it) raises here, and the
+            # next try must send these reads, not "no turn was running". The file holds the press now only: the
+            # answer of an earlier press, which the hub can have settled itself, goes. A save that fails does not
+            # keep the answer in hand from the hub.
+            try:
+                save_chat_stop_answers(self.agent, {key: answer})
+            except OSError as e:
+                self.say(f"{window}: the answer of the press of Stop is not kept ({type(e).__name__}); it goes now")
+        code, _ = http("POST", f"/helper/chat-stop/{self.agent}", answer)
+        if code not in (200, 409):
+            raise Refused(f"the hub did not take the answer of the press of Stop ({code})")
+        with contextlib.suppress(OSError):
+            save_chat_stop_answers(self.agent, {})
+        self.say(f"{window}: Stop {'confirmed' if answer['confirmed'] else 'NOT confirmed'}: {answer['detail']}")
+
+    def chat_stop_flush(self, events):
+        """Each pass: send the kept answer of a press whose event did not come in this poll (owner feature chat_stop),
+        once, and drop it on 200, 404 or 409. The hub can have settled the press itself at the read of the owner's
+        correction, after the answer's send failed; its poll then never gives the event again (a helper with no kept
+        answer would send Esc into the correction's turn), and the answer, with the cut turn's reads, comes here. One
+        that the hub does not take stays for the next pass."""
+        here = {(ev.get("extra") or {}).get("stop") for ev in events if ev.get("kind") == "chat_stop"}
+        for key, answer in load_chat_stop_answers(self.agent).items():
+            if not isinstance(answer, dict) or answer.get("stop") in here:
+                continue
+            try:
+                code, _ = http("POST", f"/helper/chat-stop/{self.agent}", answer)
+            except (urllib.error.URLError, OSError, ValueError):
+                continue
+            if code in (200, 404, 409):
+                with contextlib.suppress(OSError):
+                    save_chat_stop_answers(self.agent, {})
+                self.say(f"the kept answer of a press of Stop went to the hub ({code})")
+
+    def chat_turn_stop(self, window, extra):
+        """(confirmed, detail, cut) of a press of Stop for `window` (chat_stop): cut when a key of interrupt went to the
+        session. In the order that keeps every
+        key from a screen that does not run the turn of the press: a window of another name or another hub
+        generation, or no window, runs no turn of the message; a question on the screen gets no key and is not
+        confirmed (the screen watch tells of it, watch_screens); a screen with no running turn, and a turn that its
+        records end after the press (the manager's), get no key: Esc at an idle Codex box opens the edit of the
+        message before. Only then interrupt. A window with no record feed, an owner chat, is confirmed by the screen
+        and by its conversation file, which stays unchanged for CHAT_STOP_QUIET seconds (chat_file_quiet). A tmux that
+        does not answer raises Silent or Refused, and the event comes again."""
+        target = f"={self.session}:={window}"
+        generation = str(extra.get("generation") or "")
+        if extra.get("window") != window:
+            return True, "no session of this message runs", False
+        if window not in self.look_sure():
+            return True, "no session was running", False
+        # the manager's window carries no hub generation (start: ":0"); an owner chat's is "<generation>:1"
+        if window == "owner-chat" and self.window_attempt(window) != f"{generation}:1":
+            return True, "no session of this message runs", False
+        screen = tmux("capture-pane", "-p", "-t", target)
+        if screen.returncode != 0:
+            raise Refused(f"tmux gave no screen of {window}, so nothing was decided on it")
+        if shows_question(screen.stdout) and not WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])):
+            return False, "its screen shows a question", False
+        if not self.turn_runs(window, target):
+            return True, "no turn was running", False
+        if self.feeds_of(window):
+            self.tailer.flush(window)       # its newest records first (report_limit keeps their newest turn end)
+            if self.manager_turn_end > float(extra.get("created") or 0):
+                return True, "its turn ended before the interrupt", False
+        confirmed, detail = self.interrupt(window)
+        cut = self.interrupt_keys > 0       # "no turn was running" and "no session was running" sent no key
+        if confirmed and cut and not self.feeds_of(window) and not self.gone(window):
+            confirmed, detail = self.chat_file_quiet(generation, detail)
+        return confirmed, detail, cut
+
+    def chat_file_quiet(self, generation, detail):
+        """(confirmed, detail) after an interrupt that the screen confirmed in a window with no record feed (an owner
+        chat): its conversation file (chat_binding) stays unchanged for CHAT_STOP_QUIET seconds, at one of
+        CHAT_STOP_LOOKS looks, half a second apart. Tailer.quiet says true for such a window with no reading at all.
+        A chat whose conversation file the helper cannot find keeps the screen's word."""
+        path = self.chat_binding(self.conf.get("runtime"), generation)
+        if not path:
+            return True, detail
+        for _ in range(CHAT_STOP_LOOKS):
+            try:
+                if time.time() - os.path.getmtime(path) >= CHAT_STOP_QUIET:
+                    return True, detail
+            except OSError:
+                return True, detail
+            time.sleep(0.5)
+        return False, "its conversation file still changes after the interrupt"
+
+    def cut_reads(self, window, generation):
+        """The ids of the messages that the cut turn of `window` had read (unfinished_turn_reads), from the session's
+        own conversation file: the manager's by its window's @fleet_session (manager_binding), an owner chat's by its
+        record (chat_binding). Only a read whose first line names its messages counts (read_ids), and only the
+        manager's read begins so (hub.t_read_messages): a worker's or a lead's chat names none, so its list is empty
+        here."""
+        runtime = self.conf.get("runtime")
+        if window == "manager":
+            state = self.manager_state()
+            path = manager_binding(self.agent, runtime, state[0]) if state and state[0] else None
+        else:
+            path = self.chat_binding(runtime, generation)
+        return unfinished_turn_reads(runtime, path)
 
     def deposit(self, extra):
         """A key or a login that the central vault sealed for this machine's vault (owner feature

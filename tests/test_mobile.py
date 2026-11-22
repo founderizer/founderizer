@@ -961,7 +961,9 @@ class Devices(test_ui_api.OwnerAPI):
         only each conversation's last line, so it could say "Thinking" only for a chat that the phone itself had read.
         For the manager, his answer to its Needs-you item waits too (UI-API.md 1.283, chat_waits_answers): the manager
         works on it in its chat session, and no row moved for three answers of 21 November 2026. A worker's or a lead's
-        answer goes to the task that asked, and no chat turn follows it, so a wait on it would never end."""
+        answer goes to the task that asked, and no chat turn follows it, so a wait on it would never end. A message
+        whose press of Stop is over waits for nothing (UI-API.md 1.301, chat_stop): the bug is a row that moves for
+        ever under a stopped message, or that stops while the interrupt still waits or did not take."""
         hub.TEAM["addresses"]["w1"] = "127.0.0.3"
         hub.TEAM["agents"]["leo"] = {"role": "worker", "runtime": "claude", "machine": "w1", "can": []}
 
@@ -1007,6 +1009,22 @@ class Devices(test_ui_api.OwnerAPI):
         says("ava", 111.0, kind="answer")
         self.assertEqual(waits()["ava"], 110.0)                            # a lead's answer waits as a worker's: never
         self.assertTrue(second)
+        stopped = says("leo", 112.0)
+        stop = hub.ins("INSERT INTO chat_stops(agent,request,state,created) VALUES('leo',?,'requested',113.0)",
+                       (stopped,))
+        self.assertEqual(waits()["leo"], 112.0)                            # its helper interrupts the turn: it works
+        hub.q("UPDATE chat_stops SET state='not_confirmed' WHERE id=?", (stop,))
+        self.assertEqual(waits()["leo"], 112.0)                            # the interrupt did not take: it works on
+        line = hub.emit("leo", "chat", "[hub] The owner pressed Stop in this chat.", extra={"stop": stop})
+        hub.q("UPDATE chat_stops SET line=? WHERE id=?", (line, stop))
+        self.assertEqual(waits()["leo"], 112.0)
+        hub.q("UPDATE events SET read_at=114.0 WHERE id=?", (line,))
+        self.assertIsNone(waits()["leo"])                                  # it read the hub's line: the turn is over
+        hub.q("UPDATE events SET read_at=NULL WHERE id=?", (line,))
+        hub.q("UPDATE chat_stops SET state='stopped' WHERE id=?", (stop,))
+        self.assertIsNone(waits()["leo"])                                  # the helper confirmed the interrupt
+        says("leo", 115.0)
+        self.assertEqual(waits()["leo"], 115.0)                            # the correction waits as every message
 
 
 def register(secret, salt):
