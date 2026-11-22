@@ -434,14 +434,16 @@ def connect_by(end):
             rest = end - time.monotonic()
             if rest <= 0:
                 break
-            sock = socket.socket(family, kind, proto)
-            try:
+            sock = None
+            try:        # a family that the kernel refuses (IPv6 off) is one address that fails, not the end of the loop
+                sock = socket.socket(family, kind, proto)
                 sock.settimeout(rest)
                 sock.connect(where)
                 return sock
             except OSError as e:
                 error = e
-                sock.close()
+                if sock is not None:
+                    sock.close()
         raise Missed("download", type(error).__name__ if error else "not connected in its time")
     return connect
 

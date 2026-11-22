@@ -2487,6 +2487,34 @@ class Functions(unittest.TestCase):
                                  ("not a type", "blob", "application/octet-stream")):
             self.assertEqual(channels.file_type(mime, name), want, (mime, name))
 
+    def test_a_family_that_the_kernel_refuses_is_one_address_that_fails(self):
+        """A file's fetch tries each address of the host: when the lookup gives an IPv6 address first on a server
+        whose kernel has IPv6 off, socket.socket raises, and the IPv4 address after it still connects, as
+        socket.create_connection did. A socket made outside the try ended the loop at the first address."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        addresses = [(socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("2001:db8::1", port, 0, 0)),
+                     (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", port))]
+        real = socket.socket
+
+        def make(family=socket.AF_INET, *args, **kwargs):
+            if family == socket.AF_INET6:
+                raise OSError(97, "Address family not supported by protocol")
+            return real(family, *args, **kwargs)
+        with patch.object(channels, "lookup", lambda host, port, end: addresses), \
+                patch.object(channels.socket, "socket", make):
+            sock = channels.connect_by(time.monotonic() + 5)(("files.example", port))
+        self.addCleanup(sock.close)
+        self.assertEqual(sock.getpeername(), ("127.0.0.1", port))
+        with patch.object(channels, "lookup", lambda host, port, end: addresses[:1]), \
+                patch.object(channels.socket, "socket", make):
+            with self.assertRaises(channels.Missed) as missed:
+                channels.connect_by(time.monotonic() + 5)(("files.example", port))
+        self.assertEqual((missed.exception.code, missed.exception.why), ("download", "OSError"))
+
     def test_split_parts(self):
         self.assertEqual(channels.split_parts("short", 2000), ["short"])
         text = "\n\n".join(f"P{i} " + "x" * 1900 for i in range(6))

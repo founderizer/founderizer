@@ -5457,8 +5457,9 @@ def tools():
                             "the hub makes each repository call for it. role_access true (Founderizer for "
                             "Teams) gives a person who is there their role's set again, whole; a new person whose "
                             "role has a set needs no agents; a change of role writes the new role's set first, so "
-                            "scopes in that write name only an agent of that set or of agents, else the hub refuses "
-                            "the whole write. This tool and save_role are the only writers of the "
+                            "scopes in that write name only an agent that the person has after the set and the "
+                            "agents of that write are written, else the hub refuses the whole write. This tool and "
+                            "save_role are the only writers of the "
                             "people tables, so nothing a person says can widen their own access.",
              {"id": S["int"], "name": S["text"], "role": S["text"], "agents": {"type": "array", "items": S["text"]},
               "note": {"type": ["string", "null"], "description": "Null takes the note away."},
