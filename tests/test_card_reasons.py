@@ -191,15 +191,45 @@ class Reasons(OwnerAPI):
         self.assertTrue(error)
         self.assertIn("dev holds it: give that part of the work to dev", said)
         self.assertNotIn("raise_needs_you", said)
-        # a key's value is what the hub never sees: a revoked one is the owner's to replace
+        # a key's value is what the hub never sees: a revoked one is the owner's to replace, in request_secret's
+        # secure card (failed), never by an item whose steps send them into the vault (the key badge and key replace,
+        # 21 November 2026)
         key = "bws://00000000-0000-4000-8000-00000000c0de"
         hub.TEAM["logins"] = {key: {"kind": "api_key", "env": "SHOP_KEY", "title": "Shop API"}}
         hub.TEAM["agents"]["dev"]["secrets"] = {key: "use"}
-        self.assertIn('needs_level "value"', self.refused("dev (use) holds", reason="access",
-                                                          needs_access=f"secret:{key}"))
-        self.assertIsInstance(self.card(reason="access", needs_access=f"secret:{key}", needs_level="value"), int)
-        self.refused("needs_level value is for a secret", reason="access", needs_access="repo:acme/web",
-                     needs_level="value")
+        self.assertIn(f'request_secret with failed="{key}"',
+                      self.refused("dev (use) holds", reason="access", needs_access=f"secret:{key}"))
+        self.assertIn(f'request_secret with failed="{key}"', self.refused(
+            "Not raised: a new value of", reason="access", needs_access=f"secret:{key}", needs_level="value"))
+        # a site of the table is the manager's to switch off
+        hub.TEAM["logins"][key]["table"] = {"row": "shop", "on": True}
+        for level in ("value", "placeholder"):
+            self.assertIn('switch_key_site with to="off"', self.refused(
+                "Not raised:", reason="access", needs_access=f"secret:{key}", needs_level=level))
+        del hub.TEAM["logins"][key]["table"]
+        # a site that the owner set, held as a placeholder that a program cannot use, is the one case that only an
+        # item settles; value never raises it, because the hub cannot tell a revoked value from that
+        self.refused("no agent holds SHOP_KEY as a placeholder", reason="access", needs_access=f"secret:{key}",
+                     needs_level="placeholder")
+        with patch.object(hub, "key_swaps", lambda agent, ref: ("api.shop.example", "bearer")):
+            self.assertIn('give needs_level "placeholder"', self.refused(
+                f'failed="{key}"', reason="access", needs_access=f"secret:{key}", needs_level="value"))
+            self.assertIsInstance(self.card(reason="access", needs_access=f"secret:{key}",
+                                            needs_level="placeholder"), int)
+        login = "bws://00000000-0000-4000-8000-00000000d0de"
+        hub.TEAM["logins"][login] = {"kind": "login", "title": "shop.example", "username": "ops@example.com"}
+        hub.TEAM["agents"]["dev"]["secrets"][login] = "use"
+        self.assertIn(f'failed="{login}"', self.refused('kind "login"', reason="access",
+                                                         needs_access=f"secret:{login}", needs_level="value"))
+        hub.TEAM["logins"][login]["title"] = "Shop"         # the owner renamed it: no host, so no site to name
+        self.assertNotIn("https://Shop", self.refused("names no site that the hub can tell", reason="access",
+                                                      needs_access=f"secret:{login}", needs_level="value"))
+        app_key = "bws://00000000-0000-4000-8000-00000000e0de"
+        hub.TEAM["logins"][app_key] = {"kind": "api_key", "env": "GITHUB_APP_ACME_KEY", "title": "GitHub App"}
+        hub.TEAM["agents"]["dev"]["secrets"][app_key] = "use"
+        self.refused("is a GitHub App's key", reason="access", needs_access=f"secret:{app_key}", needs_level="value")
+        self.refused("needs_level value is for a key or a login of the fleet", reason="access",
+                     needs_access="repo:acme/web", needs_level="value")
         # what no holder can use now is the owner's: a Google account that is not connected, an MCP server whose
         # access ended
         self.assertIsInstance(self.card(reason="access", needs_access="gmail:sales@acme.com"), int)

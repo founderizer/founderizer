@@ -1762,10 +1762,11 @@ class KnowledgeWrite(Base):
     def test_a_key_shape_is_never_written_to_a_knowledge_file(self):
         key = ("-----BEGIN OPENSSH PRIVATE KEY-----\n" + "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n" * 3
                + "-----END OPENSSH PRIVATE KEY-----\n")
-        said, error = self.write(text="# Suppliers\n\nThe deploy key:\n" + key)
-        self.assertTrue(error, said)
-        self.assertIn("Blocked", said)
-        self.assertEqual(self.head(), self.seeded)
+        for written in (key, key.replace("\n", "\r")):        # old Mac line ends too, which went in with \n
+            said, error = self.write(text="# Suppliers\n\nThe deploy key:\n" + written)
+            self.assertTrue(error, said)
+            self.assertIn("Blocked", said)
+            self.assertEqual(self.head(), self.seeded)
 
     def test_the_commit_says_where_it_was_written_and_what_its_session_had_read(self):
         hub.ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,?,?,1,'call_api','{}',1,'')",

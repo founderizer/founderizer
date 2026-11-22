@@ -16642,8 +16642,8 @@ def card_dead(kind, what):
     """True when the hub sees that no holder can use this thing now, and no grant puts it right, only the owner: a
     Google account whose tools refuse it (google_access: the hub cannot read its Google file, the account is not
     connected, Google refused its saved access, or it does not allow that service), or an MCP server with Connect that
-    is not connected or whose access ended. The hub never sees a key's value, so a key that was revoked is needs_level
-    value. It commits nothing, so grant_check, which calls it, may run inside a transaction()."""
+    is not connected or whose access ended. The hub never sees a key's value, so a key that was revoked goes through
+    request_secret with failed. It commits nothing, so grant_check, which calls it, may run inside a transaction()."""
     if kind in ("drive", "gmail"):
         saved, bad = google_saved()
         entry = None if bad else google_entry(saved, what)
@@ -16709,11 +16709,60 @@ def card_named(text):
     return next((("tool", str(t)) for t in sorted(tool_catalog(TEAM)) if says(str(t).lower())), None)
 
 
+def value_route(ref, entry, holders, placeholder=False):
+    """card_access's answer to needs_level value or placeholder on a key or a login of the fleet (the key badge and key
+    replace, the owner's "Yes, both" of 21 November 2026): the refusal that names the route of the owner's new value,
+    whose card is the secure form where the owner types it, in place of an item whose steps sent the owner into the
+    vault; or None, for the one case that only an item settles: placeholder, for a key whose site the owner set (no
+    table mark) and that an agent holds as a placeholder on a server that swaps keys (key_swaps), which a program
+    cannot use. Only the owner changes that site; a site of the table is the manager's to switch off. value never
+    raises the item: the hub cannot tell a revoked value from a placeholder that a program cannot use."""
+    env = entry.get("env") or ref
+    if entry.get("kind") != "api_key":
+        replaced = retired_logins().get(ref)
+        if replaced:
+            return (f"Not raised: the owner gave a new password for {ref} already, as {replaced}: if that one fails "
+                    f"too, ask with request_secret and failed=\"{replaced}\".")
+        title = str(entry.get("title") or "")
+        head = title.partition(" · ")[0].strip()
+        # only a host is a site: a title that the owner renamed ("Stripe dashboard", "Shop") names none
+        if "." in head and SECRET_SITE.fullmatch("https://" + head) and \
+                any(r == ref for r, _ in catalog_logins("https://" + head)):
+            return (f'Not raised: a new password of the login {title} comes through request_secret with kind "login", '
+                    f'site="https://{head}" and failed="{ref}": its card is the secure form where the owner types it.')
+        return (f"Not raised: the title of the login {title or ref} names no site that the hub can tell, so "
+                f'request_secret cannot take failed="{ref}": ask with request_secret, kind "login" and its site, '
+                f"without failed, and the owner adds the login again.")
+    if GITHUB_APP_KEY_NAME.fullmatch(env):
+        return (f"Not raised: {env} is a GitHub App's key: the owner's app makes it with GitHub, nobody types it, "
+                f"and the hub asks you for its item (github_key) when it needs a new one.")
+    door = door_key_of(TEAM, ref)
+    if door.startswith("app:"):
+        return (f"Not raised: {door} is a setting of an app on a host, which keeps its value in its own settings "
+                f"file, so a new value cannot be given yet: tell the owner with message_owner which setting it is.")
+    mark = entry.get("table")
+    table_on = isinstance(mark, dict) and mark.get("on") is True
+    owner_site = not isinstance(mark, dict) and any(key_swaps(h["agent"], ref) for h in holders)
+    if placeholder:
+        if owner_site:
+            return None
+        if table_on:
+            return (f'Not raised: the table of well-known services gave {env} its site, so switch_key_site with '
+                    f'to="off" gives its sessions the key itself, and the owner is not needed.')
+        return (f"Not raised: no agent holds {env} as a placeholder, so its sessions hold the key itself. If its value "
+                f'is wrong or was revoked, request_secret with failed="{ref}" asks the owner for a new one.')
+    then = (' If a program cannot use its placeholder, give needs_level "placeholder".' if owner_site else
+            ' If a program cannot use its placeholder, the key needs no new value: switch_key_site with to="off" '
+            'gives its sessions the key itself.' if table_on else "")
+    return (f'Not raised: a new value of {env} comes through request_secret with failed="{ref}": its card is the '
+            f'secure form where the owner types it.{then}')
+
+
 def card_access(words, level):
     """The refusal of an item for access that the fleet already holds, else None. The thing is <kind>:<what> as
     grant_access names it, which the hub reads, or a few plain words for what the fleet's record does not name (a role
     in a cloud account, a database login, a new agent), which only the owner settles. So are a thing that no holder can
-    use now (card_dead) and a secret's value (needs_level value), which the hub cannot see."""
+    use now (card_dead). A secret's value, which the hub cannot see, has its own route (value_route)."""
     text = str(words or "").strip()
     if not text:
         raise ToolError("An item for access names the thing in needs_access: <kind>:<what> for what the fleet's record "
@@ -16741,18 +16790,25 @@ def card_access(words, level):
         return (f"needs_access {text} is not one thing that the fleet's record names. Give <kind>:<what> exactly as "
                 f"grant_access takes it (repo:acme/web), or a few plain words for what the record does not name. A key "
                 f"or a login that the fleet does not hold goes through request_secret.")
-    if str(level or "").strip().lower() == "value":
-        if kind != "secret":
-            raise ToolError("needs_level value is for a secret: its value itself, which only the owner gives.")
-        return None                     # a new value of a key, or its value in place of a placeholder: the owner's
+    said = str(level or "").strip().lower()
+    if said in ("value", "placeholder"):
+        entry = logins().get(what) if kind == "secret" else None
+        if not entry:
+            raise ToolError(f"needs_level {said} is for a key or a login of the fleet: the hub names the route of a "
+                            f"new value, or raises the item when only the owner can help.")
+        return value_route(what, entry, card_holders(kind, what), placeholder=said == "placeholder")
     if card_dead(kind, what):
         return None                     # no holder can use it now, and no grant puts it right: only the owner
     if kind == "repo" and team_repo_owner_step(what):
         return None                     # nor a repository that no GitHub App reaches: its holders cannot use it, a
         # plan's access refuses it (team_repo_refusal), and the owner connects GitHub or adds it to the App
     rid, want = access_needed(text, level)
-    value = (' If its value is wrong or was revoked, or a program cannot use its placeholder, give needs_level '
-             '"value": only the owner gives that.') if kind == "secret" else ""
+    entry = logins().get(what) if kind == "secret" else None
+    route = (value_route(what, entry, ()) or "").removeprefix("Not raised: ") if entry else ""
+    # the placeholder's word only where the hub cannot tell it from a new value: a key with no site of the table
+    extra = (' If a program cannot use its placeholder, give needs_level "placeholder".'
+             if route.startswith("a new value of") and "switch_key_site" not in route else "")
+    value = f" If its value is wrong or was revoked: {route}{extra}" if route else ""
     held = [h for h in card_holders(kind, what) if level_at_least(kind, h["level"], want)]
     if held:
         return (f"Not raised: {', '.join(h['agent'] + ' (' + h['level'] + ')' for h in held)} holds "
@@ -42228,7 +42284,7 @@ def t_write_knowledge(agent, a):
         raise ToolError(f"{e}. why goes in the commit message, so the owner reads what you changed and need not "
                         f"diff it to find out.") from None
     guard(agent, text, why)
-    shape = next((what for shape, what in SECRET_SHAPES if shape.search(text)), None)
+    shape = written_key(text)   # goal_text made \r\n into \n; a key with a bare \r passed here, and went in with \n
     if shape:                   # as write_skill: every agent's start lists this file, and git keeps every version
         raise ToolError(f"Blocked: text holds {shape}. A knowledge file never carries a login or a key: name the "
                         f"login (bws://<uuid>) and let your helper use it.")
@@ -42321,6 +42377,17 @@ SKILLS_LISTED = {}              # the list of one agent's skills at one revision
 # equal. A private key written out, as a block and not as a mention of its marker.
 SECRET_SHAPES = ((re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[ \t]*\n(?:[A-Za-z0-9+/=]{16,80}[ \t]*\n){2,}"),
                   "a private key, written out"),)
+
+
+def written_key(text):
+    """The words of the first of SECRET_SHAPES that a text holds ("a private key, written out"), with its line ends
+    read as \\n, or None: the shapes are publish.py's, which end a line with \\n only, so a key with Windows line
+    ends (\\r\\n) or old Mac ones (\\r) passed them (the readers of the owner's given skills, 22 November 2026): in
+    a skill's files and a given skill's files, and with a bare \\r in a skill's text and a knowledge file, which
+    goal_text gives with \\r\\n made \\n and which were then committed with \\n. For every text that an agent or the
+    owner commits."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n")
+    return next((what for shape, what in SECRET_SHAPES if shape.search(lines)), None)
 
 
 def skill_allow(agent, name):
@@ -42431,14 +42498,14 @@ def t_write_skill(agent, a):
     if not re.fullmatch(SKILL_NAME, name):
         raise ToolError("name is the skill's folder: 1 to 64 characters of a-z, 0-9 and -, with a letter or a digit "
                         "first, for example deploy-acme-web.")
-    retire = a.get("retire")
-    if retire not in (None, True, False):
-        raise ToolError("retire is true, to retire the skill, or left out.")
-    why = skill_text(a.get("why"), "why", 300, True)
     rev = kit_revision(fresh=True)
     if not rev:
         raise ToolError("The hub cannot read its own revision now, so nothing was written. Call write_skill again "
                         "with the same request_id.")
+    retire = a.get("retire")
+    if retire not in (None, True, False):
+        raise ToolError("retire is true, to retire the skill, or left out.")
+    why = skill_text(a.get("why"), "why", 300, True)
     folder, have = f"{SKILLS}/{agent}/{name}/", skill_files(rev, agent, name)
     if retire:
         if any(a.get(k) is not None for k in ("description", "text", "files")):
@@ -42484,7 +42551,7 @@ def t_write_skill(agent, a):
                             f"(retire=true), or fold two that do the same job into one.")
         guard(agent, why, description, text, *(files or {}), *(files or {}).values())
         for what, body in [("text", text), *((files or {}).items())]:
-            if any(shape.search(body) for shape, _ in SECRET_SHAPES):
+            if written_key(body):
                 raise ToolError(f"Blocked: {what} holds {SECRET_SHAPES[0][1]}. A skill never carries a login or a "
                                 f"key: name the login (bws://<uuid>) and let your helper use it.")
         changes = {path: data for path, data in content.items() if git_blob(rev, path) != data}
@@ -42495,6 +42562,14 @@ def t_write_skill(agent, a):
     command, stored = agent_write(agent, "write_skill", a, fields)
     if stored:
         return stored["text"]
+    # A skill that the owner gave keeps the owner's words (the owner's given skills, design of 21 November 2026): its
+    # write is refused, and so is its retire, but in a task that the owner's own message opened. Here, after the stored
+    # answer, so that the exact repeat of a write that went through gets its first answer again, also when a gift of
+    # that name landed since; and before anything is stored or committed. The commit asks again at its final revision
+    # (below), for a gift that lands meanwhile.
+    given = skill_given_refusal(agent, name, retire, rev)
+    if given:
+        raise ToolError(given)
     t0 = now()
     if not changes:
         said = f"The skill {name} already reads as you wrote it, so nothing was committed."
@@ -42504,10 +42579,21 @@ def t_write_skill(agent, a):
     first, *rest = sorted(changes)
     key = seen_task(agent, a)[0]
     whole = folder.rstrip("/")          # the skill's folder: a change to any of its files is a change to it
+    seen = seen_check(key, whole)
+
+    def check(final):
+        """At the revision that the commit is made on: no gift of the owner's landed on this skill since `rev`, then
+        seen_check."""
+        # at the revision that was read first, the question was asked above
+        refused = skill_given_refusal(agent, name, retire, final) if final != rev else None
+        if refused:
+            raise ToolError(refused)
+        if seen:
+            seen(final)
     try:
         commit = commit_kit_file(first, changes[first], skill_message(agent, name, why, bool(retire)),
                                  more={p: changes[p] for p in rest}, author=agent, allow=skill_allow(agent, name),
-                                 check=seen_check(key, whole))
+                                 check=check)
     except KitMoved as e:
         # A session reads a skill from its checkout, which stays as it was when the session started: so the refusal
         # shows what changed as it stands now, and the session has read it from then on (keep_refusal).
@@ -42597,10 +42683,15 @@ def skill_commits():
 
 
 def skills_view(agent=None):
-    """GET /ui/skills: every agent's own skills at the hub's revision, or one agent's, each with its newest commit."""
+    """GET /ui/skills: every agent's own skills at the hub's revision, or one agent's, each with its newest commit and
+    `given`: true for a skill that the owner gave (skills_given), false for the agent's own, and null for each skill
+    while git cannot say which are given."""
     last = skill_commits()
+    rev = kit_revision(fresh=True)
+    given = skills_given(rev) if rev else None
     return [dict(r, **last.get((r["agent"], r["name"]), {"commit": None, "at": None, "task": None,
-                                                           "outside_reads": None}))
+                                                           "outside_reads": None}),
+                 given=None if given is None else given.get((r["agent"], r["name"]), False))
             for r in skill_rows(kit_dir(), agent)]
 
 
@@ -42617,6 +42708,690 @@ def skill_remove(agent, name):
                              more={p: None for p in paths[1:]})
     log("owner", f"removed the skill {name} of {agent} in {commit[:12]}")
     return {"agent": agent, "name": name, "removed": True, "files": paths, "commit": commit}
+
+
+# ---- a skill that the owner gives (the owner's given skills, design of 21 November 2026)
+# The owner gives one of the owner's own skills to one agent: the folder or the ZIP dropped on the agent's chat. The
+# message route reads it with skill_give; there is no route and no tool of its own, because the message is the request.
+# The hub trusts nothing that the app did: it reads the ZIP itself, as bytes (skill_gift_read), and commits the owner's
+# bytes as they came, in one commit of the owner's with the trailer Fleet-Given. Every machine checks each move of its
+# checkout with lifecycle.may_take, which takes from the hub only paths of CONFIG_FILES, each a plain file (DATA_MODE):
+# one path that is deeper, a name with another character or a mode of 100755 stops the whole fleet's configuration, not
+# one skill (the design, 3.1). So a gift holds only paths of today's SKILL_FILE, each as a plain file, and a script
+# loses its run bit. A given skill keeps the owner's words: write_skill refuses a write to it, and retires it only in a
+# task that the owner's own message opened (the design, 5.5 and 6.4). Its limits are those of the open skill format;
+# an agent's own write_skill keeps its own, smaller ones (the design, 4).
+SKILL_GIFT_DESCRIPTION = 1024           # characters of a given skill's description, its white space collapsed
+SKILL_GIFT_MD_MAX = 64 * 1024           # bytes of its SKILL.md, the front matter included
+SKILL_GIFT_FILES = 100                  # files beside its SKILL.md
+SKILL_GIFT_FILE_MAX = 1024 * 1024       # bytes of each of them
+SKILL_GIFT_MAX = 4 * 1024 * 1024        # bytes of the whole folder, its SKILL.md included
+SKILL_GIFT_ENTRIES = 5000               # entries of the ZIP's central directory, counted before zipfile reads them
+SKILL_GIFT_PACKING = (0, 8)             # zipfile's ZIP_STORED and ZIP_DEFLATED: a read of bzip2 or LZMA unpacks all
+#                                         that one read takes, and only then cuts it (a packed bomb)
+SKILL_GIFT_WAIT = 10                    # seconds that the search for logins waits for another file's (CHAT_FILE_CHECKS)
+SKILL_GIFT_TRAILER = "Fleet-Given"      # the git trailer of a gift's commit: Fleet-Given: <agent>/<name>
+SKILL_GIFT_MAIL = "owner@fleet.invalid"     # commit_kit_file's mail for a commit of the owner's own
+SKILLS_GIVEN = {}                       # {(hub checkout, revision): (the marks, {(agent, name): given})}
+SKILLS_GIVEN_KEPT = 16                  # revisions that SKILLS_GIVEN keeps, the one read first going first
+SKILL_GIFT_PATH = ("at most two folders deep, and each name of at most 64 letters, digits, dots, underscores and "
+                   "dashes, with a letter, a digit or an underscore first and no two dots in a row")
+SKILL_GIFT_FRONT = ("SKILL.md starts with its front matter: a line ---, then name: and description:, each on one line, "
+                    "then --- again")
+SKILL_GIVEN_WRITE = ("The owner gave you the skill {name}, so it keeps the owner's words. Write a skill of your own "
+                     "with another name, and tell the owner what does not fit.")
+SKILL_GIVEN_RETIRE = ("The owner gave you the skill {name}. Only the owner removes a skill that the owner gave: tell "
+                      "the owner.")
+
+
+class SkillGiftMoved(Exception):
+    """commit_kit_file's check of a gift: the skill's folder changed between the gift's read of it and its commit (an
+    agent's write landed in between), so the gift reads it again (skill_give)."""
+
+
+def skill_gift_shown(path):
+    """A path of the owner's ZIP as a refusal names it: its printable characters, at most 200."""
+    return "".join(c if c.isprintable() else "?" for c in str(path))[:200] or "(a file with no name)"
+
+
+def skill_gift_read(data):
+    """(name, description, {path inside the skill's folder: bytes}) of the ZIP of a skill that the owner gives, or a
+    Refusal(422) whose words name the first file that does not fit. Bytes only: no git, no database, no file.
+
+    - Its central directory has at most SKILL_GIFT_ENTRIES entries, counted before zipfile reads them (office_package),
+      none is encrypted, and each file that it keeps is stored or deflated (SKILL_GIFT_PACKING): zipfile bounds a read
+      of a deflated file, and unpacks a bzip2 or LZMA file whole before it cuts the read.
+    - An empty part and a "." part of a name are dropped. Then, left out in silence: a folder's entry, __MACOSX/ (a
+      Mac's ZIP), every path with a part that starts with a dot, and __pycache__/. Then, when every entry is in one top
+      folder, that folder is taken off: its name is not the skill's, which the front matter gives. SKILL.md is then at
+      the top.
+    - Refused: an absolute path, a drive letter, a .. part, a backslash, a link or anything else that is not a plain
+      file or a folder (the entry's Unix mode), a path outside SKILL_FILE or with two dots in a row (CONFIG_FILES: the
+      paths that every machine takes from the hub), two paths that differ only in letter case or a name that is a file
+      and a folder (kit_names, a Mac's disk), and a SKILL.md in another case or only in a folder inside it.
+    - The sizes: first those that the central directory declares, before any read; then each read stops one byte past
+      the file's limit and the folder's, whatever its entry declared (a packed bomb).
+    - A file of the skill that is itself a ZIP has the same two bounds: at most SKILL_GIFT_ENTRIES entries, each stored
+      or deflated, because the search for logins opens an Office file.
+    - SKILL.md is UTF-8 with its front matter (skill_gift_front), and no file holds a private key written out
+      (written_key), read as UTF-8 with each byte that is no UTF-8 as U+FFFD. The registered logins are in the hub's
+      database: skill_give searches for them (skill_gift_logins)."""
+    import io
+    import zipfile
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        raise Refusal(422, "The skill is empty: give the ZIP of its folder.")
+    data = bytes(data)
+    if data.count(b"PK\x01\x02") > SKILL_GIFT_ENTRIES:     # each entry of the central directory
+        raise Refusal(422, f"The ZIP holds more than {SKILL_GIFT_ENTRIES:,} entries, more than a skill can hold.")
+    try:
+        package = zipfile.ZipFile(io.BytesIO(data))
+        entries = package.infolist()
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, ValueError, OSError, EOFError, NotImplementedError):
+        raise Refusal(422, "These bytes are not a ZIP that the hub can read.") from None
+    if len(entries) > SKILL_GIFT_ENTRIES:
+        raise Refusal(422, f"The ZIP holds more than {SKILL_GIFT_ENTRIES:,} entries, more than a skill can hold.")
+    kept = []
+    for info in entries:
+        raw, shown = info.filename, skill_gift_shown(info.filename)
+        if info.flag_bits & 0x1:
+            raise Refusal(422, f"{shown} is encrypted in the ZIP. Give the skill in a ZIP with no password.")
+        if "\\" in raw:
+            raise Refusal(422, f"{shown} has a backslash in its name. A path in a skill is {SKILL_GIFT_PATH}.")
+        if raw.startswith("/") or re.match(r"[A-Za-z]:", raw):
+            raise Refusal(422, f"{shown} is an absolute path. A skill's ZIP holds paths inside its folder only.")
+        # an empty part and a "." part name nothing: bsdtar writes each name of `tar -acf x.zip .` as ./<name>, which
+        # the dot-name rule below left out whole
+        parts = [p for p in raw.split("/") if p not in ("", ".")]
+        if not parts:
+            continue
+        if ".." in parts:
+            raise Refusal(422, f"{shown} points out of the skill's folder. A skill's ZIP holds paths inside its folder "
+                               f"only.")
+        kind = stat.S_IFMT(info.external_attr >> 16)    # the Unix mode, where the ZIP keeps one; 0 where it keeps none
+        if info.is_dir() or kind == stat.S_IFDIR or \
+                any(p in ("__MACOSX", "__pycache__") or p.startswith(".") for p in parts):
+            continue
+        if kind == stat.S_IFLNK:
+            raise Refusal(422, f"{shown} is a link. A skill holds plain files only: put the file itself in the ZIP.")
+        if kind not in (0, stat.S_IFREG):
+            raise Refusal(422, f"{shown} is not a plain file. A skill holds plain files only.")
+        if info.compress_type not in SKILL_GIFT_PACKING:
+            raise Refusal(422, f"{shown} is packed in a way that the hub does not read: make the ZIP again with the "
+                               f"usual packing.")
+        kept.append((parts, info))
+    if kept and len({parts[0] for parts, _ in kept}) == 1 and all(len(parts) > 1 for parts, _ in kept):
+        kept = [(parts[1:], info) for parts, info in kept]
+    paths = ["/".join(parts) for parts, _ in kept]
+    if "SKILL.md" not in paths:
+        top = next((p for p in paths if p.lower() == "skill.md"), None)
+        inner = next((p for p in paths if p.rsplit("/", 1)[-1].lower() == "skill.md"), None)
+        if top:
+            raise Refusal(422, f"{skill_gift_shown(top)} is not named SKILL.md: a skill's main file is SKILL.md, in "
+                               f"capital letters, at the top of its folder.")
+        if inner:
+            raise Refusal(422, f"{skill_gift_shown(inner)} is in a folder inside the skill: its SKILL.md is at the top "
+                               f"of its folder.")
+        raise Refusal(422, "The ZIP holds no SKILL.md: a skill is a folder with its SKILL.md at the top.")
+    for p in paths:
+        if not re.fullmatch(SKILL_FILE, p) or ".." in p:
+            raise Refusal(422, f"{skill_gift_shown(p)} is not a path that a skill can hold: a path in a skill is "
+                               f"{SKILL_GIFT_PATH}.")
+    folded, folders = {}, set()
+    for p in paths:
+        steps = p.split("/")
+        folders.update("/".join(steps[:n]) for n in range(1, len(steps)))
+        for n in range(1, len(steps) + 1):
+            part = "/".join(steps[:n])
+            other = folded.setdefault(part.lower(), part)
+            if other != part:
+                raise Refusal(422, f"{part} and {other} differ only in letter case, and a disk that ignores case (a "
+                                   f"Mac) keeps them as one: give one of them another name.")
+    twice = next((p for n, p in enumerate(paths) if p in paths[:n]), None)
+    if twice:
+        raise Refusal(422, f"{twice} is in the ZIP twice.")
+    both = sorted(folders & set(paths))
+    if both:
+        raise Refusal(422, f"{both[0]} is a file and a folder in the ZIP.")
+    if len(paths) - 1 > SKILL_GIFT_FILES:
+        raise Refusal(422, f"The skill has {len(paths) - 1} files beside its SKILL.md, and a skill has at most "
+                           f"{SKILL_GIFT_FILES}.")
+
+    def too_large(p):
+        return Refusal(422, f"SKILL.md is larger than {SKILL_GIFT_MD_MAX // 1024} KiB, which a skill's SKILL.md is at "
+                            f"most: put a long part into a file beside it." if p == "SKILL.md" else
+                            f"{p} is larger than {SKILL_GIFT_FILE_MAX // (1024 * 1024)} MiB, which each file of a "
+                            f"skill is at most.")
+    whole = Refusal(422, f"The skill's files are larger than {SKILL_GIFT_MAX // (1024 * 1024)} MiB in all, which a "
+                         f"skill is at most.")
+    for p, (_, info) in zip(paths, kept):      # what the central directory declares, before any read
+        if info.file_size > (SKILL_GIFT_MD_MAX if p == "SKILL.md" else SKILL_GIFT_FILE_MAX):
+            raise too_large(p)
+    if sum(info.file_size for _, info in kept) > SKILL_GIFT_MAX:
+        raise whole
+    files, left = {}, SKILL_GIFT_MAX
+    for p, (_, info) in zip(paths, kept):      # and each read stops past the limits, whatever its entry declared
+        most = SKILL_GIFT_MD_MAX if p == "SKILL.md" else SKILL_GIFT_FILE_MAX
+        try:
+            with package.open(info) as part:
+                body = part.read(min(most, left) + 1)
+        except Exception:       # noqa: BLE001 -- a file that does not unpack: the bytes' fault, never the hub's
+            raise Refusal(422, f"{p} does not unpack: the ZIP is damaged, or packed in a way that the hub does not "
+                               f"read.") from None
+        if len(body) > most:
+            raise too_large(p)
+        if len(body) > left:
+            raise whole
+        left -= len(body)
+        files[p] = body
+    # A ZIP in the skill gets the same two bounds as the gift: the search for logins opens it when it is an Office file
+    # (inbound_pieces, ooxml_texts), and a read of a bzip2 part there unpacks all of it.
+    for p, body in files.items():
+        if not body.startswith(b"PK\x03\x04"):
+            continue
+        if body.count(b"PK\x01\x02") > SKILL_GIFT_ENTRIES:
+            raise Refusal(422, f"{p} is a ZIP of more than {SKILL_GIFT_ENTRIES:,} entries, more than the hub reads in "
+                               f"a skill.")
+        try:
+            inner = zipfile.ZipFile(io.BytesIO(body)).infolist()
+        except (zipfile.BadZipFile, zipfile.LargeZipFile, ValueError, OSError, EOFError, NotImplementedError):
+            continue                    # bytes that no reader opens as a ZIP: the search reads them as bytes
+        if any(info.compress_type not in SKILL_GIFT_PACKING for info in inner):
+            raise Refusal(422, f"{p} is a ZIP with a file packed in a way that the hub does not read: make it again "
+                               f"with the usual packing.")
+    try:
+        text = files["SKILL.md"].decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refusal(422, "SKILL.md is not UTF-8 text.") from None
+    name, description = skill_gift_front(text)
+    for p, body in files.items():       # every file: the shapes are ASCII, so one byte that is no UTF-8 hides no key
+        shape = written_key(body.decode("utf-8", "replace"))
+        if shape:
+            raise Refusal(422, f"{p} holds {shape}. A skill never carries a login or a key: take it out, and give the "
+                               f"skill again.")
+    return name, description, files
+
+
+SKILL_GIFT_KEY = re.compile(r"(name|description):(.*)\Z")     # a key of the front matter's top level, as YAML has it
+
+
+def skill_gift_front(text):
+    """(name, description) of the front matter of a SKILL.md that the owner gives, or a Refusal(422). The file is
+    never written again (skill_md): its bytes are the owner's. So the forms that it takes are only those of which
+    lifecycle.skill_front, which every start's list of skills reads, gives the description's own words: one line after
+    the key, plain, in double quotes as JSON writes a string, or in single quotes. A block (| or >) or a value over
+    several lines would show there as a mark or as half its words, and the agent picks a skill by that line. Each form
+    is checked against skill_front itself, which also stops a description that it would read from another place (an
+    indented key of a map before the top-level one, a key past its 40th line)."""
+    if text.startswith("\ufeff"):       # kept as it is: the start list's reader would else read another description
+        raise Refusal(422, "SKILL.md starts with an invisible mark (a byte order mark). Save it as UTF-8 without it.")
+    lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+    end = next((n for n in range(1, len(lines)) if lines[n].strip() == "---"), None)
+    if lines[0].strip() != "---" or end is None:
+        raise Refusal(422, f"{SKILL_GIFT_FRONT}.")
+    found, n = {}, 1
+    while n < end:
+        m = SKILL_GIFT_KEY.match(lines[n])
+        n += 1
+        if not m:
+            continue
+        more = n                            # its lines: the indented ones after it, and the empty ones among them
+        while more < end and (lines[more][:1] in (" ", "\t") or not lines[more].strip()):
+            more += 1
+        if m.group(1) in found:         # a reader of YAML takes one of the two, and which one is its own choice
+            raise Refusal(422, f"The front matter of SKILL.md has {m.group(1)}: twice. Keep one.")
+        found[m.group(1)] = (m.group(2).strip(), any(lines[k].strip() for k in range(n, more)))
+        n = more
+
+    def scalar(key):
+        """(the value, its form) of one key: "plain", "double" or "single"."""
+        if key not in found:
+            raise Refusal(422, f"The front matter of SKILL.md has no {key}: {SKILL_GIFT_FRONT}.")
+        value, carried = found[key]
+        one_line = Refusal(422, f"Write the {key} of SKILL.md on the one line after {key}:, in quotes or without: the "
+                                f"list of skills at the start of each session reads only that line, so a block (| or "
+                                f">) or a {key} over several lines would not show there.")
+        if carried or value[:1] in ("|", ">"):
+            raise one_line
+        if value.startswith('"'):
+            try:
+                said = json.loads(value)
+            except ValueError:
+                said = None
+            if not isinstance(said, str):
+                raise Refusal(422, f"The {key} of SKILL.md in double quotes must be one string as JSON writes it, or "
+                                   f"write it without quotes.")
+            return said, "double"
+        if value.startswith("'"):
+            m = re.fullmatch(r"'((?:[^']|'')*)'", value)
+            if not m:
+                raise one_line
+            return m.group(1).replace("''", "'"), "single"
+        return value, "plain"
+    name, _ = scalar("name")
+    if not re.fullmatch(SKILL_NAME, name):
+        raise Refusal(422, f"The name of the skill in SKILL.md, {skill_gift_shown(name)}, is not a skill's name: 1 to "
+                           f"64 characters of a-z, 0-9 and -, with a letter or a digit first, for example "
+                           f"deploy-acme-web.")
+    said, form = scalar("description")
+    description = " ".join(said.split())
+    if CONTROL.search(description):
+        raise Refusal(422, "The description of SKILL.md must be plain text, without a control character.")
+    if not 1 <= len(description) <= SKILL_GIFT_DESCRIPTION:
+        raise Refusal(422, f"The description of SKILL.md has {len(description)} characters, and a skill's description "
+                           f"has 1 to {SKILL_GIFT_DESCRIPTION}.")
+    shown = " ".join(found["description"][0].split()) if form == "single" else description
+    if skill_front(text) != shown[:300]:     # lifecycle.skill_front cuts a line at 300 characters
+        raise Refusal(422, "The list of skills at the start of each session would read another description from this "
+                           "SKILL.md: put name: and description: at the top level of its front matter, near its top.")
+    return name, description
+
+
+def skill_gift_pieces(files):
+    """The texts that the search for registered logins reads in a given skill (inbound_texts_searched), in this order:
+    its paths, its SKILL.md, its other UTF-8 files from the smallest to the largest, then its other files from the
+    smallest to the largest. Each file's texts are those of the owner's own upload (inbound_pieces: a text file, a
+    picture's text chunks, a PDF's words, an Office file's parts, and any other bytes as bytes). The order is what the
+    search reads first: its bound ends it for the whole skill (skill_gift_logins)."""
+    def text_first(path):
+        return (path != "SKILL.md", not utf8_bytes(files[path]), len(files[path]), path)
+    yield "\n".join(sorted(files)), False
+    for path in sorted(files, key=text_first):
+        yield from inbound_pieces(files[path])
+
+
+def skill_gift_logins(files):
+    """No registered login in the paths and the bytes of a skill that the owner gives, or a Refusal(422). The search is
+    the owner's own upload's (owner_file_checked): every file, whatever its bytes, in each form that secret_hit
+    searches, in one search for the whole skill, with its bounds (CHAT_FILE_HASHES, CHAT_FILE_READS and the longest
+    stretch with no space, stretch_most). At its first stretch or read past them it stops for the whole skill: what
+    came before it is searched, and the rest is not; the skill is taken, because it is the owner's own work, as the
+    owner's own upload is. So the texts come in skill_gift_pieces' order, the paths and the text files first. Unlike the
+    upload, the search is never skipped: it waits at most SKILL_GIFT_WAIT seconds for another file's check, and then
+    refuses, because a given skill goes onto the configuration ref, which every machine clones, and the upload's own
+    check read the ZIP's packed bytes only. Not under LOCK: the search takes seconds."""
+    if not secret_key():
+        return
+    if not CHAT_FILE_CHECKS.acquire(timeout=SKILL_GIFT_WAIT):
+        raise Refusal(503, "The hub is checking another file for registered logins now. Give the skill again in a "
+                           "moment.")
+    try:
+        inbound_texts_searched(skill_gift_pieces(files), take_costly=True)
+    except TooCostly:
+        pass                        # searched up to the bounds, with no login found there (owner_file_checked)
+    except Refusal as e:
+        if (getattr(e, "extra", None) or {}).get("code") == "login_as_file":
+            raise Refusal(422, "A file of this skill holds a registered login. A skill never carries a login: take "
+                               "it out, and give the skill again.") from None
+        raise
+    finally:
+        CHAT_FILE_CHECKS.release()
+
+
+def skill_folder(rev, agent, name):
+    """(its tree id or None, {path inside it: blob id}) of one skill's folder at revision rev, or a Refusal: a 503 when
+    git cannot say, and a 409 when an entry of it, or on the way to it, is not a plain file or a folder. commit_kit_file
+    writes a file over the one that is there, which keeps that file's mode, and writes through a link: so a gift
+    writes only into a folder whose every entry is DATA_MODE, and every file of its commit is one. The way to it is one
+    git ls-tree of skills and skills/<agent>: git goes into skills when it is a folder and shows each agent's entry,
+    and shows skills itself when it is not one. A link there would make the folder's own listing empty, which reads
+    as no folder at all."""
+    path = f"{SKILLS}/{agent}/{name}"
+
+    def not_plain(where):
+        return Refusal(409, f"The skill {name} of {shown_role(agent)} holds something that is not a plain file "
+                            f"({where}), so the hub gives no skill over it. Ask it to retire that skill, then give "
+                            f"this one again.")
+    code, out, _ = git_kit("ls-tree", "-z", rev, "--", SKILLS, f"{SKILLS}/{agent}")
+    if code != 0:
+        raise Refusal(503, code="revision_unreadable")
+    for item in filter(None, out.split("\0")):
+        meta, _, where = item.partition("\t")
+        if where in (SKILLS, f"{SKILLS}/{agent}") and meta.split()[:2] != ["040000", "tree"]:
+            # no skill of the agent's is there, so no retire helps
+            raise Refusal(409, f"The folder of {shown_role(agent)}'s skills is not a plain folder ({where}), so the "
+                               f"hub gives it no skill.")
+    code, out, _ = git_kit("ls-tree", "-r", "-t", "-z", rev, "--", path)
+    if code != 0:
+        raise Refusal(503, code="revision_unreadable")
+    tree, files = None, {}
+    for item in filter(None, out.split("\0")):
+        meta, _, where = item.partition("\t")
+        mode, kind, oid = (meta.split() + ["", "", ""])[:3]
+        if kind == "tree" and mode == "040000" and where in (SKILLS, f"{SKILLS}/{agent}", path):
+            tree = oid if where == path else tree
+        elif kind == "tree" and mode == "040000" and where.startswith(path + "/"):
+            continue
+        elif kind == "blob" and mode == lifecycle.DATA_MODE and where.startswith(path + "/"):
+            files[where[len(path) + 1:]] = oid
+        else:
+            raise not_plain(where)
+    return tree, files
+
+
+def skill_gift_message(agent, name):
+    """The commit message of a gift. Its last line is the git trailer that marks the gift (skills_given)."""
+    return (f"Owner gave the skill {name} to {agent}\n\n"
+            f"The owner gave this skill to {agent} as a folder of the owner's own: its files are the owner's bytes as "
+            f"they came, each a plain file, and the agent keeps the owner's words. The owner removes it in one step."
+            f"\n\n{SKILL_GIFT_TRAILER}: {agent}/{name}\n")
+
+
+def skill_gift_taker(agent):
+    """The refusal of a gift to this agent now, or None: it is in the team, and its Shell box is on. An agent whose
+    Shell box is off reads no file, so it takes no skill."""
+    if agent not in agents():
+        return Refusal(404, code="no_such_agent")
+    if shell_off(agent):
+        return Refusal(409, f"The Shell box of {shown_role(agent)} is off, so it reads no file and takes no skill.")
+    return None
+
+
+def skill_gift_room(rev, agent):
+    """A Refusal when the agent has SKILLS_MAX skills at revision rev, given and its own together (skills_count's
+    count), or a 503 where git cannot say; None when one more fits."""
+    code, out, _ = git_kit("ls-tree", "-r", "-z", "--name-only", rev, "--", f"{SKILLS}/{agent}/")
+    if code != 0:
+        raise Refusal(503, code="revision_unreadable")
+    shape = re.compile(rf"{re.escape(SKILLS)}/{re.escape(agent)}/{SKILL_NAME}/SKILL\.md")
+    if sum(1 for path in out.split("\0") if shape.fullmatch(path)) >= SKILLS_MAX:
+        raise Refusal(409, f"{shown_role(agent)} has {SKILLS_MAX} skills, the most that an agent has. Ask it to retire "
+                           f"one that no job needs, then give this one again.")
+
+
+def skill_take_subject(agent, name):
+    """The subject of the owner's commit that takes an agent's own skill away so that the next commit gives its very
+    bytes (skill_give): fixed, so that a repeat of the gift reads it back (its `replaced`)."""
+    return f"Owner takes the skill {name} of {agent} as the owner's own"
+
+
+def skill_give(agent, data):
+    """The owner gives the agent a skill, the bytes of its ZIP (the owner's given skills, design of 21 November 2026):
+    {agent, name, description, commit, files (the paths beside its SKILL.md), replaced (a skill of that name was there:
+    the agent's own or an earlier gift)}, or a Refusal with plain words. A refusal of the ZIP, of the agent or of its
+    room comes before any commit; a 409, 500, 502 or 503 of the commits can follow a commit that landed (the push or
+    the checkout's move failed, or the mark could not be read), and the caller gives the same ZIP again, which then
+    answers as the first gift would have (UI-API.md). Called by the owner's message route, outside LOCK and outside a
+    transaction: the search for logins and the commits take seconds.
+
+    One commit of the owner's writes skills/<agent>/<name>/ as the ZIP has it, and removes every file of an older
+    folder of that name that the ZIP does not have: the owner's word wins over the agent's own skill, and the old one is
+    in the history. The same bytes again commit nothing and give the same answer, with the commit that holds the
+    folder. An agent whose Shell box is off reads no file: it gets none, and nothing of the ZIP is read.
+
+    The reads of the folder and the commits run in the turn of the hub's writes (KIT, an RLock that commit_kit_file
+    enters again for the thread that holds it), so that no write of the agent, no rename and no other gift lands
+    between a read and its commit, nor between the two commits of the agent's own copy below. A rename, a removal or a
+    change of the agent runs its whole act, its commit and its apply_team, in that turn too (ui_command's kit or
+    unlocked, kit_lock for a tool). So the check of each commit, which runs in the turn, asks first whether the agent is
+    still in the team with its Shell box on, whatever revision the commit is made on: a change of the team that ended
+    while the ZIP was read and searched is in the revision that the loop reads, and the commit would else have written
+    the old name's folder. At another revision than the one read, it also asks that the folder is the one read (else
+    the next pass reads it again, and a gift of the same name that landed is then a replacement), and that a new skill
+    still fits: two gifts of two names at once to an agent with 39 skills gave it 41 (the readers of 22 November
+    2026). And a gift never answers with no mark: its commit must read as given (skill_is_given), or it is a
+    KitFault."""
+    if LOCK._is_owned():            # it takes KIT, which a thread that holds LOCK never waits for (kit_lock)
+        raise RuntimeError("skill_give runs outside LOCK: it waits for the search for logins and for KIT")
+    refused = skill_gift_taker(agent)
+    if refused:
+        raise refused
+    name, description, files = skill_gift_read(data)
+    skill_gift_logins(files)
+    folder, replaced, took, passes = f"{SKILLS}/{agent}/{name}/", False, None, 4
+    # true whether the take landed or only its check passed: a commit_kit_file that fails after its check may or may not
+    # have pushed the take, and the gift after it may or may not have landed
+    lost = (f"The gift of the skill {name} to {shown_role(agent)} did not finish, and {shown_role(agent)}'s own copy "
+            f"of it may be gone. Give the skill again.")
+    changed = f"The skill {name} of {shown_role(agent)} changed while the hub gave it. Give it again."
+    with KIT:
+        for at in range(passes):    # a pass that takes the agent's own copy, and a write that came in all the same
+            # True once the take's check has passed: from then on its commit can have landed, also when
+            # commit_kit_file raises (its push timed out, or the checkout did not move), so the words say so
+            taking = {"on": False}
+            try:
+                rev = kit_revision(fresh=True)
+                if not rev:
+                    raise Refusal(503, code="revision_unreadable")
+                tree, have = skill_folder(rev, agent, name)
+                new = "SKILL.md" not in have
+                # a folder that the owner's take emptied (its gift did not land) is replaced all the same, as the first
+                # answer said and as a repeat says (skill_gift_holder)
+                replaced = replaced or not new or skill_took_last(agent, name, rev)
+                if new:
+                    skill_gift_room(rev, agent)
+                same = set(have) == set(files) and all(
+                    have[p] == hashlib.sha1(b"blob %d\0" % len(body) + body).hexdigest() for p, body in files.items())
+                if same:
+                    given = skills_given(rev)
+                    if given is None:
+                        raise Refusal(503, code="revision_unreadable")
+                    if given.get((agent, name)):
+                        commit, replaced = skill_gift_holder(agent, name, rev)
+                        break
+                    if at == passes - 1:        # no removal that no pass could follow with the gift
+                        raise KitFault(409, changed)
+                    # The agent's own skill holds these very bytes, and a gift of them would commit nothing and so
+                    # carry no mark. The hub does it for the owner: one commit of the owner's takes that skill away,
+                    # and the next pass gives it. A failure between the two commits leaves the skill removed, and
+                    # its words say so: the caller sends the gift again, which then gives it as a new skill.
+                    changes = {folder + p: None for p in sorted(have)}
+                    message = (f"{skill_take_subject(agent, name)}\n\nThe owner gives {agent} this skill as it "
+                               f"stands, so that it keeps the owner's words. The gift follows in a later commit; when "
+                               f"it does not, the owner gives the skill again.\n")
+                else:
+                    # the removals first: a file of the old folder can be a folder of the new one
+                    changes = {folder + p: None for p in sorted(have) if p not in files}
+                    changes.update({folder + p: files[p] for p in sorted(files)})
+                    message = skill_gift_message(agent, name)
+
+                def check(final, rev=rev, tree=tree, new=new, same=same, taking=taking):
+                    taker = skill_gift_taker(agent)
+                    if taker:
+                        raise taker
+                    if final != rev:
+                        if skill_folder(final, agent, name)[0] != tree:
+                            raise SkillGiftMoved()
+                        if new:
+                            skill_gift_room(final, agent)
+                    taking["on"] = same     # a refusal of this check came before any commit, and keeps its words
+                first, *rest = changes
+                commit = commit_kit_file(first, changes[first], message, more={p: changes[p] for p in rest},
+                                         allow=skill_allow(agent, name), check=check)
+                if same:
+                    took = commit
+                    log("owner", f"took the skill {name} of {agent} as the owner's own in {commit[:12]}, to give it")
+                    continue
+                marked = skill_is_given(agent, name, commit)
+                if marked is None:          # git failed or passed its time limit: the gift is there, its mark unread
+                    raise Refusal(503, f"The hub wrote the skill {name} of {shown_role(agent)}, but cannot read now "
+                                       f"whether it is yours. Give it again.")
+                if not marked:
+                    raise KitFault(500, f"The hub wrote the skill {name} of {shown_role(agent)}, but it does not read "
+                                        f"as yours. Give it again.")
+                log("owner", f"gave the skill {name} to {agent} in {commit[:12]}")
+                break
+            except SkillGiftMoved:
+                continue
+            except Refusal:
+                if took or taking["on"]:
+                    raise KitFault(409, lost) from None
+                raise
+        else:
+            raise KitFault(409, lost if took else changed)
+    return {"agent": agent, "name": name, "description": description, "commit": commit,
+            "files": sorted(p for p in files if p != "SKILL.md"), "replaced": replaced}
+
+
+def skill_gift_holder(agent, name, rev):
+    """(the commit that holds the given folder at rev, its `replaced`) for a repeat of a gift: replaced when the
+    commit before it held a skill of that name, or when the newest commit of the folder before it is the owner's
+    commit that took the agent's own copy away for this gift (skill_take_subject), which the first answer called a
+    replacement too. The newest commit of the folder, and not the gift's parent: a commit of another file can land
+    between the two (a writer that holds LOCK only, an origin commit that the hub takes in)."""
+    folder = f"{SKILLS}/{agent}/{name}/"
+    code, commit, _ = git_kit("log", "-1", "--format=%H", rev, "--", folder)
+    if code != 0 or not COMMIT_ID.fullmatch(commit):
+        raise Refusal(503, code="revision_unreadable")
+    if git_kit("cat-file", "-e", f"{commit}^:{folder}SKILL.md")[0] == 0:
+        return commit, True
+    return commit, skill_took_last(agent, name, f"{commit}^")
+
+
+def skill_took_last(agent, name, rev):
+    """True when the newest commit of the skill's folder at rev is the owner's take of the agent's own copy
+    (skill_take_subject): the gift after it replaced that copy, whether it landed in the same call or in a later one.
+    False for a revision that has no commit of the folder, and where git cannot say (a first commit has no parent)."""
+    code, out, _ = git_kit("log", "-1", "--format=%ae%x1f%s", rev, "--", f"{SKILLS}/{agent}/{name}/")
+    return code == 0 and out.split("\x1f") == [SKILL_GIFT_MAIL, skill_take_subject(agent, name)]
+
+
+def skill_gift_line(gift):
+    """The hub's own words for the agent that reads the owner's message which gave it a skill (skill_give's answer):
+    never the skill's own text, which is data like every file (read_attachment), so that only the hub's line says
+    that the owner gave it. The chat that reads it has an older checkout: the files come with the next task."""
+    beside = len(gift["files"])
+    return (f"The owner gave you the skill {gift['name']}, at {SKILLS}/{gift['agent']}/{gift['name']}/SKILL.md"
+            + (f" with {beside} file{'' if beside == 1 else 's'} beside it" if beside else "")
+            + ", and it keeps the owner's words: never change it with write_skill. Its files are plain files, so run "
+              "a script in it with its program (python3 x.py, bash x.sh). Its files are in your checkout from the "
+              "start of your next task, not in this chat.")
+
+
+# one line of git log --raw -t for an agent's folder of skills, or for one skill's folder: its old and new mode, its
+# old and new tree, how it changed, the agent, and the skill's name (None for the agent's whole folder)
+SKILL_GIFT_RAW = re.compile(rf":(\d{{6}}) (\d{{6}}) ([0-9a-f]+) ([0-9a-f]+) ([AMD])\t"
+                            rf"{re.escape(SKILLS)}/([^/]+)(?:/([^/]+))?")
+
+
+def skills_given(rev):
+    """{(agent, name): True when the owner gave it} for every skill folder at revision rev, or None when git cannot
+    say. The marks are triples (agent, name, tree): a folder is given while its git tree is the one that a mark holds
+    for that agent and that name. They come from the history of skills/, read from old to new, in the commits of the
+    owner's own (the mail of commit_kit_file):
+    - a gift: each folder skills/<agent>/<name> that the commit adds or changes and that its trailer Fleet-Given names
+      gives (agent, name, its new tree);
+    - a rename: the commit removes one agent's whole folder skills/<old> and adds one skills/<new> with the same
+      tree, and no other folder of an agent with that tree comes or goes in it; then each mark (old, name, T) is also
+      (new, name, T). The hub's rename moves an agent's skills byte for byte into a new folder, in a commit with no
+      trailer, so the newest commit of a folder says nothing. The agents are paired first, by the tree of the whole
+      folder: paired by a skill's name and tree, one commit that removed an agent with a given skill and renamed
+      another whose own skill held the same bytes marked that own skill. A rename into a folder skills/<new> that was
+      there already carries no mark (git shows it changed, not added), and then the skill reads as the agent's own.
+    So a mark holds through a rename, a restore that keeps the configuration ref's history (a copy without it reads
+    every given skill as the agent's own) and a second gift; an agent's own write and the owner's
+    revert give another tree, which is no gift; and a copy of one agent's own skill that the owner gives to another
+    marks only the other's (with pairs of name and tree, the first agent's own skill read as given, and it could never
+    write or retire it again: the readers of 22 November 2026). A mark never goes away: after a removal, a write of
+    the agent's own with the same bytes under that agent and name reads as given, which is the safe side for the
+    owner's words. The trailer is read here and not by git log --grep, so no git setting of the hub's user
+    (grep.patternType) can hide a gift; --topo-order puts each gift before the rename that carries it, whatever the
+    shape of the history. No table, and no step in the rename.
+
+    Kept for the last SKILLS_GIVEN_KEPT revisions read (write_skill, the owner's view and a gift each read a fresh
+    one): a new revision reads only the commits after the revision read last, from its marks, and the whole history
+    only when that one is not in it. No count of commits bounds that read: a gift older than the bound would lose its
+    mark, and the agent could then write over the owner's words. Never under LOCK and never in a transaction: its
+    callers are write_skill, GET /ui/skills and skill_give, each outside both."""
+    folder = kit_dir()
+    kept = SKILLS_GIVEN.get((folder, rev))
+    if kept:
+        return kept[1]
+    # one copy of the keys, then reads of that copy: a revision that another thread drops meanwhile is a full read
+    base = next((r for f, r in reversed(list(SKILLS_GIVEN)) if f == folder), None)
+    known = SKILLS_GIVEN.get((folder, base)) if base else None
+    marks, span = set(), rev
+    if known and git_kit("merge-base", "--is-ancestor", base, rev)[0] == 0:
+        marks, span = set(known[0]), f"{base}..{rev}"
+    code, out, _ = git_kit("log", "--reverse", "--topo-order", "--no-color", "--format=%x1e%H%x1f%ae%x1f%B%x1f",
+                           "--raw", "-t", "--no-renames", "--no-abbrev", span, "--", SKILLS + "/", timeout=60)
+    if code != 0:
+        return None
+    for chunk in out.split("\x1e"):
+        parts = chunk.split("\x1f")
+        if len(parts) != 4 or parts[1].strip() != SKILL_GIFT_MAIL:
+            continue
+        named = set(re.findall(rf"^{SKILL_GIFT_TRAILER}: ({lifecycle.SKILL_AGENT})/({SKILL_NAME})$", parts[2], re.M))
+        left, added, came = {}, {}, {}      # agent -> the tree of its whole folder; (agent, name) -> a skill's tree
+        for line in parts[3].splitlines():
+            m = SKILL_GIFT_RAW.fullmatch(line)
+            if not m:
+                continue
+            old_mode, new_mode, old, tree, status, owner, name = m.groups()
+            if name is None and status == "D" and old_mode == "040000":
+                left[owner] = old
+            elif name is None and status == "A" and new_mode == "040000":
+                added[owner] = tree
+            elif name is not None and status in ("A", "M") and new_mode == "040000":
+                came[(owner, name)] = tree
+        marks.update((owner, name, tree) for (owner, name), tree in came.items() if (owner, name) in named)
+        for new, whole in added.items():
+            olds = [old for old, tree in left.items() if tree == whole]
+            if len(olds) == 1 and list(added.values()).count(whole) == 1:
+                marks.update({(new, name, tree) for owner, name, tree in marks if owner == olds[0]})
+    code, out, _ = git_kit("ls-tree", "-r", "-d", "-z", rev, "--", SKILLS + "/")
+    if code != 0:
+        return None
+    trees = {}
+    for item in filter(None, out.split("\0")):
+        meta, _, path = item.partition("\t")
+        bits, fields = path.split("/"), meta.split()
+        if len(bits) == 3 and len(fields) == 3:
+            trees[(bits[1], bits[2])] = fields[2]
+    given = {key: (*key, tree) in marks for key, tree in trees.items()}
+    # Each step is one operation on the dict (a copy of its keys, a pop, an insert): skills_given runs in several
+    # threads at once, and an iterator of the dict fails when another thread changes it between two steps.
+    for old in list(SKILLS_GIVEN)[:-(SKILLS_GIVEN_KEPT - 1)]:      # the ones read first go
+        SKILLS_GIVEN.pop(old, None)
+    SKILLS_GIVEN[(folder, rev)] = (frozenset(marks), given)
+    return given
+
+
+def skill_is_given(agent, name, rev=None):
+    """True when the agent's skill `name` is one that the owner gave (skills_given), False when it is not or when the
+    agent has no such skill, None when git cannot say now."""
+    rev = rev or kit_revision(fresh=True)
+    given = skills_given(rev) if rev else None
+    return None if given is None else given.get((agent, name), False)
+
+
+def skill_retire_by_owner(agent):
+    """True in a task session of the agent whose task its start_task opened from a message of the owner's own: a
+    message of the owner's hand (owner_force: the screens of the owner's apps, an enrolled device, a chat app), not one
+    marked as coming through an AI session or another program, and not from a connected app. The task is the session's
+    own, from its credential (CALL.context), never from a task_id that the call names; the message is the one that
+    start_task's receipt names, which keeps the task that it opened (task_of_message). "Remove the skill X" in a chat
+    is work, and this is the one session where an agent retires a skill that the owner gave (the design, 6.4)."""
+    # In such a task the agent can retire the given skill and then write a skill of its own with that name, which is
+    # then its own: the design accepts that, as the owner asked for the removal.
+    context = getattr(CALL, "context", None)
+    if not (context and len(context) == 3 and TASK_CONTEXT.fullmatch(str(context[1]))):
+        return False
+    task = parse_task(context[1])
+    said = read_row("SELECT u.hand, u.connection FROM tool_commands c JOIN ui_requests u ON u.request_id=c.request_id "
+                    "JOIN tasks t ON t.id=? WHERE c.agent=? AND c.tool='start_task' AND "
+                    "json_extract(c.receipt, '$.task')=? AND t.owner=? AND u.recipient=? AND u.kind='message'",
+                    (task, agent, task, agent, agent))
+    return bool(said) and owner_force(said["hand"]) and said["connection"] is None
+
+
+def skill_given_refusal(agent, name, retire, rev):
+    """write_skill's refusal of a write or a retire of a skill that the owner gave, at revision rev, or None: a given
+    skill keeps the owner's words, and only a task from the owner's own message retires it (skill_retire_by_owner).
+    A skill that the agent does not have at rev keeps nothing, so a new skill reads no gift at all: only the one git
+    ls-tree of its SKILL.md, which says no as surely as yes, and a read that fails refuses."""
+    unread = "The hub cannot read its skills now, so nothing was written. Call write_skill again with the same " \
+             "request_id."
+    code, out, _ = git_kit("ls-tree", "-z", rev, "--", f"{SKILLS}/{agent}/{name}/SKILL.md")
+    if code != 0:
+        return unread
+    if not out.strip("\0"):
+        return None
+    given = skill_is_given(agent, name, rev)
+    if given is None:
+        return unread
+    if not given or (retire is True and skill_retire_by_owner(agent)):
+        return None
+    return (SKILL_GIVEN_RETIRE if retire is True else SKILL_GIVEN_WRITE).format(name=name)
 
 # ---------------------------------------------------------------- Grantable resources (owner feature resource_grants)
 # What a duty can need, as the owner already holds it. A resource is one such thing, and its id is "<kind>:<what>":
@@ -48992,8 +49767,8 @@ TOOLS = [
                         "The card closes by itself when the agent gets that access another way."},
         "needs_level": {"type": "string", "description": "With needs_access: the level that the work needs, when an "
                         "agent holds the thing at a lower one (repo:acme/web at deploy where it holds write). For a "
-                        "secret, value: its value itself, which only the owner gives (a new one when it is wrong or "
-                        "was revoked, or in place of the placeholder that a program cannot use)."},
+                        "key or a login, value: the hub names the route of a new value; placeholder: the key itself "
+                        "for a program that cannot use its placeholder."},
         "owner_words": {"type": "string", "description": f"With reason decision: the owner's own words that keep this "
                         f"decision for them, word for word and at least {CARD_WORDS_MIN} characters: a line of a "
                         f"policy file or a profile, a standing rule that they gave, or their own message. An agent's "
@@ -70510,14 +71285,15 @@ def teams_held(row):
 
 def teams_on():
     """True from the moment that the hub keeps a token that our key signed for this fleet with plan `teams`, until
-    the channel's signed word that it ended. No date, no failed poll and no missing answer makes it False."""
-    return teams_held(q1("SELECT plan, verified, ended FROM entitlement WHERE id=1"))
+    the channel's signed word that it ended. No date, no failed poll and no missing answer makes it False. It commits
+    nothing (read_row), because the seam asks it inside the caller's transaction (teams_part)."""
+    return teams_held(read_row("SELECT plan, verified, ended FROM entitlement WHERE id=1"))
 
 
 def teams_licence():
     """The token, for a call to a paid service of ours (`Authorization: Bearer`), or None while teams_on() is false.
-    A part keeps no copy of it: it reads this for each call."""
-    row = q1("SELECT token, plan, verified, ended FROM entitlement WHERE id=1")
+    A part keeps no copy of it: it reads this for each call, also inside the caller's transaction (read_row)."""
+    row = read_row("SELECT token, plan, verified, ended FROM entitlement WHERE id=1")
     return row["token"] if teams_held(row) and row["token"] else None
 
 
@@ -83353,7 +84129,7 @@ def teams_lock_here(folder=None):
         with open(os.path.join(folder or os.path.dirname(os.path.abspath(__file__)), "teams.lock"),
                   encoding="utf-8") as f:
             return teamspack.read_lock(f.read(4096))
-    except (ImportError, OSError, ValueError):
+    except Exception:           # also RecursionError: a text of deep JSON, which must not stop the import of the hub
         return None
 
 
@@ -83525,12 +84301,11 @@ def teams_files():
     They are the files of the package that TEAMS_LOCK names, in teams_dir(), read one time: the bytes must have the
     lock's SHA-256, and the texts are those of the bytes that were checked. A rig of the source repository that was
     started with --teams-source takes the Teams files of this code's own folder instead, while that folder holds no
-    lock. None for no folder, a lock that names no Python file (each release from P1 on, until a part ships), and a
-    package that is not on the disk or not whole."""
+    lock (the source repository's tree). A tree with a lock (a published one) takes its Teams code only as the package
+    of its lock, with the flag as with none. None for no folder, a lock that names no Python file (each release from
+    P1 on, until a part ships), and a package that is not on the disk or not whole."""
     import teamspack
-    if CFG.get("teams_source"):
-        if TEAMS_LOCK is not None:
-            return None                 # a published tree: its Teams code comes only as the package of its lock
+    if CFG.get("teams_source") and TEAMS_LOCK is None:
         folder, texts = os.path.dirname(os.path.abspath(__file__)), {}
         for name in sorted(os.listdir(folder)):
             if name.endswith(".py") and teamspack.NAME.fullmatch(name):
@@ -83575,7 +84350,10 @@ def teams_load():
         if getattr(module, "__loader__", None) is not finder:
             lines.append(f"The Teams part {name}.py did not load: this process holds another module of that name")
             continue
-        said = teams_take(module)
+        try:
+            said = teams_take(module)
+        except (Exception, SystemExit) as e:        # a module __getattr__ that raises, for one
+            said = f"The Teams part {name}.py did not load: {type(e).__name__}: {e}"[:400]
         if said:
             lines.append(said)
     return lines
@@ -83585,19 +84363,24 @@ def teams_steps():
     """The schema steps of each loaded part, after Core's own: its SCHEMA, each statement with sql_step, then its
     migrate(H), which gives the lines of what the records refused. The lines of what failed. A part with a line leaves
     TEAMS_CODE and TEAMS_PARTS, so that Core does what it did before Teams in its place, and its table is never read
-    in a form that the records refused."""
+    in a form that the records refused. Each statement and migrate are held to any exception, because sql_step takes
+    only sqlite3.Error: two statements in one string are sqlite3.Warning before Python 3.12, and a migrate can raise
+    anything, SystemExit too."""
     problems = []
     for feature, module in sorted(TEAMS_CODE.items()):
         own = []
         for statement in getattr(module, "SCHEMA", None) or ():
-            sql_step(statement, own)
+            try:
+                sql_step(statement, own)
+            except Exception as e:
+                own.append(f"{' '.join(statement.split())[:160]}: {type(e).__name__}: {e}"[:300])
         steps = getattr(module, "migrate", None)
         if steps is not None:
             try:
                 said = steps(TEAMS_H)
                 own += [str(one) for one in said] if isinstance(said, (list, tuple)) else \
                     [f"its migrate gave {type(said).__name__}, and no list of lines"]
-            except Exception as e:
+            except (Exception, SystemExit) as e:
                 own.append(f"its migrate raised {type(e).__name__}: {e}"[:300])
         if own:
             TEAMS_CODE.pop(feature, None)
@@ -83621,11 +84404,18 @@ def teams_schema():
             return []
     except sqlite3.Error:               # the entitlement's table or column that the records refused: migrate's line
         return []
-    try:
-        return list(teams_load()) + teams_steps()
-    except Exception as e:              # a fault of the seam itself stops no start, and the hub runs Core
+    except Exception:                   # any other fault of the read: the hub runs Core, and the fault is recorded
         print_fault()
-        return [f"The Teams parts did not load: {type(e).__name__}: {e}"[:400]]
+        return []
+    try:
+        said = list(teams_load()) + teams_steps()
+    except (Exception, SystemExit) as e:    # a fault of the seam itself stops no start, and the hub runs Core: no part
+        TEAMS_CODE.clear()                  # stays whose steps did not run
+        TEAMS_PARTS.clear()
+        print_fault()
+        said = [f"The Teams parts did not load: {type(e).__name__}: {e}"[:400]]
+    # in characters that each print and log can write: a lone surrogate of a part's text would stop main()'s print
+    return [one.encode("utf-8", "replace").decode("utf-8") for one in said]
 
 
 def main():

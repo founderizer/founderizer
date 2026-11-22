@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import http.server
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -252,7 +253,20 @@ class Seam(Folders):
                         patch.dict(os.environ)):
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.addCleanup(lambda: [sys.modules.pop(one) for one in list(sys.modules) if one.startswith("teams_")])
+        had = set(sys.modules)
+        self.addCleanup(lambda: [sys.modules.pop(one) for one in set(sys.modules) - had if one.startswith("teams_")])
+
+    def unload(self):
+        """What a load of this process did, taken back, for a second load in the same test: its record, its parts,
+        the modules that it made and its finder."""
+        finder = hub.TEAMS_LOAD.get("finder")
+        if finder in sys.meta_path:
+            sys.meta_path.remove(finder)
+        for name in getattr(finder, "texts", ()):
+            sys.modules.pop(name, None)
+        hub.TEAMS_LOAD.clear()
+        hub.TEAMS_CODE.clear()
+        hub.TEAMS_PARTS.clear()
 
     def package(self, files):
         """`files` as a package in the test's folder of packages, which teams_dir() names, and its lock as the lock of
@@ -304,7 +318,7 @@ class Seam(Folders):
                                  case)
                 self.assertNotIn("finder", hub.TEAMS_LOAD, case)
                 hub.TEAMS_LOAD.clear()
-            hub.CFG["teams_dir"], hub.TEAMS_LOCK = root, lock
+            hub.CFG["teams_dir"], hub.TEAMS_LOCK, hub.CFG["teams_source"] = root, lock, True
             said = hub.build_schema()       # the same package with a live licence: the licence was the one gate
         self.assertEqual((said, sorted(hub.TEAMS_CODE), reads.call_count),
                          (["The Teams part teams_boom.py did not load: RuntimeError: imported"], ["demo"], 1))
@@ -424,7 +438,7 @@ class Seam(Folders):
         self.licence(LIVE)
         real.write_text(source.replace("the package", "a change   "))
         self.assertEqual((hub.build_schema(), hub.TEAMS_CODE), ([], {}))     # no package that the lock names
-        hub.TEAMS_LOAD.clear()
+        self.unload()
         real.write_text(source)
         other.write_text(source.replace("the package", "a pyc file "))
         os.utime(other, ns=(real.stat().st_atime_ns, real.stat().st_mtime_ns))
@@ -447,8 +461,13 @@ class Seam(Folders):
         data = teamspack.pack(FILES)
         (code / "teams.lock").write_text(teamspack.lock_text(teamspack.lock_of(data)))
         self.assertEqual(hub.teams_lock_here(str(code)), teamspack.lock_of(data))
-        (code / "teams.lock").write_text('{"files": 1}\n')
-        self.assertIsNone(hub.teams_lock_here(str(code)))
+        for text in ('{"files": 1}\n', "[" * 4000):    # deep JSON: json's RecursionError on Python 3.9 to 3.11
+            (code / "teams.lock").write_text(text)
+            self.assertIsNone(hub.teams_lock_here(str(code)))
+        with patch.object(teamspack, "read_lock", side_effect=RecursionError("deep JSON")):     # on each Python
+            self.assertIsNone(hub.teams_lock_here(str(code)))
+        start = inspect.getsource(hub.main)                     # the folder is there before the load reads it
+        self.assertLess(start.index("teams_folder(args.teams_dir)"), start.index("build_schema()"))
         given = str(self.folder() / "packages")
         os.environ[hub.TEAMS_DIR_VAR] = "/the/folder/of/another/hub"
         with patch.dict(hub.CFG, {"team_path": str(self.folder() / "team.json")}):
@@ -474,6 +493,77 @@ class Seam(Folders):
             self.assertRaises(ValueError, hub.teams_data_dir, wrong)
         hub.CFG["db_path"] = None
         self.assertRaises(RuntimeError, hub.teams_data_dir, "person_links")
+
+    def test_a_call_through_the_seam_runs_inside_the_caller_s_transaction(self):
+        """Design 3 and design 4 ask for a part inside the caller's transaction() (the write of a role, the removal of
+        a person). The bugs: the seam's read of the licence commits there, so each such call raises (no_commit_inside)
+        or lands the caller's half-written rows; a part's write is not the caller's, and the caller's rollback leaves
+        it."""
+        hub.TEAMS_CALLS["demo"] = ("start", "write")
+        self.package({"teams_demo.py": DEMO + '\n\ndef write(H, value):\n    H.in_transaction("write")\n'
+                                              '    if H.teams_licence():\n'
+                                              '        H.DB.execute("INSERT OR REPLACE INTO kv(k, v) VALUES(?, ?)", '
+                                              '("teams-demo", value))\n'})
+        self.licence(LIVE)
+        self.assertEqual(hub.build_schema(), [])
+        with hub.transaction():
+            hub.teams_part("demo").write("kept")
+            self.assertEqual((hub.teams_features(), self.refused("other")), (["demo"], (409, "teams_part_missing")))
+        with self.assertRaises(KeyError), hub.transaction():
+            hub.teams_part("demo", need=True).write("undone")
+            raise KeyError("the caller's own fault, after the part's write")
+        self.assertEqual(hub.kv_get("teams-demo"), "kept")
+
+    def test_a_fault_after_the_load_takes_out_its_part_or_each_part_and_never_stops_the_start(self):
+        """A part's step that raises another exception than sqlite3.Error (two statements in one string are
+        sqlite3.Warning before Python 3.12; a lone surrogate is UnicodeEncodeError on each), a migrate that ends the
+        process, a module whose own __getattr__ raises, a read of the licence that fails, and a fault of the seam
+        itself. The bugs: the hub's start ends, also at main()'s print of a line; a part stays listed whose steps did
+        not run, and Core calls it on records that lack its table."""
+        hub.TEAMS_CALLS["exit"] = hub.TEAMS_CALLS["two"] = ("start",)
+        self.package({"teams_demo.py": DEMO,
+                      "teams_two.py": ROWS.replace('"rows"', '"two"').replace(
+                          'PRIMARY KEY)",', 'PRIMARY KEY); CREATE TABLE IF NOT EXISTS teams_more(id INTEGER)", '
+                                            '"CREATE TABLE IF NOT EXISTS teams_odd(a) -- \\ud800",'),
+                      "teams_exit.py": ROWS.replace('"rows"', '"exit"') + "\n\ndef migrate(H):\n"
+                                                                          "    raise SystemExit(4)\n",
+                      "teams_odd.py": "def __getattr__(name):\n    raise RuntimeError('no ' + name)\n"})
+        self.licence(LIVE)
+        said = hub.build_schema()
+        self.assertEqual(said[:2], ["The Teams part teams_odd.py did not load: RuntimeError: no FEATURE",
+                                    "The Teams part teams_exit.py did not load: its migrate raised SystemExit: 4"])
+        self.assertEqual(len(said), 4, said)
+        self.assertTrue(said[2].startswith("The Teams part teams_two.py did not load: CREATE TABLE IF NOT EXISTS "
+                                           "teams_rows(id INTEGER PRIMARY KEY); CREATE TABLE"), said[2])
+        self.assertTrue(said[3].startswith("The Teams part teams_two.py did not load: CREATE TABLE IF NOT EXISTS "
+                                           "teams_odd(a) -- ?: UnicodeEncodeError: "), said[3])
+        "\n".join(said).encode("utf-8")                    # what main() prints and logs
+        self.assertEqual((sorted(hub.TEAMS_CODE), sorted(hub.TEAMS_PARTS)), (["demo"], ["demo"]))
+        self.unload()
+        with patch.object(hub, "teams_steps", side_effect=MemoryError("the seam's own fault")), \
+                patch.object(hub, "print_fault") as fault:
+            self.assertEqual(hub.build_schema(), ["The Teams parts did not load: MemoryError: the seam's own fault"])
+            self.assertEqual((hub.TEAMS_CODE, hub.TEAMS_PARTS, hub.teams_part("demo")), ({}, {}, None))
+            with patch.object(hub, "teams_on", side_effect=RuntimeError("a fault of the read")):
+                self.assertEqual(hub.teams_schema(), [])
+            self.assertEqual(fault.call_count, 2)
+
+    def test_a_rig_of_the_source_tree_loads_its_own_files_and_a_tree_with_a_lock_only_its_package(self):
+        """--teams-source is for a rig of the source repository, whose tree has no lock: it loads the Teams files of
+        the code's own folder. In a tree with a lock the flag is no other way: the package of the lock loads, as with
+        no flag. The bugs: a rig never runs the Teams files that it tests; a published tree runs files that no lock
+        names."""
+        code = self.folder()
+        (code / "teams_demo.py").write_text(DEMO + 'FROM = "the source tree"\n')
+        self.licence(LIVE)
+        with patch.object(hub, "__file__", str(code / "hub.py")):
+            hub.CFG["teams_source"] = True
+            self.assertEqual(hub.build_schema(), [])
+            self.assertEqual(sys.modules["teams_demo"].FROM, "the source tree")
+            self.unload()
+            self.package({"teams_demo.py": DEMO + 'FROM = "the package"\n'})
+            self.assertEqual(hub.build_schema(), [])
+            self.assertEqual(sys.modules["teams_demo"].FROM, "the package")
 
 
 if __name__ == "__main__":
