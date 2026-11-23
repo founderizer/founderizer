@@ -401,6 +401,8 @@ class Talk(NeedsCase):
             self.raise_item(title="x" * 71)
         with self.assertRaisesRegex(hub.ToolError, "why is at most 240 characters.*Put the reasoning"):
             self.raise_item(why="y " * 121)
+        with self.assertRaisesRegex(hub.ToolError, "what_to_do is at most 4000 characters"):     # read under a lock
+            self.raise_item(what_to_do="Press one. " * 400)
         self.raise_item(why="Two short sentences. He decides now.", details="The reasoning, and the facts, at length.")
         item = self.item()
         self.assertEqual((item["why"], item["details"], item["multi"], item["talk"]),
@@ -628,6 +630,153 @@ class Talk(NeedsCase):
         self.assertEqual(ping.call_count, 2)
         self.assertEqual([t["who"] for t in self.item()["talk"]], ["owner", "manager", "owner", "manager"])
 
+    def test_a_card_waits_for_the_manager_until_it_answers_or_two_turns_end_with_no_answer(self):
+        """Owner API 1.316, feature need_updates (the owner, 22 November 2026: after his Needs clarification message
+        the options go "until the agent decides what's next"). His message makes the card wait (awaits) while the
+        manager can have a turn; its reply ends the wait; a manager that reads his words and ends two turns with no
+        answer, or that cannot have a turn any more, ends it too, and the next second look names the card. Bug: a card
+        that hides its options for ever because the manager's session was gone or never answered, or one that waits
+        for a manager at a usage limit."""
+        hub.touch("manager")                                  # its helper is online
+        hub.kv_set("turn_ended:manager", hub.now() - 100)     # and reports turn ends
+        self.raise_item(options=["Tide", "Harbour"])
+        self.assertIn("need_updates", hub.ui_features())
+        self.assertIsNone(self.item()["awaits"])
+        self.assertEqual(self.request("/ui/needs/1/talk", self.command(text="Which one costs less?"))[0], 200)
+        self.assertEqual(self.item()["awaits"], hub.need_talk(1)[0]["ts"])
+        said = hub.t_read_messages("manager", {})
+        self.assertIn("(The hub: the item stays open, and its card waits for your answer. Answer the owner in one of "
+                      "three ways: reply under the card with discuss_need(need=\"N-1\", text=...), in plain words "
+                      "and in a few sentences, when the request stays as it is; raise it again with "
+                      "raise_needs_you(replaces=\"N-1\") when its words or options change; or close it with "
+                      "withdraw_need(need=\"N-1\", why=...) when nothing in it is needed now, and the owner reads why "
+                      "under the card. Their answer to the item comes as its own message.)", said)
+        hub.t_discuss_need("manager", {"need": "N-1", "text": "Harbour, by 4 euros a month."})
+        self.assertIsNone(self.item()["awaits"])                # the reply: the same request again
+        # his next message, which the manager reads and leaves with no answer for two turns
+        self.assertEqual(self.request("/ui/needs/1/talk", self.command(text="And the setup?"))[0], 200)
+        hub.need_wait_sweep(hub.now())
+        hub.t_read_messages("manager", {})
+        hub.need_wait_sweep(hub.now())                          # the turn that read it still runs
+        asks = lambda: [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND kind='say' AND "
+                                                 "text LIKE '[hub] The owner''s words under%' ORDER BY id")]
+        self.assertEqual(asks(), [])
+        hub.kv_set("turn_ended:manager", hub.now())             # a turn ended after its read
+        hub.need_wait_sweep(hub.now())
+        hub.need_wait_sweep(hub.now())
+        # his words quoted, as no tool of the manager's reads a card's talk (the area's reader)
+        ask = ("[hub] The owner's words under Needs-you N-1 (Which name?) have no answer from you yet, and its card "
+               "waits for one. Their newest words there, quoted: \"{}\".{} " + hub.need_wait_ways(self.row()) +
+               " If your next turn ends with none of these, the card stops waiting for you, and a later second look "
+               "names it.")
+        self.assertEqual(asks(), [ask.format("And the setup?", "")])        # once
+        # a message of his while the ask waits makes a wait of its own, with its own ask: bug, the old ask ends the new
+        # wait at the next turn end with no word to the manager. An AI session wrote this one, and both the ask and the
+        # look say that its words are not the owner's (need_talk.hand): bug, the hub's line calls them the owner's
+        self.assertEqual(self.request("/ui/needs/1/talk", self.command(text="And who sets it up?"), headers={
+            "Content-Type": "application/json", "X-Fleet-Client": "founderizer-cli/1/test"})[0], 200)
+        hub.t_read_messages("manager", {})
+        hub.kv_set("turn_ended:manager", hub.now())
+        hub.need_wait_sweep(hub.now())
+        self.assertEqual(asks(), [ask.format("And the setup?", ""), ask.format("And who sets it up?",
+                                                                                 hub.NEED_TALK_NOT_HIS)])
+        self.assertIsNotNone(self.item()["awaits"])
+        hub.t_read_messages("manager", {})
+        hub.need_wait_sweep(hub.now())
+        self.assertIsNotNone(self.item()["awaits"])             # the turn that read the ask still runs
+        hub.kv_set("turn_ended:manager", hub.now())
+        hub.tick()                                              # the hub's own pass ends it (and gives the look)
+        self.assertIsNone(self.item()["awaits"])
+        self.assertEqual([t["who"] for t in self.item()["talk"]], ["owner", "manager", "owner", "owner"])     # kept
+        looks = lambda: [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND kind='say' AND "
+                                                  "text LIKE '[hub] A second look%' ORDER BY id")]
+        t0 = hub.now()
+        hub.need_look_sweep(t0)                                 # a card of a minute ago: named for this alone
+        self.assertEqual(len(looks()), 1)
+        mark = hub.NEED_TALK_NOT_HIS.strip().rstrip(".")
+        mark = mark[0].lower() + mark[1:]
+        self.assertIn(f'- N-1 "Which name?", yours, open 0 hours: the owner\'s words under it have no reply (quoted: '
+                      f'"And who sets it up?"; {mark}): reply there with discuss_need, raise it again with '
+                      f'raise_needs_you replaces or close it with withdraw_need.', looks()[0])
+        hub.need_look_sweep(t0 + 120)
+        self.assertEqual(len(looks()), 1)                       # once, then at its own time
+        # a reply after the hub's ask ends the wait for good: bug, the ask that stays makes the next look name an
+        # answered card as one whose words have no reply
+        self.assertEqual(self.request("/ui/needs/1/talk", self.command(text="Is it ready?"))[0], 200)
+        hub.t_read_messages("manager", {})
+        hub.kv_set("turn_ended:manager", hub.now())
+        hub.need_wait_sweep(hub.now())
+        self.assertEqual(len(asks()), 3)
+        hub.t_discuss_need("manager", {"need": "N-1", "text": "Yes, since this morning."})
+        hub.need_look_sweep(t0 + 240)
+        self.assertEqual(len(looks()), 1)
+        # a card whose manager cannot have a turn any more (its helper went away) waits no more either
+        self.assertEqual(self.request("/ui/needs/1/talk", self.command(text="Still there?"))[0], 200)
+        self.assertIsNotNone(self.item()["awaits"])
+        hub.q("UPDATE agents SET last_seen=? WHERE name='manager'", (hub.now() - 3600,))
+        hub.need_wait_sweep(hub.now())
+        self.assertIsNone(self.item()["awaits"])
+        # a door card has no replaces among the ways, and his answer still closes a card that waits
+        hub.touch("manager")
+        t0 = hub.now()
+        hub.q("INSERT INTO needs(id,title,why,todo,raised,by,options,door_call,door_host) VALUES(2,'Run one root "
+              "script on web-1?','It reads the logs.','Press Run it once',?,'manager',?,?,'web-1')",
+              (t0, json.dumps(["Run it once", "No"]), "a" * 64))
+        self.assertEqual(self.request("/ui/needs/2/talk", self.command(text="Why root?"))[0], 200)
+        self.assertIn("Answer the owner in one of two ways: reply under the card with discuss_need(need=\"N-2\"",
+                      hub.t_read_messages("manager", {}))
+        self.assertIsNotNone(self.item(2)["awaits"])
+        self.assertEqual(self.request("/ui/needs/1/talk", self.command(text="Which one is closer?"))[0], 200)
+        self.assertIsNotNone(self.item()["awaits"])
+        self.assertEqual(self.request("/ui/needs/1", self.command(choice=1))[0], 200)
+        self.assertEqual((self.item()["answer"], self.item()["awaits"]), ("Harbour", None))
+        # a card that only the hub or his phone closes does not wait: the manager neither withdraws it nor sees it in a
+        # second look (an App key's renewal, a server's key swap, a phone to add)
+        for nid, column, value in ((4, "github_key", "acme"), (5, "key_swap_server", "web-2"), (6, "add_device", 1)):
+            with self.subTest(kind=column):
+                hub.q(f"INSERT INTO needs(id,title,why,todo,raised,by,{column}) VALUES(?,'A card','Its why',"
+                      "'Press one',?,'manager',?)", (nid, hub.now(), value))
+                self.assertEqual(self.request(f"/ui/needs/{nid}/talk", self.command(text="Why now?"))[0], 200)
+                self.assertIsNone(self.item(nid)["awaits"])
+                said = hub.t_read_messages("manager", {})
+                self.assertIn(f'discuss_need(need="N-{nid}", text=...), in plain words and in a few sentences. Their '
+                              f'answer to the item comes as its own message.)', said)        # the line as before
+                self.assertNotIn(f'withdraw_need(need="N-{nid}"', said)
+        # a manager at a usage limit: his message goes to it as before, and the card does not wait
+        hub.q("INSERT INTO agent_limits(agent,since,until,reset_known) VALUES('manager',?,?,1)",
+              (hub.now(), hub.now() + 3600))
+        self.raise_item(title="Which day?", options=["Monday", "Friday"])
+        self.assertEqual(self.request("/ui/needs/7/talk", self.command(text="Why Monday?"))[0], 200)
+        self.assertIsNone(self.item(7)["awaits"])
+        self.assertIn("(The hub: the item stays open. Reply under the card with discuss_need(need=\"N-7\", text=...)",
+                      hub.t_read_messages("manager", {}))
+
+    def test_an_ai_sessions_message_from_before_the_hand_keeps_its_mark(self):
+        """Owner API 1.316: a message under a card from before need_talk.hand has no hand, which reads as the owner's
+        own words. Bug: the second look quotes an old message of an AI session or a program as the owner's words with
+        no mark, at each look while the card stays open. The one-time repair at the start reads each one's line to
+        the manager, which has carried the mark since 21 November 2026; a row whose line has no mark, or that has no
+        line, stays his own words, and a second start changes nothing."""
+        self.raise_item(options=["Tide", "Harbour"])
+        hub.need_talk_said({"need": 1, "text": "Is it cheaper?"})                     # his own: its line has no mark
+        hub.ins("INSERT INTO need_talk(need, ts, who, text) VALUES(1, ?, 'owner', 'From the old Discuss box')",
+                (hub.now(),))                                                       # no line to the manager
+        hub.need_talk_said({"need": 1, "text": "And next month?"}, hand="other")   # a program's
+        hub.need_talk_said({"need": 1, "text": "Drop that vendor"}, hand="tool")   # an AI session's
+        hub.q("UPDATE need_talk SET hand=NULL")                     # as a release before the column wrote them
+        hands = lambda: [(r["text"], r["hand"]) for r in hub.q("SELECT text, hand FROM need_talk ORDER BY id")]
+        look = lambda: hub.need_look_hints(self.row())[0]
+        self.assertNotIn("an AI session", look())                   # the fault
+        hub.settle_talk_hands()
+        self.assertEqual(hands(), [("Is it cheaper?", None), ("From the old Discuss box", None),
+                                   ("And next month?", "other"), ("Drop that vendor", "tool")])
+        self.assertIn('(quoted: "Drop that vendor"; an AI session or a program on the owner\'s Mac wrote these words',
+                      look())
+        self.assertEqual(hub.kv_get(hub.TALK_HANDS_SETTLED), "2")
+        hub.q("UPDATE need_talk SET hand=NULL WHERE text='Drop that vendor'")
+        hub.settle_talk_hands()                                     # a second start
+        self.assertEqual(hands()[3], ("Drop that vendor", None))
+
     def test_a_door_card_and_a_team_card_take_a_message_too(self):
         """The area's word of 20 November 2026: every card of the manager's takes it, a door card and a plan of team
         changes too, since the owner may ask about a script or a plan before he presses; the hub's line names no
@@ -646,6 +795,43 @@ class Talk(NeedsCase):
                 said = hub.q1("SELECT text FROM events WHERE agent='manager' AND kind='say' ORDER BY id DESC")["text"]
                 self.assertIn(f"About Needs-you N-{nid}", said)
                 self.assertNotIn("replaces", said)
+        # Owner API 1.316: on a card that waits, the hub's line and the second look name the calls that the card
+        # takes, and on a card that takes a question to the owner they say to reply first (the area's reader, findings
+        # 1 and 3). Bug: a way that the hub refuses, or the question's answer as a way, which closes the card with no
+        # word to the owner, against his yes to a ring when the agent closes a card after his message; or a replace
+        # with no question_id, whose new card drops the question, so that its asker waits with no card.
+        hub.touch("manager")
+        hub.kv_set("turn_ended:manager", hub.now() - 100)
+        task = hub.ins("INSERT INTO tasks(title, owner, requester, state, created) VALUES(?,?,?,?,?)",
+                       ("Export", "dev", "manager", "input-required", t0))
+        qid = hub.ins("INSERT INTO questions(task, asker, requester, text, asked) VALUES(?,?,?,?,?)",
+                      (task, "dev", "manager", "Which export?", t0))
+        hub.q("INSERT INTO needs(id,title,why,todo,raised,by,question) VALUES(3,'Which export?','Dev asks.','Answer',?,"
+              "'manager',?)", (t0, qid))
+        ways = {1: ("Answer the owner in one of two ways: reply under the card with discuss_need(need=\"N-1\", "
+                    "text=...), in plain words and in a few sentences, when the request stays as it is; or close it "
+                    "with withdraw_need(need=\"N-1\", why=...) when nothing in it is needed now, and the owner reads why "
+                    "under the card.", "reply there with discuss_need or close it with withdraw_need"),
+                2: ("Answer the owner in one of three ways: reply under the card with discuss_need(need=\"N-2\", "
+                    "text=...), in plain words and in a few sentences, when the request stays as it is; make a new "
+                    "plan with change_team when its changes change: a new card of a plan takes this one's place; or "
+                    "close it with withdraw_need(need=\"N-2\", why=...) when nothing in it is needed now, and the "
+                    "owner reads why under the card.",
+                    "reply there with discuss_need, make a new plan with change_team or close it with withdraw_need"),
+                3: ("Answer the owner in one of two ways: reply under the card with discuss_need(need=\"N-3\", "
+                    "text=...), in plain words and in a few sentences, when the request stays as it is; or raise it "
+                    f"again with raise_needs_you(replaces=\"N-3\", question_id=\"Q-{qid}\") when its words or options "
+                    f"change. Answering Q-{qid} closes the card with no word to the owner: reply under it first.",
+                    f"reply there with discuss_need or raise it again with raise_needs_you replaces and question_id, "
+                    f"as answering Q-{qid} closes the card with no word to them")}
+        for nid, (line, look) in ways.items():
+            with self.subTest(waits=nid):
+                self.assertEqual(self.request(f"/ui/needs/{nid}/talk", self.command(text="Why now?"))[0], 200)
+                self.assertIsNotNone(self.item(nid)["awaits"])
+                said = hub.t_read_messages("manager", {})
+                self.assertIn(f"its card waits for your answer. {line} Their answer", said)
+                self.assertEqual(hub.need_look_hints(self.row(nid))[0],
+                                 f'the owner\'s words under it have no reply (quoted: "Why now?"): {look}')
 
     def test_a_card_that_answers_by_another_route_takes_no_message_under_it(self):
         """A key request has its own Needs clarification, whose words answer it (secret_clarify), a conversation's item
@@ -672,7 +858,8 @@ class Talk(NeedsCase):
 
     def test_a_message_under_a_card_is_one_message_of_plain_words(self):
         """The route takes its text and nothing else, and a registered login never goes to the manager in it; the
-        manager's reply is one message of plain words, with no code."""
+        manager's reply is one message of plain words, with no code, and asks for no key's value, which the owner's
+        words under the card would hold."""
         self.raise_item()
         for body, status in ((self.command(text="   "), 400), (self.command(text="x" * 2001), 400),
                              (self.command(text="Why?", choice=0), 400)):
@@ -685,6 +872,8 @@ class Talk(NeedsCase):
             hub.t_discuss_need("manager", {"need": "N-1", "text": "It waits on T-12."})
         with self.assertRaisesRegex(hub.ToolError, "1 to 2000 characters"):
             hub.t_discuss_need("manager", {"need": "N-1", "text": "x" * 2001})
+        with self.assertRaisesRegex(hub.ToolError, "Not sent: this reply asks the owner for a key"):
+            hub.t_discuss_need("manager", {"need": "N-1", "text": "Type the new API key as your answer."})
 
     def test_a_replaced_item_takes_the_record_of_its_earlier_discussion_along(self):
         """Bug: the talk of a replaced item stays on its closed card, or the closed card does not name the item that
@@ -704,6 +893,25 @@ class Talk(NeedsCase):
         with self.assertRaisesRegex(hub.ToolError, "closed already"):
             hub.t_raise_needs_you("manager", {"title": "Again", "why": "W", "what_to_do": "P", "replaces": "N-1",
                                               "reason": "person"})
+        # Owner API 1.316 (need_updates): the card is a chain of versions, and its newest item gives the earlier ones,
+        # oldest first, with the raise of the first. Bug: a history with a version missing or in the wrong order.
+        hub.t_raise_needs_you("manager", {"title": "Which name, now with prices?", "why": "C costs more.",
+                                          "what_to_do": "Press one", "options": ["A", "C"], "recommended": "A",
+                                          "replaces": "N-2", "reason": "person"})
+        first, second = self.row(1), self.row(2)
+        self.assertEqual(self.item(3)["versions"], [
+            {"id": 1, "title": "Which name?", "why": "The owner names it", "options": ["A", "B"], "recommended": None,
+             "raised": first["raised"], "ended": first["answered"]},
+            {"id": 2, "title": "Which name now?", "why": "With the third way.", "options": ["A", "B", "C"],
+             "recommended": None, "raised": second["raised"], "ended": second["answered"]}])
+        self.assertEqual(self.item(3)["since"], first["raised"])
+        self.assertEqual(hub.mobile_state("test-generation")["needs"][0]["versions"], self.item(3)["versions"])
+        # a replaced item gives none: its newest version gives the chain, which would else grow as n squared
+        self.assertEqual((self.item(2)["versions"], self.item(2)["since"], self.item(1)["versions"],
+                          self.item(1)["since"]), ([], second["raised"], [], first["raised"]))
+        hub.q("DELETE FROM needs WHERE id=1")                   # a removed item: the chain starts after it
+        self.assertEqual(([v["id"] for v in self.item(3)["versions"]], self.item(2)["versions"],
+                          self.item(3)["since"]), ([2], [], second["raised"]))
 
     def test_a_question_s_words_go_behind_details_with_no_code(self):
         task = hub.ins("INSERT INTO tasks(title, owner, requester, state, created) VALUES(?,?,?,?,?)",

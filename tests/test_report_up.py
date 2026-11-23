@@ -762,8 +762,9 @@ class Bugs(Base):
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner' AND kind='notify'")["n"], 1)
 
     def test_a_grant_is_written_into_the_owner_s_chat_with_no_notification(self):
-        """One short line, the agent by its role (the owner, 17 November 2026: "Manager should be capital M - like any
-        other agent name/role", "Dont spam with messages!"), and none for a grant that changed nothing."""
+        """One short line, the agent by its name, as the apps name it (the owner, 17 November 2026: "Manager should be
+        capital M - like any other agent name/role", "Dont spam with messages!"; F16), and none for a grant that
+        changed nothing."""
         hub.TEAM["agents"]["vps"]["title"] = "Shop Deployer"
         # A clock that moves at each read of it, as the real one does: the line and the record of the grant must
         # still have one time, which is what makes the line a grant line for the apps (owner API 1.236).
@@ -776,8 +777,8 @@ class Bugs(Base):
         self.assertFalse(err, text)
         row = hub.q1("SELECT * FROM owner_reports ORDER BY id DESC LIMIT 1")
         self.assertEqual(row["agent"], "manager")
-        self.assertEqual(row["text"], f"I gave Shop Deployer {hub.resource_phrase('secret', LOGIN)} (use): the shop's "
-                                      f"deploy needs its login.")
+        self.assertEqual(row["text"], f"I gave Vps {hub.resource_phrase('secret', LOGIN)} (use): the shop's deploy "
+                                      f"needs its login.")
         self.assertEqual(f"grant secret:{LOGIN} to vps", row["about"])
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner' AND kind='notify'")["n"], 0)
         # Owner API 1.236: the app's reading gives the line's parts, which are those of the record that the same call

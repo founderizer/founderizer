@@ -249,7 +249,7 @@ class Keeping(Base):
     def test_only_a_person_s_item_gives_the_owner_a_line_in_plain_words_that_rings_nothing(self):
         """The owner, 17 November 2026, of "manager set itself I-29: ... Say 'end I-29' to stop it.": "the language is
         VERY complex, too technical", "Manager should be capital M", "Dont spam with messages!". A line names an agent
-        by its role and no item by its code, and only an item that a person gave gets one."""
+        by its name, as the apps do (F16), and no item by its code, and only an item that a person gave gets one."""
         hub.TEAM["agents"]["hand"]["title"] = "Customer Support"
         self.people_on()
         pid = self.person("Maria")
@@ -258,8 +258,8 @@ class Keeping(Base):
                        scope="agent", source=f"CM-{said}")
         self.assertIn("The owner reads one line about it.", text)
         row = hub.q1("SELECT * FROM owner_reports ORDER BY id DESC LIMIT 1")
-        self.assertEqual(row["text"], "Maria gave Customer Support an instruction: the support lead decides refunds up "
-                                      "to one month's fee.")
+        self.assertEqual(row["text"], "Maria gave Hand an instruction: the support lead decides refunds up to one "
+                                      "month's fee.")
         self.assertEqual((row["agent"], row["about"], row["in_reply_to"], row["pushed"]),
                          ("manager", "standing I-1 of hand", None, 0))          # as grant_access writes its record
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM pings")["n"], 0)          # no notification

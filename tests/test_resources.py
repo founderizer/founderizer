@@ -882,9 +882,9 @@ class Resources(OwnerAPI):
         mail = dict(title="Let Dev read support@shop.test", why="Its triage reads the mail of support@shop.test.",
                     needs_access="gmail:support@shop.test", needs_level="read", options=None)
         nid = self.give_card(**mail)
-        settings("dev", title="Triage")             # the role that the card names is now another word
+        settings("dev", title="Dev Triage")         # the label that the card names is now another one (F16)
         self.assertIn('The card\'s first option, "Give Dev read access to the Gmail mailbox support@shop.test", no '
-                      'longer says what Give gives now, "Give Triage read access to the Gmail mailbox '
+                      'longer says what Give gives now, "Give Dev Triage read access to the Gmail mailbox '
                       'support@shop.test".', closed(nid))
         self.assertNotIn("google", self.committed()["agents"]["dev"])
         # Gmail that writes or sends, and a whole Drive, reach no session of an agent whose Shell box is off
@@ -914,7 +914,7 @@ class Resources(OwnerAPI):
         self.assertIn('The card\'s step, "Press Give.", no longer says what Give gives now, "Press Give: it gives Lead '
                       'read access to the Gmail mailbox support@shop.test."',
                       hub.need_give_stale(dict(row, todo="Press Give."), hub.need_view(row)["give"]))
-        settings("lead", title="Support")
+        settings("lead", title="Support Lead")     # a role that holds its name: a new label
         hub.need_look_sweep(t0 + 2 * hub.NEED_GIVE_WAIT + 2)
         hub.need_look_sweep(t0 + 3 * hub.NEED_GIVE_WAIT + 3)
         self.assertEqual(answer(reads), hub.TEAM_CLOSED_WORDS)

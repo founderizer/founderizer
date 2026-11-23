@@ -664,7 +664,7 @@ class MacSetup(Servers):
         self.assertEqual(len(heard), 2, heard)
         self.assertIn("3. Log in as third@example.com and select its organization.", heard[-1])
         self.assertIn(f"third@example.com is also the Claude account of {hub.shown_role('manager')} on other "
-                      "machines.", heard[-1])                 # by its role, as the owner reads agents
+                      "machines.", heard[-1])                 # as the owner's apps name the agent
         self.assertNotIn(" manager on other", heard[-1])
         # A reading that cannot reach the link server adds a note, and keeps the steps: behind a proxy it reads so
         # while Chrome reaches the server.

@@ -880,6 +880,18 @@ STORE_ANY_VERSION = "external-secrets.io/"      # the start of each apiVersion t
 STORE_FOLDERS_MOST = 16     # folders above a store's file: each one is a listing of GitHub for each ask
 
 
+def no_number(word):
+    raise ValueError(f"{word} is no number of JSON")
+
+
+def finite(text):
+    "A number of JSON with a fraction or an exponent, or ValueError for one that is no finite float (1e999)."
+    value = float(text)
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError(f"{text} is no finite number")
+    return value
+
+
 def store_docs(path, data):
     """The documents of a store's file as the door's own readers of a manifest read them, or None for a file that
     none of them reads: a YAML file that is not block style (door_targets.unread: no anchor, alias, merge key, tag,
@@ -890,7 +902,8 @@ def store_docs(path, data):
     no document mark: two documents of one text would come back as one mapping."""
     if path.endswith(".json"):      # not through manifest_text: its block lines of a deep file take gigabytes
         try:
-            return [json.loads(data.decode("utf-8"), object_pairs_hook=door_targets.no_key_twice)]
+            return [json.loads(data.decode("utf-8"), object_pairs_hook=door_targets.no_key_twice,
+                               parse_constant=no_number, parse_float=finite)]   # a cluster's JSON reader takes no NaN
         except (ValueError, RecursionError):
             return None
     text, why = door_targets.manifest_text(path, data)
@@ -2251,11 +2264,11 @@ class GitHub:
         # The file as the patterns read it. One that is not block style is no refusal here, as it is in a commit: the
         # repository's own people wrote it, and the door is the agent's only way to read it. So it comes back, unless
         # the filter keeps it back (door_targets.kept_back).
-        kept = door_targets.kept_back(path, data)
+        read = door_targets.manifest_text(path, data)      # once: a file at the limit takes a moment to read
+        kept = door_targets.kept_back(path, data, read)
         if kept:
             raise Refused(f"{path} {kept}")
-        text, why = door_targets.manifest_text(path, data)
-        return data.decode("utf-8") if why else data.decode("utf-8", "replace")
+        return data.decode("utf-8") if read[1] else data.decode("utf-8", "replace")
 
     def commit(self, plan):
         """One commit on the branch's head, made through the API: the blobs, one tree on the head's tree, the commit,

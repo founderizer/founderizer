@@ -54,22 +54,75 @@ class Withdraw(OwnerAPI):
         self.assertTrue(error, said)
         self.assertIn(words, said)
 
-    def test_the_manager_withdraws_its_own_item_with_no_notification(self):
+    def pings(self):
+        return [(r["kind"], r["item"]) for r in hub.q("SELECT kind, item FROM pings ORDER BY id")]
+
+    def test_the_manager_withdraws_its_own_item_silently_unless_it_answers_the_owners_message(self):
+        """A withdrawn item leaves Needs you with no notification. Owner API 1.316, feature need_updates (the owner, 22
+        November 2026, "Yes" to his phone ringing when the agent closes a card after his message): a close of a card
+        whose newest word is his message under it answers that message, so its reason is the manager's reply under
+        the card, which rings and notifies as a reply does. Bug: his question under a card gets no answer when the
+        card closes, or a plain withdraw rings his phone."""
+        hub.TEAM["owner_devices"] = {"iphone": {"label": "iPhone", "address": "127.0.0.9"}}
+        hub.q("INSERT INTO owner_device_push(device,token,environment,updated) VALUES('iphone',?, 'production',?)",
+              ("ab" * 32, hub.now()))
         nid = self.raise_item()
         self.assertIn(nid, self.open_ids())
-        told = self.notices()
+        told, rang = self.notices(), self.pings()
         said, error = hub.call_tool("manager", "withdraw_need", {"need": f"N-{nid}",
                                                                  "why": "A plan change replaced it."})
         self.assertFalse(error, said)
-        self.assertIn(f"Withdrew N-{nid}", said)
+        self.assertIn(f"Withdrew N-{nid}. It left the owner's Needs you with no notification", said)
         row = hub.q1("SELECT * FROM needs WHERE id=?", (nid,))
         self.assertEqual((row["answer"], row["answered_by"]), (f"Withdrawn by {hub.shown_role('manager')}: A plan change replaced it.",
                                                                "manager"))
         self.assertIsNotNone(row["answered"])
         self.assertNotIn(nid, self.open_ids())                  # it left Needs you, as an answered item does
-        self.assertEqual(self.notices(), told)                  # and nothing rang
+        self.assertEqual((self.notices(), self.pings()), (told, rang))      # and nothing rang
+        self.assertEqual(hub.need_talk(nid), [])
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM events WHERE kind='say'")["n"], 0)   # nobody waits on it
         self.assertTrue(hub.q1("SELECT 1 FROM log WHERE agent='manager' AND what LIKE ?", (f"withdrew N-{nid} %",)))
+        # his message under a card: the close answers it
+        asked = self.raise_item("Pay for the DataFast key?")
+        hub.need_talk_said({"need": asked, "text": "we're no longer using datafast, it can be removed"})
+        told, rang = self.notices(), self.pings()
+        self.refused({"need": f"N-{asked}", "why": "T-12 took DataFast out."}, "say T-12 in plain words")
+        self.assertIn(asked, self.open_ids())                   # a refusal closes nothing
+        said, error = hub.call_tool("manager", "withdraw_need", {"need": f"N-{asked}", "why": "DataFast is out of the "
+                                                                 "site, so no key is needed."})
+        self.assertFalse(error, said)
+        # true also in a fleet with no phone: the Mac's notice always goes, a ring only to an enrolled phone
+        self.assertIn("your reason stands under the card as your answer to their message there; the owner is notified "
+                      "of it.", said)
+        row = hub.q1("SELECT * FROM needs WHERE id=?", (asked,))
+        self.assertEqual(row["answer"], f"Withdrawn by {hub.shown_role('manager')}: DataFast is out of the site, so "
+                                        f"no key is needed.")
+        self.assertEqual([(t["who"], t["text"], t["ts"]) for t in hub.need_talk(asked)][1:],
+                         [("manager", "DataFast is out of the site, so no key is needed.", row["answered"])])
+        reply = hub.q1("SELECT id FROM need_talk WHERE need=? AND who='manager'", (asked,))["id"]
+        self.assertEqual((self.notices(), self.pings()), (told + 1, rang + [("talk", reply)]))
+        # the apps of today draw an answered card's talk and then its answer: the view's answer leaves out the reason
+        # that stands under the card already, so they show it once (the stored answer above stays whole)
+        shown = {n["id"]: n["answer"] for n in self.request()[1]["needs"]}
+        self.assertEqual((shown[asked], shown[nid]), (f"Withdrawn by {hub.shown_role('manager')}",
+                                                      f"Withdrawn by {hub.shown_role('manager')}: A plan change "
+                                                      f"replaced it."))
+        # a rename of the manager moves need_talk.who but not needs.answered_by: the reason still shows once
+        hub.q("UPDATE need_talk SET who='chief' WHERE who='manager'")
+        shown = {n["id"]: n["answer"] for n in self.request()[1]["needs"]}
+        self.assertEqual(shown[asked], f"Withdrawn by {hub.shown_role('manager')}")
+        self.assertEqual(hub.q1("SELECT text FROM events WHERE agent='owner' AND kind='notify' ORDER BY id DESC")
+                         ["text"], f"{hub.shown_role('manager')} replied about: Pay for the DataFast key?")
+        # a new version answered his message, which it took along: its close later is silent again
+        old = self.raise_item("Add prepaid X credits?")
+        hub.need_talk_said({"need": old, "text": "how much each month?"})
+        new = int(hub.t_raise_needs_you("manager", {"title": "Add $20 of X credits?", "why": "About $20 a month.",
+                                                    "what_to_do": "Say yes or no", "reason": "person",
+                                                    "replaces": f"N-{old}"}).split("N-")[1].split(".")[0])
+        told, rang = self.notices(), self.pings()
+        self.assertFalse(hub.call_tool("manager", "withdraw_need", {"need": f"N-{new}", "why": "X dropped it."})[1])
+        self.assertEqual(([t["who"] for t in hub.need_talk(new)], self.notices(), self.pings()),
+                         (["owner"], told, rang))
 
     def test_it_needs_a_reason(self):
         nid = self.raise_item()
@@ -136,7 +189,8 @@ class Withdraw(OwnerAPI):
         self.assertNotIn("withdraw_need", [t["name"] for t in hub.tools_for("vps", ("vps", "T-1", "1"))])
         with open("rules/manager.md") as f:     # the manager's start names the brief's rules file; the brief stays short
             rules = f.read()
-        self.assertIn("close it at once with `withdraw_need`", rules)
+        # since owner API 1.316 a close that answers the owner's message under the card rings: no "no notification"
+        self.assertIn("close it at once with `withdraw_need`: it leaves Needs you and keeps your reason", rules)
         self.assertIn("The manager has twenty-six of its own", rules)    # ..., door_fleet, switch_key_site, change_team
 
     def test_the_answer_of_a_raise_names_it(self):

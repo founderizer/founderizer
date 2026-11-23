@@ -646,15 +646,14 @@ class Cases(Base):
 
     def test_a_rule_s_title_that_the_owner_cannot_read_is_news_once_for_the_agent_that_can_write_it_again(self):
         """The rules that an earlier hub took keep their titles, and each of their tasks shows them on a card. So a
-        title that the check refuses, or that may name an agent by its name where the apps say its role, is news for
-        a review, once for each rule and title, for the agent that the hub lets change the rule: its own agent for a
-        rule that it set for itself, and the fleet manager for every other one (a duty's watch, a rule of an agent
-        whose Shell box is off). The line says the whole call, and the agent that reads it can make it. A name counts
-        only as a whole word outside a role that the title says (a hyphen of it can be a space), never for the
-        manager or an agent with no role, and the line asks whether it is the agent's. The manager reads the lines
-        under words of their own, and an agent that holds no duty reads that its rules have news. No news: a rule
-        that the owner wrote, a rule that sends, a deleted rule, and a rule of an agent in setup. No mark on the
-        duty: the owner's apps would show it on every such duty at once."""
+        title that the check refuses is news for a review, once for each rule and title, for the agent that the hub
+        lets change the rule: its own agent for a rule that it set for itself, and the fleet manager for every other
+        one (a duty's watch, a rule of an agent whose Shell box is off). The line says the whole call, and the agent
+        that reads it can make it. The manager reads the lines under words of their own, and an agent that holds no
+        duty reads that its rules have news. No news: a rule that the owner wrote, a rule that sends, a deleted rule,
+        a rule of an agent in setup, and an agent's name in a title, which the owner reads as the apps name the agent
+        (F16; bug: the hub asks an agent to write a colleague's role, against RULES.md). No mark on the duty: the
+        owner's apps would show it on every such duty at once."""
         team = hub.TEAM["agents"]
         team["manager"]["title"], team["studio"]["title"] = "Fleet Manager", "Designer"
         team["desk"] = {"role": "worker", "runtime": "claude", "machine": "vps", "can": [], "title": "Help Desk"}
@@ -663,15 +662,12 @@ class Cases(Base):
         r = self.duty()
         self.sweep()
         hub.q("UPDATE tasks SET state='completed' WHERE id=?", (self.review_task()["id"],))
-        coded = self.own_rule(title="R-3 pictures that studio left open")       # both reasons, said at once
+        coded = self.own_rule(title="R-3 pictures that studio left open")       # a code, and an agent's name
         kept = self.own_rule(title="R-4 old words")
-        spaced = self.own_rule(title="What web dev left open")                  # a hyphen of a name as a space
         fine = [self.own_rule(title=title) for title in (
             "Look at the support mailbox",
-            "Tell the manager of new studios",      # the manager's name is a word, and a name in a word is none
-            "Hand it to the Help Desk",             # a role that holds its agent's name
-            "The studioDesigner pictures",          # a role is taken out as whole words only
-            "The checks that vps keeps")]           # an agent with no role has only its name
+            "What web-dev left open",               # an agent's name, beside its role "Sites": no news
+            "Hand it to the Help Desk")]            # a role in a title stays as its writer wrote it
         alone = self.own_rule(agent="studio", title="R-5 pictures")             # an agent that holds no duty
         shut = self.own_rule(agent="desk", title="R-7 tickets")                 # its own, from before its box went off
         gone = self.own_rule(title="R-6 no longer")
@@ -697,15 +693,12 @@ class Cases(Base):
         mine = self.review_task()
         self.assertIn(f'Wake-up rule {coded["id"]} of vps, "R-3 pictures that studio left open": Say R-3 in plain '
                       f"words in its task's title", mine["details"])
-        for part in ("It may name studio, the agent that the owner's apps call Designer",
-                     "if it is another studio, leave the title as it is",
-                     f"save_trigger: trigger_id {coded['id']}, base_revision 1 ", 'needs "none", goal_id null',
+        for part in (f"save_trigger: trigger_id {coded['id']}, base_revision 1 ", 'needs "none", goal_id null',
                      "The code can stand in details."):      # an agent's own rule has details of its own
             self.assertIn(part, mine["details"])
         self.assertIn(f"Wake-up rule {kept['id']} of vps", mine["details"])
-        self.assertIn(f'Wake-up rule {spaced["id"]} of vps, "What web dev left open": It may name web-dev, the agent '
-                      f"that the owner's apps call Sites", mine["details"])
         told = "\n".join(self.manager_said()[heard:])
+        self.assertNotIn("may name", mine["details"] + told)        # no line asks for a role in place of a name
         self.assertIn("[hub] These wake-up rules have a title that the owner cannot read well", told)
         self.assertIn(f'Wake-up rule {watch["id"]} of vps, "R-9 watch": Say R-9 in plain words', told)
         self.assertNotIn("The code can stand in", told.split(f"Wake-up rule {watch['id']} ")[1].split("\n")[0])

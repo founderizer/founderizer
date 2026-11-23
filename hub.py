@@ -1155,13 +1155,15 @@ def manager_name():
     return "manager"
 
 
-# ---------------------------------------------------------------- an agent by its role or by its name
+# ---------------------------------------------------------------- an agent by its name or by its role
 #
-# The owner's apps show an agent by its role, team.json "title" ("Customer Support"), with its name ("Nova") under it,
-# and he and the agents may name it either way (the owner, 10 November 2026: "both names could be edited and during
-# conversations, agents and humans can refer to them with any of the names"). So a tool field that names an agent
-# takes its name in any case or its role in any case and spacing (AGENT_NAME_FIELDS, call_tool), the words he reads
-# name it by its role (shown_role), and two agents never share a role (role_clash).
+# The owner's apps name an agent by its name ("Nova"), with its role, team.json "title" ("Customer Support"), beside it
+# where a place shows the agent as an entry of its own, and he and the agents may name it either way (the owner, 10
+# November 2026: "both names could be edited and during conversations, agents and humans can refer to them with any of
+# the names"). So a tool field that names an agent takes its name in any case or its role in any case and spacing
+# (AGENT_NAME_FIELDS, call_tool), the words he reads name it by its name (shown_role; the owner, 22 November 2026, F16:
+# the name in each place, where the role was the label since 10 November), and two agents never share a role
+# (role_clash).
 
 # The fields of the agents' tools that name one agent. call_tool gives each the agent's name before the tool's own
 # code reads it, so a check, a record and a request_id's replay see one spelling of one agent; in a list of agents
@@ -1209,12 +1211,36 @@ def role_clash(agent, word, team):
     return None
 
 
+def role_holds_name(name, role):
+    """True when one word of the role is the agent's name: the role in small letters, cut at each character that is no
+    letter and no digit, as the apps cut it (AgentNames.label in FleetCore). "Fleet Manager" holds manager, "Customer
+    Support" does not hold nova, and no role holds a name with a hyphen."""
+    words = "".join(c if c.isalnum() else " " for c in str(role or "").lower()).split()
+    return str(name or "").lower() in words
+
+
+def agent_label(name, role):
+    """The label of an agent with this name and this role (shown_role): its name as shown_name writes it ("Nova"),
+    and its role only when the role holds the name ("Fleet Manager" for manager, role_holds_name), as the apps show
+    it, so that the label does not say the name twice."""
+    role = " ".join(str(role or "").split())
+    return role if role and role_holds_name(name, role) else shown_name(name)
+
+
+def name_and_role(name):
+    """An agent in another agent's words, as the team directory writes it (colleague_line): its name, and its role in
+    brackets when it has one ("nova (Customer Support)")."""
+    role = " ".join(str((agents().get(name) or {}).get("title") or "").split())
+    return f"{name} ({role})" if role else name
+
+
 def shown_role(name):
-    """An agent as the owner's apps show it: its role when it has one ("Customer Support"), else its name as
-    shown_name writes it ("Nova"). The words he reads from the hub name an agent this way (the owner, 10 November
-    2026: the main label of an agent is its function, so that he need not learn ten names)."""
-    title = " ".join(str((agents().get(name) or {}).get("title") or "").split())
-    return title or shown_name(name)
+    """An agent as the owner's apps name it (agent_label): its name with capitals ("Nova"), and its role only when the
+    role holds the name ("Fleet Manager"). The words he reads from the hub name an agent this way (the owner, 22
+    November 2026, F16: an agent's name in each place; from 10 November it was the role). The function keeps its name
+    of that time, because other branches call it. A use that reads the role as data reads team.json "title" itself
+    (card_signs_in)."""
+    return agent_label(name, (agents().get(name) or {}).get("title"))
 
 
 def agent_active(name):
@@ -2144,6 +2170,10 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "need_pictures",     # the owner, 20 November 2026 ("the idea would be that Needs You shows multiple
                                     # options as images too"): this hub reads X-Fleet-Draws, and an item can have
                                     # `pictures`, one for each option (UI-API.md 1.285)
+               "need_updates",      # the owner, 22 November 2026 ("Yes, as drawn" to the pictures of a card that the
+                                    # agent updates after his Needs clarification): an item's `awaits`, `versions` and
+                                    # `since`, and a close of the card that answers his message is a reply under it
+                                    # (UI-API.md 1.316)
                "agent_tags",        # the owner, 20 November 2026 ("Name a helper", "Yes, as drawn", "Build tags
                                     # now"): POST /ui/messages takes `mentions`, the @ tags of a message, and
                                     # messages[].mentions of GET /ui/state gives them (UI-API.md 1.288)
@@ -3094,7 +3124,8 @@ def ping_reply(talk):
     with no options (ping_payload). The area of Needs-you, 20 November 2026, from the review of the iPhone's part: the
     reply rang with the card's own ping, which said nothing of a reply, and whose buttons answered the card and closed
     it before he had read the reply. It goes as a card's ping goes: held while he is at a Mac app, with the icon's
-    number, and none for a card that was answered by then."""
+    number, and none for a card that was answered by then, but by the close whose reason is this reply (withdraw_need
+    after his message, owner API 1.316)."""
     queue_pings("talk", talk)
 
 
@@ -3312,7 +3343,10 @@ def send_ping():
         error = "the device has no push token now"
     elif not need or row["db"] != generation:
         error = "the item is not in these records"
-    elif need["answer"] is not None:
+    elif need["answer"] is not None and not (reply and need["answered_by"] == reply["who"] and
+                                             need["answered"] == reply["ts"]):
+        # (a close whose reason is the agent's reply to his message, made in the same moment, is that reply's own
+        # end: it goes, t_withdraw_need, owner API 1.316)
         error = "the item was answered before the ping went"
     elif row["error"] and now() >= row["created"] + PUSH_KEEP:
         state, error = "failed", row["error"]       # our side held it back, and its day ended (a hub that was down)
@@ -3422,6 +3456,9 @@ def need_words(title, why, todo="", options=(), details=""):
                 f"shows behind Details. This one has {len(why)}.")
     if len(details) > NEED_DETAILS_CHARS:
         return f"details is at most {NEED_DETAILS_CHARS} characters. This one has {len(details)}."
+    if len(todo) > NEED_DETAILS_CHARS:          # the steps, which the hub reads under its lock as it reads details
+        return (f"what_to_do is at most {NEED_DETAILS_CHARS} characters: the steps that the owner takes, as a short "
+                f"numbered list. This one has {len(todo)}.")
     # the task and the details are drawn with their code blocks; the title, the reason and an option are words only
     for part, blocks in ((title, False), (why, False), (todo, True), *((option, False) for option in options),
                          (details, True)):
@@ -3833,8 +3870,8 @@ def need_unclarified(need):
 def need_reads():
     """What need_view reads for each item, read once for all of them: (need_talk of every item as {item: [{who, text,
     ts}]}, each list oldest first; the fleet's id; the task of each question that an item takes to the owner, as
-    {question: task}, for need_task; the rows of the items' pictures as {item: [row]}). The Mac app reads every
-    item with its discussion every 3 seconds
+    {question: task}, for need_task; the rows of the items' pictures as {item: [row]}; the replaced items as
+    need_chain_rows gives them, for need_versions). The Mac app reads every item with its discussion every 3 seconds
     (GET /ui/state). need_talk has no index on its item, so each item's own read reads the whole table: on the first
     fleet, on 10 November 2026, 61 items made 61 such reads in each read of the state, all under the hub's lock."""
     talks, pictures = {}, {}
@@ -3845,7 +3882,35 @@ def need_reads():
     # owner API 1.285: the picture files of all the items, {item: [row]}, by the index of their item (attachment_need)
     for r in q("SELECT * FROM attachments WHERE need IS NOT NULL"):
         pictures.setdefault(r["need"], []).append(r)
-    return talks, kv_get("fleet_id"), asked, pictures
+    return talks, kv_get("fleet_id"), asked, pictures, need_chain_rows()
+
+
+def need_chain_rows():
+    """Every item that another took the place of (replaced_by), as {the item that took its place: [its row]}, read
+    once for all the items (owner API 1.316)."""
+    chain = {}
+    for r in q("SELECT id, title, why, options, recommended, raised, answered, replaced_by FROM needs "
+               "WHERE replaced_by IS NOT NULL ORDER BY id"):
+        chain.setdefault(r["replaced_by"], []).append(r)
+    return chain
+
+
+def need_versions(nid, chain):
+    """The earlier versions of item `nid` (owner API 1.316, feature need_updates): the items that it took the place of,
+    and the items that those took the place of, oldest first, each {id, title, why, options, recommended, raised,
+    ended}. The owner, 22 November 2026: "updating the same card seems correct, so it carries the entire context of
+    what was changed and why". A version never changes after its raise, so an app draws the chain as one card with its
+    history. chain: need_chain_rows(). An item that took no place, or whose earlier item was removed, has []."""
+    rows, seen, todo = [], {nid}, [nid]
+    while todo:
+        for r in chain.get(todo.pop(), []):
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                rows.append(r)
+                todo.append(r["id"])
+    return [{"id": r["id"], "title": r["title"], "why": r["why"], "options": need_options(r),
+             "recommended": r["recommended"], "raised": r["raised"], "ended": r["answered"]}
+            for r in sorted(rows, key=lambda r: r["id"])]
 
 
 def need_options(row):
@@ -3936,11 +4001,31 @@ def need_view(row, reads=None):
             # of (vault.kept_address), and request_secret refuses an agent's site for it (key_failed)
             view["secret"].pop("site", None)
     view["talk"] = need_talk(row["id"]) if reads is None else reads[0].get(row["id"], [])
+    # owner API 1.316: a close whose reason is the agent's reply to his message (t_withdraw_need: the newest talk line
+    # is not the owner's and has the close's own time, as send_ping tells it) stands under the card already, so the
+    # view's answer leaves ": <reason>" out, and every app shows the reason once. The stored answer stays whole, and
+    # the owner's own answer (answered_by null) is never cut.
+    said = view["talk"][-1] if view["talk"] and "answered_by" in keys else None
+    if said and row["answer"] is not None and row["answered_by"] is not None and said["who"] != "owner" \
+            and said["ts"] == row["answered"] \
+            and row["answer"].endswith(": " + said["text"]):
+        view["answer"] = row["answer"][:-len(": " + said["text"])]
     # owner API 1.285: one picture for each option, in the order of `options`, or null: never the row's own text
     view["pictures"] = need_pictures_view(row, None if reads is None else reads[3].get(row["id"], []))
     # owner feature need_clarify: the card takes the owner's message under it (POST /ui/needs/<id>/talk), and his
     # talk with the manager there is `talk` (owner API 1.272)
     view["clarify"] = need_unclarified(row) is None
+    # owner API 1.316 (need_updates): while the card waits for the manager's answer to his message, the time of that
+    # message (need_talk_said, need_wait_sweep); null on every other item, also on one that closed while it waited.
+    # The card's earlier versions, and the raise of the first one. The hub's own marks of the wait stay out.
+    view["awaits"] = row["awaits"] if "awaits" in keys and row["answer"] is None else None
+    view.pop("awaits_told", None)
+    view.pop("awaits_asked", None)
+    # Only the newest version gives them: an app draws a chain in its newest item, and a replaced item that gave them
+    # too would repeat each chain in each of its items (finding 4 of the area's reader)
+    replaced = "replaced_by" in keys and row["replaced_by"] is not None
+    view["versions"] = [] if replaced else need_versions(row["id"], need_chain_rows() if reads is None else reads[4])
+    view["since"] = view["versions"][0]["raised"] if view["versions"] else row["raised"]
     if row["kind"] == JOIN_KIND:        # Teams design 4, D12: the person's name, from which an app writes the words
         links = teams_part("person_links")
         view["join"] = links.join_view(row) if links else None
@@ -4631,11 +4716,13 @@ def mobile_state(generation, at=None):
     # Owner API 1.189: the name of each ask that a head names (owner feature asks), by its message's request_id. The
     # phone keeps a chat's messages from before the work got its name, so the name comes here and not with them.
     asked = ask_names(tasks + recent)
-    needs = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NULL ORDER BY id")]
+    # the discussions and the earlier versions of all the items, read once (owner API 1.316: versions)
+    needs_read = need_reads()
+    needs = [need_view(r, needs_read) for r in q("SELECT * FROM needs WHERE answer IS NULL ORDER BY id")]
     # D-7 item 2: an answered request card stays in its chat, folded to two lines, so the phone reads the newest
     # answered items too, oldest first. `needs` stays the open ones, which every phone already reads.
-    answered = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NOT NULL ORDER BY id DESC LIMIT ?",
-                                        (MOBILE_ANSWERED,))]
+    answered = [need_view(r, needs_read) for r in q("SELECT * FROM needs WHERE answer IS NOT NULL ORDER BY id DESC "
+                                                    "LIMIT ?", (MOBILE_ANSWERED,))]
     stops = chat_stops_newest()             # owner feature chat_stop: one read for all the agents
     waiting = chat_read_waiting(n for n, c in agents().items() if owner_chat(c) and agent_active(n))
     return {"schema_version": 1, "db": generation, "time": now() if at is None else at,
@@ -9011,7 +9098,8 @@ def migrate():
         "reports": {"feedback_shown": "REAL"},     # plan C10: a decision shows in its sender's start once
         "needs": {"kind": "TEXT", "conversation": "INTEGER",   # owner feature conversations: ask_owner, request_work
                   "options": "TEXT", "chosen": "INTEGER",     # owner feature need_options: the agent's own answers
-                  "answered_by": "TEXT",      # null is the owner; "P-<id> <name>" is the deputy of that conversation
+                  "answered_by": "TEXT",      # null is the owner; "P-<id> <name>" is the deputy of that conversation;
+                                              # "Fleet" the hub; else the agent that replaced or withdrew it
                   "secret": "TEXT",           # owner feature secret_requests: what request_secret asks for, no value
                   "question": "INTEGER",      # the question that the manager took to the owner (raise_needs_you)
                   "ask": "TEXT",              # owner feature asks: the owner's message whose work waits for this item
@@ -9066,7 +9154,17 @@ def migrate():
                   # JSON list (raise_needs_you pictures; attachments.need names the item back)
                   "pictures": "TEXT",
                   # Founderizer for Teams (decision D72 a): the person of a join item, which the hub sets at its raise
-                  "person": "INTEGER"},
+                  "person": "INTEGER",
+                  # owner API 1.316 (need_updates): the time of the owner's message under the card while the card
+                  # waits for the manager's answer, else null; the hub's line that told the manager his words, and
+                  # its ask at the first turn end with no answer (need_wait_sweep), which stays after a wait that
+                  # ended with no answer until the manager's next second look names the card
+                  "awaits": "REAL", "awaits_told": "INTEGER", "awaits_asked": "INTEGER"},
+        # owner API 1.316: the hand of a message of the owner's under a card that the owner did not type (an AI
+        # session's or a program's, request_hand), else null: the hub's ask and its second look say that such words are
+        # not the owner's, as the line that told them did (NEED_TALK_NOT_HIS). The row keeps it when the talk moves to
+        # a new version. No view gives it: need_talk and need_reads read who, text and ts
+        "need_talk": {"hand": "TEXT"},
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0",      # chat apps round 2: message_owner
                           # 10 November 2026: the request id of the owner's message from the app whose turn this
@@ -15016,25 +15114,6 @@ def rule_title(title, t, field="task.title", where="details"):
         raise ToolError(wrong)
 
 
-def title_names(title):
-    """The agents that a title may name by their own names, where the owner's apps say their roles (RULES.md, "People
-    read words, not codes"): [(name, role)]. Only an agent that has a role, and never the manager, whose name is a
-    word of the language. A name inside a role that the title says is none ("Customer Support" for the agent
-    support), nor is one inside a word of any alphabet; a hyphen of a name can be a space. The hub refuses no title
-    for it, because a customer, a product or a plain word can be an agent's name: it is news for a review, said as
-    a question (rule_title_news)."""
-    roles = {name: shown_role(name) for name in agents()
-             if name != manager_name() and (agents()[name].get("title") or "").strip()}
-    for role in sorted(roles.values(), key=len, reverse=True):         # as whole words: "Ops" is no part of "DevOps"
-        title = re.sub(rf"(?<![\w-]){re.escape(role)}(?![\w-])", " ", title, flags=re.IGNORECASE)
-    out = []
-    for name, role in sorted(roles.items()):
-        words = re.escape(name).replace("\\-", "[- ]")
-        if re.search(rf"(?<![\w-]){words}(?![\w-])", title, re.IGNORECASE):
-            out.append((name, role))
-    return out
-
-
 def rule_writer(org, t):
     """The agent that the hub lets write a rule's title again, and that has the tool for it: the rule's own agent for
     the rule that it set for itself (wakeups.may_control: every other rule, a watch of a duty's list too, changes
@@ -15051,13 +15130,14 @@ RULE_NEWS = "Wake-up rule "     # how each line of rule_title_news begins: a mes
 
 
 def rule_title_news():
-    """{agent: [(mark, line)]}: the rules that run with a title that the owner cannot read on a card (title_words) or
-    that may name an agent by its name (title_names). News for a review, once for each rule and title, as an old name
-    in a duty's words is (duty_name_news): the rules that an earlier version of the hub took keep their titles until
-    somebody writes them again. It goes to the agent that can (rule_writer), and its line says the whole call: a
-    change of a rule gives its task whole, and see_triggers does not show the task's goal. A rule that the owner
-    wrote keeps the owner's words, a rule that sends (a person's reminder too) starts no task, and a rule of an
-    agent in setup changes for nobody yet (wakeups.plan_save): it is news once its agent is active."""
+    """{agent: [(mark, line)]}: the rules that run with a title that the owner cannot read on a card (title_words): a
+    code, or too many characters. An agent's name in a title is no news (F16: the owner reads an agent by its name).
+    News for a review, once for each rule and title, as an old name in a duty's words is (duty_name_news): the rules
+    that an earlier version of the hub took keep their titles until somebody writes them again. It goes to the agent
+    that can (rule_writer), and its line says the whole call: a change of a rule gives its task whole, and
+    see_triggers does not show the task's goal. A rule that the owner wrote keeps the owner's words, a rule that sends
+    (a person's reminder too) starts no task, and a rule of an agent in setup changes for nobody yet
+    (wakeups.plan_save): it is news once its agent is active."""
     out, org = {}, None
     for t in q("SELECT * FROM triggers WHERE state IN ('active','paused') ORDER BY id"):
         owner = t["agent"].split(":", 1)[0]
@@ -15068,14 +15148,10 @@ def rule_title_news():
         title = task.get("title") or ""
         managed = t["responsibility"] and t["watch"] in DUTY_WATCHES            # a watch of a duty's list
         wrong = title_words(title, "its task's title", None if managed else "details")
-        named = title_names(title)
-        if not wrong and not named:
+        if not wrong:
             continue
         org = org or wake_org()
-        why = " ".join(([wrong[:1].upper() + wrong[1:]] if wrong else []) + [
-            f"It may name {name}, the agent that the owner's apps call {role}, and the owner reads this title on a "
-            f"card: if it does, name it by that role; if it is another {name}, leave the title as it is."
-            for name, role in named])
+        why = wrong[:1].upper() + wrong[1:]
         mark = f"rule:{t['id']}:{hashlib.sha256(title.encode()).hexdigest()[:8]}"
         out.setdefault(rule_writer(org, t), []).append((mark, (
             f"{RULE_NEWS}{t['id']} of {owner}, {json.dumps(title, ensure_ascii=False)}: {why} A new title goes in "
@@ -15541,7 +15617,7 @@ def answer_rows(qu, t, text, by, t0, files=(), more="", via=None):
     for to, said, extra in rows:
         filed, about = filed_about(to, "say", tid)
         DB.execute(*event_row(to, "say", filed, said, t0, json.dumps(extra or {}), about))
-    # the owner reads it on the card (NeedAnswerBox), so in his words: no code, an agent by its role, and the
+    # the owner reads it on the card (NeedAnswerBox), so in his words: no code, an agent by its name, and the
     # answer's own words only when they are his, since an agent's answer is written for the agent that asked
     question_needs_close("id=?", (qid,), (f"Closed: {QUESTION_CLOSED_VIA[via]} answered it for you: {clip(text, 300)}"
                                           if via in QUESTION_CLOSED_VIA else f"Closed: you answered it: {clip(text, 300)}")
@@ -17883,25 +17959,145 @@ def need_is_notice(*texts):
 # agent's conversation, its runtime's own transcript and these records before anything can mask it. request_secret
 # asks for one instead: the owner types it into the app's secure form, which writes it into the vault, and the agent
 # that asked gets its name and its reference. An item that sends the owner to an app of his own (Fleet Vault, the
-# Secrets page) asks for no value in words, and passes.
+# Secrets page) asks for no value in words, and passes. A value to type into the item's own answer is a shape of its
+# own (ASKS_IN_ANSWER), checked before that exemption, because the answer is in the records whatever app the item
+# names; the first shape is read in the title, the why and what_to_do, in a card's details only as a step ("Send the
+# API key.", also after a leading clause, "now" or "please,", with the secret word at the end of its phrase or before
+# a way to send it or a Spanish adjective ("by email", "in the chat", "over Slack", "por correo", "de la API", "la
+# clave nueva"), and no contrast or new clause between the verb and it: "Send the key account list", "send the key ID,
+# not the application key" and "send Ada the report, and keep the key in the vault" are no ask, nor a noun before
+# "clave" ("el ID de la clave", "el nombre", "la fecha", "el número", "las palabras clave"); in Spanish, here and in
+# the title, the why and what_to_do, the secret word comes right after its article ("Envía a David la contraseña"),
+# and "clave" after its own noun is an adjective ("los puntos clave del informe"); "share" there only "with me" or
+# "with us", as sharing a key with an agent is a grant), and its options are read for the answer only; each part's own
+# "Fleet Vault" or "Secrets page" exempts only its own words. Its scope, which the tests hold:
+# - Refused: "Type the new API key as your answer", "Insert the password as your answer", "Input the API key in your
+#   reply", "... here", "... below", "... in this card", with up to about 40 characters after the key that begin with
+#   a place of it, a clause of the one who gives it, a comma or an adverb ("Type the key from Stripe as your answer",
+#   "Type the password for shop.com as your answer", "Type the key that Stripe shows as your answer", "Type the new
+#   API key, all of it, as your answer", "... exactly as your answer"); "Copy the new token and paste it as your
+#   answer"; in details "Send the API key", "Please send the new password", "Now send the API key", "If you have it,
+#   send the API key", "Envía la clave"; "Reply with the new key", "Reply with the API key that Stripe shows", "Answer
+#   with the key Stripe gave you", "Reply with your new password once you have reset it"; "Tell me the new API key",
+#   "Tell me the password here", "... in your reply", "... now", "Give me the new Stripe key please", "Give me the key
+#   that Stripe shows"; in Spanish "Escribe la clave de Stripe como respuesta", "Escribe la clave que te da Stripe
+#   como respuesta", "Pega aquí la nueva clave", "Escribe aquí la contraseña", "Inserta la clave como respuesta",
+#   "Dime la contraseña", "Dame la clave", "Mándame la contraseña", "Responde con la clave"; and the first shape, a
+#   secret sent in words ("Send the key", "Envía la clave").
+# - Passing: a key's name ("Give the key's name as your answer", "Type the key name as your answer", "Reply with the
+#   key's name"), a word that is no secret ("Type Yes as your answer", "Answer with Yes when the key is in the vault",
+#   "Reply with which key fails", "Pick a day and type it as your answer"), "key" as an adjective or a noun after it
+#   ("Tell me the key date", "the key that fails", "the token count", "the password policy", "Type the key date as
+#   your answer", "Type the token budget as your answer", "Choose the key message ... and type it as your answer",
+#   "Reply with the key date", "Dime la palabra clave", "Responde con la fecha clave"), an option of the first shape
+#   ("Send the password reset link") and a fact or a grant in the details ("Stripe will send the new key to the
+#   account's email", "When it is ready, Stripe will send ...", "Send the password reset link to ops@shop.com", "Share
+#   the key with Ada").
+# - Known limits: other paraphrases ("Your answer is the new API key", "Add the token to your answer"); after "tell
+#   me", "give me" and "reply with" a clause counts only with a verb of showing or giving ("the key that Stripe lists"
+#   passes, as "the key that fails" must); the idiom "the key to success" and "la clave del éxito", which words cannot
+#   tell from "the key to the account"; other languages than English and Spanish; direct-ask rewordings that main also
+#   lets through ("Type the access key ID and the secret access key as your answer", "Fill in the API key as your
+#   answer", "Type the passphrase as your answer"): a later piece.
+# The refusal quotes none of the item's words, which can hold a value.
+_SECRET_WORD = r"(?:api[ -]?keys?|keys?|tokens?|passwords?|secrets?|credentials?|passcodes?)"
+_SECRET_THING = rf"(?:{_SECRET_WORD}|value\s+of\s+(?-i:[A-Z][A-Z0-9_]*_(?:KEY|TOKEN|SECRET)))"
+_SECRET_WORD_ES = r"(?:claves?(?:\s+(?:de\s+)?api)?|contraseñas?|tokens?|secretos?|credenciales?)"
+_PHRASE_END = r"(?=\s*(?:[.,;:!?)\n]|$))"
+# no noun after the secret word: "the key name", "the key's name", "the token count", "the key date", "the key points"
+_SECRET_NOUN = (r"(?!['’]s\b|\s+(?:names?|variables?|dates?|counts?|points?|facts?|polic(?:y|ies)|limits?|results?"
+                r"|lengths?|rules?|types?|holders?|owners?|people|players?|moments?|metrics?|takeaways?|steps?"
+                r"|ids?)\b)")
+# what may follow a secret word that the owner gives: "that Stripe shows", "Stripe gave you", "you use for Stripe",
+# "once you have reset it" (not "the key that fails", "the key people we have")
+_SECRET_GIVEN = (r"\s+(?:(?:that|which)\s+(?:[\w'-]+\s+){0,2}?|(?:you|they|it|(?-i:[A-Z][\w-]*))\s+)(?:shows?|showed|"
+                 r"gave|gives|sent|sends|made|makes|created|generated|issued|copied|uses?|used|have|has|got|get)\b"
+                 r"|\s+(?:once|when|after|as\s+soon\s+as)\b")
+# the secret word ends its phrase: a mark, the end, for/of/to/from, a word that ends an ask ("here", "now", "please",
+# "in your answer"), or a clause of the one who shows or gives it
+_SECRET_END = (rf"{_SECRET_NOUN}(?=\s*(?:[.,;:!?)\n]|$)|\s+(?:for|of|to|from|here|below|now|please|again|so"
+               rf"|by\s+reply|(?:in|as|into)\s+(?:your|the|this|an?)\s+(?:answer|reply|card))\b|{_SECRET_GIVEN})")
+_ANSWER_END = (rf"(?:(?:as|in|into|with)\s+(?:your|the|this|an?)\s+(?:answer|reply)\b|(?:here|below){_PHRASE_END}"
+               r"|(?:in|into)\s+(?:this|the)\s+(?:card|item|box|field)\b)")
+_ANSWER_END_ES = (r"(?:como\s+(?:tu\s+|una\s+|la\s+)?respuesta|en\s+(?:tu|la|esta)\s+(?:respuesta|tarjeta)"
+                  r"|aqu[ií]|abajo)")
+_ES_BEFORE = r"(?:(?:la|el|tu|su|una?|esa|esta|mi)\s+)?(?:(?:nuev[oa]|actual|otra)\s+)?"   # no noun before "clave"
+_ES_OF = r"(?:\s+de\s+(?:la\s+|el\s+)?(?!nombre\b)[\w'-]+(?:\s+[\w'-]+)?)?"
+_GAP = r"(?:[^.;:!?\n]|\.(?=\w)){0,40}?"           # up to 40 characters in one sentence ("from the Stripe page")
+# a noun before "clave" that is no secret ("el nombre de la clave", "el ID de la clave", "la fecha de la clave", the
+# SEO "las palabras clave")
+_ES_NOT_SECRET = r"\b(?:nombre|ids?|fecha|n[uú]mero|palabras?)\b"
+# a Spanish secret word right after its article, as the adjective "clave" comes after its own noun ("los puntos clave")
+_ES_ARTICLE_SECRET = (r"(?<!\S)(?:la|las|el|los|tu|tus|su|sus|una?|esa|esta|mi)\s+(?:(?:nuev[oa]s?|actual(?:es)?|otra)"
+                      r"\s+)?")
+# the gap of a step: one sentence, across a comma but not before a contrast or a new clause ("send the key ID, not the
+# application key", "send Ada the report, and keep the key in the vault")
+_STEP_GAP = r"(?:[^.;:!?\n,]|,(?!\s*(?:not|no|but|instead|never|pero|sino|ni|and|then|or|y|luego|o)\b))"
 ASKS_FOR_SECRET = re.compile(
-    r"\b(?:send|paste|share|provide|forward|reply with|answer with|write)\b[^.;:!?\n]{0,40}?"
-    r"\b(?:api[ -]?keys?|keys?|tokens?|passwords?|secrets?|credentials?|passcodes?)\b", re.I)
+    rf"\b(?:send|paste|share|provide|forward|write)\b[^.;:!?\n]{{0,40}}?\b{_SECRET_WORD}\b"
+    rf"|\b(?:env[ií]a|manda|comparte)\b(?:(?!{_ES_NOT_SECRET})[^.;:!?\n]){{0,40}}?{_ES_ARTICLE_SECRET}"
+    rf"{_SECRET_WORD_ES}\b", re.I)
+# the first shape in a card's details, which hold facts as well as steps: only as a step (an order at the start of a
+# sentence or a line, after a list number, "please", "then" or "and"), and not with a noun after the secret word ("Send
+# the password reset link", "Stripe will send the new key to the account's email")
+ASKS_FOR_SECRET_STEP = re.compile(
+    rf"(?:^|(?<=[.!?:]\s))\s*(?:\d+[.)]\s*)?(?:[^.!?:\n,]{{0,60}},\s*)?"     # a list number, one leading clause
+    rf"(?:(?:please|then|and|now|next|so|first|finally|por\s+favor|luego|y|ahora|despu[eé]s|entonces|primero"
+    rf"|por\s+[uú]ltimo|as[ií]\s+que),?\s+)?"
+    # share with an agent is a grant: "share" asks for a value only with "with me" or "with us"
+    rf"(?:(?:send|paste|provide|forward|write|share(?=[^.;:!?\n]{{0,60}}?\bwith\s+(?:me|us)\b))\b"
+    rf"{_STEP_GAP}{{0,40}}?\b{_SECRET_WORD}\b"
+    rf"|(?:env[ií]a|manda|comparte(?=[^.;:!?\n]{{0,60}}?\bcon(?:migo|\s+nosotros)\b))\b"
+    rf"(?:(?!{_ES_NOT_SECRET}){_STEP_GAP}){{0,40}}?{_ES_ARTICLE_SECRET}{_SECRET_WORD_ES}\b)"
+    # the secret word ends its phrase, as in an ask ("send the key to Stripe", "send the API key by email", "envía la
+    # clave de la API"), and not "the key account list", "the key findings", "the password reset link", "the key ID"
+    rf"{_SECRET_NOUN}(?!\s+(?:reset|links?|emails?|requests?|managers?|fields?|rotations?)\b)"
+    rf"(?=\s*(?:[.,;:!?)\n]|$)|\s+(?:for|of|to|from|here|below|now|please|again|so|with|by|in|on|over|via|through"
+    rf"|using|and|con|conmigo|a|al|para|en|por|y|de|del|nuev[oa]s?|actual(?:es)?|correct[oa]s?)\b|{_SECRET_GIVEN})",
+    re.I | re.M)
+_ANSWER_VERB = r"(?:type|enter|give|put|paste|write|copy|insert|input)"
+# words between the secret word and the answer: a place of it ("from Stripe", "for shop.com", "of the shop") or a
+# clause of the one who shows or gives it ("that Stripe shows"), and not a noun ("the token budget", "the key message")
+_AFTER_SECRET = (rf"(?:\s+(?:from|for|of|on|at|in)\b{_GAP}|(?:{_SECRET_GIVEN}){_GAP}|,{_GAP},?"
+                 r"|\s+(?:exactly|in\s+full|as\s+is|verbatim|again|carefully)\b)?")
+ASKS_IN_ANSWER = re.compile(
+    rf"\b{_ANSWER_VERB}\s+(?:(?:the|your|its|a|an|that|this)\s+)?"
+    rf"(?:(?!names?\b|of\b|for\b|how\b|many\b|me\b)[\w'-]+\s+){{0,3}}?{_SECRET_THING}{_SECRET_NOUN}"
+    rf"{_AFTER_SECRET}\s+(?:here\s+)?{_ANSWER_END}"
+    rf"|\b{_SECRET_THING}{_SECRET_NOUN}(?:\s+(?:from|for|of)\s+\S+(?:\s+\S+)?)?,?\s+(?:and\s+)?(?:then\s+)?"
+    rf"(?<=and |hen ){_ANSWER_VERB}\s+(?:it|them)\s+(?:here\s+)?{_ANSWER_END}"
+    rf"|\b(?:reply|answer|respond)(?:\s+(?:to\s+)?(?:this|the)\s+(?:card|item))?\s+with\s+"
+    rf"(?:(?:the|your|its|a|an)\s+)?(?:(?!names?\b|which\b|what\b|yes\b|no\b|how\b)[\w'-]+\s+){{0,3}}?"
+    rf"{_SECRET_THING}{_SECRET_END}"
+    rf"|\b(?:tell|give|send)\s+me\s+(?:(?:the|your|its|a|an)\s+)?"
+    rf"(?:(?!names?\b|of\b|which\b|what\b|how\b)[\w'-]+\s+){{0,3}}?{_SECRET_THING}{_SECRET_END}"
+    rf"|\b(?:escribe|introduce|inserta|pon|pega|copia|da)\s+{_ES_BEFORE}{_SECRET_WORD_ES}{_ES_OF}"
+    rf"(?:\s+que\s+{_GAP})?\s+(?:aqu[ií]\s+)?{_ANSWER_END_ES}"
+    rf"|\b(?:escribe|introduce|inserta|pon|pega|copia)\s+(?:aqu[ií]|abajo)\s+{_ES_BEFORE}{_SECRET_WORD_ES}\b"
+    rf"|\b(?:dime|dame|m[aá]ndame|env[ií]ame|p[aá]same)\s+{_ES_BEFORE}{_SECRET_WORD_ES}\b(?!\s+(?:de\s+)?nombre)"
+    rf"|\b(?:responde|contesta)\s+con\s+{_ES_BEFORE}{_SECRET_WORD_ES}\b(?!\s+(?:de\s+)?nombre)", re.I)
 SECRET_IN_AN_APP = re.compile(r"\b(?:fleet|founderizer) vault\b|\bsecrets page\b", re.I)
 
 
-def need_asks_secret(*texts):
-    """The refusal of a Needs-you item that asks the owner for a secret's value in words, or None."""
-    blob = " ".join(t for t in texts if t)
-    hit = ASKS_FOR_SECRET.search(blob)
-    if not hit or SECRET_IN_AN_APP.search(blob):
+def need_asks_secret(*texts, steps=(), answer_only=()):
+    """The refusal of a Needs-you item that asks the owner for a secret's value in words, or None: as the item's
+    answer, whatever app the item names, or in words that send it nowhere but the agent. The texts of steps (a card's
+    details) are read for that second shape only as a step (ASKS_FOR_SECRET_STEP), and those of answer_only (its
+    options) for the answer only: "Send the password reset link" there is an option."""
+    blob = "\n".join(t for t in texts if t)
+    told = "\n".join(t for t in steps if t)
+    # each part's own words exempt its own ask: a fact in the details ("The old key is in Fleet Vault.") exempts no
+    # "Send the new API key" in what_to_do
+    if not ASKS_IN_ANSWER.search("\n".join(t for t in (*texts, *steps, *answer_only) if t)) and \
+            (not ASKS_FOR_SECRET.search(blob) or SECRET_IN_AN_APP.search(blob)) and \
+            (not ASKS_FOR_SECRET_STEP.search(told) or SECRET_IN_AN_APP.search(told)):
         return None
-    return (f'Not raised: this item asks the owner to "{hit.group(0)}", and a key, a password or a token is never '
-            f"sent in words. The hub masks only the values it already knows, so it would be in your conversation and "
-            f"in these records before anything could mask it. Ask for it with request_secret: the owner types it "
-            f"into a secure form in Founderizer on their Mac, it goes straight into the vault, and their answer "
-            f"gives you its name and its reference, never the value. If this item is about something else, say it "
-            f"without asking for the value itself.")
+    return ("Not raised: this item asks the owner for a key, a password or a token in words, and such a value is never "
+            "sent in words. The hub masks only the values it already knows, so it would be in your conversation and "
+            "in these records before anything could mask it. Ask for it with request_secret: the owner types it "
+            "into a secure form in Founderizer on their Mac, it goes straight into the vault, and their answer "
+            "gives you its name and its reference, never the value. If this item is about something else, say it "
+            "without asking for the value itself.")
 
 
 # A card is the manager's last step (the owner, 17 November 2026, after a card that offered their Mac and their own
@@ -18027,7 +18223,7 @@ def card_names(text, names):
 def card_signs_in(text):
     """True when the text signs in an agent or its runtime ("sign it in", "sign Customer Support back in", "log the
     agent in"), as the hub's notice of a signed-out agent asks for it, and not "log the result in the sheet"."""
-    names = {" ".join(str(x).lower().split()) for n in agents() for x in (n, shown_role(n))} - {""}
+    names = {" ".join(str(x).lower().split()) for n, a in agents().items() for x in (n, a.get("title") or "")} - {""}
     who = "|".join([CARD_SIGN_WHO] + [r"\s+".join(map(re.escape, n.split()))
                                       for n in sorted(names, key=len, reverse=True)])
     return re.search(rf"(?i)\b(?:sign|log)(?:s|ed|ged|ing|ging)?\s+(?:{who})\s+(?:back\s+)?in\b", text) is not None
@@ -18189,13 +18385,58 @@ def vendor_in_words(low):
     return None
 
 
+def card_says(low, name):
+    """True when words in lower case hold a name of the record (at least 4 characters) as a whole name."""
+    return len(name) >= 4 and re.search(rf"(?<![\w/.@-]){re.escape(name)}(?![\w/@-]|\.\w)", low) is not None
+
+
+# A real host in a login's title "host · user name": labels with a dot between them and a last label of letters (or
+# of punycode), as a site's name has, or an IPv4 address; and not a title that only looks like one ("v2.0", ".")
+LOGIN_TITLE_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})"
+                              r"|(?:\d{1,3}\.){3}\d{1,3}")
+CARD_LOGIN_WORD = re.compile(r"\b(?:logins?|passwords?|passcodes?|sign[- ]?ins?|credentials?)\b")
+
+
+def login_title_host(title):
+    """The host of a login's title "host · user name", in lower case, or "" when the title names none: one that the
+    owner renamed ("Stripe dashboard", "Shop", "Node.js": the app writes a host in lower case, and an import may write
+    it in capitals, "SHOP.COM"), or one that only looks like a host (LOGIN_TITLE_HOST)."""
+    head = str(title or "").partition(" · ")[0].strip()
+    return head.lower() if head in (head.lower(), head.upper()) and LOGIN_TITLE_HOST.fullmatch(head.lower()) else ""
+
+
+def card_secret_named(low, hosts=True):
+    """The reference of the key or the login of the list that words in lower case name, or None: by its variable or
+    its title as a whole name (card_says), else, with hosts, a login by the host of its title, also in a link and with
+    or without "www.", when one login of that host is not replaced, or the words name its user name too, and when
+    they name no other address."""
+    catalog = sorted((TEAM.get("logins") or {}).items())
+    for ref, entry in catalog:
+        if any(card_says(low, str(entry.get(k) or "").lower()) for k in ("env", "title")):
+            return ref
+    if not hosts:
+        return None
+    retired, found, emails = retired_logins(), [], set(CARD_ADDRESS.findall(low))
+    for ref, entry in catalog:
+        host = login_host(login_title_host(entry.get("title")))
+        user = str(entry.get("title")).partition(" · ")[2].strip().lower()
+        # words that name another account's address mean another login of that site, which the list may not hold
+        if entry.get("kind", "login") == "api_key" or ref in retired or not host or (emails and user not in emails):
+            continue
+        if re.search(rf"(?<![\w.@-])(?:www\.)?{re.escape(host)}(?![\w@-]|\.\w)", low):
+            found.append((ref, user))
+    users = [ref for ref, user in found if card_says(low, user)]
+    return users[0] if len(users) == 1 else found[0][0] if len(found) == 1 else None
+
+
 def card_named(text):
     """(kind, what) of a thing of the fleet's record that plain words name, or None: a repository or a server of an
-    agent, a Google account of an agent, a secret by its title or its variable, or an MCP server by its name."""
+    agent, a Google account of an agent, a secret by its title or its variable, or a login by its host beside a word
+    of a login, or an MCP server by its name."""
     low = text.lower()
 
     def says(name):
-        return len(name) >= 4 and re.search(rf"(?<![\w/.@-]){re.escape(name)}(?![\w/@-]|\.\w)", low) is not None
+        return card_says(low, name)
     for n, a in sorted(agents().items()):
         for kind, names in (("repo", a.get("repos") or {}), ("server", a.get("servers") or {})):
             for name in names:
@@ -18220,46 +18461,51 @@ def card_named(text):
     vendor = vendor_in_words(low)       # the product's own repositories by their whole name, held or not
     if vendor:
         return "repo", vendor
-    for ref, entry in sorted((TEAM.get("logins") or {}).items()):
-        if any(says(str(entry.get(k) or "").lower()) for k in ("env", "title")):
-            return "secret", ref
+    ref = card_secret_named(low, hosts=bool(CARD_LOGIN_WORD.search(low)))
+    if ref:
+        return "secret", ref
     return next((("tool", str(t)) for t in sorted(tool_catalog(TEAM)) if says(str(t).lower())), None)
 
 
-def value_route(ref, entry, holders, placeholder=False):
+def value_route(ref, entry, placeholder=False):
     """card_access's answer to needs_level value or placeholder on a key or a login of the fleet (the key badge and key
-    replace, the owner's "Yes, both" of 21 November 2026): the refusal that names the route of the owner's new value,
-    whose card is the secure form where the owner types it, in place of an item whose steps sent the owner into the
-    vault; or None, for the one case that only an item settles: placeholder, for a key whose site the owner set (no
-    table mark) and that an agent holds as a placeholder on a server that swaps keys (key_swaps), which a program
-    cannot use. Only the owner changes that site; a site of the table is the manager's to switch off. value never
-    raises the item: the hub cannot tell a revoked value from a placeholder that a program cannot use."""
+    replace, the owner's "Yes, both" of 21 November 2026), and card_value_steps' to an item whose steps send the owner
+    into the vault for a value: the refusal that names the route of the owner's new value, whose card is the secure
+    form where the owner types it; or None, for the one case that only an item settles: placeholder, for a key whose
+    site the owner set (no table mark) and that a session of an active agent can hold as a placeholder by the rule
+    (key_swap), which a program cannot use. The rule and not the owner's word for the server (key_swaps), which a new
+    server that swaps from its install lacks, and the manager's own key too. Only the owner changes that site; a site
+    of the table is the manager's to switch off. value never raises the item: the hub cannot tell a revoked value from
+    a placeholder that a program cannot use."""
     env = entry.get("env") or ref
     if entry.get("kind") != "api_key":
-        replaced = retired_logins().get(ref)
-        if replaced:
-            return (f"Not raised: the owner gave a new password for {ref} already, as {replaced}: if that one fails "
-                    f"too, ask with request_secret and failed=\"{replaced}\".")
+        retired = retired_logins()
+        newer = retired.get(ref)
+        if newer and newer in logins() and newer not in retired:        # (a loop of replaces stops at its start)
+            return (f"Not raised: the owner gave a new password for {ref} already, as {newer}. If that one fails "
+                    f"too: {value_route(newer, logins()[newer]).removeprefix('Not raised: ')}")
         title = str(entry.get("title") or "")
-        head = title.partition(" · ")[0].strip()
-        # only a host is a site: a title that the owner renamed ("Stripe dashboard", "Shop") names none
-        if "." in head and SECRET_SITE.fullmatch("https://" + head) and \
-                any(r == ref for r, _ in catalog_logins("https://" + head)):
+        host = login_title_host(title)
+        site = f"https://{host}"
+        if host and not newer and SECRET_SITE.fullmatch(site) and any(r == ref for r, _ in catalog_logins(site)):
             return (f'Not raised: a new password of the login {title} comes through request_secret with kind "login", '
-                    f'site="https://{head}" and failed="{ref}": its card is the secure form where the owner types it.')
-        return (f"Not raised: the title of the login {title or ref} names no site that the hub can tell, so "
-                f'request_secret cannot take failed="{ref}": ask with request_secret, kind "login" and its site, '
-                f"without failed, and the owner adds the login again.")
+                    f'site="{site}" and failed="{ref}": its card is the secure form where the owner types it.')
+        return ("Not raised: " + (f"the owner gave a new password for {ref} already, as {newer}, which is not a "
+                                  f"login of the list now" if newer else
+                                  f"the title of the login {title or ref} names no site that the hub can tell") +
+                f', so request_secret cannot take failed="{ref}": ask with request_secret, kind "login" and ' +
+                (f'site="{site}"' if host else "its site") + ", without failed, and the owner adds the login again.")
     if GITHUB_APP_KEY_NAME.fullmatch(env):
-        return (f"Not raised: {env} is a GitHub App's key: the owner's app makes it with GitHub, nobody types it, "
-                f"and the hub asks you for its item (github_key) when it needs a new one.")
+        return (f"Not raised: {env} is a GitHub App's key: the owner's app makes it with GitHub, and nobody types it. "
+                f"The hub asks you for its item (github_key) only in the renewal of the App key that it held; if "
+                f"GitHub refuses {env} at another time, tell the owner with message_owner.")
     door = door_key_of(TEAM, ref)
     if door.startswith("app:"):
         return (f"Not raised: {door} is a setting of an app on a host, which keeps its value in its own settings "
                 f"file, so a new value cannot be given yet: tell the owner with message_owner which setting it is.")
     mark = entry.get("table")
     table_on = isinstance(mark, dict) and mark.get("on") is True
-    owner_site = not isinstance(mark, dict) and any(key_swaps(h["agent"], ref) for h in holders)
+    owner_site = not isinstance(mark, dict) and any(key_swap(n, ref) for n in agents() if agent_active(n))
     if placeholder:
         if owner_site:
             return None
@@ -18267,12 +18513,13 @@ def value_route(ref, entry, holders, placeholder=False):
             return (f'Not raised: the table of well-known services gave {env} its site, so switch_key_site with '
                     f'to="off" gives its sessions the key itself, and the owner is not needed.')
         return (f"Not raised: no agent holds {env} as a placeholder, so its sessions hold the key itself. If its value "
-                f'is wrong or was revoked, request_secret with failed="{ref}" asks the owner for a new one.')
+                f'is wrong or was revoked, request_secret with failed="{ref}" and details (how the owner makes the new '
+                f"key) asks the owner for a new one.")
     then = (' If a program cannot use its placeholder, give needs_level "placeholder".' if owner_site else
             ' If a program cannot use its placeholder, the key needs no new value: switch_key_site with to="off" '
             'gives its sessions the key itself.' if table_on else "")
-    return (f'Not raised: a new value of {env} comes through request_secret with failed="{ref}": its card is the '
-            f'secure form where the owner types it.{then}')
+    return (f'Not raised: a new value of {env} comes through request_secret with failed="{ref}" and details (how the '
+            f'owner makes the new key): its card is the secure form where the owner types it.{then}')
 
 
 def card_access(words, level):
@@ -18313,7 +18560,7 @@ def card_access(words, level):
         if not entry:
             raise ToolError(f"needs_level {said} is for a key or a login of the fleet: the hub names the route of a "
                             f"new value, or raises the item when only the owner can help.")
-        return value_route(what, entry, card_holders(kind, what), placeholder=said == "placeholder")
+        return value_route(what, entry, placeholder=said == "placeholder")
     if card_dead(kind, what):
         return None                     # no holder can use it now, and no grant puts it right: only the owner
     if kind == "repo" and team_repo_owner_step(what):
@@ -18321,11 +18568,9 @@ def card_access(words, level):
         # plan's access refuses it (team_repo_refusal), and the owner connects GitHub or adds it to the App
     rid, want = access_needed(text, level)
     entry = logins().get(what) if kind == "secret" else None
-    route = (value_route(what, entry, ()) or "").removeprefix("Not raised: ") if entry else ""
-    # the placeholder's word only where the hub cannot tell it from a new value: a key with no site of the table
-    extra = (' If a program cannot use its placeholder, give needs_level "placeholder".'
-             if route.startswith("a new value of") and "switch_key_site" not in route else "")
-    value = f" If its value is wrong or was revoked: {route}{extra}" if route else ""
+    # with the placeholder's word where a session of an agent can hold the key as one (value_route)
+    route = value_route(what, entry).removeprefix("Not raised: ") if entry else ""
+    value = f" If its value is wrong or was revoked: {route}" if route else ""
     held = [h for h in card_holders(kind, what) if level_at_least(kind, h["level"], want)]
     if held:
         return (f"Not raised: {', '.join(h['agent'] + ' (' + h['level'] + ')' for h in held)} holds "
@@ -18354,10 +18599,221 @@ def card_access(words, level):
     return None
 
 
+# An item whose steps send the owner into the vault to type or replace a value (the owner, 21 November 2026, of the
+# card "open the vault entry ... and replace its value"; the Needs-you area's decision of 22 November 2026): an item
+# of each reason (but the placeholder's own item), of the kind that needs_level "value" refuses with the route of the
+# new value. A word check, read sentence by sentence and line by line through each field (title, why, what_to_do,
+# details, options). Its scope, which the tests hold:
+# - The place of a value: the vault as a place ("in the vault", "open Fleet Vault", "the vault entry", "the Secrets
+#   page", "del vault", "en la bóveda"), and a key of the list named by its variable. A place holds for the later
+#   sentences of the same field.
+# - Refused beside a place in the same sentence: a verb of typing or replacing and a value ("replace its value",
+#   "type a new password", "update your password", "save a new key", "reemplaza su valor"). Beside a place of an
+#   earlier sentence: the same with a value, a key or a token ("2. Replace its value with ...", "2. Replace the value
+#   for Backblaze with ...", "3. Type the new value for it"), a password only when that place named a login of the
+#   list, and never "the value of" something else, nor "the new value for" something else after a verb of typing or
+#   setting, or after any verb at another place ("type the new value for the monthly budget", "At https://..., replace
+#   the value for the Pro plan with 29 EUR"); "for" the entry, it, the key or the secret is the key's ("At Backblaze,
+#   ... replace the value for the entry with keyID:..." is refused).
+# - Refused beside a place there or before: a press of the app's Replace; a clear verb (replace, overwrite, rotate,
+#   re-enter, re-type, paste, swap, reemplaza, sustituye, rota, pega) on "it", "the key" or a key's variable, and the
+#   Spanish "it" (reemplázalo, sustitúyela, pégalo, rótalo); set, edit, change or update on a key's variable with a
+#   value after "with" in the sentence ("Update X in Fleet Vault with the new key"), or on "it" right before "with";
+#   and, with the vault and a key of the list named by its variable, a verb of typing (paste, enter, type, fill in,
+#   pega, escribe, introduce) on a value: a word with ":" or "=" and something after it, also after an article or
+#   "new", and not a link ("paste the new keyID:applicationKey"), "it", a key, a value, a token or a secret, or a
+#   password that is not the owner's own ("open the vault entry X and paste keyID:applicationKey"); in a sentence
+#   that names another place, "the new value of" or "for" something is that thing's ("On Stripe's tax page, paste the
+#   new value for the VAT rate"), but not for "the entry", "it", "the key" or "the secret" ("At https://..., paste the
+#   new value for the entry" is refused).
+# - Another place in a later sentence (a link, "At Stripe", "On Backblaze's page", "En la página de impuestos de
+#   Stripe", a keyboard, the system's settings, a panel; not the app's own words, "On the Value row", "On the Key
+#   card", "En Valor", "la página de secretos") stops an earlier place only
+#   for a password and for a soft verb: "2. At https://... paste keyID:applicationKey into the entry", "On
+#   Backblaze's page, make a new key, then replace its value" and "... replace your value with it" stay refused.
+# - Honest steps that pass: a grant on the Secrets page ("set X to Uses it for Ada", "change it so that Ada can use
+#   it", "set Ada to Uses it and press Enter", "enter X's card"), a note ("Type the note: ..."), an agent named after a
+#   typing verb ("enter Ada under Who can use it"), the Mac's password at a prompt, a password at a machine's keyboard
+#   ("its vault can start", "its vault waits ... enter it"), the owner's own account ("change your password at
+#   https://dashboard.stripe.com" after a key's name), a value of something else at a site that a login names ("change
+#   the value of its MX record"), a link pasted at a provider ("paste https://shop.example/hook as the endpoint"), "the
+#   type of X", a report of a failed attempt ("could not update the value in the
+#   vault", "no pudo"), a new key that the fleet does not hold ("Paste the shop's key into Fleet Vault"), and another
+#   vault ("Azure Key Vault", "your own 1Password vault").
+# - Known limits: other paraphrases ("Paste it there", "Save the key again", "give the login its new password"); a
+#   soft verb on a key with no value after it ("Update X in the vault"); a password two steps after a vault that names
+#   no login; put and pon on a key (a grant: "put Ada on X"); other languages than English and Spanish. A login named
+#   by its title or its host names the route only beside the vault.
+# The check looks for a verb first, reads the list and retired_logins at most once a call and each sentence once, and
+# its fields are limited (need_words): its cost does not grow with the list times the words.
+_CARD_VALUE_VERB = (r"(?:replace|change|update|overwrite|edit|rotate|re-?enter|re-?type|type|enter|paste|put|set|swap|"
+                    r"save|store|copy|fill\s+in|reemplaza|cambia|actualiza|sustituye|escribe|introduce|pega|pon|rota|"
+                    r"edita|guarda|copia)")
+_CARD_VALUE_THING = (r"(?:(?:its|the|a|their|this|that|your)\s+(?:[\w-]+'s\s+)?"
+                     r"(?:(?:new|current|old|right|correct)\s+)?(?:values?|passwords?|passcodes?)"
+                     r"|new\s+(?:[\w-]+\s+){0,2}?(?:values?|passwords?|passcodes?|"
+                     r"api[ -]?keys?|keys?|tokens?|secrets?)"
+                     r"|(?:su|el|la|tu|sus|los|las)\s+(?:(?:nuevo|nueva|actual)\s+)?"
+                     r"(?:valor(?:es)?|contraseñas?|claves?)"
+                     r"|nuev[oa]s?\s+(?:valor(?:es)?|contraseñas?|claves?|tokens?|secretos?))")
+# the key itself after "for" or "para", where the words end their phrase: "for the key", "for the secret with ...",
+# "para la clave", and not "for the key limit" or "para la clave de presupuesto", which name something of the key's
+_KEY_ITSELF = (r"the\s+(?:key|secret)(?=\s*(?:[.,;:!?)\n]|$|\s+(?:with|there|here|now|again|and|as|in|on)\b))"
+               r"|la\s+clave(?=\s*(?:[.,;:!?)\n]|$|\s+(?:con|por|ah[ií]|aqu[ií]|y|en)\b))")
+# (?P<of>: "the value of" or "for" something, which an earlier sentence's place does not make a secret's)
+CARD_VALUE = re.compile(rf"(?i)\b(?P<verb>{_CARD_VALUE_VERB})\b[^.;:!?\n]{{0,40}}?\b{_CARD_VALUE_THING}\b"
+                        rf"(?P<of>\s+(?:of|de|del)\b|\s+(?:for|para)\b(?!\s+(?:it|them|its|ella|él|the\s+new|a\s+new"
+                        rf"|el\s+nuevo|la\s+nueva|uno\s+nuevo|the\s+(?:vault\s+)?entry|{_KEY_ITSELF}"
+                        rf"|la\s+entrada|\S*[:=]\S+)\b))?")
+# verbs of replacing, after which "for" names no other thing ("Replace the value for Backblaze with keyID:...")
+_CARD_REPLACE_VERB = re.compile(r"(?i)(?:replace|overwrite|swap|rotate|reemplaza|sustituye|rota)")
+_CARD_CLEAR_VERB = r"(?:replace|overwrite|rotate|re-?enter|re-?type|paste|swap|reemplaza|sustituye|rota|pega)"
+_CARD_SOFT_VERB = r"(?:set|edit|change|update|cambia|actualiza|edita)"
+CARD_PASSWORD = re.compile(r"(?i)\b(?:passwords?|passcodes?|contraseñas?)\b")
+CARD_OWN = re.compile(rf"(?i)\b(?:passwords?|passcodes?|contraseñas?)\b|^{_CARD_SOFT_VERB}\b")
+_CARD_IT = r"(?:it|them|the\s+(?:key|token|secret))"
+_CARD_IT_ES = r"(?:reempl[aá]zal[oa]s?|sustit[uú]yel[oa]s?|p[eé]gal[oa]s?|r[oó]tal[oa]s?)"     # the Spanish "it"
+CARD_VALUE_IT = re.compile(rf"(?i)\b{_CARD_CLEAR_VERB}\s+{_CARD_IT}\b|\b(?:type|enter)\s+(?:it|them)\s+again\b"
+                           rf"|\b{_CARD_SOFT_VERB}\s+{_CARD_IT}\s+(?:again\s+)?(?:with|con|por)\b|\b{_CARD_IT_ES}\b")
+CARD_PRESS_REPLACE = re.compile(r"(?i)\b(?:press|click|choose|tap|select|pulsa|toca|elige|haz\s+clic\s+en)\s+(?:on\s+)?"
+                                r"(?:the\s+|el\s+)?(?:\*\*|[\"'\u201c])?(?:replace|reemplazar)\b")
+# a verb of typing on a value, not after "press" ("press Enter"), not the noun ("the type of X"): a word with ":" or
+# "=", "it", a key, a value, a token or a secret, or a password that is not the owner's own ("your Mac password")
+CARD_TYPED_VALUE = re.compile(
+    r"(?i)(?<!press )(?<!hit )(?<!tap )(?<!pulsa )(?<!the )(?<!a )"
+    r"\b(?:paste|enter|type|fill\s+in|pega|escribe|introduce)\s+"
+    r"(?:(?:(?:the|a|an|its|your|la|el|su|tu|una?)\s+)?(?:(?:new|nuev[oa])\s+)?(?!https?://)[^\s:=]*[:=]\S+"
+    r"|(?:it|them)\b"
+    r"|(?:(?:the|a|an|its|their|your|la|el|su|tu|una?)\s+)?(?:(?:new|current|old|nuev[oa]|actual)\s+)?"
+    r"(?:api[ -]?)?(?:keys?|values?|tokens?|secrets?|claves?|valor(?:es)?)\b(?!['\u2019]s)"
+    r"|(?:the|a|its|la|su)\s+(?:(?:new|nuev[oa])\s+)?(?:passwords?|passcodes?|contraseñas?)\b)")
+# a verb after a failed attempt, which reports and asks nothing: "could not update the value", "no pudo cambiar"
+CARD_FAILED = re.compile(r"(?i)\b(?:could\s+not|couldn't|cannot|can't|did\s+not|didn't|tried\s+to|failed\s+to|"
+                         r"(?:was|were)\s+unable\s+to|no\s+pudo|no\s+puede|no\s+pudieron|intent[oó])\s+\w+")
+CARD_VAULT = re.compile(
+    r"(?i)\b(?:in|into|on|from|to|inside)\s+(?:the\s+|your\s+|its\s+|this\s+)?(?:fleet\s+|founderizer\s+)?vault\b"
+    r"|\bopen\s+(?:the\s+|your\s+)?(?:fleet\s+|founderizer\s+)?vault\b|\bvault\s+entr(?:y|ies)\b|\bsecrets\s+page\b"
+    r"|\b(?:secret|key|login|password)\s+entr(?:y|ies)\b"
+    r"|\b(?:en|del|de\s+la|a\s+la|al)\s+(?:el\s+|la\s+|tu\s+|su\s+)?(?:vault|b[oó]veda)\b"
+    r"|\babre\s+(?:el\s+|la\s+|tu\s+)?(?:vault|b[oó]veda)\b|\bp[aá]gina\s+de\s+secretos\b")
+# another place in a sentence: a link, "At Stripe", "On Backblaze's page", a keyboard, the system's settings, a panel
+# (case kept: "at Stripe", not "at the moment"), and not the app's own words ("On the Value row", "En Valor")
+_CARD_APP_WORD = r"(?:Founderizer|Fleet|Value|Valor|Key|Clave|Secrets?|Secretos?|Who|Uses|Reads|Manage|Replace)\b"
+_CARD_APP_PART = r"(?:[Vv]ault|row|card|field|part|tab|section|box|button|fila|tarjeta|campo|parte|bot[oó]n)\b"
+CARD_OTHER_PLACE = re.compile(rf"https?://|\b(?:[Aa]t|[Oo]n|[Ee]n)\s+(?:the\s+|el\s+|la\s+)?(?!{_CARD_APP_WORD})"
+                              rf"[A-Z][\w-]*\b(?!\s+{_CARD_APP_PART})"
+                              r"|(?i:\bkeyboard\b|\bteclado\b|\bsystem\s+settings\b|\bajustes\b"
+                              r"|\bpanel\b|\bdashboard\b|\bp[aá]gina\s+de\s+(?!secretos\b))")
+_CARD_BEFORE_NAME = r"(?:(?:the|its|this|that|api|key|token|secret|la|el|su)\s+){0,3}"
+# a value after "with", "con" or "por": a new one, a key, a token, or a value with ":" "=" or "_" in it ("keyID:...")
+_CARD_WITH_VALUE = (r"(?:with|con|por)\s+(?:the\s+|a\s+|its\s+|la\s+|el\s+|su\s+|una?\s+)?"
+                    r"(?:new\b|nuev[oa]\b|value\b|valor\b|key\b|clave\b|token\b|secret\b|\S*[:=_]\S*)")
+CARD_VERB_ON_NAME = re.compile(rf"(?i)\b{_CARD_CLEAR_VERB}\s+{_CARD_BEFORE_NAME}(?P<clear>[a-z0-9_]{{4,}})(?!\w)"
+                               rf"|\b{_CARD_SOFT_VERB}\s+{_CARD_BEFORE_NAME}(?P<soft>[a-z0-9_]{{4,}})(?!\w)"
+                               rf"(?=[^.;:!?\n]{{0,60}}?\b{_CARD_WITH_VALUE})")
+_CARD_ANY_VERB = re.compile(rf"(?i)\b(?:{_CARD_VALUE_VERB}|{_CARD_CLEAR_VERB}|{_CARD_IT_ES}|press|click|choose|tap|"
+                            rf"select|pulsa|toca|elige|haz\s+clic)\b")
+_CARD_NAME_WORD = re.compile(r"(?<![\w.@-])[a-z0-9_][a-z0-9_.-]*[a-z0-9_](?![\w@-]|\.\w)")   # a variable, a host
+CARD_VALUE_REFUSAL = (
+    "Not raised: this item sends the owner into the vault to type or replace a value, and a value is never typed "
+    'there by steps. A new value of a key of the fleet comes through request_secret with failed="<its reference>" and '
+    'details (how the owner makes the new key), and a new password of a login with kind "login", its site and '
+    'failed="<its reference>": their card is the secure form where the owner types it. A key or a login that the '
+    "fleet does not hold comes through request_secret too, without failed.")
+
+
+def card_value_steps(title, why, todo, details, options):
+    """The refusal of an item whose words send the owner into the vault for the value of a key or a login, with the
+    route of its new value (value_route) when they name one of the list, else None: the scope above. Under the hub's
+    lock, so it reads the list once, looks for a verb before anything else, and reads each sentence once."""
+    texts = [str(t) for t in (title, why, todo, details, *options) if t]
+    if not any(_CARD_ANY_VERB.search(t) for t in texts):
+        return None
+    catalog = sorted(logins().items())
+    envs, hosts = {}, {}
+    for ref, e in catalog:
+        env = str(e.get("env") or "").lower()
+        if e.get("kind") == "api_key" and len(env) >= 4:
+            envs.setdefault(env, ref)
+    retired = None
+    agent_words = None
+
+    def host_ref(low):                  # a login by the host of its title (card_secret_named's rule), once a call
+        nonlocal retired
+        if retired is None:
+            retired = retired_logins()
+            for ref, e in catalog:
+                host = login_host(login_title_host(e.get("title")))
+                if e.get("kind", "login") != "api_key" and ref not in retired and host:
+                    hosts.setdefault(host, []).append((ref, str(e.get("title")).partition(" · ")[2].strip().lower()))
+        emails = set(CARD_ADDRESS.findall(low))
+        # each (login, user name) once, however often the words name its host: one pass over the words for each
+        found = list(dict.fromkeys((r, u) for w in _CARD_NAME_WORD.findall(low) for r, u in hosts.get(login_host(w), ())
+                                   if not emails or u in emails))
+        users = [r for r, u in found if card_says(low, u)]
+        return users[0] if len(set(users)) == 1 else found[0][0] if len({r for r, _ in found}) == 1 else None
+
+    def typed_value(low, other):        # a verb of typing on a value, and not on an agent by its name or its role
+        nonlocal agent_words
+        for m in CARD_TYPED_VALUE.finditer(low):
+            # at another place, "the new value of" or "for" something is that thing's ("the new value for the VAT rate")
+            if other and re.search(r"(?:values?|valor(?:es)?)$", m.group(0)) and \
+                    re.match(rf"\s+(?:of|for|de|del|para)\b(?!\s+(?:it|them|its|the\s+(?:vault\s+)?entry|"
+                             rf"{_KEY_ITSELF}|la\s+entrada|ella|él)\b)", low[m.end():]):
+                continue
+            if agent_words is None:
+                agent_words = {" ".join(str(x).lower().split()) for n in agents() for x in (n, shown_role(n))} - {""}
+            if not any(re.match(rf"\S+(?:\s+in)?\s+(?:(?:the|a|an|its|their|your|la|el|su|tu|una?)\s+)?"
+                                rf"{re.escape(w)}\b", low[m.start():]) for w in agent_words):
+                return m
+        return None
+
+    def route(ref):
+        return value_route(ref, logins()[ref]) if ref else CARD_VALUE_REFUSAL
+
+    for text in texts:
+        # what the earlier sentences of this field named: the vault, a key's variable, a key or a login
+        vault_before, key_before, ref_before, vault_low = False, None, None, None
+        for sentence in CARD_SENTENCE.split(text):
+            low = sentence.lower()
+            vault = CARD_VAULT.search(low) is not None
+            env_ref = next((envs[w] for w in _CARD_NAME_WORD.findall(low) if w in envs), None)
+            login_ref = host_ref(low) if vault or vault_before else None
+            words = CARD_FAILED.sub(" ", low)          # a failed attempt asks for nothing
+            if _CARD_ANY_VERB.search(words):
+                here = vault or env_ref is not None
+                before = vault_before or key_before is not None
+                other = not vault and CARD_OTHER_PLACE.search(sentence) is not None
+                hit = CARD_VALUE.search(words)
+                named = next((envs[m.group("clear") or m.group("soft")] for m in CARD_VERB_ON_NAME.finditer(words)
+                              if (m.group("clear") or m.group("soft")) in envs), None)
+                login_before = ref_before is not None and (logins().get(ref_before) or {}).get("kind") != "api_key"
+                typed = (vault or vault_before) and (env_ref or key_before) and typed_value(words, other)
+                # "the value of" something else; "for" or "para" only after a verb of typing or setting
+                of = hit and hit.group("of") and not (hit.group("of").strip().lower() in ("for", "para") and not other
+                                                      and _CARD_REPLACE_VERB.fullmatch(hit.group("verb")))
+                # another place stops an earlier place for a password, "your ..." and a soft verb only
+                stopped = (lambda m: other and CARD_OWN.search(m.group(0)) is not None)
+                if ((hit and here) or (named and (vault or vault_before)) or (typed and not stopped(typed)) or
+                        ((here or before) and (CARD_VALUE_IT.search(words) or CARD_PRESS_REPLACE.search(words))) or
+                        (before and not here and hit and not of and not stopped(hit) and
+                         (login_before or not CARD_PASSWORD.search(hit.group(0))))):
+                    ref = named or env_ref or login_ref or (card_secret_named(low) if vault else None)
+                    if not ref:                     # the key or the login that an earlier sentence named
+                        ref = key_before or ref_before or (card_secret_named(vault_low) if vault_low else None)
+                    return route(ref)
+            vault_before = vault_before or vault
+            key_before = env_ref or key_before
+            ref_before = env_ref or login_ref or ref_before
+            vault_low = low if vault and not (env_ref or login_ref) else vault_low
+    return None
+
+
 def card_reason(a, title, why, todo, options):
     """The item's reason, or a ToolError that says why it is not the manager's last step yet: a reason of
-    CARD_REASONS; access that nobody holds and the manager cannot grant; a decision in the owner's own words; and a
-    person's step that is no sign-in to a website, which an agent makes with the vault's login."""
+    CARD_REASONS; access that nobody holds and the manager cannot grant; a decision in the owner's own words; a
+    person's step that is no sign-in to a website, which an agent makes with the vault's login; and an item of each
+    reason whose steps send the owner into the vault for a value (card_value_steps)."""
     reason = str(a.get("reason") or "").strip().lower()
     if reason not in CARD_REASONS:
         raise ToolError(CARD_REASON_REFUSAL)
@@ -18384,6 +18840,11 @@ def card_reason(a, title, why, todo, options):
                             "of theirs keep this decision, it is yours: decide it inside the policy.")
     elif reason == "person" and card_sign_in((title, why, todo, *options)):
         raise ToolError(CARD_SIGN_IN_REFUSAL)
+    # each reason; the placeholder's own item, which card_access let through, is about the key's site, not its value
+    if str(a.get("needs_level") or "").strip().lower() != "placeholder":
+        steps = card_value_steps(title, why, todo, str(a.get("details") or ""), options)
+        if steps:
+            raise ToolError(steps)
     return reason
 
 
@@ -19001,7 +19462,10 @@ def t_raise_needs_you(agent, a):
     notice = need_is_notice(title, why, todo, *(json.loads(options) if options else ()))
     if notice:
         raise ToolError(notice)
-    secret = need_asks_secret(title, why, todo)
+    # the details as the manager wrote them, which the card shows behind Details, as steps, and the options, for the
+    # answer only
+    secret = need_asks_secret(title, why, todo, steps=(str(a.get("details") or ""),),
+                              answer_only=json.loads(options) if options else ())
     if secret:
         raise ToolError(secret)
     # The item about a server's key swap names that server, which a manager may give to an agent: it asks for the
@@ -19237,9 +19701,12 @@ def t_withdraw_need(agent, a):
     of the first 36 needed nothing from him at the end.
 
     No notification goes. The reason is the item's answer, where an answered item keeps the owner's words, and
-    answered_by names the manager, so the record says who closed it and why. An item that takes a question to the
-    owner closes when the question is answered, an item of a conversation is that person's answer, and a secret request
-    that tasks wait on closes with them or with the owner's answer: those three are refused here.
+    answered_by names the manager, so the record says who closed it and why. But a close of a card whose newest talk
+    is the owner's message under this version of it answers that message (owner API 1.316, feature need_updates; the
+    owner, 22 November 2026, "Yes" to his phone ringing when the agent closes a card after his message): the reason is
+    also the agent's reply under the card, which rings and notifies as discuss_need's reply does. An item that takes a
+    question to the owner closes when the question is answered, an item of a conversation is that person's answer, and
+    a secret request that tasks wait on closes with them or with the owner's answer: those three are refused here.
 
     Another agent's item is refused too, but for one kind (the owner, 17 November 2026, after a key request from an
     agent's chat waited ten days for nothing): the manager closes another agent's key or login request that no task
@@ -19271,15 +19738,34 @@ def t_withdraw_need(agent, a):
         if waiters:
             raise ToolError(f"{', '.join(tref(t) for t in waiters)} wait on N-{nid}: it closes with them, or with the "
                             f"owner's answer.")
+        # his message under this version of the card (talk that an earlier version took along is older than its raise,
+        # and this version answered it): why is a reply under the card, with discuss_need's rules
+        last = DB.execute("SELECT who, ts FROM need_talk WHERE need=? ORDER BY id DESC LIMIT 1", (nid,)).fetchone()
+        answers = bool(last and last["who"] == "owner" and last["ts"] >= (need["raised"] or 0))
+        code = NEED_CODES.search(why) if answers else None
+        if code or (answers and len(why) > NEED_TALK_CHARS):
+            raise ToolError(f"why answers the owner's message under the card, so it is at most {NEED_TALK_CHARS} "
+                            f"characters of plain words: " + (f"say {code.group(0)} in plain words, as the owner reads "
+                                                              f"names and what a thing is about, never a code." if code
+                                                              else "say it in fewer words."))
         t0 = now()
-        DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
+        DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=?, awaits=NULL, awaits_told=NULL, "
+                   "awaits_asked=NULL WHERE id=? AND answer IS NULL",
                    (f"Withdrawn by {shown_role(agent)}: {why}", t0, agent, nid))
         DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
                    (t0, agent, f"withdrew N-{nid} {clip(need['title'] or '', 80)}: {clip(why, 240)}"))
+        reply = DB.execute("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)",
+                           (nid, t0, agent, why)).lastrowid if answers else None
+    if reply:                           # the close answers his message: it rings as a reply does (ping_reply)
+        emit("owner", "notify", f"{shown_role(agent)} replied about: {need['title']}")
+        ping_reply(reply)
     # Another agent's request came from its owner chat, which reads only the owner's messages and agents' messages: the
     # hub writes it nothing, and the manager tells it with message_agent when its work should know.
     theirs = need["by"] if need["by"] != agent else None
-    return (f"Withdrew N-{nid}. It left the owner's Needs you with no notification, and its record keeps your reason. "
+    return (f"Withdrew N-{nid}. " + ("It left the owner's Needs you, and your reason stands under the card as your "
+                                     "answer to their message there; the owner is notified of it. " if reply else
+                                     "It left the owner's Needs you with no notification, and its record keeps your "
+                                     "reason. ")
             + (f"{theirs} is not told: tell it with message_agent when its work should know. " if theirs else "") +
             "Raise a new item only when the owner must do or decide something now.")
 
@@ -19309,16 +19795,70 @@ def need_talk_said(body, via=None, hand=None):
         raise Refusal(409, why)
     t0 = now()
     mark = capp_via(via) if via else request_via(hand)
-    told = (need["by"], "say", filed_about(need["by"], "say", None),
-            f"[owner{f' via {mark}' if mark else ''}] About Needs-you N-{need['id']} ({need['title']}), "
-            f"before answering it: {body['text']}\n(The hub: the item stays open."
-            + (NEED_TALK_NOT_HIS if not owner_force(hand) and not via else "") + " Reply under the card with "
-            f"discuss_need(need=\"N-{need['id']}\", text=...), in plain words and in a few sentences.{need_again(need)} "
-            f"Their answer to the item comes as its own message.)", {})
+    # owner API 1.316 (need_updates): the card waits for the manager's answer (awaits), but only while the manager can
+    # have a turn now and its helper reports turn ends, which end a wait that it leaves unanswered (need_wait_sweep).
+    # Else the card is as before his message. Nor does a card wait that only the hub or his phone closes (an App key's
+    # renewal, a server's key swap, a phone to add): the manager neither withdraws it nor sees it in a second look.
+    waits = not (need["github_key"] or need["key_swap_server"] or need["add_device"]) and \
+        not manager_has_no_turn(need["by"], t0) and turn_ended(need["by"]) > 0
+    head = (f"[owner{f' via {mark}' if mark else ''}] About Needs-you N-{need['id']} ({need['title']}), "
+            f"before answering it: {body['text']}\n(The hub: the item stays open")
+    talk_hand = hand if not owner_force(hand) and not via else None     # need_talk.hand: words that are not his
+    not_his = NEED_TALK_NOT_HIS if not owner_force(talk_hand) else ""
+    if waits:
+        text = (f"{head}, and its card waits for your answer.{not_his} {need_wait_ways(need)} Their answer to the "
+                f"item comes as its own message.)")
+    else:
+        text = (f"{head}.{not_his} Reply under the card with discuss_need(need=\"N-{need['id']}\", text=...), in plain "
+                f"words and in a few sentences.{need_again(need)} Their answer to the item comes as its own message.)")
+    filed, about = filed_about(need["by"], "say", None)
     with transaction():         # his message stands on the card only with its line to the manager
-        DB.execute("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (need["id"], t0, "owner", body["text"]))
-        event_rows([told], t0)
+        DB.execute("INSERT INTO need_talk(need, ts, who, text, hand) VALUES(?,?,?,?,?)",
+                   (need["id"], t0, "owner", body["text"], talk_hand))
+        told = DB.execute(*event_row(need["by"], "say", filed, text, t0, "{}", about)).lastrowid
+        DB.execute("UPDATE needs SET awaits=?, awaits_told=?, awaits_asked=NULL WHERE id=?",
+                   (t0 if waits else None, told if waits else None, need["id"]))
     return {"need": need["id"], "talk": need_talk(need["id"])}
+
+
+def need_answer_ways(need):
+    """The calls that answer the owner's message under a manager's card (owner API 1.316), each (in full, in short),
+    and only the calls that this card takes, so that the hub never names a call that it then refuses: a reply under
+    the card; the card raised again where raise_needs_you takes its place; a new plan of team changes, whose card takes
+    a team card's place; a close with withdraw_need, which refuses a card that takes a question to the owner. That
+    question's answer is no way: it closes the card with no word to the owner (question_needs_close)."""
+    nid = need["id"]
+    ways = [(f"reply under the card with discuss_need(need=\"N-{nid}\", text=...), in plain words and in a few "
+             f"sentences, when the request stays as it is", "reply there with discuss_need")]
+    if need_replaceable(need):      # the new card takes the question along only when the raise names it again
+        asks = f", question_id=\"Q-{need['question']}\"" if need["question"] else ""
+        ways.append((f"raise it again with raise_needs_you(replaces=\"N-{nid}\"{asks}) when its words or options "
+                     f"change", "raise it again with raise_needs_you replaces" + (" and question_id" if asks else "")))
+    if need["team_plan"]:
+        ways.append(("make a new plan with change_team when its changes change: a new card of a plan takes this one's "
+                     "place", "make a new plan with change_team"))
+    if not need["question"]:
+        ways.append((f"close it with withdraw_need(need=\"N-{nid}\", why=...) when nothing in it is needed now, and "
+                     f"the owner reads why under the card", "close it with withdraw_need"))
+    return ways
+
+
+def need_ways_said(ways):
+    """Ways as one list in words: "a", "a or b", "a, b or c"."""
+    return ways[0] if len(ways) == 1 else ", ".join(ways[:-1]) + " or " + ways[-1]
+
+
+def need_wait_ways(need):
+    """The calls that answer the owner's message under a card that waits for its manager (owner API 1.316), as the
+    sentences of the hub's line under that message and of its ask (need_answer_ways)."""
+    ways = [way for way, _ in need_answer_ways(need)]
+    said = (f"Answer the owner this way: {ways[0]}." if len(ways) == 1 else
+            f"Answer the owner in one of {'two' if len(ways) == 2 else 'three'} ways: " + "; ".join(ways[:-1]) +
+            "; or " + ways[-1] + ".")
+    if need["question"]:
+        said += (f" Answering Q-{need['question']} closes the card with no word to the owner: reply under it "
+                 f"first.")
+    return said
 
 
 NEED_TALK_NOT_HIS = (" An AI session or a program on the owner's Mac wrote these words for the owner: the owner did not "
@@ -19346,7 +19886,8 @@ def need_replaceable(need):
 def t_discuss_need(agent, a):
     """discuss_need (the manager; owner feature need_clarify): one reply under one of its open cards, where the owner
     asked about it (Needs clarification). The card shows it in his talk with the manager, his phone rings with it
-    (ping_reply), and the item stays open until he answers it."""
+    (ping_reply), and the item stays open until he answers it. The reply ends the card's wait for the manager
+    (awaits, owner API 1.316): the card shows the same request again, with the reply."""
     nid = parse_id(a.get("need"), "Needs-you item")
     text = str(a.get("text") or "").strip()
     if not text or len(text) > NEED_TALK_CHARS:
@@ -19355,6 +19896,10 @@ def t_discuss_need(agent, a):
     if code:
         raise ToolError(f"Say {code.group(0)} in plain words: the owner reads names and what a thing is about, never "
                         f"a code.")
+    secret = need_asks_secret(text)     # the owner answers a reply under the card in words too
+    if secret:
+        raise ToolError(secret.replace("Not raised: this item asks", "Not sent: this reply asks")
+                        .replace("If this item", "If this reply"))
     guard(agent, text)
     with LOCK:
         need = q1("SELECT * FROM needs WHERE id=?", (nid,))
@@ -19374,12 +19919,60 @@ def t_discuss_need(agent, a):
             again = f", or raise the item again with raise_needs_you(replaces=\"N-{nid}\")" if need_replaceable(need) else ""
             raise ToolError(f"N-{nid} has no new message of the owner's to reply to: you reply once, and again only "
                             f"after they write again under the card. Wait for their next message there{again}.")
-        talk = ins("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (nid, now(), agent, text))
+        with transaction():     # the reply ends the card's wait for it (owner API 1.316)
+            talk = DB.execute("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)",
+                              (nid, now(), agent, text)).lastrowid
+            DB.execute("UPDATE needs SET awaits=NULL, awaits_told=NULL, awaits_asked=NULL WHERE id=?", (nid,))
         again = need_again(need)
     emit("owner", "notify", f"{shown_role(agent)} replied about: {need['title']}")
     ping_reply(talk)                    # his phone rings with the reply, which has no buttons (owner feature push)
     return (f"Your reply is under N-{nid} on the owner's card. Their next message there comes to you, and their answer "
             f"to the item comes as its own message.{again}")
+
+
+def need_wait_sweep(t0):
+    """The end of a card's wait for the manager that its own calls did not end (owner API 1.316, feature need_updates),
+    from the tick, at events and never at a time. The owner, 22 November 2026: after his Needs clarification message
+    the card's options go "until the agent decides what's next"; a card whose agent never decides must not hide them
+    for ever. discuss_need, raise_needs_you replaces, withdraw_need and his own answer end a wait at once. Else:
+    - the manager cannot have a turn now (manager_has_no_turn), its helper reports no turn end, or another agent is the
+      manager now: the wait ends, and the card is as before his message;
+    - the manager read his words (awaits_told) and a turn of its ended after that: the hub asks it once (awaits_asked);
+    - it read that ask and a turn of its ended after that too: the wait ends, and the manager's next second look names
+      the card (need_look_sweep), which then clears awaits_asked."""
+    rows = q("SELECT * FROM needs WHERE answer IS NULL AND awaits IS NOT NULL ORDER BY id")
+    if not rows:
+        return
+    mgr = manager_name()
+    ended = turn_ended(mgr) if mgr else 0
+    gone = not mgr or not ended or manager_has_no_turn(mgr, t0)
+    for r in rows:
+        told, asked = (read_row("SELECT read_at FROM events WHERE id=?", (r[k],)) if r[k] else None
+                       for k in ("awaits_told", "awaits_asked"))
+        if gone or r["by"] != mgr or not told or (r["awaits_asked"] and not asked):
+            q("UPDATE needs SET awaits=NULL, awaits_told=NULL, awaits_asked=NULL WHERE id=?", (r["id"],))
+            continue
+        if told["read_at"] is None or ended <= told["read_at"]:
+            continue                # it has not read his words, or the turn that read them still runs
+        if not asked:
+            filed, about = filed_about(mgr, "say", None)
+            # his newest words there, quoted, and whose they are (need_talk.hand): a session that started again since
+            # has them nowhere else, as no tool of the manager's reads a card's talk
+            said = read_row("SELECT text, hand FROM need_talk WHERE need=? AND who='owner' ORDER BY id DESC LIMIT 1",
+                            (r["id"],))
+            quoted = (f" Their newest words there, quoted: \"{clip(said['text'], NEED_ASK_QUOTE)}\"." +
+                      (NEED_TALK_NOT_HIS if not owner_force(said["hand"]) else "")) if said else ""
+            text = (f"[hub] The owner's words under Needs-you N-{r['id']} ({r['title']}) have no answer from you yet, "
+                    f"and its card waits for one.{quoted} {need_wait_ways(r)} If your next turn ends with none of "
+                    f"these, the card stops waiting for you, and a later second look names it.")
+            with transaction():
+                ask = DB.execute(*event_row(mgr, "say", filed, text, t0, "{}", about)).lastrowid
+                DB.execute("UPDATE needs SET awaits_asked=? WHERE id=?", (ask, r["id"]))
+            continue
+        if asked["read_at"] is None or ended <= asked["read_at"]:
+            continue
+        q("UPDATE needs SET awaits=NULL, awaits_told=NULL WHERE id=?", (r["id"],))
+        log("hub", f"N-{r['id']} waits for {mgr} no more: two turns of its ended with no answer to the owner's words")
 
 
 ITEMS_NAMED = 5                 # open items that one accept names; the rest are a count
@@ -19421,6 +20014,8 @@ NEED_LOOK_MOST = 7 * 86400      # the longest wait between two looks at one card
 NEED_LOOK_SOON = 12 * 3600      # a card due within this time comes in the same message, so the looks come together
 NEED_LOOK_EVERY = 60            # seconds between two passes of the sweep, whose waits are days
 NEED_LOOK_NAMED = 12            # cards that one message names; the others come at the next pass
+NEED_LOOK_QUOTE = 200           # characters of the owner's unanswered words under a card that a look quotes
+NEED_ASK_QUOTE = 600            # and that the hub's ask quotes (need_wait_sweep)
 NEED_HELD_WAIT = 3600           # seconds that an agent holds what its chat request asks for before the hub closes it
 
 
@@ -19535,8 +20130,23 @@ def need_key_held(r):
 
 def need_look_hints(r):
     """What the hub knows of open card row `r` now, for the manager's second look: how it closes, a key of the fleet's
-    list that answers it, and the door's hold on a server that its words name. read_row only."""
+    list that answers it, and the door's hold on a server that its words name. read_row only, but for need_replaceable's
+    one read of the item, under the owner's unanswered words; need_look_sweep calls it outside any transaction."""
     hints, spec = [], need_secret(r)
+    # owner API 1.316: his message under the card since its raise is still the newest word there (a wait that the
+    # manager left with no answer ends at its second turn, need_wait_sweep, and the next look names the card)
+    said = read_row("SELECT who, ts, text, hand FROM need_talk WHERE need=? ORDER BY id DESC LIMIT 1", (r["id"],))
+    if said and said["who"] == "owner" and said["ts"] >= (r["raised"] or 0):
+        # his words, quoted, and whose they are (need_talk.hand): the manager has no tool that reads a card's talk
+        words = NEED_TALK_NOT_HIS.strip().rstrip(".")
+        mark = "" if owner_force(said["hand"]) else "; " + words[0].lower() + words[1:]
+        hint = (f"the owner's words under it have no reply (quoted: \"{clip(said['text'], NEED_LOOK_QUOTE)}\""
+                f"{mark})")
+        if need_unclarified(r) is None:
+            hint += ": " + need_ways_said([way for _, way in need_answer_ways(r)])
+            if r["question"]:
+                hint += f", as answering Q-{r['question']} closes the card with no word to them"
+        hints.append(hint)
     if r["question"]:
         hints.append(f"it takes Q-{r['question']} to the owner: when the work has settled it, answer Q-{r['question']} "
                      f"and the card closes")
@@ -19649,7 +20259,9 @@ def need_look_sweep(t0):
         return float(r["raised"] or t0), 0
 
     kept = {str(r["id"]): list(last(r)) for r in rows if str(r["id"]) in looks}
-    left = {r["id"]: last(r)[0] + need_look_gap(last(r)[1]) - t0 for r in rows}
+    # a card whose wait for the manager ended with no answer (need_wait_sweep: awaits_asked with no awaits) is due now
+    silent = {r["id"] for r in rows if r["awaits_asked"] is not None and r["awaits"] is None}
+    left = {r["id"]: -1 if r["id"] in silent else last(r)[0] + need_look_gap(last(r)[1]) - t0 for r in rows}
     if mgr and any(v <= 0 for v in left.values()):
         due = [r for r in rows if left[r["id"]] <= NEED_LOOK_SOON]
         lines = []
@@ -19671,6 +20283,9 @@ def need_look_sweep(t0):
              "Still the same: leave it, and the hub names it again after a longer wait. The words after a card say what "
              "the hub knows of it and how it closes.\n" + "\n".join(lines) +
              (f"\nAnd {more} more, at the next pass." if more > 0 else ""), extra=LATER_SAY)
+        for r in due[:NEED_LOOK_NAMED]:     # named once: then it waits as every card does
+            if r["id"] in silent:
+                q("UPDATE needs SET awaits_asked=NULL WHERE id=? AND awaits IS NULL", (r["id"],))
     new = json.dumps(kept, sort_keys=True) if kept else None
     if new != stored:
         kv_set("need_looks", new)
@@ -20669,9 +21284,13 @@ def t_request_secret(agent, a):
         raise ToolError(f"account is one line of at most {SECRET_ACCOUNT_MAX} characters: the user name or email of "
                         f"the account at the site.")
     replaced = retired_logins().get(failed) if failed and not renew else None
-    if replaced:
+    if replaced and worker:
         raise ToolError(f"The owner gave a new password for {failed} already, as {replaced}: ask again without "
                         f"failed, and the hub names your way to it.")
+    if replaced:            # the manager: the route that raise_needs_you names for it (value_route), in its words
+        said = value_route(failed, next((e for r, e in logins().items() if r.lower() == failed), None) or
+                           {"kind": "login"}).removeprefix("Not raised: ")
+        raise ToolError(said[:1].upper() + said[1:])
     if failed and not renew and (failed not in {ref.lower() for ref, _ in catalog_logins(site, account)} or
                    (worker and failed not in {ref.lower() for ref in granted_logins(agent)})):
         raise ToolError(f"failed names no login for {secret_site_host(site)}" + (f" as {account}" if account else "")
@@ -20693,6 +21312,20 @@ def t_request_secret(agent, a):
         raise ToolError(str(e)) from None
     # a new value keeps the holders of the old one, and the door's rules too: no grant, and no name more
     give = {} if renew else {"door": "use"} if door else {agent: "use"} if worker else a.get("give_to") or {}
+    proposed = ""
+    if not worker and kind == "login" and failed and not give:
+        # a new password is a second login, which the form gives to the agents of its "Who can use it" rows: the
+        # manager's card proposes those of the old one, by a grant or by a profile, so that none is left without it
+        old, rev = next((r for r in logins() if r.lower() == failed), failed), kit_revision(fresh=True)
+        held = sorted({h["agent"] for h in card_holders("secret", old)} | {
+            n for n in agents() if agent_active(n) and role_of(n) in ("worker", "lead") and login_signs_in(n) and
+            old.lower() in profile_logins(n, rev)})        # one revision for each profile, under the hub's lock
+        give = {name: "use" for name in held[:SECRET_GIVE_MAX]}
+        # the manager's answer names them, as its next words to the owner may (a card of one agent shows no list)
+        proposed = (f" Its card proposes the holders of {failed}: {', '.join(give)}" +
+                    (f"; {', '.join(held[SECRET_GIVE_MAX:])} held it too, beyond the {SECRET_GIVE_MAX} agents that a "
+                     f"card proposes" if len(held) > SECRET_GIVE_MAX else "") + "." if held else
+                    f" No agent held {failed}, so its card proposes none.")
     if not isinstance(give, dict) or len(give) > SECRET_GIVE_MAX:
         raise ToolError(f'give_to maps up to {SECRET_GIVE_MAX} agents to "use" or "read", for example '
                         f'{{"studio": "read"}}.')
@@ -20859,10 +21492,10 @@ def t_request_secret(agent, a):
         return (f"Asked the owner for {secret_asked(spec)} as N-{nid}.{line} The owner's answer comes to this chat as "
                 f"a message that needs no reply. Open the work that needs it with start_task only after their answer: "
                 f"a task session that starts before it does not have it. Never ask the owner for it in words.")
-    return (f"Asked the owner for {secret_asked(spec)} as N-{nid}. They type it into the secure form of N-{nid} in "
-            f"Founderizer on their Mac: it goes straight into the vault, and neither you nor any other agent ever "
-            f"sees it. The owner's answer arrives as a message in this session with its name, its reference and who "
-            f"holds it, never its value. Never ask the owner for it in words in the meantime.")
+    return (f"Asked the owner for {secret_asked(spec)} as N-{nid}.{proposed} They type it into the secure form of "
+            f"N-{nid} in Founderizer on their Mac: it goes straight into the vault, and neither you nor any other "
+            f"agent ever sees it. The owner's answer arrives as a message in this session with its name, its reference "
+            f"and who holds it, never its value. Never ask the owner for it in words in the meantime.")
 
 
 # Take over one step (owner feature need_takeover; the owner's "Yes, as drawn" of 16 November 2026 to the pictures of
@@ -21488,6 +22121,7 @@ def secret_waits_end(task_id):
 # fleet where this one ran.
 KEY_TAKES_SETTLED = "key_takes_settled"
 KEY_WORDS_SETTLED = "key_words_settled"        # kv: settle_key_words ran (one time)
+TALK_HANDS_SETTLED = "talk_hands_settled"      # kv: settle_talk_hands ran (one time)
 
 
 def settle_key_takes():
@@ -21540,6 +22174,48 @@ def settle_key_takes():
     except Exception as e:
         print_fault()
         log("hub", f"the takes of clarified key cards could not be settled at this start: {type(e).__name__}: {e}")
+
+
+def settle_talk_hands():
+    """At the start, one time (kv TALK_HANDS_SETTLED, written in the same transaction), in every fleet: the hand of each
+    message of the owner's under a card from before need_talk.hand (owner API 1.316). Such a row has no hand, which
+    reads as his own words, so the hub's ask and its second look quoted an AI session's or a program's words there as
+    his, with no mark, at each look while the card stayed open. Since 21 November 2026 the line that told the manager
+    such a message (need_talk_said) carries NEED_TALK_NOT_HIS and the mark of its hand, "[owner via ai-session]" or
+    "[owner via program]", and it has the row's own time. So a row whose line of the same time and words holds that
+    sentence gets the hand that its mark names: tool for ai-session, else other. A row with no such line keeps no hand,
+    and reads as his own words, as before: a message from before 21 November, whose line had no mark, one of the Discuss
+    box of 9 to 13 November, whose line had other words, and the key take's copy of his words of a clarify, whose line
+    is the clarify's answer. The hub cannot tell their hand, and the look's mark says that an AI session or a program
+    wrote the words, which would be false for words that he typed. It writes hands only, never a word, and logs how many
+    rows it marked. An error is logged, and the start goes on."""
+    try:
+        with transaction():
+            if read_row("SELECT v FROM kv WHERE k=?", (TALK_HANDS_SETTLED,)) is not None:
+                return
+            rows = DB.execute("SELECT id, ts, text FROM need_talk WHERE who='owner' AND hand IS NULL").fetchall()
+            lines = {}          # the time of each line that told the manager words that are not his: [its text]
+            if rows:            # one read of the events, at a start, and none in a fleet with no such row
+                for e in DB.execute("SELECT created, text FROM events WHERE kind='say' AND text LIKE '[owner%' AND "
+                                    "instr(text, 'About Needs-you N-') > 0 AND instr(text, ?) > 0",
+                                    (NEED_TALK_NOT_HIS.strip(),)).fetchall():
+                    lines.setdefault(e["created"], []).append(e["text"])
+            marked = 0
+            for r in rows:
+                said = f"before answering it: {r['text']}\n(The hub:"       # the line of this message, word for word
+                line = next((t for t in lines.get(r["ts"], []) if said in t), None)
+                if line is not None:
+                    hand = "tool" if line.startswith(f"[owner via {OWNER_TOOL_VIA}]") else "other"
+                    DB.execute("UPDATE need_talk SET hand=? WHERE id=?", (hand, r["id"]))
+                    marked += 1
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       (TALK_HANDS_SETTLED, str(marked)))
+            if marked:
+                log_row("hub", f"{marked} message(s) of the owner's under cards keep the mark that an AI session or a "
+                               f"program wrote them (a one-time repair of owner API 1.316)")
+    except Exception as e:
+        print_fault()
+        log("hub", f"the hands of old messages under cards could not be settled at this start: {type(e).__name__}: {e}")
 
 
 def settle_key_words():
@@ -39980,7 +40656,7 @@ REPORT_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_#-]{0,39}")       # a ticket's k
 
 
 def report_title(agent, key):
-    """The title of the task of a typed report: who reports, by its role, and the ticket's key when that is plainly an
+    """The title of the task of a typed report: who reports, by its name, and the ticket's key when that is plainly an
     id. A line's key is the first word of a line from outside the fleet (CASE_LINE_KEY allows an address, a path
     and a host's name), and the reader of a report has a shell: its details frame the key as data, and a title is read as the
     task's own words. No code of the hub: the report's and the case's are in the details and in `why`."""
@@ -46944,7 +47620,7 @@ TEAM_CLOSED_WORDS = "Closed by the hub: the fleet changed after this card was ma
 # pressed plan has none.
 TEAM_MAKING, TEAM_MADE, TEAM_NOT_MADE = "making", "made", "not_made"
 # needs.team_reason of a plan that was not made: what the owner reads at the card's mark. No code, no words of the
-# manager's tools, and an agent by its role ({by}: the manager, which raised the card and hears each of these ends)
+# manager's tools, and an agent by its name ({by}: the manager, which raised the card and hears each of these ends)
 TEAM_NOT_MADE_CHANGED = ("The hub did not make this change: the fleet changed after your yes. Nothing changed, and "
                          "{by} knows.")
 TEAM_NOT_MADE_TRIES = ("The hub did not make this change: it stopped after {tries} tries{why}. Nothing changed, and "
@@ -47066,9 +47742,13 @@ def team_section_change(was, now_):
 
 
 def team_said_role(team, name):
-    """An agent as the owner's apps name it, from this team: its role title, else its name."""
+    """An agent as the owner's apps name it, from this team: shown_role's label, with the role that the plan gives it
+    (agent_label). An agent that the plan adds has no name yet, since the owner presses one of the plan's names: its
+    role, as "Add <role> on <server>" says it."""
     a = (team.get("agents") or {}).get(name) or {}
-    return a.get("title") or (agents().get(name) or {}).get("title") or name
+    if name not in agents() and a.get("title"):
+        return a["title"]
+    return agent_label(name, a.get("title") or (agents().get(name) or {}).get("title"))
 
 
 def server_free_memory(server):
@@ -47424,6 +48104,8 @@ def team_remove(ctx, c):
     if n == mgr:
         raise ToolError("The manager stays in the fleet: no plan removes it.")
     role = team_said_role(team, n)
+    # the card's title names the agent and its role beside it, as the owner's apps draw an entry of its own (F16)
+    title = " ".join(str(a.get("title") or (agents().get(n) or {}).get("title") or "").split())
     server, serviced = removal_server(team, n)
     refused = remove_refusal(team, n)
     if refused:
@@ -47470,7 +48152,7 @@ def team_remove(ctx, c):
     where = (f"its service, its files and its OS user on {server}; " if serviced else
              f"nothing on {server}, which has no server service, so its files there stay; " if server else "")
     ctx["parts"].append(
-        f"**Remove {role} ({n})**\n\n"
+        f"**Remove {role}{f' ({title})' if title and not role_holds_name(n, title) else ''}**\n\n"
         f"- What goes: {where}its profile, skills, notes, lessons, standing items, reminders and wake-up rules; your "
         f"chat with it." + (f" Its duties retire: {'; '.join(duties)}." if duties else " It holds no duty.") + "\n"
         f"- What stays: its tasks, its results and its costs. Its name stays taken.\n"
@@ -49155,8 +49837,8 @@ def kpi_may_set(actor, target):
     if actor == parent:
         return None
     if actor == target:
-        return f"{shown_role(parent)} ({parent}) sets your KPIs: propose a change with message_agent."
-    return f"{shown_role(parent)} ({parent}) sets {target}'s KPIs, as it gives {target} its tasks: ask it with " \
+        return f"{name_and_role(parent)} sets your KPIs: propose a change with message_agent."
+    return f"{name_and_role(parent)} sets {target}'s KPIs, as it gives {target} its tasks: ask it with " \
            f"message_agent."
 
 
@@ -49297,7 +49979,7 @@ def kpi_setup_fields(r, measuring):
     """The setup task of KPI row r for its measuring agent (spec 7.1)."""
     parent, measured = shown_role(kpi_parent(r["agent"])), shown_role(r["agent"])
     return {"title": f"Measure {r['name']}",
-            "details": (f"{parent} set a KPI on {measured} ({r['agent']}), {iref(r['id'])}: {full_stop(r['words'])} "
+            "details": (f"{parent} set a KPI on {name_and_role(r['agent'])}, {iref(r['id'])}: {full_stop(r['words'])} "
                         f"Its level: {kpi_level(r)}, over {r['window_days']} days. Its metric: {r['metric']}. "
                         + (f"It is {measured}'s department's KPI: the results of its whole team's work. "
                            if role_of(r["agent"]) == "lead" else
@@ -49352,7 +50034,7 @@ def kpi_parent_text(agent):
     if not none:
         return ""
     return (f"\nSet KPIs with set_kpi on the agents whose tasks you give that have no KPI: "
-            f"{', '.join(f'{shown_role(n)} ({n})' for n in none)}.\n")
+            f"{', '.join(name_and_role(n) for n in none)}.\n")
 
 
 def kpi_readable(caller):
@@ -49945,7 +50627,7 @@ KPI_ITEM_KINDS = {"instruction": "an instruction", "target": "a target", "kpi": 
 
 
 def kpi_who(by, plain):
-    """Who made a mark: its agent by its role for the owner (plain), its name for an agent."""
+    """Who made a mark: for the owner (plain), its agent as his apps name it (shown_role); for an agent, its name."""
     if by in ("hub", "owner"):
         return "the hub" if by == "hub" else "the owner"
     if not plain:
@@ -50052,7 +50734,7 @@ def kpi_still_off_rows(r, value, t0):
     else:
         off = f"{measured}'s off-target task is {tref(r['off_task'])}, which has ended: read its result"
     task = {"title": f"{measured}: {r['name']} still off target",
-            "details": (f"The KPI {iref(r['id'])} of {measured} ({r['agent']}) is still off target: "
+            "details": (f"The KPI {iref(r['id'])} of {name_and_role(r['agent'])} is still off target: "
                         f"{full_stop(r['words'])} Its value is {kpi_value_text(r, value)}, where its level is "
                         f"{kpi_level(r)} over {r['window_days']} days. {off}.\n\nThe last weeks:\n"
                         f"{kpi_week_lines(r, t0)}"),
@@ -50080,7 +50762,7 @@ def kpi_name_who_rows(r, why, t0):
     answer: {} when no route reaches the parent now."""
     return kpi_step_rows(kpi_parent(r["agent"]), {
         "title": f"Name who measures {r['name']}",
-        "details": (f"{why} The KPI {iref(r['id'])} of {shown_role(r['agent'])} ({r['agent']}): "
+        "details": (f"{why} The KPI {iref(r['id'])} of {name_and_role(r['agent'])}: "
                     f"{full_stop(r['words'])} Its level: {kpi_level(r)} over {r['window_days']} days."),
         "done_when": (f"You named who measures it with set_kpi(id=\"{iref(r['id'])}\", measured_by), which opens its "
                       f"setup" + ("" if role_of(kpi_parent(r["agent"])) == "manager" else
@@ -50154,7 +50836,7 @@ def history_kpis(a, days, start, before):
     out = [f"KPIS of the last {weeks} weeks ({len(rows)}):"]
     for r in rows:
         level = f"{kpi_level(r)} over {r['window_days']} days"
-        out.append(f"{iref(r['id'])} {r['agent']} ({shown_role(r['agent'])}): {r['name']}. {full_stop(r['words'])} "
+        out.append(f"{iref(r['id'])} {name_and_role(r['agent'])}: {r['name']}. {full_stop(r['words'])} "
                    f"Level: {level}. State: {(r['kpi_state'] or 'no_data').replace('_', ' ')} since "
                    f"{item_day(r['state_since'] or r['created'])}.")
         out.append("  Weeks, oldest first: " + " | ".join(
@@ -50470,9 +51152,9 @@ def t_end_standing(agent, a):
         raise ToolError(f"{iref(item)} is a KPI: a session that a person's message drives does not end it.")
     if r["kind"] == "kpi" and not r["ended"] and agent != kpi_parent(r["agent"]):    # spec R3, 10: its parent ends it
         parent = kpi_parent(r["agent"])
-        raise ToolError(f"{shown_role(parent)} ({parent}) ends your KPIs: propose it with message_agent."
+        raise ToolError(f"{name_and_role(parent)} ends your KPIs: propose it with message_agent."
                         if agent == r["agent"] else
-                        f"{shown_role(parent)} ({parent}) ends this KPI: ask it with message_agent.")
+                        f"{name_and_role(parent)} ends this KPI: ask it with message_agent.")
     if r["agent"] != agent and role_of(agent) != "manager" and r["kind"] != "kpi":
         # a holder whose Shell box is off ends none but a colleague's own wish (shell_tools): only the manager can
         raise ToolError(f"{iref(item)} is {r['agent']}'s: ask {manager_name()} to end it." if shell_off(r["agent"]) else
@@ -51019,7 +51701,7 @@ def settings_junction(agent):
 
 
 def settings_words(agent, keys, boxes):
-    """The finding about one agent, for the manager's list of proposals: the agent by its role, the keys by name and
+    """The finding about one agent, for the manager's list of proposals: the agent by its name, the keys by name and
     never a value, the boxes, and the options, each with its cost and how to undo it. Each sentence is true of the
     agent's own case, and an option names only the keys that it fits. A use grant with call_api needs the https site
     of the key on its login (login_site). The key swap needs the rule of the key swap lane (key_swap) and a Linux
@@ -53070,9 +53752,9 @@ TOOLS = [
        ["title", "why", "what_to_do"])),
     ("manager", "withdraw_need", t_withdraw_need,
      "Close an open Needs-you item that you raised and that nothing needs any more: a plan change replaced it, the "
-     "fix is live, or the work found another route. It leaves the owner's Needs you with no notification, and why "
-     "stays in its record as its answer. Do it as soon as you know, so the owner never answers an item that needs "
-     "nothing. An item that takes a question to the owner closes when you answer that question, and a secret request "
+     "fix is live, or the work found another route. It leaves the owner's Needs you, and why stays in its record as "
+     "its answer; it rings the owner only where why answers their newest message under the card. Do it as soon as "
+     "you know. An item that takes a question to the owner closes when you answer that question, and a secret request "
      "that tasks wait on closes with them. Another agent's key or login request that no task waits on is yours to "
      "close too: ask that agent with message_agent first, as the hub does not tell it.",
      S({"need": {"type": "string", "description": "The item, for example N-12"},
@@ -53599,7 +54281,7 @@ TOOLS = [
                   "clock, check: a file of checks/ with commit and sha256, schedule, title, done_when, needs, "
                   "trigger}. The whole list replaces the watches of the duty. The owner reads a watch's title on "
                   "a card of their Tasks page at each event, before the event's key: a few plain words, at most "
-                  f"{TITLE_CHARS} characters, with no code, and an agent by its role. A watch that names its "
+                  f"{TITLE_CHARS} characters, with no code, and an agent by its name. A watch that names its "
                   "trigger and no title keeps the title that it has."},
         "tools": {"type": "array", "items": {"type": "string"}, "description": "Only for a holder whose Shell box "
                   "is off: the optional tools of the sessions of its cases, which replace the Web box's "
@@ -53830,7 +54512,7 @@ TOOLS = [
      "friend\"). Worker chat replies require "
      "in_reply_to from read_messages. Task workers still report through their task tools; managers may also post "
      "checked results. No notification. Name a task or a duty by what it is about, never by its code (T-61, R-3), and "
-     "an agent by its role; a code goes in about.",
+     "an agent by its name; a code goes in about.",
      S({"text": STR, "files": CHAT_FILES_FIELD,
         "about": {"type": "string", "description": "What this reply is about, for the owner's own record: the "
                                                    "message you are answering (M-<id>), the goal (G-<id>) and the "
@@ -53853,7 +54535,7 @@ TOOLS = [
      "own WhatsApp number, Discord bot or Telegram bot; without one it stays in the app. The first one after a task's "
      "result came back into your owner chat answers the owner's message that opened that task, where they wrote it. "
      "Answer an owner message with tell_owner instead. One request_id is one message: the same request_id again sends nothing more. Never put a login in the text. Name a task or a duty "
-     "by what it is about, never by its code (T-61, R-3), and an agent by its role.",
+     "by what it is about, never by its code (T-61, R-3), and an agent by its name.",
      S({"request_id": REQUEST_ID,
         "text": {"type": "string", "description": "The message in Markdown, 1 to 4,000 characters"},
         "files": CHAT_FILES_FIELD},
@@ -60095,6 +60777,7 @@ def tick():
         step(door_grants_sweep, t0)         # a grant that the owner's Mac's door rounds gave the door holds no restart
         step(door_changes_sweep, t0)        # and a hold or a fleet holder that they gave it gets no more words
         step(goal_sweep, t0)
+        step(need_wait_sweep, t0)           # owner API 1.316: a card that waits for a manager that does not answer
         step(need_look_sweep, t0)           # the owner, 17 November 2026: a second look at the open cards
         step(duty_sweep, t0)                # owner API 1.13: the duties that are not in order
         step(kpi_sweep, t0)                 # lanes/agent-kpis.md: once a day, a KPI with no value for two windows
@@ -62613,13 +63296,13 @@ def manager_hub_user(team=None):
 
 
 def roles_phrase(names):
-    """Agents by their roles, as one phrase: "A", "A and B", "A, B and C"."""
+    """Agents as the owner's apps name them (shown_role), as one phrase: "A", "A and B", "A, B and C"."""
     roles = [shown_role(n) for n in names]
     return roles[0] if len(roles) == 1 else ", ".join(roles[:-1]) + " and " + roles[-1] if roles else ""
 
 
 def os_user_group_words(group):
-    """A fault group as the manager reads it: the agents by their roles, and where."""
+    """A fault group as the manager reads it: the agents by their names (shown_role), and where."""
     return roles_phrase(group["agents"]), group.get("machine") or "its server"
 
 
@@ -66733,7 +67416,7 @@ def server_key_swap_reading(server, body):
         key_swap_ask(server)            # a reading that changed no word is an event of its own for the ask
     waits = key_swap_waits(server) if done and swaps else []
     if waits:                           # the server's agents with a key with a site: their checks run once now
-        keys = "; ".join(f"{shown_role(w['agent'])} ({w['agent']}): {', '.join(w['keys'])}" for w in waits)
+        keys = "; ".join(f"{name_and_role(w['agent'])}: {', '.join(w['keys'])}" for w in waits)
         emit(manager_name(), "say", f"[hub] The vault of {server} swaps keys now, by the Mac app's reading: the "
                                     f"sessions and the checks there hold a placeholder of these keys ({keys}). Have "
                                     f"each check of these agents run once now, and tell the owner only of one that "
@@ -66809,7 +67492,7 @@ def key_swap_ask(server, team=None):
     if sent >= KEY_SWAP_ASKS:
         return False
     kv_set(KEY_SWAP_ASKED + server, json.dumps({"state": state, "sent": sent + 1}, sort_keys=True))
-    keys = "; ".join(f"{shown_role(w['agent'])} ({w['agent']}): {', '.join(w['keys'])}"
+    keys = "; ".join(f"{name_and_role(w['agent'])}: {', '.join(w['keys'])}"
                      for w in key_swap_waits(server, team))
     emit(manager_name(), "say", f"[hub] {server} waits for the owner's word on the key swap: an agent there reads a "
                                 f"key that has a site ({keys}), so the Mac app does not switch it by itself. Raise "
@@ -66892,7 +67575,7 @@ def key_swap_checked():
 AGENT_COLUMNS = (
     ("mac_setups", "agent"), ("tasks", "owner"), ("tasks", "requester"), ("notes", "agent"), ("questions", "asker"), ("questions", "requester"),
     ("reports", "from_agent"), ("reports", "to_agent"), ("reports", "decided_by"), ("prompts", "agent"),
-    ("prompts", "by"), ("rules", "agent"), ("rules", "by"), ("needs", "by"), ("need_talk", "who"), ("events", "agent"), ("reminders", "agent"),
+    ("prompts", "by"), ("rules", "agent"), ("rules", "by"), ("needs", "by"), ("needs", "answered_by"), ("need_talk", "who"), ("events", "agent"), ("reminders", "agent"),
     ("sealed", "sender"), ("sealed", "recipient"), ("jobs", "agent"), ("log", "agent"), ("agents", "name"),
     ("signin_records", "agent"),        # plan 04, S5: the sign-ins of the vault in the agent's own browser
     ("agent_usage", "name"), ("calls", "agent"), ("ui_requests", "recipient"), ("owner_reports", "agent"),
@@ -67426,7 +68109,7 @@ AGENT_REMOVAL = {
     ("responsibilities", "agent"): "history", ("duty_history", "by"): "history",
     ("machine_status", "agent"): "team", ("machine_updates", "agent"): "team", ("agents", "name"): "row",
     ("signin_records", "agent"): "team",        # build plan 04, S5: the sites of its sign-ins in its own browser
-    ("notes", "agent"): "stays", ("reports", "decided_by"): "stays", ("prompts", "agent"): "stays",
+    ("notes", "agent"): "stays", ("needs", "answered_by"): "stays", ("reports", "decided_by"): "stays", ("prompts", "agent"): "stays",
     ("prompts", "by"): "stays", ("rules", "by"): "stays", ("need_talk", "who"): "stays", ("sealed", "sender"): "stays",
     ("log", "agent"): "stays", ("holds", "by"): "stays", ("holds", "released_by"): "stays", ("outcomes", "by"): "stays",
     ("goals", "paused_by"): "stays", ("goal_history", "by"): "stays", ("spends", "by"): "stays",
@@ -67800,6 +68483,14 @@ AGENT_FIRST_SUGGESTS = ("watch a page or a service", "fix the bugs of a reposito
                         "list", "check refunds and payments")
 
 
+def manager_has_no_turn(mgr, t0):
+    """True when the manager `mgr` cannot have a turn now: it has no server, a usage limit or a runtime switch holds it,
+    its helper is away, a flag is on its session (down, frozen, a question on its screen, silent: manager_flag_update),
+    or its runtime is signed out. Facts of now, and never a message's age."""
+    return bool(unplaced(mgr) or active_limit(mgr) or manager_held(mgr) or not helper_online(mgr, t0) or
+                kv_get("mgr_flag_kind") or signed_in_now(mgr, (agents().get(mgr) or {}).get("runtime")) is False)
+
+
 def manager_had_its_turn(agent, t0):
     """True when the manager has read the hub's word that the owner activated this agent and has ended that turn, or
     cannot have one now. A manager that settled the agent's job with the owner before (rules/manager.md, "A fleet with
@@ -67810,8 +68501,7 @@ def manager_had_its_turn(agent, t0):
     question on its screen, silent: manager_flag_update) has no turn to wait for, and neither has one whose helper
     reports no turn end, once it has read the word."""
     mgr = manager_name()
-    if unplaced(mgr) or active_limit(mgr) or manager_held(mgr) or not helper_online(mgr, t0) or \
-            kv_get("mgr_flag_kind") or signed_in_now(mgr, (agents().get(mgr) or {}).get("runtime")) is False:
+    if manager_has_no_turn(mgr, t0):
         return True
     told = q1("SELECT read_at FROM events WHERE agent=? AND kind='say' AND json_extract(extra, '$.activated')=? "
               "ORDER BY id DESC LIMIT 1", (mgr, agent))
@@ -68650,7 +69340,7 @@ def account_change_refusal(team, agent, old, new):
     held = lifecycle.model_account(team, {"account": old}) if old else None
     if old == new or not (held or (new and lifecycle.model_account(team, {"account": new}))):
         return None
-    name = shown_role(agent)            # as the owner's apps show it: its role, else its name ("Web-Dev"), D18
+    name = shown_role(agent)            # as the owner's apps show it: its name ("Web-Dev"), D18
     if held and held["kind"] == "server":
         return account_refusal(409, "change_server", agent=name)
     runtime = runtime_label(((team.get("agents") or {}).get(agent) or {}).get("runtime"))
@@ -89201,6 +89891,7 @@ def main():
     settle_narrowed_rows()      # person access plan, section 5: the marks of rows of before, before the hub answers
     settle_key_takes()          # once: the takes of clarified key cards that the first build of H2 left wrong
     settle_key_words()          # once, after it: his words of a clarify that the first build of H2 wrote twice
+    settle_talk_hands()         # once: the hand of his words under a card from before need_talk.hand (owner API 1.316)
     settle_history_index()      # once: the index holds only its rows' words (15 November 2026), before the hub answers
     settings_checked()          # the team that this hub starts with: a release that brings the check finds what is there
     key_swap_answered()         # an owner's press of a key swap item that a stop cut before it reached team.json

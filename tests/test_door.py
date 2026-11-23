@@ -1233,6 +1233,38 @@ class Refusals(DoorCase):
                                                       "content": base64.b64encode(b"/etc").decode()}]}).encode()
         self.assertEqual(self.decide("commit:one-org/ops", "push", content=link).kind, "refused")
 
+    def test_a_path_of_more_than_1000_characters_is_refused_before_the_commit_rules(self):
+        """The commit rules read a path from each of its folders (glob_match), so a path of 16,000 characters took 2 s,
+        one of 40,000 13 s, and one of 200 KB minutes. A commit or a read with a path of more than 1000 characters is
+        refused in plain words, in a moment, and one of 1000 is read; and so is a path of more than 64 folders, as 200
+        paths of 1000 characters in 500 folders took 1.9 s. Bug: no limit, or a limit after the rules."""
+        edge = "a" * 993 + "/x.yaml"     # 1000 characters in one folder: the 64 folders' limit is below
+        for target in ("commit:one-org/ops", "gitops:one-org/cluster"):
+            started = time.thread_time()
+            d = self.decide(target, "push", content=self.commit(("a/" * 20000 + "x.yaml", "x")))
+            self.assertLess(time.thread_time() - started, 1.0)
+            self.assertEqual((d.kind, d.why), ("refused", "a path of the commit has more than 1000 characters"))
+            d = self.decide(target, "push", content=self.commit((edge, "x")))
+            self.assertNotIn("characters", d.why)
+        started = time.thread_time()
+        d = self.decide("gitops:one-org/cluster", "read", "a/" * 20000 + "x.yaml")
+        self.assertLess(time.thread_time() - started, 1.0)
+        self.assertEqual((d.kind, d.why), ("refused", "the path has more than 1000 characters"))
+        self.assertEqual(self.decide("gitops:one-org/cluster", "read", edge).kind, "read")
+        # and 64 folders at most: 200 paths of 1000 characters in 500 folders took 1.9 s; in 64, 0.1 s
+        def paths(folders):
+            return [(f"{i:03d}" + "/".join(["a" * (1000 // folders - 1)] * folders))[:990] + "/x.txt"
+                    for i in range(200)]
+        for target in ("commit:one-org/ops", "gitops:one-org/cluster"):
+            d = self.decide(target, "push", content=self.commit(*((p, "x") for p in paths(65))))
+            self.assertEqual((d.kind, d.why), ("refused", "a path of the commit has more than 64 folders"))
+            started = time.thread_time()
+            d = self.decide(target, "push", content=self.commit(*((p, "x") for p in paths(64))))
+            self.assertLess(time.thread_time() - started, 5.0)
+            self.assertNotIn("folders", d.why)
+        self.assertEqual(self.decide("gitops:one-org/cluster", "read", "a/" * 65 + "x.yaml").why,
+                         "the path has more than 64 folders")
+
     def test_commit_rules_in_any_case_of_the_name(self):
         """A checkout on a disk that does not tell the cases apart, as a Mac's, reads claude.md as CLAUDE.md."""
         for path in ("claude.md", ".Claude/settings.json", "sub/Agents.MD", ".MCP.json", ".GitHub/workflows/x.yml",
@@ -1477,7 +1509,12 @@ class Refusals(DoorCase):
                               ("a new LoadBalancer", lambda p: p.update(kind="Service", spec={"type": "LoadBalancer"})),
                               ("RBAC", lambda p: p.update(kind="ClusterRoleBinding")),
                               ("holds a Secret object", lambda p: p.update(kind="Secret", data={"x": "eA=="})),
-                              ("holds a Secret object", lambda p: p.update(kind="List", items=[{"kind": "Secret"}]))):
+                              ("holds a Secret object", lambda p: p.update(kind="List", items=[{"kind": "Secret"}])),
+                              # a kind's List: its items with no kind of their own are of that kind
+                              ("holds a Secret object", lambda p: p.update(kind="SecretList", items=[{"data": {}}])),
+                              ("an Application", lambda p: p.update(kind="ApplicationList", items=[{}])),
+                              ("RBAC", lambda p: p.update(kind="ClusterRoleBindingList", items=[{}])),
+                              ("a CRD", lambda p: p.update(kind="CustomResourceDefinitionList", items=[{}]))):
             with self.subTest(what=what):
                 bad = json.loads(json.dumps(pod))
                 change_(bad)
@@ -1492,18 +1529,22 @@ class Refusals(DoorCase):
 
     def test_documents_of_too_many_levels_or_lines_are_refused_before_code_writes_them_out(self):
         """Code reads parsed documents as block style lines (as_block, as_lines), and a JSON file of 41 KB with 900
-        levels took 17 s and 2.5 GB there. A file of more than 64 levels, or of more than 8 MB of such lines, is
-        refused in plain words, as it is after the commit and at HEAD, and so is a render's object; a file of 64
-        levels is read. The filter of a read takes such a file with its loose reading, which still keeps back a
-        Secret in it. Bug: a limit that reads one of the two texts alone, or the levels of one route alone, and the
-        door stops for minutes on a file that an agent wrote."""
+        levels took 17 s and 2.5 GB there. A file of more than 64 levels is refused in plain words, as it is after the
+        commit and at HEAD, and so is a render's object; a file of 64 levels is read. The lines of the whole commit,
+        after it and at HEAD (a deleted file's HEAD only beside a file that the rules read), with each number as
+        code writes it, and of the objects that its render changes, have one limit of 2 MB, measured before the
+        rule of references to Secrets reads a file; a commit at that limit takes 2 to 8 s (20 s at most here). The
+        filter of a read takes a file over the limits with its loose reading, which still keeps back a Secret in it.
+        Bug: a limit that reads one of the two texts alone, one file at a time (8 MB of lines in each of many files
+        took minutes), after the rule of an earlier file, or one that counts no number, and the door stops on files
+        that an agent wrote."""
         def deep(levels, text="1"):
             return "[" * levels + text + "]" * levels
 
         def push(text, base=None):
             return self.decide("gitops:one-org/cluster", "push", content=self.commit(("apps/shop/x.json", text)),
                                lookups={"base_file": lambda p: base})
-        levels, size = "has more than 64 levels of mappings and lists", "has more than 8 MB of lines"
+        levels, size = "has more than 64 levels of mappings and lists", "more than 2 MB of lines"
         wide = deep(64, ",".join(["1"] * 75000))
         lines = json.dumps({"a": {"b": [{"c": "x\n" * 100}]}})
         for text, base, words in ((deep(65), None, levels), (wide, None, size), ("{}", deep(65).encode(), levels),
@@ -1513,6 +1554,56 @@ class Refusals(DoorCase):
                 self.assertEqual((d.kind, words in d.why), ("refused", True), d)
         for text in (deep(64), lines):
             self.assertEqual(push(text).kind, "own", text[:80])
+
+        def sized(part):            # a file of 60 levels whose lines are this part of the limit
+            k = int(part * door_targets.TREE_TEXT / (2 * 61 + 4))
+            return deep(60, ",".join(["1"] * k))
+        # one limit for the whole commit: two files that each pass alone, a render's objects too
+        half = sized(0.6)
+        self.assertEqual(push(half).kind, "own")
+        d = self.decide("gitops:one-org/cluster", "push", lookups={"base_file": lambda p: None},
+                        content=self.commit(("apps/shop/a.json", half), ("apps/shop/b.json", half)))
+        self.assertEqual((d.kind, "the commit's files have more than 2 MB of lines" in d.why), ("refused", True), d)
+        # a render's part over the limit: its own words, as no smaller commit makes it smaller
+        group = {"object": "an object", "set": "its own values", "before": [json.loads(half)], "after": [{}]}
+        report = {"units": {"helm:x": {"kind": "helm", "root": "x", "ok": True, "changed": [group]}}}
+        files = [("apps/shop/a.json", half.encode(), "100644")]
+        self.assertIn("the objects that the commit's render changes have, with its files, more than 2 MB of lines",
+                      door_targets.commit_tree_refusal(files, lambda p: (None, {}), report))
+        self.assertIn("a person makes this commit outside the door",
+                      door_targets.commit_tree_refusal(files, lambda p: (None, {}), report))
+        # a YAML file counts as the render box's parser read it, after the commit and at HEAD
+        yaml_info = {"after": [json.loads(half)], "before": [json.loads(half)]}
+        self.assertIn("the commit's files have more than 2 MB", door_targets.commit_tree_refusal(
+            [("apps/shop/a.yaml", b"x: 1\n", "100644")], lambda p: (b"x: 1\n", yaml_info), None))
+        # a number counts as code writes it: two files of 250 numbers of 4299 digits each at HEAD
+        numbers = json.dumps([10 ** 4298] * 250).encode()
+        d = self.decide("gitops:one-org/cluster", "push", lookups={"base_file": lambda p: numbers},
+                        content=self.commit(("apps/shop/a.json", "[]"), ("apps/shop/b.json", "[]")))
+        self.assertEqual((d.kind, "the commit's files have more than 2 MB of lines" in d.why), ("refused", True), d)
+        # a file that the commit only deletes counts nothing; beside a file that the rules read, its HEAD counts
+        big = sized(1.1).encode()
+
+        def delete(*more):
+            return json.dumps({"message": "m", "files": [{"path": "apps/shop/big.json", "delete": True}] + [
+                {"path": p, "content": base64.b64encode(t.encode()).decode()} for p, t in more]}).encode()
+        d = self.decide("gitops:one-org/cluster", "push", content=delete(), lookups={"base_file": lambda p: big})
+        self.assertNotIn("MB of lines", d.why)
+        d = self.decide("gitops:one-org/cluster", "push", content=delete(("apps/shop/a.json", "[]")),
+                        lookups={"base_file": lambda p: big if p.endswith("big.json") else None})
+        self.assertEqual((d.kind, "the commit's files have more than 2 MB of lines" in d.why), ("refused", True), d)
+        # measured before any rule reads a file: a later file over the limit, not an earlier file's refusal
+        secret = json.dumps({"apiVersion": "v1", "kind": "Secret", "data": {"k": "eA=="}})
+        d = self.decide("gitops:one-org/cluster", "push", lookups={"base_file": lambda p: None},
+                        content=self.commit(("apps/shop/a.json", secret), ("apps/shop/z.json", deep(65))))
+        self.assertEqual(d.why, "apps/shop/z.json has more than 64 levels of mappings and lists, after the commit or "
+                                "at HEAD, which the door does not read", d)
+        # a commit at the limit, after it and at HEAD: 2.2 s on a fast core, 8 s on a slow one
+        at = sized(0.49)
+        started = time.thread_time()
+        d = push(at.replace("1", "2"), at.encode())
+        self.assertLess(time.thread_time() - started, 20.0)
+        self.assertNotIn("MB of lines", d.why)
         # the texts of many lines count as as_lines writes them, each with the spaces of its level
         texts = json.loads(deep(60, json.dumps("\n" * 80000)))
         for write in (door_targets.objects_text, door_targets.lines_text):
@@ -1596,7 +1687,11 @@ class Refusals(DoorCase):
                  ("apps/x/projected.txt", "sources:\n- ? secret\n  : {name: k}\n", "the word secret:"),
                  ("apps/x/version.txt", "? apiVersion\n: v1\n", "a kind or an apiVersion key"),
                  ("apps/x/data.txt", '{"a #": b, kind: #c\n Secret, data: {k: c2VjcmV0}}\n',
-                  "what may be a Secret object"))
+                  "what may be a Secret object"),
+                 # a kind's List holds that kind
+                 ("apps/x/bindings.txt", "kind: ClusterRoleBindingList\n", "the word clusterrolebinding"),
+                 ("apps/x/roles.txt", "kind: RoleList\n", "the word kind: role"),
+                 ("apps/x/apps.txt", '{"kind": "ApplicationList"}\n', "the word kind: application"))
         # A file that no parser reads and that names a Secret or a service account changes only on listed lines (the
         # rule of 21 November 2026): a count of words cannot say that a name below a secretKeyRef changed.
         named = {"apps/x/env.txt", "apps/x/volume.txt", "apps/x/account.txt", "apps/x/csi.txt", "apps/x/sa.txt",
@@ -3048,7 +3143,8 @@ class GitHubFacts(DoorCase):
 
     def test_the_filter_of_a_read_keeps_back_a_secret_in_any_spelling_and_what_it_cannot_read(self):
         """No Secret object leaves the door. Before, the filter read `kind: Secret` only at the start of a line with
-        nothing after it, so a quoted or a nested one, one with a comment, and one in JSON or flow style came back."""
+        nothing after it, so a quoted or a nested one, one with a comment, and one in JSON or flow style came back; and
+        it read no SecretList, whose items with no kind of their own are Secrets, nor a key's mark with an escape."""
         api = "https://api.github.com/repos/one-org/cluster/contents/"
         held = "which the filter keeps back"
         unsure = "may hold a Secret, which the filter keeps back"    # no block style: the loose reading of its text
@@ -3063,8 +3159,16 @@ class GitHubFacts(DoorCase):
                  "apps/shop/next.yaml": ("kind:\n  Secret\nstringData:\n  key: secret\n", unsure),
                  "apps/shop/secret.json": ('{"kind": "Secret", "data": {"key": "c2VjcmV0"}}', held),
                  "apps/shop/items.json": ('{"kind": "List", "items": [{"kind": "Secret"}]}', held),
+                 # a SecretList's items need no kind: Kubernetes reads each one as a Secret
+                 "apps/shop/secrets.yaml": ("apiVersion: v1\nkind: SecretList\nitems:\n- metadata:\n    name: k\n"
+                                            "  stringData:\n    key: secret\n", held),
+                 "apps/shop/secrets.json": ('{"kind": "SecretList", "items": [{"data": {"key": "c2VjcmV0"}}]}', held),
+                 "apps/shop/secrets-flow.yaml": ("{kind: SecretList, items: [{data: {key: c2VjcmV0}}]}\n", unsure),
+                 "apps/shop/secrets-big.json": ("[" * 70 + '{"kind"\n: "SecretList", "items": [{}]}' + "]" * 70,
+                                                unsure),
                  "apps/shop/broken.json": ('{"kind": "Secret", ', unsure),
-                 "apps/shop/tls.yaml": ("data:\n  tls.key: |\n    -----BEGIN PRIVATE KEY-----\n", held)}
+                 "apps/shop/tls.yaml": ("data:\n  tls.key: |\n    -----BEGIN PRIVATE KEY-----\n", held),
+                 "apps/shop/tls-escaped.yaml": ('data:\n  tls.key: "\\x2d----BEGIN PRIVATE KEY-----"\n', held)}
         board = json.dumps({"title": "Board", "panels": [{"id": 1}]}, indent=2)
         files["apps/shop/board.json"] = (board, None)
         files["docs/notes.md"] = ("# Notes\n\n- {a: b}\n", None)
@@ -3079,6 +3183,10 @@ class GitHubFacts(DoorCase):
                 else:
                     self.assertEqual((got["ok"], why in got.get("why", "")), (False, True), got)
                     self.assertNotIn("out", got)
+        # a read reads the file as the patterns do once (a file at the limit takes a moment to read)
+        with patch.object(door_targets, "manifest_text", wraps=door_targets.manifest_text) as read:
+            self.assertTrue(self.call(ONE, "gitops:one-org/cluster", "read", "apps/shop/board.json")["ok"])
+        self.assertEqual(read.call_count, 1)
 
     def test_a_read_gives_a_file_that_is_not_block_style_unless_it_may_hold_a_secret(self):
         """Block style is the rule of a commit, where the agent writes the text. In a read the repository's own
@@ -6259,6 +6367,8 @@ class Workflows(DoorCase):
                       self.call("100.64.0.21", f"commit:{self.REPO}", "deploy-template", "x")["why"])
 
     def test_code_refuses_what_a_workflow_may_not_do(self):
+        """Each form that a repository that the door made may not hold in a workflow is refused, with its words. Bug: a
+        reader of ${{ }} that ends an expression at a }} inside a quoted text lets a secret after it pass."""
         deploy = self.template()["text"]
         def ci(**jobs_or_keys):     # noqa: E306
             w = json.loads(json.dumps(CI))
@@ -6278,6 +6388,13 @@ class Workflows(DoorCase):
             "a job-level uses": (ci(jobs={"build": build, "call": {"uses": "one-org/x/.github/workflows/a.yml@main"}}),
                                  "calls a workflow with uses"),
             "a secret": (ci(jobs={"build": secret}), "the secret in 'secrets.NPM_TOKEN'"),
+            # a }} in a quoted text ends no expression for GitHub, and one with no end runs to the end of the text
+            "a secret after a quoted }}": (ci(env={"A": "${{ '}}' || secrets.NPM_TOKEN }}"}),
+                                           "no secret but GITHUB_TOKEN"),
+            "a secret after a quoted '' and }}": (ci(env={"A": "${{ 'it''s }}' && secrets.NPM_TOKEN }}"}),
+                                                   "no secret but GITHUB_TOKEN"),
+            "a secret in an expression with no end": (ci(env={"A": "${{ '}}' || secrets.NPM_TOKEN"}),
+                                                      "no secret but GITHUB_TOKEN"),
             "a secret in an if": (
                 ci(jobs={"build": dict(build, steps=[{"if": "secrets.NPM_TOKEN != ''", "run": "x"}])}),
                 "no secret but GITHUB_TOKEN"),
@@ -9803,10 +9920,16 @@ class StoreFacts(Served):
                      BW_STORE.replace(BW_PROJECT, BW_ORG) + "---\n" +
                      BW_STORE.replace("  name: bitwarden-example\n", "  name: |-\n    bitwarden-example\n"),
                      BW_STORE.replace("name: bitwarden-example", 'name: bitwarden-example\n  note: "a #b"'),
-                     BW_STORE.replace("name: bitwarden-example", "name: bitwarden-example\n  note: 'a #b'")):
+                     BW_STORE.replace("name: bitwarden-example", "name: bitwarden-example\n  note: 'a #b'"),
+                     # YAML's infinity and not-a-number: no object of a cluster's API holds them
+                     BW_STORE.replace("name: bitwarden-example", "name: bitwarden-example\n  note: .inf"),
+                     BW_STORE.replace("name: bitwarden-example", "name: bitwarden-example\n  note: -.Inf  # x"),
+                     BW_STORE.replace("name: bitwarden-example", "name: bitwarden-example\n  note: .NaN")):
             with self.subTest(text=text[-200:]):
                 self.assertEqual(self.ask(text), (422, {"error": "rendered"}))
-        for text in ('{"kind": "ClusterSecretStore", "kind": "Secret"}', "[" * 100000):     # and too deep to read
+        nan = json.dumps(door.store_docs(BW_PATH, BW_STORE.encode())[0])[:-1] + ', "x": NaN}'
+        for text in ('{"kind": "ClusterSecretStore", "kind": "Secret"}', "[" * 100000,     # and too deep to read
+                     nan, nan.replace("NaN", "-Infinity"), nan.replace("NaN", "1e999")):   # no JSON of a cluster
             self.files({"platform/store.json": text})
             self.assertEqual(self.ask(path="platform/store.json"), (422, {"error": "rendered"}))
 
@@ -9891,6 +10014,87 @@ class LongLines(unittest.TestCase):
     BOUND = 2.0         # seconds of this thread's own time, so that other work of the machine does not count
 
     @staticmethod
+    def versions(k):
+        "k versions of one Role in one place, which differ in a label only (a free field of RBAC)"
+        return [({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "metadata": {
+            "name": "a", "namespace": "x", "labels": {"n": str(i)}}, "rules": [{"verbs": ["get"] * 20}]}, "x")
+            for i in range(k)]
+
+    @staticmethod
+    def copies(k):
+        "k copies of one Deployment that reads a Secret"
+        return [({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "a"}, "spec": {"template": {
+            "spec": {"containers": [{"name": "c", "env": [{"name": "E", "valueFrom": {"secretKeyRef": {
+                "name": "s", "key": "k"}}}]}]}}}}, "x") for _ in range(k)]
+
+    def test_the_rule_reads_the_objects_at_head_once_for_a_commit_of_200_files(self):
+        """A commit of 200 JSON files with 26 ConfigMaps each at HEAD: the rule of references to Secrets read all the
+        objects at HEAD again for each file, 8.9 s on main and 18 s with a copy of each written out; it reads them
+        once now, about 2 s (thread time; 7 to 8 s on a slow core). The count of head_key's calls holds the first
+        cost on any machine: on main it was 3 million. Each file at HEAD is read once from GitHub, where it was read
+        three times. Bug: a reading of the whole commit's HEAD inside the loop of its files."""
+        heads = {f"apps/shop/f{i:03d}.json": json.dumps({"apiVersion": "v1", "kind": "List", "items": [
+            {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": f"c{i}-{j}", "namespace": "shop"},
+             "data": {f"k{m}": "v" * 20 for m in range(8)}} for j in range(26)]}).encode() for i in range(200)}
+        content = json.dumps({"message": "m", "files": [{"path": p, "content": base64.b64encode(
+            b'{"apiVersion": "v1", "kind": "List", "items": []}').decode()} for p in heads]}).encode()
+        calls, reads, key = [], [], door_targets.head_key
+        with patch.object(door_targets, "head_key", lambda o: calls.append(1) or key(o)):
+            started = time.thread_time()
+            d = door_targets.decide(ACCESS, "ops-one", "gitops:one-org/cluster", "push", [], content,
+                                    {"base_file": lambda p: reads.append(p) or heads.get(p)})
+            spent = time.thread_time() - started
+        self.assertEqual(d.kind, "own", d)
+        self.assertLess(len(calls), 10 * 200 * 26)
+        self.assertEqual(len(reads), 200)           # each file at HEAD is one read of GitHub, and it was three
+        self.assertLess(spent, 15.0)
+
+    def test_the_rule_reads_a_render_s_objects_at_head_once_for_each_value_set(self):
+        """A render that changes 4000 ConfigMaps of one value set: the rule read all of the set's objects at HEAD again
+        for each changed object, 13.7 s; once for the set now. Bug: the known references of the set inside the loop of
+        its groups."""
+        def cm(n, value):
+            return {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": f"c{n}"}, "data": {"k": value}}
+        groups = [{"object": f"c{n}", "set": "its own values", "before": [cm(n, "a")], "after": [cm(n, "b")]}
+                  for n in range(4000)]
+        unit = {"kind": "helm", "root": "x", "ok": True, "closed": False, "changed": groups}
+        calls, key = [], door_targets.head_key
+        with patch.object(door_targets, "head_key", lambda o: calls.append(1) or key(o)):
+            self.assertEqual(door_targets.render_refusal({"units": {"helm:x": unit}, "apps": None}), (None, []))
+        self.assertLess(len(calls), 10 * 4000)
+
+    def test_the_rule_reads_16_versions_of_one_object_and_copies_once(self):
+        """The rule of references to Secrets reads each object after the commit against each version of it at HEAD,
+        so 2000 versions of one name took 7.5 s: more than 16 versions at HEAD are refused in plain words, and 16 are
+        read. Copies of one version are one version: 3000 copies of a Deployment at HEAD and after are no change.
+        Bug: no limit, or a limit that counts copies, which refuses a repository with one object twice."""
+        t = door_targets
+        self.assertEqual(t.secret_rule(self.versions(16), self.versions(16)[::-1], "f"), (None, []))
+        self.assertEqual(t.secret_rule(self.versions(17), self.versions(1), "f"),
+                         ("f: an object of the same kind, namespace and name is there in more than 16 versions at "
+                          "HEAD, which the door does not read: a person changes those files outside the door", []))
+        self.assertEqual(t.secret_rule(self.copies(3000), self.copies(3000), "f"), (None, []))
+
+    @staticmethod
+    def every_other(n, start=""):
+        "(a file of n lines, the same file with each other line changed), after the same first lines"
+        a = [f"l{i}" for i in range(n)]
+        return [(start + "\n".join(lines)).encode() for lines in (a, [x if i % 2 else "z" for i, x in enumerate(a)])]
+
+    def test_the_owner_s_card_compares_2000_changed_lines_and_counts_more(self):
+        """The owner's card shows the exact change of a file of the owner's, and difflib took 1.7 s on 8000 changed
+        lines. Between the lines that both sides share at their start and end, up to 2000 changed lines are shown one by
+        one, also after 50,000 lines that stay; above that, the words give the first 40 lines of each side and the
+        counts. Bug: no bound, one on the whole file, or difflib on the whole file."""
+        t = door_targets
+        words = t.change_words("p", *self.every_other(2000, "h\n" * 50000))
+        self.assertTrue(words.startswith("p loses 1000 lines and gains 1000: -l0 | +z | -l2"), words[:80])
+        words = t.change_words("p", *self.every_other(2002))
+        self.assertTrue(words.startswith("p changes 2001 of its 2002 lines at HEAD into 2001 lines, too many to "
+                                         "compare one by one; the first of each side: -l0 | -l1 | -l2"), words[:160])
+        self.assertTrue(words.endswith("| +l39 | and 3922 lines more"), words[-60:])
+
+    @staticmethod
     def deep(text):
         try:
             door_targets.block_tree(text)
@@ -9912,6 +10116,7 @@ class LongLines(unittest.TestCase):
             "a plain value with a run of spaces": lambda: t.plain_value("b" + " " * 100000 + "c"),
             "a quantity of digits and dots": lambda: t.quantity("9" * 60000 + "..Gi"),
             "a workflow text of ${{": lambda: t.secret_use("${{" * 34000),
+            "a workflow text of ${{ '": lambda: t.secret_use("${{ '}}" * 30000),
             "a line of dashes": lambda: self.deep(("-" + " " * 60) * 110000 + "x\n"),
             "a value on many lines": lambda: self.deep("k: a\n" + ("  " + "b" * 200 + "\n") * 25000),
             "a list item's text on many lines": lambda: self.deep("- a\n" + ("    " + "b" * 200 + "\n") * 25000),
@@ -9924,6 +10129,9 @@ class LongLines(unittest.TestCase):
             "a rule's open ranges": lambda: door_render.rule_metrics("[" * 200000),
             "a rule's open label lists": lambda: door_render.rule_metrics("by(" * 100000),
             "an ssh line of @": lambda: door.first_cause(255, "@" * 48000 + "\n", 22),
+            "2000 versions of one object at HEAD": lambda: t.secret_rule(self.versions(2000), self.versions(2000), "f"),
+            "3000 copies of one object": lambda: t.secret_rule(self.copies(3000), self.copies(3000), "f"),
+            "an owner's file of 16,000 changed lines": lambda: t.change_words("p", *self.every_other(16000)),
         }
         for name, read in rows.items():
             with self.subTest(row=name):

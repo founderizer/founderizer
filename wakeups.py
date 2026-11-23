@@ -1030,7 +1030,7 @@ TOOL_SPECS = (
           "task": {"type": "object", "description": "What the agent does when the rule wakes it. The owner reads "
                                                     "its title on a card of their Tasks page at each run: a few "
                                                     "plain words, at most 50 characters, with no code, and an "
-                                                    "agent by its role."},
+                                                    "agent by its name."},
           "check": {"description": READ_WORDS + INPUT_WORDS},
           "send": {"type": "object",
                    "description": "{\"to\": \"owner\" or one of "

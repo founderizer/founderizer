@@ -125,8 +125,9 @@ class TeamChanges(Remove):
             said = self.plan([{"kind": "remove", "agent": "scout"}], title="Remove scout?")
         ring.assert_not_called()
         card = self.card()
+        self.assertIn("**Remove Scout**\n\n", card["details"])    # F16: its name once, and it has no role to show
         options = json.loads(card["options"])
-        self.assertEqual(options, ["Yes: remove scout and its service on box", "No"])
+        self.assertEqual(options, ["Yes: remove Scout and its service on box", "No"])
         self.assertIn(options[0], said)
         phone = [n for n in hub.mobile_state(hub.kv_get("db_id"))["needs"] if n["id"] == card["id"]]
         self.assertEqual([n["team"] for n in phone], [True])
@@ -166,7 +167,7 @@ class TeamChanges(Remove):
         """Bug: a team card marks no answer, No, or another name than the manager's first as the answer that the
         manager recommends, so the owner's badge stands on a choice that the manager did not make (owner API 1.269)."""
         said = self.plan([{"kind": "remove", "agent": "scout"}], title="Remove scout?")
-        self.assertEqual(self.card()["recommended"], "Yes: remove scout and its service on box")
+        self.assertEqual(self.card()["recommended"], "Yes: remove Scout and its service on box")
         self.assertIn("the first marked as the answer that you recommend", said)
         self.add_plan()
         self.assertEqual(self.card()["recommended"], "Yes: add nova, Customer Support 2, on box2")
@@ -201,11 +202,11 @@ class TeamChanges(Remove):
         self.assertIn("Before:\n\n> Its work.", card["details"])
         self.assertIn("After:\n\n> Deploys, and their checks.", card["details"])
         self.assertIn("> It ran 12 deploys in 30 days", card["details"])
-        self.assertEqual(json.loads(card["options"]), ["Yes: change the profile of vps", "No"])
+        self.assertEqual(json.loads(card["options"]), ["Yes: change the profile of Vps", "No"])
         status, answer = self.press(0)
         self.assertEqual(status, 200, answer)
         profile = self.show("profiles/vps.md")
-        self.assertIn(f"The profile of vps goes from {was:,} to {size():,} characters. It grows", said)
+        self.assertIn(f"The profile of Vps goes from {was:,} to {size():,} characters. It grows", said)
         self.assertIn("**Responsible for.** Deploys, and their checks.", profile)
         self.assertIn("**Must ask first.** Spending.", profile)            # the sections that the plan left stay
         self.assertTrue(hub.notes_profile_newer("vps"))     # the head of its notes says so (the design's 5.2)
@@ -233,7 +234,7 @@ class TeamChanges(Remove):
         status, answer = self.press(0)
         self.assertEqual(status, 200, answer)
         profile = self.show("profiles/vps.md")
-        self.assertIn(f"The profile of vps goes from {was:,} to {size():,} characters.", said)
+        self.assertIn(f"The profile of Vps goes from {was:,} to {size():,} characters.", said)
         self.assertNotIn("It grows", said)
         self.assertIn(stay[-1], profile)
         self.assertNotIn(leave[0], profile)
@@ -272,7 +273,7 @@ class TeamChanges(Remove):
         self.assertIsNone(self.card()["answer"])
         status, answer = self.press(0)
         self.assertEqual(status, 409, answer)
-        self.assertIn("cannot make this change now: scout has open tasks now", answer["error"])
+        self.assertIn("cannot make this change now: Scout has open tasks now", answer["error"])
         self.assertIsNone(self.card()["answer"])
         hub.q("UPDATE tasks SET state='completed' WHERE id=?", (task,))
         # a profile that git does not give now passes too (removed_files' 503): the press keeps the card
@@ -530,7 +531,7 @@ class TeamChanges(Remove):
         self.assertIn("Change the reporting lines first", str(refused.exception))
         self.plan([{"kind": "lines", "lines": [{"agent": "scout", "role": "worker"}]},
                    {"kind": "remove", "agent": "lead"}], title="Fold the lead?")
-        self.assertEqual(json.loads(self.card()["options"]), ["Yes: remove lead, and 1 more change", "No"])
+        self.assertEqual(json.loads(self.card()["options"]), ["Yes: remove Lead, and 1 more change", "No"])
         self.assertIn("nothing on vps, which has no server service, so its files there stay", self.card()["details"])
         before = self.head()
         status, answer = self.press(0)

@@ -1,14 +1,17 @@
-"""An agent by its role or by its name (UI-API.md Version 1.112).
+"""An agent by its name or by its role (UI-API.md Versions 1.112 and 1.315).
 
-The owner's apps show an agent by its role, its team.json "title", with its name under it, and the owner and the
+The owner's apps name an agent by its name, with its role, its team.json "title", beside it, and the owner and the
 agents may name it either way. So a tool field that names an agent takes either, the hub's words for the owner use
-the role, the phone reads the role, and two agents never share a role.
+the name (the role only where the role holds the name), the agents' rules ask for the name, the phone reads the role,
+and two agents never share a role.
 """
 import json
+import os
 import unittest
 import uuid
 
 import hub
+import leftovers
 from test_capacity import Capacity
 
 
@@ -91,11 +94,39 @@ class Roles(Capacity):
                                                                      base_sha256=self.sha(), name="builder"))
         self.assertEqual((code, data.get("error")), (409, "Builder is the role of Deva. Choose another name."), data)
 
-    def test_the_owner_reads_an_agent_by_its_role_and_one_with_no_role_by_its_name(self):
-        self.assertEqual((hub.shown_role("seo"), hub.shown_role("deva"), hub.shown_role("gone")),
-                         ("SEO Expert", "Deva", "Gone"))
-        self.assertIn("SEO Expert has been silent since", hub.silent_words("seo", hub.now() - 7200))
-        self.assertEqual(hub.silent_words("deva", None), "Deva has never answered")
+    def test_the_owner_reads_an_agent_by_its_name_and_by_its_role_only_where_the_role_holds_the_name(self):
+        """F16 (the owner, 22 November 2026): the hub's words name an agent by its name, as his apps do, and by its
+        role only when one word of the role is the name, where the name would say less ("Fleet Manager" for manager).
+        Bug: the role comes back as the label, or the exception goes and the owner reads "Manager"."""
+        self.assertEqual(self.settings("deva", title="Builder")[0], 200)
+        self.assertEqual(self.settings("manager", title="Fleet Manager")[0], 200)
+        self.assertEqual(tuple(hub.shown_role(n) for n in ("deva", "manager", "seo", "big", "gone")),
+                         ("Deva", "Fleet Manager", "SEO Expert", "Big", "Gone"))
+        self.assertIn("Deva has been silent since", hub.silent_words("deva", hub.now() - 7200))
+        self.assertEqual(hub.silent_words("big", None), "Big has never answered")
+        self.assertEqual(hub.shown_role("seo"), hub.agent_label("seo", "  SEO   Expert "))    # a role on one line
+        self.assertEqual(hub.agent_label("web-dev", "Web Dev"), "Web-Dev")      # no role holds a name with a hyphen
+        self.assertEqual(hub.name_and_role("deva"), "deva (Builder)")            # an agent's words: as the team list
+        self.assertEqual(hub.name_and_role("big"), "big")
+        # a card that signs an agent in names it by its role or by its name: card_signs_in reads the role itself
+        self.assertTrue(hub.card_signs_in("Sign Builder in again") and hub.card_signs_in("Sign Deva in again"))
+
+    def test_the_rules_and_the_tool_texts_tell_an_agent_to_name_a_colleague_by_its_name(self):
+        """F16, the owner's "Yes, as written" to the sentence of RULES.md: an agent names a colleague by its name, and
+        never by its role alone. Bug: a later edit brings "by its role" back into RULES.md or into one of the tool
+        texts that say how to name an agent, and an agent reads two rules that disagree."""
+        sentence = ('Name an agent the way the owner\'s apps do: by its name, with a capital ("Nova"), and never by its '
+                    'role alone ("Customer Support"), which YOUR TEAM gives in brackets after the name. In a tool, its '
+                    'role and its name both reach it.')
+        with open(os.path.join(leftovers.ROOT, "RULES.md"), encoding="utf-8") as f:
+            rules = f.read()
+        self.assertIn(sentence, rules)
+        self.assertNotIn("by its role", rules.replace(sentence, ""))
+        tools = {name: json.dumps([desc, schema]) for _role, name, _fn, desc, schema in hub.TOOLS}
+        for name in ("tell_owner", "message_owner", "set_duty", "save_trigger"):
+            self.assertIn("an agent by its name", tools[name], name)
+            self.assertNotIn("by its role", tools[name], name)
+        self.assertEqual([n for n, text in tools.items() if "an agent by its role" in text], [])
 
     def test_the_phone_reads_each_agent_s_role(self):
         code, data = self.request("/ui/mobile?db=test-generation")

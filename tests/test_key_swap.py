@@ -2575,14 +2575,14 @@ class Fact(test_grants.Grants):
         hub.settings_check()
         (first,) = self.findings()
         self.assertTrue(first["text"].startswith(
-            "Developer reads 2 API keys in its sessions (OPENAI_API_KEY, SHOP_API_KEY), and it has a shell and the web "
+            "Alpha reads 2 API keys in its sessions (OPENAI_API_KEY, SHOP_API_KEY), and it has a shell and the web "
             "(Tools: Shell, Web). A text from outside, a web page for example, can then make it send a key"), first["text"])
         self.assertNotIn("placeholder", first["text"])
         self.assertEqual(self.says("box", True)[0], 200)                    # the hub checks the settings at each change
         old, new = self.findings()
         self.assertEqual((old["id"], old["note"]), (first["id"], f"The settings changed. UP-{new['id']} replaces this finding."))
         self.assertTrue(new["text"].startswith(
-            "Developer reads 1 API key in its sessions (SHOP_API_KEY), and it has a shell and the web (Tools: Shell, "
+            "Alpha reads 1 API key in its sessions (SHOP_API_KEY), and it has a shell and the web (Tools: Shell, "
             "Web). 1 more key is not in its sessions: the vault of its server swaps it, so a session holds a "
             "placeholder (OPENAI_API_KEY). A text from outside, a web page for example, can then make it send a key "
             "to another place."), new["text"])
@@ -2599,8 +2599,8 @@ class Fact(test_grants.Grants):
     def test_the_finding_names_two_placeholders_and_counts_the_rest_and_stays_inside_one_report(self):
         self.assertEqual(self.says("box", True)[0], 200)
         catalog, grants = hub.logins(), hub.agents()["alpha"]["secrets"]
-        with patch.dict(hub.agents()["alpha"], {"title": "R" * 60}):
-            for n in range(40):                                             # the longest names that team.json takes
+        with patch.dict(hub.agents()["alpha"], {"title": "Alpha " + "R" * 54}):     # a role that holds the name is
+            for n in range(40):                             # the label (F16); the longest names that team.json takes
                 ref = f"bws://11111111-2222-4333-8444-5555555555{n:02d}"
                 catalog[ref] = {"title": f"K{n:02d}", "kind": "api_key", "env": f"K{n:02d}_" + "A" * 56}
                 if n >= 36:
@@ -2756,7 +2756,7 @@ class Wish(Fact):
         told = [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND text LIKE ?",
                                          ("[hub] The vault of box swaps keys now%",))]
         self.assertEqual(len(told), 1)
-        self.assertIn("(Developer (alpha): OPENAI_API_KEY). Have each check of these agents run once now", told[0])
+        self.assertIn("(alpha (Developer): OPENAI_API_KEY). Have each check of these agents run once now", told[0])
         self.says("box", True)                                              # the same word again: no second line
         self.assertEqual(len(hub.q("SELECT id FROM events WHERE agent='manager' AND text LIKE ?",
                                    ("[hub] The vault of box swaps keys now%",))), 1)
@@ -2788,7 +2788,7 @@ class Wish(Fact):
         self.assertEqual(len(asks), 1)
         self.assertIn('key_swap_server "box"', asks[0])
         self.assertIn('the title "Switch on the key swap on box?" word for word', asks[0])
-        self.assertIn("Developer (alpha): OPENAI_API_KEY", asks[0])
+        self.assertIn("alpha (Developer): OPENAI_API_KEY", asks[0])
         for _ in range(5):                                  # no item came: each event asks again, a few times
             hub.key_swap_checked()
         self.assertEqual(len(self.asks()), hub.KEY_SWAP_ASKS)
@@ -2825,7 +2825,7 @@ class Wish(Fact):
         need = hub.q1("SELECT * FROM needs WHERE key_swap_server='box' AND answer IS NULL")
         self.assertEqual(json.loads(need["options"]), list(hub.KEY_SWAP_CARD_ANSWERS))
         self.assertEqual(need["details"], hub.key_swap_card_details("box"))
-        self.assertIn("The keys with a site on box:\n- Developer: OPENAI_API_KEY\n", need["details"])
+        self.assertIn("The keys with a site on box:\n- Alpha: OPENAI_API_KEY\n", need["details"])
         said, error = self.raise_item()
         self.assertTrue(error)
         self.assertIn("is open already", said)
@@ -2901,19 +2901,19 @@ class ChecksWait(Wish):
         asks = self.asks()
         self.assertEqual(len(asks), 1)
         self.assertIn('key_swap_server "box"', asks[0])
-        self.assertIn("Developer (alpha): OPENAI_API_KEY", asks[0])
+        self.assertIn("alpha (Developer): OPENAI_API_KEY", asks[0])
         said, error = self.raise_item()
         self.assertFalse(error, said)
         need = hub.q1("SELECT * FROM needs WHERE key_swap_server='box' AND answer IS NULL")
         self.assertEqual(need["details"], hub.key_swap_card_details("box"))
-        self.assertIn("The keys with a site on box:\n- Developer: OPENAI_API_KEY\n", need["details"])
+        self.assertIn("The keys with a site on box:\n- Alpha: OPENAI_API_KEY\n", need["details"])
         self.assertEqual(self.press(need["id"], choice=0)[0], 200)          # the owner presses Switch it on
         self.assertEqual(self.committed()["servers"]["box"].get("key_swap_wish"), "on")
         self.says("box", True)                                              # the app switched it: the new word
         told = self.told()
         self.assertEqual(len(told), 1)
-        self.assertIn("the sessions and the checks there hold a placeholder of these keys (Developer (alpha): "
-                      "OPENAI_API_KEY). Have each check of these agents run once now", told[0])
+        self.assertIn("the sessions and the checks there hold a placeholder of these keys (alpha (Developer): "
+                      "OPENAI_API_KEY). Have each check of these agents run once now", told[0])     # as the team list
 
     def test_no_broker_or_only_a_use_grant_makes_no_wait(self):
         with patch.dict(hub.agents()["alpha"], {"vault": "none"}):         # its vault does not read its keys

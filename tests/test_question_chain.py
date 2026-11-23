@@ -326,7 +326,7 @@ class Needs(Chain):
         self.answer("top", qid, "Blue.", self.t1)
         row = hub.q1("SELECT * FROM needs WHERE id=?", (need["id"],))
         self.assertEqual(row["answered_by"], "Fleet")
-        # the owner reads it on the card: no code, the agent by its role, and an agent's words, written for the
+        # the owner reads it on the card: no code, the agent by its name, and an agent's words, written for the
         # agent that asked, stay out (21 November 2026: "Closed: Q-388 was answered by manager: Miguel checked
         # (M-29708): ...")
         self.assertEqual(row["answer"], f"Closed: {hub.shown_role('top')} answered it, so it needs nothing from you.")

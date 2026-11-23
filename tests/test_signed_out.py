@@ -179,7 +179,7 @@ class SignedOut(test_agent_auth.Routes):
         self.assertIn("[hub] alpha (Example Developer) is not signed in to Claude Code on box: no session of it can "
                       "work.", to_manager)
         self.assertIn(f"Its open tasks: T-{theirs}, T-{own}.", to_manager)
-        self.assertIn("raise one that asks the owner to open Example Developer in the app and sign it in", to_manager)
+        self.assertIn("raise one that asks the owner to open Alpha in the app and sign it in", to_manager)
         (to_lead, quiet), = self.said("boss", mine)                 # in its own task, where a lead reads its team
         self.assertFalse(quiet)
         self.assertIn(f"[hub] T-{theirs} (Fix it, owner alpha) waits: alpha is not signed in", to_lead)
@@ -483,7 +483,7 @@ class SignedOut(test_agent_auth.Routes):
                       "minutes. Try again in Founderizer). It is installed there, and only its sign-in is missing",
                       move[0])
         self.assertNotIn("Read the server", move[0])
-        self.assertIn("raise one that asks the owner to open Example Developer in the app and sign it in", told[0])
+        self.assertIn("raise one that asks the owner to open Alpha in the app and sign it in", told[0])
         self.assertIn(f"[hub] T-{theirs} (Fix it, owner alpha) waits", self.said("boss", mine)[0][0])
         self.signed("alpha", True)
         self.sweep()

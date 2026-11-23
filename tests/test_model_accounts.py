@@ -469,7 +469,7 @@ class ModelAccounts(OwnerAPI):
         team["agents"]["seller-1"].update(title="Customer Support", model="openrouter/kimi-k3")
         self.put(team)
         got = merged("seller-1", dict(made_up, names=None))
-        self.assertEqual(got["names"], {"provider": "OpenRouter", "model": "kimi-k3", "agent": "Customer Support"})
+        self.assertEqual(got["names"], {"provider": "OpenRouter", "model": "kimi-k3", "agent": "Seller-1"})    # F16
         own = merged("own-1", dict(made_up, ref="spark"))          # a model server's own model, as saved: none here
         self.assertEqual((own["detail"], own["code"], own.get("names")), ("", "not_offered", None))
         # Sentence 5: the agent as the apps write it.
@@ -478,7 +478,7 @@ class ModelAccounts(OwnerAPI):
         self.assertEqual((code, said["error"]), (409, "Dev-Lead stays on Claude Code. For another AI, add a new agent."))
         code, said = self.request("/ui/team/agents/seller-1", dict(request_id=str(uuid.uuid4()), db="test-generation",
                                                                    base_sha256=self.sha(), account=None))
-        self.assertEqual((code, said["error"]), (409, "Customer Support stays on OpenRouter. For another AI, add a new "
+        self.assertEqual((code, said["error"]), (409, "Seller-1 stays on OpenRouter. For another AI, add a new "
                                                       "agent."))
 
     def test_an_event_ends_a_check_that_waits_for_its_account_item(self):

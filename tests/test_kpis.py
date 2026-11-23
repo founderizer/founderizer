@@ -97,7 +97,8 @@ class Parents(Kpis):
         ref = hub.iref(r["id"])
         self.assertIn("no tool named set_kpi", self.kpi_refused("hand", id=ref, number=10))     # a worker has none
         sub, _ = self.set_kpi("lead", "sublead", name="Team drafts")
-        self.assertIn("sets your KPIs", self.kpi_refused("sublead", id=hub.iref(sub["id"]), number=10))
+        hub.TEAM["agents"]["lead"]["title"] = "Team Lead"   # an agent reads the parent as the team list: name (role)
+        self.assertIn("lead (Team Lead) sets your KPIs", self.kpi_refused("sublead", id=hub.iref(sub["id"]), number=10))
         self.assertIn("ends your KPIs", self.refused("hand", "end_standing", id=ref, why="Too hard."))
         self.assertIn("ask it with message_agent", self.kpi_refused("manager", id=ref, number=10))
         self.assertIn("ends this KPI", self.refused("manager", "end_standing", id=ref, why="Not needed."))
@@ -383,9 +384,9 @@ class StartText(Kpis):
         with hub.transaction():
             batch = hub.lead_batch_rows("lead", hub.now())
         first = hub.q1("SELECT text FROM events WHERE task=? ORDER BY id LIMIT 1", (batch,))["text"]
-        self.assertIn("no KPI: Hand (hand), Sublead (sublead), Closed (closed)", first)
+        self.assertIn("no KPI: hand, sublead, closed", first)      # as the team list: the name, and a role
         self.assertNotIn("Set KPIs", hub.start_text("lead", self.tasks["lead"]))
-        self.assertIn("no KPI: Lead (lead), Solo (solo)", hub.manager_resume_text())
+        self.assertIn("no KPI: lead, solo", hub.manager_resume_text())     # F16: as the team list writes them
         for agent in ("hand", "closed", "sublead"):
             self.set_kpi("lead", agent, measured_by="lead" if agent == "closed" else None)
         self.assertNotIn("Set KPIs", hub.start_text("lead", batch))
@@ -427,7 +428,7 @@ class Reads(Kpis):
         such mode: its number reaches it in its task. Protects against a worker told its number in a routine read."""
         r, _ = self.set_kpi("lead", "hand")
         text = self.ok("lead", "see_history", what="kpis")
-        self.assertIn(f"{hub.iref(r['id'])} hand (Hand): Drafts sent as written.", text)
+        self.assertIn(f"{hub.iref(r['id'])} hand: Drafts sent as written.", text)       # no role: the name alone
         self.assertTrue(text.rstrip().endswith('window=<days>, agent="<name>" of your team.'))
         self.assertIn("It ranks no agent.", text)
         self.assertIn(hub.iref(r["id"]), self.ok("manager", "see_history", what="kpis"))

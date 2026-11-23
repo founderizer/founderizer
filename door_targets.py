@@ -70,6 +70,8 @@ TIMED_FORMS = ("script", "run")
 TARGET = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}|[a-z]+:[A-Za-z0-9][A-Za-z0-9._/-]{0,99}")
 REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
 CONTENT_MAX = 256 * 1024     # bytes of content in one call
+PATH_MOST = 1000            # characters of a path of a repository: the commit rules read each path from each folder on
+FOLDERS_MOST = 64           # and folders of a path: 200 paths of 1000 characters in 500 folders took 1.9 s
 
 # The commit rules (DevOps plan section 2): these paths, at any depth, never pass in any commit.
 NEVER_PATHS = (".claude/**", ".codex/**", ".mcp.json", "AGENTS.md", "CLAUDE.md", ".github/**", ".husky/**",
@@ -506,6 +508,29 @@ def canonical(workflow):
     return (json.dumps(workflow, indent=2, ensure_ascii=False) + "\n").encode()
 
 
+EXPRESSION_MARK = re.compile(r"'|\}\}")     # in a ${{ }} expression: a quoted text's quote, or the expression's end
+
+
+def expressions(text):
+    """The texts of the ${{ }} expressions of one text of a workflow, as GitHub reads them: a }} inside a quoted text
+    ('...', with '' for a quote in it) ends nothing, and an expression with no end runs to the end of the text. Each
+    text holds the text up to the first }} after each ${{ inside it, so a reading that ends at the first }} finds
+    nothing more. One pass over the text (a search for an end from each ${{ read the rest again)."""
+    out, at = [], 0
+    while True:
+        start = text.find("${{", at)
+        if start < 0:
+            break
+        mark = EXPRESSION_MARK.search(text, start + 3)
+        while mark is not None and mark.group() == "'":
+            close = text.find("'", mark.end())
+            mark = None if close < 0 else EXPRESSION_MARK.search(text, close + 1)
+        end = len(text) if mark is None else mark.start()
+        out.append(text[start + 3:end])
+        at = end + 2
+    return out
+
+
 def secret_use(node, key=None):
     """The first use of a secret other than GITHUB_TOKEN: in a ${{ }} expression, in an if (an expression with no
     marks), or a secrets key (a called workflow's or a trigger's)."""
@@ -522,8 +547,7 @@ def secret_use(node, key=None):
             if found:
                 return found
     elif isinstance(node, str):
-        # read up to the last }}: a ${{ after it closes nothing, and each one would read the rest again
-        for text in re.findall(r"\$\{\{(.*?)\}\}", node[:node.rfind("}}") + 2], re.S) + ([node] if key == "if" else []):
+        for text in expressions(node) + ([node] if key == "if" else []):
             if re.search(r"\bsecrets\b", re.sub(r"\bsecrets\s*\.\s*GITHUB_TOKEN\b", "", text, flags=re.I), re.I):
                 return f"the secret in {text.strip()[:80]!r}"
     return None
@@ -616,6 +640,10 @@ def commit_files(content):
         out = []
         for f in files:
             path, mode = f["path"], f.get("mode", "100644")
+            if isinstance(path, str) and len(path) > PATH_MOST:
+                return None, f"a path of the commit has more than {PATH_MOST} characters"
+            if isinstance(path, str) and path.count("/") > FOLDERS_MOST:
+                return None, f"a path of the commit has more than {FOLDERS_MOST} folders"
             if not isinstance(path, str) or path.startswith("/") or ".." in path.split("/") or not path or \
                     "\\" in path or "\0" in path:
                 raise ValueError
@@ -918,8 +946,9 @@ def unread(text):
 # The most that as_block and as_lines write out of parsed documents. A line starts with two spaces for each of its
 # levels, and each level copies the lines in it: a JSON file of 41 KB with 900 levels took 17 s and 2.5 GB. The levels:
 # the deepest real manifest known is the schema of a custom resource, about 35 levels (Argo CD's ApplicationSet,
-# counted by hand along its path). The text: a cluster keeps no object over 1.5 MB, 3 to 5 MB of lines at such levels.
-TREE_LEVELS, TREE_TEXT = 64, 8 * 1024 * 1024
+# counted by hand along its path). The text: one limit for all that a commit and its render write out, after the
+# commit and at HEAD, so that the patterns read it in about a second; a commit over it goes in parts.
+TREE_LEVELS, TREE_TEXT = 64, 2 * 1024 * 1024
 
 
 class TreeLimit(ValueError):
@@ -928,9 +957,26 @@ class TreeLimit(ValueError):
 
 def tree_limit(docs):
     """Why code does not write these parsed documents out as lines (as_block, as_lines), or None: more than TREE_LEVELS
-    levels of mappings and lists, or more than TREE_TEXT characters of lines, with the spaces of each line's level and
-    with each line of a text on its own, as as_lines writes it. It is measured level by level, before any line is
-    written."""
+    levels of mappings and lists, or more than TREE_TEXT characters of lines (tree_size)."""
+    size, why = tree_size(docs, TREE_TEXT)
+    return why or (f"more than {TREE_TEXT // 2 ** 20} MB of lines, as code writes its keys and items out"
+                   if size > TREE_TEXT else None)
+
+
+def scalar_size(v):
+    """The characters of a value that is no text, a mapping or a list, as as_block writes it (json.dumps), with no
+    writing: a number of 4299 digits is about 0.302 of its bits, and a float is 24 at most."""
+    if isinstance(v, bool) or v is None:
+        return 5
+    if isinstance(v, int):
+        return int(v.bit_length() * 0.302) + 2
+    return 24 if isinstance(v, float) else 0
+
+
+def tree_size(docs, most):
+    """(the characters of lines that as_lines writes of these parsed documents, with the spaces of each line's level
+    and each line of a text on its own, counted up to a little more than most; why there are more than TREE_LEVELS
+    levels of mappings and lists, or None). It is measured level by level, before any line is written."""
     size, level = 0, [doc for doc in docs if isinstance(doc, (dict, list))]
     for n in range(TREE_LEVELS):
         below = []
@@ -938,15 +984,61 @@ def tree_limit(docs):
             for key, v in node.items() if isinstance(node, dict) else ((None, v) for v in node):
                 text = v if isinstance(v, str) else ""
                 lines = len(text.splitlines())
-                size += (2 * n + 4) * (1 + (lines if lines > 1 else 0)) + len(text) + len(str(key or ""))
+                size += (2 * n + 4) * (1 + (lines if lines > 1 else 0)) + len(str(key or "")) + \
+                    (len(text) if isinstance(v, str) else scalar_size(v))
                 if isinstance(v, (dict, list)):
                     below.append(v)
-            if size > TREE_TEXT:
-                return f"more than {TREE_TEXT // 2 ** 20} MB of lines, as code writes its keys and items out"
+            if size > most:
+                return size, None
         if not below:
-            return None
+            return size, None
         level = below
-    return f"more than {TREE_LEVELS} levels of mappings and lists"
+    return size, f"more than {TREE_LEVELS} levels of mappings and lists"
+
+
+def commit_tree_refusal(files, head_of, report):
+    """Why the documents that code writes out as lines in a GitOps commit are too many, or None: of each file of the
+    commit, after it and at HEAD (a JSON file as the door parses it, a YAML file as the render box's parser read it),
+    and of each object that its render changes, before and after. Measured all at once, before any rule reads one of
+    them, against one limit for them all: a limit for each file let a rule read a file before a later file was found
+    over it, and many files at the limit took minutes. A deleted file counts only in a commit with a file that the
+    rules read: its objects at HEAD are known to those rules. A YAML file with no render report counts nothing here,
+    as code reads its text by lines and writes no lines of it."""
+    read = any(data is not None for _path, data, _mode in files)
+
+    def written():
+        for path, data, _mode in files:
+            old, info = head_of(path)
+            if data is None and not read:
+                continue
+            if path.lower().endswith(".json"):
+                yield False, path, json_docs(path, data)
+                yield False, path, json_docs(path, old)
+            else:
+                yield False, path, info.get("after")
+                yield False, path, info.get("before")
+        for _uid, unit in sorted(((report or {}).get("units") or {}).items()):
+            for group in unit.get("changed") or [] if unit.get("ok") else []:
+                where = f"{unit_name(unit)}, rendered with {group['set']}: {group['object']}"
+                yield True, where, group["before"]
+                yield True, where, group["after"]
+    used, most = 0, TREE_TEXT // 2 ** 20
+    for render, where, docs in written():
+        if not isinstance(docs, list):
+            continue
+        size, why = tree_size(docs, TREE_TEXT - used)
+        if why:
+            return f"{where} has {why}, after the commit or at HEAD, which the door does not read"
+        used += size
+        if used > TREE_TEXT and render:
+            return (f"the objects that the commit's render changes have, with its files, more than {most} MB of lines "
+                    f"as code writes their keys and items out, before and after the commit, which the door does not "
+                    f"read at once: a person makes this commit outside the door")
+        if used > TREE_TEXT:
+            return (f"the commit's files have more than {most} MB of lines as code writes their keys and items out, "
+                    f"after the commit and at HEAD, which the door does not read at once: commit fewer files at a "
+                    f"time")
+    return None
 
 
 def as_block(value, depth=0):
@@ -1083,8 +1175,8 @@ LOOSE_WORDS = ("secretkeyref", "secretref", "secretname", "hostpath", "privilege
 
 
 TRUE_WORD = r"(?:true|yes|on|y)(?![a-z0-9])"
-LOOSE_KEYS = {"kind: role": keyed("kind", key_value(r"role(?![a-z0-9])", bare=True)),
-              "kind: application": keyed("kind", key_value(r"application(?![a-z0-9])", bare=True)),
+LOOSE_KEYS = {"kind: role": keyed("kind", key_value(r"role(?:list)?(?![a-z0-9])", bare=True)),
+              "kind: application": keyed("kind", key_value(r"application(?:list)?(?![a-z0-9])", bare=True)),
               "secret:": keyed(r"(?<![a-z0-9_./-])secret", BARE_END),
               # each key that ends so, as MANIFEST_REFUSED reads them: a word of LOOSE_WORDS is a whole word only
               "*secretkeyref:": keyed("secretkeyref", BARE_END, explicit=r"[\w.-]*?secretkeyref"),
@@ -1151,7 +1243,9 @@ def loose_counts(text):
         if low not in seen:
             bare = re.sub(r"[\"'{} \t]", "", low)
             anchors = set(ANCHOR.findall(low))
-            one = {w: len(re.findall(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", low)) for w in LOOSE_WORDS}
+            # a word with list after it too: a kind's List holds that kind (ClusterRoleList, ApplicationSetList)
+            one = {w: len(re.findall(r"(?<![a-z0-9])" + re.escape(w) + r"(?:list)?(?![a-z0-9])", low))
+                   for w in LOOSE_WORDS}
             one.update({w: len(aliased(pattern, bare, anchors)) for w, pattern in LOOSE_KEYS.items()})
             seen[low] = bare
             counts = {w: max(n, counts.get(w, 0)) for w, n in one.items()}
@@ -1188,7 +1282,7 @@ def manifest_keys(text):
     return max(len(MANIFEST_KEY.findall(bare)) for bare in loose_counts(text)[1])
 
 
-KIND_SECRET = re.compile(keyed("kind", key_value(r"secret(?![a-z0-9])", bare=True)))
+KIND_SECRET = re.compile(keyed("kind", key_value(r"secret(?:list)?(?![a-z0-9])", bare=True)))
 STRING_DATA = re.compile(keyed("stringdata", BARE_END))
 
 
@@ -1209,7 +1303,8 @@ def loose_secret(text):
     while left:
         value = left.pop()
         if isinstance(value, dict):
-            if any(k.lower() == "kind" and isinstance(v, str) and v.lower() == "secret" for k, v in value.items()):
+            if any(k.lower() == "kind" and isinstance(v, str) and v.lower() in ("secret", "secretlist")
+                   for k, v in value.items()):
                 return True
             left.extend(value.values())
         elif isinstance(value, list):
@@ -1217,19 +1312,20 @@ def loose_secret(text):
     return False
 
 
-def kept_back(path, data):
+def kept_back(path, data, read=None):
     """Why the filter of a read keeps one file of a GitOps repository back from every agent, or None: no Secret
     object leaves the door. The file as the patterns read it holds a Secret or a private key; or it is not block
     style, or has another name than .yaml, .yml or .json, and a loose reading of its text says that it may hold one;
-    or it is not UTF-8 text, where the filter sees nothing. The render box asks the same of each file that a chart
-    or a Kustomize folder can read (door_render.closed)."""
-    text, why = manifest_text(path, data)
+    or it is not UTF-8 text, where the filter sees nothing. The render box asks nothing of what a file holds: a unit
+    that can read a path that the door gives no agent is closed, by its paths alone (door_render.closed). read:
+    manifest_text(path, data), when the caller has it."""
+    text, why = manifest_text(path, data) if read is None else read
     if why:
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
             return "is not UTF-8 text, so it may hold a Secret that the filter cannot see: the filter keeps it back"
-    elif secret_object(text) or "-----BEGIN" in text:
+    elif secret_object(text) or any("-----begin" in low for low in loose_texts(text)):     # also with an escape
         return "holds a Secret, which the filter keeps back"
     # the loose reading too for a file with another name than .yaml, .yml or .json, which no reader reads by lines
     if (why or not manifest_name(path)) and \
@@ -1435,7 +1531,8 @@ def block_tree(text, strict=False):
     takes its last value, and a cluster's reader may take another or refuse the file, as in no_key_twice); a \\ in
     double quotes, a '' in single quotes, and a # with space before it in either (this reader takes no escape, and it
     cuts a comment inside the quotes too, so "ma\\x69n" is another name for it than for a cluster); a block scalar as
-    the value of a name or a namespace (its lines keep their spaces here, and not in YAML); and a document mark or an
+    the value of a name or a namespace (its lines keep their spaces here, and not in YAML); .inf or .nan, which this
+    reader reads as a text and YAML as a number that no JSON of a cluster holds; and a document mark or an
     end mark with space before it, outside a block scalar (this reader skips it, and YAML reads a text). A comment
     starts at a # at the start of a text or after one space or tab, and strip takes the spaces before it: a pattern with
     a run of spaces before its # reads a long run again from each of its places (a line of 1 MB took over an hour)."""
@@ -1449,6 +1546,8 @@ def block_tree(text, strict=False):
             if not quoted or re.search(r"\\|[ \t]#" if text[0] == '"' else r"''|[ \t]#", quoted.group()[1:-1]):
                 raise ValueError("a quoted text that the block reader reads in another way than YAML")
         text = re.sub(r"(?:^|[ \t])#.*$", "", text).strip(" \t")
+        if strict and re.fullmatch(r"[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)", text):
+            raise ValueError("YAML's infinity or not-a-number, which no object of a cluster holds")
         return text[1:-1] if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'" else text
     rows = []                   # [column, text, the lines of its block scalar or None]
     scalar = None               # (the column that its lines stand to the right of, its lines)
@@ -1631,6 +1730,10 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
     if op == "read":
         if len(args) != 1 or not args[0] or args[0].startswith("/") or ".." in args[0].split("/"):
             return refused("read takes one path of the repository", target=target)
+        if len(args[0]) > PATH_MOST:
+            return refused(f"the path has more than {PATH_MOST} characters", target=target)
+        if args[0].count("/") > FOLDERS_MOST:
+            return refused(f"the path has more than {FOLDERS_MOST} folders", target=target)
         why = gitops_path_refused(args[0], access)
         if why:
             return refused(why, target=target)
@@ -1662,6 +1765,10 @@ def decide_gitops(access, me, repo, op, args, content, lookups):
     files, message = commit_files(content)
     if files is None:
         return refused(message, target=target)
+    base = lookups.get("base_file")
+    if base:                    # each file at HEAD is one read of GitHub for the whole decision
+        at_base = {}
+        lookups = dict(lookups, base_file=lambda p: at_base[p] if p in at_base else at_base.setdefault(p, base(p)))
     # checks: the call waits for the runs that the commit's push starts, and the agent learns how they ended
     plan = {"repo": repo, "files": files, "message": message, "branch": entry.get("branch"), "checks": True}
     for path, data, mode in files:
@@ -1869,16 +1976,34 @@ def list_item(doc, item):
     return item
 
 
+DIFF_LINES = 2000            # changed lines of a side that change_words compares line by line
+
+
 def change_words(path, old, new):
     """The exact change of one file as the owner's card shows it: the lines that it loses (-) and gains (+), in their
-    order, OWNER_SHOWN of them at most, each cut to GEN_LINE characters, with the count of the others."""
+    order, OWNER_SHOWN of them at most, each cut to GEN_LINE characters, with the count of the others. Between the
+    lines that the two sides share at their start and their end, difflib compares the rest; with more than DIFF_LINES
+    lines on a side it compares nothing (it took 1.7 s on 8000 changed lines, and much longer on a file of 256 KB),
+    and the words give the first OWNER_SHOWN lines of each side with the counts."""
     if new is None:
         return f"{path} is deleted ({len((old or b'').splitlines())} lines at HEAD)"
     a = [] if old is None else old.decode("utf-8", "replace").splitlines()
     b = new.decode("utf-8", "replace").splitlines()
+    start = next((n for n, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+    end = next((n for n, (x, y) in enumerate(zip(reversed(a[start:]), reversed(b[start:]))) if x != y),
+               min(len(a), len(b)) - start)
+    a, b, size = a[start:len(a) - end], b[start:len(b) - end], len(a)
+
+    def said(line):
+        return line.strip()[:GEN_LINE] if line[1:].strip() else line[0]
+    if old is not None and max(len(a), len(b)) > DIFF_LINES:
+        shown = " | ".join(said(sign + line) for sign, side in (("-", a), ("+", b)) for line in side[:OWNER_SHOWN])
+        more = len(a) + len(b) - min(len(a), OWNER_SHOWN) - min(len(b), OWNER_SHOWN)
+        return (f"{path} changes {len(a)} of its {size} lines at HEAD into {len(b)} lines, too many to compare one "
+                f"by one; the first of each side: {shown} | and {more} lines more")
     lines = [line for line in list(difflib.unified_diff(a, b, n=0, lineterm=""))[2:] if not line.startswith("@@")]
     gained = sum(1 for line in lines if line.startswith("+"))
-    shown = " | ".join(line.strip()[:GEN_LINE] if line[1:].strip() else line[0] for line in lines[:OWNER_SHOWN])
+    shown = " | ".join(said(line) for line in lines[:OWNER_SHOWN])
     more = len(lines) - OWNER_SHOWN
     return (f"{path} is new ({gained} lines)" if old is None else
             f"{path} loses {len(lines) - gained} lines and gains {gained}") + \
@@ -2882,20 +3007,29 @@ def head_key(o):
         name if isinstance(name, str) and name else ("generateName", stem)
 
 
+VERSIONS_MOST = 16          # versions at HEAD of one object in one place that the rule reads (at_head)
+
+
 def at_head(before):
-    "{(key, namespace): [object]} of the objects at HEAD, [(object, namespace)]."
+    """{(key, namespace): [object]} of the objects at HEAD, [(object, namespace)], each version once (an object equal
+    to one before it adds nothing), and VERSIONS_MOST + 1 of them at most: the rule reads each object after the commit
+    against each version of it at HEAD, and 2000 versions of one name took 7.5 s, so secret_rule refuses more than
+    VERSIONS_MOST. Each object is compared with the kept versions of its own key only, and nothing is written out."""
     out = {}
     for o, ns in before:
         key = head_key(o)
         if key:
-            out.setdefault((key, ns), []).append(o)
+            versions = out.setdefault((key, ns), [])
+            if len(versions) <= VERSIONS_MOST and all(v != o for v in versions):
+                versions.append(o)
     return out
 
 
-def held_objects(before, after, rendered=None):
+def held_objects(before, after, rendered=None, heads=None):
     """[(form, object, new)]: each object after the commit that the door holds (held_kind) and that is new, or that
-    changes from a version at HEAD outside what is free (held_change). before, after: [(object, namespace)]."""
-    heads, out = at_head(before), []
+    changes from a version at HEAD outside what is free (held_change). before, after: [(object, namespace)]; heads:
+    at_head(before), when the caller has it."""
+    heads, out = at_head(before) if heads is None else heads, []
     for o, ns in after:
         form = held_kind(o)
         if form:
@@ -2914,8 +3048,29 @@ def object_words(o):
         (shown(name) if name else f"{shown(meta.get('generateName'))}*")
 
 
+def rule_known(pool, present):
+    """The references that an object of a kind in a namespace holds at HEAD, by which another one is known
+    (secret_rule's pool and after_all): for KNOWN_OTHERS, and for every kind whose object is gone after the commit.
+    present: the (head_key, namespace) of each object after the commit."""
+    return {(kind_of(h), ns, f["form"], json.dumps(f["name"], sort_keys=True, default=str))
+            for h, ns in pool if kind_of(h) in KNOWN_OTHERS or (head_key(h), ns) not in present
+            for f in secret_facts(h, ns) if not f["pod"]}
+
+
+def kind_of(o):
+    return o["apiVersion"].rpartition("/")[0].lower(), o["kind"].lower()
+
+
+def rule_basis(before, pool=None, after_all=None):
+    """What secret_rule reads of the objects at HEAD of a whole commit, once for it: their versions (at_head) and the
+    references known by kind and namespace (rule_known). Read again for each file of a commit, the objects at HEAD of
+    200 files took 7.7 s, and 18 s with a copy of each written out."""
+    present = {(head_key(o), ns) for o, ns in after_all or [] if head_key(o)}
+    return {"heads": at_head(before), "known": rule_known(before if pool is None else pool, present)}
+
+
 def secret_rule(before, after, where, named=True, pool=None, words=None, card_at=None, after_all=None,
-                rendered=None):
+                rendered=None, basis=None):
     """The rule of references to Secrets on the objects of one place (A2 to A6). before: [(object, namespace)] at HEAD;
     after: [(object, namespace)] after the commit. where: the place, as the words name it. named: False for a render,
     whose objects the words never name, and whose Secret and key they name only where it is one of words, the words
@@ -2924,21 +3079,20 @@ def secret_rule(before, after, where, named=True, pool=None, words=None, card_at
     in the same place holds it at HEAD; for every kind, when the one that holds it at HEAD is gone from after_all, the
     commit's objects after it (after, when None): a renamed object, and no copy. rendered(source, object): the test
     of an Application's source whose chart a unit rendered whole with that object's own values (rendered_by), for the
-    objects of a file of the commit only. (why or None, [(form, words)] of each new
-    reference of a pod, which is the owner's to decide)."""
-    for form, o, new in held_objects(before, after, rendered):
+    objects of a file of the commit only. basis: rule_basis(before, pool, after_all), when the caller has it. (why or
+    None, [(form, words)] of each new reference of a pod, which is the owner's to decide)."""
+    if basis is None:
+        basis = rule_basis(before, pool, after if after_all is None else after_all)
+    heads = basis["heads"]
+    if any(len(versions) > VERSIONS_MOST for versions in heads.values()):
+        return (f"{where}: an object of the same kind, namespace and name is there in more than {VERSIONS_MOST} "
+                f"versions at HEAD, which the door does not read: a person changes those files outside the door"), []
+    for form, o, new in held_objects(before, after, rendered, heads):
         if new:
             return f"{where}: {form}" + ("" if named else ", more than at HEAD") + ", which no commit passes", []
         return (f"{where}: {form}: a change of {object_words(o) if named else 'the object'} at HEAD, which no commit "
                 f"passes", [])
-    def kind_of(o):
-        return o["apiVersion"].rpartition("/")[0].lower(), o["kind"].lower()
-    present = {(head_key(o), ns) for o, ns in (after if after_all is None else after_all) if head_key(o)}
-    known_others = {(kind_of(h), ns, f["form"], json.dumps(f["name"], sort_keys=True, default=str))
-                    for h, ns in (before if pool is None else pool)
-                    if kind_of(h) in KNOWN_OTHERS or (head_key(h), ns) not in present
-                    for f in secret_facts(h, ns) if not f["pod"]}
-    heads, cards, words = at_head(before), [], words or set()
+    known_others, cards, words = basis["known"], [], words or set()
     for o, ns in after:
         old = heads.get((head_key(o), ns), []) if head_key(o) else []
         if old and all(h == o for h in old):
@@ -3071,7 +3225,7 @@ def render_refusal(report, words=None):
 
         def token(o):
             return namespace_token(o, given, uid, uid)
-        pools, afters = {}, {}
+        pools, afters, known = {}, {}, {}
         for group in unit["changed"]:
             pools.setdefault(group["set"], []).extend((o, token(o)) for o in objects_in(group["before"]))
             afters.setdefault(group["set"], []).extend((o, token(o)) for o in objects_in(group["after"]))
@@ -3087,10 +3241,13 @@ def render_refusal(report, words=None):
                    for o in after):
                 return f"{what} is a new or a changed Secret object, which no commit passes", []
             closed = unit.get("closed")
-            why, found = secret_rule([(o, token(o)) for o in objects_in(before)],
-                                     [(o, token(o)) for o in objects_in(after)], what, named=False,
-                                     pool=pools[group["set"]], words=None if closed else words, card_at=where,
-                                     after_all=afters[group["set"]])
+            if group["set"] not in known:       # once for each value set: for each group, 4000 of them took 13.7 s
+                known[group["set"]] = rule_known(pools[group["set"]], {
+                    (head_key(o), ns) for o, ns in afters[group["set"]] if head_key(o)})
+            olds = [(o, token(o)) for o in objects_in(before)]
+            why, found = secret_rule(olds, [(o, token(o)) for o in objects_in(after)], what, named=False,
+                                     words=None if closed else words, card_at=where,
+                                     basis={"heads": at_head(olds), "known": known[group["set"]]})
             if why:
                 return why, []
             if found and closed:    # the door widens nothing in a unit that can read what it gives no agent
@@ -3164,12 +3321,15 @@ def gitops_files(lookups, op, target, plan, files, report):
         return names | ({None, "", "HEAD"} if not plan.get("branch") or plan["branch"] == default else set())
     rendered = rendered_by(report, target.partition(":")[2], revisions)
 
+    heads_read = {}
+
     def head_of(path):
-        "(the file at HEAD or None, its entry in the report)"
-        info = report["files"].get(path) or {} if report else {}
-        if report:
-            return (None if info.get("head") is None else base64.b64decode(info["head"])), info
-        return (lookups.get("base_file") or (lambda p: None))(path), info
+        "(the file at HEAD or None, its entry in the report), read once for each commit (each is a read of GitHub)"
+        if path not in heads_read:
+            info = report["files"].get(path) or {} if report else {}
+            heads_read[path] = ((None if info.get("head") is None else base64.b64decode(info["head"])), info) \
+                if report else ((lookups.get("base_file") or (lambda p: None))(path), info)
+        return heads_read[path]
 
     def namespaced(docs, path):
         """[(object, namespace token)] of documents of one path (namespace_token): the place is the root of the
@@ -3185,6 +3345,9 @@ def gitops_files(lookups, op, target, plan, files, report):
         "True when the documents of the box's reading of a YAML file are what a cluster applies, as parsed below."
         units = [report["units"][u] for u in info.get("units") or []]
         return not units or all(u.get("ok") and not u.get("closed") for u in units)
+    why = commit_tree_refusal(files, head_of, report)
+    if why:
+        return refused(why, target=target)
     # The objects at HEAD of every file of the commit, so that an object that moves from one file to another is found
     # (A2), and one that moves to a folder of another namespace is a new object there.
     before_all, after_all = [], []
@@ -3199,7 +3362,7 @@ def gitops_files(lookups, op, target, plan, files, report):
             read = json_docs(path, data) if path.lower().endswith(".json") else \
                 after if isinstance(after, list) and trusted(info) and all(isinstance(d, dict) for d in after) else None
             after_all += namespaced(docs if read is None else read, path)
-    own, cards = None, []
+    own, cards, basis = None, [], None
     for path, data, mode in files:
         if data is None:
             own = own or f"{path} is deleted"
@@ -3223,13 +3386,6 @@ def gitops_files(lookups, op, target, plan, files, report):
                           "")
         # ArgoCD runs a jsonnet file of a folder that it applies file by file, and no render of a chart shows it
         runs = path.lower().endswith((".jsonnet", ".libsonnet"))
-        # the documents that code writes out as lines below, after the commit and at HEAD
-        written = [json_docs(path, data), json_docs(path, old)] if path.lower().endswith(".json") else \
-            [docs, info.get("before")]
-        why = next((w for w in (tree_limit(d) for d in written if isinstance(d, list)) if w), None)
-        if why:
-            return refused(f"{path} has {why}, after the commit or at HEAD, which the door does not read",
-                           target=target)
         loose_yaml = block = lines = False
         text = None                 # None: nothing applies this file as it is, and only its render says what it does
         if loose_read(path, data, old) and parsed is None and (not whole or runs or (yaml_name and docs is None)):
@@ -3282,8 +3438,10 @@ def gitops_files(lookups, op, target, plan, files, report):
             if secret_object(text) if block else SECRET_KIND.search(text):
                 return refused(f"{path} holds a Secret object", target=target)
             if reading and reading[0] is not None:
+                basis = basis or rule_basis(before_all, None, after_all)       # once for the commit
                 why, found = secret_rule(before_all, namespaced(reading[0], path), path, after_all=after_all,
-                                         rendered=lambda source, o, path=path: rendered(source, app_key(path, o)))
+                                         rendered=lambda source, o, path=path: rendered(source, app_key(path, o)),
+                                         basis=basis)
                 if why:
                     return refused(why, target=target)
                 cards += [card for _form, card in found]

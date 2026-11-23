@@ -257,7 +257,7 @@ class Finding(Base):
     def test_it_names_the_agent_by_its_role_the_keys_by_name_and_the_boxes(self):
         hub.settings_check()
         text = self.reports()[0]["text"]
-        self.assertTrue(text.startswith("Developer reads 2 API keys in its sessions (ACME_API_KEY, SHOP_API_KEY), and "
+        self.assertTrue(text.startswith("Dev-Lead reads 2 API keys in its sessions (ACME_API_KEY, SHOP_API_KEY), and "
                                         "it has a shell and the web (Tools: Shell, Web). A text from outside, a web "
                                         "page for example, can then make it send a key to another place."), text)
         self.assertNotIn("dev-lead", text)                      # the name is in `about`, a field
@@ -272,10 +272,10 @@ class Finding(Base):
         self.assertIn(" The choice is the owner's: put these three options on your weekly list. (1) ", text)
         one, two, three = text.split(" (1) ")[1].split(" (2) ")[0], text.split(" (2) ")[1].split(" (3) ")[0], \
             text.split(" (3) ")[1]
-        self.assertEqual(one, "Change the grant of each key from read to use: the vault keeps the key, and Developer "
+        self.assertEqual(one, "Change the grant of each key from read to use: the vault keeps the key, and Dev-Lead "
                               "calls the service with call_api. Cost: each command or saved check that reads the key "
                               "from its variable fails until somebody changes it. To undo: give read again.")
-        self.assertEqual(two, "Set Web off for Developer. Cost: its start no longer tells it that it has the web. With "
+        self.assertEqual(two, "Set Web off for Dev-Lead. Cost: its start no longer tells it that it has the web. With "
                               "Shell on, Web off removes no tool from its sessions. Its shell still reaches the "
                               "internet, so most of the risk stays. To undo: set it on again.")
         # the manager closes it as noted only on the owner's word, and reads what the hub does then
@@ -287,19 +287,19 @@ class Finding(Base):
         self.assertIn("reads 1 API key in its sessions (ACME_API_KEY)", both)
         self.assertIn("(Tools: Shell, Web, Browser)", both)
         self.assertIn("(1) Change the grant of the key from read to use", both)
-        self.assertIn("(2) Set Web and Browser off for Developer. Cost: its start no longer tells it that it has the "
+        self.assertIn("(2) Set Web and Browser off for Dev-Lead. Cost: its start no longer tells it that it has the "
                       "web, and it takes no browser task. With Shell on, Web off removes no tool from its sessions. Its "
                       "shell still reaches the internet, so most of the risk stays. To undo: set them on again. (3)",
                       both)
         browser = hub.settings_words("dev-lead", ["ACME_API_KEY"], ["browser"])
-        self.assertIn("(2) Set Browser off for Developer. Cost: it takes no browser task. Its shell still reaches the "
+        self.assertIn("(2) Set Browser off for Dev-Lead. Cost: it takes no browser task. Its shell still reaches the "
                       "internet, so most of the risk stays. To undo: set it on again. (3)", browser)
         self.assertNotIn("Web off", browser)
 
     def test_an_agent_with_no_tools_list_gets_words_that_are_true_of_it(self):
         bare = hub.settings_words("dev-lead", ["ACME_API_KEY"], None)
         self.assertIn("(it has no Tools list, so its sessions have both)", bare)
-        self.assertIn("(2) Give Developer a Tools list with Shell on and Web off. Cost: none. With Shell on, Web off "
+        self.assertIn("(2) Give Dev-Lead a Tools list with Shell on and Web off. Cost: none. With Shell on, Web off "
                       "removes no tool from its sessions.", bare)
         self.assertIn("To undo: set Web on again. (3)", bare)
         del self.agent()["title"]                               # an agent with no role is named by its name
@@ -356,20 +356,20 @@ class Finding(Base):
         one = self.words({KEY_A: "read", KEY_D: "read"})
         self.assertIn(f"{place} Only ACME_API_KEY fits the next option: a use grant needs the https site of the key on "
                       f"its login. The choice is the owner's: put these three options on your weekly list. (1) Change "
-                      f"the grant of that key from read to use: the vault keeps the key, and Developer calls", one)
+                      f"the grant of that key from read to use: the vault keeps the key, and Dev-Lead calls", one)
         two = self.words({KEY_A: "read", KEY_B: "read", KEY_D: "read", KEY_E: "read"})
         self.assertIn(f"{place} Only ACME_API_KEY, SHOP_API_KEY fit the next option: a use grant needs the https site "
                       f"of the key on its login. The choice", two)
         self.assertIn("(1) Change the grant of those keys from read to use: the vault", two)
         for text in (each, one, two):
-            self.assertIn(" (2) Set Web off for Developer.", text)
+            self.assertIn(" (2) Set Web off for Dev-Lead.", text)
 
     def test_the_words_say_plainly_when_no_option_takes_a_key_out_of_the_sessions(self):
         none = self.words({KEY_D: "read", KEY_E: "read"})
         self.assertTrue(none.endswith(
             "can then make it send a key to another place. Nothing takes a key out of its sessions now: a use grant "
             "needs the https site of the key on its login, and none of these logins names one. The choice is the "
-            "owner's: put these two options on your weekly list. (1) Set Web off for Developer. Cost: its start no "
+            "owner's: put these two options on your weekly list. (1) Set Web off for Dev-Lead. Cost: its start no "
             "longer tells it that it has the web. With Shell on, Web off removes no tool from its sessions. Its shell "
             "still reaches the internet, so most of the risk stays. To undo: set it on again. (2) Leave it as it is. "
             "Cost: the risk stays. When the owner chooses this, decide this report as noted. The hub makes no second "
@@ -464,17 +464,23 @@ class Finding(Base):
         self.assertIsNone(hub.settings_junction("dev-lead"))    # each key is a placeholder: no case
         text = self.words({KEY_A: "read", KEY_D: "read"}, servers=swaps)
         self.assertTrue(text.startswith(
-            "Developer reads 1 API key in its sessions (DB_READ_PASSWORD), and it has a shell and the web (Tools: "
+            "Dev-Lead reads 1 API key in its sessions (DB_READ_PASSWORD), and it has a shell and the web (Tools: "
             "Shell, Web). 1 more key is not in its sessions: the vault of its server swaps it, so a session holds a "
             "placeholder (ACME_API_KEY). A text from outside, a web page for example, can then make it send a key to "
             "another place. Nothing takes a key out of its sessions now: a use grant and the key swap need the https "
             "site of the key on its login, and this login names none. The choice is the owner's: put these two "
-            "options on your weekly list. (1) Set Web off for Developer."), text)
+            "options on your weekly list. (1) Set Web off for Dev-Lead."), text)
         self.assertNotIn("Switch the key swap", text)
 
     def long_team(self, sites, kind="linux", swap=False, can=("shell", "web", "browser"), mcp=0, role="worker"):
         """dev-lead with the longest role, server name and 40 key names that team.json takes. sites: which of the
-        keys have a site. mcp: how many of those an MCP server names, so that they do not swap."""
+        keys have a site. mcp: how many of those an MCP server names, so that they do not swap. Since F16 the words
+        name an agent by its name, and by its role only where one word of the role is the name: so the longest name
+        of an agent in the words is a role of 60 characters, which dev-lead (a name with a hyphen) cannot hold, and
+        these cases lend its role to it."""
+        real = hub.shown_role
+        self.enterContext(patch.object(hub, "shown_role", lambda name: (hub.agents().get(name) or {}).get("title")
+                                       or real(name)))
         server, keys = "a" + "b" * 30, [f"K{n:02d}_" + "A" * 56 for n in range(40)]
         refs = [f"bws://11111111-2222-4333-8444-5555555555{n:02d}" for n in range(40)]
         hub.TEAM["logins"] = {ref: dict({"title": f"K{n:02d}", "kind": "api_key", "env": keys[n]},
@@ -634,20 +640,22 @@ class States(Base):
         self.assertEqual(self.open(), [1])
         self.assertEqual((self.mark("builder")["report"], self.mark("dev-lead")), (1, None))
         self.assertEqual(self.reports()[0]["about"], "builder")         # the open finding names it as it is named now
+        self.assertTrue(self.reports()[0]["text"].startswith("Builder reads 2 API keys"), self.reports()[0]["text"])
 
-    def test_an_open_finding_follows_a_new_role_and_a_decided_one_stays_as_it_was_read(self):
+    def test_an_open_finding_follows_a_new_name_and_a_decided_one_stays_as_it_was_read(self):
+        """The words name the agent as the apps do (shown_role): by its name, so a new role beside it changes no word
+        (F16), and a rename gives an open finding the new name, but not a decided one."""
         hub.settings_check()
         self.agent()["title"] = "Backend Developer"
         self.assertEqual(hub.settings_check(), [])
         (row,) = self.reports()
-        self.assertTrue(row["text"].startswith("Backend Developer reads 2 API keys in its sessions"), row["text"])
-        self.assertIn("(2) Set Web off for Backend Developer.", row["text"])
+        self.assertTrue(row["text"].startswith("Dev-Lead reads 2 API keys in its sessions"), row["text"])
+        self.assertIn("(2) Set Web off for Dev-Lead.", row["text"])
         self.assertEqual((row["about"], row["decided"]), ("dev-lead", None))
-        del self.agent()["title"]                               # with no role, the words name it by its name
-        hub.settings_check()
-        self.assertTrue(self.reports()[0]["text"].startswith("Dev-Lead reads 2 API keys"))
         self.manager("decide_report", report_id="UP-1", decision="noted", note="the owner accepts it")
-        self.agent()["title"] = "Developer"
+        with hub.transaction():
+            hub.rename_rows("dev-lead", "builder", hub.now())
+        hub.TEAM = hub.renamed_team(hub.TEAM, "dev-lead", "builder")
         self.assertEqual(hub.settings_check(), [])
         self.assertTrue(self.reports()[0]["text"].startswith("Dev-Lead reads 2 API keys"))
 
@@ -684,7 +692,7 @@ class Manager(Base):
         hub.settings_check()
         self.clock += 120
         team = self.manager("see_team").split("PROPOSALS FOR THE OWNER")[1].split("\n\n")[0]
-        self.assertIn("  UP-1 [proposal] from hub, about dev-lead, 2m ago: Developer reads 2 API keys", team)
+        self.assertIn("  UP-1 [proposal] from hub, about dev-lead, 2m ago: Dev-Lead reads 2 API keys", team)
         self.assertIn("The hub makes no second finding while these settings stay.", team)      # its last words
         self.assertNotIn("...", team)
         brief = "\n".join(hub.resume_lines(hub.now()))
@@ -739,7 +747,7 @@ class Manager(Base):
         hub.settings_check()
         (record,) = hub.history_report(hub.q1("SELECT * FROM reports"))
         self.assertEqual((record["agent"], record["person"], record["ref"]), ("manager", "hub", "UP-1"))
-        self.assertTrue(record["text"].startswith("UP-1 hub to manager, proposal about dev-lead: Developer reads 2 "))
+        self.assertTrue(record["text"].startswith("UP-1 hub to manager, proposal about dev-lead: Dev-Lead reads 2 "))
         self.assertIsNotNone(hub.HISTORY_HEADS["report"].match(record["text"]))
 
 

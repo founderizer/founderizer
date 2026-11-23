@@ -272,7 +272,10 @@ class Sender(PushCase):
 
     def test_the_banner_names_the_agent_that_asks(self):
         """T-39: the banner's title is the asking agent as the apps name it, over its question; "Needs you" only
-        for an item that names no agent. Now inside the sealed part, which the phone shows."""
+        for an item that names no agent. Now inside the sealed part, which the phone shows. F16: by its name, also for
+        an agent with a role. Bug: the banner says the role again."""
+        hub.TEAM["agents"]["atlas"] = {"role": "worker", "runtime": "claude", "machine": "hub",
+                                       "title": "Customer Support"}
         need = {"id": 7, "title": "May I restart the production database tonight at 23:00?", "by": "atlas",
                 "options": None}
         self.assertEqual({k: v for k, v in self.opened(hub.ping_payload(need, "g", SEAL)).items()
@@ -312,6 +315,7 @@ class Sender(PushCase):
         card and closes it before the owner has read the reply. Bug: the reply rang with the card's own ping, whose
         buttons answer the card and which said nothing of a reply."""
         self.give(self.enrolled(), seal=SEAL)
+        hub.TEAM["agents"]["manager"]["title"] = "Customer Support"        # F16: the reply says the name, not the role
         nid = self.raise_item(options=["Pay €12 now", "Not this year"])
         self.sent()
         self.assertIn("options", self.opened(self.side.got[0]["body"]["payload"]))     # the card's own ring
@@ -348,12 +352,31 @@ class Sender(PushCase):
         self.assertEqual(len(said["body"]), hub.PUSH_TEXT)
 
     def test_an_item_answered_before_the_ping_goes_gets_none(self):
-        self.give(self.enrolled())
+        """And a reply of the manager's under a card that closed before its ping went gets none either, but for the
+        close whose reason is that reply (withdraw_need after the owner's message, owner API 1.316): that one rings.
+        Bug: the sender drops the ring of the close that answers his message, because its card is answered, or rings
+        an older reply of a card that closed with no word to him."""
+        self.give(self.enrolled(), seal=SEAL)
         nid = self.raise_item()
         hub.q("UPDATE needs SET answer='done', answered=? WHERE id=?", (hub.now(), nid))
         ping = self.sent()
         self.assertEqual(ping["state"], "skipped")
         self.assertEqual(self.side.got, [])
+        later = self.raise_item("Renew the domain?")
+        self.sent()
+        hub.need_talk_said({"need": later, "text": "For how long?"})
+        hub.t_discuss_need("manager", {"need": f"N-{later}", "text": "One year, as before."})
+        hub.t_withdraw_need("manager", {"need": f"N-{later}", "why": "The domain renews by itself."})
+        self.assertEqual(self.sent()["state"], "skipped")       # the reply's ring: its card closed with no word to him
+        closed = self.raise_item("Pay for the DataFast key?")
+        self.sent()
+        hub.need_talk_said({"need": closed, "text": "we're no longer using datafast"})
+        hub.t_withdraw_need("manager", {"need": f"N-{closed}", "why": "DataFast is out of the site."})
+        ping = self.sent()
+        self.assertEqual((ping["kind"], ping["state"]), ("talk", "sent"))
+        self.assertEqual(self.opened(self.side.got[-1]["body"]["payload"]),
+                         {"need": closed, "db": "test-generation", "body": "DataFast is out of the site.",
+                          "title": "Manager replied about: Pay for the DataFast key?"})
 
     def test_a_token_that_apple_calls_gone_is_dropped(self):
         self.give(self.enrolled())
