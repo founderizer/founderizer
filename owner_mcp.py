@@ -349,7 +349,8 @@ NOT_TOOLS = {
     "/ui/connect/{}/revoke": "the end of a connected app's connection; connected apps are not in this release",
     "/ui/connect/settings": "connected apps on or off; connected apps are not in this release",
     "/ui/error-reports": "the owner's consent to send error reports to Founderizer's developers, which only the owner "
-                         "gives, with the switch of Settings › General in the app, and never an agent (the owner's "
+                         "gives, with the switch Settings › Help › Help improve Founderizer or the first page of the "
+                         "setup in the app, and never an agent (the owner's "
                          "yes of 16 November 2026, feedback-diagnostics-plan.md Phase 3)",
 }
 

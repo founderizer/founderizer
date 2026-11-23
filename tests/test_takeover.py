@@ -151,6 +151,35 @@ class Answer(Fixture):
         self.assertFalse(self.ask(self.tid)[1])
         self.nid = hub.q1("SELECT id FROM needs")["id"]
 
+    def fresh(self):
+        """Its helper found the session cold and asks for a fresh start (plan P9.10)."""
+        return self.request(f"/helper/fresh/ivy/{hub.tref(self.tid)}",
+                            {"attempt": 1, "why": "its cache is cold after 76 quiet minutes"})
+
+    def test_its_session_does_not_start_fresh_before_it_read_the_owners_answer(self):
+        """A session that waited on its take-over went cold, its helper asked for a fresh start, and the new attempt
+        lost the session that the owner's answer was for. The request, and the answer that it has not read, keep it;
+        once it read the answer, a cold one may start fresh again."""
+        held = (409, {"error": "its request for a take-over waits for the owner's answer"})
+        self.assertEqual(self.fresh(), held)
+        self.assertEqual(self.answer(self.nid, answer="Done")[0], 200)
+        self.assertEqual(self.fresh(), held)
+        self.assertEqual(hub.q1("SELECT attempt FROM tasks WHERE id=?", (self.tid,))["attempt"], 1)
+        text, err = hub.call_tool("ivy", "read_messages", {}, ("test-generation", f"T-{self.tid}", "1"))
+        self.assertFalse(err, text)
+        self.assertEqual(self.fresh(), (200, {"attempt": 2}))
+
+    def test_an_answer_on_the_board_keeps_it_too(self):
+        self.assertEqual(self.board(self.nid, "Done on the board"), 303)
+        self.assertEqual(self.fresh()[0], 409)
+        self.assertFalse(hub.call_tool("ivy", "read_messages", {}, ("test-generation", f"T-{self.tid}", "1"))[1])
+        self.assertEqual(self.fresh(), (200, {"attempt": 2}))
+
+    def test_the_hubs_own_recoveries_are_not_held(self):
+        """The hold is the helper's fresh start only: fresh_refusal serves the hub's recoveries as well."""
+        t = hub.q1("SELECT * FROM tasks WHERE id=?", (self.tid,))
+        self.assertNotIn("take-over", hub.fresh_refusal(t, 1) or "")
+
     def test_his_quick_reply_reaches_the_tasks_session_and_the_task_works_again(self):
         code, body = self.answer(self.nid, answer="Done")
         self.assertEqual(code, 200, body)

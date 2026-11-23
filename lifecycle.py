@@ -524,6 +524,9 @@ def web_hosts(value):
 #                     such an agent gets the download line
 #   plan_lines        the task's own line for its plan (hub.plan_line): {"open": the line of an open session,
 #                     "closed": a closed session's, or None}, or None for a runtime with no task list
+#   account_refusals  the codes of its session records (threads.Translator) by which its provider refuses the
+#                     account that the machine is signed in with, while the machine's own reading says "signed in":
+#                     the hub holds the agent for a sign-in (hub.account_refused); () where none is known
 #   cache_seconds     how long the provider keeps a session's prompt cache after its last model call, as far as
 #                     the fleet knows; a session told of a message later than that reads its whole context again at
 #                     the price of writing it (plan P9.10, session_reuse). A session's own records can say less (a
@@ -652,6 +655,7 @@ RUNTIMES = {
         "memory_off": {"config": {"features.memories": False}},
         # the task's own line for its plan (hub.plan_line): its update_plan; a closed session has none
         "plan_lines": {"open": " Keep the plan of a task of more than two steps with update_plan.", "closed": None},
+        "account_refusals": (),
         "acp_auth": None, "acp_quiet": None, "acp_models": None, "acp_allowance": None, "key_env": None,
         "own_env": None, "pinned": False, "continues": True, "acp_adapter": None,
     },
@@ -745,6 +749,9 @@ RUNTIMES = {
                                "and TaskUpdate with ToolSearch \"select:TaskCreate,TaskUpdate\".",
                        "closed": " If TaskCreate is among your tools, keep the plan of a task of more than two steps "
                                  "there."},
+        # 403 "Your organization has disabled Claude subscription access for Claude Code", read in the transcripts of a
+        # Claude Team seat on 23 November 2026 (its row's "error"; apiErrorCode oauth_not_allowed_for_organization)
+        "account_refusals": ("oauth_org_not_allowed",),
         "acp_auth": None, "acp_quiet": None, "acp_models": None, "acp_allowance": None, "key_env": None,
         "own_env": None, "pinned": False, "continues": True, "acp_adapter": None,
     },
@@ -795,6 +802,7 @@ RUNTIMES = {
         # managed remote setting. GROK_MEMORY=0 turns it off for the whole process, whatever the others say.
         "memory_off": {"env": {"GROK_MEMORY": "0"}},
         "plan_lines": None,     # no task list that a task session is told of
+        "account_refusals": (),
         # It names "xai.api_key" in its initialize answer only while it has a key, and "cached_token" only while a
         # sign-in is stored.
         "acp_auth": {"plan": "cached_token", "key": "xai.api_key"},
@@ -854,6 +862,7 @@ RUNTIMES = {
         "token_weights": None,
         "memory_off": {"env": {}},      # the program has no memory of its own to switch off
         "plan_lines": None,     # no task list that a task session is told of
+        "account_refusals": (),
         "acp_auth": None,               # its one method, opencode-login, does nothing: the key is in its configuration
         # The working folder's configuration and its .opencode folder, each AGENTS.md from the working folder to the
         # home folder, Claude Code's skills, its own update, and the address of its model catalog. ~/.agents/skills/
@@ -880,7 +889,7 @@ RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manage
                  "compact_tokens", "routine", "default_model", "task_denied", "task_allowed", "conversation_denied",
                  "manager_denied", "task_opening", "starts_idle", "token_weights", "memory_off",
                  "acp_auth", "acp_quiet", "acp_models", "acp_allowance", "key_env", "own_env", "pinned", "continues",
-                 "acp_adapter", "own_hosts", "tool_pictures", "plan_lines")
+                 "acp_adapter", "own_hosts", "tool_pictures", "plan_lines", "account_refusals")
 
 
 # The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":

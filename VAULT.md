@@ -69,6 +69,18 @@ The vault protects the value of each secret. The design gives these results:
   That key comes to the Mac over the owner's SSH connection, which accepts only a known host key. The machine's name,
   and its address when the Mac has no saved connection to it, come from the hub. The app seals only while the hub names
   the same key (`Sources/FleetCore/CentralVault.swift`, `Sources/Founderizer/CentralVaultSection.swift`).
+  **Who the Mac logs in as, and where.** A root step logs in as root, or as the user of a connection that this Mac
+  keeps from its own install. It never takes another user from the hub's record of a server, because that user's own
+  files can answer in root's place (`Sources/FleetCore/ServerRecords.swift`). A server counts as a Mac, whose vault the
+  app reads as the user of its agents, only when the hub calls it a Mac and this Mac's own Tailscale reports its system
+  as macOS too; each other server is read as root. The hub's own machine must be the Tailscale device that this Mac
+  reaches at its hub address, by its node ID or its whole name. A first host key is taken only at port 22 or at a port
+  that the owner typed (`Sources/FleetCore/MachineInstall.swift`, `Sources/FleetCore/MacNetwork.swift`,
+  `Sources/Founderizer/CentralVaultSection.swift`).
+  **Only the owner's Set up and a first install write the pin.** An install or an update that prints another key
+  stops, and the pin stays.
+  **A limit:** a hub address that is a name outside the private network is no Tailscale device, so the central vault's
+  install and update stop on such a fleet, until the owner gives the hub's address on the private network.
 - With the sealed copy, the hub gets the secret's name, its catalog entry and salted SHA-256 fingerprints of the value
   (`Sources/Founderizer/SecretEntryView.swift`). An import sends these for all its items in one command, and the hub
   puts them into the catalog with one commit (`Sources/Founderizer/SecretImportView.swift`, `hub.py`). A title that

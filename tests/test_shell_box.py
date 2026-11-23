@@ -1911,6 +1911,33 @@ class Reports(Cases):
         self.assertIsNone(start)
         self.assertNotIn("Shell box", text)
 
+    def test_a_report_counts_the_kpi_of_the_agent_whose_duty_gets_it_at_once(self):
+        """KPIs version 2 (plan 4.3, 4.8): a typed report counts again, at once, each KPI of the receiving duty's agent
+        that the hub measures from its reports. Protects against a value that waits for the daily pass, which the
+        owner's "the value needs to show immediately" of 22 November 2026 rules out."""
+        hub.TEAM["settings"]["kpis"] = True
+        _, lead = Fleet.task(self, "lead")
+        text, error = hub.call_tool("lead", "set_kpi", {
+            "agent": "ops", "name": "Defects that come back", "direction": "at_most", "number": 20, "unit": "%",
+            "words": "Of the tickets reported to the duty, at most 20% come back within 14 days, over 7 days.",
+            "metric": "reports_came_back", "task_id": lead[1]}, lead)
+        self.assertFalse(error, text)
+        kpi = hub.q1("SELECT * FROM standing WHERE kind='kpi'")
+        text, error = hub.call_tool("lead", "set_kpi", {"id": hub.iref(kpi["id"]), "check": "hub:reports_came_back",
+                                                        "how": "The hub's typed reports to the duty of ops.",
+                                                        "task_id": lead[1]}, lead)
+        self.assertFalse(error, text)
+        with patch.object(hub, "CASE_POOL", 5):         # five sessions at once: five tickets, the measure's least
+            self.once([f"T-9{n} message" for n in range(5)])
+        points = lambda: [p["value"] for p in hub.q("SELECT value FROM kpi_points WHERE item=? AND backfill=0",
+                                                    (kpi["id"],))]
+        for n, task in enumerate(self.tasks()):
+            self.assertEqual(points(), [], n)               # fewer than five tickets: no value
+            text, error = self.report(task, symptom="wrong_price", component="price_update")
+            self.assertFalse(error, text)
+        self.assertEqual((len(self.tasks()), len(self.reports())), (5, 5))
+        self.assertEqual(points(), [0.0])
+
     def test_a_report_reaches_the_named_duty_as_a_task_of_ids_and_list_values(self):
         self.once(["T-81 message 10:00"])
         case_task = self.tasks()[0]

@@ -613,11 +613,14 @@ class Reads(StateCase):
 
     def test_each_agent_view_is_the_same_with_the_rows_read_for_all(self):
         """agent_view gives the same view with what agent_reads read for all the agents as with its own reads, for each
-        outcome of chat_ready, signed_in and turn_ended_after. With those reads the views read only the turn end of an
-        agent that has one and no open limit, and the chat credentials once, at the first agent whose chat can be ready.
+        outcome of chat_ready, signed_in and turn_ended_after, also for an account that its provider refuses (zoe, whose
+        machine says "signed in"). With those reads the views read only the turn end of an agent that has one and no
+        open limit, and the chat credentials once, at the first agent whose chat can be ready.
         Both are the new code: the proof against the code before this change is the same bytes of the state of the two
         copies of the first fleet's database."""
         self.fill()
+        self.x("INSERT INTO kv(k,v) VALUES('account_refused:zoe',?)",
+               (json.dumps({"at": T0 - 1, "code": "oauth_org_not_allowed", "runtime": "claude"}),))
         with hub.LOCK:
             team = list(hub.agents().items())
             own = [hub.agent_view(name, config) for name, config in team]
@@ -625,9 +628,10 @@ class Reads(StateCase):
             views, seen = self.traced(lambda: [hub.agent_view(name, config, reads) for name, config in team])
         self.assertEqual(views, own)
         # agents, usage, limits, machine readings, server sign-ins, sign-ins, keys, turn ends, late chat messages,
-        # the active KPIs of each agent (one GROUP BY), the newest press of Stop of each agent, and the newest read
-        # message that waits of each agent whose helper names chat_stop (one WITH, chat_read_waiting)
-        self.assertEqual(len([s for s in before if s.startswith(("SELECT", "WITH"))]), 12)
+        # refusals of accounts, the active KPIs of each agent (one GROUP BY), the newest press of Stop of each agent,
+        # and the newest read message that waits of each agent whose helper names chat_stop (one WITH,
+        # chat_read_waiting)
+        self.assertEqual(len([s for s in before if s.startswith(("SELECT", "WITH"))]), 13)
         self.assertEqual(sorted(s.split(" WHERE")[0] for s in seen),
                          ["SELECT MAX(u.created) AS created FROM ui_requests u JOIN events e ON e.id=u.event_id",
                           "SELECT agent, ready FROM session_credentials", "SELECT v FROM kv"])
@@ -635,7 +639,7 @@ class Reads(StateCase):
         self.assertEqual({n: (v["chat_ready"], v["signed_in"], v["turn_ended_after"]) for n, v in by.items()},
                          {"manager": (None, True, T0 - 399), "mia": (True, True, None), "leo": (False, True, None),
                           "ivy": (None, None, None), "oli": (False, None, None), "kai": (None, False, None),
-                          "zoe": (None, True, None), "eve": (None, None, None)})
+                          "zoe": (None, False, None), "eve": (None, None, None)})
         # owner feature chat_stop: leo read its message, which waits; mia has a usage limit, and the others no message
         self.assertEqual({n: v["chat_stop"] for n, v in by.items() if "chat_stop" in v}, {"leo": "req-leo"})
         self.assertEqual((by["mia"]["limit"]["since"], by["leo"]["limit"], by["leo"]["usage"]), (T0 - 100, None, {"limits": {}}))

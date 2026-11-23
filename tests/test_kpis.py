@@ -21,7 +21,7 @@ LINES = test_standing.LINES
 def load_tests(loader, _tests, _pattern):
     """Only this file's cases, not the inherited ones."""
     suite = unittest.TestSuite()
-    for cls in (Parents, Steps, StartText, Reads, Values):
+    for cls in (Parents, Steps, StartText, Reads, Values, Now):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 
@@ -68,7 +68,8 @@ class Kpis(test_standing.Base):
                        json.dumps({"title": "Drafts", "details": "", "done_when": "x", "needs": "none",
                                    "goal_id": None}), t0, t0 + 3600, t0, t0, f"req-{agent}-{t0}", agent))
         hub.ins("INSERT INTO trigger_history(trigger_id,revision,ts,by,action,detail,saved_by_task) VALUES(?,1,?,?,"
-                "'create','{}',?)", (tid, t0, agent, saved_in))
+                "'create',?,?)", (tid, t0, agent, json.dumps({"created": {"check": {"sha256": LINES["sha256"]}}}),
+                                  saved_in))
         return hub.trigger_row(tid)
 
     def link(self, who, r, rule, part="Mark each ticket that you answer with a draft."):
@@ -179,10 +180,13 @@ class Parents(Kpis):
         self.link("lead", r, own)
         self.assertEqual(self.kpi(r)["check"], own["id"])
         self.assertTrue(hub.wakeups.may_read(hub.wake_org(), "lead", hub.trigger_view(own, hub.now())))
-        # a new meaning clears the link, and a new setup opens
+        # a new meaning clears the link and its values (KPIs version 2, 4.2: they measured something else), and a new
+        # setup opens
+        self.value(own, 70, self.kpi(r)["linked_at"] + DAY)
         self.kpi_ok("lead", id=hub.iref(r["id"]), metric="drafts_kept")
         now = self.kpi(r)
         self.assertEqual((now["check"], now["kpi_state"]), (None, "no_data"))
+        self.assertIsNone(hub.q1("SELECT 1 FROM kpi_points WHERE item=?", (r["id"],)))
         self.assertNotEqual(now["setup_task"], setup["id"])
 
 
@@ -326,8 +330,9 @@ class Steps(Kpis):
                 hub.kpi_daily_rows(r["linked_at"] + days * DAY)
             self.assertEqual(again(), count, days)
         self.assertEqual(self.kpi(r)["kpi_state"], "no_data")
+        revision = hub.trigger_row(rule["id"])["revision"]          # the link changed its schedule, so its revision
         with hub.transaction():
-            hub.trigger_state_rows(rule["id"], rule["revision"], "delete", "hand", hub.now())
+            hub.trigger_state_rows(rule["id"], revision, "delete", "hand", hub.now())
         self.assertIsNone(self.kpi(r)["check"])
         self.assertIsNotNone(hub.q1("SELECT id FROM tasks WHERE owner='lead' AND title=?",
                                     ("Name who measures Drafts sent as written",)))
@@ -390,9 +395,10 @@ class StartText(Kpis):
 
 class Reads(Kpis):
     def test_the_owner_reads_the_weeks_and_marks_and_the_snapshot_only_the_count(self):
-        """Spec 8.1: GET /ui/kpis gives each week's newest value with whether it counts, and the marks of the
-        changes; the snapshot holds only the count. Protects against a snapshot that grows with every value, and a
-        chart that judges the days before the link."""
+        """Spec 8.1, and KPIs version 2 (4.2): GET /ui/kpis gives each week's newest value, each one shown (its
+        `counts`), and the marks of the changes; the snapshot holds only the count. Protects against a snapshot that
+        grows with every value, and a chart that hides the values of the first window (the owner, 22 November 2026:
+        "the value needs to show immediately")."""
         r, _ = self.set_kpi("lead", "hand")
         rule = self.rule("hand", saved_in=r["setup_task"])
         self.link("lead", r, rule)
@@ -404,7 +410,7 @@ class Reads(Kpis):
         kpi = data["kpis"][0]
         self.assertEqual((kpi["name"], kpi["state"], kpi["setter_role"], kpi["value"]),
                          ("Drafts sent as written", "on", "Lead", 85.0))
-        self.assertEqual([(w["value"], w["counts"]) for w in kpi["weeks"]], [(40.0, False), (85.0, True)])
+        self.assertEqual([(w["value"], w["counts"]) for w in kpi["weeks"]], [(40.0, True), (85.0, True)])
         self.assertEqual([m["words"] for m in kpi["marks"]][-2:], ["Lead linked its check", "Check changed"])
         self.assertNotRegex(json.dumps(kpi["marks"]), r"[A-Z]-[0-9]|wake-up rule")     # the owner's words: no code
         code, state = self.request("/ui/state")
@@ -491,14 +497,21 @@ class Values(test_checks_v2.Lines):
         """Spec 5.2: the leading block is a value and never a wake line; on a linked check a later or malformed kpi
         line is dropped, and on any other check it wakes. Protects against a value line that wakes the agent at each
         run."""
-        answer, run = self.once(self.rule, ["kpi drafts_sent 81.5", "kpi other 3"])
-        self.assertEqual((answer["decision"], self.points()), ("quiet", [81.5]))
-        answer, run = self.once(self.rule, ["progress 4", "kpi drafts_sent 70", "T-1 new", "kpi drafts_sent lots"])
+        # KPIs version 2 (4.2): the first run after the link may give a past day, at the end of its window
+        linked = hub.q1("SELECT linked_at FROM standing WHERE id=?", (self.kpi["id"],))["linked_at"]
+        before = int(linked - 2 * DAY)
+        answer, run = self.once(self.rule, ["kpi drafts_sent 81.5", f"kpi drafts_sent 60 {before}",
+                                            f"kpi drafts_sent 61 {int(linked - 60 * DAY)}", "kpi other 3"])
+        self.assertEqual((answer["decision"], self.points()), ("quiet", [60.0, 81.5]))
+        self.assertIn("1 dated kpi line(s) were not taken", run["reason"])     # more than 56 days back
+        answer, run = self.once(self.rule, ["progress 4", "kpi drafts_sent 70", f"kpi drafts_sent 55 {before - DAY}",
+                                            "T-1 new", "kpi drafts_sent lots"])
         self.assertEqual(answer["decision"], "started")
         details = hub.q1("SELECT details FROM tasks WHERE id=?", (answer["task"],))["details"]
         self.assertIn('JSON-encoded: ["T-1 new"]', details)
         self.assertIn("1 line(s) that begin with kpi were dropped", run["reason"])
-        self.assertEqual(self.points(), [70.0])         # the same day: the newer value
+        self.assertNotIn("dated", run["reason"])        # a later run's past goes with no words: it prints it each run
+        self.assertEqual(self.points(), [60.0, 70.0])   # the same day: the newer value
         other = self.save("vps", "req-kpi-0002")
         hub.TEAM["settings"]["kpis"] = False             # a release gate: while KPIs are off, no check's lines change
         answer, _ = self.once(other, ["kpi drafts_sent 12"])
@@ -535,6 +548,136 @@ class Values(test_checks_v2.Lines):
         run = hub.q1("SELECT state, reason FROM trigger_runs WHERE id=?", (extra["run"],))
         self.assertEqual((run["state"], run["reason"]), ("not_started", "seo is in setup."))
         self.assertEqual(self.points(), [])
+
+
+class Now(Kpis):
+    """KPIs version 2, piece now (~/dev/founderizer-plans/agent-kpis-v2/plan.md 4.2, 4.7, 4.8; the owner, 22 November
+    2026: "we need kpis immediately, the value needs to show immediately")."""
+
+    def linked(self, part=None, rule=None, r=None):
+        r = r or self.set_kpi("lead", "hand")[0]
+        rule = rule or self.rule("hand", saved_in=r["setup_task"])
+        text = self.kpi_ok("lead", id=hub.iref(r["id"]), check=rule["id"], how="Sent drafts in the help desk, which "
+                           "staff write.", **({"agent_part": part} if part else {}))
+        return self.kpi(r), hub.trigger_row(rule["id"]), text
+
+    def test_a_value_shows_at_once_and_is_judged_at_once_when_the_agent_has_no_part(self):
+        """4.2, 4.8: the first value after the link shows on the owner's tab at once, with its state; a KPI whose
+        agent has no part to play is judged from its link, so an off value gives its step at once; a value older than
+        two windows keeps no colour. Protects against a tab that shows a dash for a whole window, and an old red value
+        that stays red after its check stopped."""
+        r, rule, _ = self.linked()
+        self.value(rule, 50, r["linked_at"] + 60)
+        code, data = self.request("/ui/kpis?db=test-generation&agent=hand&weeks=1")
+        kpi = data["kpis"][0]
+        self.assertEqual((kpi["value"], kpi["value_counts"], kpi["state"], kpi["weeks"][-1]["counts"]),
+                         (50.0, True, "off", True))
+        self.assertEqual(self.kpi(r)["kpi_state"], "off")
+        self.assertIsNotNone(self.kpi(r)["off_task"])
+        self.clock = r["linked_at"] + 2 * 7 * DAY + 61         # two windows with no value: it says nothing of now
+        code, data = self.request("/ui/kpis?db=test-generation&agent=hand&weeks=1")
+        self.assertEqual((data["kpis"][0]["value"], data["kpis"][0]["state"]), (50.0, "no_data"))
+
+    def test_a_checks_first_run_after_its_link_fills_its_past_days_once(self):
+        """4.2: the first recording run after a link may print past days, "kpi <metric> <value> <unix-seconds>": the
+        hub takes them only in that run, only for the code that the parent linked, only before the link and at most
+        56 days back, and only for a day with no value; they show, and are never judged. A new code of the same rule
+        is a new link, whose first run fills its past again. Protects against a run that rewrites its history at each
+        run, and a past that the measured agent's later code invents."""
+        r, rule, _ = self.linked(part="Mark each ticket that you answer with a draft.")
+        linked = r["linked_at"]
+        dated = [("drafts_sent", 70.0, linked - 3 * DAY), ("drafts_sent", 71.0, linked - 3 * DAY + 10),
+                 ("drafts_sent", 60.0, linked - 60 * DAY), ("drafts_sent", 99.0, linked + 30)]
+        self.clock = linked + 60
+        with hub.transaction():
+            hub.kpi_record_rows(rule, {"drafts_sent": 80.0}, LINES, linked + 60, dated)
+        points = lambda: [(p["value"], p["backfill"]) for p in
+                          hub.q("SELECT value, backfill FROM kpi_points WHERE item=? ORDER BY at", (r["id"],))]
+        self.assertEqual(points(), [(70.0, 1), (80.0, 0)])
+        self.assertEqual(self.kpi(r)["kpi_state"], "no_data")       # a past value is shown, never judged
+        with hub.transaction():                                     # a later run: its dated lines are dropped
+            hub.kpi_record_rows(rule, {"drafts_sent": 81.0}, LINES, linked + 960,
+                                [("drafts_sent", 10.0, linked - 5 * DAY)])
+        self.assertEqual(points(), [(70.0, 1), (81.0, 0)])
+        # new code of the same rule: the lead links it again, and its first run fills a day that had no value
+        edited = dict(LINES, sha256="c" * 64)
+        hub.q("UPDATE triggers SET check_spec=? WHERE id=?", (json.dumps(edited), rule["id"]))
+        self.clock = linked + 2000
+        self.kpi_ok("lead", id=hub.iref(r["id"]), check=rule["id"], how="Sent drafts in the help desk, which staff "
+                    "write.", agent_part="Mark each ticket that you answer with a draft.")
+        relinked = self.kpi(r)["linked_at"]
+        self.assertGreater(relinked, linked)
+        with hub.transaction():
+            hub.kpi_record_rows(rule, {}, LINES, relinked + 60, [("drafts_sent", 55.0, linked - 5 * DAY)])
+        self.assertNotIn((55.0, 1), points())                       # the old code's digest: dropped
+        with hub.transaction():
+            hub.kpi_record_rows(rule, {}, edited, relinked + 60, [("drafts_sent", 55.0, linked - 5 * DAY)])
+        self.assertIn((55.0, 1), points())
+
+    def test_a_link_runs_its_check_every_15_minutes_and_takes_a_duty_watch(self):
+        """4.7, 4.8: a check that a KPI links runs at once and at least every 15 minutes, and its history says why;
+        a duty's watch may be linked: it runs once, for its first value, and keeps its own times; a paused rule is
+        named as paused and stays so. Protects against a KPI whose value comes only at its check's own slow times,
+        the refusal of a duty's watch that cost an agent a second check on 22 November 2026, and a daily watch that
+        loses its time and wakes its agent at each quarter hour (the validator, 23 November)."""
+        r, _ = self.set_kpi("lead", "hand")
+        rule = self.rule("hand", saved_in=r["setup_task"])
+        hub.q("UPDATE triggers SET schedule=? WHERE id=?", (json.dumps({"kind": "every", "minutes": 1440}), rule["id"]))
+        _, now_rule, text = self.linked(rule=rule, r=r)
+        self.assertIn("every 15 minutes", text)
+        self.assertEqual(json.loads(now_rule["schedule"]), {"kind": "every", "minutes": 15})
+        self.assertEqual(now_rule["next_due"], self.kpi(r)["linked_at"])
+        last = hub.q1("SELECT by, action FROM trigger_history WHERE trigger_id=? ORDER BY id DESC LIMIT 1",
+                      (rule["id"],))
+        self.assertEqual((last["by"], last["action"]), ("hub", "edit"))
+        self.clock += 60                    # a second rule of hand: its own request id
+        watch, _ = self.set_kpi("lead", "hand", name="Drafts of the watch")
+        duty = self.rule("hand", saved_in=watch["setup_task"])
+        daily = {"kind": "daily", "time": "09:00", "days": ["mon", "tue", "wed", "thu", "fri"],
+                 "timezone": "Europe/Madrid"}
+        hub.q("UPDATE triggers SET schedule=?, responsibility=1 WHERE id=?", (json.dumps(daily), duty["id"]))
+        _, kept, text = self.linked(rule=hub.trigger_row(duty["id"]), r=watch)
+        self.assertIn("it runs now, and after that at its own times", text)
+        self.assertEqual((json.loads(kept["schedule"]), kept["next_due"], kept["revision"]),
+                         (daily, self.kpi(watch)["linked_at"], duty["revision"]))
+        self.clock += 60
+        asleep, _ = self.set_kpi("lead", "hand", name="Drafts asleep")
+        rule = self.rule("hand", saved_in=asleep["setup_task"])
+        hub.q("UPDATE triggers SET state='paused', paused_by='owner', schedule=? WHERE id=?",
+              (json.dumps(daily), rule["id"]))
+        _, still, text = self.linked(rule=hub.trigger_row(rule["id"]), r=asleep)
+        self.assertIn("It is paused by the owner, so it runs once it is resumed", text)
+        self.assertEqual((json.loads(still["schedule"]), still["state"]), (daily, "paused"))
+
+    def test_a_lead_links_only_the_code_it_read_and_an_old_link_keeps_its_code(self):
+        """4.2 and two readers' findings of 22 November 2026: a lead links a rule only while its code now is the code
+        saved in the setup task, where the lead read it; a link from before version 2 takes the digest of the check
+        that made its newest value, so new words of how keep it; and a check of another agent cannot read the
+        measured agent's reports. Protects against a change of how that links code the lead never read, whose first
+        run then invents a past, and a fix time measured from the wrong agent's reports."""
+        r, rule, _ = self.linked()
+        hub.ins("INSERT INTO trigger_history(trigger_id,revision,ts,by,action,detail,saved_by_task) VALUES(?,2,?,"
+                "'hand','edit',?,?)", (rule["id"], self.clock, json.dumps({"changed": {"check": {"before": None,
+                                                                                                 "after": None}}}),
+                                       self.tasks["hand"]))         # the agent edits its code in another task
+        hub.q("UPDATE triggers SET check_spec=? WHERE id=?", (json.dumps(dict(LINES, sha256="d" * 64)), rule["id"]))
+        self.assertIn("code now was not saved in", self.kpi_refused("lead", id=hub.iref(r["id"]), check=rule["id"],
+                                                                    how="New words."))
+        hub.q("UPDATE standing SET link_digest=NULL WHERE id=?", (r["id"],))         # a link from before version 2
+        hub.q("INSERT INTO kpi_points(item,day,value,at,source) VALUES(?,'2026-10-20',50,?,?)",
+              (r["id"], self.clock - 3 * DAY, f"rule {rule['id']} 0123abcd4567"))
+        self.assertEqual(hub.migrate(), [])
+        self.assertEqual(self.kpi(r)["link_digest"], "0123abcd4567")
+        # the agent saves the check again in the setup task, with no change: the lead reads it there, and links it
+        hub.ins("INSERT INTO trigger_history(trigger_id,revision,ts,by,action,detail,saved_by_task) VALUES(?,3,?,"
+                "'hand','edit','{\"changed\": {}}',?)", (rule["id"], self.clock, r["setup_task"]))
+        self.kpi_ok("lead", id=hub.iref(r["id"]), check=rule["id"], how="New words.")
+        self.assertEqual(self.kpi(r)["link_digest"], hub.kpi_digest(dict(LINES, sha256="d" * 64)))
+        mine, _ = self.set_kpi("lead", "hand", name="Fix time", measured_by="lead")
+        own = self.rule("lead")
+        hub.q("UPDATE triggers SET check_spec=? WHERE id=?", (json.dumps(dict(LINES, inputs=["reports"])), own["id"]))
+        self.assertIn("reads the input reports", self.kpi_refused("lead", id=hub.iref(mine["id"]), check=own["id"],
+                                                                  how="The fix times of the duties of hand."))
 
 
 if __name__ == "__main__":

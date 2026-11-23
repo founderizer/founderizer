@@ -339,10 +339,11 @@ class HealthBlock(unittest.TestCase):
         self.assertEqual(body["health"]["release"]["newest"], "2026.11.762")
 
     def test_each_copy_is_our_sides_list_as_it_is_today(self):
-        """Each copy is our side's list (founderizer-web, src/lib/errors.ts, HEALTH_WORDS of 21 November 2026), word
-        for word. A word comes to our side first, and only then into a copy and here: a hub whose copy took a word that
-        our side does not have would have each report with the block refused, at each fleet, each day. A new word of
-        the hub's own goes as "other" until both sides take it."""
+        """Each copy is our side's list (founderizer-web, src/lib/errors.ts, HEALTH_WORDS of 21 November 2026, with the
+        codes of the hub's own warnings of 22 November 2026), word for word. A word comes to our side first, and only
+        then into a copy and here: a hub whose copy took a word that our side does not have would have each report
+        with the block refused, at each fleet, each day. A new word of the hub's own goes as "other" until both sides
+        take it."""
         theirs = {
             "state": "verified held updating passed kept rolled_back done failed none other",
             "step": "room hold branch clean pinned fetch have already minimum clone merge keep schema selftest verify "
@@ -351,21 +352,77 @@ class HealthBlock(unittest.TestCase):
                      "own_changes other",
             "check": "uplink ipv4_route ipv6_route dns channel upstream tailnet clock disk memory oom release_lag "
                      "firewall updates restart quiet egress network ssh npm updates_off macos_update egress_table "
-                     "other"}
+                     "records schema timers release_start helper vault manager_session server_update other"}
         for name, copy in (("state", errorreports.STATES), ("step", errorreports.STEPS),
                            ("cause", errorreports.CAUSES), ("check", errorreports.CHECKS)):
             self.assertEqual(copy, tuple(theirs[name].split()), f"{name}: put a new word on our side first")
 
     def test_each_word_of_the_hubs_sources_is_in_our_sides_copy(self):
-        """A new release state, step or cause, or a new key of the server watch, must reach our side's lists, and so
-        these copies, before a release sends it: else it goes as "other", and nobody on our side reads what broke. Each
-        copy ends with "other" and holds each word once, as our side's lists do."""
+        """A new release state, step or cause, a new key of the server watch, or a new code of the hub's own warnings,
+        must reach our side's lists, and so these copies, before a release sends it: else it goes as "other", and
+        nobody on our side reads what broke. Each copy ends with "other" and holds each word once, as our side's lists
+        do. And each kind of warning that health_view can make is decided once: it goes as its code (WARNING_CODES) or
+        never (WARNING_KEPT). Else a new warning whose way out is ours ("Tell us") would never reach our side, and the
+        owner would be left with the Report a problem button that F5 asked to make needless."""
         for copy, source in ((errorreports.STATES, hub.RELEASE_STATES + ("none",)),
                              (errorreports.STEPS, releases.STEPS), (errorreports.CAUSES, releases.CAUSES + ("none",)),
-                             (errorreports.CHECKS, tuple(hub.WATCH_WORDS))):
+                             (errorreports.CHECKS, tuple(hub.WATCH_WORDS) + tuple(hub.WARNING_CODES.values()))):
             with self.subTest(copy=copy[:2]):
                 self.assertEqual([w for w in source if w not in copy], [])
                 self.assertEqual((copy[-1], len(set(copy))), ("other", len(copy)))
+        kinds, sent, kept = warning_kinds(), set(hub.WARNING_CODES), set(hub.WARNING_KEPT)
+        self.assertEqual(sorted(kinds - sent - kept), [], "decide: hub.WARNING_CODES or hub.WARNING_KEPT")
+        self.assertEqual((sorted(sent & kept), sorted((sent | kept) - kinds)), ([], []))
+        self.assertEqual(sorted((set(hub.WARNING_HUB) | set(hub.WARNING_EARLY)) - set(hub.WARNING_CODES.values())), [])
+        self.assertIn("manager_down", kinds)     # the reading of the manager's kinds found them
+        # The owner's own step never goes: the trust in a server's vault that ends or ended because his Mac did not
+        # sign it again (the second read of F5 piece 3, M2: the privacy sentence's "a server's vault is out of date" is
+        # not an ended trust, whose vault program is current). A server's update that failed or is behind goes as
+        # server_update (the owner's answer to card F5-3), and asks no early report.
+        self.assertEqual(sorted({"vault_pin_ends", "vault_pin_ended"} - kept), [])
+        self.assertEqual([hub.WARNING_CODES.get(k) for k in ("machine_failed", "machine_behind")], ["server_update"] * 2)
+        self.assertNotIn("server_update", hub.WARNING_EARLY)
+
+
+def warning_kinds():
+    """Every kind of warning that hub.health_view can make, read from its code: the first value of each call of its
+    warn(), as a word, two words of a condition, or one of the three forms that build a kind there: "machine_" and the
+    two update states that its condition names, "manager_" and each kind that manager_flag_update sets, and the kind of
+    pin_end_words. Any other form fails here, so that a new one gets its decision too."""
+    import ast
+    import inspect
+    import textwrap
+
+    def tree(fn):
+        return ast.parse(textwrap.dedent(inspect.getsource(fn)))
+
+    def words(node):
+        """The words of a word, or of a condition between two words, else None."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return {node.value}
+        if isinstance(node, ast.IfExp) and all(isinstance(n, ast.Constant) and isinstance(n.value, str)
+                                               for n in (node.body, node.orelse)):
+            return {node.body.value, node.orelse.value}
+        return None
+
+    flags = set()
+    for node in ast.walk(tree(hub.manager_flag_update)):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+            if isinstance(target, ast.Tuple) and isinstance(value, ast.Tuple):
+                target, value = target.elts[0], value.elts[0]
+            if isinstance(target, ast.Name) and target.id == "kind":
+                flags |= words(value) or set()
+    (pin,) = [n.value.elts[0] for n in ast.walk(tree(hub.pin_end_words)) if isinstance(n, ast.Return)]
+    forms = {"'machine_' + m['update']['state']": {"machine_behind", "machine_failed"},
+             "'manager_' + flag['kind']": {"manager_" + k for k in flags}, "kind": words(pin)}
+    kinds = set()
+    for node in ast.walk(tree(hub.health_view)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "warn":
+            found = words(node.args[0]) or forms.get(ast.unparse(node.args[0]))
+            assert found, f"a new form of a warning's kind: {ast.unparse(node.args[0])}"
+            kinds |= found
+    return kinds
 
 
 class Site(http.server.BaseHTTPRequestHandler):
@@ -427,12 +484,15 @@ class Send(unittest.TestCase):
         self.assertIsNone(caught.exception.retry_after)
 
     def test_a_refusal_and_no_site(self):
-        """A 4xx holds the next report a DAY: the same report would only be refused again. A 5xx or a 3xx (our site, or
-        a deploy of it, down for a moment) waits an hour, as a send that did not reach our side does. Until 22 November
-        2026 a 503 held a DAY too: one short fault of our site then put two reports 48 hours apart, and our side counts
-        a hub that sent nothing for 36 hours as silent (founderizer-web, fleet-health.ts, live_hours)."""
+        """A 4xx holds the next report a DAY: the same report would only be refused again. So does a redirect that
+        stays (301, 308): the report follows none, so it would meet it again each hour for ever, with a line in the
+        hub's log each time, if founderizer.com/api/errors became one. A 5xx or another 3xx (our site, or a deploy of
+        it, down for a moment) waits an hour, as a send that did not reach our side does. Until 22 November 2026 a 503
+        held a DAY too: one short fault of our site then put two reports 48 hours apart, and our side counts a hub that
+        sent nothing for 36 hours as silent (founderizer-web, fleet-health.ts, live_hours)."""
         for status, retry in ((400, errorreports.DAY), (404, errorreports.DAY), (413, errorreports.DAY),
-                              (301, errorreports.RETRY), (500, errorreports.RETRY), (503, errorreports.RETRY)):
+                              (301, errorreports.DAY), (308, errorreports.DAY), (302, errorreports.RETRY),
+                              (307, errorreports.RETRY), (500, errorreports.RETRY), (503, errorreports.RETRY)):
             self.site.answer = (status, {})
             with self.subTest(status=status), self.assertRaises(errorreports.ReportError) as caught:
                 errorreports.send(self.url, report({}))
@@ -659,7 +719,7 @@ class OnTheHub(OwnerAPI):
         for key in ("error_reports_tried", "error_reports_sent", "error_reports_hold", "error_reports_on_at",
                     "error_reports_release", "error_reports_watch", "error_reports_early_at", "error_reports_earlies",
                     "error_reports_health_hold", "error_reports_starts", "error_reports_oom", "error_reports_running",
-                    "error_reports_restart"):
+                    "error_reports_restart", "error_reports_warnings"):
             self.assertIn(key, hub.QUIET_KEYS)
         self.assertNotIn("error_reports", hub.QUIET_KEYS)       # the owner's switch is news for every app
 
@@ -758,10 +818,24 @@ class HealthOnTheHub(OnTheHub):
         in each source that the block reads (git's own line and made-up words in a release's row, a host as a server's
         name and its address, words in the server watch's record, the machine's start id and a line of its memory
         file) never reaches the body: a source passed on as it is would carry it to our side, where an agent reads
-        what is kept."""
+        what is kept. So for the hub's own warnings (F5 piece 3): an agent's name, a server's name, the database
+        check's result, a schema step and the helper's own words of a failed start of the manager are in the words of
+        the owner's System status, and only their codes and counts go."""
         host, link, address = f"cnry{uuid.uuid4().hex[:8]}.example.net", f"enp{uuid.uuid4().hex[:6]}s0", "203.0.113.77"
         said = f"fatal: unable to access 'https://{host}/x.git/': Could not resolve host: {host}"
+        agent, step, why = f"cnry{uuid.uuid4().hex[:8]}", f"ALTER TABLE {link} ADD COLUMN x", f"exec {address} failed"
         hub.TEAM["addresses"][host] = address
+        hub.TEAM["agents"][agent] = {"role": "worker", "runtime": "claude", "machine": host, "can": []}
+        with hub.LOCK:
+            for key, value in (("integrity", f"*** in database main *** Page 7 of {host}"),
+                               ("schema_problems", json.dumps([f"{step}: duplicate column name"])),
+                               ("mgr_flag_kind", "down"), ("mgr_flag_since", repr(hub.now())),
+                               ("mgr_flag", hub.MANAGER_NOT_RUNNING), ("mgr_start_failed", "1"),
+                               ("mgr_start_failed_why", why)):
+                hub.kv_set(key, value)
+            shown = json.dumps(hub.health_view())
+        for piece in (agent, host, step, why):      # each canary is in the words that the owner reads
+            self.assertIn(piece, shown)
         self.machine(kills=4, boot=f"{host}-{link}", extra=f"{link}: 5 kB\n")
         row = self.release("2026.11.900", link, step=f"step-{host}", cause=link, says=said, pinned="f" * 40,
                            reached="e" * 40, finished=hub.now())
@@ -777,8 +851,13 @@ class HealthOnTheHub(OnTheHub):
                           health["release"]["channel"]), ("2026.11.900", "other", "other", 0))
         checks = {c["code"]: c for c in health["checks"]}
         self.assertEqual((checks["disk"]["servers"], checks["firewall"]["hub"]), (1, True))
+        self.assertEqual([(checks[code]["hub"], checks[code]["servers"]) for code in
+                          ("records", "schema", "manager_session", "helper", "vault", "release_start", "timers",
+                           "server_update")],
+                         [(True, 0), (True, 0), (True, 0), (True, 1), (False, 0), (False, 0), (False, 0), (False, 0)])
         text = json.dumps(body)
-        for piece in (host, link, address, "unable to access", "resolve", row["revision"], "f" * 40, "e" * 40):
+        for piece in (host, link, address, "unable to access", "resolve", row["revision"], "f" * 40, "e" * 40, agent,
+                      step, why, "Page 7", "duplicate column", "database"):
             self.assertNotIn(piece, text)
 
     def test_a_refused_block_sends_the_report_again_at_once_without_it(self):
@@ -990,7 +1069,8 @@ class HealthOnTheHub(OnTheHub):
         behind the newest release after such a run, each ask for an early report once, so that a fleet that stops
         taking releases is seen within hours and not after a day. The block's tries count those runs, and its cause
         is the last one's. A read of the version at HEAD that fails once (git's time, no memory for a process) asks
-        no more: with no row that it runs, the floor would read "none" and then the version again, two asks."""
+        no more: with no row that it runs, the floor would read "none" and then the version again, two asks. That
+        holds also for the first read of a new process, which has no earlier reading to keep."""
         self.switch(True)
         t0 = hub.now()
         self.look(t0)                           # the first look: no release yet
@@ -1008,6 +1088,10 @@ class HealthOnTheHub(OnTheHub):
         with unittest.mock.patch.object(hub, "running_version", lambda: "unknown"):
             self.assertIsNone(self.look(t0 + 120 + errorreports.BEHIND_WAIT))
         self.assertIsNone(self.look(t0 + 180 + errorreports.BEHIND_WAIT))
+        hub._error_report["head"] = None        # a new process, whose first read fails: no reading to keep
+        with unittest.mock.patch.object(hub, "running_version", lambda: "unknown"):
+            self.assertIsNone(self.look(t0 + 240 + errorreports.BEHIND_WAIT))
+        self.assertIsNone(self.look(t0 + 300 + errorreports.BEHIND_WAIT))
         release = self.health()["release"]
         self.assertEqual((release["newest"], release["state"], release["tries"], release["cause"], release["since"]),
                          ("2026.11.710", "failed", 3, "timeout", round(t0 + 60, 3)))
@@ -1331,10 +1415,153 @@ class HealthOnTheHub(OnTheHub):
         self.watch({"hub": {"told": ["memory"]}, "web-1": {"told": ["disk"]}, "web-2": {"told": ["disk", "memory"]}})
         self.look(t0 + 60)
         checks = self.health()["checks"]
-        self.assertEqual(sorted(c["code"] for c in checks), sorted(hub.WATCH_WORDS))
+        self.assertEqual(sorted(c["code"] for c in checks),
+                         sorted(list(hub.WATCH_WORDS) + list(dict.fromkeys(hub.WARNING_CODES.values()))))
         found = {c["code"]: (c["hub"], c["servers"], c["since"]) for c in checks}
         self.assertEqual((found["memory"], found["disk"], found["firewall"], found["macos_update"]),
                          ((True, 1, round(t0 + 60, 3)), (False, 2, None), (None, 0, None), (False, 0, None)))
+
+    def test_a_warning_whose_way_out_is_ours_goes_as_its_code_and_asks_once(self):
+        """F5 piece 3: a warning of the owner's System status whose way out is ours ("Tell us", Report a problem) goes
+        in the report by itself while the switch is on, as its code, with the hub's own server, the count of the
+        others and since when; and nothing goes while the switch is off. A code that turns bad asks for one early
+        report, and the same code at the next look for none; a new event of it asks again. A silent helper asks for
+        none: a Mac that sleeps silences its own. A new yes of the owner starts the record again: its first look asks
+        for nothing, because the day's report goes then. Believable bugs: a warning that never reaches our side; one
+        warning that sends four early reports a day; a report at each sleep of a Mac; a yes that spends one of the
+        day's four early reports on what its day's report carries."""
+        t0 = hub.now()
+        with hub.LOCK:          # the manager's helper answers: no helper is silent before web-agent's
+            hub.q("INSERT OR REPLACE INTO agents(name, last_seen) VALUES('manager', ?)", (t0,))
+            hub.q("INSERT OR REPLACE INTO machine_status(agent, data, reported) VALUES('manager', '{}', ?)", (t0,))
+            hub.kv_set("integrity", "a test")
+        self.sweep(t0)
+        self.assertEqual(self.sent, [])         # off: nothing, and no record either
+        self.assertIsNone(hub.kv_get("error_reports_warnings"))
+        with hub.LOCK:
+            hub.kv_set("integrity", "ok")
+        self.switch(True)
+        self.sweep(t0)                          # the day's report, and the first look
+        self.assertEqual(len(self.sent), 1)
+        with hub.LOCK:
+            hub.kv_set("integrity", "a test")
+        self.assertIsNotNone(self.look(t0 + 60))
+        self.assertIsNone(self.look(t0 + 120))  # it stands still: no second ask
+        hub.TEAM["agents"]["web-agent"] = {"role": "worker", "runtime": "claude", "machine": "web-1", "can": []}
+        self.assertIsNone(self.look(t0 + 180))  # a helper that goes silent asks for none
+        found = {c["code"]: (c["hub"], c["servers"], c["since"]) for c in self.health()["checks"]}
+        self.assertEqual((found["records"], found["helper"], found["timers"], found["release_start"]),
+                         ((True, 0, round(t0 + 60, 3)), (False, 1, round(t0 + 180, 3)), (False, 0, None),
+                          (False, 0, None)))
+        with hub.LOCK:
+            hub.kv_set("integrity", "ok")
+        self.assertIsNone(self.look(t0 + 240))
+        with hub.LOCK:
+            hub.kv_set("integrity", "a test")       # a new event of the same code
+            hub.kv_set("tick_ok", repr(hub.now() - 2 * hub.TICK_WARN))     # and the timers stop
+        hub._error_report["looked"] = None      # the pass's own look, as a minute later
+        self.sweep(t0 + 300)                    # one early report, with both codes
+        self.sweep(t0 + 305)
+        found = {c["code"]: c["hub"] for c in self.sent[-1][1]["health"]["checks"]}
+        self.assertEqual((len(self.sent), found["records"], found["timers"]), (2, True, True))
+        self.switch(False)
+        with hub.LOCK:
+            hub.kv_set("schema_problems", json.dumps(["a step"]))
+        self.switch(True)
+        self.assertIsNone(self.look(t0 + 360))  # a new yes: a first look again
+
+    def test_a_failed_first_read_of_the_version_holds_the_six_hour_report_back_for_minutes_only(self):
+        """The second read of F5 piece 3, N1: a new process whose first read of the version at HEAD fails (git's time,
+        no memory for a new process) has no earlier reading to keep. Its looks say nothing of a time behind while the
+        version is not known, and the version is read again some minutes later, also while HEAD stays, so the 6-hour
+        report comes when its time comes. A reading of "unknown" kept by HEAD would turn that report off until a
+        delivery moved HEAD, which can be days on a quiet fleet, on the fleet with no row that it runs that most needs
+        it."""
+        self.switch(True)
+        t0 = hub.now()
+        with unittest.mock.patch.object(hub, "kit_revision", lambda fresh=False: "a" * 40):     # HEAD stays
+            self.look(t0)                       # the first look: no release yet
+            self.release("2026.11.710", "kept", step="fetch", cause="dns", finished=t0 + 10)
+            self.assertIsNone(self.look(t0 + 60))
+            hub._error_report["head"] = None    # a new process, whose first read fails
+            with unittest.mock.patch.object(hub, "running_version", lambda: "unknown"):
+                self.assertIsNone(self.look(t0 + 120))
+            self.assertIsNone(self.look(t0 + 180))      # "unknown" for some minutes more, then read again
+            self.assertIsNotNone(self.look(t0 + 60 + errorreports.BEHIND_WAIT))
+            self.assertIsNone(self.look(t0 + 120 + errorreports.BEHIND_WAIT))      # once
+
+    def test_the_looks_keep_since_and_tries_while_our_side_holds_the_block(self):
+        """The second read of F5 piece 3, round 2 (R2-1): for the DAY after our side refused the health block, the block
+        does not go, but the looks go on. They alone write the records of `since` and `tries`, because a release's row
+        keeps only its last run. So a release that comes in the hold and fails three times in it has, in the first
+        block after the hold, `since` at the look that first saw it and 3 tries. A hold with no look would count the
+        runs of that day as one try, with a `since` up to a day late, at every fleet at once: a hold comes from a 400
+        to the block, so from a release of the hub that the site does not take yet. The cost that W15 accepted stays:
+        an early report asked in the hold goes with no block."""
+        self.switch(True)
+        t0 = hub.now()
+        self.sweep(t0)                          # the day's report, and the first look
+        with hub.LOCK:
+            hub.kv_set("error_reports_health_hold", repr(t0 + errorreports.DAY))
+        row = self.release("2026.11.710", "kept", step="fetch", cause="dns", finished=t0 + 3600)
+        self.look(t0 + 3660)
+        asked = None
+        for n, state in ((2, "rolled_back"), (3, "failed")):
+            with hub.LOCK:
+                hub.q("UPDATE releases SET state=?, cause='timeout', finished=? WHERE revision=?",
+                      (state, t0 + n * 3600, row["revision"]))
+            asked = self.look(t0 + n * 3600 + 60)
+        with hub.LOCK:
+            hub.kv_set("error_reports_health_hold", None)       # the day ended
+        release = self.health()["release"]
+        self.assertEqual((release["tries"], release["since"], release["cause"]), (3, round(t0 + 3660, 3), "timeout"))
+        self.assertIsNotNone(asked)             # the third run that did not end done asked, also in the hold
+
+    def test_a_new_yes_during_a_send_keeps_the_counts_of_that_yes(self):
+        """The second read of F5 piece 3, N7 (W15): the owner turns error reports off and on while a report with the
+        block is on its way. His new yes starts the block's counts again (error_reports_counts_start), and the send
+        that our side then takes does not write back the counts of its body, made before that yes: the next block
+        would count kills for want of memory from before his yes."""
+        self.switch(True)                       # 3 kills at his yes
+
+        def site(url, body, timeout=None):
+            self.sent.append((url, body))
+            self.machine(kills=7)               # 4 more during the send, before his new yes
+            with hub.LOCK:
+                hub.set_error_reports(False)
+                hub.set_error_reports(True)
+
+        with unittest.mock.patch.object(errorreports, "send", site):
+            self.sweep(hub.now())
+        self.assertEqual((len(self.sent), "health" in self.sent[0][1]), (1, True))
+        self.assertEqual(self.health()["machine"]["ooms"], 0)
+
+    def test_a_servers_update_that_failed_or_is_behind_goes_as_its_code_and_asks_nothing(self):
+        """The owner's answer to card F5-3 (22 November 2026): "Send it, and add the clause: a server's update failed or
+        is behind". machine_failed and machine_behind go as the code server_update: `hub` for the hub's own server,
+        `servers` for each other server once, whatever the number of its agents, and `since`. It asks for no early
+        report: the owner's own button (Update <Agent>) settles it, and an update that waits for its turn, is asked
+        or runs is no warning, so it is not counted. Believable bugs: a failed update never reaches our side; the
+        hub's own server counted among the others, or a server once for each agent; each update that fails spends one
+        of the day's four."""
+        self.switch(True)
+        t0 = hub.now()
+        self.sweep(t0)                          # the day's report, and the first look
+        for name, server in (("web-agent", "web-1"), ("web-second", "web-1"), ("db-agent", "db-1")):
+            hub.TEAM["agents"][name] = {"role": "worker", "runtime": "claude", "machine": server, "can": []}
+        with hub.LOCK:
+            for name in hub.TEAM["agents"]:     # each helper answers, and each status is new: no `helper`
+                hub.q("INSERT OR REPLACE INTO agents(name, last_seen) VALUES(?, ?)", (name, t0))
+                hub.q("INSERT OR REPLACE INTO machine_status(agent, data, reported) VALUES(?, ?, ?)",
+                      (name, json.dumps({"revision": "b" * 40 if name == "db-agent" else "a" * 40}), t0))
+            for name in ("manager", "web-agent", "web-second"):     # the hub's own server, and web-1 twice
+                hub.q("INSERT OR REPLACE INTO machine_updates(agent, state, requested) VALUES(?, 'failed', ?)",
+                      (name, t0))
+        with unittest.mock.patch.object(hub, "kit_revision", lambda fresh=False: "a" * 40), \
+                unittest.mock.patch.object(hub, "same_code", lambda a, b: a == b):    # db-1 runs older code
+            self.assertIsNone(self.look(t0 + 60))
+            found = {c["code"]: (c["hub"], c["servers"], c["since"]) for c in self.health()["checks"]}
+        self.assertEqual((found["server_update"], found["helper"]), ((True, 2, round(t0 + 60, 3)), (False, 0, None)))
 
     def test_a_hub_with_no_proc_sends_its_report_without_the_block(self):
         """A hub on a Mac has no /proc: its report goes as before, with no block, because every key of the block is

@@ -636,6 +636,41 @@ class AnotherAccount(Machines):
               (hub.now() - 60, hub.now() + 86400))
         self.assertEqual(self.start(replace=True)[0], 200)
 
+    def test_a_browser_task_refuses_a_change_of_account_only_while_its_turn_runs(self):
+        """A browser or screen task holds its machine's desktop until its session is closed, also while it sleeps until
+        a reminder and while the owner's Stop holds it. Counted as work that a sign-out stops, it refused the only way
+        out of an account that Claude refused, for as long as the task was open (23 November 2026)."""
+        self.beside()
+
+        def turn(running):
+            hub.q("INSERT OR REPLACE INTO attempts(task,attempt,created,started,turn) VALUES(7,1,?,?,?)",
+                  (hub.now(), hub.now(), json.dumps({"running": running, "how": None, "turns": 1, "calls": {}})))
+
+        for needs in ("browser", "screen"):
+            self.working("ivy")
+            hub.q("UPDATE tasks SET needs=?", (needs,))
+            hub.q("DELETE FROM attempts")                   # its first turn, with no record yet
+            for agent in ("ivy", "solo"):                   # solo keeps the same sign-in
+                self.assertEqual(self.start(agent=agent, replace=True)[0], 409)
+            turn(True)
+            code, answer = self.start(agent="ivy", replace=True)
+            self.assertEqual(code, 409, answer)
+            self.assertIn("has 1 task running", answer["error"])
+            turn(False)
+            for state in ("working", "completed"):          # ended, and its session is not confirmed closed
+                hub.q("UPDATE tasks SET state=?", (state,))
+                self.assertEqual(hub.switch_busy("ivy")["desktop"], "T-7", "it holds the desktop for a switch")
+                for agent in ("ivy", "solo"):
+                    code, answer = self.start(agent=agent, replace=True)
+                    self.assertEqual(code, 200, answer)
+                    hub.q("DELETE FROM signin_jobs")
+        self.working("ivy")
+        hub.q("UPDATE tasks SET needs='browser'")
+        hub.q("UPDATE agents SET last_seen=? WHERE name='ivy'", (hub.now() - 200,))     # silent: its turn is not known
+        code, answer = self.start(agent="solo", replace=True)
+        self.assertEqual(code, 409, answer)
+        self.assertIn("a browser or screen task open", answer["error"])
+
     def test_a_runtime_fleet_drives_no_sign_out_for_says_so(self):
         self.reports("solo", codex=True)
         with patch.object(hub, "LOGIN_OUT_RUNTIMES", ()):

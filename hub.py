@@ -222,11 +222,11 @@ CREATE TABLE IF NOT EXISTS standing(id INTEGER PRIMARY KEY, agent TEXT NOT NULL,
   -- a KPI (kind 'kpi', lanes/agent-kpis.md): its parent's fields, its link to a check, and the hub's state of it
   name TEXT, direction TEXT, unit TEXT, window_days INTEGER, metric TEXT, linked_at REAL, agent_part TEXT,
   setup_task INTEGER, kpi_state TEXT, state_since REAL, off_task INTEGER, parent_task INTEGER, parent_event INTEGER,
-  judge_after REAL, measured_by TEXT);
+  judge_after REAL, measured_by TEXT, link_digest TEXT, source TEXT);
 CREATE INDEX IF NOT EXISTS standing_of ON standing(agent, ended, id);
 -- a KPI's values, one for each day of the fleet's time zone (the newest of the day), and who changed it, when
 CREATE TABLE IF NOT EXISTS kpi_points(item INTEGER NOT NULL, day TEXT NOT NULL, value REAL NOT NULL, at REAL NOT NULL,
-  source TEXT NOT NULL, PRIMARY KEY(item, day));
+  source TEXT NOT NULL, backfill INTEGER NOT NULL DEFAULT 0, recorded REAL, PRIMARY KEY(item, day));
 CREATE TABLE IF NOT EXISTS kpi_changes(id INTEGER PRIMARY KEY, item INTEGER NOT NULL, at REAL NOT NULL, by TEXT NOT NULL,
   words TEXT NOT NULL, outside_reads INTEGER);
 CREATE INDEX IF NOT EXISTS kpi_changes_of ON kpi_changes(item, at);
@@ -379,6 +379,9 @@ CREATE INDEX IF NOT EXISTS duty_report_case ON duty_reports(duty_case);
 CREATE INDEX IF NOT EXISTS duty_report_from ON duty_reports(from_case);
 CREATE INDEX IF NOT EXISTS duty_report_task ON duty_reports(task);
 CREATE INDEX IF NOT EXISTS duty_report_to ON duty_reports(to_duty);
+CREATE INDEX IF NOT EXISTS duty_report_ticket ON duty_reports(from_duty, ticket, created);
+CREATE INDEX IF NOT EXISTS duty_report_to_time ON duty_reports(to_duty, created);
+CREATE INDEX IF NOT EXISTS duty_report_from_time ON duty_reports(from_duty, created);
 -- A notice of an open case to the tickets of its joined reports (tell_tickets, lanes/tell-the-tickets-of-an-open-case.md):
 -- one row for each ticket, and the session of the reporting duty that told it (`told_task`, 0 for a retired duty).
 -- The reports stay open and joined, so the case's close still covers them.
@@ -1077,7 +1080,7 @@ QUIET_KEYS = ("tick_ok", "releases_swept", "releases_found", "bridge_seen", "bri
               # the health block of the error report (W15): its records, counts, holds and marks of a start
               "error_reports_release", "error_reports_watch", "error_reports_early_at", "error_reports_earlies",
               "error_reports_health_hold", "error_reports_starts", "error_reports_oom", "error_reports_running",
-              "error_reports_restart")
+              "error_reports_restart", "error_reports_warnings")
 
 
 def kv_set(k, v):
@@ -2094,8 +2097,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "owner_profile",     # the owner, 16 November 2026 ("bots should talk in Spanish", "your profile
                                     # with the user name"): the settings owner.language and owner.name, which the
                                     # owner's Mac sets from its own language and account (UI-API.md 1.200)
-               "error_reports",     # the owner, 16 November 2026 ("Yes, as drawn"): Settings › General › Error
-                                    # reports, GET and POST /ui/error-reports, off until he turns it on
+               "error_reports",     # the owner, 16 November 2026 ("Yes, as drawn"): the switch of error reports (now
+                                    # Settings › Help › Help improve Founderizer, and the first page of the setup),
+                                    # GET and POST /ui/error-reports, off until he turns it on
                "jobs",              # the owner, 18 November 2026 ("Yes, build it" to the picture of the Tasks page
                                     # with one card for each job): tasks[].job, the task whose job a task joins,
                                     # tasks[].job_name, the name of a job on its first task, and tasks[].plain, a
@@ -6788,12 +6792,13 @@ def fault_rows():
 
 # ---- the lane "Error reports": the day's report of those faults, while the owner has turned it on
 #
-# The owner, 16 November 2026, to the picture of Settings › General with a section "Error reports" and one switch,
-# "Send to Founderizer's developers", off until he turns it on: "Yes, as drawn" (feedback-diagnostics-plan.md, Phase
-# 3). What goes is errorreports.report: the faults and refused calls of diagnostics.view that came after the report
-# before it and after the owner turned reports on, and the fleet's id, the release's version, the code's id, the
-# system and two counts. Only the owner turns it on: the route is an owner route of the app, and no tool of the
-# owner's MCP server (owner_mcp.NOT_TOOLS) and no fleet tool reaches it.
+# The owner, 16 November 2026, to the picture of Settings › General with a section "Error reports" and one switch, "Send
+# to Founderizer's developers", off until he turns it on: "Yes, as drawn" (feedback-diagnostics-plan.md, Phase 3). The
+# switch is now Settings › Help › Help improve Founderizer, and the first page of the setup turns it on too (Send
+# anonymous usage data). What goes is errorreports.report: the faults and refused calls of diagnostics.view that came
+# after the report before it and after the owner turned reports on, and the fleet's id, the release's version, the
+# code's id, the system and two counts. Only the owner turns it on: the route is an owner route of the app, and no tool
+# of the owner's MCP server (owner_mcp.NOT_TOOLS) and no fleet tool reaches it.
 #
 # Since W15 of the reliability plan (21 November 2026, inside the owner's yes to "codes, versions and counts"), the
 # report carries the fleet's health too (error_report_health): the newest release and how this hub stays behind it,
@@ -6944,7 +6949,9 @@ def error_report_send(url, body, stamp, early=False, timeout=None, asked=None, t
     that does not take the block yet, or a word that it does not take yet), the same report goes again at once
     without the block, while the switch is still on, and the block waits a DAY from the report's stamp
     (error_reports_health_hold). When our side took a report with the block, the block's counts start again from what
-    it carried (`taken`, error_reports_counted); a report that went without it resets none of them."""
+    it carried (`taken`, error_reports_counted); a report that went without it resets none of them, and neither does
+    one whose body was made before a new yes of the owner during the send (an off and an on: `taken`'s `on_at` is not
+    error_reports_on_at), whose counts error_reports_counts_start began again at that yes."""
     with LOCK:
         if not error_reports_on():
             return
@@ -6972,7 +6979,7 @@ def error_report_send(url, body, stamp, early=False, timeout=None, asked=None, t
             return
     with LOCK:
         kv_set("error_reports_sent", stamp)
-        if "health" in body and taken:
+        if "health" in body and taken and taken.get("on_at") == kv_get("error_reports_on_at"):
             error_reports_counted(taken)
         if early:
             error_report_earlies(add=float(stamp))
@@ -6996,7 +7003,8 @@ def error_reports_counts_start():
     that a report holds only what came after his yes, as its faults do."""
     reading = errorreports.machine_reading()
     kv_set("error_reports_oom", json.dumps({"boot": reading["boot"], "kills": reading["kills"]}) if reading else None)
-    for key in ("error_reports_starts", "error_reports_release", "error_reports_watch", "error_reports_early_at"):
+    for key in ("error_reports_starts", "error_reports_release", "error_reports_watch", "error_reports_warnings",
+                "error_reports_early_at"):
         kv_set(key, None)
 
 
@@ -7029,12 +7037,31 @@ def error_report_earlies(add=None):
 
 def error_report_look(t0, force=False):
     """Inside LOCK, at most once a WATCH_EVERY while error reports are on, and before each report (`force`): what the
-    health block keeps over time, because the release rows and the server watch keep only what holds now, and the
-    early reports that come of it (error_look_release, error_look_watch). Nothing on a machine with no /proc
+    health block keeps over time, because the release rows, the server watch and the hub's own warnings keep only
+    what holds now, and the early reports that come of it (error_look_release, error_look_watch, error_look_warnings).
+    Nothing on a machine with no /proc
     (errorreports.machine_reading: a hub on a Mac): its reports hold no block, so the block's records serve nothing,
     and an early report for a check or a release would carry nothing of it and only use one of the day's four. The
     early reports of a start and of a failed restart onto new code still go there: what they are for is in the report
-    without the block, its `version` (the code that runs) and the faults of the code before the stop."""
+    without the block, its `version` (the code that runs) and the faults of the code before the stop.
+
+    The looks go on in the DAY after our side refused the block (error_reports_health_hold): they are the only
+    writers of the records that give the block its `since` and `tries`, and the release rows, the server watch and the
+    warnings keep only what holds now, so a day with no look would count all the runs of that day as one try, and give
+    a release or a warning of that day a `since` up to a day late, at every fleet at once. A known limit of that rule
+    (W15 accepted it): an early report that a look asks in that day goes with no block, says nothing of what asked
+    for it, and uses one of the day's four.
+
+    A known limit, of its cost: error_look_warnings reads health_view once a minute under LOCK, inside the pass, as one
+    owner read of GET /ui/health does. Most of it is reads of the records (about 7 to 11 ms on a test hub of 41 agents
+    on 12 servers, 22 November 2026), but it also starts git processes that keep nothing: one `git cat-file` for each
+    server where a release did not start (release_named, in refused_starts), one `git diff` for each agent in setup
+    whose check was made at other code (check_holds), and vault_source again after a read that failed. Where git is
+    slow, a few of them make the pass longer, and a pass longer than TICK_WARN raises the `timers` warning that this
+    same look reads (an early report, inside the four of a day). Two fixes are open: a mode of health_view for the
+    kinds alone, which builds no words (refused_starts without release_named, machine_rows without verify_view); or a
+    measure first. A test hub can measure it, with a configuration checkout that is a real git repository and rows of
+    refused starts and of agents in setup; the git time of each process is this machine's, not a small server's."""
     if not error_reports_on():
         return
     looked = _error_report["looked"]
@@ -7045,6 +7072,7 @@ def error_report_look(t0, force=False):
         return
     error_look_release(t0)
     error_look_watch(t0)
+    error_look_warnings(t0)
 
 
 def error_newest(rows):
@@ -7159,12 +7187,22 @@ def error_look_release(t0):
         revs[row["revision"]] = mark
     cap, failed = error_runs_cap()
     runs = _error_report["runs"]
-    floors = (errorreports.version_key(runs["version"] if runs else error_head_version()),)
+    floors = (errorreports.version_key(runs["version"] if runs else error_head_version(t0)),)
     behind, floor = error_behind(rows, floors, cap), error_floor(rows, floors, cap)
     since, tries, cause = error_behind_facts(behind, revs, t0, failed)
     floor = ".".join(str(n) for n in floor) if floor else "none"
     late = None if first_look else was.get("late")
-    if since is not None and tries and cause not in errorreports.NO_ALARM and \
+    if floors[0] is None:
+        # The version of the code that runs is not known in this look: the first read of a process that failed (git's
+        # 30 seconds, no memory for a new process), which error_head_version has no earlier reading to keep, or a hub
+        # before its first release. The floor would then be the rows' alone, "none" on a fleet with no row that it
+        # runs, and the next good read would move it back: two early reports for no event. So this look says nothing
+        # of a time behind, and keeps `late` as it was. error_head_version reads the version again UNKNOWN_KEPT
+        # seconds after such a reading, also while HEAD stays, so after a read that failed the looks say nothing for
+        # those minutes only. A hub with no release.json at all asks for no 6-hour report; its day's report still
+        # carries `since`, `tries` and `behind`.
+        pass
+    elif since is not None and tries and cause not in errorreports.NO_ALARM and \
             t0 - since >= errorreports.BEHIND_WAIT:
         if late != floor:
             late = floor
@@ -7178,22 +7216,30 @@ def error_look_release(t0):
         kv_set("error_reports_release", json.dumps(kept, sort_keys=True))
 
 
-def error_head_version():
-    """Inside LOCK: running_version(), read again only when the checkout's HEAD moved (kit_revision keeps its reading 30
-    seconds and reads the checkout's files), so that the look once a minute starts no git process while HEAD stays.
+UNKNOWN_KEPT = 600     # seconds that error_head_version keeps a reading of "unknown" with no version before it
+
+
+def error_head_version(t0):
+    """Inside LOCK, in the look at `t0`: running_version(), read again only when the checkout's HEAD moved (kit_revision
+    keeps its reading 30 seconds and reads the checkout's files), so that the look once a minute starts no git process
+    while HEAD stays.
 
     A reading of "unknown" after a version keeps that version: a read that failed (git's 30 seconds, no memory for a
     new process) would else move the floor of error_look_release to the rows' alone and back, and each move asks for
     an early report. A delivery moves HEAD and no release.json, and a release that changes the code restarts this
     process, so the version kept is the one of the code that runs, or one under it, which the rows of the releases
-    that it ran raise. A hub before its first release has no release.json and reads "unknown" at each move."""
+    that it ran raise. A reading of "unknown" with no version before it (the first read of a new process that failed)
+    is read again UNKNOWN_KEPT seconds later, also while HEAD stays: kept by HEAD, it would turn off the 6-hour report
+    of error_look_release until a delivery moved HEAD, which can be days on a quiet fleet. A hub before its first
+    release has no release.json and reads "unknown" again at each move and every UNKNOWN_KEPT seconds."""
     head, kept = kit_revision(), _error_report.get("head")
-    if head is not None and kept and kept[0] == head:
+    if head is not None and kept and kept[0] == head and \
+            (kept[1] != "unknown" or 0 <= t0 - kept[2] < UNKNOWN_KEPT):
         return kept[1]
     version = running_version()
     if version == "unknown" and kept and kept[1] != "unknown":
         version = kept[1]
-    _error_report["head"] = (head, version)
+    _error_report["head"] = (head, version, t0)
     return version
 
 
@@ -7216,6 +7262,93 @@ def error_look_watch(t0):
         error_report_early(f"the hub's own server needs care ({', '.join(sorted(bad))})")
     if marks != was:            # also an empty record at the first look: the next look is not the first
         kv_set("error_reports_watch", json.dumps(marks, sort_keys=True))
+
+
+# ---- F5 piece 3: the hub's own warnings in the report (the owner, 22 November 2026: "If user has the option ON to
+# share telemetry data, it must be sent automatically, instead of waiting for the user to manually send it", and his
+# "Yes" of that day to the privacy sentence that names them)
+#
+# The warnings of the owner's System status (health_view) whose way out is ours ("Tell us", Report a problem), and
+# those of the fleet's own machinery, go in the report's checks as codes of errorreports.CHECKS: whether each stands
+# now, on the hub's own server and on how many others, and since when. Only a warning's kind and the server that it is
+# about are read, never its words: they hold the names of agents and servers, a program's lines (the database check, a
+# schema step, the helper's own words of a failed start) and the owner's times. A server's name stays in the hub. The
+# Report a problem window stays the one way to send words to us, and to get an answer.
+WARNING_CODES = {
+    "integrity": "records",                 # its records failed their check
+    "schema": "schema",                     # its records refused a step of a release
+    "timers_stalled": "timers",             # its timers stopped
+    "machine_refused": "release_start",     # a release did not start on a server
+    # a server's update failed or is behind (the owner's answer to card F5-3, 22 November 2026: "Send it, and add the
+    # clause: a server's update failed or is behind")
+    "machine_failed": "server_update",
+    "machine_behind": "server_update",
+    "manager_down": "manager_session",      # the manager's session does not run (both causes of manager_warning)
+    "helper_offline": "helper",             # an agent's helper went silent
+    "machine_stale": "helper",
+    "vault_behind": "vault",                # a server's vault is out of date
+}
+# The kinds that never go: the owner's own work, plan or step (a copy of the fleet, an allowance, stuck tasks and
+# loops, reports that wait for a decision, a manager on the hub's own user, a trust in a server's vault that ends soon
+# or ended, because his Mac did not sign it again: its program is not out of date, and the privacy page names no such
+# code; and the manager's other kinds: a sign-out, a question on its screen, a limit, its silence, a switch), and what
+# goes already (hub_fault as faults, disk_low as the check disk). test_error_reports holds every kind that health_view
+# can make to be in WARNING_CODES or here, so that a new warning needs a decision.
+WARNING_KEPT = ("backup_missing", "backup_old", "hub_fault", "vault_pin_ends", "vault_pin_ended", "manager_hub_user",
+                "manager_silent", "manager_limited", "manager_screen", "manager_signed_out", "manager_switch_stalled",
+                "manager_switching", "allowance_spent", "allowance_pace", "circles_stuck", "tasks_stuck",
+                "reports_undecided", "disk_low")
+WARNING_HUB = ("records", "schema", "timers")       # the hub's own: `servers` is 0
+# A code that turns bad asks for an early report. Not `helper`, `vault` and `server_update`: a Mac that sleeps silences
+# its helper, a vault catches itself up within ten minutes, and a server's update has the owner's own button (Update
+# <Agent>). `server_update` counts an update that failed (machine_failed), and a server whose revision differs from the
+# hub's with no update under way (machine_behind): an update that waits for its turn, is asked or runs is no warning, so
+# it is not counted. Two known limits: a server whose update was asked and never taken is not counted, however long it
+# waits; and a look in the seconds between a release's move of the checkout and the hub's ask to each machine marks each
+# server once (it asks no early report, and the next look clears it). `timers` can ask: a pass whose step that restarts
+# work raises keeps the warning up while the passes run, and the first pass after a pass that hung reads it before it
+# ends.
+WARNING_EARLY = ("records", "schema", "timers", "release_start", "manager_session")
+
+
+def error_warnings_now():
+    """Inside LOCK: {code: server keys} of the warnings of health_view that the report sends (WARNING_CODES) and that
+    stand now: "" for the hub's own server, and for each code of WARNING_HUB; else the server's name, or "?" for a
+    warning that names none. A server's name is only counted (error_health_checks)."""
+    kinds, hub_machine, found = [], (TEAM.get("hub") or {}).get("machine"), {}
+    health_view(kinds)
+    for kind, server in kinds:
+        code = WARNING_CODES.get(kind)
+        if code is not None:
+            hub_own = code in WARNING_HUB or (server is not None and server == hub_machine)
+            found.setdefault(code, set()).add("" if hub_own else str(server or "?"))
+    return found
+
+
+def error_look_warnings(t0):
+    """Inside LOCK: since when each code of WARNING_CODES stands on each server that it is about, in
+    error_reports_warnings, as error_look_watch keeps the watch's facts: the time of the look that first saw it, or
+    None for one that stood at the first look (no time says since when). A code of WARNING_EARLY that turns bad, after
+    a look where it stood nowhere, asks for an early report (the plan's 3.3): one event, one report, and a code that
+    stays bad, or turns bad on one more server, asks for none. A health_view that raises is a fault of the hub: the
+    record goes, so the checks say that they cannot say (error_health_checks), and the next look is a first look."""
+    try:
+        standing = error_warnings_now()
+    except Exception:
+        print_fault()
+        kv_set("error_reports_warnings", None)
+        return
+    was = kv_json("error_reports_warnings", dict)
+    marks = {}
+    for code, keys in standing.items():
+        before = (was or {}).get(code)
+        before = before if isinstance(before, dict) else {}
+        marks[code] = {k: before[k] if k in before else None if was is None else t0 for k in keys}
+    turned = sorted(code for code in marks if code in WARNING_EARLY and was is not None and not was.get(code))
+    if turned:
+        error_report_early(f"a warning of the hub stands ({', '.join(turned)})")
+    if marks != was:            # also an empty record at the first look: the next look is not the first
+        kv_set("error_reports_warnings", json.dumps(marks, sort_keys=True))
 
 
 def error_reports_ooms(reading):
@@ -7281,7 +7414,12 @@ def error_health_checks(t0):
     server fails it, false while it can say that it does not (error_hub_judged), else null; `servers`, the other
     servers that the watch says fail it now; `since`, the earliest time that one of them turned bad (error_look_watch),
     null when that cannot be said for one of them. W8 adds the rest of the contract's codes (uplink, ipv4_route,
-    ipv6_route, dns, channel, upstream, tailnet, clock, oom, release_lag), and W9 the repairs."""
+    ipv6_route, dns, channel, upstream, tailnet, clock, oom, release_lag), and W9 the repairs.
+
+    Then each code of the hub's own warnings (WARNING_CODES), once, the passing ones too, from the look that runs just
+    before (error_look_warnings): `hub` true while it stands on the hub's own server (a code of WARNING_HUB stands
+    only there), false while it does not, and null when the look could not read the warnings; `servers` the other
+    servers that it stands on; `since` as for the watch's."""
     watch, marks = kv_json("server_watch", dict) or {}, kv_json("error_reports_watch", dict) or {}
     hub_machine, judged, checks = (TEAM.get("hub") or {}).get("machine"), error_hub_judged(t0), {}
     for key in WATCH_WORDS:
@@ -7291,10 +7429,19 @@ def error_health_checks(t0):
         entry["hub"].add(True if hub_machine in failing else False if key in judged else None)
         entry["servers"] |= failing - {hub_machine}
         entry["since"] += [(marks.get(s) if isinstance(marks.get(s), dict) else {}).get(key) for s in failing]
-    return [{"code": code, "hub": True if True in e["hub"] else None if None in e["hub"] else False,
-             "servers": len(e["servers"]),
-             "since": min(e["since"]) if e["since"] and all(finite(t) for t in e["since"]) else None}
-            for code, e in checks.items()]
+    found = [{"code": code, "hub": True if True in e["hub"] else None if None in e["hub"] else False,
+              "servers": len(e["servers"]),
+              "since": min(e["since"]) if e["since"] and all(finite(t) for t in e["since"]) else None}
+             for code, e in checks.items()]
+    record = kv_json("error_reports_warnings", dict)
+    for code in dict.fromkeys(WARNING_CODES.values()):
+        marks = (record or {}).get(code)
+        marks = marks if isinstance(marks, dict) else {}
+        times = list(marks.values())
+        found.append({"code": errorreports.word(code, errorreports.CHECKS), "hub": None if record is None else
+                      "" in marks, "servers": len([k for k in marks if k != ""]),
+                      "since": min(times) if times and all(finite(t) for t in times) else None})
+    return found
 
 
 def error_health_release(version, t0, restarting=False):
@@ -7347,7 +7494,7 @@ def error_report_health(t0, version, taken=None, restarting=False):
     machine = dict(reading, ooms=error_reports_ooms(reading), starts=starts)
     block = errorreports.health(error_health_release(version, t0, restarting), error_health_checks(t0), machine)
     if block is not None and taken is not None:
-        taken.update(boot=reading["boot"], kills=reading["kills"], starts=starts)
+        taken.update(boot=reading["boot"], kills=reading["kills"], starts=starts, on_at=kv_get("error_reports_on_at"))
     return block
 
 
@@ -9002,7 +9149,11 @@ def migrate():
         "standing": {"name": "TEXT", "direction": "TEXT", "unit": "TEXT", "window_days": "INTEGER", "metric": "TEXT",
                      "linked_at": "REAL", "agent_part": "TEXT", "setup_task": "INTEGER", "kpi_state": "TEXT",
                      "state_since": "REAL", "off_task": "INTEGER", "parent_task": "INTEGER",
-                     "parent_event": "INTEGER", "judge_after": "REAL", "measured_by": "TEXT"},
+                     "parent_event": "INTEGER", "judge_after": "REAL", "measured_by": "TEXT",
+                     # KPIs version 2: the digest of the check at its link, and a hub measure's source (hub:<name>)
+                     "link_digest": "TEXT", "source": "TEXT"},
+        # KPIs version 2 (4.2): a past value that a check printed after its link, and when the hub recorded a value
+        "kpi_points": {"backfill": "INTEGER NOT NULL DEFAULT 0", "recorded": "REAL"},
         # agent_remove: when the agent whose row keeps its name left team.json (forget_removed_agents), which the costs
         # reading of the whole fleet says (costs_deleted)
         "agents": {"deleted": "REAL"},
@@ -9042,6 +9193,14 @@ def migrate():
         sql_step("ALTER TABLE duty_steps DROP COLUMN skipped", problems)
     if unready:     # an owner chat that runs from before chat_warm lists its tools no more: it counts as ready
         sql_step("UPDATE session_credentials SET ready=created WHERE kind='chat' AND revoked IS NULL", problems)
+    # KPIs version 2 (4.2): a link from before link_digest takes the digest of the check that made its newest value
+    # (a point's source is "rule <id> <digest>"), so that new words of how keep the link and new code is a new link
+    sql_step("UPDATE standing SET link_digest=(SELECT substr(p.source, length('rule ' || standing.\"check\" || ' ') "
+             "+ 1) FROM kpi_points p WHERE p.item=standing.id AND p.source LIKE 'rule ' || standing.\"check\" || ' %' "
+             "ORDER BY p.at DESC LIMIT 1) WHERE kind='kpi' AND \"check\" IS NOT NULL AND link_digest IS NULL AND "
+             "linked_at IS NOT NULL", problems)
+    # and version 1's values were recorded at their own time, so an old link's next run is no first run after it
+    sql_step("UPDATE kpi_points SET recorded=at WHERE recorded IS NULL", problems)
     for statement in [
         "CREATE UNIQUE INDEX IF NOT EXISTS owner_reply_identity ON owner_reports(agent,in_reply_to) WHERE in_reply_to IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS owner_report_turn ON owner_reports(turn) WHERE turn IS NOT NULL",
@@ -9300,11 +9459,11 @@ def chat_session_ready(agent):
 
 def chat_wanted(agent, held):
     """True when the agent's owner chat should run now, before any message: an active worker or lead whose runtime
-    has an owner chat and is not signed out. held: something holds every new session now (a usage limit, settings
-    the helper has not loaded, an update run)."""
+    has an owner chat and is not signed out, with an account that its provider does not refuse. held: something holds
+    every new session now (a usage limit, settings the helper has not loaded, an update run)."""
     a = agents().get(agent) or {}
     return (not held and a.get("role") in ("worker", "lead") and agent_active(agent) and owner_chat(a)
-            and signed_in_now(agent, a.get("runtime")) is not False)
+            and signed_in_now(agent, a.get("runtime")) is not False and not account_refused(agent))
 
 
 def chat_ready_now(agent, alive, reads=None):
@@ -11054,6 +11213,7 @@ class AgentReads:
     read at the first chat_ready().
     turns: {agent: its stored turn end}.
     undelivered: {agent: the owner's chat message to it that is late} (chat_late_sweep).
+    refused: {agent: its stored refusal of its account} (account_refused).
     kpis: {agent: its active KPIs} (lanes/agent-kpis.md).
     stops: {agent: its newest press of Stop} (owner feature chat_stop, chat_stops_newest).
     waiting: {agent: its newest read message that waits}, only of the agents whose press of Stop can be given
@@ -11075,6 +11235,8 @@ class AgentReads:
                       for r in q("SELECT k, v FROM kv WHERE k >= 'turn_ended:' AND k < 'turn_ended;'")}
         self.undelivered = {r["k"][len("chat_undelivered:"):]: r["v"] for r in q(
             "SELECT k, v FROM kv WHERE k >= 'chat_undelivered:' AND k < 'chat_undelivered;'")}
+        self.refused = {r["k"][len("account_refused:"):]: r["v"] for r in q(
+            "SELECT k, v FROM kv WHERE k >= 'account_refused:' AND k < 'account_refused;'")}
         self.kpis = {r["agent"]: r["n"] for r in q(
             "SELECT agent, COUNT(*) n FROM standing WHERE kind='kpi' AND ended IS NULL GROUP BY agent")}
         self.stops = chat_stops_newest()
@@ -11136,7 +11298,7 @@ def agent_view(name, config, reads=None):
                 # What its machine last said about its own provider, so the app shows a signed-out agent its sign-in in
                 # place of its chat: null when the reading is old or a local model needs none.
                 signed_in=None if local_model(config, team_read().get("accounts")) else
-                signed_in_now(name, config["runtime"], reads),
+                False if account_refused(name, reads=reads) else signed_in_now(name, config["runtime"], reads),
                 # Owner feature chat_warm: whether its owner chat can answer now, so the app shows "Setting up" in place
                 # of a chat that cannot yet (chat_ready_now).
                 chat_ready=chat_ready_now(name, seen["alive"] if seen else None, reads),
@@ -16089,6 +16251,9 @@ def capacity_view(names=None, expertise=None, needs=None, login=None):
                   availability("unknown", f"The {runtime} runtime of this route is signed out: {SIGN_IN_REQUIRED}")
                   if own.get("error") == SIGN_IN_REQUIRED or group is not None and
                   not group.startswith(ACCOUNT_GROUP) and signed_in_now(name, runtime) is False else
+                  availability("unknown", f"The {runtime} runtime of this route is signed in with an account that its "
+                                          f"provider refuses: only a new sign-in by the owner ends that.")
+                  if account_refused(name, runtime) else
                   availability("unknown", f"The account of this route's {runtime} runtime changed; its own allowance is "
                                           f"not known yet.")
                   if own.get("error") == IDENTITY_CHANGED else
@@ -23643,7 +23808,7 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     generation = generation["v"] if generation else None
     extra = json.dumps({"generation": generation} if worker_chat else
                        {"generation": generation, "need": need["id"]} if secret_chat else
-                       {"quiet": True} if quiet else {"takeover": need["id"]} if closing else {})
+                       {"quiet": True} if quiet else {"takeover": need["id"]} if takeover else {})
     event_id = DB.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)",
                           (recipient, "chat" if worker_chat or secret_chat else "say", task, text, t0,
                            extra)).lastrowid
@@ -29434,6 +29599,9 @@ def conversation_records(agent, cid, generation, attempt, session, events):
                     activity(tid)
         for data, tid in limits:
             start_limit(agent, data["resets_at"], tid)
+        if conversation_runtime(agent, cid) == (agents().get(agent) or {}).get("runtime"):
+            taken = sorted((r for _, (_, b) in groups.items() for r in b), key=lambda r: r[0])
+            account_refusal_note(agent, taken, t0)
         last = max([last] + [e["seq"] for e in events if isinstance(e, dict) and isinstance(e.get("seq"), int)
                              and not isinstance(e["seq"], bool)])      # skipped records count as taken
     return 200, {"ok": True, "stored": stored, "last_seq": last}
@@ -40542,6 +40710,10 @@ def t_close_case(agent, a):
         if outcome == "handled" and not check_opened(c) and DB.execute(
                 "SELECT 1 FROM duty_reports WHERE duty_case=? LIMIT 1", (c["id"],)).fetchone():
             text += PERSON_FOUND_CLOSED
+        # KPIs version 2 (4.8): a case's close and its covers count a hub measure again, at once
+        kpi_measure_agents_rows([x["agent"] for x in DB.execute(
+            "SELECT DISTINCT rs.agent FROM duty_reports d JOIN responsibilities rs ON rs.id=d.to_duty WHERE "
+            "d.duty_case=?", (c["id"],)).fetchall()], t0)
         if learned:
             # The key is what makes it checkable later: the same event again contradicts this lesson by itself.
             mid = memory_from_work(agent, learned, f"{rref(r['id'])} opening a case with the key '{c['key']}' again",
@@ -40948,6 +41120,9 @@ def t_report_defect(agent, a):
         step_row(c, "reported", ", ".join(f"{dref(x['id'])} to {rref(x['to_duty'])}" for x in sent), tid, agent, t0)
         text = f"{dref(rid)} is with {rref(to['id'])}, whose agent joins it to a case of its own. Go on with this case."
         keep_command(command, {"report": rid, "text": text}, t0)
+        # KPIs version 2 (4.8): a hub measure counts at each event, for each agent whose duty got this ticket: a
+        # repeat moves the share of the duty that got it first
+        kpi_measure_agents_rows([to["agent"]], t0, ticket=(r["id"], c["key"]))
     activity(tid, "report_defect")
     return text
 
@@ -48966,13 +49141,16 @@ KPI_NAME_MAX, KPI_UNIT_MAX, KPI_WINDOW_MIN = 40, 8, 7
 KPI_CODE = re.compile(r"\b[A-Za-z]{1,3}-[0-9]+\b")          # a code such as I-12 or T-61, which a name never holds
 KPI_DAY = 86400
 KPIS_OFF = "KPIs are not on in this fleet yet (the setting kpis), so nothing changed."
-# R2, whole, for the setup task (spec 7.1) and set_kpi's description
+# R2 as version 2 has it (plan 4.3), for the setup task (spec 7.1); set_kpi's description says it in short
 KPI_DATA_RULE = ("A value comes from the check, which reads records that others write in a business system (staff's "
-                 "sent text, CI results, a customer's reply), never a hub record such as a task, a case or a typed "
-                 "report: a check cannot read those. A field that the measured agent writes may select which records count, never "
-                 "the outcome. A record that the measured agent wrote counts only as the source's own history shows "
-                 "it at the time of the outcome (the draft as it was when staff sent it); when the source keeps no "
-                 "such history, that record cannot decide the outcome. No tool takes a value in words.")
+                 "sent text, CI results, a customer's reply), never a hub record such as a task or a case: a check "
+                 "cannot read those. The typed reports to your duties reach a check only through its input `reports` "
+                 "(their ids and times), and their covers and case closes are the measured agent's own acts, which may "
+                 "select records but never give an end time. A field that the measured agent writes may select which "
+                 "records count, never the outcome. A record that the measured agent wrote counts only as the "
+                 "source's own history shows it at the time of the outcome (the draft as it was when staff sent it); "
+                 "when the source keeps no such history, that record cannot decide the outcome. No tool takes a value "
+                 "in words.")
 
 
 def kpi_parent(agent):
@@ -49135,12 +49313,21 @@ def kpi_setup_fields(r, measuring):
     parent, measured = shown_role(kpi_parent(r["agent"])), shown_role(r["agent"])
     return {"title": f"Measure {r['name']}",
             "details": (f"{parent} set a KPI on {measured} ({r['agent']}), {iref(r['id'])}: {full_stop(r['words'])} "
-                        f"Its level: {kpi_level(r)}, over {r['window_days']} days. Its metric: {r['metric']}.\n\n"
+                        f"Its level: {kpi_level(r)}, over {r['window_days']} days. Its metric: {r['metric']}. "
+                        + (f"It is {measured}'s department's KPI: the results of its whole team's work. "
+                           if role_of(r["agent"]) == "lead" else
+                           f"It measures a number that {measured}'s own work on its tasks and duties moves, never one "
+                           f"that mostly outside factors or other agents move. ") + "\n\n"
                         f"Write a wake-up rule of your own whose check prints lines, or edit one that you have: its "
                         f"first line is \"progress <number>\" when a target uses it too, and then the line "
                         f"\"kpi {r['metric']} <value>\", the value of the last {r['window_days']} days as one number. "
-                        f"Save the check in this task, also an existing one (as an edit), so that {parent} can read "
-                        f"it.\n\n{KPI_DATA_RULE}\n\nWhen the source does not hold the data, say what {measured}'s "
+                        f"After it, each past day may follow as \"kpi {r['metric']} <value> <unix-seconds>\" (the end "
+                        f"of that day's window: the midnight after it, in the time zone {goal_settings()[2].key}), up "
+                        f"to {KPI_BACKFILL_DAYS} days back: the hub takes them in the first run after {parent} links "
+                        f"the check and drops them with no words in later runs, and its value shows at once. Save the "
+                        f"check in this task, also an existing one (as an edit, also with no change), so that {parent} "
+                        f"can read it.\n\n{KPI_DATA_RULE}\n\nWhen the source does not hold the data, say what "
+                        f"{measured}'s "
                         f"work must add so that it does (for example, a tag that marks which tickets were answered "
                         f"with its draft): such a field may select which records count, never the outcome."),
             "done_when": (f"Your check prints the value of {r['name']} as a `kpi` line, and your result names the "
@@ -49274,7 +49461,8 @@ def kpi_new(agent, a, task):
                f"agent_part), or send it back." if setup else
                f"You measure it yourself: write a line check of your own that prints \"kpi {f['metric']} <value>\", "
                f"then link it with set_kpi(id=\"{iref(item)}\", check, how, agent_part).")
-            + f" {target}'s sessions start with its words. A value counts from one window after the link.")
+            + f" {target}'s sessions start with its words. Each value shows at once; its steps judge values from the "
+              f"link, or from one window after it when {target} has a part.")
 
 
 def kpi_change(agent, r, a, task):
@@ -49287,6 +49475,10 @@ def kpi_change(agent, r, a, task):
     if not f and not by:
         return f"{iref(r['id'])} already says this. Nothing changed."
     again = by or any(k in f for k in ("words", "window_days", "metric"))   # spec 6: the link clears, a new setup
+    if not again and kpi_measure(r) and ("unit" in f or "direction" in f):      # its link stays: so must its shape
+        wrong = hub_measure_wrong(kpi_measure(r), f.get("unit", r["unit"]), f.get("direction", r["direction"]))
+        if wrong:
+            raise ToolError(f"{wrong} {iref(r['id'])} is linked to it, so nothing changed.")
     if again and not by and not kpi_measurer_ok(r):
         raise ToolError(f"{measuring}, which measured {r['name']}, is no agent whose tasks you give now: name who "
                         f"measures it with measured_by in the same call.")
@@ -49296,25 +49488,23 @@ def kpi_change(agent, r, a, task):
     with transaction():
         sets = dict(f)
         if again:
-            sets.update({"check": None, "linked_at": None, "how": None, "agent_part": None, "judge_after": None,
+            sets.update({"check": None, "linked_at": None, "link_digest": None, "source": None, "how": None,
+                         "agent_part": None, "judge_after": None,
                          "kpi_state": "no_data", "state_since": t0, "parent_event": None, "measured_by": measuring})
             for key in ("off_task", "parent_task"):         # a step that ended clears; an open one keeps its marker
                 if r[key] and kpi_step_end(r, key) is not None:
                     sets[key] = None
         DB.execute(f"UPDATE standing SET {', '.join(chr(34) + k + chr(34) + '=?' for k in sets)} WHERE id=?",
                    (*sets.values(), r["id"]))
+        if any(k in f for k in ("words", "window_days", "metric")) or (again and r["source"]):
+            DB.execute("DELETE FROM kpi_points WHERE item=?", (r["id"],))     # they measured something else (4.2)
         setup = None
         if again:
             now_r = DB.execute("SELECT * FROM standing WHERE id=?", (r["id"],)).fetchone()
             setup = kpi_step_rows(measuring, kpi_setup_fields(now_r, measuring), t0).get("task") \
                 if measuring != agent else None
             DB.execute("UPDATE standing SET setup_task=? WHERE id=?", (setup, r["id"]))
-            if r["setup_task"] and kpi_step_end(r, "setup_task") is None:      # the old setup is replaced
-                old = DB.execute("SELECT owner FROM tasks WHERE id=?", (r["setup_task"],)).fetchone()
-                DB.execute(EVENT, (old["owner"], "say", r["setup_task"],
-                                   f"[hub] {agent} changed the KPI {iref(r['id'])}, so this setup is no longer needed"
-                                   + (f": {tref(setup)} replaces it" if setup else "") + ". Deliver this task with "
-                                   f"what you have, and change nothing more for it.", t0, "{}"))
+            kpi_setup_done_rows(r, f"{agent} changed the KPI {iref(r['id'])}", t0, setup)   # the old one is replaced
         elif "direction" in f or "number" in f:
             kpi_state_rows(r["id"], t0, steps=False)    # the state from the newest counting value, at the new level
         kpi_change_row(r["id"], agent, "changed: " + "; ".join(
@@ -49324,12 +49514,39 @@ def kpi_change(agent, r, a, task):
         log_row(agent, f"changed the KPI {iref(r['id'])} of {r['agent']}")
     if not again:
         return f"Changed {iref(r['id'])}. Its link and its values stay."
-    return (f"Changed {iref(r['id'])}. Its link cleared, and its values count again from one window after the next "
-            f"link. " + (f"{tref(setup)} asks {measuring} to build its check." if setup else
-                         "You measure it yourself: link a line check of your own with set_kpi."))
+    return (f"Changed {iref(r['id'])}. Its link cleared: its steps judge values again from the next link. " +
+            (f"{tref(setup)} asks {measuring} to build its check." if setup else
+             "You measure it yourself: link a line check of your own with set_kpi."))
+
+
+def kpi_code_read(rule, setup):
+    """True when the code of wake-up rule `rule` now is code that a KPI's parent read in its setup task: newest first,
+    a save in `setup` (also one that changed nothing: an existing check saved again) comes before any save elsewhere
+    that changed the rule's check (its create, or an edit of its check). A read."""
+    for h in read_rows("SELECT detail, saved_by_task FROM trigger_history WHERE trigger_id=? AND action IN "
+                       "('create','edit') ORDER BY id DESC", (rule,)):
+        if setup is not None and h["saved_by_task"] == setup:
+            return True
+        detail = json.loads(h["detail"] or "{}")
+        if "check" in (detail.get("created") or {}) or "check" in (detail.get("changed") or {}):
+            return False
+    return False
+
+
+def kpi_setup_done_rows(r, why, t0, setup=None):
+    """Inside a transaction: KPI row r's setup task, while it is open, is no longer needed (why: who did what); its
+    agent hears it and delivers, and `setup`, when given, replaces it."""
+    in_transaction("kpi_setup_done_rows")
+    if r["setup_task"] and kpi_step_end(r, "setup_task") is None:
+        old = DB.execute("SELECT owner FROM tasks WHERE id=?", (r["setup_task"],)).fetchone()
+        DB.execute(EVENT, (old["owner"], "say", r["setup_task"], f"[hub] {why}, so this setup is no longer needed"
+                           + (f": {tref(setup)} replaces it" if setup else "") + ". Deliver this task with what you "
+                           "have, and change nothing more for it.", t0, "{}"))
 
 
 def kpi_link(agent, r, a, task):
+    if str(a.get("check") or "").startswith("hub:"):        # KPIs version 2 (4.3): a hub measure, with no check
+        return kpi_link_measure(agent, r, a, task, str(a["check"])[4:])
     measuring = kpi_measuring_agent(r)
     if not kpi_measurer_ok(r):
         raise ToolError(f"{measuring}, which was to measure {r['name']}, is no agent whose tasks you give now: name who "
@@ -49346,15 +49563,21 @@ def kpi_link(agent, r, a, task):
         raise ToolError(f"check is a wake-up rule that {measuring}, which measures {r['name']}, saved for itself: its "
                         f"own line check with saved code.")
     spec = json.loads(t["check_spec"]) if t["check_spec"] else None
+    # KPIs version 2 (4.7): a duty's watch measures a KPI too; attach_watch makes a linked rule one anyway
     if not spec or spec.get("code") != "saved" or wakeups.is_read(spec) or not wakeups.is_lines(spec) or \
-            send_rule(t) is not None or reminder_rule(t) or t["responsibility"]:
+            send_rule(t) is not None or reminder_rule(t):
         raise ToolError(f"Wake-up rule {rule} is no line check with saved code of its own: a read, a reminder, a rule "
-                        f"that sends, a duty's watch and a value check measure no KPI.")
-    if role_of(agent) == "lead" and measuring != agent and not read_row(
-            "SELECT 1 FROM trigger_history WHERE trigger_id=? AND saved_by_task=?", (rule, r["setup_task"])):
-        raise ToolError(f"Wake-up rule {rule} was not saved in {r['name']}'s setup task"
+                        f"that sends and a value check measure no KPI.")
+    digest = kpi_digest(spec)       # KPIs version 2 (4.2): the same rule with new code is a new link
+    same = r["check"] == rule and r["link_digest"] == digest
+    if not same and role_of(agent) == "lead" and measuring != agent and not kpi_code_read(rule, r["setup_task"]):
+        raise ToolError(f"Wake-up rule {rule}'s code now was not saved in {r['name']}'s setup task"
                         + (f" {tref(r['setup_task'])}" if r["setup_task"] else "") + f", so you have not read it: ask "
-                        f"{measuring} to save it there (an edit of an existing check counts), then read it and link it.")
+                        f"{measuring} to save it there (an edit of an existing check counts), then read it and link "
+                        f"it. A setup task that ended gives no new read: set_kpi(id, measured_by) opens a new one.")
+    if "reports" in (spec.get("inputs") or []) and measuring != r["agent"]:
+        raise ToolError(f"Wake-up rule {rule} reads the input reports, which gives the typed reports to {measuring}'s "
+                        f"own duties, not to {r['agent']}'s: only a check of {r['agent']}'s own can read them for it.")
     metric = str(a.get("metric") or "").strip()
     if metric and metric != r["metric"]:
         raise ToolError(f"{iref(r['id'])}'s metric is {r['metric']}. To change it, use set_kpi(id, metric) without "
@@ -49363,10 +49586,10 @@ def kpi_link(agent, r, a, task):
     part = " ".join(str(a.get("agent_part") or "").split())
     if len(part) > STANDING_FIELD_MAX:
         raise ToolError(f"agent_part is at most {STANDING_FIELD_MAX} characters, or empty.")
-    if r["check"] == rule and r["how"] == how and (r["agent_part"] or "") == part:
+    if same and r["how"] == how and (r["agent_part"] or "") == part:
         return f"{iref(r['id'])} is linked to wake-up rule {rule} already. Nothing changed."
     t0, reads = now(), save_provenance(agent)[1]
-    if r["check"] == rule:          # the same rule: new words of how or of the agent's part, and the link stays
+    if same:                        # new words of how or of the agent's part: the link stays
         with transaction():
             DB.execute("UPDATE standing SET how=?, agent_part=? WHERE id=?", (how, part or None, r["id"]))
             kpi_change_row(r["id"], agent, f"changed: how to {how}; the agent's part to {part or 'nothing'}", t0, reads)
@@ -49378,23 +49601,119 @@ def kpi_link(agent, r, a, task):
         kept = {key: r[key] if r[key] and kpi_step_end(r, key) is None else None
                 for key in ("off_task", "parent_task")}
         marked = kept["off_task"] or kept["parent_task"]
-        DB.execute('UPDATE standing SET "check"=?, linked_at=?, how=?, agent_part=?, judge_after=?, kpi_state=?, '
-                   'state_since=?, off_task=?, parent_task=?, parent_event=NULL WHERE id=?',
-                   (rule, t0, how, part or None, t0 + r["window_days"] * KPI_DAY if marked else None, "no_data", t0,
-                    kept["off_task"], kept["parent_task"], r["id"]))
+        if r["source"]:             # from a hub measure to a check: its values measured something else
+            DB.execute("DELETE FROM kpi_points WHERE item=?", (r["id"],))
+        DB.execute('UPDATE standing SET "check"=?, linked_at=?, link_digest=?, source=NULL, how=?, agent_part=?, '
+                   'judge_after=?, kpi_state=?, state_since=?, off_task=?, parent_task=?, parent_event=NULL WHERE id=?',
+                   (rule, t0, digest, how, part or None, t0 + r["window_days"] * KPI_DAY if marked else None,
+                    "no_data", t0, kept["off_task"], kept["parent_task"], r["id"]))
+        quicker = kpi_check_often_rows(t, t0)
         kpi_change_row(r["id"], agent, f"linked to wake-up rule {rule}; how: {how}"
                                        + (f"; the agent's part: {part}" if part else ""), t0, reads)
         kpi_news_rows(r["id"], t0, agent, task)
         log_row(agent, f"linked the KPI {iref(r['id'])} of {r['agent']} to wake-up rule {rule}")
-    return (f"Linked {iref(r['id'])} to wake-up rule {rule}. Its values count from one window after now "
-            f"({r['window_days']} days); a later edit of the check records as before, with a mark on the chart.")
+    return (f"Linked {iref(r['id'])} to wake-up rule {rule}. {kpi_runs_text(t, quicker)}; each value shows at once, "
+            f"and its first run may also print the {KPI_BACKFILL_DAYS} days before the "
+            f"link, as \"kpi {r['metric']} <value> <unix-seconds>\". " +
+            (f"Its steps judge values from one window after now ({r['window_days']} days), because {r['agent']} has a "
+             f"part." if part else "Its steps judge values from now."))
+
+
+def kpi_runs_text(t, quicker):
+    """When the check of rule t that a KPI just linked runs, as the link's answer says it."""
+    if t["state"] == "paused":
+        by = "the owner" if t["paused_by"] in (None, "", "owner") else t["paused_by"]
+        return f"It is paused by {by}, so it runs once it is resumed"
+    if t["state"] != "active":
+        return f"It is {t['state']}, so it does not run"
+    if t["responsibility"]:
+        return "It is a duty's watch: it runs now, and after that at its own times"
+    return "It runs now" + (f", and every {KPI_CHECK_MINUTES} minutes from now on (its own times were slower)"
+                            if quicker else "")
+
+
+def kpi_check_often_rows(t, t0):
+    """Inside a transaction: a check that a KPI links runs now and at least every KPI_CHECK_MINUTES minutes (KPIs
+    version 2, 4.8; a quiet run costs no tokens). True when its own times were slower and the hub set the new ones,
+    which its history says. A duty's watch runs once now, for its first value, and keeps its own times: its other
+    lines wake its agent, so more runs would wake it more often, and a daily watch would lose its days and its time
+    (the validator's findings of 23 November 2026)."""
+    in_transaction("kpi_check_often_rows")
+    if t["state"] != "active":
+        return False
+    if t["responsibility"]:
+        DB.execute("UPDATE triggers SET next_due=? WHERE id=?", (t0, t["id"]))
+        return False
+    schedule = json.loads(t["schedule"])
+    if schedule.get("kind") == "every" and schedule.get("minutes", KPI_CHECK_MINUTES + 1) <= KPI_CHECK_MINUTES:
+        DB.execute("UPDATE triggers SET next_due=? WHERE id=?", (t0, t["id"]))
+        return False
+    quick = {"kind": "every", "minutes": KPI_CHECK_MINUTES}
+    DB.execute("UPDATE triggers SET schedule=?, anchor=?, next_due=?, revision=revision+1, updated=? WHERE id=?",
+               (json.dumps(quick), t0, t0, t0, t["id"]))
+    record_trigger(t["id"], "hub", "edit", {"changed": {"schedule": {"before": schedule, "after": quick}},
+                                            "why": "a KPI links this check: it runs at least every 15 minutes"}, t0)
+    return True
+
+
+def kpi_link_measure(agent, r, a, task, name):
+    """set_kpi's link of a hub measure (KPIs version 2, 4.3): the hub counts it from its own records, with no check
+    and no measuring agent, and fills its past at once."""
+    if name not in HUB_MEASURES:
+        raise ToolError(f"check is a wake-up rule's number or a hub measure: "
+                        f"{', '.join('hub:' + m for m in HUB_MEASURES)}.")
+    metric = str(a.get("metric") or "").strip()
+    if metric and metric != r["metric"]:
+        raise ToolError(f"{iref(r['id'])}'s metric is {r['metric']}. To change it, use set_kpi(id, metric) without "
+                        f"check, which opens a new setup.")
+    wrong = hub_measure_wrong(name, r["unit"], r["direction"])
+    if wrong:
+        raise ToolError(f"{wrong} Change {iref(r['id'])} with set_kpi(id, unit, direction) first.")
+    how = item_field(a.get("how"), "how")
+    part = " ".join(str(a.get("agent_part") or "").split())
+    if len(part) > STANDING_FIELD_MAX:
+        raise ToolError(f"agent_part is at most {STANDING_FIELD_MAX} characters, or empty.")
+    t0, reads = now(), save_provenance(agent)[1]
+    if r["source"] == f"hub:{name}":       # new words of how or of the agent's part: the link stays, as kpi_link
+        if r["how"] == how and (r["agent_part"] or "") == part:
+            return f"{iref(r['id'])} is the hub measure {name} already. Nothing changed."
+        with transaction():
+            DB.execute("UPDATE standing SET how=?, agent_part=? WHERE id=?", (how, part or None, r["id"]))
+            kpi_change_row(r["id"], agent, f"changed: how to {how}; the agent's part to {part or 'nothing'}", t0, reads)
+            kpi_news_rows(r["id"], t0, agent, task)
+        return f"Changed how {iref(r['id'])} is measured and the agent's part. Its link and its values stay."
+    with transaction():
+        # as kpi_link: the markers of steps that have ended clear (spec 6), and an episode that is still marked is
+        # judged one window after the new link
+        kept = {key: r[key] if r[key] and kpi_step_end(r, key) is None else None
+                for key in ("off_task", "parent_task")}
+        marked = kept["off_task"] or kept["parent_task"]
+        DB.execute("DELETE FROM kpi_points WHERE item=?", (r["id"],))     # a check's or another measure's (4.2)
+        DB.execute('UPDATE standing SET "check"=NULL, linked_at=?, link_digest=NULL, source=?, how=?, agent_part=?, '
+                   'judge_after=?, kpi_state=?, state_since=?, off_task=?, parent_task=?, parent_event=NULL WHERE id=?',
+                   (t0, f"hub:{name}", how, part or None, t0 + r["window_days"] * KPI_DAY if marked else None,
+                    "no_data", t0, kept["off_task"], kept["parent_task"], r["id"]))
+        kpi_setup_done_rows(r, f"{agent} linked the KPI {iref(r['id'])} to the hub's own measure {name}", t0)
+        kpi_measure_rows(DB.execute("SELECT * FROM standing WHERE id=?", (r["id"],)).fetchone(), t0, past=True)
+        kpi_change_row(r["id"], agent, f"linked to the hub measure {name}; how: {how}"
+                                       + (f"; the agent's part: {part}" if part else ""), t0, reads)
+        kpi_news_rows(r["id"], t0, agent, task)
+        log_row(agent, f"linked the KPI {iref(r['id'])} of {r['agent']} to the hub measure {name}")
+    lag = HUB_MEASURE_LAGS.get(name, 0)
+    return (f"Linked {iref(r['id'])} to the hub measure {name}: the hub counts it from its own records at each event, "
+            f"and its past {KPI_BACKFILL_DAYS} days show at once." +
+            (f" A value is final {lag // KPI_DAY} days after its window ends; until then it shows the count so far, "
+             f"and only final values are judged." if lag else ""))
 
 
 # ---- values, state and steps (spec 5.2, 5.3, 6)
 
 def kpi_digest(spec):
-    """The digest of the check that made a value: its code's sha256, its args and its form (spec 5.1)."""
+    """The digest of the check that made a value: its code's sha256, its args and its form (spec 5.1), and the names
+    of its inputs when it has some (plan v2 4.3), so a check with no input keeps the digest that its points hold."""
     seen = [spec.get(k) for k in ("sha256", "args", "form")] if spec else []
+    if spec and spec.get("inputs"):
+        seen.append(spec["inputs"])
     return hashlib.sha256(json.dumps(seen, sort_keys=True).encode()).hexdigest()[:12]
 
 
@@ -49403,26 +49722,156 @@ def kpi_linked(rule):
     return read_rows("SELECT * FROM standing WHERE kind='kpi' AND ended IS NULL AND \"check\"=? ORDER BY id", (rule,))
 
 
-def kpi_counts(r, at):
-    """True when a value at `at` counts for KPI row r: its window lies wholly after the link (spec 6)."""
-    return bool(r["linked_at"]) and at >= r["linked_at"] + r["window_days"] * KPI_DAY
+# KPIs version 2 (~/dev/founderizer-plans/agent-kpis-v2/plan.md, 4.2 and 4.8): every value of a KPI is shown at once,
+# on the owner's tab and in its large value; the steps judge only live values from the link, or from one window after
+# it when the agent must change its work for the data to exist (agent_part). A value of a hub measure with a lag is
+# judged only once its lag has passed and the hub counted it again.
+KPI_BACKFILL_DAYS = 56          # a check's past values reach this far back from the link
+KPI_CHECK_MINUTES = 15          # a linked check runs at least this often (4.8)
 
 
-def kpi_record_rows(t, values, spec, t0):
+def kpi_judge_from(r):
+    """When KPI row r's live values start to be judged, or None before its link."""
+    if not r["linked_at"]:
+        return None
+    return r["linked_at"] + (r["window_days"] * KPI_DAY if r["agent_part"] else 0)
+
+
+def kpi_point_judged(r, p):
+    """True when the point p of KPI row r (a kpi_points row) counts for its steps (4.2), as kpi_judged_newest takes
+    it: live, from kpi_judge_from, and past its lag for a hub measure. A shown value is every value."""
+    start = kpi_judge_from(r)
+    lag = HUB_MEASURE_LAGS.get(kpi_measure(r) or "", 0)
+    return start is not None and not p["backfill"] and p["at"] >= start and (
+        not lag or (p["recorded"] or 0) >= p["at"] + lag)
+
+
+def kpi_measure(r):
+    """The hub measure that is KPI row r's source, or None for a check."""
+    src = r["source"] or ""
+    return src[4:] if src.startswith("hub:") else None
+
+
+def kpi_judged_newest(item, r):
+    """The newest judged value of KPI row r (4.2): live, from kpi_judge_from, and past its lag for a hub measure."""
+    start = kpi_judge_from(r)
+    if start is None:
+        return None
+    lag = HUB_MEASURE_LAGS.get(kpi_measure(r) or "", 0)
+    return DB.execute("SELECT value, at FROM kpi_points WHERE item=? AND backfill=0 AND at>=? AND "
+                      "(?=0 OR recorded>=at+?) ORDER BY at DESC LIMIT 1", (item, start, lag, lag)).fetchone()
+
+
+def kpi_shown_state(r, value):
+    """on, off or no_data for KPI row r's newest shown value (GET /ui/kpis `state`)."""
+    if value is None:
+        return "no_data"
+    return "on" if (value >= r["number"] if r["direction"] == "at_least" else value <= r["number"]) else "off"
+
+
+def kpi_record_rows(t, values, spec, t0, dated=()):
     """Inside check_result's transaction: the values of a run's `kpi` lines, for each active KPI that rule t measures
     and whose metric the run printed (spec 5.2, 5.3), while the rule's agent still measures it. One value for each
-    day, the newest of the day; then the state and the next step."""
+    day, the newest of the day, which today's runs replace; then the state and the next step. A past value (a dated
+    line, KPIs version 2, 4.2) is taken only in the first recording run after the link, only while the check's digest
+    is the one that the parent linked, only for a day before the link and at most KPI_BACKFILL_DAYS before it, and
+    only for a day with no value. Its time is the end of that day's window, so a midnight belongs to the day before
+    it. Gives the sentences for the run's reason: the dated values that the first run after a link did not take
+    (4.2; a later run's go with no words, as its check prints them at each run), and a KPI that got no value because
+    the check reads another agent's reports."""
     in_transaction("kpi_record_rows")
-    day, source = item_day(t0), f"rule {t['id']} {kpi_digest(spec)}"
+    day, digest, said = item_day(t0), kpi_digest(spec), []
+    source = f"rule {t['id']} {digest}"
     for r in DB.execute("SELECT * FROM standing WHERE kind='kpi' AND ended IS NULL AND \"check\"=? ORDER BY id",
                         (t["id"],)).fetchall():
-        if r["metric"] not in values or t["agent"] != kpi_measuring_agent(r):
+        past, taken = [(v, at) for m, v, at in dated if m == r["metric"]], 0
+        if (r["metric"] not in values and not past) or t["agent"] != kpi_measuring_agent(r):
             continue
-        DB.execute("INSERT INTO kpi_points(item,day,value,at,source) VALUES(?,?,?,?,?) ON CONFLICT(item,day) DO UPDATE "
-                   "SET value=excluded.value, at=excluded.at, source=excluded.source WHERE excluded.at>=kpi_points.at",
-                   (r["id"], day, values[r["metric"]], t0, source))
-        DB.execute("UPDATE standing SET progress=? WHERE id=?", (values[r["metric"]], r["id"]))
+        if "reports" in (spec.get("inputs") or []) and t["agent"] != r["agent"]:    # an edit after the link
+            said.append(f"It reads the input reports, which gives {t['agent']}'s own reports, not {r['agent']}'s, so "
+                        f"it gave {r['name']} no value.")
+            continue
+        first = r["linked_at"] and not DB.execute("SELECT 1 FROM kpi_points WHERE item=? AND recorded>=? AND "
+                                                  "recorded<>? LIMIT 1", (r["id"], r["linked_at"], t0)).fetchone()
+        if past and first and r["link_digest"] == digest:
+            linked_day = item_day(r["linked_at"])
+            for value, at in past:      # at: the end of that day's window, so a midnight is the day before it
+                if r["linked_at"] - KPI_BACKFILL_DAYS * KPI_DAY <= at <= r["linked_at"] and \
+                        item_day(at - 1) < linked_day:
+                    taken += 1
+                    DB.execute("INSERT OR IGNORE INTO kpi_points(item,day,value,at,source,backfill,recorded) "
+                               "VALUES(?,?,?,?,?,1,?)", (r["id"], item_day(at - 1), value, at - 1, source, t0))
+        if past and first and taken < len(past):      # a later run's dated lines go with no words (4.2)
+            said.append(f"{len(past) - taken} dated kpi line(s) were not taken: a KPI takes past days only in the "
+                        f"first run after its link, from the code that its parent linked, for at most "
+                        f"{KPI_BACKFILL_DAYS} days before the link.")
+        if r["metric"] in values:
+            DB.execute("INSERT INTO kpi_points(item,day,value,at,source,backfill,recorded) VALUES(?,?,?,?,?,0,?) "
+                       "ON CONFLICT(item,day) DO UPDATE SET value=excluded.value, at=excluded.at, "
+                       "source=excluded.source, backfill=0, recorded=excluded.recorded WHERE excluded.at>=kpi_points.at",
+                       (r["id"], day, values[r["metric"]], t0, source, t0))
+            DB.execute("UPDATE standing SET progress=? WHERE id=?", (values[r["metric"]], r["id"]))
         kpi_state_rows(r["id"], t0)
+    return said
+
+
+def kpi_measure_rows(r, t0, past=False):
+    """Inside a transaction: the hub counts KPI row r's hub measure (4.3, 4.8): its value so far for the window that
+    ends now, as today's live value; each other value that is not final yet, past ones too, again as its value so far
+    (a repeat moves an earlier day at once, and its colour with it: the validator's finding of 23 November 2026); and,
+    as final, each value of a day whose lag has passed since the hub last counted it; with past, also the past days
+    before the link, as past values (HUB_MEASURES, hub_measure_past). Then the state and the next step. It commits
+    nothing."""
+    in_transaction("kpi_measure_rows")
+    name = kpi_measure(r)
+    measure = HUB_MEASURES.get(name or "")
+    if measure is None or r["ended"]:
+        return
+    source, lag = f"hub {name}", HUB_MEASURE_LAGS.get(name, 0)
+    if past and r["linked_at"]:
+        for day, value, at in hub_measure_past(name, r["agent"], r["window_days"], r["linked_at"], KPI_BACKFILL_DAYS):
+            if at < r["linked_at"] and day < item_day(r["linked_at"]):
+                DB.execute("INSERT OR IGNORE INTO kpi_points(item,day,value,at,source,backfill,recorded) "
+                           "VALUES(?,?,?,?,?,1,?)", (r["id"], day, value, at, source, t0))
+    value = measure(r["agent"], t0, r["window_days"], lag=False, t0=t0)
+    if value is not None:
+        DB.execute("INSERT INTO kpi_points(item,day,value,at,source,backfill,recorded) VALUES(?,?,?,?,?,0,?) "
+                   "ON CONFLICT(item,day) DO UPDATE SET value=excluded.value, at=excluded.at, source=excluded.source, "
+                   "backfill=0, recorded=excluded.recorded WHERE excluded.at>=kpi_points.at",
+                   (r["id"], item_day(t0), value, t0, source, t0))
+    if lag:
+        today = item_day(t0)
+        for p in DB.execute("SELECT day, at FROM kpi_points WHERE item=? AND recorded<at+?",
+                            (r["id"], lag)).fetchall():                 # a past day too: it shows, never judged
+            if p["at"] + lag <= t0:     # final: its value and the time that makes it judged
+                final = measure(r["agent"], p["at"], r["window_days"], lag=True, t0=t0)
+                if final is None:
+                    DB.execute("DELETE FROM kpi_points WHERE item=? AND day=?", (r["id"], p["day"]))
+                else:
+                    DB.execute("UPDATE kpi_points SET value=?, recorded=? WHERE item=? AND day=?",
+                               (final, t0, r["id"], p["day"]))
+            elif p["day"] != today:     # so far: its value only, so that it is still counted as final at its time
+                so_far = measure(r["agent"], p["at"], r["window_days"], lag=False, t0=t0)
+                if so_far is not None:
+                    DB.execute("UPDATE kpi_points SET value=? WHERE item=? AND day=?", (so_far, r["id"], p["day"]))
+    kpi_state_rows(r["id"], t0)
+
+
+def kpi_measure_agents_rows(names, t0, ticket=None):
+    """Inside a transaction: each event that changes a hub measure (a typed report, a cover, a case's close) counts
+    again the hub-measure KPIs of these agents (4.8: at each event, not once a day), and with ticket (its reporting
+    duty and key) of each agent whose duty got a report of that ticket."""
+    in_transaction("kpi_measure_agents_rows")
+    if not DB.execute("SELECT 1 FROM standing WHERE kind='kpi' AND ended IS NULL LIMIT 1").fetchone():
+        return                      # a fleet with no KPI: report_defect and close_case read nothing more
+    if ticket:
+        names = list(names) + [x["agent"] for x in DB.execute(
+            "SELECT DISTINCT rs.agent FROM duty_reports d JOIN responsibilities rs ON rs.id=d.to_duty WHERE "
+            "d.from_duty=? AND d.ticket=?", ticket).fetchall()]
+    for name in sorted(set(names) - {None}):
+        for r in DB.execute("SELECT * FROM standing WHERE kind='kpi' AND ended IS NULL AND agent=? AND source LIKE "
+                            "'hub:%' ORDER BY id", (name,)).fetchall():
+            kpi_measure_rows(r, t0)
 
 
 def kpi_step_end(r, key):
@@ -49450,8 +49899,8 @@ def kpi_state_rows(item, t0, steps=True):
     open, which clears when it ends. steps False: the state alone, at a change of the level."""
     in_transaction("kpi_state_rows")
     r = DB.execute("SELECT * FROM standing WHERE id=?", (item,)).fetchone()
-    row = DB.execute("SELECT value, at FROM kpi_points WHERE item=? ORDER BY at DESC LIMIT 1", (item,)).fetchone()
-    if not r or r["ended"] or not row or not kpi_counts(r, row["at"]):
+    row = kpi_judged_newest(item, r) if r else None     # KPIs version 2: only judged values move the state and steps
+    if not r or r["ended"] or not row:
         return
     value, at, window = row["value"], row["at"], r["window_days"] * KPI_DAY
     on = value >= r["number"] if r["direction"] == "at_least" else value <= r["number"]
@@ -49493,15 +49942,17 @@ def kpi_parent_busy(r):
 def kpi_weeks(r, t0, weeks):
     """The periods of 7 days that end at t0, oldest first, each with its newest value and whether that value counts
     (spec 5.3: a week's value is the newest value inside it; a week with none has none). A read."""
-    rows = read_rows("SELECT value, at FROM kpi_points WHERE item=? AND at>? AND at<=? ORDER BY at",
-                     (r["id"], t0 - weeks * 7 * KPI_DAY, t0))
+    rows = read_rows("SELECT value, at, backfill, recorded FROM kpi_points WHERE item=? AND at>? AND at<=? ORDER BY "
+                     "at", (r["id"], t0 - weeks * 7 * KPI_DAY, t0))
     out = []
     for n in range(weeks, 0, -1):
         end, start = t0 - (n - 1) * 7 * KPI_DAY, t0 - n * 7 * KPI_DAY
         inside = [x for x in rows if start < x["at"] <= end]
         last = inside[-1] if inside else None
+        # counts: shown, for the owner's tab (KPIs version 2, 4.2); judged: it counts for the steps, for an agent
         out.append({"start": start, "end": end, "value": last["value"] if last else None,
-                    "at": last["at"] if last else None, "counts": bool(last) and kpi_counts(r, last["at"])})
+                    "at": last["at"] if last else None, "counts": bool(last),
+                    "judged": bool(last) and kpi_point_judged(r, last)})
     return out
 
 
@@ -49535,7 +49986,8 @@ def kpi_marks(r, start, end, plain=False):
                               "linked": f"{who} linked its check", "ended": f"{who} ended the KPI",
                               "link": "Its check's link cleared"}.get(kind, f"{who} changed the KPI")))
     seen = None
-    for p in read_rows("SELECT at, source FROM kpi_points WHERE item=? AND at<=? ORDER BY at", (r["id"], end)):
+    for p in read_rows("SELECT at, source FROM kpi_points WHERE item=? AND at<=? AND backfill=0 ORDER BY at",
+                       (r["id"], end)):          # a past value shows a day, never when the check's code changed
         if seen is not None and p["source"] != seen and p["at"] > start:
             out.append((p["at"], "Check changed"))
         seen = p["source"]
@@ -49575,7 +50027,8 @@ def kpi_week_lines(r, t0, weeks=8):
     out = []
     for w in kpi_weeks(r, t0, weeks):
         value = "no value" if w["value"] is None else kpi_value_text(r, w["value"]) + \
-            ("" if w["counts"] else " (before one window after the link: it counts for nothing)")
+            ("" if w["judged"] else " (it counts for nothing: a past value, one before its steps judge, or one that is "
+                                    "not final yet)")
         marks = "; ".join(words for _, words in kpi_marks(r, w["start"], w["end"]))
         out.append(f"- the week to {item_day(w['end'])}: {value}" + (f". Changes: {marks}" if marks else ""))
     return "\n".join(out)
@@ -49691,14 +50144,17 @@ def kpi_view(r, t0, weeks):
     each with its newest value and whether it counts) and its change marks, and its newest value. A read."""
     ws = kpi_weeks(r, t0, weeks)
     newest = read_row("SELECT value, at FROM kpi_points WHERE item=? ORDER BY at DESC LIMIT 1", (r["id"],))
+    # a value older than two windows says nothing of now: the large value stays, and its colour goes (spec 6)
+    fresh = newest and newest["at"] >= t0 - 2 * r["window_days"] * KPI_DAY
     return {"id": r["id"], "ref": iref(r["id"]), "agent": r["agent"], "name": r["name"], "words": r["words"],
             "direction": r["direction"], "number": r["number"], "unit": r["unit"] or "",
-            "window_days": r["window_days"], "state": r["kpi_state"], "state_since": r["state_since"],
+            "window_days": r["window_days"], "state": kpi_shown_state(r, newest["value"] if fresh else None),
+            "state_since": r["state_since"],
             "setter": r["author"], "setter_role": shown_role(r["author"]), "created": r["created"],
             "weeks": [{"start": w["start"], "value": w["value"], "counts": w["counts"]} for w in ws],
             "marks": [{"at": at, "words": words} for at, words in kpi_marks(r, ws[0]["start"], t0, plain=True)],
             "value": newest["value"] if newest else None, "value_at": newest["at"] if newest else None,
-            "value_counts": bool(newest) and kpi_counts(r, newest["at"])}
+            "value_counts": bool(newest)}
 
 
 def history_kpis(a, days, start, before):
@@ -49718,13 +50174,15 @@ def history_kpis(a, days, start, before):
                    f"{item_day(r['state_since'] or r['created'])}.")
         out.append("  Weeks, oldest first: " + " | ".join(
             f"to {item_day(w['end'])}: " + ("no value" if w["value"] is None else kpi_value_text(r, w["value"])
-                                            + ("" if w["counts"] else " (counts for nothing)"))
+                                            + ("" if w["judged"] else " (counts for nothing)"))
             for w in kpi_weeks(r, t0, weeks)))
         marks = kpi_marks(r, t0 - weeks * 7 * KPI_DAY, t0)
         out.append("  Changes: " + ("; ".join(f"{item_day(at)} {words}" for at, words in marks) or "none"))
-        out.append(f"  Link: " + (f"wake-up rule {r['check']}, since {item_day(r['linked_at'])}; how: {r['how']}"
+        source = f"wake-up rule {r['check']}" if r["check"] else \
+            f"the hub measure {kpi_measure(r)}" if kpi_measure(r) else None
+        out.append(f"  Link: " + (f"{source}, since {item_day(r['linked_at'])}; how: {r['how']}"
                                   + (f"; the agent's part: {r['agent_part']}" if r["agent_part"] else "")
-                                  if r["check"] else "none: no value counts until a check is linked"))
+                                  if source else "none: no value counts until a check or a hub measure is linked"))
         steps = []
         for key, label in (("setup_task", "setup"), ("off_task", "off-target"), ("parent_task", "still-off")):
             if r[key]:
@@ -49755,6 +50213,9 @@ def kpi_daily_rows(t0):
     in_transaction("kpi_daily_rows")
     for r in DB.execute("SELECT * FROM standing WHERE kind='kpi' AND ended IS NULL AND linked_at IS NOT NULL "
                         "ORDER BY id").fetchall():
+        if kpi_measure(r):          # KPIs version 2 (4.3): the hub counts it; no check to measure again
+            kpi_measure_rows(r, t0)
+            continue
         last = DB.execute("SELECT MAX(at) at FROM kpi_points WHERE item=?", (r["id"],)).fetchone()["at"]
         since = max(last or 0, r["linked_at"])
         told = DB.execute("SELECT v FROM kv WHERE k=?", (f"kpi_spell:{r['id']}",)).fetchone()
@@ -50097,6 +50558,94 @@ def standing_view(r):
                 author_name=person_name(r["author"]) if r["author_kind"] == "person" else None,
                 steers=[r["agent"]] + (team_below(r["agent"]) if r["scope"] == "team" else []))
     return view
+
+
+# ---- hub measures (~/dev/founderizer-plans/agent-kpis-v2/plan.md 4.3 and 4.8)
+#
+# A KPI whose source is hub:<measure> takes its value from the hub's own records, with no check and no measuring
+# agent. HUB_MEASURES[name](agent, end, window_days, lag=True, t0=None) is the value for the window
+# (end - window_days days, end], or None: lag=True the judged value, None until the measure's lag (HUB_MEASURE_LAGS)
+# has passed after end; lag=False the value so far, from what happened by t0 (now() by default). Each is a read that
+# commits nothing (read_rows), safe inside a transaction and outside one. A window with no work has no value.
+
+HUB_MEASURE_MIN = 5          # tickets: a window with fewer has no value (4.3)
+REPORTS_BACK_DAYS = 14       # reports_came_back: the days after a fix in which a ticket can come back
+
+
+def hub_measure_reports_came_back(agent, end, window_days, lag=True, t0=None):
+    """"Defects that come back" (4.3): of the tickets reported to `agent`'s duties in the window, covered or not, the
+    share in percent that came back. A ticket is its reporting duty and its key; its first report is its oldest in the
+    window. It came back when a later typed report of the same reporting duty and ticket, to any duty, was created
+    after the first report's cover or its case's close and at most REPORTS_BACK_DAYS after it, or when the first
+    report is still open (neither covered nor its case closed) REPORTS_BACK_DAYS after the window's end. So `covers`
+    cannot move it, a case left open cannot hide a repeat, and a late close gives a repeat the same days as an early
+    one (a reviewer's finding of 22 November 2026: a repeat counted only up to the window's end plus the days, so a
+    close just before then hid each repeat). The value is final when the last close that can count has had its days:
+    2 * REPORTS_BACK_DAYS after the window's end. None below HUB_MEASURE_MIN tickets."""
+    t0 = now() if t0 is None else t0
+    days = REPORTS_BACK_DAYS * KPI_DAY
+    back, final = end + days, end + 2 * days
+    if lag and t0 < final:
+        return None
+    start, seen = end - window_days * KPI_DAY, min(final, t0)      # seen: what has happened, as far as it counts
+    first = {}
+    for r in read_rows("SELECT r.id, r.from_duty, r.ticket, r.created, r.covered, c.closed FROM duty_reports r JOIN "
+                       "responsibilities d ON d.id=r.to_duty LEFT JOIN duty_cases c ON c.id=r.duty_case WHERE "
+                       "d.agent=? AND r.created>? AND r.created<=? ORDER BY r.created, r.id",
+                       (agent, start, min(end, t0))):
+        first.setdefault((r["from_duty"], r["ticket"]), r)
+    if len(first) < HUB_MEASURE_MIN:
+        return None
+    duties = sorted({duty for duty, _ in first})
+    later = collections.defaultdict(list)
+    for r in read_rows(f"SELECT id, from_duty, ticket, created FROM duty_reports WHERE created>? AND created<=? AND "
+                       f"from_duty IN ({','.join('?' * len(duties))})", (start, seen, *duties)):
+        later[(r["from_duty"], r["ticket"])].append(r)
+    came = 0
+    for key, r in first.items():
+        ends = [x for x in (r["covered"], r["closed"]) if x is not None]
+        ended = min(ends) if ends else None
+        if t0 >= back and (ended is None or ended > back):
+            came += 1
+        elif ended is not None and ended <= seen and any(
+                x["id"] != r["id"] and x["created"] >= r["created"] and ended < x["created"] <= ended + days
+                for x in later[key]):
+            came += 1
+    return 100.0 * came / len(first)
+
+
+HUB_MEASURES = {"reports_came_back": hub_measure_reports_came_back}
+# the unit and the direction of each measure: a KPI of another cannot link, and a linked one cannot change to it
+HUB_MEASURE_SHAPES = {"reports_came_back": ("%", "at_most")}
+
+
+def hub_measure_wrong(name, unit, direction):
+    """Why a KPI of this unit and direction cannot take the hub measure `name`, or None."""
+    right_unit, right_direction = HUB_MEASURE_SHAPES.get(name) or (unit or "", direction)     # none: a later release's
+    if (unit or "") != right_unit:
+        return f"The hub measure {name} gives a value in {right_unit}, and this KPI's unit is {unit or 'a count'}."
+    if direction != right_direction:
+        return f"The hub measure {name} is better when it is lower, so its KPI's direction is {right_direction}."
+    return None
+HUB_MEASURE_LAGS = {"reports_came_back": 2 * REPORTS_BACK_DAYS * KPI_DAY}     # seconds after a window's end
+
+
+def hub_measure_past(name, agent, window_days, t0, days=56):
+    """A new KPI's past at once (4.2, 4.8): one (day, value, at) for each of the last `days` days, oldest first, that
+    has a value: the measure's value so far for the window that ends at that day's end, and at t0 for today. `at` is
+    that end, the day's last second, so item_day(at) is the day: the fleet's KPI day, as kpi_points keeps it (UTC
+    unless team.json "goals" sets a time zone). A read."""
+    measure, zone = HUB_MEASURES[name], goal_settings()[2]
+    today = datetime.datetime.fromtimestamp(t0, zone).date()
+    out = []
+    for n in range(days - 1, -1, -1):
+        day = today - datetime.timedelta(days=n)
+        end = t0 if n == 0 else datetime.datetime.combine(day + datetime.timedelta(days=1), datetime.time(0),
+                                                          zone).timestamp() - 1
+        value = measure(agent, end, window_days, lag=False, t0=t0)
+        if value is not None:
+            out.append((day.isoformat(), value, end))
+    return out
 
 
 # ---------------------------------------------------------------- reporting up, history and circles
@@ -53231,17 +53780,16 @@ TOOLS = [
         "progress": {"type": "number", "description": "Where it stands now, for a target with no check"},
         "task_id": TASK_ID})),
     ("all", "set_kpi", t_set_kpi,
-     "Set, change or link a KPI of an agent whose tasks you give: one to three each, from its duties and the "
-     "business's needs. Pair a speed or volume KPI with a quality KPI, and count all work that arrived. No KPI counts "
-     "asking, reporting, cost, or an outcome that the agent records itself: a value comes from a check that reads "
-     "what others write in a business system, never a hub record. New: agent, name, words, direction, number, unit, "
-     "window_days, metric, measured_by (who writes the check; by default the agent), and the hub gives that agent a "
-     "setup task. Link: id, check, "
-     "how, agent_part, once you read the check and who can write its inputs. Change: id and its fields; new words, "
-     "window_days, metric or measured_by clear the link. Never lower a level only because it is not met. The agent "
-     "reads the words and its part, never the number.",
-     S({"id": {"type": "string", "description": "The KPI to change or link, I-12; none for a new one"},
-        "agent": {"type": "string", "description": "New: the agent that it measures"},
+     "Set, change or link a KPI of an agent whose tasks you give: one to three each, a number that a worker's own "
+     "work on its tasks and duties moves, or a lead's whole team's results. Pair a speed or volume KPI with a quality "
+     "one, counting all work that arrived. No KPI counts asking, reporting, cost, or what the agent records itself: a "
+     "value comes from a hub measure or a check of what others write in a business system. New: agent, name, "
+     "words, direction, number, unit, window_days, metric, measured_by (who writes the check; default the agent), and "
+     "that agent gets a setup task. Link: id, check, how, agent_part, once you read the check and who can write its "
+     "inputs. Change: id and its fields; new words, window_days, metric or measured_by clear the link. Never lower a "
+     "level only because it is not met. The agent reads the words and its part, never the number.",
+     S({"id": {"type": "string", "description": "The KPI, I-12; none for a new one"},
+        "agent": {"type": "string", "description": "New: the agent it measures"},
         "name": {"type": "string", "description": "Its title, at most 40 characters"},
         "words": {"type": "string", "description": "The KPI in one sentence"},
         "direction": {"type": "string", "enum": list(KPI_DIRECTIONS)},
@@ -53249,10 +53797,10 @@ TOOLS = [
         "unit": {"type": "string", "description": "%, h, d, a currency, or empty for a count"},
         "window_days": {"type": "integer", "description": "Days of one value: 7 or more (default 7)"},
         "metric": {"type": "string", "description": "The check prints \"kpi <metric> <value>\""},
-        "measured_by": {"type": "string", "description": "The agent that writes the check"},
-        "check": {"type": "integer", "description": "Link: its wake-up rule"},
-        "how": {"type": "string", "description": "Link: the query, its inputs and who writes each"},
-        "agent_part": {"type": "string", "description": "Link: what the agent's work must do for the data"},
+        "measured_by": {"type": "string", "description": "Who writes the check"},
+        "check": {"type": "string", "description": "Link: its wake-up rule, or hub:reports_came_back"},
+        "how": {"type": "string", "description": "Link: the query, its inputs, who writes each"},
+        "agent_part": {"type": "string", "description": "Link: what its work must do for the data"},
         "task_id": TASK_ID})),
     ("all", "end_standing", t_end_standing,
      "End one of your standing items when its author, a person whose role allows it or the owner asks, when a "
@@ -55420,6 +55968,12 @@ CHECK_OPS = {">": "more than", ">=": "at least", "<": "less than", "<=": "at mos
              "!=": "not equal to"}
 CHECK_SOURCE_MAX = 65536        # bytes of one check file
 CHECK_ARGS_MAX = 4096           # bytes of a check's fixed arguments, as compact UTF-8 JSON
+# The inputs that the hub adds to a saved line check's args at each send (~/dev/founderizer-plans/agent-kpis-v2/plan.md
+# 4.3): "reports", the typed reports to the duties of the rule's own agent, ids and times only.
+CHECK_INPUTS = ("reports",)
+CHECK_ARG_MAX = 131071          # bytes of one Linux argument (MAX_ARG_STRLEN less its NUL): fleet.run_source gives a
+                                # check its JSON {"trigger", "run", "args"} as one argument
+REPORTS_DAYS, REPORTS_ROWS = 56, 500    # the reports input: of the last 56 days, the newest 500 at most
 # plan C12: no claim expires and no error count pauses a rule. A check runs until it answers or its author's own
 # timeout; a run that its helper lost is sent once more; one machine runs at most CHECK_SLOTS checks at a time.
 CHECK_TIMEOUT_MAX = 10 ** 7     # seconds: the author's own timeout; this only keeps the number a number
@@ -55461,10 +56015,12 @@ def trigger_check_spec(value, saved=False):
     if saved and isinstance(value, dict) and value.get("code") == "saved":
         lines = value.get("form") == wakeups.LINE_FORM
         keys = {"code", "sha256", "bytes", "code_by", "args", "timeout_seconds"} | \
-            ({"form"} if lines else {"condition", "repeat_minutes"})
+            ({"form", "inputs"} if lines else {"condition", "repeat_minutes"})
         need = {"sha256", "bytes", "code_by"} | (set() if lines else {"condition", "repeat_minutes"})
         if "form" in value and not lines:
             raise ValueError(f"check.form must be {wakeups.LINE_FORM}")
+        if "inputs" in value and not lines:
+            raise ValueError("check.inputs is only for a check that prints lines: leave out condition")
         if set(value) - keys or not need <= set(value):
             raise ValueError("a saved check needs sha256, bytes and code_by, and condition and repeat_minutes in the "
                              "value form")
@@ -55476,8 +56032,9 @@ def trigger_check_spec(value, saved=False):
                   "bytes": whole(value["bytes"], 1, CHECK_SOURCE_MAX, "check.bytes")}
         if not lines:
             return dict(check_rules(value), **common)
-        limit = setting("checks.run_seconds")
-        return dict(common, form=wakeups.LINE_FORM, args=check_args(value),
+        limit, args = setting("checks.run_seconds"), check_args(value)
+        inputs = check_inputs(value, args)
+        return dict(common, form=wakeups.LINE_FORM, args=args, **({"inputs": inputs} if inputs else {}),
                     timeout_seconds=whole(value.get("timeout_seconds", limit), 1, limit, "check.timeout_seconds"))
     if isinstance(value, dict) and "code" not in value and value.get("form") == wakeups.LINE_FORM:
         # support plan F5: a file of checks/ that prints lines, pinned by its path and its SHA-256, so that a duty can
@@ -55515,6 +56072,19 @@ def check_args(value):
     except ValueError:
         raise ValueError("check.args must be a JSON object of at most 4096 bytes as compact UTF-8 JSON") from None
     return args
+
+
+def check_inputs(value, args):
+    """A saved line check's inputs, sorted: the names of CHECK_INPUTS that the hub adds to its args at each send, or
+    []. An input's name is a key of args that the check's own args cannot hold too."""
+    inputs = value.get("inputs", [])
+    if not (isinstance(inputs, list) and all(isinstance(x, str) and x in CHECK_INPUTS for x in inputs)
+            and len(set(inputs)) == len(inputs)):
+        raise ValueError(f"check.inputs must be a list of the names {', '.join(CHECK_INPUTS)}, each at most once")
+    clash = sorted(set(inputs) & set(args))
+    if clash:
+        raise ValueError(f"check.args cannot have {clash[0]}: with check.inputs, the hub writes args.{clash[0]}")
+    return sorted(inputs)
 
 
 def check_rules(value):
@@ -56083,8 +56653,9 @@ def dispatch_check(t, run, t0):
                "reason=NULL, blocked_task=NULL, result_body=NULL, answer=NULL WHERE id=?", (token, t0, run))
     # plan C12: no claim expires; the run's earlier event, of a send that its helper lost, goes
     DB.execute("DELETE FROM events WHERE kind='trigger_check' AND json_extract(extra, '$.run')=?", (run,))
+    args = check_reports(t, run, spec["args"], t0) if "reports" in spec.get("inputs", ()) else spec["args"]
     extra = {"trigger": t["id"], "run": run, "token": token, "sha256": spec["sha256"],
-             "args": spec["args"], "timeout_seconds": spec["timeout_seconds"],
+             "args": args, "timeout_seconds": spec["timeout_seconds"],
              "generation": generation[0] if generation else None, "keys": key_stamp(runner_of(t))}
     extra.update({"code": "saved"} if spec.get("code") == "saved" else {"path": spec["path"], "commit": spec["commit"]})
     if wakeups.is_lines(spec):          # plan P4: the fleet's limits of one run, as they are now
@@ -56092,6 +56663,33 @@ def dispatch_check(t, run, t0):
                      timeout_seconds=min(spec["timeout_seconds"], setting("checks.run_seconds")))
     DB.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,'trigger_check',NULL,'',?,?)",
                (runner_of(t), t0, json.dumps(extra)))
+
+
+def check_reports(t, run, args, t0):
+    """Inside dispatch_check: the check's args with "reports" (agent-kpis-v2 plan 4.3), the typed reports to the
+    duties of rule t's own agent, for a KPI check such as a fix time that starts at the report. Ids and times only,
+    never a report's summary, email, symptom, component, ids or seen_at: {"since", "more", "rows": [{"id",
+    "from_duty", "ticket", "created", "covered", "case", "case_closed"}]}, the newest first, of the last REPORTS_DAYS
+    days. At most REPORTS_ROWS rows, and as many as fit in the one argument that the check gets (CHECK_ARG_MAX, as
+    fleet.run_source writes it); "more" is true when rows of those days were left out. covered and case_closed are the
+    measured agent's own acts: they select rows, and never give an outcome's time (R2)."""
+    since = int(t0 - REPORTS_DAYS * KPI_DAY)
+    rows = [{"id": r["id"], "from_duty": r["from_duty"], "ticket": r["ticket"], "created": int(r["created"]),
+             "covered": None if r["covered"] is None else int(r["covered"]), "case": r["duty_case"],
+             "case_closed": None if r["closed"] is None else int(r["closed"])}
+            for r in DB.execute("SELECT r.id, r.from_duty, r.ticket, r.created, r.covered, r.duty_case, c.closed FROM "
+                                "duty_reports r JOIN responsibilities d ON d.id=r.to_duty LEFT JOIN duty_cases c ON "
+                                "c.id=r.duty_case WHERE d.agent=? AND r.created>? ORDER BY r.created DESC, r.id DESC "
+                                "LIMIT ?", (t["agent"], since, REPORTS_ROWS + 1))]
+    out = dict(args, reports={"since": since, "more": False, "rows": []})     # false is the longer word
+    room, kept = CHECK_ARG_MAX - len(json.dumps({"trigger": t["id"], "run": run, "args": out})), 0
+    for row in rows[:REPORTS_ROWS]:
+        room -= len(json.dumps(row)) + (2 if kept else 0)       # json.dumps's ", " between two rows
+        if room < 0:
+            break
+        kept += 1
+    out["reports"] = {"since": since, "more": kept < len(rows), "rows": rows[:kept]}
+    return out
 
 
 def runner_of(t):
@@ -56243,7 +56841,7 @@ def check_result(t, r, body, t0, stored=None, held=None):
     fields = admission = wake = fail = cases = None
     retry = blocked = None
     printed = progress = new = None
-    kpi_values, kpi_dropped, kpi_missing = {}, 0, []   # a run's leading `kpi` lines (lanes/agent-kpis.md): values
+    kpi_values, kpi_dropped, kpi_missing, kpi_dated = {}, 0, [], []     # a run's leading `kpi` lines: values
     lost_ids = ()
     stale = wakeups.still_valid(wake_org(), trigger_view(t, t0)) if agent_rule(t) and t["agent"] in agents() else (True, None)
     if not stale[0]:                        # checked again at each result: a stale claim starts nothing
@@ -56264,7 +56862,7 @@ def check_result(t, r, body, t0, stored=None, held=None):
             progress, printed = wakeups.progress_of(body["lines"])
             linked = kpi_linked(t["id"])
             if setting("kpis") or linked:   # a release gate: no check's lines change while KPIs are off
-                kpi_values, printed = wakeups.kpi_block(printed)
+                kpi_values, printed, kpi_dated = wakeups.kpi_block(printed)
             if linked:                      # spec 5.2: on a linked check, a later or malformed kpi line is no wake
                 kept = [x for x in printed if x.split()[:1] != ["kpi"]]
                 kpi_dropped, printed = len(printed) - len(kept), kept
@@ -56328,8 +56926,9 @@ def check_result(t, r, body, t0, stored=None, held=None):
             why = record_progress(None, progress, t["id"])
             if why:
                 reason = (reason + " " if reason else "") + f"Its progress line was not recorded: {why}"
-        if kpi_values and not r["check_now"]:    # spec 5.2: at the run's first decision, also when it waits
-            kpi_record_rows(t, kpi_values, spec, t0)
+        if (kpi_values or kpi_dated) and not r["check_now"]:     # spec 5.2: at the run's first decision, also when it waits
+            for words in kpi_record_rows(t, kpi_values, spec, t0, kpi_dated):
+                reason = (reason + " " if reason else "") + words
         if kpi_dropped:
             reason = (reason + " " if reason else "") + (
                 f"{kpi_dropped} line(s) that begin with kpi were dropped: a KPI's lines come first, after an optional "
@@ -58742,9 +59341,15 @@ def liveness(t0):
             # the messages that waited for it reach (the delivery kept them from the old one). Not counted: no crash
             # loop. fresh_refusal keeps a running turn, a prompt, a job and a background command.
             runtime = runtime_label((agents().get(owner) or {}).get("runtime"))
-            new_attempt(t, SIGNED_IN, f"You were not signed in to {runtime}, and you are signed in again. Continue "
-                        f"{tref(tid)}: the turns of your last session ended at \"Not logged in\" and did nothing. First "
-                        f"check what was already done (rule 9): never repeat an outside action that already happened.")
+            # its provider refused the account that it was signed in with (its entry's account_refusals)
+            account = (sign_in_refusal(t) or {}).get("code") in \
+                runtime_fact((agents().get(owner) or {}).get("runtime"), "account_refusals", ())
+            new_attempt(t, SIGNED_IN, (f"{runtime} refused the account that you were signed in with, and you are "
+                                       f"signed in again" if account else f"You were not signed in to {runtime}, and "
+                                       f"you are signed in again") + f". Continue {tref(tid)}: the turns of your last "
+                        f"session ended at " + ("that refusal" if account else "\"Not logged in\"") + " and did "
+                        "nothing. First check what was already done (rule 9): never repeat an outside action that "
+                        "already happened.")
             kv_set(SIGN_IN_REFUSED + str(tid), None)
             log("hub", f"{tref(tid)} starts again in a new session on {owner}: its turns ended at the sign-in")
             continue
@@ -59144,17 +59749,22 @@ def signed_out_told(name, conf, t0):
     last = kv_get("signed_out_last:" + name)
     quiet = QUIET_SAY if last and not machine_news(name, float(last)) else None
     runtime = runtime_label(conf.get("runtime"))
-    emit(mgr, "say", f"[hub] {who} is not signed in to {runtime} on {conf.get('machine')}: no session of it can work. "
+    refused = account_refused(name) if signed_in_now(name, conf.get("runtime")) is not False else None
+    emit(mgr, "say", f"[hub] {who} " + (f"is signed in to {runtime} on {conf.get('machine')} with an account that "
+         f"{runtime} refuses at each turn ({refused['code']}): no session of it can work. " if refused else
+         f"is not signed in to {runtime} on {conf.get('machine')}: no session of it can work. ") +
          f"The hub starts no session of it and keeps the messages for its tasks, its chat and the conversations that "
          f"run on {runtime} until it is signed in. Its open tasks: {', '.join(tref(t['id']) for t in tasks) or 'none'}. "
          + (f"Waiting for its answer: {', '.join(waiting)}. " if waiting else "") +
          f"Only the owner can sign it in: unless a Needs-you item for it is open, raise one that asks the owner to "
-         f"open {shown_role(name)} in the app and sign it in. Give it no new work until the hub says that it is signed "
-         f"in again.", extra=quiet)
+         f"open {shown_role(name)} in the app and sign it in" + (" with another account, or with the same one once "
+         "its organization turned that access on again" if refused else "") + ". Give it no new work until the hub "
+         "says that it is signed in again.", extra=quiet)
     for t in tasks:
         if t["requester"] not in (None, mgr, name) and own_runtime_task(conf, t["needs"]):
-            emit(t["requester"], "say", f"[hub] {tref(t['id'])} ({t['title']}, owner {name}) waits: {name} is not "
-                 f"signed in to {runtime}, so no session of it can work until the owner signs it in. The manager asks "
+            emit(t["requester"], "say", f"[hub] {tref(t['id'])} ({t['title']}, owner {name}) waits: "
+                 f"{account_refused_words(name, conf.get('runtime'))}, so no session of it can work until the owner "
+                 f"signs it in. The manager asks "
                  f"the owner for it, and the hub tells you here when the task goes on.", task=t["id"], extra=quiet)
     kv_set("signed_out_told:" + name, t0)
     kv_set("signed_out_last:" + name, t0)
@@ -61848,9 +62458,11 @@ def os_user_drop(agent, machine=None, uid=None):
     OS_USERS["at"] = 0.0        # the next tick keeps again at once what the readings still show (os_user_sweep)
 
 
-def os_user_uid_own(agent):
-    """The uid of this agent's own newest reading (its helper's), or None."""
-    uid = (row_data("machine_status", "agent", agent).get("access") or {}).get("uid")
+def os_user_uid_own(agent, reads=None):
+    """The uid of this agent's own newest reading (its helper's), or None. reads: agent_reads()."""
+    data = row_data("machine_status", "agent", agent) if reads is None else \
+        reads.data(agent) if agent in reads.status else {}
+    uid = (data.get("access") or {}).get("uid")
     return uid if isinstance(uid, int) and not isinstance(uid, bool) else None
 
 
@@ -66345,7 +66957,8 @@ AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent"
               "person_agents": "agent", "person_scopes": "agent", "role_sets": "agent"}
 # The hub's own notes about one agent in kv, each kept under a prefix and the agent's name. test_rename reads every
 # kv key the code builds from a value, so a new prefix is placed here or named there with what it holds.
-AGENT_KV = ("tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
+AGENT_KV = ("account_refused:",     # account_refused, 23 November 2026
+            "tools:", "offline_told:", "signed_out_told:", "signed_out_last:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
             "default_desktop:", "checks_brief:", "chat_team:", "duty_review:", "presence:", "turn_ended:",
             "turn_cut:", "turn_cut_reads:",
             "chat_quiet:",          # the newest read of an owner chat that gave nothing new (chat_stop_since)
@@ -72957,8 +73570,12 @@ def refused_starts(machines):
                     f"It takes the next release that starts there by itself." for server, commit in kept.items()}
 
 
-def health_view():
+def health_view(kinds_seen=None):
     """Everything the owner needs to see that the hub, its database, its backup and every machine are in order.
+
+    `kinds_seen`, when it is a list, gets one (kind, server) for each warning, for the error report
+    (error_warnings_now): the server that the warning is about, by the agent that it names when it names no server,
+    else None. Never its words: they hold names, a program's lines and the owner's times.
 
     **Every warning carries the way out.** A screen that says something is wrong and offers nothing leaves the
     owner where he was (his words, 19 October 2026), so each warning has `agent`, the agent it is about when it is
@@ -72978,8 +73595,12 @@ def health_view():
     hub_machine = (TEAM.get("hub") or {}).get("machine")
     on_the_hub = next((m["agent"] for m in machines if m["machine"] and m["machine"] == hub_machine), None)
 
-    def warn(kind, detail, fix, agent=None):
+    def warn(kind, detail, fix, agent=None, server=None):
         warnings.append(dict({"agent": agent} if agent else {}, kind=kind, detail=detail, fix=fix))
+        if kinds_seen is not None:      # a name of its own: `seen` is a helper's last time below
+            if server is None and agent:
+                server = (agents().get(agent) or {}).get("machine")
+            kinds_seen.append((kind, server))
 
     backup = None
     if kv_get("backup_at"):
@@ -73043,15 +73664,16 @@ def health_view():
     refused = refused_starts(machines)
     for m in machines:
         if m["stale"]:
-            warn("machine_stale", "No status for ten minutes.", None, agent=m["agent"])
+            warn("machine_stale", "No status for ten minutes.", None, agent=m["agent"], server=m["machine"])
         elif m["release_refused"]:
             continue                                            # said once for its server below (machine_refused)
         elif m["update"]["state"] in ("behind", "failed"):      # the app's button: Update <Agent>
             warn("machine_" + m["update"]["state"],
                  "It still runs the version it had." if m["update"]["state"] == "failed" else
-                 "It runs an older version than the hub.", None, agent=m["agent"])
+                 "It runs an older version than the hub.", None, agent=m["agent"], server=m["machine"])
     for server, words in refused.items():       # the app's title: A release did not start; its button: Report a problem
-        warn("machine_refused", words, None, agent=next((m["agent"] for m in machines if m["machine"] == server), None))
+        warn("machine_refused", words, None, agent=next((m["agent"] for m in machines if m["machine"] == server), None),
+             server=server)
     # The vault broker is the one piece of the fleet that a release does not reach by itself: it runs a root-owned
     # copy of vault.py outside every checkout a helper updates, and `lifecycle.OWNER_ONLY` lets a commit that
     # changes only that file count as taken, so a machine reports "current" whatever its broker runs. The broker
@@ -73088,14 +73710,14 @@ def health_view():
         if machine in held or broker["source"] == want or broker["source"] in replaced:
             continue
         warn("vault_behind", f"The vault on {machine} has not taken the last update.",
-             "It updates itself within ten minutes; tell us if it does not.", agent=broker["agent"])
+             "It updates itself within ten minutes; tell us if it does not.", agent=broker["agent"], server=machine)
     # Package 4 of the vault's gates (C5): the owner's trust in a server's vault, the kept pin that each handover to it
     # needs, ends 90 days after the owner's app signed it, and the app signs it again after 7 days while it runs. So a
     # warning 30 days before the end, for each machine whose vault takes copies (pin_ends): the app's title names the
     # agent's server, and its button opens it.
     for entry in pin_ends(t0):
         kind, detail, fix = pin_end_words(entry, t0)
-        warn(kind, detail, fix, agent=entry["carrier"])
+        warn(kind, detail, fix, agent=entry["carrier"], server=entry["machine"])
     if manager_hub_user():
         # One OS user for each agent: a manager that runs as the hub's own user account can ask the hub's vault for
         # every login. It is never held, so the owner hears it here; its way out is its own move_agent, to the
@@ -73363,7 +73985,8 @@ def needs_sign_in(agent):
     if not a or local_model(a, team_read().get("accounts")):
         return False
     said = signed_in_now(agent, a.get("runtime"))
-    return said is False or said is None and install_open(agent)
+    # its provider refuses the account that the machine holds (account_refused, 23 November 2026)
+    return said is False or said is None and install_open(agent) or account_refused(agent) is not None
 
 
 def own_runtime_task(conf, needs):
@@ -73398,6 +74021,81 @@ def runtime_signed_out(agent):
 
 
 SIGN_IN_REFUSED = "sign_in_refused:"     # kv, with a task's id after it: sign_in_refusal's mark
+# A refusal of the agent's ACCOUNT by its provider, which its machine's reading does not see: the runtime holds a
+# sign-in and says so, and the provider refuses each turn. On 23 November 2026 from 11:09 UTC Claude answered the
+# owner's own seat of a Claude Team organization with 403 oauth_org_not_allowed ("Your organization has disabled Claude
+# subscription access for Claude Code"), and the tasks of an agent on that seat failed at each turn while
+# needs_sign_in said nothing. The step is a sign-in: with another account, or with the same one once its organization
+# turned the access on again.
+ACCOUNT_REFUSED = "account_refused:"     # kv, with an agent's name after it: account_refusal_note's mark
+
+
+def account_refused(agent, runtime=None, reads=None):
+    """The provider's refusal of the agent's account on its own runtime, {"at", "runtime", "code"}, while it stands: no
+    turn of that runtime worked after it (account_refusal_note) and no sign-in of it, of any account, ended done after
+    it, from this agent's row or from that of an agent that keeps the same sign-in. None otherwise, also for a runtime
+    that the agent no longer runs or that is not `runtime`. reads: agent_reads(), in a read of the state, which reads
+    each table once."""
+    raw = kv_get(ACCOUNT_REFUSED + agent) if reads is None else reads.refused.get(agent)
+    try:
+        mark = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    own = (agents().get(agent) or {}).get("runtime")
+    if not isinstance(mark, dict) or mark.get("runtime") != own or runtime not in (None, own):
+        return None
+    return None if newest_sign_in(agent, own, reads) > float(mark.get("at") or 0) else mark
+
+
+def refuses_account(kind, data, runtime):
+    """True for a session record that is the refusal of the session's account by the provider of `runtime` (its entry's
+    account_refusals, lifecycle.RUNTIMES). Not a subagent's record, which ends no turn of the session, and not the
+    refusal of another provider: a session from before a change of the agent's runtime says nothing of the new one."""
+    return bool(kind == "error" and runtime and not data.get("parent") and
+                data.get("code") in runtime_fact(runtime, "account_refusals", ()))
+
+
+def account_refusal_note(agent, records, t0):
+    """helper_events and conversation_records, for the records of a session of the agent's own runtime that they
+    stored: the mark of account_refused when the newest of its account refusals and its turns that worked is a refusal,
+    and none when it is a turn that worked (a cancelled one proves nothing). A batch with neither leaves the mark as it
+    is, and so does one that is older than the mark.
+
+    It is dated by its own record, and never after the hub's clock: a batch that comes late, from before a sign-in,
+    holds nobody after it. A session from before the sign-in counts as any other, because Claude Code takes a new
+    sign-in in a process that already runs (measured once on 23 November 2026, on Linux with 2.1.311: a session that
+    began at 08:52 was refused until 13:27 and worked at 13:37:08, 16 seconds after the new sign-in was written; a Mac,
+    whose sign-in is in the Keychain, is not measured)."""
+    own = (agents().get(agent) or {}).get("runtime")
+    newest, at = None, None
+    for _, ts, kind, data in records:
+        if refuses_account(kind, data, own):
+            newest, at = data["code"], min(ts or t0, t0)
+        elif kind == "result" and not data.get("parent") and data.get("stop_reason") not in ("error", "cancelled"):
+            newest, at = "worked", min(ts or t0, t0)
+    key = ACCOUNT_REFUSED + agent
+    try:
+        mark = json.loads(kv_get(key) or "null")
+    except ValueError:
+        mark = None
+    if newest is None or isinstance(mark, dict) and float(mark.get("at") or 0) > at:
+        return
+    if newest == "worked":
+        if mark is not None:
+            kv_set(key, None)
+        return
+    was = account_refused(agent)
+    kv_set(key, json.dumps({"at": at, "code": newest, "runtime": own}))
+    if was is None and account_refused(agent):
+        log("hub", f"{agent}: its provider refused its account ({newest}); it waits for a sign-in")
+
+
+def account_refused_words(agent, runtime):
+    """What the line reads of an agent that waits for its sign-in: why, in a few words. One that its machine says is
+    signed out (a sign-in that failed after its sign-out) is signed out, whatever its account was."""
+    if account_refused(agent) and signed_in_now(agent, runtime) is not False:
+        return f"{runtime_label(runtime)} refuses the account that {agent} is signed in with"
+    return f"{agent} is not signed in to {runtime_label(runtime)}"
 
 
 def sign_in_refusal(t):
@@ -73414,21 +74112,21 @@ def sign_in_refusal(t):
     return mark if isinstance(mark, dict) and mark.get("attempt") == t["attempt"] else None
 
 
-def sign_in_refusal_note(tid, attempt, records, t0):
+def sign_in_refusal_note(tid, attempt, records, t0, runtime=None):
     """helper_events, for the batch of records of task `tid`'s current attempt that it stored: the mark of
     sign_in_refusal when the newest of its refusals and its turns that worked is a refusal, and none when it is a turn
     that worked. A batch with neither leaves the mark as it is."""
-    newest = None
+    newest, code = None, None
     for _, _, kind, data in records:
-        if kind == "error" and data.get("code") == AUTH_FAILED:
-            newest = "refused"
+        if kind == "error" and data.get("code") == AUTH_FAILED or refuses_account(kind, data, runtime):
+            newest, code = "refused", data.get("code")
         elif kind == "result" and data.get("stop_reason") != "error":
             newest = "worked"
     key = SIGN_IN_REFUSED + str(tid)
     if newest == "refused":
         worked = bool(read_row("SELECT 1 FROM thread_events WHERE task=? AND attempt=? AND type='result' AND "
                                "json_extract(data, '$.stop_reason')<>'error' LIMIT 1", (tid, attempt)))
-        kv_set(key, json.dumps({"attempt": attempt, "at": t0, "worked": worked}))
+        kv_set(key, json.dumps({"attempt": attempt, "at": t0, "worked": worked, "code": code}))
     elif newest == "worked" and kv_get(key) is not None:
         kv_set(key, None)
 
@@ -73453,7 +74151,7 @@ def sign_in_restart_due(t):
     a = agents().get(t["owner"]) or {}
     if refused is None or not own_runtime_task(a, t["needs"]):
         return False
-    done = finished_sign_in(t["owner"], a.get("runtime"))
+    done = newest_sign_in(t["owner"], a.get("runtime"))
     if done and done > refused["at"]:
         return True
     if not refused.get("worked"):
@@ -73600,13 +74298,26 @@ def sign_out_busy(name):
     """What a sign-out would stop of this agent, or None: switch_busy's facts, but for an agent that a usage limit
     holds, its owner messages that wait for a reply do not count. They wait for the end of that hold, and changing the
     account is how the owner ends it (limit_account): with them, the one agent that needed another account could
-    not get one."""
+    not get one.
+
+    Nor does the desktop that a browser or screen task holds (desktop_busy). That holds off a new task of that kind and
+    a change of runtime (switch_busy), and it lasts until the task's session is closed. A sign-out stops turns, and
+    running_turns counts a turn of such a task as any other. On 23 November 2026 the account of the agent on a Mac was
+    refused at each turn, and it could get no other one: its browser task, which ran no turn, stood as work that a
+    sign-out stops, and the owner's Stop did not help, because a held task is open and still holds the desktop. It
+    counts while the agent's helper is silent: running_turns passes over a silent helper, so nobody knows its turn."""
     busy = switch_busy(name)
-    if busy and busy["chats_waiting"] and active_limit(name):
+    if busy is None:
+        return None
+    if helper_online(name, now()):
+        busy = dict(busy, desktop=None)
+    # and for one whose provider refuses its account (account_refused; the agents of one sign-in share it, and a chat's
+    # own refusal sets no mark), whose chats wait for the sign-in that ends it
+    own = (agents().get(name) or {}).get("runtime")
+    if busy["chats_waiting"] and (active_limit(name) or
+                                  any(account_refused(n, own) for n in same_sign_in(name))):
         busy = dict(busy, chats_waiting=0)
-        if not any(busy.values()):
-            return None
-    return busy
+    return busy if any(busy.values()) else None
 
 
 def busy_words(busy):
@@ -73650,6 +74361,8 @@ def start_machine_login(agent, runtime, replace=False):
         return {"agent": agent, "login": login_view(open_one, live=False), "changed": False}
     said = signed_in_now(agent, runtime)
     signed_in = said is True
+    # its provider refuses the account that the machine holds (account_refused): its sign-in signs that one out first
+    replace = replace or account_refused(agent, runtime) is not None
     if signed_in and not replace:
         raise Refusal(409, f"{runtime_label(runtime)} is signed in on this server. Use another account signs it "
                            f"out first.")
@@ -73745,21 +74458,41 @@ def login_report(agent, lid, update):
     return {"ok": True, "state": state}
 
 
+def same_sign_in(agent, reads=None):
+    """sign_in_agents(agent): [agent] and each other agent of its machine whose helper runs as the same OS user, by each
+    helper's own uid. The team and the rows come through the state's moment (agents, read_row, reads: agent_reads()),
+    because a read of the state asks it too (account_refused)."""
+    team, uid = agents(), os_user_uid_own(agent, reads)
+    machine = (team.get(agent) or {}).get("machine")
+    if not machine or uid is None:
+        return [agent]
+    return [agent] + [other for other, a in team.items() if other != agent and a.get("machine") == machine and
+                      a.get("placed") is not False and os_user_uid_own(other, reads) == uid]
+
+
+def newest_sign_in(agent, runtime, reads=None):
+    """When the newest sign-in of that runtime ended done on this agent's machine, from its own row or from the row of
+    an agent that keeps the same sign-in (same_sign_in), or 0."""
+    return max(finished_sign_in(name, runtime, reads=reads) or 0 for name in same_sign_in(agent, reads))
+
+
 def sign_in_agents(agent, strict=True):
     """[agent] and each other agent of its machine that keeps the same sign-in of each provider: the agents of one OS
     user (a Mac's agents all run as its desktop account), by each helper's own uid (os_user_uid_own). strict=False also
     counts an agent whose uid no reading gives yet, or every agent of the machine while this one's own is not known:
     for a step that signs a runtime OUT, where a wrong guess must cost a refusal, never a sign-out under running work.
     Not on a Linux server, where each agent has an OS user of its own and one with no reading yet is one in setup."""
+    if strict:
+        return same_sign_in(agent)
     machine, uid = (agents().get(agent) or {}).get("machine"), os_user_uid_own(agent)
-    if not machine or (uid is None and strict):
+    if not machine:
         return [agent]
 
     def shares(other):
         theirs = os_user_uid_own(other)
         if theirs is not None and theirs == uid:
             return True
-        return not strict and (uid is None or theirs is None) and not linux_agent(other)
+        return (uid is None or theirs is None) and not linux_agent(other)
     return [agent] + [other for other in server_agents(machine) if other != agent and shares(other)]
 
 
@@ -73959,6 +74692,13 @@ def signed_in_view(agent, data):
     if isinstance(runtimes, dict):
         runtimes = {n: dict(r, signed_in=True) if isinstance(r, dict) and r.get("signed_in") is not True and
                     signed_in_now(agent, n) is True else r for n, r in runtimes.items()}
+    # its provider refuses the account that the machine holds (account_refused): the apps' sign-in step reads this
+    # answer (AgentSetupFlow.page), and the agent view's signed_in says the same
+    refused = account_refused(agent)
+    if refused and runtime and runtime.get("name") == refused["runtime"]:
+        runtime = dict(runtime, signed_in=False)
+    if refused and isinstance(runtimes, dict) and isinstance(runtimes.get(refused["runtime"]), dict):
+        runtimes = dict(runtimes, **{refused["runtime"]: dict(runtimes[refused["runtime"]], signed_in=False)})
     return runtime, runtimes
 
 
@@ -81048,8 +81788,9 @@ class Handler(BaseHTTPRequestHandler):
         return self.json(200, {"send": on, "db": generation}, {"Cache-Control": "no-store"})
 
     def ui_error_reports_set(self):
-        """POST /ui/error-reports {"send": true|false}: the owner's switch of Settings › General › Error reports. Only
-        the owner's app sends it (owner_mcp.NOT_TOOLS); the day's report goes at the tick's next pass when it is due."""
+        """POST /ui/error-reports {"send": true|false}: the owner's switch of error reports (Settings › Help › Help
+        improve Founderizer, or the first page of the setup). Only the owner's app sends it (owner_mcp.NOT_TOOLS);
+        the day's report goes at the tick's next pass when it is due."""
         def read(data):
             if not isinstance(data.get("send"), bool):
                 raise ValueError("send must be true or false")
@@ -85822,7 +86563,7 @@ class Handler(BaseHTTPRequestHandler):
                         event_rows([(row["by"], "say", takeover, f"[owner{f' via {request_via(board)}' if board else ''}"
                                      f"] Answer to Needs-you N-{nid} ({row['title']}): {answer}{passed}"
                                      + (need_words_note(row, chosen, None, answer, board) if board else ""),
-                                     {"takeover": nid} if closing else None)], t0)
+                                     {"takeover": nid} if takeover is not None else None)], t0)
                         if takeover is not None:
                             secret_wait_moved(takeover)
                         key_swap_answered_rows(row, chosen, t0)     # a press of a server's key swap item
@@ -85979,6 +86720,13 @@ class Handler(BaseHTTPRequestHandler):
             refused = fresh_refusal(t, attempt)
             if refused:
                 return self.json(409, {"error": refused})
+            # owner feature need_takeover: the session that asked for a take-over keeps its work until it read the
+            # owner's answer, also when that answer comes long after; the say event of every answer route carries the
+            # item (extra.takeover). Only here: the hub's own recoveries (fresh_refusal's other callers) are not held.
+            if q1("SELECT 1 FROM needs WHERE kind='takeover' AND answer IS NULL AND takeover_task=? LIMIT 1", (tid,)) \
+                    or q1("SELECT 1 FROM events WHERE agent=? AND task=? AND kind='say' AND read_at IS NULL AND "
+                          "json_extract(extra, '$.takeover') IS NOT NULL LIMIT 1", (agent, tid)):
+                return self.json(409, {"error": "its request for a take-over waits for the owner's answer"})
             return self.json(200, {"attempt": fresh_attempt(t, why)})
 
     def helper_dialog(self, agent, task):
@@ -87327,7 +88075,9 @@ class Handler(BaseHTTPRequestHandler):
             for data in limits:
                 start_limit(agent, data["resets_at"], tid)
             if attempt == t["attempt"] and t["state"] not in TERMINAL:
-                sign_in_refusal_note(tid, attempt, taken, now())
+                sign_in_refusal_note(tid, attempt, taken, now(), agents()[agent].get("runtime"))
+            if own_runtime_task(agents()[agent], t["needs"]):
+                account_refusal_note(agent, taken, now())
             if signed_out:
                 # A turn that its provider refused for want of a sign-in: the machine's reading says so on its own
                 # clock, up to five minutes later, and the hold and the line's word wait for that reading

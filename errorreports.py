@@ -2,7 +2,8 @@
 """The day's error report: what a hub sends to our side, once a day, while the owner has turned error reports on.
 
 The owner, 16 November 2026, to the picture of Settings › General with a section "Error reports" and one switch,
-"Send to Founderizer's developers", off until he turns it on: "Yes, as drawn". The plan is
+"Send to Founderizer's developers", off until he turns it on: "Yes, as drawn". The switch is now Settings › Help ›
+Help improve Founderizer, and the first page of the setup turns it on too (Send anonymous usage data). The plan is
 ~/dev/founderizer-plans/feedback-diagnostics-plan.md, Phase 3, and its contract is the one of `POST
 <channel>/api/errors`, which the Mac app and the website follow too.
 
@@ -31,6 +32,9 @@ counts"; the contract's "The health of a fleet"): the newest release that the ch
 here, the health checks of the fleet's servers, and the size of the hub's own server, each value a word of a copy of
 our side's lists (STATES, STEPS, CAUSES, CHECKS), a version, a whole number or a time (health). The report goes
 sooner than a day when something breaks (due), and goes again at once without the block when our side refuses it.
+Since F5 piece 3 (22 November 2026, the owner's "Yes" to its privacy sentence) the checks also say which of the
+hub's own warnings stand whose way out is ours ("Tell us", Report a problem): each as a code of CHECKS, never its
+words (hub.WARNING_CODES).
 
 Python standard library only.
 """
@@ -49,8 +53,9 @@ import diagnostics
 
 PATH = "/api/errors"
 MANIFEST = "release.json"   # lifecycle.RELEASE_FILE: the signed manifest of the release on the configuration ref
-DAY = 86400             # seconds between two reports, and the hold after a 4xx answer that is not 429
-RETRY = 3600            # seconds before a report that could not reach our side, or got a 5xx or a 3xx, goes again
+DAY = 86400             # seconds between two reports, and the hold after a 4xx that is not 429, a 301 or a 308
+RETRY = 3600            # seconds before a report that could not reach our side, or got a 5xx or another 3xx, goes again
+LASTING = (301, 308)    # a redirect that stays: the report follows none, so each try would meet it again
 RETRY_MOST = 6 * 3600   # the longest wait that our side's Retry-After may set
 TIMEOUT = 30            # seconds for one send
 MOST = 20               # faults, and refused calls, in one report (diagnostics.MAX_SHOWN)
@@ -103,7 +108,11 @@ CAUSES = ("none", "no_ipv4_route", "dns", "connect", "tls", "http", "timeout", "
           "busy", "hold", "branch", "own_changes", "other")
 CHECKS = ("uplink", "ipv4_route", "ipv6_route", "dns", "channel", "upstream", "tailnet", "clock", "disk", "memory",
           "oom", "release_lag", "firewall", "updates", "restart", "quiet", "egress", "network", "ssh", "npm",
-          "updates_off", "macos_update", "egress_table", "other")
+          "updates_off", "macos_update", "egress_table",
+          # the hub's own warnings whose way out is ours (F5 piece 3, 22 November 2026: hub.WARNING_CODES)
+          "records", "schema", "timers", "release_start", "helper", "vault", "manager_session",
+          "server_update",      # a server's update failed or is behind (the owner's answer to card F5-3)
+          "other")
 CHECKS_MOST = 32            # checks in one report, as our side takes them
 NUMBER_MOST = 100_000       # tries, behind, servers and starts
 MB_MOST = 4_194_304         # memory and swap, in MB
@@ -126,9 +135,11 @@ class ReportError(Exception):
     """Nothing was sent, or our side refused it. The message is safe to log: it never holds a value of the report.
 
     `retry_after`: the seconds after which a report may go again: our side's Retry-After for a 429, DAY for any other
-    4xx (the same report would only be refused again) and for a channel that is not ours, RETRY for a 5xx or a 3xx
-    (our site, or a deploy of it, that is down for a moment: a DAY would put two reports 48 hours apart, and our side
-    counts a hub that sent nothing for 36 hours as silent), and None when our side was not reached."""
+    4xx (the same report would only be refused again), for a redirect that stays (LASTING: the report follows no
+    redirect, so it would only meet the same one again, each hour for ever, with a line in the hub's log each time) and
+    for a channel that is not ours, RETRY for a 5xx or another 3xx (our site, or a deploy of it, that is down for a
+    moment: a DAY would put two reports 48 hours apart, and our side counts a hub that sent nothing for 36 hours as
+    silent), and None when our side was not reached."""
 
     def __init__(self, says, retry_after=None, status=None):
         super().__init__(says)
@@ -445,8 +456,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def send(url, body, timeout=None):
     """POST the report to `url` (endpoint(channel), or a test server's). Nothing when our side took it; ReportError
-    when it refused it (retry_after: Retry-After for a 429, DAY for any other 4xx, RETRY for a 5xx or a 3xx), could
-    not be reached or gave no answer (retry_after None)."""
+    when it refused it (retry_after: Retry-After for a 429, DAY for any other 4xx and for a 301 or a 308, RETRY for a
+    5xx or another 3xx), could not be reached or gave no answer (retry_after None)."""
     request = urllib.request.Request(url, data=json.dumps(body, separators=(",", ":")).encode(), method="POST",
                                      headers={"Accept": "application/json", "Content-Type": "application/json",
                                               "User-Agent": "founderizer-hub"})
@@ -459,7 +470,7 @@ def send(url, body, timeout=None):
             pass                    # a 2xx: our side took it (a 3xx is an HTTPError here, because no redirect is followed)
     except urllib.error.HTTPError as answer:
         with answer:
-            retry = DAY if 400 <= answer.code < 500 else RETRY
+            retry = DAY if 400 <= answer.code < 500 or answer.code in LASTING else RETRY
             if answer.code == 429:
                 try:
                     retry = min(max(int(str(answer.headers.get("Retry-After") or "").strip()), 1), RETRY_MOST)

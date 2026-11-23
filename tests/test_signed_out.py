@@ -10,6 +10,7 @@ nobody was told. A local hub with a test source address for each machine; no rea
 call. Each test's hub database is test_ui_api.quick, as for every OwnerAPI test."""
 import json
 import unittest
+import unittest.mock
 
 import hub
 import test_agent_auth
@@ -19,6 +20,11 @@ from test_agent_auth import BOX, KEYS
 REFUSED = {"type": "error", "code": hub.AUTH_FAILED, "message": "Not logged in · Please run /login",
            "retryable": False, "resets_at": None}       # as the first fleet's hub had it, 16 November 2026
 LINE = {"type": "user_message", "text": "New fleet messages."}     # a turn begins at a line
+# Claude's refusal of the owner's own seat of a Claude Team organization, 23 November 2026 (its transcript row, as
+# threads.py turns it into a record)
+ORG_REFUSED = {"type": "error", "code": "oauth_org_not_allowed", "message": "Your organization has disabled Claude "
+               "subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable "
+               "access", "retryable": False, "resets_at": None}
 
 
 def setUpModule():
@@ -65,9 +71,9 @@ class SignedOut(test_agent_auth.Routes):
         with hub.LOCK:
             hub.signed_out_sweep(hub.now())
 
-    def records(self, t, *records, attempt=1, session="11111111-2222-4333-8444-555555555555"):
-        """A batch of its session's thread records through the helper's own route."""
-        events = [dict(r, seq=i + 1, ts=hub.now()) for i, r in enumerate(records)]
+    def records(self, t, *records, attempt=1, session="11111111-2222-4333-8444-555555555555", after=0):
+        """A batch of its session's thread records through the helper's own route. after: the session's last seq."""
+        events = [dict(r, seq=after + i + 1, ts=hub.now()) for i, r in enumerate(records)]
         code, data = self.call("/helper/events/alpha", dict(generation="test-generation", task=f"T-{t}",
                                                             attempt=attempt, session=session, events=events),
                                source=BOX, token=KEYS["alpha"])
@@ -226,6 +232,95 @@ class SignedOut(test_agent_auth.Routes):
         self.assertEqual(self.poll(), ["say", "task"])              # the new session, and the line that waited
         self.assertIn(f"T-{refused} starts again in a new session, because its turns ended at the sign-in",
                       self.said("manager")[-1][0])
+
+    def test_an_account_that_its_provider_refuses_is_a_sign_in_to_do_until_one_finishes(self):
+        """23 November 2026: from 11:09 UTC Claude refused the owner's own seat of a Claude Team organization at each
+        turn (403 oauth_org_not_allowed), its machine still said "signed in", and an agent on that seat failed at each
+        turn while nobody was asked to sign it in. The owner: "we need a better indicator so its as simple as logging in
+        again!" The refusal is a sign-in to do: its work waits, its line hears why, the apps show its sign-in, which
+        signs that account out first while its chat waits, and a finished sign-in ends it; the same account refused
+        again holds it again, and a turn that works ends that."""
+        t = self.task("alpha")
+        holds = lambda: self.status("alpha", features=["agent_key", "status_now"], runtimes={"claude": {
+            "signed_in": True}}, runtime={"name": "claude", "signed_in": True})
+        self.signed("alpha", True)
+        self.records(t, LINE, {"type": "result", "stop_reason": "end_turn"})         # it works, on the account of now
+        hub.q("UPDATE events SET read_at=? WHERE agent='alpha'", (hub.now(),))       # and reads what that turn end sent
+        self.records(t, LINE, ORG_REFUSED, {"type": "result", "stop_reason": "error"}, after=2)
+        self.assertTrue(hub.needs_sign_in("alpha"))
+        hub.emit("alpha", "say", "a line for it", task=t)
+        holds()                                 # its machine goes on saying that it is signed in: no new session yet
+        self.tick()
+        self.assertEqual(self.poll(), [])                           # its work waits
+        self.assertEqual(hub.q1("SELECT attempt FROM tasks WHERE id=?", (t,))["attempt"], 1)     # no new session yet
+        (to_manager, _), = self.said("manager")
+        self.assertIn("is signed in to Claude Code on box with an account that Claude Code refuses at each turn",
+                      to_manager)
+        self.assertIn("sign it in with another account", to_manager)
+        self.assertIs(hub.agent_view("alpha", hub.agents()["alpha"])["signed_in"], False)     # the apps' sign-in step
+        machine = next(m for m in hub.machine_rows()[1] if m["agent"] == "alpha")      # and its page (AgentSetupFlow)
+        self.assertIs(machine["runtime"]["signed_in"], False)
+        hub.q("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,recipient) VALUES('r1','message',"
+              "'Where do we stand?',1,?,'app','alpha')", (hub.now(),))      # its chat waits for that sign-in
+        login = hub.start_machine_login("alpha", "claude")          # Sign in, not Use another account
+        self.assertEqual(login["login"]["state"], "signing_out")    # the refused account goes first
+        hub.q("UPDATE signin_jobs SET state='done', updated=? WHERE agent='alpha'", (hub.now(),))
+        self.tick()
+        self.assertFalse(hub.needs_sign_in("alpha"))
+        self.assertEqual(hub.q1("SELECT attempt FROM tasks WHERE id=?", (t,))["attempt"], 2)    # the new sign-in
+        self.assertEqual(self.poll(), ["say", "task"])
+        start = hub.q1("SELECT text FROM events WHERE agent='alpha' AND kind='task' AND task=? ORDER BY id DESC",
+                       (t,))["text"]
+        self.assertIn("Claude Code refused the account that you were signed in with", start)
+        self.records(t, LINE, ORG_REFUSED, {"type": "result", "stop_reason": "error"}, attempt=2,
+                     session="33333333-2222-4333-8444-555555555555")
+        self.assertTrue(hub.needs_sign_in("alpha"))                 # the same account, still refused
+        self.records(t, LINE, {"type": "result", "stop_reason": "end_turn"}, attempt=2,
+                     session="44444444-2222-4333-8444-555555555555")
+        self.assertFalse(hub.needs_sign_in("alpha"))                # a turn of it that worked
+
+    def test_a_refused_account_is_its_sign_ins_and_its_own_providers(self):
+        """Two agents of one OS user keep one sign-in: after a sign-in from one row, the other must not stay held, where
+        its own Sign in would sign out the new account. An old session of another runtime, and a subagent, say nothing
+        of the account that the agent uses now."""
+        code = {"code": "oauth_org_not_allowed"}
+        note = lambda agent, data, ts=None: hub.account_refusal_note(agent, [(1, ts, "error", data)], hub.now())
+        with hub.LOCK:
+            note("alpha", dict(code, parent="toolu_1"))             # a subagent's
+            note("beta", code)                                      # beta runs on Codex
+            self.assertEqual([hub.account_refused(a) for a in ("alpha", "beta")], [None, None])
+            note("alpha", code)
+        for uid in (502, 501):
+            for agent, own in (("alpha", 501), ("boss", uid)):
+                self.status(agent, access={"uid": own}, runtimes={"claude": {"signed_in": True}})
+            hub.ins("INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES('boss','claude','done',?,?)",
+                    (hub.now(), hub.now()))
+            self.assertEqual(hub.needs_sign_in("alpha"), uid == 502)        # another user's sign-in is another one
+        with hub.LOCK:
+            note("alpha", code, hub.now() - 60)                     # a batch that comes late, from before that sign-in
+            self.assertFalse(hub.needs_sign_in("alpha"))
+            note("alpha", code)                                     # and the new account is refused too
+            self.assertTrue(hub.needs_sign_in("alpha"))
+            # boss shares it, and its own chat's refusal reaches no record: its waiting chat stops no sign-in either
+            hub.q("INSERT INTO ui_requests(request_id,kind,text,event_id,created,client,recipient) VALUES('r2',"
+                  "'message','And here?',2,?,'app','boss')", (hub.now(),))
+            self.assertIsNone(hub.sign_out_busy("boss"))
+            with unittest.mock.patch.dict(hub.TEAM["agents"]["boss"], runtime="codex"):     # another sign-in
+                self.assertEqual(hub.sign_out_busy("boss")["chats_waiting"], 1)
+
+    def test_a_persons_conversation_on_a_refused_account_holds_the_agent_too(self):
+        person = hub.ins("INSERT INTO people(name,role,added) VALUES('Example Person','customer',?)", (hub.now(),))
+        conv = hub.ins("INSERT INTO conversations(person,agent,account,chat,state,created,last) VALUES(?,'alpha',"
+                       "'example','chat-1','open',?,?)", (person, hub.now(), hub.now()))
+        tid = self.task("alpha")
+        hub.q("UPDATE tasks SET source_conversation=?, source_message=1 WHERE id=?", (conv, tid))
+        self.signed("alpha", True)
+        self.call("/helper/events/alpha", dict(
+            generation="test-generation", task=f"C-{conv}", attempt=conv,
+            session="55555555-2222-4333-8444-555555555555",
+            events=[dict(r, seq=i + 1, ts=hub.now()) for i, r in enumerate((LINE, ORG_REFUSED))]),
+            source=BOX, token=KEYS["alpha"])
+        self.assertTrue(hub.needs_sign_in("alpha"))
 
     def test_a_restart_on_the_machines_word_alone_comes_once(self):
         """A sign-in that the provider ended while the machine says that it is signed in: one new session, and then
@@ -425,6 +520,13 @@ class SignedOut(test_agent_auth.Routes):
         self.assertEqual(route["reason"], f"The claude runtime of this route is signed out: {hub.SIGN_IN_REQUIRED}")
         self.signed("alpha", True)
         self.assertNotIn("signed out", hub.capacity_view(["alpha"])["agents"][0]["routes"][0]["reason"] or "")
+        self.assertTrue(hub.chat_wanted("alpha", False))
+        with hub.LOCK:          # its machine says "signed in", and its provider refuses that account at each turn
+            hub.account_refusal_note("alpha", [(1, None, "error", {"code": "oauth_org_not_allowed"})], hub.now())
+        route = hub.capacity_view(["alpha"])["agents"][0]["routes"][0]
+        self.assertEqual(route["state"], "unknown")
+        self.assertIn("an account that its provider refuses", route["reason"])
+        self.assertFalse(hub.chat_wanted("alpha", False))           # no chat session starts for it
 
     def test_whoever_gives_it_work_reads_that_the_task_waits(self):
         self.signed("beta", False)
