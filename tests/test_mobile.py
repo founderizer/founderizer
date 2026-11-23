@@ -181,7 +181,9 @@ class Devices(test_ui_api.OwnerAPI):
         `note` from it is refused. A hub that refused a phone's words, or a receipt with a field missing, leaves the
         phone's saved request with no way out. Each answer keeps the hand that sent it (request_hand), which the agent
         reads: a tool's label counts before the device (the equal-Macs design of 22 November 2026, piece E3), so the
-        owner tools on an enrolled device, as on a second main Mac, never write the owner's own words."""
+        owner tools on an enrolled device, as on a second main Mac, never write the owner's own words, and neither does
+        a program that has the device's key (piece E3b): only the label of one of the owner's apps is the device's
+        hand."""
         key = self.enrolled()
         spec = {"kind": "login", "site": "https://shop.example/login", "give": {}}
         nid = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?)",
@@ -207,9 +209,9 @@ class Devices(test_ui_api.OwnerAPI):
         again = self.call(path, dict(body, clarify="Which account?"), source=PHONE, token=key)[1]
         self.assertEqual((again["replayed"], again["created"], again["event_id"]), (True, receipt["created"], receipt["event_id"]))
         # The hand of each sender, and what the agent reads (Fable's third check of 20 November 2026 for the owner's
-        # computer; piece E3 for a device): a tool's label or a session is an AI session's, on a device too, and its
-        # words are not the owner's; a program's label on the owner's computer is a program's; each app of the owner's
-        # writes the owner's words.
+        # computer; pieces E3 and E3b for a device): a tool's label or a session is an AI session's, on a device too,
+        # and its words are not the owner's; any other label is a program's, on a device too; each app of the owner's
+        # writes the owner's words from its own place, and the iPhone app's label is no app of the owner's computer.
         hub.TEAM["owner_devices"]["pc"] = {"label": "PC", "address": OTHER}
         status, made = self.code("pc")
         self.assertEqual(status, 200, made)
@@ -217,18 +219,25 @@ class Devices(test_ui_api.OwnerAPI):
         self.assertEqual(status, 200, got)
         pc = got["key"]
         cli, mcp = {"X-Fleet-Client": "founderizer-cli/1/test"}, {"X-Fleet-Client": "founderizer-mcp/1/test"}
+        ios, curl = {"X-Fleet-Client": "founderizer-ios/1/test"}, {"X-Fleet-Client": "curl/8.7.1"}
         session = {"X-Fleet-Session": "claude-code/1"}
         for n, (who, source, token, headers, hand, mark) in enumerate((
-                ("the phone's app", PHONE, key, {"X-Fleet-Client": "founderizer-ios/1/test"}, "device", ""),
+                ("the phone's app", PHONE, key, ios, "device", ""),
                 ("the CLI on the phone", PHONE, key, cli, "tool", " via ai-session"),
                 ("a session on the phone", PHONE, key, session, "tool", " via ai-session"),
+                ("a program on the phone", PHONE, key, curl, "other", " via program"),
+                ("a label that only starts like an app's, on the phone", PHONE, key,
+                 {"X-Fleet-Client": "founderizer-proof-a-reference/1"}, "other", " via program"),
+                ("a label that holds an app's label inside it, on the phone", PHONE, key,
+                 {"X-Fleet-Client": "proof-founderizer-ios/1"}, "other", " via program"),
                 ("the PC's app", OTHER, pc, {"X-Fleet-Client": "founderizer-windows/1/test"}, "device", ""),
                 ("the MCP server on the PC", OTHER, pc, mcp, "tool", " via ai-session"),
+                ("a program on the PC", OTHER, pc, curl, "other", " via program"),
                 ("the Mac app", MAC, None, {}, "app", ""),
                 ("the CLI on the owner's computer", MAC, None, cli, "tool", " via ai-session"),
                 ("a session on the owner's computer", MAC, None, session, "tool", " via ai-session"),
-                ("a program on the owner's computer", MAC, None, {"X-Fleet-Client": "curl/8.7.1"}, "other",
-                 " via program"))):
+                ("a program on the owner's computer", MAC, None, curl, "other", " via program"),
+                ("the iPhone app's label on the owner's computer", MAC, None, ios, "other", " via program"))):
             with self.subTest(who=who):
                 need = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?)",
                                (f"Enter a login for site{n}.example", "The tickets.", hub.SECRET_TODO, hub.now(),
@@ -244,9 +253,17 @@ class Devices(test_ui_api.OwnerAPI):
                 self.assertTrue(said.startswith(f"[owner{mark}] Answer to Needs-you N-{need} "), said)
                 self.assertEqual("An AI session or a program wrote the words before this line for the owner" in said,
                                  bool(mark), said)
-        # every route refuses a request with no label (X-Fleet-Client is required); the hand of none stays the
-        # device's on a device, and a program's on the owner's computer
-        self.assertEqual((hub.request_hand("", device="iphone"), hub.request_hand("")), ("device", "other"))
+        # the route refuses an answer with no label, from a device or the owner's computer, and the item stays open
+        required = {"error": "X-Fleet-Client is required (at most 128 characters)"}
+        for source, token in ((PHONE, key), (MAC, None)):
+            need = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?)",
+                           ("Enter a login for none.example", "The tickets.", hub.SECRET_TODO, hub.now(), "manager",
+                            "secret", json.dumps(spec)))
+            status, refused = self.call(f"/ui/needs/{need}/secret", {"request_id": str(uuid.uuid4()),
+                                                                   "db": "test-generation", "clarify": "Which one?"},
+                                        source=source, token=token, headers={"X-Fleet-Client": ""})
+            self.assertEqual((status, refused), (400, required))
+            self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (need,))["answer"])
 
     def test_a_code_works_once_and_only_from_its_device(self):
         status, made = self.code()

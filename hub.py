@@ -2245,22 +2245,28 @@ def owner_device_class(device):
 # program on the Mac that holds the Mac key is the owner to ui_allowed, so the hub keeps, with each owner message,
 # answer, steer and command, the kind of program that sent it, and the session that it names:
 #   "app"       the Mac app's own screen (its label, OWNER_APP_LABELS)
-#   "device"    an enrolled phone or PC, by its checked key (owner_device_at), with no tool's label and no session
+#   "device"    an app on an enrolled device of the owner's, by its checked key (owner_device_at) and its label
+#               (OWNER_DEVICE_LABELS), with no session
 #   "connected" a connected app (capp_connections), "chat" a chat app's message (its origin)
 #   "tool"      the owner tools that his AI sessions use (the MCP server and the shell forms of founderizer-cli and
 #               owner_mcp.py, OWNER_TOOL_LABELS), or any request that names a session (X-Fleet-Session), from the
 #               owner's computer or from an enrolled device alike
-#   "other"     any other label: a script, a test
+#   "other"     any other label: a script, a test, from the owner's computer or from an enrolled device alike
 # A label is the client's own claim (SECURITY.md): this tells an honest AI session from the owner's hand, never a
 # program that lies about itself.
 OWNER_TOOL_LABELS = ("founderizer-cli/", "founderizer-mcp/")
 OWNER_APP_LABELS = ("founderizer-swift/", "founderizer-windows/")     # the Mac app's screen, the PC app's
+# The apps of the owner's devices (piece E3b, 23 November 2026). On a computer, a program of the same user can send with
+# the device's key, as each program on the Mac can with the Mac key. So only these labels are the owner's own hand on a
+# device, and a program that gives its own name (`curl/8.7.1`) is "other", as on the owner's computer. The iPhone app's
+# label is in this list alone: no iPhone is the owner's computer.
+OWNER_DEVICE_LABELS = OWNER_APP_LABELS + ("founderizer-ios/",)
 OWNER_SESSION = re.compile(r"[A-Za-z0-9._:/-]{1,128}")      # X-Fleet-Session, e.g. claude-code/<session id>
 OWNER_TOOL_VIA = "ai-session"           # the mark of a tool's request in its header: [owner via ai-session]
 OWNER_PROGRAM_VIA = "program"           # and of an "other" request (any label that no app of the owner's gives)
 # The hands whose words are the owner's own (Fable's check of 20 November 2026, finding 1: a request with any label
 # that no client lists, `curl/8.7.1` for one, had the owner's force, so the whole chain of N-230 ran again): the Mac
-# app's own screen, an enrolled device and a chat app's message, and a row of before the hand was kept (None).
+# app's own screen, an app on an enrolled device and a chat app's message, and a row of before the hand was kept (None).
 OWNER_FORCE_HANDS = ("app", "device", "chat")
 
 
@@ -2291,7 +2297,8 @@ def request_hand(client, device=None, connection=None, origin=None, session=None
     X-Fleet-Session.
     A tool's label counts before the device (the equal-Macs design of 22 November 2026, hazard 4.9 and piece E3): a
     device that runs the owner tools, as a second main Mac does, gives their calls the hand "tool", never the owner's
-    own words (OWNER_FORCE_HANDS), as on the owner's computer."""
+    own words (OWNER_FORCE_HANDS), as on the owner's computer. A device's own hand needs the label of an app of the
+    owner's devices (OWNER_DEVICE_LABELS, piece E3b): any other label on a device is "other"."""
     label = str(client or "")
     if connection is not None:      # the hub's own record of a connected app; its label alone is a program's claim
         return "connected"
@@ -2300,7 +2307,7 @@ def request_hand(client, device=None, connection=None, origin=None, session=None
     if session or label.startswith(OWNER_TOOL_LABELS):      # an AI session's request, from any machine
         return "tool"
     if device:
-        return "device"
+        return "device" if label.startswith(OWNER_DEVICE_LABELS) else "other"
     return "app" if label.startswith(OWNER_APP_LABELS) else "other"
 
 
@@ -3209,8 +3216,12 @@ def ping_payload(need, generation, seal=None, badge=None, reply=None):
     # owner API 1.285: and none for an item with pictures. A button on a notice shows words alone, and the owner must
     # not choose an ad that they did not see: a tap opens the card, which shows the pictures.
     pictured = "pictures" in need.keys() and need["pictures"]
+    # and none for a GitHub App card or an Add device card, whose first option starts on the Mac (a GitHub page, the
+    # Add device picture): a press of it on the lock screen closed the card and started nothing
+    on_mac = any(k in need.keys() and need[k] for k in ("github_app", "add_device"))
     if 2 <= len(options) <= NEED_OPTIONS_MAX and all(len(o) <= PUSH_BUTTON for o in options) \
-            and scrub(options) == options and need_give_view(need) is None and not door_run and not pictured:
+            and scrub(options) == options and need_give_view(need) is None and not door_run and not pictured \
+            and not on_mac:
         said["options"] = options         # the phone's notification content extension draws one button for each
     return sealed_ping(payload, said, seal)
 
@@ -68654,7 +68665,7 @@ def check_mcp_server(name, entry, agent=None, new=False):
     needs and the fleet does not hold, because that is the other typo that shows only in a session. ValueError (the
     shape) is the caller's 400. agent: whose machine to ask about a command server, for a server that no agent has
     yet; it changes nothing for a url server. new: a server that the owner is about to save, which takes the rules
-    of a new write (lifecycle.mcp_server, D33)."""
+    of a new write (lifecycle.mcp_server, D33), and the saved token only at the saved server's own address."""
     made = mcp_server(name, entry, new=new)         # ValueError with the reason
     needs = [v for v in tool_needs(made) if v != mcp_variable(name)]
     kind = "url" if "url" in made else "package" if "package" in made else "command"
@@ -68687,7 +68698,11 @@ def check_mcp_server(name, entry, agent=None, new=False):
                       says=f"{what}: each server answered for itself and nobody ran it. {said}")
         return result
     access, url = None, made["url"]
-    if made["auth"] == "oauth":
+    # The saved access token of a connected server goes only to the address that was connected: a check of a new
+    # server under a connected name, at another address, asks without it. Else any caller of the owner's route (an AI
+    # session of the owner's, or a client that steers one) could send the token to an address of its own choice.
+    kept = (TEAM.get("mcp") or {}).get(name)
+    if made["auth"] == "oauth" and (not new or isinstance(kept, dict) and kept.get("url") == url):
         saved, bad = mcp_saved()
         if not bad and mcp_connection(saved, name):
             with contextlib.suppress(Refusal):
@@ -68699,7 +68714,13 @@ def check_mcp_server(name, entry, agent=None, new=False):
         about = mcp.check(url, access)
     except mcp.McpError as e:
         result["checked"] = True
-        if e.status in (401, 403) and made["auth"] == "oauth" and not access:
+        moved = made["auth"] == "oauth" and isinstance(kept, dict) and kept.get("url") != url and \
+            mcp_connection(mcp_saved()[0], name) is not None
+        if e.status in (401, 403) and moved:        # a new address under a connected name: the token stayed home
+            result.update(answers=True, needs="connect", says=(
+                f"{url} answers and asks for a sign-in. The saved sign-in of {name} goes only to {kept.get('url')}: "
+                f"save the new address, then Connect again."))
+        elif e.status in (401, 403) and made["auth"] == "oauth" and not access:
             result.update(answers=True, needs="connect", says=f"{url} answers and asks for a sign-in: Connect it.")
         elif e.status in (401, 403) and made["auth"] == "oauth":
             result.update(answers=False, needs="connect",
@@ -69043,7 +69064,7 @@ def mcp_renew_sweep(t0):
 
 def save_mcp(body):
     """One owner change of team.json "mcp": a new server, a changed one, or a delete, which also takes the server from
-    every agent that had it."""
+    every agent that had it. A delete, and a change of a server's url or auth, end the owner's connection of it."""
     name, entry, deleting = body["name"], body.get("server"), body.get("delete") is True
     was = []            # the server's entry in team.json before this write, or None
 
@@ -69075,7 +69096,18 @@ def save_mcp(body):
     what = f"removed the MCP server {name}" if deleting else f"added or changed the MCP server {name}"
     result = save_integration(body["base_sha256"], change, f"Owner {what}")
     if result["changed"]:
-        if deleting:            # the owner's connection of a server that is gone keeps no use
+        # a new server says the next step once; one that signs in (oauth) says it at its Connect, after this save. The
+        # app saves a found server with oauth first, and again with none when the server has no Connect (no_oauth),
+        # so a server that leaves oauth with no connection says it too
+        old = was[0] if was and isinstance(was[0], dict) else None
+        first = not deleting and (entry or {}).get("auth", "none") != "oauth" and (
+            old is None or old.get("auth") == "oauth" and mcp_connection(mcp_saved()[0], name) is None)
+        # The owner's connection keeps no use when its server is gone, and is no longer this server's when its address
+        # or its sign-in changed: else the next check (check_mcp_server) and each task session (helper_mcp) would send
+        # the saved token to the new address. A Connect at the new address is a new one (ui_mcp_finish refuses a
+        # Connect whose address changed while it ran).
+        moved = not deleting and old is not None and any(old.get(k) != (entry or {}).get(k) for k in ("url", "auth"))
+        if deleting or moved:
             saved, bad = mcp_saved()
             if not bad and name in (saved.get("servers") or {}):
                 mcp_store(dict(saved, servers={k: v for k, v in saved["servers"].items() if k != name}))
@@ -69084,12 +69116,6 @@ def save_mcp(body):
                 MCP.setdefault("ended", {}).pop(name, None)       # a new Connect or no server: no end
                 if MCP["problems"].pop(name, None) is not None:
                     changed()
-        # a new server says the next step once; one that signs in (oauth) says it at its Connect, after this save. The
-        # app saves a found server with oauth first, and again with none when the server has no Connect (no_oauth),
-        # so a server that leaves oauth with no connection says it too
-        old = was[0] if was and isinstance(was[0], dict) else None
-        first = not deleting and (entry or {}).get("auth", "none") != "oauth" and (
-            old is None or old.get("auth") == "oauth" and mcp_connection(mcp_saved()[0], name) is None)
         emit(manager_name(), "say", f"[hub] The owner {what}. An agent gets it in its next task session." +
              (team_no_holder_for(f"tool:{name}") if first else ""))
     return dict(result, name=name, deleted=deleting, server=None if deleting else entry)

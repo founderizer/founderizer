@@ -559,6 +559,54 @@ class HubSide(OwnerAPI):
         for text in (json.dumps(data), json.dumps([dict(r) for r in hub.q("SELECT * FROM ui_controls")])):
             self.assertNotIn(ACCESS, text)
 
+    def test_a_check_of_a_new_address_under_a_connected_name_sends_no_token(self):
+        """A check of a server that the caller is about to save takes the saved access token only at the address that
+        was connected. Before 23 November 2026 a check with the name of a connected server and a `server` of the
+        caller's own sent that token, as a bearer token, to the caller's address: any https host, or a port of the
+        hub's own host. The owner's edit of the connected server at its own address keeps the token."""
+        self.oauth()
+        self.mcp_endpoint(bearer=ACCESS)
+        self.crm()
+        self.assertEqual(self.connect_server()[1]["connected"], True)
+        saved = self.origin_team()["mcp"]["crm"]
+        code, data = self.post("/ui/mcp/check", name="crm", server=dict(saved, title="Acme CRM, renamed"))
+        self.assertEqual((code, data["answers"], data["needs"]), (200, True, None), data)
+        heard = []
+
+        def other(handler, req):
+            heard.append(req["headers"].get("Authorization"))
+            handler.send_error(401, "unauthorized")
+        self.stand.on("POST", "/other", other)
+        code, data = self.post("/ui/mcp/check", name="crm", server=dict(saved, url=self.stand.url + "/other"))
+        self.assertEqual((code, data["answers"], data["needs"], heard), (200, True, "connect", [None]), data)
+        self.assertIn(f"The saved sign-in of crm goes only to {saved['url']}", data["says"])
+
+    def test_a_connected_server_saved_at_a_new_address_is_no_longer_connected(self):
+        """The owner's connection of a server is for the address that was connected. Before 23 November 2026 a save
+        of a connected server (POST /ui/team/mcp) at another url kept it, so the next check with no `server`, and
+        each task session (helper_mcp), sent the saved token to the new address. Now a change of url or auth ends
+        the connection, as a delete does: the new address hears no token, and the server waits for its next
+        Connect. A save that changes neither keeps it."""
+        self.oauth()
+        self.mcp_endpoint(bearer=ACCESS)
+        self.crm()
+        self.assertEqual(self.connect_server()[1]["connected"], True)
+        saved = self.origin_team()["mcp"]["crm"]
+        code, data = self.save("/ui/team/mcp", name="crm", server=dict(saved, title="Acme CRM, renamed"))
+        self.assertEqual(code, 200, data)
+        self.assertTrue(hub.mcp_state(hub.TEAM)["crm"]["connected"])
+        heard = []
+
+        def other(handler, req):
+            heard.append(req["headers"].get("Authorization"))
+            handler.send_error(401, "unauthorized")
+        self.stand.on("POST", "/other", other)
+        code, data = self.save("/ui/team/mcp", name="crm", server=dict(saved, url=self.stand.url + "/other"))
+        self.assertEqual(code, 200, data)
+        self.assertFalse(hub.mcp_state(hub.TEAM)["crm"]["connected"])
+        code, data = self.post("/ui/mcp/check", name="crm")
+        self.assertEqual((code, data["answers"], data["needs"], heard), (200, True, "connect", [None]), data)
+
     def test_a_server_that_does_not_answer_is_a_200_that_says_why(self):
         code, data = self.post("/ui/mcp/check", name="crm", server=dict(CRM, url=self.closed_address()))
         self.assertEqual((code, data["checked"], data["answers"], data["needs"]), (200, True, False, None), data)

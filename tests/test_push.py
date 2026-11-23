@@ -287,7 +287,8 @@ class Sender(PushCase):
     def test_the_door_s_card_of_a_run_gets_no_button_and_a_tap_opens_its_script(self):
         """Owner API 1.247: Run it once signs a root script that a ping does not show, and Full access counts only with
         the owner key on the Mac, so the ping of the door's card of a run carries no buttons, also for a phone from
-        before. Bug: a press on the lock screen signs a script that the owner never saw."""
+        before; nor does a GitHub App card or an Add device card (App shell's phone-dead-cards, 22 November 2026). Bug: a
+        press on the lock screen signs a script that the owner never saw, or closes a card and starts nothing."""
         card = {"id": 7, "title": "Run one root script on web-1?", "by": "atlas", "door_host": "web-1",
                 "options": json.dumps(["Run it once", "Full access on web-1", "No"])}
         said = self.opened(hub.ping_payload(card, "g", SEAL))
@@ -296,6 +297,14 @@ class Sender(PushCase):
         for other in (dict(card, door_host=None), {k: v for k, v in card.items() if k != "door_host"}):
             self.assertEqual(self.opened(hub.ping_payload(other, "g", SEAL))["options"],
                              ["Run it once", "Full access on web-1", "No"])
+        # a GitHub App card and an Add device card: their first option starts on the Mac (a GitHub page, the Add
+        # device picture), so a press of it on the lock screen would close the card and start nothing
+        app = {"id": 8, "title": "Make the GitHub App for acme?", "by": "atlas",
+               "options": json.dumps(["Make it", "Not now"])}
+        for kind in ({"github_app": "acme"}, {"add_device": 1}):
+            self.assertNotIn("options", self.opened(hub.ping_payload(dict(app, **kind), "g", SEAL)))
+        self.assertEqual(self.opened(hub.ping_payload(dict(app, github_app=None, add_device=0), "g", SEAL))["options"],
+                         ["Make it", "Not now"])
 
     def test_the_managers_reply_under_a_card_rings_as_a_reply_with_no_button(self):
         """Needs clarification (owner API 1.272; the area's review of 20 November 2026): the ring of the manager's reply
