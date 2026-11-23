@@ -5809,7 +5809,8 @@ class Table(unittest.TestCase):
         self.assertNotIn("add_machine", names)                       # absent: the app's own Add server does it
         self.assertEqual(owner_mcp.dump_tools()["categories"], [list(c) for c in owner_mcp.CATEGORIES])
         for words, callable_ in ((server, {t["name"] for t in listed}), (table, set(names))):
-            self.assertLessEqual(set(re.findall(r"\b[a-z]+(?:_[a-z]+)+\b", words)), callable_)
+            # and the pages of fleet_read, which a line of the rule of places names too (F15: profile_orders)
+            self.assertLessEqual(set(re.findall(r"\b[a-z]+(?:_[a-z]+)+\b", words)), callable_ | set(owner_mcp.PAGES))
             shown = re.search(r"read with fleet_read: ([^.]*)\.", words).group(1).replace(" and ", ", ").split(", ")
             self.assertLessEqual(set(shown), set(owner_mcp.PAGES), shown)
 

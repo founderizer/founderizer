@@ -1533,6 +1533,11 @@ before character 2,048 (`test_owner_mcp.Table`).
 - What steers one agent is on the pages `profiles`, `responsibilities`, `standing`, `notes`,
   `lessons` and `skills` of `fleet_read`. `end_standing` takes back a kept wish, `restore_notes` its
   notes, `forget_lesson` a lesson, `remove_skill` a skill and `duty_state` a duty.
+- A line that the fleet manager took out of a profile with no card (F15, owner API 1.318: an item
+  of a list that is the whole section, or a whole paragraph, each word for word under a heading with
+  that section's title in that agent's watched duty or own skill):
+  `fleet_read(page="profile_orders")` names each line, the line before it, its place and whether the
+  place still holds it, and `save_profile` puts it back.
 
 ### Read
 

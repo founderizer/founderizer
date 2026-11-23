@@ -220,11 +220,13 @@ class TeamChanges(Remove):
         hub.save_profile("vps", self.base_of("vps"), sections)
         self.assertGreater(int(hub.kv_get(hub.PROFILE_LONG + "vps")), 7800)
         leave, stay = lines[::2], lines[1::2]
+        self.duty("vps", "\n".join(leave))      # F15: a section that the owner decides is never an order (claim C3)
         was = size()
         said = self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"),
                            "sections": [{"key": "responsible_for", "title": "Responsible for",
                                          "text": "\n".join(stay)}]}],
                          title="Make the profile of vps shorter?", why="Half of its lines are in its duty's words.")
+        self.assertTrue(said.startswith("Raised N-"), said)
         details = self.card()["details"]
         for line in leave:
             self.assertIn(line, details)
@@ -239,6 +241,642 @@ class TeamChanges(Remove):
         self.assertIn(stay[-1], profile)
         self.assertNotIn(leave[0], profile)
         self.assertIsNone(hub.kv_get(hub.PROFILE_LONG + "vps"))        # the count starts from the plan's number
+
+    def duty(self, agent, text, state="active", watch="clock", running="active", reads=0):
+        """A duty of `agent` with a watch of this kind in this state, or with none (watch=None), whose words a save of
+        this release wrote after `reads` reads of outside text (None: a duty of before, with no count): a duty is a
+        place of an order only while a managed watch that runs brings its words to the agent's sessions, and only with
+        a count of 0 (F15)."""
+        t0 = hub.now()
+        duty = hub.ins("INSERT INTO responsibilities(agent,text,state,revision,created,updated,created_by,request_id,"
+                       "outside_reads) VALUES(?,?,?,1,?,?,'manager',?,?)",
+                       (agent, text, state, t0, t0, str(uuid.uuid4()), reads))
+        if watch:
+            hub.ins("INSERT INTO triggers(agent,state,revision,schedule,task,late_minutes,max_tasks_per_day,anchor,"
+                    "created,updated,request_id,responsibility,watch) VALUES(?,?,1,'{}','Look.',30,4,?,?,?,?,?,?)",
+                    (agent, running, t0, t0, t0, str(uuid.uuid4()), duty, watch))
+        return duty
+
+    def long_vps(self):
+        """F15: vps's profile as the owner's save left it, with a free section "How you work" of 8 lines and one
+        "Style" of 3,000 characters (9,700 of free text), and an owner file in its Knowledge files that holds line 4.
+        The places of its own work, each under a heading with that section's title: an active duty that holds lines 1
+        and 2 as a list (with another mark, in other spaces and quotes), its own skill desk with line 3 and a second
+        active duty with line 4, each as a paragraph of its own. Lines 5 to 8 stand in no such place. (duty of lines 1
+        and 2, duty of line 4)."""
+        lines = [f"- Rule {n} of the desk: " + (f"answer each ticket of kind {n} in the customer's own words, "
+                                                f"and log it at once. ") * 10 for n in range(1, 9)]
+        lines = [line.rstrip() for line in lines]
+        catalog = patch.dict(hub.CFG, {"artifact_repo": hub.kit_dir()})      # the knowledge catalog of this fleet
+        catalog.start()
+        self.addCleanup(catalog.stop)
+        self.write({"skills/vps/desk/SKILL.md": f"---\nname: desk\ndescription: \"The desk.\"\n---\n\n# Desk\n\n"
+                                                f"## How you work\n\n{lines[2][2:]}\n",
+                    "knowledge/owner/desk-policy.md": f"# Desk policy\n\nSource: the owner\n\n{lines[3]}\n"})
+        duty = self.duty("vps", "Answer the support queue.\n\n## How you work\n\n" + "\n".join(
+            "* " + line[2:].replace("customer's", "customer’s").replace(" of ", "  of ") for line in lines[:2]))
+        closing = self.duty("vps", f"Close the day.\n\n## How you work\n\n{lines[3][2:]}\n\nThen log off.")
+        sections = [s for s in hub.profile_view("vps", hub.kit_revision(fresh=True))["sections"]] + [
+            {"key": "other", "title": "How you work", "text": "\n".join(lines)},
+            {"key": "other", "title": "Style", "text": ("Short and plain. " * 176).strip()},
+            {"key": "knowledge_files", "title": "Knowledge files", "text": "- knowledge/owner/desk-policy.md"}]
+        hub.save_profile("vps", self.base_of("vps"), sections)
+        return lines, (duty, closing)
+
+    def skill_unread(self):
+        """git gives no answer for a skill's SKILL.md, and answers every other read."""
+        real = hub.kit_file
+
+        def read(rev, path):
+            if path.endswith("/SKILL.md"):
+                raise hub.KitUnread(path)
+            return real(rev, path)
+        return patch.object(hub, "kit_file", read)
+
+    def free(self, title, lines):
+        return {"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"),
+                "sections": [{"key": "other", "title": title, "text": "\n".join(lines)}]}
+
+    def test_a_plan_that_only_takes_out_lines_that_stand_in_the_agents_places_is_made_with_no_card(self):
+        """F15 pieces 1 and 2 (the owner, 22 November 2026: "This should happen autoamtically under the hood with no
+        impact at all for the user"). Bug: the card comes back for a profile that only gets shorter, which is the state
+        of before; or the order rings the owner, writes a line in his chat or leaves the other sections and the number
+        of its free text behind; or a refusal of its commit (a busy turn) reaches the manager as an error of the
+        hub's own; or the owner cannot find where a line of his went, or the way back is a way to add words with no
+        press or to change what a line means by its place: a line that no order took out, one that came back already,
+        one at another place than just after the line before it, or one that an order took out before the owner's own
+        save of the profile, makes a card."""
+        lines, (duty, closing) = self.long_vps()
+
+        def profile():
+            return hub.profile_view("vps", hub.kit_revision(fresh=True))["text"]
+
+        def asks():
+            return hub.q1("SELECT COUNT(*) n FROM events WHERE agent='manager' AND text LIKE '%is long: its free "
+                          "text%'")["n"]
+        was, notices, asked = profile(), hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner'")["n"], asks()
+        with patch.object(hub, "commit_kit_file", side_effect=hub.KitFault(409, hub.KIT_BUSY)), \
+                self.assertRaises(hub.ToolError) as refused:        # a busy turn: the manager's words, no fault
+            self.plan([self.free("How you work", lines[4:])], title="Put the profile of Vps in order?", why="A test.")
+        self.assertEqual(str(refused.exception), "The hub did not make this order, and nothing changed. "
+                         f"{hub.KIT_BUSY.rstrip('.')}. Give the plan again.")
+        self.assertEqual((profile(), hub.q1("SELECT COUNT(*) n FROM profile_orders")["n"]), (was, 0))
+        said = self.plan([self.free("How you work", lines[4:])], title="Put the profile of Vps in order?",
+                         why="Four of its lines stand in its duties and its skill.")
+        self.assertIsNone(self.card(), said)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner'")["n"], notices)
+        now_ = profile()
+        self.assertEqual(git("--git-dir", str(self.root / "origin.git"), "log", "-1", "--format=%s", "main"),
+                         "Fleet manager put the profile of vps in order")
+        self.assertEqual(now_, was.replace("\n".join(lines[:4]) + "\n", ""))     # nothing else moved
+        self.assertTrue(said.startswith(f"Made at once, with no card, in commit {self.head()[:12]}: the profile of Vps "
+                                        f"(profiles/vps.md) goes from {len(was):,} to {len(now_):,} characters: 4 "
+                                        f"lines left it, 2 in the duty R-{duty} (Answer the support queue), 1 in the "
+                                        f"skill desk, 1 in the duty R-{closing} (Close the day)."), said)
+        free = hub.profile_free_text(hub.parse_profile(now_))
+        self.assertEqual(hub.kv_get(hub.PROFILE_LONG + "vps"), str(free))      # the new number, and no ask about it
+        self.assertGreater(free, hub.PROFILE_LONG_MARK)
+        self.assertEqual(asks(), asked)
+        self.assertGreater(float(hub.kv_get(hub.PROFILE_CHANGED + "vps")), 0)
+        status, read = self.request(f"/ui/profile-orders?agent=vps&db=test-generation")
+        self.assertEqual(status, 200, read)
+        order, = read["orders"]
+        self.assertEqual((order["agent"], order["size_before"], order["size_after"], order["commit_after"],
+                          order["owner_saved"]), ("vps", len(was), len(now_), self.head(), None))
+        self.assertEqual([(x["section"], x["line"], x["way"], x["after"], x["place"], x["still"])
+                          for x in order["lines"]],
+                         [("How you work", line, "out", after, place, True) for line, after, place in zip(
+                             lines[:4], [None] + lines[:3], [f"the duty R-{duty} (Answer the support queue)"] * 2 +
+                             ["the skill desk", f"the duty R-{closing} (Close the day)"])])
+        # the way back: a recorded line just after the line before it needs no card; once more, at another place, or
+        # a line of no order makes one
+        said = self.plan([self.free("How you work", lines[:1] + lines[4:])], title="Put a line of Vps back?",
+                         why="Its results got worse.")
+        self.assertIsNone(self.card(), said)
+        self.assertIn("1 line came back into it", said)
+        self.assertIn(lines[0], self.show("profiles/vps.md"))
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM profile_orders WHERE agent='vps'")["n"], 2)
+        for name, given in (("twice", lines[:1] * 2 + lines[4:]),
+                            ("at another place", lines[:1] + lines[4:] + lines[1:2]),
+                            ("of no order", lines[:1] + ["- A rule that no order took out."] + lines[4:])):
+            with self.subTest(given=name):
+                said = self.plan([self.free("How you work", given)], title="Change the profile of Vps?",
+                                 why="A test.")
+                self.assertTrue(said.startswith("Raised N-"), said)
+        self.assertNotIn("A rule that no order took out", self.show("profiles/vps.md"))
+        # the owner's own save: the profile is the owner's word again, and line 2 no longer comes back with no press
+        sections = hub.profile_view("vps", hub.kit_revision(fresh=True))["sections"]
+        hub.save_profile("vps", self.base_of("vps"), [dict(s, text="Short.") if s["title"] == "Style" else s
+                                                      for s in sections])
+        self.assertIsNotNone(hub.q1("SELECT owner_saved FROM profile_orders WHERE agent='vps' ORDER BY id LIMIT 1")[
+            "owner_saved"])
+        said = self.plan([self.free("How you work", lines[:2] + lines[4:])], title="Put a line of Vps back?",
+                         why="A test.")
+        self.assertTrue(said.startswith("Raised N-"), said)
+        # a plan that the owner pressed ends the way back too: line 1 leaves again, a press changes the profile
+        said = self.plan([self.free("How you work", lines[4:])], title="Put the profile of Vps in order?",
+                         why="A test.")
+        self.assertTrue(said.startswith("Made at once"), said)
+        self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"), "sections": [
+            {"key": "may_do", "title": "May do without asking", "text": "Read and write files."}]}])
+        self.assertEqual(self.press(0)[0], 200)
+        self.assertIsNotNone(hub.q1("SELECT owner_saved FROM profile_orders WHERE agent='vps' ORDER BY id DESC "
+                                    "LIMIT 1")["owner_saved"])     # the owner reads that the way back ended
+        said = self.plan([self.free("How you work", lines[:1] + lines[4:])], title="Put a line of Vps back?",
+                         why="A test.")
+        self.assertTrue(said.startswith("Raised N-"), said)
+
+    def test_the_record_says_whether_each_place_still_holds_its_line(self):
+        """F15 piece 2, GET /ui/profile-orders `still`. Bug: the owner reads that a place still holds a line of his
+        that its holder took out or put in another order, that a retired duty holds, or that only another agent's skill
+        of the same name holds; or a read that git does not answer says that the line is lost."""
+        lines, (duty, closing) = self.long_vps()
+        said = self.plan([self.free("How you work", lines[4:])], title="Put vps in order?", why="A test.")
+        self.assertTrue(said.startswith("Made at once"), said)
+        self.write({"skills/studio/desk/SKILL.md": "---\nname: desk\ndescription: \"The desk.\"\n---\n\nAnother.\n"})
+        hub.ins("INSERT INTO profile_orders(agent,at,commit_before,commit_after,size_before,size_after,lines) "
+                "VALUES('studio',?,'a','b',2,1,?)", (hub.now(), json.dumps([
+                    {"section": "How you work", "line": lines[2], "way": "out", "after": None,
+                     "place": "the skill desk", "ref": {"skill": "desk"}}])))
+
+        def still():
+            status, read = self.request("/ui/profile-orders?db=test-generation")
+            self.assertEqual(status, 200, read)
+            return {o["agent"]: [x["still"] for x in o["lines"]] for o in read["orders"]}
+        self.assertEqual(still(), {"studio": [False], "vps": [True] * 4})
+        with self.skill_unread():
+            self.assertEqual(still(), {"studio": [None], "vps": [True, True, None, True]})
+        text = hub.q1("SELECT text FROM responsibilities WHERE id=?", (duty,))["text"]
+        head, one, two = text.rsplit("\n", 2)
+        hub.q("UPDATE responsibilities SET text=? WHERE id=?", ("\n".join([head, two, one]), duty))
+        hub.q("UPDATE responsibilities SET state='retired' WHERE id=?", (closing,))
+        self.assertEqual(still()["vps"], [False, False, True, False])       # in another order; retired
+        hub.q("UPDATE responsibilities SET text=? WHERE id=?", ("\n".join([head, two]), duty))
+        self.assertEqual(still()["vps"], [False, True, True, False])        # its holder took line 1 out
+
+    def test_a_stop_of_the_hub_leaves_an_order_its_record_and_the_end_of_its_way_back(self):
+        """F15 piece 2. Bug: the hub stops after an order's commit, and the owner's lines are gone with no record, no
+        way back and no word to the manager, or the manager's repeat makes a second order; or it stops after the owner's
+        save of the profile, and an order puts back, with no press, a line that the owner's save left out; or git
+        with no answer is taken for a save; or a mark of an order that cannot be read stops the owner's own save; or
+        the next order writes over the mark of an order whose record still waits, which then keeps none."""
+        lines, _ = self.long_vps()
+        plan = {"changes": [self.free("How you work", lines[4:])], "title": "Put vps in order?", "why": "A test.",
+                "request_id": str(uuid.uuid4())}
+        started = patch.dict(hub.PROFILE_ORDERS_READ, {"start": True})
+        started.start()
+        self.addCleanup(started.stop)
+
+        def orders():
+            return hub.q("SELECT * FROM profile_orders WHERE agent='vps' ORDER BY id")
+        with patch.object(hub, "profile_order_record", side_effect=SystemExit), self.assertRaises(SystemExit):
+            self.plan(**plan)
+        self.assertNotIn(lines[0], self.show("profiles/vps.md"))
+        self.assertEqual(orders(), [])
+        hub.profile_orders_repair(hub.now())
+        order, = orders()
+        self.assertEqual((order["commit_after"], [x["line"] for x in json.loads(order["lines"])]),
+                         (self.head(), lines[:4]))
+        self.assertIn("Made at once", self.told("The hub stopped while it made your plan")["text"])
+        self.assertTrue(self.plan(**plan).startswith("Made at once"))       # the repeat reads the answer
+        # a stop before the commit: nothing was made, and nothing is recorded
+        back = {"changes": [self.free("How you work", lines[:1] + lines[4:])], "title": "Put a line back?",
+                "why": "A test."}
+        with patch.object(hub, "commit_kit_file", side_effect=SystemExit), self.assertRaises(SystemExit):
+            self.plan(**back)
+        hub.profile_orders_repair(hub.now())
+        self.assertEqual((len(orders()), hub.kv_get(hub.PROFILE_ORDER_MAKING)), (1, None))
+        # the owner's save, stopped after its commit
+        base, real = self.base_of("vps"), hub.commit_kit_file
+        saved = [dict(s, text="Short.") if s["title"] == "Style" else s
+                 for s in hub.profile_view("vps", hub.kit_revision(fresh=True))["sections"]]
+
+        def stop(*args, **kwargs):
+            real(*args, **kwargs)
+            raise SystemExit
+        with patch.object(hub, "commit_kit_file", stop), self.assertRaises(SystemExit):
+            hub.save_profile("vps", base, saved)
+        self.assertIsNone(orders()[0]["owner_saved"])
+        for name, again in (("the owner's retry", lambda: self.assertRaises(hub.Conflict, hub.save_profile, "vps", base,
+                                                                            saved)),
+                            ("the next start", lambda: (hub.PROFILE_ORDERS_READ.update(start=False),
+                                                        hub.profile_orders_repair(hub.now()))),
+                            ("the manager's plan", lambda: self.assertTrue(self.plan(
+                                [self.free("How you work", lines[:1] + lines[4:])], title="Put a line back?",
+                                why="A test.").startswith("Raised N-")))):
+            with self.subTest(end=name):
+                hub.q("UPDATE profile_orders SET owner_saved=NULL")
+                again()
+                self.assertIsNotNone(orders()[0]["owner_saved"])
+        # git with no answer: nothing is taken for a save, and an order waits
+        hub.q("UPDATE profile_orders SET owner_saved=NULL")
+        real_git = hub.git_kit
+        with patch.object(hub, "git_kit", lambda *a, **k: (1, "", "no answer") if a[0] == "rev-list" else
+                          real_git(*a, **k)):
+            self.assertIs(hub.profile_orders_ended("vps"), False)
+            self.assertIsNone(orders()[0]["owner_saved"])
+            with self.assertRaises(hub.TeamPassing):
+                self.plan([self.free("How you work", lines[:1] + lines[4:])], title="Put a line back?", why="A test.")
+        # a mark that cannot be read stops no save of the owner's
+        hub.kv_set(hub.PROFILE_ORDER_MAKING, "{")
+        self.assertFalse(hub.save_profile("vps", self.base_of("vps"), [
+            dict(s, text="Shorter.") if s["title"] == "Style" else s
+            for s in hub.profile_view("vps", hub.kit_revision(fresh=True))["sections"]])["unchanged"])
+        self.assertIsNone(hub.kv_get(hub.PROFILE_ORDER_MAKING))
+        # an order whose record still waits keeps its mark: the next order waits for it
+        self.duty("vps", f"Desk.\n\n## How you work\n\n{lines[4][2:]}")
+        hub.kv_set(hub.PROFILE_ORDER_MAKING, json.dumps({"waits": True}))
+        with patch.object(hub, "profile_order_land", lambda: None), self.assertRaises(hub.TeamPassing):
+            self.plan([self.free("How you work", lines[5:])], title="Put vps in order?", why="A test.")
+        self.assertEqual(hub.kv_get(hub.PROFILE_ORDER_MAKING), json.dumps({"waits": True}))
+
+    def test_an_order_moves_only_an_item_of_a_titles_flat_list_or_a_whole_paragraph(self):
+        """F15, the two rules of order_pieces, for a line that leaves, one that comes back and one in its place. Bug: a
+        line leaves what opens it, a line that stays gets another opener, or a place holds the line under an opener or a
+        heading of the opposite sense, so a decision of the owner's changes with no press; or such a plan, which only
+        makes the profile shorter, is a card."""
+        rev = hub.kit_revision(fresh=True)
+        base = hub.profile_view("vps", rev)["sections"]
+
+        def order(before, after, asked=False):
+            texts = [hub.render_profile("vps", base + ([{"key": "other", "title": "Refunds", "text": t}] if t else []))
+                     for t in (before, after)]
+            kind, said = hub.profile_order("manager", {"rev": rev, "profiles": [{
+                "agent": "vps", "role": "vps", "text": texts[0], "sections": hub.parse_profile(texts[0]),
+                "new": texts[1].encode()}]}, asked)
+            return kind if kind != "refuse" else said
+        held = ("a refund", "a deploy", "a chargeback", "Ask the owner first.", "A refund.", "A deploy.")
+        place = self.duty("vps", "Handle it all.\n\n## Refunds\n\n" + "\n".join(f"- {x}" for x in held) +
+                          "\n\n## Refunds\n\nShare the number, and\nsay when it ends.")
+        for name, before, after, why in (
+                ("•", "Without asking:\n• a deploy\nAsk the owner first:\n• a refund",
+                 "Without asking:\n• a deploy\n• a refund", "\"Without asking:\" can open"),
+                ("•, each alone", "• A refund.\n\n• A deploy.", "• A refund.", "only an item of a list"),
+                ("–", "– A refund.\n\n– A deploy.", "– A deploy.", "only an item of a list"),
+                ("a)", "a) A refund.\n\nb) A deploy.", "b) A deploy.", "only an item of a list"),
+                ("1)", "1) a refund\n2) a deploy", "1) a refund", "can open"),
+                ("an opener in a title's list", "- Ask first:\n- a refund\n- a deploy", "- a refund\n- a deploy",
+                 "\"- Ask first:\" can open"),
+                ("an item under it", "- Ask first:\n- a refund\n- a deploy", "- Ask first:\n- a deploy",
+                 "\"- Ask first:\" can open"),
+                ("two lists in a row", "- a refund\n- a deploy\n\n- a chargeback", "- a refund\n- a deploy",
+                 "only an item of a list"),
+                ("two lists, the first", "- a refund\n- a deploy\n\n- a chargeback", "- a chargeback",
+                 "only an item of a list"),
+                ("two marks", "- a refund\n* a deploy", "- a refund", "only an item of a list"),
+                ("an opener line with bullets", "Ask the owner first:\n- a refund\n- a deploy",
+                 "Ask the owner first:\n- a deploy", "\"Ask the owner first:\" can open"),
+                ("its opener alone", "Ask the owner first:\n- a refund\n- a deploy", "- a refund\n- a deploy",
+                 "\"Ask the owner first:\" can open"),
+                ("an opener with no colon", "Ask the owner first.\n\n- a refund", "- a refund",
+                 "only an item of a list"),
+                ("plain lines under openers", "Without asking:\nA refund.\nAsk the owner first:\nA deploy.",
+                 "Without asking:\nA refund.\nA deploy.", "can open"),
+                ("a heading", "### Ask the owner first\n\nA refund.", "### Ask the owner first", "can open"),
+                ("a bold line", "**Ask the owner first**\n\nA refund.", "**Ask the owner first**", "can open"),
+                ("a line that ends no sentence", "Ask the owner first\n\nA refund.", "Ask the owner first",
+                 "\"Ask the owner first\" can open"),
+                ("a part of a paragraph", "Refund at once,\nbut never above 50 EUR.", "Refund at once,",
+                 "a part of a paragraph that stays"),
+                ("a nested item", "- a refund\n  - a deploy", "- a refund", "only an item of a list"),
+                ("a wrapped item", "- a refund\n  that is large.\n- a deploy", "- a deploy", "only an item"),
+                ("a quote", "> - A refund.\n\nA deploy.", "> - A refund.", "only an item of a list"),
+                ("code", "```\nA refund.\n\nA deploy.\n```", "```\nA deploy.\n```", "can open"),
+                ("the form of what stays", "A refund.\n\nShare it\nnow.\n\nA deploy.", "Share it now.\n\nA deploy.",
+                 None),
+                ("a paragraph joined to the next", "A refund.\n\nA deploy.\n\nAsk the owner first.",
+                 "A deploy.\nAsk the owner first.", "its form"),
+                ("a numbered list", "1. a refund\n2. a deploy", "1. a refund", "a numbered item is a step"),
+                ("a list numbered again", "1. Check the logs.\n2. A refund.\n3. A deploy.",
+                 "1. Check the logs.\n2. A deploy.", "a numbered item is a step"),
+                ("a list before a paragraph", "- a refund\n- a deploy\n\nShare it.", "- a deploy\n\nShare it.",
+                 "only an item of a list"),
+                ("a paragraph that speaks of the list", "- a refund\n- a deploy\n\nNone of the above is for a shop.",
+                 "- a refund\n\nNone of the above is for a shop.", "only an item of a list")):
+            with self.subTest(out=name):
+                said = order(before, after)
+                self.assertEqual(said, "card") if why is None else self.assertIn(why, said)
+                if why:
+                    self.assertEqual(order(before, after, asked=True), "card")
+        for name, before, after in (
+                ("-", "- a refund\n- a deploy", "- a deploy"), ("*", "* a refund\n* a deploy", "* a refund"),
+                ("+", "+ a refund\n+ a deploy", ""), ("end spaces", "- a deploy  \n- a refund", "- a deploy"),
+                ("a paragraph", "A refund.\n\nA deploy.", "A deploy."),
+                ("a paragraph of two lines", "A refund.\n\nShare the number, and\nsay when it ends.", "A refund.")):
+            with self.subTest(order=name):
+                self.assertEqual(order(before, after), "order")
+        self.assertIn("before a line that it follows", order("- a deploy\n- a refund", ""))
+        # the way back: only a piece by the same rules, just after the one line before it
+        hub.ins("INSERT INTO profile_orders(agent,at,commit_before,commit_after,size_before,size_after,lines) "
+                "VALUES('vps',?,'a','b',2,1,?)", (hub.now(), json.dumps([
+                    {"section": "Refunds", "line": line, "way": "out", "after": after} for line, after in (
+                        ("- a deploy", "- a refund"), ("• A deploy.", "A refund."), ("Without asking:", None),
+                        ("Share the number, and\nsay when it ends.", "A refund."))])))
+        for before, after, kind in (
+                ("- a refund\n- a chargeback", "- a refund\n- a deploy\n- a chargeback", "order"),
+                ("A refund.", "A refund.\n\nShare the number, and\nsay when it ends.", "order"),
+                ("A refund.", "A refund.\n\nShare the number, and", "card"),
+                ("A refund.", "A refund.\n\n• A deploy.", "card"),
+                ("Ask the owner first:\n- a refund", "Ask the owner first:\n- a refund\n- a deploy", "card"),
+                ("- a refund\n\nA refund.\n\nShare it.", "Without asking:\n\n- a refund\n\nA refund.\n\nShare it.",
+                 "card"),
+                ("A refund.\n\nShare it.\n\nA refund.",
+                 "A refund.\n\nShare it.\n\nA refund.\n\nShare the number, and\nsay when it ends.", "card")):
+            with self.subTest(back=after):
+                self.assertEqual(order(before, after), kind)
+        # the place: the same two rules, only under that section's own title, which travels with the piece
+        hub.q("DELETE FROM profile_orders")
+        for text, kind in (("Handle it.\n\n## Refunds\n- a chargeback", "order"),
+                           ("Handle it.\n\n**Refunds.**\n\n- a chargeback", "order"),
+                           ("# Refunds\n\n- a chargeback", "order"), ("- a chargeback\n- a deploy", None),
+                           ("# What you never do\n\n- a chargeback", None), ("Never.\n\n- a chargeback", None),
+                           ("# Desk\n\n## Refunds\n\n- a chargeback", None),     # a duty's "# ..." is a heading
+                           ("## Refunds\n\n- a chargeback\n\nNever do one of the above.", None),
+                           ("Without asking:\n- a chargeback", None), ("Handle it.\n\n## Never\n- a chargeback", None),
+                           ("Handle it.\n\n## Never\n\n### Refunds\n- a chargeback", None),
+                           ("Never do these:\n\n## Refunds\n- a chargeback", None),
+                           ("## Refunds\nAlone:\n- a chargeback", None), ("## Refunds\n• a chargeback", None),
+                           ("## Refunds\n- Never:\n- a chargeback", None),
+                           ("Handle it.\n\n```\n## Refunds\n- a chargeback\n## More\n```", None),
+                           ("We keep no such rule: a chargeback is one.", None)):
+            with self.subTest(place=text):
+                hub.q("UPDATE responsibilities SET text=? WHERE id=?", (text, place))
+                said = order("- a chargeback", "")
+                self.assertEqual(said, kind) if kind else self.assertIn("stands in no place", said)
+        for text, kind in (("Handle it.\n\n## Refunds\n\nA refund.\n\nShare it.", "order"),
+                           ("Handle it.\n\nA refund.\n\nShare it.", None), ("## Refunds\n\nNever:\n\nA refund.", None),
+                           ("## Refunds\nHandle it.\nA refund.", None), ("## Refunds\n\nA refund.\n\n- a deploy", None),
+                           ("## Never\n\nA refund.", None),
+                           ("## Refunds\n\n" + "More of it. " * 440 + "\n\nA refund.", None),     # a start cuts it
+                           ("## Refunds\n\nA refund.\n\n" + "More of it. " * 440, "order")):
+            with self.subTest(place=text[:40]):
+                hub.q("UPDATE responsibilities SET text=? WHERE id=?", (text, place))
+                said = order("A refund.\n\nA deploy.", "A deploy.")
+                self.assertEqual(said, kind) if kind else self.assertIn("stands in no place", said)
+
+    def test_a_plan_that_changes_a_decision_access_or_a_word_is_a_card_and_one_that_loses_a_line_is_refused(self):
+        """F15 claims C2 to C7: each of these plans takes lines 1 to 4 of vps out too, which alone would be an order.
+        Bug: a change of what the owner decided, of access or of a word goes out with no press; or a line goes to a
+        place that another agent or a release can write (its notes, a shared knowledge file, an owner file, another
+        agent's duty), that no session reads (a retired duty, one with no watch, a paused one, only an attached rule or
+        typed reports, a skill of an agent whose Shell box is off), that the owner gave, or that was written after reads
+        of outside text; or a failed read of a skill is taken for no place; or such a plan rings the owner with a card
+        for a shorter profile, or one that the owner's own newest message asks for is refused; or another hand, an older
+        message, a card's answer, a task or a stopped message opens the card, or takes the ask of the card before it; or
+        a second section with a title of the owner's decisions, or a head that is not the hub's, leaves with no press or
+        with one that does not show it; or the manager makes its own rules its own to change."""
+        lines, duties = self.long_vps()
+        out = self.free("How you work", lines[4:])
+        hub.q("UPDATE responsibilities SET state='retired' WHERE agent='vps'")
+        notices = hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner'")["n"]
+
+        def refused_with(why, changes=None, said=None, **extra):
+            with self.assertRaises(hub.ToolError) as refused:
+                self.plan(changes or [self.free("How you work", lines[4:])], title="Put vps in order?", why="A test.",
+                          **extra)
+            self.assertNotIsInstance(refused.exception, hub.TeamPassing)
+            self.assertEqual(str(refused.exception), hub.PROFILE_ORDER_NONE.format(
+                why=why, ask=hub.PROFILE_ORDER_ASK if said is None else said))
+
+        def lost(n, own=" or an own skill"):
+            return (f"the line \"{hub.clip(lines[n], 80)}\" of How you work in the profile of Vps stands in no place "
+                    f"of that agent: a duty whose running check or clock watch brings its words to it{own}, under a "
+                    f"heading \"How you work\", as a paragraph of its own or an item of a list that is the whole part, "
+                    f"where no line opens others. A duty's part that a start cuts, a duty whose words no session saved "
+                    f"since this release, what was written after reads of outside text" +
+                    (" and a skill that the owner gave are none. Move it there word for word first (set_duty, or a "
+                     "task that writes a skill)" if own else " and each skill (its sessions read no file) are none. Move it "
+                     "there word for word first (set_duty)") + ", or leave it in the profile.")
+        paragraphs = "Work the desk.\n\n## How you work\n\n" + "\n\n".join(line[2:] for line in lines[:4])
+        for place in ("a retired duty", "a duty with no watch", "a duty whose watch is paused",
+                      "a duty with an attached rule only", "a duty with typed reports only",
+                      "a duty written after reads of outside text", "a duty of before this release",
+                      "a duty with that title only as its first line", "a skill whose first line says the opposite",
+                      "notes", "a shared knowledge file",
+                      "an owner file that its profile lists", "another agent's duty",
+                      "a skill written after reads of outside text", "a skill that the owner gave"):
+            with self.subTest(place=place):
+                gave = contextlib.nullcontext()
+                if place == "a duty with no watch":
+                    self.duty("vps", paragraphs, watch=None)
+                elif place == "a duty whose watch is paused":
+                    self.duty("vps", paragraphs, running="paused")
+                elif place == "a duty with an attached rule only":
+                    self.duty("vps", paragraphs, watch=hub.DUTY_OWN)
+                elif place == "a duty with typed reports only":
+                    taker = self.duty("vps", paragraphs, watch=None)
+                    hub.q("UPDATE responsibilities SET report_to=? WHERE id=?",
+                          (json.dumps([taker]), self.duty("studio", "Report it.")))
+                elif place == "a duty written after reads of outside text":
+                    self.duty("vps", paragraphs, reads=1)
+                elif place == "a duty of before this release":
+                    self.duty("vps", paragraphs, reads=None)
+                elif place == "a skill whose first line says the opposite":
+                    self.write({"skills/vps/never/SKILL.md": "---\nname: never\ndescription: \"Never.\"\n---\n\n"
+                                "# Things you never do\n\n## How you work\n\n" +
+                                "\n\n".join(line[2:] for line in lines[:4]) + "\n"})
+                elif place == "a duty with that title only as its first line":
+                    self.duty("vps", paragraphs.replace("Work the desk.\n\n## How you work", "How you work."))
+                elif place == "notes":
+                    with hub.LOCK, hub.transaction():
+                        hub.notes_save("vps", "\n".join(lines[:2]), "my notes", "vps", hub.now())
+                elif place == "a shared knowledge file":
+                    self.write({"knowledge/desk.md": f"# Desk\n\n{paragraphs}\n"})
+                elif place == "an owner file that its profile lists":
+                    self.write({"knowledge/owner/desk-policy.md":
+                                f"# Desk policy\n\nSource: the owner\n\n{paragraphs}\n"})
+                elif place == "another agent's duty":
+                    self.duty("studio", paragraphs)
+                elif place == "a skill written after reads of outside text":
+                    self.write({"skills/vps/weighed/SKILL.md": "---\nname: weighed\ndescription: \"Read.\"\n"
+                                f"outside-reads: 2\n---\n\n{paragraphs}\n"})
+                elif place == "a skill that the owner gave":
+                    self.write({"skills/vps/gift/SKILL.md": f"---\nname: gift\ndescription: \"Read.\"\n---\n\n"
+                                f"{paragraphs}\n"})
+                    gave = patch.object(hub, "skill_is_given", lambda agent, name, rev=None: name == "gift")
+                with gave:
+                    refused_with(lost(0))
+        self.write({"skills/vps/gift/SKILL.md": "---\nname: gift\ndescription: \"Read.\"\n---\n\nNothing.\n"})
+        self.assertIsNone(self.card())
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner'")["n"], notices)
+        for fails in (self.skill_unread(), patch.object(hub, "skill_is_given", lambda *a: None)):
+            with fails, self.assertRaises(hub.TeamPassing):     # a read that fails is never taken for no place
+                self.plan([self.free("How you work", lines[4:])], title="Put vps in order?", why="A test.")
+
+        def owner_message(hand="app", kind="message", asked="Take the desk rules out", read=True, need=None):
+            eid = hub.ins("INSERT INTO events(agent,kind,text,created,read_at) VALUES('manager','owner',?,?,?)",
+                          ("Take the desk rules out.", hub.now(), hub.now() if read else None))
+            request = str(uuid.uuid4())
+            hub.ins("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,hand,"
+                    "asked) VALUES(?,?,?,?,?,?,'Founderizer','manager',?,?)",
+                    (request, kind, need, "Take the desk rules out.", eid, hub.now(), hand, asked))
+            return f"M-{eid}", request
+
+        def not_newest(ref):
+            return f" {ref} is not the newest message that the owner typed to you in Founderizer themselves, so your " \
+                   f"ask opens no card."
+        older, request = owner_message()
+        newest, _ = owner_message()
+        task = hub.ins("INSERT INTO tasks(title,owner,requester,state,needs,attempt,created,ask) VALUES('Desk',"
+                       "'manager','manager','completed','none',1,?,?)", (hub.now(), request))
+        need = hub.ins("INSERT INTO needs(title,why,todo,raised,by,options,ask,answer) VALUES('Which?','It waits.',"
+                       "'',?,'manager','[]',?,'No')", (hub.now(), request))
+        for name, ref in (("an older message", older), ("an AI session's message", owner_message("tool")[0]),
+                          ("a chat app's message", owner_message("chat")[0]), ("a task", f"T-{task}"),
+                          ("a card", f"N-{need}"),
+                          ("the answer of a card", owner_message(kind="answer", asked=None, need=need)[0])):
+            with self.subTest(ask=name):
+                refused_with(lost(0), ask=ref, said=not_newest(ref))
+        self.assertIsNone(self.card())
+        owner_message(read=False)                               # a newer one that the manager did not read yet
+        said = self.plan([self.free("How you work", lines[4:])], title="Take the desk rules out?",
+                         why="The owner asked for it.", ask=newest)
+        self.assertTrue(said.startswith("Raised N-"), said)     # the owner's own message: the owner's press decides
+        self.assertIsNotNone(self.card()["ask"])
+        new, request = owner_message("device", asked=None)      # no work is filed under it: no ask of the old card's
+        said = self.plan([self.free("How you work", lines[4:])], title="Take the desk rules out?",
+                         why="The owner asked for it.", ask=new)
+        self.assertTrue(said.startswith("Raised N-"), said)
+        self.assertIsNone(self.card()["ask"])
+        hub.q("UPDATE ui_requests SET asked='Take it out' WHERE request_id=?", (request,))
+        hub.ins("INSERT INTO chat_stops(agent,request,state,created) VALUES('manager',?,'stopped',?)",
+                (request, hub.now()))
+        refused_with(lost(0), ask=new, said=not_newest(new))    # a press of Stop closed it
+        self.duty("vps", "Work the desk.\n\n## How you work\n\n" +
+                  "\n\n".join(line[2:] for line in lines[:2] + lines[3:4]))
+        with patch.object(hub, "shell_off", lambda agent: agent == "vps"):
+            refused_with(lost(2, own=""))
+        decision = {"key": "may_do", "title": "May do without asking", "text": "Read and write files."}
+        for name, changes in (
+                ("may_do", [dict(out, sections=out["sections"] + [decision])]),
+                ("must_ask", [dict(out, sections=out["sections"] + [dict(decision, key="must_ask", title="Must ask "
+                                                                                    "first", text="Nothing.")])]),
+                ("responsible_for", [dict(out, sections=out["sections"] + [
+                    {"key": "responsible_for", "title": "Responsible for", "text": "Its work and more."}])]),
+                ("knowledge_files", [dict(out, sections=out["sections"] + [
+                    {"key": "knowledge_files", "title": "Knowledge files", "text": ""}])]),
+                ("a new line", [self.free("How you work", lines[4:] + ["- A new rule."])]),
+                ("a line reworded", [self.free("How you work", lines[4:7] + [lines[7].replace("once", "twice")])]),
+                ("a new free section", [dict(out, sections=out["sections"] + [
+                    {"key": "other", "title": "Tone", "text": "Warm."}])]),
+                ("another change", [out, {"kind": "settings", "agent": "vps", "title": "Desk"}])):
+            with self.subTest(change=name):
+                said = self.plan(changes, title="Change the profile of Vps?", why="A test.")
+                self.assertTrue(said.startswith("Raised N-"), said)
+        login = {"key": "logins", "title": "Logins it may use", "text": "`bws://11111111-2222-4333-8444-55555555555b`"}
+        with self.assertRaises(hub.ToolError) as refused:
+            self.plan([dict(out, base_sha256=self.base_of("vps"), sections=out["sections"] + [login])])
+        self.assertIn("Logins it may use", str(refused.exception))
+        self.assertIn(lines[0], self.show("profiles/vps.md"))
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM profile_orders")["n"], 0)
+        # a profile written by hand: a second section with a title of the owner's decisions is a card, and words
+        # before the sections that are not the hub's are refused, also when the owner's own message asks
+        text = hub.profile_view("vps", hub.kit_revision(fresh=True))["text"]
+        self.duty("vps", "Work the queue.\n\nRefunds above 50 EUR.")
+        self.write({"profiles/vps.md": text + "\n**What goes to the owner (Needs you).** Refunds above 50 EUR.\n"})
+        said = self.plan([{"kind": "profile", "agent": "vps", "base_sha256": self.base_of("vps"), "sections": [
+            {"key": "other", "title": "What goes to the owner (Needs you)", "text": ""}]}], title="Change vps?",
+            why="A test.")
+        self.assertTrue(said.startswith("Raised N-"), said)
+        self.write({"profiles/vps.md": text.replace("Agents cannot change it.\n",
+                                                    "Agents cannot change it.\n\nAnd a word of the owner's.\n")})
+        head = ("the profile of Vps has words before its first section that are not the hub's own, and a write of it "
+                "would lose them. Leave this profile as it is.")
+        refused_with(head, said="")
+        refused_with(head, ask=owner_message()[0], said="")
+        self.write({"profiles/vps.md": text})
+        # the manager's own profile, whose line stands in the manager's own duty
+        self.duty("manager", "Plan the work.\n\nRead the queue first.")
+        sections = hub.profile_view("manager", hub.kit_revision(fresh=True))["sections"]
+        hub.save_profile("manager", self.base_of("manager"), sections + [
+            {"key": "other", "title": "How you work", "text": "- Read the queue first.\n- Then plan."}])
+        said = self.plan([{"kind": "profile", "agent": "manager", "base_sha256": self.base_of("manager"),
+                           "sections": [{"key": "other", "title": "How you work", "text": "- Then plan."}]}],
+                         title="Put my profile in order?", why="A test.")
+        self.assertTrue(said.startswith("Raised N-"), said)
+        self.assertIn("Read the queue first.", self.show("profiles/manager.md"))
+
+    def test_a_duty_keeps_the_count_of_the_outside_reads_behind_its_words(self):
+        """F15, claim C6 (duty_save). Bug: a duty that a session wrote after reads of outside text is a place of an
+        order, because the save writes no count, writes 0, or a later save from a clean session clears it; or a save of
+        the watches alone vouches for the words of a duty of before this release, which no session saved since."""
+        def save(body, duty_id=None, reads=0):
+            with patch.object(hub, "save_provenance", lambda by: (7, reads)), hub.LOCK:
+                return hub.duty_save(hub.duty_fields(body, duty_id is None), "vps", hub.now(), duty_id=duty_id)
+
+        def count(duty_id):
+            return hub.q1("SELECT outside_reads FROM responsibilities WHERE id=?", (duty_id,))["outside_reads"]
+        duty = save({"agent": "vps", "text": "Answer the queue."}, reads=3)["id"]
+        self.assertEqual(count(duty), 3)
+        save({"text": "Answer the queue at once."}, duty)
+        self.assertEqual(count(duty), 3)                # a clean session's save keeps the mark
+        hub.q("UPDATE responsibilities SET outside_reads=NULL WHERE id=?", (duty,))
+        save({"watch": []}, duty)
+        self.assertIsNone(count(duty))                  # the watches alone vouch for no words
+        save({"text": "Answer the queue."}, duty)
+        self.assertEqual(count(duty), 0)
+
+    def test_twenty_finished_tasks_after_an_order_bring_the_manager_its_numbers_once(self):
+        """F15 piece 3 (the owner: "a seamless experience that actually GETS better"). Bug: a message at each task,
+        before the twentieth, or again after it; numbers of another agent's tasks, or of a task that ran when the
+        order came, with the profile of before; a word to the owner; the tasks of an agent that never finishes 20
+        read at each pass of the tick, under the hub's lock (MEMORY_COUNT_EVERY); or "it needs no card" for a line
+        back after the owner's save, which makes that plan a card, or the other way round."""
+        t0 = hub.now()
+        hub.ins("INSERT INTO profile_orders(agent,at,commit_before,commit_after,size_before,size_after,lines) "
+                "VALUES('vps',?,?,?,9000,6000,?)", (t0, "a" * 40, self.head(), json.dumps([
+                    {"section": "How you work", "line": "- Rule 1.", "way": "out", "after": None,
+                     "place": "the duty R-1 (Desk)"}])))
+
+        def task(owner, at, accepted=1, started=None):
+            return hub.ins("INSERT INTO tasks(title,owner,requester,state,needs,attempt,created,delivered,accepted) "
+                           "VALUES('Work',?,'manager','completed','none',1,?,?,?)",
+                           (owner, at - 60 if started is None else started, at, accepted))
+        before = [task("vps", t0 - 1000 + n, accepted=0 if n < 3 else 1) for n in range(25)]
+        counted = patch.dict(hub.PROFILE_ORDER_COUNTED, clear=True)
+        counted.start()
+        self.addCleanup(counted.stop)
+        hub.ins("INSERT INTO questions(task,asker,requester,text,asked) VALUES(?,'vps','manager','Which?',?)",
+                (before[-1], t0 - 900))
+        hub.ins("INSERT INTO tasks(title,owner,requester,state,needs,attempt,created,follows) "
+                "VALUES('Again','vps','manager','completed','none',1,?,?)", (t0 - 500, before[-2]))
+        for n in range(5):
+            task("studio", t0 + 65 + n, accepted=0)
+        for n in range(3):          # each ran when the order came, so it read the profile of before
+            task("vps", t0 + 70 + n, accepted=0, started=t0 - 30)
+        for n in range(19):
+            task("vps", t0 + 70 + n, accepted=0 if n == 0 else 1)
+        owner_events = hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner'")["n"]
+
+        def said():
+            return [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' AND text LIKE "
+                                             "'%after the order that put its profile in order%'")]
+        at = hub.now()
+        hub.profile_orders_measure(at)
+        self.assertEqual(said(), [])
+        task("vps", t0 + 100)
+        hub.profile_orders_measure(at + 10)         # the 20th, 10 seconds after a count: the next count comes later
+        self.assertEqual(said(), [])
+        for n in (1, 2):
+            hub.profile_orders_measure(at + n * hub.MEMORY_COUNT_EVERY)
+        task("vps", t0 + 101)
+        hub.profile_orders_measure(at + 3 * hub.MEMORY_COUNT_EVERY)
+        message, = said()
+        self.assertIn("finished 20 tasks that started after the order", message)
+        self.assertIn("Its 20 finished tasks before the order, and its 20 after it: results that their requester "
+                      "refused: 0 before, 1 after; tasks that needed doing again: 1 before, 0 after; questions that it "
+                      "asked up: 1 before, 0 after;", message)
+        self.assertIn("\"- Rule 1.\" (How you work, then put in the duty R-1 (Desk))", message)
+        way = "put a line back with a plan that gives its section with that line again, just after the line that " \
+              "stood before it: "
+        self.assertTrue(message.endswith(way + "it needs no card."), message)
+        sections = hub.profile_view("vps", hub.kit_revision(fresh=True))["sections"]
+        hub.save_profile("vps", self.base_of("vps"), sections + [{"key": "other", "title": "Style", "text": "Short."}])
+        hub.q("UPDATE profile_orders SET measured=NULL")
+        hub.profile_orders_measure(at + 4 * hub.MEMORY_COUNT_EVERY)
+        self.assertTrue(said()[-1].endswith(way + "a write of the profile since the order, a save or a press of the "
+                                            "owner's, makes that plan a card."), said()[-1])
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM events WHERE agent='owner'")["n"], owner_events)
 
     def test_a_press_after_the_owner_changed_the_same_profile_writes_nothing_and_closes_the_card(self):
         """Bug: an old plan writes over the owner's own later edit, or the owner sees a yes that did nothing."""

@@ -411,6 +411,17 @@ CREATE TABLE IF NOT EXISTS agent_notes(id INTEGER PRIMARY KEY, agent TEXT NOT NU
   revision INTEGER NOT NULL, created REAL NOT NULL, by TEXT NOT NULL, task INTEGER, duty_case INTEGER,
   why TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS agent_note_of ON agent_notes(agent, revision);
+-- F15 piece 2: one row for each order of the manager's that put an agent's profile in order with no card
+-- (profile_order_make): its commit before and after, the profile's size before and after, and `lines`, a JSON list of
+-- each line that left a section or came back into it, with its section, the line before it (`after`) and, for a line
+-- that left, its place. The owner reads it (GET /ui/profile-orders); `measured` is when the hub sent the manager the
+-- agent's results before and after it (profile_orders_measure), or -1 when a later order of the same agent took its
+-- place first; `owner_saved` is when the hub read that a write of the profile that is no order came since, a save or a
+-- press of the owner's, which ends the way back of the order's lines (profile_orders_ended).
+CREATE TABLE IF NOT EXISTS profile_orders(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, at REAL NOT NULL,
+  commit_before TEXT NOT NULL, commit_after TEXT NOT NULL, size_before INTEGER NOT NULL, size_after INTEGER NOT NULL,
+  lines TEXT NOT NULL, measured REAL, owner_saved REAL);
+CREATE INDEX IF NOT EXISTS profile_order_of ON profile_orders(agent, id);
 -- The summary of one line of each knowledge file (knowledge_index), and the git blob of the text it was written for:
 -- a file whose blob is another one has changed since, and the manager is asked again (ask_for_summaries).
 CREATE TABLE IF NOT EXISTS knowledge_summaries(path TEXT PRIMARY KEY, blob TEXT NOT NULL, summary TEXT NOT NULL,
@@ -8995,7 +9006,8 @@ def migrate():
         "chat_stops": {"cut": "INTEGER NOT NULL DEFAULT 0", "reads": "TEXT", "since": "REAL"},
         # support plan F1: the optional tools of the sessions of a duty's cases, for a Shell-off holder (JSON list);
         # F4: the owner's file of the lists of its typed values, and the duties that its sessions report to (JSON)
-        "responsibilities": {"tools": "TEXT", "servers": "TEXT", "lists": "TEXT", "report_to": "TEXT"},
+        "responsibilities": {"tools": "TEXT", "servers": "TEXT", "lists": "TEXT", "report_to": "TEXT",
+                             "outside_reads": "INTEGER"},       # F15: duty_save, which says what it counts
         # the hand of the owner command that made a hold, only for the fleet manager's own `admin` (MANAGER_HAND):
         # a hold of the manager's that holds what is under it, as the owner's does (other_hold_around)
         "holds": {"hand": "TEXT"},
@@ -33952,24 +33964,37 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
 
 
 # A long profile (the design "An agent keeps its own rules", version 2, slice 1; the owner's yes of 20 November 2026 to
-# its decisions 1 and 2): a profile holds what is the owner's, and the fleet manager puts a long one in order in one plan
-# of team changes, which the owner presses. Agents' own texts have stores with no working limit; a profile's section
-# takes 8,000 characters (profile_sections), and on 20 November 2026 four profiles held more than 6,000.
+# its decisions 1 and 2): a profile holds what is the owner's, and the fleet manager puts a long one in order. Agents'
+# own texts have stores with no working limit; a profile's section takes 8,000 characters (profile_sections), and on 20
+# November 2026 four profiles held more than 6,000. Since F15 (the owner, 22 November 2026: "This should happen
+# autoamtically under the hood with no impact at all for the user"), the manager does it with an order, which needs no
+# card (profile_order), and never with a card; the manager's own profile changes only with a card, so the hub asks it
+# about no long profile of its own.
 PROFILE_LONG = "profile_long:"      # kv, with the agent's name after it: the free text of its profile at the last ask
-PROFILE_LONG_SEEDED = "profile_long_seeded"     # kv: the first start of the release that brought the mark read them all
+# kv: the first start of the release of orders named each long profile again, with the words of orders. The mark of
+# the first round, "profile_long_seeded" (20 November 2026), stays in a fleet and no code reads it any more.
+PROFILE_LONG_SEEDED = "profile_long_seeded_orders"
 PROFILE_LONG_MARK = 6000        # characters of free text above which the manager is asked to put a profile in order
 PROFILE_LONG_AGAIN = 1000       # characters more than at the last ask, before the manager is asked again
 PROFILE_LONG_TRIED = {"start": False}       # this process tried the first start's pass (long_texts_seed)
 # The rule of places, at the moment of use: a message of the hub's, so it is in no size ceiling of the rules.
 PROFILE_LONG_RULE = (
     "A profile holds what is the owner's: what the agent is for, what it may do without asking, what it must ask "
-    "first, and which person decides what. Put it in order with your own tools. A line that one of the agent's duties "
-    "or an owner file that its profile lists already says leaves the profile. How the work of a duty goes moves into "
-    "that duty's words (set_duty). The steps of a job go into a skill of the agent: give it a task to write one; for "
-    "an agent whose Shell box is off, they go into a knowledge file that the duty's words name. Nothing goes into the "
-    "agent's notes or its lessons. A rule that several profiles repeat goes one time into an owner file that they "
-    "list. A line that is the owner's decision stays, word for word. Then write one plan for this profile with "
-    "change_team, whose words say where each line went. When each line is the owner's decision, change nothing.")
+    "first, and which person decides what. Put it in order with your own tools, and with no card. A line of a free "
+    "section that says how the work of one duty goes moves into that duty's words (set_duty), word for word; a duty "
+    "is such a place only while a check or clock watch of it runs, after a save of its words in this release, and "
+    "only in the part of its words that a start shows. The steps of a job move into a skill of the agent, word for "
+    "word: give it a task to write one (not for an agent whose Shell box is off; a skill that the owner gave is no "
+    "place, and neither is a skill or a duty written after reads of outside text). Two forms move, in the profile and "
+    "in the place alike: an item of a list with \"-\", \"*\" or \"+\" that is the whole section, one line each, and a "
+    "whole paragraph with no list right before or after it; in the place, under a heading with the section's own "
+    "title. Nothing moves out of a section that has a line ending with \":\", a heading, a line all in bold or a "
+    "paragraph that ends no sentence, and no numbered item moves. Nothing goes into the agent's notes, its lessons, an "
+    "owner file or a shared knowledge file. Then give one plan for this profile with change_team: each free section "
+    "with only those items and paragraphs taken out, and no other change. The hub checks that each one stands word "
+    "for word in such a place and that nothing else changed, and makes the plan at once, with no card. A line that "
+    "is the owner's decision stays, and so does a line that each kind of the agent's work needs. Change no word of a "
+    "line. Never raise a card to make a profile shorter: when no line can move, change nothing.")
 
 
 def profile_free_text(sections):
@@ -33981,24 +34006,25 @@ def profile_free_text(sections):
 
 
 def profile_long_words(agent, n):
-    """The hub's ask to the manager about one long profile."""
-    whose = "Your profile" if agent == manager_name() else f"The profile of {shown_role(agent)}"
-    return (f"{whose} (profiles/{agent}.md) is long: its free text holds {n:,} characters, and one section takes "
-            f"8,000. {PROFILE_LONG_RULE}")
+    """The hub's ask to the manager about one long profile of another agent."""
+    return (f"The profile of {shown_role(agent)} (profiles/{agent}.md) is long: its free text holds {n:,} characters, "
+            f"and one section takes 8,000. {PROFILE_LONG_RULE}")
 
 
 def profile_long_after(agent, sections, ask):
     """After a write of the profile of these sections: the free text that the manager was last asked about, kept in kv,
     and the ask's words when `ask` and this write took the free text past the mark, or PROFILE_LONG_AGAIN characters
     past the last ask; else "". A write at or below the mark removes the record, so that the next one past it asks
-    again. ask=False (a plan that the owner pressed, the manager's own) records the new number and asks nothing, so
-    the count starts from it. No ask while the manager may not write a plan (team_manager_refusal): the next save asks.
-    Each ask was the owner's "Dont spam with messages!" (17 November 2026) at each save, so a small save is quiet."""
+    again. ask=False (a plan that the owner pressed, an order, the manager's own) records the new number and asks
+    nothing, so the count starts from it; so does a write of the manager's own profile, which only a card changes, and
+    the rule of the ask says never to raise a card for a shorter profile (F15). No ask while the manager may not write
+    a plan (team_manager_refusal): the next save asks. Each ask was the owner's "Dont spam with messages!" (17 November
+    2026) at each save, so a small save is quiet."""
     n, key = profile_free_text(sections), PROFILE_LONG + agent
     if n <= PROFILE_LONG_MARK:
         kv_set(key, None)
         return ""
-    if not ask:
+    if not ask or agent == manager_name():
         kv_set(key, n)
         return ""
     try:
@@ -34020,7 +34046,8 @@ def long_texts_seed(t0):
     seconds, holds nothing, and its writes take LOCK in their transaction. A revision or a read that git does not
     answer now leaves the profiles for the next start of the hub; a commit of the configuration between the read and
     the write (a profile saved then would keep an old number) leaves the whole pass, the items too; and a manager that
-    may not write a plan now leaves both. A read that failed is never taken for profiles that are short."""
+    may not write a plan now leaves both. A read that failed is never taken for profiles that are short. The manager's
+    own profile is not named: only a card changes it (profile_long_after)."""
     if PROFILE_LONG_TRIED["start"]:
         return
     PROFILE_LONG_TRIED["start"] = True
@@ -34029,14 +34056,14 @@ def long_texts_seed(t0):
         return
     mgr, names, long, crowded, long_rev = manager_name(), sorted(agents()), [], [], None
     if PROFILE_LONG_SEEDED in due:
-        rev = kit_revision(fresh=True)
-        paths = [f"profiles/{n}.md" for n in names]
+        rev, others = kit_revision(fresh=True), [n for n in names if n != mgr]
+        paths = [f"profiles/{n}.md" for n in others]
         read = kit_batch(kit_dir(), rev, paths) if rev else {}     # one git read: a missing file, a file, or no answer
         if not rev or any(path not in read for path in paths):
             due.remove(PROFILE_LONG_SEEDED)
         else:
             long_rev = rev
-            for n in names:
+            for n in others:
                 data = read[f"profiles/{n}.md"][1]
                 if data is None:
                     continue
@@ -34048,8 +34075,7 @@ def long_texts_seed(t0):
     said = []
     if long:
         said.append("These profiles are long, each above 6,000 characters of free text, and one section takes 8,000: "
-                    + "; ".join(f"{'yours' if n == mgr else shown_role(n)} (profiles/{n}.md) {free:,}"
-                                for n, free in long)
+                    + "; ".join(f"{shown_role(n)} (profiles/{n}.md) {free:,}" for n, free in long)
                     + f". Put each one in order, one plan for each profile. {PROFILE_LONG_RULE}")
     if crowded:
         mine = read_row("SELECT count(*) n FROM standing WHERE agent=? AND ended IS NULL", (mgr,))["n"]
@@ -34088,6 +34114,7 @@ def save_profile(agent, base, sections):
     except KitUnread:
         raise Refusal(503, code="profile_unread", names={"agent": shown_role(agent)}) from None
     current = hashlib.sha256(old).hexdigest() if old is not None else None
+    profile_orders_ended(agent)     # F15: also a retry of a save whose commit landed, and whose next steps a stop cut
     if base != current:
         raise Conflict("the profile changed meanwhile; reload it", sha256=current)
     new = render_profile(agent, sections).encode()
@@ -34095,6 +34122,7 @@ def save_profile(agent, base, sections):
         return {"agent": agent, "sha256": current, "commit": rev, "revision": rev, "unchanged": True, "updates_requested": []}
     commit = commit_kit_file(path, new, f"Owner changed the {agent} profile")
     kv_set(PROFILE_CHANGED + agent, now())      # the head of the agent's notes compares it (notes_start_text)
+    profile_orders_ended(agent)                 # F15: no order puts back a line that one took out before this save
     mgr = manager_name()
     whose, then = (("your profile", ": it replaces the profile in your start prompt.") if agent == mgr else
                    (f"the profile of {agent}", f", before you give {agent} new work."))
@@ -39591,9 +39619,14 @@ def duty_mechanism_text(body):
             f"the rules that you have.")
 
 
+def duty_task_head(body):
+    """The first line of duty_task_text, which the duty's own words follow (profile_order_duty counts it)."""
+    return f"Your duty {rref(body['id'])}: {duty_name(body['text'])}"
+
+
 def duty_task_text(body, watch):
     """The task that one watch starts: the duty in front of the agent, and what it must record."""
-    lines = [f"Your duty {rref(body['id'])}: {duty_name(body['text'])}", body["text"],
+    lines = [duty_task_head(body), body["text"],
              "That is the duty, and it says what you do yourself and what you ask first. Everything it covers you "
              "do alone, with what you hold: no draft, no branch and no approval that the duty already gives."]
     if body["agent"] == manager_name():
@@ -39774,28 +39807,36 @@ def duty_save(body, by, t0, duty_id=None, command=None):
         want = duty_kept_watches(duty_id)
     duty_report_target(body, want)
     duty_watch_target(body, want, t0)
+    # F15: a duty whose words a task session wrote after reads of outside text is no place of an order
+    # (profile_order_duty), as a skill written so. The most reads of any such session, and never less: a later write
+    # keeps the mark, as a skill's does. The manager's standing session is not counted: it gives the order itself.
+    written_in, reads = save_provenance(by)
+    reads = written_in and reads or 0
     with transaction():
         if old is None:
             new_id = DB.execute(
                 "INSERT INTO responsibilities(agent,text,"
-                "state,revision,created,updated,created_by,request_id,tools,servers,lists,report_to) "
-                "VALUES(?,?,'active',1,?,?,?,?,?,?,?,?)",
+                "state,revision,created,updated,created_by,request_id,tools,servers,lists,report_to,outside_reads) "
+                "VALUES(?,?,'active',1,?,?,?,?,?,?,?,?,?)",
                 (body["agent"], body["text"], t0, t0, by,
                  body.get("request_id") or "",
                  None if body.get("tools") is None else json.dumps(body["tools"]),
                  None if body.get("servers") is None else json.dumps(body["servers"]), body.get("lists"),
-                 None if body.get("report_to") is None else json.dumps(body["report_to"]))).lastrowid
+                 None if body.get("report_to") is None else json.dumps(body["report_to"]), reads)).lastrowid
             DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,'created',?)",
                        (new_id, t0, by, duty_name(body["text"])))
         else:
             new_id, before = old["id"], duty_stored(old)
             changed = [k for k in ("agent", "text", "tools", "servers", "lists", "report_to")
                        if body.get(k) != before[k]]
+            # the count follows the words: a save of the watches alone vouches for no words (a NULL stays NULL)
             DB.execute("UPDATE responsibilities SET agent=?, text=?, tools=?, servers=?, lists=?, report_to=?, "
-                       "revision=revision+1, updated=? WHERE id=?",
+                       "revision=revision+1, updated=?, outside_reads=CASE WHEN ? THEN "
+                       "MAX(COALESCE(outside_reads,0),?) ELSE outside_reads END WHERE id=?",
                        (body["agent"], body["text"], None if body.get("tools") is None else json.dumps(body["tools"]),
                         None if body.get("servers") is None else json.dumps(body["servers"]), body.get("lists"),
-                        None if body.get("report_to") is None else json.dumps(body["report_to"]), t0, new_id))
+                        None if body.get("report_to") is None else json.dumps(body["report_to"]), t0,
+                        int("text" in changed), reads, new_id))
             DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,'edited',?)",
                        (new_id, t0, by, ", ".join(changed) or "no field"))
         keep_command(command, {"responsibility": new_id, "revision": (old["revision"] + 1) if old else 1,
@@ -47966,15 +48007,16 @@ def team_manager_refusal():
     return None
 
 
-def team_plan_effect(changes, name=None):
+def team_plan_effect(changes, name=None, shown=True):
     """What a plan does, from the fleet as it stands, with no write: a TeamPassing for a change that cannot be made now
     but can later, a ToolError for one that cannot be made, else {team, files, job, after, details, options, names,
-    said, digest, sizes}; sizes: (role, characters before, after) of each profile that it changes. name: the name that
-    the owner pressed for the new agent of an add, which is the one name checked; without it every name is checked, and
-    the first stands in. The digest is of the plan and of the facts that the card shows (the agents, people, accounts,
-    access and files that it touches, and the value before of each field that it changes), never of the time, of the
-    names' own state or of the rest of the fleet: a check at the press finds the same digest exactly when nothing that
-    the card showed changed."""
+    said, digest, sizes, profiles, rev}; sizes: (role, characters before, after) of each profile that it changes;
+    profiles: each profile change as profile_order reads it. name: the name that the owner pressed for the new agent of
+    an add, which is the one name checked; without it every name is checked, and the first stands in. The digest is of
+    the plan and of the facts that the card shows (the agents, people, accounts, access and files that it touches, and
+    the value before of each field that it changes), never of the time, of the names' own state or of the rest of the
+    fleet: a check at the press finds the same digest exactly when nothing that the card showed changed. shown=False:
+    no card shows it (an order, F15), so its Details may be longer than a card shows."""
     rev = kit_revision(fresh=True)
     passing = team_unread()
     if not rev:
@@ -47985,7 +48027,7 @@ def team_plan_effect(changes, name=None):
         raise passing from None
     before = json.loads(json.dumps(team))
     ctx = {"rev": rev, "team": team, "mgr": manager_name(), "name": name, "files": {}, "facts": [], "parts": [],
-           "access": [], "said": [], "job": None, "names": [], "phrases": [], "sizes": [],
+           "access": [], "said": [], "job": None, "names": [], "phrases": [], "sizes": [], "profiles": [],
            "after": {"profiles": False, "moved": [], "left": [], "removed": None, "added": None}}
     steps = {"add": team_add, "remove": team_remove, "profile": team_profile, "settings": team_settings,
              "lines": team_lines, "owner_file": team_owner_file}
@@ -47999,15 +48041,21 @@ def team_plan_effect(changes, name=None):
         raise ToolError("The plan changes nothing: the fleet is like that already.")
     details = "\n\n".join(["**Access this change gives**\n\n" + ("\n".join(f"- {x}" for x in ctx["access"]) or
                                                                  "- None.")] + ctx["parts"])
-    if len(details) > TEAM_PLAN_DETAILS_CHARS:
-        raise ToolError(f"The card cannot show this plan whole: its Details are {len(details)} characters, and a card "
-                        f"shows {TEAM_PLAN_DETAILS_CHARS}. Split it into plans that the owner decides one after the "
-                        f"other.")
+    if shown:
+        team_details_fit(details)
     digest = hashlib.sha256(json.dumps([changes, ctx["facts"]], sort_keys=True, ensure_ascii=False,
                                        default=str).encode()).hexdigest()
     return {"team": ctx["team"], "files": ctx["files"], "job": ctx["job"], "after": ctx["after"], "details": details,
             "options": team_plan_options(ctx), "names": ctx["names"], "said": ctx["said"], "digest": digest,
-            "sizes": ctx["sizes"]}
+            "sizes": ctx["sizes"], "profiles": ctx["profiles"], "rev": rev}
+
+
+def team_details_fit(details):
+    """The refusal of a plan whose Details a card cannot show whole."""
+    if len(details) > TEAM_PLAN_DETAILS_CHARS:
+        raise ToolError(f"The card cannot show this plan whole: its Details are {len(details)} characters, and a card "
+                        f"shows {TEAM_PLAN_DETAILS_CHARS}. Split it into plans that the owner decides one after the "
+                        f"other.")
 
 
 def team_plan_options(ctx):
@@ -48342,6 +48390,7 @@ def team_profile(ctx, c):
     ctx["after"]["profiles"] = True
     role = team_said_role(team, n)
     ctx["sizes"].append((role, len(view["text"]), len(new.decode())))     # for the manager's answer (t_change_team)
+    ctx["profiles"].append({"agent": n, "role": role, "text": view["text"], "sections": old, "new": new})
     reads = [set(next((knowledge_list(x["text"]) for x in group if x["key"] == "knowledge_files"), []))
              for group in (old, sections)]
     if reads[1] - reads[0]:
@@ -48453,10 +48502,750 @@ def team_owner_file(ctx, c):
     ctx["phrases"].append((1, f"change the owner file {path.rsplit('/', 1)[-1]}", "change an owner file"))
 
 
+# F15 pieces 1 and 2 (the owner, 22 November 2026: "This should happen autoamtically under the hood with no impact at
+# all for the user", and his answer F15-1, "Yes, for each line of a free section", to the move of a line "into that
+# agent's duty or skill" when "the line stands there word for word": "agents need freedom managing their own
+# learnings"; ~/dev/founderizer-plans/owner-feedback-2026-11-22/F15-analysis.md, 6.1 to 6.3, and the area's reads). A
+# plan of the manager's whose changes are all of the kind profile, none of them of the manager's own profile, is an
+# ORDER when each change only takes pieces out of the free sections (key other) of a profile in the hub's own form, or
+# puts back, each at its place, pieces that an earlier order took out of the same section, and changes nothing else:
+# each other section, its title and its text, are the same, and each piece that stays is one of before, unchanged and
+# in its order. A piece is what the two rules of order_pieces make one, in the profile and in the place: an item of a
+# flat list that is the whole section, or a whole paragraph, and nothing where a line opens others. Each piece that
+# leaves stands word for word as a piece of one place of that agent's work, under a heading with its section's own
+# title (profile_order_places, order_stands), so the title travels with it. The hub makes an order at
+# once, with no card and no word to the owner (profile_order_make), and keeps a record of each piece, the line before
+# it and its place (profile_orders), which the owner reads (GET /ui/profile-orders). A plan that only takes lines out
+# and misses is refused, with its reason and no card (the rule: never a card for a shorter profile), unless the owner's
+# own newest message asks for it (profile_order_ask): then it is a card for the owner's press. Any other plan is a card.
+# What the code cannot see: a line that opens others with no sign of it (no ":", no heading, a whole sentence), and a
+# paragraph that refers to the one before it ("This does not apply to ..."). And a place can change after the order
+# (C6): its holder writes it, and a session that began
+# with the older profile can take a moved line out of its duty or skill, because RULES.md says to take out what the
+# profile says. The record says whether the place still holds the piece, and the way back is the record's.
+ORDER_ITEM = re.compile(r"([-*+]|\d{1,9}\.)[ \t]+(?=\S)")               # an item's plain mark, at no indent
+ORDER_MOVES = ("-", "*", "+")   # the marks of a list whose items move: a numbered item is a step of a sequence
+# "a)", "(b)", "1a.", "iv.", "A:" and "[x]" before the words: a mark of a list in another form
+ORDER_COUNTED = re.compile(r"(?i)[(\[]?(?:\d{0,3}[^\W\d_]|[ivxlcdm]{1,5})[.):\]](?:\s|$)")
+ORDER_OPENS, ORDER_CLOSES = "\"'“”‘’«»([`*_", "\"'“”‘’«»)]`*_ \t"
+ORDER_HEADING = re.compile(r" {0,3}(#{1,6})(?:[ \t]+(.*))?$")
+ORDER_FENCE = re.compile(r"\s*(`{3,}|~{3,})")
+PROFILE_ORDER_SAID = 80         # characters of a line that the manager's answer quotes
+# characters of a start's details that a hub line before a duty's words can take: a question about a report (about
+# 1,800 with its longest question), the closed cases that cover a ticket, the time that a session set for a case
+PROFILE_ORDER_ROOM = 2000
+PROFILE_ORDER_NONE = ("The hub did not make this order, and raised no card: {why} Never raise a card to make a profile "
+                      "shorter.{ask}")
+PROFILE_ORDER_ASK = (" A line that the owner wants gone, and that no place holds, leaves by a card: give the plan with "
+                     "ask, the M-<n> of the newest message that the owner typed to you in Founderizer, when it asks "
+                     "for that.")
+PROFILE_ORDER_HANDS = ("app", "device")     # an owner's message that opens the card route: typed in Founderizer
+# the wait of an order while an earlier order's record waits for the hub's last write of a profile (KIT_PUSHED), which
+# the next write of team.json or a profile, or the hub's next start (settle_kit_push), settles
+PROFILE_ORDER_WAITS = ("An earlier order still waits for its record, because the hub's last write of a profile has not "
+                       "settled, so nothing changed. The hub's next save of a profile or of the team, or its next "
+                       "start, settles it: give the plan again then.")
+
+
+def order_item(line):
+    """(its plain mark, its words) of a line that is an item of a list at no indent, else None: "1." for each number."""
+    m = ORDER_ITEM.match(line)
+    return ("1." if m.group(1)[0].isdigit() else m.group(1), line[m.end():]) if m else None
+
+
+def order_word(words):
+    """True when these words begin with a word: one with a letter in it, which starts (after quotes, brackets or bold
+    marks) with a letter, a digit, "/", "~/", "$", "@" or ".", and which is no mark of a list in another form. So "•",
+    "–", "→", "✅", "1)", "a)", "[ ]", "#", ">", "|" and a bare number begin no words: a rule of what a line may begin
+    with, not a list of known marks."""
+    first = (words.lstrip(ORDER_OPENS).split() or [""])[0]
+    return bool(first) and (first[0].isalpha() or first[0] in "0123456789/$@." or first[:2] == "~/") and \
+        any(c.isalpha() for c in first) and not ORDER_COUNTED.match(words)
+
+
+def order_plain(line):
+    """True for a line outside each list: no indent, one line for each reader, and it begins with a word."""
+    return not line[:1].isspace() and line.splitlines() == [line] and not order_item(line) and order_word(line)
+
+
+def order_opener(block):
+    """The line of this block (lines with no empty line between them) that opens others, or None: a heading ("#"), a
+    line all in bold or italics, a line that ends with ":", or a block outside a list that ends no sentence."""
+    for line in block:
+        words = (order_item(line.strip()) or ("", line.strip()))[1]
+        if words[:1] == "#" or words[:1] in "*_" and words[-1:] in "*_" or \
+                words.rstrip(ORDER_CLOSES)[-1:] in (":", "："):
+            return line
+    end = block[-1].rstrip(ORDER_CLOSES)
+    return None if order_item(block[-1].strip()) or end[-1:] in (".", "!", "?", "。", "！", "？") else block[-1]
+
+
+def order_key(lines):
+    """The words of a piece, as an order compares it: each of its lines without its indent and its plain mark, as
+    plain_words gives it."""
+    return tuple(plain_words((order_item(x.strip()) or ("", x))[1]) for x in lines)
+
+
+def order_pieces(text):
+    """The text of one section, of a profile or of a place, as pieces: ([(its lines, its key or None, the line where
+    it ends, its block)], the line that opens others or None). A piece with a key is what an order may take out, put
+    back, or find in a place; one with no key it never moves. THE TWO RULES, the same for all three:
+    (1) An item of a flat list that is the whole section is a piece: the section is that one block, each of its lines
+    an item with the same mark "-", "*" or "+", at no indent, whose words begin with a word. A numbered item is a step
+    of a sequence, and never moves. (2) A line outside a list is a part of its paragraph, and only the whole paragraph
+    is a piece: a block between empty lines or the section's edges, each line of it at no indent and beginning with a
+    word, with no list right before or after it. And in a section with a line that opens others (order_opener) nothing
+    is a piece. So a piece never leaves what opens it, nothing that stays gets another opener, no paragraph loses the
+    list that it speaks of, and each other form (an opener with its items, a nested list, another mark, a table, a
+    quote, code) stays whole, by construction. Spaces at the end of a line do not count."""
+    blocks, block = [], []
+    for i, line in enumerate(str(text or "").replace("\r\n", "\n").split("\n") + [""]):
+        if line.strip():
+            block.append((i, line.rstrip()))
+        elif block:
+            blocks.append(block)
+            block = []
+    texts = [[line for _, line in b] for b in blocks]
+    opener = next(filter(None, map(order_opener, texts)), None)
+    out = []
+    for n, (b, lines) in enumerate(zip(blocks, texts)):
+        items = [order_item(x) for x in lines]
+        after = n + 1 == len(texts) or order_plain(texts[n + 1][0])
+        if len(texts) == 1 and all(items) and len({mark for mark, _ in items}) == 1 and items[0][0] in ORDER_MOVES \
+                and all(order_word(words) and x.splitlines() == [x] for x, (_, words) in zip(lines, items)):
+            out += [([x], None if opener else order_key([x]), i, n) for i, x in b]      # rule 1
+        else:
+            whole = not opener and all(map(order_plain, lines)) and after and (n == 0 or order_plain(texts[n - 1][-1]))
+            out.append((lines, order_key(lines) if whole else None, b[-1][0], n))       # rule 2
+    return out, opener
+
+
+def order_text(pieces, drop=()):
+    """The text of these pieces (order_pieces) without the ones whose indexes are in `drop`: the lines of each block as
+    they were, and one empty line between two blocks. Two texts that give the same are the same in form and words."""
+    blocks = {}
+    for k, (lines, _, _, block) in enumerate(pieces):
+        if k not in drop:
+            blocks.setdefault(block, []).extend(lines)
+    return "\n\n".join("\n".join(b) for b in blocks.values())
+
+
+def order_title(title):
+    return plain_words(str(title or "").strip(" \t#.:*_`"))
+
+
+def order_place(text, name=None):
+    """The pieces that a place holds (order_pieces, for each of its sections by itself): {title: {key: the line where
+    it ends}}, by the words of a heading (or of a profile's title line, **...**) that stands under no other one. A
+    piece of a profile's section stands in a place only under that section's own title (order_stands), so that the
+    title, which can open the section ("Never."), travels with it, and no heading of the place says another thing of
+    it. One first line stands over none of the parts after it: "# <name>", the skill's own name (`name`, its "-" read
+    as a space), which names the part right under it alone. Any other first line "# ...", and each one of a duty, is a
+    heading like the others ("# Things you never do" over "## Work" holds nothing under "work"). The words under no
+    heading hold none, and neither does a part right after a line that opens others."""
+    lines = str(text or "").replace("\r\n", "\n").split("\n")
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    parts, path, fence = [[(), 0, []]], [], None
+    for i, line in enumerate(lines):
+        code, head, bold = ORDER_FENCE.match(line), ORDER_HEADING.match(line), SECTION_LINE.match(line)
+        if fence:
+            fence = None if code and line.strip().strip(fence[0]) == "" and line.strip().startswith(fence) else fence
+        elif code:
+            fence = code.group(1)
+        elif head or bold:
+            level = len(head.group(1)) if head else 7
+            title = order_title(head.group(2) if head else bold.group(1))
+            if i == first and level == 1 and name is not None and title == order_title(name.replace("-", " ")):
+                parts.append([(title,), i + 1, []])
+                continue
+            path = [x for x in path if x[0] < level] + [(level, title)]
+            own = bold.group(2) if bold and not head else ""
+            parts.append([tuple(t for _, t in path), i if own else i + 1, [own] if own else []])
+            continue
+        parts[-1][2].append(line)
+    held, opened = {}, False
+    for path, start, part in parts:
+        pieces, opener = order_pieces("\n".join(part))
+        if len(path) == 1 and not opened:
+            for _, key, end, _ in pieces:
+                if key is not None:
+                    held.setdefault(path[0], {}).setdefault(key, start + end)
+        opened = bool(pieces) and bool(order_opener(pieces[-1][0])) if opener else False
+    return held
+
+
+def order_stands(held, title, key):
+    """The line where a place (order_place) holds this piece of a profile's section, under that section's own title,
+    or None."""
+    return held.get(order_title(title), {}).get(key)
+
+
+def order_shorter(was, now_):
+    """True when these free sections ({title: section}) only lose lines, by the words of their lines alone: such a plan
+    is never a card (a shorter profile), also when it is no order because it changes the form of what stays."""
+    def words(section):
+        return [order_key([line])[0] for line in section["text"].split("\n") if line.strip()]
+    for title, section in now_.items():
+        left = iter(words(was[title]) if title in was else ())
+        if not all(x in left for x in words(section)):
+            return False
+    return sum(len(words(s)) for s in now_.values()) < sum(len(words(s)) for s in was.values())
+
+
+def profile_order_duty(r):
+    """The pieces that the duty row r holds as a place (order_place): of an active duty, while a managed watch of it
+    runs (DUTY_WATCHES), whose task is the only one that carries a duty's words (watch_details: an attached rule and a
+    typed report carry none), and only up to the part that the start of such a task shows (TASK_DETAILS_CHARS of its
+    details in one line, less PROFILE_ORDER_ROOM for a hub line that some case tasks put first). None of a duty whose
+    words a task session wrote after reads of outside text (duty_save), nor of one whose count nobody knows: a duty of
+    before this release, until a save of its words writes the count (NULL)."""
+    if not r or r["state"] != "active" or r["outside_reads"] is None or r["outside_reads"] or \
+            not any(t["state"] == "active" for t in duty_watches_read(r["id"], managed=True)):
+        return {}
+    lines, used, seen = r["text"].split("\n"), len(" ".join(duty_task_head(r).split())), None
+    for i, line in enumerate(lines):           # the details in one line, as the start counts them (task_itself)
+        used += len(" ".join(line.split())) + 1 if line.strip() else 0
+        if used > TASK_DETAILS_CHARS - PROFILE_ORDER_ROOM:
+            seen = i
+            break
+    seen = len(lines) if seen is None else seen
+    return {title: {key: end for key, end in held.items() if end < seen}
+            for title, held in order_place(r["text"]).items()}
+
+
+def profile_order_skill(agent, rev, name):
+    """The pieces that the agent's skill `name` holds as a place at the commit rev (order_place of its SKILL.md after
+    the front matter). None of a skill that the owner gave (skill_is_given), whose words the agent does not change, nor
+    of one written after reads of outside text, which a start marks "weigh it". A read that git does not answer passes
+    by itself (team_unread)."""
+    given = skill_is_given(agent, name, rev)
+    try:
+        data = kit_file(rev, f"{SKILLS}/{agent}/{name}/SKILL.md")
+    except KitUnread:
+        raise team_unread() from None
+    if given is None:
+        raise team_unread()
+    text = (data or b"").decode("utf-8", "replace")
+    if given or skill_front(text, "outside-reads"):
+        return {}
+    return order_place(text.split("\n---", 1)[1] if text.startswith("---") and "\n---" in text else text, name)
+
+
+def profile_order_places(agent, rev):
+    """Where a piece that leaves the profile of `agent` may stand, each (its name, the pieces that it holds, its ref for
+    the record): the duties of the agent that bring their words to its sessions (profile_order_duty), and the skills of
+    its own (profile_order_skill), at the commit `rev`. Only these, which the owner's yes of F15-1 names: each is
+    changed by the agent, its line above or the owner (claim C6). No owner file and not RULES.md, which a release
+    changes, nor a shared knowledge file, notes, lessons, standing items or another agent's duty. An agent whose Shell
+    box is off reads no file in its sessions, so its skills are none."""
+    out = [(f"the duty {rref(r['id'])} ({duty_name(r['text'])})", profile_order_duty(r), {"duty": r["id"]})
+           for r in read_rows("SELECT * FROM responsibilities WHERE agent=? AND state='active' ORDER BY id", (agent,))]
+    if not shell_off(agent):
+        code, tree, _ = git_kit("ls-tree", "-r", "-z", "--name-only", rev, "--", f"{SKILLS}/{agent}/")
+        if code != 0:
+            raise team_unread()
+        shape = re.compile(rf"{re.escape(SKILLS)}/{re.escape(agent)}/({SKILL_NAME})/SKILL\.md")
+        out += [(f"the skill {m.group(1)}", profile_order_skill(agent, rev, m.group(1)), {"skill": m.group(1)})
+                for m in map(shape.fullmatch, tree.split("\0")) if m]
+    return [x for x in out if x[1]]
+
+
+def profile_order_still(agent, lines, rev, cache):
+    """For the owner's page (profile_orders_view): for each line of an order that left, in their order, True when its
+    place still holds it now, with the others of its section in the same order, and is still a place; False when it
+    does not; None when the hub cannot read the place now. cache: the places read for this page, by agent and ref (two
+    agents can have a skill of one name)."""
+    ends = []
+    for x in lines:
+        ref, at = x.get("ref") or {}, (agent, json.dumps(x.get("ref"), sort_keys=True))
+        if at not in cache:
+            try:
+                if "duty" in ref:
+                    r = read_row("SELECT * FROM responsibilities WHERE id=? AND agent=?", (ref["duty"], agent))
+                    cache[at] = profile_order_duty(r)
+                elif "skill" in ref and not shell_off(agent):
+                    cache[at] = profile_order_skill(agent, rev, ref["skill"])
+                else:
+                    cache[at] = {}
+            except ToolError:
+                cache[at] = None
+        ends.append((at, None if cache[at] is None else
+                     order_stands(cache[at], x["section"], order_key(x["line"].split("\n")))))
+    out = []
+    for i, (at, end) in enumerate(ends):
+        mates = [(k, e) for k, (a, e) in enumerate(ends)
+                 if a == at and e is not None and lines[k]["section"] == lines[i]["section"]]
+        out.append(None if cache[at] is None else end is not None and
+                   all(e <= end if k < i else e >= end for k, e in mates))
+    return out
+
+
+def profile_order_back(agent):
+    """The pieces that earlier orders took out of the profile of `agent` and that no order put back, each with the line
+    that stood just before it in its section (None for the first): a Counter of (section title, piece, before). Not of
+    an order that the owner's own save, a press or another write of the profile came after (profile_orders_ended)."""
+    left = collections.Counter()
+    for r in read_rows("SELECT lines FROM profile_orders WHERE agent=? AND owner_saved IS NULL ORDER BY id",
+                       (agent,)):
+        for x in json.loads(r["lines"]):
+            left[(x["section"], x["line"], x.get("after"))] += 1 if x["way"] == "out" else -1
+    return +left
+
+
+def profile_orders_ended(agent):
+    """Under LOCK or in a turn of the hub's writes: ends the way back (owner_saved) of each order of the agent after
+    which the configuration ref changed its profile by anything but a later order: the owner's own save, a press of a
+    plan, a rename. The profile is then the owner's word again. Read from git, and not from the write itself: a stop of
+    the hub between the owner's commit and this leaves the end to the owner's retry (save_profile), to the next order,
+    or to the next start (profile_orders_repair). False when git did not answer for an order: that order's way back is
+    then not known, and not ended (an order refuses until git answers, profile_order_make). The record of an order that
+    a stop cut off comes first (profile_order_land); a fault of it is logged and never stops the caller, the owner's
+    own save among them: the next pass tries it again."""
+    try:
+        profile_order_land()        # the commit of an order whose record a stop cut off is an order's too
+    except Exception as e:          # pylint: disable=broad-except
+        log("hub", f"the record of an order that a stop cut off waits: {type(e).__name__}: {e}")
+    rows = read_rows("SELECT id, commit_after, owner_saved FROM profile_orders WHERE agent=?", (agent,))
+    made, rev, known = {r["commit_after"] for r in rows}, kit_revision(fresh=True), True
+    for r in rows:
+        if r["owner_saved"] is None:
+            code, out, _ = git_kit("rev-list", f"{r['commit_after']}..{rev}", "--", f"profiles/{agent}.md") \
+                if rev else (1, "", "")
+            if code != 0:
+                known = False
+            elif not made.issuperset(out.split()):
+                q("UPDATE profile_orders SET owner_saved=? WHERE id=? AND owner_saved IS NULL", (now(), r["id"]))
+    return known
+
+
+def profile_order_head(agent, text):
+    """True when the words of a profile before its first section are the ones that the hub writes there itself
+    (render_profile): its title line and its opening. A write of the profile renders it again, and so it keeps no
+    other word there."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    first = next((i for i, line in enumerate(lines) if SECTION_LINE.match(line)), len(lines))
+    opening = MANAGER_OPENING if agent == manager_name() else "Written by the owner. Agents cannot change it."
+    return plain_words("\n".join(lines[:first])) == plain_words(f"# Profile: {agent}\n\n{opening}")
+
+
+def profile_order_change(p, was, now_, rev):
+    """(lines, miss, words) of one profile of a plan whose free sections go from `was` to `now_` ({title: section}): the
+    lines of its record, the words of the first thing that no order may do (or None), and True when the plan gives
+    this profile a word or a form that is neither of before nor a piece that comes back by the rules. A line that
+    leaves takes its piece with it whole (order_pieces); what stays is checked whole, by its text (order_text)."""
+    import difflib
+    n, lines, miss, words, places, back = p["agent"], [], None, False, None, profile_order_back(p["agent"])
+    for title in list(was) + [t for t in now_ if t not in was]:
+        (before, opener), (after, _) = (order_pieces(x[title]["text"] if title in x else "") for x in (was, now_))
+        a = [(k, line) for k, piece in enumerate(before) for line in piece[0]]
+        b = [(k, line) for k, piece in enumerate(after) for line in piece[0]]
+        gone, came, first = collections.Counter(), collections.Counter(), {}
+        for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, [x for _, x in a], [x for _, x in b],
+                                                          autojunk=False).get_opcodes():
+            if op != "equal":
+                gone.update(k for k, _ in a[i1:i2])
+                came.update(k for k, _ in b[j1:j2])
+                for k, line in a[i1:i2]:
+                    first.setdefault(k, line)
+        out = {k for k in gone if gone[k] == len(before[k][0])}
+        into = {k for k in came if came[k] == len(after[k][0])}
+        if set(came) != into or order_text(before, out) != order_text(after, into):
+            words = True                    # a word or the form of what stays
+        for k in sorted(into):              # C4: only a piece that an order took out, just after the one line before
+            prior = after[k - 1][0][-1] if k else None
+            once = prior is None or sum(x == prior for piece in after for x in piece[0]) == 1
+            text = "\n".join(after[k][0])
+            if after[k][1] is None or back[(title, text, prior)] < 1 or not once:
+                words = True
+            else:
+                back[(title, text, prior)] -= 1
+                lines.append({"section": title, "line": text, "way": "back", "after": prior})
+        last = {}                           # a place's name -> the line of it where the piece before ends
+        for k in sorted(gone):
+            said = (f"the line \"{clip(first[k].strip(), PROFILE_ORDER_SAID)}\" of {title} in the profile of "
+                    f"{p['role']} ")
+            place = None
+            if before[k][1] is None:
+                miss = miss or said + "leaves by no order: " + (
+                    f"\"{clip(opener.strip(), PROFILE_ORDER_SAID)}\" can open other lines of that section." if opener
+                    else "only an item of a list with \"-\", \"*\" or \"+\" that is the whole section and a whole "
+                         "paragraph with no list right before or after it do; a numbered item is a step of a "
+                         "sequence.")
+            elif k not in out:
+                miss = miss or said + "is a part of a paragraph that stays: only the whole paragraph leaves."
+            else:
+                if places is None:
+                    places = profile_order_places(n, rev)
+                place = next(((name, ref, order_stands(held, title, before[k][1])) for name, held, ref in places
+                              if order_stands(held, title, before[k][1]) is not None), None)
+                if place is None:           # C5: the owner's line would be lost
+                    own = "" if shell_off(n) else " or an own skill"
+                    miss = miss or said + (
+                        f"stands in no place of that agent: a duty whose running check or clock watch brings its "
+                        f"words to it{own}, under a heading \"{title}\", as a paragraph of its own or an item of a "
+                        f"list that is the whole part, where no line opens others. A duty's part that a start cuts, a "
+                        f"duty whose words no session saved since this release, what was written after reads of "
+                        f"outside text" +
+                        (" and a skill that the owner gave are none. Move it there word for word first (set_duty, or a "
+                         "task that writes a skill)" if own else " and each skill (its sessions read no file) are "
+                         "none. Move it there word for word first (set_duty)") + ", or leave it in the profile.")
+                elif place[2] < last.get(place[0], place[2]):
+                    miss = miss or said + (f"stands in {place[0]} before a line that it follows in the profile. Give "
+                                           f"that place the lines in their order first.")
+                else:
+                    last[place[0]] = place[2]
+            if k in out:
+                lines.append({"section": title, "line": "\n".join(before[k][0]), "way": "out",
+                              "after": before[k - 1][0][-1] if k else None, "place": place[0] if place else None,
+                              "ref": place[1] if place else None})
+    return lines, miss, words
+
+
+def profile_order(giver, effect, owner_asked=False, ask_why=None):
+    """What a plan whose changes are all of the kind profile (team_plan_effect's `profiles`) is: ("order", moves), a
+    list of {agent, role, size_before, size_after, lines, base, file}; ("refuse", the manager's words) for a plan that
+    only takes lines out of free sections and misses (profile_order_change), also one whose head is not the hub's,
+    which a write would lose (F15, the area's second reader, finding 5: such a card rang the owner's Mac for a shorter
+    profile); or ("card", None) for each other plan, which is a card as before, and for a miss when `owner_asked`: the
+    owner's own newest message asks for the plan (profile_order_ask), so the owner's press decides it. The head stays a
+    refusal then too: a press would take the owner's words there away, and no Details show it. ask_why: why the plan's
+    `ask` opens no card."""
+    moves, refused, lost, card = [], None, None, False
+    for p in effect["profiles"]:
+        n, old, new_text = p["agent"], p["sections"], p["new"].decode("utf-8")
+        new = parse_profile(new_text)
+        was = {s["title"]: s for s in old if s["key"] == "other"}
+        now_ = {s["title"]: s for s in new if s["key"] == "other"}
+        if n == giver or [s for s in old if s["key"] != "other"] != [s for s in new if s["key"] != "other"] or \
+                len(was) != len([s for s in old if s["key"] == "other"]) or \
+                len(now_) != len([s for s in new if s["key"] == "other"]) or \
+                any(profile_key(t) != "other" for t in list(was) + list(now_)):
+            # C7; C2 and C3, access and the owner's decisions; two free sections of one title; and a second section
+            # with a title of the owner's decisions, which parse_profile reads as a free one (round 3, finding 6)
+            card = True
+            continue
+        lines, miss, words = profile_order_change(p, was, now_, effect["rev"])
+        if words and order_shorter(was, now_):      # never a card for a shorter profile
+            miss = miss or (f"the profile of {p['role']} only loses lines, and what stays changes its form: each item, "
+                            f"each paragraph and each empty line between them stays as it is.")
+        elif words or not lines:
+            card = True                             # a plan of another shape: the owner's press
+            continue
+        if not profile_order_head(n, p["text"]):
+            lost = lost or (f"the profile of {p['role']} has words before its first section that are not the hub's "
+                            f"own, and a write of it would lose them. Leave this profile as it is.")
+        refused = refused or miss
+        moves.append({"agent": n, "role": p["role"], "size_before": len(p["text"]), "size_after": len(new_text),
+                      "lines": lines, "base": hashlib.sha256(p["text"].encode()).hexdigest(), "file": p["new"]})
+    if card:
+        return "card", None
+    if lost:
+        return "refuse", PROFILE_ORDER_NONE.format(why=lost, ask="")
+    if refused and not owner_asked:
+        return "refuse", PROFILE_ORDER_NONE.format(why=refused, ask=f" {ask_why}, so your ask opens no card."
+                                                   if ask_why else PROFILE_ORDER_ASK)
+    return ("card", None) if refused else ("order", moves)
+
+
+def profile_order_ask(agent, ref):
+    """(the owner's message, None) when `ask` of a plan names the one message that opens the card route of a plan that
+    misses: the newest one that the owner typed to the manager in a Founderizer app themselves (an M-<n>, a message and
+    no answer, the hand app or device, no connected app and no chat app) that the manager read and no press of Stop
+    names. Else (None, why it opens no card), or (None, None) with no ask. The hub reads the message's row, not what
+    it asks for: the owner's press decides."""
+    if ref in (None, ""):
+        return None, None
+    found = ASK_REF.match(str(ref))
+    row = read_row("SELECT u.* FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.recipient=? AND "
+                   "u.kind='message' AND u.need_id IS NULL AND u.hand IN (?,?) AND u.connection IS NULL AND "
+                   f"u.origin IS NULL AND e.read_at IS NOT NULL AND {NOT_STOPPED} ORDER BY u.event_id DESC LIMIT 1",
+                   (agent, *PROFILE_ORDER_HANDS))
+    if row and found and row["event_id"] == int(found.group(1)):
+        return row, None
+    return None, (f"{str(ref).strip()[:40]} is not the newest message that the owner typed to you in Founderizer "
+                  f"themselves")
+
+
+PROFILE_ORDER_MAKING = "profile_order_making"   # kv: the order that the hub makes now, from before its commit to its
+                                                # record, as JSON (profile_order_make, profile_order_land)
+PROFILE_ORDERS_READ = {"start": False}          # in this process: profile_orders_repair read every agent's orders
+
+
+def profile_order_make(giver, changes, command, owner_asked=False, ask_why=None):
+    """Under KIT and LOCK (kit_lock, KIT_TOOLS): the plan as an order, at once, and the manager's answer; None for a
+    plan that is a card (profile_order); a ToolError for a plan that only takes lines out and misses, with no card. An
+    order is one commit of the profile files, "Fleet manager put the profile of <agent> in order", on the revision whose
+    profiles and places the plan read (check). A mark before the commit (PROFILE_ORDER_MAKING) holds the record, so that
+    a stop of the hub after the commit leaves it to the next pass (profile_order_land). No row in needs, no notice and
+    no line in the owner's chat. ask_why: why the `ask` that the plan gave opens no card (profile_order_ask)."""
+    team_plan_busy()
+    effect = team_plan_effect(changes, shown=False)
+    if not all([profile_orders_ended(p["agent"]) for p in effect["profiles"]]):
+        raise team_unread()             # a put-back could pass an owner's save that git did not show
+    kind, moves = profile_order(giver, effect, owner_asked, ask_why)
+    if kind == "card":
+        return None
+    if kind == "refuse":
+        raise ToolError(moves)
+    files = {f"profiles/{m['agent']}.md": m["file"] for m in moves}
+    bases = {f"profiles/{m['agent']}.md": m["base"] for m in moves}
+
+    def same_base(at):
+        if at != effect["rev"]:         # the places and the profiles were read at effect["rev"] (round 2's open path)
+            raise ToolError("The fleet's configuration changed while the hub checked this order, so nothing changed: "
+                            "give the plan again.")
+        for path, sha in bases.items():
+            data = git_blob(at, path)
+            if data is None or hashlib.sha256(data).hexdigest() != sha:
+                raise ToolError(f"{path} changed after you read it: read it again, and give the plan again.")
+    names = [m["agent"] for m in moves]
+    first = next(iter(files))
+    mark = {"giver": giver, "rev": effect["rev"], "command": command, "at": now(),
+            "subject": f"Fleet manager put the profile{'s' if len(names) > 1 else ''} of {key_names(names)} in order",
+            "moves": [{k: m[k] for k in ("agent", "role", "size_before", "size_after", "lines")} for m in moves]}
+    if kv_get(PROFILE_ORDER_MAKING):    # an older order whose record still waits (profile_order_land): it keeps it
+        raise TeamPassing(PROFILE_ORDER_WAITS, "an earlier order still waits for its record")
+    kv_set(PROFILE_ORDER_MAKING, json.dumps(mark, ensure_ascii=False))
+    try:            # a busy turn, a fetch or a push that failed, local changes: no fault of the hub's, and no write
+        commit = commit_kit_file(first, files[first], mark["subject"],
+                                 more={p: d for p, d in files.items() if p != first} or None, check=same_base)
+    except Refusal as e:
+        said = str(e).strip().rstrip(".")
+        raise ToolError(f"The hub did not make this order, and nothing changed. {said[:1].upper()}{said[1:]}. Give the "
+                        f"plan again.") from None
+    return profile_order_record(dict(mark, at=now()), commit)
+
+
+def profile_order_record(mark, commit, landed=False):
+    """The record of an order (PROFILE_ORDER_MAKING) whose commit is in the hub's checkout, and the manager's answer:
+    what a pressed plan does after a profile (the time of the change, the new number of its free text with no ask, the
+    update of each machine), and one row for each agent (profile_orders), the answer under the plan's request_id and
+    the end of the mark in one transaction. landed: a stop of the hub cut the first try, so the manager reads the
+    answer as a message too."""
+    code, parent, _ = git_kit("rev-parse", f"{commit}^")
+    parent = parent.strip() if code == 0 and parent.strip() else mark["rev"]
+    said, moves = [], [m for m in mark["moves"] if m["agent"] in agents()]
+    for m in moves:
+        n = m["agent"]
+        # the head of the agent's notes compares the time (notes_start_text); a later save of the owner's keeps its own
+        kv_set(PROFILE_CHANGED + n, max(mark["at"], float(kv_get(PROFILE_CHANGED + n) or 0)))
+        data = git_blob(kit_revision(fresh=True), f"profiles/{n}.md")
+        if data is not None:
+            profile_long_after(n, parse_profile(data.decode("utf-8", "replace")), ask=False)
+        out = [x for x in m["lines"] if x["way"] == "out"]
+        back = len(m["lines"]) - len(out)
+        where = collections.Counter(x["place"] for x in out)
+        said.append(f"the profile of {m['role']} (profiles/{n}.md) goes from {m['size_before']:,} to "
+                    f"{m['size_after']:,} characters" +
+                    (f": {len(out)} line{'s' if len(out) != 1 else ''} left it, " +
+                     ", ".join(f"{k} in {place}" for place, k in where.items()) if out else "") +
+                    (f"{';' if out else ':'} {back} line{'s' if back != 1 else ''} came back into it" if back else ""))
+    text = (f"Made at once, with no card, in commit {commit[:12]}: " + "; ".join(said) + ". The hub keeps a record of "
+            "each line, the line before it and its place for the owner, and a plan that gives a section with such a "
+            "line again, just after the line that stood before it, puts it back with no card. After the agent's next "
+            "20 tasks that start after this order and finish, the hub sends you its results before and after. Each "
+            "agent whose profile changed reads it at its next session's start.")
+    with transaction():
+        DB.execute("DELETE FROM kv WHERE k=?", (PROFILE_ORDER_MAKING,))
+        for m in moves:
+            DB.execute("UPDATE profile_orders SET measured=-1 WHERE agent=? AND measured IS NULL", (m["agent"],))
+            DB.execute("INSERT INTO profile_orders(agent,at,commit_before,commit_after,size_before,size_after,lines) "
+                       "VALUES(?,?,?,?,?,?,?)", (m["agent"], mark["at"], parent, commit, m["size_before"],
+                                                 m["size_after"], json.dumps(m["lines"], ensure_ascii=False)))
+        if mark["command"] and not DB.execute("SELECT 1 FROM tool_commands WHERE agent=? AND request_id=?",
+                                              tuple(mark["command"][:2])).fetchone():
+            keep_command(mark["command"], {"text": text}, now())    # a request_id that another call took keeps that
+        if landed:
+            event_rows([(mark["giver"], "say", None, f"[hub] The hub stopped while it made your plan, and its order "
+                         f"stands. {text}", None)], now())
+        log_row(mark["giver"], f"put the profile of {key_names([m['agent'] for m in moves])} in order with no card, in "
+                               f"{commit[:12]}")
+    for name in agents():           # every machine, as at the owner's save: same_code counts a profile
+        request_update(name, commit)
+    return text
+
+
+def profile_order_land():
+    """Under LOCK or in a turn of the hub's writes, where no order runs (profile_order_make holds both from its mark to
+    its record): the order whose record a stop of the hub cut off (PROFILE_ORDER_MAKING). Its commit in the hub's
+    checkout, by its subject after the order's revision, gets its record; with no such commit nothing was made, and the
+    mark goes, and so it does when a commit that the hub took back (undo_kit_push, 'Revert "<subject>"') follows it. A
+    git that does not answer, and a push that the hub still has to take back (KIT_PUSHED), leave it to the next
+    pass."""
+    kept = kv_get(PROFILE_ORDER_MAKING)
+    rev = kit_revision(fresh=True) if kept else None
+    if not rev or kv_get(KIT_PUSHED):
+        return
+    try:
+        mark = json.loads(kept)
+        moves, rev0, subject = [m["agent"] for m in mark["moves"]], mark["rev"], mark["subject"]
+    except (ValueError, TypeError, KeyError):       # a mark that cannot be read names no order: nothing to record
+        kv_set(PROFILE_ORDER_MAKING, None)
+        return
+    code, out, _ = git_kit("log", "--reverse", "--format=%H %s", f"{rev0}..{rev}", "--",
+                           *(f"profiles/{n}.md" for n in moves))
+    if code != 0:
+        return
+    said = [line.partition(" ")[::2] for line in out.splitlines()]
+    at = next((i for i, (_, words) in enumerate(said) if words == subject), None)
+    commit = None if at is None or any(words == f'Revert "{subject}"' for _, words in said[at + 1:]) else said[at][0]
+    if commit:
+        profile_order_record(mark, commit, landed=True)
+    else:
+        kv_set(PROFILE_ORDER_MAKING, None)
+
+
+def profile_orders_repair(t0):
+    """In tick, under LOCK: what a stop of the hub left open of an order (profile_order_land), and, once at each start,
+    of the end of each order's way back (profile_orders_ended)."""
+    profile_order_land()
+    if not PROFILE_ORDERS_READ["start"]:
+        PROFILE_ORDERS_READ["start"] = all([profile_orders_ended(r["agent"]) for r in read_rows(
+            "SELECT DISTINCT agent FROM profile_orders WHERE owner_saved IS NULL")])     # else again at the next pass
+
+
+PROFILE_ORDERS_MOST = 200       # orders that one read of the owner's gives, the newest
+
+
+def profile_orders_view(agent=None):
+    """The orders of one agent, or of every agent, newest first, for the owner's read (GET /ui/profile-orders): each
+    with its time, its commits before and after, the profile's size before and after, its lines (a whole paragraph is
+    one), when the hub measured the agent's results after it, and when a write of the profile that is no order came
+    since (owner_saved), which ends the way back of its lines. Each line that left says whether its place still holds
+    it now (still; null while git does not answer). Each line's words, and the line before it, are masked as they are
+    read, as a lesson's are."""
+    rows = read_rows("SELECT * FROM profile_orders" + (" WHERE agent=?" if agent else "") + " ORDER BY id DESC LIMIT ?",
+                     ((agent,) if agent else ()) + (PROFILE_ORDERS_MOST,))
+    rev, cache = kit_revision(fresh=True), {}
+
+    def lines_view(r):
+        lines = json.loads(r["lines"])
+        still = iter(profile_order_still(r["agent"], [x for x in lines if x["way"] == "out"], rev, cache))
+        for x in lines:
+            x.pop("ref", None)
+            x.update(line=mask_secrets(x["line"]), after=None if x.get("after") is None else mask_secrets(x["after"]),
+                     **({"still": next(still)} if x["way"] == "out" else {}))
+        return lines
+    return [{"id": r["id"], "agent": r["agent"], "at": r["at"], "commit_before": r["commit_before"],
+             "commit_after": r["commit_after"], "size_before": r["size_before"], "size_after": r["size_after"],
+             "measured": r["measured"] if (r["measured"] or 0) > 0 else None, "owner_saved": r["owner_saved"],
+             "lines": lines_view(r)} for r in rows]
+
+
+# F15 piece 3 (the owner, 22 November 2026: "a seamless experience that actually GETS better"): when the agent of an
+# order has finished PROFILE_ORDER_MEASURE tasks after it, the hub sends the manager, once, the numbers of those tasks
+# and of the as many before it, and no verdict; the owner gets nothing. A count of events, never of time (AUTONOMY.md
+# decision 39). The number 20 is the analysis's own: no record gives a better one.
+PROFILE_ORDER_MEASURE = 20
+PROFILE_ORDER_COUNTED = {}      # an order's id -> when this process last counted its agent's finished tasks
+
+
+def profile_order_tasks(agent, at, after):
+    """The finished tasks of `agent` (a result delivered, the reviews left out) that started after the time `at`, the
+    first to finish first, or that finished before it, the newest first: PROFILE_ORDER_MEASURE of them at the most. A
+    task that ran at the time of the order read the profile of before, so it is in neither. read_rows only."""
+    return read_rows(f"SELECT * FROM tasks WHERE owner=? AND delivered IS NOT NULL AND "
+                     f"{'created>=' if after else 'delivered<'}? AND title NOT IN (?,?) "
+                     f"ORDER BY delivered {'ASC' if after else 'DESC'}, id LIMIT ?",
+                     (agent, at, *REVIEW_TITLES, PROFILE_ORDER_MEASURE))
+
+
+def profile_order_numbers(agent, tasks):
+    """The five numbers of these tasks of `agent`: results that their requester refused; tasks that needed doing
+    again (a later task follows it, or the key of its case came back); questions that the agent asked up in them; the
+    owner's messages about one of them and the owner's new wishes for the agent while they ran; and tokens a task, or
+    None before any report."""
+    if not tasks:
+        return [0, 0, 0, 0, None]
+    ids, marks = [t["id"] for t in tasks], ",".join("?" * len(tasks))
+    again = 0
+    for t in tasks:
+        case = read_row("SELECT responsibility, key FROM duty_cases WHERE id=?", (t["duty_case"],)) \
+            if t["duty_case"] else None
+        again += bool(read_row("SELECT 1 FROM tasks WHERE follows=? LIMIT 1", (t["id"],)) or
+                      case and read_row("SELECT 1 FROM duty_cases WHERE responsibility=? AND key=? AND id>? AND "
+                                        "repeated=1 LIMIT 1", (case["responsibility"], case["key"], t["duty_case"])))
+    asked = read_row(f"SELECT COUNT(*) n FROM questions WHERE asker=? AND task IN ({marks})", (agent, *ids))["n"]
+    since = min(t["created"] for t in tasks)
+    until = max(t["delivered"] for t in tasks)
+    about = sum(1 for r in read_rows("SELECT about FROM ui_requests WHERE about IS NOT NULL AND created>=?", (since,))
+                if (message_about_read(r["about"]) or None) and
+                message_about_task(message_about_read(r["about"])) in ids)
+    wishes = read_row("SELECT COUNT(*) n FROM standing WHERE agent=? AND author_kind='owner' AND created>=? AND "
+                      "created<=?", (agent, since, until))["n"]
+    tokens = read_row(f"SELECT SUM(st.total) total FROM session_tokens st JOIN (SELECT DISTINCT t.owner, "
+                      f"json_extract(te.data, '$.session_id') sid FROM tasks t JOIN thread_events te ON te.task=t.id "
+                      f"AND te.type='session' WHERE t.id IN ({marks})) s ON st.agent=s.owner AND st.session_id=s.sid",
+                      tuple(ids))["total"]
+    return [sum(1 for t in tasks if t["accepted"] == 0), again, asked, about + wishes,
+            None if tokens is None else round(tokens / len(tasks))]
+
+
+def profile_orders_measure(t0):
+    """In tick, under LOCK: each order whose agent has finished PROFILE_ORDER_MEASURE tasks after it gets its one
+    message to the manager, with each number of those tasks against the tasks before the order, the lines that left
+    the profile and their places, and how a line comes back. Marked measured in the same transaction, so it comes
+    once. An order that a later order of the same agent took the place of is never measured (measured -1). The count
+    reads the agent's task history, so each order is counted at most every MEMORY_COUNT_EVERY seconds, as the memory's
+    count is (duty_reviews), and with a count of at most PROFILE_ORDER_MEASURE rows before any row is read: an
+    agent that never finishes 20 tasks after its order is not read at each pass of the tick for ever."""
+    mgr = manager_name()
+    for r in read_rows("SELECT * FROM profile_orders WHERE measured IS NULL ORDER BY id"):
+        if t0 - PROFILE_ORDER_COUNTED.get(r["id"], float("-inf")) < MEMORY_COUNT_EVERY:
+            continue
+        PROFILE_ORDER_COUNTED[r["id"]] = t0
+        done = read_row("SELECT COUNT(*) n FROM (SELECT 1 FROM tasks WHERE owner=? AND delivered IS NOT NULL AND "
+                        "created>=? AND title NOT IN (?,?) LIMIT ?)",
+                        (r["agent"], r["at"], *REVIEW_TITLES, PROFILE_ORDER_MEASURE))["n"]
+        if done < PROFILE_ORDER_MEASURE:
+            continue
+        after = profile_order_tasks(r["agent"], r["at"], True)
+        before = profile_order_tasks(r["agent"], r["at"], False)
+        old, new = profile_order_numbers(r["agent"], before), profile_order_numbers(r["agent"], after)
+        labels = ("results that their requester refused", "tasks that needed doing again",
+                  "questions that it asked up", "the owner's messages about one of these tasks and new wishes of the "
+                  "owner's for it", "tokens a task")
+        pairs = "; ".join(f"{label}: " + ", ".join(f"{'no report' if v is None else f'{v:,}'} {when}"
+                                                   for v, when in ((b, "before"), (a, "after")))
+                          for label, b, a in zip(labels, old, new))
+        out = [x for x in json.loads(r["lines"]) if x["way"] == "out"]
+        if not profile_orders_ended(r["agent"]):
+            continue                    # its last sentence waits until git answers
+        ended = read_row("SELECT owner_saved FROM profile_orders WHERE id=?", (r["id"],))["owner_saved"] is not None
+        left = "; ".join(f"\"{clip(x['line'].strip(), PROFILE_ORDER_SAID)}\" ({x['section']}, then put in {x['place']})"
+                         for x in out)
+        text = (f"[hub] {shown_role(r['agent'])} finished {len(after)} tasks that started after the order that put its "
+                f"profile in "
+                f"order (commit {r['commit_after'][:12]}). Its {len(before)} finished tasks before the order, and its "
+                f"{len(after)} after it: {pairs}." + (f" What left the profile, each line and its place: {left}; "
+                                                      f"git show {r['commit_after'][:12]} gives each line whole."
+                                                      if out else "") +
+                " If its results got worse, read what left the profile (the record names each line and its place), "
+                "and put a line back with a plan that gives its section with that line again, just after the line "
+                "that stood before it: " + ("a write of the profile since the order, a save or a press of the owner's, "
+                                            "makes that plan a card." if ended else "it needs no card."))
+        with transaction():
+            DB.execute("UPDATE profile_orders SET measured=? WHERE id=? AND measured IS NULL", (t0, r["id"]))
+            event_rows([(mgr, "say", None, text, None)], t0)
+
+
+def team_plan_busy():
+    """The refusal of a new plan while the hub still makes a plan that the owner pressed."""
+    busy = read_row("SELECT k, v FROM kv WHERE k>=? AND k<? LIMIT 1", (TEAM_PLAN_MARK, TEAM_PLAN_MARK[:-1] + ";"))
+    if busy:
+        stuck = json.loads(busy["v"])
+        raise ToolError(f"The hub still makes the plan that the owner pressed on "
+                        f"N-{busy['k'][len(TEAM_PLAN_MARK):]}: wait for its message, then write the next plan." +
+                        (f" It stands at its step {stuck.get('step')} after {stuck['tries']} failed passes, the "
+                         f"last one: {stuck.get('last')}. Tell the owner in one line if it stays so."
+                         if stuck.get("tries") else ""))
+
+
 def t_change_team(agent, a):
     """change_team (the fleet manager): one plan of team changes, which only the owner's press of its card makes
     (owner API 1.214). Its checks run now, so that a plan that cannot work never reaches the owner; the card is the
-    hub's own words from the kept plan, with the manager's title, why and words on it."""
+    hub's own words from the kept plan, with the manager's title, why and words on it. An order (profile_order, F15)
+    has no card: the hub makes it at once."""
     if agent != manager_name():
         raise ToolError("Only the fleet manager writes a plan of team changes: tell it what the team needs "
                         "(report_up).")
@@ -48476,20 +49265,29 @@ def t_change_team(agent, a):
         raise ToolError(CARD_ROUTE_REFUSAL)
     changes = team_plan_parse(a.get("changes"))
     guard(agent, title, why, words, json.dumps(changes))
-    ask = need_ask(agent, a.get("ask"))
+    # F15: a plan that may be an order takes the owner's own newest message M-<n> as ask also when no work is filed
+    # under it (the owner said "take that line out", and a card is the owner's way to decide it)
+    order = all(c["kind"] == "profile" and c.get("agent") != agent for c in changes)
+    own, why_not = profile_order_ask(agent, a.get("ask")) if order else (None, None)
+    try:
+        ask, ask_refused = (None if own and not own["asked"] else need_ask(agent, a.get("ask"))), None
+    except ToolError as e:
+        if not order:
+            raise
+        ask, ask_refused = None, e      # an order needs no ask: the refusal holds only if the plan is a card
     command, stored = agent_write(agent, "change_team", a, {"title": title, "why": why, "words": words,
                                                             "changes": changes, "ask": ask})
     if stored:
         return stored["text"]
+    if order:                                                   # F15: perhaps an order
+        with kit_lock():
+            text = profile_order_make(agent, changes, command, bool(own), why_not)
+        if text is not None:
+            return text
+        if ask_refused:
+            raise ask_refused
     with LOCK:
-        busy = read_row("SELECT k, v FROM kv WHERE k>=? AND k<? LIMIT 1", (TEAM_PLAN_MARK, TEAM_PLAN_MARK[:-1] + ";"))
-        if busy:
-            stuck = json.loads(busy["v"])
-            raise ToolError(f"The hub still makes the plan that the owner pressed on "
-                            f"N-{busy['k'][len(TEAM_PLAN_MARK):]}: wait for its message, then write the next plan." +
-                            (f" It stands at its step {stuck.get('step')} after {stuck['tries']} failed passes, the "
-                             f"last one: {stuck.get('last')}. Tell the owner in one line if it stays so."
-                             if stuck.get("tries") else ""))
+        team_plan_busy()
         effect = team_plan_effect(changes)
         details = effect["details"] + (f"\n\n**{shown_role(agent)}'s words**\n\n{team_quote(words)}" if words else "")
         if len(details) > TEAM_PLAN_DETAILS_CHARS:
@@ -48520,7 +49318,7 @@ def t_change_team(agent, a):
         with transaction():
             DB.execute("INSERT INTO needs(id,title,why,todo,raised,by,options,details,team_plan,ask,recommended) "
                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (nid, title, why, "", t0, agent, options, details, kept,
-                                                         ask or (old["ask"] if old else None), picks[0]))
+                                                         ask or (old["ask"] if old and not own else None), picks[0]))
             if old:     # the old card leaves, and the owner's talk under it moves along, as at a replaces
                 DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=?, replaced_by=? WHERE id=? AND "
                            "answer IS NULL", (f"Replaced by {shown_role(agent)} with a new plan: {title}", t0, agent, nid,
@@ -48838,6 +49636,7 @@ def team_plan_after(nid, need, mark):
             except (TypeError, ValueError):
                 pass
             kv_set(PROFILE_CHANGED + c["agent"], when)
+            profile_orders_ended(c["agent"])    # F15: the owner pressed this profile, which is their word again
             data = git_blob(commit, f"profiles/{c['agent']}.md")
             if data is None:            # the plan wrote it, so git did not answer: one more ask is better than none
                 kv_set(PROFILE_LONG + c["agent"], None)
@@ -54342,15 +55141,16 @@ TOOLS = [
     ("manager", "change_team", t_change_team,
      "Write a plan of team changes that only the owner decides: add an agent, remove one, change an agent's profile, "
      "its role title or its expertise, change reporting lines, or change an owner file (knowledge/owner/). The hub "
-     "checks the plan now, with the app's own checks. Then it raises one card: your title and why, its own options "
-     "(each yes says what it does, one for each name of a new agent, the first marked as the one that you "
-     "recommend) and its own Details "
-     "(the whole change, before and after), with your words under them. Only the owner's press of a yes option, in "
-     "Founderizer on the Mac or a PC, makes the change: the hub checks the plan again, makes one commit and at most "
-     "one job on a server, and tells you what it did. No, or an answer in words, changes nothing. One open plan at a "
-     "time: a new plan replaces it. A plan holds at most one add or one removal. Write a plan when the records show a "
-     "need (see_history, see_capacity), with the evidence in why. Before a removal, keep what must stay: move its "
-     "duties (set_duty) and standing items, and have it write what it knows into a knowledge file. Yours with no card: duties, model, effort, pool grants, standing items. The owner's, in the "
+     "checks the plan now. Then it raises one card: your title and why, its options and its Details "
+     "(the whole change, before and after), with your words under them. Only the owner's press of a yes option, "
+     "on the Mac or a PC, makes the change: the hub checks the plan again, makes one commit and at most "
+     "one job on a server, and tells you what it did. No, or an answer in words, changes nothing. A plan that only "
+     "takes out of another agent's free profile sections a list's items or whole paragraphs, each word for word "
+     "under its section's title in its watched duty or skill, or puts such back where they stood, the hub makes at "
+     "once, with no card; one that takes lines out and misses is refused, or a card with ask, the owner's newest "
+     "message. One open plan at a time: a new plan "
+     "replaces it. A plan holds at most one add or one removal. Before a removal, keep what must stay: move its "
+     "duties (set_duty) and standing items, and have it write what it knows into a knowledge file. The owner's, in the "
      "app: renames, an agent on a Mac or a key account, Tools boxes, a new server or AI account, logins.",
      S({"request_id": REQUEST_ID,
         "title": {"type": "string", "description": "The decision that the owner makes, in at most 70 characters of "
@@ -55626,7 +56426,8 @@ def stale_instructions(name, extra):
 # switch_key_site). A tool left out of it is refused while an owner's write runs its git (KIT_BUSY), and writes nothing;
 # test_every_writer_that_takes_the_lock_from_outside_takes_the_turn reads TOOLS for one.
 KIT_TOOLS = ("grant_access", "move_agent", "set_agent_model", "switch_key_site", "door_rollout", "door_hold",
-             "door_gitops", "door_fleet", "request_secret", "note_secret")
+             "door_gitops", "door_fleet", "request_secret", "note_secret",
+             "change_team")     # F15: an order commits the profile files (profile_order_make)
 
 
 def tool_reads_ahead(name, args):
@@ -60808,6 +61609,8 @@ def tick():
         step(agent_first_message_sweep, t0)     # the owner, 12 November 2026: and so does each new agent
         step(team_plan_sweep, t0)           # owner API 1.214: a team card whose plan cannot be made any more
         step(team_plans_retry, t0)          # and a pressed plan whose last pass failed, once a minute
+        step(profile_orders_repair, t0)     # F15: what a stop of the hub left open of an order
+        step(profile_orders_measure, t0)    # F15 piece 3: an agent's results before and after an order, to the manager
         step(mcp_renew_sweep, t0)           # the owner, 15 November 2026: an MCP server's access ends (Needs you)
         step(stop_finished_sessions, t0)
         step(offline_sweep, t0)
@@ -67611,7 +68414,8 @@ AGENT_COLUMNS = (
     ("egress_hosts", "agent"), ("egress_names", "agent"),      # the outgoing gate's records of the agent's hosts
     ("home_items", "agent"), ("home_readings", "agent"),       # the home reading: what stays in the agent's home
     ("needs", "give_agent"),       # the lane "Give on a card": the agent that an item's Give gives access to
-    ("link_codes", "agent"))                # Telegram (CHAT-APPS.md 19.4): the agent whose bot a person's invite opens
+    ("link_codes", "agent"),                # Telegram (CHAT-APPS.md 19.4): the agent whose bot a person's invite opens
+    ("profile_orders", "agent"))            # F15 piece 2: the orders that put its profile in order with no card
 # The tables with one row for each agent. A row under the new name is what an agent of that name left before it
 # was removed by hand, so it goes first, and the renamed agent's own row takes the name.
 AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent",
@@ -68127,7 +68931,8 @@ AGENT_REMOVAL = {
     ("needs", "give_agent"): "stays",       # a Give card's record; an open one finds no agent at its press
     # a person's Telegram invite (CHAT-APPS.md 19.4): read by its code's hash, never by the agent's name, and it binds
     # its person, whom a delete does not touch; its link names a bot whose account leaves with its agent
-    ("link_codes", "agent"): "stays"}
+    ("link_codes", "agent"): "stays",
+    ("profile_orders", "agent"): "delete"}      # F15 piece 2: the orders of its profile, which leaves with it
 REMOVAL_WHERE = {
     ("triggers", "agent"): "state='deleted'",       # remove_rows has put each of its rules in that state
     # an item that a conversation raised is that conversation's, and a conversation with no message is no history
@@ -84202,6 +85007,23 @@ class Handler(BaseHTTPRequestHandler):
         result = {"db": generation, "agent": agent, "skills": skills_view(agent)}
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
 
+    def ui_profile_orders(self, query):
+        """GET /ui/profile-orders (owner API 1.318, F15 piece 2): the orders that put a profile in order with no card,
+        of one agent (agent=<name>) or of every agent, newest first: each line that left a section or came back into
+        it, and the place of a line that left. A read changes nothing; no screen shows it, and the admin MCP reads it
+        (fleet_read page profile_orders). A line comes back with save_profile, or with a plan of the manager's that
+        gives its section with that line again."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, refusal_words.answer("hub_changed"))
+        agent = query.get("agent") or None
+        if agent is not None and agent not in agents():
+            return self.json(404, refusal_words.answer("no_such_agent"))
+        result = {"db": generation, "agent": agent, "orders": profile_orders_view(agent)}   # it reads git, so no LOCK
+        return self.json(200, scrub(result), {"Cache-Control": "no-store"})
+
     def ui_skill_remove(self):
         """POST /ui/skills/remove (design v4 D7): the owner removes one agent's skill, its whole folder, in one commit
         of his own. It needs no base: what it removes is named, and a skill that is gone already is a 404."""
@@ -86195,6 +87017,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_memory(parts[2], query)
         if parts == ["ui", "skills"]:               # design v4 D7
             return self.ui_skills(query)
+        if parts == ["ui", "profile-orders"]:       # F15 piece 2 (owner API 1.318)
+            return self.ui_profile_orders(query)
         if parts == ["ui", "history"]:              # AUTONOMY.md P6
             return self.ui_history(query)
         if parts == ["ui", "costs"]:                # AUTONOMY.md P8

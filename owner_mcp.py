@@ -975,6 +975,11 @@ PAGES = {
     "skills": ("/ui/skills", "every agent's own skills, or one agent's (give agent): each one's name, description, "
                              "path and files, and its newest commit with the task it was written in and that task's "
                              "reads of outside text. The agents write them; remove_skill removes one"),
+    "profile_orders": ("/ui/profile-orders", "the orders that put a profile in order with no card, of every agent or "
+                                             "of one (give agent), newest first: each line that left a section, with "
+                                             "the line before it, the duty or skill where it stood word for word, and "
+                                             "whether it still does, and each line that came back. save_profile puts "
+                                             "a line back"),
     "chat_link": ("/ui/chat-apps/{name}/link", "one WhatsApp account's link state and its current QR text (give "
                                                "name, the account id). The QR is only here, and it dies in seconds"),
 }
@@ -997,7 +1002,8 @@ PAGE_TAKES = {"agent_messages": ("agent", "after", "before", "limit"), "capacity
               "events": ("after", "limit"), "owner_chat": ("since",),
               "homes": ("agent",), "hosts": ("agent",), "knowledge": ("path",), "kpis": ("agent",),
               "responsibility": ("before", "limit"),
-              "skills": ("agent",), "standing": ("agent", "before", "limit"), "trigger": ("before", "limit")}
+              "skills": ("agent",), "standing": ("agent", "before", "limit"), "trigger": ("before", "limit"),
+              "profile_orders": ("agent",)}
 
 
 def page_needs(page):
@@ -5720,6 +5726,8 @@ def instructions(listed):
     if "fleet_read" in names and pages:
         places.append("- To see what steers one agent, read with fleet_read: " + and_list(pages) + ".")
     back = [f"{name} ({what})" for name, what in TAKE_BACK if name in names]
+    if "fleet_read" in names and "save_profile" in names and "profile_orders" in PAGES:     # F15 piece 2
+        back.append("a line that left a profile: fleet_read(page=profile_orders), then save_profile")
     if back:
         places.append("- To take back what an agent keeps: " + ", ".join(back) + ".")
     lines = [MAP_HEAD]

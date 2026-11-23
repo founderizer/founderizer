@@ -313,8 +313,9 @@ class ChatApps(OwnerAPI):
         URL, a "." before a letter, code, a fenced block, the chat's own agent (also by a role that it shares with
         another agent) and an unknown word are never tags, so a tag never opens work for the wrong agent. A role that is
         another agent's name is that agent's name, as its label says, so the Mac draws the badge of the agent that the
-        hub tagged. The table of rules 1 and 2 is the same as the one of FleetCore's AgentTagsTests
-        (`theTagsAreTheHubsRulesOneAndTwo`), by hand."""
+        hub tagged. The name of an agent that has a role is its agent too, because a pick in the Mac's @ list writes
+        the name (the owner's answer of 22 November 2026). The table of rules 1 and 2 is the same as the one of
+        FleetCore's AgentTagsTests (`theTagsAreTheHubsRulesOneAndTwo`), by hand."""
         self.own()
         for name, title in (("nova", "Customer Support"), ("kai", "Customer Support Lead"),
                             ("atlas", "Growth Marketing Lead"), ("juno", "Grok"), ("mia", "Studio Ops")):
@@ -329,7 +330,9 @@ class ChatApps(OwnerAPI):
                            ("pat@marketing.example", []), ("https://example.com/@marketing", []),
                            ("see @marketing.example", []), ("run `@marketing` now", []),
                            ("```\n@marketing\n```\nok", []), ("@studio, you", []), ("@nobody here", []),
-                           ("@Grok, then", [("grok", 0, 5)]), ("@Studio Ops now", []), ("@support, then", [])):
+                           ("@Grok, then", [("grok", 0, 5)]), ("@Studio Ops now", []),
+                           ("@Nova and @kai.", [("nova", 0, 5), ("kai", 10, 4)]),      # a name that has a role
+                           ("@support, then", [])):
             self.assertEqual(self.inbound(text)[0], "stored", text)
             req = self.last_request()
             self.assertEqual([(m["agent"], m["start"], m["length"]) for m in hub.mentions_read(req["mentions"])],
