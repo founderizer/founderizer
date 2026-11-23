@@ -1343,7 +1343,7 @@ class Door:
                                      (FULL_NOTE.format(host=full_host) if full_host else ""), target=d.target)
         elif d.kind == "own":
             if unmade:          # D25: the owner's, by code
-                d = door_targets.refused(door_providers.delete_refusal(unmade[0]) + APPROVAL_NOTE.format(sha=sha),
+                d = door_targets.refused(door_providers.delete_refusal(unmade[0], d.plan) + APPROVAL_NOTE.format(sha=sha),
                                          target=d.target)
             else:               # the owner, 11 November 2026: no model decides, "it needs to be the agent itself"
                 d.why = f"{agent}'s own call, which it answers for: {d.why}"

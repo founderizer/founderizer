@@ -528,6 +528,7 @@ class OwnerContact(StandIn):
                   patch.object(fleet, "type_into", return_value="typed"),
                   patch.object(h, "start", side_effect=start),
                   patch.object(h, "restart_fresh", return_value=False),       # the session is not cold
+                  patch.object(h.tailer, "flush", return_value=[]),           # its records, read before a report
                   patch.object(h, "window_runtime", side_effect=lambda w: "claude" if w in self.windows else None)):
             p.start()
             self.addCleanup(p.stop)
@@ -621,11 +622,28 @@ class OwnerContact(StandIn):
         self.assertTrue(h.manager_fresh)                            # a new conversation with the hub's brief
         h.manage()
         self.assertIn("manager", self.windows)
+        # 23 November 2026: Claude refused the manager's account at each turn, and the owner read only that a message
+        # was not taken. Its newest records are read before the report (Tailer.flush), and the error at which the turn
+        # of its last line ended goes with it; a late record of the session before it is not the fresh session's
+        h.manager_session = "fresh"                                 # the record reader's window list (manager_windows)
+        refused = {"code": "oauth_org_not_allowed",
+                   "message": "Your organization has disabled Claude subscription access for Claude Code"}
+        turn = lambda session, *records: h.report_limit({"session": session, "events": [
+            dict(r, seq=n, ts=time.time()) for n, r in enumerate(({"type": "user_message", "text": "x"},) + records, 1)]})
+        # the refusal comes back at once, while its line is typed (type_into waits for its Enter)
+        fleet.type_into.side_effect = lambda *a, **kw: turn("fresh", dict(refused, type="error", retryable=False),
+                                                            {"type": "result", "stop_reason": "error"}) and "typed"
+        h.tailer.flush.side_effect = lambda window: [
+            turn("old", dict(refused, type="error", code="api_error"), {"type": "result", "stop_reason": "error"})]
         self.untaken(h, 1)                                          # the fresh session leaves it untaken too
-        self.assertEqual(self.reports(), [{"kind": "untaken", "fresh": True}, {"kind": "untaken"}])
+        self.assertEqual(self.reports(), [{"kind": "untaken", "fresh": True}, {"kind": "untaken", "error": refused}])
         self.assertEqual(len(self.killed), 1)                       # the owner hears of it, and nothing is closed
         h.handle_events([])                                         # its messages were read
         self.assertIsNone(h.manager_untaken)
+        h.tailer.flush.side_effect = fleet.type_into.side_effect = None
+        turn("fresh", {"type": "result", "stop_reason": "end_turn"})    # a turn that worked: no error any more
+        self.assertIsNone(h.manager_error)
+        turn("fresh", dict(refused, type="error"), {"type": "result", "stop_reason": "error"})   # before its next line
         self.untaken(h, 2)                                          # a later line starts it fresh again
         self.assertEqual(self.reports()[-1], {"kind": "untaken", "fresh": True})
         self.assertEqual(len(self.killed), 2)

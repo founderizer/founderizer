@@ -5219,6 +5219,9 @@ class Helper:
         # (tool listings, time) at the start of the session that this helper started last, until it came up
         # (manager_came_up); and the messages for whose untaken line it started that session fresh (fresh_untaken)
         self.manager_fails, self.manager_fail_told, self.manager_mark, self.manager_untaken = 0, False, None, None
+        # {"session", "code", "message", "at"}: the error of its provider at which the manager's newest turn ended, and
+        # when, from its records (report_limit), which its untaken report names (signal); None after a turn that worked
+        self.manager_error = None
         # {pid: args} of its processes that did not end when it closed, also from before a restart of this helper
         self.manager_left = load_closing(agent) if conf.get("role") == "manager" else {}
         self.manager_left_start = closing_start(agent) if self.manager_left else True     # due when they have ended
@@ -7082,9 +7085,18 @@ class Helper:
                         return
                     line["fresh"] = fresh       # a report that goes again says what this one said
                 fresh = line["fresh"]
+                report = {"kind": "untaken", "fresh": True} if fresh else {"kind": "untaken"}
+                # the turn of its last line ended at an error of its provider (report_limit): the owner's warning names
+                # that error, and not the untaken line (23 November 2026: Claude refused the manager's account at each
+                # turn). Its newest records are read first, and an error of an earlier turn or session is not this one.
+                if window == "manager":
+                    with contextlib.suppress(Exception):
+                        self.tailer.flush(window)
+                    error = self.manager_error
+                    if error and error["session"] == self.manager_session and error["at"] >= line["wall"]:
+                        report["error"] = {"code": error["code"], "message": error["message"]}
                 try:
-                    code, _ = http("POST", f"/helper/dialog/{self.agent}/{window}",
-                                   {"kind": "untaken", "fresh": True} if fresh else {"kind": "untaken"}, timeout=10)
+                    code, _ = http("POST", f"/helper/dialog/{self.agent}/{window}", report, timeout=10)
                 except (urllib.error.URLError, OSError, ValueError):
                     code = None
                 if code is None or code >= 500:
@@ -7093,7 +7105,8 @@ class Helper:
                     return
                 line["reported"] = True         # a refusal too: the same report would be refused again
                 self.say(f"{window}: its line was told twice and not taken; the hub knows" +
-                         ("; it starts again on a new conversation with the hub's brief" if fresh else ""))
+                         ("; it starts again on a new conversation with the hub's brief" if fresh else "") +
+                         (f"; its turns end at the error {report['error']['code']}" if "error" in report else ""))
             return
         if window in STANDING_WINDOWS and self.turn_runs(window, target):
             return                  # a turn runs: it reads its messages at its end, and this tells it after that
@@ -7111,6 +7124,9 @@ class Helper:
                 if self.worker and window != "owner-chat" else CHAT_SIGNAL)
         # A runner's window prints its agent's own words and never asks, so its line is typed whatever it shows
         runner = bool(re.fullmatch(r"T-\d+", window) and self.runner(target))
+        # before the typing, which waits for its Enter: a turn that its provider refuses at once ends inside that wait,
+        # and its records' clock must not read it as older than its own line (report_limit, the untaken report)
+        wall = time.time()
         if runner:
             got = type_into(self.session, window, text, asks=False)
         else:
@@ -7119,7 +7135,8 @@ class Helper:
         if got == "typed":
             self.typed_at[window] = time.monotonic()
             self.lines[window] = {"wid": wid, "ids": ids, "at": time.monotonic(), "retold": line is not None,
-                                  "reported": False, "text": text, "box": not runner, "enters": 0}
+                                  "reported": False, "text": text, "box": not runner, "enters": 0,
+                                  "wall": wall}
         # "asks": its screen shows a question, which the screen watch tells (watch_screens). Until runtime gaps C1 this
         # told it too, before the watch could say whether the session stood still or showed its usage-limit menu.
         self.say(f"{window}: inbox signal {got}{' again' if line else ''}; only read_messages acknowledges delivery")
@@ -8528,9 +8545,19 @@ class Helper:
         turn = {"session": batch.get("session"), "running": self.manager_turn.get("session") == batch.get("session")
                 and self.manager_turn.get("running", False)}
         marks, read = {}, time.time()
+        # the error of its provider at which a turn of the session that runs now ended, with its time, until one of its
+        # turns works (signal names it to the hub); a usage limit has its own report above and its own warning, and a
+        # cancelled turn proves nothing
+        error, now_runs = self.manager_error, batch.get("session") == self.manager_session
         for r in batch["events"]:
             if "parent" in r:           # a subagent's record starts and ends no turn of the session
                 continue
+            if now_runs and r["type"] == "error":
+                error = None if r.get("code") == "usage_limit" else {
+                    "session": batch.get("session"), "code": r.get("code"), "message": r.get("message"),
+                    "at": r.get("ts") or read}
+            elif now_runs and r["type"] == "result" and r.get("stop_reason") not in ("error", "cancelled"):
+                error = None
             # The end of a turn that a read found whole, with no line after it (threads.Translator.idle), has no time
             # of its own: about one turn end in ten. It ended by the time of this read, which is its time here; only
             # in the session that runs now: an earlier session's last end can be read late, after the new one began.
@@ -8555,7 +8582,7 @@ class Helper:
             code, _ = http("POST", f"/helper/turn/{self.agent}", marks, timeout=10)
             if code not in (200, 404):
                 return code, {}
-        self.manager_turn = turn
+        self.manager_turn, self.manager_error = turn, error
         return 200, {"last_seq": max([0] + [r["seq"] for r in batch["events"]])}
 
     def runner(self, target):

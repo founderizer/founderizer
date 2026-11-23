@@ -96,6 +96,27 @@ A copy of the fleet holds the hub's records, and with them the licence of a flee
 bearer for Founderizer's own paid services for that one fleet, so that a restore needs no new claim. It opens nothing
 on the fleet's servers and reads nothing of the fleet.
 
+## Who can read the owner's knowledge files
+
+Today the owner's knowledge files (`knowledge/owner/`) are on the configuration ref of the hub's repository, and each
+earlier text of them is in its history. All of these can read every one of them, also a file that an agent's profile
+does not list:
+
+- each agent that has a shell, in its own checkout of the configuration ref, history included;
+- each program on a machine of the fleet's private network that reaches the hub's git service (port 9418) or the
+  hub's own port (8765, at `/code/`): both serve the whole repository, read only, with no sign-in. The access policy
+  of the fleet's private network (Tailscale) decides which devices reach these ports, and that policy is not in this
+  repository;
+- the manager, through its tools;
+- a person whose conversation with an agent runs with that agent's own tools (a role with tools on, and access that is
+  not narrowed), through that agent;
+- an app that the owner connected with read access (the current text of each file);
+- whoever holds a copy of the fleet: the copy holds the current text of each file, not its earlier texts.
+
+The names of these files are not private: the profiles and the repository's history name them. Do not put into a
+knowledge file anything that a reader on this list must not read. A change that takes these files off the
+configuration ref is designed (23 November 2026), not built.
+
 ## An agent's own browser on a Linux server
 
 Each agent with its Shell box and its Browser box on a Linux server has a Chrome of its own (build plan 04). The

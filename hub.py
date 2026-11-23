@@ -58860,6 +58860,50 @@ MANAGER_START_FAILS = "manager_start_fails"
 # detail (health_view).
 MANAGER_NOT_RUNNING = "The manager session is not running."
 
+# The error of its provider at which the turn of the manager's last told line ended, from its helper's untaken report
+# (Handler.helper_dialog, untaken_error): JSON {"code", "message"}, or nothing. On 23 November 2026 Claude refused the
+# manager's account at each turn ("Your organization has disabled Claude subscription access for Claude Code", code
+# oauth_org_not_allowed), and the owner read "The manager did not take a message it was given twice.", which named
+# neither the cause nor the step; the step was a new sign-in, with another account.
+MGR_UNTAKEN_ERROR = "mgr_untaken_error"
+# The provider's errors that refuse the manager's account or its sign-in, in the owner's words: its warning is the
+# signed_out kind, whose band and page lead to its sign-in (the owner, the same day: "we need a better indicator so
+# its as simple as logging in again!").
+MANAGER_SIGN_IN_ERRORS = {
+    "oauth_org_not_allowed": "The manager must sign in with another Claude account: its organization turned off "
+                             "Claude Code for this one.",
+    "authentication_failed": "The manager must sign in again: Claude refused its sign-in.",
+}
+
+
+def untaken_error(value):
+    """The error of a helper's untaken report, cleaned as a session record's error is (clean_record): {"code",
+    "message"}, or None. A helper before it sends none, and a malformed one costs only the words, never the report."""
+    if not isinstance(value, dict):
+        return None
+    code = re.sub(r"[^a-z_]", "", str(value.get("code") or "").lower())[:40]
+    return {"code": code, "message": text_field(value.get("message"), 500, False, sent_cut=True)} if code else None
+
+
+def manager_turn_error():
+    """MGR_UNTAKEN_ERROR as it is kept: {"code", "message"}, or None."""
+    try:
+        error = json.loads(kv_get(MGR_UNTAKEN_ERROR) or "null")
+    except ValueError:
+        return None
+    return error if isinstance(error, dict) and isinstance(error.get("code"), str) else None
+
+
+def manager_error_words(error, runtime):
+    """The manager's flag for a line that its session did not take because the turn of that line ended at this error
+    of its provider, in the provider's own message, which the runtime showed on the session's screen; None when it
+    gave no message."""
+    message = " ".join(str(error.get("message") or "").split())
+    if not message:
+        return None
+    message = message if len(message) <= 200 else cut_whole(message, 199) + "…"
+    return f"The manager's last turn ended at an error of {runtime_label(runtime)}, and its messages wait: \"{message}\""
+
 
 def manager_flag_update(t0):
     """The manager's own warning (`mgr_flag`), which the hub tells the owner itself. The tick runs it, and so do the
@@ -58880,10 +58924,14 @@ def manager_flag_update(t0):
       to start anything, and it rings at once.
     - `silent` for a line told twice and not taken: the helper starts a fresh session first and says so in that
       report (`fresh`), so it rings when the fresh session leaves its line untaken too, or as `down` when that start
-      fails. A helper loop that is stuck and a frozen screen ring at once: that loop can start nothing, and a frozen
-      screen may still move again, which no close may cut short.
-    - `signed_out` (only the owner signs in), `limited`, `screen` (a helper with stuck_screens has closed a session
-      at a question once already) and `switch_stalled` ring at once, as before."""
+      fails. When the turn of that line ended at an error of its provider, its words name that error and not the
+      untaken line (manager_error_words, 23 November 2026). A helper loop that is stuck and a frozen screen ring at
+      once: that loop can start nothing, and a frozen screen may still move again, which no close may cut short.
+    - `signed_out` (only the owner signs in) also for a line untaken because its provider refused its account or its
+      sign-in (MANAGER_SIGN_IN_ERRORS); it is held while the owner's own sign-in of it runs, and a sign-in that ended
+      done after the untaken report ends that report's warning. `limited`, `screen` (a
+      helper with stuck_screens has closed a session at a question once already) and `switch_stalled` ring at once,
+      as before."""
     mgr = manager_name()
     if not mgr:
         return
@@ -58904,9 +58952,19 @@ def manager_flag_update(t0):
             # Its helper told it the line twice, at two idle points, and it took neither (C5's untaken report).
             untaken = float(kv_get(f"untaken:{mgr}:manager") or 0)
             read = q1("SELECT MAX(read_at) m FROM events WHERE agent=?", (mgr,))["m"] or 0
-            if untaken >= pending and untaken > max(read, limit_ended(mgr), switch_ended(mgr)):
-                kind = "silent"
-                flag = "The manager did not take a message it was given twice."
+            # a sign-in of its runtime that ended done after that report starts its session again, whose line is new
+            runtime = (agents().get(mgr) or {}).get("runtime")
+            if untaken >= pending and untaken > max(read, limit_ended(mgr), switch_ended(mgr)) and \
+                    untaken > (finished_sign_in(mgr, runtime) or 0):
+                kind, flag = "silent", "The manager did not take a message it was given twice."
+                # the turn of that line ended at an error of its provider: a refusal of its account or its sign-in is
+                # a sign-in to do again, and any other error names itself
+                error = manager_turn_error()
+                if error and error["code"] in MANAGER_SIGN_IN_ERRORS and \
+                        not local_model(agents().get(mgr) or {}, team_read().get("accounts")):
+                    kind, flag = "signed_out", MANAGER_SIGN_IN_ERRORS[error["code"]]
+                elif error:
+                    flag = manager_error_words(error, runtime) or flag
                 # B3: its helper starts a fresh session for that line, as that same report says
                 fresh = kv_get("mgr_untaken_fresh")
                 held = fresh is not None and fresh == kv_get(f"untaken:{mgr}:manager")
@@ -58971,6 +59029,13 @@ def manager_flag_update(t0):
         if signed_out:
             kind, held = "signed_out", False
             flag = "The manager is not signed in."
+        # The owner's own sign-in of it holds its sign-in warning: the sign-out that a sign-in with another account
+        # makes first is that sign-in's, and the owner is at it (23 November 2026: "The manager is not signed in." rang
+        # while the owner signed it in with another account). A sign-in that ends without it shows and rings.
+        if kind == "signed_out" and q1(f"SELECT 1 FROM signin_jobs WHERE agent=? AND runtime=? AND {LOGIN_OPEN} AND "
+                                       "updated>=? LIMIT 1", (mgr, (agents().get(mgr) or {}).get("runtime"),
+                                                              t0 - LOGIN_LIFE)):
+            held = True
         # Its runtime switch waits for the new session: no reader yet, so neither down nor silent. A usage limit of
         # the new session still shows. A switch stalls on a fact (plan C10): a question on the old session's screen,
         # a failed update of its machine, or a sign-out; otherwise it is the quiet switching, however long it takes.
@@ -85551,7 +85616,8 @@ class Handler(BaseHTTPRequestHandler):
 
         Owner-contact plan B3, for the manager's window: "start_failed" says that its helper's own start of the
         standing session failed twice in a row, and "untaken" with fresh that its helper starts a fresh session for
-        the line that it reports (manager_flag_update).
+        the line that it reports (manager_flag_update). "untaken" with error, {"code", "message"}: the error of its
+        provider at which the session's newest turn ended, which the owner's warning then names (untaken_error).
 
         "undelivered" is the word of a helper of release 2026.11.399 only, for an owner chat whose line it could
         not type at ten polls in a row. The hub takes it and keeps nothing of it: the hub itself says when an owner's
@@ -85572,6 +85638,7 @@ class Handler(BaseHTTPRequestHandler):
         fresh = body.get("fresh")
         if fresh is not None and not isinstance(fresh, bool):
             return self.json(400, {"error": "fresh is true or false"})
+        turn_error = untaken_error(body.get("error"))       # the words of the manager's flag (manager_flag_update)
         manager_window = agent == manager_name() and task == "manager"
         if kind == "start_failed" and manager_window:
             # B3: the manager's down flag rings the owner from here on (manager_flag_update)
@@ -85632,8 +85699,10 @@ class Handler(BaseHTTPRequestHandler):
                     kv_set(f"untaken:{agent}:{task}", t0)
                     if manager_window:
                         kv_set("mgr_untaken_fresh", t0 if fresh else None)
+                        kv_set(MGR_UNTAKEN_ERROR, json.dumps(turn_error) if turn_error else None)
                 log("hub", f"{agent}'s {task} did not take its line, told twice" +
-                    ("; its helper starts a fresh session for it" if manager_window and fresh else ""))
+                    ("; its helper starts a fresh session for it" if manager_window and fresh else "") +
+                    (f"; its turns end at the error {turn_error['code']}" if manager_window and turn_error else ""))
                 if t:       # plan C9: unread messages are no live reason any more, so its last turn end decides again
                     turn_end_check(t, turn_state(t["id"], t["attempt"]), now(), force=True, untaken=True)
             return self.json(200, {})

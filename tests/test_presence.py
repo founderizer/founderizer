@@ -431,6 +431,66 @@ class ManagerRings(test_runtime.Runtime):
         hub.tick()
         self.assertEqual(self.rings(), [self.SILENT])
 
+    def test_a_line_untaken_because_its_provider_refuses_its_account_asks_for_a_sign_in(self):
+        """23 November 2026: Claude refused the manager's account at each turn ("Your organization has disabled Claude
+        subscription access for Claude Code"), and the owner read "The manager did not take a message it was given
+        twice.", which named neither the cause nor the step. The owner: "we need a better indicator so its as simple as
+        logging in again!" The helper's report names the error of the turn of its line (fleet.Helper.signal), and a
+        refusal of its account or its sign-in is the signed_out warning, whose band and page lead to its sign-in; the
+        owner's own sign-in holds it."""
+        refused = {"code": "oauth_org_not_allowed", "message": "Your organization has disabled Claude subscription "
+                   "access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access"}
+        self.poll("manager")
+        self.unread()
+        self.dialog(kind="untaken", fresh=True)             # its helper closed the session and starts a fresh one
+        hub.tick()
+        self.poll()
+        self.poll("manager")
+        self.assertEqual(self.rings(), [])
+        self.dialog(kind="untaken", error=refused)          # the turn of the fresh session's line ended at it
+        hub.tick()
+        words = hub.MANAGER_SIGN_IN_ERRORS["oauth_org_not_allowed"]
+        self.assertEqual(self.rings(), [f"Fleet hub: {words}"])
+        self.assertEqual(self.shown(), ("signed_out", ["manager_signed_out"], "signed_out", words))
+        self.assertIn("sign it in", [w["fix"] for w in hub.health_view()["warnings"]
+                                     if w["kind"] == "manager_signed_out"][0])
+        # the owner signs it in with another account, whose sign-out comes first: he is at it, and nothing shows
+        job = hub.ins("INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES('manager','claude',"
+                      "'signing_out',?,?)", (hub.now(), hub.now()))
+        self.status(signed_in=False)
+        hub.tick()
+        self.assertEqual(self.shown(), self.QUIET)
+        hub.q("UPDATE signin_jobs SET state='done', updated=? WHERE id=?", (hub.now(), job))
+        self.status(signed_in=True)
+        hub.tick()                                          # its helper starts its session on the new account
+        self.assertEqual((self.shown(), len(self.rings())), (self.QUIET, 1))
+
+    def test_the_sign_out_of_the_owner_s_own_sign_in_rings_nobody(self):
+        """23 November 2026, 11:29 UTC: the owner signed the manager in with another account, whose sign-out comes
+        first, and his phone rang "The manager is not signed in." while he was at that sign-in. A sign-in that ends
+        without it shows and rings, once."""
+        self.poll("manager")
+        job = hub.ins("INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES('manager','claude',"
+                      "'signing_out',?,?)", (hub.now(), hub.now()))
+        self.status(signed_in=False)
+        hub.tick()
+        self.assertEqual((self.shown(), self.rings()), (self.QUIET, []))
+        hub.q("UPDATE signin_jobs SET state='failed', updated=? WHERE id=?", (hub.now(), job))      # he left it
+        hub.tick()
+        self.assertEqual(self.shown()[:3], ("signed_out", ["manager_signed_out"], "signed_out"))
+        self.assertEqual(self.rings(), ["Fleet hub: The manager is not signed in."])
+
+    def test_a_line_untaken_at_another_error_of_its_provider_names_that_error(self):
+        self.poll("manager")
+        self.unread()
+        self.dialog(kind="untaken", error={"code": "API Error", "message": "API Error: 529\n Overloaded"})
+        hub.tick()
+        self.assertEqual(self.rings(), ["Fleet hub: The manager's last turn ended at an error of Claude Code, and its "
+                                        "messages wait: \"API Error: 529 Overloaded\""])
+        self.dialog(kind="untaken", error="overloaded")     # a malformed error costs only the words
+        hub.tick()
+        self.assertEqual(hub.kv_get("mgr_flag"), self.SILENT.removeprefix("Fleet hub: "))
+
     def test_a_fresh_start_that_fails_rings_as_down(self):
         self.poll("manager")
         self.unread()

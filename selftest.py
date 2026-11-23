@@ -8,7 +8,7 @@ Needs nothing but Python. The sealed-handover checks are skipped when `age` is n
 Takes about a minute because it waits for the hub's timers. It tests hub.py only: fleet.py needs
 tmux and real sessions, which is what the pilot itself is for.
 """
-import ast, atexit, base64, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading
+import ast, atexit, base64, gc, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading
 import time, uuid
 import urllib.error, urllib.parse, urllib.request
 
@@ -822,6 +822,159 @@ try:
                            f"Pair.one (lines {PIECE_LINES * 2 + 6} and {PIECE_LINES * 2 + 7})"]), repr(found))
 except Exception as bound_twice_problem:     # a changed shape is a failure, never a silent pass
     check("hub.py can be read for names bound twice", False, repr(bound_twice_problem))
+
+# 0d each test class of a module that chooses its tests is in that choice
+#
+# A module's `load_tests` can name the classes to run, and a class that it leaves out never runs: no module run and no
+# ship of a change runs it, while its tests stand there as if they protected a behavior. On 23 November 2026 three such
+# classes were found by a reader of Teams (test_releases.SecondOpinion, 7 tests of the second check of a release's
+# signature; test_diagnostics.Stalls; test_door.ErrorLines), and a fourth (Teams piece 4's own, fixed before it landed).
+# This holds each top-level test module of this checkout that has a `load_tests`: a TestCase class with tests of its own
+# or of a base class in the module is named in the code of its last `load_tests` (a name or a string there, or in a
+# module constant that it uses, and not in its docstring or a comment), or `load_tests` loads the module whole (by
+# loader.loadTestsFromModule, globals(), inspect.getmembers, or the suite that it is given), or another class of the
+# module inherits from it and that form runs inherited tests. A `load_tests` that runs the members of `cls.__dict__`
+# runs no test of a base class, so a base with tests is named there too. A base class counts as a TestCase when it is
+# unittest's, or one of a module named test_* (also by an alias): another file's class that is a TestCase is not seen.
+# Source only: nothing is imported, and a fleet's own files (outputs/, skills/) are no part of this: a file here that
+# this Python cannot parse is not this check's, and the run of that module says so.
+GENERIC_LOADS = {"loadTestsFromModule", "globals", "getmembers"}
+
+
+def left_out(text):
+    """[(class, line)] of one module's text: each class with tests that its `load_tests` leaves out (check 0d)."""
+    tree = ast.parse(text)
+    loads = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "load_tests"]
+    if not loads:
+        return []
+    load = loads[-1]                                    # Python keeps the last one
+    code = load.body[1:] if ast.get_docstring(load) is not None else load.body     # a name in its docstring is no name
+    nodes = [n for one in code for n in ast.walk(one)]
+    calls = {n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "") for n in nodes
+             if isinstance(n, ast.Call)}
+    said = {n.id for n in nodes if isinstance(n, ast.Name)} | {n.attr for n in nodes if isinstance(n, ast.Attribute)}
+    given = [a.arg for a in load.args.args]
+    stored = {n.id for n in nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    if calls & GENERIC_LOADS or (len(given) > 1 and given[1] in said - stored):     # the second: the module's suite
+        return []
+    tops = {n.targets[0].id: n.value for n in tree.body if isinstance(n, ast.Assign) and len(n.targets) == 1
+            and isinstance(n.targets[0], ast.Name)} | {n.target.id: n.value for n in tree.body if
+            isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.value}    # CLASSES = [A, B]
+    for name in [n for n in said if n in tops]:
+        said |= {m.id for m in ast.walk(tops[name]) if isinstance(m, ast.Name)}
+    for one in code + [tops[n] for n in said if n in tops]:
+        for m in ast.walk(one):
+            if isinstance(m, ast.Constant) and isinstance(m.value, str):
+                said |= set(re.findall(r"\w+", m.value))
+    found = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+    imported = {a.asname or a.name for n in tree.body if isinstance(n, ast.ImportFrom)
+                and (n.module or "").startswith("test_") for a in n.names}
+    modules = {a.asname or a.name for n in tree.body if isinstance(n, ast.Import) for a in n.names
+               if a.name.startswith("test_")}
+
+    def bases(name):
+        out = []
+        for b in found[name].bases:
+            if isinstance(b, ast.Attribute):
+                out.append("test_base" if getattr(b.value, "id", "") in modules | {"unittest"} and (
+                    getattr(b.value, "id", "") != "unittest" or b.attr in ("TestCase", "IsolatedAsyncioTestCase"))
+                    else b.attr)
+            else:
+                out.append(getattr(b, "id", ""))
+        return out
+
+    def reaches(name, seen=()):
+        if name in seen or name not in found:
+            return False
+        return any(b in ("TestCase", "IsolatedAsyncioTestCase", "test_base") or b in imported or
+                   reaches(b, (*seen, name)) for b in bases(name))
+
+    def tests(name, seen=()):
+        return name in found and name not in seen and (any(
+            isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")
+            for n in found[name].body) or any(tests(b, (*seen, name)) for b in bases(name)))
+
+    own_only = ("__dict__" in said or "vars" in said) and "dir" not in said    # only the class's own members run
+    parents = {b for name in found for b in bases(name)}
+    return [(name, node.lineno) for name, node in found.items() if name not in said and (
+        name not in parents or own_only) and reaches(name) and tests(name)]
+
+
+def left_out_in(folder):
+    """["file:line class"] of each top-level test module of `folder` (check 0d)."""
+    lost = []
+    for one in sorted(os.listdir(folder)):
+        if not (one.startswith("test_") and one.endswith(".py")):
+            continue
+        with open(os.path.join(folder, one), encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        if "def load_tests" not in text:
+            continue
+        try:
+            lost += [f"{one}:{line} {name}" for name, line in left_out(text)]
+        except (SyntaxError, RecursionError, MemoryError):
+            pass                        # this Python cannot parse it: its module's own run says so
+        gc.collect()
+        memory_given_back()
+    return lost
+
+
+try:
+    lost = left_out_in(KIT)
+    check("no test class with tests is left out of its module's load_tests (check 0d)", not lost, "; ".join(lost))
+    # the check finds its bug in modules of its own, and is not fooled by the forms beside it
+    head, plain = "import unittest\n\nclass Base(unittest.TestCase):\n", "def load_tests(loader, tests, pattern):\n"
+    cases = [
+        (head + "    def test_a(self): pass\n\nclass Named(Base):\n    def test_b(self): pass\n\n"
+         "class Missed(unittest.TestCase):\n    def test_c(self): pass\n\nclass Empty(unittest.TestCase):\n"
+         "    pass\n\n" + plain + "    return loader.loadTestsFromTestCase(Named)\n", ["Missed"]),
+        (head + "    def test_a(self): pass\n\nclass Named(Base):\n    def test_b(self): pass\n\n"
+         + plain + "    return unittest.TestSuite(cls(n) for cls in (Named,) for n in cls.__dict__)\n", ["Base"]),
+        (head + "    def test_a(self): pass\n\n" + plain + "    return loader.loadTestsFromModule(__import__(__name__))\n", []),
+        (head + "    def test_a(self): pass\n\n" + plain + "    return unittest.TestSuite(vars() and globals())\n", []),
+        (head + "    def test_a(self): pass\n\n" + plain + "    import inspect\n"
+         "    return unittest.TestSuite(inspect.getmembers(None))\n", []),
+        (head + "    def test_a(self): pass\n\n" + plain + "    return tests\n", []),
+        ("from test_ui_api import OwnerAPI\n\nclass Missed(OwnerAPI):\n    def test_a(self): pass\n\n" + plain +
+         "    return None\n", ["Missed"]),
+        ("import test_ui_api as ui\nimport test_x\n\nclass Missed(ui.OwnerAPI):\n    def test_a(self): pass\n\n"
+         "class Missed2(test_x.Base):\n    def test_a(self): pass\n\n" + plain + "    return None\n",
+         ["Missed", "Missed2"]),
+        ("from unittest import IsolatedAsyncioTestCase\n\nclass Missed(IsolatedAsyncioTestCase):\n"
+         "    async def test_a(self): pass\n\n" + plain + "    return None\n", ["Missed"]),
+        ("import unittest\n\nclass Missed(unittest.IsolatedAsyncioTestCase):\n    async def test_a(self): pass\n\n"
+         "def load_tests(loader, tests, pattern):\n    \"\"\"Missed runs elsewhere.\"\"\"\n    return None\n", ["Missed"]),
+        (head + "    pass\n\nclass Mid(Base):\n    pass\n\nclass Missed(Mid):\n    def test_a(self): pass\n\n" + plain +
+         "    return None\n", ["Missed"]),
+        (head + "    def test_a(self): pass\n\nclass Missed(Base):\n    pass\n\n" + plain + "    return None\n",
+         ["Missed"]),
+        (head + "    def test_a(self): pass\n\n" + plain + "    return loader.loadTestsFromTestCase(Base)\n"
+         + plain + "    return None\n", ["Base"]),
+        (head + "    def test_a(self): pass\n\nKINDS = [Base]\n\n" + plain +
+         "    return unittest.TestSuite(KINDS[0](n) for n in ('test_a',))\n", []),
+        (head + "    def test_a(self): pass\n\n" + plain + "    return [\"Base\"]\n", []),
+        (head + "    def test_a(self): pass\n\nKINDS: tuple = (Base,)\n\n" + plain + "    return KINDS\n", []),
+        (head + "    def test_a(self): pass\n\n" + plain + "    tests = unittest.TestSuite()\n    return tests\n",
+         ["Base"]),
+        (head + "    def test_a(self): pass\n\nclass Sub(Base):\n    def test_b(self): pass\n\n" + plain +
+         "    return unittest.TestSuite(Sub(n) for n in vars(Sub))\n", ["Base"]),
+    ]
+    found = [[name for name, _ in left_out(text)] for text, _ in cases]
+    with open(os.path.join(TMP, "test_left.py"), "w") as f:
+        f.write(cases[0][0])
+    with open(os.path.join(TMP, "test_whole.py"), "w") as f:
+        f.write(cases[2][0])
+    with open(os.path.join(TMP, "test_a_none.py"), "w") as f:
+        f.write("import unittest\n\nclass Kept(unittest.TestCase):\n    def test_a(self): pass\n")
+    walked = left_out_in(TMP)
+    for one in ("test_left.py", "test_whole.py", "test_a_none.py"):
+        os.unlink(os.path.join(TMP, one))
+    check("the modules of a folder are read, and one that load_tests leaves out is found there", walked ==
+          [f"test_left.py:{n} Missed" for _, n in left_out(cases[0][0])], repr(walked))
+    check("a class that load_tests leaves out is found, and each form beside it is not",
+          found == [want for _, want in cases], repr([(i, f) for i, (f, (_, w)) in enumerate(zip(found, cases)) if f != w]))
+except Exception as left_out_problem:     # a changed shape is a failure, never a silent pass
+    check("the load_tests of the test modules can be read", False, repr(left_out_problem))
 
 # 1 handshake and roles
 code, headers, resp = rpc("manager", "initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "sim-cli", "version": "9.9"}})

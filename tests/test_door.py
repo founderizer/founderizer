@@ -4293,6 +4293,7 @@ class MadeDeletes(DoorCase):
     DELETES = [("cloudflare:one", "change", ["DELETE", f"/zones/{ZONE}/dns_records/r1"], None),
                ("hetzner:one", "change", ["DELETE", "/servers/42"], None),
                ("hetzner:one", "change", ["POST", "/servers/42/actions/disable_backup"], None),
+               ("hetzner:one", "change", ["POST", "/primary_ips/7/actions/change_protection"], b'{"delete": false}'),
                ("azure:one", "change", ["DELETE", f"{AZ_SUB}/resourcegroups/web", "2021-04-01"], None),
                ("backblaze:one", "change", ["b2_delete_bucket"], b'{"bucketId": "bk1"}'),
                ("backblaze:one", "change", ["b2_hide_file"], b'{"bucketId": "bk1", "fileName": "db.tar"}'),

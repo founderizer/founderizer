@@ -500,9 +500,9 @@ def hz_disks(access, agent, d):
     of it with an SSH key of their own is root there. So a write that names a server by its id passes only for a
     server of hz_held: the door reads what hz_reads says first, and sends the write when each need holds. A delete
     keeps its own rule (deletes)."""
-    if deletes(d.plan, {}):
-        return d
     last = d.plan["steps"][-1]
+    if deletes(d.plan, {}) and not hz_unguards(last):
+        return d
     words, first = hz_reads(last["path"], last["body"])
     if words:
         return refused(words)
@@ -513,6 +513,28 @@ def hz_disks(access, agent, d):
                            "that this agent holds at Fix, and it holds none")
         d.plan["steps"][:0] = first
     return d
+
+
+# A protection at Hetzner is the owner's own word that a thing stays: a delete, or a delete of the server that it is on,
+# is refused there until somebody takes the protection off. On a server that takes a held server (hz_reads).
+HZ_GUARDED = re.compile(r"(/(?:volumes|primary_ips|floating_ips|networks|load_balancers)/[0-9]{1,12})/actions/"
+                        r"(change_protection|delete_[a-z_]{1,33})")
+
+
+def hz_unguards(s):
+    """The path of the thing that this step's write takes the protection off, or a part of which it deletes (a
+    network's subnet or route, a load balancer's service), or None. A change_protection that does anything but turn
+    the protection on counts, and so does a Primary IP's auto_delete unless it is turned off: the address then goes with
+    its server. An address that a firewall trusts must not become a stranger's."""
+    method, path, body = s.get("method"), s.get("path") or "", s.get("body")
+    body = body if isinstance(body, dict) else {}
+    found = HZ_GUARDED.fullmatch(path) if method == "POST" else None
+    if found and not (found.group(2) == "change_protection" and list(body) == ["delete"] and body["delete"] is True):
+        return found.group(1)
+    if method == "PUT" and re.fullmatch(r"/primary_ips/[0-9]{1,12}", path) and any(
+            str(k).lower() == "auto_delete" and v is not False for k, v in body.items()):
+        return path
+    return None
 
 
 def hz_reads(path, body):
@@ -1027,10 +1049,11 @@ def made_keys(provider, method, path, status, answer):
 def deletes(plan, conf):
     """The names of what a plan deletes, as made_keys names them, or [] when it deletes nothing: the DELETE method,
     and each provider's delete calls that use another method (B2's b2_delete_*, b2_hide_file and b2_cancel_large_file,
-    Cloudflare's batch and bulk deletes, Hetzner's disable_backup, which deletes the server's backups, and Azure's
-    delete, purge and reimage actions). A key is made when the door minted it. A delete whose target the door cannot
-    name gets a name that nothing made, so it goes to the owner, and so does every AWS delete of the generic `call`
-    (AWS_DELETE), by its action's name or the REST API's DELETE method."""
+    Cloudflare's batch and bulk deletes, Hetzner's disable_backup, which deletes the server's backups, and its writes
+    that take a protection off (hz_unguards), and Azure's delete, purge and reimage actions). A key is made when the
+    door minted it. A delete whose target the door cannot name gets a name that nothing made, so it goes to the owner,
+    and so does every AWS delete of the generic `call` (AWS_DELETE), by its action's name or the REST API's DELETE
+    method."""
     provider, out = (plan or {}).get("provider"), []
     for s in (plan or {}).get("steps") or []:
         method, path = s.get("method"), s.get("path") or ""
@@ -1055,7 +1078,9 @@ def deletes(plan, conf):
             path = path.replace("{account_id}", str(conf.get("account_id") or ""))
         if provider == "azure":
             path = path.lower()
-        if method == "DELETE":
+        if provider == "hetzner" and hz_unguards(s):
+            out.append(hz_unguards(s))
+        elif method == "DELETE":
             key = re.fullmatch(r"/tailnet/-/keys/([A-Za-z0-9]{1,100})", path) if provider == "tailscale" else None
             out.append(f"key:{key.group(1)}" if key else path)
         elif method != "POST":
@@ -1081,10 +1106,13 @@ def named(key):
     return f"{words[kind]} {rest}" if kind in words and not key.startswith("/") else key
 
 
-def delete_refusal(key):
-    """The door's words for a delete that is the owner's, for the first name that deletes() gave."""
+def delete_refusal(key, plan=None):
+    """The door's words for a delete of a plan that is the owner's, for the first name that deletes() gave."""
     if key.startswith("aws:"):
         return f"this call is an AWS delete ({key[4:]}), and every AWS delete is the owner's."
+    if plan and plan["provider"] == "hetzner" and hz_unguards(plan["steps"][-1]):
+        return f"this call takes the protection off {key} or deletes a part of it, which no agent made through the " \
+               f"door, and such a change is the owner's."
     return f"this call deletes {named(key)}, which no agent made through the door, and such a delete is the owner's."
 
 

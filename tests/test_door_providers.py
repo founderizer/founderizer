@@ -1212,7 +1212,9 @@ class NotListed(Provider):
 
     def test_each_delete_form_names_its_target_and_other_writes_name_none(self):
         """The coordinator's change to D25: a delete of what no agent made is a code check. deletes() names what each
-        provider's delete forms remove, as made_keys() names what a write made."""
+        provider's delete forms remove, as made_keys() names what a write made. At Hetzner a write that takes the
+        protection off a thing names it too: an agent lifted the owner's protection of an address that a firewall
+        trusts (a review of 23 November 2026)."""
         account, zone, rg = "b" * 32, ZONE, f"{self.SUB}/resourceGroups/Web/providers/Microsoft.Web/sites/Shop"
         conf = ACCESS["credentials"]["cloudflare:one"]
         cases = [
@@ -1226,6 +1228,15 @@ class NotListed(Provider):
              [f"/accounts/{account}/storage/kv/namespaces/ns1"]),
             ("hetzner:one", ["DELETE", "/servers/42"], None, ["/servers/42"]),
             ("hetzner:one", ["POST", "/servers/42/actions/disable_backup"], None, ["/servers/42"]),
+            # the provider's own protection of a thing that is no server, taken off, and a part of a network
+            ("hetzner:one", ["POST", "/primary_ips/7/actions/change_protection"], b'{"delete": false}',
+             ["/primary_ips/7"]),
+            ("hetzner:one", ["POST", "/volumes/5/actions/change_protection"], None, ["/volumes/5"]),
+            ("hetzner:one", ["POST", "/networks/4/actions/change_protection"], b'{"delete": true, "Delete": false}',
+             ["/networks/4"]),
+            ("hetzner:one", ["PUT", "/primary_ips/7"], b'{"auto_delete": true}', ["/primary_ips/7"]),
+            ("hetzner:one", ["POST", "/networks/4/actions/delete_subnet"], b'{"ip_range": "10.0.1.0/24"}',
+             ["/networks/4"]),
             ("azure:one", ["DELETE", rg, "2023-01-01"], None, [rg.lower()]),
             ("azure:one", ["POST", rg.replace("Microsoft.Web/sites/Shop", "Microsoft.Compute/virtualMachines/vm/"
                                               "reimage"), "2023-01-01"], b"{}",
@@ -1253,6 +1264,12 @@ class NotListed(Provider):
         self.assertEqual(door_providers.deletes(self.decide("oauth-client", "revoke", "kC1234",
                                                             target="tailscale:net").plan, {}), ["key:kC1234"])
         for target, args, content in (("hetzner:one", ["POST", "/firewalls"], b'{"name": "web"}'),
+                                      ("hetzner:one", ["POST", "/primary_ips/7/actions/change_protection"],
+                                       b'{"delete": true}'),
+                                      ("hetzner:one", ["PUT", "/primary_ips/7"],
+                                       b'{"name": "web", "auto_delete": false}'),
+                                      ("hetzner:one", ["POST", "/servers/42/actions/change_protection"],
+                                       b'{"delete": false, "rebuild": false}'),       # a held server, as each write on one
                                       ("cloudflare:one", ["PATCH", f"/zones/{zone}/dns_records/r1"], b"{}"),
                                       ("azure:one", ["POST", rg + "/restart", "2023-01-01"], b"{}")):
             self.assertEqual(door_providers.deletes(self.decide("change", *args, content=content, target=target).plan,
