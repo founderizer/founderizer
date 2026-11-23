@@ -675,7 +675,8 @@ class FromNothing(WithServer):
         carries no value, so the owner's agent sends it, and the asker reads "Not given" with his reason."""
         client = self.started()
         asked, error = hub.call_tool("manager", "request_secret", {
-            "kind": "api_key", "env": "SHOP_API_KEY", "why": "the shop's orders", "give_to": {"vps": "use"}})
+            "kind": "api_key", "env": "SHOP_API_KEY", "why": "the shop's orders", "give_to": {"vps": "use"},
+            "details": "1. Open https://shop.example.com/keys. 2. Click New key, and copy it into the card."})
         self.assertFalse(error, asked)
         need = hub.q1("SELECT id FROM needs ORDER BY id DESC")["id"]
         with self.assertRaises(Refused) as words:

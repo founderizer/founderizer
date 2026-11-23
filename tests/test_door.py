@@ -13,6 +13,7 @@
 
 Everything runs locally: the hosts' sshd and the providers are stubs that record what the door sends."""
 import base64
+import builtins
 import calendar
 import contextlib
 import copy
@@ -122,7 +123,7 @@ def load_tests(loader, _tests, _pattern):
                                                     WorkKeys,
                                                     Workflows, RunnerNew, Probe, CallerGone, Rendered, RenderPath,
                                                     GeneratedFiles, GeneratedPath, OwnerFiles, OwnerPath,
-                                                    SecretReferences, SecretReferencePath, StoreFacts,
+                                                    SecretReferences, SecretReferencePath, StoreFacts, LongLines,
                                                     ErrorLines, YamlTags, RenderBoxUnit, RenderBoxLive)
                               for name in cls.__dict__ if name.startswith("test_"))
 
@@ -332,7 +333,8 @@ class Access(DoorCase):
         self.assertEqual(door.read_json(door.ACCESS_FILE, {})["agents"]["ops-two"]["servers"], {})
         # White space around the file is no change: a file that was edited by hand, and a read that a login shell put
         # an empty line around, gave a SHA-256 that no write ever matched. A file that is no JSON is nobody's write.
-        for raw in (b"\n" + json.dumps(other).encode() + b"\r\n", b'{"v": 1, "x": "\xff"}'):
+        for raw in (b"\n" + json.dumps(other).encode() + b"\r\n", b'{"v": 1, "x": "\xff"}',
+                    json.dumps(other).encode("utf-16")):        # the door's own reader takes UTF-8 alone
             with self.subTest(raw=raw[:20]):
                 with open(self.root + door.ACCESS_FILE, "wb") as f:
                     f.write(raw)
@@ -366,19 +368,25 @@ class Access(DoorCase):
         self.assertEqual(door.read_json(door.ACCESS_FILE, {}), one)
 
     def test_the_compare_of_was_and_the_write_are_under_one_lock(self):
-        """Another Mac's write that lands between this write's compare and its replace would be lost as with no --was:
-        root's lock of the access file is held through both, and another writer waits for it."""
+        """Another Mac's write that lands between this write's read and its replace would be lost as with no --was:
+        root's lock of the access file is held through the read, the compare and the write, and another writer waits
+        for it: a lock that a second writer can share, or a read before the lock, loses a write."""
         def locked():
             fd = os.open(self.root + door.ACCESS_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)      # taken beside a shared lock, never beside root's own
             except BlockingIOError:
                 return True
             finally:
                 os.close(fd)
             return False
-        seen, sha256, write_json = [], hashlib.sha256, door.write_json
+        seen, sha256, write_json, opened = [], hashlib.sha256, door.write_json, builtins.open
         was = self.file_sha256()
+
+        def read(path, *args, **kwargs):
+            if path == self.root + door.ACCESS_FILE:
+                seen.append(("read", locked()))
+            return opened(path, *args, **kwargs)
 
         def compare(data=b""):
             seen.append(("compare", locked()))
@@ -387,9 +395,10 @@ class Access(DoorCase):
         def write(*args, **kwargs):
             seen.append(("write", locked()))
             return write_json(*args, **kwargs)
-        with patch.object(door.hashlib, "sha256", compare), patch.object(door, "write_json", write):
+        with patch.object(door.hashlib, "sha256", compare), patch.object(door, "write_json", write), \
+                patch("builtins.open", read):
             self.access_was(json.loads(json.dumps(ACCESS)), was)
-        self.assertEqual(seen, [("compare", True), ("write", True)])
+        self.assertEqual(seen, [("read", True), ("compare", True), ("write", True)])
         self.assertFalse(locked())
 
     def test_an_update_leaves_the_code_readable_by_the_door_s_user(self):
@@ -1477,6 +1486,50 @@ class Refusals(DoorCase):
                 d = push(text)
                 self.assertEqual((d.kind, "a JSON file that is not JSON with each key once" in d.why),
                                  ("refused", True), d)
+
+    def test_documents_of_too_many_levels_or_lines_are_refused_before_code_writes_them_out(self):
+        """Code reads parsed documents as block style lines (as_block, as_lines), and a JSON file of 41 KB with 900
+        levels took 17 s and 2.5 GB there. A file of more than 64 levels, or of more than 8 MB of such lines, is
+        refused in plain words, as it is after the commit and at HEAD, and so is a render's object; a file of 64
+        levels is read. The filter of a read takes such a file with its loose reading, which still keeps back a
+        Secret in it. Bug: a limit that reads one of the two texts alone, or the levels of one route alone, and the
+        door stops for minutes on a file that an agent wrote."""
+        def deep(levels, text="1"):
+            return "[" * levels + text + "]" * levels
+
+        def push(text, base=None):
+            return self.decide("gitops:one-org/cluster", "push", content=self.commit(("apps/shop/x.json", text)),
+                               lookups={"base_file": lambda p: base})
+        levels, size = "has more than 64 levels of mappings and lists", "has more than 8 MB of lines"
+        wide = deep(64, ",".join(["1"] * 75000))
+        lines = json.dumps({"a": {"b": [{"c": "x\n" * 100}]}})
+        for text, base, words in ((deep(65), None, levels), (wide, None, size), ("{}", deep(65).encode(), levels),
+                                  ("{}", wide.encode(), size)):
+            with self.subTest(words=words, base=bool(base)):
+                d = push(text, base)
+                self.assertEqual((d.kind, words in d.why), ("refused", True), d)
+        for text in (deep(64), lines):
+            self.assertEqual(push(text).kind, "own", text[:80])
+        # the texts of many lines count as as_lines writes them, each with the spaces of its level
+        texts = json.loads(deep(60, json.dumps("\n" * 80000)))
+        for write in (door_targets.objects_text, door_targets.lines_text):
+            for docs in ([json.loads(deep(65))], [texts]):
+                with self.assertRaises(door_targets.TreeLimit):
+                    write(docs)
+        for at in ("before", "after"):
+            unit = {"kind": "helm", "root": "monitoring/stack", "ok": True, "closed": False,
+                    "changed": [dict({"object": "an object", "set": "its own values", "before": [], "after": [{}]},
+                                     **{at: [json.loads(deep(65))]})]}
+            self.assertIn("an object has more than 64 levels", door_targets.render_refusal(
+                {"units": {"helm:monitoring/stack": unit}, "apps": None})[0])
+        self.assertIsNone(door_targets.kept_back("a/x.json", deep(65).encode()))
+        secret = deep(65, '{"kind": "Secret", "data": {"k": "eA=="}}').encode()
+        self.assertEqual(door_targets.kept_back("a/x.json", secret), "may hold a Secret, which the filter keeps back")
+        for begin in ("-----BEGIN PRIVATE KEY-----", "\\u002d----BEGIN PRIVATE KEY-----"):      # also with an escape
+            for levels in (3, 70):
+                key = deep(levels, '{"k": "%s"}' % begin).encode()
+                kept = door_targets.kept_back("a/x.json", key) or ""
+                self.assertIn("a Secret, which the filter keeps back", kept, (begin, levels))
 
     def test_a_file_with_another_name_gets_the_loose_reading_in_a_gitops_commit(self):
         """The block reader went by the file's name, and Kustomize takes any name in `resources:`, as Helm renders
@@ -4432,26 +4485,24 @@ class AppSettingsPath(HostPath):
     random bytes, or the key that the owner saved for the door as app:<app>:<NAME>, on the host's stdin, and neither
     the answer nor the record shows it. unit-new sends the unit with its sha256."""
     KEY = 'sk_test_a"b$c'
+    NAME = "app:shop:STRIPE_SECRET_KEY"
 
     def setUp(self):
         super().setUp()
-        data = json.loads(json.dumps(ACCESS))
-        data["credentials"]["app:shop:STRIPE_SECRET_KEY"] = {"secret": ref(11)}
-        data["agents"]["ops-one"]["providers"].append("app:shop:STRIPE_SECRET_KEY")
-        self.write_access(data)
-        with open(os.path.join(self.root + door.SECRETS_DIR, hashlib.sha256(ref(11).encode()).hexdigest()), "w") as f:
-            f.write(self.KEY + "\n")
+        self.names({self.NAME: ref(11)})
+        self.hold(ref(11), self.KEY + "\n")
         for folder in ("/etc/ops-root/apps", "/var/www/shop/shared", "/etc/systemd/system"):
             os.makedirs(self.host + folder, exist_ok=True)
         with open(self.host + "/etc/ops-root/apps/shop.json", "w") as f:
             json.dump({"app": "shop", "port": 8080, "health": "/api/health"}, f)
         with open(os.open(self.host + "/var/www/shop/shared/.env", os.O_WRONLY | os.O_CREAT, 0o600), "w"):
             pass
-        self.sent = []
+        self.sent, self.known = [], []
         real = self.sshd
 
         def sshd(argv, stdin, env, timeout=600, limit=None):
             self.sent.append(stdin)
+            self.known.append(door.read_json(door.NAMES_FILE, {}).get("names", {}))
             return real(argv, stdin, env, timeout)
         patcher = patch.object(door, "run_program", sshd)
         patcher.start()
@@ -4459,6 +4510,48 @@ class AppSettingsPath(HostPath):
 
     def settings(self):
         return slurp(self.host + "/var/www/shop/shared/.env", "r")
+
+    def names(self, changes):
+        """The door's file with these names of ops-one's keys: each one's reference, or None for one that left it."""
+        data = json.loads(json.dumps(door.read_json(door.ACCESS_FILE, {})))
+        held = data["agents"]["ops-one"]["providers"]
+        for name, reference in changes.items():
+            data["credentials"].pop(name, None)
+            held[:] = [n for n in held if n != name] + ([name] if reference else [])
+            if reference:
+                data["credentials"][name] = {"secret": reference}
+        self.write_access(data)
+
+    def hold(self, reference, value):
+        with open(self.root + door.SECRETS_DIR + "/" + hashlib.sha256(reference.lower().encode()).hexdigest(),
+                  "w") as f:
+            f.write(value)
+
+    def sweep(self, *copies, keep=None):
+        """One pass of the vault sweep: the hub's copies, each (reference, value), and its keep list."""
+        answer = {"copies": [{"id": n, "login": r, "sealed": v} for n, (r, v) in enumerate(copies, 1)], "keep": keep}
+        with patch.object(self.door, "http", lambda method, url, headers, data: (200, answer)), \
+                patch.object(door, "run_program", lambda argv, stdin, env: (0, stdin.decode())):
+            return door.fetch_sealed(self.door)
+
+    def key(self):
+        return self.call(ONE, "web-1", "env-new", "shop", "STRIPE_SECRET_KEY", "key")
+
+    def refused(self, words):
+        """The app's key goes nowhere, and the caller reads these words."""
+        got = self.key()
+        self.assertFalse(got["ok"], got)
+        self.assertIn(words, got["why"])
+        self.assertEqual(self.sent, [])
+
+    def provider_sends(self):
+        """The authorization of each request of one call of hetzner:one."""
+        asked = []
+        with patch.object(self.door, "http", lambda method, url, headers, data: (
+                asked.append(headers["Authorization"]), (200, {"servers": []}))[1]):
+            got = self.call(ONE, "hetzner:one", "servers")
+        self.assertTrue(got["ok"], got)
+        return asked
 
     def test_env_new_sends_the_door_s_random_bytes_or_the_owner_s_key(self):
         first = self.call(ONE, "web-1", "env-new", "shop", "SESSION_SECRET", "random")
@@ -4488,8 +4581,7 @@ class AppSettingsPath(HostPath):
         # into an app). Pairs of (the provider's line, the app's line), with a reference that has hex letters and a
         # value of its own, so that capitals in the UUID count and a compare that lowers one side only fails.
         hexed = "bws://0000000a-bcde-4abc-8def-00000000000f"
-        with open(os.path.join(self.root + door.SECRETS_DIR, hashlib.sha256(hexed.encode()).hexdigest()), "w") as f:
-            f.write("hz-provider-key")
+        self.hold(hexed, "hz-provider-key")
         for provider, app in ((ref(4), ref(4)), (ref(4), ref(4).upper()), (hexed, hexed.upper()),
                               (hexed.upper(), hexed), (hexed.upper().replace("BWS://", "bws://"), hexed)):
             with self.subTest(provider=provider, app=app):
@@ -4499,6 +4591,150 @@ class AppSettingsPath(HostPath):
                 got = self.call(ONE, "web-1", "env-new", "shop", "STRIPE_SECRET_KEY", "key")
                 self.assertIn("a key that the door uses for something else", got["why"])
                 self.assertEqual(self.sent, [])
+
+    def test_a_provider_s_key_goes_to_no_app_after_the_file_dropped_its_name(self):
+        """A hub that is broken into drops a provider's credential from the door's file and names its key as an app's
+        setting (VAULT.md, limit 15). The door gives an app a key only under the name by which a file first named it.
+        Believable bugs: the check reads only the file of now; the record begins at the first use (nothing uses this
+        key), or ends with the value or with the process; it compares the exact text of a reference."""
+        for n, (provider, app) in enumerate(((str, str), (str, str.upper), (str.upper, str))):
+            with self.subTest(provider=provider, app=app):
+                key = f"bws://0000000{n}-bcde-4abc-8def-00000000000f"
+                self.hold(key, f"hz-{n}")
+                self.names({"hetzner:one": provider(key)})
+                self.door.access()
+                self.names({"hetzner:one": None, self.NAME: app(key)})
+                self.sweep(keep=[ref(1)])
+                self.door = door.Door(conf={"address": "127.0.0.1"}, http=self.stubs.http, clock=lambda: self.clock_at)
+                self.sweep((app(key), f"hz-{n}"))
+                self.refused("a key that the door knew first as hetzner:one")
+
+    def test_a_key_that_two_names_have_at_first_is_the_provider_s_or_no_app_s(self):
+        """The first file of the record, on the day of the update, can name one key two times: the provider's name is
+        its first name, and of two settings none is. Believable bug: the record takes the setting that the hub leaves,
+        or the first name of the alphabet, and the hub that drops the other name chooses where the key goes."""
+        for n, (other, first) in enumerate((("app:blog:API_KEY", "several settings"), ("hetzner:one", "hetzner:one"),
+                                            ("app:web:API_KEY", "several settings")), 12):
+            with self.subTest(other=other):
+                self.names({self.NAME: ref(n), other: ref(n).upper()})
+                self.hold(ref(n), f"sk_{n}")
+                self.door.access()
+                self.names({other: None})
+                self.refused(f"a key that the door knew first as {first}")
+        # a provider's name before a database's, which sorts first: else the provider's key gets no mark
+        both = {"credentials": {"db:a-db": {"secret": ref(30)}, "hetzner:one": {"secret": ref(30)}}}
+        self.assertEqual(door.first_names(both), {ref(30): "hetzner:one"})
+
+    def test_a_key_goes_to_an_app_only_with_its_first_name_on_the_disk(self):
+        """The read of a file that changed writes the record, and a hub can make that write fail: each copy under a new
+        reference is one more file of the door's disk. Believable bugs: a key whose entry is only in memory leaves, or
+        the entry is written after the key left. A provider's call never waits for the record."""
+        def write(path, *args, real=door.write_json, **kwargs):
+            if path == door.NAMES_FILE:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real(path, *args, **kwargs)
+        with patch.object(door, "write_json", write):
+            self.refused("could not write its record of the first names of its keys (OSError)")
+            self.assertEqual(self.provider_sends(), ["Bearer value-of-0000"])
+        self.assertFalse(os.path.exists(self.root + door.NAMES_FILE))
+        self.assertTrue(self.key()["ok"])
+        self.assertEqual((self.sent, self.known[0][ref(11)]), ([self.KEY.encode()], self.NAME))
+
+    def test_no_value_leaves_the_door_in_a_pass_whose_record_failed(self):
+        """A hub can fill the door's disk with copies under new references, so that the record's write at the start of
+        a pass fails. Believable bug: the pass still deletes each value that the hub's keep does not name, and a
+        provider's value that the door held from before its update leaves with no mark; the hub then sends it again
+        under an app's new reference, and the door gives it."""
+        self.hold(ref(4), "hz-old")
+        held = self.root + door.SECRETS_DIR + "/" + hashlib.sha256(ref(4).lower().encode()).hexdigest()
+
+        def write(path, *args, real=door.write_json, **kwargs):
+            if path == door.NAMES_FILE:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real(path, *args, **kwargs)
+        with patch.object(door, "write_json", write):
+            self.sweep(keep=[ref(11)])
+        self.assertTrue(os.path.exists(held))
+        self.sweep(keep=[ref(11)])                          # the record is written now: the value leaves with its mark
+        self.assertFalse(os.path.exists(held))
+        self.assertEqual(door.read_json(door.NAMES_FILE, {})["marks"].get(door_providers.key_mark("hz-old")),
+                         "hetzner:one")
+
+    def test_a_provider_s_value_goes_to_no_app_under_a_new_reference(self):
+        """The hub sends the sealed copy of a provider's key again, under a reference that is new and an app's. The door
+        knows each value that it held for a provider by its mark. Believable bugs: a mark is made only when a call uses
+        the value (none does here), it goes with the credential (as KEYS_FILE's does, end_keys) or with the value, a
+        write that failed is never done again, or a value that came and was replaced in one pass has none. Another
+        value under a new reference goes to the app."""
+        self.hold(ref(4), "hz-first")
+        with patch.object(door, "write_json", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.door.access()
+        self.sweep(keep=[ref(11)])
+        self.sweep((ref(4).upper(), "hz-second"), (ref(4), "hz-third"))
+        self.names({"hetzner:one": None})
+        self.sweep(keep=[ref(11)])
+        door.end_keys(self.door)
+        for n, value in enumerate(("hz-first", "hz-second", "hz-third"), 40):
+            with self.subTest(value=value):
+                self.names({self.NAME: ref(n)})
+                self.sweep((ref(n), value))
+                self.refused("a key that the door knows as hetzner:one")
+        # an App's key comes to the door before a file names it (a renewal), so it has no mark: its form refuses it
+        self.sweep((ref(50), "pem:" + base64.b64encode(b"-----BEGIN RSA PRIVATE KEY-----").decode()))
+        self.names({self.NAME: ref(50)})
+        self.refused("names the key of a GitHub App")
+        self.names({self.NAME: ref(51)})
+        self.sweep((ref(51), "sk_another"))
+        self.assertTrue(self.key()["ok"])
+        self.assertEqual(self.sent, [b"sk_another"])
+
+    def test_a_new_value_under_its_own_reference_and_name_goes_on_working(self):
+        """The owner replaces a key: the new value comes under the same reference and the same name. Believable bugs:
+        the record takes a new value for a moved key, or it marks each value that the door holds: then the owner's new
+        key is refused, and the mark of a database's password, which a person chose, could be guessed."""
+        self.door.access()
+        self.sweep((ref(11).upper(), "sk_new"), (ref(4), "hz-new"))
+        self.assertEqual(self.provider_sends(), ["Bearer hz-new"])
+        self.assertTrue(self.key()["ok"])
+        self.assertEqual(self.sent, [b"sk_new"])
+        self.hold(ref(70), "password")
+        held = self.door.keep_names({"credentials": {"db:shop-db": {"secret": ref(70)}}})
+        self.assertEqual(held["names"][ref(70)], "db:shop-db")
+        self.assertNotIn(door_providers.key_mark("password"), held["marks"])
+
+    def test_a_record_that_is_broken_or_full_gives_no_key_to_an_app_and_stops_no_provider(self):
+        """Believable bugs: a record that the door cannot read counts as an empty one, or is written over, so each key
+        can get a new first name; it holds a provider's new value back, or its call; or a hub makes it grow with
+        references, values or long names."""
+        self.door.access()
+        path, good = self.root + door.NAMES_FILE, door.read_json(door.NAMES_FILE, {})
+        self.assertIn(ref(4), good["names"])
+        for n, broken in enumerate((None, [], {"v": 2, "names": {}, "marks": {}}, {"v": 1, "names": {}},
+                                    dict(good, names={ref(4).upper(): "hetzner:one"}))):
+            with self.subTest(broken=broken):
+                text = "{" if broken is None else json.dumps(broken)
+                pathlib.Path(path).write_text(text)
+                self.names({self.NAME: ref(60 + n)})
+                self.sweep((ref(60 + n), "sk_new"), (ref(4), f"hz-{n}"))
+                self.refused(f"first names of its keys, {door.NAMES_FILE}, cannot be read")
+                self.assertEqual(self.provider_sends(), [f"Bearer hz-{n}"])
+                self.assertEqual(slurp(path, "r"), text)
+        for part in ("names", "marks"):
+            with self.subTest(full=part), patch.object(door, "NAMES_MOST", len(good["names"]) + len(good["marks"])):
+                full = dict(good, **{part: dict(good[part])})
+                while len(full[part]) < door.NAMES_MOST:
+                    n = len(full[part])
+                    full[part][ref(100 + n) if part == "names" else f"{n:064x}"] = "hetzner:one"
+                door.write_json(door.NAMES_FILE, full)
+                self.names({self.NAME: ref(80)})
+                self.sweep((ref(80), "sk_new"), (ref(4), "hz-" + part))
+                self.refused(f"first names of its keys, {door.NAMES_FILE}, is full")
+                self.assertEqual(self.provider_sends(), ["Bearer hz-" + part])
+                self.assertEqual(len(door.read_json(door.NAMES_FILE, {})[part]), door.NAMES_MOST)
+        door.write_json(door.NAMES_FILE, good)              # root put an earlier copy back
+        self.assertTrue(self.key()["ok"])
+        held = self.door.keep_names({"credentials": {"hetzner:" + "x" * 500: {"secret": ref(90)}}})
+        self.assertEqual(len(held["names"][ref(90)]), door.NAME_KEPT)
 
     def test_env_add_after_the_first_release_is_the_agent_s_own_call_and_its_value_stays_the_door_s(self):
         os.symlink("releases/one", self.host + "/var/www/shop/current")
@@ -5638,11 +5874,14 @@ class Vault(DoorCase):
             calls.append((method, url, data))
             if url.endswith("/door/sealed"):
                 return 200, {"copies": [{"id": 5, "login": ref(6), "sealed": "-----BEGIN AGE ENCRYPTED FILE-----"},
-                                        {"id": 6, "login": "not a ref", "sealed": "x"}]}
+                                        {"id": 6, "login": "not a ref", "sealed": "x"},
+                                        {"id": 7, "login": ref(30), "sealed": "-----BEGIN AGE ENCRYPTED FILE-----"}]}
             return 200, {}
         self.door.http = http
         with patch.object(door, "run_program", lambda argv, stdin, env, timeout=600: (0, "the-new-value\n")):
-            self.assertEqual(door.fetch_sealed(self.door), 1)
+            self.assertEqual(door.fetch_sealed(self.door), 2)
+        # the successor of an App key, which no credential of the file names until the door holds it (DoorSync)
+        self.assertEqual(self.door.secret(ref(30)), "the-new-value")
         path = os.path.join(self.root + door.SECRETS_DIR, hashlib.sha256(ref(6).encode()).hexdigest())
         self.assertEqual((slurp(path, "r"), oct(os.stat(path).st_mode & 0o777)), ("the-new-value", "0o600"))
         self.assertEqual(self.door.secret(ref(6)), "the-new-value")
@@ -5654,7 +5893,7 @@ class Vault(DoorCase):
         """Since the owner can replace a value, a copy comes for a secret that the door holds and uses. A call reads
         the old value or the new one, never a part: the new file is written beside the old one and then put in its
         place, so a write that stops leaves the old value."""
-        values = iter(["the-old-value\n", "the-new-value\n", "the-third-value\n"])
+        values = iter(["the-old-value\n", "the-new-value\n", "the-new-value\n", "the-third-value\n"])
         self.door.http = lambda method, url, headers, data: (200, {"copies": [
             {"id": 8, "login": ref(6), "sealed": "-----BEGIN AGE ENCRYPTED FILE-----"}]}) \
             if url.endswith("/door/sealed") else (200, {})
@@ -5662,9 +5901,15 @@ class Vault(DoorCase):
         with patch.object(door, "run_program", lambda argv, stdin, env, timeout=600: (0, next(values))):
             self.assertEqual(door.fetch_sealed(self.door), 1)
             self.assertEqual(self.door.secret(ref(6)), "the-old-value")
-            with patch.object(door.os, "replace", side_effect=OSError("the disk is full")), self.assertRaises(OSError):
-                door.fetch_sealed(self.door)
-            self.assertEqual(self.door.secret(ref(6)), "the-old-value")     # the old value, whole
+            real = os.replace
+            for stops in (door.NAMES_FILE, door.SECRETS_DIR):       # the mark of the new value, and then the value
+                def replace(old, new):
+                    if new.startswith(self.root + stops):
+                        raise OSError("the disk is full")
+                    real(old, new)
+                with patch.object(door.os, "replace", replace), self.assertRaises(OSError):
+                    door.fetch_sealed(self.door)
+                self.assertEqual(self.door.secret(ref(6)), "the-old-value")     # the old value, whole
             self.assertEqual(door.fetch_sealed(self.door), 1)
         self.assertEqual(self.door.secret(ref(6)), "the-third-value")
         name = hashlib.sha256(ref(6).encode()).hexdigest()
@@ -8837,8 +9082,10 @@ class StoreFacts(Served):
     def test_a_wrong_form_or_no_gitops_target_reads_nothing_of_github(self):
         """The form and the GitOps target come before any read: a body with a field more (a project that the agent
         names), one less, or one out of its form is 400; an agent with no GitOps target for the repository is
-        no_target, and a secret path or one of the exposure register is no_file. A check after the first read of
-        GitHub would make the door read a repository for a stranger's name."""
+        no_target, and a secret path, one of the exposure register, or one of more than 16 folders is no_file. A check
+        after the first read of GitHub would make the door read a repository for a stranger's name; with no limit of
+        folders, a path of 97 folders makes about 100 calls of GitHub for each ask, and a limit one lower refuses a
+        path of 16 folders that the form allows."""
         data = json.loads(json.dumps(ACCESS))
         data["agents"]["ops-one"]["repos"].update({"one-org/website": {"kind": "gitops"},       # on the never list
                                                    "founderizer/founderizer": {"kind": "gitops"}})
@@ -8856,9 +9103,11 @@ class StoreFacts(Served):
                    {"repo": "founderizer/founderizer"}):
             with self.subTest(no=no):
                 self.assertEqual(self.ask(**no), (422, {"error": "no_target"}))
-        for path in ("platform/Secrets/store.yaml", "apps/legacy/store.yaml"):
+        for path in ("platform/Secrets/store.yaml", "apps/legacy/store.yaml", "a/" * 17 + "store.yaml"):
             self.assertEqual(self.ask(path=path), (422, {"error": "no_file"}))
         self.assertEqual(self.calls, [])
+        self.files({"a/" * 16 + "store.yaml": BW_STORE})            # 16 folders above the file are read
+        self.assertEqual(self.ask(path="a/" * 16 + "store.yaml"), (200, BW_FACTS))
 
     def test_the_store_of_the_first_case_gives_two_words_and_two_ids(self):
         """A ClusterSecretStore shaped like the first real case (a plain manifest, Bitwarden's US pair, three namespaces
@@ -8866,17 +9115,24 @@ class StoreFacts(Served):
         and project, for each namespace that it serves; so do its JSON copy and its file with a second document. An
         answer with a field of the manifest (an address, the SDK server, the token's Secret) would bring the
         repository's text to the hub, and from there to an address that the owner's Mac calls. The block reader
-        alone reads two documents as one mapping, and the second one's kind and name would hide the store."""
+        alone reads two documents as one mapping, and the second one's kind and name would hide the store. A line of
+        a block scalar (a certificate of a ConfigMap beside the store) and a JSON key that starts with ... are no
+        document mark: a check of the file's text by lines read them as one, and answered rendered. A \\ in single
+        quotes and a '' in double quotes are the text itself for YAML and for the block reader alike."""
         for namespace in ("shop", "shop-jobs", "browsers"):
             self.assertEqual(self.ask(namespace=namespace), (200, BW_FACTS))
+        alike = "name: bitwarden-example\n  annotations:\n    a: '^shop-\\d+$'\n    b: \"it''s\"  # c\n    c: '\"'"
+        self.assertEqual(self.ask(BW_STORE.replace("name: bitwarden-example", alike)), (200, BW_FACTS))
         store = door.store_docs(BW_PATH, BW_STORE.encode())[0]
+        store["metadata"]["annotations"] = {"...note": "x", "---": "y"}
         self.files({"platform/store.json": json.dumps(store)})
         self.assertEqual(self.ask(path="platform/store.json"), (200, BW_FACTS))
         store["spec"]["provider"]["bitwardensecretsmanager"]["projectID"] += " #x"     # in JSON, no comment
         self.files({"platform/store.json": json.dumps(store)})
         self.assertEqual(self.ask(path="platform/store.json"), (422, {"error": "other_provider"}))
         status, got = self.ask(BW_STORE.replace("        - browsers\n", "") + "---\napiVersion: v1\nkind: ConfigMap\n"
-                               "metadata:\n  name: other\n")
+                               "metadata:\n  name: other\ndata:\n  ca.crt: |\n    -----BEGIN CERTIFICATE-----\n"
+                               "    MIIBexample\n    -----END CERTIFICATE-----\n")
         self.assertEqual((status, got), (200, BW_FACTS))
         self.assertEqual(sorted(got), ["organization", "project", "provider", "region"])
 
@@ -8914,8 +9170,12 @@ class StoreFacts(Served):
     def test_each_error_word_alone(self):
         """No file, not exactly one store of that kind and name, another provider (also beside Bitwarden), an id that
         is no lower-case UUID, a namespace that the store does not serve: each is its word, and the answer holds that
-        word alone. A store that the door counts wrong, or an id with a text of the manifest, reaches the card. YAML's
-        null as the conditions serves each namespace, as no conditions do: the block reader gives it as a text."""
+        word alone. A store that the door counts wrong, or an id with a text of the manifest, reaches the card: a count
+        of v1 and v1beta1 alone answers a decoy's project where the cluster's store is a v1alpha1 of the same name,
+        and so does a count of the names as written, where a reader gives a name with the spaces of its lines; an
+        answer by the name with its spaces taken out gives a project for an object that no cluster takes.
+        YAML's null as the conditions serves each namespace, as no conditions do: the block reader gives it as a
+        text."""
         aws = "    aws:\n      service: SecretsManager\n      region: eu-central-1\n"
         link = dict(self.answers[("GET", self.url(BW_PATH))][1], type="symlink", path="platform/link.yaml")
         self.answers[("GET", self.url("platform/link.yaml"))] = (200, link)       # a symlink, with its own path
@@ -8931,6 +9191,9 @@ class StoreFacts(Served):
             # the group with no version, or another version, makes no store of the cluster: a decoy names no project
             ("not_one", {}, BW_STORE.replace("external-secrets.io/v1", "external-secrets.io")),
             ("not_one", {}, BW_STORE.replace("external-secrets.io/v1", "external-secrets.io/v9")),
+            # a decoy, and the cluster's store last in a version that its operator serves too: the same object
+            ("not_one", {}, BW_STORE.replace(BW_PROJECT, BW_ORG) + "---\n" +
+             BW_STORE.replace("external-secrets.io/v1", "external-secrets.io/v1alpha1")),
             ("other_provider", {}, BW_STORE.replace("    bitwardensecretsmanager:\n",
                                                     aws + "    bitwardensecretsmanager:\n")),
             ("other_provider", {}, BW_STORE.replace("    bitwardensecretsmanager:\n", "    aws:\n")),
@@ -8946,6 +9209,21 @@ class StoreFacts(Served):
         for word, fields, text in cases:
             with self.subTest(word=word, fields=fields):
                 self.assertEqual(self.ask(text, **fields), (422, {"error": word}))
+        # a name with a space at an end (also U+00A0 and U+3000) is no store of the cluster: alone it names no project
+        for name in ('" bitwarden-example"', "'bitwarden-example '", "bitwarden-example\u00a0",
+                     "\u3000bitwarden-example"):
+            with self.subTest(name=name):
+                self.assertEqual(self.ask(BW_STORE.replace("name: bitwarden-example", f"name: {name}")),
+                                 (422, {"error": "not_one"}))
+        spaced = door.store_docs(BW_PATH, BW_STORE.encode())[0]
+        spaced["metadata"]["name"] = "bitwarden-example\n"
+        self.files({"platform/store.json": json.dumps(spaced)})
+        self.assertEqual(self.ask(path="platform/store.json"), (422, {"error": "not_one"}))
+        # a name as a reader gives it with the spaces of its lines is counted: a decoy beside it names no project
+        decoy, store = (door.store_docs(BW_PATH, BW_STORE.encode())[0] for _ in range(2))
+        store["metadata"]["name"] = "    bitwarden-example"
+        self.assertEqual(door.store_answer([decoy, store], "ClusterSecretStore", "bitwarden-example", "shop"),
+                         {"error": "not_one"})
         # served: a ClusterSecretStore with no conditions, a condition's flow list, a SecretStore's own namespace
         conditions = "  conditions:\n    - namespaces:\n        - shop\n        - shop-jobs\n        - browsers\n"
         for kind, text in (("ClusterSecretStore", BW_STORE.replace(conditions, "")),
@@ -8967,7 +9245,8 @@ class StoreFacts(Served):
         document with an items key, which kubectl and Argo CD apply as a list of its items, whatever its kind.
         Kustomize can patch the project of a plain file, so a reading of its text would name a project that the
         cluster's store does not read; the block reader alone takes a key's last value, where a cluster's reader may
-        take another."""
+        take another, and it reads "bitwarden-ex\\x61mple" or a name as a block scalar (with the spaces of its line) as
+        another name than the cluster does, so a decoy before it would name its project."""
         for mark in ("platform/external-secrets/Chart.yaml", "platform/Chart.yaml", "Chart.yaml",
                      "platform/kustomization.yaml", "platform/external-secrets/kustomization.yml", "Kustomization"):
             github_stubs(self)
@@ -8995,11 +9274,22 @@ class StoreFacts(Served):
                      BW_STORE.replace("kind: ClusterSecretStore\n", "kind: ClusterSecretStore\n  ...\n"),
                      BW_STORE.replace("kind: ClusterSecretStore\n", "kind: ClusterSecretStore\n  ---#x\n"),
                      BW_STORE.replace("\n", "\r\n").replace("kind: ClusterSecretStore\r\n",
-                                                             "kind: ClusterSecretStore\r\n  ...\r\n")):
+                                                             "kind: ClusterSecretStore\r\n  ...\r\n"),
+                     # a decoy, and the cluster's store last with its name in a quoted form that the block reader
+                     # reads as another name: an escape, and the two other forms that it reads in another way
+                     BW_STORE.replace(BW_PROJECT, BW_ORG) + "---\n" +
+                     BW_STORE.replace("name: bitwarden-example", 'name: "bitwarden-ex\\x61mple"'),
+                     BW_STORE.replace("name: bitwarden-example", "name: 'bitwarden-example'\n  note: 'it''s'"),
+                     # the same with the name as a block scalar, whose lines keep their spaces in the block reader
+                     BW_STORE.replace(BW_PROJECT, BW_ORG) + "---\n" +
+                     BW_STORE.replace("  name: bitwarden-example\n", "  name: |-\n    bitwarden-example\n"),
+                     BW_STORE.replace("name: bitwarden-example", 'name: bitwarden-example\n  note: "a #b"'),
+                     BW_STORE.replace("name: bitwarden-example", "name: bitwarden-example\n  note: 'a #b'")):
             with self.subTest(text=text[-200:]):
                 self.assertEqual(self.ask(text), (422, {"error": "rendered"}))
-        self.files({"platform/store.json": '{"kind": "ClusterSecretStore", "kind": "Secret"}'})
-        self.assertEqual(self.ask(path="platform/store.json"), (422, {"error": "rendered"}))
+        for text in ('{"kind": "ClusterSecretStore", "kind": "Secret"}', "[" * 100000):     # and too deep to read
+            self.files({"platform/store.json": text})
+            self.assertEqual(self.ask(path="platform/store.json"), (422, {"error": "rendered"}))
 
     def test_a_github_that_does_not_answer_is_no_missing_file(self):
         """GitHub's 500 for the file or for a folder above it is 502, with no word of the list, so that the hub says
@@ -9053,11 +9343,74 @@ class StoreFacts(Served):
         self.assertEqual((set(words["kinds"]), words["provider"], set(words["regions"])),
                          (set(door.STORE_KINDS), door.STORE_PROVIDER, set(door.BITWARDEN)))
 
+    def test_a_long_run_of_spaces_in_a_value_is_read_in_a_short_time(self):
+        """A value with a long run of spaces (note: b<spaces>c), which unread passes, is read in well under a second.
+        Bug: a comment pattern with a run before its # ((?:^|[ \\t]+)#) reads the run again from each of its places:
+        20,000 spaces took 2.4 s, a file of 1 MB more than an hour, and re holds the GIL, so no other call of the door
+        runs. The bound is loose for a slow machine: the read takes some milliseconds."""
+        text = BW_STORE.replace("  name: bitwarden-example\n", "  name: bitwarden-example\n  labels:\n    note: b" +
+                                " " * 40000 + "c\n")
+        started = time.thread_time()
+        self.assertEqual(self.ask(text), (200, BW_FACTS))
+        self.assertLess(time.thread_time() - started, 2.0)
+
     def test_door_py_holds_no_text_that_the_mac_reads_as_the_pass(self):
         """The owner's Mac looks in door.py for the text store_keys to learn that the door checks key records (the
         design's section 7). Until the pass (piece D2) brings that text, door.py must not hold it, also not in a
         comment, or the Mac writes records that this door does not check. D2 removes this test."""
         self.assertNotIn("store_keys", slurp(door.__file__, "r"))
+
+
+class LongLines(unittest.TestCase):
+    """No reader of the door takes more than a moment on one long line that an agent's commit, a repository's file, an
+    owner's rule or a host's ssh output can hold: one row for each pattern or loop that the review of 22 November 2026
+    rewrote. Bug: a pattern that reads a run again from each of its places (two runs side by side, a run at the start
+    of a search, a search for an end that is not there), or a loop that copies the rest of the text at each step (the
+    block lines of a JSON file at each of its levels, with gigabytes of memory): each row took seconds to minutes, and
+    re holds the GIL, so no other call of the door runs. Each row takes some milliseconds;
+    the bound is loose for a slow machine."""
+    BOUND = 2.0         # seconds of this thread's own time, so that other work of the machine does not count
+
+    @staticmethod
+    def deep(text):
+        try:
+            door_targets.block_tree(text)
+        except RecursionError:          # a list as deep as its dashes: the reader of a store reads it as rendered
+            pass
+
+    def test_each_reader_reads_a_long_line_in_a_moment(self):
+        t = door_targets
+        rows = {
+            "a listed line": lambda: t.LISTED_LINE.fullmatch(" " * 40000 + "x"),
+            "a rule call's changed line": lambda: t.app_path_rule(
+                "apps/web/values.yaml", (" " * 60000 + "x\n").encode(),
+                {"base_file": lambda p: b"replicas: 1\n"}, "one-org/cluster"),
+            "the images of a file of blank lines": lambda: t.image_rule(b"", b"\n" * 3000, {}),
+            "a word of secret": lambda: t.names_secret("secret" * 6000),
+            "a long word": lambda: t.names_secret("a" * 50000),
+            "a word before secretKeyRef, secretRef or secretName": lambda: t.manifest_refusal("", "a" * 40000),
+            "a flow list with a run of spaces": lambda: t.unread("k: [a" + " " * 50000 + ",\n"),
+            "a plain value with a run of spaces": lambda: t.plain_value("b" + " " * 100000 + "c"),
+            "a quantity of digits and dots": lambda: t.quantity("9" * 60000 + "..Gi"),
+            "a workflow text of ${{": lambda: t.secret_use("${{" * 34000),
+            "a line of dashes": lambda: self.deep(("-" + " " * 60) * 110000 + "x\n"),
+            "a value on many lines": lambda: self.deep("k: a\n" + ("  " + "b" * 200 + "\n") * 25000),
+            "a list item's text on many lines": lambda: self.deep("- a\n" + ("    " + "b" * 200 + "\n") * 25000),
+            "a JSON file of 900 levels, read by the filter": lambda: t.kept_back(
+                "a/x.json", b"[" * 900 + b",".join([b"1"] * 14000) + b"]" * 900),
+            "a store's JSON file of 900 levels": lambda: door.store_docs(
+                "a/store.json", b"[" * 900 + b",".join([b"1"] * 14000) + b"]" * 900),
+            "a rule's open strings": lambda: door_render.rule_metrics('"\\' * 32000),
+            "a rule's open label matchers": lambda: door_render.rule_metrics("{" * 200000),
+            "a rule's open ranges": lambda: door_render.rule_metrics("[" * 200000),
+            "a rule's open label lists": lambda: door_render.rule_metrics("by(" * 100000),
+            "an ssh line of @": lambda: door.first_cause(255, "@" * 48000 + "\n", 22),
+        }
+        for name, read in rows.items():
+            with self.subTest(row=name):
+                started = time.thread_time()
+                read()
+                self.assertLess(time.thread_time() - started, self.BOUND)
 
 
 class YamlTags(RenderCase):

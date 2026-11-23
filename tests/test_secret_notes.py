@@ -142,7 +142,8 @@ class Notes(test_grants.Grants):
         self.assertEqual(self.add(login=FOURTH, title="EXAMPLE_API_KEY", kind="api_key", env="EXAMPLE_API_KEY",
                                   fingerprints=self.prints(FOURTH))[0], 200)
         key = dict(kind="api_key", env="OTHER_API_KEY", site="https://api.shop.test", why="The orders API.",
-                   note="The key of the test shop", give_to={"alpha": "use"})
+                   note="The key of the test shop", give_to={"alpha": "use"},
+                   details="1. Open https://shop.test/keys. 2. Click New key, and copy it into the card.")
         text, err = hub.call_tool("manager", "request_secret", key)
         self.assertFalse(err, text)
         nid = hub.q1("SELECT id FROM needs ORDER BY id DESC LIMIT 1")["id"]

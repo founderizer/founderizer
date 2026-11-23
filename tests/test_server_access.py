@@ -20,6 +20,7 @@ from test_mobile import PHONE, Devices
 from test_servers import OTHER, OWNER, Servers, git
 
 DOOR = "127.0.0.20"             # the door's address in these tests: no machine of the fleet
+STEPS = "1. Open https://keys.example.com/new. 2. Click Create key, and copy it into the card."   # a key's details
 
 
 def load_tests(loader, _tests, _pattern):
@@ -1124,7 +1125,7 @@ class DoorCalls(Access):
         self.assertIsNone(hub.q1("SELECT id FROM needs WHERE kind='secret'"))
         said = hub.t_request_secret("manager", {"kind": "api_key", "env": "CLOUDFLARE_ACME_DOOR_TOKEN",
                                                 "site": "https://api.cloudflare.com", "door": "Cloudflare:ACME",
-                                                "why": "Acme's DNS through the door"})
+                                                "why": "Acme's DNS through the door", "details": STEPS})
         nid = hub.q1("SELECT max(id) AS id FROM needs WHERE kind='secret'")["id"]
         self.assertIn(f"N-{nid}", said)
         spec = hub.need_secret(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
@@ -1169,7 +1170,7 @@ class DoorCalls(Access):
         with patch.dict(hub.CENTRAL, {"status": read, "read_at": hub.now(), "error": None}), \
                 patch.object(hub, "save_door_credential", side_effect=AssertionError("a new value names nobody")):
             said = hub.t_request_secret("manager", {"failed": self.ref, "why": "Backblaze refuses the key",
-                                                    "details": "Make a new door key with b2, as the steps say."})
+                                                    "details": STEPS})
             nid = hub.q1("SELECT max(id) AS id FROM needs WHERE kind='secret'")["id"]
             self.assertIn(f"a new value of the API key DOOR_BACKBLAZE_ACME_KEY as N-{nid}", said)
             with hub.LOCK:
@@ -1373,7 +1374,7 @@ class DoorCalls(Access):
         that name, and its answer says which door form puts it in the app's settings."""
         said = hub.t_request_secret("manager", {"kind": "api_key", "env": "STRIPE_SECRET_KEY",
                                                 "site": "https://api.stripe.com", "door": "app:Shop:STRIPE_SECRET_KEY",
-                                                "why": "the shop's payments"})
+                                                "why": "the shop's payments", "details": STEPS})
         nid = hub.q1("SELECT max(id) AS id FROM needs WHERE kind='secret'")["id"]
         self.assertIn(f"N-{nid}", said)
         spec = hub.need_secret(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
@@ -1399,7 +1400,9 @@ class DoorCalls(Access):
         key from it. The tool tells each asker which key that is, and the card is the asker's own words: the owner
         chose no fixed words for it ("No fixed steps"). Since 20 November 2026 (the owner, of such a card with no
         address: "also when possible these tasks should include specific links") the tool gives the address of
-        Cloudflare's own form for that key, which comes with the key's two permissions, and the card keeps it."""
+        Cloudflare's own form for that key, which comes with the key's two permissions, and the card keeps it. A
+        request with no steps is refused with those words (F18), and raises no card; for another provider with the
+        door's own words, which end in a full stop, the refusal ends in one, and it names no door name of the caller."""
         form = urllib.parse.urlsplit(hub.CLOUDFLARE_KEY_FORM)
         asked = urllib.parse.parse_qs(form.query)
         self.assertEqual((form.scheme, form.netloc, asked["to"]), ("https", "dash.cloudflare.com",
@@ -1415,6 +1418,20 @@ class DoorCalls(Access):
                          hub.CLOUDFLARE_KEY_FORM, "with nothing changed", "with that full address"):
                 self.assertIn(part, words)
         ask = {"kind": "api_key", "site": "https://api.cloudflare.com", "why": "Acme's DNS through the door"}
+        with self.assertRaises(hub.ToolError) as none:         # no steps: the refusal gives the form's address (F18)
+            hub.t_request_secret("manager", dict(ask, door="cloudflare:acme"))
+        self.assertIn("An API key needs details: how the owner makes or finds it", str(none.exception))
+        self.assertIn(f" For this key: {hub.DOOR_CLOUDFLARE_KEY}.", str(none.exception))
+        self.assertIn(hub.CLOUDFLARE_KEY_FORM, str(none.exception))
+        for door in ("backblaze:zq9", "hetzner:zq9", "tailscale:zq9"):
+            with self.subTest(door=door):
+                with self.assertRaises(hub.ToolError) as none:
+                    hub.t_request_secret("manager", dict(ask, door=door))
+                said = str(none.exception)
+                self.assertIn(" For this key: " + hub.door_key_words(door).rstrip("."), said)
+                self.assertTrue(said.endswith(".") and not said.endswith(".."), said)
+                self.assertNotIn("zq9", said)
+        self.assertFalse(hub.q("SELECT 1 FROM needs WHERE kind='secret'"))
         details = f"One key that only makes tokens, on {hub.CLOUDFLARE_KEY_FORM} in Acme's account."
         hub.t_request_secret("manager", dict(ask, door="cloudflare:acme", details=details))
         row = hub.q1("SELECT why, details FROM needs WHERE kind='secret' ORDER BY id DESC LIMIT 1")
@@ -1463,7 +1480,8 @@ class DoorCalls(Access):
         self.grant(level="fix")
         self.grant(agent="studio", server="web-2", level="fix")
         self.door_key()
-        ask = {"kind": "api_key", "site": "https://api.cloudflare.com", "door": "cloudflare:acme", "why": "DNS"}
+        ask = {"kind": "api_key", "site": "https://api.cloudflare.com", "door": "cloudflare:acme", "why": "DNS",
+               "details": STEPS}
         with patch.object(hub, "chat_context", return_value=False), \
                 patch.object(hub, "contact_session", return_value=False), \
                 patch.object(hub, "parse_task", return_value=None):
@@ -1680,16 +1698,22 @@ class DoorCalls(Access):
 
     def test_a_door_key_needs_no_env(self):
         """The coordinator, 7 November 2026: the manager's and an agent's first request for a door key were both
-        refused for want of env, which no agent reads. The hub names the key in the vault after its door name."""
+        refused for want of env, which no agent reads. The hub names the key in the vault after its door name. A name
+        that the request gives and that breaks a rule gets that rule (F18), never the words for a name that is too
+        long, which are about the hub's own name."""
         for door, env in (("Cloudflare:Acme", "DOOR_CLOUDFLARE_ACME_KEY"),
                           ("app:shop:STRIPE_SECRET_KEY", "DOOR_APP_SHOP_STRIPE_SECRET_KEY")):
             with self.subTest(door=door):
-                hub.t_request_secret("manager", {"kind": "api_key", "door": door, "why": "a test"})
+                hub.t_request_secret("manager", {"kind": "api_key", "door": door, "why": "a test", "details": STEPS})
                 nid = hub.q1("SELECT max(id) AS id FROM needs WHERE kind='secret'")["id"]
                 self.assertEqual(hub.need_secret(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))["env"], env)
         with self.assertRaisesRegex(hub.ToolError, "give env, a shorter name"):
             hub.t_request_secret("manager", {"kind": "api_key", "door": "app:shop:" + "A" * 60 + "_KEY",
                                              "why": "a test"})
+        with self.assertRaisesRegex(hub.ToolError, "CLOUDFLARE_AUTHKEY does not end as an API key's name does: .* for "
+                                                   "example CLOUDFLARE_AUTH_KEY"):
+            hub.t_request_secret("manager", {"kind": "api_key", "door": "cloudflare:two", "env": "CLOUDFLARE_AUTHKEY",
+                                             "why": "a test", "details": STEPS})
 
     def test_nobody_can_ask_for_a_model_key_for_the_door(self):
         """The owner, 11 November 2026: "no, I dont want any api key! it needs to be the agent itself". The door calls
@@ -2903,7 +2927,7 @@ class DoorCalls(Access):
     def test_the_manager_may_propose_the_door_as_the_holder_of_a_new_key(self):
         text = hub.t_request_secret("manager", {"kind": "api_key", "env": "HETZNER_TOKEN",
                                                 "site": "https://api.hetzner.cloud", "why": "the door's power cycle",
-                                                "give_to": {"door": "use"}})
+                                                "give_to": {"door": "use"}, "details": STEPS})
         self.assertNotIn("give_to names workers", text)
         need = hub.q1("SELECT secret FROM needs ORDER BY id DESC LIMIT 1")
         self.assertEqual(json.loads(need["secret"])["give"], {"door": "use"})

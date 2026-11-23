@@ -95,10 +95,11 @@ def kind_line(names):
 
 # The three reference forms take each key that ENDS in secretKeyRef, secretRef or secretName, in any case (a CSI
 # volume's nodePublishSecretRef, a store's tokenSecretRef), and the operator's kinds each group of external-secrets.io
-# (generators.external-secrets.io too).
+# (generators.external-secrets.io too). A match starts at a word's start, and (?<!\w) keeps the search there: from
+# each place of a long word, \w* would read the rest of it again.
 MANIFEST_REFUSED = {
-    "a new secretKeyRef": r"(?i:\w*secretKeyRef)\s*:", "a new secretRef": r"(?i:\w*secretRef)\s*:",
-    "a new secret volume": ITEM + r"(?i:secret)[ \t]*:[ \t\r]*(?:#.*)?$|(?i:\w*secretName)\s*:",
+    "a new secretKeyRef": r"(?<!\w)(?i:\w*secretKeyRef)\s*:", "a new secretRef": r"(?<!\w)(?i:\w*secretRef)\s*:",
+    "a new secret volume": ITEM + r"(?i:secret)[ \t]*:[ \t\r]*(?:#.*)?$|(?<!\w)(?i:\w*secretName)\s*:",
     "a hostPath": r"\bhostPath\s*:",
     "privileged": r"\bprivileged\s*:" + TRUE, "a host namespace": r"\bhost(Network|PID|IPC)\s*:" + TRUE,
     "an Application": kind_line("Application|ApplicationSet|AppProject"),
@@ -140,7 +141,7 @@ PLAIN = (r"(?:[\w./~+=$^(]|-(?=[\w.$-]))"       # a plain value of a flow sequen
          r"(?:[^\s,\[\]{}#:]|:(?=[^\s,\[\]{}])|[ \t]+(?=[^\s,\[\]{}#:]))*")
 NOT_PLAIN = "\"'{[|>&*!%@`"                    # what a plain key or a plain value never starts with
 FLOW_ONE = f"(?:{DQ}|{SQ}|{PLAIN})"
-FLOW_LIST = re.compile(rf"\[[ \t]*(?:{FLOW_ONE}[ \t]*(?:,[ \t]*{FLOW_ONE}[ \t]*)*,?[ \t]*)?\]")
+FLOW_LIST = re.compile(rf"\[[ \t]*(?:{FLOW_ONE}[ \t]*(?:,[ \t]*{FLOW_ONE}[ \t]*)*(?:,[ \t]*)?)?\]")
 NPM_AGE = 7 * 86400          # min-release-age=7, which npm ci does not check on a lockfile: the door does
 
 
@@ -519,7 +520,8 @@ def secret_use(node, key=None):
             if found:
                 return found
     elif isinstance(node, str):
-        for text in re.findall(r"\$\{\{(.*?)\}\}", node, re.S) + ([node] if key == "if" else []):
+        # read up to the last }}: a ${{ after it closes nothing, and each one would read the rest again
+        for text in re.findall(r"\$\{\{(.*?)\}\}", node[:node.rfind("}}") + 2], re.S) + ([node] if key == "if" else []):
             if re.search(r"\bsecrets\b", re.sub(r"\bsecrets\s*\.\s*GITHUB_TOKEN\b", "", text, flags=re.I), re.I):
                 return f"the secret in {text.strip()[:80]!r}"
     return None
@@ -673,6 +675,12 @@ def decide_commit(access, agent, me, repo, op, args, content, lookups):
     return Decision("rule", "a checked change of the listed forms", target=f"commit:{repo}", plan=plan)
 
 
+# A rule call's changed line: a replica count, or an image, a tag or a digest. (?:-\s*)? and not -?\s*, as in
+# LISTED_LINE.
+LISTED_REPLICAS = re.compile(r"\s*(?:-\s*)?replicas\s*:\s*\d{1,2}\s*")
+LISTED_IMAGE = re.compile(r"\s*(?:-\s*)?(image|tag|digest|newTag|newName)\s*:\s*\S+\s*")
+
+
 def app_path_rule(path, data, lookups, repo):
     """True for a rule form, "refused: ..." for a refusal, else the reason that it is the agent's own call."""
     base = os.path.basename(path)
@@ -688,9 +696,9 @@ def app_path_rule(path, data, lookups, repo):
     changed = changed_lines(old, data)
     if changed is None:
         return f"{path} changes more than its values"
-    if all(re.fullmatch(r"\s*-?\s*replicas\s*:\s*\d{1,2}\s*", line) for line in changed):
+    if all(LISTED_REPLICAS.fullmatch(line) for line in changed):
         return True
-    if all(re.fullmatch(r"\s*-?\s*(image|tag|digest|newTag|newName)\s*:\s*\S+\s*", line) for line in changed):
+    if all(LISTED_IMAGE.fullmatch(line) for line in changed):
         return image_rule(old, data, lookups)
     return f"{path}: {changed[0].strip()[:80]} is not a listed form"
 
@@ -726,7 +734,7 @@ def image_rule(old, new, lookups):
     """A checked image: the same repository name, and a green release run of that repository made this tag or
     digest."""
     def refs(data):
-        return re.findall(r"^\s*-?\s*image\s*:\s*['\"]?([^\s'\"]+)", data.decode("utf-8", "replace"), re.M)
+        return re.findall(r"^[^\S\n]*(?:-\s*)?image\s*:\s*['\"]?([^\s'\"]+)", data.decode("utf-8", "replace"), re.M)
     before, after = refs(old), refs(new)
     made = lookups.get("image_made") or (lambda image: False)
     for x, y in zip(before, after):
@@ -911,6 +919,40 @@ def unread(text):
     return None
 
 
+# The most that as_block and as_lines write out of parsed documents. A line starts with two spaces for each of its
+# levels, and each level copies the lines in it: a JSON file of 41 KB with 900 levels took 17 s and 2.5 GB. The levels:
+# the deepest real manifest known is the schema of a custom resource, about 35 levels (Argo CD's ApplicationSet,
+# counted by hand along its path). The text: a cluster keeps no object over 1.5 MB, 3 to 5 MB of lines at such levels.
+TREE_LEVELS, TREE_TEXT = 64, 8 * 1024 * 1024
+
+
+class TreeLimit(ValueError):
+    "Parsed documents over the limits of tree_limit, which no code writes out as lines."
+
+
+def tree_limit(docs):
+    """Why code does not write these parsed documents out as lines (as_block, as_lines), or None: more than TREE_LEVELS
+    levels of mappings and lists, or more than TREE_TEXT characters of lines, with the spaces of each line's level and
+    with each line of a text on its own, as as_lines writes it. It is measured level by level, before any line is
+    written."""
+    size, level = 0, [doc for doc in docs if isinstance(doc, (dict, list))]
+    for n in range(TREE_LEVELS):
+        below = []
+        for node in level:
+            for key, v in node.items() if isinstance(node, dict) else ((None, v) for v in node):
+                text = v if isinstance(v, str) else ""
+                lines = len(text.splitlines())
+                size += (2 * n + 4) * (1 + (lines if lines > 1 else 0)) + len(text) + len(str(key or ""))
+                if isinstance(v, (dict, list)):
+                    below.append(v)
+            if size > TREE_TEXT:
+                return f"more than {TREE_TEXT // 2 ** 20} MB of lines, as code writes its keys and items out"
+        if not below:
+            return None
+        level = below
+    return f"more than {TREE_LEVELS} levels of mappings and lists"
+
+
 def as_block(value, depth=0):
     """A JSON value as the block style lines that say the same, for the patterns: one key or one item on each line."""
     def flat(v):
@@ -942,7 +984,10 @@ def as_lines(value, depth=0):
 
 
 def lines_text(docs):
-    "Documents as as_lines writes them, one document each: the second text of the count."
+    "Documents as as_lines writes them, one document each: the second text of the count. TreeLimit: tree_limit."
+    why = tree_limit(docs)
+    if why:
+        raise TreeLimit(why)
     return "---\n".join(as_lines(doc) for doc in docs if isinstance(doc, (dict, list)))
 
 
@@ -965,7 +1010,8 @@ def manifest_text(path, data):
             why = unread(text)
             return (None, why) if why else (text, None)
         value = json.loads(text, object_pairs_hook=no_key_twice)
-        return (as_block(value) if isinstance(value, (dict, list)) else text), None
+        why = tree_limit([value])
+        return (None, why) if why else ((as_block(value) if isinstance(value, (dict, list)) else text), None)
     except UnicodeDecodeError:
         return None, "bytes that are not UTF-8"
     except (ValueError, RecursionError):
@@ -1078,15 +1124,16 @@ def kept_back(path, data):
     elif secret_object(text) or "-----BEGIN" in text:
         return "holds a Secret, which the filter keeps back"
     # the loose reading too for a file with another name than .yaml, .yml or .json, which no reader reads by lines
-    if (why or not manifest_name(path)) and (loose_secret(text) or "-----BEGIN" in text):
+    if (why or not manifest_name(path)) and (loose_secret(text) or "-----begin" in loose_text(text)):
         return "may hold a Secret, which the filter keeps back"
     return None
 
 
-# The lines that a commit changes in a YAML file that code reads only loosely: the values of decide_gitops's rule calls
-LISTED_LINE = re.compile(r"\s*-?\s*replicas\s*:\s*\d{1,2}\s*|"
+# The lines that a commit changes in a YAML file that code reads only loosely: the values of decide_gitops's rule calls.
+# (?:-\s*)? and not -?\s*: two runs side by side can split a long run of spaces at each place, which takes minutes.
+LISTED_LINE = re.compile(r"\s*(?:-\s*)?replicas\s*:\s*\d{1,2}\s*|"
                          r"\s*[\w./-]*restartedAt['\"]?\s*:\s*['\"]?[0-9T:.Z+-]{10,40}['\"]?\s*|"
-                         r"\s*-?\s*(?:image|tag|digest|newTag|newName)\s*:\s*[\w./:@-]+\s*")
+                         r"\s*(?:-\s*)?(?:image|tag|digest|newTag|newName)\s*:\s*[\w./:@-]+\s*")
 # What makes a file that no parser of the door reads one that changes only on listed lines (the rule of references to
 # Secrets, A8): a key that contains secret, with its spaces kept, so that "the secrets of an application:" in a README
 # is no key; an apiVersion of the operator's groups, of the Secrets Store CSI driver, of Argo CD or of RBAC; and, where
@@ -1096,10 +1143,11 @@ LISTED_LINE = re.compile(r"\s*-?\s*replicas\s*:\s*\d{1,2}\s*|"
 HELD_GROUPS = (r"(?:(?:[\w-]+\.)*external-secrets\.io|argoproj\.io|secrets-store\.csi\.x-k8s\.io|"
                r"rbac\.authorization\.k8s\.io)/")
 # A key's colon may stand on the next line: in a flow mapping ({"secretKeyRef"\n: ...}) and after YAML's explicit key
-# (? secretKeyRef\n: ...).
-NAMES_SECRET = re.compile(r"(?<![\w.-])(?!imagepullsecrets[\"']?\s*:)[\w.-]*secret[\w.-]*[\"']?\s*:")
+# (? secretKeyRef\n: ...). A match is a whole word that holds the name (a lookahead), from the word's start: with a
+# [\w.-]* on each side of the name, a long word of it took minutes.
+NAMES_SECRET = re.compile(r"(?<![\w.-])(?!imagepullsecrets[\"']?\s*:)(?=[\w.-]*?secret)[\w.-]*[\"']?\s*:")
 NAMES_HELD = re.compile(r"apiversion[\"']?\s*:\s*[\"']?" + HELD_GROUPS)
-NAMES_ACCOUNT = re.compile(r"[\w.-]*serviceaccount[\w.-]*[\"']?\s*:")
+NAMES_ACCOUNT = re.compile(r"(?<![\w.-])(?=[\w.-]*?serviceaccount)[\w.-]*[\"']?\s*:")
 
 
 def uncommented(text):
@@ -1160,18 +1208,31 @@ def sensitive(docs):
     return out
 
 
+BLOCK_DASH = re.compile(r"-(?:[ \t]+|$)")      # the dash of a list item, with the blanks after it
+
+
 def block_tree(text, strict=False):
     """A text that unread reads as block style, as the tree of mappings, lists and texts that it says, for sensitive:
     a value is the text of its line with no comment and no quotes, and a block scalar's value its lines. Each
-    document of the text is one item of the list that it gives. strict: a key that one mapping holds twice is a
-    ValueError, as in no_key_twice, where this reader would take its last value and a cluster's reader may take
-    another or refuse the file (door.store_docs)."""
+    document of the text is one item of the list that it gives. strict (door.store_docs): a form that this reader
+    reads in another way than a cluster's reader is a ValueError. That is a key twice in one mapping (this reader
+    takes its last value, and a cluster's reader may take another or refuse the file, as in no_key_twice); a \\ in
+    double quotes, a '' in single quotes, and a # with space before it in either (this reader takes no escape, and it
+    cuts a comment inside the quotes too, so "ma\\x69n" is another name for it than for a cluster); a block scalar as
+    the value of a name or a namespace (its lines keep their spaces here, and not in YAML); and a document mark or an
+    end mark with space before it, outside a block scalar (this reader skips it, and YAML reads a text). A comment
+    starts at a # at the start of a text or after one space or tab, and strip takes the spaces before it: a pattern with
+    a run of spaces before its # reads a long run again from each of its places (a line of 1 MB took over an hour)."""
     def split(text):
         colon = re.search(r":(?=[ \t]|$)", text)
         return (text[:colon.start()].rstrip(" \t"), text[colon.end():].strip(" \t")) if colon else (None, text)
 
     def value(text):
-        text = re.sub(r"(?:^|[ \t]+)#.*$", "", text).strip(" \t")
+        if strict and text[:1] in ("\"", "'"):
+            quoted = re.match(DQ if text[0] == '"' else SQ, text)
+            if not quoted or re.search(r"\\|[ \t]#" if text[0] == '"' else r"''|[ \t]#", quoted.group()[1:-1]):
+                raise ValueError("a quoted text that the block reader reads in another way than YAML")
+        text = re.sub(r"(?:^|[ \t])#.*$", "", text).strip(" \t")
         return text[1:-1] if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'" else text
     rows = []                   # [column, text, the lines of its block scalar or None]
     scalar = None               # (the column that its lines stand to the right of, its lines)
@@ -1183,20 +1244,24 @@ def block_tree(text, strict=False):
                 scalar[1].append(line)
                 continue
             scalar = None
-        if not rest.strip(" \t") or rest.startswith("#") or re.fullmatch(r"(?:---|\.\.\.)[ \t]*(?:#.*)?", rest):
+        mark = re.fullmatch(r"(?:---|\.\.\.)[ \t]*(?:#.*)?", rest)
+        if strict and mark and col > 0:
+            raise ValueError("a document mark or an end mark with space before it")
+        if not rest.strip(" \t") or rest.startswith("#") or mark:
             continue
-        owner = col
-        while re.match(r"-(?:[ \t]+|$)", rest):
-            dash = re.match(r"-[ \t]*", rest).end()
+        owner = col             # col walks the line past its dashes: a copy of the rest at each dash took seconds
+        dash = BLOCK_DASH.match(line, col)
+        while dash:
             rows.append([col, "-", None])
-            owner, col, rest = col, col + dash, rest[dash:]
-        rest = rest.rstrip(" \t")
+            owner, col = col, dash.end()
+            dash = BLOCK_DASH.match(line, col)
+        rest = line[col:].rstrip(" \t")
         if not rest:
             continue
         rows.append([col, rest, None])
         # a block scalar: the value after its key, with no comment, or the text after a dash, is | or > alone
         key, said = split(rest)
-        if re.fullmatch(r"[|>][-+0-9]*", re.sub(r"(?:^|[ \t]+)#.*$", "", said).strip(" \t")):
+        if re.fullmatch(r"[|>][-+0-9]*", re.sub(r"(?:^|[ \t])#.*$", "", said).strip(" \t")):
             rows[-1][2] = []
             scalar = (col if key is not None else owner, rows[-1][2])
 
@@ -1212,11 +1277,12 @@ def block_tree(text, strict=False):
                 items.append(item)
             return items, i
         key, said = split(rows[i][1])
-        if key is None:         # a text, and the lines that go on with it
-            text, lines, i = rows[i][1], rows[i][2], i + 1
+        if key is None:         # a text, and the lines that go on with it (joined once: a join at each took seconds)
+            parts, lines, i = [rows[i][1]], rows[i][2], i + 1
             while i < len(rows) and rows[i][0] > col and rows[i][1] != "-":
-                text, i = text + " " + rows[i][1], i + 1
-            return ("\n".join(lines) if lines is not None else value(text)), i
+                parts.append(rows[i][1])
+                i += 1
+            return ("\n".join(lines) if lines is not None else value(" ".join(parts))), i
         out = {}
         while i < len(rows) and rows[i][0] == col and rows[i][1] != "-":
             key, said = split(rows[i][1])
@@ -1224,11 +1290,15 @@ def block_tree(text, strict=False):
                 raise ValueError("a key is there twice")
             lines, i = rows[i][2], i + 1
             if lines is not None:
+                if strict and key in ("name", "namespace"):
+                    raise ValueError("a block scalar as a name: its lines keep their spaces here, and YAML's do not")
                 out[key] = "\n".join(lines)
             elif said and not said.startswith("#"):
+                parts = [said]
                 while i < len(rows) and rows[i][0] > col and rows[i][1] != "-":
-                    said, i = said + " " + rows[i][1], i + 1
-                out[key] = value(said)
+                    parts.append(rows[i][1])
+                    i += 1
+                out[key] = value(" ".join(parts))
             elif i < len(rows) and (rows[i][0] > col or rows[i][0] == col and rows[i][1] == "-"):
                 out[key], i = node(i, rows[i][0])
             else:
@@ -1303,7 +1373,7 @@ def storage_grew(old_text, new_text):
 
 def quantity(text):
     m = re.fullmatch(r"([0-9.]+)([KMGTP])(i?)", text, re.I)        # in lower case too, for the loose reading
-    if not m or not re.fullmatch(r"[0-9]+[.]?[0-9]*|[.][0-9]+", m.group(1)):
+    if not m or not re.fullmatch(r"[0-9]+(?:[.][0-9]*)?|[.][0-9]+", m.group(1)):     # not [.]?: two runs side by side
         return 0
     return float(m.group(1)) * (1024 if m.group(3) else 1000) ** ("KMGTP".index(m.group(2).upper()) + 1)
 
@@ -1938,7 +2008,7 @@ def object_key(doc):
 
 def plain_value(value):
     "The value of one block style line as text, with no comment and no quotes, or None when it is not a plain one."
-    value = re.sub(r"[ \t]+#.*$", "", value).strip()
+    value = re.sub(r"[ \t]#.*$", "", value).strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
         value = value[1:-1]
     return value if value and not value.startswith(("{", "[", "|", ">", "&", "*", "!")) else None
@@ -2610,7 +2680,10 @@ def reference_card(cards, target, plan):
 
 def objects_text(docs):
     """Objects as the block style lines that say the same, one document each: what the patterns read of a render,
-    and of a file that the real parser read."""
+    and of a file that the real parser read. TreeLimit: tree_limit."""
+    why = tree_limit(docs)
+    if why:
+        raise TreeLimit(why)
     return "---\n".join(as_block(doc) for doc in docs)
 
 
@@ -2652,6 +2725,9 @@ def render_refusal(report, words=None):
             if not after:
                 continue            # an object that the commit takes away adds nothing
             what = f"{where}, rendered with {group['set']}: {group['object']}"
+            why = tree_limit(after) or tree_limit(before)
+            if why:
+                return f"{what} has {why}, after the commit or at HEAD, which the door does not read", []
             if any(isinstance(o.get("kind"), str) and o["kind"].lower() == "secret" and o not in before
                    for o in after):
                 return f"{what} is a new or a changed Secret object, which no commit passes", []
@@ -2767,6 +2843,13 @@ def gitops_files(lookups, op, target, plan, files, report):
                           "")
         # ArgoCD runs a jsonnet file of a folder that it applies file by file, and no render of a chart shows it
         runs = path.lower().endswith((".jsonnet", ".libsonnet"))
+        # the documents that code writes out as lines below, after the commit and at HEAD
+        written = [json_docs(path, data), json_docs(path, old)] if path.lower().endswith(".json") else \
+            [docs, info.get("before")]
+        why = next((w for w in (tree_limit(d) for d in written if isinstance(d, list)) if w), None)
+        if why:
+            return refused(f"{path} has {why}, after the commit or at HEAD, which the door does not read",
+                           target=target)
         loose_yaml = block = lines = False
         text = None                 # None: nothing applies this file as it is, and only its render says what it does
         if loose_read(path, data, old) and parsed is None and (not whole or runs or (yaml_name and docs is None)):
@@ -2883,12 +2966,12 @@ def gitops_files(lookups, op, target, plan, files, report):
             # in a file that code does not read by lines, a line can hold more than its first key: a rule call
             # there is a change of listed lines only
             own = own or f"{path} changes more than its values"
-        elif all(re.fullmatch(r"\s*-?\s*replicas\s*:\s*\d{1,2}\s*", line) for line in changed):
+        elif all(LISTED_REPLICAS.fullmatch(line) for line in changed):
             continue
         elif all(re.fullmatch(r"\s*[\w./-]*restartedAt['\"]?\s*:\s*['\"]?[0-9T:.Z+-]{10,40}['\"]?\s*", line)
                  for line in changed):
             continue
-        elif all(re.fullmatch(r"\s*-?\s*(image|tag|digest|newTag|newName)\s*:\s*\S+\s*", line) for line in changed):
+        elif all(LISTED_IMAGE.fullmatch(line) for line in changed):
             ok = image_rule(old, data, lookups)
             if ok is not True:
                 own = own or ok

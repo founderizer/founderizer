@@ -1261,7 +1261,8 @@ check("request_secret: nobody reads a login", err and '"use"' in text, text)
 text, err = tool("manager", "request_secret", base=hubS, env="STRIPE_SECRET_KEY", why="Billing")
 check("request_secret: a key the catalog has is refused, with its reference", err and STRIPE in text, text)
 text, err = tool("manager", "request_secret", base=hubS, env="OPENAI_API_KEY", site="https://api.openai.com",
-                 why="studio writes the product copy", give_to={"studio": "read"})
+                 why="studio writes the product copy", give_to={"studio": "read"},
+                 details="1. Open https://platform.openai.com/api-keys. 2. Click Create new secret key.")
 check("request_secret raises a Needs-you item and says the value never passes the manager",
       not err and "N-1" in text and "never its value" in text, text)
 text, err = tool("manager", "request_secret", base=hubS, env="OPENAI_API_KEY", why="again")

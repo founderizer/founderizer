@@ -7,6 +7,8 @@ import json
 import os
 import re
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 import urllib.error
@@ -17,6 +19,7 @@ from unittest.mock import patch
 
 import hub
 import test_ui_api
+from leftovers import ROOT
 
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
 JPEG = b"\xff\xd8\xff" + bytes(range(64))
@@ -688,9 +691,13 @@ class Attachments(test_ui_api.OwnerAPI):
         kept = os.path.join(self.files.name, one["sha256"] + ".png")
         self.assertTrue(os.path.exists(kept))
         self.assertFalse(os.path.abspath(kept).startswith(os.path.dirname(os.path.abspath(hub.__file__)) + os.sep))
-        hub.CFG.pop("attachment_dir")
-        self.assertEqual(hub.ATTACH_DIR, os.path.expanduser("~/.fleet/attachments"))
-        hub.CFG["attachment_dir"] = self.files.name
+        # hub.ATTACH_DIR is fixed when hub.py loads, from HOME at that time: a fresh hub.py, loaded with a HOME of this
+        # test, names the folder in that HOME. HOME read now, in this process, says nothing of what that load used.
+        with tempfile.TemporaryDirectory(prefix="fleet-attach-home-") as home:
+            loaded = subprocess.run([sys.executable, "-c", "import hub; print(hub.ATTACH_DIR)"], cwd=ROOT,
+                                    env=dict(os.environ, HOME=home), capture_output=True, text=True, timeout=120)
+            self.assertEqual(loaded.returncode, 0, loaded.stderr)
+            self.assertEqual(loaded.stdout.strip(), os.path.join(home, ".fleet", "attachments"))
 
     # ---- the sweep: what the hub lets go
 

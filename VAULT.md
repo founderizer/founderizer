@@ -897,17 +897,41 @@ host.
     of another person at a provider (`fetch_sealed` in `door.py`). The same hub can also make the door delete a value
     that it holds (the `keep` list). It can also send the sealed copy of one key again under the reference of another,
     because the door keeps an opened copy under the `login` that the hub names and the central vault seals only the
-    value: so a provider's key can reach an app's setting, and the door writes it onto a host. A signature of the
-    central vault on each copy, which names its reference and which the door checks before it
-    keeps the copy, closes the first and the last of these; it is planned (22 November 2026), not built.
+    value: so a provider's key that the door has not held under its provider's name (the door's record, below) can
+    reach an app's setting, and the door writes it onto a host. A signature of the central vault on each copy, which
+    names its reference and which the door checks before it keeps the copy, closes the first and the last of these; it
+    is planned (22 November 2026), not built.
     The names in the door's file are the hub's word too. The Mac writes each card credential's name, the reference of
-    the secret behind it, and the providers of each agent as the hub's view gives them (`DoorAccess.swift`). So the
-    same hub can drop a credential, and the door then deletes its value. It can also point a credential of an app's
-    setting (`app:<app>:<NAME>`) at the reference of a provider's key, give that credential to an agent that it
-    steers, and the door then writes the provider's key into that app's settings on a host. A signature on the copy
-    does not stop this, because the value is the right one. The fix is planned with the signed copies: the owner's
-    grant to the door names its credential, and the door keeps and gives a value only under that name. Until then the
-    Mac is to refuse a reference that moves to another credential name (22 November 2026), not built.
+    the secret behind it, and the providers of each agent as the hub's view gives them (`DoorAccess.swift`). So the same
+    hub can drop a credential, and the door then deletes its value. It can also point a credential of an app's setting
+    (`app:<app>:<NAME>`) at the reference of another key, and give that credential to an agent that it steers. A
+    signature on the copy does not stop this, because the value is the right one. So the door keeps a record of its own,
+    which no later file changes: the first name of each reference that its file names, and a mark (an SHA-256 with no
+    salt) of each value that it holds under a provider's first name. Both stay after the credential and its value are
+    gone. The door gives a key to an app's setting only when that setting is the first name of the key's reference, and
+    never a provider's key of that record or the key of a GitHub App. While the door cannot read or write the record, or
+    the record is full, it gives no saved key to an app, and its calls to the providers go on (`keep_names` and
+    `setting` in `door.py`). A key that the door knew first under another name cannot become an app's setting: the owner
+    ends the door's hold of that key (the owner tool `grant_access`, resource `secret:<reference>`, agent `door`, no
+    level), then removes the key in Secrets, and the next key card of that setting makes a new reference, under which
+    the door gives the key. A provider's key stays out of the app then too, and the owner makes another key for it. The
+    same value under a new reference is refused only for a provider's key: the value of an app's key, or of a database's
+    login, can come again under another app's new reference. While the record is full or cannot be read, the owner puts
+    an earlier copy of it back on the door's server, or removes it, after they checked the hub and replaced at its
+    provider each provider key that the door held: the record then forgets what came after, and a hub that is broken
+    into can fill it on purpose, because it can seal any value to the door. What stays open: the first name of a new key
+    is the hub's word, and so is the reference of a value that the door has not held yet. The record begins with the
+    file and the values of the day of the door's update, or of its install, so it knows no move from before that day.
+    The login of a database (`db:<name>`) has a first name and no mark, because a person can choose its password: so a
+    broken hub can send that login's copy again under the reference of an app's new setting, and the door then writes it
+    onto a host. The fix is planned with the signed copies (22 November 2026), not built: the owner's grant to the door
+    names its credential, and the door keeps and gives a value only under that name.
+
+    The door's own server is a server at a provider. If a credential of the door is a server provider's token, and the
+    project of that token also holds the door's server, whoever reads the central vault's store (limit 4) can take the
+    door's server with the provider's rescue system, and so can write the door's file. The door's server belongs in a
+    project (an account) of its own, for which the fleet holds no token. This is a limit of today, and no code checks
+    it.
 16. **The links between the machines.** The hub serves HTTP, not HTTPS (`hub.py`). It depends on the fleet's private
     network, Tailscale, to protect these links (`HUB-INSTALL.md`, "The private network" and "The firewall"). Agent keys
     and job numbers go over them. A value of a secret goes over them only as a sealed copy, except a key that
@@ -1083,6 +1107,18 @@ host.
     gate (`hub.sh`); on a joined server also the firewall and the hardening (`join.sh`). If that user is broken into, root
     runs that user's code, and on the hub's server it can read the vault's store. The second claim of a lost Mac
     (`HUB-INSTALL.md`) is such a run. The check of a later update of the checkout is that user's program too.
+
+29. **The hub's ports on a server that also runs agents.** The hub listens on 8765, its git service on 9418, and the
+    link of a Mac's installer on 8767. A user of that server can listen on a port that no program holds. So while
+    the hub or the git service does not run (a crash, a restart by hand, a start of the server, a release that changes
+    the text of a service's unit), an agent's own user on that server can listen on the port in its place. The vault's
+    program on the server then takes that user's program as the hub, and gives it what it gives the hub: the keys of
+    other agents and of the pool. The local agents' keys of that server, its service key and the key of the chat
+    bridge reach it too, and they stay good. The agent needs no break-out of its account. This holds today for a fleet
+    of one server, and for each fleet that has an agent on the hub's server. In that time the program also answers the
+    other servers' helpers and brokers, and the door, as the hub does. The central vault answers the hub's own user
+    only, and the owner's pins stay as they are. A hub on a server with no agents does not have this limit (`hub.py`,
+    `vault.py`, `lifecycle.py`).
 
 ## What the owner must do
 

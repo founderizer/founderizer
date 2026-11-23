@@ -632,7 +632,7 @@ class Resources(OwnerAPI):
         self.assertIsInstance(nid, int, nid)
         need = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
         self.assertEqual(need["options"], ["Give Dev write", "No: keep it read-only"])
-        self.assertEqual(need["give"], {"agent": "dev", "level": "write", "repos": ["acme/web"]})
+        self.assertEqual(need["give"], {"agent": "dev", "level": "write", "repos": ["acme/web"], "resources": []})
         # the hub writes Give, so the manager's recommendation "Give" is that option (owner API 1.269), and a word
         # that is no option is refused
         hub.q("DELETE FROM needs WHERE id=?", (nid,))
@@ -673,7 +673,9 @@ class Resources(OwnerAPI):
         self.assertEqual(self.request(f"/ui/needs/{third}", self.command(choice=0))[0], 200)
         self.assertEqual(self.committed()["agents"]["lead"]["repos"], {"acme/docs": "deploy"})
         # what one press cannot give is refused before it reaches the owner
-        for fields, words in ((dict(needs_access=f"secret:{KEY}"), "repositories only"),
+        for fields, words in ((dict(needs_access=f"secret:{KEY}"), "or one gmail:, drive: or tool: alone"),
+                              (dict(needs_access=f"secret:{KEY}", needs_level="use"),    # its kind before its level
+                               "or one gmail:, drive: or tool: alone"),
                               (dict(needs_agent="nobody"), "there is no agent nobody"),
                               (dict(needs_agent="manager"), "manager is not one now"),
                               (dict(needs_level="admin"), "the level that Give gives"),
@@ -687,9 +689,14 @@ class Resources(OwnerAPI):
                 self.assertIn(words, said)
 
     def test_a_give_card_for_several_repositories_closes_by_itself_once_given_another_way(self):
+        """And a card for a mailbox, once the owner gave it on its own page (F6 piece 2). Believable bug: a card that
+        stays open, so that its press gives what the agent holds already, or that closes before the agent holds it."""
         nid = self.give_card(title="Let Lead read the shop's repositories", why="Its review reads them.",
                              needs_access="repo:acme/api, repo:acme/docs", needs_level="read", needs_agent="lead",
                              options=None)
+        mail = self.give_card(title="Let Lead read support@shop.test", why="Its review reads that mail.",
+                              needs_access="gmail:support@shop.test", needs_level="read", needs_agent="lead",
+                              options=None)
         need = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
         self.assertEqual(need["options"], ["Give Lead read on 2 repositories", "No"])
         self.assertIn("Give gives Lead read access to these repositories:\n- acme/api\n- acme/docs", need["details"])
@@ -701,20 +708,35 @@ class Resources(OwnerAPI):
         t0 = hub.now()
         hub.need_look_sweep(t0)             # held now: the card waits a moment for a press that answers it
         self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"])
+        code, given = self.request("/ui/team/google", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                       "base_sha256": self.pool()["sha256"], "service": "gmail",
+                                                       "account": "support@shop.test", "access": {"lead": "write"}})
+        self.assertEqual(code, 200, given)
         hub.need_look_sweep(t0 + hub.NEED_GIVE_WAIT + 1)
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"],
                          "Closed by the hub: Lead has read access to the 2 repositories now, given another way.")
-        self.assertIn(f"N-{nid} (Let Lead read the shop's repositories)",
-                      hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC LIMIT 1")["text"])
+        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (mail,))["answer"])     # seen a moment ago
+        hub.need_look_sweep(t0 + 2 * hub.NEED_GIVE_WAIT + 2)
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (mail,))["answer"],
+                         "Closed by the hub: Lead has read access to the Gmail mailbox support@shop.test now, given "
+                         "another way.")
+        told = [r["text"] for r in hub.q("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC LIMIT 2")]
+        self.assertIn(f"N-{nid} (Let Lead read the shop's repositories)", told[1])
+        self.assertIn(f"N-{mail} (Let Lead read support@shop.test)", told[0])
 
     def test_only_a_press_of_give_on_the_mac_or_a_pc_gives(self):
         """A phone shows no Details, so its press gives nothing and answers nothing; Give's words typed give nothing
         either; and a card whose agent left the fleet closes, at a press and by itself."""
         nid, before = self.give_card(), self.commits()
+        mail = self.give_card(title="Let Lead answer support@shop.test", why="It answers that mail.", options=None,
+                              needs_access="gmail:support@shop.test", needs_level="send", needs_agent="lead")
         with patch.object(hub, "owner_device_at", lambda address: "phone" if address == "100.64.0.9" else None), \
                 patch.object(hub, "owner_device_class", lambda device: "iPhone" if device == "phone" else None):
-            code, said = hub.phone_submit(self.command(choice=0), "a phone", nid, address="100.64.0.9")
-        self.assertEqual((code, said["error"]), (409, hub.TEAM_PRESS_WHERE))
+            for card in (nid, mail):        # a repository, and a mailbox (F6 piece 2)
+                code, said = hub.phone_submit(self.command(choice=0), "a phone", card, address="100.64.0.9")
+                self.assertEqual((code, said["error"]), (409, hub.TEAM_PRESS_WHERE))
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (mail,))["answer"], None)
+        self.assertNotIn("google", self.committed()["agents"]["lead"])
         code, said = self.request(f"/ui/needs/{nid}", self.command(answer="give dev write"))
         self.assertEqual((code, said["error"]), (409, hub.TEAM_PRESS_WORDS))
         self.assertEqual((self.commits(), hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"]),
@@ -727,3 +749,205 @@ class Resources(OwnerAPI):
                       f"nothing. The hub closed the card.",
                       hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC LIMIT 1")["text"])
         self.assertEqual(self.commits(), before)
+
+    def test_give_on_a_card_gives_one_mailbox_drive_or_mcp_server_and_takes_none_away(self):
+        """F6 piece 2: Give on a card for a mailbox gives that level of that mailbox to that agent at the owner's press,
+        and nothing before it. Believable bugs: a press that gives more than the card named (the account's Drive, a
+        higher level, another agent); an option that does not say what it gives, which on the Mac, where the card
+        draws no step, lets a card about mail give the Drive of the same address; a card for a thing that the fleet
+        does not hold or whose grant the owner's Mac signs (an MCP server with a key); a Give that takes the place of
+        the agent's Drive of another account; a press that lowers a level given another way, or gives after a fact
+        that the card checked changed; and more open items with Give than the hub counts."""
+        mail = dict(title="Let Dev read support@shop.test", why="Its triage reads the mail of support@shop.test.",
+                    needs_access="gmail:support@shop.test", needs_level="read", options=None)
+        nid, before, team = self.give_card(**mail), self.commits(), self.committed()
+        self.assertIsInstance(nid, int, nid)
+        need = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (nid,)))
+        self.assertEqual((need["options"], need["todo"], need["give"]),
+                         (["Give Dev read access to the Gmail mailbox support@shop.test", "No"],
+                          "Press Give: it gives Dev read access to the Gmail mailbox support@shop.test.",
+                          {"agent": "dev", "level": "read", "repos": [], "resources": ["gmail:support@shop.test"]}))
+        self.assertEqual(self.commits(), before)
+        code, receipt = self.request(f"/ui/needs/{nid}", self.command(choice=0))
+        self.assertEqual(code, 200, receipt)
+        gmail = {"gmail": {"account": "support@shop.test", "level": "read"}}
+        self.assertEqual(self.committed(), dict(team, agents=dict(team["agents"], dev=dict(team["agents"]["dev"],
+                                                                                            google=gmail))))
+        self.assertEqual((self.commits(), self.history("gmail:support@shop.test")),
+                         (before + 1, [("dev", "read", "owner")]))
+        self.assertIn("The hub gave it at this press", hub.q1("SELECT text FROM events WHERE id=?",
+                                                              (receipt["event_id"],))["text"])
+        self.assertIn(f"N-{nid} (Let Dev read support@shop.test): dev has read access to the Gmail mailbox "
+                      f"support@shop.test (gmail:support@shop.test) now",
+                      hub.q1("SELECT text FROM events WHERE agent='manager' AND text LIKE '[hub] The owner pressed%' "
+                             "ORDER BY id DESC LIMIT 1")["text"])
+        # what one press cannot give makes no item, and no refusal sends the manager to write the owner's steps
+        hub.TEAM["agents"]["shopper"]["google"] = {"drive": {"account": "old@shop.test", "level": "read"}}
+        rows = hub.q1("SELECT COUNT(*) n FROM needs")["n"]
+        for fields, words in (
+                (dict(needs_access="gmail:other@shop.test", title="Let Dev read other@shop.test"),
+                 "only the owner can connect it for Gmail, with Connect account in Settings › Apps › Gmail"),
+                (dict(needs_access="tool:jobs", needs_level="use", title="Let Dev read Failed jobs"),
+                 "The MCP server Failed jobs needs a key, whose grant the owner's Mac signs, so Give does not give it"),
+                (dict(needs_access="tool:crm", needs_level=None, title="Let Dev use the CRM"),
+                 "The MCP server CRM is not connected, so no session gets it: the owner connects it in Founderizer"),
+                (dict(needs_agent="shopper", needs_access="drive:support@shop.test",
+                      title="Let Shopper read the Drive of support@shop.test"),
+                 "Give only adds access, and Shopper has Drive of old@shop.test"),
+                (dict(needs_level="send", title="Let Dev answer mail", why="Its triage answers the support mail."),
+                 "The title or the why names the Gmail mailbox support@shop.test, which Give gives"),
+                (dict(needs_level="admin"),
+                 "the level that Give gives on Gmail of support@shop.test: read, write, send"),
+                (dict(needs_access="gmail:support@shop.test, repo:acme/api", needs_level="send"),
+                 "goes alone in needs_access")):
+            with self.subTest(fields=fields):
+                said = self.give_card(**dict(mail, **fields))
+                self.assertIsInstance(said, str)
+                self.assertIn(words, said)
+                self.assertNotIn("steps", said)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], rows)
+        # a fact that the card checked changes before the press: the card closes, and nothing changes
+        drive = self.give_card(**dict(mail, needs_agent="lead", needs_access="drive:support@shop.test",
+                                      needs_level="write_shared", title="Let Lead share files of support@shop.test"))
+        need = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (drive,)))
+        self.assertEqual((need["options"][0], need["todo"]),
+                         ("Give Lead write access, shared files too, to the whole Drive of support@shop.test",
+                          "Press Give: it gives Lead write access, shared files too, to the whole Drive of "
+                          "support@shop.test."))
+        self.google("gmail.modify")                     # the account no longer allows Drive
+        before = self.commits()
+        code, said = self.request(f"/ui/needs/{drive}", self.command(choice=0))
+        self.assertEqual((code, said.get("error")), (409, hub.TEAM_PRESS_CHANGED.format(by=hub.shown_role("manager"))))
+        self.assertEqual((hub.q1("SELECT answer FROM needs WHERE id=?", (drive,))["answer"], self.commits()),
+                         (hub.TEAM_CLOSED_WORDS, before))
+        self.assertNotIn("google", self.committed()["agents"]["lead"])
+        self.assertIn("but the hub gave nothing: The Google account support@shop.test does not allow Drive now",
+                      hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC LIMIT 1")["text"])
+        # an MCP server with no key, at its one level
+        tool = self.give_card(**dict(mail, needs_agent="lead", needs_access="tool:github", needs_level=None,
+                                     title="Let Lead use GitHub's MCP server"))
+        need = hub.need_view(hub.q1("SELECT * FROM needs WHERE id=?", (tool,)))
+        self.assertEqual((need["options"][0], need["todo"]), ("Give Lead use of the MCP server GitHub",
+                                                              "Press Give: it gives Lead use of the MCP server "
+                                                              "GitHub."))
+        self.assertEqual(self.request(f"/ui/needs/{tool}", self.command(choice=0))[0], 200)
+        self.assertEqual((self.committed()["agents"]["lead"].get("tools"), self.commits()), (["github"], before + 1))
+        # an option that would be longer than a row names the kind alone
+        long = {"agent": "dev", "level": "read", "repos": [], "resources": [f"gmail:{'a' * 100}@shop.test"]}
+        self.assertEqual(hub.need_give_words(long), "Give Dev read access to Gmail")
+        # a level that the agent got another way after the card stays at the press: never lowered
+        lower = self.give_card(**dict(mail, needs_agent="lead", needs_level="write",
+                                      title="Let Lead file the mail of support@shop.test"))
+        self.assertIsInstance(lower, int, lower)
+        code, given = self.request("/ui/team/google", {"request_id": str(uuid.uuid4()), "db": "test-generation",
+                                                       "base_sha256": self.pool()["sha256"], "service": "gmail",
+                                                       "account": "support@shop.test", "access": {"lead": "send"}})
+        self.assertEqual(code, 200, given)
+        before, grants = self.commits(), self.history("gmail:support@shop.test")
+        code, receipt = self.request(f"/ui/needs/{lower}", self.command(choice=0))
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual((self.committed()["agents"]["lead"]["google"]["gmail"], self.commits(),
+                          self.history("gmail:support@shop.test")),
+                         ({"account": "support@shop.test", "level": "send"}, before, grants))
+        self.assertIn("The agent held that access already", hub.q1("SELECT text FROM events WHERE id=?",
+                                                                    (receipt["event_id"],))["text"])
+        # the hub counts the open items with Give, and one that replaces another takes its place
+        with patch.object(hub, "NEED_GIVE_OPEN", 1):
+            first = self.give_card()
+            self.assertIsInstance(first, int, first)
+            self.assertIn("1 items with Give wait for the owner already", self.give_card())
+            self.assertIsInstance(self.give_card(replaces=f"N-{first}"), int)
+
+    def test_a_give_card_closes_at_the_press_when_its_words_its_kind_or_the_shell_box_no_longer_hold(self):
+        """F6 piece 2: the press checks the card again. Believable bugs: a press that gives under words that name
+        another agent or thing now (the owner reads "Give Dev", and the press gives the agent that is now called
+        otherwise); Gmail at write or send, or a whole Drive, for an agent whose Shell box is off, whose sessions have
+        no Gmail or Drive tools; a card of a kind that this hub cannot read, whose press would answer as given with
+        nothing given, and which would never close; a sweep that leaves open a card that its press would close; and a
+        stop of the hub between the grant's commit and its record, after which the same press again says "held
+        already" and no record ever says who gave the hold."""
+        def settings(agent, **fields):
+            code, said = self.request(f"/ui/team/agents/{agent}", dict(
+                request_id=str(uuid.uuid4()), db="test-generation", base_sha256=self.pool()["sha256"], **fields))
+            self.assertEqual(code, 200, said)
+
+        def closed(nid):
+            before = self.commits()
+            code, said = self.request(f"/ui/needs/{nid}", self.command(choice=0))
+            self.assertEqual((code, said.get("error")),
+                             (409, hub.TEAM_PRESS_CHANGED.format(by=hub.shown_role("manager"))))
+            self.assertEqual((hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"], self.commits()),
+                             (hub.TEAM_CLOSED_WORDS, before))
+            return hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC LIMIT 1")["text"]
+        mail = dict(title="Let Dev read support@shop.test", why="Its triage reads the mail of support@shop.test.",
+                    needs_access="gmail:support@shop.test", needs_level="read", options=None)
+        nid = self.give_card(**mail)
+        settings("dev", title="Triage")             # the role that the card names is now another word
+        self.assertIn('The card\'s first option, "Give Dev read access to the Gmail mailbox support@shop.test", no '
+                      'longer says what Give gives now, "Give Triage read access to the Gmail mailbox '
+                      'support@shop.test".', closed(nid))
+        self.assertNotIn("google", self.committed()["agents"]["dev"])
+        # Gmail that writes or sends, and a whole Drive, reach no session of an agent whose Shell box is off
+        lead = dict(mail, needs_agent="lead", title="Let Lead answer support@shop.test")
+        card = self.give_card(**dict(lead, needs_level="write"))
+        whole = self.give_card(**dict(lead, needs_access="drive:support@shop.test"))
+        self.assertTrue(all(isinstance(x, int) for x in (card, whole)), (card, whole))
+        with patch.object(hub, "helper_features", lambda agent: [hub.SHELL_BOX]):  # its helper starts it closed
+            settings("lead", can=[])
+        self.assertIn("Lead's Shell box is off, so no session of it has the Gmail tools", closed(card))
+        self.assertNotIn("google", self.committed()["agents"]["lead"])
+        for fields, words in ((dict(needs_level="send"), "Lead's Shell box is off, so no session of it has the Gmail "
+                                                         "tools: give the work to an agent whose Shell box is on."),
+                              (dict(needs_access="drive:support@shop.test"), "has the Drive tools")):
+            with self.subTest(fields=fields):
+                self.assertIn(words, self.give_card(**dict(lead, **fields)))
+        reads = self.give_card(**lead)      # read: a wake-up rule reads its mail
+        self.assertIsInstance(reads, int, reads)
+        # the sweep closes what a press would close: the Drive of an agent whose Shell box went off, then a card whose
+        # words are no longer its change; a step that no longer names the thing is stale too
+        answer = lambda nid: hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"]  # noqa: E731
+        t0 = hub.now()
+        hub.need_look_sweep(t0)
+        hub.need_look_sweep(t0 + hub.NEED_GIVE_WAIT + 1)
+        self.assertEqual((answer(whole), answer(reads)), (hub.TEAM_CLOSED_WORDS, None))
+        row = hub.q1("SELECT * FROM needs WHERE id=?", (reads,))
+        self.assertIn('The card\'s step, "Press Give.", no longer says what Give gives now, "Press Give: it gives Lead '
+                      'read access to the Gmail mailbox support@shop.test."',
+                      hub.need_give_stale(dict(row, todo="Press Give."), hub.need_view(row)["give"]))
+        settings("lead", title="Support")
+        hub.need_look_sweep(t0 + 2 * hub.NEED_GIVE_WAIT + 2)
+        hub.need_look_sweep(t0 + 3 * hub.NEED_GIVE_WAIT + 3)
+        self.assertEqual(answer(reads), hub.TEAM_CLOSED_WORDS)
+        # a card of a kind that this code does not read closes, and its press gives nothing
+        other = hub.ins("INSERT INTO needs(title,why,todo,raised,by,options,give_agent,give_level,give_repos,"
+                        "give_resource) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        ("Let Lead use the key", "Its deploy needs it.", "Press Give.", hub.now(), "manager",
+                         json.dumps(["Give Lead use", "No"]), "lead", "use", "[]", f"secret:{KEY}"))
+        words = "Closed by the hub: this hub cannot give what this card gives, so Give gives nothing."
+        self.assertEqual(hub.need_give_closes(hub.q1("SELECT * FROM needs WHERE id=?", (other,))), words)
+        before = self.commits()
+        code, said = self.request(f"/ui/needs/{other}", self.command(choice=0))
+        self.assertEqual((code, said.get("code"), self.commits()), (409, "request_answered", before))
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (other,))["answer"], words)
+        # a stop between the grant's commit and its record: the same press again writes the record (grant_access's
+        # repeat rule), one commit in all
+        card = self.give_card(**dict(mail, needs_agent="shopper", title="Let Shopper read support@shop.test"))
+        self.assertIsInstance(card, int, card)
+        real, stopped = hub.resource_record, []
+
+        def stops(*args, **kw):
+            if not stopped:
+                stopped.append(args)
+                raise RuntimeError("the hub stopped")
+            return real(*args, **kw)
+        press, before = self.command(choice=0), self.commits()
+        with patch.object(hub, "resource_record", stops), self.assertRaises(RuntimeError):
+            hub.phone_submit(press, "founderizer-swift/1/test", card)
+        self.assertEqual((self.commits(), self.history("gmail:support@shop.test"), answer(card)),
+                         (before + 1, [], None))
+        code, receipt = self.request(f"/ui/needs/{card}", press)
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual((self.commits(), self.history("gmail:support@shop.test")),
+                         (before + 1, [("shopper", "read", "owner")]))
+        self.assertIn("The hub gave it at this press", hub.q1("SELECT text FROM events WHERE id=?",
+                                                              (receipt["event_id"],))["text"])

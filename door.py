@@ -106,6 +106,10 @@ REPOS_FILE = STATE + "/repos.json"          # the repositories that the door mad
 ACCOUNTS_FILE = STATE + "/accounts.json"    # the Cloudflare account of a token whose credential names none (plan N1)
 KEYS_FILE = STATE + "/keys.json"            # what each saved Cloudflare key is, and the work keys that the door made
 KEY_SAID_AGAIN = 600                        # seconds before the same failure of a work key gets a second record line
+NAMES_FILE = STATE + "/names.json"          # the first name of each reference, and the marks of the providers' keys
+NAMES_MOST = 4096                           # entries of each of those two parts: the hub's catalog holds 256 secrets
+                                            # at a time, so only a hub that is broken into comes near it
+NAME_KEPT = 120                             # characters of a name in it: an app's setting has at most 93, and is whole
 SECRETS_DIR = STATE + "/secrets"            # opened values, one file each, mode 600, this user only
 VAULT_KEY = STATE + "/vault.key"            # the door's own age identity (its recipient is pinned in the vault)
 SSH_KEY = STATE + "/ssh/id_ed25519"         # the door's SSH key to the second sshd of each host
@@ -256,6 +260,13 @@ def same_ref(a, b):
     lower case, so a comparison of the exact text would let one value pass under two names: a hub that is broken into
     could write a provider's key as an app's setting by its reference in capitals (a read of 22 November 2026)."""
     return isinstance(a, str) and isinstance(b, str) and a.lower() == b.lower()
+
+
+def value_file(ref):
+    """The file of the value that the door opened under this reference: one file for a reference in either case."""
+    return os.path.join(P(SECRETS_DIR), hashlib.sha256(ref.lower().encode()).hexdigest())
+
+
 # new-projects plan N4: a key that the owner saved for one setting of one app, app:<app>:<NAME>
 APP_KEY = re.compile(r"app:" + door_targets.OPS_ROOT.APP_NAME.pattern + ":" + door_targets.OPS_ROOT.ENV_NAME.pattern)
 ROLE = re.compile(r"arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,128}")
@@ -317,9 +328,10 @@ def read_json(path, default):
         return default
 
 
-def write_json(path, data, mode=0o600, group=None):
+def write_json(path, data, mode=0o600, group=None, sync=False):
     """The file, replaced whole. group: root's file for that group, set before the replace, so that no reader of the
-    group finds a file that it cannot read yet."""
+    group finds a file that it cannot read yet. sync: its bytes are on the disk before the replace, for a file that a
+    power cut must not leave empty."""
     folder = os.path.dirname(P(path))
     os.makedirs(folder, mode=0o700, exist_ok=True)
     fd, temp = tempfile.mkstemp(dir=folder, prefix=".door-")
@@ -329,6 +341,9 @@ def write_json(path, data, mode=0o600, group=None):
             if group is not None:
                 with contextlib.suppress(OSError):
                     os.fchown(f.fileno(), 0, group)
+            if sync:
+                f.flush()
+                os.fsync(f.fileno())
         os.chmod(temp, mode)
         os.replace(temp, P(path))
     finally:
@@ -856,11 +871,13 @@ def store_form(data):
     return agent, repo, path, kind, store, namespace
 
 
-# The operator's own versions of a store: an apiVersion with no version ("external-secrets.io") or another one makes no
-# object of the cluster, and a decoy of that form must never name a project (the review of 22 November 2026)
+# The operator's own versions of a store: only these answer. The door counts an object of each version of the group
+# (external-secrets.io/<any>): a cluster whose operator serves another one (v1alpha1) applies it too, as the same
+# object, so a decoy of that version beside the store is not_one and names no project. An apiVersion with no version
+# ("external-secrets.io") makes no object of the cluster.
 STORE_VERSIONS = ("external-secrets.io/v1", "external-secrets.io/v1beta1")
-# A document mark or an end mark with space before it: the block reader skips such a line, and YAML reads it as text
-INDENTED_MARK = re.compile(r"^[ \t]+(?:---|\.\.\.)", re.M)       # also before a "#", a CR, or more text
+STORE_ANY_VERSION = "external-secrets.io/"      # the start of each apiVersion that is counted
+STORE_FOLDERS_MOST = 16     # folders above a store's file: each one is a listing of GitHub for each ask
 
 
 def store_docs(path, data):
@@ -868,13 +885,17 @@ def store_docs(path, data):
     none of them reads: a YAML file that is not block style (door_targets.unread: no anchor, alias, merge key, tag,
     flow mapping or template), one whose stream a cluster's readers do not all split alike (door_render.split_docs),
     one document that the block reader reads as more than one, a key twice in one mapping (YAML's readers differ on
-    which value counts), and a JSON file that is not JSON with each key once. The block reader reads one document at a
-    time, because it reads no document mark: two documents of one text would come back as one mapping."""
+    which value counts), a form that the block reader reads in another way than YAML (block_tree's strict), and a
+    JSON file that is not JSON with each key once. The block reader reads one document at a time, because it reads
+    no document mark: two documents of one text would come back as one mapping."""
+    if path.endswith(".json"):      # not through manifest_text: its block lines of a deep file take gigabytes
+        try:
+            return [json.loads(data.decode("utf-8"), object_pairs_hook=door_targets.no_key_twice)]
+        except (ValueError, RecursionError):
+            return None
     text, why = door_targets.manifest_text(path, data)
-    if why or INDENTED_MARK.search(text):
+    if why:
         return None
-    if path.endswith(".json"):
-        return [json.loads(data.decode("utf-8"), object_pairs_hook=door_targets.no_key_twice)]
     try:
         docs = [door_targets.block_tree(part, strict=True) for part in door_render.split_docs(text)]
     except (door_render.Failed, RecursionError, ValueError):
@@ -906,9 +927,11 @@ def store_answer(docs, kind, store, namespace):
     if any(isinstance(doc, dict) and any(str(key).lower() == "items" for key in doc) for doc in docs):
         return {"error": "rendered"}
     found = [o for o in door_targets.objects_in(docs) if o["kind"] == kind
-             and o["apiVersion"] in STORE_VERSIONS
-             and isinstance(o.get("metadata"), dict) and o["metadata"].get("name") == store]
-    if len(found) != 1:
+             and o["apiVersion"].startswith(STORE_ANY_VERSION)
+             and isinstance(o.get("metadata"), dict) and isinstance(o["metadata"].get("name"), str)
+             and o["metadata"]["name"].strip() == store]      # stripped: a form that keeps spaces is counted too
+    # and the answer is for the name as it is: a name with a space at an end is no name of the cluster
+    if len(found) != 1 or found[0]["metadata"]["name"] != store or found[0]["apiVersion"] not in STORE_VERSIONS:
         return {"error": "not_one"}
     spec = found[0].get("spec") if isinstance(found[0].get("spec"), dict) else {}
     provider = spec.get("provider")
@@ -992,6 +1015,7 @@ class Door:
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self.record = Record()
         self.lock = threading.Lock()
+        self.names_lock = threading.Lock()      # one thread at a time brings the record of first names up to date
         self.host_locks, self.business_locks, self.repo_locks, self.tunnel_locks = {}, {}, {}, {}
         self.key_locks, self.key_failures = {}, {}      # one call of an account makes its work key; what failed last
         self.access_cache = (None, None)
@@ -1030,6 +1054,8 @@ class Door:
                 self.access_cache = (mark, {"v": 1, "agents": {}, "hosts": {}})     # a broken file names nobody
             else:
                 self.keep_modes(data)       # the first read of a new file: a mode of a host that left it ends
+                with contextlib.suppress(OSError):      # and its new references get their first names
+                    self.keep_names(data)
         return self.access_cache[1]
 
     def keep_modes(self, access):
@@ -1038,6 +1064,49 @@ class Door:
             modes = read_json(MODES_FILE, {})
             if isinstance(modes, dict) and settle_modes(access, modes):
                 write_json(MODES_FILE, modes)
+
+    def keep_names(self, access, ref=None, value=None):
+        """The door's record of the names of its keys (kept_names), with this access file in it, as it is on the disk
+        now; or None for a record that the door cannot read. An OSError says that it could not be written.
+
+        A hub that is broken into chooses the names of the door's keys and the references behind them (VAULT.md, limit
+        15): it could drop a provider's credential from the file and then name its key as an app's setting, which goes
+        to a host where an agent reads it. So the record keeps what a later file cannot change, also after the
+        credential and its value are gone: for each reference, the name under which a file first named it
+        (first_names), and for each value that the door holds under a provider's first name, its mark, because the
+        same value can come again under a new reference. setting gives a key to an app only by this record.
+
+        It runs at the first read of each file that changed (access), so a key that nothing used since has its entry
+        too; with each copy, before its value (ref, value) can be used (fetch_sealed); each minute before a value
+        leaves the door, which also does a write again that failed; and in setting, before the value leaves for a
+        host. The mark is door_providers.key_mark, a fast hash with no salt, as in KEYS_FILE: it stands only for the
+        key of a provider, which the provider makes at random. A database's login (db:) has no mark, because a person
+        can choose its password, and a mark that stays after the value could then be guessed.
+
+        Only the service writes the record, and its threads write it one at a time (names_lock). Root's commands
+        (access, update, follow) make no Door, and systemd stops the service before it starts the one of a new
+        release, so no second process writes it."""
+        with self.names_lock:
+            held = kept_names()
+            if held is None:
+                return None
+            names, marks = held["names"], held["marks"]
+            before = len(names), len(marks)
+            for key, name in sorted(first_names(access).items()):
+                if key not in names and len(names) < NAMES_MOST:
+                    names[key] = name
+            found = [(names[ref.lower()], value)] if ref is not None and of_provider(names.get(ref.lower())) else []
+            for key, name in names.items():
+                if of_provider(name) and os.path.exists(value_file(key)):
+                    with contextlib.suppress(OSError, ValueError):      # it left meanwhile, or it is no text
+                        found.append((name, held_value(key)))
+            for name, text in found:
+                mark = door_providers.key_mark(text.strip())
+                if mark not in marks and len(marks) < NAMES_MOST:
+                    marks[mark] = name
+            if (len(names), len(marks)) != before:
+                write_json(NAMES_FILE, held, sync=True)
+            return held
 
     def modes_said(self):
         """{host: {mode, at}}: the mode that the door keeps for each host of its access file now, auto or full, and
@@ -1076,16 +1145,21 @@ class Door:
         """A value that the vault sealed to the door, opened by the vault sweep; never passed on."""
         if not isinstance(ref, str) or not REF.fullmatch(ref):
             raise Refused("this account names no secret of the door")
-        path = os.path.join(P(SECRETS_DIR), hashlib.sha256(ref.lower().encode()).hexdigest())
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(value_file(ref), encoding="utf-8") as f:
                 return f.read().strip()
         except OSError:
             raise Refused(f"the door does not hold {ref} yet: the owner grants it to the door") from None
 
     def setting(self, access, value):
         """The value of an app's new setting (new-projects plan N4), as bytes for the host's stdin: 32 random bytes in
-        base64, or the key that the owner saved for the door as app:<app>:<NAME>, and never a provider's key."""
+        base64, or the key that the owner saved for the door as app:<app>:<NAME>, and never a provider's key.
+
+        The name in the door's file is the hub's word, so it is not enough: the key goes to the host only under the
+        first name of its reference, and never when its value is a key that the door held for a provider (keep_names).
+        Both are on the disk before the value leaves. A record that the door cannot read, cannot write or has no more
+        room in gives no key to an app; no call to a provider asks it. A GitHub App's key comes to the door before the
+        file names it, so its form alone refuses it (door_providers.app_pem)."""
         source, name = value
         if source == "random":
             return base64.b64encode(secrets.token_bytes(32))
@@ -1095,7 +1169,32 @@ class Door:
             raise Refused(f"the door holds no key as {name}")
         if any(isinstance(c, dict) and same_ref(c.get("secret"), ref) for k, c in credentials.items() if k != name):
             raise Refused(f"{name} names a key that the door uses for something else: it goes in no app")
-        return self.secret(ref).encode()
+        given = self.secret(ref)        # before the record: a mark that came since is then in what is read
+        if given.startswith("pem:"):
+            raise Refused(f"{name} names the key of a GitHub App: it goes in no app")
+        try:
+            held = self.keep_names(access)
+        except OSError as e:
+            raise Refused(f"the door could not write its record of the first names of its keys "
+                          f"({e.__class__.__name__}), so it gives no saved key to an app now: send the same call "
+                          f"again") from None
+        if held is None or max(len(held["names"]), len(held["marks"])) >= NAMES_MOST:
+            raise Refused(f"the door's record of the first names of its keys, {NAMES_FILE}, "
+                          f"{'cannot be read' if held is None else 'is full'}, so it gives no saved key to an app: the "
+                          f"owner puts an earlier copy of that file back on the door's server, or removes it, after the "
+                          f"owner checked the hub and replaced at its provider each provider key that the door held, because "
+                          f"the record then forgets what came after")
+        first = held["names"].get(ref.lower())
+        if first != name:
+            raise Refused(f"{name} names a key that the door knew first as {first or 'several settings'}, and a key "
+                          f"goes to an app only under its first name: tell the owner, who ends the door's hold of that "
+                          f"key (grant_access with agent door and no level), removes it in Secrets, and saves it again "
+                          f"on the next key card of {name}")
+        known = held["marks"].get(door_providers.key_mark(given))
+        if known:
+            raise Refused(f"{name} holds the value of a key that the door knows as {known}: a provider's key goes in "
+                          f"no app, so tell the owner, who makes another key for {name}")
+        return given.encode()
 
     def runner_input(self, access, value):
         """What runner-new sends on the host's stdin (new-projects plan N6): a registration token and a remove token
@@ -1974,8 +2073,8 @@ class Door:
         entry = door_targets.repo_entry(me, repo, ("gitops",)) if isinstance(me, dict) else None
         if entry is None or door_targets.vendor(repo) or repo.lower() in never:
             return 422, {"error": "no_target"}
-        if door_targets.gitops_path_refused(path, access):         # a secret path, or one of the exposure register
-            return 422, {"error": "no_file"}
+        if door_targets.gitops_path_refused(path, access) or path.count("/") > STORE_FOLDERS_MOST:
+            return 422, {"error": "no_file"}        # a secret path, one of the exposure register, or one too deep
         hub = GitHub(self, access, repo)
         try:
             branch = entry["branch"] if isinstance(entry.get("branch"), str) and entry["branch"] else hub.branch()
@@ -1984,6 +2083,8 @@ class Door:
             if raw is None:
                 hub.listing("", ref)        # GitHub's 404 for the whole repository at that commit is no missing file
                 return 422, {"error": "no_file"}
+            # A known limit: Kustomize with LoadRestrictionsNone can take a plain file of another folder as a resource
+            # and patch it. The door reads only the folders above the file, so it does not see such a kustomization.
             if hub.folder_mark(path, ref):
                 return 422, {"error": "rendered"}
         except Refused as e:            # the door has no App of the repository's owner
@@ -2910,6 +3011,61 @@ def kept_keys():
     return {part: held[part] if isinstance(held.get(part), dict) else {} for part in ("kinds", "work")}
 
 
+def of_provider(name):
+    """True for the name of a provider's credential, <provider>:<account>: an app's setting (app:), a database's login
+    (db:) and no name ("" or None) are none."""
+    return bool(name) and name.partition(":")[0] in door_providers.PROVIDERS
+
+
+def held_value(ref):
+    """The value that the door holds under a reference, read for its mark only (Door.keep_names): no call uses it, so
+    it is no use of a key, and Door.secret, which a call's use goes through, does not read it."""
+    with open(value_file(ref), encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def first_names(access):
+    """{reference, in lower case: its name} of one access file, as the door's record keeps it for a reference that it
+    does not know: a provider's name before any other, and a name that is no app's setting before one that is, so that a
+    key that a provider's name and another name both name on the day of the update is the provider's and has its mark;
+    and "" for one that several settings of apps name, because none of them is the first."""
+    named = {}
+    for name, c in sorted((access.get("credentials") or {}).items()):
+        if isinstance(c, dict) and isinstance(c.get("secret"), str):
+            named.setdefault(c["secret"].lower(), []).append(name[:NAME_KEPT])
+    out = {}
+    for ref, found in named.items():       # a provider's name first, then a database's, then the others
+        others = sorted((name for name in found if not name.startswith("app:")), key=lambda name: not of_provider(name))
+        out[ref] = others[0] if others else found[0] if len(found) == 1 else ""
+    return out
+
+
+def kept_names():
+    """The door's record of the names of its keys, {v: 1, names: {reference in lower case: its first name}, marks:
+    {mark of a provider's key: that provider's name}}, or None for a file that is there and that the door cannot read:
+    it is broken, or of another version. No file is the first start of a door that keeps the record, and the record
+    then begins with the access file of that moment. A file that cannot be read is never written over, because an empty
+    one would forget every first name: root puts an earlier copy of it back, or takes it away, and the record then
+    begins again with the names of now. A state folder that was put back from a copy brings the record of its day: a
+    reference that is newer than the copy gets its first name from the file of now, and each value that the door holds
+    gets its mark again."""
+    try:
+        with open(P(NAMES_FILE), encoding="utf-8") as f:
+            held = json.load(f)
+    except FileNotFoundError:
+        return {"v": 1, "names": {}, "marks": {}}
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(held, dict) or set(held) != {"v", "names", "marks"} or type(held["v"]) is not int or \
+            held["v"] != 1:
+        return None
+    for part, form in (("names", REF), ("marks", re.compile("[0-9a-f]{64}"))):
+        if not isinstance(held[part], dict) or not all(form.fullmatch(key) and key == key.lower() and
+                                                       isinstance(name, str) for key, name in held[part].items()):
+            return None
+    return held
+
+
 def end_keys(door):
     """The door's work keys whose grant ended, each minute: a key of an account that left the access file, or that no
     agent holds any more, is deleted at its provider with the key that made it, and leaves the door's list and its
@@ -2969,16 +3125,25 @@ def hub_url(hub):
 
 
 def fetch_sealed(door):
-    hub = door.access().get("hub") or {}
+    access = door.access()
+    hub = access.get("hub") or {}
     if not hub.get("address"):
         return 0
+    try:                                # a value that leaves the door below has its mark first (Door.keep_names)
+        recorded = door.keep_names(access)
+    except OSError:
+        recorded = None
     base = hub_url(hub)
     status, answer = door.http("GET", f"{base}/door/sealed", {"X-Fleet-Client": "door"}, None)
     if status != 200 or not isinstance(answer, dict):
         return 0
     opened = 0
     keep = answer.get("keep")
-    if isinstance(keep, list):          # a grant that ended: its value leaves the door too (never a minted key's)
+    # a grant that ended: its value leaves the door too (never a minted key's), but not in a pass whose record the door
+    # could not read or write, or which is full: a hub that fills the disk or the record would else make a provider's
+    # value leave with no mark, and send it again later under an app's new reference
+    if isinstance(keep, list) and recorded is not None and \
+            max(len(recorded["names"]), len(recorded["marks"])) < NAMES_MOST:
         kept = {hashlib.sha256(str(ref).lower().encode()).hexdigest() for ref in keep}
         for name in os.listdir(P(SECRETS_DIR)) if os.path.isdir(P(SECRETS_DIR)) else []:
             if re.fullmatch(r"[0-9a-f]{64}", name) and name not in kept:
@@ -2991,12 +3156,16 @@ def fetch_sealed(door):
         if status != 0 or not value.strip():
             continue
         os.makedirs(P(SECRETS_DIR), mode=0o700, exist_ok=True)
-        path = os.path.join(P(SECRETS_DIR), hashlib.sha256(ref.lower().encode()).hexdigest())
+        path, opened_value = value_file(ref), item_secret(value.strip())
+        # The mark of a provider's key is on the disk before its value is (Door.keep_names): the next copy under the
+        # same reference, in this pass too, takes the value's place. A write that fails ends the pass, as one of the
+        # value does: the copy stays at the hub. A record that cannot be read or is full keeps no copy back.
+        door.keep_names(access, ref, opened_value)
         # A whole new file takes the place of the old one: since the owner can replace a value, a copy can come for
         # a secret that the door holds and uses, and a call must read the old value or the new one, never a part.
         with open(os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
             os.fchmod(f.fileno(), 0o600)
-            f.write(item_secret(value.strip()))
+            f.write(opened_value)
         os.replace(path + ".new", path)
         door.http("POST", f"{base}/door/sealed/{item.get('id')}", {"Content-Type": "application/json",
                                                                     "X-Fleet-Client": "door"},
@@ -3073,9 +3242,10 @@ def fetch_approvals(door):
 # ---------------------------------------------------------------- root commands
 
 def access_in(raw):
-    """The access file's bytes as the object that they hold, or None: no file, or one that is no JSON object."""
+    """The access file's bytes as the object that the door's own reader (read_json) takes from them, or None: no file,
+    or one that is no JSON object in UTF-8."""
     try:
-        data = json.loads(raw) if raw is not None else None
+        data = json.loads(raw.decode("utf-8")) if raw is not None else None
     except (ValueError, RecursionError):
         data = None
     return data if isinstance(data, dict) else None
@@ -3129,7 +3299,9 @@ def cmd_access(args):
                 sys.exit("refused: the access file changed after the read that this write was made from")
         elif len(owner_keys_in(held)) >= 2:
             sys.exit("refused: the access file names two or more owner keys, and a write without --was could take "
-                     "another Mac's write back")
+                     "another Mac's write back. The one that passes: python3 -I /opt/fleet-door/current/door.py access "
+                     "--was <the SHA-256 of the file with no white space around it: "
+                     "printf %s \"$(cat /etc/fleet-door/access.json)\" | sha256sum>")
         write_json(ACCESS_FILE, data, mode=0o640, group=group)
     finally:
         os.close(lock)
@@ -3440,7 +3612,8 @@ FIRST_LINES = tuple((stopped, re.compile(line), said) for stopped, line, said in
     ("connect", r"ssh: connect to host \S+ port \d+: Network is unreachable",
      "the door's network does not reach the host"),
     ("connect", r"ssh: connect to host \S+ port \d+: [A-Za-z' ]+", "the door could not connect to port {port}"),
-    ("login", r"\S+@\S+: Permission denied \([a-z,-]+\)\.", "the host's second sshd refused the door's key"),
+    # \S[^\s@]* and not \S+ before the @: a line of many @ made \S+@\S+ read the rest again from each @
+    ("login", r"\S[^\s@]*@\S+: Permission denied \([a-z,-]+\)\.", "the host's second sshd refused the door's key"),
     ("login", r"kex_exchange_identification: (?:read: )?Connection (?:closed by remote host|reset by peer)",
      "the host closed the door's connection"),
     ("login", r"Connection (?:closed|reset) by \S+ port \d+", "the host closed the door's connection"),

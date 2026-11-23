@@ -3906,9 +3906,10 @@ def need_view(row, reads=None):
     # owner API 1.280: the task whose own mark an app draws on the answered card of a question, a door call or a
     # take-over
     view["task"] = need_task(row, None if reads is None else reads[2])
-    # the lane "Give on a card": the grant that the item's first option makes, {agent, level, repos}, else null
+    # the lane "Give on a card": the grant that the item's first option makes, {agent, level, repos, resources}, else
+    # null
     view["give"] = need_give_view(row)
-    for kept in ("give_agent", "give_level", "give_repos"):
+    for kept in ("give_agent", "give_level", "give_repos", "give_resource"):
         view.pop(kept, None)
     # owner feature need_talk: the long part behind Details, whether the options combine, the indexes he ticked, and
     # his talk with the manager under the item: Discuss left the apps on 13 November 2026, and Needs clarification
@@ -8910,8 +8911,9 @@ def migrate():
                   "takeover_task": "INTEGER",
                   # the lane "Give on a card" (the owner, 19 November 2026): the grant that an item for access carries,
                   # which its first option, Give, makes at his press: the agent, the level, and the repositories as a
-                  # JSON list (need_give)
-                  "give_agent": "TEXT", "give_level": "TEXT", "give_repos": "TEXT",
+                  # JSON list (need_give); and F6 piece 2: the one gmail:, drive: or tool: that it gives, as a
+                  # resource id
+                  "give_agent": "TEXT", "give_level": "TEXT", "give_repos": "TEXT", "give_resource": "TEXT",
                   # owner API 1.285: the ids of the pictures of the item's options, in the order of `options`, as a
                   # JSON list (raise_needs_you pictures; attachments.need names the item back)
                   "pictures": "TEXT",
@@ -18230,9 +18232,23 @@ def card_reason(a, title, why, todo, options):
 # the agent holds already is never lowered. An item whose agent holds the level on each repository, given another way,
 # closes by itself (need_look_sweep). A grant is the authorization (COORDINATION.md): the press is the owner's grant,
 # and nothing asks him a second time.
+#
+# F6 piece 2 (the owner, 22 November 2026: "Tasks should ideally be just important approvals and confirmations, not
+# steps to do something!"): Give also carries one Gmail mailbox, one Drive (the whole account) or one MCP server, which
+# the fleet holds now, with the checks of a team plan's access (team_access_refusal): never an MCP server with a key,
+# whose grant the owner's Mac signs. Give only adds: it never takes the place of the agent's mailbox or Drive of another
+# account. The raise checks it, and the press checks it again on team.json as it is then; a fact that changed closes the
+# card. Only the manager raises an item (raise_needs_you), and the hub counts the open items with Give (NEED_GIVE_OPEN).
 NEED_GIVE_MOST = 50             # repositories that one Give gives: one decision, which Details still lists whole
 NEED_GIVE_WAIT = 120            # seconds that the agent holds what an open Give card gives before the hub closes the
                                 # card: a press of Give commits the grant a moment before its answer is written
+NEED_GIVE_OPEN = 10             # open items with Give at once: each rings the owner's phone and waits for his press
+# the one thing of another kind than a repository that a Give gives, in the owner's words (resource_title)
+# (a Drive is the whole account: an agent that the owner limited to some folders of it gets all of them). A change of
+# these words closes each open Give card of that form, at its press and at the sweep (need_give_stale).
+NEED_GIVE_SAID = {"gmail": "the Gmail mailbox {}", "drive": "the whole Drive of {}", "tool": "the MCP server {}"}
+NEED_GIVE_KINDS = {"gmail": "Gmail", "drive": "a whole Drive", "tool": "an MCP server"}    # the option's kind, when the
+# thing does not fit in NEED_OPTION_CHARS
 GIVE_TURN = threading.local()   # on: this thread's press of Give runs in its turn of the hub's writes (phone_submit)
 
 
@@ -18245,12 +18261,13 @@ def need_give_things(a):
 
 
 def need_give(a):
-    """{agent, level, repos} of a raise_needs_you that names the agent that needs the access (needs_agent): the grant
-    that its first option gives. None when it names none. A ToolError for a grant that one press cannot give: an agent
-    that is not an active worker or lead (the manager holds no repository: validate_team), a level that a repository
-    does not take, a thing that is not a repository, or one of the product's own repositories, which the door refuses
-    in every fleet. card_reason checks each repository against the fleet's record after this (card_access): no agent
-    holds it at that level, and it is not in the pool that the manager grants from."""
+    """{agent, level, repos, resources} of a raise_needs_you that names the agent that needs the access (needs_agent):
+    the grant that its first option gives, of 1 to NEED_GIVE_MOST repositories, or of one Gmail mailbox, one Drive or
+    one MCP server (resources, F6 piece 2). None when it names none. A ToolError for a grant that one press cannot
+    give: an agent that is not an active worker or lead (the manager holds none: validate_team), a level that the thing
+    does not take, a thing of another kind, one of the product's own repositories, which the door refuses in every
+    fleet, or what need_give_refusal refuses. card_reason checks each thing against the fleet's record after this
+    (card_access): no agent holds it at that level, and it is not in the pool that the manager grants from."""
     things = need_give_things(a)
     if things is None:
         return None
@@ -18259,36 +18276,132 @@ def need_give(a):
         raise ToolError(f"needs_agent is the agent that needs the access, by its name or its role, and there is no "
                         f"agent {agent}.")
     if not agent_active(agent) or role_of(agent) not in ("worker", "lead"):
-        raise ToolError(f"needs_agent is a worker or a lead that is active, which holds repositories: {agent} is not "
-                        f"one now.")
+        raise ToolError(f"needs_agent is a worker or a lead that is active, which holds access: {agent} is not one "
+                        f"now.")
     if str(a.get("reason") or "").strip().lower() != "access":
-        raise ToolError("needs_agent goes with reason access, and needs_access names the repositories that it needs.")
+        raise ToolError("needs_agent goes with reason access, and needs_access names what Give gives.")
     level = str(a.get("needs_level") or "").strip().lower()
+    kind, what = resource_parts(things[0]) if len(things) == 1 else (None, None)
+    if kind in NEED_GIVE_SAID:      # F6 piece 2: one mailbox, one Drive or one MCP server
+        level = level or ("use" if kind == "tool" else "")
+        if level not in RESOURCE_LEVELS[kind]:
+            raise ToolError(f"With needs_agent, needs_level is the level that Give gives on "
+                            f"{resource_phrase(kind, what)}: {', '.join(RESOURCE_LEVELS[kind])}.")
+        refused = need_give_refusal(TEAM, kind, what, agent, level)     # TeamPassing while it cannot read
+        if refused:
+            raise ToolError(refused)
+        return {"agent": agent, "level": level, "repos": [], "resources": [f"{kind}:{what}"]}
+    mixed = next((t for t in things if resource_parts(t)[0] in NEED_GIVE_SAID), None)
+    if mixed:
+        raise ToolError(f"With needs_agent, a gmail:, drive: or tool: goes alone in needs_access: give {mixed} in an "
+                        f"item of its own.")
+    other = next((t for t in things if resource_parts(t)[0] != "repo"), None)   # its kind before the level of a repo
+    if other:
+        raise ToolError(f"With needs_agent, needs_access names repositories, or one gmail:, drive: or tool: alone, and "
+                        f"{other} is not one of those. For another thing, leave needs_agent out and write the owner's "
+                        f"steps in what_to_do.")
     if level not in REPO_ACCESS:
         raise ToolError(f"With needs_agent, needs_level is the level that Give gives on the repositories: "
                         f"{', '.join(REPO_ACCESS)}.")
     if not things or len(things) > NEED_GIVE_MOST or len(set(things)) != len(things):
-        raise ToolError(f"With needs_agent, needs_access names 1 to {NEED_GIVE_MOST} different repositories as "
-                        f"repo:<owner>/<name>, separated by commas.")
+        raise ToolError(f"With needs_agent, needs_access names one gmail:, drive: or tool:, or 1 to {NEED_GIVE_MOST} "
+                        f"different repositories as repo:<owner>/<name>, separated by commas.")
     import door_targets
     repos = []
     for thing in things:
         kind, what = resource_parts(thing)
-        if kind != "repo":
-            raise ToolError(f"With needs_agent, needs_access names repositories only (repo:<owner>/<name>), and {thing} "
-                            f"is not one. For another thing, leave needs_agent out and write the owner's steps in "
-                            f"what_to_do.")
         if door_targets.vendor(what):       # the words of every grant of one (vendor_repo_check, grant_check)
             raise ToolError(refusal_words.words("repo_vendor", {"repo": what}))
         repos.append(what)
-    return {"agent": agent, "level": level, "repos": sorted(repos)}
+    return {"agent": agent, "level": level, "repos": sorted(repos), "resources": []}
+
+
+def need_give_refusal(team, kind, what, agent, level):
+    """Why Give cannot give `agent` this gmail:, drive: or tool: on this team.json, in words for the manager, or None:
+    the raise checks it, and the press checks it again. The checks of a team plan's access (team_access_refusal): the
+    fleet holds it now, and an MCP server is connected and needs no key, whose grant the owner's Mac signs (F6 piece
+    4). TeamPassing while the hub cannot read its Google file or its MCP connections now. And Give only adds: it never
+    takes the place of the agent's mailbox or Drive of another account, as a write of that service would
+    (resource_hold_set). Nor Gmail at write or send, or a Drive, for an agent whose Shell box is off: no session of it
+    has the tools of Gmail or Drive (SHELL_OFF_TOOLS), and only a wake-up rule reads its mail (gmail_label_read)."""
+    refused = team_access_refusal(team, kind, what)
+    if refused and kind == "tool" and resource_known(kind, what, team):
+        # a plan's own words name a plan's next step; a known MCP server is refused for a key or for no connection
+        phrase = resource_phrase(kind, what, team)
+        phrase = phrase[0].upper() + phrase[1:]
+        return (f"{phrase} needs a key, whose grant the owner's Mac signs, so Give does not give it: leave needs_agent "
+                f"out." if team_tool_keyed(what, team) else
+                f"{phrase} is not connected, so no session gets it: the owner connects it in Founderizer first, so "
+                f"leave needs_agent out.")
+    if refused or kind not in GOOGLE_NAMES:
+        return refused
+    a = (team.get("agents") or {}).get(agent) or {}
+    if need_give_shell_off(a, kind, level):
+        return (f"{shown_role(agent)}'s Shell box is off, so no session of it has the {GOOGLE_NAMES[kind]} tools: give "
+                f"the work to an agent whose Shell box is on.")
+    got = (a.get("google") or {}).get(kind)
+    held = drive_grant(agent, team)[0] if kind == "drive" else got.get("account") if isinstance(got, dict) else None
+    if held and held != what:
+        return (f"Give only adds access, and {shown_role(agent)} has {GOOGLE_NAMES[kind]} of {held}, whose place "
+                f"{what} would take: leave needs_agent out, and ask the owner which account it keeps.")
+    return None
+
+
+def need_give_thing(rid, team=None):
+    """The one thing of another kind than a repository that a Give gives, in the owner's words (NEED_GIVE_SAID)."""
+    kind, what = resource_parts(rid)
+    return NEED_GIVE_SAID[kind].format(resource_title(kind, what, team))
+
+
+def need_give_access(level, thing):
+    """The words "<level> access to <thing>", with Drive's write_shared and an MCP server's use in plain words."""
+    return f"write access, shared files too, to {thing}" if level == "write_shared" else \
+        f"use of {thing}" if level == "use" else f"{level} access to {thing}"
 
 
 def need_give_words(give):
     """The first option of an item that carries a grant, as the owner presses it: Give <role> <level>, with the count
-    of the repositories when it gives more than one."""
-    count = len(give["repos"])
-    return f"Give {shown_role(give['agent'])} {give['level']}" + (f" on {count} repositories" if count > 1 else "")
+    of the repositories when it gives more than one. For another thing it names the kind and the thing, because the
+    Mac draws no step on a card with Give, and one address is both a Gmail mailbox and a Drive: "Give Dev read access
+    to the Gmail mailbox a@b.com", or the kind alone when that is longer than NEED_OPTION_CHARS ("Give Dev read access
+    to Gmail"). A change of these words, or of NEED_OPTION_CHARS, closes each open Give card of that form, at its press
+    and at the sweep (need_give_stale)."""
+    role, level, count = shown_role(give["agent"]), give["level"], len(give["repos"])
+    if give["resources"]:
+        rid = give["resources"][0]
+        whole = f"Give {role} {need_give_access(level, need_give_thing(rid))}"
+        return whole if len(whole) <= NEED_OPTION_CHARS else \
+            f"Give {role} {need_give_access(level, NEED_GIVE_KINDS[resource_parts(rid)[0]])}"
+    return f"Give {role} {level}" + (f" on {count} repositories" if count > 1 else "")
+
+
+def need_give_step(give):
+    """The hub's step of a card that gives a mailbox, a Drive or an MCP server: the thing whole, also when the first
+    option names the kind alone (need_give_words)."""
+    rid = give["resources"][0]
+    return f"Press Give: it gives {shown_role(give['agent'])} {need_give_access(give['level'], need_give_thing(rid))}."
+
+
+def need_give_stale(r, give):
+    """Why open Give card row `r` no longer says the change that its press would make now, in words for the manager,
+    else None: its first option is not need_give_words of its grant now (a rename, a role, an MCP server's title, or a
+    change of the hub's words), or, for a mailbox, a Drive or an MCP server, its step is not need_give_step (the step
+    names the thing whole where the option names the kind alone)."""
+    pressed, said = (need_options(r) or [""])[0], need_give_words(give)
+    if pressed != said:
+        return f"The card's first option, \"{pressed}\", no longer says what Give gives now, \"{said}\"."
+    step = need_give_step(give) if give["resources"] else None
+    if step is not None and (r["todo"] or "") != step:
+        return f"The card's step, \"{r['todo']}\", no longer says what Give gives now, \"{step}\"."
+    return None
+
+
+def need_give_shell_off(a, kind, level):
+    """True when Gmail at write or send, or a Drive, would go to the worker or lead of team.json entry `a` whose Shell
+    box is off (shell_off): no session of it has the tools of Gmail or Drive (SHELL_OFF_TOOLS), and only a wake-up rule
+    reads its mail (gmail_label_read)."""
+    return isinstance(a.get("can"), list) and "shell" not in a["can"] and kind in GOOGLE_NAMES and \
+        (kind == "drive" or level != "read")
 
 
 def need_give_named(repo, title, why):
@@ -18298,7 +18411,8 @@ def need_give_named(repo, title, why):
 
 
 def need_give_view(row):
-    """needs[].give: {agent, level, repos} of an item that carries a grant, else None."""
+    """needs[].give: {agent, level, repos, resources} of an item that carries a grant, else None. resources: the one
+    gmail:, drive: or tool: that it gives (F6 piece 2), as a resource id, or none."""
     keys = row.keys() if hasattr(row, "keys") else ()
     if "give_agent" not in keys or not row["give_agent"] or not row["give_level"]:
         return None
@@ -18306,8 +18420,10 @@ def need_give_view(row):
         repos = json.loads(row["give_repos"] or "[]")
     except (ValueError, TypeError):
         repos = []
+    rid = row["give_resource"] if "give_resource" in keys else None
     return {"agent": row["give_agent"], "level": row["give_level"],
-            "repos": [r for r in repos if isinstance(r, str)] if isinstance(repos, list) else []}
+            "repos": [r for r in repos if isinstance(r, str)] if isinstance(repos, list) else [],
+            "resources": [rid] if isinstance(rid, str) and resource_parts(rid)[0] in NEED_GIVE_SAID else []}
 
 
 def need_gives(need_id):
@@ -18318,12 +18434,16 @@ def need_gives(need_id):
 
 
 def need_give_gone(give):
-    """The words that close an item whose Give has nobody to give to any more: its agent left the fleet, or holds no
-    repositories now (it is no worker or lead), or the item names one of the product's own repositories, which no grant
-    gives (a card from before it was one: need_give refuses a new one); else None. An agent that is paused or in setup
-    keeps its card: a grant to it still works."""
+    """The words that close an item whose Give has nobody to give to any more: an item of a kind that this hub cannot
+    read (no repository and no thing that it knows: a secret of a later code, or a row of this piece after a revert of
+    it), its agent left the fleet, or holds no repositories now (it is no worker or lead), or the item names one of the
+    product's own repositories, which no grant gives (a card from before it was one: need_give refuses a new one); else
+    None. An agent that is paused or in setup keeps its card: a grant to it still works."""
     import door_targets
     agent = give["agent"]
+    # a kind that this code does not read (a secret, of a later or an earlier code): its press would give nothing
+    if not give["repos"] and not give["resources"]:
+        return "Closed by the hub: this hub cannot give what this card gives, so Give gives nothing."
     vendor = [r for r in give["repos"] if door_targets.vendor(r)]
     if vendor:
         return f"Closed by the hub: the door refuses {vendor[0]} in every fleet, so Give gives nothing."
@@ -18358,7 +18478,17 @@ def need_give_press(need_id, request_id, db, connection, address, signed):
     A (status, answer) refuses the press, and then no answer is written: from a client that shows no Details (a phone,
     a connected app: the Mac and a PC show what Give gives), or an item whose agent is gone, which the hub closes. Else
     {repos}: the repositories whose level the press raised, none when the agent held them already. Whatever the answer
-    does next, the manager hears the grant at once, as after every grant of the owner's (save_agent_repos)."""
+    does next, the manager hears the grant at once, as after every grant of the owner's (save_agent_repos).
+
+    F6 piece 2: an item of one gmail:, drive: or tool: gives it through the same path (resource_hold_set, the one
+    mutation of every grant of these kinds), after need_give_refusal passes again on team.json as it is at this press:
+    a check that can pass by itself (TeamPassing) refuses the press and keeps the card, and any other closes it, as a
+    team card's press does. So does a card whose words are no longer its change (need_give_stale), of any kind.
+    Else {repos: [], resources}: the thing when the press raised its level, and a record of the owner's grant
+    (resource_record), as a team plan's access writes one. A stop of the hub between the commit and the record leaves a
+    hold with no record: the Mac's press again writes it (the repeat rule of grant_access, below). A known limit: when
+    no press comes again, the sweep closes the card as given another way, and only the commit, whose message names the
+    card, says that this press gave it."""
     need = q1("SELECT * FROM needs WHERE id=?", (need_id,))
     give = need_give_view(need) if need else None
     if give is None or need["answer"] is not None or db != kv_get("db_id") or signed or \
@@ -18379,10 +18509,24 @@ def need_give_press(need_id, request_id, db, connection, address, signed):
                                             if asker else ""))
         return (409, refusal_words.answer("request_answered"))
     agent, level, repos, raised = give["agent"], give["level"], give["repos"], []
+    rid = give["resources"][0] if give["resources"] else None
+    kind, thing = resource_parts(rid) if rid else ("repo", None)
+    refused, given_before = [], [None]     # given_before: the agent's level of the thing before this press
 
     def give_levels(team):
         known_agents(team, [agent])
         a = team["agents"][agent]
+        if rid:
+            why = need_give_refusal(team, kind, thing, agent, level)    # TeamPassing passes up: the card stays
+            if why:
+                refused.append(why)
+                return False
+            got = next((h["level"] for h in resource_holders(kind, thing, team) if h["agent"] == agent), None)
+            given_before[0] = got
+            if level_at_least(kind, got, level):
+                return False            # never lowered: a level that it holds already stays
+            raised[:] = [rid]
+            return resource_hold_set(a, kind, thing, level)
         held = dict(a.get("repos") or {})
         raised[:] = [r for r in repos if not level_at_least("repo", held.get(r), level)]
         for repo in raised:
@@ -18390,11 +18534,49 @@ def need_give_press(need_id, request_id, db, connection, address, signed):
         if raised:
             a["repos"] = dict(sorted(held.items()))
         return bool(raised)
-    what = repos[0] if len(repos) == 1 else f"{len(repos)} repositories"
+    what = rid if rid else repos[0] if len(repos) == 1 else f"{len(repos)} repositories"
+    # the words that the owner pressed are the change that the press makes now: a rename, a role or an MCP server's
+    # title that changed after the card was made would give another agent or thing under the card's old words
+    stale = need_give_stale(need, give)
+    if stale:
+        refused.append(stale)
     try:
-        save_integration(None, give_levels, f"Owner gave {agent} {level} access to {what} with Give on N-{need_id}")
+        result = None if refused else save_integration(
+            None, give_levels, f"Owner gave {agent} {level} access to {what} with Give on N-{need_id}")
+    except TeamPassing as e:
+        return (409, {"error": TEAM_PRESS_LATER.format(why=e.owner)})
     except Refusal as e:
         return (e.status, refusal_body(e))
+    if refused:         # a fact of the card changed after it was made: it closes, and nothing changed
+        t0 = now()
+        with transaction():
+            closed, asker = need_give_close_rows(need, TEAM_CLOSED_WORDS, t0)
+        if closed:
+            emit(manager_name(), "say", f"[hub] The owner pressed Give on N-{need_id} ({need['title']}), but the hub "
+                 f"gave nothing: {refused[0]} The hub closed the card." +
+                 (f" Q-{need['question']} of {asker} has its words as the answer." if asker else ""))
+        return (409, {"error": TEAM_PRESS_CHANGED.format(by=shown_role(need["by"]))})
+    if raised and rid:
+        with transaction():
+            resource_record(rid, agent, level, "owner", result["revision"])
+        emit(manager_name(), "say", f"[hub] The owner pressed Give on N-{need_id} ({need['title']}): {agent} has "
+             f"{level} access to {need_give_thing(rid)} ({rid}) now. An agent gets the change in its next task "
+             f"session.")
+        return {"repos": [], "resources": [rid]}
+    if rid and given_before[0] == level and not level_at_least(kind, resource_recorded(rid, agent), level):
+        # The hub stopped after this card's commit and before its record (a release's restart), and the Mac sends the
+        # same press again: the agent holds exactly the card's level, and no record says so. The repeat rule of
+        # grant_access: the record now, at this press's revision, and the manager's line; the commit itself names the
+        # card ("with Give on N-<id>"). A level given another way at exactly the card's level gets the owner's record
+        # too, which is true of who gave it.
+        with transaction():
+            resource_record(rid, agent, level, "owner", result["revision"])
+        emit(manager_name(), "say", f"[hub] The owner pressed Give on N-{need_id} ({need['title']}): {agent} has "
+             f"{level} access to {need_give_thing(rid)} ({rid}) now. An agent gets the change in its next task "
+             f"session.")
+        return {"repos": [], "resources": [rid]}
+    if rid:
+        return {"repos": [], "resources": []}
     if raised:
         pages = github_unreached(raised)
         emit(manager_name(), "say", f"[hub] The owner pressed Give on N-{need_id} ({need['title']}): {agent} has "
@@ -18411,20 +18593,32 @@ def need_give_note(need, choice, gave):
     if need is None or choice != 0 or not isinstance(gave, dict) or need_give_view(need) is None:
         return ""
     return (" The hub gave it at this press, as its line before this answer says: do nothing for it yourself."
-            if gave["repos"] else " The agent held that access already, so the press changed nothing: do nothing "
-                                  "for it yourself.")
+            if gave["repos"] or gave.get("resources") else " The agent held that access already, so the press "
+                                                           "changed nothing: do nothing for it yourself.")
 
 
 def need_give_closes(r):
     """The words that close open card row `r` by itself, when it carries a grant and its agent holds that level on
-    each of its repositories now, given another way, or when its agent is gone (need_give_gone); else None.
-    team.json's grants only (agents())."""
+    each of its repositories, or on its one other thing, now, given another way, or when its agent is gone or the hub
+    cannot read its kind (need_give_gone); else None. A card of a mailbox, a Drive or an MCP server also closes, with
+    TEAM_CLOSED_WORDS, when its press would close it: its words are no longer its change (need_give_stale), or its
+    agent's Shell box is off for it (need_give_shell_off). team.json's grants only (agents())."""
     give = need_give_view(r)
-    if give is None or not give["repos"]:
+    if give is None:
         return None
     gone = need_give_gone(give)
     if gone:
         return gone
+    if give["resources"]:       # F6 piece 2: a mailbox, a whole Drive or an MCP server
+        kind, what = resource_parts(give["resources"][0])
+        # what its press would refuse and close: words that are no longer its change, a Shell box that is off
+        if need_give_stale(r, give) or need_give_shell_off(agents().get(give["agent"]) or {}, kind, give["level"]):
+            return TEAM_CLOSED_WORDS
+        got = next((h["level"] for h in resource_holders(kind, what) if h["agent"] == give["agent"]), None)
+        if not level_at_least(kind, got, give["level"]):
+            return None
+        return (f"Closed by the hub: {shown_role(give['agent'])} has "
+                f"{need_give_access(give['level'], need_give_thing(give['resources'][0]))} now, given another way.")
     held = (agents().get(give["agent"]) or {}).get("repos") or {}
     if not all(level_at_least("repo", held.get(x), give["level"]) for x in give["repos"]):
         return None
@@ -18469,8 +18663,8 @@ def t_raise_needs_you(agent, a):
         options = check_need_options(a.get("options"), least=1 if pictures else 2)
     else:
         # Give is the hub's first option, the manager's own options (its No) follow it, and the hub writes the step:
-        # the press is the step. The owner reads which repository it gives on the card: its title or its why names
-        # the one, and Details lists several.
+        # the press is the step. The owner reads what it gives on the card: its title or its why names the one
+        # repository or other thing, and Details lists several repositories.
         given = a.get("options")
         if given is not None and not isinstance(given, list):
             check_need_options(given)       # its own refusal of options that are no list
@@ -18481,7 +18675,14 @@ def t_raise_needs_you(agent, a):
                             "of yours that gives would give nothing.")
         options = check_need_options([need_give_words(give)] + (list(given) if given else ["No"]))
         repos, role = give["repos"], shown_role(give["agent"])
-        if len(repos) == 1 and not need_give_named(repos[0], title, why):
+        if give["resources"]:       # F6 piece 2: one mailbox, one Drive or one MCP server, which the card names
+            kind, what = resource_parts(give["resources"][0])
+            thing = need_give_thing(give["resources"][0])
+            if not any(need_give_named(n, title, why) for n in {what, resource_title(kind, what)}):
+                raise ToolError(f"The title or the why names {thing}, which Give gives, so that the owner reads what "
+                                f"the press gives.")
+            todo = need_give_step(give)
+        elif len(repos) == 1 and not need_give_named(repos[0], title, why):
             raise ToolError(f"The title or the why names the repository that Give gives as {repos[0]}, owner and "
                             f"name, so that the owner reads what the press gives.")
         if len(repos) > 1:
@@ -18492,8 +18693,9 @@ def t_raise_needs_you(agent, a):
                                 f"they would be longer than {NEED_DETAILS_CHARS} characters: shorten your details, "
                                 f"or split the repositories into two items.")
             details = (details + "\n\n" if details else "") + listed
-        todo = f"Press Give: it gives {role} {give['level']} access to " + \
-            (f"{repos[0]}." if len(repos) == 1 else f"the {len(repos)} repositories under Details.")
+        if repos:
+            todo = f"Press Give: it gives {role} {give['level']} access to " + \
+                (f"{repos[0]}." if len(repos) == 1 else f"the {len(repos)} repositories under Details.")
     multi = a.get("multi")
     if multi is not None and not isinstance(multi, bool):
         raise ToolError("multi is true when the owner may tick several of the options, and false or left out when "
@@ -18664,6 +18866,13 @@ def t_raise_needs_you(agent, a):
         guard(agent, recommended)
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
         old = need_replaced(agent, replaces, door_host) if replaces else None
+        # the Door area's rule for each kind of card that gives (F6 piece 2): the hub counts the open ones, and the
+        # item that this one replaces leaves Needs you with this write
+        if give and q1("SELECT COUNT(*) n FROM needs WHERE give_agent IS NOT NULL AND answer IS NULL AND id!=?",
+                       (old["id"] if old else 0,))["n"] >= NEED_GIVE_OPEN:
+            raise ToolError(f"Not raised: {NEED_GIVE_OPEN} items with Give wait for the owner already. Raise this one "
+                            f"once the owner answered one of them or you withdrew one that is not needed "
+                            f"(withdraw_need), or in the place of one, with replaces.")
         qu = need_question(agent, a.get("question_id"), ignore=old["id"] if old else None)
         # owner API 1.285: each picture, checked under the lock that the item's own write holds, so that no message
         # and no other item takes one between this check and the take (need_takes_pictures)
@@ -18685,12 +18894,14 @@ def t_raise_needs_you(agent, a):
             door_card_open(door_call, door_host, asking, old)
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,door_host,github_app,"
                   "add_device,github_key,details,multi,door_script,door_task,door_task_id,key_swap_server,give_agent,"
-                  "give_level,give_repos,recommended,pictures) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "give_level,give_repos,give_resource,recommended,pictures) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, todo, t0, agent, options, qu["id"] if qu else None, door_call,
                    door_host, github_app, 1 if add_device else None, github_key, details or None,
                    1 if multi else None, door_script, door_task, asking["id"] if asking else None, key_swap_server,
                    give["agent"] if give else None, give["level"] if give else None,
-                   json.dumps(give["repos"]) if give else None, recommended,
+                   json.dumps(give["repos"]) if give else None,
+                   give["resources"][0] if give and give["resources"] else None, recommended,
                    json.dumps([row["id"] for row in picture_files]) if picture_files else None))
         need_takes_pictures(nid, picture_files, t0, old)
         # owner feature asks: the ask that the agent named, else the ask of the item that this one replaces, else the
@@ -18748,8 +18959,9 @@ def t_raise_needs_you(agent, a):
                 f"by itself when the wish is set another way or nothing on {key_swap_server} waits any more, so do not "
                 f"withdraw it.")
     if give:
+        given = ", ".join(give["repos"]) or f"{need_give_thing(give['resources'][0])} ({give['resources'][0]})"
         door = (f" Its first option is {json.loads(options)[0]}: the owner's press gives {give['agent']} "
-                f"{give['level']} access to {', '.join(give['repos'])} in one commit, and your answer says so; do not "
+                f"{give['level']} access to {given} in one commit, and your answer says so; do not "
                 f"grant it or ask for it again. When {give['agent']} gets that access another way, the hub closes "
                 f"N-{nid} by itself.")
     later = "" if qu or github_key or key_swap_server else (" If nothing needs it any more before the owner answers, "
@@ -19251,8 +19463,9 @@ def need_look_sweep(t0):
                          f"tell it with message_agent.", extra=LATER_SAY)
     if given and mgr:       # the lane "Give on a card": a Give card whose grant came another way, or that has nobody
         emit(mgr, "say", f"[hub] The hub closed {', '.join(given)} on the owner's Needs you: its answer says why (the "
-                         f"agent holds that access now, given another way, or cannot take it any more). "
-                         f"A question that it carried has that answer; do not raise it again.", extra=LATER_SAY)
+                         f"agent holds that access now, given another way, or cannot take it any more, or the fleet "
+                         f"changed after the card was made). A question that it carried has that answer; raise a new "
+                         f"card only when the fleet changed and the work still needs it.", extra=LATER_SAY)
     held_now = json.dumps(held, sort_keys=True) if held else None
     if held_now != held_before:
         kv_set("need_held", held_now)
@@ -19839,6 +20052,52 @@ SECRET_RENEW = "For a wrong or expired key, use failed, never steps that send th
 SECRET_FAILED_OWN = SECRET_FAILED.replace(
     "of the fleet", "that you hold, or of a door key that the door uses for you,").replace("env, door and give_to",
                                                                                          "env and door")
+# request_secret's refusal of an API key's variable name names the one rule that the name breaks (the owner's feedback
+# of 22 November 2026, F18). The words before named only the form, so an agent read the refusal of
+# TAILSCALE_RUNNER_AUTHKEY, a name with no ending of a key's name, as a fault of the tool, and the manager, which got
+# the same words, took the key's site, note and steps out of its request together with the name: its card came to the
+# owner with no steps. The endings stay out of the tool's own text, which each session loads (test_context_size).
+SECRET_ENV_ENDINGS = ", ".join(KEY_SUFFIXES[:-1]) + " or " + KEY_SUFFIXES[-1]
+SECRET_ENV_ONLY = "Change only env: this refusal is not about the other fields."
+# An API key's steps (F18): each key is one that the owner makes or finds outside the app, a door key and a new value
+# too, and card 297 asked for one with no word of how, so the owner did not know what to do with it. A login needs no
+# steps: the owner types a password that they hold. An agent that cannot find the page, such as a chat with no web
+# tool, would else make an address up, and the owner would open it for a key.
+SECRET_NEEDS_STEPS = ("An API key needs details: how the owner makes or finds it, as numbered steps, with its page as "
+                      "its full address with https:// and what to click there by the words on the buttons. The owner "
+                      "cannot answer a key card without them. If you cannot find the page, give no address.")
+
+
+def secret_env_refusal(env):
+    """The words of request_secret's refusal of env, a name that env_name does not take: the rule of key_env that it
+    breaks, the form, a reserved name or the ending, with an example name that keeps the rules. The answer and the line
+    of the log are these words, so they hold env only when it has the form of a variable name and a "_", as a key's
+    name has, or is a reserved name by its exact text (PATH). Other text can be a value that came in env by mistake,
+    also one of capitals and digits only (a TOTP seed, a token): the words hold no part of it."""
+    if not env:
+        return (f"An API key needs env: the variable name an agent reads it by. It has A-Z, 0-9 and _, starting with "
+                f"a letter, at most 60 characters, and it ends in {SECRET_ENV_ENDINGS}, for example "
+                f"STRIPE_SECRET_KEY. The names a session sets itself (FLEET_*, ANTHROPIC_*, PATH and their like) are "
+                f"not available.")
+    if not lifecycle.KEY_ENV.fullmatch(env):
+        return (f"env is not a variable name: it has A-Z, 0-9 and _, starting with a letter, at most 60 characters, "
+                f"and it ends in {SECRET_ENV_ENDINGS}, for example STRIPE_SECRET_KEY. {SECRET_ENV_ONLY}")
+    ends = env.endswith(KEY_SUFFIXES)
+    # a reserved name with no "_" is one of the list's own words: each pattern of ENV_RESERVED that takes more has a "_"
+    if ENV_RESERVED.fullmatch(env):
+        return (f"{env} is a name that a session sets itself (FLEET_*, ANTHROPIC_*, PATH and their like): give env "
+                f"another name" + ("" if ends else f" that ends in {SECRET_ENV_ENDINGS}") +
+                f", for example STRIPE_SECRET_KEY. {SECRET_ENV_ONLY}")
+    if not ends:
+        said, example = "env", "STRIPE_SECRET_KEY"
+        if "_" in env:
+            # the name with its ending as a key's name has it: X_AUTHKEY gives X_AUTH_KEY, else the name and _KEY
+            named = [env[:-len(e) + 1] + e for e in KEY_SUFFIXES if env.endswith(e[1:])] + [env + "_KEY"]
+            said = env
+            example = next((n for n in named if key_env(n)), "STRIPE_SECRET_KEY")
+        return (f"{said} does not end as an API key's name does: give env a name that ends in {SECRET_ENV_ENDINGS}, "
+                f"for example {example}. {SECRET_ENV_ONLY}")
+    return secret_env_refusal("")
 
 
 def login_host(text):
@@ -20029,8 +20288,8 @@ def key_failed(agent, a, worker, chat, tid):
         raise ToolError("failed names no API key of the fleet: give the reference (bws://...) of the key whose value "
                         "no longer works, as the hub named it.")
     env, said = logins()[ref].get("env") or "", str(a.get("env") or "").strip()
-    if said and said != env:
-        raise ToolError(f"failed names the API key {env}, not {said}: leave env out.")
+    if said and said != env:            # no part of it in the words, nor of the door below: each can be a value
+        raise ToolError(f"failed names the API key {env}: leave env out.")
     if GITHUB_APP_KEY_NAME.fullmatch(env):
         raise ToolError(f"{env} is a GitHub App's key: the owner's app makes it with GitHub, and nobody types it.")
     if a.get("give_to"):
@@ -20043,8 +20302,8 @@ def key_failed(agent, a, worker, chat, tid):
     door = door_key_of(TEAM, ref)
     named = door_key_name(a.get("door"))
     if named and named != door:
-        raise ToolError(f"failed names {'the door key ' + door if door else 'a key that the door does not use'}, not "
-                        f"{named}: leave door out.")
+        raise ToolError(f"failed names {'the door key ' + door if door else 'a key that the door does not use'}: leave "
+                        f"door out.")
     route = "ask your requester with ask_my_requester." if tid else "ask the manager with message_agent."
     if door.startswith("app:"):
         raise ToolError(f"{door} is a setting of an app on a host, and its app keeps the value that it has in its own "
@@ -20205,15 +20464,14 @@ def t_request_secret(agent, a):
                     f"{'you' if door_user == agent else door_user} from {door_round_due()}, with nothing to type; "
                     f"then `ops` takes it. {DOOR_EARLY_REFUSAL}" +
                     ("" if door_user == agent else f" {DOOR_EARLY_TASK}"))
-    env = renew[1] if renew else str(a.get("env") or "").strip() or (door_env(door) if door else "")
+    said_env = str(a.get("env") or "").strip()
+    env = renew[1] if renew else said_env or (door_env(door) if door else "")
     if kind == "api_key" and not env_name(env):
-        if door:
+        if door and not said_env:       # the hub's own name for the door key (door_env)
             raise ToolError(f"The vault's name for this door key would be longer than a variable name may be: give "
                             f"env, a shorter name that ends in _KEY, _TOKEN or _SECRET, for example "
                             f"{door_env('app:shop:API_KEY')}. No agent reads it.")
-        raise ToolError("An API key needs env: the variable name an agent reads it by, A-Z, 0-9 and _, starting "
-                        "with a letter, at most 60 characters, for example STRIPE_SECRET_KEY. The names a session "
-                        "sets itself (FLEET_*, ANTHROPIC_*, PATH and their like) are not available.")
+        raise ToolError(secret_env_refusal(env))
     if kind == "login" and env:
         raise ToolError("A login has no env: no agent ever reads a password, its vault signs in with it. Leave env "
                         "out, or ask for an API key instead.")
@@ -20395,6 +20653,11 @@ def t_request_secret(agent, a):
         raise ToolError(f"This task has asked the owner for {SECRET_ASKS_PER_TASK} secrets already: deliver what you "
                         f"can, and say in the result what else it needs.")
     guard(agent, why, details, site, note)
+    # after each answer that raises no card (a key that the fleet holds, a request that is open already, a decline),
+    # and before the card: one with no steps is one that the owner cannot answer (SECRET_NEEDS_STEPS)
+    if kind == "api_key" and not details:
+        steps = door_key_words(door).rstrip(".")       # the door's own words end in a full stop (door_providers)
+        raise ToolError(SECRET_NEEDS_STEPS + (f" For this key: {steps}." if steps else ""))
     host = secret_site_host(site) if site else ""
     title = f"New value for {env}" if renew else \
         (f"Enter the API key {env}" + (f" for {host}" if host else "")) if kind == "api_key" else \
@@ -26845,6 +27108,22 @@ def role_sets():
     return sets if sets is not None and "role_sets" in teams_features() else None
 
 
+ROLE_SETS_FAULTS = set()        # (call, class of the exception): the faults of the part that this process printed
+
+
+def role_sets_fault(call):
+    """In the `except` of a call of the part role_sets (`call`, its name): diagnostics.py counts the fault each time,
+    and the journal gets its traceback only the first time in this process for this call and this class of exception.
+    A part that faults on a fleet's rows faults at each read: each GET /ui/people, for each person and each role, at
+    each poll of the app."""
+    key = (call, sys.exc_info()[0])
+    if key in ROLE_SETS_FAULTS:
+        diagnostics.record("hub")
+        return
+    ROLE_SETS_FAULTS.add(key)
+    print_fault()
+
+
 def role_view(r):
     """One role for the owner (AUTONOMY.md 6.3). With Founderizer for Teams' part `role_sets` (role_sets()): also
     the role's set `access`, its count of `people` and the people who `differ` from it (role_fields)."""
@@ -26855,7 +27134,7 @@ def role_view(r):
         try:
             view.update(sets.role_fields(r["name"]))
         except Exception:       # a fault of the part on this fleet's rows: the Core view, so that the page answers
-            print_fault()
+            role_sets_fault("role_fields")
     return view
 
 
@@ -26883,7 +27162,7 @@ def people_roles():
             try:
                 names = sets.role_agents(r["name"])
             except Exception:   # a fault of the part on this fleet's rows: the Core entry, as role_view
-                print_fault()
+                role_sets_fault("role_agents")
         if names is not None:
             entry["agents"] = names
         out.append(entry)
@@ -28974,7 +29253,7 @@ def person_view(p, t0):
         try:
             view.update(sets.person_fields(p))
         except Exception:       # a fault of the part on this person's rows: the Core view, as role_view; also in
-            print_fault()       # the answer of POST /ui/people, after its commit
+            role_sets_fault("person_fields")        # the answer of POST /ui/people, after its commit
     return view
 
 
@@ -44877,12 +45156,12 @@ def t_write_skill(agent, a):
     if stored:
         return stored["text"]
     # A skill that the owner gave keeps the owner's words (the owner's given skills, design of 21 November 2026): its
-    # write is refused, and so is its retire, but in a task that the owner's own message opened, whatever that message
-    # asked: the hub cannot read intent, so only the agent's rule holds "but when the owner tells you to remove it"
-    # (skill_retire_by_owner). Here, after the stored
-    # answer, so that the exact repeat of a write that went through gets its first answer again, also when a gift of
-    # that name landed since; and before anything is stored or committed. The commit asks again at its final revision
-    # (below), for a gift that lands meanwhile.
+    # write is refused, and so is its retire, but in a task that the owner's own message opened, or in the manager's
+    # own session while its newest read holds the owner's message that names the skill, whatever that message asked:
+    # the hub cannot read intent, so only the agent's rule holds "but when the owner tells you to remove it"
+    # (skill_retire_by_owner). Here, after the stored answer, so that the exact repeat of a write that went through gets
+    # its first answer again, also when a gift of that name landed since; and before anything is stored or committed.
+    # The commit asks again at its final revision (below), for a gift that lands meanwhile.
     given = skill_given_refusal(agent, name, retire, rev)
     if given:
         raise ToolError(given)
@@ -45034,9 +45313,9 @@ def skill_remove(agent, name):
 # checkout with lifecycle.may_take, which takes from the hub only paths of CONFIG_FILES, each a plain file (DATA_MODE):
 # one path that is deeper, a name with another character or a mode of 100755 stops the whole fleet's configuration, not
 # one skill (the design, 3.1). So a gift holds only paths of today's SKILL_FILE, each as a plain file, and a script
-# loses its run bit. A given skill keeps the owner's words: write_skill refuses a write to it, and retires it only in a
-# task that the owner's own message opened (the design, 5.5 and 6.4). Its limits are those of the open skill format;
-# an agent's own write_skill keeps its own, smaller ones (the design, 4).
+# loses its run bit. A given skill keeps the owner's words: write_skill refuses a write to it, and retires it only on
+# the owner's own message (skill_retire_by_owner; the design, 5.5 and 6.4). Its limits are those of the open skill
+# format; an agent's own write_skill keeps its own, smaller ones (the design, 4).
 SKILL_GIFT_DESCRIPTION = 1024           # characters of a given skill's description, its white space collapsed
 SKILL_GIFT_MD_MAX = 64 * 1024           # bytes of its SKILL.md, the front matter included
 SKILL_GIFT_FILES = 100                  # files beside its SKILL.md
@@ -45058,6 +45337,13 @@ SKILL_GIVEN_WRITE = ("The owner gave you the skill {name}, so it keeps the owner
                      "with another name, and tell the owner what does not fit.")
 SKILL_GIVEN_RETIRE = ("The owner gave you the skill {name}. Only the owner removes a skill that the owner gave: tell "
                       "the owner.")
+# the manager's refusal in its place (skill_retire_newest): with "tell the owner" alone, the owner would ask again in
+# the same words and get it again, so it says the rule and a step for each case
+SKILL_GIVEN_RETIRE_MANAGER = ("The owner gave you the skill {name}. Only the owner removes a skill that the owner "
+                              "gave: you retire it only while your newest read of messages holds the owner's own "
+                              "message that names it and no message of an AI session, a program or a connected app, "
+                              "and while no message waits unread. If a message waits, read your messages first; if "
+                              "not, ask the owner to name the skill in a new message to you in the Founderizer app.")
 # the same refusal in a task that a message of an AI session, a program or a connected app opened: the owner may have
 # asked for the removal there, so the words name the owner's ways that remove it (the area Needs-you's reader, F5)
 SKILL_GIVEN_RETIRE_VIA = ("The owner gave you the skill {name}, and this task comes from a message that an AI session "
@@ -45572,13 +45858,18 @@ def skill_gift_line(gift, task=False):
     never the skill's own text, which is data like every file (read_attachment), so that only the hub's line says
     that the owner gave it. The chat that reads it has an older checkout: the files come with the next task. task:
     the line in the start of a task that the chat opened from the message (task_itself), whose checkout has the files
-    already: the gift committed before the message, and the task's start moves its checkout (sync_checkout)."""
-    beside = len(gift["files"])
-    return (f"The owner gave you the skill {gift['name']}, at {SKILLS}/{gift['agent']}/{gift['name']}/SKILL.md"
+    already: the gift committed before the message, and the task's start moves its checkout (sync_checkout). The
+    manager's own session gets no task from its chat, and its helper moves its checkout only at the start of a task
+    session or at an update: until then it reads the files on the configuration ref."""
+    beside, folder = len(gift["files"]), f"{SKILLS}/{gift['agent']}/{gift['name']}"
+    return (f"The owner gave you the skill {gift['name']}, at {folder}/SKILL.md"
             + (f" with {beside} file{'' if beside == 1 else 's'} beside it" if beside else "")
             + ", and it keeps the owner's words: never change it with write_skill. Its files are plain files, so run "
               "a script in it with its program (python3 x.py, bash x.sh). "
             + ("Its files are in your checkout." if task else
+               f"Your checkout gets its files when your helper next brings it up to date. Until then, run git fetch "
+               f"origin and read them with git show origin/{CONFIG_BRANCH}:{folder}/SKILL.md."
+               if role_of(gift["agent"]) == "manager" else
                "Its files are in your checkout from the start of your next task, not in this chat."))
 
 
@@ -45679,19 +45970,27 @@ def skill_is_given(agent, name, rev=None):
     return None if given is None else given.get((agent, name), False)
 
 
-def skill_retire_by_owner(agent):
-    """True in a task session of the agent whose task its start_task opened from a message of the owner's own: a
-    message of the owner's hand (owner_force: the screens of the owner's apps, an enrolled device, a chat app), not one
-    marked as coming through an AI session or another program, and not from a connected app. The task is the session's
-    own, from its credential (CALL.context), never from a task_id that the call names; the message is the one that
-    start_task's receipt names, which keeps the task that it opened (task_of_message). "Remove the skill X" in a chat
-    is work, and this is the one session where an agent retires a skill that the owner gave (the design, 6.4)."""
-    # In such a task the agent can retire the given skill and then write a skill of its own with that name, which is
+def skill_retire_by_owner(agent, name, rev):
+    """True when a message of the owner's own lets this session of the agent retire its skill `name` of revision rev,
+    which the owner gave: a message of the owner's own hand (skill_owner_words). In a task session of the agent it is
+    the message that its start_task opened the task from: the task is the session's own, from its credential
+    (CALL.context), never from a task_id that the call names; the message is the one that start_task's receipt names,
+    which keeps the task that it opened (task_of_message). "Remove the skill X" in a chat is work, and this is the one
+    session where a worker or a lead retires a skill that the owner gave (the design, 6.4). The manager has no
+    start_task: in its own session it is a message of its newest read (skill_retire_newest)."""
+    # In such a session the agent can retire the given skill and then write a skill of its own with that name, which is
     # then its own: the design accepts that, as the owner asked for the removal. The hub cannot read what the message
-    # asked: in such a task it lets the retire through whatever the message said, and only the agent's rule holds
+    # asked: in such a session it lets the retire through whatever the message said, and only the agent's rule holds
     # "but when the owner tells you to remove it" (RULES.md, "Your memory"; the area Needs-you's reader, F5).
-    said = skill_retire_message(agent)
-    return bool(said) and owner_force(said["hand"]) and said["connection"] is None
+    said = skill_retire_message(agent) or skill_retire_newest(agent, name, rev)
+    return bool(said) and skill_owner_words(said)
+
+
+def skill_owner_words(row):
+    """True for a row of ui_requests that the owner's own hand wrote (owner_force: the Mac app's screen, one of the
+    owner's apps on an enrolled device, a chat app), not one marked as coming through an AI session or another program
+    (also a program on an enrolled device, request_hand), and not from a connected app."""
+    return owner_force(row["hand"]) and row["connection"] is None
 
 
 def skill_retire_message(agent):
@@ -45707,9 +46006,51 @@ def skill_retire_message(agent):
                     (task, agent, task, agent, agent))
 
 
+def skill_retire_newest(agent, name, rev):
+    """The owner's message of the manager's newest read that lets it retire the skill (skill_retire_by_owner), in the
+    manager's own session (the one session with no context, which its credential binds: binding_matches); else None,
+    and for every other session. The newest read is the rows that took the manager's newest read time: one
+    read_messages gives one time to all that it gives. So the read of the owner's "Remove the skill X" retires it,
+    also with more of the owner's words in the same read, and the next read ends that, also a read of a wake-up, a
+    result or an agent's words, which write no row of ui_requests. It holds when: the read holds a chat message of the
+    owner's own hand that the owner did not stop and whose words name the skill among the manager's skills at revision
+    rev (skill_named); no row of ui_requests in it is of another hand (an AI session, a program, a connected app), whose
+    words could be the ask; no chat message to the manager waits unread (the owner's "No, keep it"); and the read came
+    after the start of the manager's session of now (its standing credential, as seen_task reads it), because a new
+    session never read the message. A manager with no standing credential retires none."""
+    if getattr(CALL, "context", None) is not None or role_of(agent) != "manager":
+        return None
+    start = read_row("SELECT created FROM session_credentials WHERE agent=? AND kind='standing' AND revoked IS NULL "
+                     "ORDER BY created DESC LIMIT 1", (agent,))
+    newest = read_row("SELECT MAX(read_at) AS t FROM events WHERE agent=? AND kind='say'", (agent,))["t"]
+    if start is None or newest is None or newest < start["created"]:
+        return None
+    if read_row("SELECT 1 FROM events e JOIN ui_requests u ON u.event_id=e.id WHERE e.agent=? AND e.kind='say' AND "
+                "e.read_at IS NULL AND u.kind='message' LIMIT 1", (agent,)):
+        return None
+    rows = read_rows(f"SELECT u.text, u.kind, u.hand, u.connection, {NOT_STOPPED} AS open FROM events e JOIN "
+                     "ui_requests u ON u.event_id=e.id WHERE e.agent=? AND e.kind='say' AND e.read_at=?",
+                     (agent, newest))
+    if not all(skill_owner_words(r) for r in rows):
+        return None
+    mine = [skill for owner, skill in skills_given(rev) or () if owner == agent]
+    return next((r for r in rows if r["kind"] == "message" and r["open"] and skill_named(name, r["text"], mine)), None)
+
+
+def skill_named(name, text, names):
+    """True when the words of `text` name the skill: they hold its name, whole and in any case, with "-" and "_" read as
+    spaces. At each place of the words the longest name counts, of the agent's skills (names) and of the words that
+    the text itself joins with "-" or "_", of any letters: "Remove deploy-acme-web" does not name the skill deploy of
+    an agent that has both, and "Remove deploy-acme-web-eu" or "deploy-acme-web-ñu" does not name deploy-acme-web."""
+    names = list(names) + re.findall(r"(?<![^\W_])[^\W_]+(?:[-_]+[^\W_]+)+", (text or "").casefold())
+    name, text, *names = (" ".join(re.sub("[-_]", " ", t).casefold().split()) for t in (name, text or "", *names))
+    names = "|".join(map(re.escape, sorted(names, key=len, reverse=True)))
+    return name in re.findall(rf"\b(?:{names})\b", text)
+
+
 def skill_given_refusal(agent, name, retire, rev):
     """write_skill's refusal of a write or a retire of a skill that the owner gave, at revision rev, or None: a given
-    skill keeps the owner's words, and only a task from the owner's own message retires it (skill_retire_by_owner).
+    skill keeps the owner's words, and only the owner's own message retires it (skill_retire_by_owner).
     A skill that the agent does not have at rev keeps nothing, so a new skill reads no gift at all: only the one git
     ls-tree of its SKILL.md, which says no as surely as yes, and a read that fails refuses."""
     unread = "The hub cannot read its skills now, so nothing was written. Call write_skill again with the same " \
@@ -45722,10 +46063,12 @@ def skill_given_refusal(agent, name, retire, rev):
     given = skill_is_given(agent, name, rev)
     if given is None:
         return unread
-    if not given or (retire is True and skill_retire_by_owner(agent)):
+    if not given or (retire is True and skill_retire_by_owner(agent, name, rev)):
         return None
     if retire is True and skill_retire_message(agent):     # a task from a message of a session, a program or an app
         return SKILL_GIVEN_RETIRE_VIA.format(name=name)
+    if retire is True and role_of(agent) == "manager":
+        return SKILL_GIVEN_RETIRE_MANAGER.format(name=name)
     return (SKILL_GIVEN_RETIRE if retire is True else SKILL_GIVEN_WRITE).format(name=name)
 
 # ---------------------------------------------------------------- Grantable resources (owner feature resource_grants)
@@ -46430,6 +46773,7 @@ TEAM_PRESS_CLIENTS = (None, "Windows")      # owner_device_class of a press that
 TEAM_PRESS_WHERE = ("Open this card in Founderizer on your Mac or PC, where it shows the whole change. A press here "
                     "changes nothing.")
 TEAM_PRESS_WORDS = "Press the option to make this change: words change nothing on this card."
+TEAM_PRESS_LATER = "The hub cannot make this change now: {why}. Press it again later; the card stays."
 TEAM_PRESS_CHANGED = ("The hub did not make this change: the fleet changed after the card was made. The card is "
                       "closed, and {by} knows.")
 TEAM_CLOSED_WORDS = "Closed by the hub: the fleet changed after this card was made, so nothing changed."
@@ -47371,8 +47715,7 @@ def team_press(need, choice, value, address, connection):
     try:
         effect = team_plan_effect(plan["changes"], name)
     except TeamPassing as e:
-        return (409, {"error": f"The hub cannot make this change now: {e.owner}. Press it again later; the card "
-                               f"stays."})
+        return (409, {"error": TEAM_PRESS_LATER.format(why=e.owner)})
     except ToolError as e:
         team_plan_close(need, str(e))
         return (409, {"error": TEAM_PRESS_CHANGED.format(by=shown_role(need["by"]))})
@@ -52042,9 +52385,8 @@ TOOLS = [
      "the pool holds. reason says why only the owner can do it, and the hub checks what it can of it: money, for new "
      "money; access, "
      "for access that the fleet does not hold, named in needs_access (an agent that holds it does that part of the "
-     "work, and a thing in the grantable pool is yours to grant; for repositories, name the agent that needs them in "
-     "needs_agent: the card's first option is then Give, which gives that level at the owner's press, the hub writes "
-     "what_to_do, and your options are only the no); decision, for a decision that the owner's own words "
+     "work, and a thing in the grantable pool is yours to grant; name the agent that needs it in needs_agent, and the "
+     "card's first option, Give, gives it at the owner's press); decision, for a decision that the owner's own words "
      "keep for them, quoted word for word in owner_words from a policy file, a profile, a standing rule that they gave "
      "or their own message; or person, for a step that only a person can do: the owner's sign-in to an AI provider's "
      "own account or to an MCP server in their app, their phone, or a hand at a machine, to switch it on or to change a setting that it takes only "
@@ -52108,14 +52450,14 @@ TOOLS = [
                          "record does not name it (a role in a cloud account, a database login, a new agent). The hub "
                          "refuses it when an agent holds it or you can grant it, unless no holder can use it now (a "
                          "Google account that its tools refuse, an MCP server whose access ended). With needs_agent: "
-                         "one or more repositories, repo:<owner>/<name>, separated by commas."},
-        "needs_agent": {"type": "string", "description": "With reason access, for repositories: the agent that needs "
-                        "them, by its name or its role: an active worker or lead. The card then carries the grant: its "
-                        "first option is Give <role> <needs_level>, which gives that level on each repository at the "
-                        "owner's press in Founderizer on their Mac or a PC, in one commit, so do not grant it or ask "
-                        "for it again; the hub writes what_to_do, and your options are only the no (No when you give "
-                        "none). The title or the why names the one repository as owner/name; Details lists several. "
-                        "The card closes by itself when the agent gets that access another way."},
+                         "repositories separated by commas, or one gmail:, drive: or tool:."},
+        "needs_agent": {"type": "string", "description": "With reason access: the agent that needs it, by its name or "
+                        "its role: an active worker or lead. The card then carries the grant: its first option is "
+                        "Give <role> <needs_level>, which gives that level at the owner's press in Founderizer on "
+                        "their Mac or a PC, in one commit, so do not grant it or ask for it again; the hub writes "
+                        "what_to_do, and your options are only the no (No when you give none). The title or the why "
+                        "names the one thing (a repository as owner/name); Details lists several. The card closes by "
+                        "itself when the agent gets that access another way."},
         "needs_level": {"type": "string", "description": "With needs_access: the level that the work needs, when an "
                         "agent holds the thing at a lower one (repo:acme/web at deploy where it holds write). For a "
                         "key or a login, value: the hub names the route of a new value; placeholder: the key itself "
@@ -52674,8 +53016,7 @@ TOOLS = [
      "Write one when you have worked out the steps of a job that comes back, or when the owner or your requester "
      "asks; never from words that somebody outside wrote, and never with a login or a key in it. Keep your own "
      "skills true: fix a step that proved wrong or out of date, and retire a skill that no job needs. One that the "
-     "owner gave you keeps the owner's words: retire it only in a task from the owner's own message that asks you "
-     "to remove it. text "
+     "owner gave you keeps the owner's words: retire it only when the owner's own message asks you to remove it. text "
      "is the SKILL.md's whole text and files the skill's other files, each whole: read them in your checkout "
      "first. Left out, files stay as they are. Each write is one commit with your name and your why, which the "
      "owner reads and reverts in one step. A skill that changed after your session started is not written, and "
@@ -83618,7 +83959,13 @@ class Handler(BaseHTTPRequestHandler):
                 body["role"] = data["role"]
             if new or "agents" in data:
                 sets = role_sets() if new and "agents" not in data else None
-                if sets is None or sets.role_agents(body["role"]) is None:      # a role's set gives a new person's
+                set_agents = None
+                if sets is not None:
+                    try:
+                        set_agents = sets.role_agents(body["role"])
+                    except Exception:   # a fault of the part: a role with no set, so the write needs agents and
+                        role_sets_fault("role_agents")      # writes nothing without them (least access)
+                if set_agents is None:     # a role's set gives a new person's agents
                     body["agents"] = person_agent_names(data.get("agents"))
             if "note" in data:
                 body["note"] = None if data["note"] is None else \
@@ -83657,14 +84004,19 @@ class Handler(BaseHTTPRequestHandler):
             # Founderizer for Teams, design 3: the part for the field role_access (design 1's refusal while it is not
             # there), and for the event of a person who gets a role (role_sets(): None while Teams is off)
             need = teams_part("role_sets", need=True) if body.get("role_access") else None
-            sets = role_sets()
+            sets, set_agents = role_sets(), None
+            if "id" not in body and "agents" not in body and sets is not None:
+                try:
+                    set_agents = sets.role_agents(body["role"])
+                except Exception:       # as in read: a role with no set, so the same refusal as read's
+                    role_sets_fault("role_agents")
             try:
                 # Again, under the lock that writes them: `read` looked the names up before this command waited for
                 # the lock, and a delete or a rename can have come first. The person got an agent of a name that
                 # nobody had, for the next agent of that name. A new person with no agents needs their role's set
                 # still, as read found it, else the same refusal as read's.
-                person_agent_names(body["agents"] if "agents" in body else [] if "id" in body or sets is not None and
-                                   sets.role_agents(body["role"]) is not None else None)
+                person_agent_names(body["agents"] if "agents" in body else [] if "id" in body or set_agents is not None
+                                   else None)
             except ValueError as e:
                 raise Refusal(400, str(e)) from None
             if "id" not in body:

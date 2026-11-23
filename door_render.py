@@ -1046,6 +1046,10 @@ def owner_docs(before):
 # matchers, the label lists of by, without, on, ignoring, group_left and group_right, the ranges and the offsets taken
 # out, and with no function, keyword or number.
 PROMQL_STRING = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|`[^`]*`')
+# The start of each form of PROMQL_STRING with no end: where its reading of a string stops (at its end quote, at a
+# backslash before a line break, or at the end of the text)
+PROMQL_OPEN = {'"': re.compile(r'"(?:[^"\\]|\\.)*'), "'": re.compile(r"'(?:[^'\\]|\\.)*"), "`": re.compile(r"`[^`]*")}
+PROMQL_QUOTE = re.compile(r"[\"'`]")
 PROMQL_LISTS = re.compile(r"\b(?:by|without|on|ignoring|group_left|group_right)\s*\([^)]*\)", re.I)
 PROMQL_NAME = re.compile(r"(?<![\w:.])([A-Za-z_:][A-Za-z0-9_:]*)(?![\w:])(?!\s*\()")
 PROMQL_WORDS = {"by", "without", "on", "ignoring", "group_left", "group_right", "and", "or", "unless", "bool",
@@ -1054,11 +1058,37 @@ PROMQL_WORDS = {"by", "without", "on", "ignoring", "group_left", "group_right", 
 
 def rule_metrics(expr):
     "The metric names that one PromQL expression reads (a superset only where a name is also a keyword)."
-    text = PROMQL_STRING.sub(" ", str(expr))
-    text = re.sub(r"\{[^}]*\}", " ", text)                  # label matchers
-    text = re.sub(r"\[[^\]]*\]", " ", text)                  # ranges and subqueries
-    text = PROMQL_LISTS.sub(" ", text)
+    text = strings_out(str(expr))
+    text = up_to_last(r"\{[^}]*\}", "}", text)              # label matchers
+    text = up_to_last(r"\[[^\]]*\]", "]", text)              # ranges and subqueries
+    text = up_to_last(PROMQL_LISTS, ")", text)
     return {m for m in PROMQL_NAME.findall(text) if m.lower() not in PROMQL_WORDS and not m[0].isdigit()}
+
+
+def up_to_last(pattern, close, text):
+    """re.sub(pattern, " ", text) for a pattern whose match ends at its first close mark after its start, read only up
+    to the last close mark of text: no match ends after it. Each opening mark after it would read the rest of the
+    text again, so that a long text of them took minutes."""
+    end = text.rfind(close) + 1
+    return re.sub(pattern, " ", text[:end]) + text[end:]
+
+
+def strings_out(text):
+    """PROMQL_STRING.sub(" ", text), in a time that grows as the text does. A quote whose string does not end stops
+    its reading at a place (PROMQL_OPEN): each quote of its kind before that place stands in an escape of that
+    reading, so it opens no string either, and it is not read again."""
+    out, at, i, dead = [], 0, 0, {}
+    while True:
+        found = PROMQL_QUOTE.search(text, i)
+        if found is None:
+            return "".join(out) + text[at:]
+        j, quote = found.start(), found.group()
+        stop = None if j < dead.get(quote, 0) else PROMQL_OPEN[quote].match(text, j).end()
+        if stop is not None and text.startswith(quote, stop):
+            out += [text[at:j], " "]
+            at = i = stop + 1
+        else:
+            dead[quote], i = max(dead.get(quote, 0), stop or 0), j + 1
 
 
 def owned(runner, before):
