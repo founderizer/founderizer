@@ -1015,7 +1015,8 @@ class GoogleHub(OwnerAPI):
     def test_a_parts_file_that_cannot_be_read_keeps_the_key_file(self):
         """A file of a part's folder that cannot be listed, read, parsed or opened keeps the hub's own key file when the
         central vault takes the key: the file may need that key. Only a file that its key no longer opens is passed
-        over. Bug: a part's file that the move did not read loses its key with the key file, and each link ends."""
+        over. Bugs: a part's file that the move did not read loses its key with the key file, and each link ends; or a
+        copy that went aside keeps each status read from its done check."""
         self.connected(client_id=APP_ID)
         path = self.part_file()
         bad = os.path.join(os.path.dirname(path), "other.key")
@@ -1041,6 +1042,21 @@ class GoogleHub(OwnerAPI):
             for _ in range(3):
                 self.assertFalse(hub.google_vault_turn())
         self.assertEqual(drop.call_count, 1)
+        # a copy that went aside (set_aside, decision D72 b) needs no key: each status read ends at the check that the
+        # files moved, with no drop under LOCK
+        os.rename(path, path + ".lost-1-abcdef12")
+        hub.sealed_write(path, "links.key", {"links": {}})
+        with patch.object(hub, "google_key_drop", wraps=hub.google_key_drop) as drop:
+            for _ in range(3):
+                hub.CENTRAL["read_at"] += 60
+                self.assertFalse(hub.google_vault_turn())
+        self.assertEqual((drop.call_count, hub.GOOGLE_OPENED["done_for"]), (0, hub.CENTRAL["read_at"]))
+        # only the name that set_aside gives is passed over: a part's own file with ".lost-" in its name moves
+        notes = os.path.join(os.path.dirname(path), "notes.lost-2-abcdefg")
+        hub.sealed_write(notes, "notes.lost-2-abcdefg", {"links": {}})
+        new, _ = self.vault()
+        self.assertTrue(hub.google_vault_turn())
+        self.assertEqual((self.part_holder(path), self.part_holder(notes)), (("vault", atrest.key_id(new)),) * 2)
 
     def test_a_running_hub_follows_a_new_key_of_the_vault_and_asks_a_refusing_vault_once_a_minute(self):
         """The vault's status names the id of the key that it keeps (hub_key_ids): a running hub that holds another

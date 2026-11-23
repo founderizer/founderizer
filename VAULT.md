@@ -1026,6 +1026,14 @@ host.
     own records, so such a session cannot put words of its own there. The repair is to remove the agent and add it
     again.
 
+28. **The first program of a new server.** A server that joins runs the join script that the hub serves, as root (a
+    Mac runs it as root in the installer, or else as the user of its agents). Its first checkout comes from the hub's
+    repository with no check by a release key; each later update of that checkout is checked (`join.sh`, `hub.py`). So
+    a hub that is broken into at the time of a join can give the machine another program. On a Linux server that
+    program is root, and it can know the key of the broker that it installs, which the owner's Mac then reads there
+    and pins. The hub can then open each value that the owner gives to an agent of that server. A machine that joined
+    before does not change by this, nor does the hub's own server, which installs from GitHub (`hub.sh`).
+
 ## What the owner must do
 
 1. **Protect the Mac.** The owner key and the recovery code are in its login Keychain, and the app uses the owner key

@@ -5,6 +5,7 @@ central vault, whose sealed copies wait for the door at its own address."""
 import base64
 import contextlib
 import json
+import os
 import threading
 import time
 import unittest
@@ -757,6 +758,22 @@ class DoorTokens(Access):
         secrets.write_text("not json")
         view = self.request("/ui/door?db=test-generation", source=OWNER)[1]
         self.assertEqual((view["linked"], view["door_secrets"]), (False, True))
+        # nor one whose stat fails for a moment (a folder that the service cannot read): os.path.exists said False for
+        # each error, and the app would link that hub again (a Fable read of 22 November 2026)
+        real = {"stat": os.stat, "lstat": os.lstat}
+
+        def denied(name):
+            def call(path, *args, **kwargs):
+                if os.fspath(path) == str(secrets):
+                    raise PermissionError(13, "Permission denied", str(secrets))
+                return real[name](path, *args, **kwargs)
+            return call
+        with patch("os.lstat", denied("lstat")), patch("os.stat", denied("stat")):
+            view = self.request("/ui/door?db=test-generation", source=OWNER)[1]
+        self.assertEqual(view["door_secrets"], True)
+        secrets.unlink()
+        self.assertFalse(hub.door_secrets_there())
+        secrets.write_text("not json")
 
     def test_a_hub_put_back_with_no_key_of_its_own_is_linked_and_keeps_a_key_file_that_it_cannot_read(self):
         """A hub put back from a backup holds no App key (it gave it to the door) and no file of the door's secrets:
@@ -1151,7 +1168,8 @@ class DoorCalls(Access):
                 "grants": [{"login": self.ref, "agent": "door", "machine": "door"}]}
         with patch.dict(hub.CENTRAL, {"status": read, "read_at": hub.now(), "error": None}), \
                 patch.object(hub, "save_door_credential", side_effect=AssertionError("a new value names nobody")):
-            said = hub.t_request_secret("manager", {"failed": self.ref, "why": "Backblaze refuses the key"})
+            said = hub.t_request_secret("manager", {"failed": self.ref, "why": "Backblaze refuses the key",
+                                                    "details": "Make a new door key with b2, as the steps say."})
             nid = hub.q1("SELECT max(id) AS id FROM needs WHERE kind='secret'")["id"]
             self.assertIn(f"a new value of the API key DOOR_BACKBLAZE_ACME_KEY as N-{nid}", said)
             with hub.LOCK:
@@ -1680,6 +1698,12 @@ class DoorCalls(Access):
         for agent in ("manager", "vps"):
             with self.subTest(agent=agent), self.assertRaisesRegex(hub.ToolError, "door is the key's name"):
                 hub.t_request_secret(agent, {"kind": "api_key", "door": "model", "why": "a test",
+                                             "task_id": "T-1"})
+            # nor for an Azure account, which needs a tenant and a client id beside its key, that no card gives: a card
+            # for it would ask the owner for a key that the door cannot use (a Fable read of 22 November 2026)
+            with self.subTest(agent=agent, door="azure"), \
+                    self.assertRaisesRegex(hub.ToolError, "Ask for no key of azure:one: an azure account of the door"):
+                hub.t_request_secret(agent, {"kind": "api_key", "door": "azure:one", "why": "a test",
                                              "task_id": "T-1"})
         self.assertIsNone(hub.q1("SELECT id FROM needs WHERE kind='secret'"))
         self.owner("/ui/secrets/grant", login=self.ref, agent="door", grant="use")

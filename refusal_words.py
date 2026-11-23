@@ -179,6 +179,11 @@ WORDS = {
     "link_active": "A device already joined. Remove the row to share again.",
     "link_channel": "This fleet's release channel is not Founderizer's own, so it makes no invite.",
     "link_file": "The hub cannot open the key file of the Founderizer app's links.",
+    # the key of a new key file cannot be read now (decision D72 b: the file that its key no longer opens waits)
+    "link_key": "The hub cannot read the key of the Founderizer app's links now. Try again in a minute.",
+    # the bound of the rows with an invite or a device (decision D72 e: the mailbox's boxes for one licence)
+    "link_most": "This fleet has {most} Founderizer rows with an invite or a device, the most that it can have. "
+                 "Remove one first.",
     # an invite asked by an AI session or a program (teams-design-4, section 6; decision D68 e): its line never reaches
     # a transcript
     "link_from_tool": "An invite is made in Founderizer on the Mac, never by an AI session or a program.",

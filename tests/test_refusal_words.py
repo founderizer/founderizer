@@ -137,7 +137,8 @@ OLD = {
     # the Teams part role_sets (teams-design-3, 3.7): its own two, which its Teams file raises (PART_CODES)
     "role_sets_contacts_off": "A role's access needs the setting contacts.v2, which is off.",
     "role_no_set": "The role {role} has no access of its own.",
-    # the Teams part person_links (teams-design-4, 4.4, and the area Vault's link_file): its own seven (PART_CODES)
+    # the Teams part person_links (teams-design-4, 4.4, the area Vault's link_file, D72's link_key and link_most): its own ten
+    # (PART_CODES)
     "join_no_code": "No device shows this code.",
     "join_two": "Two devices show this code. Send a new invite.",
     "join_file": "An answer to this item carries no file.",
@@ -145,6 +146,9 @@ OLD = {
     "link_active": "A device already joined. Remove the row to share again.",
     "link_channel": "This fleet's release channel is not Founderizer's own, so it makes no invite.",
     "link_file": "The hub cannot open the key file of the Founderizer app's links.",
+    "link_key": "The hub cannot read the key of the Founderizer app's links now. Try again in a minute.",
+    "link_most": "This fleet has {most} Founderizer rows with an invite or a device, the most that it can have. "
+                 "Remove one first.",
     "link_from_tool": "An invite is made in Founderizer on the Mac, never by an AI session or a program.",
 }
 
@@ -299,7 +303,8 @@ LEFT = {"a registered login cannot be sent as text": 1}
 # to the place that raises it (test_teams_<feature>.py). The apps know them as the client side of the part.
 PART_CODES = {"role_sets_contacts_off": "role_sets", "role_no_set": "role_sets",
               **{code: "person_links" for code in ("join_no_code", "join_two", "join_file", "link_no_agent",
-                                                   "link_active", "link_channel", "link_file", "link_from_tool")}}
+                                                   "link_active", "link_channel", "link_file", "link_from_tool",
+                                                   "link_key", "link_most")}}
 # The codes that a release raised and that no place raises any more. Each stays in the table with its English, because
 # a hub of an older release still sends it and each app holds its own words for it. browser_no_room: the move's one
 # code until 20 November 2026, when its two cases got their own (browser_no_place, browser_room_unknown).

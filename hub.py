@@ -170,6 +170,7 @@ class Call(threading.local):
     agent = None
     folder = None
     heads = ()              # the conversations whose words this tool call's answer gives (conversation_head)
+    hand = None             # the hand of the owner command whose act runs now (command_run, command_actor)
 
 
 CALL = Call()
@@ -278,7 +279,7 @@ CREATE TABLE IF NOT EXISTS thread_events(id INTEGER PRIMARY KEY, task INTEGER NO
   UNIQUE(task, attempt, session, seq));
 CREATE TABLE IF NOT EXISTS holds(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, kind TEXT NOT NULL, by TEXT NOT NULL,
   note TEXT, state TEXT NOT NULL, created REAL NOT NULL, attempt INTEGER NOT NULL, confirmed REAL, detail TEXT,
-  released REAL, released_by TEXT, resume_mode TEXT);
+  released REAL, released_by TEXT, resume_mode TEXT, hand TEXT);
 CREATE TABLE IF NOT EXISTS outcomes(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, attempt INTEGER NOT NULL,
   hold INTEGER NOT NULL, tool_call_id TEXT NOT NULL, title TEXT, kind TEXT, state TEXT NOT NULL, created REAL NOT NULL,
   resolved REAL, by TEXT, note TEXT, UNIQUE(task, attempt, tool_call_id));
@@ -3494,9 +3495,13 @@ DOOR_KEY_STEPS = ". ".join(DOOR_KEY_WORDS.values())
 
 
 def door_key_words(name):
-    """The words of DOOR_KEY_WORDS for a door name (cloudflare:acme gives DOOR_CLOUDFLARE_KEY), or "" for a provider
-    that has none."""
-    return DOOR_KEY_WORDS.get(str(name or "").partition(":")[0].strip().lower(), "")
+    """The words of DOOR_KEY_WORDS for a door name (cloudflare:acme gives DOOR_CLOUDFLARE_KEY), else the door's own
+    words of how the owner makes that key (door_providers.KEY_WORDS, which a call to the account gives too), or "" for
+    a provider that has none. So an ask for a new value of a key that failed gets the steps of every provider, and the
+    Backblaze words that never ask for a new master key (a Fable read of 22 November 2026: only Cloudflare had them)."""
+    import door_providers
+    kind = str(name or "").partition(":")[0].strip().lower()
+    return DOOR_KEY_WORDS.get(kind) or door_providers.KEY_WORDS.get(kind) or ""
 
 
 DOOR_SCRIPT_CHARS = 4000        # characters of the script of a door card: what the card shows whole, as details
@@ -3881,6 +3886,7 @@ def need_view(row, reads=None):
     it, the item reads its own."""
     view = dict(row, options=need_options(row), secret=need_secret(row))
     view.pop("approval", None)
+    view.pop("person", None)        # a join item's person (D72 a): the hub's own key of its removal, in no read
     # owner API 1.214: the hub's own record of a team card's plan (Details show it) stays here; owner API 1.244 says
     # only that the item is a team card, whose yes options a phone cannot press (team_press), so that the iPhone draws
     # one line to the Mac in their place (the lane "Give on the iPhone"). Owner API 1.280: where its pressed plan
@@ -8743,6 +8749,9 @@ def migrate():
         # support plan F1: the optional tools of the sessions of a duty's cases, for a Shell-off holder (JSON list);
         # F4: the owner's file of the lists of its typed values, and the duties that its sessions report to (JSON)
         "responsibilities": {"tools": "TEXT", "servers": "TEXT", "lists": "TEXT", "report_to": "TEXT"},
+        # the hand of the owner command that made a hold, only for the fleet manager's own `admin` (MANAGER_HAND):
+        # a hold of the manager's that holds what is under it, as the owner's does (other_hold_around)
+        "holds": {"hand": "TEXT"},
         # account_limits: a hold belongs to one agent, an allowance to one account. `cause` is the id of the row
         # whose session reported the limit (null when this agent reported it itself), so one episode of one account
         # is one row for each agent it holds and one message for the manager. `route` is the route of this agent
@@ -8894,7 +8903,9 @@ def migrate():
                   "give_agent": "TEXT", "give_level": "TEXT", "give_repos": "TEXT",
                   # owner API 1.285: the ids of the pictures of the item's options, in the order of `options`, as a
                   # JSON list (raise_needs_you pictures; attachments.need names the item back)
-                  "pictures": "TEXT"},
+                  "pictures": "TEXT",
+                  # Founderizer for Teams (decision D72 a): the person of a join item, which the hub sets at its raise
+                  "person": "INTEGER"},
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0",      # chat apps round 2: message_owner
                           # 10 November 2026: the request id of the owner's message from the app whose turn this
@@ -11825,16 +11836,22 @@ def control_extra(t, hid, kind):
                            "AND finished IS NULL", (t["id"], t["attempt"]))["n"]}
 
 
-def request_hold(task_id, kind, by, note=""):
+def request_hold(task_id, kind, by, note="", press=False):
     """Save the hold first, then ask the owner's helper to interrupt the session. Returns (hold, changed). A hold of
     a task takes over the stop hold of a restart (restart_task): the restart is over, the hold is now this caller's,
-    and nothing continues by itself."""
+    and nothing continues by itself. press: the owner's own Pause or Stop of this task (task_control_act), which makes
+    its hold his; a hold that his goal or a parent of the task makes (goal_state_change, hold_subtasks) keeps its
+    holder."""
     t = q1("SELECT * FROM tasks WHERE id=?", (task_id,))
     if not t:
         raise ToolError(f"There is no task {tref(task_id)}.")
     if t["state"] in TERMINAL:
         raise ToolError(f"{tref(task_id)} is already {t['state']}.")
     h = active_hold(task_id)
+    # The manager's own `admin` changes no hold of another (the Door area's read of F6, claim 11, and its validator):
+    # a hold of the owner's, of the hub's or of a restart's requester stays as it was, before any takeover of it.
+    if h and CALL.hand == MANAGER_HAND and (h["by"], h["hand"]) != (by, MANAGER_HAND):
+        return h, False
     taken = q1("SELECT * FROM restart_holds WHERE hold=?", (h["id"],)) if h else None
     if taken:           # the end of the restart, the hold's new holder and the message go together
         told = [(taken["by"], "say", filed_about(taken["by"], "say", task_id),
@@ -11843,20 +11860,29 @@ def request_hold(task_id, kind, by, note=""):
                  f"session by itself. Only {holder(by)} resumes it.", None)] if taken["state"] == "pending" and by != taken["by"] else []
         with transaction():
             DB.execute("UPDATE restart_holds SET state='canceled' WHERE hold=? AND state='pending'", (h["id"],))
-            DB.execute("UPDATE holds SET by=?, note=? WHERE id=?", (by, note or h["note"], h["id"]))
+            DB.execute("UPDATE holds SET by=?, note=?, hand=? WHERE id=?",
+                       (by, note or h["note"], h["hand"] if by == h["by"] else None, h["id"]))
             event_rows(told, now())
         h = active_hold(task_id)
         if told:
             log(by, f"took over H-{h['id']} of {tref(task_id)}: its restart is over")
+    # The owner's press makes the hold his, also one that holds already at least as firmly: only he resumes it then
+    # (the Door area's read of F6, claim 11, and its validator: the owner's Stop or Pause on a hold in the manager's
+    # name, the hub's pause after a session's error included, stayed in the manager's name, and the manager's resume
+    # lifted it).
+    if h and press and by == "owner" and h["by"] != "owner":
+        q("UPDATE holds SET by='owner', hand=NULL WHERE id=?", (h["id"],))
+        h = active_hold(task_id)
     if h and h["state"] != "not_confirmed" and (h["kind"] == "stop" or kind == "pause"):
         return h, bool(taken)           # already held at least this firmly
     kind = "stop" if h and h["kind"] == "stop" else kind
+    hand = MANAGER_HAND if CALL.hand == MANAGER_HAND else None      # a hold of the manager's own `admin`
     if h:
         q("UPDATE holds SET kind=?, state='requested', confirmed=NULL, detail=NULL WHERE id=?", (kind, h["id"]))
         hid = h["id"]
     else:
-        hid = ins("INSERT INTO holds(task,kind,by,note,state,created,attempt) VALUES(?,?,?,?,'requested',?,?)",
-                  (task_id, kind, by, note, now(), t["attempt"]))
+        hid = ins("INSERT INTO holds(task,kind,by,note,state,created,attempt,hand) VALUES(?,?,?,?,'requested',?,?,?)",
+                  (task_id, kind, by, note, now(), t["attempt"], hand))
     # a permission prompt that is waiting gets its answer now, so the session is not left at a question
     q("UPDATE prompts SET decision='deny', reason=?, decided=?, by='hub' WHERE task=? AND decision IS NULL "
       "AND kind<>'code'", (f"{tref(task_id)} is held.", now(), task_id))
@@ -12130,6 +12156,13 @@ def t_restart_task(agent, a):
         raise ToolError(f"{tref(tid)} is at attempt {t['attempt']} now, not {expected}: its session already changed. "
                         f"Read its newest messages before you decide again.")
     h = active_hold(tid)
+    # A hold of the manager's own `admin` under the owner's hold of a task above: his Stop of the parent left it as it
+    # was, with no row of parent_holds, so a restart in the manager's name would let it go on under his Stop (the
+    # Door area's read of F6, claim 11, my reader's round 4). Only his Resume of the task above lets it go on.
+    above = owner_held_above(tid) if h is not None and h["hand"] == MANAGER_HAND else None
+    if above:
+        raise ToolError(f"The owner holds {tref(above)} above {tref(tid)}: {tref(tid)} goes on only after the owner "
+                        f"resumes {tref(above)}.")
     own = h is not None and h["by"] == agent    # only a restart makes a hold of an open task in its requester's name
     if own and q1("SELECT 1 FROM restart_holds WHERE hold=? AND state='pending'", (h["id"],)):
         lacking = door_lacks(t["owner"], asked_repos(tid, t["attempt"])) if h["state"] == "stopped" else []
@@ -14313,31 +14346,38 @@ def cancel_subtasks(task_id, reason):
         cancel_subtasks(sub["id"], reason)
 
 
-def hold_subtasks(task_id, kind):
-    """An owner Pause or Stop on a lead's task also holds its open subtasks, and theirs."""
+def hold_subtasks(task_id, kind, by="owner"):
+    """An owner Pause or Stop on a lead's task also holds its open subtasks, and theirs. by: who holds them, the owner
+    or, for the manager's own `admin`, the fleet manager (command_actor)."""
     held = []
     for sub in q(f"SELECT id FROM tasks WHERE parent=? AND {OPEN_TASK} ORDER BY id", (task_id,)):
         try:
-            h, changed = request_hold(sub["id"], kind, "owner", f"{tref(task_id)} is held by the owner")
+            h, changed = request_hold(sub["id"], kind, by, f"{tref(task_id)} is held by {holder(by)}")
         except ToolError:
             continue
-        if changed:
+        # a subtask's hold joins its parent's when the owner holds the parent, as before, or when it is the holder's
+        # own: the manager's `admin` changes no hold of another, and its resume of the parent lifts only its own
+        if changed and (by == "owner" or h["by"] == by):
             q("INSERT OR REPLACE INTO parent_holds(hold,parent) VALUES(?,?)", (h["id"], task_id))
-        held += [sub["id"]] + hold_subtasks(sub["id"], kind)
+        held += [sub["id"]] + hold_subtasks(sub["id"], kind, by)
     return held
 
 
-def release_subtasks(task_id):
-    """Resume the subtasks that a parent's hold held; one with unknown outcomes stays held for the owner."""
+def release_subtasks(task_id, by="owner"):
+    """Resume the subtasks that a parent's hold held; one with unknown outcomes stays held for the owner. by: who
+    resumes them, as for hold_subtasks."""
     resumed, still = [], []
-    for r in q("SELECT h.task FROM parent_holds ph JOIN holds h ON h.id=ph.hold WHERE ph.parent=? AND h.state<>'released' "
-               "ORDER BY h.task", (task_id,)):
+    for r in q("SELECT h.task, h.by, h.hand FROM parent_holds ph JOIN holds h ON h.id=ph.hold WHERE ph.parent=? AND "
+               "h.state<>'released' ORDER BY h.task", (task_id,)):
+        if CALL.hand == MANAGER_HAND and (r["by"], r["hand"]) != (by, MANAGER_HAND):    # not its own: it stays held
+            still.append(r["task"])
+            continue
         try:
-            release_hold(r["task"], "resume", "owner", via="parent")
+            release_hold(r["task"], "resume", by, via="parent")
             resumed.append(r["task"])
         except ToolError:
             still.append(r["task"])
-        more, left = release_subtasks(r["task"])
+        more, left = release_subtasks(r["task"], by)
         resumed, still = resumed + more, still + left
     q("DELETE FROM parent_holds WHERE parent=?", (task_id,))
     return resumed, still
@@ -20030,7 +20070,7 @@ def key_failed(agent, a, worker, chat, tid):
                             f"too.")
     if door and door_key_words(door) and not str(a.get("details") or "").strip():
         raise ToolError(f"Write in details how the owner makes the new key at its provider, as for the first ask of "
-                        f"{door}: {door_key_words(door)}.")
+                        f"{door}: {door_key_words(door).rstrip('.')}.")
     return ref, env, door
 
 
@@ -20093,9 +20133,13 @@ def t_request_secret(agent, a):
                             f"out.")
         if not TEAM.get("door"):
             raise ToolError("This fleet has no door, so there is no key to ask for it. Leave door out.")
+        if door.startswith("azure:"):    # beside a key, the door needs a tenant and a client id that no card gives
+            import door_providers
+            raise ToolError(f"Ask for no key of {door}: {door_providers.AZURE_NO_KEY}")
         if kind != "api_key" or not DOOR_CREDENTIAL.fullmatch(door):
             raise ToolError(f"door is the key's name in the door's rules: <provider>:<account> of "
-                            f"{', '.join(DOOR_PROVIDERS)} (for example cloudflare:acme), or app:<app>:<NAME> for "
+                            f"{', '.join(p for p in DOOR_PROVIDERS if p != 'azure')} (for example cloudflare:acme), "
+                            f"or app:<app>:<NAME> for "
                             f"one setting of an app on a host (for example app:shop:STRIPE_SECRET_KEY), and it is "
                             f"an API key. AWS needs no key, and a GitHub App key comes through the app.")
         # Only an agent that holds servers through the door can use a key of the door (door_holders). A request of
@@ -28110,11 +28154,13 @@ def links_gone_rows(person=None, link=None):
     # keeps its record (D68 d). Core reads its own link table for it: the one read of it that test_publish.TeamsFiles
     # lets through, in this function only (D68 c)
     if link is None:
+        # each by the person that it keeps (decision D72 a), so also an item of an earlier invite and one of a row that
+        # went first, after a restore too; an item from before that column, by the link that names it now
         join_items_gone_rows([r["id"] for r in DB.execute(
-            "SELECT id FROM needs WHERE kind=? AND id IN "
+            "SELECT id FROM needs WHERE kind=? AND (person=? OR id IN "
             "(SELECT need FROM person_links WHERE person=? OR link IN "      # (D68 c)
-            "(SELECT handle FROM person_handles WHERE app=? AND person=?))",
-            (JOIN_KIND, person, BUILT_IN_APP, person)).fetchall()])
+            "(SELECT handle FROM person_handles WHERE app=? AND person=?)))",
+            (JOIN_KIND, person, person, BUILT_IN_APP, person)).fetchall()])
     else:
         DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=? WHERE kind=? AND answer IS NULL AND id IN "
                    "(SELECT need FROM person_links WHERE link=?)",  # (D68 c)
@@ -28136,8 +28182,7 @@ def join_items_gone_rows(ids):
     that its title names (decision D69); and the answer of each (its ui_requests row and its event, the owner's own,
     which hold the hub's word and no word of the owner's), so that no read gives an answer of an item that is gone. An
     id of no join item is passed over. The items' ids never come back: the floor of needs is raised first, as each
-    delete of an item raises it (unused_id). The Teams part person_links uses it for the items of an earlier invite,
-    which only its key file names."""
+    delete of an item raises it (unused_id)."""
     in_transaction("join_items_gone_rows")
     items = [n for n in (DB.execute("SELECT id, title, raised FROM needs WHERE id=? AND kind=?", (nid, JOIN_KIND))
                          .fetchone() for nid in ids) if n is not None]
@@ -33664,7 +33709,7 @@ def sealed_part_files(headers=True):
             return found, f"could not list the files of the Teams part {feature}: {e.strerror or e}"
         for name in names:
             path = os.path.join(folder, name)
-            if name.startswith("."):
+            if name.startswith(".") or SET_ASIDE_NAME.search(name):     # a copy that went aside needs no key that goes
                 continue
             try:
                 mode = kind(path)
@@ -33941,15 +33986,26 @@ def google_set_aside():
     """A Google file that its key no longer opens (google_file_lost) goes aside under a name of its own, beside it, so
     that a Connect can start a new file: what it held is lost with its key, and a key file that comes back still opens
     the copy. The new name, or None when there was no file."""
-    path = CFG.get("google_file") or GOOGLE_FILE
+    return set_aside(CFG.get("google_file") or GOOGLE_FILE, "the Google file", lambda: GOOGLE_OPENED.update(last=None),
+                     "this Connect starts a new one")
+
+
+SET_ASIDE_NAME = re.compile(r"\.lost-[0-9]+-[0-9a-f]{8}$")        # the end of the name that set_aside gives a copy
+
+
+def set_aside(path, what, forget, then):
+    """A sealed file that its key no longer opens (google_file_lost: the Google file, or a Teams part's file, decision
+    D72 b) goes aside under a name of its own beside it, never to a delete, so that a key that comes back still opens
+    the copy; forget() empties the memory of its opened bytes, and the owner's log names its new base name only. The
+    caller checks the key first (google_key_ready), so that nothing goes aside when the next write cannot seal. The new
+    path, or None when there was no file."""
     aside = f"{path}.lost-{int(now())}-{uuid.uuid4().hex[:8]}"     # a name of its own: a rename replaces a file there
     try:
         os.rename(path, aside)
     except FileNotFoundError:
         return None
-    GOOGLE_OPENED["last"] = None
-    log("owner", f"the Google file does not open with its key, so it went aside as {os.path.basename(aside)}, "
-                 f"and this Connect starts a new one")
+    forget()
+    log("owner", f"{what} does not open with its key, so it went aside as {os.path.basename(aside)}, and {then}")
     return aside
 
 
@@ -52236,8 +52292,8 @@ TOOLS = [
                                    "never sees it) or, for an API key, read (the key is in its sessions as env). "
                                    "The owner can change this before they save."},
         "door": {"type": "string", "description": "Only for a key that the DevOps door uses: its name in the door's "
-                                                  "rules, <provider>:<account> (cloudflare, hetzner, backblaze, "
-                                                  "azure or tailscale), or "
+                                                  "rules, <provider>:<account> (cloudflare, hetzner, backblaze "
+                                                  "or tailscale), or "
                                                   "app:<app>:<NAME> for one setting of an app on a host. The card "
                                                   "gives it to the door alone. " + DOOR_KEY_STEPS + ". The "
                                                   "door uses such a key for one agent "
@@ -52280,7 +52336,7 @@ TOOLS = [
                                                          "message to you"},
         "door": {"type": "string", "description": "Only for a key that the DevOps door uses for you: its name in "
                                                   "the door's rules. <provider>:<account> (cloudflare, hetzner, "
-                                                  "backblaze, azure or tailscale) is a provider account that you "
+                                                  "backblaze or tailscale) is a provider account that you "
                                                   "call through the door with ops. app:<app>:<NAME> is one setting "
                                                   "of an app on a host, for example app:shop:STRIPE_SECRET_KEY, "
                                                   "which `ops <host> env-new <app> <NAME> key` puts in the app's "
@@ -54307,6 +54363,8 @@ def overview_text(scope):
     out.append("")
     out.append("NEEDS YOU (owner)")
     rows = q("SELECT * FROM needs ORDER BY id")
+    if scope != OWNER_VIEW:     # a join item is the owner's own (decision D9), as in resume_lines: its title names a person
+        rows = [r for r in rows if r["kind"] != JOIN_KIND]
     for r in rows:
         state = f'answered: "{r["answer"]}"' if r["answer"] is not None else "open"
         out.append(f"  N-{r['id']} {r['title']}" + (f" (for Q-{r['question']})" if r["question"] else "") +
@@ -69400,6 +69458,19 @@ def record_status(agent, data):
 # vault: the secrets of team.json "door".secrets are sealed to the door's pinned key, and the door fetches each copy
 # from its own address (GET /door/sealed), which nobody else is answered on.
 DOOR_SECRETS_FILE = os.path.expanduser("~/.fleet/door.json")   # {"token", "record"}, written as root (plan step X2)
+
+
+def door_secrets_there():
+    """False only when the hub's file of the door's two secrets is not there at all. os.path.exists says False for
+    each error of its stat too (a folder that the service cannot read for a moment), and the app would then link a
+    linked hub again and stop the secrets that the door holds (a Fable read of 22 November 2026)."""
+    try:
+        os.lstat(CFG.get("door_secrets") or DOOR_SECRETS_FILE)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
 DOOR_PORT = 8766
 # A key that the owner saves for the door from a key card is one credential of the door's rules (DevOps plan 13, item
 # 3): <provider>:<account>. AWS has no key (the door's own bot), and a GitHub App key comes through the app's GitHub
@@ -69708,7 +69779,7 @@ def door_view():
             # whether the hub's file of the door's two secrets is there at all: the app links a hub that holds no App
             # key of its own again only when it is not (a hub put back from a backup), never a linked hub whose file
             # it could not read for a moment, whose secrets a new link would stop (owner API 1.298)
-            "door_secrets": os.path.exists(CFG.get("door_secrets") or DOOR_SECRETS_FILE),
+            "door_secrets": door_secrets_there(),
             # plan 13, item 4: the Apps that the app made with GitHub's manifest flow, whose keys the door holds
             "github_apps": dict(sorted((door.get("github_apps") or {}).items())),
             # plan 13, items 3 and 4: the key that the central vault holds pinned under the name door, to which alone
@@ -73310,21 +73381,22 @@ def turn_worked_since(names, runtime, since):
 def other_hold_around(t):
     """Why task row `t` does not go on by a resume of its own hold alone, or None. The owner holds a task above it:
     the owner's Pause of a parent that comes after the hub's pause of this task leaves this hold as it is, with no row
-    of parent_holds (request_hold, hold_subtasks), so resume_plan does not see it. Only the owner's hold holds what is
-    under it (hold_subtasks has no other caller): under a task that its requester or the hub paused, a subtask ran
+    of parent_holds (request_hold, hold_subtasks), so resume_plan does not see it. Only the owner's hold, and the
+    fleet manager's hold of its own `admin` (holds.hand), hold what is under it (hold_subtasks has no other caller): under a task that its requester or the hub paused, a subtask ran
     before this rule and goes on now (a wake-up, a case or a review of a lead's worker is a subtask of the lead's one
     task). Or tasks under it are held with it (parent_holds), which only a Resume of this task by the owner releases
     (release_subtasks).
 
-    Known: a Pause of a task that is paused already changes nothing (request_hold answers `changed` false), so the
-    owner's Pause, through the API or the owner tools, of this task or of a task above it that is paused already is
-    not seen here: the hold stays its first holder's, and the hub's own pause is resumed. The apps show no Pause on a
-    held task, and the owner's Stop is kept (it changes the hold's kind)."""
+    The owner's own Pause or Stop of this task makes its hold his (request_hold's press), and sign_in_resumes skips
+    it. Known: his Pause of a task above it that is paused already changes nothing there (request_hold answers
+    `changed` false), so it is seen here only while it holds that task."""
     above, seen = t["parent"], set()
     while above and above not in seen:
         seen.add(above)
-        if (active_hold(above) or {"by": None})["by"] == "owner":
-            return f"the owner holds {tref(above)} above it"
+        h = active_hold(above)
+        # and the fleet manager's own `admin` hold (holds.hand), which holds what is under it as the owner's does
+        if h and (h["by"] == "owner" or h["hand"] == MANAGER_HAND):
+            return f"{holder(h['by'])} holds {tref(above)} above it"
         row = q1("SELECT parent FROM tasks WHERE id=?", (above,))
         above = row["parent"] if row else None
     if q1("SELECT 1 FROM parent_holds ph JOIN holds h ON h.id=ph.hold WHERE ph.parent=? AND h.state<>'released' LIMIT 1",
@@ -73372,6 +73444,8 @@ def sign_in_resumes(agent, runtime):
         h = active_hold(t["id"])
         if not h or h["kind"] != "pause" or h["note"] != session_failed_note(t["needs"]) or \
                 session_runtime(agents().get(t["owner"]) or {}, t["needs"]) != runtime:
+            continue
+        if h["by"] == "owner":      # his own Pause took the hub's pause: only he resumes it (request_hold's press)
             continue
         if turn_worked_since(names, runtime, h["created"]):
             continue
@@ -76678,7 +76752,8 @@ def command_run(route, request_id, client, db, body, act, keep=None, outside=Non
             "VALUES(?,?,?,?,?,'',?,?)", (request_id, route, canonical, client, now(), hand, session))
         if outside is None:
             try:
-                result = act(body)
+                with acting(hand):
+                    result = act(body)
             except Refusal as e:        # checked before any write of its own, so it leaves no record
                 q("DELETE FROM ui_controls WHERE request_id=?", (request_id,))
                 return e.status, refusal_body(e)
@@ -76686,12 +76761,69 @@ def command_run(route, request_id, client, db, body, act, keep=None, outside=Non
     if outside is not None:
         try:
             answer = outside(body)
-            with turn(), kit_turn(unlocked):
+            with turn(), kit_turn(unlocked), acting(hand):
                 result = command_kept(route, request_id, client, keep, act(body, answer))
         except Refusal as e:
             q("DELETE FROM ui_controls WHERE request_id=?", (request_id,))
             return e.status, refusal_body(e)
     return 200, result
+
+
+# The owner feedback of 22 November 2026, F6 (the Fleet Manager's own CLI, `admin`): the manager runs some owner
+# routes' own acts through command_run with this hand. Such an act names the manager in its rows, never the owner
+# (the Door area's read, claim 14), and undoes only what the manager itself did (claim 11).
+MANAGER_HAND = "manager"
+
+
+@contextlib.contextmanager
+def acting(hand):
+    """The hand of the owner command whose act runs now, for command_actor; the thread's earlier one after it."""
+    before, CALL.hand = CALL.hand, hand
+    try:
+        yield
+    finally:
+        CALL.hand = before
+
+
+def command_actor():
+    """Who the act of the owner command that runs now is, as its rows name it (a hold's by, a rule's paused_by and its
+    history): the fleet manager for the hand `manager`, else the owner."""
+    return manager_name() if CALL.hand == MANAGER_HAND else "owner"
+
+
+def hold_holder(h):
+    """Who holds hold row `h`, in words, as the manager's `admin` answers name it: its holder; for a hold in the
+    manager's name that `admin` did not make, the manager's restart, or the hub (its pause after a session's error)."""
+    if h["by"] != manager_name() or h["hand"] == MANAGER_HAND:
+        return holder(h["by"])
+    if q1("SELECT 1 FROM restart_holds WHERE hold=? AND state='pending'", (h["id"],)):
+        return f"{holder(h['by'])}'s restart"
+    return "the hub"
+
+
+def owner_held_above(task_id):
+    """The task above this one that the owner holds, or None: the first loop of other_hold_around, for the owner's
+    hold alone."""
+    row = q1("SELECT parent FROM tasks WHERE id=?", (task_id,))
+    above, seen = row["parent"] if row else None, set()
+    while above and above not in seen:
+        seen.add(above)
+        h = active_hold(above)
+        if h and h["by"] == "owner":
+            return above
+        row = q1("SELECT parent FROM tasks WHERE id=?", (above,))
+        above = row["parent"] if row else None
+    return None
+
+
+def manager_resumes_only_its_own(h):
+    """The manager's hand resumes only a hold that its own `admin` made (holds.hand; the Door area's read of F6, claim
+    11): the owner's hold, the hub's pause after a session's error that carries the manager's name as the task's
+    requester, and a restart's hold stay theirs. A Refusal, or nothing."""
+    if CALL.hand == MANAGER_HAND and (h["by"], h["hand"]) != (manager_name(), MANAGER_HAND):
+        who = hold_holder(h)
+        raise Refusal(403, f"{who[:1].upper() + who[1:]} held it, and the fleet manager resumes only what it held "
+                           f"itself.")
 
 
 def task_control_read(task_id, data):
@@ -76708,15 +76840,53 @@ def task_control_act(task_id, body):
     """POST /ui/tasks/<id>/control, under LOCK (command_run): the owner's hold or release of one task."""
     if not q1("SELECT id FROM tasks WHERE id=?", (task_id,)):
         raise Refusal(404, code="no_such_task")
+    by = command_actor()
     try:
         if body["action"] in ("pause", "stop"):
-            hold, changed = request_hold(task_id, body["action"], "owner", body["note"])
-            return {"hold": dict(hold), "changed": changed, "subtasks_held": hold_subtasks(task_id, body["action"])}
-        hold, how = release_hold(task_id, "check" if body["action"] == "resume_check" else "resume", "owner")
-        resumed, still = release_subtasks(task_id)
+            hold, changed = request_hold(task_id, body["action"], by, body["note"], press=True)
+            answer = {"hold": dict(hold), "changed": changed, "subtasks_held": hold_subtasks(task_id, body["action"], by)}
+            if CALL.hand == MANAGER_HAND and (hold["by"], hold["hand"]) != (by, MANAGER_HAND):
+                # the manager's `admin` changed no hold of another (request_hold): its answer says so in words
+                waits = q1("SELECT 1 FROM restart_holds WHERE hold=? AND state='pending'", (hold["id"],))
+                answer["unchanged"] = (f"{tref(task_id)} is held by {hold_holder(hold)}" +
+                                       (", and its restart waits" if waits else "") +
+                                       ": the fleet manager's admin changes no hold of another, so it stays as it was.")
+            return answer
+        held = active_hold(task_id)
+        if held:
+            manager_resumes_only_its_own(held)
+        # nor anything under the owner's hold of a task above it: his Stop of a parent that came after the manager's
+        # stop of this task left this hold as it was, with no row of parent_holds (the validator's round 2)
+        above = owner_held_above(task_id) if CALL.hand == MANAGER_HAND else None
+        if above:
+            raise Refusal(403, f"The owner holds {tref(above)} above it, and the fleet manager resumes nothing under "
+                               f"the owner's hold.")
+        hold, how = release_hold(task_id, "check" if body["action"] == "resume_check" else "resume", by)
+        resumed, still = release_subtasks(task_id, by)
         return {"hold": dict(hold), "resumed_with": how, "subtasks_resumed": resumed, "subtasks_still_held": still}
     except ToolError as e:
         raise Refusal(409, str(e)) from None
+
+
+def trigger_state_act(trigger_id, body):
+    """POST /ui/triggers/<id>/state, under LOCK (command_run): the owner's pause, resume, delete, run now or check now
+    of a wake-up rule (the route's read stays in Handler.ui_trigger_state). For the manager's hand (MANAGER_HAND) the
+    rows name the manager, and the act is the one that the manager's own change_trigger may do (wakeups.may_control:
+    never a rule that the owner set, and never the resume of one that the owner paused; the Door area's read of F6,
+    claim 11, and its validator), and never a run now of a rule that sends: its run posts to the groups that the rule
+    names (WAKEUPS-INTERFACE.md 8), which only the owner starts outside its times (claim 10)."""
+    t0 = now()
+    t = trigger_row(trigger_id)
+    if t and CALL.hand == MANAGER_HAND:
+        try:
+            wakeups.may_control(wake_org(), manager_name(), trigger_view(t, t0), body["action"])
+        except wakeups.Refused as e:
+            raise Refusal(403, str(e)) from None
+        if body["action"] == "run_now" and send_rule(t):
+            raise Refusal(403, f"Trigger {trigger_id} sends a message to people: a run now outside its times stays "
+                               f"the owner's.")
+    t, run = trigger_action(trigger_id, body["base_revision"], body["action"], command_actor(), t0)
+    return {"trigger": trigger_view(t, t0), "run": run_view(run) if run else None}
 
 
 def task_steer_read(task_id, data):
@@ -80399,11 +80569,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("action must be pause, resume, delete, run_now or check_now")
             return {"trigger": trigger_id, "base_revision": base_revision(data), "action": data["action"]}
 
-        def act(body):
-            t0 = now()
-            t, run = trigger_action(trigger_id, body["base_revision"], body["action"], "owner", t0)
-            return {"trigger": trigger_view(t, t0), "run": run_view(run) if run else None}
-        return self.ui_command(f"triggers/{trigger_id}/state", read, act)
+        return self.ui_command(f"triggers/{trigger_id}/state", read, lambda body: trigger_state_act(trigger_id, body))
 
     def ui_health(self, query):
         """Hub, database, backup and machine health in one answer (owner API 1.5)."""

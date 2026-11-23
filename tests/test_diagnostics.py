@@ -228,6 +228,7 @@ class Recorder(unittest.TestCase):
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite(loader.loadTestsFromTestCase(Recorder))
     suite.addTests(OnTheHub(name) for name in OnTheHub.__dict__ if name.startswith("test_"))
+    suite.addTests(loader.loadTestsFromTestCase(Stalls))
     return suite
 
 

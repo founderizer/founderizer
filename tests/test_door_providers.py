@@ -80,9 +80,14 @@ class Backblaze(Provider):
         """An agent that calls a provider account that the door holds no key for reads how the owner makes the key,
         for its request_secret card. For Backblaze, a separate key made with the b2 tool and the master key, never a
         new master key, which would stop the old one wherever the owner uses it (the owner's delegate, 22 November
-        2026). An account that the door holds a key for is decided as before."""
-        for target, words in (("backblaze:two", ("b2 account authorize", "b2 key create --all-capabilities",
-                                                 "b2 account clear", "a colon and the key, with no space",
+        2026). Each b2 command names its own profile: b2's default file can hold the owner's own sign-in on that
+        computer, and authorize would write over it and clear would erase it (a Fable read of 22 November). An
+        account that the door holds a key for is decided as before."""
+        for target, words in (("backblaze:two", ("b2 account authorize --profile founderizer-door",
+                                                 "b2 key create --all-capabilities --profile founderizer-door",
+                                                 "b2 account clear --profile founderizer-door",
+                                                 "rm ~/.b2db-founderizer-door.sqlite",
+                                                 "a colon and the key, with no space",
                                                  "Never ask for a new master application key")),
                               ("hetzner:two", ("https://console.hetzner.com/", "Read & Write")),
                               ("tailscale:other", ("https://console.tailscale.com/admin/settings/trust-credentials",

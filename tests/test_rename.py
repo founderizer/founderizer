@@ -480,6 +480,7 @@ class Columns(unittest.TestCase):
         ("deposits", "machine"): "a machine", ("deposits", "recipient"): "a vault key", ("jobs", "target"): "a site",
         ("join_codes", "name"): "a server", ("join_codes", "agent"): "a first agent that does not exist yet", ("link_failures", "sender"): "a chat handle", ("owner_handles", "name"): "the owner",
         ("people", "name"): "a person", ("person_handles", "name"): "a person", ("place_codes", "machine"): "a machine",
+        ("needs", "person"): "a person's id: the person of a join item (Founderizer for Teams, decision D72 a)",
         ("roles", "name"): "a role of people",
         ("place_hosts", "machine"): "a machine", ("placements", "target"): "a target", ("placements", "name"): "a variable",
         ("history_fts", "agent"): "the index's own key for an agent, which a rename keeps (hub.history_key)",
