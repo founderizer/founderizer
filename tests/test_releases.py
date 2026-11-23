@@ -85,7 +85,8 @@ PROFILE = "# Profile: vps\n\n**Character.** Careful.\n"
 def load_tests(loader, _tests, _pattern):
     """Only the tests of this file: the fixture it borrows carries its own."""
     suite = unittest.TestSuite()
-    for cls in (Signature, Manifest, Entitlement, Channel, Updates, Causes, HubRoutes, HubUpdates, TeamsCode):
+    for cls in (Signature, SecondOpinion, Manifest, Entitlement, Channel, Updates, Causes, HubRoutes, HubUpdates,
+                TeamsCode):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     return suite
 

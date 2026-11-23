@@ -3395,6 +3395,50 @@ class Configure(unittest.TestCase):
         self.assertEqual(machine.conf["owner_keys"], [a, b, c])
         self.assertNotIn("swap", machine.conf)                          # keep: the swap is as it was
 
+    def test_the_remove_form_takes_a_key_out_and_starts_the_broker_again(self):
+        """The remove form (F8, piece E1), for a Mac that the owner removed: --remove-owner-key takes a key out, and
+        the broker starts again, because a running broker reads its keys only at its start. The believable bug: the
+        file changes and the running broker still hands a login over on a pin that the removed Mac's key signed. The
+        configuration that it wrote refuses the removed key's statement and takes each other key's. A key that is not
+        there changes no key and still starts the broker again (the second believable bug: a lost connection cuts a
+        remove after its write and before the restart, and the same remove again answers "there" while the running
+        broker still takes the removed key); the last key is never taken out, a run adds or removes, and each is
+        refused before anything is written; a broker that does not stay up gets the keys of before back, as for each
+        new configuration."""
+        a, b, c = self.KEYS
+        machine = Machine(dict(self.BROKER, owner_keys=[a, b, c], fleet=self.FLEET))
+        answer = self.step(machine, remove_owner_keys=[b])
+        self.assertEqual((machine.conf["owner_keys"], answer["owner_keys"], answer["state"], answer["changed"]),
+                         ([a, c], 2, "made", ["the configuration"]))
+        self.assertTrue([s for s in machine.changes() if "systemctl restart fleet-vault\n" in s])
+        pin = json.dumps({"v": 1, "kind": "pin", "fleet": self.FLEET, "machine": "vps", "recipient": "age1" + "m" * 58,
+                          "at": 1761300000}, sort_keys=True, separators=(",", ":"))
+        self.assertEqual([vault.owner_signed(machine.conf, pin, test_vault.owner_sign(d, pin)) for d in (2, 3, 5)],
+                         [True, False, True])                           # KEYS are the keys of 2, 3 and 5
+        machine.ran.clear()
+        again = self.step(machine, remove_owner_keys=[b])               # the file has the new list already
+        self.assertEqual((again["state"], again["changed"], machine.conf["owner_keys"]), ("made", ["the broker"], [a, c]))
+        self.assertEqual([("systemctl restart fleet-vault\n" in s, vault.VAULT_CONF_PATH in s)
+                          for s in machine.changes()], [(True, False)])         # one restart, and no write
+        machine.ran.clear()
+        for kw, words in (({"remove_owner_keys": [a, c]}, "at least one owner key"),
+                          ({"remove_owner_keys": [a], "owner_keys": [b]}, "adds owner keys or removes them")):
+            with self.subTest(kw=kw), self.assertRaisesRegex(vault.ConfigureStop, words):
+                self.step(machine, **kw)
+        self.assertEqual((machine.conf["owner_keys"], machine.changes()), ([a, c], []))
+        # A key that is no owner key, which a hand put there, keeps the broker from its start: its removal is the
+        # repair, so it is not refused for its form (the believable bug: the remove form checks the key's form).
+        hand = Machine(dict(self.BROKER, owner_keys=[a, "bm90IGEga2V5"], fleet=self.FLEET))
+        self.assertEqual(self.step(hand, remove_owner_keys=["bm90IGEga2V5"])["state"], "made")
+        self.assertEqual(hand.conf["owner_keys"], [a])
+        down = self.swapping()
+        down.conf.update(owner_keys=[a, b], fleet=self.FLEET)
+        down.broker_stays = False
+        with self.assertRaisesRegex(vault.ConfigureStop, "the configuration is as it was") as said:
+            self.step(down, remove_owner_keys=[b])
+        self.assertTrue(said.exception.undone)
+        self.assertEqual(down.conf["owner_keys"], [a, b])
+
     def test_the_fleet_is_set_where_the_vault_has_none_and_another_fleet_is_refused(self):
         a, b, _ = self.KEYS
         machine = Machine(dict(self.BROKER))                            # a vault of the app's Add server: no key
@@ -3489,6 +3533,13 @@ class Configure(unittest.TestCase):
                 with patch.object(vault, "unchangeable"):
                     self.assertEqual(said(euid=0, program=vault.INSTALLED), (0, {"ok": True, "state": "there"}))
                 self.assertEqual(step.call_args.args, (vault.VAULT_CONF_PATH, [], None, "on", False))
+                self.assertEqual(step.call_args.kwargs["remove_owner_keys"], [])
+                # The remove form reaches the step: a flag that is read and not passed on would leave the key there.
+                args.remove_owner_key = [self.KEYS[1]]
+                with patch.object(vault, "unchangeable"):
+                    said(euid=0, program=vault.INSTALLED)
+                self.assertEqual(step.call_args.kwargs["remove_owner_keys"], [self.KEYS[1]])
+                del args.remove_owner_key
                 for stop, line in ((vault.ConfigureStop("Put back.", undone=True),
                                     {"ok": False, "reason": "Put back.", "undone": True}),
                                    (vault.ConfigureStop("No broker."), {"ok": False, "reason": "No broker."})):
@@ -3497,8 +3548,11 @@ class Configure(unittest.TestCase):
         with patch.object(vault, "configure_main", return_value=0) as main:
             vault.main(["configure", "--swap", "off", "--add-owner-key", "x", "--fleet", self.FLEET])
         parsed = main.call_args.args[0]
-        self.assertEqual((parsed.swap, parsed.add_owner_key, parsed.fleet, parsed.config, parsed.check),
-                         ("off", ["x"], self.FLEET, vault.VAULT_CONF_PATH, False))
+        self.assertEqual((parsed.swap, parsed.add_owner_key, parsed.fleet, parsed.config, parsed.check,
+                          parsed.remove_owner_key), ("off", ["x"], self.FLEET, vault.VAULT_CONF_PATH, False, []))
+        with patch.object(vault, "configure_main", return_value=0) as main:
+            vault.main(["configure", "--remove-owner-key", "y", "--remove-owner-key", "z"])
+        self.assertEqual(main.call_args.args[0].remove_owner_key, ["y", "z"])
 
     def test_no_rule_of_the_sudoers_file_reaches_the_vault_program(self):
         """The service user's root rights are two other programs: fleet-agent-user, which takes one agent user name

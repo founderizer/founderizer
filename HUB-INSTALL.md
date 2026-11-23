@@ -765,7 +765,7 @@ never from the hub's checkout:
 - `/usr/local/lib/fleet-vault-central/vault.py`: the clone's `vault.py`, owned by root,
   mode 644;
 - `/etc/fleet-vault-central/vault.json`: its configuration, owned by root, mode 644, with
-  no secret in it: the hub's uid, the fleet's id and the owner's public key;
+  no secret in it: the hub's uid, the fleet's id and the owner's public keys;
 - in `/var/lib/fleet-vault-central/` (mode 700, its user alone): its own key, which the
   owner's app seals new values to, the store's key, the store, and the owner's signed
   pins and grants that it keeps;
@@ -783,10 +783,37 @@ changed, and never replaces a key, the store or the owner's statements that are 
 owner's app runs them again by itself when the program that the vault runs is not the
 `vault.py` of the hub's release (UI-API.md, version 1.87). In root's clone of a hub installed
 before the key change of 4 November 2026, which has no `early-key.pub`, it first writes its own
-release keys into `release-key.pub`, so that the clone's own `kit-clone` can check the release. The
-owner's key is the one exception: each run writes the key it is given as the only one, so a
-run from a new Mac replaces the key of a lost one. Root on this machine is the owner's own
-authority, and that is why this is a root step.
+release keys into `release-key.pub`, so that the clone's own `kit-clone` can check the release.
+
+**The owner's keys.** A run keeps the owner keys of the vault's configuration as they are when
+the key that it is given is one of them, with `--keep-owner` or without, so the run of one Mac
+of the owner never takes the key of another Mac away. A run with a key that is not one of them
+writes that key as the only one, so a run from a new Mac replaces the key of a lost one (with
+`--keep-owner`, such a run changes nothing). Root on this machine is the owner's own authority,
+and that is why this is a root step. Two forms change one key. Each takes the run's key too,
+and each changes only a vault whose keys hold the run's key: on any other vault it changes
+nothing, because the run would first write its own key alone:
+
+```sh
+sudo python3 /usr/local/lib/founderizer-kit/hubsetup.py central-vault --owner-key <key> \
+    --keep-owner --add-owner-key <another key>
+sudo python3 /usr/local/lib/founderizer-kit/hubsetup.py central-vault --owner-key <key> \
+    --keep-owner --remove-owner-key <a key>
+```
+
+The first adds a key at the end of the list, and the second takes a key out of it, also a key
+that is no point of the curve, but never the last one. A key that is in the list already, or a
+key that is not in it, changes no key, and the run still starts the vault again: so the same
+form again finishes a run that a lost connection cut after its write and before its start.
+Each run checks the list before it writes anything: 1 to 8 keys, each a point of the P-256
+curve. A run that changes the keys starts the vault again, because the vault reads them only
+at its start. One run at a time: a run holds a lock of root's
+(`/run/fleet-vault-central-install.lock`) from its first read to its end, and a run that finds
+it held changes nothing and says so. So the update of one Mac does not write back a key that
+the other Mac takes out at the same time. The run reads the clone's `vault.py` once, and it
+installs the bytes that it hashed, also when a `kit-clone` changes the clone meanwhile. What a
+removed key signed stays in the vault's state (VAULT.md, "The owner's keys of the central
+vault").
 
 **The hub's user can neither read it nor replace its code.** Its files belong to root or
 to its own user, and there is no sudoers line and no root helper for it: the hub asks its

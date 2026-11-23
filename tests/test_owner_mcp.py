@@ -927,6 +927,7 @@ class Install(unittest.TestCase):
     }
 
     def setUp(self):
+        self.MACHINE = dict(self.MACHINE)   # a test that changes a line changes its own copy, so the order of the tests counts for nothing
         self.calls = pathlib.Path(tempfile.mkdtemp(prefix="fleet-ssh-"))
         self.addCleanup(shutil.rmtree, str(self.calls), True)
         table = self.calls / "table.json"

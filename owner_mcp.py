@@ -4995,6 +4995,8 @@ def tools():
         tool("Behaviour",
              "save_knowledge", "The owner's own knowledge files, which agents read and never write: a policy for a "
                                "team (who decides what, money, what customers read), or facts that agents must know. "
+                               "Write no secret into one, and nothing that some agent must not read: today every "
+                               "agent's machine holds every knowledge file. "
                                "Not for how one agent does its work: send_message. Five shapes: "
                                "{title, text, source} for a file of text, {path, text} for new text in a file that "
                                "is there (it keeps its path, title and source, its date says changed, and a page is no "

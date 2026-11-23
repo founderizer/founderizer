@@ -5,6 +5,7 @@ and records every script: nothing here touches this computer, and no credential 
 `vault.py` is the other half: a broker that belongs to a machine and not to one agent, so every agent user of that
 machine reaches it through one group, and a machine whose agent user changed is repaired instead of silently broken.
 """
+import base64
 import contextlib
 import hashlib
 import io
@@ -441,13 +442,34 @@ class LiveConfigurations(unittest.TestCase):
         return loaded, status
 
     def test_every_configuration_that_the_installer_writes_loads_and_opens_the_fleets_own_store(self):
+        """Also the configuration of a by-hand install for a second Mac of the owner (F8, piece E1): it adds that
+        Mac's key to the keys there and takes none away, as `vault.py configure` does. The believable bug, which was
+        the code before E1: the keys given replace the list, so the step for one Mac takes the handovers of the
+        other. A configuration of another fleet keeps none of its keys, and more keys than a broker takes are refused
+        before anything is written, because such a broker would not start."""
+        from test_vault import owner_key
+        second = owner_key(7)
         fresh = hubsetup.vault_config(HUB)
         owned = hubsetup.vault_config(HUB, owner_keys=[self.owner], fleet=self.fleet)
+        both = hubsetup.vault_config(HUB, before=owned, owner_keys=[second], fleet=self.fleet)
+        self.assertEqual(both["owner_keys"], [self.owner, second])
+        self.assertEqual(hubsetup.vault_config(HUB, before=both, owner_keys=[second, self.owner], fleet=self.fleet),
+                         both)                                          # nothing new: the same configuration
+        self.assertEqual(hubsetup.vault_config(HUB, before=both, owner_keys=[second],
+                                               fleet="fedcba9876543210")["owner_keys"], [second])
+        full = dict(owned, owner_keys=[owner_key(d) for d in range(20, 20 + vault.OWNER_KEYS)])
+        with self.assertRaisesRegex(hubsetup.Stop, f"at most {vault.OWNER_KEYS} owner keys"):
+            hubsetup.vault_config(HUB, before=full, owner_keys=[second], fleet=self.fleet)
+        # A given key that is no point of the curve: the broker would not start with it, so it is refused before the
+        # write, with the vault's own check (the believable bug: only the broker's start finds it).
+        off_curve = base64.b64encode(b"\x04" + bytes(range(1, 65))).decode()
+        with self.assertRaisesRegex(hubsetup.Stop, "--owner-key is the base64"):
+            hubsetup.vault_config(HUB, before=owned, owner_keys=[off_curve], fleet=self.fleet)
         # An older file, of a machine that ran one agent: its agent, its one caller and the ssh of an older installer,
         # and no curl and no worker_group yet. vault_config keeps the caller and the agent, and drops the ssh.
         older = dict({k: v for k, v in fresh.items() if k not in ("curl", "worker_group")}, agent="vps",
                      worker_uid=self.AGENT_UID, ssh="/usr/bin/ssh")
-        cases = {"fresh": fresh, "with the owner's keys": owned,
+        cases = {"fresh": fresh, "with the owner's keys": owned, "with the keys of two Macs": both,
                  "run again": hubsetup.vault_config(HUB, before=owned, owner_keys=[self.owner], fleet=self.fleet),
                  "older, brought up to date": hubsetup.vault_config(HUB, before=older, owner_keys=[self.owner],
                                                                     fleet=self.fleet),

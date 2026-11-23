@@ -34,6 +34,7 @@ import hubsetup
 import vault
 import lifecycle
 import releases
+import test_vault
 from test_backup_restore import Fixture
 from test_ui_api import OwnerAPI
 from leftovers import ROOT, scratch_home
@@ -1484,8 +1485,11 @@ class HelperWithdraw(unittest.TestCase):
 
 # ---------------------------------------------------------------- hubsetup.py central-vault
 
-OWNER_KEY = base64.b64encode(b"\x04" + bytes(range(1, 65))).decode()
-NEW_KEY = base64.b64encode(b"\x04" + bytes(range(65, 129))).decode()
+# Two owner keys of the curve, as two Macs of the owner give them, whose private halves these tests hold: since F8's
+# piece E1 the install checks that each key is a point of the curve, as the vault does at its start.
+OWNER_D, NEW_D = 11, 13
+OWNER_KEY, NEW_KEY = test_vault.owner_key(OWNER_D), test_vault.owner_key(NEW_D)
+OFF_CURVE = base64.b64encode(b"\x04" + bytes(range(1, 65))).decode()   # the shape of a key, and no point of the curve
 FLEET = "0f1e2d3c4b5a6978"
 UNIT = ("[Unit]\nDescription=Fleet central vault\n\n[Service]\nUser=founderizer-vault\nGroup=fleet\n"
         "ExecStart=/usr/bin/python3 /usr/local/lib/fleet-vault-central/vault.py serve --config "
@@ -1500,6 +1504,7 @@ class Machine:
 
     def __init__(self, root):
         self.root, self.ran, self.made = Path(root), [], {"age.key": 0, "store.key": 0, "store.age": 0}
+        self.loaded = None          # the owner keys that the running vault read at its last start
         self.state = {"user": "no", "age": "no", "keygen": "no", "program": "", "age.key": "no", "store.key": "no",
                       "store.age": "no", "active": "", "restarts": "0"}
         self.status = {"ok": True, "v": 2, "central": True, "recipient": CENTRAL_KEY, "store_recipient": STORE_KEY,
@@ -1535,6 +1540,8 @@ class Machine:
                     self.state["program"] = hashlib.sha256(target.read_bytes()).hexdigest()
         if "systemctl restart" in script:
             self.state.update(active="active", restarts="0")
+            conf = self.root / hubsetup.CENTRAL_CONF.lstrip("/")
+            self.loaded = json.loads(conf.read_text())["owner_keys"] if conf.exists() else None
         return 0, "", ""
 
     def read(self, path):
@@ -1563,6 +1570,7 @@ class Install(unittest.TestCase):
         self.addCleanup(quiet.stop)
 
     def install(self, key=OWNER_KEY, **extra):
+        extra.setdefault("lock", str(self.tmp / "install.lock"))        # root's lock, in this test's folder
         return hubsetup.central_install(key, hub_user="fleet", kit=str(self.kit), run=self.box.run,
                                         read=self.box.read, db=str(self.db),
                                         account=lambda user: {"uid": 998, "group": "fleet", "home": "/home/fleet"},
@@ -1571,11 +1579,37 @@ class Install(unittest.TestCase):
     def file(self, path):
         return (self.box.root / path.lstrip("/")).read_text(encoding="utf-8")
 
+    def keys(self):
+        """The owner keys of the configuration that the install wrote."""
+        return json.loads(self.file(hubsetup.CENTRAL_CONF))["owner_keys"]
+
+    def writes(self, since=0):
+        """The scripts from `since` on that write or start anything on the machine."""
+        return [s for s in self.box.ran[since:]
+                if any(word in s for word in ("install -o root", "useradd", "age-keygen -o", "store-init",
+                                              "systemctl restart", "systemctl daemon-reload"))]
+
+    def counts(self, d):
+        """True when the configuration that the install wrote takes a statement that the key of `d` signed, by the
+        vault's own check."""
+        pin = statement(kind="pin", fleet=FLEET, machine="vps", recipient="age1" + "m" * 58)
+        return vault.owner_signed(json.loads(self.file(hubsetup.CENTRAL_CONF)), pin, test_vault.owner_sign(d, pin))
+
     def test_a_hub_machine_with_no_central_vault_gets_one(self):
-        done = self.install()
+        """The program that it installs is the clone's vault.py as the run read and hashed it, also when a kit-clone
+        of another Mac changes the clone meanwhile (the believable bug: the run hashes one file and installs the
+        file that is there later, so the vault runs a program that the run did not read)."""
+        read, run = (self.kit / "vault.py").read_bytes(), self.box.run
+
+        def clone_moves(script, timeout=120):           # a kit-clone at the same moment, after the run's first read
+            (self.kit / "vault.py").write_bytes(read + b"\n# the next release\n")
+            return run(script, timeout)
+        with patch.object(self.box, "run", clone_moves):
+            done = self.install()
         self.assertEqual(done, {"state": "made", "recipient": CENTRAL_KEY, "store_recipient": STORE_KEY,
                                 "fleet": FLEET})
-        self.assertEqual(self.file(hubsetup.CENTRAL_LIB + "/vault.py"), (self.kit / "vault.py").read_text())
+        self.assertEqual((self.box.root / hubsetup.CENTRAL_LIB.lstrip("/") / "vault.py").read_bytes(), read)
+        self.assertEqual(self.box.state["program"], hashlib.sha256(read).hexdigest())
         self.assertEqual(json.loads(self.file(hubsetup.CENTRAL_CONF)), {
             "central": True, "hub_uid": 998, "fleet": FLEET, "owner_keys": [OWNER_KEY], "age": "/usr/bin/age",
             "age_key": "/var/lib/fleet-vault-central/age.key", "store": "/var/lib/fleet-vault-central/store.age",
@@ -1635,10 +1669,14 @@ class Install(unittest.TestCase):
         self.assertIn("--fleet", str(stop.exception))
 
     def test_a_key_that_is_not_the_owner_s_public_key_stops_before_anything_runs(self):
+        """Also a key of the right shape that is no point of the curve, and also in a form (the believable bug: only
+        the shape is checked, so the vault, which checks the curve at its start, stays down on the new list)."""
         for key in ("", "not base64!", base64.b64encode(b"\x04" + b"x" * 63).decode(),
-                    base64.b64encode(b"\x02" + b"x" * 64).decode()):
+                    base64.b64encode(b"\x02" + b"x" * 64).decode(), OFF_CURVE):
             with self.assertRaises(hubsetup.Stop):
                 self.install(key)
+        with self.assertRaisesRegex(hubsetup.Stop, "--add-owner-key is the base64"):
+            self.install(add=OFF_CURVE)
         self.assertEqual(self.box.ran, [])
 
     def test_a_vault_that_does_not_answer_the_hub_s_user_stops_the_install(self):
@@ -1653,7 +1691,8 @@ class Install(unittest.TestCase):
 
         def stub(key, **kw):
             return real(key, kit=str(self.kit), run=self.box.run, read=self.box.read, db=str(self.db),
-                        account=lambda user: {"uid": 998, "group": "fleet", "home": "/home/fleet"}, **kw)
+                        account=lambda user: {"uid": 998, "group": "fleet", "home": "/home/fleet"},
+                        lock=str(self.tmp / "install.lock"), **kw)
         out = io.StringIO()
         with patch.object(hubsetup, "central_install", stub), \
                 patch.object(hubsetup.platform, "system", lambda: "Linux" if linux else "Darwin"), \
@@ -1694,7 +1733,13 @@ class Install(unittest.TestCase):
 
     def test_the_apps_own_install_takes_no_vault_of_another_owner(self):
         """--keep-owner, which the app's own install runs by itself: a vault whose configuration names another owner
-        key, or cannot be read, is left as it is, and only the owner's own Set up (no --keep-owner) takes it over."""
+        key, or cannot be read, is left as it is, and only the owner's own Set up (no --keep-owner) takes it over.
+
+        F8, piece E1 (fault 4.1): when the file holds the keys of two Macs of the owner, the run of either Mac, the
+        app's own update or the owner's Set up, keeps both in their order, changes nothing and starts nothing again.
+        The believable bug, which was the code before E1: each run writes its own key alone, so the routine update of
+        one Mac takes the vault away from the other, and the vault then refuses each statement that the other Mac
+        signs. A third key is still another owner's: --keep-owner changes nothing, and the Set up replaces both."""
         self.install(NEW_KEY)
         ran = len(self.box.ran)
         with self.assertRaises(hubsetup.OtherOwner):
@@ -1709,6 +1754,135 @@ class Install(unittest.TestCase):
         with self.assertRaises(hubsetup.OtherOwner):
             self.install(NEW_KEY, keep_owner=True)
         self.assertEqual(self.install(OWNER_KEY)["state"], "made")                         # the owner's Set up
+        two = dict(json.loads(self.file(hubsetup.CENTRAL_CONF)), owner_keys=[NEW_KEY, OWNER_KEY])
+        (self.box.root / hubsetup.CENTRAL_CONF.lstrip("/")).write_text(json.dumps(two, indent=2) + "\n")
+        for key in (OWNER_KEY, NEW_KEY):
+            for keep_owner in (True, False):
+                with self.subTest(key=key, keep_owner=keep_owner):
+                    ran = len(self.box.ran)
+                    self.assertEqual(self.install(key, keep_owner=keep_owner)["state"], "there")
+                    self.assertEqual((self.keys(), self.writes(ran)), ([NEW_KEY, OWNER_KEY], []))
+                    self.assertEqual((self.counts(OWNER_D), self.counts(NEW_D)), (True, True))
+        third = test_vault.owner_key(17)
+        with self.assertRaises(hubsetup.OtherOwner):
+            self.install(third, keep_owner=True)
+        self.assertEqual(self.keys(), [NEW_KEY, OWNER_KEY])
+        self.assertEqual(self.install(third)["state"], "made")
+        self.assertEqual(self.keys(), [third])
+
+    def test_the_add_and_remove_forms_change_one_key_and_start_the_vault_again(self):
+        """The forms of F8's piece E1, which a main Mac runs as root: --add-owner-key puts one key at the end of the
+        list, and --remove-owner-key takes one out. A run that changes the keys starts the vault again, because a
+        running vault reads its keys only at its start. The believable bug: a form writes the file and starts nothing
+        again, so the running vault still takes each statement of the removed Mac's key until its next start. The
+        second believable bug: a lost connection cuts a remove after its write and before its start, and the same
+        remove again answers "there" and starts nothing, so the running vault still takes the removed key while the
+        file says that it is out. A form therefore starts the vault again also when the list is already as it makes
+        it. The configuration that the remove wrote refuses the removed key's statement."""
+        self.install()
+        self.assertEqual(self.install(keep_owner=True, add=NEW_KEY)["state"], "made")
+        self.assertEqual((self.keys(), self.box.loaded), ([OWNER_KEY, NEW_KEY], [OWNER_KEY, NEW_KEY]))
+        connected = self.box.run
+
+        def cut(script, timeout=120):                   # the connection drops after the write, before the start
+            if "systemctl restart" in script:
+                return 255, "", "Connection to 100.64.0.1 closed by remote host."
+            return connected(script, timeout)
+        with patch.object(self.box, "run", cut), self.assertRaises(hubsetup.Stop):
+            self.install(NEW_KEY, keep_owner=True, remove=OWNER_KEY)
+        self.assertEqual((self.keys(), self.box.loaded), ([NEW_KEY], [OWNER_KEY, NEW_KEY]))
+        self.assertEqual(self.install(NEW_KEY, keep_owner=True, remove=OWNER_KEY)["state"], "made")   # again
+        self.assertEqual((self.keys(), self.box.loaded), ([NEW_KEY], [NEW_KEY]))
+        self.assertEqual((self.counts(OWNER_D), self.counts(NEW_D)), (False, True))
+        ran = len(self.box.ran)
+        self.assertEqual(self.install(NEW_KEY, keep_owner=True)["state"], "there")      # with no form: as before
+        self.assertEqual(self.writes(ran), [])
+        with self.assertRaises(hubsetup.OtherOwner):                     # the removed Mac's own update
+            self.install(OWNER_KEY, keep_owner=True)
+        # The root step as the app runs it: each form is one more word of central-vault.
+        code, last = self.command("--owner-key", NEW_KEY, "--keep-owner", "--add-owner-key", OWNER_KEY)
+        self.assertEqual((code, last["ok"], self.keys()), (0, True, [NEW_KEY, OWNER_KEY]))
+        code, last = self.command("--owner-key", NEW_KEY, "--keep-owner", "--remove-owner-key", OWNER_KEY)
+        self.assertEqual((code, last["ok"], self.keys()), (0, True, [NEW_KEY]))
+
+    def test_a_form_with_a_key_that_the_vault_does_not_hold_changes_nothing(self):
+        """A form changes only a list that holds the run's key (--owner-key). The believable bug: without
+        --keep-owner, a run whose key is not in the list writes its own key alone first, so `--owner-key C
+        --remove-owner-key B` on the keys [A, B] writes [C] and A goes too, and `--add-owner-key A` writes [C, A] and
+        B goes: a form that says it changes one key takes the keys of the other Macs away. Each such run stops before
+        anything is written, and the Set up (no form) of a new Mac still replaces the list, as before."""
+        third = test_vault.owner_key(17)
+        self.install()
+        self.install(keep_owner=True, add=NEW_KEY)
+        ran = len(self.box.ran)
+        for form in ({"remove": NEW_KEY}, {"add": OWNER_KEY}, {"add": test_vault.owner_key(19)}):
+            with self.subTest(form=form), self.assertRaisesRegex(hubsetup.Stop, "does not hold it: nothing was"):
+                self.install(third, **form)
+        self.assertEqual((self.keys(), self.writes(ran)), ([OWNER_KEY, NEW_KEY], []))
+        code, last = self.command("--owner-key", third, "--remove-owner-key", NEW_KEY)
+        self.assertEqual((code, last["ok"], self.keys()), (1, False, [OWNER_KEY, NEW_KEY]))
+        self.assertEqual(self.install(third)["state"], "made")
+        self.assertEqual(self.keys(), [third])
+
+    def test_one_run_at_a_time_so_no_update_writes_a_removed_key_back(self):
+        """Each run holds root's lock from its first read of the machine to its answer. The believable bug, two runs
+        at once: the app's update of one Mac (a new program, so it writes) reads the keys, the other Mac's remove
+        form takes a key out meanwhile, and the update then writes the list that it read, with the removed key back
+        in it. Here the remove comes while the update reads the configuration: it changes nothing and says so, and
+        the remove after the update takes the key out for good."""
+        third = test_vault.owner_key(17)
+        self.install()
+        conf = json.loads(self.file(hubsetup.CENTRAL_CONF))
+        (self.box.root / hubsetup.CENTRAL_CONF.lstrip("/")).write_text(
+            json.dumps(dict(conf, owner_keys=[OWNER_KEY, NEW_KEY, third]), indent=2) + "\n")
+        self.box.state["program"] = "an older vault.py"                 # a release: the update writes the file
+        meanwhile, read = [], self.box.read
+
+        def reads(path):
+            text = read(path)                                           # the update has read the keys
+            if path == hubsetup.CENTRAL_CONF and not meanwhile:
+                meanwhile.append("remove")
+                try:
+                    self.install(keep_owner=True, remove=third)        # the other Mac, at the same moment
+                except hubsetup.Stop as e:
+                    meanwhile.append(str(e))
+            return text
+        with patch.object(self.box, "read", reads):
+            self.assertEqual(self.install(NEW_KEY, keep_owner=True)["state"], "made")
+        self.assertEqual(len(meanwhile), 2)
+        self.assertIn("Another step changes this machine's vault now, so this one changed nothing", meanwhile[1])
+        self.assertEqual(self.keys(), [OWNER_KEY, NEW_KEY, third])     # the remove did not happen, and nothing is lost
+        self.assertEqual(self.install(keep_owner=True, remove=third)["state"], "made")
+        self.assertEqual(self.install(NEW_KEY, keep_owner=True)["state"], "there")
+        self.assertEqual(self.keys(), [OWNER_KEY, NEW_KEY])
+
+    def test_a_list_with_no_key_or_more_than_the_vault_takes_is_refused_before_any_write(self):
+        """The install writes the configuration, starts the vault and only then reads it, and puts nothing back. So
+        the believable bug is a list that is checked late or not at all: a remove of the last key, an add past
+        vault.OWNER_KEYS, or a kept key that is no point of the curve (a file changed by hand while the vault runs
+        on the list that it read at its start) would leave the vault down at the next start, with every secret
+        behind it. Each is refused before anything is written, and the file stays as it was."""
+        self.install()
+        before, ran = self.file(hubsetup.CENTRAL_CONF), len(self.box.ran)
+        with self.assertRaisesRegex(hubsetup.Stop, "at least one owner key"):
+            self.install(keep_owner=True, remove=OWNER_KEY)
+        hand = json.dumps(dict(json.loads(before), owner_keys=[OWNER_KEY, OFF_CURVE]), indent=2) + "\n"
+        (self.box.root / hubsetup.CENTRAL_CONF.lstrip("/")).write_text(hand)
+        self.box.state["program"] = "an older vault.py"                 # a release: the update would write the file
+        with self.assertRaisesRegex(hubsetup.Stop, "would not start with it"):
+            self.install(keep_owner=True)
+        self.assertEqual((self.file(hubsetup.CENTRAL_CONF), self.writes(ran)), (hand, []))
+        full = [test_vault.owner_key(d) for d in range(20, 20 + vault.OWNER_KEYS)]
+        (self.box.root / hubsetup.CENTRAL_CONF.lstrip("/")).write_text(
+            json.dumps(dict(json.loads(before), owner_keys=full), indent=2) + "\n")
+        with self.assertRaisesRegex(hubsetup.Stop, f"at most {vault.OWNER_KEYS} owner keys"):
+            self.install(full[0], keep_owner=True, add=OWNER_KEY)
+        self.assertEqual((self.keys(), self.writes(ran)), (full, []))
+        # The repair of a list changed by hand: its key that is no point of the curve can be taken out (the believable
+        # bug: the remove form checks the key's form, so the one fix of such a list is refused).
+        (self.box.root / hubsetup.CENTRAL_CONF.lstrip("/")).write_text(hand)
+        self.assertEqual(self.install(keep_owner=True, remove=OFF_CURVE)["state"], "made")
+        self.assertEqual(self.keys(), [OWNER_KEY])
 
     def test_it_runs_only_from_roots_own_clone(self):
         """DevOps plan V2: never from a folder that the hub's user can change, such as the hub's own checkout."""

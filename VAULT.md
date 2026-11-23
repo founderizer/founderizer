@@ -257,6 +257,38 @@ The vault protects the value of each secret. The design gives these results:
   fleet. It keeps a dated record of each machine, recovery key, grant and pool entry, also after its end, and of the
   newest replace of each reference, and it refuses a statement that is not newer than that record. So the hub cannot
   send an old statement again (`vault.py`).
+- **The owner's keys of the central vault.** The central vault takes a statement that one of its owner keys signed,
+  and it holds 1 to 8 of them (`vault.py`). Only root on the hub's server writes them, with the root step
+  `hubsetup.py central-vault`. A run of that step keeps the keys as they are when its own key is one of them, with
+  `--keep-owner` or without, so the step of one Mac of the owner never takes the key of another Mac away. A run whose
+  key is not one of them writes its own key alone, so a run from a new Mac takes the place of the key of a lost Mac.
+  On a vault whose keys hold the run's own key, `--add-owner-key` adds one key at the end of the list, and
+  `--remove-owner-key` takes one key out, also a key that is no point of the curve, but never the last one. Each form
+  starts the vault again also when the list is already as the form makes it, so the same form again finishes a run
+  that a lost connection cut after its write. On any other vault each form changes nothing, because the run would
+  first write its own key alone. The step checks the list before it writes anything: 1 to 8 keys, each a point of the
+  curve. A run that changes the keys starts the central vault again, because the vault reads its keys only at its
+  start. One run at a time: a run holds a lock of root's from its first read to its end, and a second run at the same
+  time changes nothing, so no update writes back a key that a remove took out (`hubsetup.py`). No step of the app adds
+  a second key yet. A step that gives a second Mac its key must use the add form, from a Mac whose key is in the list,
+  and never the Set up from the second Mac: the Set up writes the second Mac's key alone and takes the key of each
+  other Mac away.
+  **What stays after the removal of a key.** The central vault refuses each new statement of the removed key, of each
+  kind. Each record that the removed key signed before stays in force: a pin, a grant, a pool entry, the recovery key
+  and the newest replace of a reference, with the value that the replace put in the store. A record keeps a time and
+  no signer, and the vault checks no signature again when it seals a copy or makes a backup (`vault.py`). A record
+  that the removed key dated after the vault's clock stops each newer statement of its kind until that time: one day
+  at most for each kind but a replace, which has no such bound (limit 24). The pin that the hub keeps of a machine
+  keeps the removed key's signature: a broker that no longer holds the key refuses it, and a broker that still holds
+  the key takes it until it is 90 days old (`hub.py`, `vault.py`). The door checks each signature again at each use,
+  with the keys of its own access file, so there the removed key's statements end only when that file no longer names
+  the key (`door.py`); the root step of the central vault does not change that file. No step of the app cleans these
+  records yet. The app signs a recovery key only when the vault holds none
+  (`Sources/FleetCore/CentralVaultPlan.swift`), and it has no step that signs the end of a record that the hub's
+  records do not hold. So after a removal, until such a step: the recovery key that the removed key signed stays, and
+  each backup (`export`, which the hub's user can ask for) is locked to it; each value that a replace of the removed
+  key put in stays in the store; and each pin, grant and pool entry that the removed key signed stays in force, but
+  for a pin that the app signs again with a key that stays.
 - **No statement from ahead.** The central vault keeps no pin, unpin, recovery, grant, ungrant, pool or unpool
   statement of the owner's that is dated more than one day after its own clock, and the record before it stays
   (`vault.py` `central_signed`). A replace statement is not checked so (limit 24). The app dates no grant, ungrant,
@@ -388,9 +420,14 @@ server that joined before, it is off until root switches it on.
 - **Off.** `vault.py configure --swap off` takes the part away, restarts the broker and stops the proxy. Each session
   that runs on that server with a placeholder then gets no key until its next start, because the proxy stops with
   the switch.
-- **The owner's keys and the fleet.** The same step adds owner keys to a vault (`--add-owner-key`) and never takes
-  one away, so the step of one Mac of the owner does not take the handovers of another Mac. It sets the fleet's ID
-  (`--fleet`) where the vault has none, and it refuses a vault of another fleet.
+- **The owner's keys and the fleet.** The same step adds owner keys to a vault (`--add-owner-key`) and never takes one
+  away, so the step of one Mac of the owner does not take the handovers of another Mac. Only its remove form,
+  `--remove-owner-key`, takes a key out, in a run that adds none and never the last key, and the broker then starts
+  again with the keys that stay, also when the key is gone from the file already. The broker's state stays as it is
+  ("The owner's keys of the central vault"). `hubsetup.py vault --owner-key` also adds the keys that it is given to
+  the broker's keys, and keeps none of a vault of another fleet. On a Mac, `Vault/install.py --owner-keys-only` writes
+  the keys that it is given in place of the list: it is the remove form there, so give it each key that stays. The
+  step sets the fleet's ID (`--fleet`) where the vault has none, and it refuses a vault of another fleet.
 - **What the step reads.** Its last line is one JSON object, with `swaps`: the broker that runs now swaps keys. Root
   cannot ask the broker itself, because the broker's socket admits only the agents' users. So the step reads the
   broker's socket for the proxy, which the broker makes only after it loads the part `swap`, in its runtime folder,
@@ -791,8 +828,10 @@ host.
    a later build raises the generation (`Sources/FleetVaultCore/VaultKeychain.swift`). A pin that the central vault
    took with a time more than a day ahead, before it refused such a pin, cannot be put right before its time: each
    broker refuses it until it is less than a day ahead, and a new pin is not newer than it (`vault.py`). The live fleet had none on 14 November 2026. A broker also keeps the owner keys that its root step gave it after the owner changes
-   Macs, until a root step on that machine changes them, and it refuses a pin that another key signed (`hubsetup.py`,
-   `Vault/install.py`). The app signs each kept pin again with the new Mac's owner key, so such a broker then refuses
+   Macs, until a root step on that machine takes them out (`vault.py configure --remove-owner-key`, and on a Mac
+   `Vault/install.py --owner-keys-only`), and it refuses a pin that another key signed (`hubsetup.py`,
+   `Vault/install.py`). The central vault keeps each record that a removed owner key signed ("The owner's keys of the
+   central vault"). The app signs each kept pin again with the new Mac's owner key, so such a broker then refuses
    handovers until that root step (`Sources/FleetCore/CentralVaultPlan.swift`).
 8. **The end of a grant.** The end of a grant, of a pin and of a pool entry reaches the central vault only through
    the hub. A hub that is broken into can hold it back, and the central vault then still seals that secret
@@ -1070,12 +1109,15 @@ host.
 6. **Keep the recovery code.** It is only in the Mac's login Keychain and on a phone that enrolled after the Mac had
    the code (`Sources/FleetCore/RecoveryCode.swift`, `Sources/Founderizer/RecoveryCopy.swift`). Without it, a backup
    of the central vault cannot be opened (`vault.py`).
-7. **Know what a new Mac changes.** The root step from a new Mac makes its key the only owner key of the central vault
-   (`hubsetup.py`, `Sources/FleetCore/OwnerKey.swift`). The recovery key does not change: a backup still opens only
+7. **Know what a new Mac changes.** The root step from a new Mac, whose key is not one of the central vault's owner
+   keys, makes its key the only owner key of the central vault (`hubsetup.py`, `Sources/FleetCore/OwnerKey.swift`). A
+   run of that step from a Mac whose key is one of them keeps all of them. The recovery key does not change: a backup still opens only
    with the lost Mac's code, which only a phone that took a copy has (`Sources/FleetCore/CentralVaultPlan.swift`,
    `Sources/Founderizer/RecoveryCopy.swift`). A Linux broker, and Fleet Vault on a Mac that has the owner's keys,
-   keep the old owner key until a root step on that machine changes it (`hubsetup.py`, `Vault/install.py`). Do that
-   root step on each such machine soon. Within 7 days the new Mac signs the pin of each machine again with its own
+   keep the old owner key until a root step on that machine changes their keys: on Linux, `vault.py configure` adds
+   the new key (`--add-owner-key`) and takes the old one out (`--remove-owner-key`); on a Mac,
+   `Vault/install.py --owner-keys-only` with the new key alone (`vault.py`, `Vault/install.py`). Do that root step on
+   each such machine soon. Within 7 days the new Mac signs the pin of each machine again with its own
    key, and such a broker refuses each pin that the new key signed. So that machine's broker hands no login over
    until its root step (`Sources/FleetCore/CentralVaultPlan.swift`, `vault.py`). Keep Founderizer running on a Mac:
    it signs each pin again after 7 days, and a pin lives 90 days. When the Mac stops, handovers go on for at least 83

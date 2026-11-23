@@ -8094,14 +8094,16 @@ WantedBy=multi-user.target
 #
 # Part B of the changed key swap (the manager's choice C43, 15 November 2026): the one command that changes this
 # machine's vault configuration after its install. It adds the owner's keys and never takes one away, so that the step
-# of one Mac of the owner does not take the handovers of another; it sets the fleet's ID where the vault has none; and
-# it switches the key swap on or off. It runs only as root and only as the installed program (configure_main), as
-# store-init does, so the code that root runs here is root's own: the program that the install put in place, or the
-# one that fleet-vault-program took from a signed release above its floor (hubsetup.vault_program_script). Nothing of a
-# checkout runs, and the hub names nothing. The owner's Mac runs it over SSH; join.sh and hub.sh run it at an install
-# (`hubsetup.py key-swap`); `hubsetup.py vault --swap` calls it. No rule of the machine's sudoers file reaches it: the
-# service user's two root commands are other programs, and its third right is to run commands as an agent user, which
-# this command refuses (hubsetup.sudoers_text; test_key_swap.Configure holds both).
+# of one Mac of the owner does not take the handovers of another; only its remove form (`--remove-owner-key`, F8 piece
+# E1) takes a key out, for a Mac that the owner removed, and never the last one; it sets the fleet's ID where the vault
+# has none; and it switches the key swap on or off. It runs only as root and only as the installed program
+# (configure_main), as store-init does, so the code that root runs here is root's own: the program that the install put
+# in place, or the one that fleet-vault-program took from a signed release above its floor
+# (hubsetup.vault_program_script). Nothing of a checkout runs, and the hub names nothing. The owner's Mac runs it over
+# SSH; join.sh and hub.sh run it at an install (`hubsetup.py key-swap`); `hubsetup.py vault --swap` calls it. No rule of
+# the machine's sudoers file reaches it: the service user's two root commands are other programs, and its third right is
+# to run commands as an agent user, which this command refuses (hubsetup.sudoers_text; test_key_swap.Configure holds
+# both).
 #
 # Its last line on standard output is one JSON object, which the owner's app reads: {"ok": true, "state", "swaps",
 # "swaps_from", "owner_keys", "fleet", "changed"}, or {"ok": false, "reason"} with exit 1.
@@ -8194,9 +8196,14 @@ def configure_answer(state, conf, reading, changes):
 
 
 def configure(config=VAULT_CONF_PATH, owner_keys=(), fleet=None, swap="keep", check=False, run=None, read=None,
-              settle=CONFIGURE_SETTLE, lock=CONFIGURE_LOCK, egress="keep", egress_rules_step=None):
+              settle=CONFIGURE_SETTLE, lock=CONFIGURE_LOCK, egress="keep", egress_rules_step=None, remove_owner_keys=()):
     """This machine's own root step (the section above). `owner_keys` are added to the vault's list, `fleet` is set
     where the vault has none, and `swap` is "on", "off" or "keep". With `check` it reads and changes nothing.
+    `remove_owner_keys` (the remove form) are taken out of the vault's list, in a run that adds none, and never the
+    last key: the broker then starts again, because a running broker reads its keys only at its start. A key that is
+    not in the list changes no key, and the broker still starts again, so the same remove again finishes a run that
+    a lost connection cut after its write. A key that is no point of the curve can be taken out too. The broker's
+    state stays as it is (VAULT.md, "The owner's keys of the central vault").
 
     The order of the install's swap step stays: it reads first; it refuses before anything changes (a vault of another
     fleet, a key that is not in the owner's form, a machine where each user can listen on the proxy's port); it makes
@@ -8211,7 +8218,8 @@ def configure(config=VAULT_CONF_PATH, owner_keys=(), fleet=None, swap="keep", ch
         raise ConfigureStop("swap and egress are on, off or keep. Nothing changed.")
     held = configure_lock(lock) if lock and not check else None
     try:
-        answer = configure_locked(config, list(owner_keys), fleet, swap, check, run, read, settle)
+        answer = configure_locked(config, list(owner_keys), fleet, swap, check, run, read, settle,
+                                  list(remove_owner_keys))
         # The outgoing gate (configure_egress): read where the machine has it, changed only on its own word.
         if egress != "keep" or os.path.exists(EGRESS_CONF):
             changes, part = configure_egress(egress, check, run, json.loads(read(config)), settle,
@@ -8228,7 +8236,7 @@ def configure(config=VAULT_CONF_PATH, owner_keys=(), fleet=None, swap="keep", ch
             os.close(held)
 
 
-def configure_locked(config, owner_keys, fleet, swap, check, run, read, settle):
+def configure_locked(config, owner_keys, fleet, swap, check, run, read, settle, removed=()):
     try:
         current = json.loads(read(config))
         current = current if isinstance(current, dict) else None
@@ -8236,25 +8244,33 @@ def configure_locked(config, owner_keys, fleet, swap, check, run, read, settle):
         current = None
     if current is None or not current.get("worker_group") or current.get("central") is True:
         raise ConfigureStop("This machine has no vault broker of its own to configure: run `hubsetup.py vault` first.")
-    for text in owner_keys:
-        try:
+    for text in owner_keys:             # a key that is taken out needs no check: one that is no point of the curve
+        try:                            # keeps the broker from its start, and its removal is the repair
             owner_key(text)
         except ValueError:
             raise ConfigureStop("Each owner key is the base64 of an uncompressed P-256 public key (65 bytes), as the "
                                 "app shows it. Nothing changed.") from None
+    if owner_keys and removed:
+        raise ConfigureStop("One run adds owner keys or removes them, not both. Nothing changed.")
     if fleet is not None and not FLEET_ID.fullmatch(str(fleet)):
         raise ConfigureStop("fleet is the fleet's ID: 16 lowercase hex characters. Nothing changed.")
     if fleet and current.get("fleet") and current["fleet"] != fleet:
         raise ConfigureStop(f"This vault is of another fleet ({current['fleet']}), so nothing changed.")
     conf, had = dict(current), list(current.get("owner_keys") or [])
     added = [k for k in dict.fromkeys(owner_keys) if k not in had]
+    kept = [k for k in had if k not in removed]
     if added and not (current.get("fleet") or fleet):
         raise ConfigureStop("The owner's keys go with the fleet's ID: give --fleet. Nothing changed.")
     if len(had) + len(added) > OWNER_KEYS:
         raise ConfigureStop(f"A vault takes at most {OWNER_KEYS} owner keys, and this one would have "
                             f"{len(had) + len(added)}. Nothing changed.")
+    if had and not kept:
+        raise ConfigureStop("A vault keeps at least one owner key, and this run would take away each one that it has. "
+                            "Nothing changed.")
     if added:
         conf["owner_keys"] = had + added
+    if kept != had:                     # the remove form: the broker starts again below, as for each new configuration
+        conf["owner_keys"] = kept
     if fleet and not current.get("fleet"):
         if not conf.get("owner_keys"):
             raise ConfigureStop("The fleet's ID goes with the owner's keys: give --add-owner-key. Nothing changed.")
@@ -8276,7 +8292,10 @@ def configure_locked(config, owner_keys, fleet, swap, check, run, read, settle):
     conf_new = conf != current
     # A broker that started while the part could not be read (no proxy's user yet) serves without its socket for the
     # proxy, and gives no key that has a site until it starts again; a broker that does not run starts.
-    broker_again = conf_new or (swaps and (before.get("broker") != "active" or before.get("socket") != VAULT_USER))
+    # A remove form starts the broker again also when the key is gone from the file already: a run that a lost
+    # connection cut after its write and before the restart leaves the running broker on the keys of before.
+    broker_again = conf_new or bool(removed) or \
+        (swaps and (before.get("broker") != "active" or before.get("socket") != VAULT_USER))
     unit_new = swaps and before.get("unit") != hashlib.sha256(unit.encode()).hexdigest()
     proxy_again = swaps and (unit_new or before.get("active") != "active")
     proxy_enable = swaps and (unit_new or before.get("enabled") != "enabled")
@@ -8379,7 +8398,8 @@ def configure_main(args, euid=None, program=None):
         except SystemExit as e:
             raise ConfigureStop(str(e)) from None
         answer = configure(args.config, args.add_owner_key, args.fleet, args.swap, args.check,
-                           egress=getattr(args, "egress", "keep"))
+                           egress=getattr(args, "egress", "keep"),
+                           remove_owner_keys=getattr(args, "remove_owner_key", None) or [])
     except ConfigureStop as e:
         print(json.dumps(dict({"ok": False, "reason": str(e)}, **({"undone": True} if e.undone else {}))))
         return 1
@@ -8414,12 +8434,15 @@ def main(argv=None):
                                           "Never a value")
     p.add_argument("--config", required=True)
     p = sub.add_parser("configure", help="This machine's own root step, as root and only as the installed program: "
-                                         "add the owner's keys, set the fleet's ID, and switch the key swap on or "
-                                         "off. Its last line is one JSON object")
+                                         "add the owner's keys or remove one, set the fleet's ID, and switch the "
+                                         "key swap on or off. Its last line is one JSON object")
     p.add_argument("--config", default=VAULT_CONF_PATH)
     p.add_argument("--add-owner-key", action="append", default=[], metavar="KEY",
                    help="one public key of the owner (base64 of 65 bytes): added to the vault's keys, never in their "
                         "place")
+    p.add_argument("--remove-owner-key", action="append", default=[], metavar="KEY",
+                   help="one public key of the owner (base64 of 65 bytes) that is taken out of the vault's keys, in a "
+                        "run that adds none; the last key is never taken out")
     p.add_argument("--fleet", help="the fleet's ID, 16 lowercase hex characters: set where the vault has none")
     p.add_argument("--swap", choices=("on", "off", "keep"), default="keep",
                    help="the key swap: on, off, or as it is (the default)")

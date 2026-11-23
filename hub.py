@@ -38750,9 +38750,10 @@ DUTY_REVIEW_TASK = {
                "something they do not say, or showed that something in them is wrong. Leave them "
                "as they are when nothing changed: a version that says the same thing is noise. "
                + NOTES_RULE +
-               " Then your skills, if you have any (your start lists them): change one with write_skill where the "
-               "work since the last review showed a step of it wrong or missing, and retire one that no job needs "
-               "any more; leave the others as they are. "
+               " Then the skills that you wrote, if you have any (your start lists them, with the ones that the "
+               "owner gave you, which you leave as they are): change one with write_skill where the work since the "
+               "last review showed a step of it wrong or missing, and retire one that no job needs any more; leave "
+               "the others as they are. "
                "Then the lessons of your memory that this review lists below, if it lists any. "
                + MEMORY_REVIEW_WHAT +
                " A lesson whose key has not come back is the best-evidenced kind you hold, and what that evidence "
@@ -38774,7 +38775,7 @@ RULE_TITLES_SAY = ("[hub] These wake-up rules have a title that the owner cannot
 DUTY_REVIEW_SAY = ("[hub] Your duties have news since your last review:\n{news}\nPut them in order as their words "
                    "say: build the mechanism of a duty that has no watch, repair a broken watch and work a case that "
                    "waits. Then read your notes with see_notes, and rewrite what the work since your last review "
-                   "showed you; change a skill of yours that it showed wrong with write_skill.")
+                   "showed you; change a skill that you wrote and that it showed wrong, with write_skill.")
 
 
 # Memory phase 3 (AUTONOMY.md decision 44): the review is the agent's own "dream". Besides news, it starts once the
@@ -44849,8 +44850,8 @@ def t_write_skill(agent, a):
                             f"fewer words, or put a long part in a file beside it.")
         content.update({folder + p: body.encode() for p, body in (files or {}).items()})
         if "SKILL.md" not in have and len(skill_rows(kit_dir(), agent)) >= SKILLS_MAX:
-            raise ToolError(f"You have at most {SKILLS_MAX} skills. Retire one that no job needs any more "
-                            f"(retire=true), or fold two that do the same job into one.")
+            raise ToolError(f"You have at most {SKILLS_MAX} skills. Retire one that you wrote and that no job needs "
+                            f"any more (retire=true), or fold two of yours that do the same job into one.")
         guard(agent, why, description, text, *(files or {}), *(files or {}).values())
         for what, body in [("text", text), *((files or {}).items())]:
             if written_key(body):
@@ -44921,7 +44922,7 @@ def t_write_skill(agent, a):
                   "this commit and reverts it in one step.")
     many = skills_count(commit, agent)
     if many > SKILLS_MAX * 3 // 4:      # three quarters of SKILLS_MAX: retire one before the next write is refused
-        said += f" You have {many} of {SKILLS_MAX} skills: retire one that no job needs."
+        said += f" You have {many} of {SKILLS_MAX} skills: retire one that you wrote and that no job needs."
     with transaction():
         keep_command(command, {"name": name, "commit": commit, "text": said}, t0)
     log(agent, f"{'retired' if retire else 'wrote'} the skill {name} as {commit[:12]}: {why}")

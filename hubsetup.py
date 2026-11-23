@@ -51,11 +51,13 @@ Standard library only, and it reads no credential of a model provider.
                                                     it is while the hub has taken no release; --first is hub.sh's own
                                                     word, in the run that makes the hub: the first clone, at the commit
                                                     of the installer's tree; safe to run again
-    python3 /usr/local/lib/founderizer-kit/hubsetup.py central-vault --owner-key KEY [--hub-user fleet] [--fleet ID]
+    python3 /usr/local/lib/founderizer-kit/hubsetup.py central-vault --owner-key KEY [--keep-owner]
+            [--add-owner-key KEY | --remove-owner-key KEY] [--hub-user fleet] [--fleet ID]
                                                     as root on the hub's machine, from that clone only: the central
                                                     vault, its own user and service, which the hub's user can ask and
                                                     neither read nor replace; kit-clone and a second run of it are how
-                                                    it is updated
+                                                    it is updated; a run keeps the vault's owner keys when its own key
+                                                    is one of them, and adds or removes one key with its form
     python3 /usr/local/lib/founderizer-kit/hubsetup.py connect on|off [--hub-user fleet]
                                                     as root on the hub's Linux machine, from that clone only: the gate
                                                     of the remote MCP address, its own user and service, and Tailscale
@@ -125,6 +127,7 @@ import hub  # noqa: E402
 import lifecycle  # noqa: E402
 import onboard  # noqa: E402
 import releases  # noqa: E402
+import vault  # noqa: E402   the owner keys' own check (owner_key, OWNER_KEYS), as the vault makes it at its start
 
 KIT = os.path.dirname(os.path.abspath(__file__))
 CODE_LENGTH = 12                # hub.LINK_ALPHABET: 12 characters, 60 bits, as a join code
@@ -198,6 +201,8 @@ CENTRAL_CONF_DIR = "/etc/fleet-vault-central"
 CENTRAL_CONF = CENTRAL_CONF_DIR + "/vault.json"     # root with mode 644, and no secret in it
 CENTRAL_STATE = "/var/lib/fleet-vault-central"      # its key, the store's key, the store and the pins: its user alone
 CENTRAL_UNIT = "/etc/systemd/system/fleet-vault-central.service"
+# root's: one run of central-vault at a time, from its read of the configuration to its write (vault.configure_lock)
+CENTRAL_LOCK = "/run/fleet-vault-central-install.lock"
 # DevOps plan 0.3: what the vault program checks a release with, root-owned beside the broker's program and put there
 # by the root step of a machine (agent_helper) and never by a release, and the floor of the releases it took.
 RELEASE_CHECK = VAULT_LIB + "/releases.py"          # this checkout's releases.py, the one check of a release
@@ -2055,9 +2060,21 @@ def vault_config(hub_address, group=AGENT_GROUP, before=None, owner_keys=None, f
     # place left the broker (DevOps plan 0.3), and with it the ssh client it wrote a key into a target with.
     conf.pop("ssh", None)
     # The owner's keys and the fleet's ID (DevOps plan 0.3): the broker hands a login over only to a recipient that
-    # the owner signed a pin for, checked with these. Given by the root step of the machine, and kept after it.
+    # the owner signed a pin for, checked with these. Given by the root step of the machine, and kept after it. The
+    # step adds the keys that it is given and takes none away (F8, piece E1), as `vault.py configure` does, so the
+    # step for one Mac of the owner keeps the key of another. Only a configuration of another fleet keeps none of its
+    # keys. A key that is no point of the curve, and more keys than the broker takes, stop here, before anything is
+    # written: the broker would not start with them.
     if owner_keys:
-        conf.update(owner_keys=list(owner_keys), fleet=fleet)
+        for key in owner_keys:
+            owner_public_key(key)
+        had = conf.get("owner_keys") if conf.get("fleet") in (None, fleet) else None
+        had = list(had) if isinstance(had, list) else []
+        keys = had + [key for key in dict.fromkeys(owner_keys) if key not in had]
+        if len(keys) > vault.OWNER_KEYS:
+            raise Stop(f"a vault broker takes at most {vault.OWNER_KEYS} owner keys, and this one would have "
+                       f"{len(keys)}: nothing was changed.")
+        conf.update(owner_keys=keys, fleet=fleet)
     return conf
 
 
@@ -2734,15 +2751,14 @@ def kit_first(root_kit, tree, commit, source, git, own):
 # second run of it are how the vault is updated: there is no sudoers line and no root helper that lets the hub's user
 # install or change it.
 
-def owner_public_key(value):
-    """The owner's public key as his app gives it: the base64 of a 65-byte uncompressed P-256 point (0x04, X, Y).
-    Only its shape is checked here; the central vault refuses to start with a point that is not on the curve."""
+def owner_public_key(value, option="--owner-key"):
+    """The owner's public key as his app gives it: the base64 of a 65-byte uncompressed P-256 point (0x04, X, Y) that
+    is a point of the curve. This is the check of the central vault itself (vault.owner_key), made before anything
+    is written: the vault refuses to start with a key that fails it, and so would leave every secret behind it."""
     try:
-        raw = base64.b64decode(value or "", validate=True)
+        vault.owner_key(value)
     except (ValueError, TypeError):
-        raw = b""
-    if len(raw) != 65 or raw[0] != 4 or base64.b64encode(raw).decode() != value:
-        raise Stop("--owner-key is the base64 of the owner's 65-byte P-256 public key, as their app gives it.")
+        raise Stop(f"{option} is the base64 of the owner's 65-byte P-256 public key, as their app gives it.") from None
     return value
 
 
@@ -2783,12 +2799,50 @@ def hub_fleet(db):
     return row[0]
 
 
-def central_config(hub_uid, fleet, owner_key):
+def central_config(hub_uid, fleet, owner_key, current=None, add=None, remove=None):
     """The central vault's configuration (vault.py, central mode), which holds no secret: the one uid it answers, the
-    fleet each signed statement must name, the owner's public key, and where its files are. owner_keys is the key
-    of this run and nothing else, so a run from a new Mac replaces the key of a lost one: root on the hub's machine
-    is the owner's own authority, and the key files themselves are never replaced (central_install)."""
-    return {"central": True, "hub_uid": hub_uid, "fleet": fleet, "owner_keys": [owner_key], "age": "/usr/bin/age",
+    fleet each signed statement must name, the owner's public keys, and where its files are.
+
+    The owner keys (F8, piece E1). When the configuration of now (`current`) names this run's key, its list stays,
+    in its order, with keep_owner or without: so the run of one Mac of the owner never takes the key of another Mac
+    away, and a list that did not change gives the same configuration, which starts nothing again. Any other run
+    writes this run's key alone, so a run from a new Mac replaces the key of a lost one: root on the hub's machine
+    is the owner's own authority, and the key files themselves are never replaced (central_install). The fleet is no
+    condition of the keep: the hub's user can write the fleet id that a run reads (hub_fleet), and with such a
+    condition a broken hub that changed it would make the next update of one Mac take the other Mac's key away.
+
+    The add form (`add`) puts one key at the end of the list, and the remove form (`remove`) takes one key out of
+    it, also a key that is no point of the curve, which a list changed by hand can hold. A form changes only a list
+    that holds this run's key: on any other configuration it stops, because the run would first write its own key
+    alone and so take the keys of the other Macs away. A key that is in the list already, or a key that is not in
+    it, changes no key, and the run still starts the vault again (central_install).
+
+    Stop when the list is not one that the vault starts with: no key, more than vault.OWNER_KEYS, or a key that is
+    not a point of the curve. central_install asks this before it writes anything and puts nothing back after it,
+    so a list that the vault refuses would leave the vault down, with every secret behind it."""
+    had = current.get("owner_keys") if isinstance(current, dict) else None
+    kept = isinstance(had, list) and owner_key in had
+    if (add or remove) and not kept:
+        raise Stop("--add-owner-key and --remove-owner-key change only the owner keys of a central vault that holds "
+                   "this run's key (--owner-key), and this vault does not hold it: nothing was changed.")
+    keys = list(had) if kept else [owner_key]
+    if add and add not in keys:
+        keys.append(add)
+    if remove:
+        keys = [key for key in keys if key != remove]
+    if not keys:
+        raise Stop("the central vault keeps at least one owner key, and --remove-owner-key names its last one: "
+                   "nothing was changed.")
+    if len(keys) > vault.OWNER_KEYS:
+        raise Stop(f"the central vault takes at most {vault.OWNER_KEYS} owner keys, and this run would give it "
+                   f"{len(keys)}: nothing was changed.")
+    for key in keys:
+        try:
+            vault.owner_key(key)
+        except (ValueError, TypeError):
+            raise Stop("the central vault's configuration names an owner key that is not the base64 of a P-256 "
+                       "public key of the curve, so the vault would not start with it: nothing was changed.") from None
+    return {"central": True, "hub_uid": hub_uid, "fleet": fleet, "owner_keys": keys, "age": "/usr/bin/age",
             "age_key": CENTRAL_STATE + "/age.key", "store": CENTRAL_STATE + "/store.age",
             "store_key": CENTRAL_STATE + "/store.key", "socket": hub.CENTRAL_SOCKET,
             "state": CENTRAL_STATE + "/central.json"}
@@ -2881,7 +2935,7 @@ class OtherOwner(Stop):
 
 
 def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None, read=None, account=None, db=None,
-                    keep_owner=False):
+                    keep_owner=False, add=None, remove=None, lock=CENTRAL_LOCK):
     """The central vault on the hub's machine, as root (HUB-INSTALL.md, "The central vault"): age, its own user, the
     kit's vault.py as a root-owned program, its configuration, its own key, the store's key and the empty store, its
     service, and then its status, asked as the hub's user.
@@ -2889,23 +2943,51 @@ def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None,
     Safe to run again, and that is how it is updated: each step reads first, the service is restarted only when
     something changed, and a key, a store or a state file that is there is never replaced (age-keygen behind
     `test -s`, and `vault.py store-init`, which keeps what it finds). The configuration is written whole on every run
-    that changes it, with this run's owner key as the only one (central_config). keep_owner: the owner's app runs it
-    by itself, so a vault whose configuration names another owner key, or cannot be read, is left as it is
-    (OtherOwner): only the owner's own Set up takes a vault over. The fleet id is the one given, else the hub's own
-    (hub_fleet). Returns {"state": "made"|"there", "recipient", "store_recipient", "fleet"}: public
-    keys only, because nothing here reads or prints a key file."""
+    that changes it. Its owner keys stay as they are when they name this run's key, and are this run's key alone
+    when they do not; `add` adds one key and `remove` takes one away (central_config). A run that changes the keys
+    starts the vault again, because a running vault reads them only at its start: until then it would still take a
+    statement of a key that was removed. A run with a form starts it again also when the list is as the form makes
+    it, so the same form again finishes a run that a lost connection cut after its write. The remove form changes no state of the vault: what a removed key signed
+    stays (VAULT.md, "The owner's keys of the central vault"). keep_owner: the owner's app runs it by itself, so a
+    vault whose configuration names another owner key, or cannot be read, is left as it is (OtherOwner): only the
+    owner's own Set up takes a vault over. The fleet id is the one given, else the hub's own (hub_fleet).
+
+    One run at a time: each run holds root's lock (CENTRAL_LOCK, the vault's own configure_lock) from its first read
+    to its answer, and a run that finds it held changes nothing. Without it, the update of one Mac that read the keys
+    before another Mac's remove form would write the removed key back after it. The program is read once, under the
+    lock, and the bytes that were hashed are the bytes that are installed, so a kit-clone that changes root's clone
+    at the same time cannot put a program in place that this run did not read. A vault that does not stay up gets
+    nothing back: the keys are checked with the vault's own check before the write, so they are not what stops it,
+    and to put back the program and the configuration is a later piece. Returns
+    {"state": "made"|"there", "recipient", "store_recipient", "fleet"}: public keys only, because nothing here reads
+    or prints a key file."""
     run = run or _shell
     read = read or (lambda path: pathlib.Path(path).read_text(encoding="utf-8"))
     kit, key = kit or KIT, owner_public_key(owner_key)
+    add = owner_public_key(add, "--add-owner-key") if add is not None else None
+    try:
+        held = vault.configure_lock(lock) if lock else None
+    except vault.ConfigureStop as e:
+        raise Stop(str(e)) from None
+    try:
+        return central_install_locked(run, read, kit, key, add, remove or None, hub_user, fleet, account, db,
+                                      keep_owner)
+    finally:
+        if held is not None:
+            os.close(held)
+
+
+def central_install_locked(run, read, kit, key, add, remove, hub_user, fleet, account, db, keep_owner):
+    """central_install from its first read to its answer, while it holds the lock."""
     who = (account or hub_account)(hub_user)
     fleet = fleet or hub_fleet(db or os.path.join(who["home"], ".fleet", "pilot.db"))
     if not FLEET_ID.fullmatch(fleet):
         raise Stop("--fleet is this fleet's id: sixteen lowercase hex characters, as GET /ui/vault gives it.")
     try:
-        program = hashlib.sha256(pathlib.Path(kit, "vault.py").read_bytes()).hexdigest()
+        source = pathlib.Path(kit, "vault.py").read_bytes()        # one snapshot: hashed here and installed below
     except OSError:
         raise Stop(f"{os.path.join(kit, 'vault.py')} is not readable, so the central vault cannot be installed.") from None
-    conf = central_config(who["uid"], fleet, key)
+    program = hashlib.sha256(source).hexdigest()
     before = kv(run(central_reading())[1])
     try:
         current = json.loads(read(CENTRAL_CONF))
@@ -2915,11 +2997,15 @@ def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None,
         current = False                 # there, and not readable: another owner's, for keep_owner
     if keep_owner and current is not None and not (isinstance(current, dict) and key in (current.get("owner_keys") or [])):
         raise OtherOwner("the central vault on this machine holds another owner key")
+    conf = central_config(who["uid"], fleet, key, current, add, remove)     # before anything is written
     try:
         unit_now = read(CENTRAL_UNIT)
     except OSError:
         unit_now = None
-    if all(before.get(k) == "yes" for k in ("user", "age", "keygen", "age.key", "store.key", "store.age")) and \
+    # A form is never "there": a run that a lost connection cut after its write and before its start leaves the
+    # running vault on the keys of before, with the new list in the file, so the same form again starts it again.
+    if not (add or remove) and \
+            all(before.get(k) == "yes" for k in ("user", "age", "keygen", "age.key", "store.key", "store.age")) and \
             before.get("program") == program and current == conf and before.get("active") == "active" and \
             unit_now and central_unit_text(run, who["group"]) == unit_now:
         say(f"the central vault is in place already, kept by {CENTRAL_USER}: only {hub_user} may ask it")
@@ -2935,13 +3021,15 @@ def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None,
             raise Stop(f"{what} could not be put in place: {(err or out).strip()[-300:]}")
     folder = tempfile.mkdtemp(prefix="fleet-vault-central-")
     try:
-        one = os.path.join(folder, "vault.json")
+        one, copy = os.path.join(folder, "vault.json"), os.path.join(folder, "vault.py")
         with open(one, "w", encoding="utf-8") as f:
             f.write(json.dumps(conf, indent=2) + "\n")
+        with open(copy, "wb") as f:
+            f.write(source)
         # The program first: store-init and unit run from the installed copy, which no checkout can change.
         code, out, err = run("install -o root -g root -m 644 %s %s/vault.py\n"
                              "install -o root -g root -m 644 %s %s\n"
-                             % (shlex.quote(os.path.join(kit, "vault.py")), CENTRAL_LIB, shlex.quote(one), CENTRAL_CONF))
+                             % (shlex.quote(copy), CENTRAL_LIB, shlex.quote(one), CENTRAL_CONF))
         if code != 0:
             raise Stop(f"the central vault's program and configuration could not be installed: "
                        f"{(err or out).strip()[-300:]}")
@@ -4577,7 +4665,8 @@ def cmd_central_vault(args):
         if os.path.realpath(KIT) != ROOT_KIT or not root_owned(ROOT_KIT):
             raise Stop(f"the central vault is installed only from root's own clone, {ROOT_KIT}, which kit-clone makes: "
                        f"never from a folder that the hub's user can change")
-        done = central_install(args.owner_key, hub_user=args.hub_user, fleet=args.fleet, keep_owner=args.keep_owner)
+        done = central_install(args.owner_key, hub_user=args.hub_user, fleet=args.fleet, keep_owner=args.keep_owner,
+                               add=args.add_owner_key, remove=args.remove_owner_key)
     except OtherOwner as e:             # the app's own install reads this line and changes nothing
         print(json.dumps({"ok": False, "owner": "other", "error": str(e)}), flush=True)
         raise
@@ -4680,8 +4769,9 @@ def main(argv=None):
     va.add_argument("--hub", required=True, help="the hub's address, for example http://100.80.1.2:8765")
     va.add_argument("--kit", help="the checkout whose vault.py is installed; default: this one")
     va.add_argument("--owner-key", action="append", help="one public key of the owner (base64 of 65 bytes, as the "
-                                                         "app shows it); with --fleet, a handover goes only to a key "
-                                                         "that the owner signed a pin for")
+                                                         "app shows it), added to the broker's keys and never in their "
+                                                         "place; with --fleet, a handover goes only to a key that the "
+                                                         "owner signed a pin for")
     va.add_argument("--fleet", help="the fleet's ID, 16 lowercase hex characters")
     va.add_argument("--check", action="store_true")
     va.add_argument("--swap", action="store_true",
@@ -4742,6 +4832,13 @@ def main(argv=None):
     cv.add_argument("--fleet", help="this fleet's id; default: the one in the hub's own records")
     cv.add_argument("--keep-owner", action="store_true", help="leave a central vault that another owner key holds as "
                                                                "it is: the app's own install, which takes nothing over")
+    form = cv.add_mutually_exclusive_group()
+    form.add_argument("--add-owner-key", metavar="KEY", help="add one more public key of the owner to the vault's "
+                                                             "owner keys, at the end of their list; only for a vault "
+                                                             "whose keys hold --owner-key")
+    form.add_argument("--remove-owner-key", metavar="KEY", help="take one key out of the vault's owner keys; only for "
+                                                                "a vault whose keys hold --owner-key, and never the "
+                                                                "last key")
     cv.set_defaults(fn=cmd_central_vault)
     cn = sub.add_parser("connect")
     cn.add_argument("turn", choices=("on", "off"), help="on: the gate, its service and Funnel; off: Funnel and the "
