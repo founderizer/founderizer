@@ -1183,7 +1183,8 @@ def manager_name():
 AGENT_NAME_FIELDS = {"create_task": ("owner",), "door_fleet": ("agent",), "door_gitops": ("agents",),
                      "grant_access": ("agent",),
                      "move_agent": ("agent",),
-                     "raise_needs_you": ("needs_agent",),       # the lane "Give on a card": who Give gives it to
+                     # the lane "Give on a card": who Give gives it to; F6, piece 1: whose runtime's sign-in it asks for
+                     "raise_needs_you": ("needs_agent", "sign_in"),
                      "hand_over": ("to",), "message_agent": ("agent",), "report_up": ("about",),
                      "save_trigger": ("agent",), "search_history": ("person",), "see_earlier_work": ("agent",),
                      "see_history": ("agent",), "see_responsibilities": ("agent",), "set_agent_model": ("agent",),
@@ -3990,7 +3991,9 @@ def need_view(row, reads=None):
     # the lane "Give on a card": the grant that the item's first option makes, {agent, level, repos, resources}, else
     # null
     view["give"] = need_give_view(row)
-    for kept in ("give_agent", "give_level", "give_repos", "give_resource"):
+    # F6, piece 1: the sign-in that the hub's own step asks for is the hub's record, and no field of the apps
+    for kept in ("give_agent", "give_level", "give_repos", "give_resource", "sign_in_agent", "sign_in_runtime",
+                 "sign_in_server"):
         view.pop(kept, None)
     # owner feature need_talk: the long part behind Details, whether the options combine, the indexes he ticked, and
     # his talk with the manager under the item: Discuss left the apps on 13 November 2026, and Needs clarification
@@ -9171,7 +9174,11 @@ def migrate():
                   # waits for the manager's answer, else null; the hub's line that told the manager his words, and
                   # its ask at the first turn end with no answer (need_wait_sweep), which stays after a wait that
                   # ended with no answer until the manager's next second look names the card
-                  "awaits": "REAL", "awaits_told": "INTEGER", "awaits_asked": "INTEGER"},
+                  "awaits": "REAL", "awaits_told": "INTEGER", "awaits_asked": "INTEGER",
+                  # F6, piece 1: the agent and the runtime of the sign-in that the item asks for, in the hub's own
+                  # words (need_sign_in), which closes it by itself when the hub reads it signed in, and the server
+                  # that its step names, which closes it when the agent runs on another one (need_sign_in_closes)
+                  "sign_in_agent": "TEXT", "sign_in_runtime": "TEXT", "sign_in_server": "TEXT"},
         # owner API 1.316: the hand of a message of the owner's under a card that the owner did not type (an AI
         # session's or a program's, request_hand), else null: the hub's ask and its second look say that such words are
         # not the owner's, as the line that told them did (NEED_TALK_NOT_HIS). The row keeps it when the talk moves to
@@ -18210,6 +18217,12 @@ CARD_SIGN_IN_REFUSAL = (
     "(sign_in), and an agent that holds no login for that site asks the owner for it once with request_secret. Only "
     "the owner's own sign-in to an AI provider's account (Claude, ChatGPT), to their Founderizer app or Apple account, "
     "to an MCP server in their app, or at a machine's own keyboard is theirs.")
+# F6, piece 1: a person's item whose words sign an agent in to its runtime goes on the hub's own card of that sign-in
+# (need_sign_in), whose step names the page and the button that the owner's app has (card_runtime_sign_in)
+CARD_RUNTIME_SIGN_IN_REFUSAL = (
+    "Not raised: an agent's sign-in to its runtime is an item with sign_in, the agent by its name or role, and why: "
+    "the hub writes its title and its step from its own record, with the page and the button that the owner's app "
+    "has, and closes it at the sign-in. If the item is about something else, say it without those words.")
 OWNER_TEXT_CACHE = {"key": None, "texts": ()}
 OWNER_FILES_UNREAD = ("Not raised: the knowledge files cannot be read now, so the hub cannot check owner_words in "
                       "them. Call raise_needs_you again in a minute.")
@@ -18239,6 +18252,32 @@ def card_signs_in(text):
     who = "|".join([CARD_SIGN_WHO] + [r"\s+".join(map(re.escape, n.split()))
                                       for n in sorted(names, key=len, reverse=True)])
     return re.search(rf"(?i)\b(?:sign|log)(?:s|ed|ged|ing|ging)?\s+(?:{who})\s+(?:back\s+)?in\b", text) is not None
+
+
+def card_runtime_sign_in(texts):
+    """True when the words of a person's item sign an agent or its runtime in, as the manager wrote such cards before
+    the hub wrote them (F6, piece 1): an agent by its name or role, "the agent" or "its runtime", or a runtime whose
+    sign-in the owner's app makes by its name, before "in" ("Sign Customer Support in", "Sign Codex in again on the Mac
+    Studio"); or a sign-in "to" such a runtime ("sign it in to Claude Code", "log into Codex"). Not "sign it in" alone,
+    which an MCP server's sign-in is too, nor "signed in to Claude Code", which says how a thing is, nor a sign-in to
+    a runtime's account ("log in to Claude Code's account", in a Chrome extension)."""
+    labels = [r"\s+".join(map(re.escape, runtime_label(r).split())) for r in LOGIN_RUNTIMES]
+    # the role as data, not as the label that the owner reads (F16: shown_role is the agent's name)
+    names = {" ".join(str(x).lower().split()) for n, a in agents().items() for x in (n, a.get("title") or "")} - {""}
+    named = labels + [r"\s+".join(map(re.escape, n.split())) for n in sorted(names, key=len, reverse=True)]
+    who = "|".join([r"(?:the|this|that|its)\s+(?:agent|runtime)"] + named)
+    to = "|".join(labels)
+    # and in Spanish, the owner's other language of the apps, which the manager writes to them (the area's reader of
+    # piece 1, finding 1): "Inicia la sesión de Soporte en Claude Code", "inicia sesión en Codex", "vuelve a iniciar
+    # la sesión del agente"; not how a thing is ("tiene la sesión iniciada en Codex") nor a sign-in to a runtime's
+    # account ("inicia sesión en la cuenta de Claude Code")
+    quien = "|".join([r"(?:el|este|ese|su)\s+agente"] + named)
+    pattern = re.compile(rf"(?i)\b(?:sign|log)(?:s|ed|ged|ing|ging)?\s+(?:{who})\s+(?:back\s+)?in\b|"
+                         rf"\b(?:sign|log)(?:\s+(?:it|them))?(?:\s+back)?(?:[\s-]+in(?:\s+again)?\s+(?:to|at)|\s+into)"
+                         rf"\s+(?:{to})\b(?!['’]s)|"
+                         rf"\binici(?:a|ar|e)\s+(?:la\s+|su\s+)?sesi[oó]n\s+(?:de\s+nuevo\s+|otra\s+vez\s+)?"
+                         rf"(?:(?:de|para)\s+(?:{quien})\b|del\s+agente\b|en\s+(?:{to})\b)")
+    return any(pattern.search(text) for text in texts)
 
 
 def card_machines():
@@ -18825,7 +18864,8 @@ def card_value_steps(title, why, todo, details, options):
 def card_reason(a, title, why, todo, options):
     """The item's reason, or a ToolError that says why it is not the manager's last step yet: a reason of
     CARD_REASONS; access that nobody holds and the manager cannot grant; a decision in the owner's own words; a
-    person's step that is no sign-in to a website, which an agent makes with the vault's login; and an item of each
+    person's step that is no sign-in to a website, which an agent makes with the vault's login, and no agent's sign-in
+    to its runtime, which an item with sign_in asks for in the hub's own words (need_sign_in); and an item of each
     reason whose steps send the owner into the vault for a value (card_value_steps)."""
     reason = str(a.get("reason") or "").strip().lower()
     if reason not in CARD_REASONS:
@@ -18851,6 +18891,8 @@ def card_reason(a, title, why, todo, options):
                             "message that they typed. An agent's reading of them, a standing item that an agent wrote, "
                             "the manager's own profile and an option that the owner pressed do not count. If no words "
                             "of theirs keep this decision, it is yours: decide it inside the policy.")
+    elif reason == "person" and card_runtime_sign_in((title, why, todo, *options)):
+        raise ToolError(CARD_RUNTIME_SIGN_IN_REFUSAL)
     elif reason == "person" and card_sign_in((title, why, todo, *options)):
         raise ToolError(CARD_SIGN_IN_REFUSAL)
     # each reason; the placeholder's own item, which card_access let through, is about the key's site, not its value
@@ -19267,6 +19309,294 @@ def need_give_closes(r):
             f"way.")
 
 
+# ---------------------------------------------------------------- A runtime's sign-in on a card (F6, piece 1)
+#
+# The owner, 22 November 2026: "Tasks should ideally be just important approvals and confirmations, not steps to do
+# something!" On 19 November four cards in one hour asked the owner to sign one agent's Codex in, each with the
+# manager's own guess of the app's pages, and they answered "what agent should I open?", "No sign in button appears" and
+# "There is no machines page, do you mean Servers?". An item with sign_in names the agent, and the hub writes its title
+# and its one step from its own record: the agent's server as team.json names it, the Servers tab of Settings, and the
+# row and the button that the server's page draws for that runtime (the app's MachineSignInSection: the provider's
+# name, and Sign in, or Try again after a sign-in that failed). So the card has no link and no code that an agent chose,
+# it never names a page or a button that the app does not have, and it closes by itself when the hub reads the sign-in
+# (need_look_sweep). One sign-in, one open card: a second one for the same runtime of the same sign-in is refused.
+#
+# The words of the card, in the owner's language (the area's reader of piece 1, finding 1): the apps show their own
+# words in the language of the device, and the card's title and step as the hub wrote them, so a Mac in Spanish showed
+# "Ajustes › Servidores" beside a step that named "Settings › Servers". The hub reads the owner's language from the
+# setting owner.language, which the Mac fills with the first of its own preferred languages (OwnerProfile.languageTag),
+# as takeover_title reads it; a language that this table does not have gets the English. A known hole, written (the
+# area's reader of piece 1, round 5): owner.language is the Mac's FIRST preferred language, not the language that the
+# app shows, which is the first of those languages that the app has (String(l10n:), Bundle's own choice). So on a Mac
+# with Catalan first and Spanish second, the hub writes the English step while the app shows "Ajustes › Servidores" and
+# "Iniciar sesión"; and the value is one for all of the owner's Macs: the first Mac that is not in English sets it, an
+# agent of the owner's can set it, and a Mac in another language keeps it. The fix is the Mac's word of the app's own
+# language (Bundle.main.preferredLocalizations.first), which is App shell's. The
+# page and the buttons are the app's own words in each language of the app (app/Localization/Localizable.xcstrings,
+# the languages of app/Localization/shipped): test_the_cards_words_are_the_apps_own reads both. "on your Mac": the
+# phone shows the step too, and its own app has no Servers (the validation of piece 1, finding 4).
+NEED_SIGN_IN_WORDS = {
+    "en": {"title": "Sign {role} in to {runtime}", "page": "Settings › Servers", "button": "Sign in",
+           "again": "Try again", "whose": " for {role}",
+           "step": "In Founderizer on your Mac, open {page} and choose {server}. Press {button} beside {runtime}"
+                   "{whose}, then follow the steps that it opens."},
+    "es": {"title": "Inicia la sesión de {role} en {runtime}", "page": "Ajustes › Servidores",
+           "button": "Iniciar sesión", "again": "Reintentar", "whose": " para {role}",
+           "step": "En Founderizer en tu Mac, abre {page} y elige {server}. Pulsa {button} junto a {runtime}{whose} "
+                   "y sigue los pasos que se abren."}}
+
+
+def sign_in_words():
+    """NEED_SIGN_IN_WORDS in the owner's language (owner.language: its first part, "es" of "es-ES"), else English."""
+    tag = str(setting("owner.language") or "").split("-")[0].lower()
+    return NEED_SIGN_IN_WORDS.get(tag, NEED_SIGN_IN_WORDS["en"])
+
+
+
+# what the hub's words of a signed-out agent tell the manager to do (signed_out_told, os_user_sweep, and a Mac's Codex
+# that is signed out in mac_desktop_sweep), in place of "open <role> in the app and sign it in", which named no page
+# and sent the owner to an agent page with no such button, and of "Raise it for the owner with raise_needs_you"
+SIGN_IN_ASK = ('raise_needs_you with sign_in "{agent}" asks them, with the hub\'s own step, unless an item for it is '
+               'open.')
+# the fields that an item with sign_in leaves out: it is no other kind of card. A title and a what_to_do, which the
+# tool's schema asks for, are taken and not shown: the hub's own words take their place, as Give's step does
+NEED_SIGN_IN_ONLY = ("options", "multi", "details", "recommended", "pictures", "needs_access", "needs_agent",
+                     "needs_level", "owner_words", "door_call", "door_host", "door_script", "github_app", "add_device",
+                     "github_key", "key_swap_server")
+# what a why beside the hub's step of a sign-in may not hold, because the owner would type it or open it there, nor the
+# manager's reply under that card (t_discuss_need): any "://" before the email addresses go (so also a web address whose
+# user part reads as one: "https://owner@evil.com/device"), a web address (CARD_WEBSITE), a host with a path
+# ("evil.app/device"), a code in the shape of a device code ("K7QD-2M4P"), a word of 16 characters or more of letters
+# and digits (a token, also after a prefix with an underscore: "ghp_...", "sk_live_..."), and inline code. It reads the
+# words after NFKC, with each dash as a hyphen and no invisible character, so a code in full-width letters, with a
+# non-breaking hyphen or with a zero-width space in it is read too (the validation of piece 1, rounds 4 and 5, lows 1
+# and 2); half of a code in the why and the other half in a reply, or a code in words, still passes. The refusal says
+# whether it read an address or a code, and quotes none of the words: a quote stops at a hyphen, so it could hold most
+# of a key, and the hub's log and the call's record mask a key only whole (the validation of piece 1, round 3). A known
+# hole is fixed or written, and these are the limits of this check (round 2): a bare host whose ending CARD_WEBSITE does
+# not know, with no path ("evil.app"), passes; the shape of a device code is read only in capitals with a hyphen, so
+# "k7qd-2m4p", "K7QD 2M4P" and "K7QD2M4P" (under 16 characters) pass; and some honest lines are refused, such as
+# "2025-2026" and "Version 2.1/3", while the same line in other words passes. A check of words cannot hold this,
+# because a person reads a code in any spelling.
+# The manager's own words are the only free text on that card: its why, a reply under it and a reason that withdraws
+# it, and this check reads each of the three (need_sign_in, t_discuss_need, t_withdraw_need).
+NEED_SIGN_IN_CODE = re.compile(r"(?P<address>\w\.\w+/)|(?<![A-Za-z0-9])[A-Z0-9]{4,}-[A-Z0-9]{4,}(?![A-Za-z0-9])|"
+                               r"(?<![A-Za-z0-9])(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{16,}"
+                               r"(?![A-Za-z0-9])|`")
+NEED_SIGN_IN_DASHES = str.maketrans({c: "-" for c in "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\ufe63\uff0d"})
+
+
+def sign_in_why_refusal(why, field="With sign_in, why"):
+    """The refusal of words beside the hub's step of a sign-in that hold what the owner would type or open there
+    (NEED_SIGN_IN_CODE), or None: the kind of what the hub read, and none of the words."""
+    why = hidden.skeleton(unicodedata.normalize("NFKC", str(why or ""))).translate(NEED_SIGN_IN_DASHES)
+    if "://" in why:            # before the email addresses go: "owner@evil.com" is the user part of a web address
+        kind = "an address"
+    else:
+        why = CARD_ADDRESS.sub(" ", why)        # an email address names an account, and no page
+        hit = CARD_WEBSITE.search(why) or NEED_SIGN_IN_CODE.search(why)
+        if not hit:
+            return None
+        kind = "an address" if hit.re is CARD_WEBSITE or hit.lastgroup == "address" else "a code"
+    return (f"{field} holds no address and no code: a part of it reads as {kind}. The owner signs in on the "
+            f"provider's own page, which the app opens.")
+
+
+def sign_in_runtimes(name):
+    """(own, screen) of agent `name`: the runtimes whose sign-in a card with sign_in asks the owner for, each a list of
+    at most one. Its own runtime whose sign-in the app makes (LOGIN_RUNTIMES, and not on a model server of the
+    owner's), and the Codex of its screen tasks (APP_SERVER_RUNTIME), whose row the page of its Mac draws (the app's
+    ScreenSignIn). need_sign_in raises a card for one of them, and need_sign_in_closes closes a card of any other."""
+    conf = agents()[name]
+    own = [conf.get("runtime")] if conf.get("runtime") in LOGIN_RUNTIMES and \
+        not local_model(conf, team_read().get("accounts")) else []
+    screen = [APP_SERVER_RUNTIME] if "screen" in (conf.get("can") or []) and APP_SERVER_RUNTIME in LOGIN_RUNTIMES \
+        and APP_SERVER_RUNTIME not in own else []
+    return own, screen
+
+
+def sign_in_peers(name, runtime):
+    """The agents of one sign-in of `runtime` with agent `name`, `name` first: the agents of one OS user keep one
+    sign-in of each provider (sign_in_agents), and the Codex of a Mac's screen tasks is one row of its page for each
+    agent there (the app's ScreenSignIn)."""
+    if runtime in sign_in_runtimes(name)[0]:
+        return sign_in_agents(name)
+    return [name] + [n for n in server_agents(agents()[name].get("machine")) if n != name]
+
+
+def sign_in_asked(name, runtime, replaces=None):
+    """The id of the open card that asks for that sign-in for any agent of it (sign_in_peers), but item `replaces`;
+    else None. One sign-in, one open card."""
+    group = sign_in_peers(name, runtime)
+    row = q1(f"SELECT id FROM needs WHERE answer IS NULL AND sign_in_runtime=? AND sign_in_agent IN "
+             f"({','.join('?' * len(group))}) AND id IS NOT ? ORDER BY id LIMIT 1", (runtime, *group, replaces))
+    return row["id"] if row else None
+
+
+# F13's way to replace a card names the question that it carries (owner API 1.316): a new card takes it along only
+# when the raise names it again
+SIGN_IN_ASKED = ("Not raised: N-{id} asks the owner for that sign-in already, and it closes by itself at the sign-in. "
+                 "To change its why, raise it again with replaces=\"N-{id}\"{question}.")
+def sign_in_reading(agent, runtime):
+    """What a card of a sign-in reads of that runtime of the agent: False while its provider refuses the account that
+    the machine holds (account_refused, 23 November 2026: the machine still says signed in, and the step is a sign-in
+    with another account, or with the same one once its organization turned that access on again), else
+    signed_in_now: True, False, or None for no current reading."""
+    return False if account_refused(agent, runtime) else signed_in_now(agent, runtime)
+
+
+# kv, for each agent: its runtimes of a card that need_sign_in refused for want of a current reading, as a JSON list.
+# The refusal says "Raise it when the hub says that it is not signed in", and no sweep said it again (the area's reader
+# of piece 1, finding 3: the Mac's line and signed_out_sweep each tell once), so sign_in_unread_sweep says it.
+SIGN_IN_UNREAD = "sign_in_unread:"
+
+
+def sign_in_unread_sweep(mgr):
+    """From need_look_sweep, under its caller's lock: each wait of SIGN_IN_UNREAD ends when the hub reads that runtime,
+    signed out with one line to the manager that asks for the card (SIGN_IN_ASK), signed in with none. The wait of an
+    agent that left the fleet, or of a runtime whose sign-in it no longer has (sign_in_runtimes), ends with none."""
+    for row in q("SELECT k, v FROM kv WHERE k >= ? AND k < ?", kv_range(SIGN_IN_UNREAD)):
+        name = row["k"][len(SIGN_IN_UNREAD):]
+        try:
+            waits = json.loads(row["v"])
+        except ValueError:
+            waits = []
+        if name not in agents() or not isinstance(waits, list):
+            kv_set(row["k"], None)
+            continue
+        said = {r: sign_in_reading(name, r) for r in waits if r in sum(sign_in_runtimes(name), [])}
+        out = [r for r in said if said[r] is False]
+        if out and mgr:
+            emit(mgr, "say", f"[hub] {agent_with_title(name)} is not signed in to "
+                             f"{' and '.join(runtime_label(r) for r in out)} on {agents()[name].get('machine')}: the "
+                             f"hub reads it now, after it refused your card for want of a reading. Only the owner can "
+                             f"sign it in: {SIGN_IN_ASK.format(agent=name)}")
+        left = [r for r in said if said[r] is None]
+        kv_set(row["k"], json.dumps(left) if left else None)
+
+
+def need_sign_in(a):
+    """{agent, runtime, server, title, todo} of a raise_needs_you with sign_in, the agent that is not signed in; None
+    without one. The runtime is the one that the hub's current reading says is signed out, of sign_in_runtimes: the
+    agent's own, else the Codex of its screen tasks. The title and the step are in the owner's language
+    (sign_in_words). A ToolError for an item that the owner could not do as the step says: the hub reads each of them
+    signed in, or has no current reading (an agent whose page shows no sign-in then; the hub tells the manager when it
+    reads one: SIGN_IN_UNREAD); an open item asks for that sign-in already; a sign-in of it runs now; a Mac
+    with no ChatGPT app, whose page has no sign-in of Codex; or an owner whose computer is a PC, whose app does not sign
+    an agent in again yet (app/windows/PARITY.md, machine_signin)."""
+    name = str(a.get("sign_in") or "").strip()      # call_tool gave a role's agent by its name (AGENT_NAME_FIELDS)
+    if not name:
+        return None
+    if name not in agents():
+        raise ToolError(f"sign_in is the agent that is not signed in, by its name or its role, and there is no agent "
+                        f"{name}.")
+    extra = [field for field in NEED_SIGN_IN_ONLY if a.get(field) not in (None, "", [], False)]
+    if extra or str(a.get("reason") or "person").strip().lower() != "person":
+        raise ToolError(f"With sign_in, give why, and ask, question_id or replaces where they apply: the hub writes "
+                        f"the title and what_to_do, and the reason is person. Leave out "
+                        f"{', '.join(extra or ['reason'])}.")
+    # the owner signs in on the provider's own page, which the app opens: a link or a code beside the hub's step would
+    # be an agent's, and could be a machine's that is not the fleet's (NEED_SIGN_IN_CODE says what is read)
+    refused = sign_in_why_refusal(a.get("why"))
+    if refused:
+        raise ToolError(refused)
+    # the value check of each reason (card_value_steps): the reason of a sign-in card is the hub's (t_raise_needs_you),
+    # so card_reason, which runs it for every other card, never reads this why (the validation, round 8)
+    steps = card_value_steps("", a.get("why"), "", "", ())
+    if steps:
+        raise ToolError(steps)
+    role, server = shown_role(name), agents()[name].get("machine")
+    own, screen = sign_in_runtimes(name)
+    if not server or not own + screen:
+        raise ToolError(f"Not raised: {role} has no sign-in that the owner's app makes: its runtime signs in nowhere, "
+                        f"or it runs on the owner's own model server.")
+    said = {r: sign_in_reading(name, r) for r in own + screen}       # a refused account is signed out
+    out = [r for r in own + screen if said[r] is False]
+    if not out:
+        unread = " and ".join(runtime_label(r) for r in own + screen if said[r] is None)
+        if unread:
+            with LOCK:
+                before = kv_get(SIGN_IN_UNREAD + name)
+                waits = set(json.loads(before)) if before else set()
+                kv_set(SIGN_IN_UNREAD + name, json.dumps(sorted(waits | {r for r in own + screen if said[r] is None})))
+            raise ToolError(f"Not raised: the hub has no current reading of {role}'s sign-in to {unread} on {server}, "
+                            f"so its page may show no sign-in now. Raise it when the hub says that it is not signed "
+                            f"in: it tells you when it reads that.")
+        # a refusal of the account that the hub reads is signed out above (account_refused, sign_in_reading); one
+        # that it does not read (a code that the runtime's entry does not list, an owner chat's own refusal, which
+        # reaches no record of the hub) leaves the machine's reading, and card_runtime_sign_in refuses a card in other
+        # words: the manager has a route that the hub does not stop
+        raise ToolError(f"Not raised: the hub reads {role} signed in to "
+                        f"{' and '.join(runtime_label(r) for r in own + screen)} on {server} now, so the owner has no "
+                        f"sign-in to make. If its turns still end because the provider refuses that account, a refusal "
+                        f"that the hub did not read, tell the owner with message_owner that {role} needs a sign-in "
+                        f"with another account there, or with the same one once its organization turned that access "
+                        f"on again.")
+    # one card for one sign-in (sign_in_asked): call_tool runs this tool whole under LOCK, this read and the write
+    # of the card, so two calls at one moment raise one card (test_two_raises_at_one_moment_make_one_card)
+    replaces = None if a.get("replaces") in (None, "") else parse_id(a.get("replaces"), "Needs-you item")
+    open_items = {r: sign_in_asked(name, r, replaces) for r in out}
+    runtime = next((r for r in out if not open_items[r]), None)
+    if runtime is None:
+        held = q1("SELECT question FROM needs WHERE id=?", (open_items[out[0]],))
+        carried = held["question"] if held else None
+        raise ToolError(SIGN_IN_ASKED.format(id=open_items[out[0]],
+                                             question=f" and question_id=\"Q-{carried}\"" if carried else ""))
+    label = runtime_label(runtime)
+    computer = owner_computer()
+    if computer["kind"] != "mac":
+        raise ToolError(f"Not raised: the owner's computer is a {computer['label']}, and only Founderizer on a Mac "
+                        f"signs an agent in again yet. Tell the owner with message_owner that {role} is not signed in "
+                        f"to {label} on {server}.")
+    if runtime not in own and (mac_desktop(server) or {}).get("chatgpt_app") is False:
+        raise ToolError(f"Not raised: {CHATGPT_NO_APP} on {server}, so its page has no sign-in of {label}. "
+                        f"{CHATGPT_INSTALL}")
+    # the newest sign-in of each agent of that sign-in, which its row reads (/ui/machines `login`): the agent's own
+    # card shows its own, and the Codex row of a Mac shows the agent of a sign-in that failed after the last one that
+    # ended well there, else the first agent (the app's ScreenSignIn and MachineSignInSection's button)
+    lasts = [(n, row) for n in sign_in_peers(name, runtime) for row in [last_login(n)]
+             if row is not None and row["runtime"] == runtime]
+    if any(row["state"] in LOGIN_STATES for _, row in lasts):
+        raise ToolError(f"Not raised: a sign-in of {label} runs on {server} now. One that nobody finishes ends by "
+                        f"itself within {LOGIN_LIFE // 60} minutes: raise the item after that if the hub still reads "
+                        f"it signed out.")
+    row_of = [(n, row) for n, row in lasts if n == name or runtime not in own]       # what the row shows
+    done = max((row["updated"] for _, row in row_of if row["state"] == "done"), default=0)
+    failed = any(row["state"] == "failed" and not row["timed_out"] and row["updated"] > done and
+                 (n == name or sign_in_reading(n, runtime) is False) for n, row in row_of)
+    words = sign_in_words()             # in the owner's language
+    return {"agent": name, "runtime": runtime, "server": server,
+            "title": words["title"].format(role=role, runtime=label),
+            "todo": words["step"].format(page=words["page"], server=server,
+                                         button=words["again" if failed else "button"], runtime=label,
+                                         whose=words["whose"].format(role=role) if runtime in own else "")}
+
+
+def need_sign_in_closes(r):
+    """The words that close open card row `r` by itself, when it asks for a runtime's sign-in that is made, or whose
+    step is no longer true: the hub reads that runtime signed in now, with an account that its provider does not
+    refuse (sign_in_reading); its agent left the fleet (a rename moves the row's
+    agent: AGENT_COLUMNS); the agent has no such sign-in now (a switch of its runtime, its screen taken away:
+    sign_in_runtimes); or it runs on another server than the one that the step names (a move, the server's rename).
+    Else None. Give's card closes in the same way when Give has nobody to give to (need_give_gone): the area's reader
+    of piece 1, finding 5, found a card whose step named a row that the page no longer draws."""
+    keys = r.keys() if hasattr(r, "keys") else ()
+    agent = r["sign_in_agent"] if "sign_in_agent" in keys else None
+    if not agent:
+        return None
+    if agent not in agents():
+        return f"Closed by the hub: {shown_role(agent)} left the fleet."
+    role, runtime = shown_role(agent), r["sign_in_runtime"]
+    if runtime not in sum(sign_in_runtimes(agent), []):
+        return f"Closed by the hub: {role} does not use {runtime_label(runtime)} now."
+    server = r["sign_in_server"] if "sign_in_server" in keys else None
+    if server and agents()[agent].get("machine") != server:
+        return f"Closed by the hub: {role} does not run on {server} now."
+    if sign_in_reading(agent, runtime) is not True:      # not while its provider refuses the account (account_refused)
+        return None
+    return f"Closed by the hub: {role} is signed in to {runtime_label(runtime)} now."
+
+
 def t_raise_needs_you(agent, a):
     # owner API 1.285, before each other check: an item takes pictures only while each of the owner's apps draws
     # them (apps_draw). The tool list has no `pictures` then, but this session can hold the list of a time when they
@@ -19282,6 +19612,9 @@ def t_raise_needs_you(agent, a):
     why = str(a.get("why") or "").strip()
     todo = str(a.get("what_to_do") or "").strip()
     give = need_give(a)         # the lane "Give on a card": the grant that the item's first option makes
+    sign_in = need_sign_in(a)   # F6, piece 1: a runtime's sign-in, whose title and step are the hub's own
+    if sign_in:
+        title, todo = sign_in["title"], sign_in["todo"]
     if not title or not why or not (todo or give):
         raise ToolError("A Needs-you item needs a title, a why and what_to_do: the one thing that only the owner "
                         "can do or decide now. If there is no such thing, it is not a Needs-you item: news that the "
@@ -19365,8 +19698,8 @@ def t_raise_needs_you(agent, a):
     # and the title of the item about a server's key swap, which names the server however long its name is
     swap_title = isinstance(a.get("key_swap_server"), str) and \
         title == KEY_SWAP_CARD_TITLE.format(server=a["key_swap_server"])
-    wrong = need_words("" if door_title or swap_title else title, why, todo, json.loads(options) if options else (),
-                       details)
+    wrong = need_words("" if door_title or swap_title or sign_in else title, why, todo,
+                       json.loads(options) if options else (), details)
     if wrong:
         raise ToolError(wrong)
     replaces = None if a.get("replaces") in (None, "") else parse_id(a.get("replaces"), "Needs-you item")
@@ -19482,8 +19815,8 @@ def t_raise_needs_you(agent, a):
     if secret:
         raise ToolError(secret)
     # The item about a server's key swap names that server, which a manager may give to an agent: it asks for the
-    # owner's word on the vault there, and for no access.
-    mine = None if key_swap_server is not None else need_is_yours(agent, title, why, todo)
+    # owner's word on the vault there, and for no access. So does the hub's step of a runtime's sign-in.
+    mine = None if key_swap_server is not None or sign_in else need_is_yours(agent, title, why, todo)
     if mine:
         raise ToolError(mine)
     guard(agent, title, why, todo, details, *(json.loads(options) if options else ()))
@@ -19494,9 +19827,13 @@ def t_raise_needs_you(agent, a):
         raise ToolError("needs_agent goes on an item for access, with no door_call, door_host, github_app, add_device, "
                         "github_key or key_swap_server.")
     listed = json.loads(options) if options else ()
-    if door_call is None and door_host is None and card_route(title, why, todo, details, listed):
+    # the hub's own title and step of a runtime's sign-in say "on your Mac" and name a server, which can be "deploy-1":
+    # only the manager's words are read for fleet work
+    if door_call is None and door_host is None and card_route("" if sign_in else title, why, "" if sign_in else todo,
+                                                              details, listed):
         raise ToolError(CARD_ROUTE_REFUSAL)     # the door's card shows the call that the owner's yes lets through
-    reason = None if fixed else card_reason(a, title, why, todo, listed)
+    # a runtime's sign-in is a person's step, in the hub's own words, which card_reason would read as the manager's
+    reason = "person" if sign_in else None if fixed else card_reason(a, title, why, todo, listed)
     ask = need_ask(agent, a.get("ask"))     # owner feature asks: the ask whose work waits for this item
     recommended = need_recommended(a.get("recommended"), listed, give=give is not None)
     if recommended and not listed:          # the free words get every check that an option gets
@@ -19523,8 +19860,9 @@ def t_raise_needs_you(agent, a):
         picture_files = picture_rows(pictures, card_picture(agent, t0, old), "Nothing was raised.")
         # the asker's own words, which the owner answers: behind Details, with no code, and once: not where the
         # agent's details quote them already (the owner, 20 November 2026: "why is the text like repeated ... I need
-        # more brevity and clarity")
-        if qu and door_script is None and not words_held(details, qu["text"]):
+        # more brevity and clarity"). Not on a card of a runtime's sign-in, whose words are the hub's alone: an asker's
+        # text, which can hold any address and any code, would stand beside the hub's step (F6, piece 1)
+        if qu and door_script is None and not sign_in and not words_held(details, qu["text"]):
             words = clip_lines(qu["text"], 1000)
             gap = "\n" if "\n" in words else " "    # a question of several lines starts on a line of its own
             details = (details + "\n\n" if details else "") + \
@@ -19537,15 +19875,18 @@ def t_raise_needs_you(agent, a):
             door_card_open(door_call, door_host, asking, old)
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question,door_call,door_host,github_app,"
                   "add_device,github_key,details,multi,door_script,door_task,door_task_id,key_swap_server,give_agent,"
-                  "give_level,give_repos,give_resource,recommended,pictures) "
-                  "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "give_level,give_repos,give_resource,recommended,pictures,sign_in_agent,sign_in_runtime,"
+                  "sign_in_server) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, todo, t0, agent, options, qu["id"] if qu else None, door_call,
                    door_host, github_app, 1 if add_device else None, github_key, details or None,
                    1 if multi else None, door_script, door_task, asking["id"] if asking else None, key_swap_server,
                    give["agent"] if give else None, give["level"] if give else None,
                    json.dumps(give["repos"]) if give else None,
                    give["resources"][0] if give and give["resources"] else None, recommended,
-                   json.dumps([row["id"] for row in picture_files]) if picture_files else None))
+                   json.dumps([row["id"] for row in picture_files]) if picture_files else None,
+                   sign_in["agent"] if sign_in else None, sign_in["runtime"] if sign_in else None,
+                   sign_in["server"] if sign_in else None))
         need_takes_pictures(nid, picture_files, t0, old)
         # owner feature asks: the ask that the agent named, else the ask of the item that this one replaces, else the
         # ask of the task whose question it carries to the owner
@@ -19607,6 +19948,9 @@ def t_raise_needs_you(agent, a):
                 f"{give['level']} access to {given} in one commit, and your answer says so; do not "
                 f"grant it or ask for it again. When {give['agent']} gets that access another way, the hub closes "
                 f"N-{nid} by itself.")
+    if sign_in:
+        door = (f" Its title and its step are the hub's: \"{title}\", and \"{todo}\" The hub closes N-{nid} by "
+                f"itself when it reads {sign_in['agent']} signed in to {runtime_label(sign_in['runtime'])}.")
     later = "" if qu or github_key or key_swap_server else (" If nothing needs it any more before the owner answers, "
                                                             "close it at once with withdraw_need.")
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{later}{door}{picks}"
@@ -19761,6 +20105,11 @@ def t_withdraw_need(agent, a):
                             f"characters of plain words: " + (f"say {code.group(0)} in plain words, as the owner reads "
                                                               f"names and what a thing is about, never a code." if code
                                                               else "say it in fewer words."))
+        # F6, piece 1 (its validation, rounds 4 and 5, S2): the reason stands on the closed card under the hub's step,
+        # as the why does, so it gets the why's check (NEED_SIGN_IN_CODE)
+        refused = sign_in_why_refusal(why, "With a card of a sign-in, why") if need["sign_in_agent"] else None
+        if refused:
+            raise ToolError(refused)
         t0 = now()
         DB.execute("UPDATE needs SET answer=?, answered=?, answered_by=?, awaits=NULL, awaits_told=NULL, "
                    "awaits_asked=NULL WHERE id=? AND answer IS NULL",
@@ -19925,6 +20274,11 @@ def t_discuss_need(agent, a):
         why = need_unclarified(need)
         if why:
             raise ToolError(f"N-{nid} takes no reply under its card: {why}.")
+        # F6, piece 1 (its validation, round 3): a reply under a card of a sign-in stands beside the hub's step as its
+        # why does, so it gets the why's check (NEED_SIGN_IN_CODE)
+        refused = sign_in_why_refusal(text, "Under a card of a sign-in, text") if need["sign_in_agent"] else None
+        if refused:
+            raise ToolError(refused)
         # **One reply, and the next only after his next message** (the area's word of 20 November 2026): a reply needs
         # a message of theirs after the last reply, so no loop of replies rings their phone again and again
         last = q1("SELECT who FROM need_talk WHERE need=? ORDER BY id DESC LIMIT 1", (nid,))
@@ -20201,7 +20555,8 @@ def need_look_sweep(t0):
     """A second look at the owner's open cards, from the hub tick, at most once a minute (the owner, 17 November 2026).
     First the hub closes, with no notification, each worker's or lead's own key request from its chat whose agent has
     held that key for NEED_HELD_WAIT (need_key_held, need_held in kv: {id: first seen}): the owner's own answer in the
-    app gives the key a moment before it answers, and that answer must not find the card closed. Then, when a card is
+    app gives the key a moment before it answers, and that answer must not find the card closed. A card of a runtime's
+    sign-in closes at once when the hub reads it signed in (need_sign_in_closes). Then, when a card is
     due, one message to the manager, which waits for its next read,
     an hour at most (LATER_SAY): every card due now or within NEED_LOOK_SOON, each with whose it is, how long it has
     been open and what the hub knows of it. A card is due a day after its raise, then two, four and at most seven days
@@ -20212,7 +20567,7 @@ def need_look_sweep(t0):
     if 0 <= since < NEED_LOOK_EVERY:        # a clock that was set back runs the sweep at once, not hours later
         return
     kv_set("need_look_sweep_at", t0)
-    mgr, rows, closed, given = manager_name(), [], [], []
+    mgr, rows, closed, given, signed = manager_name(), [], [], [], []
     held_before = kv_get("need_held")
     try:
         seen = json.loads(held_before or "{}")
@@ -20221,6 +20576,15 @@ def need_look_sweep(t0):
     seen, held = seen if isinstance(seen, dict) else {}, {}
     for r in q("SELECT * FROM needs WHERE answer IS NULL AND conversation IS NULL AND github_key IS NULL AND "
                "key_swap_server IS NULL AND COALESCE(add_device, 0)=0 AND kind IS NOT ? ORDER BY id", (JOIN_KIND,)):
+        # F6, piece 1: a card of a runtime's sign-in closes at once when the hub reads that runtime signed in: the
+        # owner answers nothing on it, and their sign-in is the step (need_give_close_rows answers its question)
+        words = need_sign_in_closes(r)
+        if words:
+            with transaction():
+                done, asker = need_give_close_rows(r, words, t0)
+            if done:
+                signed.append(f"N-{r['id']} ({clip(r['title'] or '', 80)}" + (f", for {asker}" if asker else "") + ")")
+            continue
         # the lane "Give on a card" (the owner's Close by itself, 19 November 2026): a card whose agent holds what its
         # Give gives closes too, NEED_GIVE_WAIT after the hub first saw it, which a press of Give answers well within
         gives = need_give_closes(r)
@@ -20255,6 +20619,13 @@ def need_look_sweep(t0):
                          f"agent holds that access now, given another way, or cannot take it any more, or the fleet "
                          f"changed after the card was made). A question that it carried has that answer; raise a new "
                          f"card only when the fleet changed and the work still needs it.", extra=LATER_SAY)
+    if signed and mgr:      # F6, piece 1
+        emit(mgr, "say", f"[hub] The hub closed {', '.join(signed)} on the owner's Needs you: its answer says why (the "
+                         f"hub reads that sign-in now, or its agent left the fleet, has no such sign-in now or runs on "
+                         f"another server). A question that it carried has that answer. When the hub still reads that "
+                         f"agent signed out after a move or a change of its runtime, raise it again with sign_in.",
+             extra=LATER_SAY)
+    sign_in_unread_sweep(mgr)
     held_now = json.dumps(held, sort_keys=True) if held else None
     if held_now != held_before:
         kv_set("need_held", held_now)
@@ -21543,7 +21914,9 @@ TAKEOVER_DONE = re.compile(r"\s*\u00a1?(?:(?:done|ok|okay|hecho|listo|resuelto|y
 
 
 def takeover_title(step):
-    """The card's title for `step`, in the owner's language (Spanish, else English)."""
+    """The card's title for `step`, in the owner's language (Spanish, else English). The limit of sign_in_words holds
+    here too (NEED_SIGN_IN_WORDS): owner.language is the Mac's first preferred language, not the language that the app
+    shows, so a Mac with Catalan first and Spanish second gets the English title beside the app's Spanish."""
     tag = str(setting("owner.language") or "").split("-")[0].lower()
     return TAKEOVER_TITLES.get(tag, TAKEOVER_TITLES["en"])[step]
 
@@ -54421,16 +54794,14 @@ TOOLS = [
      "shows the problem. When an item of yours is not needed any more, withdraw_need closes it. Keep the card short: a "
      f"title of at most {NEED_TITLE_CHARS} characters that names what the owner decides, and in why one or two plain "
      f"sentences (at most {NEED_WHY_CHARS} characters) on what they decide and why it matters now; the reasoning, an "
-     "agent's words and the facts go in details, which the card shows behind Details. When the owner may pick several "
-     "of the options, set multi: they tick any of them and send them together, so never write combined options such as "
-     "\"Yes to A and C\". The owner answers with an option or in their own words, and either one closes the item. "
+     "agent's words and the facts go in details, which the card shows behind Details. Never write combined options "
+     "such as \"Yes to A and C\": set multi. The owner answers with an option or in their own words, and either one "
+     "closes the item. "
      "When their words ask you something back or do not settle it, reply with a new item: its why answers what they "
      "asked, with the options that follow from it. Before they answer, they may ask about it under its card "
-     "(Needs clarification): you reply there with discuss_need. When an open item's options or words change, raise it again with "
-     "replaces. what_to_do is what the owner does, and the card shows it under why: for a choice, one short sentence "
-     "that names the decision; for a person's step, the exact steps, a page as its full address with what to click "
-     "there by the words on the buttons, and a numbered list for more than one step. Two kinds of item have their own "
-     "rule. With a door_call the owner runs nothing: what_to_do shows the call that their yes lets through the door "
+     "(Needs clarification): you reply there with discuss_need. what_to_do is what the owner does, and the card shows "
+     "it under why. Two kinds of item have their own rule. With a door_call the owner runs nothing: what_to_do shows "
+     "the call that their yes lets through the door "
      "one time, and says that they press the first option. The door's card of a run (door_host) takes no backtick in "
      "why and what_to_do. Use only these marks: `code`, a code block for the door's call, ** around the words of a "
      "button, and a numbered list, and write a page's address as it is, with no mark. The Mac app draws them as it "
@@ -54453,10 +54824,11 @@ TOOLS = [
                      "example N-12, when its options or its words changed: that item leaves Needs you. Give "
                      "question_id and recommended again."},
         "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now, "
-                       "as the card shows it. For a choice: one short sentence. For a person's step: the exact steps "
-                       "(each page as its full address, with what to click there; what the hand does at a machine; "
-                       "a numbered list for more than one step), and never a command. If there is none, do not raise "
-                       "the item. With needs_agent, leave it out: Give is the step, and the hub writes it."},
+                       "as the card shows it. For a choice: one short sentence that names the decision. For a person's "
+                       "step: the exact steps (each page as its full address, with what to click there by the words "
+                       "on its buttons; what the hand does at a machine; a numbered list for more than one step), and "
+                       "never a command. If there is none, do not raise the item. With needs_agent (Give is the step) "
+                       "or sign_in, leave it out: the hub writes it."},
         "reason": {"type": "string", "enum": list(CARD_REASONS), "description": "Why only the owner can do it, for "
                    "every item but the door's, an App's, a phone's, an App key's and a key swap's: money, access "
                    "(with needs_access), decision (with owner_words) or person."},
@@ -54474,6 +54846,10 @@ TOOLS = [
                         "what_to_do, and your options are only the no (No when you give none). The title or the why "
                         "names the one thing (a repository as owner/name); Details lists several. The card closes by "
                         "itself when the agent gets that access another way."},
+        "sign_in": {"type": "string", "description": "The agent that is not signed in to its runtime, by its name or "
+                    "its role. Give only why: the hub writes the title and the step for the runtime that it reads "
+                    "signed out (its own, else Codex of its screen tasks), refuses a second item for that sign-in, and "
+                    "closes it at the sign-in."},
         "needs_level": {"type": "string", "description": "With needs_access: the level that the work needs, when an "
                         "agent holds the thing at a lower one (repo:acme/web at deploy where it holds write). For a "
                         "key or a login, value: the hub names the route of a new value; placeholder: the key itself "
@@ -55812,7 +56188,8 @@ def closed_servers(owner, start):
         if not tool or conf.get("runtime") not in tool["runtimes"] or \
                 not (t in named if isinstance(named, list) else not tool.get("mint")):
             continue
-        if [v for v in tool_needs(tool) if v != mcp_variable(t)]:
+        if [v for v in tool_needs(tool) if v != mcp_variable(t)] or \
+                lifecycle.mcp_left_out(tool, conf.get("runtime")):     # a text that the session would replace
             continue
         if tool.get("auth") == "oauth":
             state = mcp_state(TEAM) if state is None else state
@@ -61225,10 +61602,9 @@ def signed_out_told(name, conf, t0):
          f"The hub starts no session of it and keeps the messages for its tasks, its chat and the conversations that "
          f"run on {runtime} until it is signed in. Its open tasks: {', '.join(tref(t['id']) for t in tasks) or 'none'}. "
          + (f"Waiting for its answer: {', '.join(waiting)}. " if waiting else "") +
-         f"Only the owner can sign it in: unless a Needs-you item for it is open, raise one that asks the owner to "
-         f"open {shown_role(name)} in the app and sign it in" + (" with another account, or with the same one once "
-         "its organization turned that access on again" if refused else "") + ". Give it no new work until the hub "
-         "says that it is signed in again.", extra=quiet)
+         f"Only the owner can sign it in" + (" with another account, or with the same one once its organization "
+         "turned that access on again" if refused else "") + f": {SIGN_IN_ASK.format(agent=name)} Give it no new work "
+         f"until the hub says that it is signed in again.", extra=quiet)
     for t in tasks:
         if t["requester"] not in (None, mgr, name) and own_runtime_task(conf, t["needs"]):
             emit(t["requester"], "say", f"[hub] {tref(t['id'])} ({t['title']}, owner {name}) waits: "
@@ -64256,9 +64632,8 @@ def os_user_sweep(t0):
             "It is signed in there since, and its work goes on." if sign_in and signed else \
             "It is installed there, and only its sign-in is missing, which only the owner gives: the hub's word that " \
             "it is not signed in says what to do." if sign_in and swept else \
-            (f"It is installed there, and only its sign-in is missing, which only the owner gives: unless a Needs-you "
-             f"item for it is open, raise one that asks the owner to open {shown_role(agent)} in the app and sign it "
-             f"in.") if sign_in else \
+            (f"It is installed there, and only its sign-in is missing, which only the owner gives: "
+             f"{SIGN_IN_ASK.format(agent=agent)}") if sign_in else \
             "Read the server, then try the move again with move_agent and the same item." if failed \
             else "Ask the owner in a Needs-you item what comes next."
         why = " ".join(str(job["detail"] or "").split())
@@ -66259,6 +66634,16 @@ VAULT_HANDS_ONLY = ("Only a person at that Mac itself, with its own keyboard or 
                     "Screen Sharing")
 
 
+def screen_sign_in_agent(names):
+    """The agent that a Mac's line of a signed-out ChatGPT names for the card of its Codex (SIGN_IN_ASK), of that Mac's
+    active agents `names`: the first with the screen whose reading says that Codex is signed out, else the first with
+    no reading of it; None when the hub reads each of them signed in, as need_sign_in then refuses the card. The first
+    agent with the screen was the one before (the validation of F6, piece 1, round 2): while it read signed in and a
+    second one read signed out, the line asked the manager for a card that the tool refused."""
+    said = {a: signed_in_now(a, APP_SERVER_RUNTIME) for a in names if "screen" in (agents()[a].get("can") or [])}
+    return next((a for a in said if said[a] is False), next((a for a in said if said[a] is None), None))
+
+
 def mac_desktop_sweep():
     """What only hands at a Mac can put right reaches the manager once, in the second reading that shows it: a Mac that
     is reopening Chrome is no news. A Mac whose owner sits at it, and a Mac with no agent that works in its Chrome, are
@@ -66336,9 +66721,12 @@ def mac_desktop_sweep():
             # which of the two it is, and a server service that does not say it yet gets the words of both.
             route = (CHATGPT_INSTALL if words == CHATGPT_NO_APP else
                      CHATGPT_SIGN_IN if desktop.get("chatgpt_app") is True else CHATGPT_EITHER)
+            # F6, piece 1: that sign-in is the hub's own card, for an agent of that Mac whose screen tasks wait
+            eye = screen_sign_in_agent(active) if words == CHATGPT_SIGNED_OUT else None
+            ask = SIGN_IN_ASK.format(agent=eye) if eye else "Raise it for the owner with raise_needs_you."
             linked = kv_get(f"desktop_linked:{name}")
             emit(manager_name(), "say", f"[hub] On the Mac {name}, {words}. Its tasks on its screen wait. {route} "
-                                        f"Raise it for the owner with raise_needs_you."
+                                        f"{ask}"
                  if words in (CHATGPT_SIGNED_OUT, CHATGPT_NO_APP) else
                  f"[hub] On the Mac {name}, {words}. "
                  + unlinked_steps(name, account, json.loads(linked) if linked else None, desktop.get("bridge") is False,
@@ -68414,6 +68802,7 @@ AGENT_COLUMNS = (
     ("egress_hosts", "agent"), ("egress_names", "agent"),      # the outgoing gate's records of the agent's hosts
     ("home_items", "agent"), ("home_readings", "agent"),       # the home reading: what stays in the agent's home
     ("needs", "give_agent"),       # the lane "Give on a card": the agent that an item's Give gives access to
+    ("needs", "sign_in_agent"),    # F6, piece 1: the agent whose runtime's sign-in an item asks for (need_sign_in)
     ("link_codes", "agent"),                # Telegram (CHAT-APPS.md 19.4): the agent whose bot a person's invite opens
     ("profile_orders", "agent"))            # F15 piece 2: the orders that put its profile in order with no card
 # The tables with one row for each agent. A row under the new name is what an agent of that name left before it
@@ -68444,7 +68833,8 @@ AGENT_KV = ("account_refused:",     # account_refused, 23 November 2026
             "memory_close:", "lead_batch:", "moved_from:",
             "profile_long:",        # the free text of its profile at the manager's last ask (PROFILE_LONG)
             "profile_changed:",     # when the owner's save or a pressed plan last changed its profile (PROFILE_CHANGED)
-            "default_browser:", "browser_closed_told:")     # build plan 04: BROWSER_DEFAULT and BROWSER_CLOSED_TOLD
+            "default_browser:", "browser_closed_told:",     # build plan 04: BROWSER_DEFAULT and BROWSER_CLOSED_TOLD
+            "sign_in_unread:")      # F6, piece 1: its runtimes of a card refused for want of a reading (SIGN_IN_UNREAD)
 # The same, with more after the name: `<prefix><agent>:<window, task or item>`.
 AGENT_KV_SCOPED = ("listed:", "untaken:", "chased:")
 # Keys that hold two agents' names, in their sorted order: `<prefix><one>:<two>` (agent_limit's talk guard).
@@ -68929,6 +69319,7 @@ AGENT_REMOVAL = {
     ("kpi_changes", "by"): "stays", ("standing", "measured_by"): "spent",
     ("questions", "passed"): "stays",
     ("needs", "give_agent"): "stays",       # a Give card's record; an open one finds no agent at its press
+    ("needs", "sign_in_agent"): "stays",    # a sign-in card's record; an open one closes (need_sign_in_closes)
     # a person's Telegram invite (CHAT-APPS.md 19.4): read by its code's hash, never by the agent's name, and it binds
     # its person, whom a delete does not touch; its link names a bot whose account leaves with its agent
     ("link_codes", "agent"): "stays",
@@ -70932,6 +71323,12 @@ def mcp_access(name):
         got = mcp.refresh(entry["token_endpoint"], entry["client_id"], entry.get("client_secret"),
                           entry["refresh_token"], resource=entry.get("resource"))
     except mcp.McpError as e:
+        if e.why == "token_form":       # the hub refused what the server gave, and a new Connect gets the same
+            with MCP_LOCK:
+                MCP["problems"][name] = mcp.TOKEN_FORM_SAYS
+            changed()
+            log("owner", f"the MCP server {name} renewed its access with a token of another form")
+            raise Refusal(502, mcp.TOKEN_FORM_SAYS) from None
         with MCP_LOCK:
             MCP["problems"][name] = f"{mcp_why(e)}. Connect this server again."
             if e.status in (400, 401) and e.reason in MCP_DEFINITE_ENDS:     # not an outage: the access ended
@@ -71102,6 +71499,9 @@ def check_mcp_server(name, entry, agent=None, new=False):
     yet; it changes nothing for a url server. new: a server that the owner is about to save, which takes the rules
     of a new write (lifecycle.mcp_server, D33), and the saved token only at the saved server's own address."""
     made = mcp_server(name, entry, new=new)         # ValueError with the reason
+    field = lifecycle.mcp_expanded(made)
+    if field:           # a saved server of before the rule: no session loads it, so it is not asked
+        raise ValueError(f"the MCP server {name}: {lifecycle.MCP_EXPANDS_SAYS[field]}")
     needs = [v for v in tool_needs(made) if v != mcp_variable(name)]
     kind = "url" if "url" in made else "package" if "package" in made else "command"
     result = {"name": name, "kind": kind, "checked": False, "answers": None,
@@ -71145,6 +71545,10 @@ def check_mcp_server(name, entry, agent=None, new=False):
     local = (" The address is a loopback address, so the hub asked its own server, which is the agent's server "
              "only when the agent works there." if urllib.parse.urlsplit(url).hostname in ("127.0.0.1", "localhost")
              else "")
+    # one sentence, in each answer of this check; hub.py names no runtime (test_runtime_table)
+    if any(lifecycle.mcp_expanded(made, runtime) for runtime in lifecycle.MCP_LOOSE_RUNTIMES):
+        local += (" A Grok or OpenCode agent does not load it: its address holds a $ before a letter, which those "
+                  "programs may replace with a variable of the session.")
     try:
         about = mcp.check(url, access)
     except mcp.McpError as e:
@@ -71323,6 +71727,8 @@ def mcp_registry_remote(remote):
     if not isinstance(remote, dict) or remote.get("type") != "streamable-http":
         return False
     url = remote.get("url")
+    if lifecycle.mcp_expands(url):      # an address that a session would replace: the form's Add refuses it
+        return False
     host = urllib.parse.urlsplit(url).hostname if isinstance(url, str) and lifecycle.mcp_address(url) else None
     if not host or urllib.parse.urlsplit(url).scheme != "https" or not mcp_public_name(host):
         return False
@@ -71455,6 +71861,8 @@ def mcp_renew_sweep(t0):
     the hub, and a new Connect clears it; the mark of a server that is gone goes too. At most every MCP_RENEW_EVERY
     seconds, and nothing at all in a fleet without a server with Connect."""
     servers = {n: e for n, e in (TEAM.get("mcp") or {}).items() if isinstance(e, dict) and e.get("auth") == "oauth"}
+    # a server that no session loads (lifecycle.mcp_expanded) asks for no sign-in
+    servers = {n: e for n, e in servers.items() if not lifecycle.mcp_expanded(e)}
     marks = {r["k"][len("mcp_renew:"):]: r["k"] for r in q("SELECT k FROM kv WHERE k >= ? AND k < ?",
                                                            kv_range("mcp_renew:"))}
     if not servers and not marks:
@@ -71469,7 +71877,7 @@ def mcp_renew_sweep(t0):
     for name in sorted(set(marks) - set(state)):
         with area("quiet"):
             kv_set(marks[name], None)
-    for name, entry in sorted(state.items()):
+    for name, entry in sorted((n, e) for n, e in state.items() if n in servers):
         title = (servers.get(name) or {}).get("title") or name
         ends, since = entry.get("access_ends"), entry.get("connected_at")
         try:
@@ -83806,6 +84214,8 @@ class Handler(BaseHTTPRequestHandler):
             raise Refusal(404, f"no MCP server {name}")
         if entry.get("auth") != "oauth":
             raise Refusal(409, MCP_NO_OAUTH)
+        if lifecycle.mcp_expanded(entry):       # a server saved before the rule, which no session loads: no sign-in
+            raise refusal_words.Coded("mcp_url_replaced", server=name)
         return name
 
     def ui_mcp_connect(self):
@@ -83900,6 +84310,9 @@ class Handler(BaseHTTPRequestHandler):
                                    made["code"], p["verifier"], p["redirect_uri"],
                                    resource=found["resource"] or entry["url"])
             except mcp.McpError as e:
+                if e.why == "token_form":       # the hub refused what the server gave: a new Connect gets the same
+                    log("owner", f"the MCP server {name} gave a Connect an access token of another form")
+                    raise Refusal(502, code="mcp_token_refused", names={"server": name}) from None
                 log("owner", f"the MCP server {name} refused a Connect: {mcp_why(e)}")
                 raise Refusal(502, f"the MCP server {name} refused: {mcp_why(e)}. Start Connect again.") from None
             about = {}
@@ -88581,15 +88994,25 @@ class Handler(BaseHTTPRequestHandler):
         # no token.
         servers, problems = {}, []
         catalog = tool_catalog(TEAM)            # the applied team: an owner change counts from its commit
-        for name in tools:
+        # A server whose text a session would replace (lifecycle.mcp_left_out) goes to no helper: one of an older
+        # release loads each name that it gets, and prints the reason in mcp_problems
+        left = {name: lifecycle.mcp_left_out(catalog.get(name) or {}, a.get("runtime")) for name in tools}
+        problems += [f"The MCP server {name} is not loaded: {why}." for name, why in left.items() if why]
+        tools = [name for name in tools if not left[name]]
+        for name in list(tools):
             if (catalog.get(name) or {}).get("auth") != "oauth":
                 continue
             try:
                 access, ends = mcp_access(name)
             except Refusal as e:            # Fleet's own words, or fixed words: a server's text reaches no session
-                why = str(e) if str(e) in (MCP_UNCONNECTED, MCP_ENDED) else \
+                why = str(e) if str(e) in (MCP_UNCONNECTED, MCP_ENDED, mcp.TOKEN_FORM_SAYS) else \
                     "the server did not give an access now; the owner can sign in again in Settings, Apps"
                 problems.append(f"The MCP server {name} is not loaded: {why}.")
+                continue
+            why = lifecycle.mcp_left_out(catalog[name], a.get("runtime"), access)
+            if why:         # an access token that the hub saved before mcp._tokens refused a $ in one
+                problems.append(f"The MCP server {name} is not loaded: {why}.")
+                tools.remove(name)
                 continue
             servers[mcp_variable(name)] = access
             log(agent, f"an access token of the MCP server {name} for a task session, for "

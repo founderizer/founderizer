@@ -855,14 +855,28 @@ host.
    central vault seals it to each machine whose key the owner pinned (`Sources/FleetCore/OwnerKey.swift`, `vault.py`).
 10. **Agents of one Mac.** All agents of a Mac run as one OS user, and the hub key of each agent is a file of that user
     (`fleet.py`). So an agent can use the grants of another agent of the same Mac.
-    It can also get its own key pinned as that Mac's vault key. The owner's Mac reads a Mac server's vault key by
-    asking Fleet Vault's socket as the agents' user (`CentralVaultRemote.readMacVaultKey`), and the key that the hub
-    reports comes from that Mac's helper, a process of the same user. So an agent of that Mac can answer in Fleet
-    Vault's place with a key of its own before the owner's Mac reads it, and the owner's Mac then pins that key. The
-    central vault then seals each copy for that Mac to the agent's key: the values of each agent there, "Uses it"
-    values and logins too, and the pool. A fix is planned (22 November 2026), not built: the read checks that the
-    socket's peer is Fleet Vault's own signed code, or the key comes signed by a key that only Fleet Vault's code can
-    use.
+    It can also get a key of its own pinned as that Mac's vault key. The owner's Mac pins a Mac's vault key when the
+    answer of Fleet Vault's socket, asked over SSH as the agents' user (`CentralVaultRemote.readMacVaultKey`), is the
+    key that the hub bound for that Mac at its first grant (`store_key`, `hub.py`). A program of that user can answer in
+    Fleet Vault's place, on the socket or in the SSH session itself, because that user owns its `authorized_keys` and
+    its `~/.zshenv`. So the pin is only as true as the bound key. A report of another key later moves neither the bound
+    key nor the pin (`vault_store_mismatch`), and an older signed build gets nothing (limit 6). The bound key is the
+    agents' word in limit 21's three ways, and after the owner removes that Mac by another way than the owner's Mac's
+    Remove server and adds it again. A hub that is broken into can bind any key at any time, and with one agent of that
+    Mac that key gets the owner's pin at a first pin of that Mac: when the owner's Mac has no record of it, or under a
+    new Tailscale name where its agents' user runs that Mac's Tailscale. The owner's Mac keeps the key that it last
+    signed for each Mac server, and signs no other key for it on the socket's or the hub's word, until the owner removes
+    that server on the owner's Mac and adds it again (`Sources/FleetCore/MacVaultPin.swift`). For a Mac that the owner's
+    Mac pinned before this guard, the record starts at a run's read of the app, when the hub's pin, the bound key and
+    the read key are one key, or at its next signature, when the hub's pin of it is 7 days old. The owner's Mac keeps
+    the record by the hub's address, so the same hub at another address starts with no record. A machine with no server
+    record takes its kind from its helper's reading, so its agents can make the hub call it a Linux server. The app
+    reads a server as a Mac only when the hub and the owner's Mac's Tailscale both say so, and the guard covers a server
+    that either of them names a Mac. When an agent's key gets the pin, the central vault seals each copy for that Mac to
+    the agent's key: the values of each agent there, "Uses it" values and logins too, and the pool. A fix is planned (22
+    November 2026), not built: root on that Mac reads the key with its own copy of Fleet Vault and signs a line with
+    that Mac's SSH host key, and the owner's Mac pins only the key of such a line (`mac-server-pin-design.md`, with its
+    validation).
 11. **The release key.** Releases change the vault's code on each server and in the central vault without a step from
     the owner (see "How the vault's code is updated"). So the holder of a release key can change every broker and the
     central vault (`hubsetup.py`, `hub.py`). On a Mac, a build with the team's Apple signature can replace Fleet Vault
@@ -1161,14 +1175,16 @@ host.
    host key the Mac does not know yet, the owner connects to it once with ssh from Terminal
    (`Sources/Founderizer/CentralVaultSection.swift`).
 3. **Give each secret on purpose.** The app makes the recovery key and the pins of the servers itself
-   (`Sources/FleetCore/CentralVaultPlan.swift`). An agent gets a secret when the owner gives it, and the app signs that
-   grant (`Sources/Founderizer/GrantSigning.swift`), or when the fleet manager gives it a secret of the pool
+   (`Sources/FleetCore/CentralVaultPlan.swift`). After a real change of a Mac server's vault key (a lost Keychain, a new
+   install of Fleet Vault), its row says that the key is not the one that the hub reports, and Try again does not pass:
+   remove that server on the Mac and add it again. An agent gets a secret when the owner gives it, and the app signs
+   that grant (`Sources/Founderizer/GrantSigning.swift`), or when the fleet manager gives it a secret of the pool
    (`Sources/FleetCore/OwnerKey.swift`). Put a secret into the pool only if any agent may have it. "Reads it" puts an
    API key in the agent's sessions, so give it only to an agent that must have the key itself
-   (`Sources/Founderizer/SecretEntryView.swift`). For a key that swaps, name the exact host of the service's API as
-   its site. Do not name a host that sends a request back in its answer, or a host that the service shares with
-   other customers, because the agent can send the key in a request to each path of that host. Give the key the
-   smallest rights at its service (`hub.py`, `vault.py`).
+   (`Sources/Founderizer/SecretEntryView.swift`). For a key that swaps, name the exact host of the service's API as its
+   site. Do not name a host that sends a request back in its answer, or a host that the service shares with other
+   customers, because the agent can send the key in a request to each path of that host. Give the key the smallest
+   rights at its service (`hub.py`, `vault.py`).
 4. **Put keys in the vault, never in a chat.** Use Add secret. An agent asks for a key with a form, never in words
    (`RULES.md`). If a key went into a chat, replace it at its service (`RULES.md`).
 5. **Delete an export file.** After an import, select **Delete export file**, or delete the file in Finder and empty

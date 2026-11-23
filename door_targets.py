@@ -754,25 +754,217 @@ def listed_before(old, new):
     return len(a) == len(b) and all(LISTED_LINE.fullmatch(x) for x, y in zip(a, b) if x != y)
 
 
+IMAGE_KEYS = ("image", "tag", "digest", "newTag", "newName")
+# The start of a key line of a block mapping: its indentation with a list's dash, its key, and its colon, with a blank
+# or the line's end after it (tag:1 is a text). One run of blanks at each place, so that no line takes a square time.
+KEY_HEAD = re.compile(r"([ \t]*(?:-[ \t]+)?)([\w./-]+)[ \t]*:(?=[ \t]|$)")
+BLOCK_MARK = re.compile(r"[|>][-+0-9]{0,2}")
+BLOCK_TEXT = "\n|"       # the value of a key whose value is a block scalar's text: no value of one line is it
+REGISTRY_WORD = re.compile(r"(?i)registry")
+MOVES_IMAGES = re.compile(r"(?i)registry|parameters")      # also Argo CD's Helm parameters and fileParameters
+
+
+def registry_line(line):
+    """True when a line may give a key that names a registry (Bitnami's global.imageRegistry, which a chart reads
+    before an image's own registry): a key line whose key holds the word; and any other line that holds it anywhere
+    (an explicit key, an anchor that an alias takes as a key, a flow mapping) or that has a backslash and a double
+    quote (an escape in a quoted key); and so for a key that holds parameters (an Argo CD Application's Helm parameters
+    and fileParameters set any value of the chart, global.imageRegistry and image.repository too). A value of a key line that holds the word
+    (https://registry...) is none. A known limit: a chart that moves its images under another key (Istio's global.hub)
+    is not seen."""
+    found = key_line(line)
+    if found:
+        return bool(MOVES_IMAGES.search(found[1]))
+    return bool(MOVES_IMAGES.search(line)) or "\\" in line and "\"" in line
+DOC_MARK = re.compile(r"(?:---|\.\.\.)(?=[ \t]|$)")
+# a quoted text to its end, or to the line's end where it stays open (no closing group); a flow bracket; a comment
+OPEN_MARKS = re.compile(r"\"(?:[^\"\\]|\\.)*(\")?|'(?:[^']|'')*(')?|[\[\]{}]|(?:^|[ \t])#")
+
+
+def line_value(text):
+    """A value of one line as YAML reads it, where this text says it, with its comment taken out: without its quotes,
+    "" for none, and BLOCK_TEXT for a block scalar's mark; or None for an anchor, an alias, a tag, a flow collection
+    other than {} and [], a list's dash, a quoted text that does not end on its line or that has an escape, and a
+    key in it."""
+    value = re.split(r"[ \t]#", text, 1)[0].strip(" \t")
+    if value[:1] in ("\"", "'"):
+        closed = len(value) > 1 and value[-1] == value[0] and value[0] not in value[1:-1] and "\\" not in value
+        return value[1:-1] if closed else None
+    if BLOCK_MARK.fullmatch(value):
+        return BLOCK_TEXT
+    if value and (value[0] in "&*!|>{}[]%@`,#?:" and value not in ("{}", "[]") and not FLOW_LIST.fullmatch(value)
+                  or value[:2] in ("- ", "-") or ": " in value):
+        return None
+    return value
+
+
+def left_open(text):
+    """True when a value of one line leaves a quoted text or a flow collection open: YAML reads the lines after it as
+    part of that value, and no reading by lines can say where it ends. One pass over the line's marks. A quote counts
+    as the start of a quoted text only at the text's start, after a [, a { or a , (blanks between them), or after a :
+    and a blank; any other (it's, [a 's, a:'s) is a letter for YAML, and this pass cannot tell where its quoted text
+    would end, so it counts as open too."""
+    depth, last, end = 0, "", 0
+    for mark in OPEN_MARKS.finditer(text):
+        token, gap = mark.group(0), text[end:mark.start()]
+        between = gap.rstrip(" \t")
+        last = between[-1] if between else last
+        starts = last in ("", "[", "{", ",") or last == ":" and len(between) < len(gap)
+        if token[0] in "\"'" and not starts:
+            return True
+        if token[0] == "\"" and mark.group(1) is None or token[0] == "'" and mark.group(2) is None:
+            return True
+        if token[-1] == "#":
+            break
+        depth += 1 if token in "[{" else -1 if token in "]}" else 0
+        last, end = token[-1], mark.end()
+    return depth != 0
+
+
+def key_line(line):
+    """(prefix, key, value) of a key line of a block mapping whose key and value YAML reads as this text says
+    (line_value), or None for any other line: also a quoted key, a merge key (<<) and an explicit key (?)."""
+    head = KEY_HEAD.match(line)
+    value = head and line_value(line[head.end():])
+    return None if value is None else (head.group(1), head.group(2), value)
+
+
+def image_repo(ref):
+    "An image's reference without its tag and its digest: a registry's port stays (host:5000/name:tag)."
+    ref = ref.split("@", 1)[0]
+    colon = ref.rfind(":")
+    return ref[:colon] if colon > ref.rfind("/") else ref
+
+
+def line_maps(lines):
+    """For each line, the block mapping that it is a line of (an id, or None for a blank line, a comment or a document
+    mark), the keys of each mapping with their values, and whether this reading of each mapping is sure, as the lines'
+    indentation and list dashes say: a key at the column of an open mapping is one of its keys, a deeper key opens a
+    mapping, a list's dash opens its item's mapping, a line further left closes each deeper one, and a document mark
+    closes them all. A block scalar's text is read as a text of its own (an Argo CD Application's Helm values). Not
+    sure: a mapping with a line that key_line cannot read (a tag, an anchor, a merge key, a quoted key); one that opens
+    under a key with a value, with each mapping around it; and, after a quoted text or a flow collection that a line
+    leaves open, each mapping of the rest of its document. One pass, so that each changed tag of a commit reads its own
+    mapping in it."""
+    ids, keys, sure, saved = [], [], [], []
+    stack, opens, over, lost = [], True, None, False     # over: the column that a block scalar's text is deeper than
+    for line in lines:
+        rest = line.lstrip(" \t")
+        indent = len(line) - len(rest)
+        if not rest or rest.startswith("#"):
+            ids.append(None)
+            continue
+        while over is not None and indent <= over:
+            stack, opens, over, lost = saved.pop()
+        if indent == 0 and DOC_MARK.match(rest):
+            stack, opens, lost = [], True, False
+            ids.append(None)
+            continue
+        dash = re.match(r"-(?:[ \t]+|$)", rest)
+        while stack and stack[-1][0] > indent:
+            stack.pop()
+        if dash or not stack or stack[-1][0] < indent:
+            stack.append((indent + (dash.end() if dash else 0), len(keys)))
+            keys.append({})
+            sure.append(not lost)
+            if not (dash or len(stack) == 1 or opens):
+                for _column, held in stack:
+                    sure[held] = False
+        mapping = stack[-1][1]
+        ids.append(mapping)
+        found = key_line(line)
+        value = found[2] if found else line_value(rest[dash.end():]) if dash else None
+        if found:
+            keys[mapping].setdefault(found[1], []).append(value)
+        if value == BLOCK_TEXT:
+            saved.append((stack, False, over, lost))
+            stack, opens, over = [], True, len(found[0]) if found else indent     # a text that is lost stays lost
+        elif value is not None:
+            opens = value == ""
+        else:
+            opens, sure[mapping] = False, False
+            head = KEY_HEAD.match(line)
+            if left_open(line[head.end():].lstrip(" \t") if head else rest[dash.end():] if dash else rest):
+                lost = True
+                for _column, held in stack:
+                    sure[held] = False
+    return ids, keys, sure
+
+
+def image_name(keys):
+    """The one image that a mapping's keys name for its tag: Helm's registry and repository (an empty registry is
+    none), an image's own repository, and Kustomize's newName, else its name; or None where they name more than one
+    or none, or such a key stands twice or has no value."""
+    def one(key):
+        values = keys.get(key) or []
+        return values[0] if len(values) == 1 and values[0] != BLOCK_TEXT else None
+    if any(REGISTRY_WORD.search(key) for key in keys if key != "registry"):
+        return None             # a chart's own key that can move the image (imageRegistryOverride)
+    names = set()
+    if "repository" in keys:
+        registry, repository = one("registry") if "registry" in keys else "", one("repository")
+        if registry is None or not repository:
+            return None
+        names.add(f"{registry}/{repository}" if registry else repository)
+    if "image" in keys:
+        if not one("image"):
+            return None
+        names.add(image_repo(one("image")))
+    if "newName" in keys or "name" in keys:
+        name = one("newName" if "newName" in keys else "name")
+        if not name:
+            return None
+        names.add(name)
+    return names.pop() if len(names) == 1 else None
+
+
 def image_rule(old, new, lookups):
-    """A checked image: the same repository name, and a green release run of that repository made this tag or
-    digest."""
-    def refs(data):
-        return IMAGE_REF.findall(yaml_breaks(data.decode("utf-8", "replace")))      # a CR, a NEL: a line's start too
-    before, after = refs(old), refs(new)
-    made = lookups.get("image_made") or (lambda image: False)
-    for x, y in zip(before, after):
+    """A checked change of image lines, each line by itself (decide_gitops and the listed forms of a repository of
+    code give it only a change that keeps its lines in place and changes only these keys' values): an image keeps its
+    repository, and a green release run of that repository made its new tag; a tag or a newTag is one of the image
+    that its own mapping names (image_name: Helm's values, Kustomize's images), where this reading of the mapping is
+    sure (line_maps), where no line outside that mapping may give a key of a registry (a chart's global.imageRegistry
+    comes first), and a green release run made it; a newName is another repository; and no release run says that
+    it made a digest. Each image is asked once: each ask is a call to GitHub. Before 23 November 2026 the rule read
+    only the image lines, and in Helm's values it took the line after image: as the image, so a changed tag there was
+    no check at all (the validator of the review of stage A)."""
+    asked = {}
+
+    def made(image):
+        if image not in asked:
+            asked[image] = (lookups.get("image_made") or (lambda image: False))(image)
+        return asked[image]
+    a, b = old.decode("utf-8", "replace").splitlines(), new.decode("utf-8", "replace").splitlines()
+    if len(a) != len(b):
+        return "the change does not keep its lines in place"
+    maps = registries = None
+    for i, (x, y) in enumerate(zip(a, b)):
         if x == y:
             continue
-        name_x, name_y = re.split(r"[:@]", x, 1)[0], re.split(r"[:@]", y, 1)[0]
-        if name_x != name_y:
-            return f"the image changes its repository: {name_x} to {name_y}"
-        if not made(y):
-            return f"no green release run made {y}"
-    if not before:      # a tag or digest field on its own line: the run check reads it as the chart's values
-        tags = [line.split(":", 1)[1].strip() for line in changed_lines(old, new) or []]
-        if not all(made(t) for t in tags):
-            return "no green release run made this tag"
+        before, after = key_line(x), key_line(y)
+        if not before or not after or before[:2] != after[:2] or after[1] not in IMAGE_KEYS:
+            return f"{y.strip()[:80]} is not a listed form"
+        key, was, now = after[1], before[2], after[2]
+        if key == "image":
+            if image_repo(was) != image_repo(now):
+                return f"the image changes its repository: {image_repo(was)} to {image_repo(now)}"
+            if not made(now):
+                return f"no green release run made {now}"
+        elif key == "newName":
+            return f"the image changes its repository: {was} to {now}"
+        elif key == "digest":
+            return f"no release run says that it made the digest {now[:80]}"
+        else:
+            ids, keys, sure = maps = maps or line_maps(b)
+            registries = registries if registries is not None else \
+                {ids[j] for j, line in enumerate(b) if ids[j] is not None and registry_line(line)}
+            name = image_name(keys[ids[i]]) if ids[i] is not None and sure[ids[i]] else None
+            if not name:
+                return f"no image of its own mapping names the tag {now[:80]}"
+            if registries - {ids[i]}:
+                return f"a registry outside the mapping of the tag {now[:80]} can move its image (global.imageRegistry)"
+            if not made(f"{name}:{now}"):
+                return f"no green release run made {name}:{now}"
     return True
 
 
@@ -1335,11 +1527,9 @@ def kept_back(path, data, read=None):
 
 
 # The lines that a commit changes in a YAML file that code reads only loosely: the values of decide_gitops's rule calls
-# (one run of spaces before a list's dash and one after it: \s*-?\s* splits a long run of spaces in each place, and
-# an image's line is read from its line's start, not from each blank line before it)
+# (one run of spaces before a list's dash and one after it: \s*-?\s* splits a long run of spaces in each place)
 REPLICAS_LINE = re.compile(r"\s*(?:-\s*)?replicas\s*:\s*\d{1,2}\s*")
 IMAGE_LINE = re.compile(r"\s*(?:-\s*)?(image|tag|digest|newTag|newName)\s*:\s*\S+\s*")
-IMAGE_REF = re.compile(r"^[ \t]*(?:-\s*)?image\s*:\s*['\"]?([^\s'\"]+)", re.M)
 LISTED_LINE = re.compile(r"\s*(?:-\s*)?replicas\s*:\s*\d{1,2}\s*|"
                          r"\s*[\w./-]*restartedAt['\"]?\s*:\s*['\"]?[0-9T:.Z+-]{10,40}['\"]?\s*|"
                          r"\s*(?:-\s*)?(?:image|tag|digest|newTag|newName)\s*:\s*[\w./:@-]+\s*")

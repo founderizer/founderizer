@@ -9,12 +9,17 @@ a move left signed out ran a session for each of its tasks for seven hours, ever
 nobody was told. A local hub with a test source address for each machine; no real host, credential, session or AI
 call. Each test's hub database is test_ui_api.quick, as for every OwnerAPI test."""
 import json
+import os
+import re
+import string
+import threading
 import unittest
 import unittest.mock
+from unittest.mock import patch
 
 import hub
 import test_agent_auth
-from leftovers import scratch_home
+from leftovers import ROOT, scratch_home
 from test_agent_auth import BOX, KEYS
 
 REFUSED = {"type": "error", "code": hub.AUTH_FAILED, "message": "Not logged in · Please run /login",
@@ -25,6 +30,11 @@ LINE = {"type": "user_message", "text": "New fleet messages."}     # a turn begi
 ORG_REFUSED = {"type": "error", "code": "oauth_org_not_allowed", "message": "Your organization has disabled Claude "
                "subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable "
                "access", "retryable": False, "resets_at": None}
+# what the hub tells the manager to do for alpha's sign-in (F6, piece 1): the card with the hub's own step, and no
+# words of the manager's that name a page ("open Example Developer in the app and sign it in" named none)
+ASK = ('Only the owner can sign it in: raise_needs_you with sign_in "alpha" asks them, with the hub\'s own step, '
+       'unless an item for it is open.')
+SOURCES = os.path.join(ROOT, "app", "Sources")
 
 
 def setUpModule():
@@ -179,7 +189,7 @@ class SignedOut(test_agent_auth.Routes):
         self.assertIn("[hub] alpha (Example Developer) is not signed in to Claude Code on box: no session of it can "
                       "work.", to_manager)
         self.assertIn(f"Its open tasks: T-{theirs}, T-{own}.", to_manager)
-        self.assertIn("raise one that asks the owner to open Alpha in the app and sign it in", to_manager)
+        self.assertIn(ASK, to_manager)
         (to_lead, quiet), = self.said("boss", mine)                 # in its own task, where a lead reads its team
         self.assertFalse(quiet)
         self.assertIn(f"[hub] T-{theirs} (Fix it, owner alpha) waits: alpha is not signed in", to_lead)
@@ -239,7 +249,10 @@ class SignedOut(test_agent_auth.Routes):
         turn while nobody was asked to sign it in. The owner: "we need a better indicator so its as simple as logging in
         again!" The refusal is a sign-in to do: its work waits, its line hears why, the apps show its sign-in, which
         signs that account out first while its chat waits, and a finished sign-in ends it; the same account refused
-        again holds it again, and a turn that works ends that."""
+        again holds it again, and a turn that works ends that. With F6 piece 1 the manager's line asks for the hub's
+        card of that sign-in, which the hub raises while its machine reads the account signed in, keeps open while the
+        refusal stands, and closes at the sign-in: the bugs, a card refused as "signed in", or closed at the next sweep
+        with "is signed in" while every turn still fails."""
         t = self.task("alpha")
         holds = lambda: self.status("alpha", features=["agent_key", "status_now"], runtimes={"claude": {
             "signed_in": True}}, runtime={"name": "claude", "signed_in": True})
@@ -257,6 +270,17 @@ class SignedOut(test_agent_auth.Routes):
         self.assertIn("is signed in to Claude Code on box with an account that Claude Code refuses at each turn",
                       to_manager)
         self.assertIn("sign it in with another account", to_manager)
+        self.assertIn('raise_needs_you with sign_in "alpha" asks them', to_manager)       # the hub's card (F6, piece 1)
+        # that card comes, for the refused account that its machine reads signed in, and stays while the refusal
+        # stands: its step is the page's Sign in, which signs that account out first
+        who = hub.shown_role("alpha")
+        card = self.sign_in_card()
+        self.assertIsInstance(card, int, card)
+        self.assertEqual(hub.q1("SELECT todo FROM needs WHERE id=?", (card,))["todo"], (
+            f"In Founderizer on your Mac, open Settings › Servers and choose box. Press Sign in beside Claude Code for "
+            f"{who}, then follow the steps that it opens."))
+        self.sweep_cards()
+        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (card,))["answer"])
         self.assertIs(hub.agent_view("alpha", hub.agents()["alpha"])["signed_in"], False)     # the apps' sign-in step
         machine = next(m for m in hub.machine_rows()[1] if m["agent"] == "alpha")      # and its page (AgentSetupFlow)
         self.assertIs(machine["runtime"]["signed_in"], False)
@@ -267,6 +291,9 @@ class SignedOut(test_agent_auth.Routes):
         hub.q("UPDATE signin_jobs SET state='done', updated=? WHERE agent='alpha'", (hub.now(),))
         self.tick()
         self.assertFalse(hub.needs_sign_in("alpha"))
+        self.sweep_cards()                                          # the sign-in that ends the refusal closes the card
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (card,))["answer"],
+                         f"Closed by the hub: {who} is signed in to Claude Code now.")
         self.assertEqual(hub.q1("SELECT attempt FROM tasks WHERE id=?", (t,))["attempt"], 2)    # the new sign-in
         self.assertEqual(self.poll(), ["say", "task"])
         start = hub.q1("SELECT text FROM events WHERE agent='alpha' AND kind='task' AND task=? ORDER BY id DESC",
@@ -483,7 +510,7 @@ class SignedOut(test_agent_auth.Routes):
                       "minutes. Try again in Founderizer). It is installed there, and only its sign-in is missing",
                       move[0])
         self.assertNotIn("Read the server", move[0])
-        self.assertIn("raise one that asks the owner to open Alpha in the app and sign it in", told[0])
+        self.assertIn(ASK, told[0])
         self.assertIn(f"[hub] T-{theirs} (Fix it, owner alpha) waits", self.said("boss", mine)[0][0])
         self.signed("alpha", True)
         self.sweep()
@@ -536,6 +563,298 @@ class SignedOut(test_agent_auth.Routes):
         self.signed("beta", True)
         said = hub.t_create_task("manager", {"owner": "beta", "title": "Write the notes", "done_when": "they exist"})
         self.assertNotIn("not signed in", said)
+
+    # ---- the owner's card of its sign-in (F6, piece 1)
+    def sign_in_card(self, agent="Example Developer", caller="manager", **fields):
+        """The manager's item with sign_in (by the agent's role) and a why: the new item's id, or the refusal."""
+        said, error = hub.call_tool(caller, "raise_needs_you", dict({"sign_in": agent, "why": "Its tasks wait for it."},
+                                                                    **fields))
+        return said if error else int(said.split("N-")[1].split(".")[0])
+
+    def sweep_cards(self):
+        hub.kv_set("need_look_sweep_at", None)
+        with hub.LOCK:
+            hub.need_look_sweep(hub.now())
+
+    def test_a_card_for_its_sign_in_has_the_hubs_step_and_closes_at_the_sign_in(self):
+        """The owner, 19 November 2026, of four cards in one hour whose steps the manager wrote from memory: "what agent
+        should I open?", "No sign in button appears", "There is no machines page, do you mean Servers?". With sign_in
+        the hub writes the card's title and step from its own record. The believable bugs: a step that names a page, a
+        server or a button that the owner's app does not show, or that a phone's reader takes for a page of the phone;
+        a card for an agent that the hub reads signed in; a second card for the same sign-in; a card that stays open
+        after the sign-in; a worker that raises one; a link or a code beside the hub's step, in why or in the asker's
+        words behind Details, which could be a machine's that is not the fleet's; a card while the hub has no current
+        reading, when the server's page shows no sign-in; a why that sends the owner into the vault for a key's value,
+        which no card of another reason carries; a refused call for the title and what_to_do that the tool's
+        schema asks for; a refusal of why that quotes what it read, which can be most of a key, into the hub's records;
+        a web address whose user part reads as an email address, a key after a prefix with an underscore, or a code in
+        full-width letters, with a non-breaking hyphen or a zero-width space; a limit of that check that its comment
+        does not write (a known hole is fixed or written); the hub's word after a refusal for want of a reading, which
+        never came (the area's reader of piece 1, finding 3); a reply under the card with an address or a code."""
+        who = hub.shown_role("alpha")           # the label of the owner's apps (a role before F16, the name after)
+        self.assertIn(f"the hub has no current reading of {who}'s sign-in to Claude Code and Codex on box",
+                      self.sign_in_card())
+        self.signed("beta", True)
+        signed_in = self.sign_in_card("beta")
+        self.assertIn(f"the hub reads {hub.shown_role('beta')} signed in to Codex on box now, so the owner has no "
+                      f"sign-in to make.", signed_in)
+        # a provider can refuse an account that the machine reads signed in: the refusal leaves a way to the owner,
+        # because card_runtime_sign_in refuses a card in the manager's own words
+        self.assertIn("If its turns still end because the provider refuses that account, a refusal that the hub did "
+                      "not read, tell the owner with message_owner that", signed_in)
+        self.assertIn("needs a sign-in with another account there, or with the same one once its organization turned "
+                      "that access on again.", signed_in)
+        self.signed("alpha", False)
+        self.sweep_cards()          # the hub's word after the first refusal: it reads one of them now
+        told = self.said("manager")
+        self.assertEqual(told[-1][0], '[hub] alpha (Example Developer) is not signed in to Claude Code on box: the hub '
+                                      'reads it now, after it refused your card for want of a reading. Only the owner '
+                                      'can sign it in: raise_needs_you with sign_in "alpha" asks them, with the hub\'s '
+                                      'own step, unless an item for it is open.')
+        self.sweep_cards()
+        self.assertEqual(len(self.said("manager")), len(told))          # once: Codex has no reading yet
+        for why, kind in (("Its tasks wait: open https://auth.openai.com/codex/device and enter `K7QD-2M4P`.",
+                           "an address"),
+                          ("Its tasks wait. On the page that opens, enter the code K7QD-2M4P.", "a code"),
+                          ("Its tasks wait. Open https://owner@evil.com/device first.", "an address"),  # a user part
+                          ("Its tasks wait. Open evil.app/device and enter the code that it shows.", "an address"),
+                          ("Its tasks wait. Paste sk4f9Qz81LmN0pW2xV7-x9Lp2Qr7Zt5Vb3Nm when it asks.", "a code"),
+                          ("Its tasks wait. Run `codex login` on it.", "a code"),
+                          ("Its tasks wait. Paste ghp_9fQz81LmN0pW2xV7a4Kd2 there.", "a code"),       # a prefix
+                          ("Its tasks wait. Paste sk_live_4f9Qz81LmN0pW2xV7 there.", "a code"),
+                          ("Its tasks wait. Enter K7QD\u20112M4P there.", "a code"),          # a non-breaking hyphen
+                          ("Its tasks wait. Enter K7Q\u200bD-2M4P there.", "a code"),          # a zero-width space
+                          ("Its tasks wait. Open \uff45\uff56\uff49\uff4c.app\uff0fdevice first.", "an address"),
+                          ("Its seat of 2025-2026 ended.", "a code"),           # honest lines
+                          ("Version 2.1/3 of its app signed it out.", "an address")):
+            with self.subTest(why=why):
+                said = self.sign_in_card(why=why)
+                self.assertIn(f"why holds no address and no code: a part of it reads as {kind}. The owner signs in on "
+                              f"the provider's own page", said)
+                # none of its words: the hub's log and the call's record mask a key only whole
+                for word in re.findall(r"\S*[\d/:@]\S*", why):
+                    self.assertNotIn(word.strip(".`"), said)
+        # the limits of that check, which the comment above NEED_SIGN_IN_CODE writes: each is true, and each is written
+        with open(hub.__file__, encoding="utf-8") as f:
+            source = f.read()
+        lines = source[source.index("# what a why beside the hub's step of a sign-in"):
+                       source.index("\nNEED_SIGN_IN_CODE = ")].splitlines()
+        comment = " ".join(line.lstrip("# ") for line in lines)      # its words, read whole across the lines
+        for why, written in (("Its seat of 2025 to 2026 ended.", "2025-2026"),          # the same lines in other words
+                             ("Version 2.1 of 3 of its app signed it out.", "Version 2.1/3"),
+                             ("Its tasks wait. Enter the code k7qd-2m4p.", "k7qd-2m4p"),
+                             ("Its tasks wait. Enter the code K7QD 2M4P.", "K7QD 2M4P"),
+                             ("Its tasks wait. Enter the code K7QD2M4P.", "K7QD2M4P")):
+            with self.subTest(why=why):
+                self.assertIsNone(hub.sign_in_why_refusal(why))
+                self.assertIn(f'"{written}"', comment)
+        # a why that sends the owner into the vault for a key's value gets the value check of every other card, and
+        # its route (card_value_steps); an honest why still raises the card below
+        hub.TEAM["logins"] = {"bws://00000000-0000-4000-8000-0000000a0de0": {"kind": "api_key", "title": "Anthropic",
+                                                                              "env": "ANTHROPIC_API_KEY"}}
+        self.assertIn("Not raised: a new value of ANTHROPIC_API_KEY comes through request_secret", self.sign_in_card(
+            why="Its tasks wait. Also replace ANTHROPIC_API_KEY in Secrets with the new key."))
+        self.assertIn("A check of words cannot hold this", comment)
+        self.assertIn("The manager's own words are the only free text on that card: its why, a reply under it and a "
+                      "reason that withdraws it", comment)
+        asker = self.task("alpha")
+        qid = hub.ins("INSERT INTO questions(task,asker,requester,text,asked) VALUES(?,?,'manager',?,?)",
+                      (asker, "alpha", "Open https://evil.example/device and enter K7QD-2M4P for me?", hub.now()))
+        nid = self.sign_in_card(question_id=f"Q-{qid}", title="Sign in alpha", what_to_do="Open its page.")
+        code, state = self.request("/ui/state")
+        self.assertEqual(code, 200, state)
+        card, = [n for n in state["needs"] if n["id"] == nid]
+        self.assertEqual((card["title"], card["todo"], card["details"]), (
+            f"Sign {who} in to Claude Code",
+            f"In Founderizer on your Mac, open Settings › Servers and choose box. Press Sign in beside Claude Code for "
+            f"{who}, then follow the steps that it opens.", None))
+        self.assertIn(f"N-{nid} asks the owner for that sign-in already, and it closes by itself at the sign-in. To "
+                      f"change its why, raise it again with replaces=\"N-{nid}\" and question_id=\"Q-{qid}\".",
+                      self.sign_in_card("alpha"))         # F13: the new card takes the question only when named
+        self.assertIn("You have no tool named raise_needs_you", self.sign_in_card(caller="beta"))  # the manager's alone
+        # the manager's reply under the card stands beside the hub's step too
+        hub.ins("INSERT INTO need_talk(need, ts, who, text) VALUES(?,?,?,?)", (nid, hub.now(), "owner", "Which page?"))
+        said, error = hub.call_tool("manager", "discuss_need", {"need": f"N-{nid}",
+                                                               "text": "Open https://owner@evil.com/device there."})
+        self.assertIn("Under a card of a sign-in, text holds no address and no code: a part of it reads as an address.",
+                      said)
+        said, error = hub.call_tool("manager", "discuss_need", {"need": f"N-{nid}",
+                                                               "text": "The page and its button are in the step."})
+        self.assertIn(f"Your reply is under N-{nid}", said)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], 1)
+        self.signed("alpha", True)
+        self.sweep_cards()
+        words = f"Closed by the hub: {who} is signed in to Claude Code now."
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"], words)
+        self.assertEqual(hub.q1("SELECT answer FROM questions WHERE id=?", (qid,))["answer"], words)
+        self.assertIn(f"[hub] The hub closed N-{nid} (Sign {who} in to Claude Code, for alpha) on the "
+                      f"owner's Needs you: its answer says why (the hub reads that sign-in now, or its agent left the "
+                      f"fleet, has no such sign-in now or runs on another server).", self.said("manager")[-1][0])
+
+    def test_the_card_of_its_screen_tasks_names_codex_and_the_button_that_the_page_shows(self):
+        """An agent whose own runtime is signed in and whose screen tasks' Codex is not (the owner's cards of 19
+        November 2026 were of that Codex), on a Mac with a second such agent: the card is for Codex, whose one row on
+        the Mac's page has no role, and whose button follows the sign-ins of both agents (the app's ScreenSignIn).
+        The believable bugs: a card for the runtime that is signed in; Sign in on a step where the row shows Try again
+        after a sign-in that failed, or Open while one runs, also another agent's of that Mac; a second card for that
+        one sign-in; a step on a page that the owner's computer does not have (a PC), or with a button that a Mac with
+        no ChatGPT app does not show; the hub's own step refused as fleet work for a server named deploy-1; a card
+        that stays open after its agent left the fleet, moved to another server or lost its screen, whose step then
+        names a row that the page does not draw (the area's reader of piece 1, finding 5); a reason that withdraws the
+        card with an address or a code in it; replaces that does not take the open card's place."""
+        who = hub.shown_role("alpha")
+        hub.TEAM["agents"]["alpha"]["machine"] = "deploy-1"
+        hub.TEAM["agents"]["gamma"] = dict(role="worker", runtime="claude", machine="deploy-1", can=["shell", "screen"],
+                                           title="Example Designer")
+        for agent in ("alpha", "gamma"):
+            self.status(agent, features=["agent_key"], runtimes={"claude": {"signed_in": True},
+                                                                 "codex": {"signed_in": False}})
+        with patch.object(hub, "owner_computer", lambda: {"kind": "windows", "label": "PC", "can": []}):
+            self.assertIn("the owner's computer is a PC, and only Founderizer on a Mac signs an agent in again yet",
+                          self.sign_in_card())
+        with patch.object(hub, "mac_desktop", lambda machine: {"chatgpt": False, "chatgpt_app": False}):
+            self.assertIn("the ChatGPT app is not installed on deploy-1, so its page has no sign-in of Codex",
+                          self.sign_in_card())
+        login = hub.ins("INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES('gamma','codex',"
+                        "'signing_in',?,?)", (hub.now(), hub.now()))
+        self.assertIn("a sign-in of Codex runs on deploy-1 now", self.sign_in_card())
+        step = ("In Founderizer on your Mac, open Settings › Servers and choose deploy-1. Press {} beside Codex, then "
+                "follow the steps that it opens.")
+        hub.q("UPDATE signin_jobs SET state='failed', timed_out=1 WHERE id=?", (login,))    # nobody finished it in time
+        nid = self.sign_in_card()
+        self.assertEqual(tuple(hub.q1("SELECT title, todo FROM needs WHERE id=?", (nid,))),
+                         (f"Sign {who} in to Codex", step.format("Sign in")))
+        hub.q("UPDATE needs SET answer='Not now' WHERE id=?", (nid,))
+        hub.q("UPDATE signin_jobs SET timed_out=NULL WHERE id=?", (login,))                 # one that failed
+        nid = self.sign_in_card()
+        self.assertEqual(hub.q1("SELECT todo FROM needs WHERE id=?", (nid,))["todo"], step.format("Try again"))
+        self.assertIn(f"N-{nid} asks the owner for that sign-in already", self.sign_in_card("gamma"))
+        # a reason that withdraws the card stands on it under the hub's step, as its why does
+        said, error = hub.call_tool("manager", "withdraw_need", {"need": f"N-{nid}",
+                                                                "why": "Not needed: open evil.app/device first."})
+        self.assertIn("With a card of a sign-in, why holds no address and no code: a part of it reads as an address.",
+                      said)
+        self.assertIsNone(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"])
+        # replaces takes the open card's place for that sign-in, with the hub's step again
+        new = self.sign_in_card(replaces=f"N-{nid}", why="Its screen tasks wait for it.")
+        self.assertIsInstance(new, int, new)
+        old = hub.q1("SELECT answer, replaced_by FROM needs WHERE id=?", (nid,))
+        self.assertTrue(old["answer"].startswith("Replaced by "), old["answer"])
+        self.assertEqual((old["replaced_by"], hub.q1("SELECT todo FROM needs WHERE id=?", (new,))["todo"]),
+                         (new, step.format("Try again")))
+        nid = new
+        alpha = hub.TEAM["agents"]["alpha"]
+        for change, back, words in ((dict(machine="deploy-2"), dict(machine="deploy-1"),
+                                     f"Closed by the hub: {who} does not run on deploy-1 now."),
+                                    (dict(can=["shell"]), dict(can=["shell", "screen"]),
+                                     f"Closed by the hub: {who} does not use Codex now.")):
+            with self.subTest(change=change):
+                alpha.update(change)
+                self.sweep_cards()
+                self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"], words)
+                self.assertIn("When the hub still reads that agent signed out after a move or a change of its runtime, "
+                              "raise it again with sign_in.", self.said("manager")[-1][0])
+                alpha.update(back)
+                nid = self.sign_in_card()
+                self.assertIsInstance(nid, int)
+        del hub.TEAM["agents"]["alpha"]
+        self.sweep_cards()
+        self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"],
+                         "Closed by the hub: Alpha left the fleet.")
+
+    def test_the_card_is_in_the_owners_language(self):
+        """The apps show their own words in the language of the device, and the card's title and step as the hub wrote
+        them (the area's reader of piece 1, finding 1). The believable bugs: a Mac in Spanish shows "Ajustes ›
+        Servidores" and "Iniciar sesión" beside a step that names "Settings › Servers" and "Sign in"; a language that
+        the apps do not have gets no card, or words that the app does not show."""
+        self.signed("alpha", False)
+        real, who = hub.setting, hub.shown_role("alpha")
+        for tag, title, todo in (
+                ("es-ES", f"Inicia la sesión de {who} en Claude Code",
+                 "En Founderizer en tu Mac, abre Ajustes › Servidores y elige box. Pulsa Iniciar sesión junto a Claude "
+                 f"Code para {who} y sigue los pasos que se abren."),
+                ("fr-FR", f"Sign {who} in to Claude Code",          # a Mac in French alone: the app shows English
+                 "In Founderizer on your Mac, open Settings › Servers and choose box. Press Sign in beside Claude Code "
+                 f"for {who}, then follow the steps that it opens.")):
+            def language(key, tag=tag):
+                return tag if key == "owner.language" else real(key)
+            with self.subTest(tag=tag), patch.object(hub, "setting", language):
+                nid = self.sign_in_card()
+                self.assertEqual(tuple(hub.q1("SELECT title, todo FROM needs WHERE id=?", (nid,))), (title, todo))
+                hub.q("UPDATE needs SET answer='Not now' WHERE id=?", (nid,))
+
+    def test_two_raises_at_one_moment_make_one_card(self):
+        """One sign-in, one open card, also for two calls of the manager at the same moment: two parallel tool calls of
+        one turn, or its owner chat and a task session that act on one line of the hub's, each on a thread of its own
+        (ThreadingHTTPServer). call_tool runs raise_needs_you whole under LOCK (`with kit_lock() if name in KIT_TOOLS
+        else LOCK`), need_sign_in's read of the open cards and the card's write, so the second call reads the first
+        one's card. The believable bug: raise_needs_you joins the tools that call_tool runs outside LOCK, both calls
+        read no open card before either writes its own, and the owner gets two cards and two rings for one sign-in."""
+        self.signed("alpha", False)
+        real, both, said = hub.need_sign_in, threading.Barrier(2), []
+
+        def read_together(a):
+            got = real(a)
+            try:        # each call has read the open cards before either one writes
+                both.wait(timeout=2)
+            except threading.BrokenBarrierError:        # a lock around the whole call: the first one waits alone
+                pass
+            return got
+        with patch.object(hub, "need_sign_in", read_together):
+            calls = [threading.Thread(target=lambda: said.append(self.sign_in_card())) for _ in range(2)]
+            for call in calls:
+                call.start()
+            for call in calls:
+                call.join(60)
+        cards = [nid for nid in said if isinstance(nid, int)]
+        self.assertEqual(len(cards), 1, said)
+        refused, = [words for words in said if not isinstance(words, int)]
+        self.assertIn(f"Not raised: N-{cards[0]} asks the owner for that sign-in already", refused)
+        self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], 1)
+
+    @unittest.skipUnless(os.path.isdir(SOURCES), "a tree with no app/")
+    def test_the_cards_words_are_the_apps_own(self):
+        """The hub's step of a sign-in names the Mac app's page, row and button by the words of the views that draw
+        them. The believable bug: the app renames its button, its tab or a runtime on its row, and the hub's cards go
+        on naming what the owner no longer sees."""
+        def source(*parts):
+            with open(os.path.join(SOURCES, *parts), encoding="utf-8") as f:
+                return f.read()
+        section = source("Founderizer", "MachineSignInSection.swift")
+        button = section.split("private var button: String {", 1)[1].split("\n    }", 1)[0]
+        en = hub.NEED_SIGN_IN_WORDS["en"]
+        for words in (en["button"], en["again"]):
+            self.assertIn(f'String(l10n: "{words}")', button)
+        self.assertIn("FormRow(card ? providerName(runtime)", section)         # the row is the runtime's own name
+        self.assertIn('isFailure: Bool { state == "failed" && timed_out != true }',     # when the button says Try again
+                      source("FleetCore", "MachineSignin.swift"))
+        names = dict(re.findall(r'case "(\w+)": "([^"]+)"', source("FleetCore", "RuntimeSwitch.swift")
+                                .split("func providerName", 1)[1].split("\n}", 1)[0]))
+        self.assertEqual({r: names.get(r) for r in hub.LOGIN_RUNTIMES}, {r: hub.runtime_label(r)
+                                                                         for r in hub.LOGIN_RUNTIMES})
+        settings, tab = en["page"].split(" › ")
+        self.assertEqual(settings, "Settings")
+        self.assertIn(f'case .servers: String(l10n: "{tab}")', source("Founderizer", "SettingsPage.swift"))
+        self.assertIn(f'("{tab}", "servers")', source("FleetCore", "CardNames.swift"))     # the step links the page
+        # the same words in each language of the apps, as the app's catalog has them (the area's reader of piece 1,
+        # finding 1): the app shows the card as the hub wrote it, and its own page and buttons in its own language
+        with open(os.path.join(ROOT, "app", "Localization", "Localizable.xcstrings"), encoding="utf-8") as f:
+            catalog = json.load(f)["strings"]
+        with open(os.path.join(ROOT, "app", "Localization", "shipped"), encoding="utf-8") as f:
+            shipped = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        self.assertEqual(set(hub.NEED_SIGN_IN_WORDS), {"en", *shipped})
+
+        def fields(text):
+            return {name for _, name, _, _ in string.Formatter().parse(text) if name}
+        for language in shipped:
+            with self.subTest(language=language):
+                words = hub.NEED_SIGN_IN_WORDS[language]
+
+                def app(key):
+                    return catalog[key]["localizations"][language]["stringUnit"]["value"]
+                self.assertEqual((words["button"], words["again"], words["page"]),
+                                 (app(en["button"]), app(en["again"]), f"{app(settings)} › {app(tab)}"))
+                self.assertEqual({key: fields(words[key]) for key in en}, {key: fields(en[key]) for key in en})
 
 
 if __name__ == "__main__":

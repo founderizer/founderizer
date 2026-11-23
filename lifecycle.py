@@ -1365,6 +1365,72 @@ def mcp_variable(name):
     return "FLEET_MCP_" + name.upper().replace("-", "_")
 
 
+# The text that a session's MCP file would replace: ${NAME} and ${NAME:-default} of Claude Code, in a server's command,
+# args, env, url and headers (code.claude.com/docs/en/mcp, "Environment variable expansion in `.mcp.json`"; its program
+# 2.1.312 matches /\$\{([A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?)\}/ in each of them, so a $ alone stays as it is), and
+# {env:NAME} and {file:path}, which OpenCode reads in its own configuration file. Each ${ is refused, so that no new
+# form of Claude's own pattern slips by. The session's environment holds each key and token that its agent has
+# (FLEET_MCP_<NAME>, SHOP_KEY): an address with ${FLEET_MCP_CRM} would send that token to its host at each task.
+# Codex 0.171.0 sends the text as it is (a search of its program found no such replacement). An ACP program (OpenCode,
+# Grok) gets its servers in session/new, and what it does with such a text is not measured.
+MCP_EXPANDS = re.compile(r"\$\{|\{(?:env|file):")
+# The plain words of the refusal of a server of mcp_expanded, for a new write and for a saved one, with no value in
+# them: for each field that holds such a text, the field and what the owner does instead. A setting and an argument
+# take no $ at all (plain_value), so only {env:...} and {file:...} reach them.
+MCP_EXPANDS_SAYS = {
+    "url": "its url must not hold ${...}, {env:...} or {file:...}: a session would put one of its own variables there "
+           "and send it to that address. Give the server its key with auth \"key\"",
+    "setting": "a setting must not hold {env:...} or {file:...}: a session would put one of its own variables or files "
+               "there. Write the value itself, and give a key in env, from an API key of the Secrets page",
+    "argument": "an argument must not hold {env:...} or {file:...}: a session would put one of its own variables or "
+                "files there. Write the value itself, and give a key in env, from an API key of the Secrets page",
+}
+
+
+def mcp_expands(value):
+    """True for a text that a session's MCP file would replace (MCP_EXPANDS)."""
+    return isinstance(value, str) and MCP_EXPANDS.search(value) is not None
+
+
+# The runtimes whose own replacing is not proven: a $ before a letter or _ is a variable there too, until it is. Grok's
+# program holds the library shellexpand; OpenCode is not measured. Claude Code and Codex leave such a $ as it is. So
+# an address with a query of OData's form (?$top=5, ?$filter=) loads in no session of those two: the check says it.
+MCP_LOOSE_RUNTIMES = ("grok", "opencode")
+MCP_LOOSE = re.compile(r"\$[A-Za-z_]")
+
+
+def mcp_replaced(text, runtime=None):
+    """True for a text that a session of this runtime may replace: MCP_EXPANDS for each runtime, and for a runtime of
+    MCP_LOOSE_RUNTIMES a $ before a letter or _ too."""
+    return isinstance(text, str) and (MCP_EXPANDS.search(text) is not None or
+                                      runtime in MCP_LOOSE_RUNTIMES and MCP_LOOSE.search(text) is not None)
+
+
+def mcp_expanded(tool, runtime=None):
+    """The first field of a catalog tool ("url", "setting" or "argument", the keys of MCP_EXPANDS_SAYS) with a text
+    that a session of this runtime may replace (mcp_replaced), or None. A command is a program's name, which holds no
+    such text (MCP_PROGRAM)."""
+    for field, texts in (("url", [tool.get("url")]), ("setting", (tool.get("settings") or {}).values()),
+                         ("argument", tool.get("args") or [])):
+        if any(mcp_replaced(text, runtime) for text in texts):
+            return field
+    return None
+
+
+def mcp_left_out(tool, runtime=None, bearer=None):
+    """Why no session of this runtime loads this server, in plain words and with no value in them, or None: a text of it
+    (mcp_expanded), or its access token or key (bearer, the value that its header sends), may be replaced with a
+    variable of the session. The helper asks it for each tool, and so does the hub for a helper that is older."""
+    field = mcp_expanded(tool)
+    if field:
+        return MCP_EXPANDS_SAYS[field]
+    if mcp_expanded(tool, runtime):
+        return f"its address holds a $ before a letter, which {runtime} may replace with a variable of the session"
+    if mcp_replaced(bearer, runtime):
+        return "its access token or key holds text that a session would replace with one of its own variables"
+    return None
+
+
 def mcp_address(value):
     """One url server's address, or None: https anywhere, http on 127.0.0.1 only, with a host, no user part and no
     fragment, at most 300 characters."""
@@ -1529,7 +1595,7 @@ def mcp_server(name, entry, new=False):
             if entry.get(field):        # an empty one is none, as team.json had it before 15 November 2026
                 raise ValueError(f"the MCP server {name}: {field} is for a program server; a url server takes only "
                                  f"a key")
-        return made
+        return mcp_written(name, made, new)
     if auth != "none":
         raise ValueError(f"the MCP server {name}: a program server has no auth; give its key in env")
     if "key" in entry:
@@ -1575,6 +1641,16 @@ def mcp_server(name, entry, new=False):
                          f"command server: give the server's npm or PyPI package, which Fleet installs itself")
     else:
         made["command"] = entry["command"]
+    return mcp_written(name, made, new)
+
+
+def mcp_written(name, made, new):
+    """A server's catalog entry, for a new write (mcp_server's `new`) only when a session would leave it out of its
+    MCP file for no reason of its own: ValueError (MCP_EXPANDS_SAYS, for the field) for one that it would expand. An
+    entry that a fleet already has is read as before, so that no team is refused; no session loads it (mcp_left_out)."""
+    field = mcp_expanded(made) if new else None
+    if field:
+        raise ValueError(f"the MCP server {name}: {MCP_EXPANDS_SAYS[field]}")
     return made
 
 

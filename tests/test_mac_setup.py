@@ -15,7 +15,7 @@ from test_servers import NEW, OWNER, FakeLife, Servers, ServerService, git
 
 
 def load_tests(loader, _tests, _pattern):
-    return unittest.TestSuite(cls(name) for cls in (MacSetup, MacService, Readings)
+    return unittest.TestSuite(cls(name) for cls in (MacSetup, MacService, Readings, ScreenSignIn)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -270,6 +270,10 @@ class MacSetup(Servers):
         heard = heard_of(chatgpt_app=True)  # the Mac says that it has the app: the sign-in alone, with no hands there
         self.assertIn("ChatGPT is signed out. Its tasks on its screen wait. A new sign-in of Codex for an agent of "
                       "that Mac puts this right, with no hands at that Mac", heard)
+        # F6, piece 1: the card of that sign-in is the hub's own, for the Mac's screen agent; the owner's four cards
+        # of 19 November 2026 in the manager's words named pages that the app does not have
+        self.assertTrue(heard.endswith(" " + hub.SIGN_IN_ASK.format(agent="juno")), heard)
+        self.assertNotIn("Raise it for the owner with raise_needs_you", heard)
         self.assertNotIn("needs the app first", heard)
         self.assertNotIn("installer", heard)
         # One reading with no app (the app replaces itself) is no news, also not as the first of two on a later day.
@@ -284,6 +288,7 @@ class MacSetup(Servers):
         self.assertIn("the ChatGPT app is not installed", heard)
         self.assertIn("Founderizer's installer at that Mac brings the app", heard)
         self.assertNotIn("sign-in of Codex", heard)
+        self.assertNotIn("with sign_in", heard)                 # the hub refuses that card: its page has no such row
         self.assertNotIn("Only hands at that Mac", heard)
         self.assertEqual(len(self.manager_heard()), 3)          # each of the three once
 
@@ -979,6 +984,27 @@ class Readings(unittest.TestCase):
         self.assertIsNone(self.probe("something else"))
         self.assertIsNone(self.probe('{"a": 1}'))
         self.assertIsNone(lifecycle.browser_connected("/no/such/runtime"))
+
+
+class ScreenSignIn(unittest.TestCase):
+    """The agent that a Mac's line of a signed-out ChatGPT names for the card of its Codex, with no hub."""
+
+    def test_the_line_names_a_screen_agent_whose_card_the_hub_takes(self):
+        """F6, piece 1 (its validation, round 2): need_sign_in refuses a card for an agent that the hub reads signed in
+        to Codex, or has no current reading of. The believable bug: the line names the Mac's first agent with the
+        screen, which reads signed in, while another one reads signed out, so the manager raises a card that the tool
+        refuses; or it names an agent with no reading before one that reads signed out."""
+        team = {"ada": {"can": ["shell"]}, "bo": {"can": ["screen"]}, "cy": {"can": ["shell", "screen"]},
+                "di": {"can": ["screen"]}}
+
+        def named(**said):
+            def reading(agent, runtime):
+                return said.get(agent) if runtime == hub.APP_SERVER_RUNTIME else True
+            with patch.object(hub, "agents", lambda: team), patch.object(hub, "signed_in_now", reading):
+                return hub.screen_sign_in_agent(list(team))
+        self.assertEqual(named(ada=False, bo=True, cy=None, di=False), "di")     # ada has no screen
+        self.assertEqual(named(bo=True, cy=None, di=True), "cy")
+        self.assertIsNone(named(ada=False, bo=True, cy=True, di=True))            # the line keeps its old ending
 
 
 if __name__ == "__main__":

@@ -2554,11 +2554,17 @@ class GitHub:
     def image_made(self, image):
         """True when a green run of the repository that built the image made its tag: the run of that tag's push, or
         one whose head commit is the tag. That repository is the one that the access file's `images` names for the
-        image, else the image's own <owner>/<name>, which GitHub reads in any case. A run it cannot read is no run."""
+        image, else, for an image of GitHub's registry (ghcr.io/<owner>/<name>), that <owner>/<name>, which GitHub
+        reads in any case. An image of another registry counts only through the access file: a run of a repository
+        made a tag there only where that registry's image is that repository's (before 23 November 2026 the door read
+        the last two parts of any name, so after a commit that set another registry, later tags there counted as
+        made). A run it cannot read is no run."""
         name, _, tag = image.rpartition(":")
         if not name or "/" in tag or "@" in name or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", tag):
             return False
-        repo = (self.access.get("images") or {}).get(name) or "/".join(name.split("/")[-2:])
+        parts = name.lower().split("/")         # a registry's host in any case is that host (the map's keys are lower)
+        repo = (self.access.get("images") or {}).get("/".join(parts)) or \
+            ("/".join(parts[1:]) if len(parts) == 3 and parts[0] == "ghcr.io" else "")
         if not door_targets.REPO.fullmatch(repo) or door_targets.vendor(repo):
             return False
         built = GitHub(self.door, self.access, repo)

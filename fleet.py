@@ -1655,6 +1655,12 @@ def integration_env(agent, conf, keys=None, place=None, closed=False, attempt=No
                                                                "this machine's Fleet does not have it yet") + ".")
             continue
         have = dict(keys or {}, **values)       # the variables that this session has: its API keys and these values
+        why = lifecycle.mcp_left_out(tool, conf.get("runtime"), have.get(tool.get("bearer")))
+        if why:         # a server of the fleet's, whose text a session would replace: the note names no value
+            notes.append(f"The tool {name} is not loaded: {why}. " + (
+                MCP_OWNER_CHANGES if lifecycle.mcp_expanded(tool, conf.get("runtime")) else
+                MCP_MAKER_CHANGES if tool.get("auth") == "oauth" else MCP_NEW_KEY))
+            continue
         need = tool_needs(tool)
         if conf.get("runtime") not in tool["runtimes"]:
             notes.append(f"The tool {name} does not run in {conf.get('runtime')}.")
@@ -2241,6 +2247,32 @@ def github_text(values, tools):
     return "\n\n" + text.strip() if text else ""
 
 
+# The owner's step for a server that a session leaves out (lifecycle.mcp_left_out), in an agent's start text: the Mac
+# app neither changes nor removes an MCP server, so the step is the owner MCP's tool. For a text of the server itself,
+# for the access token of an OAuth server, and for an API key's value.
+MCP_OWNER_CHANGES = "The owner changes or removes the server with the save_mcp_server tool of an AI session."
+MCP_MAKER_CHANGES = ("The server's maker must change its tokens; the owner can remove the server with the "
+                     "save_mcp_server tool of an AI session.")
+MCP_NEW_KEY = "The owner makes a new key at the service and saves it on the Secrets page."
+
+
+def loadable(tools, catalog, runtime, values=None):
+    """`tools` without each server that a session of this runtime must not load (lifecycle.mcp_left_out): its text, or
+    its access token or key in `values`, would be replaced with a variable of the session. integration_env leaves
+    such a server out with its reason in the start text; this is the last stop before each runtime's own form of a
+    server (claude_server, codex_server, acp_server), so one that got here reaches no session, and the session starts
+    with the others. The line names the server and no value."""
+    kept = []
+    for name in tools:
+        tool = catalog[name]
+        why = lifecycle.mcp_left_out(tool, runtime, (values or {}).get(tool.get("bearer")))
+        if why:
+            print(time.strftime("%H:%M:%S"), f"the MCP server {name} is left out of this session: {why}", flush=True)
+        else:
+            kept.append(name)
+    return kept
+
+
 def claude_server(name, catalog=None, values=None):
     """A catalog tool as a Claude Code MCP server: its variables come from the session's own (${NAME}), or, for a
     variable in values, the value itself, which then reaches the session's mode-600 MCP file only: a mint server's
@@ -2644,8 +2676,9 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     if runtime == "codex":
         values.update({catalog[t]["bearer"]: v for t, v in minted.items() if t in catalog})
     acp = runtime_fact(runtime, "driver") == "acp"      # its start writes an env file of its own (acp_command)
-    tools = [] if not runtime_fact(runtime, "mcp_servers") or app_server_task(conf, needs) else \
-        [t for t in values.get("FLEET_TOOLS", "").split() if t in catalog and (t in minted or not catalog[t].get("mint"))]
+    tools = [] if not runtime_fact(runtime, "mcp_servers") or app_server_task(conf, needs) else loadable(
+        [t for t in values.get("FLEET_TOOLS", "").split() if t in catalog and (t in minted or not catalog[t].get("mint"))],
+        catalog, runtime, values)
     # A Codex session's catalog servers are -c options, which grow with the owner's servers: a program server's
     # settings and arguments alone can be thousands of characters (lifecycle.MCP_SETTINGS_MOST). They come from its
     # env file, and the command gives them to Codex where it names ARGS (env_prefix). Its rules come from there too, as
@@ -2906,10 +2939,10 @@ def closed_task_command(agent, conf, prompt, task, needs, attempt, generation, s
     catalog = team_catalog()
     values.update({catalog[t]["bearer"]: v for t, v in minted.items() if t in catalog})
     servers = closed.get("servers")         # the duty's own: only those; without it, no server of a session's token
-    tools = [t for t in values.get("FLEET_TOOLS", "").split()
-             if t in catalog and conf.get("runtime") in catalog[t]["runtimes"] and
-             (t in servers if isinstance(servers, list) else not catalog[t].get("mint")) and
-             (t in minted or not catalog[t].get("mint"))]
+    tools = loadable([t for t in values.get("FLEET_TOOLS", "").split()
+                      if t in catalog and conf.get("runtime") in catalog[t]["runtimes"] and
+                      (t in servers if isinstance(servers, list) else not catalog[t].get("mint")) and
+                      (t in minted or not catalog[t].get("mint"))], catalog, conf.get("runtime"), values)
     servers = {t: claude_server(t, catalog, values) for t in tools}
     url = f"{HUB}/mcp/{agent}/{generation}/{task}/{attempt}"
     allow = ["mcp__fleet__*"] + [f"mcp__{t}__*" for t in tools] + \
@@ -3285,15 +3318,19 @@ def model_flags(conf):
 
 
 CHAT_SIGNAL = "New fleet messages. Call read_messages now."     # the helper's signal to an owner chat window
-# The Fleet tools that a Claude owner chat may call: hub.CHAT_TOOLS, a junction that test_direct_chat and
-# test_chat_agents pin on both sides. request_secret is allowed here one release before the hub offers it to a
+# The Fleet tools that a Claude owner chat may call (its allow list): what the hub serves to an owner chat
+# (hub.CHAT_TOOLS, hub.SHELL_OFF_CHAT, tools_for) is inside it (test_secret_requests), and test_direct_chat and
+# test_chat_agents pin it. request_secret is allowed here one release before the hub offers it to a
 # worker's chat (owner feature secret_requests), so that no machine that has not updated yet refuses it.
 # keep_instruction and end_standing came the same way (the design "An agent keeps its own rules", slice 4, release
 # one), and the hub offers them since release two: the owner's lasting wish in an agent's own chat stays there, with
-# the owner's message as its source (chat_instructions; test_secret_requests holds the two lists equal).
+# the owner's message as its source (chat_instructions; test_secret_requests holds the hub's list inside this one).
+# set_kpi and see_history come the same way (KPIs version 2, plan 4.4, release A): a lead's owner chat sets a KPI with
+# the owner's message as asked_by, and reads the KPIs of its team; the hub offers them in a later release, to a lead's
+# chat only. Until then the hub serves them to no chat, and an allowed name that no server lists does nothing.
 CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall",
               "start_task", "request_secret", "search_history", "read_history", "read_attachment",
-              "keep_instruction", "end_standing")
+              "keep_instruction", "end_standing", "set_kpi", "see_history")
 def chat_instructions(agent, conf):
     """The instructions of an owner chat, the head of its start text (chat_command, standing_text)."""
     prompt = (f'You are {agent}, speaking directly with the owner in this agent\'s chat. '

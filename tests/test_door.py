@@ -1827,6 +1827,129 @@ class Refusals(DoorCase):
         self.assertEqual(push(secret.replace("replicas: 2", "replicas: 3"), base=secret).why,
                          "charts/shop/templates/deployment.yaml holds a Secret object")
 
+    def test_a_tag_is_checked_with_the_image_that_its_own_mapping_names(self):
+        """Each changed line of an image, a tag, a newTag, a digest or a newName is checked by itself. A tag in Helm's
+        values (image: with its registry, repository and tag below it) or a newTag in Kustomize's images (each item's
+        name or newName) is one of the image that its own mapping names, which a green release run made; a newName is
+        another repository. Bug (since 2 November 2026): the rule read only the image lines, and in Helm's values it
+        took the line after image: as the image, so a tag that no run made passed as a checked change."""
+        made = {"image_made": lambda image: image in ("ghcr.io/one-org/web:2222222", "docker.io/one-org/web:2222222",
+                                                       "ghcr.io/one-org/api:4444444")}
+
+        def rule(old, new):
+            return door_targets.app_path_rule("apps/web/values.yaml", new.encode(),
+                                              dict(made, base_file=lambda p: old.encode()), "one-org/web")
+        helm = STACK_VALUES
+        registry = helm.replace("  repository: ghcr.io/one-org/web\n",
+                                "  registry: docker.io\n  repository: one-org/web\n")
+        kustomize = ("images:\n- name: ghcr.io/one-org/api\n  newTag: \"1111111\"\n- name: ghcr.io/one-org/web\n"
+                     "  newName: ghcr.io/one-org/web\n  newTag: \"1111111\"\n")
+        web_tag = 'web\n  newTag: "1111111"'
+        for old, new, said in (
+                (helm, helm.replace("1111111", "2222222"), True),
+                (helm, helm.replace("1111111", "3333333"), "no green release run made ghcr.io/one-org/web:3333333"),
+                (registry, registry.replace("1111111", "2222222"), True),
+                # a second document's keys are a mapping of their own
+                ('repository: ghcr.io/one-org/web\ntag: "1111111"\n---\nrepository: ghcr.io/one-org/api\n',
+                 'repository: ghcr.io/one-org/web\ntag: "2222222"\n---\nrepository: ghcr.io/one-org/api\n', True),
+                ("worker:\n  tag: \"1111111\"\n", "worker:\n  tag: \"2222222\"\n",
+                 "no image of its own mapping names the tag 2222222"),
+                (kustomize, kustomize.replace('"1111111"', '"4444444"', 1), True),
+                # the second item's newTag is one of its own image, not of the item before it
+                (kustomize, kustomize.replace(web_tag, web_tag.replace("1111111", "4444444")),
+                 "no green release run made ghcr.io/one-org/web:4444444"),
+                (kustomize, kustomize.replace("newName: ghcr.io/one-org/web", "newName: ghcr.io/other/web"),
+                 "the image changes its repository: ghcr.io/one-org/web to ghcr.io/other/web"),
+                (helm.replace('tag: "1111111"', "digest: sha256:aaaa"),
+                 helm.replace('tag: "1111111"', "digest: sha256:bbbb"),
+                 "no release run says that it made the digest sha256:bbbb"),
+                # a registry's port is part of the repository's name, and a line keeps its key
+                ("image: registry.example:5000/one-org/web:1111111\n",
+                 "image: registry.example:5000/other/web:2222222\n",
+                 "the image changes its repository: registry.example:5000/one-org/web to "
+                 "registry.example:5000/other/web"),
+                (helm, helm.replace('tag: "1111111"', 'newTag: "2222222"'), 'newTag: "2222222" is not a listed form'),
+                # an image line of the same repository is one that a green run made
+                ("image: ghcr.io/one-org/web:1111111\n", "image: ghcr.io/one-org/web:3333333\n",
+                 "no green release run made ghcr.io/one-org/web:3333333")):
+            with self.subTest(new=new):
+                self.assertEqual(rule(old, new), said)
+        # a mapping that YAML may read in another way than its lines say names no image (a tag, a merge key, a quoted
+        # key, a comment in the place of a value), nor one that names two images (the readers of 23 November 2026);
+        # an empty registry is none, a comment after a value is no part of it, and a block scalar's text holds no key
+        unsure = "no image of its own mapping names the tag 2222222"
+        for text, said in (
+                ('image:\n  repository: !!str ghcr.io/other/web\n  name: ghcr.io/one-org/web\n  tag: "1111111"\n',
+                 unsure),
+                ("base: &d\n  registry: evil.example\nimage:\n  <<: *d\n  repository: ghcr.io/one-org/web\n"
+                 '  tag: "1111111"\n', unsure),
+                ('image:\n  repository: ghcr.io/one-org/web\n  "repository": ghcr.io/other/web\n  tag: "1111111"\n',
+                 unsure),
+                ('image:\n  repository: #ghcr.io/one-org/web\n  tag: "1111111"\n', unsure),
+                ('sidecar:\n  image: ghcr.io/other/web\n  name: ghcr.io/one-org/web\n  tag: "1111111"\n', unsure),
+                ('image:\n  registry: ""\n  repository: ghcr.io/one-org/web\n  tag: "1111111"\n', True),
+                ('image:\n  repository: ghcr.io/one-org/web # the web app\n  tag: "1111111"\n', True),
+                ('image:\n  note: |\n    repository: ghcr.io/other/web\n  repository: ghcr.io/one-org/web\n'
+                 '  tag: "1111111"\n', True),
+                # a key that starts with --- is no document mark, and a quoted text that a line leaves open makes the
+                # rest of its document unsure; a closed flow list and a key with a / are read
+                ('repository: ghcr.io/other/web\n---x: 1\nname: ghcr.io/one-org/web\ntag: "1111111"\n', unsure),
+                ('image:\n  repository: ghcr.io/other/web\n  note: "open\nx:\n  name: ghcr.io/one-org/web\n'
+                 '  k: # "\n  tag: "1111111"\n', unsure),
+                ('image:\n  repository: ghcr.io/other/web\n  note: "open\nk: |\n  name: ghcr.io/one-org/web\n'
+                 '  x: # "\n  tag: "1111111"\n', unsure),
+                ("image:\n  repository: ghcr.io/other/web\n  note: [it's, 'y]\nx:\n  name: ghcr.io/one-org/web\n"
+                 "  k: # ']\n  tag: \"1111111\"\n", unsure),
+                ("image:\n  repository: ghcr.io/other/web\n  note: [a 's, 'y]\nx:\n  name: ghcr.io/one-org/web\n"
+                 "  k: # ']\n  tag: \"1111111\"\n", unsure),
+                ("image:\n  repository: ghcr.io/other/web\n  note: [a:'s, 'y]\nx:\n  name: ghcr.io/one-org/web\n"
+                 "  k: # ']\n  tag: \"1111111\"\n", unsure),
+                ('image:\n  repository: ghcr.io/one-org/web\n  pullSecrets: [regcred]\n  labels:\n'
+                 '    app.kubernetes.io/name: web\n  tag: "1111111"\n', True),
+                # a registry outside the tag's mapping comes first in a chart (Bitnami's global.imageRegistry)
+                ('global:\n  imageRegistry: evil.example\nimage:\n  registry: ghcr.io\n  repository: one-org/web\n'
+                 '  tag: "1111111"\n', "a registry outside the mapping of the tag 2222222 can move its image "
+                 "(global.imageRegistry)"),
+                ('global:\n  imageRegistry: !!str evil.example\nimage:\n  repository: ghcr.io/one-org/web\n'
+                 '  tag: "1111111"\n', "a registry outside the mapping of the tag 2222222 can move its image "
+                 "(global.imageRegistry)"),
+                ('global:\n  ? imageRegistry\n  : evil.example\nimage:\n  repository: ghcr.io/one-org/web\n'
+                 '  tag: "1111111"\n', "a registry outside the mapping of the tag 2222222 can move its image "
+                 "(global.imageRegistry)"),
+                ('global:\n  "image\\x52egistry": evil.example\nimage:\n  repository: ghcr.io/one-org/web\n'
+                 '  tag: "1111111"\n', "a registry outside the mapping of the tag 2222222 can move its image "
+                 "(global.imageRegistry)"),
+                # an Argo CD Application's Helm parameters set any value of the chart
+                ("spec:\n  source:\n    helm:\n      parameters:\n      - name: global.imageRegistry\n"
+                 "        value: evil.example\n      values: |\n        image:\n"
+                 '          repository: ghcr.io/one-org/web\n          tag: "1111111"\n',
+                 "a registry outside the mapping of the tag 2222222 can move its image (global.imageRegistry)"),
+                ("spec:\n  source:\n    helm:\n      fileParameters:\n      - name: image.repository\n"
+                 "        path: other.txt\n      values: |\n        image:\n"
+                 '          repository: ghcr.io/one-org/web\n          tag: "1111111"\n',
+                 "a registry outside the mapping of the tag 2222222 can move its image (global.imageRegistry)"),
+                ("spec:\n  source:\n    helm:\n      parameters: [{name: image.repository, value: ghcr.io/other/web}]\n"
+                 "      values: |\n        image:\n"
+                 '          repository: ghcr.io/one-org/web\n          tag: "1111111"\n',
+                 "a registry outside the mapping of the tag 2222222 can move its image (global.imageRegistry)"),
+                ('image:\n  imageRegistryOverride: evil.example\n  repository: ghcr.io/one-org/web\n  tag: "1111111"\n',
+                 unsure),
+                # a value that holds the word is no key of a registry
+                ('docs:\n  url: https://registry.example/help\nimage:\n  repository: ghcr.io/one-org/web\n'
+                 '  tag: "1111111"\n', True),
+                # an Argo CD Application's Helm values are a text of their own
+                ("spec:\n  source:\n    helm:\n      values: |\n        image:\n"
+                 '          repository: ghcr.io/one-org/web\n          tag: "1111111"\n  destination: {}\n', True)):
+            with self.subTest(text=text):
+                self.assertEqual(rule(text, text.replace("1111111", "2222222")), said)
+        # and so in a GitOps commit
+        for tag, kind in (("2222222", "rule"), ("3333333", "own")):
+            with self.subTest(tag=tag):
+                d = self.decide("gitops:one-org/cluster", "push",
+                                content=self.commit(("apps/web/values.yaml", helm.replace("1111111", tag))),
+                                lookups=dict(made, base_file=lambda p: helm.encode()))
+                self.assertEqual(d.kind, kind, d)
+
     def test_the_loose_reading_takes_a_time_that_grows_with_the_text_s_length(self):
         """One Python process serves every agent, so a pattern whose time grows with the square of a text's length
         stops the door for everybody (the reviews of da396d0fc: 32 s for 100 KB of -& in YAML_KEY's anchor, 2.3 s for
@@ -1842,7 +1965,8 @@ class Refusals(DoorCase):
                    lambda s: door_targets.loose_danger("", s), lambda s: door_targets.manifest_refusal("", s),
                    lambda s: door_targets.rbac_changed("rbac: {}\n" + s, s))
         lines = (door_targets.LISTED_LINE.fullmatch, door_targets.REPLICAS_LINE.fullmatch,
-                 door_targets.IMAGE_LINE.fullmatch, door_targets.IMAGE_REF.findall)
+                 door_targets.IMAGE_LINE.fullmatch, door_targets.key_line,
+                 lambda s: door_targets.line_maps(s.splitlines()))
         for size, most, marks in ((16000, 0.25, units), (200000, 1.0, ("-&", '":&', "?*", "secret", " ", "\\\n"))):
             slow = []
             for unit in marks:
@@ -3284,6 +3408,14 @@ class GitHubFacts(DoorCase):
         self.assertTrue(gitops.image_made("ghcr.io/one-org/web:3333333"))                  # the image's own name
         self.assertFalse(gitops.image_made("registry.example/one-org/shop-api:v9.9.9"))
         self.assertFalse(gitops.image_made("ghcr.io/founderizer/founderizer-apps:3333333"))      # a product repository
+        # the same name on another registry, which any run could push to, is no image of that repository's runs: it
+        # counts only through the access file (the door read the last two parts of any name)
+        for image in ("registry.other.example/one-org/web:3333333", "one-org/web:3333333"):
+            self.assertFalse(gitops.image_made(image), image)
+        # and the map's name in another case of its host is that name, not an image of GitHub's registry
+        self.assertTrue(gitops.image_made("REGISTRY.EXAMPLE/one-org/shop-api:v2.0.1"))
+        mapped = dict(ACCESS, images={"ghcr.io/one-org/web": "one-org/shop"})
+        self.assertFalse(door.GitHub(self.door, mapped, "one-org/cluster").image_made("GHCR.IO/one-org/web:3333333"))
         self.assertFalse([u for m, u, d in self.calls if "/repos/one-org/cluster/actions" in u])
         self.assertFalse([u for m, u, d in self.calls if "founderizer-apps" in u])
 
@@ -10108,8 +10240,13 @@ class LongLines(unittest.TestCase):
             "a rule call's changed line": lambda: t.app_path_rule(
                 "apps/web/values.yaml", (" " * 60000 + "x\n").encode(),
                 {"base_file": lambda p: b"replicas: 1\n"}, "one-org/cluster"),
-            "the images of a file of blank lines": lambda: t.image_rule(b"", b"\n" * 3000, {}),
+            "the tags of many changed lines in one mapping": lambda: t.image_rule(
+                b"image:\n  repository: r\n" + b"  tag: 1\n" * 30000, b"image:\n  repository: r\n" + b"  tag: 2\n" * 30000,
+                {"image_made": lambda image: True}),
             "a word of secret": lambda: t.names_secret("secret" * 6000),
+            "a word of serviceaccount": lambda: t.names_secret("serviceaccount" * 4000),
+            "a key and a run of blanks before two words": lambda: t.line_maps(["a:" + " " * 60000 + "x y"]),
+            "an open quoted text of escaped quotes": lambda: t.line_maps(['note: "' + '\\"' * 32000]),
             "a long word": lambda: t.names_secret("a" * 50000),
             "a word before secretKeyRef, secretRef or secretName": lambda: t.manifest_refusal("", "a" * 40000),
             "a flow list with a run of spaces": lambda: t.unread("k: [a" + " " * 50000 + ",\n"),

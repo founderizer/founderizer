@@ -117,7 +117,13 @@ WORDS = {
     "mcp_registry_no_list": "the MCP Registry gave no list of servers",
     # an MCP server's Connect (POST /ui/mcp/connect)
     "mcp_no_endpoints": "the MCP server {server} gave no OAuth endpoints: {reason}",
-    # a server whose name in Tailscale is the door's name in the central vault (UI-API.md 1.188)
+    # a server whose url a session would replace (lifecycle.MCP_EXPANDS), and a token of such a text (mcp._tokens)
+    "mcp_url_replaced": "the MCP server {server} has text in its url that a session would replace with one of its own "
+                        "values, so no session loads it and it takes no sign-in. Change or remove the server with the "
+                        "save_mcp_server tool of an AI session that has the Founderizer tools",
+    "mcp_token_refused": "Fleet did not keep the sign-in of the MCP server {server}: the server gave an access token "
+                         "that a session could fill with one of its own values, or that no header takes. A new sign-in "
+                         "gets the same kind of token, so the server's maker must change it",
     "server_name_kept": "This server is called {name} in Tailscale, and Fleet keeps that name for itself. Rename this "
                         "server in Tailscale, then run the line again.",
     # an agent's browser on a Linux server (build plan 04, S3; UI-API.md 1.218): its Shell box (D2), a server that runs

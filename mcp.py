@@ -230,6 +230,17 @@ def consent_url(endpoint, client_id, redirect_uri, state, challenge, scopes=(), 
     return endpoint + glue + urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
 
 
+# The text that a session's MCP file would replace (lifecycle.MCP_EXPANDS, which this file does not import), and each
+# $, which Grok and OpenCode may take for a variable (lifecycle.MCP_LOOSE_RUNTIMES). Not RFC 6750's form alone: a
+# token of a known service holds "!" (Salesforce's).
+REPLACED = ("$", "{env:", "{file:")
+# The words of such a token, and of one with a character that no header takes: the hub refused it, and a new sign-in
+# gets the same kind of token
+TOKEN_FORM_SAYS = ("the server gave an access token that holds $, {env: or {file:, or a character that no header "
+                   "takes, so Fleet sends it to no session. A new sign-in gets the same kind of token: the server's "
+                   "maker must change it")
+
+
 def _tokens(answer, had=None):
     """The token fields of one OAuth answer. A server that gives no new refresh token keeps the one that it had; a
     server that gives none at all (an authorization_code server) gives its access token a long life instead, and the
@@ -237,6 +248,10 @@ def _tokens(answer, had=None):
     access = answer.get("access_token")
     if not isinstance(access, str) or not access:
         raise McpError("this MCP server gave no access token")
+    # A token is sent in a header: one that a session's file would replace would send a variable of the session with it
+    # (the T6 of the F6 validation), and a character that no header takes makes the request fail
+    if any(text in access for text in REPLACED) or any(c < " " or c > "~" for c in access):
+        raise McpError(TOKEN_FORM_SAYS, why="token_form")
     seconds = answer.get("expires_in")
     seconds = seconds if isinstance(seconds, int) and not isinstance(seconds, bool) and 0 < seconds <= LIFE else 3600
     token = answer.get("refresh_token")

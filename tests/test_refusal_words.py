@@ -98,6 +98,12 @@ OLD = {
     "mcp_registry_away": "the MCP Registry cannot be reached now",
     "mcp_registry_no_list": "the MCP Registry gave no list of servers",
     "mcp_no_endpoints": "the MCP server {server} gave no OAuth endpoints: {reason}",
+    "mcp_url_replaced": "the MCP server {server} has text in its url that a session would replace with one of its own "
+                        "values, so no session loads it and it takes no sign-in. Change or remove the server with the "
+                        "save_mcp_server tool of an AI session that has the Founderizer tools",
+    "mcp_token_refused": "Fleet did not keep the sign-in of the MCP server {server}: the server gave an access token "
+                         "that a session could fill with one of its own values, or that no header takes. A new sign-in "
+                         "gets the same kind of token, so the server's maker must change it",
     "server_name_kept": "This server is called {name} in Tailscale, and Fleet keeps that name for itself. Rename this "
                         "server in Tailscale, then run the line again.",
     # an agent's browser on a Linux server (build plan 04, S3; UI-API.md 1.218): its Shell box (D2), a server that runs
@@ -177,6 +183,7 @@ SITES = {
     'knowledge_delete': {'profile_unread': 1, 'revision_unreadable': 1},
     'knowledge_replace': {'revision_unreadable': 1},
     'known_login': {'profile_unread': 1, 'revision_unreadable': 1},  # the made login's report
+    'mcp_name_field': {'mcp_url_replaced': 1},
     'mcp_package_lookup': {'package_no_record': 1, 'package_no_version': 1, 'package_none_old': 1,
                            'package_record_large': 1, 'package_registry_away': 1, 'package_too_new': 1,
                            'package_too_new_older': 1, 'package_unknown': 1, 'package_unread': 1},
@@ -265,7 +272,7 @@ SITES = {
     'ui_machines': {'hub_changed': 1},
     'ui_mcp_check': {'login_as_text': 1},
     'ui_mcp_connect': {'mcp_no_endpoints': 1},
-    'ui_mcp_finish': {'connect_stale': 1},
+    'ui_mcp_finish': {'connect_stale': 1, 'mcp_token_refused': 1},
     'ui_memory': {'hub_changed': 1, 'no_such_agent': 1},
     'ui_notes': {'hub_changed': 1, 'no_such_agent': 1},
     'ui_owner_device_recovery_read': {'hub_changed': 1},
@@ -538,7 +545,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 218)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 220)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

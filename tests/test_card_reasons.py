@@ -129,9 +129,12 @@ class Reasons(OwnerAPI):
                             what_to_do="Press the power button of studio-1, then log in to it at its keyboard.",
                             options=["Done: I restarted it", "Not now"]),
                        dict(person, title="Approve the agent's sign-in", what_to_do="Approve it on your phone."),
-                       # the hub's own notice of a signed-out agent asks for this one
-                       dict(person, title="Sign Customer Support in again", why="Its Claude session was signed out.",
-                            what_to_do="Open Customer Support in Founderizer on your Mac and sign it in to Claude "
+                       # a runtime's account in a Chrome extension, which is no agent's sign-in to its runtime
+                       dict(person, title="Link Claude's extension on studio-1",
+                            what_to_do="In Chrome on studio-1, open Claude's extension and log in to Claude Code's "
+                                       "account."),
+                       dict(person, title="Vincula la extensión de Claude en studio-1",       # the same, in Spanish
+                            what_to_do="En Chrome, abre la extensión de Claude e inicia sesión en la cuenta de Claude "
                                        "Code."),
                        # a word or a code that a page or a prompt asks for is no command
                        dict(person, title="Confirm the cancellation",
@@ -530,6 +533,39 @@ class Reasons(OwnerAPI):
                             details="Customer Support could not update the value in the vault.")):
             with self.subTest(fields=fields):
                 self.assertIsInstance(self.card(**{**person, "title": "The shop's key", **fields}), int)
+
+    def test_an_agents_sign_in_to_its_runtime_is_the_hubs_card(self):
+        """The owner, 19 November 2026, of four cards whose steps the manager wrote for one agent's sign-in to Codex:
+        "There is no machines page, do you mean Servers?". Such a card is an item with sign_in now, whose title and
+        step are the hub's (test_signed_out). The believable bug: a card in the manager's own words for that sign-in
+        still reaches the owner, with a page or a button that the app does not have. The owner's own sign-ins (an AI
+        provider's account, an MCP server, a Chrome extension) stay theirs, as
+        test_what_only_the_owner_can_do_reaches_them checks."""
+        hub.TEAM["agents"]["ivy"]["title"] = "Customer Support"
+        for fields in (dict(title="Sign Customer Support in", what_to_do="Press Sign in on its row."),
+                       # the title of the owner's item 187 of 19 November 2026
+                       dict(title="Sign Codex in again on the Mac Studio",
+                            why="ChatGPT is signed out on studio-1, so the screen tasks of its agents wait."),
+                       # the hub's own notice of a signed-out agent asked for this one until F6, piece 1
+                       dict(title="Sign Customer Support in again", why="Its Claude session was signed out.",
+                            what_to_do="Open Customer Support in Founderizer on your Mac and sign it in to Claude "
+                                       "Code."),
+                       dict(title="Codex is signed out on studio-1",
+                            what_to_do="Log into Codex on the Machines page."),
+                       # in Spanish, which the manager writes to an owner whose apps are in Spanish (the area's reader
+                       # of piece 1, finding 1)
+                       dict(title="Inicia la sesión de Customer Support en Claude Code",
+                            what_to_do="Abre Ajustes y pulsa Iniciar sesión."),
+                       dict(title="Codex no tiene sesión en studio-1", what_to_do="Inicia sesión en Codex en su página."),
+                       dict(title="Vuelve a iniciar la sesión del agente", why="Sus tareas esperan.")):
+            with self.subTest(fields=fields):
+                self.assertIn("an item with sign_in", self.refused("an agent's sign-in to its runtime", reason="person",
+                                                                   options=["Done", "Not now"], **fields))
+        # the role is read as data: the label that the owner reads is the agent's name since F16 (shown_role)
+        with patch.object(hub, "shown_role", hub.shown_name):
+            self.assertIn("an item with sign_in", self.refused(
+                "an agent's sign-in to its runtime", reason="person", options=["Done", "Not now"],
+                title="Sign Customer Support in", what_to_do="Press Sign in on its row."))
 
     def test_access_that_an_agent_holds_or_the_manager_can_grant_never_reaches_the_owner(self):
         # the fleet's GitHub App reaches acme's repositories, so dev can use acme/web: with no App, a repository's

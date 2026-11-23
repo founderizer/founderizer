@@ -150,6 +150,23 @@ class McpApiTest(unittest.TestCase):
         self.assertIn("gave no access token", str(self.refused(
             mcp.exchange, self.s.url + "/oauth/token", CLIENT, None, CODE, "v", "http://127.0.0.1:1/")))
 
+    def test_a_token_that_no_session_can_use_is_refused(self):
+        """T6 of the F6 validation (23 November 2026): Claude Code replaces ${NAME} in a header, and a second time when
+        it connects, so an access token of the text x${SHOP_KEY} sent the agent's SHOP_KEY to the server that gave it.
+        Such a token, one with a $ that Grok or OpenCode may replace (t$SHOP_KEY), and one with a character that no
+        header takes, is refused at the Connect and at each renewal, with Fleet's own words and code; the words hold no
+        part of it. A token of a form beyond RFC 6750's that a known service gives (Salesforce's "!") is taken."""
+        for access in ("x${SHOP_KEY}", "x${1}", "{env:SHOP_KEY}", "{file:/srv/key}", "t$SHOP_KEY", "a\nb", "a\u00e9b"):
+            self.s.on("POST", "/oauth/token", {"access_token": access, "expires_in": 3600})
+            for call in (lambda: mcp.exchange(self.s.url + "/oauth/token", CLIENT, None, CODE, "v", "http://127.0.0.1:1/"),
+                         lambda: mcp.refresh(self.s.url + "/oauth/token", CLIENT, None, REFRESH)):
+                with self.subTest(access=access), self.assertRaises(mcp.McpError) as refused:
+                    call()
+                self.assertEqual((str(refused.exception), refused.exception.why), (mcp.TOKEN_FORM_SAYS, "token_form"))
+        self.s.on("POST", "/oauth/token", {"access_token": "00Dx0!AQ4AQ.k-_~+/=", "expires_in": 3600})
+        self.assertEqual(mcp.refresh(self.s.url + "/oauth/token", CLIENT, None, REFRESH)["access_token"],
+                         "00Dx0!AQ4AQ.k-_~+/=")
+
     def test_a_refresh_keeps_the_saved_token_until_the_server_rotates_it(self):
         self.s.on("POST", "/oauth/token", {"access_token": ACCESS, "expires_in": 3600})
         got = mcp.refresh(self.s.url + "/oauth/token", CLIENT, None, REFRESH, resource=self.s.url, scopes=["crm"])
