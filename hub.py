@@ -2141,10 +2141,14 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "agent_tags",        # the owner, 20 November 2026 ("Name a helper", "Yes, as drawn", "Build tags
                                     # now"): POST /ui/messages takes `mentions`, the @ tags of a message, and
                                     # messages[].mentions of GET /ui/state gives them (UI-API.md 1.288)
-               "chat_stop"]         # the owner, 21 November 2026 ("Yes, add Stop (Recommended)": "While the agent
+               "chat_stop",         # the owner, 21 November 2026 ("Yes, add Stop (Recommended)": "While the agent
                                     # works on your message or your answer, Stop stands where Send stands. A press
                                     # interrupts that turn, as Pause does for a task."): agents[].chat_stop of GET
                                     # /ui/state and GET /ui/mobile, and POST /ui/chats/<agent>/stop (UI-API.md 1.301)
+               "message_skills"]    # the owner, 21 November 2026 ("Yes, as drawn" to the / list) and 22 November 2026
+                                    # ("Yes, as drawn" to the given skill): POST /ui/messages takes `skills`, a skill to
+                                    # use and the ZIP of a skill that the owner gives, and messages[].skills of GET
+                                    # /ui/state gives them (UI-API.md 1.304)
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -5387,8 +5391,11 @@ def message_views(rows, attached, conf, named=None):
             m["about"] = about
         # owner feature agent_tags: the tags as a list ([] for none), each entry as stored, also when its agent left
         m["mentions"] = mentions_read(m.get("mentions"))
-    for m in views:                         # owner feature attachments: the files of each message
-        m["attachments"] = attached.get(m["request_id"], [])
+        # owner feature message_skills: the skill to use and the skills given, as a list ([] for none), as stored
+        m["skills"] = message_skills_read(m.get("skills"))
+    for m in views:                         # owner feature attachments: the files of each message, a gift's ZIP not
+        gifts = skill_gives(m["skills"])    # among them: the apps draw a gift as its badge (`skills`)
+        m["attachments"] = [f for f in attached.get(m["request_id"], []) if f["id"] not in gifts]
     return views
 
 
@@ -5513,10 +5520,14 @@ def mobile_chat(agent, since):
         for f in q(f"SELECT * FROM attachments WHERE message IN ({marks}) ORDER BY id", [r["request_id"] for r in said]):
             files.setdefault(f["message"], []).append(attachment_view(f))
     # answer_to: the Needs-you item that a message answers, as the Mac's chat links it (its kind and need_id)
+    # skills: the skill to use and the skills given (owner feature message_skills), as GET /ui/state gives them, and
+    # a gift's ZIP is no file of the message there either
     items = [{"kind": "message", "ts": r["created"], "id": r["request_id"], "text": r["text"], "client": r["client"],
               "read_at": r["read_at"], "replaces": r["replaces_request_id"], "edited": message_edited(r),
-              "attachments": files.get(r["request_id"], []),
-              "answer_to": r["need_id"] if r["kind"] == "answer" else None}
+              "attachments": [f for f in files.get(r["request_id"], [])
+                              if f["id"] not in skill_gives(message_skills_read(r["skills"]))],
+              "answer_to": r["need_id"] if r["kind"] == "answer" else None,
+              "skills": message_skills_read(r["skills"])}
              for r in said]
     reports = q("SELECT * FROM owner_reports WHERE agent=? AND created>? ORDER BY id", (agent, since))
     carried = carried_files("report", [r["id"] for r in reports])      # CHAT-APPS.md 20: an agent's files
@@ -8802,6 +8813,9 @@ def migrate():
                         # owner feature agent_tags: the tags of a message, as JSON ([{agent, start, length}]); NULL
                         # for none
                         "mentions": "TEXT",
+                        # owner feature message_skills: the skill to use and the skills given of a message, as JSON
+                        # ([{use} or {give, name, commit, beside}]); NULL for none
+                        "skills": "TEXT",
                         # the review of 20 November 2026, issue 4: the hand that sent it (request_hand) and the AI
                         # session that it names (X-Fleet-Session); null for a row of before
                         "hand": "TEXT", "session": "TEXT"},
@@ -10394,12 +10408,15 @@ def task_itself(task_id, closed=False):
     about = message_about_of_task(t) if t["owner"] in agents() else None
     page = message_about_words(t["owner"], about, task=True, closed=closed) if about else ""
     tags = tag_words(t["owner"], task_mentions(t)) if t["owner"] in agents() else ""    # owner feature agent_tags
+    # owner feature message_skills: a skill to use is work for the task that the chat opens, and a gift says the same
+    used = skill_lines(t["owner"], task_skills(t), task=True) if t["owner"] in agents() else ""
     return (f'Your task is {tref(task_id)}, from {t["requester"]}: "{mask_secrets(str(t["title"]))}". Done when: '
             f'{mask_secrets(str(t["done_when"]))}'
             + (f"\nDetails: {shown}" + (" ... (list_my_tasks gives the rest)" if more else "")
                if line else "")
             + (f"\n{page}" if page else "")
             + (f"\n{tags}" if tags else "")
+            + (f"\n{used}" if used else "")
             + attachment_words(files)
             + (f"\n{summary}" if summary else "")       # a report's task: its reporter's summary, as data
             + ((f'\nIt belongs to {gref(goal["id"])} "{aim}".' if closed else
@@ -22996,6 +23013,27 @@ def message_about_task(about):
     return next(iter(about.values()))
 
 
+def message_about_held(about, recipient):
+    """(about, None) for a chat message about this task or job, with about None when the hub has the task no more;
+    (None, the 409) when the recipient's chat cannot read it. phone_submit asks it under LOCK, and before a gift too
+    (message_gifts), so that no gift commits for a message that is then refused. read_row only.
+
+    A task that the hub has no more is left out, and the message goes. A task that the recipient's chat cannot read
+    refuses the whole message, and nothing is written: the reader's line would name work that its chat cannot read, so
+    the message would reach an agent that cannot know what it is about. What read_history gives that chat
+    (history_records with an owner chat's scope: no contact drives it, and no person's list narrows it) is the task's
+    agent and its requester, of a task of no narrowed pair (history_task, history_result, history_check;
+    history_scope_sql leaves out each task with scope_person). The check reads that from the task's own row, and not
+    from the history's index, which takes a new task in later: work that the agent did a minute ago would read as work
+    of another."""
+    named = read_row("SELECT owner, requester, scope_person FROM tasks WHERE id=?", (message_about_task(about),))
+    if not named:
+        return None, None
+    if recipient not in (named["owner"], named["requester"]) or named["scope_person"] is not None:
+        return None, (409, refusal_words.answer("about_unreadable", agent=shown_role(recipient)))
+    return about, None
+
+
 def message_about_names(ids):
     """{task id: {"title", "state", "owner", "job", "hidden"}} for each of these tasks that the hub has: its title, its
     state and its agent, and the name of its job as the owner's Tasks board gives it (HubState.jobs of the apps). For a
@@ -23110,7 +23148,7 @@ def message_about_reads(rows):
 
 
 def owner_message_text(request_id, value, recipient, origin, replaces, files, device=False, connection=None,
-                       about=None, mentions=(), unsure=(), hand=None):
+                       about=None, mentions=(), unsure=(), hand=None, skills=()):
     """The words of one owner chat message, as its reader gets them: the owner's text under the header that says who
     wrote it, and for a worker or a lead the request id that its reply names. A correction says what it corrects; a
     message that the owner edited before anything read it says nothing, because it is the same message with other
@@ -23123,9 +23161,12 @@ def owner_message_text(request_id, value, recipient, origin, replaces, files, de
     so that no app's name reads as a chat app or a device. about: the task or the job that the message is about (owner
     feature message_about), whose reader's line comes after the owner's words and before the correction line and the
     files, built at this moment (message_about_words). mentions, unsure: the tags of the message and the words that fit
-    two agents (owner feature agent_tags), whose line comes after that one, built at this moment (tag_words). hand: request_hand of the request; a "tool" (an AI
-    session on the owner's Mac, through the owner tools) is marked via=ai-session, [owner via ai-session], so that its
-    reader knows that a session wrote these words for the owner, and the owner did not type them."""
+    two agents (owner feature agent_tags), whose line comes after that one, built at this moment (tag_words). skills:
+    the skill to use and the skills given (owner feature message_skills, as stored), whose lines come after the tags'
+    line, built at this moment (skill_lines); files never name a gift's ZIP. hand: request_hand of the request; a
+    "tool" (an AI session on the owner's Mac, through the owner tools) is marked via=ai-session, [owner via
+    ai-session], so that its reader knows that a session wrote these words for the owner, and the owner did not type
+    them."""
     via = CHAT_APP_NAMES[origin["app"]] if origin else capp_via(connection) if connection else \
         request_via(hand) if request_via(hand) else \
         (device if isinstance(device, str) else OWNER_DEVICE_VIA) if device else None
@@ -23139,6 +23180,9 @@ def owner_message_text(request_id, value, recipient, origin, replaces, files, de
     tags = tag_words(recipient, mentions, unsure) if mentions or unsure else ""
     if tags:
         text += "\n" + tags
+    used = skill_lines(recipient, skills) if skills else ""
+    if used:
+        text += "\n" + used
     if replaces:
         text += f"\n[Correction to request {replaces}. This is a new message, not cancellation or replay of earlier work.]"
     return text.rstrip() + attachment_words(files)
@@ -23161,7 +23205,7 @@ def message_unread(previous):
 
 
 def owner_message_replace(previous, value, request_id, t0, device=False, mentions=(), unsure=(), hand=None,
-                          session=None):
+                          session=None, use=None):
     """Inside a transaction: the owner edited a message that nothing had read, so the message itself changes. Its
     ui_requests row and its event keep their id and their time, which is why the bubble changes where it stands;
     their text becomes the new words with nothing appended, and the words they replace go into the log, so the
@@ -23173,11 +23217,15 @@ def owner_message_replace(previous, value, request_id, t0, device=False, mention
     tags of the new words are the message's tags now (owner feature agent_tags): the row takes them, and their line is
     built again; the edits log keeps the words alone. hand, session:
     request_hand of the edit and its X-Fleet-Session, which the row takes with the new words (an AI session's edit of
-    a row of before the hand was kept is the session's words, not the owner's); None keeps the row's."""
+    a row of before the hand was kept is the session's words, not the owner's); None keeps the row's. use: the skill
+    to use of the new words (owner feature message_skills, skill_use_kept), which takes the place of the row's; the
+    row's gifts stay, because their commits are done, and their lines are built again. Returns the row's skills now."""
     in_transaction("owner_message_replace")
     hand = hand or previous["hand"]
     session = session if hand != previous["hand"] or session else previous["session"]
-    files = DB.execute("SELECT * FROM attachments WHERE message=? ORDER BY id", (previous["request_id"],)).fetchall()
+    skills = ([use] if use else []) + [e for e in message_skills_read(previous["skills"]) if "give" in e]
+    files = [f for f in DB.execute("SELECT * FROM attachments WHERE message=? ORDER BY id",
+                                   (previous["request_id"],)).fetchall() if f["id"] not in skill_gives(skills)]
     origin = json.loads(previous["origin"]) if previous["origin"] else None
     via = None
     if previous["connection"] is not None:
@@ -23185,21 +23233,22 @@ def owner_message_replace(previous, value, request_id, t0, device=False, mention
         via = app["name"] if app else "App"     # a connection's row stays as the record; "App" as shown_name's last name
     text = owner_message_text(previous["request_id"], value, previous["recipient"], origin, None, files, device, via,
                               about=message_about_read(previous["about"]), mentions=mentions, unsure=unsure,
-                              hand=hand)
+                              hand=hand, skills=skills)
     edits = json.loads(previous["edits"] or "[]") + [{"request_id": request_id, "text": value, "at": t0}]
     DB.execute("UPDATE events SET text=? WHERE id=?", (text, previous["event_id"]))
-    DB.execute("UPDATE ui_requests SET text=?,edits=?,mentions=?,hand=?,session=? WHERE request_id=?",
+    DB.execute("UPDATE ui_requests SET text=?,edits=?,mentions=?,hand=?,session=?,skills=? WHERE request_id=?",
                (value, json.dumps(edits), json.dumps(list(mentions)) if mentions else None, hand, session,
-                previous["request_id"]))
+                json.dumps(skills) if skills else None, previous["request_id"]))
     history_rewrite_message(previous["request_id"])     # AUTONOMY.md P6: the history reads it as it stands now
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI message {request_id} replaced the "
                f"words of {previous['request_id']} (M-{previous['event_id']} for {previous['recipient']}), which "
                f"nothing had read. It said: {previous['text']}"))
+    return skills
 
 
 def owner_message_rows(request_id, kind, need, value, client, recipient, replaces, t0, origin=None, files=(),
                        chosen=None, task=None, quiet=False, note="", device=False, connection=None, about=None,
-                       pictured="", mentions=(), unsure=(), session=None):
+                       pictured="", mentions=(), unsure=(), session=None, skills=()):
     """Inside a transaction: one owner message or answer, from the app (POST /ui/messages, /ui/needs/<id>) or from a
     chat app (origin): the answer of the need, one event and one ui_requests row. The caller checked everything.
     Returns the event ID. task: the task whose session the answer of a secret request goes to (answer_secret), and
@@ -23215,7 +23264,9 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     the item and for the asker of its question, and never in the stored answer. mentions: the tags of a message (owner
     feature agent_tags), which go into ui_requests.mentions, with unsure their reader's line (tag_words). session: the
     X-Fleet-Session of the request; the row keeps it with the hand that sent it (request_hand), and a tool's message and
-    answer say via ai-session in their header."""
+    answer say via ai-session in their header. skills: the skill to use and the gifts of a message (owner feature
+    message_skills, as stored), which go into ui_requests.skills, with their lines (skill_lines); each gift's file is
+    bound to the message as its other files are, and only the gift's line names it."""
     in_transaction("owner_message_rows")
     hand = request_hand(client, device, connection, origin, session)
     if need is not None and need["kind"] == JOIN_KIND:     # Teams design 4, S9 (C26): before any word goes to an agent
@@ -23232,7 +23283,8 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     via = connection["name"] if connection else None
     if need is None:
         text = owner_message_text(request_id, value, recipient, origin, replaces, files, device, via,
-                                  about=about, mentions=mentions, unsure=unsure, hand=hand) + (note or "")
+                                  about=about, mentions=mentions, unsure=unsure, hand=hand,
+                                  skills=skills) + (note or "")
     else:
         mark = f" via {capp_via(via)}" if via else f" via {request_via(hand)}" if request_via(hand) else ""
         text = f"[owner{mark}] Answer to Needs-you N-{need['id']} ({need['title']}): {value}"
@@ -23280,14 +23332,15 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     if takeover:        # its next owner wait holds the task, else it works again
         secret_wait_moved(task)
     DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,"
-               "replaces_request_id,origin,connection,about,mentions,hand,session) "
-               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               "replaces_request_id,origin,connection,about,mentions,hand,session,skills) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (request_id, kind, need["id"] if need is not None else None, value, event_id, t0, client, recipient,
                 replaces, json.dumps(origin) if origin else None, connection["id"] if connection else None,
                 json.dumps(about) if about and need is None else None,
-                json.dumps(list(mentions)) if mentions and need is None else None, hand, session))
-    for f in files:
-        DB.execute("UPDATE attachments SET message=? WHERE id=?", (request_id, f["id"]))
+                json.dumps(list(mentions)) if mentions and need is None else None, hand, session,
+                json.dumps(list(skills)) if skills and need is None else None))
+    for f in [f["id"] for f in files] + (skill_gives(skills) if need is None else []):
+        DB.execute("UPDATE attachments SET message=? WHERE id=?", (request_id, f))
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} accepted as "
                f"M-{event_id} for {recipient}" + (f" from {origin['account']}" if origin else "") +
                request_hand_words(hand, session)))
@@ -23660,6 +23713,259 @@ def tags_check(task_id):
                                    f'got no task and no message in that work. Tell the owner why, or give '
                                    f'{said if len(names) == 1 else "each of them"} its task now.', extra=QUIET_SAY)
     kv_set(TAGS_TOLD + head["request_id"], now())
+
+
+# ---------------------------------------------------------------- owner feature message_skills: a skill in a message
+#
+# The owner, 21 November 2026 ("Yes, as drawn" to the / list: "You pick one and write your words after it. In your
+# message it shows as a badge with a bolt."), and 22 November 2026 ("Yes, as drawn" to the given skill: the Mac's box
+# takes the folder of a skill, and its ZIP with the plus) (~/dev/founderizer-plans/slash-list-and-skills-build-design-
+# 2026-11-22.md, piece A). `skills` of POST /ui/messages is one family of two entries: {"use": <name>}, a skill of the
+# recipient that the owner picked for this message, and {"give": <attachment id>}, the ZIP of a skill that the owner
+# gives it (skill_give). A use never stops a message: one that does not hold is left out, as a tag. A gift that does
+# not hold refuses the message, with the gift's own words: the owner asked for a commit, and a message that went
+# without it would tell him that it went. The agent reads one line of the hub's for each (skill_use_words,
+# skill_gift_line), never the skill's own text. The hub reads a use in the words itself (skill_use_found) for a chat
+# app and for each caller that sends no `skills`.
+MESSAGE_SKILLS_SHAPE = "skills is a list of at most 4 {use} or {give}, for a chat message"     # 4: ATTACH_PER_MESSAGE
+# words that are, or will be, the commands of a chat (CHAT-APPS.md 15.6, the design's pieces C and D): never a skill
+SKILL_COMMAND_WORDS = ("stop", "new", "status", "usage", "skills", "help", "whoami", "start")
+SKILL_USE_AT = re.compile(rf"/({SKILL_NAME})(?=\s|\Z)")    # "/" and a skill's name at the start of the words
+SKILL_GIFT_CLIENT = "founderizer-swift/"    # the Mac app's label (OWNER_APP_LABELS holds the PC app's label too)
+SKILL_GIFT_HAND = "A skill is given from the Founderizer app on the Mac."
+SKILL_GIFT_ZIP = "A skill is given as the ZIP of its folder."
+SKILL_GIFT_TWICE = "This message gives the skill {name} twice. Keep one."
+SKILL_NAMES = {}            # {(hub checkout, revision, agent): the names of its skills} (skill_names)
+
+
+def message_skills_given(value):
+    """The `skills` of POST /ui/messages as the hub takes them, or None for a wrong shape (MESSAGE_SKILLS_SHAPE): a list
+    of at most ATTACH_PER_MESSAGE objects, each with exactly one key, `use` (a string) or `give` (a whole number above
+    0; a bool is none), with at most one use and no gift twice. The use comes first, then the gifts in their order.
+    The caller checks the rest: no gift on a correction, and no gift that is also a file of `attachments`."""
+    if not isinstance(value, list) or len(value) > ATTACH_PER_MESSAGE:
+        return None
+    uses, gives = [], []
+    for entry in value:
+        if not isinstance(entry, dict) or len(entry) != 1:
+            return None
+        (key, item), = entry.items()
+        if key == "use" and isinstance(item, str):
+            uses.append({"use": item})
+        elif key == "give" and isinstance(item, int) and not isinstance(item, bool) and item > 0:
+            gives.append({"give": item})
+        else:
+            return None
+    if len(uses) > 1 or len({g["give"] for g in gives}) != len(gives):
+        return None
+    return uses + gives
+
+
+def message_skills_read(stored):
+    """The skills that a ui_requests row keeps (ui_requests.skills, JSON), as a list: [] for NULL and for a value that
+    is no such list."""
+    try:
+        said = json.loads(stored) if stored else []
+    except ValueError:
+        return []
+    if not isinstance(said, list):
+        return []
+    return [e for e in said if isinstance(e, dict) and (isinstance(e.get("use"), str) or isinstance(e.get("give"), int))]
+
+
+def skill_gives(skills):
+    """The attachment ids of the gifts among these entries (message_skills_given, or as stored), in their order."""
+    return [e["give"] for e in skills if isinstance(e.get("give"), int) and not isinstance(e["give"], bool)]
+
+
+def skill_names(agent):
+    """The names of the skills of `agent` that a use can name, at the hub checkout's revision: the skills that its
+    start lists (lifecycle.skill_rows), and none for an agent whose Shell box is off, which reads no file
+    (skills_start_text). Kept for that revision, as skills_listed: only a commit changes them, and a commit reads the
+    revision again (commit_kit_file). Reads git only, once for each revision, so chat_route may call it inside its
+    transaction."""
+    if shell_off(agent):
+        return frozenset()
+    rev = kit_revision()
+    if not rev:
+        return frozenset()
+    key = (kit_dir(), rev, agent)
+    names = SKILL_NAMES.get(key)        # one read: another reader's clear can come between a test of the key and it
+    if names is None:
+        if len(SKILL_NAMES) > 256:
+            SKILL_NAMES.clear()
+        names = SKILL_NAMES[key] = frozenset(r["name"] for r in skill_rows(kit_dir(), agent))
+    return names
+
+
+def skill_use_found(value, recipient):
+    """The use of a skill that the words of a message hold, {"use": <name>}, or None: the words start with "/" and the
+    name of a skill of the recipient now (skill_names), then whitespace or their end, and the name is no command word
+    (SKILL_COMMAND_WORDS). Nothing else is read: a skill's name in the middle of the words is plain words. The app's
+    pick holds only when this finds the same name (skill_use_kept); the hub reads it itself for a chat app and for each
+    caller that sends no `skills`. A person's conversation reads none."""
+    m = SKILL_USE_AT.match(value or "")
+    if not m or m.group(1) in SKILL_COMMAND_WORDS or m.group(1) not in skill_names(recipient):
+        return None
+    return {"use": m.group(1)}
+
+
+def skill_use_kept(value, skills, recipient, hand):
+    """The use of a message as the hub keeps it: the app's pick (`skills`, message_skills_given) when the words hold it
+    (skill_use_found finds the same name), None when it does not hold or when the app picked none ([] says that the app
+    read the words), and the hub's own reading for no `skills` at all (None). A use that does not hold is left out, and
+    the message goes: a pick that a rename, a retire or the owner's edit made stale must never say "Not sent". Only
+    the owner's own hand asks for a use (owner_force: the Mac's screen, an enrolled device, a chat app): the line says
+    "The owner asked you", and an AI session's, a program's or a connected app's words are no ask of the owner's, so
+    such a message gets no use, from its own `skills` or from the hub's reading (the area's decision of 22 November
+    2026)."""
+    if not owner_force(hand):
+        return None
+    asked = next((e["use"] for e in skills if "use" in e), None) if skills is not None else None
+    if skills is not None and asked is None:
+        return None
+    found = skill_use_found(value, recipient)
+    return found if found and (asked is None or found["use"] == asked) else None
+
+
+def skill_use_words(recipient, name):
+    """The reader's line of a skill that the owner asked the recipient to use for a message, in its chat and in the
+    task that start_task opens from that message (task_itself): the hub's words, never the skill's own text."""
+    return (f"[The owner asked you to use your skill {name} for this message: read "
+            f"{SKILLS}/{recipient}/{name}/SKILL.md and follow it. If it does not fit the work, say why in your reply.]")
+
+
+def skill_lines(recipient, skills, task=False):
+    """The reader's lines of a message's skills (as stored), in their order: skill_use_words for a use, and the hub's
+    line of a gift (skill_gift_line, in brackets, as the hub's other lines under the owner's words), each built at this
+    moment with the recipient's name of now. task: the lines of the start of the task that the chat opened from the
+    message (task_itself). "" for none."""
+    lines = []
+    for e in skills:
+        if "use" in e:
+            lines.append(skill_use_words(recipient, e["use"]))
+        elif isinstance(e.get("name"), str):
+            beside = e.get("beside") if isinstance(e.get("beside"), int) else 0
+            lines.append("[" + skill_gift_line({"agent": recipient, "name": e["name"], "files": range(beside)},
+                                               task=task) + "]")
+    return "\n".join(lines)
+
+
+def task_skills(t):
+    """The skills of the owner's message that a task comes from, for the session of that task (task_itself), as
+    task_mentions reads the tags: of its ask and each correction under it, when the task's agent is their recipient,
+    as start_task opens it. A task that the manager or a lead gave another agent gets none: the skill is the
+    recipient's. A narrowed pair's task gets none either. read_rows only, as task_itself."""
+    if not t["ask"] or t["scope_person"] is not None:
+        return []
+    return [e for r in read_rows("WITH RECURSIVE chain(r) AS (SELECT ? UNION SELECT u.request_id FROM ui_requests u "
+                                 "JOIN chain ON u.replaces_request_id=chain.r) SELECT u.skills FROM ui_requests u "
+                                 "JOIN chain ON u.request_id=chain.r WHERE u.recipient=? AND u.skills IS NOT NULL "
+                                 "ORDER BY u.created", (t["ask"], t["owner"]))
+            for e in message_skills_read(r["skills"])]
+
+
+def chat_unavailable(recipient):
+    """The refusal of a chat message to a worker or a lead whose runtime has no owner chat, or None (phone_submit)."""
+    a = agents()[recipient]
+    if a.get("role") in ("worker", "lead") and not owner_chat(a):
+        return (409, {"error": f"direct chat with a {runtime_label(a.get('runtime'))} agent is not available yet"})
+    return None
+
+
+def message_gifts(request_id, client, hand, recipient, gives, db, files, about):
+    """The gifts of one owner message, before its write and outside LOCK (skill_give takes the turn of the hub's writes
+    itself, and its search for logins and its commits take seconds): ([the entries to store], None), or (None, (status,
+    answer)) when one does not hold, and then the route writes nothing of the message. In order, each before any
+    commit: a message that the hub holds already gives no gift again, and the route answers its replay under LOCK
+    (([], None)); the hand is the owner's Mac app (request_hand "app" and its label, SKILL_GIFT_CLIENT), because a
+    session's words are no rule of the owner's, and his yes named the Mac's box; then the route's own checks of the
+    message that can refuse it under LOCK, so that no gift commits for a message that the route then refuses: the
+    generation, the request id of a steer, the recipient's chat (chat_unavailable), the work that the message is about
+    (message_about_held) and its other files; an agent whose Shell box is off takes none (skill_gift_taker); each gift
+    is this client's upload of a ZIP that no message took yet (owner_upload_rows), and with two gifts or more, each
+    one's bytes, its name once, the folder of that name that is there and the room for all of them are checked before
+    the first commit. Then skill_give, gift by gift. A
+    refused gift answers with its own words, its code where it has one, and `refused_gift`: the attachment id of the
+    gift, for the app's chip. A 409, 500, 502 or 503 of skill_give can follow a commit that landed, also of an earlier
+    gift: the app sends the same request again, no row of it is there yet, and each gift then answers from its same
+    bytes."""
+    if read_row("SELECT 1 FROM ui_requests WHERE request_id=?", (request_id,)):    # no row of it is ever deleted
+        return [], None
+    if hand != "app" or not client.startswith(SKILL_GIFT_CLIENT):
+        return None, (403, {"error": SKILL_GIFT_HAND})
+    if db != kv_get("db_id"):
+        return None, (409, refusal_words.answer("hub_changed_sending"))
+    if read_row("SELECT 1 FROM steers WHERE request_id=?", (request_id,)):
+        return None, (409, {"error": STEER_ID_WORDS})
+    unavailable = chat_unavailable(recipient) or (message_about_held(about, recipient)[1] if about else None)
+    if unavailable:
+        return None, unavailable
+    try:
+        owner_upload_rows(files, client)
+    except Refusal as e:
+        return None, (e.status, refusal_body(e))
+    # every gift's own checks before the first commit: its file, its type and its bytes (skill_gift_read and, for each
+    # gift after the first, the search for logins, which skill_give makes for the first one before its commit), its
+    # name once, the folder of that name that is there (skill_folder), and the room for all of them. A first gift that
+    # committed and a second that its bytes then refused wrote no message, so the agent never read the first one's line
+    # (the readers of 22 November 2026)
+    taker = skill_gift_taker(recipient)         # an agent whose Shell box is off: no byte of a ZIP is read
+    if taker:
+        return None, (taker.status, dict(refusal_body(taker), refused_gift=gives[0]))
+    rev = kit_revision(fresh=True) if len(gives) > 1 else None
+    zips, names = [], []
+    for at, give in enumerate(gives):
+        try:
+            row = owner_upload_rows([give], client)[0]
+            if row["mime"] != "application/zip":
+                raise Refusal(422, SKILL_GIFT_ZIP)
+            data = attachment_bytes(row)
+            if data is None:
+                raise Refusal(404, "an attachment does not exist")
+            if len(gives) > 1:
+                name, _, gift_files = skill_gift_read(data)
+                if name in names:
+                    raise Refusal(422, SKILL_GIFT_TWICE.format(name=name))
+                if at:
+                    skill_gift_logins(gift_files)
+                if rev:                 # where git cannot say now, each gift's own check decides (skill_give)
+                    skill_folder(rev, recipient, name)
+                names.append(name)
+        except Refusal as e:
+            return None, (e.status, dict(refusal_body(e), refused_gift=give))
+        zips.append(data)
+    full = skill_gifts_room(recipient, names, rev) if len(gives) > 1 else None
+    if full:
+        return None, (full.status, dict(refusal_body(full), refused_gift=gives[-1]))
+    # Then the commits, gift by gift: a 409, 500, 502 or 503 of a later one can follow an earlier commit, and the same
+    # request again answers each gift that landed from its same bytes
+    entries = []
+    for give, data in zip(gives, zips):
+        try:
+            gift = skill_give(recipient, data)
+        except Refusal as e:
+            return None, (e.status, dict(refusal_body(e), refused_gift=give))
+        entries.append({"give": give, "name": gift["name"], "commit": gift["commit"], "beside": len(gift["files"])})
+    return entries, None
+
+
+def skill_gifts_room(agent, names, rev):
+    """The Refusal(409) of the gifts of one message whose new names do not fit beside the agent's skills (SKILLS_MAX,
+    given and its own together, as skill_gift_room counts them) at revision rev, or None: a first gift that took the
+    last room would else commit, and the second's refusal write no message. None where git cannot say: then each
+    gift's own check of its room decides (skill_give). Outside LOCK."""
+    code, out, _ = git_kit("ls-tree", "-r", "-z", "--name-only", rev, "--", f"{SKILLS}/{agent}/") if rev else (1, "", "")
+    if code != 0:
+        return None
+    shape = re.compile(rf"{re.escape(SKILLS)}/{re.escape(agent)}/({SKILL_NAME})/SKILL\.md")
+    have = {m.group(1) for m in map(shape.fullmatch, out.split("\0")) if m}
+    new = set(names) - have
+    if len(have) + len(new) <= SKILLS_MAX:
+        return None
+    return Refusal(409, f"{shown_role(agent)} has {len(have)} skill{'' if len(have) == 1 else 's'}, and this message "
+                        f"gives {len(new)} new one{'' if len(new) == 1 else 's'}: an agent has at most {SKILLS_MAX}. "
+                        f"Ask it to retire skills that no job needs, then give them again.")
 
 
 def request_hand_words(hand, session):
@@ -24444,9 +24750,12 @@ def chat_route(account, acc, m, t0, hit, preview):
     # owner feature agent_tags: a chat app sends the words as they are, so the hub finds the tags in them (CHAT-APPS.md
     # 21); a person's conversation (person_route) has none
     found, unsure = tags_found(m["text"].strip(), agent)
+    # owner feature message_skills: "/" and the name of a skill of the agent at the start of his words, after the
+    # commands of chat_command, is that skill to use (CHAT-APPS.md 22); a chat app gives no skill
+    use = skill_use_found(m["text"].strip(), agent)
     owner_message_rows(request_id, "message", None, m["text"].strip(), f"fleet-channels/1/{account}", agent, None, t0,
                        origin, files=files, note=chat_unopened_line(m["kind"], acc["app"], m["missed"], len(files)),
-                       mentions=found, unsure=unsure)
+                       mentions=found, unsure=unsure, skills=[use] if use else ())
     return "stored", request_id
 
 
@@ -35148,9 +35457,13 @@ def task_files(t):
     while got and t and t["id"] not in seen and len(seen) < 100:
         seen.add(t["id"])
         if got["recipient"] in (t["owner"], t["requester"]):
+            # the ZIP of a skill that the owner gave with the message is no file of the task: the gift's line names
+            # the skill (owner feature message_skills, task_skills)
             return read_rows("WITH RECURSIVE chain(r) AS (SELECT ? UNION SELECT u.request_id FROM ui_requests u JOIN "
                              "chain ON u.replaces_request_id=chain.r) SELECT a.* FROM attachments a JOIN chain ON "
-                             "a.message=chain.r ORDER BY a.id", (ask,))
+                             "a.message=chain.r WHERE a.id NOT IN (SELECT json_extract(j.value, '$.give') FROM "
+                             "ui_requests u, json_each(u.skills) j WHERE u.request_id=a.message AND "
+                             "json_extract(j.value, '$.give') IS NOT NULL) ORDER BY a.id", (ask,))
         up = read_row("SELECT * FROM tasks WHERE id=?", (t["parent"],)) if t["parent"] else None
         t = up if up and up["ask"] == ask and up["owner"] == t["requester"] else None
     return []
@@ -44494,7 +44807,9 @@ def t_write_skill(agent, a):
     if stored:
         return stored["text"]
     # A skill that the owner gave keeps the owner's words (the owner's given skills, design of 21 November 2026): its
-    # write is refused, and so is its retire, but in a task that the owner's own message opened. Here, after the stored
+    # write is refused, and so is its retire, but in a task that the owner's own message opened, whatever that message
+    # asked: the hub cannot read intent, so only the agent's rule holds "but when the owner tells you to remove it"
+    # (skill_retire_by_owner). Here, after the stored
     # answer, so that the exact repeat of a write that went through gets its first answer again, also when a gift of
     # that name landed since; and before anything is stored or committed. The commit asks again at its final revision
     # (below), for a gift that lands meanwhile.
@@ -44673,6 +44988,12 @@ SKILL_GIVEN_WRITE = ("The owner gave you the skill {name}, so it keeps the owner
                      "with another name, and tell the owner what does not fit.")
 SKILL_GIVEN_RETIRE = ("The owner gave you the skill {name}. Only the owner removes a skill that the owner gave: tell "
                       "the owner.")
+# the same refusal in a task that a message of an AI session, a program or a connected app opened: the owner may have
+# asked for the removal there, so the words name the owner's ways that remove it (the area Needs-you's reader, F5)
+SKILL_GIVEN_RETIRE_VIA = ("The owner gave you the skill {name}, and this task comes from a message that an AI session "
+                          "or a program sent, which removes no skill that the owner gave. Tell the owner the ways that "
+                          "do: the remove_skill tool of the owner's AI session, or the owner's own message to you in "
+                          "the Founderizer app.")
 
 
 class SkillGiftMoved(Exception):
@@ -45176,16 +45497,19 @@ def skill_took_last(agent, name, rev):
     return code == 0 and out.split("\x1f") == [SKILL_GIFT_MAIL, skill_take_subject(agent, name)]
 
 
-def skill_gift_line(gift):
+def skill_gift_line(gift, task=False):
     """The hub's own words for the agent that reads the owner's message which gave it a skill (skill_give's answer):
     never the skill's own text, which is data like every file (read_attachment), so that only the hub's line says
-    that the owner gave it. The chat that reads it has an older checkout: the files come with the next task."""
+    that the owner gave it. The chat that reads it has an older checkout: the files come with the next task. task:
+    the line in the start of a task that the chat opened from the message (task_itself), whose checkout has the files
+    already: the gift committed before the message, and the task's start moves its checkout (sync_checkout)."""
     beside = len(gift["files"])
     return (f"The owner gave you the skill {gift['name']}, at {SKILLS}/{gift['agent']}/{gift['name']}/SKILL.md"
             + (f" with {beside} file{'' if beside == 1 else 's'} beside it" if beside else "")
             + ", and it keeps the owner's words: never change it with write_skill. Its files are plain files, so run "
-              "a script in it with its program (python3 x.py, bash x.sh). Its files are in your checkout from the "
-              "start of your next task, not in this chat.")
+              "a script in it with its program (python3 x.py, bash x.sh). "
+            + ("Its files are in your checkout." if task else
+               "Its files are in your checkout from the start of your next task, not in this chat."))
 
 
 # one line of git log --raw -t for an agent's folder of skills, or for one skill's folder: its old and new mode, its
@@ -45293,16 +45617,24 @@ def skill_retire_by_owner(agent):
     start_task's receipt names, which keeps the task that it opened (task_of_message). "Remove the skill X" in a chat
     is work, and this is the one session where an agent retires a skill that the owner gave (the design, 6.4)."""
     # In such a task the agent can retire the given skill and then write a skill of its own with that name, which is
-    # then its own: the design accepts that, as the owner asked for the removal.
+    # then its own: the design accepts that, as the owner asked for the removal. The hub cannot read what the message
+    # asked: in such a task it lets the retire through whatever the message said, and only the agent's rule holds
+    # "but when the owner tells you to remove it" (RULES.md, "Your memory"; the area Needs-you's reader, F5).
+    said = skill_retire_message(agent)
+    return bool(said) and owner_force(said["hand"]) and said["connection"] is None
+
+
+def skill_retire_message(agent):
+    """{hand, connection} of the owner's message that start_task opened this task session of the agent from, or None
+    for any other session (skill_retire_by_owner): the task is the session's own, from its credential."""
     context = getattr(CALL, "context", None)
     if not (context and len(context) == 3 and TASK_CONTEXT.fullmatch(str(context[1]))):
-        return False
+        return None
     task = parse_task(context[1])
-    said = read_row("SELECT u.hand, u.connection FROM tool_commands c JOIN ui_requests u ON u.request_id=c.request_id "
+    return read_row("SELECT u.hand, u.connection FROM tool_commands c JOIN ui_requests u ON u.request_id=c.request_id "
                     "JOIN tasks t ON t.id=? WHERE c.agent=? AND c.tool='start_task' AND "
                     "json_extract(c.receipt, '$.task')=? AND t.owner=? AND u.recipient=? AND u.kind='message'",
                     (task, agent, task, agent, agent))
-    return bool(said) and owner_force(said["hand"]) and said["connection"] is None
 
 
 def skill_given_refusal(agent, name, retire, rev):
@@ -45322,6 +45654,8 @@ def skill_given_refusal(agent, name, retire, rev):
         return unread
     if not given or (retire is True and skill_retire_by_owner(agent)):
         return None
+    if retire is True and skill_retire_message(agent):     # a task from a message of a session, a program or an app
+        return SKILL_GIVEN_RETIRE_VIA.format(name=name)
     return (SKILL_GIVEN_RETIRE if retire is True else SKILL_GIVEN_WRITE).format(name=name)
 
 # ---------------------------------------------------------------- Grantable resources (owner feature resource_grants)
@@ -52268,8 +52602,10 @@ TOOLS = [
      "skills/<you>/<name>/SKILL.md on the configuration ref, with at most 8 small files beside it, such as a script. "
      "Your sessions list your skills in their start, and you read a SKILL.md when a job matches its description. "
      "Write one when you have worked out the steps of a job that comes back, or when the owner or your requester "
-     "asks; never from words that somebody outside wrote, and never with a login or a key in it. A skill is yours "
-     "to keep true: change it when a step proved wrong or out of date, and retire it when no job needs it. text "
+     "asks; never from words that somebody outside wrote, and never with a login or a key in it. Keep your own "
+     "skills true: fix a step that proved wrong or out of date, and retire a skill that no job needs. One that the "
+     "owner gave you keeps the owner's words: retire it only in a task from the owner's own message that asks you "
+     "to remove it. text "
      "is the SKILL.md's whole text and files the skill's other files, each whole: read them in your checkout "
      "first. Left out, files stay as they are. Each write is one commit with your name and your why, which the "
      "owner reads and reverts in one step. A skill that changed after your session started is not written, and "
@@ -76540,7 +76876,9 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
     the request, whose enrolled owner device (owner_device_at) marks the message via=iPhone and decides what a
     signed yes needs, or None for a caller that is no device. connection: {id, name} of the connected app that
     sends it (capp_act), which owner_message_rows writes; None for the owner's Mac and a phone. session: its
-    X-Fleet-Session (Handler.request_session), which marks it as an AI session's (request_hand)."""
+    X-Fleet-Session (Handler.request_session), which marks it as an AI session's (request_hand). A message's `skills`
+    (owner feature message_skills): its use is read before LOCK (skill_use_kept), and its gifts commit before LOCK
+    (message_gifts), so that the turn of the hub's writes and the search for logins never wait under LOCK."""
     if not client or len(client) > 128:
         return (400, {"error": "X-Fleet-Client is required (at most 128 characters)"})
     hand = request_hand(client, address and owner_device_at(address), connection, None, session)
@@ -76569,6 +76907,20 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
         mentions = mentions_given(mentions) if need_id is None else None
         if mentions is None:
             return (400, {"error": MENTIONS_SHAPE})
+    # owner feature message_skills: the skill that the owner picked for a chat message, and the skills that he gives
+    # with it; [] says that the app read the words and found no skill in them. No key, and null, are no reading: the
+    # hub reads the words itself (skill_use_found)
+    skills = data.get("skills")
+    if skills is not None:
+        skills = message_skills_given(skills) if need_id is None else None
+        if skills is None:
+            return (400, {"error": MESSAGE_SKILLS_SHAPE})
+    gives = skill_gives(skills or [])
+    # a gift is one of the message's files (ATTACH_PER_MESSAGE), never also in `attachments`, and never in a correction
+    # or an edit: the commit of the first message is done
+    if len(files) + len(gives) > ATTACH_PER_MESSAGE or set(gives) & set(files) or \
+            (gives and data.get("replaces_request_id") is not None):
+        return (400, {"error": MESSAGE_SKILLS_SHAPE})
     lead = 0                            # the characters that the strip of the words takes from their start
     yes, signed = data.get("statement"), data.get("signature")      # his signed yes to a door call
     if (yes is not None or signed is not None) and (need_id is None or not isinstance(yes, str) or
@@ -76613,9 +76965,9 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
             return (400, {"error": "an answer by choice carries no answer text: the words of the option "
                                    "are the answer"})
     elif ticked is None and ran is None:
-        if value is None and files:
-            value = ""                  # the files are the message
-        if not isinstance(value, str) or len(value) > 16000 or (not value.strip() and not files):
+        if value is None and (files or gives):
+            value = ""                  # the files, or the skills that he gives, are the message
+        if not isinstance(value, str) or len(value) > 16000 or (not value.strip() and not files and not gives):
             return (400, {"error": "text must contain 1 to 16000 characters, or the message carries a file"})
         lead = len(value) - len(value.lstrip())
         value = value.strip()
@@ -76661,6 +77013,15 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
         if need_id is not None and choice == 0 and getattr(GIVE_TURN, "on", False) else None
     if isinstance(gave, tuple):
         return gave
+    # owner feature message_skills, before LOCK: the skill to use, whose names git gives once for each revision of the
+    # hub checkout, and the gifts, which commit before the message is written (message_gifts). Under LOCK the message is
+    # written as before, with them, or its replay answers
+    use = skill_use_kept(value, skills, recipient, hand) if need_id is None else None
+    gifted = None
+    if gives:
+        gifted, refused = message_gifts(request_id, client, hand, recipient, gives, data.get("db"), files, about)
+        if refused:
+            return refused
     with LOCK:
         if data.get("db") != kv_get("db_id"):
             return (409, refusal_words.answer("hub_changed_sending"))
@@ -76756,14 +77117,18 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
             had = [r["id"] for r in DB.execute("SELECT id FROM attachments WHERE message=? ORDER BY id",
                                                (request_id,)).fetchall()]
             said = old["text"] if need is not None and need["kind"] == JOIN_KIND else value     # S9: never the code
-            if (old["kind"], old["need_id"], old["text"], old["client"], old["recipient"], old["replaces_request_id"]) != (kind, need_id, said, client, recipient, replaces) or had != sorted(files):
+            # a gift is one of the message's files (owner feature message_skills): the same request names the same
+            # files and the same gifts, and the receipt names the gifts in `skills` alone
+            stored = message_skills_read(old["skills"])
+            if (old["kind"], old["need_id"], old["text"], old["client"], old["recipient"], old["replaces_request_id"]) != (kind, need_id, said, client, recipient, replaces) or had != sorted(files + gives):
                 return (409, refusal_words.answer("command_reused_content"))
             read_at = DB.execute("SELECT read_at FROM events WHERE id=?", (old["event_id"],)).fetchone()[0]
             return (200, dict(ok=True, request_id=request_id, event_id=old["event_id"],
        created=old["created"], read_at=read_at, replayed=True, client=client, edited=False,
        message_request_id=request_id,
-       recipient=recipient, replaces_request_id=replaces, attachments=had,
-       chosen=need["chosen"] if need is not None else None, mentions=mentions_read(old["mentions"])))
+       recipient=recipient, replaces_request_id=replaces,
+       attachments=[f for f in had if f not in skill_gives(stored)],
+       chosen=need["chosen"] if need is not None else None, mentions=mentions_read(old["mentions"]), skills=stored))
         # owner API 1.223: a request id is a message's or a steer's, never both (owner_file_refused), and the replay
         # of this same message got its stored answer above
         if DB.execute("SELECT 1 FROM steers WHERE request_id=?", (request_id,)).fetchone():
@@ -76819,27 +77184,14 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
            created=previous["created"], read_at=read_at, replayed=True, client=client, edited=True,
            message_request_id=previous["request_id"],
            recipient=recipient, replaces_request_id=replaces, attachments=[], chosen=None,
-           mentions=mentions_read(previous["mentions"])))
-        worker_chat = need_id is None and agents()[recipient].get("role") in ("worker", "lead")
-        if worker_chat and not owner_chat(agents()[recipient]):
-            return (409, {"error": f"direct chat with a "
-                                   f"{runtime_label(agents()[recipient].get('runtime'))} agent is not "
-                                   f"available yet"})
+           mentions=mentions_read(previous["mentions"]), skills=message_skills_read(previous["skills"])))
+        unavailable = chat_unavailable(recipient) if need_id is None else None
+        if unavailable:
+            return unavailable
         if about is not None:
-            # A task that the hub has no more is left out, and the message goes. A task that the recipient's chat cannot
-            # read refuses the whole message, and nothing is written: the reader's line would name work that its chat
-            # cannot read, so the message would reach an agent that cannot know what it is about. What read_history
-            # gives that chat (history_records with an owner chat's scope: no contact drives it, and no person's list
-            # narrows it) is the task's agent and its requester, of a task of no narrowed pair (history_task,
-            # history_result, history_check; history_scope_sql leaves out each task with scope_person). The check reads
-            # that from the task's own row, and not from the history's index, which takes a new task in later: work
-            # that the agent did a minute ago would read as work of another.
-            number = message_about_task(about)
-            named = read_row("SELECT owner, requester, scope_person FROM tasks WHERE id=?", (number,))
-            if not named:
-                about = None
-            elif recipient not in (named["owner"], named["requester"]) or named["scope_person"] is not None:
-                return (409, refusal_words.answer("about_unreadable", agent=shown_role(recipient)))
+            about, unreadable = message_about_held(about, recipient)
+            if unreadable:
+                return unreadable
         # owner feature agent_tags: the app's tags that hold in the words, or the hub's own reading of them, against the
         # team of now; an answer to a Needs-you item has none
         unsure = []
@@ -76851,8 +77203,11 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
             mentions = mentions_kept(value, mentions, recipient, lead)
         try:
             rows = owner_upload_rows(files, client)
+            owner_upload_rows(gives, client)    # a gift's file is the message's too: no other message took it since
         except Refusal as e:
             return (e.status, refusal_body(e))
+        # owner feature message_skills: the use, then the gifts, as stored; an answer to a Needs-you item has none
+        skills = ([use] if use else []) + (gifted or [])
         created = now()
         # T3 Code idea 5: a message from the enrolled phone says so in its header. ui_allowed checked the
         # device's key for this address, so the class comes from the request and not from the client's label:
@@ -76867,14 +77222,14 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
             # the same moment wins and this edit falls back to a correction.
             edited = previous is not None and not files and message_unread(previous)
             if edited:
-                owner_message_replace(previous, value, request_id, created, device, mentions=mentions, unsure=unsure,
-                                      hand=hand, session=session)
+                skills = owner_message_replace(previous, value, request_id, created, device, mentions=mentions,
+                                               unsure=unsure, hand=hand, session=session, use=use)
                 event_id, created = previous["event_id"], previous["created"]
             else:
                 event_id = owner_message_rows(request_id, kind, need, value, client, recipient, replaces, created,
                                               files=rows, chosen=None if ticked is not None else choice,
                                               device=device, connection=connection, about=about, session=session,
-                                              mentions=mentions, unsure=unsure,
+                                              mentions=mentions, unsure=unsure, skills=skills,
                                               note=need_run_note(need, ran["status"], ran_output) if ran is not None
                                               else team_answer_note(need, choice) or given or
                                               need_words_note(need, choice, ticked, value, hand),
@@ -76893,7 +77248,7 @@ def phone_submit(data, client, need_id=None, address=None, connection=None, sess
    created=created, read_at=None, replayed=False, client=client, edited=edited,
    message_request_id=previous["request_id"] if edited else request_id,
    recipient=recipient, replaces_request_id=replaces, attachments=[r["id"] for r in rows],
-   chosen=choice, mentions=mentions))
+   chosen=choice, mentions=mentions, skills=skills))
     if need is not None and not edited and need["key_swap_server"]:
         key_swap_answered()     # the owner's press of a server's key swap item: after LOCK, in the turn (kit_lock)
     if isinstance(pressed, dict):

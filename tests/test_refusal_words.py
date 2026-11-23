@@ -177,6 +177,8 @@ SITES = {
                            'package_record_large': 1, 'package_registry_away': 1, 'package_too_new': 1,
                            'package_too_new_older': 1, 'package_unknown': 1, 'package_unread': 1},
     'mcp_registry_find': {'mcp_registry_away': 1, 'mcp_registry_no_list': 1},
+    'message_about_held': {'about_unreadable': 1},         # phone_submit's check, before a gift too
+    'message_gifts': {'hub_changed_sending': 1},           # a gift of a stale client commits nothing
     'move_agent': {'agent_mid_turn': 1, 'agent_open_signin': 1, 'no_such_agent': 1, 'no_such_server': 1,
                    'server_no_service': 1, 'server_silent': 1, 'team_changed': 1},
     'need_give_press': {'request_answered': 1},  # the lane "Give on a card": a Give whose agent left the fleet
@@ -191,7 +193,7 @@ SITES = {
     'phone_ended': {'hub_changed': 1},
     'phone_knowledge': {'hub_changed': 1, 'knowledge_unread': 1},
     'phone_mobile': {'hub_changed': 1},
-    'phone_submit': {'about_unreadable': 1, 'card_words_from_tool': 1, 'command_reused_content': 2,
+    'phone_submit': {'card_words_from_tool': 1, 'command_reused_content': 2,
                      'hub_changed_sending': 1, 'login_as_text': 3,
                      'request_answered': 1, 'request_unknown': 1, 'signature_unchecked': 1},
     'phone_task': {'hub_changed': 1, 'no_such_task': 1},
@@ -531,7 +533,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 217)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 218)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

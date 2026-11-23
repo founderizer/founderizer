@@ -341,6 +341,36 @@ class ChatApps(OwnerAPI):
                                       'Support Lead (kai). The hub took neither as a tag: ask the owner which one, '
                                       'when it matters.]'), said)
 
+    def test_a_chat_app_message_that_starts_with_a_skill_s_name_uses_that_skill(self):
+        """Owner feature message_skills (CHAT-APPS.md 22): a chat app sends the owner's words as they are, so the hub
+        reads "/" and the name of a skill of the account's agent at their start, after the commands, as that skill to
+        use, and the agent reads the hub's line. A command stays a command, a skill named like a command is never used,
+        and a name in the middle of the words or of another agent's skill is plain words. Bug: a skill named "help"
+        or "stop" takes the owner's command."""
+        self.own()
+        kit = self.root / "kit"
+        for agent, name in (("studio", "seo-radar"), ("studio", "help"), ("studio", "stop"), ("vps", "deploy")):
+            folder = kit / "skills" / agent / name
+            folder.mkdir(parents=True)
+            (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: The {name} steps.\n---\n\nSteps.\n")
+        git("add", "-A", cwd=kit)
+        git("commit", "-q", "-m", "skills", cwd=kit)
+        hub._revision_cache.update(at=0.0, value=None)
+        self.addCleanup(hub.SKILL_NAMES.clear)
+        line = ("[The owner asked you to use your skill seo-radar for this message: read skills/studio/seo-radar/"
+                "SKILL.md and follow it. If it does not fit the work, say why in your reply.]")
+        for text, used in (("/seo-radar check the shop", True), ("/seo-radar", True), ("/stop the scrape", False),
+                           ("Please /seo-radar it", False), ("/deploy it", False), ("/seo-radar, now", False)):
+            self.assertEqual(self.inbound(text)[0], "stored", text)
+            req = self.last_request()
+            self.assertEqual(hub.message_skills_read(req["skills"]), [{"use": "seo-radar"}] if used else [], text)
+            said = hub.q1("SELECT text FROM events WHERE id=?", (req["event_id"],))["text"]
+            self.assertEqual(said.endswith("\n" + line), used, said)
+        rows = self.count("ui_requests")
+        self.assertEqual([self.inbound(text)[0] for text in ("/help", "/whoami")], ["stored", "stored"])
+        self.assertEqual(self.count("ui_requests"), rows)           # the hub answered both, and no agent reads them
+        self.assertTrue(self.texts()[-2].startswith("Commands:\n"))
+
     def test_owner_message_from_whatsapp_reaches_the_manager_on_its_number(self):
         self.own("whatsapp", OWNER_LID, alias=OWNER_WA)
         result, body = self.inbound("Start the Acme goal.", account="whatsapp-main", sender=OWNER_LID,

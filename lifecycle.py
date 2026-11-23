@@ -2128,8 +2128,9 @@ def give_way_to(kit, target, run=None):
 
 
 SKILLS_CHARS = 6000         # the most that the list of an agent's skills adds to a session's start; the rest are counted
-SKILLS_HEAD = ("YOUR SKILLS: procedures that you wrote for yourself. When a job matches the description of one, read "
-               "its SKILL.md and follow it. Change or retire a skill only with write_skill.")
+SKILLS_HEAD = ("YOUR SKILLS: procedures that you wrote, and skills that the owner gave you, which keep the owner's "
+               "words. When a job matches the description of one, read its SKILL.md and follow it. Change or retire a "
+               "skill only with write_skill.")
 SKILL_AGENT = r"[a-z][a-z0-9-]{1,30}"          # hub.AGENT_NAME
 
 
