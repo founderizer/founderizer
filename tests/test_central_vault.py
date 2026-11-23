@@ -18,6 +18,7 @@ import shutil
 import socket
 import subprocess
 import sqlite3
+import sys
 import stat
 import tempfile
 import threading
@@ -1509,6 +1510,8 @@ class Machine:
                       "store.age": "no", "active": "", "restarts": "0"}
         self.status = {"ok": True, "v": 2, "central": True, "recipient": CENTRAL_KEY, "store_recipient": STORE_KEY,
                        "fleet": FLEET, "owner_keys": 1, "pins": {}, "recovery": None, "items": 0, "source": "0" * 64}
+        self.keys = {"age.key": CENTRAL_KEY, "store.key": STORE_KEY}     # the public key line of each key file
+        self.hub_user = None        # a line as the hub's user, run for real; else the status above is its answer
 
     def run(self, script, timeout=120):
         self.ran.append(script)
@@ -1516,8 +1519,11 @@ class Machine:
             return 0, "\n".join(f"{k}={v}" for k, v in self.state.items()), ""
         if "vault.py unit --central" in script:
             return 0, UNIT, ""
+        if "echo store_recipient=" in script:                               # root's read of the two key files
+            return 0, "\n".join(f"{name}={self.keys[f] if self.state[f] == 'yes' else ''}"
+                                for name, f in (("recipient", "age.key"), ("store_recipient", "store.key"))), ""
         if script.startswith("runuser -u "):
-            return 0, json.dumps(self.status), ""
+            return self.hub_user(script) if self.hub_user else (0, json.dumps(self.status), "")
         if "useradd --system" in script:
             self.state["user"] = "yes"
         if "apt-get" in script:
@@ -1623,7 +1629,9 @@ class Install(unittest.TestCase):
                  "/usr/local/lib/fleet-vault-central/vault.py\ninstall -o root -g root -m 644",
                  "vault.py store-init --config /etc/fleet-vault-central/vault.json --user founderizer-vault",
                  "vault.py unit --central --config /etc/fleet-vault-central/vault.json --group fleet",
-                 "systemctl daemon-reload", "systemctl restart fleet-vault-central", "runuser -u fleet -- python3"]
+                 "systemctl daemon-reload", "systemctl restart fleet-vault-central",
+                 "echo recipient=$(sed -n 's/^# public key: //p' /var/lib/fleet-vault-central/age.key",
+                 "runuser -u fleet -- /usr/bin/python3 -I -c"]
         at = [self.box.ran.index(self.box.scripts(fragment)[0]) for fragment in order]
         self.assertEqual(at, sorted(at), order)
         self.assertTrue(self.box.scripts("systemctl enable fleet-vault-central"))
@@ -1640,9 +1648,9 @@ class Install(unittest.TestCase):
         self.box.ran.clear()
         done = self.install()
         self.assertEqual(done["state"], "there")
-        self.assertEqual(len(self.box.ran), 3)                      # the reading, the unit it prints, the status
-        self.assertEqual([bool(self.box.scripts(f)) for f in ("echo active=", "unit --central", "runuser -u fleet")],
-                         [True, True, True])
+        self.assertEqual(len(self.box.ran), 4)          # the reading, the unit it prints, the key files, the status
+        self.assertEqual([bool(self.box.scripts(f)) for f in ("echo active=", "unit --central", "echo store_recipient=",
+                                                               "runuser -u fleet")], [True, True, True, True])
         self.assertEqual(self.box.made, {"age.key": 1, "store.key": 1, "store.age": 1})
 
     def test_a_new_owner_key_replaces_the_old_one_and_no_key_file(self):
@@ -1684,6 +1692,74 @@ class Install(unittest.TestCase):
         with self.assertRaises(hubsetup.Stop) as stop:
             self.install()
         self.assertIn("this caller is not the hub", str(stop.exception))
+
+    def test_a_usercustomize_in_the_hub_users_site_changes_nothing_that_the_install_prints(self):
+        """The bug: root asks the vault's status as the hub's user with a plain `python3 -c`. runuser gives that
+        process the hub user's home, Python then runs a usercustomize.py of that home's user site, and the hub's user
+        writes its own home. So a hub that is broken into decides the key that the owner's app pins, and each value
+        that the owner types after it is sealed to the hub's own key (the F8 read of 22 November 2026, round 3, S3).
+        Here the hub's user put such a file there, which prints a status with its own key last. The ask runs none of
+        it, as runuser runs it (the hub user's home as HOME, root's environment otherwise), and the install prints the
+        key of the vault's own file."""
+        home = Path(tempfile.mkdtemp(prefix="fleet-hub-home-"))
+        self.addCleanup(shutil.rmtree, home, True)
+        env = dict({k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}, HOME=str(home))
+        probe = subprocess.run([sys.executable, "-c", "import site; print(site.ENABLE_USER_SITE); "
+                                "print(site.getusersitepackages())"], env=env, capture_output=True, text=True,
+                               timeout=60, cwd=home)
+        enabled, user_site = probe.stdout.splitlines()[:2]
+        if enabled != "True":
+            self.skipTest("this python3 has no user site, so nothing can be put there")
+        marker = home / "planted-code-ran"
+        attack = dict(self.box.status, recipient=OTHER)
+        Path(user_site).mkdir(parents=True)
+        (Path(user_site) / "usercustomize.py").write_text(
+            "import atexit, json, sys\n"
+            f"open({str(marker)!r}, 'w').close()\n"
+            f"atexit.register(lambda: sys.stdout.write(json.dumps({attack!r}) + chr(10)))\n")
+        subprocess.run([sys.executable, "-c", "pass"], env=env, timeout=60, cwd=home)
+        self.assertTrue(marker.exists())            # the planted file runs in a plain python3 of that home
+        marker.unlink()
+        folder = tempfile.mkdtemp(prefix="fleet-central-")
+        if len(folder) > 80:                        # a Unix socket's path is short (104 bytes on a Mac)
+            shutil.rmtree(folder, ignore_errors=True)
+            folder = tempfile.mkdtemp(prefix="fc-", dir="/tmp")
+        self.addCleanup(shutil.rmtree, folder, True)
+        central = FakeCentral(os.path.join(folder, "vault.sock"), FLEET)
+        self.addCleanup(central.close)
+        cwd = home / "root"                         # runuser keeps root's own folder, which the hub's user cannot open
+        cwd.mkdir()
+
+        def as_hub_user(script):
+            words = shlex.split(script)
+            self.assertEqual(words[:4], ["runuser", "-u", "fleet", "--"])
+            argv = [sys.executable, *words[5:]]
+            self.assertEqual(argv[-1], hub.CENTRAL_SOCKET)
+            argv[-1] = central.path
+            done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60, cwd=cwd,
+                                  stdin=subprocess.DEVNULL)
+            return done.returncode, done.stdout.strip(), done.stderr.strip()
+        self.box.hub_user = as_hub_user
+        code, last = self.command("--owner-key", OWNER_KEY)
+        self.assertEqual((code, last), (0, {"ok": True, "recipient": CENTRAL_KEY, "store_recipient": STORE_KEY,
+                                            "fleet": FLEET}))
+        self.assertEqual(self.install()["recipient"], CENTRAL_KEY)          # the run that finds it in place
+        self.assertEqual([r["op"] for r in central.requests], ["status", "status"])
+        self.assertFalse(marker.exists())
+
+    def test_a_status_with_another_key_than_the_key_files_stops_the_install_with_no_key_to_pin(self):
+        """The bug: the install prints the keys of the status that a process of the hub's user read, so what that
+        process says is what the owner's app pins. The vault's own key files, which root reads, are the vault's word:
+        a status that names another key, of the vault or of its store, stops the run at its first install and in a
+        run that finds the vault in place, and the last line, which the app reads, names no key at all."""
+        for field in ("recipient", "store_recipient"):
+            self.box.status = dict(self.box.status, **{field: OTHER})
+            code, last = self.command("--owner-key", OWNER_KEY)
+            self.assertEqual((code, set(last), last["ok"]), (1, {"ok", "error"}, False), field)
+            self.assertIn("names another public key than the vault's own key files", last["error"])
+            self.box.status[field] = CENTRAL_KEY if field == "recipient" else STORE_KEY
+        self.assertEqual(len(self.box.scripts("systemctl restart")), 1)     # the second stop: the vault in place
+        self.assertEqual(self.command("--owner-key", OWNER_KEY)[1]["recipient"], CENTRAL_KEY)    # the same status
 
     def command(self, *argv, linux=True, root=True, kit=None):
         """central-vault as the app runs it: from root's own clone, which is this test's kit here."""

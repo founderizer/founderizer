@@ -3,7 +3,9 @@
 write of an Operator and every read of a host passes through it. Standard library only.
 
     python3 door.py serve           the service, as the OS user `door` (door.sh installs it)
-    python3 door.py access          root: the access file, one JSON object on stdin (the owner's app writes it)
+    python3 door.py access [--was <sha256>]
+                                    root: the access file, one JSON object on stdin (the owner's app writes it); with
+                                    --was, only while the file is the one that the app read
     python3 door.py update          root: a signed release manifest on stdin; the code of that release, never an
                                     older one, cloned from the public repository at that revision
     python3 door.py hub-secrets     root: the hub's two secrets, made here; their SHA-256 stays, the secrets go once
@@ -47,6 +49,7 @@ import base64
 import calendar
 import contextlib
 import datetime
+import fcntl
 import hashlib
 import hmac
 import io
@@ -83,6 +86,7 @@ ETC = "/etc/fleet-door"
 STATE = "/var/lib/fleet-door"
 CODE = "/opt/fleet-door"
 ACCESS_FILE = ETC + "/access.json"          # root writes it; the door's user reads it
+ACCESS_LOCK = ETC + "/access.lock"          # root's lock of a write of the access file (door.py access --was)
 CONF_FILE = ETC + "/door.json"              # door.sh writes it: the address and the port
 HUB_FILE = ETC + "/hub.json"                # the SHA-256 of the hub's two secrets
 KEY_FILE = ETC + "/release-key.pub"         # the release keys, pinned at install
@@ -3068,10 +3072,34 @@ def fetch_approvals(door):
 
 # ---------------------------------------------------------------- root commands
 
+def access_in(raw):
+    """The access file's bytes as the object that they hold, or None: no file, or one that is no JSON object."""
+    try:
+        data = json.loads(raw) if raw is not None else None
+    except (ValueError, RecursionError):
+        data = None
+    return data if isinstance(data, dict) else None
+
+
+def owner_keys_in(raw):
+    """The owner keys of the access file's bytes, or [] for a file that is not one: such a file keeps today's write."""
+    keys = (access_in(raw) or {}).get("owner_keys")
+    return keys if isinstance(keys, list) else []
+
+
 def cmd_access(args):
-    """root: the access file, one JSON object on stdin. The owner's app sends it over its own SSH."""
+    """root: the access file, one JSON object on stdin. The owner's app sends it over its own SSH. With --was, the
+    SHA-256 of the file as the app read it, with the white space around it left out (DoorAccess.digest): under one
+    lock with the write, a file that is another one now is refused, so a write of another of the owner's Macs after
+    that read is not lost, and the app reads the file again. A file that is no JSON object is nobody's write, and the
+    door names nobody from it: the app's write repairs it, as before. Without
+    --was, the file is written as before, unless the file names two or more owner keys: two Macs of the owner write
+    it then, and a write with no compare could take the other Mac's write back, its key with it."""
     if os.geteuid() != 0 and not os.environ.get("FLEET_DOOR_ROOT"):
         sys.exit("door.py access runs as root")
+    was = getattr(args, "was", None)
+    if was is not None and not re.fullmatch(r"[0-9a-f]{64}", was):
+        sys.exit("refused: --was is the SHA-256 of the access file, in lower-case hex")
     raw = sys.stdin.buffer.read(1024 * 1024 + 1)
     if len(raw) > 1024 * 1024:
         sys.exit("the access file is over 1 MiB")
@@ -3084,8 +3112,27 @@ def cmd_access(args):
         import grp
         group = grp.getgrnam("door").gr_gid
     # The door's group and the mode go on the file before it takes the place of the old one: a door that read it
-    # between the two steps could not open it, and named nobody.
-    write_json(ACCESS_FILE, data, mode=0o640, group=group)
+    # between the two steps could not open it, and named nobody. The lock is a file of its own: the write replaces the
+    # access file, and a lock on the old one would hold nobody else.
+    os.makedirs(os.path.dirname(P(ACCESS_LOCK)), mode=0o700, exist_ok=True)
+    lock = os.open(P(ACCESS_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(P(ACCESS_FILE), "rb") as f:
+                held = f.read()
+        except OSError:
+            held = None
+        if was is not None:
+            if held is None or (access_in(held) is not None and
+                                hashlib.sha256(held.strip(b" \t\r\n")).hexdigest() != was):
+                sys.exit("refused: the access file changed after the read that this write was made from")
+        elif len(owner_keys_in(held)) >= 2:
+            sys.exit("refused: the access file names two or more owner keys, and a write without --was could take "
+                     "another Mac's write back")
+        write_json(ACCESS_FILE, data, mode=0o640, group=group)
+    finally:
+        os.close(lock)
     print(f"access file saved: {len(data.get('agents') or {})} agents, {len(data.get('hosts') or {})} hosts")
 
 
@@ -3530,7 +3577,9 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="door.py")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("serve").set_defaults(fn=lambda a: serve())
-    sub.add_parser("access").set_defaults(fn=cmd_access)
+    accessing = sub.add_parser("access")
+    accessing.add_argument("--was")         # the owner's app greps this line (DoorAccess.wasProbe)
+    accessing.set_defaults(fn=cmd_access)
     sub.add_parser("update").set_defaults(fn=cmd_update)
     sub.add_parser("follow").set_defaults(fn=cmd_follow)
     sub.add_parser("hub-secrets").set_defaults(fn=cmd_hub_secrets)

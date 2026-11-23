@@ -773,9 +773,12 @@ never from the hub's checkout:
   so the socket `/run/fleet-vault-central/vault.sock` (mode 660) opens to the hub and to
   nobody else, and the vault answers the hub's uid alone. It has no network.
 
-Then it asks the vault for its status as the hub's user, and its last line is one JSON
-object: `{"ok": true, "recipient", "store_recipient", "fleet"}`, or `{"ok": false,
-"error"}` with a non-zero exit. It never prints a key file.
+Then root reads the vault's two public keys from the public key line of each key file, and
+it asks the vault for its status as the hub's user, with `python3 -I`, so that no file of
+that user's home runs. The status must name the same two keys, or the run stops. Its last
+line is one JSON object: `{"ok": true, "recipient", "store_recipient", "fleet"}`, with the
+keys that root read, or `{"ok": false, "error"}` with a non-zero exit. It never prints a
+private key.
 
 **Running the two again is how it is updated**: `kit-clone` takes the newer signed release,
 and `central-vault` reads first in each step, starts the service again only when something

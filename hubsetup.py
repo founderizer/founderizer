@@ -2474,6 +2474,9 @@ def one_server(hub_user="fleet", kit=None, run=None, account=None, vault=None, k
         if code != 0:
             raise Stop(f"the checkout of the server service could not be cloned from {repo}: "
                        f"{(err or out).strip()[-300:]}. Check that the hub's git service runs.")
+    # This python3 has no -I, which central_status gives its own: this program is the hub user's own checkout, so
+    # that user decides its code in any case, and root takes only its exit status and its lines, each said after
+    # "Founderizer: ". -I would also take the program's own folder out of sys.path, and then its `import hub` fails.
     code, out, err = run(f"cd / && {as_user}python3 {shlex.quote(os.path.join(server_kit, 'hubsetup.py'))} hub-server "
                          f"--team {shlex.quote(team_path)} --repo {shlex.quote(repo)} </dev/null", timeout=900)
     for line in (out or "").splitlines():
@@ -2894,7 +2897,9 @@ def central_unit_text(run, group):
 
 
 # Asked as the hub's user, because the central vault answers that uid alone: one status line, and nothing that a key
-# file holds. The socket's path is its one argument.
+# file holds. The socket's path is its one argument. Root starts it with `/usr/bin/python3 -I` (central_status): a
+# process of the hub's user gets that user's home from runuser, and without -I Python runs a usercustomize.py or a
+# .pth file of the user site there, which the hub's user can write.
 CENTRAL_ASK = ("import socket, sys\n"
                "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
                "s.settimeout(10)\n"
@@ -2909,10 +2914,27 @@ CENTRAL_ASK = ("import socket, sys\n"
                "sys.stdout.write(data.decode())\n")
 
 
+def central_keys_reading():
+    """The shell that reads, as root, the public half of the central vault's two keys from their own files: the
+    `# public key:` line that age-keygen writes, as the broker's reading does (vault_reading). sed prints only what
+    follows that comment, so no line of a private key leaves the file."""
+    return ("echo recipient=$(sed -n 's/^# public key: //p' %(state)s/age.key 2>/dev/null)\n"
+            "echo store_recipient=$(sed -n 's/^# public key: //p' %(state)s/store.key 2>/dev/null)\n") % {
+                "state": CENTRAL_STATE}
+
+
 def central_status(run, hub_user, fleet):
-    """The central vault's own status, asked over its socket as the hub's user: {recipient, store_recipient, fleet},
-    its public keys only."""
-    code, out, err = run(f"runuser -u {shlex.quote(hub_user)} -- python3 -c {shlex.quote(CENTRAL_ASK)} "
+    """The central vault's public keys, {recipient, store_recipient, fleet}, which the owner's app pins
+    (cmd_central_vault). Root reads them from the vault's own key files (central_keys_reading), so no process of the
+    hub's user decides what is printed. The vault's status is also asked over its socket as the hub's user, with
+    `python3 -I`, which proves that the hub reaches the vault. That status must name the same two keys: when it names
+    another one, a process of the hub's user can have changed the answer, and the run stops with no key to pin."""
+    files = kv(run(central_keys_reading())[1])
+    own = (files.get("recipient"), files.get("store_recipient"))
+    if not all(isinstance(k, str) and hub.AGE_RECIPIENT.fullmatch(k) for k in own):
+        raise Stop(f"root reads no public key in the central vault's key files ({CENTRAL_STATE}/age.key and "
+                   f"store.key).")
+    code, out, err = run(f"runuser -u {shlex.quote(hub_user)} -- /usr/bin/python3 -I -c {shlex.quote(CENTRAL_ASK)} "
                          f"{hub.CENTRAL_SOCKET}", timeout=60)
     try:
         answer = json.loads(out.strip().splitlines()[-1]) if code == 0 and out.strip() else None
@@ -2927,7 +2949,11 @@ def central_status(run, hub_user, fleet):
     keys = (answer.get("recipient"), answer.get("store_recipient"))
     if not all(isinstance(k, str) and hub.AGE_RECIPIENT.fullmatch(k) for k in keys):
         raise Stop("the central vault's status gives no public key.")
-    return {"recipient": keys[0], "store_recipient": keys[1], "fleet": fleet}
+    if keys != own:
+        raise Stop(f"the central vault's status, as the hub's user {hub_user} reads it, names another public key "
+                   f"than the vault's own key files. So this run gives no key to pin: a program of the hub's user can "
+                   f"have changed that answer. Examine the hub's server before the next Set up.")
+    return {"recipient": own[0], "store_recipient": own[1], "fleet": fleet}
 
 
 class OtherOwner(Stop):
@@ -2938,7 +2964,8 @@ def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None,
                     keep_owner=False, add=None, remove=None, lock=CENTRAL_LOCK):
     """The central vault on the hub's machine, as root (HUB-INSTALL.md, "The central vault"): age, its own user, the
     kit's vault.py as a root-owned program, its configuration, its own key, the store's key and the empty store, its
-    service, and then its status, asked as the hub's user.
+    service, and then its public keys, which root reads from their files and its status asked as the hub's user must
+    name (central_status).
 
     Safe to run again, and that is how it is updated: each step reads first, the service is restarted only when
     something changed, and a key, a store or a state file that is there is never replaced (age-keygen behind
@@ -2959,8 +2986,8 @@ def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None,
     at the same time cannot put a program in place that this run did not read. A vault that does not stay up gets
     nothing back: the keys are checked with the vault's own check before the write, so they are not what stops it,
     and to put back the program and the configuration is a later piece. Returns
-    {"state": "made"|"there", "recipient", "store_recipient", "fleet"}: public keys only, because nothing here reads
-    or prints a key file."""
+    {"state": "made"|"there", "recipient", "store_recipient", "fleet"}: public keys only, because of a key file root
+    reads only its public key line, and nothing here prints a private key."""
     run = run or _shell
     read = read or (lambda path: pathlib.Path(path).read_text(encoding="utf-8"))
     kit, key = kit or KIT, owner_public_key(owner_key)
@@ -4655,7 +4682,9 @@ def cmd_hub_server(args):
 def cmd_central_vault(args):
     """central-vault, as root on the hub's machine. The owner's app runs it over his SSH and reads its last line on
     standard output, which is always one JSON object: {"ok": true, "recipient", "store_recipient", "fleet"}, or
-    {"ok": false, "error": "<one sentence>"} with a non-zero exit. Every line before it is progress."""
+    {"ok": false, "error": "<one sentence>"} with a non-zero exit. Every line before it is progress. The app pins that
+    recipient, so it is the key that root read in the vault's own key file, never a word of a process of the hub's
+    user (central_status)."""
     try:
         if platform.system() != "Linux":
             raise Stop("the central vault runs on the hub's Linux server, and this machine is not one.")

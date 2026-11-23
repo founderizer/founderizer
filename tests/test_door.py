@@ -18,6 +18,7 @@ import contextlib
 import copy
 import datetime
 import errno
+import fcntl
 import hashlib
 import io
 import json
@@ -122,7 +123,7 @@ def load_tests(loader, _tests, _pattern):
                                                     Workflows, RunnerNew, Probe, CallerGone, Rendered, RenderPath,
                                                     GeneratedFiles, GeneratedPath, OwnerFiles, OwnerPath,
                                                     SecretReferences, SecretReferencePath, StoreFacts,
-                                                    YamlTags, RenderBoxUnit, RenderBoxLive)
+                                                    ErrorLines, YamlTags, RenderBoxUnit, RenderBoxLive)
                               for name in cls.__dict__ if name.startswith("test_"))
 
 
@@ -290,11 +291,12 @@ class Access(DoorCase):
                 door.validate_access(data)
 
     def test_the_root_command_writes_the_file_and_refuses_a_bad_one(self):
+        """With no --was, the write of an older app, the file is written as before."""
         data = json.loads(json.dumps(ACCESS))
         data["agents"]["ops-two"]["servers"] = {}
         with patch("sys.stdin", io.TextIOWrapper(io.BytesIO(json.dumps(data).encode()))), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
-            door.cmd_access(None)
+            door.main(["access"])
         self.assertIn("2 agents, 7 hosts", out.getvalue())
         self.assertEqual(door.read_json(door.ACCESS_FILE, {})["agents"]["ops-two"]["servers"], {})
         data["agents"]["ops-two"]["address"] = ONE
@@ -303,6 +305,92 @@ class Access(DoorCase):
             door.cmd_access(None)
         self.assertIn("share the address", str(stop.exception))
         self.assertEqual(door.read_json(door.ACCESS_FILE, {})["agents"]["ops-two"]["address"], TWO)
+
+    def access_was(self, data, was):
+        with patch("sys.stdin", io.TextIOWrapper(io.BytesIO(json.dumps(data).encode()))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            door.main(["access", "--was", was])
+
+    def file_sha256(self):
+        with open(self.root + door.ACCESS_FILE, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    def test_a_write_with_was_lands_only_on_the_file_that_the_app_read(self):
+        """Two Macs of the owner write the door's file: a write made from a read that another Mac's write followed would
+        take that write back, the other Mac's owner key with it. With --was, the SHA-256 of the file as the app read it,
+        a file that is another one now is refused and stays, and the file of that SHA-256 is replaced."""
+        read = self.file_sha256()
+        other = json.loads(json.dumps(ACCESS))
+        other["agents"]["ops-two"]["servers"] = {"web-2": "read"}
+        self.write_access(other)                    # another Mac's write, after this one's read
+        data = json.loads(json.dumps(ACCESS))
+        data["agents"]["ops-two"]["servers"] = {}
+        with self.assertRaisesRegex(SystemExit, "changed after the read"):
+            self.access_was(data, read)
+        self.assertEqual(door.read_json(door.ACCESS_FILE, {}), other)
+        self.access_was(data, self.file_sha256())
+        self.assertEqual(door.read_json(door.ACCESS_FILE, {})["agents"]["ops-two"]["servers"], {})
+        # White space around the file is no change: a file that was edited by hand, and a read that a login shell put
+        # an empty line around, gave a SHA-256 that no write ever matched. A file that is no JSON is nobody's write.
+        for raw in (b"\n" + json.dumps(other).encode() + b"\r\n", b'{"v": 1, "x": "\xff"}'):
+            with self.subTest(raw=raw[:20]):
+                with open(self.root + door.ACCESS_FILE, "wb") as f:
+                    f.write(raw)
+                self.access_was(data, hashlib.sha256(json.dumps(other).encode()).hexdigest())
+                self.assertEqual(door.read_json(door.ACCESS_FILE, {})["agents"]["ops-two"]["servers"], {})
+        os.remove(self.root + door.ACCESS_FILE)             # a file that somebody took away is another one
+        with self.assertRaisesRegex(SystemExit, "changed after the read"):
+            self.access_was(data, read)
+
+    def test_a_file_with_two_owner_keys_takes_no_write_without_was(self):
+        """Two Macs of the owner write a file that names two owner keys: a write with no compare (an older app, or a
+        door that the app could not ask) could take the other Mac's write back, its key with it. It is refused and the
+        file stays, and the same write with --was of the file lands. A file with one key takes today's write."""
+        from test_vault_central import OWNER_A, OWNER_B
+        two = json.loads(json.dumps(ACCESS))
+        two.update(owner_keys=[OWNER_A, OWNER_B], fleet="fleet-1")
+        self.write_access(two)
+        data = json.loads(json.dumps(two))
+        data["agents"]["ops-two"]["servers"] = {}
+        with patch("sys.stdin", io.TextIOWrapper(io.BytesIO(json.dumps(data).encode()))), \
+                self.assertRaisesRegex(SystemExit, "two or more owner keys"):
+            door.main(["access"])
+        self.assertEqual(door.read_json(door.ACCESS_FILE, {}), two)
+        self.access_was(data, self.file_sha256())
+        self.assertEqual(door.read_json(door.ACCESS_FILE, {})["agents"]["ops-two"]["servers"], {})
+        one = dict(two, owner_keys=[OWNER_A])
+        self.write_access(one)
+        with patch("sys.stdin", io.TextIOWrapper(io.BytesIO(json.dumps(one).encode()))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            door.main(["access"])
+        self.assertEqual(door.read_json(door.ACCESS_FILE, {}), one)
+
+    def test_the_compare_of_was_and_the_write_are_under_one_lock(self):
+        """Another Mac's write that lands between this write's compare and its replace would be lost as with no --was:
+        root's lock of the access file is held through both, and another writer waits for it."""
+        def locked():
+            fd = os.open(self.root + door.ACCESS_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            finally:
+                os.close(fd)
+            return False
+        seen, sha256, write_json = [], hashlib.sha256, door.write_json
+        was = self.file_sha256()
+
+        def compare(data=b""):
+            seen.append(("compare", locked()))
+            return sha256(data)
+
+        def write(*args, **kwargs):
+            seen.append(("write", locked()))
+            return write_json(*args, **kwargs)
+        with patch.object(door.hashlib, "sha256", compare), patch.object(door, "write_json", write):
+            self.access_was(json.loads(json.dumps(ACCESS)), was)
+        self.assertEqual(seen, [("compare", True), ("write", True)])
+        self.assertFalse(locked())
 
     def test_an_update_leaves_the_code_readable_by_the_door_s_user(self):
         """The update clones the release into a folder that mkdtemp makes at 0700 for root, and the service runs as the
@@ -6101,19 +6189,26 @@ class Probe(DoorCase):
         logins = [argv for argv in self.ran if argv[0] == "ssh" and argv[-2:] == ["-T", "ops-agent@100.64.1.1"]]
         self.assertEqual(len(logins), 1)
 
-    def test_the_app_passes_first_only_when_the_door_s_code_has_the_line_that_it_greps(self):
+    def test_the_app_passes_a_flag_only_when_the_door_s_code_has_the_line_that_it_greps(self):
         """The owner's app passes --first only when its grep (DoorAccess.firstProbe) finds this parser's line in the
-        door's door.py: a line written another way would leave the app on its count of three rounds for good. A clone
-        with no app folder (the published hub) has nothing to compare."""
+        door's door.py: a line written another way would leave the app on its count of three rounds for good. So for
+        --was of access (DoorAccess.wasProbe): the app would write with no compare for good, and a second Mac's write
+        could be lost. A clone with no app folder (the published hub) has nothing to compare."""
         path = os.path.join(ROOT, "app", "Sources", "FleetCore", "DoorAccess.swift")
         if not os.path.isfile(path):
             self.skipTest("this clone has no app folder")
         with open(path, encoding="utf-8") as f:
-            found = re.search(r"firstProbe = \"grep -qs -- '([^']+)' /opt/fleet-door/current/door\.py", f.read())
-        self.assertIsNotNone(found, "DoorAccess.firstProbe greps door.py")
-        pattern = found.group(1).replace('\\"', '"')                   # the Swift string's escapes
+            swift = f.read()
         with open(door.__file__, encoding="utf-8") as f:
-            self.assertIn(pattern, f.read())
+            code = f.read()
+        for probe in ("firstProbe", "wasProbe"):
+            found = re.search(probe + r" = \"grep -qs -- '([^']+)' /opt/fleet-door/current/door\.py", swift)
+            self.assertIsNotNone(found, f"DoorAccess.{probe} greps door.py")
+            pattern = found.group(1).replace('\\"', '"')               # the Swift string's escapes
+            self.assertIn(pattern, code, probe)
+        found = re.search(r'wasRefused = "([^"]+)"', swift)
+        self.assertIsNotNone(found, "DoorAccess.wasRefused")
+        self.assertIn(found.group(1), code)
 
     def test_every_cause_of_the_door_is_of_the_app_s_alphabet(self):
         """The owner's app passes on the door's cause only when it is of its alphabet (DoorHosts.causeWords), else its

@@ -63,6 +63,9 @@ The vault protects the value of each secret. The design gives these results:
 - The value is only in the memory of the form. The app clears it when the hub has the reference, at Cancel, and when
   the form closes. No draft and no log gets it (`Sources/Founderizer/SecretEntryView.swift`).
 - The app seals only to the key that the central vault's install printed on the machine that the hub names as its own.
+  Root reads that key on that machine from the public key line of the vault's own key file. The vault's status, which
+  the install asks as the hub's user with `python3 -I`, must name the same key, or the install stops and prints no key
+  (`hubsetup.py` `central_status`). So no program of the hub's user decides the key that the Mac pins.
   That key comes to the Mac over the owner's SSH connection, which accepts only a known host key. The machine's name,
   and its address when the Mac has no saved connection to it, come from the hub. The app seals only while the hub names
   the same key (`Sources/FleetCore/CentralVault.swift`, `Sources/Founderizer/CentralVaultSection.swift`).
