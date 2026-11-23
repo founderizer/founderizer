@@ -1561,12 +1561,14 @@ def checkout_conf(agent):
 def team_catalog():
     """The catalog of this checkout: Fleet's own tools and the owner's MCP servers of team.json (owner feature mcp).
     The helper brings the checkout up to date before a task session starts, so a server that the owner added reaches
-    the next session; one that this checkout does not have yet is not loaded, and the start text says so."""
+    the next session; one that this checkout does not have yet is not loaded, and the start text says so. It is a
+    session's catalog (lifecycle.tool_catalog's session): a server that no session loads is not in it, so no
+    runtime's file gets it (Claude's, Codex's options, an ACP runner's, a closed start's), and no mint asks for it."""
     try:
         with open(os.path.join(KIT, "team.json"), encoding="utf-8") as f:
-            return tool_catalog(json.load(f))
+            return tool_catalog(json.load(f), session=True)
     except (OSError, ValueError, TypeError):
-        return tool_catalog(TEAM)
+        return tool_catalog(TEAM, session=True)
 
 
 def team_refused():
@@ -1575,9 +1577,9 @@ def team_refused():
     refused = {}
     try:
         with open(os.path.join(KIT, "team.json"), encoding="utf-8") as f:
-            tool_catalog(json.load(f), refused)
+            tool_catalog(json.load(f), refused, session=True)
     except (OSError, ValueError, TypeError):
-        tool_catalog(TEAM, refused)
+        tool_catalog(TEAM, refused, session=True)
     return refused
 
 

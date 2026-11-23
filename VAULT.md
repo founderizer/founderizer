@@ -880,7 +880,10 @@ host.
 11. **The release key.** Releases change the vault's code on each server and in the central vault without a step from
     the owner (see "How the vault's code is updated"). So the holder of a release key can change every broker and the
     central vault (`hubsetup.py`, `hub.py`). On a Mac, a build with the team's Apple signature can replace Fleet Vault
-    (`Vault/update.zsh`).
+    (`Vault/update.zsh`). Its hourly root update checks the build's SHA-256 against the release manifest, the team's
+    signature and a higher build number, but not the manifest's own signature, which the app's own update checks
+    (`Sources/FleetCore/AppUpdate.swift`). So a release channel's host that is broken into can give each Mac a newer
+    build of the team's that the owner did not approve for customers, and root installs it.
 12. **A page in the browser.** On a Mac, Fleet Vault types the password and the code into the page in the Chrome that
     the agent uses (`Sources/FleetVaultCore/VaultBrowser.swift`, `rules/logins.md`). A program that can run a script
     in that page can read them, and it can use the session's cookies after the sign-in. The code says that it protects

@@ -307,7 +307,9 @@ class Refusals(Fixture):
     def test_the_card_is_the_hubs_words_for_a_captcha_only(self):
         """The agent names the step and writes no word of the card, so no wording and no language can ask the owner for
         a password on its screen; and a one-time code is no step yet: a code typed on a screen that the agent drives
-        can sign in somewhere else (review of 17 November 2026). The card is in the owner's language."""
+        can sign in somewhere else (review of 17 November 2026). The card is in the language that the owner's app
+        shows (the owner, 23 November 2026, "Yes, two values"): owner.app_language, "en" included, else
+        owner.language. The bug: the card follows the Mac's first preferred language, beside an app in another."""
         tid = self.task()
         for step in (None, "", "password", "code", "new_device", ["captcha"]):
             self.refused(tid, step=step)
@@ -316,10 +318,17 @@ class Refusals(Fixture):
                                   ("test-generation", f"T-{tid}", "1"))
         self.assertTrue(err, text)
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM needs")["n"], 0)
-        hub.TEAM["settings"] = {"owner.language": "es"}
+        hub.TEAM["settings"] = {"owner.language": "en", "owner.app_language": "es"}     # the app shows Spanish
         self.addCleanup(hub.TEAM.pop, "settings", None)
         self.assertFalse(self.ask(tid)[1])
         self.assertEqual(hub.q1("SELECT title FROM needs")["title"], "Resuelve el CAPTCHA en su pantalla")
+        english, spanish = "Solve the CAPTCHA on its screen", "Resuelve el CAPTCHA en su pantalla"
+        for settings, title in (({"owner.language": "es", "owner.app_language": "en"}, english),    # "en" is a value
+                                ({"owner.language": "es-ES"}, spanish),        # an app that sent none yet
+                                ({"owner.language": "en", "owner.app_language": "es-419"}, spanish),
+                                ({}, english)):
+            hub.TEAM["settings"] = settings
+            self.assertEqual(hub.takeover_title("captcha"), title, settings)
 
 
 PASSWORD = "Ab3dEf7h"           # a one-time password of 8 letters and digits, as the helper makes one

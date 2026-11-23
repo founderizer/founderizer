@@ -1575,6 +1575,8 @@ def mcp_server(name, entry, new=False):
             if not key_env(key):
                 raise ValueError(f"the MCP server {name}: auth \"key\" needs key, the name of an API key that the "
                                  f"agent reads in its sessions")
+            if new and key in FLEET_KEYS:       # one that a fleet has is read as before, and no session loads it
+                raise ValueError(f"the MCP server {name}: {mcp_fleet_key_says(key)}")
             made["bearer"] = key
         elif auth == "mint":
             key, path, field = entry.get("key"), entry.get("mint"), entry.get("mint_field", "case")
@@ -1662,17 +1664,43 @@ def tool_needs(tool):
                   ({tool["bearer"]} if tool.get("bearer") and not tool.get("mint") else set()))
 
 
-def tool_catalog(team, refused=None):
+def mcp_fleet_key(tool):
+    """The key of Fleet's own (FLEET_KEYS) that this url server sends to its address as its bearer, or None. A session
+    holds the fleet's GitHub token under those names, so a server saved with "key": "GH_TOKEN" got that token at each
+    task (T2b, 23 November 2026). A new write refuses such a key (mcp_server); one that a fleet saved before stays in
+    its team, and a session's catalog leaves it out (tool_catalog's session)."""
+    bearer = tool.get("bearer")
+    return bearer if tool.get("url") and bearer in FLEET_KEYS else None
+
+
+def mcp_fleet_key_says(key):
+    """The plain words of a url server whose key is Fleet's own, for the owner's write and for a session's note."""
+    return (f"its key {key} is Fleet's own: a session holds the fleet's GitHub token under that name and would send it "
+            f"to the server's address. Save the server's key on the Secrets page under a name of its own, and give the "
+            f"server that name")
+
+
+def tool_catalog(team, refused=None, session=False):
     """The catalog of this team: Fleet's own tools and the owner's MCP servers of team.json "mcp". A server that does
     not pass mcp_server is left out, so a hand-written entry can never reach a session; refused, a dict, gets the
-    reason of each one, so that the start text can say it."""
+    reason of each one, so that the start text can say it. session: the catalog of a task session's start (the
+    helper's, fleet.team_catalog), which also leaves out a server that no session loads (mcp_fleet_key): every
+    runtime's file reads this one. The hub's catalog keeps it, so that the team, the release gate and the owner's
+    views stay whole."""
     catalog = {name: dict(tool, custom=False, auth="none") for name, tool in TOOL_CATALOG.items()}
     for name, entry in sorted(((team or {}).get("mcp") or {}).items()):
         try:
-            catalog[name] = mcp_server(name, entry)
+            made = mcp_server(name, entry)
         except ValueError as e:
             if refused is not None:
                 refused[name] = str(e)
+            continue
+        key = mcp_fleet_key(made) if session else None
+        if key:
+            if refused is not None:
+                refused[name] = mcp_fleet_key_says(key)
+            continue
+        catalog[name] = made
     return catalog
 
 

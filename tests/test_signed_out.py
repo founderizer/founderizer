@@ -766,19 +766,25 @@ class SignedOut(test_agent_auth.Routes):
         """The apps show their own words in the language of the device, and the card's title and step as the hub wrote
         them (the area's reader of piece 1, finding 1). The believable bugs: a Mac in Spanish shows "Ajustes ›
         Servidores" and "Iniciar sesión" beside a step that names "Settings › Servers" and "Sign in"; a language that
-        the apps do not have gets no card, or words that the app does not show."""
+        the apps do not have gets no card, or words that the app does not show; the card follows the Mac's first
+        preferred language, not the language that the app shows, which the Mac sends (owner.app_language, the owner,
+        23 November 2026, "Yes, two values"): a Mac with Catalan first and Spanish second, or an English app on a
+        Spanish Mac."""
         self.signed("alpha", False)
         real, who = hub.setting, hub.shown_role("alpha")
-        for tag, title, todo in (
-                ("es-ES", f"Inicia la sesión de {who} en Claude Code",
-                 "En Founderizer en tu Mac, abre Ajustes › Servidores y elige box. Pulsa Iniciar sesión junto a Claude "
-                 f"Code para {who} y sigue los pasos que se abren."),
-                ("fr-FR", f"Sign {who} in to Claude Code",          # a Mac in French alone: the app shows English
-                 "In Founderizer on your Mac, open Settings › Servers and choose box. Press Sign in beside Claude Code "
-                 f"for {who}, then follow the steps that it opens.")):
-            def language(key, tag=tag):
-                return tag if key == "owner.language" else real(key)
-            with self.subTest(tag=tag), patch.object(hub, "setting", language):
+        spanish = (f"Inicia la sesión de {who} en Claude Code",
+                   "En Founderizer en tu Mac, abre Ajustes › Servidores y elige box. Pulsa Iniciar sesión junto a "
+                   f"Claude Code para {who} y sigue los pasos que se abren.")
+        english = (f"Sign {who} in to Claude Code",
+                   "In Founderizer on your Mac, open Settings › Servers and choose box. Press Sign in beside Claude "
+                   f"Code for {who}, then follow the steps that it opens.")
+        for tag, app, (title, todo) in (("es-ES", None, spanish),     # a Mac app from before: owner.language
+                                        ("fr-FR", None, english),     # a Mac in French alone: the app shows English
+                                        ("ca-ES", "es", spanish),     # Catalan first, the app in Spanish
+                                        ("es-ES", "en", english)):    # an English app on a Spanish Mac
+            def language(key, tag=tag, app=app):
+                return tag if key == "owner.language" else app if key == "owner.app_language" and app else real(key)
+            with self.subTest(tag=tag, app=app), patch.object(hub, "setting", language):
                 nid = self.sign_in_card()
                 self.assertEqual(tuple(hub.q1("SELECT title, todo FROM needs WHERE id=?", (nid,))), (title, todo))
                 hub.q("UPDATE needs SET answer='Not now' WHERE id=?", (nid,))

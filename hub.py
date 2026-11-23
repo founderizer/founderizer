@@ -2136,6 +2136,9 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "owner_profile",     # the owner, 16 November 2026 ("bots should talk in Spanish", "your profile
                                     # with the user name"): the settings owner.language and owner.name, which the
                                     # owner's Mac sets from its own language and account (UI-API.md 1.200)
+               "owner_app_language",    # the owner, 23 November 2026 ("Yes, two values"): the setting
+                                    # owner.app_language, the language that the owner's app shows, which the Mac sends;
+                                    # the hub's own fixed words on a card take it (UI-API.md 1.323)
                "error_reports",     # the owner, 16 November 2026 ("Yes, as drawn"): the switch of error reports (now
                                     # Settings › Help › Help improve Founderizer, and the first page of the setup),
                                     # GET and POST /ui/error-reports, off until he turns it on
@@ -10039,6 +10042,16 @@ def language_said(tag):
     LANGUAGE_NAMES."""
     base = tag.split("-")[0].lower()
     return f"{LANGUAGE_NAMES[base]} ({tag})" if base in LANGUAGE_NAMES else f"the language of the tag {tag}"
+
+
+def owner_app_language():
+    """The first part of the language that the owner's app shows ("es" of "es-ES"), which the hub's own fixed words on
+    a card take: owner.app_language, which the Mac sends, "en" included; while it is empty, owner.language. The owner,
+    23 November 2026 ("Yes, two values"): owner.language is the Mac's first preferred language, which need not be the
+    app's (a Mac with Catalan first and Spanish second shows the app in Spanish). What an agent writes keeps
+    owner.language (owner_start_text). The limit: one value for the fleet, which the last Mac that sends it sets (once
+    for each hub generation in a launch, UI-API.md 1.323), for every card, on the phone and the PC too."""
+    return str(setting("owner.app_language") or setting("owner.language") or "").split("-")[0].lower()
 
 
 # A change of the owner's name or language in Settings, for the sessions that run (start_settings_changed). The
@@ -19321,17 +19334,16 @@ def need_give_closes(r):
 # it never names a page or a button that the app does not have, and it closes by itself when the hub reads the sign-in
 # (need_look_sweep). One sign-in, one open card: a second one for the same runtime of the same sign-in is refused.
 #
-# The words of the card, in the owner's language (the area's reader of piece 1, finding 1): the apps show their own
-# words in the language of the device, and the card's title and step as the hub wrote them, so a Mac in Spanish showed
-# "Ajustes › Servidores" beside a step that named "Settings › Servers". The hub reads the owner's language from the
-# setting owner.language, which the Mac fills with the first of its own preferred languages (OwnerProfile.languageTag),
-# as takeover_title reads it; a language that this table does not have gets the English. A known hole, written (the
-# area's reader of piece 1, round 5): owner.language is the Mac's FIRST preferred language, not the language that the
-# app shows, which is the first of those languages that the app has (String(l10n:), Bundle's own choice). So on a Mac
-# with Catalan first and Spanish second, the hub writes the English step while the app shows "Ajustes › Servidores" and
-# "Iniciar sesión"; and the value is one for all of the owner's Macs: the first Mac that is not in English sets it, an
-# agent of the owner's can set it, and a Mac in another language keeps it. The fix is the Mac's word of the app's own
-# language (Bundle.main.preferredLocalizations.first), which is App shell's. The
+# The words of the card, in the language that the owner's app shows (the area's reader of piece 1, finding 1): the
+# apps show their own words in the language of the device, and the card's title and step as the hub wrote them, so a
+# Mac in Spanish showed "Ajustes › Servidores" beside a step that named "Settings › Servers". The hub reads that
+# language with owner_app_language, as takeover_title does: the setting owner.app_language, which the Mac sends from
+# its app's own language (Bundle.main.preferredLocalizations.first, UI-API.md 1.323), else owner.language, the first of
+# the Mac's preferred languages, for a Mac app from before; a language that this table does not have gets the English.
+# So a Mac with Catalan first and Spanish second, whose app shows Spanish, gets the Spanish step (the owner, 23 November
+# 2026, "Yes, two values"). The limit that stays: the value is one for the fleet, which the last Mac that sends it sets
+# (once for each hub generation in a launch), so the owner's other Mac, phone or PC in another language shows the card
+# in that Mac's language beside its own words. The
 # page and the buttons are the app's own words in each language of the app (app/Localization/Localizable.xcstrings,
 # the languages of app/Localization/shipped): test_the_cards_words_are_the_apps_own reads both. "on your Mac": the
 # phone shows the step too, and its own app has no Servers (the validation of piece 1, finding 4).
@@ -19347,9 +19359,8 @@ NEED_SIGN_IN_WORDS = {
 
 
 def sign_in_words():
-    """NEED_SIGN_IN_WORDS in the owner's language (owner.language: its first part, "es" of "es-ES"), else English."""
-    tag = str(setting("owner.language") or "").split("-")[0].lower()
-    return NEED_SIGN_IN_WORDS.get(tag, NEED_SIGN_IN_WORDS["en"])
+    """NEED_SIGN_IN_WORDS in the language that the owner's app shows (owner_app_language), else English."""
+    return NEED_SIGN_IN_WORDS.get(owner_app_language(), NEED_SIGN_IN_WORDS["en"])
 
 
 
@@ -19478,12 +19489,12 @@ def sign_in_unread_sweep(mgr):
 def need_sign_in(a):
     """{agent, runtime, server, title, todo} of a raise_needs_you with sign_in, the agent that is not signed in; None
     without one. The runtime is the one that the hub's current reading says is signed out, of sign_in_runtimes: the
-    agent's own, else the Codex of its screen tasks. The title and the step are in the owner's language
-    (sign_in_words). A ToolError for an item that the owner could not do as the step says: the hub reads each of them
-    signed in, or has no current reading (an agent whose page shows no sign-in then; the hub tells the manager when it
-    reads one: SIGN_IN_UNREAD); an open item asks for that sign-in already; a sign-in of it runs now; a Mac
-    with no ChatGPT app, whose page has no sign-in of Codex; or an owner whose computer is a PC, whose app does not sign
-    an agent in again yet (app/windows/PARITY.md, machine_signin)."""
+    agent's own, else the Codex of its screen tasks. The title and the step are in the language that the owner's app
+    shows (sign_in_words). A ToolError for an item that the owner could not do as the step says: the hub reads each of
+    them signed in, or has no current reading (an agent whose page shows no sign-in then; the hub tells the manager when
+    it reads one: SIGN_IN_UNREAD); an open item asks for that sign-in already; a sign-in of it runs now; a Mac with no
+    ChatGPT app, whose page has no sign-in of Codex; or an owner whose computer is a PC, whose app does not sign an
+    agent in again yet (app/windows/PARITY.md, machine_signin)."""
     name = str(a.get("sign_in") or "").strip()      # call_tool gave a role's agent by its name (AGENT_NAME_FIELDS)
     if not name:
         return None
@@ -19564,7 +19575,7 @@ def need_sign_in(a):
     done = max((row["updated"] for _, row in row_of if row["state"] == "done"), default=0)
     failed = any(row["state"] == "failed" and not row["timed_out"] and row["updated"] > done and
                  (n == name or sign_in_reading(n, runtime) is False) for n, row in row_of)
-    words = sign_in_words()             # in the owner's language
+    words = sign_in_words()             # in the language that the owner's app shows
     return {"agent": name, "runtime": runtime, "server": server,
             "title": words["title"].format(role=role, runtime=label),
             "todo": words["step"].format(page=words["page"], server=server,
@@ -21895,9 +21906,9 @@ def t_request_secret(agent, a):
 # (the owner's rule of 1 November 2026). A one-time code is not one either, yet: both vaults report a sign-in that
 # ends on a code page as failed, and send a text-message code to the requester (fleet.py do_sign_in, VaultBrowser), and
 # a code typed on a screen that the agent drives can sign in somewhere else (a code relay). The agent names the step,
-# and the hub writes the card's title in the owner's language: no word of it is the agent's (review of 17 November
-# 2026: the title "Type the portal's password on my screen" passed the hub, and no list of refused words holds in
-# every language and wording).
+# and the hub writes the card's title in the language that the owner's app shows (owner_app_language): no word of it
+# is the agent's (review of 17 November 2026: the title "Type the portal's password on my screen" passed the hub, and
+# no list of refused words holds in every language and wording).
 TAKEOVER_NEEDS = ("browser", "screen")
 TAKEOVER_TITLES = {"en": {"captcha": "Solve the CAPTCHA on its screen"},
                    "es": {"captcha": "Resuelve el CAPTCHA en su pantalla"}}
@@ -21914,11 +21925,9 @@ TAKEOVER_DONE = re.compile(r"\s*\u00a1?(?:(?:done|ok|okay|hecho|listo|resuelto|y
 
 
 def takeover_title(step):
-    """The card's title for `step`, in the owner's language (Spanish, else English). The limit of sign_in_words holds
-    here too (NEED_SIGN_IN_WORDS): owner.language is the Mac's first preferred language, not the language that the app
-    shows, so a Mac with Catalan first and Spanish second gets the English title beside the app's Spanish."""
-    tag = str(setting("owner.language") or "").split("-")[0].lower()
-    return TAKEOVER_TITLES.get(tag, TAKEOVER_TITLES["en"])[step]
+    """The card's title for `step`, in the language that the owner's app shows (owner_app_language: Spanish, else
+    English)."""
+    return TAKEOVER_TITLES.get(owner_app_language(), TAKEOVER_TITLES["en"])[step]
 
 
 def takeover_way(agent):
@@ -63736,7 +63745,7 @@ LANGUAGE_NAMES = {
 
 
 def language_check(value):
-    """owner.language: the language that the owner reads, as a BCP 47 tag of at most 35 characters."""
+    """owner.language and owner.app_language: a language as a BCP 47 tag of at most 35 characters."""
     if not isinstance(value, str) or len(value) > 35 or not LANGUAGE_TAG.fullmatch(value):
         raise ValueError('must be a language tag (BCP 47) of at most 35 characters, for example "es" or "es-ES"')
     return value
@@ -63827,6 +63836,14 @@ SETTINGS = {
     "owner.language": ("", language_check,
                        "The language that the owner reads, as a BCP 47 tag: every agent writes in it what the owner's "
                        "apps show. Empty: the agents write as before. The owner's Mac sets it from its own language."),
+    # the owner, 23 November 2026 ("Yes, two values"): the agents keep owner.language, the Mac's first preferred
+    # language, and the hub's own fixed words follow the language that the owner's app shows (owner_app_language()),
+    # which the Mac sends once for each hub generation in a launch, when it differs, "en" included (owner feature
+    # owner_app_language), with no control
+    "owner.app_language": ("", language_check,
+                           "The language in which the owner's apps show their words, as a BCP 47 tag: the hub's own "
+                           "fixed words on a card (a sign-in card's title and step, a take-over's title) take it. "
+                           "Empty: they take owner.language."),
     # the owner, 16 November 2026: "something like your profile with the user name so the fleet can address them
     # properly", and to its picture, "Mac account + Settings row": Settings › General › Your profile › Name
     "owner.name": ("", name_check,
@@ -71532,6 +71549,9 @@ def check_mcp_server(name, entry, agent=None, new=False):
         result.update(checked=True, answers=not short, needs="machine" if short or open_ones else None,
                       says=f"{what}: each server answered for itself and nobody ran it. {said}")
         return result
+    key = lifecycle.mcp_fleet_key(made)
+    if key:             # a saved server whose key is Fleet's own: no session loads it, so it is not asked
+        raise ValueError(f"the MCP server {name}: {lifecycle.mcp_fleet_key_says(key)}")
     access, url = None, made["url"]
     # The saved access token of a connected server goes only to the address that was connected: a check of a new
     # server under a connected name, at another address, asks without it. Else any caller of the owner's route (an AI
@@ -88963,6 +88983,11 @@ class Handler(BaseHTTPRequestHandler):
         if a.get("role") not in ("worker", "lead"):
             return self.json(409, {"error": "only a worker or a lead has task sessions"})
         repos, tools, tokens, errors = dict(a.get("repos") or {}), list(a.get("tools") or []), [], []
+        # A url server whose key is Fleet's own (lifecycle.mcp_fleet_key) goes to no helper: one of an older release
+        # loads each name that it gets, with the session's GitHub token as its bearer. Its reason is in mcp_problems.
+        known = tool_catalog(TEAM)
+        keyed = {name: lifecycle.mcp_fleet_key(known.get(name) or {}) for name in tools}
+        tools = [name for name in tools if not keyed[name]]
         # support plan F1: no repository and no GitHub token for a Shell-off session; and none renewed for an agent
         # that the owner made inactive
         if shell_off(agent) or (renew and not agent_active(agent)):
@@ -89017,6 +89042,8 @@ class Handler(BaseHTTPRequestHandler):
             servers[mcp_variable(name)] = access
             log(agent, f"an access token of the MCP server {name} for a task session, for "
                        f"{max(0, int(ends - now()) // 60)} minutes")
+        problems = [f"The MCP server {name} is not loaded: {lifecycle.mcp_fleet_key_says(key)}."
+                    for name, key in keyed.items() if key] + problems
         return self.json(200, {"repos": repos, "tools": tools, "tokens": tokens, "errors": errors,
                                "mcp": servers, "mcp_problems": problems}, {"Cache-Control": "no-store"})
 

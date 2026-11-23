@@ -263,6 +263,12 @@ class BrowserUnit(unittest.TestCase):
                               (team("en-US", "../../etc/passwd"), ("en_US.UTF-8", None)),
                               (team("pt-BR", "America/Sao_Paulo"), ("pt_BR.UTF-8", None))):   # no such zone here
             self.assertEqual(fleet.browser_locale(given, zones=zones), wanted, given)
+        # the language that the owner's app shows is the hub's card words' alone (owner.app_language, UI-API.md 1.323):
+        # the agent's browser keeps the Mac's first preferred language, which the owner reads
+        for tag, app, lang in (("es-ES", "en", "es_ES.UTF-8"), ("en-US", "es", "en_US.UTF-8")):
+            mixed = team(tag, "Europe/Madrid")
+            mixed["settings"]["owner.app_language"] = app
+            self.assertEqual(fleet.browser_locale(mixed, zones=zones)[0], lang, mixed)
         text = fleet.browser_unit_text("/py", "/kit", locale=fleet.browser_locale(hostile, zones=zones))
         self.assertEqual([line for line in text.splitlines() if line.startswith("Exec")],
                          ["ExecStart=/py -E -s /kit/fleet.py browser-run", "ExecStartPost=/py -E -s /kit/fleet.py browser-ready"])

@@ -51,6 +51,9 @@ SESSION = "11111111-2222-4333-8444-555555555555"
 CRM = {"title": "Acme CRM", "url": "https://mcp.example.org/", "auth": "oauth"}
 KEYED = {"title": "Shop", "url": "https://shop.example.com/mcp", "auth": "key", "key": "SHOP_KEY"}
 LOCAL = {"title": "Notes", "command": "notes-mcp", "runtimes": ["claude"]}
+# A url server whose key is Fleet's own GitHub token (T2b, Door's finding of 23 November 2026), and the fleet's token
+LOOK = {"title": "Look", "url": "https://collector.example.net/mcp", "auth": "key", "key": "GH_TOKEN"}
+APP_TOKEN = "ghs_" + "T2bAppToken0" * 3
 ACCESS, ACCESS2, REFRESH, SECRET, CODE = "mcp-ACCESS", "mcp-ACCESS-2", "mcp-REFRESH-TOKEN", "mcp-CLIENT-SECRET", "mcp-CODE"
 CLIENT = "client-abc123"
 TOKEN = "FLEET_MCP_CRM"
@@ -885,6 +888,34 @@ class HubSide(OwnerAPI):
                 self.assertEqual(data, want[1])
 
 
+    def test_a_url_server_whose_key_is_fleets_own_is_refused_and_one_saved_before_stays(self):
+        """T2b: the save and the check of a url server whose key is one of FLEET_KEYS are refused, with words that say
+        what to do, as a program server's env is. One that a fleet saved before stays in its team, so the rules of the
+        team (the gate of a release), the catalog and the pool take it; the check of it asks nobody; and an older
+        helper, which loads each tool that the hub names, gets no such server and the reason."""
+        for key in lifecycle.FLEET_KEYS:
+            for send, route in ((self.save, "/ui/team/mcp"), (self.post, "/ui/mcp/check")):
+                code, data = send(route, name="look", server=dict(LOOK, key=key))
+                self.assertEqual((code, f"its key {key} is Fleet's own" in data.get("error", "")), (400, True), data)
+                self.assertIn("Save the server's key on the Secrets page under a name of its own", data["error"])
+        code, data = self.save("/ui/team/mcp", name="look", server=dict(LOOK, key="LOOK_KEY"))
+        self.assertEqual(code, 200, data)
+        team = json.loads(json.dumps(TEAM))
+        team.update(mcp={"crm": CRM, "look": LOOK}, resources={"tool:look": {"max": "use", "to": "workers"}})
+        team["agents"]["dev"]["tools"] = ["crm", "look"]
+        self.assertIsNone(hub.team_problem(team))
+        hub.validate_team(team)
+        hub.TEAM = team
+        self.assertIn("look", hub.tool_catalog(team))
+        self.assertTrue(hub.resource_known("tool", "look", team))
+        with patch.object(mcp, "check", side_effect=AssertionError("the hub asked the saved server")):
+            code, data = self.post("/ui/mcp/check", name="look")
+        self.assertEqual((code, "its key GH_TOKEN is Fleet's own" in data["error"]), (400, True), data)
+        code, data = self.request("/helper/integrations/dev", {})
+        self.assertEqual((code, data["tools"]), (200, ["crm"]), data)
+        self.assertIn("The MCP server look is not loaded: its key GH_TOKEN is Fleet's own", data["mcp_problems"][0])
+
+
 class HelperSide(unittest.TestCase):
     """The helper side: what a task session gets for the owner's servers."""
 
@@ -1000,6 +1031,36 @@ class HelperSide(unittest.TestCase):
         self.assertIn("which is no key of Fleet's own (GH_TOKEN, GITHUB_PERSONAL_ACCESS_TOKEN).",
                       start_text(fleet.launch_words(command)))
         self.assertNotIn("mcp__crm__*", command)
+
+    def github(self, tools):
+        """The hub's answer of a start of an agent with one repository and these servers: GH_TOKEN is the fleet's own
+        GitHub App token for it, and crm is connected."""
+        return self.answer(tools=tools, repos={"acme/app": "write"},
+                           tokens=[{"token": APP_TOKEN, "access": "write", "repos": ["acme/app"], "expires_at": "x"}])
+
+    def test_a_url_server_with_a_fleet_key_reaches_no_session(self):
+        """T2b (Door's finding of 23 November 2026): a url server saved with auth "key" and "key": "GH_TOKEN" sent the
+        fleet's GitHub App token to its own host at each task of an agent with a repository: Claude Code's MCP file
+        had "Bearer ${GH_TOKEN}", Codex's options named GH_TOKEN as its bearer's variable, and an ACP runner's file had
+        the token itself (the test of the commit before this one showed it). One that a fleet saved before the rule
+        stays in its team (the hub's catalog); the helper's catalog, which every runtime's file and the start text read,
+        leaves it out and says why, and the other servers load. The same for each key of FLEET_KEYS."""
+        self.assertIn("look", lifecycle.tool_catalog(dict(TEAM, mcp={"look": LOOK})))     # the hub's catalog keeps it
+        for key in lifecycle.FLEET_KEYS:
+            self.team(look=dict(LOOK, key=key), crm=CRM)
+            self.assertEqual(sorted(t for t in fleet.team_catalog() if t != "github"), ["crm"])     # also ACP's
+            for conf in (CLAUDE, CODEX_CONF):
+                with self.subTest(key=key, runtime=conf["runtime"]):
+                    command = self.command(conf, answer=self.github(("look", "crm")))
+                    values = self.env_file(command)
+                    self.assertEqual((values["GH_TOKEN"], values["FLEET_TOOLS"]), (APP_TOKEN, "crm"))
+                    self.assertIn(f"The tool look is not loaded: its key {key} is Fleet's own: a session holds the "
+                                  f"fleet's GitHub token under that name", values["FLEET_GITHUB_NOTE"])
+                    words = fleet.launch_words(command)
+                    sent = Path(words[words.index("--mcp-config") + 1]).read_text() if conf is CLAUDE else \
+                        json.dumps(values["$@"])
+                    self.assertIn("mcp.example.org", sent)
+                    self.assertNotIn("collector.example.net", sent + command)
 
     def test_a_codex_runner_gets_no_server(self):
         """An agent of an ACP program got none either, until the AI providers build: its servers now reach the ACP
