@@ -736,7 +736,10 @@ host.
    person with a copy of that database can find a short or simple value by guessing.
 3. **A key that the owner types into a chat.** It is in the chat's records before anything can mask it (`RULES.md`).
    The Mac app asks before it pastes a key into a chat message, but the owner can paste it anyway
-   (`Sources/Founderizer/FleetView.swift`).
+   (`Sources/Founderizer/FleetView.swift`). The same holds for a value that an agent writes into a field of a fleet tool
+   and that the hub does not know: the record of that call keeps the field as it came, and a refusal of another tool can
+   quote a field (`hub.py`). The hub masks only registered values. Its leak check finds the record after the owner
+   registers the value.
 4. **Root, and the vault's own OS user.** On a Linux server, only file owners and modes protect the keys and the
    stores, so root and the vault user can read them (`vault.py`, `hubsetup.py`). On a Mac, root installs and replaces
    Fleet Vault (`Vault/install.py`).
@@ -1033,6 +1036,11 @@ host.
     program is root, and it can know the key of the broker that it installs, which the owner's Mac then reads there
     and pins. The hub can then open each value that the owner gives to an agent of that server. A machine that joined
     before does not change by this, nor does the hub's own server, which installs from GitHub (`hub.sh`).
+    **An installer that runs again** on a server runs root steps from the checkout of the service's own user: on the
+    hub's server the agents' users and their list, and where agents share it the vault, the key swap and the outgoing
+    gate (`hub.sh`); on a joined server also the firewall and the hardening (`join.sh`). If that user is broken into, root
+    runs that user's code, and on the hub's server it can read the vault's store. The second claim of a lost Mac
+    (`HUB-INSTALL.md`) is such a run. The check of a later update of the checkout is that user's program too.
 
 ## What the owner must do
 
