@@ -850,8 +850,11 @@ host.
     the hub knows the door's pinned key. So a hub that is broken into can put a value of its own under each name of
     the door's file, with no step of the owner, and the door then works with that value, for example in the account
     of another person at a provider (`fetch_sealed` in `door.py`). The same hub can also make the door delete a value
-    that it holds (the `keep` list). A signature of the central vault on each copy, which the door checks before it
-    keeps the copy, closes the first part; it is planned (22 November 2026), not built.
+    that it holds (the `keep` list). It can also send the sealed copy of one key again under the reference of another,
+    because the door keeps an opened copy under the `login` that the hub names and the central vault seals only the
+    value: so a provider's key can reach an app's setting, and the door writes it onto a host. A signature of the
+    central vault on each copy, which names its reference and which the door checks before it
+    keeps the copy, closes the first and the last of these; it is planned (22 November 2026), not built.
     The names in the door's file are the hub's word too. The Mac writes each card credential's name, the reference of
     the secret behind it, and the providers of each agent as the hub's view gives them (`DoorAccess.swift`). So the
     same hub can drop a credential, and the door then deletes its value. It can also point a credential of an app's

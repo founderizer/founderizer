@@ -245,6 +245,13 @@ VENDOR_TOKEN_WORDS = ("it is one of the product's own repositories, and the door
 NAME = re.compile(r"[a-z][a-z0-9-]{1,30}")
 HOST = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}")
 REF = re.compile(r"bws://[0-9a-f-]{36}", re.I)
+
+
+def same_ref(a, b):
+    """True when two secret references name one value. REF takes either case and secret() opens the reference in
+    lower case, so a comparison of the exact text would let one value pass under two names: a hub that is broken into
+    could write a provider's key as an app's setting by its reference in capitals (a read of 22 November 2026)."""
+    return isinstance(a, str) and isinstance(b, str) and a.lower() == b.lower()
 # new-projects plan N4: a key that the owner saved for one setting of one app, app:<app>:<NAME>
 APP_KEY = re.compile(r"app:" + door_targets.OPS_ROOT.APP_NAME.pattern + ":" + door_targets.OPS_ROOT.ENV_NAME.pattern)
 ROLE = re.compile(r"arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,128}")
@@ -1082,7 +1089,7 @@ class Door:
         ref = (credentials.get(name) or {}).get("secret")
         if not ref:
             raise Refused(f"the door holds no key as {name}")
-        if any(isinstance(c, dict) and c.get("secret") == ref for k, c in credentials.items() if k != name):
+        if any(isinstance(c, dict) and same_ref(c.get("secret"), ref) for k, c in credentials.items() if k != name):
             raise Refused(f"{name} names a key that the door uses for something else: it goes in no app")
         return self.secret(ref).encode()
 
@@ -1635,7 +1642,7 @@ class Door:
         when the file names none (keep_account)."""
         conf = dict((access.get("credentials") or {}).get(target) or {})
         kept = read_json(ACCOUNTS_FILE, {}).get(target) or {}
-        if not conf.get("account_id") and kept.get("account_id") and kept.get("secret") == conf.get("secret"):
+        if not conf.get("account_id") and kept.get("account_id") and same_ref(kept.get("secret"), conf.get("secret")):
             # account_kept: the door's own reading of the key before, not the file's word. The names of what a call
             # makes and deletes take it; what a saved key is, and which account it is for, is asked of its provider
             conf.update(account_id=kept["account_id"], account_kept=True)
@@ -1887,7 +1894,8 @@ class Door:
         it, "repos": [owner/name, ...]}}}, account and repository names in lower case. Unlike github_reach it lists an
         installation that has all its account's repositories too. Archived repositories and suspended installations
         are left out; an installation with more than the door reads is an error."""
-        apps = sorted({(str(c["app_id"]), c["secret"]) for k, c in (self.access().get("credentials") or {}).items()
+        apps = sorted({(str(c["app_id"]), str(c["secret"]).lower())
+                       for k, c in (self.access().get("credentials") or {}).items()
                        if k.lower().startswith("github:") and isinstance(c, dict) and c.get("app_id") and c.get("secret")})
         accounts = {}
         for app_id, ref in apps:
@@ -1919,7 +1927,7 @@ class Door:
         app_id = str(app_id or "")
         if not re.fullmatch(r"[1-9][0-9]{0,11}", app_id):
             raise Refused("app_id is the App's number")
-        used = sorted({c["secret"] for k, c in (self.access().get("credentials") or {}).items()
+        used = sorted({c["secret"].lower() for k, c in (self.access().get("credentials") or {}).items()
                        if k.lower().startswith("github:") and isinstance(c, dict) and str(c.get("app_id")) == app_id
                        and isinstance(c.get("secret"), str)})
         if not used:
@@ -1990,7 +1998,8 @@ class Door:
         never taken from GitHub's answer; the accounts whose installation has all their repositories; the repositories
         of the others; the page that installs the App on another account; and the accounts that own the Apps. Every
         name in lower case."""
-        apps = sorted({(str(c["app_id"]), c["secret"]) for k, c in (self.access().get("credentials") or {}).items()
+        apps = sorted({(str(c["app_id"]), str(c["secret"]).lower())
+                       for k, c in (self.access().get("credentials") or {}).items()
                        if k.lower().startswith("github:") and isinstance(c, dict) and c.get("app_id") and c.get("secret")})
         pages, every, repos, install, owners = {}, set(), set(), None, set()
         for app_id, ref in apps:
@@ -2474,7 +2483,8 @@ def github_app(access, owner):
 def sole_app(access):
     """The door's one GitHub App, when its file names one App only: an account that the owner installed it on after
     the move has no line of its own yet, and GitHub's installation of the repository decides, as it did for the hub."""
-    apps = {(str(c.get("app_id")), c.get("secret")): c for k, c in (access.get("credentials") or {}).items()
+    apps = {(str(c.get("app_id")), str(c.get("secret")).lower()): c
+            for k, c in (access.get("credentials") or {}).items()
             if k.lower().startswith("github:") and isinstance(c, dict) and c.get("app_id")}
     return next(iter(apps.values())) if len(apps) == 1 else None
 

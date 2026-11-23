@@ -4394,11 +4394,22 @@ class AppSettingsPath(HostPath):
         self.assertIn("no key of yours is saved for the door as app:shop:STRIPE_SECRET_KEY", got["why"])
         self.assertEqual(self.sent, [])
         data = json.loads(json.dumps(door.read_json(door.ACCESS_FILE, {})))
-        data["credentials"]["app:shop:STRIPE_SECRET_KEY"] = {"secret": ref(4)}      # hetzner:one's key
-        self.write_access(data)
-        got = self.call(ONE, "web-1", "env-new", "shop", "STRIPE_SECRET_KEY", "key")
-        self.assertIn("a key that the door uses for something else", got["why"])
-        self.assertEqual(self.sent, [])
+        # hetzner:one's key, also when one of the two lines names it in capitals, which secret() opens as the same
+        # value (a read of 22 November 2026: a comparison of the exact text let a broken hub write a provider's key
+        # into an app). Pairs of (the provider's line, the app's line), with a reference that has hex letters and a
+        # value of its own, so that capitals in the UUID count and a compare that lowers one side only fails.
+        hexed = "bws://0000000a-bcde-4abc-8def-00000000000f"
+        with open(os.path.join(self.root + door.SECRETS_DIR, hashlib.sha256(hexed.encode()).hexdigest()), "w") as f:
+            f.write("hz-provider-key")
+        for provider, app in ((ref(4), ref(4)), (ref(4), ref(4).upper()), (hexed, hexed.upper()),
+                              (hexed.upper(), hexed), (hexed.upper().replace("BWS://", "bws://"), hexed)):
+            with self.subTest(provider=provider, app=app):
+                data["credentials"]["hetzner:one"]["secret"] = provider
+                data["credentials"]["app:shop:STRIPE_SECRET_KEY"] = {"secret": app}
+                self.write_access(data)
+                got = self.call(ONE, "web-1", "env-new", "shop", "STRIPE_SECRET_KEY", "key")
+                self.assertIn("a key that the door uses for something else", got["why"])
+                self.assertEqual(self.sent, [])
 
     def test_env_add_after_the_first_release_is_the_agent_s_own_call_and_its_value_stays_the_door_s(self):
         os.symlink("releases/one", self.host + "/var/www/shop/current")

@@ -179,7 +179,9 @@ class Devices(test_ui_api.OwnerAPI):
         for a key or a login, the hub closes the item with those words, and the receipt has each field that the phone
         reads of the receipt of an answer, also when the same request comes again. The phone saves no secret, so
         `note` from it is refused. A hub that refused a phone's words, or a receipt with a field missing, leaves the
-        phone's saved request with no way out."""
+        phone's saved request with no way out. Each answer keeps the hand that sent it (request_hand), which the agent
+        reads: a tool's label counts before the device (the equal-Macs design of 22 November 2026, piece E3), so the
+        owner tools on an enrolled device, as on a second main Mac, never write the owner's own words."""
         key = self.enrolled()
         spec = {"kind": "login", "site": "https://shop.example/login", "give": {}}
         nid = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?)",
@@ -196,36 +198,55 @@ class Devices(test_ui_api.OwnerAPI):
         self.assertEqual({k: type(receipt.get(k)) for k in ("ok", "request_id", "client", "event_id", "created", "replayed")},
                          {"ok": bool, "request_id": str, "client": str, "event_id": int, "created": float, "replayed": bool})
         self.assertEqual(hub.q1("SELECT answer FROM needs WHERE id=?", (nid,))["answer"], "Which account?")
-        # Fable's second check of 20 November 2026: the phone's own answer is its hand, whatever its label, and the
-        # agent reads the owner's words with no mark of a program
+        # Fable's second check of 20 November 2026: the phone's own answer is its hand, also with the label of another
+        # app of the owner's (here the Mac app's), and the agent reads the owner's words with no mark of a program
         self.assertEqual(hub.q1("SELECT hand FROM ui_requests WHERE request_id=?", (body["request_id"],))["hand"],
                          "device")
         self.assertTrue(hub.q1("SELECT text FROM events WHERE id=?", (receipt["event_id"],))["text"].startswith(
             f"[owner] Answer to Needs-you N-{nid} "))
         again = self.call(path, dict(body, clarify="Which account?"), source=PHONE, token=key)[1]
         self.assertEqual((again["replayed"], again["created"], again["event_id"]), (True, receipt["created"], receipt["event_id"]))
-        # an AI session's clarify (Fable's third check of 20 November 2026): its words are not the owner's, and the
-        # agent reads so in the mark and in the hub's line
-        other = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?)",
-                        ("Enter a login for crm.example", "The tickets.", hub.SECRET_TODO, hub.now(), "manager",
-                         "secret", json.dumps(spec)))
-        status, told = self.call(f"/ui/needs/{other}/secret", {"request_id": str(uuid.uuid4()), "db": "test-generation",
-                                                             "clarify": "The support one."},
-                                 headers={"X-Fleet-Client": "founderizer-cli/1/test"})
-        self.assertEqual(status, 200, told)
-        said = hub.q1("SELECT text FROM events WHERE id=?", (told["event_id"],))["text"]
-        self.assertTrue(said.startswith(f"[owner via ai-session] Answer to Needs-you N-{other} "), said)
-        self.assertIn("An AI session or a program wrote the words before this line for the owner", said)
-        third = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?)",
-                        ("Enter a login for mail.example", "The mail.", hub.SECRET_TODO, hub.now(), "manager",
-                         "secret", json.dumps(spec)))
-        status, told = self.call(f"/ui/needs/{third}/secret", {"request_id": str(uuid.uuid4()), "db": "test-generation",
-                                                             "clarify": "The shared one."},
-                                 headers={"X-Fleet-Client": "curl/8.7.1"})
-        self.assertEqual(status, 200, told)
-        said = hub.q1("SELECT text FROM events WHERE id=?", (told["event_id"],))["text"]
-        self.assertTrue(said.startswith(f"[owner via program] Answer to Needs-you N-{third} "), said)
-        self.assertIn("An AI session or a program wrote the words before this line for the owner", said)
+        # The hand of each sender, and what the agent reads (Fable's third check of 20 November 2026 for the owner's
+        # computer; piece E3 for a device): a tool's label or a session is an AI session's, on a device too, and its
+        # words are not the owner's; a program's label on the owner's computer is a program's; each app of the owner's
+        # writes the owner's words.
+        hub.TEAM["owner_devices"]["pc"] = {"label": "PC", "address": OTHER}
+        status, made = self.code("pc")
+        self.assertEqual(status, 200, made)
+        status, got = self.call("/ui/owner/enroll", {"code": made["code"], "kind": "windows"}, source=OTHER)
+        self.assertEqual(status, 200, got)
+        pc = got["key"]
+        cli, mcp = {"X-Fleet-Client": "founderizer-cli/1/test"}, {"X-Fleet-Client": "founderizer-mcp/1/test"}
+        session = {"X-Fleet-Session": "claude-code/1"}
+        for n, (who, source, token, headers, hand, mark) in enumerate((
+                ("the phone's app", PHONE, key, {"X-Fleet-Client": "founderizer-ios/1/test"}, "device", ""),
+                ("the CLI on the phone", PHONE, key, cli, "tool", " via ai-session"),
+                ("a session on the phone", PHONE, key, session, "tool", " via ai-session"),
+                ("the PC's app", OTHER, pc, {"X-Fleet-Client": "founderizer-windows/1/test"}, "device", ""),
+                ("the MCP server on the PC", OTHER, pc, mcp, "tool", " via ai-session"),
+                ("the Mac app", MAC, None, {}, "app", ""),
+                ("the CLI on the owner's computer", MAC, None, cli, "tool", " via ai-session"),
+                ("a session on the owner's computer", MAC, None, session, "tool", " via ai-session"),
+                ("a program on the owner's computer", MAC, None, {"X-Fleet-Client": "curl/8.7.1"}, "other",
+                 " via program"))):
+            with self.subTest(who=who):
+                need = hub.ins("INSERT INTO needs(title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?)",
+                               (f"Enter a login for site{n}.example", "The tickets.", hub.SECRET_TODO, hub.now(),
+                                "manager", "secret", json.dumps(spec)))
+                request_id = str(uuid.uuid4())
+                status, told = self.call(f"/ui/needs/{need}/secret", {"request_id": request_id, "db": "test-generation",
+                                                                    "clarify": "The support one."},
+                                         source=source, token=token, headers=headers)
+                self.assertEqual(status, 200, told)
+                self.assertEqual(hub.q1("SELECT hand FROM ui_requests WHERE request_id=?", (request_id,))["hand"],
+                                 hand)
+                said = hub.q1("SELECT text FROM events WHERE id=?", (told["event_id"],))["text"]
+                self.assertTrue(said.startswith(f"[owner{mark}] Answer to Needs-you N-{need} "), said)
+                self.assertEqual("An AI session or a program wrote the words before this line for the owner" in said,
+                                 bool(mark), said)
+        # every route refuses a request with no label (X-Fleet-Client is required); the hand of none stays the
+        # device's on a device, and a program's on the owner's computer
+        self.assertEqual((hub.request_hand("", device="iphone"), hub.request_hand("")), ("device", "other"))
 
     def test_a_code_works_once_and_only_from_its_device(self):
         status, made = self.code()

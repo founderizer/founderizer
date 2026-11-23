@@ -2244,10 +2244,11 @@ def owner_device_class(device):
 # program on the Mac that holds the Mac key is the owner to ui_allowed, so the hub keeps, with each owner message,
 # answer, steer and command, the kind of program that sent it, and the session that it names:
 #   "app"       the Mac app's own screen (its label, OWNER_APP_LABELS)
-#   "device"    an enrolled phone or PC, by its checked key (owner_device_at)
+#   "device"    an enrolled phone or PC, by its checked key (owner_device_at), with no tool's label and no session
 #   "connected" a connected app (capp_connections), "chat" a chat app's message (its origin)
 #   "tool"      the owner tools that his AI sessions use (the MCP server and the shell forms of founderizer-cli and
-#               owner_mcp.py, OWNER_TOOL_LABELS), or any request that names a session (X-Fleet-Session)
+#               owner_mcp.py, OWNER_TOOL_LABELS), or any request that names a session (X-Fleet-Session), from the
+#               owner's computer or from an enrolled device alike
 #   "other"     any other label: a script, a test
 # A label is the client's own claim (SECURITY.md): this tells an honest AI session from the owner's hand, never a
 # program that lies about itself.
@@ -2286,18 +2287,19 @@ def request_hand(client, device=None, connection=None, origin=None, session=None
     """The hand that sent an owner request (OWNER_TOOL_LABELS above): "app", "device", "connected", "chat", "tool" or
     "other". client: its X-Fleet-Client; device: true when it came from an enrolled owner device whose key the route
     checked; connection: the connected app that sent it; origin: the chat app message that brought it; session: its
-    X-Fleet-Session."""
+    X-Fleet-Session.
+    A tool's label counts before the device (the equal-Macs design of 22 November 2026, hazard 4.9 and piece E3): a
+    device that runs the owner tools, as a second main Mac does, gives their calls the hand "tool", never the owner's
+    own words (OWNER_FORCE_HANDS), as on the owner's computer."""
     label = str(client or "")
     if connection is not None:      # the hub's own record of a connected app; its label alone is a program's claim
         return "connected"
     if origin:
         return "chat"
-    if session:                 # a session names itself: an AI session's request, from any machine
+    if session or label.startswith(OWNER_TOOL_LABELS):      # an AI session's request, from any machine
         return "tool"
     if device:
         return "device"
-    if label.startswith(OWNER_TOOL_LABELS):
-        return "tool"
     return "app" if label.startswith(OWNER_APP_LABELS) else "other"
 
 
