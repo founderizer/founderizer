@@ -18761,8 +18761,9 @@ def card_value_steps(title, why, todo, details, options):
                     re.match(rf"\s+(?:of|for|de|del|para)\b(?!\s+(?:it|them|its|the\s+(?:vault\s+)?entry|"
                              rf"{_KEY_ITSELF}|la\s+entrada|ella|él)\b)", low[m.end():]):
                 continue
-            if agent_words is None:
-                agent_words = {" ".join(str(x).lower().split()) for n in agents() for x in (n, shown_role(n))} - {""}
+            if agent_words is None:     # an agent by its name or its role: team.json "title", as card_signs_in reads it
+                agent_words = {" ".join(str(x).lower().split()) for n, e in agents().items()
+                               for x in (n, e.get("title") or "")} - {""}
             if not any(re.match(rf"\S+(?:\s+in)?\s+(?:(?:the|a|an|its|their|your|la|el|su|tu|una?)\s+)?"
                                 rf"{re.escape(w)}\b", low[m.start():]) for w in agent_words):
                 return m

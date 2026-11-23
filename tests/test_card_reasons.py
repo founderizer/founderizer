@@ -178,6 +178,8 @@ class Reasons(OwnerAPI):
         door = "bws://00000000-0000-4000-8000-00000000b2de"
         login = "bws://00000000-0000-4000-8000-00000000d0de"
         hub.TEAM["agents"]["ada"] = {"role": "worker", "runtime": "claude", "machine": "worker-1", "can": []}
+        hub.TEAM["agents"]["kam"] = {"role": "worker", "runtime": "claude", "machine": "worker-1", "can": [],
+                                     "title": "Key Account Manager"}
         hub.TEAM["logins"] = {door: {"kind": "api_key", "env": "DOOR_BACKBLAZE_ACME_KEY",
                                      "title": "DOOR_BACKBLAZE_ACME_KEY"},
                               login: {"kind": "login", "title": "shop.example · ops@example.com"},
@@ -433,6 +435,10 @@ class Reasons(OwnerAPI):
                        dict(what_to_do="En la página de secretos, abre STRIPE_SECRET_KEY y escribe una nota: la clave "
                                        "de la tienda."),
                        dict(what_to_do="Open the vault entry STRIPE_SECRET_KEY and enter Ada under Who can use it."),
+                       # an agent by its role, which team.json's "title" holds (the label that the owner reads since
+                       # F16 is its name): a role that begins with "key" is no key
+                       dict(what_to_do="Open the vault entry STRIPE_SECRET_KEY and enter the Key Account Manager under "
+                                       "Who can use it."),
                        dict(what_to_do="1. Open the Secrets page.\n2. Open STRIPE_SECRET_KEY.\n3. Set Ada to Uses it "
                                        "and press Enter."),
                        dict(what_to_do="On the Secrets page, enter STRIPE_SECRET_KEY's card and set Ada to Uses it."),
