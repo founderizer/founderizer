@@ -1132,6 +1132,23 @@ host.
     only, and the owner's pins stay as they are. A hub on a server with no agents does not have this limit (`hub.py`,
     `vault.py`, `lifecycle.py`).
 
+30. **A hub's own server that takes agents with no key swap and no outgoing gate.** `hub.sh` switches on the key swap
+    and the outgoing gate for a hub's own server only when it runs with the word of one server for all
+    (`FLEET_HUB_SERVER=shared`, a word of a hub's first install): the key swap since 16 November 2026 and the gate
+    since 17 November 2026. A hub whose owner chose one server for all later
+    (Founderizer's step, `hubsetup.py one-server`) gets the root helpers, its own broker and the server service, but
+    neither of the two; a hub installed with the word before those days has neither, or only the key swap. Each agent
+    that then comes to that server (Add agent or a move) gets each API key of the pool as a value in its sessions, so it
+    can print it, and no gate records where it connects. Nothing tells the owner. Root switches both on there with
+    `hubsetup.py key-swap` and `hubsetup.py egress` (`hubsetup.py`, `hub.sh`).
+
+31. **An API key with the name GH_TOKEN.** A task session's environment is the agent's keys first, and then the
+    variables that Fleet sets for the task itself (`fleet.py`): for an agent with repositories, GH_TOKEN is the fleet's
+    own GitHub token. So a key that the owner saves with the name GH_TOKEN does not reach that agent's task sessions:
+    the fleet's token takes its place, and nothing says so. Its owner-chat sessions get the key. The Secrets page and
+    `save_secret` take that name today. Give such a key another name, as `GITHUB_TOKEN` (`fleet.py`, `lifecycle.py`
+    `FLEET_KEYS`).
+
 ## What the owner must do
 
 1. **Protect the Mac.** The owner key and the recovery code are in its login Keychain, and the app uses the owner key

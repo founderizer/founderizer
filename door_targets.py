@@ -90,20 +90,22 @@ TRUE = r"\s*[\"']?(?i:true|yes|on|y)\b"       # the words that YAML 1.1 reads as
 
 
 def kind_line(names):
-    return ITEM + r"(?i:kind)[ \t]*:\s*[\"']?(?i:" + names + ")" + END
+    # also the kind's List, whose items with no kind of their own are of that kind in Kubernetes' reading
+    return ITEM + r"(?i:kind)[ \t]*:\s*[\"']?(?i:(?:" + names + ")(?:List)?)" + END
 
 
 # The three reference forms take each key that ENDS in secretKeyRef, secretRef or secretName, in any case (a CSI
 # volume's nodePublishSecretRef, a store's tokenSecretRef), and the operator's kinds each group of external-secrets.io
-# (generators.external-secrets.io too). A match starts at a word's start, and (?<!\w) keeps the search there: from
-# each place of a long word, \w* would read the rest of it again.
+# (generators.external-secrets.io too). A key's word is read from its start: \w* from each place of a long word would
+# take a time that grows with the square of its length.
 MANIFEST_REFUSED = {
     "a new secretKeyRef": r"(?<!\w)(?i:\w*secretKeyRef)\s*:", "a new secretRef": r"(?<!\w)(?i:\w*secretRef)\s*:",
     "a new secret volume": ITEM + r"(?i:secret)[ \t]*:[ \t\r]*(?:#.*)?$|(?<!\w)(?i:\w*secretName)\s*:",
     "a hostPath": r"\bhostPath\s*:",
     "privileged": r"\bprivileged\s*:" + TRUE, "a host namespace": r"\bhost(Network|PID|IPC)\s*:" + TRUE,
     "an Application": kind_line("Application|ApplicationSet|AppProject"),
-    "an external-secrets kind": ITEM + r"apiVersion[ \t]*:\s*[\"']?(?i:(?:[\w-]+\.)*external-secrets\.io)/",
+    # the group with its version, or alone with no version (no object of the cluster, but a reading of the door's)
+    "an external-secrets kind": ITEM + r"apiVersion[ \t]*:\s*[\"']?(?i:(?:[\w-]+\.)*external-secrets\.io)(?:/|" + END + ")",
     "a CRD": kind_line("CustomResourceDefinition"),
     "a webhook": kind_line("(?:Mutating|Validating)WebhookConfiguration"),
     "a new LoadBalancer": r"\btype\s*:\s*[\"']?LoadBalancer\b", "a Secret object": kind_line("Secret"),
@@ -111,10 +113,10 @@ MANIFEST_REFUSED = {
     "a Tailscale operator setting": r"tailscale\.com/tags\s*:|" + kind_line("ProxyClass"),
 }
 SECRET_KIND = re.compile(MANIFEST_REFUSED["a Secret object"], re.M)
-SECRET_TOP = re.compile(r"^(?i:kind)[ \t]*:\s*[\"']?(?i:Secret)" + END, re.M)
+SECRET_TOP = re.compile(r"^(?i:kind)[ \t]*:\s*[\"']?(?i:Secret(?:List)?)" + END, re.M)
 SECRET_DATA = re.compile(ITEM + r"(?i:data|stringData)[ \t]*:", re.M)
 LIST_TOP = re.compile(kind_line(r"\w*List"), re.M)        # a List of objects, at any depth of a JSON array of them
-KEY_AT = re.compile(r"^([ \t]*(?:-[ \t]+)*)(?i:(kind)[ \t]*:\s*[\"']?(?i:Secret)" + END +
+KEY_AT = re.compile(r"^([ \t]*(?:-[ \t]+)*)(?i:(kind)[ \t]*:\s*[\"']?(?i:Secret(?:List)?)" + END +
                     r"|(apiVersion)[ \t]*:)", re.M)
 
 
@@ -675,12 +677,6 @@ def decide_commit(access, agent, me, repo, op, args, content, lookups):
     return Decision("rule", "a checked change of the listed forms", target=f"commit:{repo}", plan=plan)
 
 
-# A rule call's changed line: a replica count, or an image, a tag or a digest. (?:-\s*)? and not -?\s*, as in
-# LISTED_LINE.
-LISTED_REPLICAS = re.compile(r"\s*(?:-\s*)?replicas\s*:\s*\d{1,2}\s*")
-LISTED_IMAGE = re.compile(r"\s*(?:-\s*)?(image|tag|digest|newTag|newName)\s*:\s*\S+\s*")
-
-
 def app_path_rule(path, data, lookups, repo):
     """True for a rule form, "refused: ..." for a refusal, else the reason that it is the agent's own call."""
     base = os.path.basename(path)
@@ -696,9 +692,9 @@ def app_path_rule(path, data, lookups, repo):
     changed = changed_lines(old, data)
     if changed is None:
         return f"{path} changes more than its values"
-    if all(LISTED_REPLICAS.fullmatch(line) for line in changed):
+    if all(REPLICAS_LINE.fullmatch(line) for line in changed):
         return True
-    if all(LISTED_IMAGE.fullmatch(line) for line in changed):
+    if all(IMAGE_LINE.fullmatch(line) for line in changed):
         return image_rule(old, data, lookups)
     return f"{path}: {changed[0].strip()[:80]} is not a listed form"
 
@@ -734,7 +730,7 @@ def image_rule(old, new, lookups):
     """A checked image: the same repository name, and a green release run of that repository made this tag or
     digest."""
     def refs(data):
-        return re.findall(r"^[^\S\n]*(?:-\s*)?image\s*:\s*['\"]?([^\s'\"]+)", data.decode("utf-8", "replace"), re.M)
+        return IMAGE_REF.findall(yaml_breaks(data.decode("utf-8", "replace")))      # a CR, a NEL: a line's start too
     before, after = refs(old), refs(new)
     made = lookups.get("image_made") or (lambda image: False)
     for x, y in zip(before, after):
@@ -1026,48 +1022,148 @@ def manifest_name(path):
 # The loose reading, for a text that the block reader does not read: a file of the GitOps repository with another name
 # than .yaml, .yml or .json, which Kustomize takes as a resource and Helm renders as a template all the same, and a
 # YAML file that its own people wrote in another style. It finds a word wherever it stands, and never says what the
-# text means. LOOSE_WORDS are the words of every form that MANIFEST_REFUSED and the checks beside it refuse, and the
-# tag by which YAML reads a key from base64. Role, Application and a secret volume are words of plain speech too, so
-# LOOSE_KEYS takes them with their key, in the text with its quotes, spaces, tabs and braces taken out.
+# text means. LOOSE_WORDS are the words of every form that MANIFEST_REFUSED and the checks beside it refuse, the tag
+# by which YAML reads a key from base64, and the directive that names a tag's handle. Role, Application and a secret
+# volume are words of plain speech too, so LOOSE_KEYS takes them with their key, in the text with its quotes, spaces,
+# tabs and braces taken out (the bare text).
+# A key in a text that no parser reads, as go-yaml and Helm read one: the key and its own closing quote, then its colon
+# (also after spaces and line breaks: a flow mapping's key), where a colon ends a key: before a space, a line break,
+# the text's end or a flow mark, or after a quoted key ("k":v). A colon inside a word is no key's: secret-db:5432 and
+# external-secrets:v0.9.1 name none. go-yaml and Helm refuse a key whose colon stands on a later line than the key,
+# but an explicit key's (? key): after a ?, the word alone counts as the key (EXPLICIT), whatever comment lines stand
+# before its colon. The bare text has no spaces, so there any colon ends a key (BARE_END). No quantifier stands inside
+# another, and a pattern that reads a word starts only at the word's start, so no text makes the door's reading slow.
+KEY_END = r"(?:[\"']\s*:|\s*:(?=[\s,\[\]{}]|$))"
+BARE_END = r"\s*:"
+# an explicit key's ? where a node starts, and the key's opening quote; after a colon and a list's dash too, for the
+# bare text, which has no braces and no spaces ({? k} after a key's colon, - ? k)
+EXPLICIT = r"(?<![^\s\[{,:-])\?\s*[\"']?"
+# What may stand after a held key's colon before its value on a later line: a block scalar's mark, and comment lines
+# (kind: # Deployment or Role, then the value). One line at a time, so that no text has two ways to be read.
+BREAK = r"[\n\r\x85\u2028\u2029]"
+AFTER = r"[ \t]*(?:[|>][-+0-9]{0,2}[ \t]*)?(?:(?:#[^\n\r\x85\u2028\u2029]*)?" + BREAK + r"[ \t]*)*"
+AFTER_BARE = r"(?:[|>][-+0-9]{0,2})?(?:(?:#[^\n\r\x85\u2028\u2029]*)?" + BREAK + r")*"
+
+
+def key_value(value, bare=False):
+    """The rest of a held key's pattern after its name: its colon (KEY_END, or BARE_END in the bare text), what may
+    stand before its value (AFTER), and the value's pattern, also after an anchor (&a Role); or a tag, which can make
+    any value (!!binary); or an alias, whose anchor can hold any value: its name is the group alias, and it counts only
+    where the text holds an anchor of that name (aliased), so that a * of Markdown (**Kind:**, a * list after "of this
+    kind:") counts for nothing."""
+    if bare:
+        return BARE_END + AFTER_BARE + r"(?:!|\*(?P<alias>[\w-]+)|(?:&[\w-]*?\s*)?" + value + ")"
+    return KEY_END + AFTER + r"(?:!|\*(?P<alias>[\w-]+)|(?:&[\w-]+\s+)?[\"']?" + value + ")"
+
+
+def keyed(word, end=KEY_END, explicit=None):
+    """A pattern of word as a key: with its end (KEY_END, BARE_END, key_value), or after the ? of an explicit key
+    (EXPLICIT), where explicit, if given, is the whole key's pattern (a key that ends in the word), with no colon after
+    it on its line, where the key's colon and its value say what it is (? kind: supplier is a key of a mapping, and a
+    script's ternary)."""
+    return r"(?:" + word + end + "|" + EXPLICIT + (explicit or word) + r"(?![\w.-])(?![ \t]*:))"
+
+
+ANCHOR = re.compile(r"&([\w-]+)")
+
+
+def aliased(pattern, text, anchors=None):
+    """The matches of a held key's pattern (key_value) in a text, but one whose value is an alias that names no anchor
+    of the text (ANCHOR, or anchors if given)."""
+    anchors = set(ANCHOR.findall(text)) if anchors is None else anchors
+    return [m for m in pattern.finditer(text) if not m.groupdict().get("alias") or m.group("alias") in anchors]
+
+
 LOOSE_WORDS = ("secretkeyref", "secretref", "secretname", "hostpath", "privileged", "hostnetwork", "hostpid", "hostipc",
                "applicationset", "appproject", "external-secrets.io", "secrets-store.csi.x-k8s.io",
                "customresourcedefinition", "mutatingwebhookconfiguration", "validatingwebhookconfiguration",
                "loadbalancer", "clusterrole",
                "rolebinding", "clusterrolebinding", "tailscale.com/tags", "proxyclass", "upgrade.cattle.io",
-               "serviceaccountname", "!!binary", "tag:yaml.org,2002:binary")
-LOOSE_KEYS = {"kind: role": r"kind:\s*role(?![a-z0-9])", "kind: application": r"kind:\s*application(?![a-z0-9])",
-              "secret:": r"(?<![a-z0-9_./-])secret:",
+               "serviceaccountname", "!!binary", "tag:yaml.org,2002:binary", "%tag")
+
+
+TRUE_WORD = r"(?:true|yes|on|y)(?![a-z0-9])"
+LOOSE_KEYS = {"kind: role": keyed("kind", key_value(r"role(?![a-z0-9])", bare=True)),
+              "kind: application": keyed("kind", key_value(r"application(?![a-z0-9])", bare=True)),
+              "secret:": keyed(r"(?<![a-z0-9_./-])secret", BARE_END),
               # each key that ends so, as MANIFEST_REFUSED reads them: a word of LOOSE_WORDS is a whole word only
-              "*secretkeyref:": r"secretkeyref:", "*secretref:": r"secretref:", "*secretname:": r"secretname:",
+              "*secretkeyref:": keyed("secretkeyref", BARE_END, explicit=r"[\w.-]*?secretkeyref"),
+              "*secretref:": keyed("secretref", BARE_END, explicit=r"[\w.-]*?secretref"),
+              "*secretname:": keyed("secretname", BARE_END, explicit=r"[\w.-]*?secretname"),
               # and the two that a text can turn on with no new word, from false to true
-              "privileged: true": r"privileged:\s*(?:true|yes|on|y)(?![a-z0-9])",
-              "a host namespace: true": r"host(?:network|pid|ipc):\s*(?:true|yes|on|y)(?![a-z0-9])"}
+              "privileged: true": keyed("privileged", key_value(TRUE_WORD, bare=True)),
+              "a host namespace: true": keyed(r"host(?:network|pid|ipc)", key_value(TRUE_WORD, bare=True)),
+              # an explicit key that starts with an anchor, a tag, a comment or a block scalar, before which EXPLICIT
+              # does not read the key's word (EXPLICIT_MARK)
+              "an explicit key's mark": r"(?<![^\s\[{,:-])\?\s*(?:&[\w-]|!!|!<|[#|>])"}
+LOOSE_KEYS = {word: re.compile(pattern) for word, pattern in LOOSE_KEYS.items()}
 
 
-def loose_text(text):
-    """A text in lower case, with the escapes that YAML and JSON read in a quoted text written out (a backslash with
-    x50 or u0050, and a line that ends in a backslash, which goes on in the next one), so that no word hides in one."""
-    def char(found):
-        try:
-            return chr(int(next(g for g in found.groups() if g), 16))
-        except (ValueError, OverflowError):
-            return ""
-    text = re.sub(r"\\\r?\n[ \t]*", "", text)
-    return re.sub(r"\\(?:x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))", char, text).lower()
+# A backslash and what it escapes, in a double-quoted text of YAML: a line break (with the next line's indentation),
+# a number of 2, 4 or 8 hex digits, or one character
+ESCAPE = re.compile(r"\\(?:(\r\n|[\r\n\x85\u2028\u2029])[ \t]*|x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|"
+                    r"U([0-9a-fA-F]{8})|(.))", re.S)
+DQ_ESCAPES = {"0": "\0", "a": "\a", "b": "\b", "t": "\t", "\t": "\t", "n": "\n", "v": "\v", "f": "\f", "r": "\r",
+              "e": "\x1b", " ": " ", '"': '"', "/": "/", "\\": "\\", "N": "\x85", "_": "\xa0", "L": "\u2028",
+              "P": "\u2029"}
+
+
+def loose_texts(text):
+    """The four readings of a text in the loose reading, in lower case, so that no word hides in an escape of YAML or
+    JSON: with each number escape written out (a backslash with x50, u0050 or U00000050), (1) with each line that
+    ends in a backslash joined with the next one, as a double-quoted text goes on (a line break of YAML is a CR LF, a
+    CR, a LF, a NEL, an LS or a PS, as go-yaml reads them), and (2) with no join, as a comment that ends in a backslash
+    ends at its line's end (joined, its last word would glue to the next line's first); and (3, 4) the same two with
+    each other escape of a double-quoted text written out too (\\" and \\n: JSON in a quoted text). A word that one of
+    them shows counts. A text with no backslash has one reading, four times."""
+    if "\\" not in text:
+        return [text.lower()] * 4
+    # one pass for the four: (joined, as is), (as is, as is), (joined, every escape), (as is, every escape)
+    pieces, last = [[], [], [], []], 0
+    for found in ESCAPE.finditer(text):
+        whole = found.group(0)
+        if found.group(1):
+            outs = ("", whole, "", whole)
+        elif found.group(5) is None:
+            try:
+                outs = (chr(int(found.group(2) or found.group(3) or found.group(4), 16)),) * 4
+            except (ValueError, OverflowError):
+                outs = ("",) * 4
+        else:
+            outs = (whole, whole) + (DQ_ESCAPES.get(found.group(5), whole),) * 2
+        for piece, out in zip(pieces, outs):
+            piece += (text[last:found.start()], out)
+        last = found.end()
+    return ["".join(piece + [text[last:]]).lower() for piece in pieces]
+
+
+def loose_views(text):
+    "Each distinct reading of a text (loose_texts), as it stands and without its comments (uncommented)."
+    return list(dict.fromkeys(view for low in loose_texts(text) for view in (low, uncommented(low))))
 
 
 def loose_counts(text):
-    low = loose_text(text)
-    bare = re.sub(r"[\"'{} \t]", "", low)
-    counts = {w: len(re.findall(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", low)) for w in LOOSE_WORDS}
-    counts.update({w: len(re.findall(pattern, bare)) for w, pattern in LOOSE_KEYS.items()})
-    return counts, bare
+    """How many of each word of LOOSE_WORDS and key of LOOSE_KEYS a text holds, the most that one of its readings
+    (loose_texts) shows, and the bare text of each of the four readings: in lower case, with its quotes, spaces, tabs
+    and braces taken out. An alias after a held key's colon counts where an anchor of its name stands (aliased)."""
+    counts, bares, seen = {}, [], {}
+    for low in loose_texts(text):
+        if low not in seen:
+            bare = re.sub(r"[\"'{} \t]", "", low)
+            anchors = set(ANCHOR.findall(low))
+            one = {w: len(re.findall(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", low)) for w in LOOSE_WORDS}
+            one.update({w: len(aliased(pattern, bare, anchors)) for w, pattern in LOOSE_KEYS.items()})
+            seen[low] = bare
+            counts = {w: max(n, counts.get(w, 0)) for w, n in one.items()}
+        bares.append(seen[low])
+    return counts, bares
 
 
 def loose_danger(old_text, new_text):
     """The first refused form that the loose reading finds more of in the new text than in the old, or None: a word of
-    LOOSE_WORDS or a key of LOOSE_KEYS, another service account, or a bigger volume claim. With no old text, one
-    word is enough: a README that says hostPath is refused too, and the refusal names the word."""
+    LOOSE_WORDS or a key of LOOSE_KEYS, another service account, or a bigger volume claim, in any reading
+    (loose_counts). With no old text, one word is enough: a README that says hostPath is refused too, and the refusal
+    names the word."""
     (old, old_bare), (new, new_bare) = loose_counts(old_text), loose_counts(new_text)
     word = next((w for w in new if new[w] > old[w]), None)
     if word:
@@ -1075,25 +1171,37 @@ def loose_danger(old_text, new_text):
     # serviceAccount, the old name of the pod's field, too: a pattern, as a loose word would take kind: ServiceAccount
     accounts, sizes = (lambda bare: re.findall(r"serviceaccount(?:name)?:([^,\s\]]*)", bare)), \
         (lambda bare: [quantity(x) for x in re.findall(r"storage:([0-9.]+[kmgtp]i?)", bare)])
-    if accounts(old_bare) != accounts(new_bare):
+    if any(accounts(a) != accounts(b) for a, b in zip(old_bare, new_bare)):
         return "a changed serviceAccountName"
-    a, b = sizes(old_bare), sizes(new_bare)
-    return "a bigger volume claim" if len(b) > len(a) or any(n > o for o, n in zip(a, b)) else None
+    for a, b in ((sizes(a), sizes(b)) for a, b in zip(old_bare, new_bare)):
+        if len(b) > len(a) or any(n > o for o, n in zip(a, b)):
+            return "a bigger volume claim"
+    return None
+
+
+MANIFEST_KEY = re.compile(keyed(r"(?<![a-z0-9_./-])(?:kind|apiversion)", BARE_END))
 
 
 def manifest_keys(text):
-    """How many kind and apiVersion keys a text holds, in the loose reading: what makes a text a manifest."""
-    return len(re.findall(r"(?<![a-z0-9_./-])(?:kind|apiversion):", loose_counts(text)[1]))
+    """How many kind and apiVersion keys a text holds, in the loose reading (the most of its readings): what makes a
+    text a manifest."""
+    return max(len(MANIFEST_KEY.findall(bare)) for bare in loose_counts(text)[1])
+
+
+KIND_SECRET = re.compile(keyed("kind", key_value(r"secret(?![a-z0-9])", bare=True)))
+STRING_DATA = re.compile(keyed("stringdata", BARE_END))
 
 
 def loose_secret(text):
-    """True when the loose reading says that a text may hold a Secret object. The text in lower case, with its quotes,
-    spaces, tabs and braces taken out, names the kind Secret or has a stringData key; or the text is JSON and an
-    object in it has that kind, in any case. The filter of a read asks it of a file that the block reader cannot
-    read, where the repository's own people wrote the text, and a commit of a file that gets the loose reading."""
-    bare = re.sub(r"[\"'{} \t]", "", loose_text(text))
-    if re.search(r"kind:\s*secret(?![a-z0-9])", bare) or "stringdata:" in bare:
-        return True
+    """True when the loose reading says that a text may hold a Secret object. A reading of the text (loose_texts) in
+    lower case, with its quotes, spaces, tabs and braces taken out, names the kind Secret or has a stringData key; or
+    the text is JSON and an object in it has that kind, in any case. The filter of a read asks it of a file that the
+    block reader cannot read, where the repository's own people wrote the text, and a commit of a file that gets the
+    loose reading."""
+    for low in set(loose_texts(text)):
+        bare = re.sub(r"[\"'{} \t]", "", low)
+        if aliased(KIND_SECRET, bare, set(ANCHOR.findall(low))) or STRING_DATA.search(bare):
+            return True
     try:
         left = [json.loads(text)]
     except (ValueError, RecursionError):
@@ -1124,13 +1232,18 @@ def kept_back(path, data):
     elif secret_object(text) or "-----BEGIN" in text:
         return "holds a Secret, which the filter keeps back"
     # the loose reading too for a file with another name than .yaml, .yml or .json, which no reader reads by lines
-    if (why or not manifest_name(path)) and (loose_secret(text) or "-----begin" in loose_text(text)):
+    if (why or not manifest_name(path)) and \
+            (loose_secret(text) or any("-----begin" in low for low in loose_texts(text))):
         return "may hold a Secret, which the filter keeps back"
     return None
 
 
-# The lines that a commit changes in a YAML file that code reads only loosely: the values of decide_gitops's rule calls.
-# (?:-\s*)? and not -?\s*: two runs side by side can split a long run of spaces at each place, which takes minutes.
+# The lines that a commit changes in a YAML file that code reads only loosely: the values of decide_gitops's rule calls
+# (one run of spaces before a list's dash and one after it: \s*-?\s* splits a long run of spaces in each place, and
+# an image's line is read from its line's start, not from each blank line before it)
+REPLICAS_LINE = re.compile(r"\s*(?:-\s*)?replicas\s*:\s*\d{1,2}\s*")
+IMAGE_LINE = re.compile(r"\s*(?:-\s*)?(image|tag|digest|newTag|newName)\s*:\s*\S+\s*")
+IMAGE_REF = re.compile(r"^[ \t]*(?:-\s*)?image\s*:\s*['\"]?([^\s'\"]+)", re.M)
 LISTED_LINE = re.compile(r"\s*(?:-\s*)?replicas\s*:\s*\d{1,2}\s*|"
                          r"\s*[\w./-]*restartedAt['\"]?\s*:\s*['\"]?[0-9T:.Z+-]{10,40}['\"]?\s*|"
                          r"\s*(?:-\s*)?(?:image|tag|digest|newTag|newName)\s*:\s*[\w./:@-]+\s*")
@@ -1139,36 +1252,133 @@ LISTED_LINE = re.compile(r"\s*(?:-\s*)?replicas\s*:\s*\d{1,2}\s*|"
 # is no key; an apiVersion of the operator's groups, of the Secrets Store CSI driver, of Argo CD or of RBAC; and, where
 # the door reads no object in the file (a values file, a file of another name), a key that contains serviceaccount.
 # In a manifest of objects the count reads serviceAccountName and serviceAccount by their values (sa_changed).
-# imagePullSecrets names a Secret that only the node reads, to pull an image: no key of this rule.
+# imagePullSecrets names a Secret that only the node reads, to pull an image: no key of this rule. A group stands with
+# its version or alone: an apiVersion of external-secrets.io with no version makes no object of the cluster, but the
+# store route of the door would read such a decoy as a store.
 HELD_GROUPS = (r"(?:(?:[\w-]+\.)*external-secrets\.io|argoproj\.io|secrets-store\.csi\.x-k8s\.io|"
-               r"rbac\.authorization\.k8s\.io)/")
+               r"rbac\.authorization\.k8s\.io)(?:/|(?![\w./-]))")
 # A key's colon may stand on the next line: in a flow mapping ({"secretKeyRef"\n: ...}) and after YAML's explicit key
-# (? secretKeyRef\n: ...). A match is a whole word that holds the name (a lookahead), from the word's start: with a
-# [\w.-]* on each side of the name, a long word of it took minutes.
-NAMES_SECRET = re.compile(r"(?<![\w.-])(?!imagepullsecrets[\"']?\s*:)(?=[\w.-]*?secret)[\w.-]*[\"']?\s*:")
-NAMES_HELD = re.compile(r"apiversion[\"']?\s*:\s*[\"']?" + HELD_GROUPS)
-NAMES_ACCOUNT = re.compile(r"(?<![\w.-])(?=[\w.-]*?serviceaccount)[\w.-]*[\"']?\s*:")
+# (? secretKeyRef\n: ...).
+# A key's whole word, at its start, with the word that it must hold looked for ahead: [\w.-]*secret[\w.-]* would try
+# each split of one long word, a time that grows with the square of its length.
+NAMES_SECRET = re.compile(keyed(r"(?<![\w.-])(?!imagepullsecrets(?![\w.-]))(?=[\w.-]*secret)[\w.-]+"))
+NAMES_HELD = re.compile(keyed("apiversion", key_value(HELD_GROUPS)))
+NAMES_ACCOUNT = re.compile(keyed(r"(?<![\w.-])(?=[\w.-]*serviceaccount)[\w.-]+"))
+# RBAC, as sensitive_key and rbac_rule read it: a key with rbac (but an RBAC proxy's) or clusterrole, and a rule's verbs
+RBAC_WORD = r"rbac(?![-_]?proxy)"       # but an RBAC proxy's: kubeRBACProxy, kube-rbac-proxy, rbac_proxy
+NAMES_RBAC = re.compile(keyed(r"(?<![\w.-])(?=[\w.-]*(?:" + RBAC_WORD + r"|clusterrole))[\w.-]+") + "|" +
+                        keyed(r"(?<![\w.-])verbs"))
+# The two keys of a Secret's name and key (name_and_key), each as a key itself, where a node starts (at a line's start,
+# after a flow mark, a list's dash or an explicit key's ?, and after a node's anchor and tag there, in either order:
+# {!x name: admin}), so that "the api key: ..." in an alert's text is no such key. At most two of them: a loop over
+# them would read each run of tags from each dash before it ({!x- !x- ...).
+PROPERTIES = r"(?:(?:&[\w-]+|![^\s,\[\]{}]*)[ \t]+){0,2}"
+NAMES_PAIR = [re.compile(r"(?:^|[\r\x85\u2028\u2029\[{,]|[?\-][ \t])[ \t]*" + PROPERTIES + r"[\"']?" + word + KEY_END +
+                         r"|(?<![^\s\[{,:-])\?\s*" + PROPERTIES + r"[\"']?" + word + r"(?![\w.-])", re.M)
+              for word in ("key", "name")]
 
 
 def uncommented(text):
-    """A text with each YAML comment taken out: a # at a line's start or after a space, a tab or a CR, to the line's
-    end, which a CR alone makes too (YAML reads one as a line break, and re's lines end at a LF only)."""
-    return re.sub(r"(^|[ \t\r])#[^\n\r]*", r"\1", text, flags=re.M)
+    """A text with each YAML comment taken out: a # at a line's start or after a space, a tab or a line break, to the
+    line's end, which each line break of YAML makes (a LF, a CR, a NEL, an LS or a PS, as go-yaml reads them; re's
+    lines end at a LF only)."""
+    return re.sub(r"(^|[ \t\r\x85\u2028\u2029])#[^\n\r\x85\u2028\u2029]*", r"\1", text, flags=re.M)
 
 
-def names_secret(text, accounts=True):
-    """True when a text names a Secret, a held kind or, with accounts, a service account, in the loose reading
-    (NAMES_SECRET, NAMES_HELD, NAMES_ACCOUNT), as it stands and without its comments: a comment can stand between a
-    key and its colon on the next line."""
-    low = loose_text(text)
-    return any(NAMES_SECRET.search(t) or NAMES_HELD.search(t) or accounts and NAMES_ACCOUNT.search(t)
-               for t in (low, uncommented(low)))
+def names_secret(text, accounts=True, rbac=True, views=None):
+    """True when a text names a Secret, a held kind, with rbac RBAC, or, with accounts, a service account, in the loose
+    reading (NAMES_SECRET, NAMES_HELD, NAMES_RBAC, NAMES_ACCOUNT), in each of its readings, as it stands and without
+    its comments (loose_views)."""
+    views = loose_views(text) if views is None else views
+    return any(NAMES_SECRET.search(t) or aliased(NAMES_HELD, t) or rbac and NAMES_RBAC.search(t) or
+               accounts and NAMES_ACCOUNT.search(t) for t in views)
+
+
+# What makes a key of a text that its words never spell, as go-yaml and Helm read YAML: a tag that changes a node
+# (!!binary c2VjcmV0UmVm: is secretRef; a verbatim !<...>; and, with a %TAG directive, any tag), where a node starts:
+# at a line's start, after a colon, a dash or a ? and a space, after a flow mark, after a quoted key's colon, and after
+# an anchor there; an explicit key that starts with an anchor, a tag, a comment or a block scalar, before which
+# EXPLICIT does not read its word (in a flow, a ? with no space after it is an explicit key's too, but a comment and a
+# block scalar need a space before them and an anchor its name, so a regex's [?&] is none); and an alias as a key (*k :
+# and ? *k, ?*k) whose anchor (&k) the text holds. The
+# name of an anchor and of an alias is letters, digits, _ and - (go-yaml refuses &a.b), so a long run of other marks
+# takes one try, not one for each. A ! with a space after it, a ! after a word or a ? with no space ("what?!", a
+# regex's (?!api)), a local tag (- !x, which go-yaml reads as the text), an anchor alone, an alias as a value, and a
+# * with no anchor of its name (Markdown's *Alert:*, a host *.example.com:443) make no key.
+NODE = r"(?:^[ \t]*|[?:\-][ \t]+|[\[{,][ \t]*|[\"']:[ \t]*)(?:&[\w-]+[ \t]+)?"
+CHANGING_TAG = re.compile(NODE + r"!(?:!|<)", re.M)
+ANY_TAG = re.compile(NODE + r"!(?=\S)", re.M)
+DIRECTIVE = re.compile(r"^%", re.M)
+EXPLICIT_MARK = re.compile(r"(?<![^\s\[{,])\?(?:\s*(?:&[\w-]|!!|!<)|\s+[#|>])")
+ALIAS_KEY = re.compile(r"(?<![^\s,\[\]{}?])\*([\w-]+)\s*:|(?<![^\s,\[\]{}])\?\s*\*([\w-]+)")
+
+
+def yaml_key(views):
+    "True when a reading of a text (loose_views) has what makes a key that its words never spell."
+    for view in views:
+        text = yaml_breaks(view)
+        if (ANY_TAG if DIRECTIVE.search(text) else CHANGING_TAG).search(text) or EXPLICIT_MARK.search(text):
+            return True
+        anchors = set(ANCHOR.findall(text))
+        if anchors and any((m.group(1) or m.group(2)) in anchors for m in ALIAS_KEY.finditer(text)):
+            return True
+    return False
+
+
+ONE_WORD = re.compile(r"[\w./:@-]*")
+
+
+def text_holds(text, rbac=True):
+    """True when a text may hold a mapping that names a Secret, a service account, a held kind or, with rbac, RBAC, as
+    a chart reads a text that it renders (tpl, extraObjects: - |) or a values text that is not block style: in its
+    readings (loose_views) it names one (names_secret), it has a name key and a key key (NAMES_PAIR: a mapping of a
+    name and a key, as basicAuth.password: {name, key}, names a key of a Secret under any key's name; a key key alone,
+    as a toleration's or an affinity's, names none), or it has a tag, an explicit key or an alias that can make any
+    key of the text (yaml_key: !!binary c2VjcmV0S2V5UmVm, *k : {name: db1, key: k} after &k secretKeyRef). An anchor
+    alone holds none, nor does a text of one word with no space, as an image with its tag or a URL, nor a colon in a
+    word (KEY_END): external-secrets:v1+k3s1 names no key. The known limit: a template's action ({{ "secretRef" }}:,
+    printf) can make any key of a text that a chart gives to tpl, and no reading of the text sees it."""
+    if ONE_WORD.fullmatch(text):
+        return False
+    views = loose_views(text)
+    return names_secret(text, rbac=rbac, views=views) or yaml_key(views) or \
+        all(any(pair.search(view) for view in views) for pair in NAMES_PAIR)
+
+
+# The value of a key that a rule call changes, as LISTED_LINE reads it (an image, a tag, a digest, a replica count)
+# (the value's own quotes, if any, around a plain value: a quote that opens another scalar cannot be taken for a value)
+# (on the key's own line: a value that a line break would take could be the next key)
+LISTED_VALUE = re.compile(r"(?i)(?<![\w.-])((?:image|tag|digest|newtag|newname|replicas)[\"']?[ \t]*:[ \t]*)"
+                          r"([\"']?)[\w./:@-]*\2")
+
+
+def rbac_changed(old, new):
+    """True when a change of a values text that code does not read by lines can change what the text says of RBAC. A
+    text with no key of RBAC (NAMES_RBAC) in any reading, before or after, says none. Else only the value of a listed
+    key (an image, a tag, a digest, a replica count) may change: an image bump in a text that also has rbac: is free.
+    A count of the keys of RBAC would also free rbac: {create: false} turned to {create: true}, which no reading of
+    such a text can tell from a bump."""
+    if not any(NAMES_RBAC.search(view) for text in (old, new) for view in loose_views(text)):
+        return False
+    # the texts as written: a key's case is Helm's (rbac.Create is another key, and create keeps the chart's default)
+    return LISTED_VALUE.sub(r"\1", old) != LISTED_VALUE.sub(r"\1", new)
 
 
 def sensitive_key(key):
-    "True for a key that names a Secret or an account: it contains secret or serviceaccount; but imagePullSecrets."
+    """True for a key that names a Secret, an account or RBAC: it contains secret, serviceaccount, clusterrole or rbac
+    (a chart's rbac.create, rbac.extraRules, createClusterRoles); but imagePullSecrets, and rbac in a key of an RBAC
+    proxy (kubeRBACProxy, kube-rbac-proxy, an image beside a server)."""
     low = key.lower() if isinstance(key, str) else ""
-    return ("secret" in low or "serviceaccount" in low) and low != "imagepullsecrets"
+    named = "secret" in low or "serviceaccount" in low or "clusterrole" in low or re.search(RBAC_WORD, low)
+    return bool(named) and low != "imagepullsecrets"
+
+
+def rbac_rule(node):
+    """True for a mapping that is a rule of a Role (verbs, with resources, apiGroups, resourceNames or
+    nonResourceURLs), under a key of any name: a chart's clusterRoleRules or additionalPermissions. No key with the
+    word rules is read alone: a monitoring chart's defaultRules and alerting rules are ordinary values."""
+    return isinstance(node, dict) and "verbs" in node and \
+        bool({"resources", "apiGroups", "resourceNames", "nonResourceURLs"} & set(node))
 
 
 def name_and_key(node, parent):
@@ -1183,16 +1393,19 @@ def name_and_key(node, parent):
 
 
 def sensitive(docs):
-    """What of parsed documents names a Secret, a service account or a held kind, with its place, in their order: each
-    value under a key that contains secret or serviceaccount, each mapping of a name and a key (name_and_key), and
-    each mapping with an apiVersion of a held group. Check 1 of a file that the parser reads compares it at HEAD and
-    after the commit, and nothing else."""
+    """What of parsed documents names a Secret, a service account, RBAC or a held kind, with its place, in their
+    order: each value under a key that sensitive_key reads, each mapping of a name and a key (name_and_key), each rule
+    of a Role (rbac_rule), each mapping with an apiVersion of a held group, and each text that may hold a mapping
+    that names one of these (text_holds: a manifest that a chart takes as a text, as extraObjects: - |). Check 1 of a
+    file that the parser reads compares it at HEAD and after the commit, and nothing else. An item of a list is placed by its name, where
+    it has one (an env item before another moves no reference), else by its index (a reference that moves to another
+    container, as a sidecar, changes its place)."""
     out = []
 
     def walk(node, at, parent):
         if isinstance(node, dict):
             if isinstance(node.get("apiVersion"), str) and re.match(HELD_GROUPS, node["apiVersion"], re.I) or \
-                    name_and_key(node, parent):
+                    name_and_key(node, parent) or rbac_rule(node):
                 out.append((at, json.dumps(node, sort_keys=True, default=str)))
                 return
             for k, v in node.items():
@@ -1202,7 +1415,10 @@ def sensitive(docs):
                     walk(v, at + (str(k),), k)
         elif isinstance(node, list):
             for n, v in enumerate(node):
-                walk(v, at + (n,), parent)
+                named = isinstance(v, dict) and isinstance(v.get("name"), str)
+                walk(v, at + (("name", v["name"]) if named else n,), parent)
+        elif isinstance(node, str) and text_holds(node):        # a text with a line break or none (one-line JSON)
+            out.append((at, json.dumps(node)))
     for n, doc in enumerate(docs or []):
         walk(doc, (n,), None)
     return out
@@ -1631,11 +1847,26 @@ OWNER_SHOWN = 40            # lines of a change of the owner's files that the de
 
 
 def listed_objects(doc, depth=0):
-    "The objects of one document: itself, or the items of a List, at any depth (door_render.objects)."
+    """The objects of one document as Kubernetes reads it (apimachinery's Unstructured.IsList, which kubectl and Argo
+    CD use): any document whose items is a list is a list, whatever its kind, and only its items are applied; an item
+    with no kind or apiVersion of its own takes the list's kind, less "List", and the list's apiVersion. At any depth
+    (door_render.objects). A ConfigMap with items, or a List whose items have no kind, hid a held object from the
+    door (the review of 22 November 2026)."""
     items = doc.get("items")
-    if isinstance(doc.get("kind"), str) and doc["kind"].endswith("List") and isinstance(items, list) and depth < 40:
-        return [o for item in items if isinstance(item, dict) for o in listed_objects(item, depth + 1)]
+    if isinstance(items, list) and depth < 40:
+        return [o for item in items if isinstance(item, dict)
+                for o in listed_objects(list_item(doc, item), depth + 1)]
     return [doc]
+
+
+def list_item(doc, item):
+    "One item of a list with the kind and the apiVersion that Kubernetes gives it where it names none."
+    kind, version = doc.get("kind"), doc.get("apiVersion")
+    if not item.get("kind") and isinstance(kind, str) and kind:
+        item = dict(item, kind=kind[:-4] if kind.endswith("List") else kind)
+    if not item.get("apiVersion") and isinstance(version, str) and version:
+        item = dict(item, apiVersion=version)
+    return item
 
 
 def change_words(path, old, new):
@@ -2188,6 +2419,7 @@ def decide_prune(lookups, repo, target, caller, app):
 #   whole, and a file that a chart's source of HEAD takes as its values (whatever it holds), keeps what of it names a
 #   Secret, a service account or a held kind (sensitive), where the parser read it; where no parser did, it changes
 #   only on listed lines when it names one (names_secret: a service account only where the door reads no object);
+#   text that no tool of a cluster reads, by the render box's word, is no such file (a README, a runbook);
 # - a unit that can read a path that the door gives no agent (closed) gets the same rule, and a refusal in the place
 #   of each card;
 # - the words of a commit's new references fit the door's record (REFERENCES_MOST). A render's names are a template's
@@ -2204,7 +2436,10 @@ def decide_prune(lookups, repo, target, caller, app):
 # serviceAccount: whose name: stands on the next line by that next line, not by the account; with no render box, or
 # with Applications of HEAD that the box cannot read, the door knows no file that a chart takes as its values, so one
 # that looks like an object (apiVersion and kind atop the values) is read as an object; an operator or an Application
-# field newer than these lists is refused; a store that the Vault area cannot write has no next stage.
+# field newer than these lists is refused; a store that the Vault area cannot write has no next stage; an
+# Application that is not in this repository, and a plugin that Argo CD finds by its own discover rule with no
+# plugin word in the source, can read a file that the box takes as text, as they can read what no render of the door
+# shows; an aggregationRule that selects ClusterRoles by a label of a chart's version (VERSION_LABELS), which is free.
 
 REFERENCE_FORMS = ("a new secretKeyRef", "a new secretRef", "a new secret volume")
 SECRET_ENDS = ("secretkeyref", "secretref", "secretname")      # the endings of a key of another reference
@@ -2219,7 +2454,21 @@ APP_KINDS = ("application", "applicationset", "appproject")
 # moved Ingress): never the Prometheus operator's, whose name and key can read any Secret of the namespace.
 KNOWN_OTHERS = (("networking.k8s.io", "ingress"), ("cert-manager.io", "certificate"))
 RBAC_KINDS = ("role", "clusterrole", "rolebinding", "clusterrolebinding")
+# The names of the kinds that held_kind holds, and of Secret, a CRD and the webhook configurations, which the commit
+# rules refuse as kinds (MANIFEST_REFUSED), each also as its List: what a helm parameter's value can name (a chart's
+# extraObjects[0].kind=Secret). The operator's kinds stand here by name, its group by HELD_GROUPS: a new kind of the
+# operator that this list lacks is held by its group alone.
+HELD_KIND_NAMES = frozenset(name + end for name in (
+    ("secret", "secretproviderclass", "customresourcedefinition", "mutatingwebhookconfiguration",
+     "validatingwebhookconfiguration", "externalsecret", "clusterexternalsecret", "secretstore", "clustersecretstore",
+     "pushsecret", "clusterpushsecret") + RBAC_KINDS + APP_KINDS) for end in ("", "list"))
 AGGREGATION = "rbac.authorization.k8s.io/"      # a ClusterRole's label of this prefix adds its rules to another's
+# The labels of a chart's version, which a version bump changes on each object of the chart: Helm's, and the older
+# chart: <name>-<version> that kube-prometheus-stack sets, and a plain version: 1.2.3 (Kustomize's commonLabels). Every
+# other label of a ClusterRole is held: an aggregationRule in the cluster can select by any label, also one that no
+# file of this repository holds (another repository's, an operator's, Kubernetes' own), so the tree's selectors say
+# too little. The known limit: an aggregationRule that selects by one of these free labels, which a bump can change.
+VERSION_LABELS = ("helm.sh/chart", "app.kubernetes.io/version", "chart", "version")
 # What a commit may change in an Application's spec; every other field is refused, so one that the door does not know
 # is closed. A source's targetRevision is free only with a chart: in a git source it can name a commit that never went
 # through the door. The helm values of a source of this repository whose chart a unit rendered whole are the
@@ -2231,6 +2480,8 @@ HELM_FREE = ("values", "valuesObject", "parameters", "valueFiles")
 KUSTOMIZE_FREE = ("images", "replicas")
 SERVER_KINDS = ("prometheus", "prometheusagent", "alertmanager", "thanosruler")     # their spec.secrets are mounted
 REFERENCES_MOST = 300       # characters of the words of a commit's new references: what door.py's record keeps
+ARGOCD_SOURCE = re.compile(r"\.argocd-source(?:-[^/]*)?\.ya?ml", re.I)      # Argo CD's overrides of a source
+RENDER_ONLY = "only the render names"       # a Secret or a key of a card that is no word of the commit's files
 NAME_SHOWN = 63             # characters of one name in those words
 
 
@@ -2367,6 +2618,17 @@ def stripped(docs):
     return out
 
 
+def yaml_breaks(text):
+    "A text with each line break that YAML reads (CR LF, CR, NEL, LS and PS) as a line feed."
+    return re.sub(r"\r\n?|[\x85\u2028\u2029]", "\n", text)
+
+
+def argo_set(value):
+    """A value of a helm parameter as Argo CD gives it to helm's --set (cleanSetParameters): a list in braces as it is,
+    and else with a backslash before each comma that has none (door_render.value_set does the same)."""
+    return value if value.startswith("{") and value.endswith("}") else re.sub(r"(?<!\\),", r"\\,", value)
+
+
 def neutral(text):
     "A text without the three forms of a reference, which the rule decides on the objects: what the count reads."
     for form in REFERENCE_FORMS:
@@ -2384,7 +2646,10 @@ def held_kind(obj):
     """The form of an object whose change the door refuses (A4): of the operator's groups, of the Secrets Store CSI
     driver, an Application, an ApplicationSet or an AppProject of Argo CD, a Role, a ClusterRole or a binding; or
     None."""
-    group, kind = obj["apiVersion"].rpartition("/")[0].lower(), obj["kind"].lower()
+    # an apiVersion with no "/" is held by its whole text: "external-secrets.io" alone makes no object of the
+    # cluster, but the door's other readers (the store route) must never take such a decoy for a store
+    version = obj["apiVersion"]
+    group, kind = (version.rpartition("/")[0] if "/" in version else version).lower(), obj["kind"].lower()
     if OPERATOR_GROUP.fullmatch(group):
         return "an external-secrets kind"
     if group == STORE_GROUP:
@@ -2405,24 +2670,99 @@ def notes_changed(old, new, free=FREE_ANNOTATIONS):
     return any(not (isinstance(k, str) and k.startswith(free)) for k, v in b.items() if k not in a or a[k] != v)
 
 
-def helm_changed(key, x, y):
-    """True when a free helm field of an Application's source changes what names a Secret, a service account or a held
-    kind (sensitive): in values, valuesObject and parameters (a values text that is not block style, when it names
-    one or has a key: key, a part of a mapping of a name and a key); and each change of its valueFiles, which name
-    files whatever they hold. source_changed asks it of each source that no unit of the door rendered whole."""
+def helm_unescape(text):
+    "A text of a helm parameter as Helm's --set reads it: a backslash keeps the character after it, and goes."
+    return re.sub(r"\\(.)", r"\1", text, flags=re.S)
+
+
+def helm_path(name):
+    """The parts of a helm parameter's name as Helm's --set reads them: a key between dots (a backslash keeps a dot in
+    it) and an index in brackets, as a number."""
+    return [int(index) if index else helm_unescape(key)
+            for key, index in re.findall(r"((?:\\.|[^.\[\]\\])+)|\[(\d+)\]", name, re.S)]
+
+
+# A list in braces as one parameter's value: Helm reads its commas as the list's, up to its first closing brace, so a
+# value with more after that brace sets more (argo_set gives it to Helm as it is)
+HELM_LIST = re.compile(r"\{[^}]*\}")
+# The names of held kinds that are words of plain speech too: such a value is held only as a kind's (x.kind=Secret)
+PLAIN_KINDS = ("secret", "role", "application")
+
+
+def helm_values(helm):
+    """The values that a source's helm block gives a chart, as far as the door reads them, with each of its parameters
+    set at its path as Helm's --set sets it: valuesObject, which Argo CD takes over values, else a values text in block
+    style (block_tree); and whether a values text that is not block style may hold a mapping of a name and a key (the
+    door then reads no tree of it)."""
+    tree, loose = {}, False
+    if isinstance(helm.get("valuesObject"), dict):
+        tree = copy.deepcopy(helm["valuesObject"])
+    elif isinstance(helm.get("values"), str) and helm["values"].strip():
+        docs = None if unread(helm["values"]) else block_tree(helm["values"])
+        if docs and isinstance(docs[0], dict):
+            tree = docs[0]
+        loose = docs is None and text_holds(helm["values"])
+    for p in helm.get("parameters") if isinstance(helm.get("parameters"), list) else []:
+        if not isinstance(p, dict) or not isinstance(p.get("name"), str):
+            continue
+        parts, node = helm_path(p["name"]), tree
+        if not parts or any(isinstance(part, int) and part > 255 for part in parts):
+            continue
+        for part, after in zip(parts, parts[1:] + [None]):
+            new = {} if isinstance(after, str) else [] if isinstance(after, int) else str(p.get("value"))
+            if isinstance(part, int) and isinstance(node, list):
+                node.extend([None] * (part + 1 - len(node)))
+                if after is None or not isinstance(node[part], (dict, list)):
+                    node[part] = new
+            elif isinstance(part, str) and isinstance(node, dict):
+                if after is None or not isinstance(node.get(part), (dict, list)):
+                    node[part] = new
+            else:
+                break
+            node = node[part]
+    return tree, loose
+
+
+def helm_changed(key, x, y, helm=None):
+    """True when a free helm field of an Application's source changes what names a Secret, a service account, RBAC or
+    a held kind (sensitive): in values, valuesObject and parameters (a values text that is not block style, when it
+    may hold a mapping that names one: text_holds; RBAC there changes only by the value of a listed key: rbac_changed;
+    a parameter by its name as Helm reads it, with no backslash, a name with a comma or an =, which sets more than one
+    value, a list of a rule of a Role, and by its value as Helm reads it where that names a held kind, its group or a
+    Secret; and, given the source's two helm blocks, a mapping of a name and a key that a parameter sets a part of in
+    the values that the door reads, or in a values text that it cannot read and that may hold one);
+    and each change of its valueFiles, which name files whatever they hold. source_changed asks it of each source
+    that no unit of the door rendered whole."""
     if key == "values" and isinstance(x or "", str) and isinstance(y or "", str):
         a, b = sensitive_lines(x or ""), sensitive_lines(y or "")
         if a is None or b is None:
-            return any(names_secret(t) or any(re.search(r"(?<![\w.-])key[\"']?\s*:", low)
-                                              for low in (loose_text(t), uncommented(loose_text(t))))
-                       for t in (x or "", y or ""))
+            return any(text_holds(t, rbac=False) for t in (x or "", y or "")) or rbac_changed(x or "", y or "")
         return a != b
     if key == "valuesObject":
         return sensitive([x]) != sensitive([y])
     lists = (x or [], y or [])
     if key == "parameters" and all(isinstance(v, list) and all(isinstance(p, dict) for p in v) for v in lists):
-        a, b = ([p for p in v if sensitive_key(p.get("name"))] for v in lists)
-        return a != b
+        def held(p, loose):
+            raw, value = (p.get("name") if isinstance(p.get("name"), str) else ""), p.get("value")
+            name = helm_unescape(raw)           # Helm's --set reads a\b as ab
+            value = value if isinstance(value, str) else ""
+            said = helm_unescape(value).strip()
+            last = next((part for part in reversed(helm_path(raw)) if isinstance(part, str)), "")
+            # Argo CD writes the name as it is and the value with a backslash before each comma (argo_set): a comma or
+            # an = in the name, and a comma in the value that has none, start another parameter in Helm, but in a list
+            # in braces that the value is whole
+            more = bool(re.search(r"[,=]", raw)) or "=" in value and not HELM_LIST.fullmatch(value) and \
+                argo_set(value).replace("\\\\", "").replace("\\,", "").count(",") > 0
+            # a value that is the group of a held kind or the name of one (extraDeploy[0].kind=ClusterRoleBinding),
+            # or that holds a manifest that names a Secret, an account or RBAC, makes an object that no name shows
+            kind = said.lower() in HELD_KIND_NAMES and (said.lower() not in PLAIN_KINDS or last.lower() == "kind")
+            return sensitive_key(name) or more or text_holds(value) or text_holds(said) or kind or \
+                re.match(HELD_GROUPS, said, re.I) or loose and last in ("name", "key", "optional") or re.search(
+                r"(?<![a-z0-9_])(?:verbs|resources|apigroups|resourcenames|nonresourceurls)(?:[\[=]|$)", name.lower())
+        blocks = helm if helm is not None else ({}, {})
+        trees = [helm_values(block) if isinstance(block, dict) else ({}, False) for block in blocks]
+        a, b = ([p for p in v if held(p, trees[0][1] or trees[1][1])] for v in lists)
+        return a != b or helm is not None and sensitive([trees[0][0]]) != sensitive([trees[1][0]])
     return True
 
 
@@ -2446,6 +2786,10 @@ def source_changed(a, b, rendered=None):
                     continue
                 if k not in free or key == "helm" and not seen and helm_changed(k, x.get(k), y.get(k)):
                     return True
+            # the values that the parameters set a part of, whichever field of them changed (helm_values)
+            if key == "helm" and not seen and x != y and helm_changed("parameters", x.get("parameters"),
+                                                                    y.get("parameters"), (x, y)):
+                return True
         elif x != y:
             return True
     return False
@@ -2481,7 +2825,9 @@ def held_change(old, new, rendered=None):
     is free for the operator's kinds only. Argo CD's kinds: an Application's spec outside its free fields
     (app_spec_changed), an ApplicationSet's spec outside the free fields of its template's spec, an AppProject's spec,
     each field beside metadata and spec (an operation), and an annotation as above. RBAC: all but labels and
-    annotations, and a label of the prefix AGGREGATION is no free label."""
+    annotations, and a label of the prefix AGGREGATION is no free label, nor any label of a ClusterRole but
+    VERSION_LABELS: an aggregationRule can select ClusterRoles by a label of any name, and adds their rules to its
+    own."""
     form = held_kind(new)
     if form in ("an external-secrets kind", "a SecretProviderClass"):
         versions = {old["apiVersion"].rpartition("/")[2], new["apiVersion"].rpartition("/")[2]}
@@ -2511,9 +2857,15 @@ def held_change(old, new, rendered=None):
         meta = o.get("metadata")
         if not isinstance(meta, dict):
             return without(o, "status")
-        labels = meta.get("labels")
-        kept = {k: v for k, v in labels.items() if str(k).startswith(AGGREGATION)} if isinstance(labels, dict) \
-            else labels
+        labels = meta.get("labels") or {}          # no labels, as no label of AGGREGATION: a first label is free
+        if not isinstance(labels, dict):
+            kept = labels
+        elif o["kind"].lower() == "clusterrole":
+            # a version label's value changes freely, but adding or removing one is a change (an aggregationRule can
+            # select by a key's presence alone)
+            kept = {k: (None if k in VERSION_LABELS else v) for k, v in labels.items()}
+        else:
+            kept = {k: v for k, v in labels.items() if str(k).startswith(AGGREGATION)}
         return dict(without(o, "status", "metadata"), metadata=dict(without(meta, "labels", "annotations"),
                                                                      labels=kept))
     return bare(old) != bare(new)
@@ -2616,9 +2968,9 @@ def secret_rule(before, after, where, named=True, pool=None, words=None, card_at
                     (f" key {shown(key)}" if key is not None else "")
             else:
                 said = f"{card_at or where} reads " + (f"{fact['what']} {shown(name)}" if name in words else
-                                                       f"a {fact['what']} that only the render names") + \
+                                                       f"a {fact['what']} that {RENDER_ONLY}") + \
                     ("" if key is None else f" key {shown(key)}" if key in words else
-                     ", by a key that only the render names")
+                     f", by a key that {RENDER_ONLY}")
             cards.append((fact["form"], f"{fact['form']}: {said}"))
     return None, cards
 
@@ -2705,8 +3057,11 @@ def render_refusal(report, words=None):
     same value set at HEAD as those that make another reference known by kind and namespace: a new reference of a pod
     is a card, and in a closed unit a refusal; the count reads the objects with each reference renamed. words: the
     words of the commit's own files, the only names out of a render that a card prints. The same reference in each
-    value set of a unit is one card. An Application that a render makes has its helm values held where they name a
-    Secret (helm_changed): no unit rendered with them."""
+    value set of a unit is one card, and in several units one card that names each of them, where the commit's words
+    name its Secret and its key (else each unit's card stays its own: a Secret that only a render names can be another
+    one in each unit).
+    An Application that a render makes has its helm values held where they name a Secret (helm_changed): no unit
+    rendered with them."""
     apps, most = report.get("apps"), {}
     for uid, unit in sorted(report["units"].items()):
         where = unit_name(unit)
@@ -2740,16 +3095,41 @@ def render_refusal(report, words=None):
                 return why, []
             if found and closed:    # the door widens nothing in a unit that can read what it gives no agent
                 return f"{what}: {found[0][0]}, more than at HEAD, which no commit passes", []
-            most.setdefault((uid, group["set"]), collections.Counter()).update(card for _form, card in found)
+            # each card without the unit's name, which begins its words (card_at)
+            most.setdefault((uid, group["set"]), collections.Counter()).update(
+                (form, card[len(f"{form}: {where}"):]) for form, card in found)
             free_before, free_after = stripped(before), stripped(after)
             hit = manifest_refusal(objects_text(free_before), objects_text(free_after)) or \
                 manifest_refusal(lines_text(free_before), lines_text(free_after))
             if hit:
                 return f"{what}: {hit}, more than at HEAD, which no commit passes", []
-    cards = collections.Counter()
-    for found in most.values():                 # in each value set its own, and the most of any set
-        cards |= found
-    return None, list(cards.elements())
+    units = {}
+    for (uid, _set), found in most.items():     # in each value set its own, and the most of any set
+        units[uid] = units.get(uid, collections.Counter()) | found
+    places = {}                                 # (form, the words after the unit's name): [(unit, how often)]
+    for uid, found in sorted(units.items()):
+        for said, n in found.items():
+            places.setdefault(said, []).append((report["units"][uid], n))
+    cards = []
+    for (form, rest), at in places.items():
+        if len(at) == 1 or RENDER_ONLY in rest:     # one unit, or Secrets that may differ in each unit: a card each
+            cards += [f"{form}: {unit_name(unit)}{rest}" for unit, n in at for _ in range(n)]
+        else:               # a Kustomize base that three overlays read: one card that names each of them
+            cards += [f"{form}: {units_words([unit for unit, _n in at])}{rest.replace(' reads ', ' read ', 1)}"] * \
+                max(n for _unit, n in at)
+    return None, cards
+
+
+def units_words(units):
+    "Several units as one card names them: the charts a and b, and the Kustomize folders c, d and e."
+    def joined(roots):
+        return roots[0] if len(roots) == 1 else ", ".join(roots[:-1]) + " and " + roots[-1]
+    parts = []
+    for kind, one, many in (("helm", "chart", "charts"), ("kustomize", "Kustomize folder", "Kustomize folders")):
+        roots = sorted(unit["root"] for unit in units if unit["kind"] == kind)
+        if roots:
+            parts.append(f"the {one if len(roots) == 1 else many} {joined(roots)}")
+    return ", and ".join(parts)
 
 
 def json_docs(path, data):
@@ -2926,6 +3306,21 @@ def gitops_files(lookups, op, target, plan, files, report):
         # names one, only its listed lines change. The render decides a file that each unit reading it rendered whole,
         # so that a chart's template stays free to edit, but for a jsonnet file, which ArgoCD runs. A service account
         # counts only where the door reads no object in it.
+        # Argo CD merges .argocd-source.yaml, and .argocd-source-<app>.yaml, of a source's folder into that source
+        # (the image updater writes one), and no render of the door reads it: its helm and kustomize fields change
+        # as those of a source that no unit rendered (source_changed), and it holds nothing else.
+        if ARGOCD_SOURCE.fullmatch(path.rpartition("/")[2]):
+            def overrides(docs):
+                docs = [d for d in docs or [] if d is not None]
+                return {} if not docs else docs[0] if len(docs) == 1 and isinstance(docs[0], dict) else None
+            if reading is not None:
+                now, was = overrides(reading[0]), overrides(reading[1])
+            else:               # the door's own reading of block style, at HEAD and after, or none
+                texts = [(b or b"").decode("utf-8", "replace") for b in (data, old)]
+                now, was = (None if unread(t) else overrides(block_tree(t)) for t in texts)
+            if now is None or was is None or source_changed(was, now):
+                return refused(f"{path} changes what Argo CD merges into the source of an Application beyond the "
+                               f"source's free fields, which no commit passes", target=target)
         held = f"{path} names a Secret, a service account or a held kind, and no parser of the door reads it: only " \
                f"an image, a tag, a replica count and a restart time change in it{unrendered}"
         # (a box that names no source's targetRevision renders none of them as the cluster does)
@@ -2933,7 +3328,19 @@ def gitops_files(lookups, op, target, plan, files, report):
             "targetRevision" in v["source"] and rendered(v["source"], v.get("app")))
             for v in report.get("values") or [])
         read = reading[0] if reading and reading[0] is not None else None
-        check = named or not (whole and not runs) and not (read is not None and all(is_object(d) for d in read))
+        # Text that no tool of a cluster reads (a README, a runbook) is no file of check 1: a file whose name ends in
+        # none of MANIFEST_ENDS, which no unit reads and no source takes as its values, where the box's any_file says
+        # that no reader of the tree takes a file by any name (door_render.any_file: a jsonnet file, a plugin, a
+        # templatePatch, a folder with no filter of endings, a git files generator, value files that the box cannot
+        # follow, a link of a manifest's name to such a file). A folder of an Application applies the files of
+        # MANIFEST_ENDS alone, a chart reads the files of its own folder, and a Kustomize folder what its
+        # kustomization names, which the box follows (its units). A door with no box, and an older box, know none of
+        # that: check 1 holds every file there.
+        prose = report is not None and report.get("any_file") is False and info.get("units") == [] and \
+            isinstance(report.get("values"), list) and not path.lower().endswith(MANIFEST_ENDS) and \
+            not any(fnmatch.fnmatchcase(path, v["path"]) for v in report["values"])
+        check = not prose and (named or not (whole and not runs) and
+                               not (read is not None and all(is_object(d) for d in read)))
         unparsed = False
         if check and read is not None and (old is None or reading[1] is not None):
             def pick(docs):
@@ -2966,12 +3373,12 @@ def gitops_files(lookups, op, target, plan, files, report):
             # in a file that code does not read by lines, a line can hold more than its first key: a rule call
             # there is a change of listed lines only
             own = own or f"{path} changes more than its values"
-        elif all(LISTED_REPLICAS.fullmatch(line) for line in changed):
+        elif all(REPLICAS_LINE.fullmatch(line) for line in changed):
             continue
         elif all(re.fullmatch(r"\s*[\w./-]*restartedAt['\"]?\s*:\s*['\"]?[0-9T:.Z+-]{10,40}['\"]?\s*", line)
                  for line in changed):
             continue
-        elif all(LISTED_IMAGE.fullmatch(line) for line in changed):
+        elif all(IMAGE_LINE.fullmatch(line) for line in changed):
             ok = image_rule(old, data, lookups)
             if ok is not True:
                 own = own or ok

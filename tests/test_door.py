@@ -1390,12 +1390,15 @@ class Refusals(DoorCase):
             "a host namespace": [pod + "      hostPID: True\n", pod + "      hostNetwork: yes\n",
                                  pod + "      hostIPC:   ON\n"],
             "a Secret object": ["kind: List\nitems:\n- kind: Secret\n  data:\n    x: eA==\n",
+                                "apiVersion: v1\nkind: SecretList\nitems:\n- metadata:\n    name: x\n  stringData:\n    k: v\n",
                                 "kind: List\nitems:\n  - apiVersion: v1\n    kind: Secret\n", 'kind: "Secret"\n',
                                 "kind: 'Secret'\n", "kind: Secret # a key\n", "kind : Secret\n", "kind: secret\n",
                                 "apiVersion: v1\r\nkind: Secret\r\nstringData:\r\n  key: secret\r\n",
                                 "extraObjects:\n  - apiVersion: v1\n    kind: Secret   \n"],
             "RBAC": ["kind: 'ClusterRole'\n", "items:\n- kind: RoleBinding # x\n", "  kind: clusterrolebinding\n",
-                     "apiVersion: rbac.authorization.k8s.io/v1\r\nkind: Role\r\n"],
+                     "apiVersion: rbac.authorization.k8s.io/v1\r\nkind: Role\r\n",
+                     # a List of the kind, whose items with no kind of their own are of it in Kubernetes' reading
+                     "apiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBindingList\nitems:\n- metadata:\n    name: x\n"],
             "a CRD": ['kind: "CustomResourceDefinition"\n'], "an Application": ["- kind: applicationset\n"],
             "a webhook": ["  kind: 'MutatingWebhookConfiguration' # x\n"],
             "an external-secrets kind": ['- apiVersion: "external-secrets.io/v1"\n  kind: ExternalSecret\n',
@@ -1564,10 +1567,41 @@ class Refusals(DoorCase):
                  # a key that only ends in the word, and the pod's old field: no whole word of LOOSE_WORDS
                  ("apps/x/csi.txt", "volumes: [{csi: {driver: x, nodePublishSecretRef: {name: k}}}]\n",
                   "the word *secretref:"),
-                 ("apps/x/sa.txt", "spec: {serviceAccount: admin}\n", "a changed serviceAccountName"))
+                 ("apps/x/sa.txt", "spec: {serviceAccount: admin}\n", "a changed serviceAccountName"),
+                 # a comment between a key and its colon: one that ends in a backslash, which the loose reading joins
+                 # with the colon's line, and one after a # in a quoted text, which no reader of comments can tell
+                 # from a comment (the reviews of afc580ec3: each let a Role or a Secret through)
+                 ("apps/x/hidden.txt", "? kind #c " + back + "\n: Role\n", "the word kind: role"),
+                 ("apps/x/quoted.txt", '{"a #": b, ? kind #c\n: Role}\n', "the word kind: role"),
+                 ("apps/x/explicit.txt", '[ "x #", {? kind\n#c\n: Role} ]\n', "the word kind: role"),
+                 ("charts/shop/templates/data.tpl", '{"a #": b, ? stringData #c\n: {k: c2VjcmV0}}\n',
+                  "what may be a Secret object"),
+                 # round 7 (the reviews of da396d0fc): a comment that ends in a backslash and a NEL, which the
+                 # joined reading glued to the next line's first word; a %TAG directive, whose handle makes
+                 # !e!binary a key from base64; an explicit key that starts with an anchor, after a list's dash, after
+                 # a key's colon in the bare text, or that only ends in a held word; a held value after a comment
+                 # line or that an alias of its anchor gives; and an explicit apiVersion key. Each let a Role, a
+                 # reference, a host namespace or a manifest through
+                 ("apps/x/nel.txt", "spec: {a: 1, # c" + back + "\x85hostPID: true}\n", "the word hostpid"),
+                 ("apps/x/directive.txt", "%TAG !e! tag:yaml.org,2002:\n---\nspec: {volumes: [{name: h, "
+                                          "!e!binary aG9zdFBhdGg=: {path: /}}]}\n", "the word %tag"),
+                 ("apps/x/anchor.txt", "? &a kind\n# c\n: Role\n", "the word an explicit key's mark"),
+                 ("apps/x/item.txt", "items:\n- ? kind\n  # c\n  : Role\n", "the word kind: role"),
+                 ("apps/x/flowkey.txt", "x: {? kind #c\n: Role}\n", "the word kind: role"),
+                 ("apps/x/alias.txt", "x: &k Role\nroleRef: {kind: *k, name: admin}\n", "the word kind: role"),
+                 ("apps/x/later.txt", "x: 1\nkind: # c\n  Application\n", "the word kind: application"),
+                 ("apps/x/token.txt", "? tokenSecretRef\n: {name: k}\n", "the word *secretref:"),
+                 ("apps/x/csikey.txt", "? nodePublishSecretKeyRef\n: {name: k}\n", "the word *secretkeyref:"),
+                 ("apps/x/tokenname.txt", "? tokenSecretName\n: k\n", "the word *secretname:"),
+                 ("apps/x/projected.txt", "sources:\n- ? secret\n  : {name: k}\n", "the word secret:"),
+                 ("apps/x/version.txt", "? apiVersion\n: v1\n", "a kind or an apiVersion key"),
+                 ("apps/x/data.txt", '{"a #": b, kind: #c\n Secret, data: {k: c2VjcmV0}}\n',
+                  "what may be a Secret object"))
         # A file that no parser reads and that names a Secret or a service account changes only on listed lines (the
         # rule of 21 November 2026): a count of words cannot say that a name below a secretKeyRef changed.
-        named = {"apps/x/env.txt", "apps/x/volume.txt", "apps/x/account.txt", "apps/x/csi.txt", "apps/x/sa.txt"}
+        named = {"apps/x/env.txt", "apps/x/volume.txt", "apps/x/account.txt", "apps/x/csi.txt", "apps/x/sa.txt",
+                 "apps/x/token.txt", "apps/x/csikey.txt", "apps/x/tokenname.txt", "apps/x/projected.txt",
+                 "apps/x/version.txt"}
         for path, text, word in cases:
             with self.subTest(path=path, word=word):
                 d = push(path, text, None)              # a new file: one word is enough
@@ -1584,6 +1618,14 @@ class Refusals(DoorCase):
                                                                   f"restart time change in it"))
                 else:
                     self.assertNotEqual(d.kind, "refused", d)
+        # round 7: an account in JSON in a double-quoted text, which only the reading with its escapes written out
+        # sees, and a host namespace turned on after a comment line, in a file that has both words at HEAD
+        account = 'x: "{\\"serviceAccountName\\":\\"a\\"}"\n'
+        d = push("apps/x/sa.txt", account.replace('\\"a', '\\"admin'), account.encode())
+        self.assertEqual((d.kind, d.why.split(", ")[0]), ("refused", "apps/x/sa.txt: a changed serviceAccountName"), d)
+        d = push("apps/x/pod.txt", "spec:\n  hostPID: # c\n    true\n", b"spec:\n  hostPID: false\n")
+        self.assertEqual((d.kind, d.why.split(", ")[0]),
+                         ("refused", "apps/x/pod.txt: the word a host namespace: true"), d)
         # a text that has the word at HEAD and becomes a manifest with it is refused for its new keys
         readme = "# The cluster\n\nNo pod here mounts a hostPath.\n"
         d = push("docs/README.md", "kind: Pod\nspec: {volumes: [{name: host, hostPath: {path: /}}]}\n",
@@ -1603,6 +1645,13 @@ class Refusals(DoorCase):
                                                                   "{{- end }}\n")):
             with self.subTest(path=path):
                 self.assertEqual(push(path, text).kind, "own")
+        # round 7: a comment after a value that a template gives, in an edit of a template that has the word at HEAD,
+        # counted as the held key itself (round 6 read "kind #" and "privileged #" as keys, so the edit was refused)
+        for path, text in (("charts/shop/templates/_kind.tpl", "kind: {{ .Values.kind }}"),
+                           ("charts/shop/templates/_flag.tpl", "a: {{ .Values.privileged }}")):
+            with self.subTest(path=path):
+                d = push(path, text + " # Deployment or Role, true only for dev\n", (text + "\n").encode())
+                self.assertNotEqual(d.kind, "refused", d)
 
     HELM = ("kind: Deployment\nmetadata:\n  name: {{ .Release.Name }}\nspec:\n  replicas: 2\n  template:\n    spec:\n"
             "      serviceAccountName: shop\n      containers:\n      - name: shop\n"
@@ -1626,13 +1675,18 @@ class Refusals(DoorCase):
             with self.subTest(new=new):
                 d = push(self.HELM.replace(old, new))
                 self.assertEqual(d.kind, kind, d)
+        # an image line after a CR or a NEL, which YAML reads as a line break, is an image too: the rule read lines
+        # only after a LF, and took an image of another repository after a CR as a checked rule call
+        for brk in ("\n\r", "\r", "\x85"):
+            old = ("- name: shop" + brk + "  image: ghcr.io/one-org/shop:1111111\n").encode()
+            self.assertEqual(door_targets.image_rule(old, old.replace(b"one-org/shop", b"other/x"),
+                                                     {"image_made": lambda image: True}),
+                             "the image changes its repository: ghcr.io/one-org/shop to ghcr.io/other/x")
         commented = self.HELM + "# a note about hostPath and privileged: true\n"
         for base, old, new in (
                 (self.HELM, "value: live", "value: test"),
                 (self.HELM, "emptyDir: {}}]", "emptyDir: {medium: Memory}}]"),
                 (self.HELM, '{"privileged": false}', "{ {{ .Values.flag }}: true }"),
-                (self.HELM, '{"privileged": false}', '{"privileged": !!bool "true"}'),
-                (self.HELM, "kind: Deployment", '? "kind"\n: {{ .Values.kind }}'),
                 (self.HELM, "image: ghcr.io/one-org/shop:1111111", "image: {{ .Values.other }}"),
                 # a line of another key that becomes a listed one: the first one is gone
                 (self.HELM, '        securityContext: {"privileged": false}', "  replicas: 2"),
@@ -1651,6 +1705,9 @@ class Refusals(DoorCase):
         loosely = "which no commit passes in a file that code reads only loosely"
         for old, new, word in (
                 ('{"privileged": false}', '{"privileged": true}', "the word privileged: true"),
+                # a tag before the value, and an explicit key: the loose reading holds the key itself
+                ('{"privileged": false}', '{"privileged": !!bool "true"}', "the word privileged: true"),
+                ("kind: Deployment", '? "kind"\n: {{ .Values.kind }}', "the word kind: role"),
                 ('{"privileged": false}', '{"privileged": false}\n      hostPID: yes', "the word hostpid"),
                 ("emptyDir: {}", "hostPath: {path: /}", "the word hostpath"),
                 ("{name: MODE, value: live}", "{name: MODE, valueFrom: {secretKeyRef: {name: k, key: k}}}",
@@ -1660,7 +1717,7 @@ class Refusals(DoorCase):
                 ("[{name: tmp, emptyDir: {}}]",
                  "[{name: tmp, emptyDir: {}}]\nextra: [{kind: Secret, stringData: {k: v}}]",
                  "what may be a Secret object")):
-            with self.subTest(word=word):
+            with self.subTest(word=word, new=new):
                 d = push(self.HELM.replace(old, new))
                 self.assertEqual((d.kind, d.why.split(", ")[0], loosely in d.why),
                                  ("refused", f"charts/shop/templates/deployment.yaml: {word}", True), d)
@@ -1674,6 +1731,36 @@ class Refusals(DoorCase):
         secret = self.HELM.replace("kind: Deployment", "kind: Secret")          # one that HEAD holds is no rule call
         self.assertEqual(push(secret.replace("replicas: 2", "replicas: 3"), base=secret).why,
                          "charts/shop/templates/deployment.yaml holds a Secret object")
+
+    def test_the_loose_reading_takes_a_time_that_grows_with_the_text_s_length(self):
+        """One Python process serves every agent, so a pattern whose time grows with the square of a text's length
+        stops the door for everybody (the reviews of da396d0fc: 32 s for 100 KB of -& in YAML_KEY's anchor, 2.3 s for
+        8 KB of secretKeyRef's \\w* in MANIFEST_REFUSED, and \\s*-?\\s* over a long run of spaces in the listed
+        lines). Each reader of the loose reading, of the helm values and of the listed lines, on a text of one hostile
+        mark repeated (after an anchor and a space, which open the readings of aliases and of more than one word): 16
+        KB first, which a quadratic pattern takes half a second or more for, then 200 KB, in a CPU time far under a
+        second for each reader (measured: at most 0.015 s and 0.19 s)."""
+        units = ("-&", '":&', "?*", "? *a", "*a:", "&a ", "secret", "secretkeyref", "serviceaccount", "rbac", "key ",
+                 " ", "\n", "kind: #c\n", "\\\n", "\\x41", "[&", "! ", "{a,", "#", "!x- ", "{!x- ")
+        readers = (door_targets.text_holds, door_targets.names_secret, door_targets.loose_secret,
+                   lambda s: door_targets.helm_changed("values", "a: {b: 1}\n", s),
+                   lambda s: door_targets.loose_danger("", s), lambda s: door_targets.manifest_refusal("", s),
+                   lambda s: door_targets.rbac_changed("rbac: {}\n" + s, s))
+        lines = (door_targets.LISTED_LINE.fullmatch, door_targets.REPLICAS_LINE.fullmatch,
+                 door_targets.IMAGE_LINE.fullmatch, door_targets.IMAGE_REF.findall)
+        for size, most, marks in ((16000, 0.25, units), (200000, 1.0, ("-&", '":&', "?*", "secret", " ", "\\\n"))):
+            slow = []
+            for unit in marks:
+                text = (unit * (size // len(unit) + 1))[:size]
+                # the listed lines read a line from its start; the loose readers, a text that opens every reading
+                for n, (read, given) in enumerate([(read, "&a x " + text) for read in readers] +
+                                                  [(read, text) for read in lines]):
+                    begun = time.thread_time()
+                    read(given)
+                    took = time.thread_time() - begun
+                    if took >= most:
+                        slow.append((unit, n, round(took, 3)))
+            self.assertEqual(slow, [], size)       # a slow 16 KB text stops the test before the 200 KB ones
 
     def test_a_rule_call_changes_a_value_and_never_a_key(self):
         """A change of equal line count that turns a line of another key into a listed one took the first line out
@@ -3052,6 +3139,11 @@ class GitHubFacts(DoorCase):
                  "apps/x/key.pem": ("-----BEGIN PRIVATE KEY-----\n", held),
                  "apps/x/pod.txt": ('{"kind": "Pod", "spec": {"hostPID": true, "volumes": [{"hostPath": {}}]}}', None),
                  "docs/README.md": ("# The cluster\n\nThe kind SecretStore, and - {a: b}.\n", None),
+                 # round 7: a * of Markdown after "Kind:" in a text with an &, and a script's ternary ? before kind:,
+                 # which round 6 read as an alias and as an explicit kind key, and an alias whose anchor is Secret
+                 "docs/adr-7.md": ("# ADR 7\n\nR&D: **Kind:** decision\nKind: *draft*\n", None),
+                 "scripts/pick.js": ("const kind = choice.ok\n  ? kind: 'supplier'\n  : 'shop'\n", None),
+                 "apps/x/alias.txt": ("x: &k Secret\ny: {kind: *k, data: {a: Yg==}}\n", may),
                  "charts/shop/templates/_helpers.tpl": ('{{- define "name" -}}{{ .Chart.Name }}{{- end }}\n', None)}
         for path, (text, why) in files.items():
             self.answers[("GET", f"{api}{path}?ref=master")] = (200, {
@@ -7577,7 +7669,8 @@ class SecretReferences(RenderCase):
         """The same change of a name below a secretKeyRef, with no render (a door with no box) or in a values file of
         a chart that did not render, has no reading of the objects: a bug that read only rendered files let it
         through as the agent's own call. A listed line stays a rule call. A template of a chart that rendered whole
-        stays free to edit: a bug without the skip refuses it."""
+        stays free to edit: a bug without the skip refuses it. Text that no tool of a cluster reads (a runbook) is
+        free to edit too, by the box's word, and held wherever a tool can read it."""
         words = f"{API_PATH} names a Secret, a service account or a held kind, and no parser of the door reads it: " \
                 f"only an image, a tag, a replica count and a restart time change in it"
         d = self.secret({API_PATH: API.replace("name: db\n", "name: admin\n")}, render=False)
@@ -7650,6 +7743,278 @@ class SecretReferences(RenderCase):
                                                                                       "          image:")},
                         dict(SECRET_TREE, **{"apps/core/app/web.yaml": account}), render=False)
         self.assertEqual((d.kind, d.why), ("own", "apps/core/app/web.yaml changes more than its values"), d)
+        # An item of a list is in its place by its name: a new env item before a reference in a remote chart's values
+        # moves no reference (review of 22 November 2026: a bug that placed items by their index refused it), and one
+        # that moves to another container is held (a bug that dropped the place let it into a sidecar)
+        env = "level: info\ncontainers:\n  - name: api\n    env:\n      - name: DB\n        valueFrom:\n" \
+              "          secretKeyRef:\n            name: db\n            key: password\n  - name: side\n"
+        tree = dict(SECRET_TREE, **{VALUES_PATH: env})
+        d = self.secret({VALUES_PATH: env.replace("    env:\n", "    env:\n      - name: MODE\n        value: fast\n")},
+                        tree)
+        self.assertEqual(d.kind, "own", (d, self.last))
+        d = self.secret({VALUES_PATH: "level: info\ncontainers:\n  - name: api\n  - name: side\n    env:\n"
+                                      "      - name: DB\n        valueFrom:\n          secretKeyRef:\n"
+                                      "            name: db\n            key: password\n"}, tree)
+        self.assertEqual(d.kind, "refused", (d, self.last))
+        # Text that no tool of a cluster reads is no file of check 1 (review of 22 November 2026: a bug that held each
+        # file of another name refused each later edit of a runbook whose heading names Secrets): a name of no
+        # manifest, read by no chart or Kustomize folder and taken by no source as its values, where the box says
+        # that no jsonnet file, plugin or templatePatch can read a file by any name. The same text stays held with no
+        # box and with an older box, in a chart and a Kustomize folder that did not render whole, as a source's
+        # values, and where a jsonnet file of the commit, a plugin or a templatePatch can read it (a bug that skipped
+        # check 1 for each file of another name)
+        runbook = "# Runbook\n\n## Secrets: managed by Vault\n\n```yaml\nenv:\n  - valueFrom:\n      secretKeyRef:\n" \
+                  "        name: db\n```\n"
+        edit = runbook + "\nRotate the key each month.\n"
+        tree = dict(SECRET_TREE, **{"docs/runbook.md": runbook, "monitoring/stack/files/runbook.md": runbook,
+                                    "knative/runbook.md": runbook})
+        d = self.secret({"docs/runbook.md": edit}, tree)
+        self.assertEqual(d.kind, "own", (d, self.last))
+        self.assertIs(self.last["any_file"], False)
+        held = "docs/runbook.md names a Secret, a service account or a held kind, and no parser of the door reads it"
+        d = self.secret({"docs/runbook.md": edit}, tree, render=False)
+        self.assertTrue(d.kind == "refused" and d.why.startswith(held), d)
+
+        def older(files, render=self.lookup(tree)):
+            "The render of a box of before 22 November: no word any_file."
+            report = render(files)
+            report.pop("any_file", None)
+            return report
+        d = self.push({"docs/runbook.md": edit}, tree, more={"render": older})
+        self.assertTrue(d.kind == "refused" and d.why.startswith(held), (d, self.last))
+        closed = dict(tree, **{"monitoring/stack/_config/token.txt": "x\n", "knative/_config/token.txt": "x\n"})
+        for path, unit in (("monitoring/stack/files/runbook.md", "helm:monitoring/stack"),
+                           ("knative/runbook.md", "kustomize:knative")):
+            with self.subTest(path=path):
+                d = self.secret({path: edit}, closed)
+                self.assertTrue(d.kind == "refused" and d.why.startswith(held.replace("docs/runbook.md", path)),
+                                (d, self.last))
+                self.assertTrue(self.last["units"][unit]["closed"])
+                self.assertEqual(self.secret({path: edit}, tree).kind, "own", self.last)    # rendered whole
+        plugin = APPS.split("---\n")[0].replace("name: site\n", "name: tool\n").replace(
+            "    path: apps/site\n", "    path: apps/tool\n    plugin:\n      name: envsubst\n")
+        patched = APPS.replace('  template:\n    metadata:\n      name: "site-{{name}}"',
+                               '  templatePatch: |\n    spec: {}\n  template:\n    metadata:\n      name: "site-{{name}}"')
+        # round 2: a folder with no filter of endings, a git files generator, a source's own value files where the
+        # box cannot give the chart its value sets, a link of a manifest's name, and a Kustomize generator's key=path
+        raw = plugin.replace("name: tool\n", "name: raw\n").replace(
+            "    plugin:\n      name: envsubst\n", "    directory:\n      disableExtensionFilter: true\n")
+        generated = APPS.replace("    - list:\n        elements:\n          - name: a\n", (
+            "    - git:\n        repoURL: ssh://git@github.com/one-org/cluster.git\n        revision: master\n"
+            "        files:\n          - path: docs/*.md\n"))
+        kz = CLUSTER["_config/cluster/stack-argocd.yaml"].replace("name: stack\n", "name: kz\n").replace(
+            "    path: monitoring/stack\n", "    path: knative\n    kustomize:\n      components:\n"
+                                           "        - ../components/x\n")
+        boot = "apiVersion: v2\nname: boot\nversion: 0.1.0\n"
+        app = ('{{- define "app" }}\napiVersion: argoproj.io/v1alpha1\nkind: Application\nspec:\n  source:\n'
+               "    helm:\n      valueFiles: [$values/docs/runbook.md]\n{{- end }}\n")
+        lost = CLUSTER["_config/cluster/stack-argocd.yaml"].replace("name: stack\n", "name: stack-docs\n").replace(
+            "    path: monitoring/stack\n", "    path: monitoring/stack\n    helm:\n      valueFiles:\n"
+                                           "        - ../../docs/runbook.md\n      postRenderers: []\n")
+        for what, more, files, links in (
+                ("a source's values", {METRICS_PATH: METRICS.replace("values/metrics.yaml", "docs/runbook.md")}, {},
+                 None),
+                ("a jsonnet file of the commit", {}, {"apps/core/app/runbook.jsonnet": 'importstr "../../../docs/'
+                                                                                       'runbook.md"\n'}, None),
+                ("a plugin", {"argocd/tool.yaml": plugin}, {}, None),
+                ("a templatePatch", {APPS_PATH: patched}, {}, None),
+                ("a folder with no filter of endings", {"argocd/raw.yaml": raw}, {}, None),
+                ("a git files generator", {APPS_PATH: generated}, {}, None),
+                ("value files that the box cannot follow", {"argocd/stack-docs.yaml": lost}, {}, None),
+                ("a link of a manifest's name", {}, {}, {"apps/core/app/runbook.yaml": "../../../docs/runbook.md"}),
+                # round 4: a kustomization whose generators or transformers name a config, which can name any file,
+                # and an .argocd-source file, which Argo CD merges into a source (its valueFiles can name any file)
+                ("a kustomization with generators", {"fn/kustomization.yaml": "generators:\n  - gen.yaml\n",
+                                                     "fn/gen.yaml": "kind: Generator\n"}, {}, None),
+                ("an .argocd-source file", {"apps/site/.argocd-source.yaml": "helm:\n  parameters: []\n"}, {},
+                 None),
+                # round 7 (the review of da396d0fc): an Application's Kustomize components, which name a folder whose
+                # patch file no unit reaches, and a chart that renders Applications (an app of apps; also a packed
+                # one), whose value files no list of the box holds
+                ("an Application's Kustomize components", {"argocd/kz.yaml": kz}, {}, None),
+                ("a chart that renders an Application", {"boot/Chart.yaml": boot, "boot/templates/_app.tpl": app}, {},
+                 None),
+                ("a packed chart that renders an Application", {
+                    "boot/Chart.yaml": boot, "boot/charts/apps-1.0.0.tgz": subchart("apps", {"app.yaml": app})},
+                 {}, None),
+                ("a Kustomize resource of another name that holds an Application", {
+                    "kapps/kustomization.yaml": "resources:\n  - apps.txt\n", "kapps/apps.txt": app}, {}, None),
+                ("a Kustomize generator's key=path", {"gen/kustomization.yaml": (
+                    "configMapGenerator:\n  - name: runbook\n    files:\n      - runbook.md=../docs/runbook.md\n")},
+                 {}, None)):
+            with self.subTest(what=what):
+                d = self.push(dict({"docs/runbook.md": edit}, **files), dict(tree, **more), links)
+                self.assertTrue(d.kind == "refused" and d.why.startswith(held), (d, self.last))
+        self.assertEqual(self.last["files"]["docs/runbook.md"]["units"], ["kustomize:gen"])
+        # Kustomize images and a patch with no path, and an annotation of Argo CD in a chart's template, name no file
+        # and make no Application
+        free = dict(tree, **{"argocd/kz.yaml": kz.replace("      components:\n        - ../components/x\n",
+                                                          "      images:\n        - ghcr.io/one-org/web:2\n"
+                                                          "      patches:\n        - patch: '[]'\n"),
+                             "monitoring/stack/templates/hook.yaml": "metadata:\n  annotations:\n"
+                                                                     "    argocd.argoproj.io/sync-wave: \"1\"\n"})
+        d = self.push({"docs/runbook.md": edit}, free)
+        self.assertEqual((d.kind, self.last["any_file"]), ("own", False), (d, self.last))
+        # with no box, a file that no parser reads and that names RBAC (a remote chart's values of another name)
+        # changes only on listed lines (round 2: a bug that read no rbac key there let rbac.create turn on)
+        d = self.secret({"values/rbac.txt": "rbac:\n  create: true\n"},
+                        dict(SECRET_TREE, **{"values/rbac.txt": "rbac:\n  create: false\n"}), render=False)
+        self.assertTrue(d.kind == "refused" and d.why.startswith("values/rbac.txt names a Secret, a service account "
+                                                                 "or a held kind"), d)
+
+    def test_a_free_helm_field_holds_what_a_chart_can_read_as_a_reference(self):
+        """Round 4 of the reviews of 22 November 2026, on a helm field of a source that no unit rendered whole: a key
+        whose quoted text goes on after a line break of YAML other than LF (CR, NEL, LS, PS) is the key that YAML joins
+        (a bug that joined only LF let secretRef through); a manifest in a text value (extraObjects: - |) names its
+        reference (a bug that read keys only let db1 turn to db2); a parameter's value that is a held kind, the group
+        of one, or a manifest makes an object that no name shows (extraDeploy[0].kind=ClusterRoleBinding); an image
+        bump in a text that also has rbac: is free, and rbac turned on is not; and a key of an RBAC proxy is free."""
+        changed = door_targets.helm_changed
+        for brk in ("\r", "\x85", "\u2028", "\u2029"):
+            with self.subTest(brk=repr(brk)):
+                x = '{tag: v1, envFrom: [{? "other" : {name: db}}]}'
+                y = '{tag: v1, envFrom: [{? "secret\\' + brk + '   Ref" : {name: db}}]}'
+                self.assertTrue(changed("values", x, y))
+        manifest = ("extraObjects:\n  - |\n    apiVersion: apps/v1\n    kind: Deployment\n    spec:\n      template:\n"
+                    "        spec:\n          containers:\n            - name: a\n              env:\n"
+                    "                - valueFrom:\n                    secretKeyRef:\n                      name: db1\n")
+        self.assertTrue(changed("values", manifest, manifest.replace("db1", "db2")))
+        self.assertTrue(changed("valuesObject", {"extraObjects": [manifest.split("|\n")[1]]},
+                                {"extraObjects": [manifest.split("|\n")[1].replace("db1", "db2")]}))
+        for name, value in (("extraDeploy[0].kind", "ClusterRoleBinding"), ("extraDeploy[0].kind", "secretlist"),
+                            ("extraDeploy[0].apiVersion", "rbac.authorization.k8s.io/v1"),
+                            ("extraDeploy[0].apiVersion", "external-secrets.io")):
+            with self.subTest(name=name, value=value):
+                self.assertTrue(changed("parameters", [], [{"name": name, "value": value}]))
+        self.assertFalse(changed("parameters", [{"name": "image.tag", "value": "v1"}],
+                                 [{"name": "image.tag", "value": "v2"}]))
+        flow = "{image: {tag: v1}, rbac: {create: false}}"
+        self.assertFalse(changed("values", flow, flow.replace("tag: v1", "tag: v2")))
+        self.assertTrue(changed("values", flow, flow.replace("create: false", "create: true")))
+        # round 5: a manifest in a one-line text (JSON, or a block scalar written with \\n), a key's case and a quote
+        # that opens another scalar in a values text, and a comment that a NEL, an LS or a PS ends (the review of
+        # 7d975c2e2: each let a reference or rbac through)
+        one = ('{"apiVersion":"apps/v1","kind":"Deployment","spec":{"template":{"spec":{"containers":[{"name":"a",'
+               '"env":[{"name":"K","valueFrom":{"secretKeyRef":{"name":"db1","key":"k"}}}]}]}}}}')
+        self.assertTrue(changed("valuesObject", {"extraDeploy": [one]}, {"extraDeploy": [one.replace("db1", "db2")]}))
+        escaped = 'extraObjects:\n  - "apiVersion: v1\\nkind: Pod\\nsecretKeyRef:\\n name: db1"\n'
+        self.assertTrue(changed("values", escaped, escaped.replace("db1", "db2")))
+        self.assertTrue(changed("values", flow, flow.replace("create: false", "Create: false")))
+        quoted = "{a: 'tag: \"', rbac: {create: false}, b: '\"'}"
+        self.assertTrue(changed("values", quoted, quoted.replace("create: false", "create: true")))
+        self.assertFalse(changed("values", flow.replace("tag: v1", 'tag: "v1"'), flow.replace("tag: v1", 'tag: "v2"')))
+        for brk in ("\x85", "\u2028", "\u2029"):
+            with self.subTest(comment=repr(brk)):
+                x = "{tag: v1, envFrom: [{? secretRef #c" + brk + " : {name: db1}}]}"
+                self.assertTrue(changed("values", x, x.replace("db1", "db2")))
+        # round 6 (the reviews of afc580ec3): a comment that ends in a backslash, which the loose reading joined with
+        # the key's colon; a # in a quoted text before a key, which the comment reader took for a comment; an alias,
+        # a tag and a name and a key in a text value; a listed key with no value before the next key, whose name read
+        # as its value. Each let a reference or rbac through. And an image of one word whose name holds secret, whose
+        # bump round 5 refused.
+        for brk in ("\n", "\r\n", "\x85"):
+            with self.subTest(backslash=repr(brk)):
+                x = "{tag: v1, envFrom: [{? secretRef #c \\" + brk + " : {name: db1}}]}"
+                self.assertTrue(changed("values", x, x.replace("db1", "db2")))
+                x = "{x: 1, ? rbac #c \\" + brk + ": {create: false}}"
+                self.assertTrue(changed("values", x, x.replace("false", "true")))
+        for x in ('{"a #": b, ? secretRef #c\n: {name: db1}}', '[ "x #", {? secretRef #c\n: {name: db1}} ]',
+                  '[ "x #", {? secretRef\n#c\n: {name: db1}} ]',      # an explicit key: a comment on a later line
+                  '{"a #": b, apiVersion: #c\n  external-secrets.io/v1, kind: ExternalSecret, name: db1}',
+                  '{apiVersion: !!str external-secrets.io/v1, kind: ExternalSecret, name: db1}'):
+            with self.subTest(quoted=x):
+                self.assertTrue(changed("values", x, x.replace("db1", "db2")))
+        for text in ("k: &k secretKeyRef\nenv: [{name: A, valueFrom: {*k : {name: db1, key: k}}}]\n",
+                     "{!!binary c2VjcmV0S2V5UmVm : {name: db1}}", "basicAuth:\n  password: {name: db1, key: pw}\n"):
+            with self.subTest(text=text):
+                self.assertTrue(changed("valuesObject", {"extraObjects": [text]},
+                                        {"extraObjects": [text.replace("db1", "db2")]}))
+        lifted = "x: {a: 1}\nimage:\n"
+        self.assertTrue(changed("values", lifted + "foo:\n  create: true\n", lifted + "rbac:\n  create: true\n"))
+        bump = "x: {a: 1}\nimage:\n  tag: v1\nrbac: {create: false}\n"
+        self.assertFalse(changed("values", bump, bump.replace("v1", "v2")))
+        image = "ghcr.io/external-secrets/external-secrets:v0.9.1"
+        self.assertFalse(changed("valuesObject", {"image": image}, {"image": image.replace("0.9.1", "0.9.2")}))
+        self.assertFalse(changed("parameters", [{"name": "image", "value": image}],
+                                 [{"name": "image", "value": image.replace("0.9.1", "0.9.2")}]))
+        self.assertFalse(door_targets.sensitive_key("kube-rbac-proxy"))
+        self.assertTrue(door_targets.names_secret("apiVersion: external-secrets.io\nkind: ClusterSecretStore\n"))
+        # round 7 (the reviews of da396d0fc): a comment that ends in a backslash and a line break, which the joined
+        # reading glued to the next line's first word (main too, with a LF); JSON in a double-quoted text; a held
+        # value after a block scalar's mark; an explicit key that starts with an anchor or a block scalar, or an
+        # alias with no space after the ?; a tag with a %TAG directive; an explicit account key after a quoted #;
+        # and a held value after an anchor, or that an alias of its anchor gives. Each let a reference through.
+        for brk in ("\n", "\x85"):
+            with self.subTest(joined=repr(brk)):
+                x = "{basicAuth: {password: {name: db1, # c\\" + brk + "key: pw}}}"
+                self.assertTrue(changed("values", x, x.replace("db1", "db2")))
+                x = "prometheusSpec: {a: 1, # imagePull\\" + brk + "secrets: [db1]}"
+                self.assertTrue(changed("values", x, x.replace("db1", "db2")))
+        for x in ('x: {a: 1}\nextraDeploy: ["{\\"secretRef\\":{\\"name\\":\\"db1\\"}}"]\n',
+                  "x: {a: 1}\napiVersion: >-\n  rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nname: db1\n",
+                  "x: {a: 1}\nb: &k secretRef\nc: {?*k : {name: db1}}\n",
+                  '[ "x #", {? &a secretRef\n#c\n: {name: db1}} ]', "x: {a: 1}\n? |-\n  secretRef\n: {name: db1}\n",
+                  "%TAG ! tag:yaml.org,2002:\n---\nc: {!binary c2VjcmV0UmVm : {name: db1}}\n",
+                  '{"a #": b, ? serviceAccountName\n#c\n: db1}',
+                  "{apiVersion: &a external-secrets.io/v1, kind: ExternalSecret, name: db1}",
+                  "{g: &g external-secrets.io/v1, apiVersion: *g, kind: ExternalSecret, name: db1}",
+                  'x: {a: 1}\nauth: {"name":"db1","key":"pw"}\n',
+                  # a node's tag and anchor, in either order, before a pair's key (the review of 3ff2ea103)
+                  "{a: 1, p: {!x name: db1, key: pw}}", "p: {! name: db1, key: pw}",
+                  "x: {a: 1}\np:\n  !x name: db1\n  key: pw\n", "{a: 1, p: {? !x name : db1, key: pw}}",
+                  "{a: 1, p: {name: db1, !x &n key: pw}}", "{a: 1, p: {&n !x name: db1, key: pw}}"):
+            with self.subTest(held=x):
+                self.assertTrue(changed("values", x, x.replace("db1", "db2")))
+        # the ordinary texts that round 6 held for a key, an alias, a tag or a comment that they only seem to have
+        # (each refused an edit of an alert, a script or a regex, and an image bump in the same values): each stays
+        # free, as a text value and in a values text that is not block style. A text with a key key alone (a
+        # toleration's) holds no mapping of a name and a key, and a colon inside a word ends no key.
+        for text in ("*Alert:* {{ .CommonAnnotations.summary }}", "hosts: *.example.com:443",
+                     "if [ ! -f /data/x ]; then touch /data/x; fi", "match: ^/(?!api)", "what?! it failed", "- !x",
+                     "the api key: in the vault", "# see the secret # docs", "## Secrets ##",
+                     "cat /run/key # the port's file", "postgres://app@secret-db:5432/app?sslmode=disable",
+                     "rancher/external-secrets:v1+k3s1", "tolerations:\n  - key: node-role\n    operator: Exists",
+                     "sed 's#([?&](token|key)=)[^&]*#\\1<redacted>#g'", "Q&A\n**Q:** where?\n**A:** here",
+                     "really?!! it failed", "the user name: and the api key: are in the vault"):
+            with self.subTest(free=text):
+                self.assertFalse(changed("valuesObject", {"t": text + " v1"}, {"t": text + " v2"}))
+                values = "x: {a: 1}\nimage:\n  tag: v1\nt: |\n  " + text.replace("\n", "\n  ") + "\n"
+                self.assertFalse(changed("values", values, values.replace("v1", "v2")))
+        bump = "x: {a: 1}\nimage: rbac-manager:v1\nlevel: info\n"
+        self.assertFalse(changed("values", bump, bump.replace("info", "debug")))
+        # a parameter as Helm reads it: a value with a backslash (which Helm drops), a name with a comma or an =
+        # (Argo CD escapes the value alone), a value with a mapping of a name and a key, and a list in braces with
+        # more after its brace; a list in braces alone is one value, and a held kind's plain word is held only as a
+        # kind's
+        for name, value in (("extra[0].kind", "Cluster\\RoleBinding"),
+                            ("extra[0].apiVersion", "r\\bac.authorization.k8s.io/v1"),
+                            ("x=1,e[0].apiVersion=argoproj.io/v1alpha1,e[0].kind=Application,y", "1"),
+                            ("extra[0].kind", "Secret"), ("extra", "{name: db1, key: pw}"),
+                            ("extraArgs", "{--a=1},e[0].kind=Role,x={b}")):
+            with self.subTest(name=name, value=value):
+                self.assertTrue(changed("parameters", [], [{"name": name, "value": value}]))
+        for name, value in (("extraArgs", "{--a=1,--b=2}"), ("auth.mode", "secret"), ("server.role", "role")):
+            with self.subTest(name=name, value=value):
+                self.assertFalse(changed("parameters", [], [{"name": name, "value": value}]))
+        # a parameter that sets a part of a mapping of a name and a key that the values hold, also when only the
+        # values change; a part of a mapping that is none stays free
+        source = {"repoURL": "https://charts.example.com", "chart": "prom", "targetRevision": "1.0.0"}
+        values = "prom:\n  remoteWrite:\n    basicAuth:\n      password:\n        name: db\n        key: pw\n"
+        one = {"values": values, "parameters": [{"name": "image.tag", "value": "v1"}]}
+        two = dict(one, parameters=one["parameters"] + [{"name": "prom.remoteWrite.basicAuth.password.name",
+                                                          "value": "admin"}])
+        self.assertTrue(door_targets.source_changed(dict(source, helm=one), dict(source, helm=two)))
+        pair = [{"name": "prom.password.name", "value": "admin"}]
+        old, new = ({"values": "prom:\n  password:\n    " + kept + "\n", "parameters": pair} for kept in ("foo: x",
+                                                                                                     "key: pw"))
+        self.assertFalse(changed("values", old["values"], new["values"]))
+        self.assertTrue(door_targets.source_changed(dict(source, helm=old), dict(source, helm=new)))
+        # and a values text that the door cannot read, which may hold a mapping of a name and a key
+        flow = [{"values": "x: {a: 1}\npassword: {name: db, key: pw}\n", "parameters": pair[:n]} for n in (0, 1)]
+        self.assertTrue(door_targets.source_changed(dict(source, helm=flow[0]), dict(source, helm=flow[1])))
+        cluster = [{"values": "cluster:\n  name: prod\n", "parameters": [{"name": "cluster.name", "value": v}]}
+                   for v in ("a", "b")]
+        self.assertFalse(door_targets.source_changed(dict(source, helm=cluster[0]), dict(source, helm=cluster[1])))
 
     def test_a_chart_of_this_repository_that_rendered_whole_decides_its_application_s_values(self):
         """A source of this repository whose chart the door rendered whole with the Application's values is decided
@@ -7874,6 +8239,37 @@ class SecretReferences(RenderCase):
         d = self.secret({ES_PATH: listed.replace("0b6f-example-db", "0b6f-example-other")}, tree)
         self.assertEqual((d.kind, d.why.split(": a change")[0]), ("refused", f"{ES_PATH}: an external-secrets kind"),
                          (d, self.last))
+        # Kubernetes reads any document whose items is a list as a list, whatever its kind (apimachinery's IsList,
+        # which kubectl and Argo CD use), and an item with no kind takes the list's: the same ExternalSecret in a
+        # ConfigMap's items, or in an ExternalSecretList whose item names no kind, changes as one at HEAD (a bug that
+        # unpacked only a kind that ends in List hid a held object from the door, the review of 22 November 2026)
+        for wrapped in (listed.replace("kind: List\n", "kind: ConfigMap\n"),
+                        listed.replace("kind: List\n", "kind: ExternalSecretList\n").replace(
+                            "apiVersion: v1\n", "apiVersion: external-secrets.io/v1beta1\n").replace(
+                            "  - apiVersion: external-secrets.io/v1beta1\n    kind: ExternalSecret\n    metadata:",
+                            "  - metadata:")):
+            with self.subTest(wrapped=wrapped[:60]):
+                tree = dict(SECRET_TREE, **{ES_PATH: wrapped})
+                d = self.secret({ES_PATH: wrapped.replace("0b6f-example-db", "0b6f-example-other")}, tree)
+                self.assertEqual((d.kind, d.why.split(": a change")[0]),
+                                 ("refused", f"{ES_PATH}: an external-secrets kind"), (d, self.last))
+        self.assertEqual(door_targets.listed_objects({"kind": "ConfigMap", "items": [{"kind": "Pod"}]}),
+                         [{"kind": "Pod"}])
+        # an apiVersion of the operator's group with no version makes no object of the cluster, but the store route
+        # would read such a decoy as a store: a new one is refused as the operator's kind (the review of 22 November)
+        decoy = ("apiVersion: external-secrets.io\nkind: ClusterSecretStore\nmetadata:\n  name: main\nspec:\n"
+                 "  provider:\n    bitwardensecretsmanager:\n      projectID: other\n")
+        d = self.secret({"apps/core/app/decoy.yaml": decoy})
+        self.assertEqual((d.kind, d.why), ("refused", "apps/core/app/decoy.yaml: an external-secrets kind, which no "
+                                                      "commit passes"), d)
+        self.assertEqual(door_targets.held_kind({"apiVersion": "external-secrets.io", "kind": "ClusterSecretStore"}),
+                         "an external-secrets kind")
+        # in a file that no parser reads (an anchor), the count of the operator's kinds holds the same decoy
+        d = self.secret({"apps/core/app/decoy.yaml": decoy.replace("name: main", "name: &n main")})
+        self.assertEqual(d.kind, "refused", d)
+        self.assertIn("an external-secrets kind", d.why)
+        self.assertEqual(door_targets.listed_objects({"kind": "SecretList", "apiVersion": "v1", "items": [{}]}),
+                         [{"kind": "Secret", "apiVersion": "v1"}])
 
     def test_an_application_and_rbac_at_head_change_only_in_their_free_fields(self):
         """An Application at HEAD could get another destination, source or revision as the agent's own call, which
@@ -7909,7 +8305,38 @@ class SecretReferences(RenderCase):
             "a remote chart's existingSecret": APPS.replace("        level: info\n",
                                                             "        level: info\n        existingSecret: other\n"),
             "a remote chart's serviceAccount": APPS.replace("        level: info\n", "        level: info\n"
-                                                            "        serviceAccount:\n          name: admin\n")}
+                                                            "        serviceAccount:\n          name: admin\n"),
+            # a parameter by its name as Helm's --set reads it, with no backslash (review of 22 November 2026: a bug
+            # that read the name as written let envFrom[0].sec\retRef.name through)
+            "a parameter of a secretRef with a backslash": APPS.replace("    helm:\n      values: |\n", (
+                "    helm:\n      parameters:\n        - name: 'envFrom[0].sec\\retRef.name'\n          value: admin\n"
+                "      values: |\n")),
+            "a parameter of an account with a backslash": APPS.replace("    helm:\n      values: |\n", (
+                "    helm:\n      parameters:\n        - name: 'serviceAcc\\ount.name'\n          value: admin\n"
+                "      values: |\n")),
+            # RBAC of a remote chart: a key with rbac, a rule of a Role under any key, and a rule's list in a
+            # parameter (a bug that read keys of Secrets and accounts alone gave a pod the right to read Secrets)
+            "a remote chart's rbac": APPS.replace("        level: info\n", "        level: info\n        rbac:\n"
+                                                                          "          create: true\n"),
+            "a remote chart's rule of a Role": APPS.replace("        level: info\n", (
+                "        level: info\n        additionalPermissions:\n          - apiGroups: [\"\"]\n"
+                "            resources: [secrets]\n            verbs: [get]\n")),
+            "a parameter of a rule's list": APPS.replace("    helm:\n      values: |\n", (
+                "    helm:\n      parameters:\n        - name: extraRules[0].resources\n"
+                "          value: '{secrets}'\n      values: |\n")),
+            # round 2: a rule's list before an = in the name, and a value whose comma Argo CD leaves with no
+            # backslash, in a list in braces or after a backslash, which starts another parameter in Helm
+            "a rule's list before an =": APPS.replace("    helm:\n      values: |\n", (
+                "    helm:\n      parameters:\n        - name: 'extraRules[0].verbs={*},x'\n"
+                "          value: '1'\n      values: |\n")),
+            "a list in braces that sets more": APPS.replace("    helm:\n      values: |\n", (
+                "    helm:\n      parameters:\n        - name: image.tag\n"
+                "          value: '{x},envFrom[0].secretRef.name=db,z={y}'\n      values: |\n")),
+            "a comma after a backslash that sets more": APPS.replace("    helm:\n      values: |\n", (
+                "    helm:\n      parameters:\n        - name: image.tag\n"
+                "          value: 'a\\\\,envFrom[0].secretRef.name=db'\n      values: |\n")),
+            "a chart's ClusterRoles": APPS.replace("        level: info\n", "        level: info\n"
+                                                                            "        createClusterRoles: true\n")}
         for what, text in refused.items():
             with self.subTest(what=what):
                 d = self.secret({APPS_PATH: text})
@@ -7921,6 +8348,16 @@ class SecretReferences(RenderCase):
         for what, text in (("syncPolicy", APPS.replace("prune: true", "prune: false")),
                            ("a chart's targetRevision", APPS.replace("targetRevision: 1.0.0", "targetRevision: 1.1.0")),
                            ("helm.values", APPS.replace("level: info", "level: debug")),
+                           # a monitoring chart's alerting rules and a container's resources are no RBAC
+                           ("a remote chart's defaultRules", APPS.replace("        level: info\n", (
+                               "        level: info\n        defaultRules:\n          rules:\n"
+                               "            etcd: false\n"))),
+                           ("an RBAC proxy's image", APPS.replace("        level: info\n", (
+                               "        level: info\n        kubeRBACProxy:\n          image:\n"
+                               "            tag: v2\n"))),
+                           ("a parameter of resources", APPS.replace("    helm:\n      values: |\n", (
+                               "    helm:\n      parameters:\n        - name: resources.limits.cpu\n"
+                               "          value: \"1\"\n      values: |\n"))),
                            ("a listed annotation", APPS.replace("  name: site\n  namespace: argocd\n",
                                                                 "  name: site\n  namespace: argocd\n  annotations:\n"
                                                                 "    argocd.argoproj.io/sync-wave: \"1\"\n")),
@@ -7981,14 +8418,55 @@ class SecretReferences(RenderCase):
                      RBAC.replace("    name: api\nroleRef", "    name: api\n  - kind: ServiceAccount\n"
                                                               "    name: other\nroleRef"),
                      RBAC.replace("    team: api\n", "    team: api\n    rbac.authorization.k8s.io/aggregate-to-admin: "
-                                                   "\"true\"\n")):
+                                                   "\"true\"\n"),
+                     # any label of a ClusterRole: an aggregationRule at HEAD can select it by a label of any name
+                     # (review of 22 November 2026: a bug that held the prefix alone let it join an aggregated role)
+                     RBAC.replace("team: api", "team: web")):
             with self.subTest(text=text):
                 d = self.secret({RBAC_PATH: text})
                 self.assertEqual(d.kind, "refused", (d, self.last))
                 self.assertTrue(d.why.startswith(f"{RBAC_PATH}: RBAC: a change of "), d.why)
-        # another label is free, also of a ClusterRole whose name no prune names (a bug that found no such object at
-        # HEAD made it new, and refused it)
-        self.assertEqual(self.secret({RBAC_PATH: RBAC.replace("team: api", "team: web")}).kind, "own", self.last)
+        # another label of a Role is free, and a ClusterRole's labels of its chart's version (round 2: a bug that held
+        # each label of a ClusterRole refused a chart's version bump), and an annotation of a ClusterRole whose name no
+        # prune names (a bug that found no such object at HEAD made it new, and refused it)
+        versioned = RBAC.replace("    team: api\n", "    team: api\n    helm.sh/chart: api-1.1.0\n"
+                                                   "    app.kubernetes.io/version: 1.1.0\n")
+        self.assertEqual(self.secret({RBAC_PATH: versioned.replace("1.1.0", "1.2.0")},
+                                     dict(SECRET_TREE, **{RBAC_PATH: versioned})).kind, "own", self.last)
+        # and the older label chart: <name>-<version> (kube-prometheus-stack) and a plain version: (Kustomize's
+        # commonLabels), round 4: a bug that freed only Helm's two labels refused those bumps
+        labelled = RBAC.replace("    team: api\n", "    team: api\n    chart: api-1.1.0\n")
+        self.assertEqual(self.secret({RBAC_PATH: labelled.replace("api-1.1.0", "api-1.2.0")},
+                                     dict(SECRET_TREE, **{RBAC_PATH: labelled})).kind, "own", self.last)
+        # but a version label added or taken away is a change: an aggregationRule can select by its key alone (round 5)
+        self.assertEqual(self.secret({RBAC_PATH: RBAC.replace("    team: api\n", "    team: api\n    version: 1.1.0\n")}
+                                     ).kind, "refused", self.last)
+        self.assertEqual(self.secret({RBAC_PATH: RBAC.replace("kind: Role\nmetadata:\n  name: api\n",
+                                                              "kind: Role\nmetadata:\n  name: api\n  labels:\n"
+                                                              "    team: web\n")}).kind, "own", self.last)
+        self.assertEqual(self.secret({RBAC_PATH: RBAC.replace("    team: api\n", "    team: api\n  annotations:\n"
+                                                                                "    note: web\n")}).kind, "own",
+                         self.last)
+        # Argo CD merges .argocd-source-<app>.yaml into the source of its folder: it changes only in a source's free
+        # fields, with a render and with none (round 2: a bug that read it as a values file let a parameter read a
+        # Secret), and the image updater's own write stays free
+        overrides = "apps/site/.argocd-source-site.yaml"
+        for render in (True, False):
+            with self.subTest(render=render):
+                d = self.secret({overrides: "helm:\n  parameters:\n    - name: envFrom[0].secretRef.name\n"
+                                            "      value: admin\n"}, render=render)
+                self.assertEqual((d.kind, d.why), ("refused", f"{overrides} changes what Argo CD merges into the "
+                                                              f"source of an Application beyond the source's free "
+                                                              f"fields, which no commit passes"), (d, self.last))
+                d = self.secret({overrides: "kustomize:\n  images:\n    - ghcr.io/one-org/site:2222222\n"},
+                                render=render)
+                self.assertEqual(d.kind, "own", (d, self.last))
+        # the box gives a parameter's value to helm as Argo CD does (cleanSetParameters): a list in braces as it is,
+        # and a backslash before each other comma (round 2: a bug that wrote the list's commas otherwise rendered
+        # another value than the cluster's)
+        one = door_render.value_set("x", "ns", {"path": "monitoring/stack", "helm": {"parameters": [
+            {"name": "hosts", "value": "{a,b}"}, {"name": "note", "value": "a,b"}]}}, [], False, "monitoring/stack")
+        self.assertEqual([step[2] for step in one["steps"]], ["hosts={a,b}", "note=a\\,b"])
 
     def test_a_service_account_a_list_an_object_with_no_name_and_an_unknown_namespace(self):
         """The pod's old field serviceAccount is an account too, and kind: ServiceAccount is none (a bug that read a
@@ -8139,14 +8617,32 @@ class SecretReferences(RenderCase):
                      '{level: info, "secretKeyRef" # c\n: {}}\n', "? secretKeyRef # c\n: {name: admin}\n",
                      '{level: info, "key" # c\n: password, "name": admin}\n',
                      # a CR alone ends a line in YAML, and the comment with it (round 8)
-                     '{level: info, "secretKeyRef" # c\r: {}}\n', '{level: info, "key" # c\r: password, "name": admin}\n'):
+                     '{level: info, "secretKeyRef" # c\r: {}}\n', '{level: info, "key" # c\r: password, "name": admin}\n',
+                     # an alias as a key, whose anchor names the key that the text never spells (review of 22 November
+                     # 2026: a bug that read the text's words alone let envFrom read the Secret admin), also after
+                     # each line break of YAML and a flow colon with no space, and a tag of a key (round 2)
+                     "a: &k secretRef\nenvFrom: [ {*k : {name: admin}} ]\n",
+                     "a:\r &k secretRef\nenvFrom: [ {\r*k : {name: admin}} ]\n",
+                     "a:\u2028&k secretRef\nenvFrom: [ {\x85*k : {name: admin}} ]\n",
+                     '{"x":&k secretRef, "envFrom": [{*k: {name: admin}}]}\n',
+                     "envFrom: [{!!binary c2VjcmV0UmVm: {name: db}}]\n",
+                     "a: &k secretRef\nenvFrom: [{*k # c\n: {name: admin}}]\n",
+                     "a: &k secretRef\nenvFrom:\n  - ? *k\n    : {name: admin}\n",
+                     # RBAC in a text that is not block style: a key with rbac, and a rule's verbs (round 2)
+                     "{level: info, rbac: {create: true}}\n",
+                     'additionalPermissions: [{apiGroups: [""], resources: [secrets], verbs: [get]}]\n'):
             with self.subTest(text=text):
                 d = self.secret({path: json.dumps(at(app, "/spec/source/helm/values", text))}, tree, render=False)
                 self.assertEqual(d.kind, "refused", d)
-        # imagePullSecrets is no key of the rule, also with its colon on the next line
-        text = '{level: info, "imagePullSecrets"\n: [{name: regcred}]}\n'
-        d = self.secret({path: json.dumps(at(app, "/spec/source/helm/values", text))}, tree, render=False)
-        self.assertEqual(d.kind, "own", d)
+        # imagePullSecrets is no key of the rule, also with its colon on the next line; an anchor and an alias as a
+        # value make no key, and an RBAC proxy's image is no RBAC (round 2: a bug that held every anchor refused an
+        # image bump in such a text, and a && line)
+        for text in ('{level: info, "imagePullSecrets"\n: [{name: regcred}]}\n',
+                     "{level: info}\nimage: &img {tag: v2}\nsidecar: {image: *img}\n",
+                     "{level: info}\nscript: |\n  && make\n", "{level: info, kubeRBACProxy: {image: {tag: v2}}}\n"):
+            with self.subTest(text=text):
+                d = self.secret({path: json.dumps(at(app, "/spec/source/helm/values", text))}, tree, render=False)
+                self.assertEqual(d.kind, "own", d)
         # a text value that no other check holds (a ConfigMap's file, in JSON, which as_block wrote on one line) is
         # still counted line by line: a form at the start of one of its lines is refused with the count's words
         config = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "logs"},
@@ -8163,7 +8659,11 @@ class SecretReferences(RenderCase):
 
     def test_the_new_references_of_one_commit_fit_the_door_s_record(self):
         """The door's record keeps 300 characters of a refusal's words: a commit whose new references need more is
-        refused, so that no card hides one of them (a bug that cut the words)."""
+        refused, so that no card hides one of them (a bug that cut the words). The same reference that several units
+        render is one card that names each unit, where the commit's words name its Secret and its key: a Kustomize
+        base that three overlays read made five cards in 347 characters, and its one new reference was refused
+        (review of 22 November 2026). A Secret that only a render names can be another one in each unit: a card
+        for each (round 2: a bug that merged them named one of the Secrets)."""
         five = API.replace("                  key: password\n", "                  key: password\n" + "".join(
             f"            - name: KEY_{n}\n              valueFrom:\n                secretKeyRef:\n"
             f"                  name: db-{n}\n                  key: password\n" for n in range(5)))
@@ -8176,6 +8676,25 @@ class SecretReferences(RenderCase):
             f"                  name: db-{n}\n                  key: password\n" for n in range(3, 5)), "")})
         self.assertEqual(d.kind, "full", d)
         self.assertLessEqual(len(d.why.split(CARD)[0]), 300)
+        tree = dict(SECRET_TREE, **{"base/kustomization.yaml": "resources:\n  - api.yaml\n", "base/api.yaml": API},
+                    **{f"overlays/{env}/kustomization.yaml": f"resources:\n  - ../../base\nnamespace: {env}\n"
+                       for env in ("dev", "staging", "prod")})
+        d = self.secret({"base/api.yaml": API.replace("name: db\n", "name: admin\n")}, tree)
+        self.assertEqual((d.kind, d.why), ("full", "a new secretKeyRef: Deployment api reads Secret admin key password; "
+                                                   "a new secretKeyRef: the Kustomize folders base, overlays/dev, "
+                                                   "overlays/prod and overlays/staging read Secret admin key password"
+                                                   + CARD), (d, self.last))
+        self.assertEqual(len(self.last["units"]), 4)
+        api = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "api"}, "spec": {"template": {
+            "spec": {"containers": [{"name": "api", "env": [{"name": "P", "valueFrom": {"secretKeyRef": {
+                "name": "admin", "key": "password"}}}]}]}}}}
+        units = {f"kustomize:overlays/{env}": {"kind": "kustomize", "root": f"overlays/{env}", "ok": True, "changed": [
+            {"object": "an object", "set": "its own values", "before": [], "after": [api]}]} for env in ("dev", "prod")}
+        self.assertEqual(door_targets.render_refusal({"units": units, "apps": None}, {"admin", "password"}), (None, [
+            "a new secretKeyRef: the Kustomize folders overlays/dev and overlays/prod read Secret admin key password"]))
+        self.assertEqual(door_targets.render_refusal({"units": units, "apps": None}, set()), (None, [
+            f"a new secretKeyRef: the Kustomize folder overlays/{env} reads a Secret that only the render names, by a "
+            f"key that only the render names" for env in ("dev", "prod")]))
 
 
 class RenderDoor(RenderCase, DoorCase):

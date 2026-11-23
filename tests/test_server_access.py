@@ -1976,13 +1976,22 @@ class DoorCalls(Access):
         hub.t_withdraw_need("manager", {"need": f"N-{again}", "why": "The agent found another way."})
         later = raised(card("echo part four\n"))
         # a card whose line of the door's record names no task: the job is the caller's on that server, and no task's,
-        # so it neither waits for a task's card nor replaces one (security review, round 2)
+        # so it neither waits for a task's card nor replaces one (security review, round 2): a card in the place of a
+        # task's would let that task hear the answer to another call (review of 22 November 2026, round 2)
         loose = raised(card("echo clean up\n", task=None))
         refused(card("echo clean up more\n", task=None), f"N-{loose} is open for a root script of the same agent on "
                                                           f"web-1")
         refused(card("echo clean up more\n", task=None, replaces=f"N-{rotate}"), f"N-{rotate} is the door card of "
                                                                                f"another job on web-1")
         self.assertEqual((open_cards(), open_cards("web-2")), ([rotate, later, loose], [elsewhere]))
+        # an item with no door call is replaced by a door card, as before one job was one card (review of 22 November
+        # 2026: a bug that took it for the door card of another job refused it)
+        hub.q("UPDATE needs SET answer='No', answered=? WHERE id=?", (hub.now(), elsewhere))
+        plain = raised({"title": "Choose the plan", "why": "Two plans fit.", "what_to_do": "Say which one",
+                        "reason": "money"})
+        took = raised(card("echo look again\n", host="web-2", replaces=f"N-{plain}"))
+        self.assertEqual(hub.q1("SELECT replaced_by FROM needs WHERE id=?", (plain,))["replaced_by"], took)
+        self.assertEqual(open_cards("web-2"), [took])
 
     def test_the_door_s_card_names_the_task_that_asked_after_its_title(self):
         """Incident intake, part 3 (the owner, 14 November 2026, "Yes, as shown", to that title with the name of

@@ -102,6 +102,7 @@ from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, DEPLOY_APP_NOTE, GITHUB_T
                        app_server_task, mcp_server, mcp_variable, no_sign_in, reuse_value, runtime_fact,
                        runtimes_with, shown_name, switch_target, tool_catalog, tool_needs)
 from lifecycle import SKILL_FILE, SKILL_NAME, SKILLS, skill_front, skill_rows, skills_text   # design v4 D: agents' skills
+from lifecycle import SKILL_GIFT_LOG, SKILL_GIFT_MAIL, SKILL_GIFT_TRAILER, skill_gift_marks  # one rule of gifts
 from lifecycle import CONFIG_FILES, floor_path, keep_floor, may_take    # DevOps plan 0.1: the check of every move
 from lifecycle import VAULT_CHROME     # a Mac's word of what stops its vault in Chrome (desktop_status)
 from lifecycle import KEY_SUFFIXES, SCREEN_COMMANDS, key_env, start_form    # DevOps plan 0.2: data stops being code
@@ -19172,15 +19173,15 @@ def door_card_open(call, host, asking, old):
     characters for one task on one server: "every time the same?". Two cards are of one job when they have the same
     door_host and the same task (door_task_id), or, when neither has a task, the same caller in the door's record. The
     card that the new one replaces (old) is no second card, and neither is an answered one: a task that runs one
-    script, reads its result and needs a second is real work. replaces takes only a card of the same job: it closes the
-    old card with no word to its task."""
+    script, reads its result and needs a second is real work. replaces takes only a card of the same job, or an item
+    with no door call: it closes the old card with no word to its task."""
     task, caller = asking["id"] if asking else None, door_call_caller(call)
 
     def same_job(r):            # a card of a task is of that task's job alone; with no task, of the caller's
         if task or r["door_task_id"]:
             return r["door_task_id"] == task
         return caller is not None and door_call_caller(r["door_call"]) == caller
-    if old and not same_job(old):
+    if old and old["door_call"] is not None and not same_job(old):
         raise ToolError(f"N-{old['id']} is the door card of another job on {host} (another task, or another agent), "
                         f"and replaces takes only the open card of the same job. Raise this card without replaces.")
     rows = q("SELECT id, door_call, door_task_id, question FROM needs WHERE door_host=? AND answer IS NULL AND "
@@ -45405,8 +45406,22 @@ def skills_listed(agent):
     if listed is None:                  # another reader's clear can come between a test of the key and its read
         if len(SKILLS_LISTED) > 256:
             SKILLS_LISTED.clear()
-        listed = SKILLS_LISTED[key] = skills_text(kit_dir(), agent)
+        listed = skills_text(kit_dir(), agent)
+        # Kept only with the gift marks of that commit (lifecycle.skill_marks_at keeps no failed read): a list that
+        # git could not mark is read again at the next start, as a helper's start reads it each time.
+        if not listed or (os.path.realpath(kit_dir()), rev) in lifecycle.SKILL_MARKS:
+            SKILLS_LISTED[key] = listed
     return listed
+
+
+def skill_marks_warm():
+    """At the hub's start, in a thread of its own and outside LOCK: the gift marks of the hub checkout's commit
+    (lifecycle.skill_marks_at), so that the first start text after it, which can run under LOCK in admit_task's
+    transaction, reads only the commits after that one and not the whole history of skills/."""
+    try:
+        skill_rows(kit_dir(), gifts=True)
+    except Exception:           # a fault here stops no start: the first start text reads the marks itself
+        print_fault()
 
 
 def skills_start_text(agent, stable):
@@ -45500,8 +45515,6 @@ SKILL_GIFT_ENTRIES = 5000               # entries of the ZIP's central directory
 SKILL_GIFT_PACKING = (0, 8)             # zipfile's ZIP_STORED and ZIP_DEFLATED: a read of bzip2 or LZMA unpacks all
 #                                         that one read takes, and only then cuts it (a packed bomb)
 SKILL_GIFT_WAIT = 10                    # seconds that the search for logins waits for another file's (CHAT_FILE_CHECKS)
-SKILL_GIFT_TRAILER = "Fleet-Given"      # the git trailer of a gift's commit: Fleet-Given: <agent>/<name>
-SKILL_GIFT_MAIL = "owner@fleet.invalid"     # commit_kit_file's mail for a commit of the owner's own
 SKILLS_GIVEN = {}                       # {(hub checkout, revision): (the marks, {(agent, name): given})}
 SKILLS_GIVEN_KEPT = 16                  # revisions that SKILLS_GIVEN keeps, the one read first going first
 SKILL_GIFT_PATH = ("at most two folders deep, and each name of at most 64 letters, digits, dots, underscores and "
@@ -46048,12 +46061,6 @@ def skill_gift_line(gift, task=False):
                "Its files are in your checkout from the start of your next task, not in this chat."))
 
 
-# one line of git log --raw -t for an agent's folder of skills, or for one skill's folder: its old and new mode, its
-# old and new tree, how it changed, the agent, and the skill's name (None for the agent's whole folder)
-SKILL_GIFT_RAW = re.compile(rf":(\d{{6}}) (\d{{6}}) ([0-9a-f]+) ([0-9a-f]+) ([AMD])\t"
-                            rf"{re.escape(SKILLS)}/([^/]+)(?:/([^/]+))?")
-
-
 def skills_given(rev):
     """{(agent, name): True when the owner gave it} for every skill folder at revision rev, or None when git cannot
     say. The marks are triples (agent, name, tree): a folder is given while its git tree is the one that a mark holds
@@ -46093,32 +46100,10 @@ def skills_given(rev):
     marks, span = set(), rev
     if known and git_kit("merge-base", "--is-ancestor", base, rev)[0] == 0:
         marks, span = set(known[0]), f"{base}..{rev}"
-    code, out, _ = git_kit("log", "--reverse", "--topo-order", "--no-color", "--format=%x1e%H%x1f%ae%x1f%B%x1f",
-                           "--raw", "-t", "--no-renames", "--no-abbrev", span, "--", SKILLS + "/", timeout=60)
+    code, out, _ = git_kit(*SKILL_GIFT_LOG, span, "--", SKILLS + "/", timeout=60)
     if code != 0:
         return None
-    for chunk in out.split("\x1e"):
-        parts = chunk.split("\x1f")
-        if len(parts) != 4 or parts[1].strip() != SKILL_GIFT_MAIL:
-            continue
-        named = set(re.findall(rf"^{SKILL_GIFT_TRAILER}: ({lifecycle.SKILL_AGENT})/({SKILL_NAME})$", parts[2], re.M))
-        left, added, came = {}, {}, {}      # agent -> the tree of its whole folder; (agent, name) -> a skill's tree
-        for line in parts[3].splitlines():
-            m = SKILL_GIFT_RAW.fullmatch(line)
-            if not m:
-                continue
-            old_mode, new_mode, old, tree, status, owner, name = m.groups()
-            if name is None and status == "D" and old_mode == "040000":
-                left[owner] = old
-            elif name is None and status == "A" and new_mode == "040000":
-                added[owner] = tree
-            elif name is not None and status in ("A", "M") and new_mode == "040000":
-                came[(owner, name)] = tree
-        marks.update((owner, name, tree) for (owner, name), tree in came.items() if (owner, name) in named)
-        for new, whole in added.items():
-            olds = [old for old, tree in left.items() if tree == whole]
-            if len(olds) == 1 and list(added.values()).count(whole) == 1:
-                marks.update({(new, name, tree) for owner, name, tree in marks if owner == olds[0]})
+    skill_gift_marks(out, marks)        # the one copy of the rule: the start list reads it too (skill_rows)
     code, out, _ = git_kit("ls-tree", "-r", "-d", "-z", rev, "--", SKILLS + "/")
     if code != 0:
         return None
@@ -89242,6 +89227,7 @@ def main():
     threading.Thread(target=read_watcher, name="read-checks", daemon=True).start()  # a read check of a wake-up rule
     # AUTONOMY.md P6: the records written before this start, into the history, a short step at a time (the backfill)
     threading.Thread(target=history_indexer, name="history-index", daemon=True).start()
+    threading.Thread(target=skill_marks_warm, name="skill-marks", daemon=True).start()     # the start list's marks
     diagnostics.watch_stalls()      # Hub core: a stall names itself in faults (kind "stall"), after the start's own work
     TAILNET_NAMES["names"] = tailnet_names()        # devops task 1.1: the names that a client may call this hub by
     capp_sync_later()           # the connected apps' socket, with guard 6(b) (nothing runs while it cannot be on)

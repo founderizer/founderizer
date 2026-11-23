@@ -33,6 +33,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))     # python3 -I leaves the code's own folder out
 
@@ -505,12 +506,11 @@ def read_file(runner, data):
     return None if texts is None else read_yaml(runner, texts)
 
 
-def objects(doc):
-    "The objects of one document: itself, or the items of a List, at any depth."
-    kind, items = doc.get("kind"), doc.get("items")
-    if isinstance(kind, str) and kind.endswith("List") and isinstance(items, list):
-        return [o for item in items if isinstance(item, dict) for o in objects(item)]
-    return [doc]
+def objects(doc, depth=0):
+    """The objects of one document as Kubernetes reads it: any document whose items is a list is a list, whatever its
+    kind, and an item with no kind or apiVersion takes the list's (door_targets.listed_objects)."""
+    import door_targets
+    return door_targets.listed_objects(doc, depth)
 
 
 def word(value):
@@ -597,13 +597,14 @@ class Kustomize:
                 continue
             folders.add(at)
             for text in strings(self.docs.get(at)):
-                path = inside(at, text)
-                if path is None:
-                    continue
-                if is_dir(self.tree, path):
-                    left.append(path)
-                elif is_file(self.tree, path):
-                    files.add(path)
+                for name in [text] + ([text.partition("=")[2]] if "=" in text else []):    # a generator's key=path
+                    path = inside(at, name)
+                    if path is None:
+                        continue
+                    if is_dir(self.tree, path):
+                        left.append(path)
+                    elif is_file(self.tree, path):
+                        files.add(path)
         self.reached[folder] = (folders, files)
         return folders, files
 
@@ -750,8 +751,10 @@ def value_set(name, namespace, source, every, patched, root):
                 continue
             value = entry.get("value", "")
             value = json.dumps(value) if isinstance(value, bool) else str(value)
-            # ArgoCD's own escape: a comma that has no backslash before it gets one
-            value = re.sub(r"(?<!\\),", r"\\,", value)
+            # ArgoCD's own escape (cleanSetParameters): a list in braces stays as it is, and else a comma that has
+            # no backslash before it gets one
+            if not (value.startswith("{") and value.endswith("}")):
+                value = re.sub(r"(?<!\\),", r"\\,", value)
             steps.append(("arg", "--set-string" if entry.get("forceString") is True else flag,
                           f"{entry['name']}={value}"))
     if isinstance(helm.get("kubeVersion"), str):
@@ -1194,6 +1197,133 @@ def chart_values(found, exposure=()):
     return [out[k] for k in sorted(out)]
 
 
+MANIFEST_NAMES = (".yaml", ".yml", ".json", ".jsonnet", ".libsonnet")     # door_targets.MANIFEST_ENDS
+
+
+def files_generator(node, depth=0):
+    "True for generators of an ApplicationSet with a git files generator, whose glob can match a file of any name."
+    if depth > 20:
+        return True
+    if isinstance(node, dict):
+        git = node.get("git")
+        return isinstance(git, dict) and "files" in git or any(files_generator(v, depth + 1) for v in node.values())
+    return isinstance(node, list) and any(files_generator(v, depth + 1) for v in node)
+
+
+def outside_files(source):
+    """True when a source names files of this repository as its values by its own path (valueFiles that are no
+    $ref/ path, and fileParameters) outside its folder, or by a path that only a cluster knows."""
+    helm = source.get("helm") if isinstance(source.get("helm"), dict) else {}
+    named = (helm.get("valueFiles") if isinstance(helm.get("valueFiles"), list) else [helm.get("valueFiles")]) + \
+        [p.get("path") if isinstance(p, dict) else p for p in (helm.get("fileParameters") if
+                                                               isinstance(helm.get("fileParameters"), list) else
+                                                               [helm.get("fileParameters")])]
+    root = source.get("path")
+    for value in named:
+        if value is None or isinstance(value, str) and value.startswith("$"):
+            continue
+        if not isinstance(value, str) or not isinstance(root, str) or "{{" in value or "{{" in root:
+            return True
+        folder, path = inside("", root), inside(inside("", root) or "", value)
+        if path is not None and folder not in ("", None) and not path.startswith(folder + "/"):
+            return True
+    return False
+
+
+ARGOCD_SOURCE = re.compile(r"\.argocd-source(?:-[^/]*)?\.ya?ml", re.I)     # as door_targets.ARGOCD_SOURCE
+# the keys of a kustomization that name the config of a function or a plugin, which can read a file that Kustomize.reach
+# never opens (it takes each text of a kustomization as a path, and does not read what a config at that path names)
+KUSTOMIZE_CONFIGS = ("generators", "transformers", "configurations")
+# The kustomize options of an Application's source that name no file (Argo CD's ApplicationSourceKustomize): its
+# components and a patch with a path name files that Kustomize reads and that no unit of the box reaches
+KUSTOMIZE_NO_FILE = {"namePrefix", "nameSuffix", "images", "replicas", "commonLabels", "commonAnnotations",
+                     "commonAnnotationsEnvsubst", "forceCommonLabels", "forceCommonAnnotations", "namespace", "version",
+                     "kubeVersion", "apiVersions", "labelWithoutSelector", "labelIncludeTemplates", "patches"}
+# Argo CD's group as a word of its own: an Application's apiVersion, or a part that a template joins (printf
+# "%s.io/v1alpha1" "argoproj"), but not an annotation's argocd.argoproj.io/ prefix
+ARGO_GROUP = re.compile(rb"(?<![\w.-])argoproj(?![\w-])", re.I)
+PACKED_MAX = 64 * 1024 * 1024       # what the box unpacks of one packed chart to look for that word
+
+
+def names_files(kustomize):
+    """True for an Application's kustomize options that can name a file: components, a patch with a path, and each
+    option that the box does not know."""
+    if not isinstance(kustomize, dict):
+        return True
+    patches = kustomize.get("patches")
+    return bool(set(kustomize) - KUSTOMIZE_NO_FILE) or patches is not None and not (
+        isinstance(patches, list) and all(isinstance(p, dict) and "path" not in p for p in patches))
+
+
+def renders_applications(tree, kustomize):
+    """True when a chart or a Kustomize folder of a tree can make an Application that the box does not read
+    (application_texts reads files of a manifest's name): a file of a chart's folder (Chart.yaml in it or above it),
+    in a packed chart too, or a file of another name that a kustomization reaches, holds Argo CD's group as a word."""
+    for folder, dirs, names in os.walk(tree):
+        dirs[:] = [d for d in dirs if d != ".git" and not os.path.islink(os.path.join(folder, d))]
+        rel = os.path.relpath(folder, tree).replace(os.sep, "/")
+        rel = "" if rel == "." else rel
+        if not chart_roots([tree], posixpath.join(rel, "x")):
+            continue
+        for name in names:
+            data = read(tree, posixpath.join(rel, name), most=TAR_MAX)
+            if data is None:
+                continue
+            if name.lower().endswith((".tgz", ".tar.gz")):
+                try:
+                    data = zlib.decompressobj(47).decompress(data, PACKED_MAX)
+                except zlib.error:
+                    continue
+            if ARGO_GROUP.search(data):
+                return True
+    for root in kustomize.files if kustomize is not None else ():
+        if kustomize.unit(root):
+            for path in kustomize.reach(root)[1]:
+                if not path.lower().endswith(APP_FILES) and ARGO_GROUP.search(read(tree, path, most=TAR_MAX) or b""):
+                    return True
+    return False
+
+
+def any_file(trees, apps, links, lost, kustomize=()):
+    """True when a tool of a cluster can read a file of the repository of any name outside the charts and the
+    Kustomize folders that hold or name it, in either tree: a jsonnet file (importstr reads any file of the
+    repository), the source of a plugin (Argo CD gives a plugin the whole repository), an ApplicationSet whose
+    templatePatch the door cannot follow, one with a git files generator, a folder that an Application applies with
+    no filter of endings (directory.disableExtensionFilter), an Application that the parser cannot read, a link with
+    a manifest's name to a file of another name, and, where the box cannot give a chart its value sets (lost), a
+    source's own value files outside its folder, a kustomization with generators, transformers or configurations
+    (their configs name files that no reach of the box opens), an .argocd-source file, which Argo CD merges into a
+    source (its helm.valueFiles can name any file), an Application's kustomize options that name a file (its
+    components, a patch's path), and a chart or a Kustomize folder that can make an Application that the box does not
+    read (renders_applications: an app of apps, whose value files no list of the box holds). Where it is False, a
+    file of another name than a manifest's that no unit reads and no source takes as its values is read by no tool of
+    a cluster (door_targets: check 1 of the rule of references to Secrets)."""
+    for found, unread in apps:
+        for app, _rel in found:
+            spec = app.get("spec") if isinstance(app.get("spec"), dict) else {}
+            every = [s for _n, _ns, s, _e, _p in sources(app)]
+            if app.get("kind") == "ApplicationSet" and (spec.get("templatePatch") or
+                                                        files_generator(spec.get("generators"))) or \
+                    any("plugin" in s or isinstance(s.get("directory"), dict) and
+                        "disableExtensionFilter" in s["directory"] or lost and outside_files(s) or
+                        "kustomize" in s and names_files(s["kustomize"]) for s in every):
+                return True
+        if unread:
+            return True
+    if any(link.lower().endswith(MANIFEST_NAMES) and not names.lower().endswith(MANIFEST_NAMES)
+           for link, names in links):
+        return True
+    for one in kustomize:
+        if any(isinstance(doc, dict) and any(key in doc for key in KUSTOMIZE_CONFIGS) for doc in one.docs.values()):
+            return True
+    for tree in trees:
+        for folder, dirs, names in os.walk(tree):
+            dirs[:] = [d for d in dirs if d != ".git" and not os.path.islink(os.path.join(folder, d))]
+            if any(name.lower().endswith((".jsonnet", ".libsonnet")) or ARGOCD_SOURCE.fullmatch(name) for name in names):
+                return True
+    return any(renders_applications(tree, one) for tree, one in zip(trees, list(kustomize) or [None] * len(trees)))
+
+
 # The YAML tags of a commit's files (the coordinator of the DevOps plan, 16 November 2026): a tag outside YAML's core
 # schema can make a reader build an object of its own program, as Psych's !ruby/object and PyYAML's !!python/object
 # do, and the generator of a declaration, the repository's checks and its people's tools are such readers. The pinned
@@ -1415,6 +1545,8 @@ def answer(header, tar, blobs, tools, scratch, log=False):
             for path in commit:
                 if named & set([path] + also_at(links, path)):
                     wanted.setdefault(("helm", root), set()).add(path)
+        # a chart whose value sets the box cannot give can take files that no unit names (any_file)
+        lost = any(inputs(n, "helm", root)[1] for n in (0, 1) for root in charts)
         if len(wanted) > UNITS_MOST:
             raise Failed(f"the commit touches more than {UNITS_MOST} charts and Kustomize folders: commit fewer at "
                          f"a time")
@@ -1452,7 +1584,8 @@ def answer(header, tar, blobs, tools, scratch, log=False):
         report = {"v": 1, "ok": True, "files": files, "units": units, "tags": tags,
                   "generated": generated(runner, before, after, stop=stop), "owner": owned(runner, before),
                   "apps": None if apps[0][1] else app_roots(apps[0][0]),
-                  "values": None if apps[0][1] else chart_values(apps[0][0], exposure)}
+                  "values": None if apps[0][1] else chart_values(apps[0][0], exposure),
+                  "any_file": any_file(trees, apps, links, lost, kustomize)}
     except Skip as e:
         return {"v": 1, "ok": False, "skip": str(e)}
     except Late:

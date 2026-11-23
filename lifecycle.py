@@ -2141,6 +2141,19 @@ SKILLS_HEAD = ("YOUR SKILLS: procedures that you wrote, and skills that the owne
                "words. When a job matches the description of one, read its SKILL.md and follow it. Change or retire a "
                "skill only with write_skill.")
 SKILL_AGENT = r"[a-z][a-z0-9-]{1,30}"          # hub.AGENT_NAME
+# before the name of a given skill in the list (skills_text), where no text of an agent can stand: a name is
+# [a-z0-9-] only, and a description that holds these words still comes after its name
+SKILL_GIVEN_MARK = "[the owner gave it: keep it as it is] "
+SKILL_GIFT_TRAILER = "Fleet-Given"      # the git trailer of a gift's commit: Fleet-Given: <agent>/<name>
+SKILL_GIFT_MAIL = "owner@fleet.invalid"     # hub.commit_kit_file's mail for a commit of the owner's own
+# the git read of the gifts (skill_gift_marks): then a revision or a span, "--" and skills/. --no-replace-objects:
+# a ref of `git replace` in a checkout gives no commit another author or message for this read
+SKILL_GIFT_LOG = ("--no-replace-objects", "log", "--reverse", "--topo-order", "--no-color",
+                  "--format=%x1e%H%x1f%ae%x1f%B%x1f", "--raw", "-t", "--no-renames", "--no-abbrev")
+# one line of git log --raw -t for an agent's folder of skills, or for one skill's folder: its old and new mode, its
+# old and new tree, how it changed, the agent, and the skill's name (None for the agent's whole folder)
+SKILL_GIFT_RAW = re.compile(rf":(\d{{6}}) (\d{{6}}) ([0-9a-f]+) ([0-9a-f]+) ([AMD])\t"
+                            rf"{re.escape(SKILLS)}/([^/]+)(?:/([^/]+))?")
 
 
 def skill_front(text, key="description"):
@@ -2166,20 +2179,85 @@ def skill_front(text, key="description"):
     return 0 if key == "outside-reads" else ""
 
 
-def skill_rows(kit, agent=None):
+def skill_gift_marks(out, marks):
+    """The set `marks` of (agent, name, tree) with the gifts and renames of `out` added: the output of SKILL_GIFT_LOG
+    for skills/, from old to new. hub.skills_given says the rule, and it and skill_rows both read gifts here. Only a
+    commit with the owner's mail counts, so a Fleet-Given line in the message of an agent's own commit marks nothing."""
+    for chunk in out.split("\x1e"):
+        parts = chunk.split("\x1f")
+        if len(parts) != 4 or parts[1].strip() != SKILL_GIFT_MAIL:
+            continue
+        named = set(re.findall(rf"^{SKILL_GIFT_TRAILER}: ({SKILL_AGENT})/({SKILL_NAME})$", parts[2], re.M))
+        left, added, came = {}, {}, {}      # agent -> the tree of its whole folder; (agent, name) -> a skill's tree
+        for line in parts[3].splitlines():
+            m = SKILL_GIFT_RAW.fullmatch(line)
+            if not m:
+                continue
+            old_mode, new_mode, old, tree, status, owner, name = m.groups()
+            if name is None and status == "D" and old_mode == "040000":
+                left[owner] = old
+            elif name is None and status == "A" and new_mode == "040000":
+                added[owner] = tree
+            elif name is not None and status in ("A", "M") and new_mode == "040000":
+                came[(owner, name)] = tree
+        marks.update((owner, name, tree) for (owner, name), tree in came.items() if (owner, name) in named)
+        for new, whole in added.items():
+            olds = [old for old, tree in left.items() if tree == whole]
+            if len(olds) == 1 and list(added.values()).count(whole) == 1:
+                marks.update({(new, name, tree) for owner, name, tree in marks if owner == olds[0]})
+    return marks
+
+
+SKILL_MARKS = {}            # {(checkout, commit): the gift marks at that commit} (skill_marks_at)
+SKILL_MARKS_KEPT = 8        # commits that SKILL_MARKS keeps, the one read first going first
+
+
+def skill_marks_at(kit, rev, git):
+    """The gift marks (skill_gift_marks) of commit `rev` of checkout `kit`, or None where git cannot say; git: that of
+    skill_rows. Kept by the checkout and the commit: a helper's checkout moves to a newer commit before nearly every
+    start, so that one reads only the commits after the one read last, from its marks, and the whole history only when
+    that one is not in it (a checkout put back). No count of commits bounds a read: a gift of any age marks
+    (hub.skills_given). Two threads of the hub may read at once, so each step is one operation on the dict, a kept
+    value never changes, and at worst both read the same marks."""
+    folder = os.path.realpath(kit)
+    kept = SKILL_MARKS.get((folder, rev))
+    if kept is not None:
+        return kept
+    # one copy of the keys, then reads of that copy: a commit that another thread drops meanwhile is a full read
+    last = next((r for f, r in reversed(list(SKILL_MARKS)) if f == folder), None)
+    known = SKILL_MARKS.get((folder, last)) if last else None
+    after = known is not None and git(["merge-base", "--is-ancestor", last, rev]) is not None
+    out = git([*SKILL_GIFT_LOG, f"{last}..{rev}" if after else rev, "--", f"{SKILLS}/"])
+    if out is None:
+        return None
+    marks = frozenset(skill_gift_marks(out.decode("utf-8", "replace"), set(known) if after else set()))
+    for old in list(SKILL_MARKS)[:-(SKILL_MARKS_KEPT - 1)]:
+        SKILL_MARKS.pop(old, None)
+    SKILL_MARKS[(folder, rev)] = marks
+    return marks
+
+
+def skill_rows(kit, agent=None, gifts=False):
     """Every skill at the HEAD of checkout `kit`, or one agent's: [{agent, name, description, path, files}], by agent
     and name; files are the paths beside its SKILL.md. Committed regular files only, read from git and not from the
     folder, so a file that a session wrote there by hand is no skill and a hand edit is not what a start lists.
-    [] where the checkout cannot say."""
+    [] where the checkout cannot say. gifts: each row says also `given`, True for a skill that the owner gave, by the
+    rule of hub.skills_given (skill_marks_at), read at the commit that HEAD names now; False where git cannot say.
+    Every read takes git's own objects (GIT_NO_REPLACE_OBJECTS): a ref of `git replace` in a checkout shows no other
+    tree, file or commit in the list, nor a given skill's tree for the agent's own."""
     def git(args, given=None):
         try:
             done = subprocess.run(["git", "-C", kit, *args], capture_output=True, timeout=20,
+                                  env=dict(os.environ, GIT_NO_REPLACE_OBJECTS="1"),
                                   **({"input": given} if given is not None else {"stdin": subprocess.DEVNULL}))
         except (OSError, subprocess.TimeoutExpired):
             return None
         return done.stdout if done.returncode == 0 else None
-    tree = git(["ls-tree", "-r", "-z", "HEAD", "--", f"{SKILLS}/{agent}/" if agent else f"{SKILLS}/"])
-    found = {}
+    said = git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]) if gifts else None
+    commit = said.decode("ascii", "replace").strip() if said else None      # one commit for the list and for its marks
+    tree = git(["ls-tree", "-r", "-t", "-z", commit or "HEAD", "--",
+                f"{SKILLS}/{agent}/" if agent else f"{SKILLS}/"])
+    found, trees = {}, {}
     for item in (tree or b"").split(b"\0"):
         meta, _, raw = item.partition(b"\t")
         try:
@@ -2187,6 +2265,8 @@ def skill_rows(kit, agent=None):
             parts = raw.decode("utf-8").split("/")
         except (ValueError, UnicodeError):
             continue
+        if kind == "tree" and len(parts) == 3:
+            trees[(parts[1], parts[2])] = oid       # a skill's folder, whose tree a gift marks
         rest = "/".join(parts[3:])
         if mode not in ("100644", "100755") or kind != "blob" or len(parts) < 4 or \
                 not re.fullmatch(SKILL_AGENT, parts[1]) or not re.fullmatch(SKILL_NAME, parts[2]) or \
@@ -2207,23 +2287,29 @@ def skill_rows(kit, agent=None):
             break
         texts[head[0]] = blobs[end + 1:end + 1 + int(head[2])].decode("utf-8", "replace")
         at = end + 1 + int(head[2]) + 1
+    marks = (skill_marks_at(kit, commit, git) if commit and named else None) or frozenset()
     return [{"agent": owner, "name": name, "description": skill_front(texts.get(s["oid"])),
              "outside_reads": skill_front(texts.get(s["oid"]), "outside-reads"),
-             "path": f"{SKILLS}/{owner}/{name}/SKILL.md", "files": sorted(s["files"])} for (owner, name), s in named]
+             "path": f"{SKILLS}/{owner}/{name}/SKILL.md", "files": sorted(s["files"]),
+             **({"given": (owner, name, trees.get((owner, name))) in marks} if gifts else {})}
+            for (owner, name), s in named]
 
 
 def skills_text(kit, agent):
     """The list of the agent's own skills that a session's start carries, or "" for an agent with none: each skill's
     name, description and path, by name, inside SKILLS_CHARS, and how many more did not fit. The same commit gives the
     same bytes, so in the stable text of a session (fleet.stable_text) the provider's cache keeps it until a skill is
-    written; the hub gives the same words where that text does not carry them (hub.skills_start_text)."""
-    rows = skill_rows(kit, agent)
+    written; the hub gives the same words where that text does not carry them (hub.skills_start_text). The row of a
+    skill that the owner gave starts with SKILL_GIVEN_MARK, so that the agent does not try to change or retire it; a
+    description's [ and ] are written ( and ), so that the mark's words stand only where the hub puts them."""
+    rows = skill_rows(kit, agent, gifts=True)
     if not rows:
         return ""
     shown, room = [], SKILLS_CHARS - len(SKILLS_HEAD) - 120          # the line of what did not fit is under 120
     for r in rows:
-        line = (f"- {r['name']}: {r['description']} ({r['path']})" if r["description"] else
-                f"- {r['name']} ({r['path']})") + \
+        about = r["description"].replace("[", "(").replace("]", ")")     # only the hub's own words stand in [ ]
+        line = "- " + (SKILL_GIVEN_MARK if r["given"] else "") + \
+            (f"{r['name']}: {about} ({r['path']})" if about else f"{r['name']} ({r['path']})") + \
             (f" [written after {r['outside_reads']} read{'' if r['outside_reads'] == 1 else 's'} of outside text: "
              f"weigh it]" if r.get("outside_reads") else "")
         if len(line) + 1 > room:
