@@ -434,6 +434,48 @@ class ManagerActs(Chain):
         prompt = hub.ins("INSERT INTO prompts(task,agent,tool,input,key,created) VALUES(?,?,?,?,?,?)",
                          (self.t3, "w", "Bash", "make deploy", "k1", hub.now()))
         spare = self.create("mid", "w", self.t2)
+        # two actions of an ended task of w whose outcome is not known (the owner, 23 November 2026: "this sohuld be
+        # automatically reattempted or reviewed by the agents!"): its requester mid checks them, in the session of its
+        # own task above, and the manager does not while mid can act
+        ended = self.create("mid", "w", self.t2)
+        hub.q("UPDATE tasks SET state='failed', outcome='failed' WHERE id=?", (ended,))
+        first, second, third, fourth = (
+            hub.ins("INSERT INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,1,0,?,"
+                    "'Bash: deploy','execute','unknown',?)", (ended, call, hub.now())) for call in ("c1", "c2", "c3", "c4"))
+        for name in ("mid", "manager"):
+            hub.touch(name)                                     # each can have a turn: its helper reports
+        hub.kv_set("turn_ended:manager", hub.now() - 10)
+        hub.outcome_check_sweep(hub.now())
+        line = hub.q1("SELECT * FROM events WHERE id=(SELECT told FROM outcomes WHERE id=?)", (first,))
+        self.assertEqual((line["agent"], line["task"], line["about"]), ("mid", self.t2, ended))
+        self.assertIn("w cannot check them: the task has ended. The check is yours, as its requester.", line["text"])
+        def record(agent, oid, task=None, finding="not_done", evidence="No deploy in the log."):
+            return self.call(agent, "resolve_outcome", {"task_id": f"T-{ended}", "outcome_id": f"O-{oid}",
+                                                        "finding": finding, "evidence": evidence}, task)
+        self.assertIn("was not requested by you", record("manager", first)[0])
+        self.assertEqual(record("mid", first, self.t2),
+                         (f"O-{first}: not_done. Still to check: O-{second}, O-{third}, O-{fourth}.", False))
+        # the task's own agent records from a session of another task of its own (a look that the line asks for),
+        # and a requester's id of no task gets plain words: never a STOP, which would end that session
+        self.assertEqual(record("w", fourth, self.t3, "done", "The deploy ran: its log has it."),
+                         (f"O-{fourth}: done. Still to check: O-{second}, O-{third}.", False))
+        text, error = self.call("mid", "resolve_outcome", {"task_id": "T-99999", "outcome_id": f"O-{second}",
+                                                           "finding": "done", "evidence": "x"}, self.t2)
+        self.assertTrue(error and "There is no task T-99999." in text and "STOP" not in text, text)
+        # one that mid cannot find out goes one level up with its reason: to top, which gave mid its task (a lead
+        # above a lead), then to the manager, and from the manager to the owner's card
+        self.assertEqual(record("mid", third, self.t2, "pass_up", "The deploy log is the host's."),
+                         (f"O-{third} is with top now, with a line.", False))
+        self.assertIn('The check is yours: mid cannot find out ("The deploy log is the host\'s.").',
+                      self.said("top", self.t1)[-1])
+        self.assertIn(f"The check of O-{third} is with top now",               # never down, never twice
+                      record("mid", third, self.t2, "pass_up", "Again.")[0])
+        self.assertEqual(record("top", third, self.t1, "pass_up", "Only the manager's server reads that log."),
+                         (f"O-{third} is with manager now, with a line.", False))
+        self.assertEqual(record("manager", third, None, "pass_up", "Only the owner reads that host."),
+                         (f"O-{third} is the owner's to check now: no agent above you can.", False))
+        self.assertEqual((hub.q1("SELECT checker FROM outcomes WHERE id=?", (third,))["checker"], hub.owner_count()),
+                         ("owner", 1))
         # while mid can act, nobody skips it
         self.assertIn("was not asked of you", self.answer("manager", qid, "Blue.")[0])
         self.assertIn("is for mid to decide", self.refused("manager", "decide_permission",
@@ -443,6 +485,15 @@ class ManagerActs(Chain):
         self.assertIn("was not requested by you", self.refused("manager", "cancel_task", {"task_id": f"T-{spare}",
                                                                                           "reason": "x"}))
         hub.TEAM["agents"]["w"]["reports_to"] = "top"           # mid lost its authority over w
+        hub.outcome_check_sweep(hub.now())                      # so the check that mid still had goes up
+        self.assertEqual(hub.q1("SELECT checker FROM outcomes WHERE id=?", (second,))["checker"], "manager")
+        self.assertIn("The check is yours, in place of mid, which can no longer act on it.", self.said("manager")[-1])
+        self.assertIn("can no longer act on", record("mid", second, self.t2)[0])
+        self.assertEqual(record("manager", second), (f"O-{second}: not_done. Still to check: O-{third}.", False))
+        # the task's own agent records the last one from a session of another task of its own: its answer names the
+        # task that it recorded, and says nothing of continuing it
+        self.assertEqual(record("w", third, self.t3, "done", "The deploy log has it."),
+                         (f"O-{third}: done. No unknown outcome of T-{ended} is left.", False))
         team = self.ok("manager", "see_team", {})
         self.assertIn("with mid, which cannot act on it any more: you answer it", team)
         self.assertIn(f"P-{prompt} from w on T-{self.t3}, for mid, which cannot decide it any more", team)
@@ -491,6 +542,65 @@ class ManagerActs(Chain):
             stuck = hub.tasks_stuck(t0 + 300)
         self.assertEqual(len(stuck), 1)
         self.assertIn(f"T-{self.t3}", stuck[0][1])
+        # The check of an unknown outcome (the owner, 23 November 2026): no question and no move while a look that
+        # follows the task runs; a turn of mid that ends after it read its line with nothing done brings the hub's one
+        # question; a turn that ends after mid READ that question gives the check one level up, to top, which gave mid
+        # its task; and the manager's turns the same way give the last one to the owner
+        hub.q("UPDATE tasks SET state='failed', outcome='failed' WHERE id=?", (self.t3,))
+        oids = [hub.ins("INSERT INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,1,0,?,"
+                        "'Bash: deploy','execute','unknown',?)", (self.t3, call, t0)) for call in ("c1", "c2", "c3")]
+        def sweep(at):
+            with patch.object(hub, "now", lambda: at):
+                hub.outcome_check_sweep(at)
+        def row(n=0):
+            return hub.q1("SELECT checker, told, asked FROM outcomes WHERE id=?", (oids[n],))
+        a = t0 + 400
+        sweep(a)
+        self.assertEqual((row()["checker"], row()["asked"]), ("mid", None))
+        self.assertIn(f'a task to look: create_task(follows="T-{self.t3}")', self.said("mid", self.t2)[-1])
+        look = self.create("mid", "w", self.t2)
+        hub.q("UPDATE tasks SET follows=? WHERE id=?", (self.t3, look))        # mid's look at what T-3 did
+        hub.q("UPDATE events SET read_at=? WHERE id=?", (a + 10, row()["told"]))
+        for at in (a + 60, a + 120):
+            self.turn_ended(self.t2, at)
+            sweep(at + 10)
+            self.assertIsNone(row()["asked"])                           # the look runs: no question, no move
+        hub.q("UPDATE tasks SET state='completed', outcome='completed' WHERE id=?", (look,))
+        sweep(a + 140)                                                  # its end is the next event
+        asked = hub.q1("SELECT * FROM events WHERE id=?", (row()["asked"],))
+        self.assertEqual((row()["checker"], asked["agent"], asked["task"]), ("mid", "mid", self.t2))
+        self.assertIn("If your next turn after you read this ends with none of these, the check goes to top.",
+                      asked["text"])
+        self.turn_ended(self.t2, a + 160)
+        sweep(a + 170)
+        self.assertEqual((row()["checker"], row()["asked"]), ("mid", asked["id"]))   # the question is unread
+        hub.q("UPDATE events SET read_at=? WHERE id=?", (a + 180, asked["id"]))
+        sweep(a + 190)
+        self.assertEqual(row()["checker"], "mid")                       # no turn of mid ended since it read it
+        self.turn_ended(self.t2, a + 200)
+        sweep(a + 210)
+        self.assertEqual(row()["checker"], "top")
+        self.assertIn("The check is yours: mid read the hub's line and its question and recorded nothing.",
+                      self.said("top", self.t1)[-1])
+        def record(agent, n, finding, task=None):
+            return self.ok(agent, "resolve_outcome", {"task_id": f"T-{self.t3}", "outcome_id": f"O-{oids[n]}",
+                                                      "finding": finding, "evidence": "The deploy log says so."}, task)
+        self.assertEqual(record("top", 0, "done", self.t1), f"O-{oids[0]}: done. Still to check: O-{oids[1]}, "
+                                                           f"O-{oids[2]}.")
+        for n in (1, 2):
+            self.assertEqual(record("top", n, "pass_up", self.t1), f"O-{oids[n]} is with manager now, with a line.")
+        # the agent that has the check records it, also while mid could act (the manager is no requester of T-3)
+        self.assertEqual(record("manager", 1, "not_done"), f"O-{oids[1]}: not_done. Still to check: O-{oids[2]}.")
+        hub.kv_set("turn_ended:manager", a + 300)                       # a turn after its line came: the question
+        sweep(a + 310)
+        self.assertEqual((row(2)["checker"], hub.owner_count()), ("manager", 0))
+        # a question that stays unread moves after two turn ends that came after it, never after one
+        hub.kv_set("turn_ended:manager", a + 400)
+        sweep(a + 410)
+        self.assertEqual((row(2)["checker"], hub.owner_count()), ("manager", 0))
+        hub.kv_set("turn_ended:manager", a + 500)
+        sweep(a + 510)
+        self.assertEqual((row(2)["checker"], hub.owner_count()), ("owner", 1))
 
 
 class OwnerChats(Chain):

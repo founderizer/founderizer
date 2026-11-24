@@ -259,7 +259,8 @@ class WarmStart(Capacity):
         """Only the first session after a resume with a check had them, in resume_plan's note: a session after a lost
         one, or one that a message started for a parked task, began with no list, while the owner's apps leave that
         check to the agent of a task that runs (the review of 19 November 2026). A Shell-off session has no
-        resolve_outcome, and no list."""
+        resolve_outcome, and no list. Bug that the sweep's part catches: a check that the task's own session makes
+        given to its requester too, which would do the same work twice."""
         ids = [hub.ins("INSERT INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) "
                        "VALUES(?,1,0,?,?,'other','unknown',?)", (self.first, f"call_{n}", title, hub.now()))
                for n, title in enumerate(("Click Post", ""))]
@@ -272,6 +273,61 @@ class WarmStart(Capacity):
         self.assertIn(f"O-{ids[1]} an action with no name", named)
         hub.new_attempt(hub.q1("SELECT * FROM tasks WHERE id=?", (self.first,)), hub.PARK_MESSAGE)
         self.assertIn(f"  - O-{ids[0]} Click Post", self.start_text(self.first))
+        # Its own agent checks them while its sessions come: the hub gives the check to nobody else, also while the
+        # stop of a restart that goes on holds the task (its new session checks first). A stop that stays, of a
+        # restart that did not go on, gives it to the requester, the lead pma, in the session of its task above, with
+        # what the stopped attempt changed and the way to find out.
+        def checkers():
+            return {r["checker"] for r in hub.q("SELECT checker FROM outcomes WHERE task=?", (self.first,))}
+        said = hub.q1("SELECT COUNT(*) n FROM events WHERE kind='say'")["n"]
+        hub.outcome_check_sweep(hub.now())
+        hold = hub.ins("INSERT INTO holds(task,kind,by,state,created,attempt) VALUES(?,'stop','pma','stopped',?,1)",
+                       (self.first, hub.now()))
+        hub.ins("INSERT INTO restart_holds(hold,by,reason,created,state) VALUES(?,'pma','its browser',?,'pending')",
+                (hold, hub.now()))
+        hub.ins("INSERT INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,1,?,?,?,"
+                "'other','unknown',?)", (self.first, hold, f"restart-{hold}", "Attempt 1 was stopped for a restart "
+                                         "(its browser): check what its last actions did", hub.now()))
+        self.record(self.first, 1, 1, "tool_call", tool_call_id="d1", kind="execute", status="in_progress",
+                    title="Bash: deploy")
+        hub.outcome_check_sweep(hub.now())
+        self.assertEqual((checkers(), hub.q1("SELECT COUNT(*) n FROM events WHERE kind='say'")["n"]), ({""}, said))
+        hub.q("UPDATE restart_holds SET state='canceled' WHERE hold=?", (hold,))
+        hub.outcome_check_sweep(hub.now())
+        self.assertEqual(checkers(), {"pma"})
+        line = hub.q1("SELECT * FROM events WHERE kind='say' ORDER BY id DESC LIMIT 1")
+        self.assertEqual((line["agent"], line["task"], line["about"]), ("pma", self.parent, self.first))
+        self.assertIn("seo cannot check them: it is stopped by pma. The check is yours, as its requester.", line["text"])
+        self.assertIn("(attempt 1). Attempt 1: Its own tools: 1 call(s), 1 of which changed something. The last of "
+                      "those: Bash: deploy. seo cannot check them", line["text"])
+        self.assertIn(f'or give seo, which holds it, a task to look: create_task(follows="T-{self.first}")',
+                      line["text"])
+        # When the task runs again, its own session checks them first: pma keeps the check, with no question and no
+        # move, whatever its turns do (the move would give the owner a card on a task that checks it now)
+        hub.q("UPDATE holds SET state='released', released=? WHERE id=?", (hub.now(), hold))
+        hub.q("UPDATE events SET read_at=? WHERE id=?", (hub.now(), line["id"]))
+        attempt = hub.q1("SELECT attempt FROM tasks WHERE id=?", (self.parent,))["attempt"]
+        hub.q("UPDATE attempts SET turn=? WHERE task=? AND attempt=?",
+              (json.dumps({"running": False, "turns": 1, "at": hub.now() + 60}), self.parent, attempt))
+        hub.outcome_check_sweep(hub.now() + 70)
+        self.assertEqual([(r["checker"], r["asked"]) for r in hub.q("SELECT checker, asked FROM outcomes WHERE task=?",
+                                                                    (self.first,))], [("pma", None)] * 3)
+        # and its turn ends keep their nudge and their Stalled mark: a session that can record waits for nothing else,
+        # so the task never stalls in silence (no live reason "outcome" while its own session can check)
+        task = hub.q1("SELECT * FROM tasks WHERE id=?", (self.first,))
+        self.assertNotEqual((hub.live_reason(task, None) or ("",))[0], "outcome")
+        # Held again, with pma signed out (a fact that lasts until the owner signs it in): the manager checks it
+        hub.q("UPDATE holds SET state='stopped', released=NULL WHERE id=?", (hold,))
+        hub.q("INSERT INTO machine_status(agent,data,reported) VALUES('pma',?,?) ON CONFLICT(agent) DO UPDATE SET "
+              "data=excluded.data, reported=excluded.reported",
+              (json.dumps({"runtimes": {hub.agents()["pma"].get("runtime"): {"signed_in": False}}}), hub.now()))
+        hub.kv_set("turn_ended:manager", hub.now() - 10)
+        hub.outcome_check_sweep(hub.now())
+        self.assertEqual(checkers(), {hub.manager_name()})
+        self.assertIn("The check is yours, in place of pma, which cannot have a turn now.",
+                      hub.q1("SELECT text FROM events WHERE kind='say' ORDER BY id DESC LIMIT 1")["text"])
+        hub.q("DELETE FROM machine_status WHERE agent='pma'")
+        hub.q("DELETE FROM holds WHERE id=?", (hold,))
         hub.TEAM["agents"]["seo"]["can"] = ["web", "browser"]  # its Shell box is off
         self.assertNotIn("Not known yet", self.lost(self.first))
 

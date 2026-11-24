@@ -841,7 +841,7 @@ class Reads(OwnerAPI):
         self.minutes(t, 1)
         held = self.runs(t)[-1]
         self.assertEqual(held["state"], "waiting")
-        self.assertIn("is unknown. Settle it first.", held["reason"])
+        self.assertIn("is unknown, and its check comes first.", held["reason"])
         self.assertEqual(held["retry_at"], self.clock + hub.READ_HOLD_RETRY)
 
     def test_a_stop_of_the_hub_loses_no_mail_and_a_long_one_is_told_with_one_gap_line(self):

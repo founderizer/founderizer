@@ -306,7 +306,7 @@ class Triggers(OwnerAPI):
         oid = hub.ins("INSERT INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,1,1,?,?,?,?,?)",
                       (first["id"], "call-1", "Send the note", "execute", "unknown", self.clock))
         self.sweep(MON_19)
-        self.assertEqual(self.last_run(), ("not_started", f"O-{oid} of T-{first['id']} is unknown. Settle it first."))
+        self.assertEqual(self.last_run(), ("not_started", f"O-{oid} of T-{first['id']} is unknown, and its check comes first."))
         hub.settle_outcome(oid, "not_done", "owner")
         self.clock = MON_19 + 60
         second = self.run_now(tid)

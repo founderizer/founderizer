@@ -241,11 +241,45 @@ class Runtime(unittest.TestCase):
         self.assertNotIn("control", [e["kind"] for e in self.delivered("studio")])
         unknown = {o["tool_call_id"]: o for o in hub.q("SELECT * FROM outcomes WHERE task=?", (tid,))}
         self.assertEqual(set(unknown), {"send", "edit"})
+        # The owner's hold keeps the task's own session away, so its requester gets the check, in one line that names
+        # both, once (the owner, 23 November 2026: "this sohuld be automatically reattempted or reviewed by the
+        # agents!"), and the owner's count and apps show nothing for it.
+        before = len(self.said("manager"))
+        hub.kv_set("turn_ended:manager", hub.now() - 10)               # it can have a turn: its helper reports them
+        for _ in range(2):
+            hub.outcome_check_sweep(hub.now())
+        line, = self.said("manager")[before:]
+        self.assertIn(f"these actions of T-{tid} (Send the note once, owner studio) took effect", line)
+        self.assertIn("studio cannot check them: it is paused by the owner. The check is yours, as its requester.", line)
+        self.assertTrue(all(f"O-{o['id']} {o['title']}" in line for o in unknown.values()))
+        self.assertIn(f'resolve_outcome(task_id="T-{tid}"', line)
+        self.assertIn(f'read the service if you hold its access, or give studio, which holds it, a task to look: '
+                      f'create_task(follows="T-{tid}"); the check stays yours while that task is open.', line)
+        self.assertEqual({(o["checker"], o["told"] is not None) for o in hub.q("SELECT * FROM outcomes WHERE task=?",
+                                                                                 (tid,))}, {("manager", True)})
+        self.assertEqual(hub.owner_count(), 0)
         code, body = self.control(tid, "resume")
         self.assertEqual(code, 409)
         self.assertIn("unknown outcomes", body["error"])
-        self.assertEqual(self.settle(unknown["send"]["id"], "not_done")[0], 200)
+        text, err = hub.call_tool("manager", "resolve_outcome", {"task_id": f"T-{tid}", "outcome_id":
+                                  f"O-{unknown['send']['id']}", "finding": "not_done", "evidence": "the outbox is empty"})
+        self.assertFalse(err, text)
+        self.assertEqual(text, f"O-{unknown['send']['id']}: not_done. Still to check: O-{unknown['edit']['id']}.")
         self.assertEqual(self.settle(unknown["send"]["id"], "done")[0], 409)            # settled once
+        self.assertTrue(self.tool("vps", "resolve_outcome", tid, outcome_id=f"O-{unknown['edit']['id']}",
+                                  finding="done", evidence="x")[1])                    # neither its agent nor its requester
+        # a flag on the manager's session, or its helper away, is no lasting fact: the check waits for its turn; a
+        # manager whose helper reports no turn end at all leaves the other one to the owner
+        hub.kv_set("mgr_flag_kind", "down")
+        hub.q("UPDATE agents SET last_seen=? WHERE name='manager'", (hub.now() - 3600,))
+        hub.outcome_check_sweep(hub.now())
+        self.assertEqual(hub.q1("SELECT checker FROM outcomes WHERE id=?", (unknown["edit"]["id"],))["checker"],
+                         "manager")
+        hub.kv_set("mgr_flag_kind", None)
+        hub.kv_set("turn_ended:manager", None)
+        hub.outcome_check_sweep(hub.now())
+        self.assertEqual((hub.q1("SELECT checker FROM outcomes WHERE id=?", (unknown["edit"]["id"],))["checker"],
+                          hub.owner_count()), ("owner", 1))
         self.assertEqual(self.control(tid, "resume")[0], 409)                          # one is still unknown
         code, body = self.control(tid, "resume_check")
         self.assertEqual((code, body["resumed_with"], body["hold"]["state"]), (200, "new session", "released"))

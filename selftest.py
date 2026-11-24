@@ -252,7 +252,10 @@ MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "an
                                # the owner, 5 November 2026: the summary of each knowledge file
                                "summarize_knowledge",
                                # the owner, 17 November 2026: a plan of team changes, which the owner's press makes
-                               "change_team"]
+                               "change_team",
+                               # the owner, 23 November 2026: an unknown outcome that its task's agent cannot check
+                               # goes up the chain first (outcome_checker), and the manager records what it found
+                               "resolve_outcome"]
 WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "ask_my_requester",
                               "deliver_result", "sign_in", "hand_over", "resolve_outcome", "see_earlier_work",
                               "report_up",

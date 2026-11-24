@@ -234,8 +234,14 @@ class Leads(OwnerAPI):
                                                                       action="resume", note=""))
         self.assertEqual(code, 409)                                         # it resumes with its parent
         self.assertIn("Resume the parent", result["error"])
+        hub.ins("INSERT INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,1,?,'c1',"
+                "'Bash: deploy','execute','unknown',?)", (sub, hub.active_hold(sub)["id"], hub.now()))
         code, result = control("resume")
+        # with an unknown outcome too: it goes on with a check, and stays held for nobody (the owner, 23 November
+        # 2026: "this sohuld be automatically reattempted or reviewed by the agents!")
         self.assertEqual((code, result["subtasks_resumed"], result["subtasks_still_held"]), (200, [sub], []))
+        self.assertEqual(hub.q1("SELECT resume_mode FROM holds WHERE task=? ORDER BY id DESC LIMIT 1", (sub,))[0],
+                         "check")
         self.assertIsNone(hub.active_hold(sub))
         self.assertFalse(self.call("manager", "cancel_task", {"task_id": f"T-{lead}", "reason": "not needed"})[1])
         self.assertEqual(hub.q1("SELECT state FROM tasks WHERE id=?", (sub,))["state"], "canceled")

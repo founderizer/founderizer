@@ -331,7 +331,7 @@ class Narrowed(Base):
         each other tool that takes a task id: set_reminder said who owns it, and create_task's job, raise_needs_you's
         ask, record_spend's task, decide_report's became_task and message_agent's to_task wrote on it. A plain
         message_agent listed its title among the tasks that the message could go to, and create_task's note named it
-        as work that runs now."""
+        as work that runs now. An unknown outcome of it stays the owner's check, with no line to its requester."""
         narrowed, plain = self.finished_pair()
         hub.q("UPDATE tasks SET requester='manager' WHERE id IN (?,?)", (narrowed, plain))
         for tool, args in (("check_result", {"accepted": True}), ("restart_task", {"reason": "again", "request_id": str(uuid.uuid4()),
@@ -343,11 +343,58 @@ class Narrowed(Base):
         self.assertIsNone(hub.q1("SELECT accepted FROM tasks WHERE id=?", (narrowed,))["accepted"])
         hub.t_check_result("manager", {"task_id": hub.tref(plain), "accepted": True})
         self.assertEqual(hub.q1("SELECT accepted FROM tasks WHERE id=?", (plain,))["accepted"], 1)
+        # an action of the pair's ended task whose outcome is not known: the owner's check, because no agent above it
+        # may learn of it (the owner, 23 November 2026, sends every other such check up the chain first). No line
+        # names its title to the requester, and the requester's resolve_outcome answers as for no task.
+        oid = hub.ins("INSERT INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,1,0,'c1',"
+                      "'call_api POST /drawer','other','unknown',?)", (narrowed, hub.now()))
+        before = hub.q1("SELECT COUNT(*) n FROM events")["n"]
+        hub.outcome_check_sweep(hub.now())
+        self.assertEqual((hub.q1("SELECT checker FROM outcomes WHERE id=?", (oid,))["checker"],
+                          hub.q1("SELECT COUNT(*) n FROM events")["n"]), ("owner", before))
+        with self.assertRaises(hub.ToolError) as refused:
+            hub.t_resolve_outcome("manager", {"task_id": hub.tref(narrowed), "outcome_id": f"O-{oid}",
+                                              "finding": "done", "evidence": "The drawer is open."})
+        self.assertEqual(str(refused.exception), f"There is no task {hub.tref(narrowed)}.")
+        # nor does a resume that is not its requester's own tell the requester of it (a parent's or a goal's resume
+        # with a check), as it tells it of a task of the agent's own
+        pid = hub.q1("SELECT scope_person FROM tasks WHERE id=?", (narrowed,))["scope_person"]
+        held, _ = self.normal_task(title="Pack the drawer")
+        hub.ins("INSERT INTO holds(task,kind,by,state,created,attempt) VALUES(?,'pause','owner','stopped',?,1)",
+                (held, hub.now()))
+        hub.ins("INSERT INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,1,0,'c1',"
+                "'call_api POST /drawer','other','unknown',?)", (held, hub.now()))
+        for person, lines in ((None, 1), (pid, 0)):
+            hub.q("UPDATE tasks SET scope_person=? WHERE id=?", (person, held))
+            plan = hub.resume_plan(held, "check", "owner")
+            self.assertEqual(len([e for e in plan["events"] if e[0] == "manager"]), lines, person)
+        hub.q("UPDATE tasks SET scope_person=NULL, state='completed' WHERE id=?", (held,))
+        hub.q("DELETE FROM holds WHERE task=?", (held,))
+        hub.q("DELETE FROM outcomes WHERE task=?", (held,))
         # the pair's open task that the manager gave, one open task of the agent's own beside it, and an id of no task
         opened = self.conversation_task(self.says(PAT, "The okapi code is under the mat.")["conversation"])["id"]
         hub.q("UPDATE tasks SET requester='manager' WHERE id=?", (opened,))
         other, _ = self.normal_task(title="Prepare the next report")
         missing = hub.q1("SELECT MAX(id) n FROM tasks")["n"] + 500
+        # resolve_outcome from the pair's own task reaches no other task: another task of the agent's own, a task of
+        # another agent and an id of no task answer the same words, and no row is settled (a person's words would
+        # settle the agent's other actions, and learn who requested which task)
+        theirs, _ = self.normal_task(owner="vps", title="Pay the supplier")
+        rows = [hub.ins("INSERT INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,1,0,"
+                        "'c1','Bash: pay','execute','unknown',?)", (task, hub.now())) for task in (other, theirs)]
+        hub.CALL.context = ("test-generation", hub.tref(opened), "1")
+        try:
+            for task, oid in ((other, rows[0]), (theirs, rows[1]), (missing, rows[0])):
+                with self.assertRaises(hub.ToolError) as refused:
+                    hub.t_resolve_outcome("studio", {"task_id": hub.tref(task), "outcome_id": f"O-{oid}",
+                                                     "finding": "not_done", "evidence": "Pat says it never went."})
+                self.assertEqual(str(refused.exception), f"There is no task {hub.tref(task)}.")
+        finally:
+            hub.CALL.context = None
+        self.assertEqual([hub.q1("SELECT state FROM outcomes WHERE id=?", (oid,))["state"] for oid in rows],
+                         ["unknown", "unknown"])
+        hub.q("DELETE FROM outcomes WHERE id IN (?,?)", tuple(rows))
+        hub.q("UPDATE tasks SET state='completed' WHERE id=?", (theirs,))
         t0 = hub.now()
         goal = hub.ins("INSERT INTO goals(title,text,state,revision,limits,created,updated,request_id) "
                        "VALUES('Sell more','Sell the spring range.','active',1,?,?,?,?)",

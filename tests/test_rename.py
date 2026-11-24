@@ -502,12 +502,14 @@ class Columns(unittest.TestCase):
     WORDS = {"agent", "owner", "requester", "asker", "from_agent", "to_agent", "decided_by", "by", "sender", "recipient",
              "released_by", "paused_by", "created_by", "closed_by", "dropped_by", "name", "who", "machine", "target",
              "holder", "author", "runner", "approver", "caller",           # and every column whose name ends in _by
-             "give_agent", "sign_in_agent"}             # the agent of a card's Give, and of a card's sign-in (F6)
+             "give_agent", "sign_in_agent",             # the agent of a card's Give, and of a card's sign-in (F6)
+             "checker"}                                 # the agent that checks an unknown outcome (owner API 1.324)
     NOT_AGENT_KV = {
         "check_fails:": "a wake-up rule", "check_lost:": "a run of a check", "check_running:": "a machine check",
         "check_after:": "a machine check", "check_probe:": "a machine check",
         "check_queued:": "a machine check", "chat_removed:": "a chat app account",
         "conversation_brief:": "a conversation",
+        "outcome_seen:": "the first turn end after an unread question of an outcome check (an event id)",
         "deliver_files:": "a task", "deliver_secret:": "a task",
         "deliver_running:": "a task", "desktop_click:": "a Mac", "desktop_seen:": "a Mac", "desktop_told:": "a Mac",
         "desktop_linked:": "a Mac",

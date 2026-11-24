@@ -328,10 +328,13 @@ class ScreenFailure(unittest.TestCase):
 
     def test_a_sign_in_resumes_only_what_it_can_have_put_right(self):
         """A task stays as it is when it failed while the runtime still worked there, when the pause is its
-        requester's own, when nobody confirmed its stop, when the owner turned the pause into a stop, when an action
-        of its stopped attempt has an unknown result (rule 9), when the owner holds the task above it, and when its
-        subtasks are held with it. None of them stops the report of the sign-in's end, and a task above that its
-        requester paused holds no subtask: a worker's task under a lead's paused task goes on."""
+        requester's own, when nobody confirmed its stop, when the owner turned the pause into a stop, when the owner
+        holds the task above it, and when its subtasks are held with it. None of them stops the report of the sign-in's
+        end, and a task above that its requester paused holds no subtask: a worker's task under a lead's paused task
+        goes on. A task whose stopped attempt has an action of unknown result (rule 9) goes on with a check (owner API
+        1.324, the owner's "this sohuld be automatically reattempted or reviewed by the agents!"): its new session
+        finds out first. Bugs that this catches: a sign-in's resume that repeats an action of unknown outcome (a plain
+        resume, with no check), and one that leaves that task held with nothing that moves it and no card."""
         before = self.paused()
         self.records(self.task(), [result(1, "end_turn")], session=str(uuid.uuid4()))   # the runtime works after it
         own = self.task()
@@ -360,8 +363,13 @@ class ScreenFailure(unittest.TestCase):
         self.assertEqual({name: self.holds(t)[-1]["state"] for name, t in (
             ("before", before), ("own", own), ("open stop", open_stop), ("stop", stop), ("unknown", unknown),
             ("under", under), ("over", over), ("after", after))},
-            {"before": "stopped", "own": "stopped", "open stop": "requested", "stop": "stopped", "unknown": "stopped",
+            {"before": "stopped", "own": "stopped", "open stop": "requested", "stop": "stopped", "unknown": "released",
              "under": "stopped", "over": "stopped", "after": "released"})
+        self.assertEqual(self.holds(unknown)[-1]["resume_mode"], "check")
+        start = hub.q1("SELECT text FROM events WHERE task=? AND kind='task' ORDER BY id DESC LIMIT 1", (unknown,))["text"]
+        self.assertIn("is resumed by the hub, with a check. Before anything else, find out whether each of these "
+                      "actions took effect, without repeating any of them", start)
+        self.assertIn(f'resolve_outcome(task_id="T-{unknown}"', start)
 
     def test_only_the_current_attempt_of_an_open_screen_task_is_paused(self):
         browser = self.task(owner="studio", needs="browser")

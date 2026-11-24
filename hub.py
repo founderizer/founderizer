@@ -283,7 +283,8 @@ CREATE TABLE IF NOT EXISTS holds(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, 
   released REAL, released_by TEXT, resume_mode TEXT, hand TEXT);
 CREATE TABLE IF NOT EXISTS outcomes(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, attempt INTEGER NOT NULL,
   hold INTEGER NOT NULL, tool_call_id TEXT NOT NULL, title TEXT, kind TEXT, state TEXT NOT NULL, created REAL NOT NULL,
-  resolved REAL, by TEXT, note TEXT, UNIQUE(task, attempt, tool_call_id));
+  resolved REAL, by TEXT, note TEXT, checker TEXT NOT NULL DEFAULT '', told INTEGER, asked INTEGER,
+  UNIQUE(task, attempt, tool_call_id));
 CREATE TABLE IF NOT EXISTS agent_limits(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, since REAL NOT NULL,
   until REAL NOT NULL, reset_known INTEGER NOT NULL, task INTEGER, ended REAL, resumed REAL);
 CREATE TABLE IF NOT EXISTS ui_controls(request_id TEXT PRIMARY KEY, route TEXT NOT NULL, body TEXT NOT NULL,
@@ -2003,6 +2004,10 @@ def revoked_windows(name):
 
 
 UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "limit_holds",
+               # owner API 1.324: outcomes[].checker says who checks each unknown outcome; an app reads it only
+               # from a hub that serves this name, so that a hub that went back to an older release, which still
+               # sends the column and gives no check to anyone, keeps the apps' own rule (OUTCOME_CHECKS)
+               "outcome_checks",
                "liveness", "live_desktop", "machines", "goals", "profiles", "goal_tokens",
                "task_steering", "health", "reporting_lines", "leads", "browser_desktop",
                "machine_check", "file_changes", "subagents", "vault_isolation",
@@ -3160,30 +3165,20 @@ def queue_pings(kind, item):
 
 def owner_count():
     """The count of what needs the owner now: the open Needs-you items, and each task that only he can move once (an
-    outcome that nobody knows of a task that a hold holds or that ended, a stop that the helper did not confirm). It is
-    the iPhone's Needs you tab count, and its twin is MobileStore.needsYouCount in app/ios/Sources/MobileStore.swift,
-    which counts the same rows of GET /ui/mobile (mobile_state): a change to one is a change to the other. It commits
-    nothing. At most PUSH_BADGE_MOST, the most that our side's push route takes, so that no count can make it refuse a
-    Needs-you ping.
+    outcome that no agent can check, a stop that the helper did not confirm). It is the iPhone's Needs you tab count,
+    and its twin is MobileStore.needsYouCount in app/ios/Sources/MobileStore.swift, which counts the same rows of GET
+    /ui/mobile (mobile_state): a change to one is a change to the other. It commits nothing. At most PUSH_BADGE_MOST,
+    the most that our side's push route takes, so that no count can make it refuse a Needs-you ping.
 
-    An outcome of a task that runs or waits for its next session is not the owner's: each new session of its agent gets
-    the list first (unknown_start_text) and records each one with resolve_outcome, and the outcome gate holds a
-    completed result until then, as FleetCore's TaskOutcome.waitsOnOwner says for both apps. The owner, 19 November
-    2026, of such a task's orange check: "what does this mean?? who needs to check?". It stays the owner's when no
-    such session comes: a hold holds the task (any hold, also the stop of a requester's restart, which a restart that
-    does not go on leaves in place), the task ended or the hub no longer has it, or its agent is a worker or a lead
-    with no "shell" box, whose sessions have no resolve_outcome. That last part reads the boxes as the apps do, which
-    get a missing Tools list as [] (mobile_agent): shell_off reads such an agent as Shell on, and the tab and the icon
-    would count apart."""
-    team = agents()
+    An unknown outcome is the owner's only when its checker is 'owner' (outcome_step): a session of the task's own
+    agent checks it first while one comes, and else the agent above it on the chain (outcome_check_sweep). The owner,
+    19 November 2026, of a task's orange check: "what does this mean?? who needs to check?", and 23 November 2026, of
+    the cards that were left: "this sohuld be automatically reattempted or reviewed by the agents!". The apps read the
+    same column (FleetCore's TaskOutcome.waitsOnOwner)."""
     with LOCK:
         needs = read_row("SELECT COUNT(*) n FROM needs WHERE answer IS NULL")["n"]
-        rows = read_rows("SELECT o.task, t.owner, t.state, EXISTS (SELECT 1 FROM holds h WHERE h.task=o.task AND "
-                         "h.released IS NULL) held FROM outcomes o LEFT JOIN tasks t ON t.id=o.task WHERE o.resolved "
-                         "IS NULL AND o.state='unknown'")
-        tasks = {r["task"] for r in rows if r["state"] is None or r["state"] in TERMINAL or r["held"] or
-                 ((team.get(r["owner"]) or {}).get("role") in ("worker", "lead") and
-                  "shell" not in ((team.get(r["owner"]) or {}).get("can") or []))}
+        tasks = {r["task"] for r in read_rows("SELECT task FROM outcomes WHERE state='unknown' AND resolved IS NULL "
+                                              "AND checker='owner'")}
         tasks |= {r["task"] for r in read_rows("SELECT task FROM holds WHERE released IS NULL AND state='not_confirmed'")}
     return min(needs + len(tasks), PUSH_BADGE_MOST)
 
@@ -9285,6 +9280,10 @@ def migrate():
         "releases": {"cause": "TEXT"},
         # Founderizer for Teams: the signed word that the licence ended, and whether it renews (teams_on, teams_state)
         "entitlement": {"ended": "REAL", "ended_word": "TEXT", "renews": "INTEGER"},
+        # the owner, 23 November 2026, of the cards "Outcome not known: check it" ("this sohuld be automatically
+        # reattempted or reviewed by the agents!"): who checks an unknown outcome (outcome_step), the line that told
+        # that agent, and the hub's one question to it (outcome_check_sweep)
+        "outcomes": {"checker": "TEXT NOT NULL DEFAULT ''", "told": "INTEGER", "asked": "INTEGER"},
     }.items():
         try:
             have = {r["name"] for r in q(f"PRAGMA table_info({table})")}
@@ -9469,6 +9468,8 @@ def migrate():
         # AUTONOMY.md P2 (lane L2): the tasks of one conversation, read for each message, fleet call and hook of it
         "CREATE INDEX IF NOT EXISTS task_of_conversation ON tasks(source_conversation) "
         "WHERE source_conversation IS NOT NULL",
+        # the unknown outcomes, which owner_count and outcome_check_sweep read at each tick and each read of the count
+        "CREATE INDEX IF NOT EXISTS outcome_unknown ON outcomes(task) WHERE state='unknown'",
     ]:
         sql_step(statement, problems)
     # Plan P1: the default roles, one time, so a role that the owner deleted does not come back at the next start.
@@ -11621,6 +11622,11 @@ def live_reason(t, state, but=None):
         return "place", f"a browser place on {found}"
     if waits_on_parts(tid):
         return "parts", "its open subtasks"
+    found = q1("SELECT id, checker FROM outcomes WHERE task=? AND state='unknown' AND checker<>'' ORDER BY id LIMIT 1",
+               (tid,))
+    if found and not own_check(t):      # the owner, 23 November 2026: its line, or the owner, checks what it did, and
+        # the gate waits; a session that can record keeps its nudges, so that a resumed task never stalls in silence
+        return "outcome", f"{holder(found['checker'])}'s check of O-{found['id']}"
     if unread_for(t, but):
         return "unread", "a message that its session has not read"
     found = waits_on_message(tid)
@@ -12270,9 +12276,12 @@ def settle_hold(h, confirmed, detail, ran=False, ended=0):
     return state
 
 
-def outcome_text(task_id):
+def outcome_text(task_id, closed=False):
+    """Each outcome of the task and what is known of it. closed: for an agent of the line of a task whose owner's Shell
+    box is off, each call named by its server and tool only (outcome_title)."""
     words = {"unknown": "unknown", "done": "done (it took effect)", "not_done": "not done"}
-    return "; ".join(f"O-{o['id']} {o['title']}: {words[o['state']]}" + (f" ({o['by']}: {o['note']})" if o["note"] else "")
+    return "; ".join(f"O-{o['id']} {outcome_title(o, True) if closed else o['title']}: {words[o['state']]}" +
+                     (f" ({o['by']}: {o['note']})" if o["note"] else "")
                      for o in q("SELECT * FROM outcomes WHERE task=? ORDER BY id", (task_id,)))
 
 
@@ -12308,7 +12317,13 @@ def resume_plan(task_id, mode, by, via=None, note="", why=""):
         raise ToolError("First settle the unknown outcomes: " + "; ".join(f"O-{o['id']} {o['title']}" for o in unknown) +
                         ". Confirm each one as done or not done, or resume with an agent check.")
     checked = outcome_text(task_id)
-    if unknown:
+    if unknown and shell_off(t["owner"]):       # its sessions have no resolve_outcome: its line checks (outcome_step)
+        finds = "the owner settles each one in the app" if all(o["checker"] == "owner" for o in unknown) else \
+            "your line finds out"
+        text = (f"{tref(task_id)} is resumed by {holder(by)}. It is not known yet whether these actions took effect: "
+                f"{checked}. Do not repeat any of them: {finds}, and this task takes a completed result after that. "
+                f"Continue from where it stopped.")
+    elif unknown:
         text = (f"{tref(task_id)} is resumed by {holder(by)}, with a check. Before anything else, find out whether each of these "
                 f"actions took effect, without repeating any of them: {checked}. Record each finding with "
                 f"resolve_outcome(task_id=\"{tref(task_id)}\", outcome_id=..., finding=\"done\" or \"not_done\", evidence=...). "
@@ -12325,10 +12340,13 @@ def resume_plan(task_id, mode, by, via=None, note="", why=""):
     live = h["kind"] == "pause" and session_alive(t["owner"], task_id) and not guarded
     how = "message to its session" if live else "new session"
     events = [(t["owner"], "say", filed_under(t["owner"], "say", task_id), "[hub] " + text, None)] if live else []
-    if by != t["requester"]:
+    # its requester hears of a resume that is not its own: never of a narrowed pair's task, which no other session may
+    # learn of, and of the actions of a task whose owner's Shell box is off by their server and tool only (RULES.md)
+    told = outcome_text(task_id, closed=shell_off(t["owner"])) if checked and not outcome_private(t) else ""
+    if by != t["requester"] and task_scope(t) is None:
         events.append((t["requester"], "say", filed_about(t["requester"], "say", task_id),
                        f"[hub] {holder(by, cap=True)} resumed {tref(task_id)} ({t['title']}) with a {how}." +
-                       (f" {why}" if why else "") + (f" Outcomes: {checked}." if checked else ""), None))
+                       (f" {why}" if why else "") + (f" Outcomes: {told}." if told else ""), None))
     return {"task": t, "hold": h, "by": by, "mode": mode if unknown else "resume", "how": how,
             "attempt": None if live else attempt_event(t, text), "events": events}
 
@@ -12621,8 +12639,11 @@ def restart_continue(hold_id):
     except ToolError as e:
         return held(str(e))
     again = (r["by"], "say", filed_about(r["by"], "say", tid),
-             f"[hub] {name} ({t['title']}) runs again in a new session, as attempt {t['attempt'] + 1}. {t['owner']} first "
-             f"checks: {outcome_text(tid)}.", None)
+             f"[hub] {name} ({t['title']}) runs again in a new session, as attempt {t['attempt'] + 1}. " +
+             (f"{t['owner']} does not repeat them, and its line checks: " if shell_off(t["owner"]) else
+              f"{t['owner']} first checks: ") +
+             (f"{outcome_text(tid, closed=shell_off(t['owner']))}." if not outcome_private(t) else "its actions."),
+             None)
     with transaction():
         resume_rows(plan, t0)
         # The questions of the earlier session end here, with no message to any session: an answer now would reach
@@ -12675,8 +12696,290 @@ def settle_outcome(outcome_id, finding, by, note="", task_id=None):
     if o["state"] != "unknown":
         raise ToolError(f"O-{outcome_id} is already settled as {o['state']}.")
     q("UPDATE outcomes SET state=?, resolved=?, by=?, note=? WHERE id=?", (finding, now(), by, note or None, outcome_id))
+    if o["asked"] and not q1("SELECT 1 FROM outcomes WHERE asked=? AND state='unknown' LIMIT 1", (o["asked"],)):
+        kv_set(f"outcome_seen:{o['asked']}", None)      # the mark of its question goes with the last row that it asked
     log(by, f"O-{outcome_id} on {tref(o['task'])}: {finding}")
     return q1("SELECT * FROM outcomes WHERE id=?", (outcome_id,))
+
+
+def outcomes_settled_line(t, by):
+    """After `by` (the owner, or an agent above the task) recorded the last unknown outcome of open task row `t`: one
+    line to the task's own agent, so that a session that the outcome gate stopped goes on now (a Shell-off session
+    waits until its time otherwise), and none checks again what is known."""
+    if t["state"] in TERMINAL or by in (t["owner"], "hub") or \
+            q1("SELECT 1 FROM outcomes WHERE task=? AND state='unknown' LIMIT 1", (t["id"],)):
+        return
+    emit(t["owner"], "say", f"[hub] {holder(by, cap=True)} recorded what the earlier actions of {tref(t['id'])} did: "
+                            f"{outcome_text(t['id'])}. Never repeat one marked done.", task=t["id"])
+
+
+# ---- Who checks an unknown outcome. The owner, 23 November 2026, of the cards "Outcome not known: check it": "why do
+# ---- we have this? this sohuld be automatically reattempted or reviewed by the agents!"
+# A check goes to the lowest level of the chain that can make it (RULES.md, "Who answers to whom"): a session of the
+# task's own agent while one comes, else the agent that decides as the task's requester (acts_for), and one level up
+# from there (outcome_up: the lead above a lead, the manager, the owner) only when that agent can no longer act on the
+# task, cannot have a turn by a fact that lasts, passes it up (resolve_outcome pass_up), or lets a turn end after its
+# line, and another after it read the hub's one question, with nothing done (as need_wait_sweep waits for
+# the manager); never while a look at the task (a task that follows it) runs, or while the task's own session checks.
+# The owner checks only what no agent may learn of (a narrowed pair's task, or a task that the hub no longer has) and
+# what the manager cannot make or leaves. outcomes.checker keeps who has the
+# check: '' its own agent, an agent's name, or 'owner'; told is the line that gave it, asked the hub's question. The
+# owner's count and the apps read only 'owner' (owner_count; FleetCore's TaskOutcome.waitsOnOwner, while the hub
+# serves OUTCOME_CHECKS). No clock moves a check: a record ends it, and an event moves it up.
+OUTCOME_CHECKS = "outcome_checks"       # the feature name: this hub gives each unknown outcome its checker
+OUTCOME_RUNS = ("restart-", "ended-", "attempt-")   # the rows of a whole attempt: its last actions name what it did
+OUTCOME_HUB_ROWS = OUTCOME_RUNS + ("request-", "gmail-", "job-")     # rows whose titles are the hub's own words
+
+
+def own_check(t):
+    """True while a session of task row `t`'s own agent comes to check its unknown outcomes and can record them: the
+    task is open, its agent is an active agent of the team whose Shell box is on (a Shell-off session has no
+    resolve_outcome), and no hold holds it, or the hold is the stop of a restart that still goes on, whose new session
+    checks first (restart_continue)."""
+    if t is None or t["state"] in TERMINAL or t["owner"] not in agents() or not agent_active(t["owner"]) or \
+            shell_off(t["owner"]):
+        return False
+    h = active_hold(t["id"])
+    return h is None or bool(q1("SELECT 1 FROM restart_holds WHERE hold=? AND state='pending'", (h["id"],)))
+
+
+def outcome_private(t):
+    """True for a task that no agent above its own may learn of (narrowed_from): a narrowed pair's task (task_scope),
+    and a task with a call of a narrowed session (calls.scope_person), whose list the owner set back to All after it:
+    its rows keep the locked window's titles. Its check stays with its own session or the owner."""
+    return task_scope(t) is not None or bool(read_row("SELECT 1 FROM calls WHERE task=? AND scope_person IS NOT NULL "
+                                                      "LIMIT 1", (t["id"],)))
+
+
+def outcome_no_turn(agent, t0):
+    """True when `agent` cannot have a turn, by a fact that lasts until the owner or the team changes it, so that a
+    check waits for nothing there: the manager's account refused or its runtime signed out, no server of its own, or a
+    helper that reports no turn end at all; a worker or a lead that left the team, is in setup, has no server of its
+    own, or whose runtime is signed out or its account refused (runtime_signed_out). A helper that is away for a while, a usage limit or a hub
+    that starts again is no such fact: the check waits for its turn, and moves only by the agent's own turns."""
+    if agent == manager_name():
+        return bool(unplaced(agent) or not turn_ended(agent) or account_refused(agent) is not None or
+                    signed_in_now(agent, (agents().get(agent) or {}).get("runtime")) is False)
+    return agent not in agents() or not agent_active(agent) or bool(unplaced(agent) or runtime_signed_out(agent))
+
+
+def outcome_line_passed(agent, event_id, read=False):
+    """True when a turn of `agent` ended after the line `event_id` with nothing done: after its read, or, while it is
+    unread, after it came (read: after its read, as need_wait_sweep waits for its ask, or, while it stays unread,
+    after two turn ends that came after it); and for a line that is gone. A worker's or a lead's turn is the one of
+    the session that the line is filed under; one that runs now has not ended."""
+    e = q1("SELECT agent, task, created, read_at FROM events WHERE id=?", (event_id,)) if event_id else None
+    if not e or e["agent"] != agent:
+        return True
+    if agent == manager_name():
+        ended = turn_ended(agent)
+    else:
+        row = q1("SELECT attempt FROM tasks WHERE id=?", (e["task"],)) if e["task"] else None
+        state = turn_state(e["task"], row["attempt"]) if row else None
+        if not state or state.get("running"):
+            return False
+        ended = state.get("at") or 0
+    if read and e["read_at"] is None:
+        # unread: two turn ends after it came, so that a turn that ran when it came is never enough; the first end
+        # that the sweep saw is kept (kv outcome_seen:<line>)
+        if ended <= e["created"]:
+            return False
+        seen = kv_get(f"outcome_seen:{event_id}")
+        if seen is None:
+            kv_set(f"outcome_seen:{event_id}", ended)
+            return False
+        return ended > float(seen)
+    return ended > (e["read_at"] or e["created"])
+
+
+def outcome_manager(t0):
+    """The manager for a check, or the owner when the manager cannot have a turn (outcome_no_turn)."""
+    mgr = manager_name()
+    return "owner" if outcome_no_turn(mgr, t0) else mgr
+
+
+def outcome_up(agent, t, t0):
+    """The level above `agent` for a check of task row `t`, as a question goes up (pass_question): the requester of
+    the agent's own task above, when it can act on it (a lead above a lead), else the manager, and the owner above the
+    manager or above a manager that cannot have a turn."""
+    mgr = manager_name()
+    if agent == mgr:
+        return "owner"
+    link = chain_link(agent, t) if t is not None else None
+    up = read_row("SELECT * FROM tasks WHERE id=?", (link["parent"],)) if link and link["parent"] else None
+    r = up["requester"] if up else None
+    if r and r != mgr and r in agents() and up["state"] not in TERMINAL and not lead_left(r, up) and \
+            not outcome_no_turn(r, t0):
+        return r
+    return outcome_manager(t0)
+
+
+def outcome_first(t, t0):
+    """(who gets the check that task row `t`'s own agent cannot make, why): the agent that decides as its requester,
+    the manager in place of a requester that can no longer act on it (lead_left) or that is no agent of the team, and
+    the manager in place of one that cannot have a turn."""
+    mgr, r = manager_name(), t["requester"]
+    if not r or r == mgr or r not in agents() or lead_left(r, t):
+        first, why = mgr, (", as its requester" if r == mgr else
+                           f", in place of its requester {r}, which can no longer act on it" if r else "")
+    else:
+        first, why = r, ", as its requester"
+    if outcome_no_turn(first, t0):
+        return outcome_manager(t0) if first != mgr else "owner", f", in place of {first}, which cannot have a turn now"
+    return first, why
+
+
+def outcome_looked(t):
+    """True while an open task follows task row `t` (create_task follows): a look at what its actions did, which the
+    line asks for, runs, and its end is the next event of the check."""
+    return bool(read_row(f"SELECT 1 FROM tasks WHERE follows=? AND state NOT IN {ENDED_STATES} LIMIT 1", (t["id"],)))
+
+
+def outcome_step(o, t, t0):
+    """(who checks unknown outcome row `o` of task row `t` now, why it moved, whether the hub asks once): '' its own
+    agent (own_check), an agent's name, or 'owner'. t is None for a task that the hub no longer has. A check never
+    moves down. An agent that got its line keeps it, with no question and no move, while a session of the task's own
+    agent comes to check (the first record wins: settle_outcome) and while a task that looks follows the task."""
+    stored, mgr = o["checker"] or "", manager_name()
+    if stored == "owner" or t is None:
+        return "owner", "", False
+    if stored == "":
+        if own_check(t):
+            return "", "", False
+        if outcome_private(t):              # no other session may learn of it
+            return "owner", "", False
+        return (*outcome_first(t, t0), False)
+    if own_check(t):
+        return stored, "", False
+    if outcome_private(t):                  # a pair narrowed after the line: no question names it to that agent
+        return "owner", "", False
+    if stored != mgr and lead_left(stored, t):          # the owner's rule of 29 October: the manager acts for it
+        return outcome_manager(t0), f", in place of {stored}, which can no longer act on it", False
+    if outcome_no_turn(stored, t0):
+        return (outcome_manager(t0) if stored != mgr else "owner"), \
+            f", in place of {stored}, which cannot have a turn now", False
+    if outcome_looked(t):
+        return stored, "", False
+    if not o["asked"]:
+        return stored, "", outcome_line_passed(stored, o["told"])
+    if outcome_line_passed(stored, o["asked"], read=True):
+        read = (q1("SELECT read_at FROM events WHERE id=?", (o["asked"],)) or {"read_at": None})["read_at"]
+        return outcome_up(stored, t, t0), (f": {stored} read the hub's line and its question and recorded nothing"
+                                           if read is not None else f": {stored} let two turns end with the hub's "
+                                           f"question unread, and recorded nothing"), False
+    return stored, "", False
+
+
+def outcome_title(o, closed):
+    """An unknown outcome's title for an agent of the line, masked and cut. closed: for a task whose owner's Shell box
+    is off, a call by its server and tool only ("crm: send_reply"): Claude Code ends an MCP call's title with the
+    first words of its first argument, and such a session's text reaches a session with a shell only as ids and short
+    words (RULES.md). The hub's own rows (OUTCOME_HUB_ROWS) keep their words."""
+    title = mask_secrets(clip(o["title"])) or "an action with no name"
+    if closed and not str(o["tool_call_id"]).startswith(OUTCOME_HUB_ROWS):
+        title = ": ".join(title.split(": ")[:2])
+    return title
+
+
+def outcome_actions(t, rows):
+    """The unknown outcome rows `rows` of task row `t` in a line's words (outcome_title), each with its attempt, and
+    for a row of a whole attempt (OUTCOME_RUNS) what that attempt's own tools changed (tool_work_line; for a task whose
+    owner's Shell box is off, the counts alone)."""
+    closed = shell_off(t["owner"])
+    named = "; ".join(f"O-{o['id']} {outcome_title(o, closed)} (attempt {o['attempt']})" for o in rows)
+    runs = sorted({o["attempt"] for o in rows if str(o["tool_call_id"]).startswith(OUTCOME_RUNS)})
+    work = [f"Attempt {a}: {mask_secrets(line)}" for a in runs
+            if (line := tool_work_line(t["id"], a, titles=not closed))]
+    return named + "." + ("".join(f" {w}" for w in work))
+
+
+def outcome_route(t):
+    """The way to find out that a line names: the service, or a task of the task's own agent, which holds its access,
+    while that agent is in the team and active."""
+    owner = t["owner"]
+    return ("read the service if you hold its access" +
+            (f", or give {owner}, which holds it, a task to look: create_task(follows=\"{tref(t['id'])}\"); the check "
+             f"stays yours while that task is open" if owner in agents() and agent_active(owner) else ""))
+
+
+def outcome_check_text(agent, t, rows, why, t0):
+    """The line that gives `agent` the check of unknown outcome rows `rows` of task row `t`. why: how it came to it."""
+    owner, ref, h = t["owner"], tref(t["id"]), active_hold(t["id"])
+    state = ("the task has ended" if t["state"] in TERMINAL else f"{owner} is no longer in the team"
+             if owner not in agents() else f"{owner} is in setup" if not agent_active(owner) else
+             f"it is {held_word(h)}" if h else "its Shell box is off, so its sessions record no finding"
+             if shell_off(owner) else "it passed them up")
+    up = outcome_up(agent, t, t0)
+    return (f"[hub] It is not known whether these actions of {ref} ({t['title']}, owner {owner}) took effect: "
+            f"{outcome_actions(t, rows)} {owner} cannot check them: {state}. The check is yours{why}. Find out "
+            f"without repeating any of them: {outcome_route(t)}. Record each finding with resolve_outcome(task_id="
+            f'"{ref}", outcome_id=..., finding="done" or "not_done", evidence=...). When you cannot find out, use '
+            f'finding="pass_up" with why in evidence: the check goes to {holder(up)}. If one was not done and its '
+            f"work is still needed, give that work again.")
+
+
+def outcome_ask_text(agent, t, rows, t0):
+    """The hub's one question to `agent`, whose turn ended after its line with the check still open."""
+    up, ids = outcome_up(agent, t, t0), ", ".join("O-" + str(o["id"]) for o in rows)
+    return (f"[hub] The check of {ids} of {tref(t['id'])} ({t['title']}) is still yours, and still open. Record each "
+            f'one with resolve_outcome, pass it up with finding="pass_up" and why in evidence, or find out: '
+            f"{outcome_route(t)}. If your next turn after you read this ends with none of these, the check goes to "
+            f"{holder(up)}.")
+
+
+def outcome_move(t, rows, want, why, before, t0):
+    """The rows `rows` of task row `t` go to `want` (an agent: with one line, filed for it as filed_about files a line
+    about a task; 'owner': the write alone, also for a task that the hub no longer has, t None), only if they are
+    still with `before` and unknown. The line and the rows that name it are one write."""
+    ids, tid = [o["id"] for o in rows], rows[0]["task"]
+    marks = ",".join("?" * len(ids))
+    line = None if want == "owner" else (filed_about(want, "say", tid), outcome_check_text(want, t, rows, why, t0))
+    with transaction():
+        told = DB.execute(*event_row(want, "say", line[0][0], line[1], t0, "{}", line[0][1])).lastrowid \
+            if line else None
+        DB.execute(f"UPDATE outcomes SET checker=?, told=?, asked=NULL WHERE id IN ({marks}) AND state='unknown' AND "
+                   f"checker=?", (want, told, *ids, before))
+        for asked in {o["asked"] for o in rows if o["asked"]}:      # the question's mark goes with it
+            DB.execute("DELETE FROM kv WHERE k=?", (f"outcome_seen:{asked}",))
+    log("hub", f"{', '.join(f'O-{i}' for i in ids)} of {tref(tid)}: " +
+        ("the owner checks it, as no agent can" if want == "owner" else f"{want} checks it{why}"))
+
+
+def outcome_check_sweep(t0):
+    """From the hub tick: each unknown outcome goes to the one who checks it now (outcome_step), decided once for each
+    task and each holder, and a holder whose turn ended after its line with nothing done gets the hub's one question
+    first. A task whose decision raises gives its rows to the owner, with a log line, so that no row reaches nobody and
+    no other task waits for it. The first pass after the release of this rule moved the owner's open cards to the
+    chain at once, as the owner asked (one line for each task: a person's removal finds a line by its task)."""
+    groups = {}
+    for o in q("SELECT * FROM outcomes WHERE state='unknown' AND resolved IS NULL AND checker<>'owner' "
+               "ORDER BY task, id"):
+        groups.setdefault((o["task"], o["checker"] or "", o["told"], o["asked"]), []).append(o)
+    for (tid, before, _told, _asked), rows in groups.items():
+        t = q1("SELECT * FROM tasks WHERE id=?", (tid,))
+        try:
+            want, why, ask = outcome_step(rows[0], t, t0)
+            if ask:
+                filed, about = filed_about(before, "say", tid)
+                text = outcome_ask_text(before, t, rows, t0)
+                with transaction():
+                    asked = DB.execute(*event_row(before, "say", filed, text, t0, "{}", about)).lastrowid
+                    DB.execute(f"UPDATE outcomes SET asked=? WHERE id IN ({','.join('?' * len(rows))}) AND "
+                               f"state='unknown'", (asked, *(o["id"] for o in rows)))
+            elif want != before:
+                outcome_move(t, rows, want, why, before, t0)
+        except Exception:
+            print_fault()
+            q(f"UPDATE outcomes SET checker='owner' WHERE id IN ({','.join('?' * len(rows))}) AND state='unknown'",
+              tuple(o["id"] for o in rows))
+            log("hub", f"the check of the unknown outcomes of {tref(tid)} raised: the owner checks them")
+
+
+def outcome_wait_words(o, t):
+    """A wake-up rule's words for the unknown outcome row `o` of its last task, row `t`: who checks it."""
+    c = o["checker"] or ""
+    return (f"O-{o['id']} of {tref(t['id'])} is unknown, and " +
+            ("the owner checks it" if c == "owner" else f"{c} checks it" if c else "its check comes first") + ".")
 
 
 # The hub's own word about a usage limit is the one `say` that reaches a limited agent. Every other message waits
@@ -13105,7 +13408,8 @@ def describe_task(t, details=None):
     if hold:
         lines.append(f"  HELD: {held_word(hold)}. Do not work on it until a message says that it resumes.")
     for o in q("SELECT * FROM outcomes WHERE task=? ORDER BY id", (t["id"],)):
-        state = (("UNKNOWN: do not repeat it; the owner settles in the app whether it took effect" if closed else
+        state = (("UNKNOWN: do not repeat it; " + ("the owner settles in the app" if o["checker"] == "owner" else
+                                                    "your line finds out") + " whether it took effect" if closed else
                   "UNKNOWN: find out whether it took effect, without repeating it, then call resolve_outcome")
                  if o["state"] == "unknown" else {"done": "done (it took effect)", "not_done": "not done"}[o["state"]])
         lines.append(f"  Outcome O-{o['id']} {o['title']}: {state}" + (f" ({o['by']}: {o['note']})" if o["note"] else ""))
@@ -13214,22 +13518,23 @@ def outward_line(c):
     return f"{c['name']}: {clip(mask_secrets(c['detail'] or ''), 140)}"
 
 
-def tool_work_line(task_id, attempt):
+def tool_work_line(task_id, attempt, titles=True):
     """One line on the tool work of an attempt, from the records its runner already wrote: how many calls it made,
-    how many of them changed something, and the last few of those. One query, and never a transcript."""
+    how many of them changed something, and the last few of those (titles False: the counts alone, for a line about a
+    task whose owner's Shell box is off, outcome_actions). One query, and never a transcript."""
     rows = read_rows("SELECT data FROM thread_events WHERE task=? AND attempt=? AND type='tool_call' ORDER BY id",
               (task_id, attempt))
     if not rows:
         return None
-    titles, changed = [], 0
+    names, changed = [], 0
     for r in rows:
         d = json.loads(r["data"])
         if d.get("kind") in EFFECTFUL and d.get("server") != "fleet":
             changed += 1
             if d.get("title"):
-                titles.append(clip(d["title"], 70))
+                names.append(clip(d["title"], 70))
     return (f"Its own tools: {len(rows)} call(s), {changed} of which changed something" +
-            (". The last of those: " + "; ".join(titles[-3:]) if titles else "") + ".")
+            (". The last of those: " + "; ".join(names[-3:]) if names and titles else "") + ".")
 
 
 def result_lines(p):
@@ -13276,9 +13581,10 @@ def unknown_start_text(task_id, closed, note=""):
     resume with a check had them: a session after a lost one, a usage limit or a sign-in began with "check before
     repeating" and no list, and one that a message started for a parked task with none either (the review of 19
     November 2026), while the owner's apps leave such a check to the agent of a task that runs
-    (TaskOutcome.waitsOnOwner, owner_count). Not for a Shell-off session, which has no resolve_outcome: the owner
-    checks its outcomes. One line for each outcome, each masked on its own, so that a login in one title takes no
-    other line with it. read_rows only: the start text is made inside the transaction that writes the attempt."""
+    (TaskOutcome.waitsOnOwner, owner_count). Not for a Shell-off session, which has no resolve_outcome: the agent
+    above it checks its outcomes (outcome_step). One line for each outcome, each masked on its own, so that a
+    login in one title takes no other line with it. read_rows only: the start text is made inside the transaction
+    that writes the attempt."""
     if closed:
         return ""
     # A known hole (person-scope-call-mark.md): the mark of a narrowed session's calls (calls.scope_person) does not
@@ -13485,8 +13791,9 @@ def notes_block(rows, head, indent="    "):
     return out + [f"{indent}{when(n['ts'])}, {n['agent']}: {clip(n['text'], 300)}" for n in rows[-EARLIER_NOTES:]]
 
 
-def task_in_full(p):
-    """One earlier task, with everything a session needs to not do its work again."""
+def task_in_full(p, reader=None):
+    """One earlier task, with everything a session needs to not do its work again. reader: the agent that reads it; a
+    Shell-off task's calls reach another agent by their server and tool only (outcome_text closed)."""
     lines = [f"{tref(p['id'])} [{p['state']}] {p['title']}",
              f"  Owner: {p['owner']}; requester: {p['requester']}; done when: {clip(p['done_when'], 300)}"]
     lines += [f"  {x}" for x in result_lines(p)]
@@ -13500,7 +13807,7 @@ def task_in_full(p):
     if sent:
         lines.append(f"  What it sent outside ({len(sent)}):")
         lines += [f"    {outward_line(c)}" for c in sent]
-    found = outcome_text(p["id"])
+    found = outcome_text(p["id"], closed=shell_off(p["owner"]) and reader != p["owner"])
     if found:
         lines.append(f"  Actions whose effect was checked: {found}")
     return lines
@@ -13752,7 +14059,7 @@ def earlier_work_said(agent, a):
                             (f"It follows {', '.join(tref(x['id']) for x in chain)}. "
                              if chain else f"{tref(t['id'])} follows no task. ") +
                             "mine=true names your own finished tasks.")
-        lines = task_in_full(p)
+        lines = task_in_full(p, agent)
         followed = follows_line(p["id"], scope)
         if followed:
             lines.append("  " + followed)
@@ -14670,8 +14977,9 @@ def hold_subtasks(task_id, kind, by="owner"):
 
 
 def release_subtasks(task_id, by="owner"):
-    """Resume the subtasks that a parent's hold held; one with unknown outcomes stays held for the owner. by: who
-    resumes them, as for hold_subtasks."""
+    """Resume the subtasks that a parent's hold held, each with a check when an outcome of it is unknown (its own
+    agent checks first, or its line: outcome_step), so that none stays held with nothing on the owner's screen to
+    say so. by: who resumes them, as for hold_subtasks."""
     resumed, still = [], []
     for r in q("SELECT h.task, h.by, h.hand FROM parent_holds ph JOIN holds h ON h.id=ph.hold WHERE ph.parent=? AND "
                "h.state<>'released' ORDER BY h.task", (task_id,)):
@@ -14679,7 +14987,7 @@ def release_subtasks(task_id, by="owner"):
             still.append(r["task"])
             continue
         try:
-            release_hold(r["task"], "resume", by, via="parent")
+            release_hold(r["task"], "check", by, via="parent")
             resumed.append(r["task"])
         except ToolError:
             still.append(r["task"])
@@ -15524,20 +15832,88 @@ def end_holds(task_id):
       "WHERE task=? AND decision IS NULL", (now(), task_id))
 
 
+def outcome_above(agent, args, context):
+    """True when a resolve_outcome call names another task than the session's own: a task of the line below the agent
+    (its requester's check, or the one that the hub gave it: outcome_step), or the agent's own task from a session of
+    another of its tasks (a look that follows it, which the line asks for). call_tool fences such a call to the
+    session's own task, as a team tool, and t_resolve_outcome checks the named one itself, with plain words and never
+    a STOP. A task_id that names no task id keeps the session's own fence."""
+    try:
+        tid = parse_task(args.get("task_id"))
+    except ToolError:
+        return False
+    own = context_task(context)
+    return own is not None and tid != own
+
+
 def t_resolve_outcome(agent, a):
     tid = parse_task(a.get("task_id"))
     oid = parse_id(a.get("outcome_id"), "outcome")
     finding = str(a.get("finding") or "").strip().lower()
     evidence = str(a.get("evidence") or "").strip()
     if not evidence:
-        raise ToolError("Say in evidence how you checked it.")
+        raise ToolError("Say in evidence how you checked it." if finding != "pass_up" else
+                        "Say in evidence why you cannot find out.")
     guard(agent, evidence)
-    get_task(tid, owner=agent)
+    here = context_task(getattr(CALL, "context", None))
+    if session_scope(agent) is not None and here != tid:
+        # a session that a narrowed person's words drive reaches no other task, and learns of none: no record, no
+        # requester's name, and the same words for each task id (person access plan, sections 13 and 16)
+        raise ToolError(f"There is no task {tref(tid)}.")
+    t = named_task(agent, tid)
+    own = t is not None and t["owner"] == agent
+    row = read_row("SELECT * FROM outcomes WHERE id=? AND task=?", (oid, tid)) if t is not None else None
+    if own:
+        if here == tid:
+            get_task(tid, owner=agent)      # the fence of its own task's session
+        # else a session of another task of its own, which call_tool fenced (outcome_above): it records there too
+    elif row is not None and row["checker"] == agent:
+        in_scope(agent, t)                  # the hub gave it this check (outcome_step); a lead from its task above
+    else:       # the agent above it on the chain: its requester, or the manager for a lead that left (acts_for)
+        t = requested_task(agent, tid)
+        in_scope(agent, t)
+    if finding == "pass_up":
+        return outcome_pass_up(agent, t, oid, evidence, own)
     settle_outcome(oid, finding, agent, evidence, task_id=tid)
     left = q("SELECT id FROM outcomes WHERE task=? AND state='unknown' ORDER BY id", (tid,))
     if left:
         return f"O-{oid}: {finding}. Still to check: {', '.join('O-' + str(r['id']) for r in left)}."
+    if not own:
+        outcomes_settled_line(t, agent)
+    if not own or here != tid:      # a look task's own agent reads the task that it recorded, not "continue the task"
+        return f"O-{oid}: {finding}. No unknown outcome of {tref(tid)} is left."
     return f"O-{oid}: {finding}. No unknown outcomes are left. Continue the task, and never repeat an action that was done."
+
+
+def outcome_pass_up(agent, t, oid, why, own):
+    """resolve_outcome with pass_up: `agent` cannot find out whether unknown outcome O-<oid> of task row `t` took
+    effect, and says why. The check goes one level up the chain, as a question does (pass_question): from the task's
+    own agent to the agent that decides as its requester, from the agent that has it to the level above it
+    (outcome_up: the lead above a lead, the manager, the owner, whose card then shows). Only the task's own agent, while
+    the check is its own, and the agent that has it pass it: a check never goes down, and never back to the agent that
+    passes it. The agent's words go into the line, as data from an agent of the chain."""
+    o = q1("SELECT * FROM outcomes WHERE id=? AND task=?", (oid, t["id"]))
+    if not o:
+        raise ToolError(f"There is no outcome O-{oid} on {tref(t['id'])}.")
+    if o["state"] != "unknown":
+        raise ToolError(f"O-{oid} is already settled as {o['state']}.")
+    stored, t0 = o["checker"] or "", now()
+    if stored == "owner":
+        raise ToolError(f"O-{oid} is the owner's to check already.")
+    if stored and stored != agent:
+        raise ToolError(f"The check of O-{oid} is with {stored} now: it records it or passes it up.")
+    if stored:
+        want = outcome_up(agent, t, t0)
+    elif own:
+        want = "owner" if outcome_private(t) else outcome_first(t, t0)[0]
+    else:
+        raise ToolError(f"{t['owner']} checks O-{oid} itself first, in a session of {tref(t['id'])}. Record it only "
+                        f"when you know whether it took effect.")
+    if want in (stored, agent):
+        raise ToolError(f"No agent above you can take the check of O-{oid} now. Record it when you know.")
+    outcome_move(t, [o], want, f": {agent} cannot find out (\"{clip(why, 300)}\")", stored, t0)
+    return f"O-{oid} is with {want} now, with a line." if want != "owner" else \
+        f"O-{oid} is the owner's to check now: no agent above you can."
 
 
 def question_passers(qu):
@@ -33030,12 +33406,13 @@ def budget_text(g):
 
 
 def release_goal_holds(goal_id, by):
-    """Resume the tasks that a goal pause held. A task with unknown outcomes stays held for the owner."""
+    """Resume the tasks that a goal pause held, each with a check when an outcome of it is unknown, as
+    release_subtasks."""
     resumed, still = [], []
     for r in q("SELECT h.task FROM goal_holds gh JOIN holds h ON h.id=gh.hold WHERE gh.goal=? AND h.state<>'released' "
                "ORDER BY h.task", (goal_id,)):
         try:
-            release_hold(r["task"], "resume", by, via="goal")
+            release_hold(r["task"], "check", by, via="goal")
             resumed.append(r["task"])
         except ToolError:
             still.append(r["task"])
@@ -33547,8 +33924,8 @@ def goal_state_change(g, action, note):
     say = {"pause": f"The owner paused {gref(gid)} ({g['title']}). Its open tasks are being paused: {tasks}. "
                     f"Create no task for it until the owner resumes it.",
            "resume": f"The owner resumed {gref(gid)} ({g['title']}). Resumed: "
-                     f"{', '.join(tref(t) for t in extra.get('resumed', [])) or 'none'}; still held until the owner "
-                     f"settles their unknown outcomes: {', '.join(tref(t) for t in extra.get('still_held', [])) or 'none'}. "
+                     f"{', '.join(tref(t) for t in extra.get('resumed', [])) or 'none'}; still held: "
+                     f"{', '.join(tref(t) for t in extra.get('still_held', [])) or 'none'}. "
                      f"Plan the next step and call update_goal.",
            "done": f"The owner closed {gref(gid)} ({g['title']}) as done.",
            "drop": f"The owner dropped {gref(gid)} ({g['title']}). The owner asks you to cancel its open tasks: {tasks}. "
@@ -54445,11 +54822,12 @@ TOOLS = [
                      "description": "note (it waits to be read), soon (the next thing your requester reads), now (at "
                                     "once, when about names something live). Default note."}},
        ["task_id", "request_id", "kind", "text"])),
-    ("worker", "resolve_outcome", t_resolve_outcome,
-     "After a pause or stop, record what you found out about one unknown outcome: done (the action took effect) "
-     "or not_done. Check first. Never repeat the action to find out.",
+    ("all", "resolve_outcome", t_resolve_outcome,
+     "Record what you found out about one unknown outcome of your own task, or of one whose check the hub gave you: "
+     "done (it took effect) or not_done; pass_up, with why in evidence, when you cannot find out. Check first. Never "
+     "repeat the action to find out.",
      S({"task_id": TASK_ID, "outcome_id": {"type": "string", "description": "Outcome id, for example O-3"},
-        "finding": {"type": "string", "enum": ["done", "not_done"]}, "evidence": STR},
+        "finding": {"type": "string", "enum": ["done", "not_done", "pass_up"]}, "evidence": STR},
        ["task_id", "outcome_id", "finding", "evidence"])),
     # The three tools of a locked conversation window with another person (CHAT-APPS.md 7.2). tools_for offers them
     # there and nowhere else, and the person's role decides which of them they are.
@@ -56703,7 +57081,7 @@ def gate(agent, task_id, name, args):
                         f"A message will say when it resumes.")
     completing = name == "deliver_result" and str(args.get("outcome") or "completed").strip().lower() == "completed"
     if name in ("sign_in", "hand_over", "create_login", "save_key", "call_api", "gmail_send") or completing:
-        left = q("SELECT id, title FROM outcomes WHERE task=? AND state='unknown' ORDER BY id", (task_id,))
+        left = q("SELECT id, title, checker FROM outcomes WHERE task=? AND state='unknown' ORDER BY id", (task_id,))
         # call_api: a request that reads (GET) is a way to check, and the same request_id only asks for its answer.
         # A request_id that the rule refuses is no repeat: the tool's own refusal answers it.
         rid = wakeups.request_ref(args.get("request_id"))
@@ -56716,12 +57094,14 @@ def gate(agent, task_id, name, args):
                                                         (task_id, f"gmail-{rid}")):
             left = []
         if left and not session_holds(agent, task_id, "resolve_outcome"):
-            # a session whose Shell box is off has no resolve_outcome: the owner settles its outcomes (owner_count),
-            # so the line names no tool that it does not have (the review of 19 November 2026)
+            # a session whose Shell box is off has no resolve_outcome: the agent above it checks its outcomes
+            # (outcome_step), so the line names no tool that it does not have (the review of 19 November 2026)
             raise ToolError("STOP: it is not known whether these earlier actions of this task took effect: " +
                             "; ".join(f"O-{r['id']} {r['title']}" for r in left) + ". Do not repeat them. Your "
-                            "session has no tool that records a finding: the owner settles each one in the app, and "
-                            "this task takes a completed result after that. " +
+                            "session has no tool that records a finding: " +
+                            ("the owner settles each one in the app" if all(r["checker"] == "owner" for r in left)
+                             else "your line finds out for each one") + ", and this task takes a completed result "
+                            "after that. " +
                             ("Come back at a time with set_reminder, or deliver failed with a typed reason."
                              if session_holds(agent, task_id, "set_reminder") else
                              "When the task cannot wait for that, deliver failed with a typed reason."))
@@ -56922,7 +57302,8 @@ def call_tool(agent, name, args, context=None):
             chat_fence(agent, context)
         elif role in ("worker", "lead") and not conversation:
             attempt = context[2] if context else None
-            team = (role == "lead" and name in LEAD_TEAM_TOOLS) or (role == "worker" and name in PEER_TOOLS)
+            team = (role == "lead" and name in LEAD_TEAM_TOOLS) or (role == "worker" and name in PEER_TOOLS) or \
+                (name == "resolve_outcome" and outcome_above(agent, args, context))
             # these name subtasks; the fence is the session's task
             tid = parse_task((None if team else args.get("task_id")) or (context[1] if context else ""))
             t = fence(agent, tid, context)
@@ -57752,10 +58133,10 @@ def trigger_decision(t, manual, due, t0):
     last = q1("SELECT id, state FROM tasks WHERE trigger_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
     if last and last["state"] not in TERMINAL:
         return "not_started", f"{tref(last['id'])} is still open."
-    unknown = q1("SELECT id FROM outcomes WHERE task=? AND state='unknown' ORDER BY id LIMIT 1",
+    unknown = q1("SELECT id, checker FROM outcomes WHERE task=? AND state='unknown' ORDER BY id LIMIT 1",
                  (last["id"],)) if last else None
     if unknown:
-        return "not_started", f"O-{unknown['id']} of {tref(last['id'])} is unknown. Settle it first."
+        return "not_started", outcome_wait_words(unknown, last)
     try:            # the create_task rules for a task that the manager requests: capability, goal, login text
         return None, check_task(manager_name(), {"owner": agent, "title": task["title"],
                                                  "details": watch_details(t, task),
@@ -58163,10 +58544,10 @@ def wake_decision(t, manual, t0, due):
     if last and last["open"]:
         return "not_started", f"{last['ref']} is still open.", None, None
     done = q1("SELECT id FROM tasks WHERE trigger_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
-    unknown = q1("SELECT id FROM outcomes WHERE task=? AND state='unknown' ORDER BY id LIMIT 1",
+    unknown = q1("SELECT id, checker FROM outcomes WHERE task=? AND state='unknown' ORDER BY id LIMIT 1",
                  (done["id"],)) if done else None
     if unknown:
-        return "not_started", f"O-{unknown['id']} of {tref(done['id'])} is unknown. Settle it first.", None, None
+        return "not_started", outcome_wait_words(unknown, done), None, None
     try:
         return "started", None, wake_admission(t, route, task), None
     except ToolError as e:
@@ -58363,10 +58744,10 @@ def check_decision(t, r, value, t0):
     last = q1("SELECT id, state FROM tasks WHERE trigger_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
     if last and last["state"] not in TERMINAL:
         return "waiting", f"{tref(last['id'])} is still open.", None
-    unknown = q1("SELECT id FROM outcomes WHERE task=? AND state='unknown' ORDER BY id LIMIT 1",
+    unknown = q1("SELECT id, checker FROM outcomes WHERE task=? AND state='unknown' ORDER BY id LIMIT 1",
                  (last["id"],)) if last else None
     if unknown:
-        return "waiting", f"O-{unknown['id']} of {tref(last['id'])} is unknown. Settle it first.", None
+        return "waiting", outcome_wait_words(unknown, last), None
     lim = active_limit(agent)
     if lim:
         return "waiting", f"{agent} is at its usage limit until {clock(lim['until'])}.", None
@@ -59028,10 +59409,10 @@ def lines_held(t, r, route, t0):
             return str(e)
         return None
     done = q1("SELECT id FROM tasks WHERE trigger_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
-    unknown = q1("SELECT id FROM outcomes WHERE task=? AND state='unknown' ORDER BY id LIMIT 1",
+    unknown = q1("SELECT id, checker FROM outcomes WHERE task=? AND state='unknown' ORDER BY id LIMIT 1",
                  (done["id"],)) if done else None
     if unknown:
-        return f"O-{unknown['id']} of {tref(done['id'])} is unknown. Settle it first."
+        return outcome_wait_words(unknown, done)
     lim = active_limit(t["agent"])
     if lim:
         return f"{t['agent']} is at its usage limit until {clock(lim['until'])}."
@@ -61969,6 +62350,7 @@ def tick():
         step(duty_sweep, t0)                # owner API 1.13: the duties that are not in order
         step(kpi_sweep, t0)                 # lanes/agent-kpis.md: once a day, a KPI with no value for two windows
         step(circle_sweep, t0)              # what looks like running in circles
+        step(outcome_check_sweep, t0)       # the owner, 23 November 2026: an unknown outcome goes up the chain first
         step(lead_unread_sweep, t0)         # what a lead left unread, to the manager before the owner's screen
         step(allowance_sweep, t0)           # the manager's own allowance, while it can still act on it
         step(integrity_check, t0)
@@ -68788,7 +69170,7 @@ AGENT_COLUMNS = (
     ("sealed", "sender"), ("sealed", "recipient"), ("jobs", "agent"), ("log", "agent"), ("agents", "name"),
     ("signin_records", "agent"),        # plan 04, S5: the sign-ins of the vault in the agent's own browser
     ("agent_usage", "name"), ("calls", "agent"), ("ui_requests", "recipient"), ("owner_reports", "agent"),
-    ("holds", "by"), ("holds", "released_by"), ("outcomes", "by"), ("agent_limits", "agent"),
+    ("holds", "by"), ("holds", "released_by"), ("outcomes", "by"), ("outcomes", "checker"), ("agent_limits", "agent"),
     ("chat_stops", "agent"),            # owner feature chat_stop: the presses of Stop in its chat
     ("machine_status", "agent"), ("machine_updates", "agent"), ("goals", "paused_by"), ("goal_history", "by"),
     ("spends", "by"), ("restart_holds", "by"), ("machine_checks", "agent"), ("session_tokens", "agent"),
@@ -69324,6 +69706,7 @@ AGENT_REMOVAL = {
     ("notes", "agent"): "stays", ("needs", "answered_by"): "stays", ("reports", "decided_by"): "stays", ("prompts", "agent"): "stays",
     ("prompts", "by"): "stays", ("rules", "by"): "stays", ("need_talk", "who"): "stays", ("sealed", "sender"): "stays",
     ("log", "agent"): "stays", ("holds", "by"): "stays", ("holds", "released_by"): "stays", ("outcomes", "by"): "stays",
+    ("outcomes", "checker"): "stays",       # outcome_check_sweep moves a check on from an agent that left (lead_left)
     ("goals", "paused_by"): "stays", ("goal_history", "by"): "stays", ("spends", "by"): "stays",
     ("restart_holds", "by"): "stays", ("triggers", "paused_by"): "stays", ("triggers", "created_by"): "stays",
     ("trigger_code", "by"): "stays", ("trigger_history", "by"): "stays", ("responsibilities", "created_by"): "stays",
@@ -76527,7 +76910,7 @@ def sign_in_resumes(agent, runtime):
         why_not = other_hold_around(t)
         if not why_not:
             try:
-                release_hold(t["id"], "resume", "hub",
+                release_hold(t["id"], "check", "hub",
                              note=f"The hub resumed it because a sign-in of {label} ended on your server after your "
                                   f"session ended with an error.",
                              why=f"A sign-in of {label} ended on its server, and no turn of {label} had ended there "
@@ -85950,9 +86333,13 @@ class Handler(BaseHTTPRequestHandler):
             if not q1("SELECT id FROM outcomes WHERE id=?", (outcome_id,)):
                 raise Refusal(404, "no such outcome")
             try:
-                return {"outcome": dict(settle_outcome(outcome_id, body["finding"], "owner", body["note"]))}
+                o = settle_outcome(outcome_id, body["finding"], "owner", body["note"])
             except ToolError as e:
                 raise Refusal(409, str(e)) from None
+            t = q1("SELECT * FROM tasks WHERE id=?", (o["task"],))
+            if t:
+                outcomes_settled_line(t, "owner")
+            return {"outcome": dict(o)}
         return self.ui_command(f"outcomes/{outcome_id}", read, act)
 
     def ui_submit(self, need_id=None):
