@@ -34400,8 +34400,14 @@ KIT_PUSHED = "kit_pushed"
 # it (17 November 2026).
 KIT = threading.RLock()
 KIT_TURN = threading.local()        # .unlocked: the owner command that this thread runs lets its git go without LOCK
-FLIGHT = {"thread": None}           # the thread whose commit_kit_file runs its git without LOCK now; under LOCK
+FLIGHT = {"thread": None, "restore": False}     # the thread whose commit_kit_file runs its git without LOCK now, or
+                                                # whose restore unpacks under KIT without LOCK (ui_restore, "restore"
+                                                # True); under LOCK
 KIT_BUSY = "The hub is saving another change of its files now. Nothing was written: try again in a few seconds."
+# The same refusal while a restore unpacks a copy under KIT (ui_restore), which takes minutes for a large copy: "a few
+# seconds" would not be true (the hub-side second reader's R4-2, 22 November 2026).
+KIT_BUSY_RESTORE = ("A copy of this fleet is being put back now, which can take some minutes. Nothing was written: "
+                    "try again when it is done.")
 
 
 @contextlib.contextmanager
@@ -34645,7 +34651,7 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None, che
             with KIT:                   # an agent's knowledge or skill, a task's output: after a write in its turn
                 return commit_kit_file(path, data, message, more, author, allow, check)
         if kit_flying():                # LOCK alone never waits for KIT: refused, before it reads or writes anything
-            raise KitFault(409, KIT_BUSY)
+            raise KitFault(409, KIT_BUSY_RESTORE if FLIGHT["restore"] else KIT_BUSY)
     unlocked = KIT._is_owned() and LOCK._is_owned() and getattr(KIT_TURN, "unlocked", False) and check is None \
         and not getattr(TX, "open", 0)
     out = KitOutside(unlocked)
@@ -37836,25 +37842,67 @@ def zip_entries(data):
 
 def zip_directory_bytes(data):
     """The size of the central directory of the ZIP `data`, read before zipfile opens it, from the end record that
-    zipfile reads (its _EndRecData, whose private name a later Python may change): the last 22 bytes when they are an
-    end record that states no comment, else the last end record in the last 64 KiB and 22 bytes. A search alone found
-    a later "PK\x05\x06" inside a record whose two counts write it, and read 0 bytes where zipfile read 31.3 MiB.
+    zipfile reads (zip_end_record). 0xFFFFFFFF, which is no copy's, for a found record whose comment does not fit in the
+    bytes, and for one with a Zip64 locator before it, whose record zipfile reads in place of the end record's (the Mac
+    app refuses Zip64, and the hub never writes it: at most 20,000 entries, and records of at most COPY_FORMAT_MAX). 0
+    for bytes with no end record, which zipfile then refuses itself."""
+    return zip_end_record(data)[1]
 
-    0xFFFFFFFF, which is no copy's, for a found record whose comment does not fit in the bytes, and for one with a
-    Zip64 locator before it, whose record zipfile reads in place of the end record's (the Mac app refuses Zip64, and
-    the hub never writes it: at most 20,000 entries and 256 MiB). 0 for bytes with no end record, which zipfile then
-    refuses itself."""
+
+def zip_end_record(data):
+    """(where the end record that zipfile reads begins in `data`, the size of the central directory that it states),
+    read before zipfile opens the ZIP, as zipfile reads it (its _EndRecData, whose private name a later Python may
+    change): the last 22 bytes when they are an end record that states no comment, else the last end record in the
+    last 65,536 and 22 bytes (ZIP_SEARCH). A search alone found a later "PK\x05\x06" inside a record whose two counts
+    write it, and read 0 bytes where zipfile read 31.3 MiB. (None, 0xFFFFFFFF) for a found record whose comment does not
+    fit in the bytes, and for one with a Zip64 locator before it; (None, 0) for bytes with no end record."""
     if len(data) >= 22 and data[-22:-18] == b"PK\x05\x06" and data[-2:] == b"\0\0":
         end = len(data) - 22
     else:
-        end = data.rfind(b"PK\x05\x06", max(0, len(data) - 65535 - 22))
+        end = data.rfind(b"PK\x05\x06", max(0, len(data) - ZIP_SEARCH - 22))
         if end < 0 or end + 22 > len(data):
-            return 0
+            return None, 0
         if end + 22 + int.from_bytes(data[end + 20:end + 22], "little") > len(data):
-            return 0xFFFFFFFF
+            return None, 0xFFFFFFFF
     if end >= 20 and data[end - 20:end - 16] == b"PK\x06\x07":
-        return 0xFFFFFFFF
-    return int.from_bytes(data[end + 12:end + 16], "little")
+        return None, 0xFFFFFFFF
+    return end, int.from_bytes(data[end + 12:end + 16], "little")
+
+
+# How far from its end, beyond the 22 bytes of the end record, zipfile looks for that record: 1 << 16 in Python 3.10 and
+# 3.11 (Ubuntu 22.04's and Debian 12's), and 65,535 in 3.12 and later, which then refuse a record that stands one byte
+# further. The hub reads a copy's directory before zipfile does, so it looks as far as the farthest zipfile (a finding of
+# Fable's read of 22 November 2026: at 65,535 a copy whose record stood there read as no ZIP here, and zipfile of 3.10
+# then read its whole directory).
+ZIP_SEARCH = 1 << 16
+ZIP_TAIL = ZIP_SEARCH + 22 + 20     # the end of a ZIP in which zipfile finds its end record, and a Zip64 locator before it
+ZIP_PART = 64 * 1024            # the part of a central directory that zip_file_shape reads at a time
+
+
+def zip_file_shape(f):
+    """(entries, directory bytes) of the ZIP in the binary file `f`, as zip_entries and zip_directory_bytes give them of
+    its bytes, read from its last ZIP_TAIL bytes and its central directory alone, so that a copy of any size is never
+    read whole: the entries are counted in the central directory that zipfile reads (the bytes before the end record,
+    of the size that it states), where each entry that zipfile's constructor makes begins with its signature. (0, the
+    size) for a directory larger than BACKUP_DIRECTORY_MAX, which is no copy's, or that begins before the file; (0, 0)
+    with no end record, which zipfile refuses itself."""
+    size = f.seek(0, os.SEEK_END)
+    base = max(0, size - ZIP_TAIL)
+    f.seek(base)
+    end, directory = zip_end_record(f.read(size - base))
+    if end is None or directory > BACKUP_DIRECTORY_MAX or base + end < directory:
+        return 0, directory
+    f.seek(base + end - directory)
+    count, left, carry = 0, directory, b""
+    while left:         # in parts, so the count holds no more than one: a signature across two parts is found too
+        piece = f.read(min(ZIP_PART, left))
+        if not piece:
+            break
+        left -= len(piece)
+        block = carry + piece
+        count += block.count(b"PK\x01\x02")
+        carry = block[-3:]
+    return count, directory
 
 
 def office_package(data, mime):
@@ -74908,8 +74956,9 @@ def door_deliver(login, sealed, t0=None):
 
 STARTED = time.time()
 BACKUP_WARN = 26 * 3600             # an owner backup older than this, or none, is a health warning
-BACKUP_MAX = 256 * 1024 * 1024      # a larger database is backed up on the hub machine, not through the API
-BACKUP_LOCK = threading.Lock()      # one copy in the making at a time (ui_backup): taken before LOCK, never under it
+# One copy in the making and on its way out at a time (ui_backup): taken before LOCK, never under it
+BACKUP_LOCK = threading.Lock()
+RESTORE_LOCK = threading.Lock()     # one copy on its way back at a time (ui_restore): taken before LOCK and KIT
 INTEGRITY_EVERY = 6 * 3600          # seconds between quick integrity checks of the database
 DISK_LOW = 2 * 1024 ** 3
 
@@ -74919,9 +74968,9 @@ def backups_enabled():
 
     They were off until 18 October 2026, under the owner's rule that no backup, dump, snapshot, archive or copy is
     made on a host unless he asks. That rule is about **copies left on hosts**, and it is kept here exactly: the
-    hub keeps nothing and schedules nothing. What this serves is one copy, made in memory when the owner presses the
-    button (on Python 3.10 through one passing file, records_image), sent to the owner's own machine and gone from
-    the hub the moment it is sent.
+    hub keeps nothing and schedules nothing. What this serves is one copy, made when the owner's Mac asks for it, in
+    passing files of a folder of mode 700 beside the records (copy_folder), sent to the owner's own machine and gone
+    from the hub the moment it is sent.
 
     Off by default was wrong for a product whose data has one copy on one disk. The hub finds its own corruption
     every six hours (integrity_check) and the owner could do nothing about it; the records hold every task, every
@@ -74984,13 +75033,30 @@ RESTORE_SUFFIX = ".restore"         # a copy waiting beside the database for the
 # What a restore takes of a copy (read_bundle), whatever the copy states, and the backup serves no copy that is more
 # (ui_backup), so each copy that the hub serves restores. The Mac app's restore reads a copy before it sends it, with
 # the first three limits (app/Sources/FleetCore/FleetRestore.swift: the central directory at lines 484-485, fleet.json
-# at line 661), and the hub's follow the app's. A restore holds about two times RESTORE_UNPACK at its peak, because
-# zlib joins its output blocks at the end of a read: a later piece streams each file to the staging file with a
-# running SHA-256.
+# at line 661), and the hub's follow the app's. RESTORE_UNPACK is the bound of the ZIP format that the Mac app reads
+# (no Zip64), not of the hub's memory: a restore reads its body and unpacks its records to files in pieces, so the room
+# on the hub's disk bounds it (restore_room).
 BACKUP_ENTRIES_MAX = 20_000
 BACKUP_DIRECTORY_MAX = 4 * 1024 * 1024
 BACKUP_MANIFEST_MAX = 1024 * 1024
-RESTORE_UNPACK = 8 * BACKUP_MAX
+RESTORE_UNPACK = 2048 * 1024 * 1024
+# A copy is made and sent through passing files (copy_folder), so its size is bounded by the room on the hub's disk and
+# by the ZIP format that the Mac app reads, never by the hub's memory. Python's zipfile writes the fields of Zip64 for
+# a member of more than zipfile.ZIP64_LIMIT bytes (2,147,483,647), and the Mac app's reader refuses them: records of
+# more than that are refused before anything is written (copy_fits), until both sides read Zip64.
+COPY_FORMAT_MAX = 2 ** 31 - 1
+COPY_PART = "founderizer-copy-"     # the passing folder of one copy, beside the records; a start removes what is left
+COPY_RECORDS = "records"            # the names of its files: fixed, and nothing of a request is in them
+COPY_ZIP = "copy.zip"
+COPY_PIECE = 1024 * 1024            # what a copy reads, packs or sums at a time
+COPY_SEND_PIECE = 16 * COPY_PIECE   # what one sendfile of a copy's answer sends at most (send_file)
+COPY_IDLE = 300                     # seconds in which the client of a copy takes nothing: then the copy's answer ends
+# What a copy leaves free on the disk of the records beside its own files: room for what the hub writes in the minutes of
+# a copy (the write-ahead file is held at 64 MiB, an attachment is 25 MiB, a delivery 24 MiB). Not DISK_LOW: the copy
+# was made in memory before 22 November 2026 and needed no disk, so a reserve of 2 GiB refused the daily copy of a hub on
+# a disk that is nearly full, the day on which a copy matters most, and the disk_low warning says that already (the
+# validator's finding 1 of piece 1, 22 November 2026).
+COPY_RESERVE = 256 * 1024 * 1024
 REPLACED_SUFFIX = ".replaced"       # the records a deliberate replacement put aside, which the owner asked for
 SQLITE_SIDE = ("-journal", "-wal", "-shm")      # what SQLite keeps beside a database file, under that file's name
 WORK_TABLES = ("tasks", "goals", "needs", "owner_reports", "conversations", "responsibilities", "triggers")
@@ -75112,9 +75178,9 @@ def hub_only_notes(found):
     The attachments are the one of the four that is not a credential, and they are not in the copy either. They
     are his own files, sent from his own machine, so the hub's copy is the derived one; the hub itself throws
     them away after ninety days (ATTACH_KEEP), so a copy that carried them would keep what the product has
-    decided to forget; and the copy is made in memory and refused over 256 MiB (BACKUP_MAX), so a folder that
-    grew would cost him the records, which are the part nothing else holds. What it costs him is said plainly
-    below, with the count, because he is the one who gets to think it too small a price or not."""
+    decided to forget; and a folder that grew would make each copy larger, in each of the copies that his Mac keeps,
+    for files that he already has. What it costs him is said plainly below, with the count, because he is the one
+    who gets to think it too small a price or not."""
     import textwrap
     github, google = found.get("github_app") or {}, found.get("google") or {}
     servers, files = found.get("mcp") or {}, found.get("attachments") or {}
@@ -75350,159 +75416,315 @@ A copy nobody has ever put back is not a copy. Try it once on a spare machine be
 """
 
 
-def rollback_header(records):
-    """An image of a database, with the header of rollback mode where it has the one of WAL mode: bytes 18 and 19 (the
-    file format's write and read versions) are 1 and 1 where WAL mode writes 2 and 2. The hub's records are in WAL mode
-    since 11 November 2026 (wal_on), and DB.serialize() copies that header, as SQLite's backup into a file does on
-    Python 3.10 (records_image). SQLite opens no image in WAL mode from memory ("unable to open database file"), so
-    read_bundle refused every such copy, and so does the restore of a hub from before this change. SQLite's
-    documentation of sqlite3_deserialize (https://www.sqlite.org/c3ref/deserialize.html) says to set bytes 18 and 19
-    to 1 for it. The pages are the whole records either way, and a hub that takes the copy puts them in WAL mode again
-    at its start."""
-    if records[18:20] == b"\x02\x02":
-        records = b"".join((records[:18], b"\x01\x01", records[20:]))
-    return records
-
-
-# Whether this Python holds a database image in memory: Connection.serialize and deserialize came with Python 3.11,
-# and only where SQLite has that part. Ubuntu 22.04 has Python 3.10, which the installers take, so there a copy is
-# made and read through a file (records_image, image_opened). The two ways give the same pages, and each reads the
-# copies of the other.
-SQLITE_IMAGES = hasattr(sqlite3.Connection, "serialize") and hasattr(sqlite3.Connection, "deserialize")
-
-
-def records_image():
-    """DB's records as the bytes of one database file, from one moment: what a copy carries (backup_bundle). Call it
-    under LOCK and outside a transaction. With DB.serialize() the image never touches the disk. Without it (Python
-    3.10), SQLite's backup writes the records into a file of a new folder of mode 700, which is read and removed
-    before this returns, as the copy for a release's schema check is. That file has the same pages; three numbers of
-    its first 100 bytes, the change counter, its copy and the schema cookie, are those of a new file, and no restore
-    reads them."""
-    if SQLITE_IMAGES:
-        return DB.serialize()
-    import shutil
-    import tempfile
-    if DB.in_transaction:   # SQLite's backup answers "busy" to a source in a write, and Python asks again for ever
-        raise RuntimeError("records_image runs outside a transaction")
-    folder = tempfile.mkdtemp(prefix="founderizer-records-")
+def disk_room(path):
+    """The bytes that this user may still write on the disk of `path`, or None when the system does not say."""
     try:
-        path = os.path.join(folder, "pilot.db")
-        with contextlib.closing(sqlite3.connect(path)) as target:
-            DB.backup(target)
-        with open(path, "rb") as f:
-            return f.read()
-    finally:
-        shutil.rmtree(folder, ignore_errors=True)
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize
+
+
+def size_words(n, rounding=None):
+    """A size as the Mac app writes one (FleetHealth.storageWords): 1024-based, with one decimal, "830 KB",
+    "117.4 MB", "1.2 GB". `rounding` "down" or "up" rounds its last digit that way, with no error of a float: a
+    refusal for room writes what is free rounded down and what is needed rounded up, as the Mac app does, because
+    both rounded to the nearest read the same near the bound ("The hub's server has 1.1 GB free. A copy needs 1.1 GB
+    there", from 60 MiB under the need: the validator's finding W1 of 22 November 2026)."""
+    if n < 1024:
+        return f"{max(n, 0):,} B"
+    size, unit = n / 1024, 0
+    while size >= 1024 and unit < 4:
+        size, unit = size / 1024, unit + 1
+    if rounding in ("down", "up"):
+        scale, whole = (1 if unit == 0 else 10), 1024 ** (unit + 1)
+        size = (n * scale // whole if rounding == "down" else -(-n * scale // whole)) / scale
+    return f"{int(size):,} KB" if unit == 0 else f"{size:,.1f} {('KB', 'MB', 'GB', 'TB', 'PB')[unit]}"
+
+
+def records_folder():
+    """The folder of the records: where the passing files of a copy go, on the disk whose room they need. The hub's
+    start names their file (CFG["db_path"]); without that name, the file that DB has open."""
+    return os.path.dirname(os.path.abspath(CFG.get("db_path") or q1("PRAGMA database_list")["file"]))
+
+
+def copy_folder():
+    """A new folder of mode 700 beside the records, for the passing files of one copy. Beside the records, and not in
+    the system's temporary folder: that one is memory on some systems (Debian 13 keeps /tmp in memory), and it can be on
+    another disk than the one whose room copy_fits read. A person who can read its files can read the records in the
+    same folder already, so they open nothing new."""
+    import tempfile
+    return tempfile.mkdtemp(prefix=COPY_PART, dir=records_folder())
+
+
+def copy_leftovers_gone(db_path):
+    """At each start, before the records are opened: the passing folders of a copy (COPY_PART) that a hub which was
+    killed left beside the records go, because the owner's rule leaves no copy on a host. Only folders of that prefix,
+    never a link. Returns how many went."""
+    gone = 0
+    with contextlib.suppress(OSError):
+        with os.scandir(os.path.dirname(os.path.abspath(db_path))) as there:
+            for one in there:
+                if one.name.startswith(COPY_PART) and one.is_dir(follow_symlinks=False):
+                    shutil.rmtree(one.path, ignore_errors=True)
+                    gone += 1
+    return gone
+
+
+def copy_fits():
+    """Before a copy writes anything (ui_backup, under LOCK): a Refusal when the records cannot go into one copy now.
+    Records of more than COPY_FORMAT_MAX bytes need Zip64, which the Mac app does not read (413, copy_over_format). The
+    hub's disk needs room for the records' file and the zip beside it for a moment, which is at most two times the
+    records, and COPY_RESERVE beside them, because a full disk stops the hub itself (507, copy_no_room, with what is
+    free and what the copy needs, its files and that reserve, as the Mac app writes a size: so the words never say that
+    the disk has more than the copy needs). A disk whose room the system does not say is not refused."""
+    records = q1("PRAGMA page_count")[0] * q1("PRAGMA page_size")[0]
+    if records > COPY_FORMAT_MAX:
+        raise Refusal(413, code="copy_over_format")
+    free, need = disk_room(records_folder()), 2 * records + COPY_RESERVE
+    if free is not None and free < need:
+        raise Refusal(507, code="copy_no_room", names={"free": size_words(free, "down"),
+                                                       "need": size_words(need, "up")})
+
+
+def records_pinned():
+    """(a read connection whose read transaction holds the records of this moment, its turn), or None where DB has no
+    read connection (reader: records that are not in WAL mode, a test's own database), or where its read cannot start.
+    Call it under LOCK: every writer commits under LOCK, so this moment is the one of the configuration and the facts
+    that the caller reads beside it, and the records are then written from it with LOCK free (backup_packed), as
+    state_moment reads the state. records_let_go ends it."""
+    try:
+        got = reader()
+    except sqlite3.Error:
+        return None
+    if got is None:
+        return None
+    try:
+        got[0].execute("BEGIN")
+        got[0].execute("SELECT count(*) FROM sqlite_master").fetchone()     # the read begins: the moment
+    except sqlite3.Error:
+        got[0].close()
+        return None
+    except BaseException:
+        got[0].close()
+        raise
+    return got
+
+
+def records_let_go(pinned):
+    """The read connection of records_pinned, its read transaction ended, back for the next read (reader_back)."""
+    if pinned is None:
+        return
+    conn, turn = pinned
+    try:
+        conn.execute("ROLLBACK")            # it read only: this ends its read transaction
+    except sqlite3.Error:
+        conn.close()
+    else:
+        reader_back(conn, turn)
+
+
+def records_file(source, folder):
+    """The records of `source` as one database file in `folder`, and its path: DB under LOCK, or a read connection
+    whose read transaction holds a moment (records_pinned). SQLite's backup writes them page by page, so each row keeps
+    its row id: ui_requests is a table whose row id is a key, and VACUUM INTO gives no such promise in SQLite's
+    documentation. The file is new (O_EXCL, O_NOFOLLOW, mode 600) and has the header of rollback mode: bytes 18 and 19
+    (the file format's write and read versions) are 1 and 1 where SQLite's backup copies the 2 and 2 of the WAL mode of
+    the hub's records (wal_on). A hub from before 22 November 2026 reads a copy's records as an image in memory, and
+    SQLite opens no image in WAL mode from memory (https://www.sqlite.org/c3ref/deserialize.html). The pages are the
+    whole records either way, and a hub that takes the copy puts them in WAL mode again at its start. Three numbers of
+    its first 100 bytes, the change counter, its copy and the schema cookie, are those of a new file, and no restore
+    reads them. Never inside a write of DB: SQLite's backup answers "busy" to a source in a write, and Python asks
+    again for ever."""
+    if source is DB and DB.in_transaction:
+        raise RuntimeError("records_file runs outside a transaction")
+    path = os.path.join(folder, COPY_RECORDS)
+    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+    with contextlib.closing(sqlite3.connect(path)) as target:
+        target.execute("PRAGMA journal_mode=OFF")       # a passing file: no journal beside it, and no wait for the disk
+        target.execute("PRAGMA synchronous=OFF")
+        source.backup(target)
+    with open(path, "r+b") as f:
+        if f.read(20)[18:20] == b"\x02\x02":
+            f.seek(18)
+            f.write(b"\x01\x01")
+    return path
+
+
+def file_digest(path):
+    """(the size, the SHA-256) of the file at `path`, read in pieces of COPY_PIECE: never whole in memory."""
+    digest, size = hashlib.sha256(), 0
+    with open(path, "rb") as f:
+        for piece in iter(lambda: f.read(COPY_PIECE), b""):
+            digest.update(piece)
+            size += len(piece)
+    return size, digest.hexdigest()
 
 
 @contextlib.contextmanager
-def image_opened(image):
-    """A connection to the database image `image` (bytes) with the header of rollback mode (rollback_header), closed
-    at the end: in memory with Connection.deserialize, and without it (Python 3.10) from a file of a new folder of
-    mode 700, opened read-only and removed at the end. It reads the image and nothing else."""
-    image = rollback_header(image)
-    if SQLITE_IMAGES:
-        conn = sqlite3.connect(":memory:")
-        try:
-            conn.deserialize(image)
-            yield conn
-        finally:
-            conn.close()
-        return
-    import shutil
-    import tempfile
-    folder = tempfile.mkdtemp(prefix="founderizer-records-")
+def records_opened(path):
+    """A connection to the database file at `path` that reads it and nothing else, closed at the end: read-only and
+    immutable, so SQLite writes no journal, no WAL and no shared memory file beside it and takes no lock, also for a
+    file with the header of WAL mode (a hub's records file put in a zip by hand, or the copy of a hub that wrote that
+    header), which a plain read-only open refuses, or opens with a WAL beside it."""
+    # "file://" and an empty authority: a path that begins with "//" stays a path
+    conn = sqlite3.connect(f"file://{urllib.parse.quote(os.path.abspath(path))}?mode=ro&immutable=1", uri=True)
     try:
-        path = os.path.join(folder, "pilot.db")
-        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
-            f.write(image)
-        # "file://" and an empty authority: a path that begins with "//" stays a path
-        conn = sqlite3.connect(f"file://{urllib.parse.quote(os.path.abspath(path))}?mode=ro", uri=True)
-        try:
-            yield conn
-        finally:
-            conn.close()
+        yield conn
     finally:
-        shutil.rmtree(folder, ignore_errors=True)
+        conn.close()
 
 
-def backup_read(central=None):
+def backup_read(folder, central=None):
     """What a copy of this fleet reads from the hub, at one moment: the records, the owner's configuration and the
-    facts of the manifest. Call it under LOCK; nothing is written on the hub machine but, on Python 3.10, the passing
-    file of records_image. central: what central_backup() gave, asked before LOCK was taken, because the central
-    vault's socket is never asked under it; without it, the copy says that the central vault was not asked. What it
-    returns is for backup_packed, which needs no lock."""
+    facts of the manifest. Call it under LOCK. Where DB has a read connection (records_pinned), that connection holds
+    the records' moment and backup_packed writes them from it with LOCK free, so LOCK is held for the moment and the
+    configuration only; else the records are written into `folder` here (records_file). central: what
+    central_backup() gave, asked before LOCK was taken, because the central vault's socket is never asked under it;
+    without it, the copy says that the central vault was not asked. What it returns is for backup_packed, which needs
+    no lock, and which ends the read connection's moment."""
     export, entry = central or (None, {"in": None, "vault": False, "why": "the central vault was not asked for this "
                                                                           "copy"})
     fleet = fleet_id()          # before the records are read: it is made on first use, and the copy needs it in
-    records = rollback_header(records_image())  # the records themselves: a restore reads them, not the manifest
-    config = owner_files()
-    facts = {"format": BACKUP_FORMAT, "made_at": now(), "fleet_id": fleet, "db_id": kv_get("db_id"),
-             "revision": kit_revision(), "agents": sorted(agents()),
-             # a copy: backup_packed writes these facts with no lock, and this one is TEAM's own object
-             "hub": json.loads(json.dumps(TEAM.get("hub"))),
-             "vault": vault_holders(),
-             # What this hub had on its own disk and this copy has not, in counts only: RESTORE.md turns it
-             # into the paragraph that names what stops working. Never a value (hub_only_files).
-             "hub_only": hub_only_files(),
-             # What the last six-hourly check said about these records. A copy of a corrupt database is worth
-             # taking and is not worth trusting, and a restore refuses one, so the copy says which it is.
-             "integrity": kv_get("integrity"),
-             # Owner feature central_vault: whether this copy carries the central vault's sealed store, and if
-             # not, why, in one line (central_backup). Public keys and a count, never a value.
-             "central_vault": entry}
-    return export, records, config, facts
+    pinned = records_pinned()
+    try:
+        # the records themselves: a restore reads them, not the manifest
+        records = os.path.join(folder, COPY_RECORDS) if pinned else records_file(DB, folder)
+        config = owner_files()
+        facts = {"format": BACKUP_FORMAT, "made_at": now(), "fleet_id": fleet, "db_id": kv_get("db_id"),
+                 "revision": kit_revision(), "agents": sorted(agents()),
+                 # a copy: backup_packed writes these facts with no lock, and this one is TEAM's own object
+                 "hub": json.loads(json.dumps(TEAM.get("hub"))),
+                 "vault": vault_holders(),
+                 # What this hub had on its own disk and this copy has not, in counts only: RESTORE.md turns it
+                 # into the paragraph that names what stops working. Never a value (hub_only_files).
+                 "hub_only": hub_only_files(),
+                 # What the last six-hourly check said about these records. A copy of a corrupt database is worth
+                 # taking and is not worth trusting, and a restore refuses one, so the copy says which it is.
+                 "integrity": kv_get("integrity"),
+                 # Owner feature central_vault: whether this copy carries the central vault's sealed store, and if
+                 # not, why, in one line (central_backup). Public keys and a count, never a value.
+                 "central_vault": entry}
+    except BaseException:
+        records_let_go(pinned)
+        raise
+    return export, (records, pinned), config, facts
 
 
-def backup_packed(read):
-    """(the zip, its manifest) from what backup_read gave: the SHA-256 of each file, RESTORE.md and the compression.
-    It reads nothing of the hub, neither its records nor its files, so it runs with LOCK free: for 358 MB of records
-    the sums and the compression took 7.4 seconds, and with the lock held the hub answered nobody in that time
-    (measured on 17 November 2026)."""
-    import io
+def backup_packed(read, folder):
+    """(the zip's path, its manifest) in `folder`, from what backup_read gave: the records' file where a read
+    connection holds their moment, the SHA-256 of each file, RESTORE.md and the compression. It reads nothing of the
+    hub but from that read connection, so it runs with LOCK free: for 358 MB of records the sums and the compression
+    took 7.4 seconds, and with the lock held the hub answered nobody in that time (measured on 17 November 2026).
+
+    The records are summed and packed in pieces of COPY_PIECE, and their file goes as soon as the zip holds them, so
+    the hub's memory holds no copy (the analysis of the owner's question "why is there a backup limit?", 22 November
+    2026), and its disk holds the records' file and the zip for a moment, which copy_fits counted. The zip is new
+    (O_EXCL, O_NOFOLLOW, mode 600) and has no Zip64: a copy that would need it is refused (copy_over_format)."""
     import zipfile
-    export, records, config, facts = read
+    export, (records, pinned), config, facts = read
+    if pinned is not None:
+        try:
+            records_file(pinned[0], folder)
+        finally:
+            records_let_go(pinned)
     member = json.dumps(export, indent=2, sort_keys=True).encode() if export else None
+    size, digest = file_digest(records)
     manifest = dict(facts,
-                    files={BACKUP_DB: {"bytes": len(records), "sha256": hashlib.sha256(records).hexdigest()},
+                    files={BACKUP_DB: {"bytes": size, "sha256": digest},
                            **{BACKUP_CONFIG + path: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                               for path, data in config.items()},
                            **({CENTRAL_MEMBER: {"bytes": len(member), "sha256": hashlib.sha256(member).hexdigest()}}
                               if member else {})})
     notes = restore_notes(manifest).encode()
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, data in [(BACKUP_MANIFEST, json.dumps(manifest, indent=2, sort_keys=True).encode()),
-                           ("RESTORE.md", notes), (BACKUP_DB, records),
-                           *((BACKUP_CONFIG + path, data) for path, data in config.items()),
-                           *([(CENTRAL_MEMBER, member)] if member else [])]:
-            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))   # the copy of one hour ago, byte for byte
-            info.compress_type = zipfile.ZIP_DEFLATED
-            zf.writestr(info, data)
-    return buffer.getvalue(), manifest
+    packed = os.path.join(folder, COPY_ZIP)
+    with os.fdopen(os.open(packed, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "w+b") as out:
+        try:
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, allowZip64=False) as zf:
+                for name, data in [(BACKUP_MANIFEST, manifest_bytes(manifest)), ("RESTORE.md", notes),
+                                   (BACKUP_DB, None), *((BACKUP_CONFIG + path, data) for path, data in config.items()),
+                                   *([(CENTRAL_MEMBER, member)] if member else [])]:
+                    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))   # the copy of an hour ago, byte for byte
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    if data is not None:
+                        zf.writestr(info, data)
+                        continue
+                    with open(records, "rb") as source, zf.open(info, "w") as entry:
+                        for piece in iter(lambda: source.read(COPY_PIECE), b""):
+                            entry.write(piece)
+        # zipfile's two errors of a size that needs Zip64 with allowZip64 off: a member that packs to more than
+        # ZIP64_LIMIT (RuntimeError, from records that do not pack), and a directory past it (LargeZipFile)
+        except (zipfile.LargeZipFile, RuntimeError):
+            raise Refusal(413, code="copy_over_format") from None
+    os.remove(records)
+    return packed, manifest
 
 
-def backup_bundle(central=None):
-    """One copy of this fleet for the owner's own machine, as a zip: the database, the owner's configuration, a
-    manifest and RESTORE.md, and the central vault's sealed store when it gave one. Call it under LOCK, as
-    backup_read, whose arguments it takes. A caller that serves others meanwhile holds LOCK for backup_read only
-    (ui_backup)."""
-    return backup_packed(backup_read(central))
+def manifest_bytes(manifest):
+    """fleet.json, as a copy carries it."""
+    return json.dumps(manifest, indent=2, sort_keys=True).encode()
 
 
-def read_bundle(data):
-    """A copy, read and checked: {manifest, records, config, central}. It refuses anything it cannot stand behind,
-    because what comes next replaces a fleet. Nothing here trusts a name or a size in the zip: every member is read
-    and its SHA-256 is compared with the manifest's. central is the central vault's sealed store (CENTRAL_MEMBER) as
-    the copy carries it, or None: it is never a file a restore writes, and the hub never opens it."""
-    import io
+def copy_over_restore(path, manifest):
+    """The words of the first limit of a restore (read_bundle) that the copy at `path` with this manifest passes, or
+    None. Each copy that the hub serves is one that a restore takes, on the Mac app and on the hub (ui_backup's 413).
+    Records of a raw image with secure_delete and no VACUUM pack 8:1 to 30:1, so a fleet can state more than
+    RESTORE_UNPACK in a small copy, and its copy would be refused only at the restore, when the old machine is gone. The
+    zip is read from its end and its central directory alone (zip_file_shape)."""
+    files = sum(entry["bytes"] for entry in manifest["files"].values())
+    if files > RESTORE_UNPACK:
+        return (f"the copy holds {-(-files // MIB):,} MiB of files, and a restore unpacks at most "
+                f"{RESTORE_UNPACK // MIB:,} MiB")
+    with open(path, "rb") as f:
+        entries, directory = zip_file_shape(f)
+    if entries > BACKUP_ENTRIES_MAX:
+        return f"the copy holds more than {BACKUP_ENTRIES_MAX:,} files, and a restore takes at most {BACKUP_ENTRIES_MAX:,}"
+    if directory > BACKUP_DIRECTORY_MAX:
+        return (f"the copy's list of files is larger than {BACKUP_DIRECTORY_MAX // MIB} MiB, and a restore reads at "
+                f"most {BACKUP_DIRECTORY_MAX // MIB} MiB")
+    if len(manifest_bytes(manifest)) > BACKUP_MANIFEST_MAX:
+        return (f"the copy's {BACKUP_MANIFEST} is larger than {BACKUP_MANIFEST_MAX // MIB} MiB, and a restore reads "
+                f"at most {BACKUP_MANIFEST_MAX // MIB} MiB")
+    return None
+
+
+def backup_bundle(folder, central=None):
+    """One copy of this fleet into `folder`, for a caller that holds LOCK for all of it: (the zip's path, its
+    manifest), with the arguments of backup_read. ui_backup holds LOCK for backup_read only."""
+    return backup_packed(backup_read(folder, central), folder)
+
+
+def read_bundle(path, records_into):
+    """The copy at `path`, read and checked: {manifest, records, records_bytes, config, central}. It refuses anything it
+    cannot stand behind, because what comes next replaces a fleet. Nothing here trusts a name or a size in the zip:
+    every member is read and its SHA-256 is compared with the manifest's. records is `records_into`, the file into
+    which the records were unpacked in pieces, with a running SHA-256 and no further than the size that the manifest
+    states and one byte, so no copy is whole in the hub's memory (the analysis of the owner's question "why is there a
+    backup limit?", 22 November 2026). A refusal removes that file. central is the central vault's sealed store
+    (CENTRAL_MEMBER) as the copy carries it, or None: it is never a file a restore writes, and the hub never opens it.
+
+    The configuration members are read into memory, each no further than its stated size and one byte: together with
+    the records they stay inside RESTORE_UNPACK and inside the room on the disk (restore_room)."""
+    try:
+        return bundle_read(path, records_into)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(records_into)
+        raise
+
+
+def bundle_read(path, records_into):
+    """read_bundle's work, which leaves the records' file to read_bundle on a refusal."""
     import zipfile
-    # before zipfile opens the copy, whose constructor holds some 500 bytes for each entry
-    if zip_entries(data) > BACKUP_ENTRIES_MAX or zip_directory_bytes(data) > BACKUP_DIRECTORY_MAX:
-        raise Refusal(422, "this file is not a copy of a fleet")
     with contextlib.ExitStack() as stack:
         try:
-            zf = stack.enter_context(zipfile.ZipFile(io.BytesIO(data)))
+            f = stack.enter_context(open(path, "rb"))
+            # before zipfile opens the copy, whose constructor holds some 500 bytes for each entry
+            entries, directory = zip_file_shape(f)
+            if entries > BACKUP_ENTRIES_MAX or directory > BACKUP_DIRECTORY_MAX:
+                raise Refusal(422, "this file is not a copy of a fleet")
+            f.seek(0)
+            zf = stack.enter_context(zipfile.ZipFile(f))
             names = set(zf.namelist())
             if BACKUP_MANIFEST not in names:
                 raise Refusal(422, f"this file carries no {BACKUP_MANIFEST}, so it is not a copy of a fleet")
@@ -75528,14 +75750,15 @@ def read_bundle(data):
         if not isinstance(listed, dict) or BACKUP_DB not in listed:
             raise Refusal(422, f"this copy does not list its own {BACKUP_DB}")
         # The sizes that the manifest states are the copy's own word: a copy of 65,523 bytes that stated 64 MiB of
-        # records made the hub unpack them and held 128 MiB. Together they stay inside RESTORE_UNPACK, so each read
-        # below, of its stated size and one byte, is inside it too.
+        # records made the hub unpack them and held 128 MiB. Together they stay inside RESTORE_UNPACK and inside the
+        # room on the disk of the records, so each read below, of its stated size and one byte, is inside them too.
         stated = {name: says["bytes"] if isinstance(says, dict) and type(says.get("bytes")) is int else 0
                   for name, says in listed.items()}
         files = sum(max(0, size) for size in stated.values())
         if files > RESTORE_UNPACK:
             raise Refusal(422, f"this copy states {-(-files // MIB):,} MiB of files; a restore unpacks at most "
                                f"{RESTORE_UNPACK // MIB:,} MiB")
+        restore_room(os.path.dirname(os.path.abspath(records_into)), files)
         read = {}
         for name, says in listed.items():
             if name not in (BACKUP_DB, CENTRAL_MEMBER) and not (name.startswith(BACKUP_CONFIG) and
@@ -75546,16 +75769,23 @@ def read_bundle(data):
             # at most the bytes that the manifest states, and one more: a deflate entry is unpacked only that far. A
             # file that does not unpack (a wrong CRC-32) is no copy, nor one whose local name says that it is UTF-8 and
             # is not: zipfile's open raises UnicodeDecodeError (a copy of 286 bytes)
+            most = max(0, stated[name])
             try:
                 with zf.open(name) as entry:
-                    read[name] = entry.read(max(0, stated[name]) + 1)
+                    if name == BACKUP_DB:
+                        size, digest = records_unpacked(entry, records_into, most)
+                    else:
+                        read[name] = entry.read(most + 1)
+                        size, digest = len(read[name]), hashlib.sha256(read[name]).hexdigest()
             except (zipfile.BadZipFile, zlib.error, EOFError, ValueError):
                 raise Refusal(422, "this file is not a copy of a fleet") from None
-            if not isinstance(says, dict) or hashlib.sha256(read[name]).hexdigest() != says.get("sha256"):
+            if not isinstance(says, dict) or digest != says.get("sha256"):
                 raise Refusal(422, f"{name} in this copy is not the file its own manifest describes")
-    records, central = read.pop(BACKUP_DB), read.pop(CENTRAL_MEMBER, None)
+            if name == BACKUP_DB:
+                records_bytes = size
+    central = read.pop(CENTRAL_MEMBER, None)
     try:
-        with image_opened(records) as check:
+        with records_opened(records_into) as check:
             bad = [str(r[0]) for r in check.execute("PRAGMA quick_check")]
             if bad != ["ok"]:
                 raise Refusal(422, "the records in this copy do not pass SQLite's own check: " + "; ".join(bad[:3]))
@@ -75565,8 +75795,39 @@ def read_bundle(data):
             manifest["fleet_id"] = row[0]
     except sqlite3.Error as e:
         raise Refusal(422, f"the records in this copy cannot be opened: {e}") from None
-    return {"manifest": manifest, "records": records, "central": central,
+    return {"manifest": manifest, "records": records_into, "records_bytes": records_bytes, "central": central,
             "config": {name[len(BACKUP_CONFIG):]: data for name, data in read.items()}}
+
+
+def records_unpacked(entry, into, most):
+    """(the size, the SHA-256) of the records member `entry` of a copy, unpacked into the file `into` in pieces of
+    COPY_PIECE, no further than `most` bytes and one, and on the disk (fsync) before this returns. The file is made
+    anew (O_TRUNC, O_NOFOLLOW, mode 600): the staged copy is beside the records, under their name (stage_restore)."""
+    digest, size = hashlib.sha256(), 0
+    with os.fdopen(os.open(into, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), "wb") as out:
+        while size <= most:
+            piece = entry.read(min(COPY_PIECE, most + 1 - size))
+            if not piece:
+                break
+            digest.update(piece)
+            out.write(piece)
+            size += len(piece)
+        out.flush()
+        os.fsync(out.fileno())
+    return size, digest.hexdigest()
+
+
+def restore_room(folder, need):
+    """A Refusal (507, restore_no_room) when the disk of `folder` has less room than `need` bytes and COPY_RESERVE,
+    which stays free because a full disk stops the hub itself; the sizes as the Mac app writes a size, the need with that
+    reserve in it. Not DISK_LOW: yesterday's copy went back onto a hub that had room for its records and less than 2 GiB
+    besides (the validator's finding 2 of piece 3, 22 November 2026). A disk whose room the system does not say is not
+    refused. ui_restore asks it for the body before it reads a byte of it, and read_bundle for the files that the copy
+    states before it unpacks one."""
+    free, need = disk_room(folder), need + COPY_RESERVE
+    if free is not None and free < need:
+        raise Refusal(507, code="restore_no_room", names={"free": size_words(free, "down"),
+                                                          "need": size_words(need, "up")})
 
 
 def fleet_has_records():
@@ -75771,15 +76032,41 @@ def restored_own(db_path):
     return said
 
 
-def stage_restore(data, db_path, commit, replace=False):
-    """Put a copy back: the owner's configuration onto the configuration ref now, and the records beside the
-    database for the next start to take (take_restore).
+def restore_settled(request_id, asked, client, replace):
+    """The answer of POST /ui/restore that comes before its staging, as (status, body), or None (ui_restore, under
+    kit_lock): the first answer again for the same request_id from the same client with the same copy; 409 for that
+    UUID with another client or another copy; 409 for a hub that holds a fleet's work, unless replace=yes."""
+    old = q1("SELECT * FROM ui_controls WHERE request_id=?", (request_id,))
+    if old:
+        if (old["route"], old["body"], old["client"]) != ("restore", asked, client):
+            return 409, refusal_words.answer("command_reused")
+        return 200, dict(json.loads(old["result"]), replayed=True)
+    if fleet_has_records() and not replace:
+        return 409, {"error": "This hub already holds a fleet's work. A restore is for a new server."}  # replace=yes
+    return None
+
+
+def stage_restore(path, db_path, commit, replace=False):
+    """Put the copy at `path` back: the owner's configuration onto the configuration ref now, and the records beside
+    the database for the next start to take (take_restore).
 
     The records cannot be swapped under a running hub, so this is the two-step: the file is written next to the
-    database and the start that follows moves it into place. The configuration goes first, through the same path
-    that every owner write uses, so a checkout that is not in order refuses the whole restore before anything has
-    been staged."""
-    bundle = read_bundle(data)
+    database and the start that follows moves it into place. read_bundle unpacks them into `<database>.restore.part`
+    and checks them there, before anything else is written; then the configuration goes, through the same path that
+    every owner write uses, so a checkout that is not in order refuses the whole restore before the records have their
+    name. Each refusal removes the part file."""
+    part = db_path + RESTORE_SUFFIX + ".part"
+    bundle = read_bundle(path, part)
+    try:
+        return bundle_staged(bundle, db_path, commit, replace)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(part)
+        raise
+
+
+def bundle_staged(bundle, db_path, commit, replace):
+    """stage_restore's work after read_bundle, which leaves the part file to stage_restore on a refusal."""
     files, reset = dict(bundle["config"]), []
     files["team.json"] = restored_team(bundle, reset)
     # Before anything is written: this machine's own records of its server, for the start (restored_own). Records
@@ -75799,15 +76086,11 @@ def stage_restore(data, db_path, commit, replace=False):
     if changed or gone:
         first = "team.json" if "team.json" in changed else written[0]
         commit(first, changed.pop(first), "Owner restored this fleet from a copy", dict(changed, **gone))
-    # Written to one side and moved into place, so `<database>.restore` exists only when the whole copy is on the
-    # disk: the next start replaces the records with whatever is under that name, and a hub that died halfway
-    # through this write must not leave it half a database to take.
-    staged, part = db_path + RESTORE_SUFFIX, db_path + RESTORE_SUFFIX + ".part"
-    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(bundle["records"])
-        f.flush()
-        os.fsync(f.fileno())
+    # The records were unpacked to one side (read_bundle, which syncs them to the disk) and are moved into place, so
+    # `<database>.restore` exists only when the whole copy is on the disk: the next start replaces the records with
+    # whatever is under that name, and a hub that died halfway through this write must not leave it half a database
+    # to take.
+    staged, part = db_path + RESTORE_SUFFIX, bundle["records"]
     with open(db_path + RESTORE_SUFFIX + ".json", "w", encoding="utf-8") as f:
         json.dump({"fleet_id": bundle["manifest"]["fleet_id"], "made_at": bundle["manifest"].get("made_at"),
                    "keep_replaced": bool(replace), "asked_at": now()}, f)
@@ -75823,7 +76106,7 @@ def stage_restore(data, db_path, commit, replace=False):
     os.replace(db_path + OWN_SUFFIX + ".part", db_path + OWN_SUFFIX)
     os.replace(part, staged)
     return {"fleet_id": bundle["manifest"]["fleet_id"], "made_at": bundle["manifest"].get("made_at"),
-            "records_bytes": len(bundle["records"]), "files": sorted(files), "changed": written,
+            "records_bytes": bundle["records_bytes"], "files": sorted(files), "changed": written,
             "removed": sorted(gone), "keep_replaced": bool(replace)}
 
 
@@ -75902,9 +76185,10 @@ def restore_by_hand(path, db_path):
     It opens the database only to read what the staging needs, and it keeps whatever is already there, because a
     person at a console is not the ordinary path and is not the place to decide that records may go."""
     global DB
+    path = os.path.expanduser(path)
     try:
-        with open(os.path.expanduser(path), "rb") as f:
-            data = f.read()
+        with open(path, "rb"):          # read in pieces by read_bundle, never whole
+            pass
     except OSError as e:
         print(f"That copy could not be read: {e}", flush=True)
         return 1
@@ -75912,7 +76196,7 @@ def restore_by_hand(path, db_path):
     DB.row_factory = sqlite3.Row
     build_schema()
     try:
-        staged = stage_restore(data, db_path, commit_kit_file, replace=fleet_has_records())
+        staged = stage_restore(path, db_path, commit_kit_file, replace=fleet_has_records())
     except Refusal as e:
         print(f"That copy was not put back: {e}", flush=True)
         return 1
@@ -78182,6 +78466,9 @@ def start_release_work(applying, automatic=False, fetch=None, take=False):
             if not idle:
                 raise Refusal(409, "this fleet is working, and an update waits until no turn runs: "
                                    + (", ".join(tref(t) for t in busy[:6]) if busy else "a check runs now"))
+            going = copies_going()
+            if going:
+                raise Refusal(409, code="update_waits_for_copy", names={"copy": ", ".join(going)})
         thread = threading.Thread(target=release_work, name="release-update", daemon=True,
                                   args=(applying, automatic, fetch, take))
         _release["thread"], _release["applying"] = thread, bool(applying)       # before start: see release_applying
@@ -78244,6 +78531,8 @@ def release_work(applying, automatic=False, fetch=None, take=False):
                     release_probe(row)                  # its run could not reach the network: the probe first
                 return                                  # else its runs failed here: it rests at this poll
             idle, busy = fleet_idle()
+            going = copies_going()          # a copy on its way holds the update as a turn does (copies_going)
+            idle = idle and not going
             fresh = automatic and (row["state"] == "verified" or again is True)    # taken as a new release
             probed = again is True and release_unreached(row)       # a run that a passed probe starts
             bundled = release_unreached(row) and release_bundled(row)   # or the second route took its commit (W12)
@@ -78252,8 +78541,8 @@ def release_work(applying, automatic=False, fetch=None, take=False):
                     kv_set("release_waits", None)
                     return
                 finish_release(row["id"], releases.KEPT, "hold", "this fleet started working before the update "
-                               "did: " + (", ".join(tref(t) for t in busy[:6]) or "a check runs now"), automatic,
-                               cause="busy")
+                               "did: " + (", ".join([tref(t) for t in busy[:6]] + going) or "a check runs now"),
+                               automatic, cause="busy")
                 return
             # W2: under the memory that a release's checks need, with free swap, no automatic run starts. A run that
             # did not fit ended after 300 s of a server that swapped, and the hub answered nothing meanwhile (15
@@ -78298,7 +78587,7 @@ def release_work(applying, automatic=False, fetch=None, take=False):
         import shutil
         import tempfile
         # The copy the released code's schema is checked against. It is a copy that this hub writes on its own
-        # machine (on Python 3.10 the owner's copy and its restore pass through one too: records_image, image_opened),
+        # machine (the owner's copy and its restore pass through files too: copy_folder),
         # it is in a folder of mode 700, and it is gone before this function returns — which is what the
         # owner's rule about copies on hosts asks of work like this. VACUUM INTO and not DB.serialize(), because
         # it streams page by page: a grown database must not be held in memory to make an update safe.
@@ -78536,6 +78825,66 @@ def pieces_written(folder=None, run=None):
     print(f"WARNING: hub.py was not compiled in pieces before the restart ({says}). The start after it compiles the "
           f"whole file.", flush=True)
     return says
+
+
+# **A copy of the fleet on its way holds an update back as a turn that runs does** (the hub-side second reader's note 3
+# and its round 2, 22 November 2026). A restart in place waits DRAIN_MOST seconds for an open request and then cuts it,
+# a copy of 2 GB goes out or comes back in minutes on a home line, and his hub restarted 20 to 36 times a day. So each
+# place that starts an update (start_release_work, release_work, the sweep's first moment with no turn) and the Teams
+# restart (teams_restart) counts the copies on their way (copies_going): a copy that is made and sent (ui_backup), a
+# copy that comes back (ui_restore) and the body of a refused restore that is read and dropped (refused_unread). The
+# gate waits, and not the restart: a restart that waited after its release run had ended let held tasks start, and
+# then cut their turns (round 2, R2-1). A copy bounds itself, because its send and its read end after COPY_IDLE seconds
+# of silence, but a thread that is stuck in the copy's code could hold every release for ever: so a copy holds no
+# update once RESTART_COPY_MOST seconds passed with no piece of it moved (copy_moved). A copy that moves holds the
+# updates for as long as it moves, also a restore of 2 GB on a home uplink of 2 Mbit/s, some 2.3 hours (round 3, R3-4).
+# Two known limits. A fresh automatic release that meets a copy waits as for a turn that runs (release_wait), and
+# holds the fleet's new sessions meanwhile, for up to RELEASE_POLL (15 minutes) or until the copy ends and the sweep
+# takes the release; a copy of 2 GB on a slow line holds them the whole 15 minutes (round 3, R3-3). And a copy that
+# starts inside a release run's own minute, after its gate, is still cut at that release's restart, as before F14: by
+# his numbers about one daily copy in 40 to 160 days, and the app takes the next one an hour later.
+RESTART_COPY_MOST = 3600
+COPIES = {}                 # each copy on its way: a key of its own → [what it is, time.monotonic() it last moved]
+COPIES_LOCK = threading.Lock()
+COPY_MARK = threading.local()   # the key of the copy that this thread moves now (copy_moved)
+
+
+def copy_clock():
+    """The clock of the copies' marks: time.monotonic(), which a test sets in its place."""
+    return time.monotonic()
+
+
+@contextlib.contextmanager
+def copy_going(what):
+    """The mark of one copy on its way (copies_going): `what` says it in the owner's words. Its time is its start, and
+    then the time of each piece of it that moves (copy_moved)."""
+    key, outer = object(), getattr(COPY_MARK, "key", None)
+    with COPIES_LOCK:
+        COPIES[key] = [what, copy_clock()]
+    COPY_MARK.key = key
+    try:
+        yield
+    finally:
+        COPY_MARK.key = outer
+        with COPIES_LOCK:
+            COPIES.pop(key, None)
+
+
+def copy_moved():
+    """A piece of the copy that this thread moves went now (send_file, body_to, body_dropped): its mark's time moves."""
+    key = getattr(COPY_MARK, "key", None)
+    if key is not None:
+        with COPIES_LOCK:
+            if key in COPIES:
+                COPIES[key][1] = copy_clock()
+
+
+def copies_going():
+    """What holds an update back now that is no turn: the copies of the fleet on their way (copy_going) of which a piece
+    moved less than RESTART_COPY_MOST seconds ago, in the owner's words, each once."""
+    t = copy_clock()
+    with COPIES_LOCK:
+        return sorted({what for what, moved in COPIES.values() if t - moved < RESTART_COPY_MOST})
 
 
 def restart_hub_soon(pinned, reached, always=False):
@@ -79317,7 +79666,7 @@ def release_sweep(t0):
         if release_waiting():
             kv_set("release_waits", None)       # plan P0: nothing waits while the owner turned it off, or on a hub
         return                                  # that takes no release by itself (a test's or a scratch hub)
-    if release_waiting() and not release_running() and fleet_idle()[0]:
+    if release_waiting() and not release_running() and fleet_idle()[0] and not copies_going():
         try:
             start_release_work(True, automatic=True)        # plan P0: the first moment no turn runs takes it
         except Refusal:
@@ -79554,7 +79903,7 @@ def teams_restart(sha256):
     `sha256`, which passed its check in this process, when no turn runs, no check or update of a release runs and no
     restart is under way; and its record (teams_once), written first, so that it is one time for that package. True
     when it asked for the restart. A signed word that ended the licence during the check ends it here too."""
-    if not teams_up() or not fleet_idle()[0] or release_running() or teams_restarts():
+    if not teams_up() or not fleet_idle()[0] or copies_going() or release_running() or teams_restarts():
         return False
     teams_once_set(sha256)
     log("hub", f"the Teams code of the release that this hub runs ({sha256[:12]}) is on this server: the hub restarts "
@@ -82216,9 +82565,9 @@ class Handler(BaseHTTPRequestHandler):
 
         The bytes are the same as before. send_response() and send_header() put the head in the buffer of http.server,
         as always, and this adds the same blank line that end_headers() adds: none for a request of HTTP/0.9, which
-        gets no head. sendmsg gives the kernel the head and the body as one write, with no copy of the body (a backup
-        is up to 256 MiB). When the kernel takes only a part, the next call sends the rest. TCP_NODELAY also stops the
-        wait, but then each head leaves alone in a packet of its own."""
+        gets no head. sendmsg gives the kernel the head and the body as one write, with no copy of the body. When the
+        kernel takes only a part, the next call sends the rest. TCP_NODELAY also stops the wait, but then each head
+        leaves alone in a packet of its own. A body that is a file goes after its head in pieces (send_file)."""
         if self.request_version != "HTTP/0.9":
             self._headers_buffer.append(b"\r\n")
         parts = [memoryview(part) for part in (b"".join(getattr(self, "_headers_buffer", ())), body) if part]
@@ -82229,6 +82578,39 @@ class Handler(BaseHTTPRequestHandler):
                 sent -= parts.pop(0).nbytes
             if parts:
                 parts[0] = parts[0][sent:]
+
+    def send_file(self, code, path, size, ctype, headers=None):
+        """An answer whose body is the file at `path`, of `size` bytes, which the caller read: the head, then the file
+        from the disk to the socket in pieces (socket.sendfile), never whole in the hub's memory (a copy of the fleet,
+        ui_backup). A client that takes nothing for COPY_IDLE seconds, or that goes, ends the answer and its connection:
+        the main handler has no such time of its own, and the caller's files stay on the disk until it ends."""
+        self.answered = True
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.head_and_body_out(b"")
+        if self.command == "HEAD":
+            return
+        kept = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(COPY_IDLE)
+            with open(path, "rb") as f:
+                sent = 0
+                while sent < size:          # in pieces, so that each one moves the copy's mark (copy_moved)
+                    went = self.connection.sendfile(f, sent, min(COPY_SEND_PIECE, size - sent))
+                    if not went:
+                        break
+                    sent += went
+                    copy_moved()
+                if sent != size:
+                    self.close_connection = True        # a cut answer, never one that reads as whole
+        except OSError:
+            self.close_connection = True                # the client went, or took nothing for COPY_IDLE seconds
+        finally:
+            with contextlib.suppress(OSError):
+                self.connection.settimeout(kept)
 
     def json(self, code, obj, headers=None):
         """A JSON answer. A 200 of the owner API (/ui/...) with more than GZIP_MIN bytes goes gzip-compressed to a
@@ -84254,8 +84636,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def ui_backup(self, query):
         """One copy of this fleet for the owner's own machine: the records, the owner's own configuration, a
-        manifest and RESTORE.md, in one zip. Nothing is written on the hub machine but, on Python 3.10, the passing
-        file of records_image."""
+        manifest and RESTORE.md, in one zip. It is made in a passing folder beside the records (copy_folder), sent
+        from there in pieces, and the folder goes when the answer ends, also when the client went: no copy stays on
+        the hub's server, and none is whole in its memory. So its size is bounded by the room on that disk and by the
+        ZIP format of the Mac app (copy_fits), and not by a number of the hub's own."""
         if not self.ui_allowed():
             return
         generation = kv_get("db_id")
@@ -84264,45 +84648,36 @@ class Handler(BaseHTTPRequestHandler):
         if not backups_enabled():
             return self.json(403, {"error": "owner backups are turned off on this hub"})
         central = central_backup()          # owner feature central_vault: its socket is never asked under LOCK
-        # One copy in the making at a time. Each holds an image of the records and its zip in memory, and LOCK keeps
-        # a second request (the app and a tool, or a retry) waiting only while the first one reads. So the second
-        # waits here for the whole of the first, with LOCK free for everybody else.
-        with BACKUP_LOCK:
-            with LOCK:
-                read = backup_read(central)
-            data, manifest = backup_packed(read)    # the sums and the compression: seconds, so with LOCK free
-            del read                                # the records' image: not kept while the answer goes out
-        if len(data) > BACKUP_MAX:
-            return self.json(413, {"error": "the copy is larger than 256 MiB; take it on the hub's server"})
-        # Each copy that the hub serves is one that a restore takes (read_bundle), on the Mac app and on the hub.
-        # Records of a raw image with secure_delete and no VACUUM pack 8:1 to 30:1, so a fleet can state more than
-        # RESTORE_UNPACK inside BACKUP_MAX, and its copy would be refused only at the restore, when the old machine is
-        # gone. No command makes a copy on the hub's server that a restore takes, so these words name no way round.
-        import io
-        import zipfile
-        files = sum(entry["bytes"] for entry in manifest["files"].values())
-        for over, words in (
-                (files > RESTORE_UNPACK, f"the copy holds {-(-files // MIB):,} MiB of files, and a restore unpacks "
-                                         f"at most {RESTORE_UNPACK // MIB:,} MiB"),
-                (zip_entries(data) > BACKUP_ENTRIES_MAX, f"the copy holds more than {BACKUP_ENTRIES_MAX:,} files, and "
-                                                         f"a restore takes at most {BACKUP_ENTRIES_MAX:,}"),
-                (zip_directory_bytes(data) > BACKUP_DIRECTORY_MAX,
-                 f"the copy's list of files is larger than {BACKUP_DIRECTORY_MAX // MIB} MiB, and a restore reads at "
-                 f"most {BACKUP_DIRECTORY_MAX // MIB} MiB"),
-                (zipfile.ZipFile(io.BytesIO(data)).getinfo(BACKUP_MANIFEST).file_size > BACKUP_MANIFEST_MAX,
-                 f"the copy's {BACKUP_MANIFEST} is larger than {BACKUP_MANIFEST_MAX // MIB} MiB, and a restore reads "
-                 f"at most {BACKUP_MANIFEST_MAX // MIB} MiB")):
-            if over:
-                return self.json(413, {"error": words})
-        digest, t0 = hashlib.sha256(data).hexdigest(), now()
-        with LOCK:
-            kv_set("backup_served", json.dumps({"sha256": digest, "bytes": len(data), "at": t0}))
-            log("owner", f"took a copy of this fleet ({len(data)} bytes, {len(manifest['files'])} files)")
-        name = f"founderizer-{manifest['fleet_id']}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(t0))}.zip"
-        return self.send(200, data, "application/zip", headers={
-            "X-Fleet-DB": generation, "X-Fleet-Backup-SHA256": digest, "Cache-Control": "no-store",
-            "X-Fleet-Fleet-Id": manifest["fleet_id"], "X-Content-Type-Options": "nosniff",
-            "Content-Disposition": f'attachment; filename="{name}"'})
+        # One copy in the making and on its way out at a time: each holds its files on the hub's disk until its answer
+        # ends, and LOCK keeps a second request (the app and a tool, or a retry) waiting only while the first one
+        # reads. So the second waits here for the whole of the first, with LOCK free for everybody else.
+        with BACKUP_LOCK, copy_going("a copy goes to the owner's computer"):
+            folder = None
+            try:
+                with LOCK:
+                    copy_fits()             # before anything is written: the format's bound and the room on the disk
+                    folder = copy_folder()
+                    read = backup_read(folder, central)
+                path, manifest = backup_packed(read, folder)    # the records, the sums and the compression: LOCK free
+                del read
+                over = copy_over_restore(path, manifest)
+                if over:
+                    return self.json(413, {"error": over})
+                size, digest = file_digest(path)
+                t0 = now()
+                with LOCK:      # before the first byte goes out: a confirm names this copy only once it is whole
+                    kv_set("backup_served", json.dumps({"sha256": digest, "bytes": size, "at": t0}))
+                    log("owner", f"took a copy of this fleet ({size} bytes, {len(manifest['files'])} files)")
+                name = f"founderizer-{manifest['fleet_id']}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(t0))}.zip"
+                return self.send_file(200, path, size, "application/zip", headers={
+                    "X-Fleet-DB": generation, "X-Fleet-Backup-SHA256": digest, "Cache-Control": "no-store",
+                    "X-Fleet-Fleet-Id": manifest["fleet_id"], "X-Content-Type-Options": "nosniff",
+                    "Content-Disposition": f'attachment; filename="{name}"'})
+            except Refusal as e:
+                return self.json(e.status, refusal_body(e))
+            finally:
+                if folder is not None:
+                    shutil.rmtree(folder, ignore_errors=True)
 
     def ui_restore(self, query):
         """POST /ui/restore (owner API 1.5): the copy comes back. Its own request_id makes it idempotent, as an
@@ -84310,56 +84685,165 @@ class Handler(BaseHTTPRequestHandler):
 
         `replace=yes` is needed to put a copy over a hub that already holds work; without it this is refused, so
         the ordinary case — a new machine standing in for a dead one — cannot touch a working fleet by mistake.
-        The records the replacement puts aside are kept beside the database, because the owner asked for them."""
+        The records the replacement puts aside are kept beside the database, because the owner asked for them.
+
+        do_POST leaves the body unread. The owner's computer, the generation, the two headers and the room on the disk
+        are checked from the head, and only then is the body read: into a file of a passing folder beside the records
+        (copy_folder), in pieces, with a running SHA-256 and a time of silence (body_to), one upload at a time. A
+        refusal to a stranger ends the connection with no byte of its body read; one to the owner's computer goes after
+        its body was read and dropped, so that it reaches the app (refused_unread). The folder goes when the answer
+        ends; a start removes one that a killed hub left."""
+        self.close_connection = True        # its body is read here, after the checks, or never
         if not self.ui_allowed():
             return
         generation = kv_get("db_id")
         if query.get("db") != generation:
-            return self.json(409, refusal_words.answer("hub_changed_sending"))
+            return self.refused_unread(409, refusal_words.answer("hub_changed_sending"))
         if not backups_enabled():
-            return self.json(403, {"error": "owner backups are turned off on this hub"})
+            return self.refused_unread(403, {"error": "owner backups are turned off on this hub"})
         client = self.headers.get("X-Fleet-Client", "").strip()
         if not client or len(client) > 128:
-            return self.json(400, {"error": "X-Fleet-Client is required (at most 128 characters)"})
+            return self.refused_unread(400, {"error": "X-Fleet-Client is required (at most 128 characters)"})
         request_id = str(self.headers.get("X-Fleet-Request-Id", "")).strip().lower()
         try:
             if str(uuid.UUID(request_id)) != request_id:
                 raise ValueError()
         except (ValueError, AttributeError):
-            return self.json(400, {"error": "X-Fleet-Request-Id must be a UUID"})
-        data = self.body()
-        if not data or len(data) > BACKUP_MAX:
-            return self.json(413, {"error": f"a copy of 1 byte to {BACKUP_MAX // 1024 ** 2} MiB is expected"})
+            return self.refused_unread(400, {"error": "X-Fleet-Request-Id must be a UUID"})
+        n = int(self.headers.get("Content-Length") or 0)       # a whole number of 0 or more: do_POST read it
+        if n < 1:
+            return self.refused_unread(400, {"error": "the copy is the body of this request"})
+        try:
+            restore_room(records_folder(), n)
+        except Refusal as e:
+            return self.refused_unread(e.status, refusal_body(e))
         replace = query.get("replace") == "yes"
-        # The copy itself is the body of this command, so the record keeps its digest: the same UUID with another
-        # copy is a different command and is refused, as every other owner command's body is (ui_command).
-        asked = json.dumps({"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data), "replace": replace},
-                           sort_keys=True)
-        with kit_lock():                # it commits the copy's files, in the turn of the hub's writes (KIT)
-            old = q1("SELECT * FROM ui_controls WHERE request_id=?", (request_id,))
-            if old:
-                if (old["route"], old["body"], old["client"]) != ("restore", asked, client):
-                    return self.json(409, refusal_words.answer("command_reused"))
-                return self.json(200, dict(json.loads(old["result"]), replayed=True))
-            if fleet_has_records() and not replace:
-                return self.json(409, {"error": "This hub already holds a fleet's work. A restore is for a new "
-                                                "server."})      # the app's button replaces it (replace=yes)
+        with RESTORE_LOCK, copy_going("a copy comes back from the owner's computer"):
+            folder = copy_folder()
             try:
-                staged = stage_restore(data, CFG["db_path"], commit_kit_file, replace=replace)
-            except Refusal as e:
-                return self.json(e.status, refusal_body(e))
-            result = dict(staged, ok=True, restarting=bool(CFG.get("hub_restart", HUB_RESTART)))
-            session = (self.headers.get("X-Fleet-Session") or "").strip() or None
-            if session is not None and not OWNER_SESSION.fullmatch(session):
-                session = None          # the restore ran: its record keeps no session that is no name
-            q("INSERT INTO ui_controls(request_id,route,body,client,created,result,hand,session) "
-              "VALUES(?,?,?,?,?,?,?,?)", (request_id, "restore", asked, client, now(), json.dumps(result),
-                                          request_hand(client, owner_device_at(self.client_address[0]), None, None,
-                                                       session), session))
-            log("owner", f"restored fleet {staged['fleet_id']} from a copy ({staged['records_bytes']} bytes of "
-                         f"records, {len(staged['files'])} files)" + (" over this hub's own work" if replace else ""))
-            restart_hub_soon(None, None, always=True)
+                path = os.path.join(folder, COPY_ZIP)
+                digest = self.body_to(path, n)
+                if digest is None:
+                    return          # the client went, or sent nothing for COPY_IDLE seconds: no answer reaches it
+                self.close_connection = False
+                # The copy itself is the body of this command, so the record keeps its digest: the same UUID with
+                # another copy is a different command and is refused, as every other owner command's body is.
+                asked = json.dumps({"sha256": digest, "bytes": n, "replace": replace}, sort_keys=True)
+                with kit_lock():            # a replay and the two 409s before the unpack, which takes minutes
+                    early = restore_settled(request_id, asked, client, replace)
+                if early is not None:
+                    return self.json(*early)
+                # The unpack of up to 2 GiB, its fsync and SQLite's check of the records hold no LOCK: under kit_lock
+                # every route, the tick and each agent's call waited for them (the hub-side second reader's note 1, 22
+                # November 2026). They hold KIT, the turn of the writes of the fleet's files, from the unpack to the
+                # commit of the copy's files. A writer that takes its turn waits for all of it and lands after the
+                # restore, as before: an owner command that takes a turn, a tool of KIT_TOOLS, an agent's knowledge or
+                # skill, the files of a delivery, the page refresher (round 2, R2-4; round 3, R3-1). A writer that
+                # holds LOCK and not KIT does not wait (KIT's rule, commit_kit_file): the mark of a flight (FLIGHT,
+                # kit_flying) refuses its commit (KIT_BUSY_RESTORE) or makes it skip its pass to the next tick, so
+                # it writes nothing of the fleet's files until the copy's files are staged, and the copy goes over
+                # nothing. No path holds LOCK and then waits for KIT, so this waits for nobody in turn.
+                part = CFG["db_path"] + RESTORE_SUFFIX + ".part"
+                try:
+                    with KIT:
+                        with LOCK:
+                            FLIGHT["thread"], FLIGHT["restore"] = threading.get_ident(), True
+                        try:
+                            try:
+                                bundle = read_bundle(path, part)
+                            except Refusal as e:
+                                return self.json(e.status, refusal_body(e))
+                            with kit_lock():    # it commits the copy's files, in the turn of the hub's writes (KIT)
+                                # The flight ends only now that the staging holds LOCK: a tick's pass between the unpack
+                                # and this moment would commit, and the copy would go over it (the validator's H-3).
+                                FLIGHT["thread"], FLIGHT["restore"] = None, False
+                                early = restore_settled(request_id, asked, client, replace)   # records can have come
+                                if early is not None:
+                                    return self.json(*early)
+                                try:
+                                    staged = bundle_staged(bundle, CFG["db_path"], commit_kit_file, replace)
+                                except Refusal as e:
+                                    return self.json(e.status, refusal_body(e))
+                                result = dict(staged, ok=True, restarting=bool(CFG.get("hub_restart", HUB_RESTART)))
+                                session = (self.headers.get("X-Fleet-Session") or "").strip() or None
+                                if session is not None and not OWNER_SESSION.fullmatch(session):
+                                    session = None      # the restore ran: its record keeps no session that is no name
+                                q("INSERT INTO ui_controls(request_id,route,body,client,created,result,hand,session) "
+                                  "VALUES(?,?,?,?,?,?,?,?)",
+                                  (request_id, "restore", asked, client, now(), json.dumps(result),
+                                   request_hand(client, owner_device_at(self.client_address[0]), None, None, session),
+                                   session))
+                                log("owner", f"restored fleet {staged['fleet_id']} from a copy "
+                                             f"({staged['records_bytes']} bytes of records, {len(staged['files'])} "
+                                             f"files)" + (" over this hub's own work" if replace else ""))
+                                restart_hub_soon(None, None, always=True)
+                        finally:
+                            with LOCK:
+                                FLIGHT["thread"], FLIGHT["restore"] = None, False
+                finally:
+                    with contextlib.suppress(FileNotFoundError):    # staged: it has its name, and this finds none
+                        os.remove(part)
+            finally:
+                shutil.rmtree(folder, ignore_errors=True)
         return self.json(200, dict(result, replayed=False))
+
+    def body_to(self, path, n):
+        """The `n` bytes of this request's body into the new file `path` (O_EXCL, O_NOFOLLOW, mode 600), read in pieces
+        of COPY_PIECE, never whole in memory: their SHA-256, or None when the client went, or sent nothing for
+        COPY_IDLE seconds (the main handler has no such time of its own)."""
+        digest, kept = hashlib.sha256(), self.connection.gettimeout()
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as out:
+            try:
+                self.connection.settimeout(COPY_IDLE)
+                while n:
+                    try:
+                        piece = self.rfile.read(min(COPY_PIECE, n))
+                    except OSError:
+                        piece = b""
+                    if not piece:
+                        return None
+                    digest.update(piece)
+                    out.write(piece)
+                    n -= len(piece)
+                    copy_moved()
+            finally:
+                with contextlib.suppress(OSError):
+                    self.connection.settimeout(kept)
+        return digest.hexdigest()
+
+    def refused_unread(self, status, body):
+        """The answer to the owner's computer for a request whose body this hub has not read yet (ui_restore): first the
+        whole stated body is read and dropped (body_dropped), then the answer goes. A server that answers and ends the
+        connection while an upload still sends gives that upload a lost connection in URLSession in place of the
+        answer, and the Mac app then waits for a new generation and never shows the hub's words, or reads an old
+        generation's 409 as a restore that landed (the validator's finding 1 of piece 3, 22 November 2026): before this
+        route read its body from its head, the hub read every body before its answer. Only the owner's computer gets
+        here (each call stands after ui_allowed), so no stranger's byte is read; no byte is kept, in memory or on the
+        disk. A client that goes, or sends nothing for COPY_IDLE seconds, gets no answer."""
+        with copy_going("a copy comes back from the owner's computer"):     # its body: a restart waits for it
+            dropped = self.body_dropped(int(self.headers.get("Content-Length") or 0))
+        if dropped:
+            self.json(status, body)
+
+    def body_dropped(self, n):
+        """The `n` bytes of this request's body read in pieces of COPY_PIECE and dropped: True when all came, False when
+        the client went, or sent nothing for COPY_IDLE seconds."""
+        kept = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(COPY_IDLE)
+            while n:
+                try:
+                    piece = self.rfile.read(min(COPY_PIECE, n))
+                except OSError:
+                    piece = b""
+                if not piece:
+                    return False
+                n -= len(piece)
+                copy_moved()
+            return True
+        finally:
+            with contextlib.suppress(OSError):
+                self.connection.settimeout(kept)
 
     def ui_backup_confirm(self):
         """The app saved and checked the copy. Only the copy that the hub served last can be confirmed."""
@@ -87792,9 +88276,17 @@ class Handler(BaseHTTPRequestHandler):
             if n < 0:           # no length to read by: the caller's mistake, and not a fault of the hub
                 self.close_connection = True
                 return self.json(400, {"error": "Content-Length must be a whole number"})
-            if n > max(BACKUP_MAX, GOOGLE_UPLOAD_MAX, OUTPUTS_BODY_MAX, ATTACH_MAX):     # more than any route takes
+            # A copy of the fleet coming back: its body goes to a file in pieces after the route's own checks, and is
+            # never read here (ui_restore). By the route's own parts, as post() reads them.
+            if self.route()[0] == ["ui", "restore"]:
+                self._raw, self.close_connection = None, True      # until ui_restore has read the whole body
+                if not self.funnel_refused() and self.host_allowed() and self.origin_allowed():
+                    self.post()
+                return
+            if n > max(GOOGLE_UPLOAD_MAX, OUTPUTS_BODY_MAX, ATTACH_MAX):     # more than any route takes
                 self.close_connection = True
-                return self.json(413, {"error": f"a body is at most {BACKUP_MAX // MIB} MiB"})
+                return self.json(413, {"error": f"a body is at most "
+                                                f"{max(GOOGLE_UPLOAD_MAX, OUTPUTS_BODY_MAX, ATTACH_MAX) // MIB} MiB"})
             # by the route's own parts, as code() reads them: "/%63ode/..." is this route too
             if self.route()[0][:1] == ["code"] and not 0 <= n <= CODE_BODY_MAX:
                 self.close_connection = True
@@ -87815,9 +88307,6 @@ class Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/ui/attachments") and not 0 <= n <= ATTACH_MAX:
                 self.close_connection = True
                 return self.json(413, {"error": f"an attachment is at most {ATTACH_MAX // (1024 * 1024)} MiB"})
-            if self.path.startswith("/ui/restore") and not 0 <= n <= BACKUP_MAX:
-                self.close_connection = True
-                return self.json(413, {"error": f"a copy is at most {BACKUP_MAX // (1024 * 1024)} MiB"})
             if self.path.startswith("/google/file/") and not 0 <= n <= GOOGLE_UPLOAD_MAX:
                 self.close_connection = True
                 return self.send(413, "The file is larger than 50 MiB. It was not uploaded.\n", "text/plain; charset=utf-8")
@@ -91626,6 +92115,7 @@ def main():
     if unit_says:
         print("WARNING: " + unit_says, flush=True)
     hub_lock(db_path)           # before anything that takes the records as this process's own
+    copy_leftovers_gone(db_path)        # a copy's passing folder that a killed hub left: no copy stays on the host
     restored, restore_says = take_restore(db_path)      # the one moment a hub's records can be replaced
     DB = sqlite3.connect(db_path, check_same_thread=False)
     DB.row_factory = sqlite3.Row

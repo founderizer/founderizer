@@ -211,6 +211,13 @@ def hardening(run=None):
 # earlier release installed gets a change of its unit with no step of its owner's. One function for the installer
 # and for the hub, so that the two write one text where they read the same folder, program and home.
 HUB_UNIT = "fleet-hub.service"
+PORT_HOLDER = "/usr/local/lib/founderizer-ports/holder"     # ports.HOLDER: root's one command of the hub's ports
+PORT_SUDOERS = "/etc/sudoers.d/founderizer-ports"           # ports.SUDOERS: the line that lets the units run it
+# Before each start of the hub and of its git service: the holder, where root's step installed it (a server from before
+# it runs nothing, and sudo writes no "not in sudoers" line); "-": a fault goes on. The test is of the holder itself,
+# whose folder each user can read: /etc/sudoers.d is root's 0750 on Debian and Ubuntu, so a test of the sudoers file
+# as the hub's user is always false (the Door area's read of 24 November 2026).
+PORT_HOLD = (f'ExecStartPre=-/bin/sh -c "test -x {PORT_HOLDER} && exec /usr/bin/sudo -n {PORT_HOLDER}; exit 0"\n')
 
 
 def service_path(home):
@@ -266,9 +273,17 @@ def service_unit(name, argv, kit, path_env):
 
     The folder is written as it is, with a space as a space: systemd reads the whole rest of the line as the path
     and takes \x20 for four characters, so that a unit with it never started (measured on 16 November 2026; until
-    then this text wrote \x20). A percent sign is doubled, because systemd reads %h and its like in that line."""
+    then this text wrote \x20). A percent sign is doubled, because systemd reads %h and its like in that line.
+
+    The hub and the git service, before each start: root's one command of the hub's ports (ports.py, the holder),
+    with sudo, which ends another user's listener on 8765, 9418 and 8767 and writes one line for each port to the
+    journal (PORT_HOLD). The hub and git daemon stop when their port is taken, and the unit starts them again 5 seconds
+    later: that start then finds the port free, also after a crash, a restart and a start of the server (the Door
+    area's read of 24 November 2026). A server with no holder (an install from before it) runs nothing, and the start
+    goes on as before."""
     more = ("OOMPolicy=continue\n" if name == "hub" else "") + \
-        ("UMask=0077\n" if name == "channels" else "")      # the bridge's journal holds the text of messages
+        ("UMask=0077\n" if name == "channels" else "") + \
+        (PORT_HOLD if name in ("hub", "git") else "")
     return _unit(name, argv, kit.replace("%", "%%"), path_env, more)
 
 
@@ -292,7 +307,10 @@ def hub_units_before(kit, python, home):
 
     1. From 18 October 2026 until the release that brought the module form (16 November 2026): the hub by its
        path, and no OOMPolicy line. A folder with a space had \x20 there. (hub.sh of 17 and 18 October 2026 wrote
-       two texts before it, without StartLimitIntervalSec. No release carried them, and they are not here.)"""
+       two texts before it, without StartLimitIntervalSec. No release carried them, and they are not here.)
+    2. From 16 November 2026 until the release that brought the holder of the hub's ports (the port piece, November
+       2026): the module form and OOMPolicy=continue, and no ExecStartPre line. Its folder is a real path, written
+       with a space as a space."""
     def quote(x):
         return json.dumps(x.replace("%", "%%"))
     first = ("[Unit]\nDescription=Founderizer hub\nAfter=network-online.target\nStartLimitIntervalSec=0\n"
@@ -303,7 +321,15 @@ def hub_units_before(kit, python, home):
              "ExecStart=" + quote(python) + " " + quote(os.path.join(kit, "hub.py")) + "\n"
              "Restart=always\nRestartSec=5\nKillMode=process\nTimeoutStopSec=15\n"
              "[Install]\nWantedBy=default.target\n")
-    return [first]
+    second = ("[Unit]\nDescription=Founderizer hub\nAfter=network-online.target\nStartLimitIntervalSec=0\n"
+              "[Service]\nType=simple\nWorkingDirectory=" + kit.replace("%", "%%") + "\n"
+              "Environment=" + quote("PATH=" + os.pathsep.join([
+                  os.path.join(home, ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+                  "/usr/sbin", "/sbin"])) + "\n"
+              "ExecStart=" + quote(python) + " " + quote("-m") + " " + quote("hub") + "\n"
+              "Restart=always\nRestartSec=5\nKillMode=process\nTimeoutStopSec=15\nOOMPolicy=continue\n"
+              "[Install]\nWantedBy=default.target\n")
+    return [first, second]
 
 
 def unit_of_a_release(text, kit, python, home):

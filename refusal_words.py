@@ -193,6 +193,19 @@ WORDS = {
     # an invite asked by an AI session or a program (teams-design-4, section 6; decision D68 e): its line never reaches
     # a transcript
     "link_from_tool": "An invite is made in Founderizer on the Mac, never by an AI session or a program.",
+    # a copy of the fleet (GET /ui/backup): the hub's disk has no room for its passing files now, or its records need
+    # the fields of Zip64, which the Mac app does not read yet (the analysis of F14, 22 November 2026). The sizes are
+    # written as the Mac app writes a size ("1.2 GB")
+    "copy_no_room": "The hub's server has {free} free. A copy needs {need} there while the hub makes it.",
+    "copy_over_format": "This fleet's records are larger than 2 GB. Founderizer cannot put them into one copy yet.",
+    # a copy that comes back (POST /ui/restore): the hub's disk has no room for its body or for the files that it states.
+    # "at least": at the head the hub knows the body's length and not the records that the copy will unpack beside it
+    # (the hub-side second reader's note 2, 22 November 2026)
+    "restore_no_room": "The hub's server has {free} free. This copy needs at least {need} there.",
+    # the owner's Update press while a copy of the fleet is on its way (start_release_work): the update waits for it,
+    # and a fleet whose automatic updates are off takes it at his next press (the first validator, 22 November 2026)
+    "update_waits_for_copy": "A copy of this fleet is on its way ({copy}), and an update waits until it ends. When "
+                             "it is done, press Update again.",
 }
 
 

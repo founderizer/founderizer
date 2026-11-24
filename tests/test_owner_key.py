@@ -859,7 +859,7 @@ class Clients(WithKeyFolder):
             asked.append(host)
             return "127.0.0.1" if len(asked) == 1 else "127.0.0.9"
 
-        def one_call(method, path, body, base, timeout, limit, mime, extra, total, key):
+        def one_call(method, path, body, base, timeout, limit, mime, extra, total, into, key):
             sent.append((base, key))
             return answers.pop(0) if answers else owner_mcp.Answer(200, {}, b"{}", {})
         with patch.object(owner_mcp, "host_address", turning), patch.object(owner_mcp, "_call", one_call):
@@ -1019,7 +1019,7 @@ class Clients(WithKeyFolder):
         pending.write_text(OTHER_KEY + "\n")
         sent, answers = [], []
 
-        def one_call(method, path, body, base, timeout, limit, mime, extra, total, key):
+        def one_call(method, path, body, base, timeout, limit, mime, extra, total, into, key):
             sent.append((base, key))
             return answers.pop(0) if answers else owner_mcp.Answer(200, {}, b"{}", {})
         with patch.object(owner_mcp, "host_address", lambda _host: "127.0.0.1"), patch.object(owner_mcp, "_call", one_call):

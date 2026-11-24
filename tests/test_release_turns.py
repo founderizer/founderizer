@@ -481,6 +481,73 @@ class Turns(test_releases.HubUpdates):
         self.assertFalse(hub.release_holds_starts())
         self.assertIn(hub.tref(later), self.delivered("task"))
 
+    def test_a_copy_on_its_way_holds_an_update_as_a_running_turn_does(self):
+        """A restart in place cuts a request that is still open after DRAIN_MOST seconds, and a copy of 2 GB goes out or
+        comes back in minutes. A copy on its way (hub.copy_going) holds the start of an update as a turn that runs does:
+        the owner's press gets a 409 that names it, an automatic release waits and gives out no task meanwhile, and the
+        first tick after the copy ends takes it. The bugs that it catches: a release that cuts a copy on its way, and a
+        restart that waited for the copy after its run, while held tasks started, and then cut their turns (the
+        hub-side second reader's note 3 and its R2-1, 22 November 2026)."""
+        self.assertEqual(self.press("entitlement", token=self.token())[0], 200)
+        windows("vps")                              # its helper runs no window: no turn runs
+        released = self.publish(self.code(2))
+        with self.channel(manifest(released)), \
+                patch.object(releases, "Update", functools.partial(releases.Update, run=self.runner())):
+            with hub.copy_going("a copy goes to the owner's computer"):
+                with hub.LOCK, self.assertRaises(hub.Refusal) as pressed:
+                    hub.start_release_work(True)
+                self.assertEqual(str(pressed.exception), "A copy of this fleet is on its way (a copy goes to the "
+                                                         "owner's computer), and an update waits until it ends. When "
+                                                         "it is done, press Update again.")
+                hub.release_sweep(hub.now())
+                self.finish()
+                self.assertEqual(self.newest()["state"], "verified")       # offered, not taken: it waits
+                self.assertTrue(hub.release_holds_starts())
+                later = self.task_for()
+                self.assertEqual(self.delivered("task"), [], "a session started while a copy held the release")
+                waited = hub._release["thread"]
+                hub.release_sweep(hub.now())        # the copy goes on: a tick starts nothing, not even a run's poll
+                self.finish()
+                self.assertIs(hub._release["thread"], waited)
+                self.assertEqual(self.newest()["state"], "verified")
+            hub.release_sweep(hub.now())            # the copy ended: the next tick takes it
+            self.finish()
+        self.assertEqual(self.newest()["state"], releases.DONE)
+        self.assertIn(hub.tref(later), self.delivered("task"))
+
+    def test_a_copy_holds_no_update_past_its_bound_and_holds_the_teams_restart_as_an_update(self):
+        """A fault that keeps a thread in the copy's code could hold every release for ever: a copy of which no piece
+        moved for RESTART_COPY_MOST seconds holds nothing, and one that moves holds for as long as it moves. The restart onto a Teams package
+        waits for a copy on its way as an update does. The bugs that it catches: a release that a copy holds for ever,
+        and a Teams restart that cuts a copy or a restore's unpack (the hub-side second reader's R2-3)."""
+        clock = [0.0]                               # the copies' clock, which this test moves: no sleep, no room
+        with patch.object(hub, "copy_clock", lambda: clock[0]):
+            with hub.copy_going("a copy that is stuck"):
+                clock[0] += hub.RESTART_COPY_MOST + 1
+                self.assertEqual(hub.copies_going(), [])    # an hour and a second from its start, no piece moved
+        with patch.object(hub, "copy_clock", lambda: clock[0]), \
+                hub.copy_going("a copy goes to the owner's computer"):
+            clock[0] += hub.RESTART_COPY_MOST - 1
+            hub.copy_moved()                        # a piece of it moved: the bound counts from now
+            clock[0] += hub.RESTART_COPY_MOST - 1
+            self.assertEqual(hub.copies_going(), ["a copy goes to the owner's computer"])   # past an hour from its start
+            clock[0] += 2
+            self.assertEqual(hub.copies_going(), [])        # an hour and a second with no piece moved
+        with hub.copy_going("a copy comes back from the owner's computer"):
+            self.assertEqual(hub.copies_going(), ["a copy comes back from the owner's computer"])
+            with patch.object(hub, "teams_up", return_value=True), patch.object(hub, "teams_once_set"), \
+                    patch.object(hub, "fleet_idle", return_value=(True, [])), \
+                    patch.object(hub, "release_running", return_value=False), \
+                    patch.object(hub, "teams_restarts", return_value=False), \
+                    patch.object(hub, "restart_hub_soon") as restart, hub.LOCK:     # all else lets it restart
+                self.assertFalse(hub.teams_restart("d" * 64))
+                self.assertEqual(restart.call_count, 0)
+                with patch.object(hub, "RESTART_COPY_MOST", 0):
+                    self.assertEqual(hub.copies_going(), [])
+                    self.assertTrue(hub.teams_restart("d" * 64))
+            self.assertEqual(restart.call_count, 1)
+        self.assertEqual(hub.copies_going(), [])
+
     def kept_for_the_network(self):
         """A release whose run this fleet's server could not download (W11 of the reliability plan of 21 November
         2026): the fleet is idle at the poll, and git's fetch says what it said on the owner's test hub. Gives the

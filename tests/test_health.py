@@ -102,7 +102,10 @@ class Health(OwnerAPI):
         notes = zf.read("RESTORE.md").decode()
         self.assertIn("## What is NOT in it", notes)                    # it says what it does not carry
         self.assertIn("what no copy can carry, and what this one leaves out on purpose", notes)
-        with hub.image_opened(zf.read("fleet.sqlite3")) as copy:     # Python 3.10 has no deserialize
+        records = os.path.join(self.tmp.name, "copy.records")
+        with open(records, "wb") as f:
+            f.write(zf.read("fleet.sqlite3"))
+        with hub.records_opened(records) as copy:
             self.assertEqual(copy.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()[0], "test-generation")
         self.assertIn("backup_missing", [w["kind"] for w in self.health()["warnings"]])   # served is not saved
         self.assertEqual(self.confirm("0" * 64, len(data))[0], 409)

@@ -11,18 +11,23 @@ Git is real throughout, because the owner's own configuration lives on the confi
 did not write it would leave the new machine with a stranger's team. Nothing here reaches the network, and no AI
 call is made.
 """
+import contextlib
+import functools
 import hashlib
+import http.client
 import inspect
 import io
 import json
 import os
 import re
+import select
 import socket
 import sqlite3
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tracemalloc
 import unittest
@@ -62,7 +67,6 @@ def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite()
     for cls in (Copy, HubOnly, Restore, ByHand, RecordsFile):
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
-    suite.addTests(ThroughAFile(name) for name in ThroughAFile.__dict__ if name.startswith("test_"))
     return suite
 
 
@@ -220,6 +224,73 @@ class Fixture(OwnerAPI):
             with e:
                 return e.code, dict(e.headers), e.read()
 
+    def bundle(self, data):
+        """hub.read_bundle of a copy's bytes, as a restore reads the file that it wrote: the records go to a file of
+        this test, whose bytes the answer gives as `records`."""
+        path, into = os.path.join(self.tmp.name, "read.zip"), os.path.join(self.tmp.name, "read.records")
+        with open(path, "wb") as f:
+            f.write(data)
+        bundle = hub.read_bundle(path, into)
+        with open(into, "rb") as f:
+            return dict(bundle, records=f.read())
+
+    def opened(self, records):
+        """The records of a copy (the bytes of its member), opened as a restore opens them (hub.records_opened)."""
+        fd, path = tempfile.mkstemp(dir=self.tmp.name)
+        with os.fdopen(fd, "wb") as f:
+            f.write(records)
+        opening = hub.records_opened(path)
+        conn = opening.__enter__()
+        self.addCleanup(opening.__exit__, None, None, None)
+        return conn
+
+    def records_of(self, mib):
+        """`mib` MiB more of records that do not pack: random bytes, in rows of 64 KiB."""
+        hub.DB.execute("CREATE TABLE ballast(x BLOB)")
+        for _ in range(mib * 16):
+            hub.DB.execute("INSERT INTO ballast VALUES(?)", (os.urandom(64 * 1024),))
+        hub.DB.commit()
+
+    def download_in_pieces(self):
+        """GET /ui/backup as the Mac app takes it: into a file, in pieces, with its SHA-256 read as it comes.
+        (status, headers, bytes, SHA-256, the file)."""
+        req = urllib.request.Request(self.base + "/ui/backup?db=test-generation",
+                                     headers={"X-Fleet-Client": "founderizer-swift/1/test"})
+        path, digest, size = os.path.join(self.tmp.name, "taken.zip"), hashlib.sha256(), 0
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=60) as r, \
+                open(path, "wb") as f:
+            for piece in iter(lambda: r.read(1 << 20), b""):
+                digest.update(piece)
+                size += len(piece)
+                f.write(piece)
+            return r.status, dict(r.headers), size, digest.hexdigest(), path
+
+    @staticmethod
+    def room(free, asked=None):
+        """The disks of this Mac said to have `free` bytes for this user (os.statvfs), and each folder asked put in
+        `asked`."""
+        def statvfs(path):
+            if asked is not None:
+                asked.append(os.path.abspath(path))
+            return os.statvfs_result((1, 1, 1 << 40, free, free, 0, 0, 0, 0, 255))
+        return patch.object(os, "statvfs", statvfs)
+
+    def copy_files(self):
+        """The passing folders of a copy or of an upload beside the records (hub.copy_folder), once the copy that went
+        out or came in has ended: none. The client reads the last byte before the hub's thread removes the folder and
+        lets BACKUP_LOCK or RESTORE_LOCK go."""
+        self.assertTrue(self.copy_ended(), "a copy's answer did not end")
+        return sorted(name for name in os.listdir(os.path.dirname(self.path)) if name.startswith(hub.COPY_PART))
+
+    @staticmethod
+    def copy_ended(within=30):
+        """True once no copy is in the making, on its way out or on its way back (BACKUP_LOCK and RESTORE_LOCK are
+        free), within `within` seconds."""
+        deadline = time.monotonic() + within
+        while (hub.BACKUP_LOCK.locked() or hub.RESTORE_LOCK.locked()) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return not (hub.BACKUP_LOCK.locked() or hub.RESTORE_LOCK.locked())
+
     def send(self, data, query="", request_id=None, client="founderizer-swift/1/test"):
         req = urllib.request.Request(self.base + "/ui/restore?db=test-generation" + query, data=data, method="POST",
                                      headers={"Content-Type": "application/zip", "X-Fleet-Client": client,
@@ -238,20 +309,34 @@ class Fixture(OwnerAPI):
 class Copy(Fixture):
     def test_the_copy_is_the_records_and_the_owner_s_own_configuration(self):
         """The database alone is not the fleet: `team.json`, the profiles and the owner's knowledge live only in
-        the checkout, whose bare repository is on the same disk."""
+        the checkout, whose bare repository is on the same disk. The records are copied page by page, so each row
+        keeps its row id: ui_requests is a table whose row id is a key, with no INTEGER PRIMARY KEY, and a copy made
+        row by row (a dump, or VACUUM INTO, which SQLite's documentation lets renumber) gives a later row an id of an
+        earlier one that was deleted."""
         self.work()
+        for n in range(6):
+            hub.q("INSERT INTO ui_requests(request_id,kind,event_id,created,client) VALUES(?,'message',?,1,'t')",
+                  (f"request-{n}", n))
+        hub.q("INSERT INTO ui_requests(rowid,request_id,kind,event_id,created,client) "
+              "VALUES(-4,'request-below','message',9,1,'t')")          # some rows have a row id below 0
+        hub.q("DELETE FROM ui_requests WHERE request_id IN ('request-0','request-1','request-2')")
+        rows = [tuple(r) for r in hub.q("SELECT rowid, request_id FROM ui_requests ORDER BY rowid")]
+        self.assertEqual([r[0] for r in rows], [-4, 4, 5, 6])
         code, headers, data = self.download()
         self.assertEqual(code, 200)
         self.assertEqual(headers["Content-Type"], "application/zip")
         self.assertEqual(headers["X-Fleet-Backup-SHA256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(int(headers["Content-Length"]), len(data))
         zf = zipfile.ZipFile(io.BytesIO(data))
         self.assertEqual(sorted(zf.namelist()),
                          ["RESTORE.md", "config/knowledge/owner/brand.md", "config/profiles/vps.md",
                           "config/team.json", "fleet.json", "fleet.sqlite3"])
         self.assertEqual(zf.read("config/profiles/vps.md").decode(), PROFILE)
         self.assertEqual(json.loads(zf.read("config/team.json")), OWNER)
-        with hub.image_opened(zf.read("fleet.sqlite3")) as records:      # Python 3.10 has no deserialize
-            self.assertEqual(records.execute("SELECT title FROM tasks").fetchone()[0], "Write the October report")
+        records = self.opened(zf.read("fleet.sqlite3"))
+        self.assertEqual(records.execute("SELECT title FROM tasks").fetchone()[0], "Write the October report")
+        self.assertEqual([tuple(r) for r in records.execute("SELECT rowid, request_id FROM ui_requests "
+                                                            "ORDER BY rowid")], rows)
 
     def test_the_copy_names_the_machines_whose_vault_it_cannot_carry(self):
         """The one thing a copy cannot hold: each store key is in a folder only that machine's vault user can
@@ -280,17 +365,20 @@ class Copy(Fixture):
     def test_each_copy_that_the_hub_serves_is_one_that_a_restore_takes(self):
         """A restore unpacks at most RESTORE_UNPACK of a copy's files, takes at most BACKUP_ENTRIES_MAX entries and
         BACKUP_DIRECTORY_MAX of central directory, and reads at most BACKUP_MANIFEST_MAX of its fleet.json. Records of
-        a raw image with secure_delete and no VACUUM pack 8:1 to 30:1, so a fleet could state more inside the BACKUP_MAX
-        of a copy, and the owner would learn it only at the restore, when the old machine is gone. So the backup
-        refuses such a copy at once (413), with the limits of the restore, which refuses it too."""
+        a raw image with secure_delete and no VACUUM pack 8:1 to 30:1, so a fleet could state more in a small copy, and
+        the owner would learn it only at the restore, when the old machine is gone. So the backup refuses such a copy
+        at once (413), with the limits of the restore, which refuses it too. And records of more than COPY_FORMAT_MAX
+        bytes would need Zip64, which the Mac app does not read: refused with its code before anything is written,
+        and no other size refuses a copy."""
         self.work()
         code, _headers, data = self.download()
         self.assertEqual(code, 200)
         package = zipfile.ZipFile(io.BytesIO(data))
         files = sum(entry["bytes"] for entry in json.loads(package.read("fleet.json"))["files"].values())
-        hub.read_bundle(data)
+        self.bundle(data)
         for limit, value, words in (
-                ("BACKUP_MAX", len(data) // 2, r"^the copy is larger than 256 MiB; take it on the hub's server$"),
+                ("COPY_FORMAT_MAX", package.getinfo("fleet.sqlite3").file_size - 1,
+                 r"^This fleet's records are larger than 2 GB\. Founderizer cannot put them into one copy yet\.$"),
                 ("RESTORE_UNPACK", files // 2, r"^the copy holds [\d,]+ MiB of files, and a restore unpacks at most "
                                                r"[\d,]+ MiB$"),
                 ("BACKUP_ENTRIES_MAX", len(package.infolist()) - 1,
@@ -303,9 +391,13 @@ class Copy(Fixture):
                 code, _headers, body = self.download()
                 self.assertEqual(code, 413)
                 self.assertRegex(json.loads(body)["error"], words)
-                if limit != "BACKUP_MAX":                   # the restore route's own limit of the bytes that come
+                if limit == "COPY_FORMAT_MAX":
+                    self.assertEqual(json.loads(body)["code"], "copy_over_format")
+                    self.assertEqual(self.copy_files(), [])
+                else:
                     with self.assertRaises(hub.Refusal):
-                        hub.read_bundle(data)
+                        self.bundle(data)
+        self.assertEqual(self.copy_files(), [])
 
     @unittest.skipUnless(os.path.isdir(os.path.join(ROOT, "app")),
                          "the apps' folder app/ is not in this tree (the published repository has none)")
@@ -328,21 +420,55 @@ class Copy(Fixture):
     def test_the_hub_holds_its_lock_while_it_reads_a_copy_and_not_while_it_packs_it(self):
         """While LOCK is held the hub answers nobody, and the sums and the compression of a copy take seconds: 7.4
         for 358 MB of records (measured on 17 November 2026). So the route holds the lock for the reads only, which
-        must be of one moment. And it makes one copy at a time, under a lock of its own (BACKUP_LOCK): two requests
-        that pack at the same time hold two images of the records in memory."""
-        calls = []          # each call of the two parts, in order: a second pack inside the lock is seen too
+        must be of one moment. And it makes and sends one copy at a time, under a lock of its own (BACKUP_LOCK): two
+        requests at the same time hold two copies on the hub's disk.
 
-        def watched(name):
+        Where the records have a read connection (WAL mode, readers_for), that connection holds their moment, and the
+        records' file is written from it with LOCK free: on this Mac the file of 420 MB of records took 1.1 s, where
+        DB.serialize() under the lock took 0.26 s. A write that comes after the moment is not in the copy, which is
+        then of one moment with its configuration. While it is made and sent it is a copy on its way, which holds an
+        update's start (copies_going)."""
+        calls, folders = [], []     # each call of the parts, in order: a second pack inside the lock is seen too
+
+        def watched(name, then=None):
             real = getattr(hub, name)
 
             def call(*args):        # LOCK: of the thread that serves the request; BACKUP_LOCK: of this one request
-                calls.append((name, hub.LOCK._is_owned(), hub.BACKUP_LOCK.locked()))
+                calls.append((name, hub.LOCK._is_owned(), hub.BACKUP_LOCK.locked(), args[0] is hub.DB) if
+                             name == "records_file" else (name, hub.LOCK._is_owned(), hub.BACKUP_LOCK.locked()))
+                if name == "records_file":      # a new folder of mode 700 beside the records, and of no other disk
+                    folders.append((os.path.dirname(args[1]), os.stat(args[1]).st_mode & 0o777))
+                if then:
+                    then()
                 return real(*args)
             return patch.object(hub, name, call)
-        with watched("backup_read"), watched("backup_packed"):
+        with watched("backup_read"), watched("backup_packed"), watched("records_file"):
             self.assertEqual(self.download()[0], 200)
-        self.assertEqual(calls, [("backup_read", True, True), ("backup_packed", False, True)])
-        self.assertFalse(hub.BACKUP_LOCK.locked())
+        self.assertEqual(calls, [("backup_read", True, True), ("records_file", True, True, True),
+                                 ("backup_packed", False, True)])
+        self.assertTrue(self.copy_ended())
+        self.assertEqual(hub.wal_on(), (True, None))
+        hub.readers_for(self.path)
+        self.addCleanup(hub.readers_for, None)
+        calls.clear()
+        later = lambda: hub.q("INSERT INTO notes(task,agent,ts,text) VALUES(1,'vps',2,'a write after the moment')")
+        with watched("backup_read"), watched("backup_packed", then=later), watched("records_file"):
+            code, _headers, data = self.download()
+        self.assertEqual(code, 200)
+        self.assertEqual(calls, [("backup_read", True, True), ("backup_packed", False, True),
+                                 ("records_file", False, True, False)])
+        self.assertEqual(hub.q1("SELECT count(*) n FROM notes WHERE text='a write after the moment'")["n"], 1)
+        self.assertEqual(folders, [(os.path.dirname(self.path), 0o700)] * 2)
+        going = []
+        with watched("backup_packed", then=lambda: going.append(hub.copies_going())):
+            self.assertEqual(self.download()[0], 200)
+        self.assertEqual(going, [["a copy goes to the owner's computer"]])
+        self.assertTrue(self.copy_ended())
+        self.assertEqual(hub.copies_going(), [])
+        records = self.opened(zipfile.ZipFile(io.BytesIO(data)).read("fleet.sqlite3"))
+        self.assertEqual(records.execute("SELECT count(*) FROM notes WHERE text='a write after the moment'")
+                         .fetchone()[0], 0)
+        self.assertEqual(self.copy_files(), [])
 
     def test_a_copy_of_records_in_wal_mode_is_records_that_a_restore_opens(self):
         """The hub keeps its records in WAL mode since 11 November 2026 (hub.wal_on), and DB.serialize() copies the
@@ -350,14 +476,15 @@ class Copy(Fixture):
         "cannot be opened". The copy has the header of rollback mode, and a restore reads it."""
         self.assertEqual(hub.wal_on(), (True, None))
         self.work()
-        with hub.LOCK:
-            self.assertEqual(hub.records_image()[18:20], b"\x02\x02")
+        with open(self.path, "rb") as f:
+            self.assertEqual(f.read(20)[18:20], b"\x02\x02")       # the hub's own records, in WAL mode
         code, _headers, data = self.download()
         self.assertEqual(code, 200)
         records = zipfile.ZipFile(io.BytesIO(data)).read("fleet.sqlite3")
         self.assertEqual(records[18:20], b"\x01\x01")
-        self.assertEqual(hub.read_bundle(data)["manifest"]["fleet_id"], hub.fleet_id())
-        if hub.SQLITE_IMAGES:       # the image itself, in memory, where this Python can hold one
+        self.assertEqual(self.bundle(data)["manifest"]["fleet_id"], hub.fleet_id())
+        # the image itself, in memory, as a hub from before 22 November 2026 reads it where its Python can hold one
+        if hasattr(sqlite3.Connection, "deserialize"):
             copy = sqlite3.connect(":memory:")
             self.addCleanup(copy.close)
             copy.deserialize(records)
@@ -397,7 +524,142 @@ class Copy(Fixture):
         with zipfile.ZipFile(buffer, "w") as out:
             for name, body in members.items():
                 out.writestr(name, body)
-        self.assertEqual(hub.read_bundle(buffer.getvalue())["records"], walled)
+        self.assertEqual(self.bundle(buffer.getvalue())["records"], walled)
+        # and its check wrote nothing beside them: no WAL and no shared memory file (hub.records_opened, immutable)
+        self.assertEqual([name for name in os.listdir(self.tmp.name) if name.startswith("read.records")],
+                         ["read.records"])
+
+    def test_a_copy_goes_out_through_files_and_never_whole_in_memory(self):
+        """The hub built a whole copy in its memory and sent it as one block, so it refused one of more than 256 MiB
+        (the owner, 22 November 2026: "why is there a backup limit? it shouldn't?"), and the copy of 358 MB of records
+        held 950 MB more. Now the records go to a file beside them, are packed as they are read, and the zip goes out
+        in pieces: a copy of 24 MiB of records that do not pack is made and sent with a peak of Python's memory of a
+        few MiB, to a client that reads it in pieces too, and the folder of its files is gone when the answer ends.
+        The bug that it catches: a later change reads the records' file or the zip whole again."""
+        self.work()
+        self.records_of(24)
+        tracemalloc.start()
+        try:
+            status, headers, size, digest, path = self.download_in_pieces()
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(status, 200)
+        self.assertGreater(size, 24 << 20)
+        self.assertEqual((int(headers["Content-Length"]), headers["X-Fleet-Backup-SHA256"]), (size, digest))
+        self.assertLess(peak, 8 << 20)
+        self.assertEqual(self.copy_files(), [])
+        self.assertEqual(json.loads(hub.kv_get("backup_served"))["bytes"], size)
+        bundle = hub.read_bundle(path, os.path.join(self.tmp.name, "read.records"))
+        self.assertEqual(bundle["records_bytes"], json.loads(zipfile.ZipFile(path).read("fleet.json"))["files"]
+                         ["fleet.sqlite3"]["bytes"])
+        with hub.records_opened(bundle["records"]) as records:
+            self.assertEqual(records.execute("SELECT count(*), sum(length(x)) FROM ballast").fetchone(),
+                             (384, 24 << 20))
+
+    def test_no_file_of_a_copy_stays_when_its_client_goes_or_its_hub_was_killed(self):
+        """The owner's rule of 18 October 2026: no copy stays on a host. A client that goes in the middle of a copy
+        ends its answer, its folder goes with it, and the next copy can start. A hub that was killed while it made or
+        sent one leaves its folder, and the next start removes it before it takes its records; a file or a link of
+        that name, and any other folder, stay where they are."""
+        self.work()
+        self.records_of(24)         # more than the two sides of a socket hold on this Mac, so the hub is still sending
+        port = self.server.server_port
+        with socket.create_connection(("127.0.0.1", port), timeout=30) as s:
+            s.sendall(f"GET /ui/backup?db=test-generation HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                      f"X-Fleet-Client: founderizer-swift/1/test\r\n\r\n".encode())
+            got = b""
+            while len(got) < 1 << 16:
+                piece = s.recv(1 << 16)
+                self.assertTrue(piece, got[:200])
+                got += piece
+            self.assertTrue(got.startswith(b"HTTP/1.1 200 "), got[:200])
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))     # a reset: the client is gone
+        self.assertEqual(self.copy_files(), [])
+        self.assertEqual(self.download()[0], 200)
+        # what a hub that was killed in the middle of a copy leaves, and what has a name like it and stays
+        here = os.path.dirname(self.path)
+        left = os.path.join(here, hub.COPY_PART + "k1ll3d")
+        os.makedirs(left, mode=0o700)
+        with open(os.path.join(left, hub.COPY_ZIP), "wb") as f:
+            f.write(b"PK\x03\x04 half a copy")
+        elsewhere = os.path.join(self.tmp.name, "elsewhere")
+        os.makedirs(elsewhere)
+        with open(os.path.join(elsewhere, "kept.txt"), "w") as f:
+            f.write("not a copy")
+        os.symlink(elsewhere, os.path.join(here, hub.COPY_PART + "link"))
+        with open(os.path.join(here, hub.COPY_PART + "file"), "w") as f:
+            f.write("not a folder")
+        os.makedirs(os.path.join(here, "founderizer-records-x"))
+        self.assertEqual(hub.copy_leftovers_gone(self.path), 1)
+        self.assertEqual(self.copy_files(), [hub.COPY_PART + "file", hub.COPY_PART + "link"])
+        self.assertTrue(os.path.exists(os.path.join(elsewhere, "kept.txt")))
+        self.assertTrue(os.path.isdir(os.path.join(here, "founderizer-records-x")))
+        source = inspect.getsource(hub.main)        # each start, after it holds the records and before it takes them
+        self.assertLess(source.index("hub_lock(db_path)"), source.index("copy_leftovers_gone(db_path)"))
+        self.assertLess(source.index("copy_leftovers_gone(db_path)"), source.index("take_restore(db_path)"))
+
+    def test_a_copy_that_the_hub_s_disk_has_no_room_for_is_refused_before_anything_is_written(self):
+        """A copy takes up to two times the records on the hub's disk for a moment, and a full disk stops the hub
+        itself, so 256 MiB stay free beside the copy's files. With less room than that on the disk of the records, the
+        hub refuses with its code, says the sizes as the Mac app writes them, writes nothing and records no copy as
+        served. And with that room it makes the copy, also on a disk with less than DISK_LOW free: the copy was made in
+        memory before, with no room on the disk at all, so a reserve of 2 GiB took the daily copy from a hub whose disk
+        is nearly full. The bugs that it catches: a copy that fills the hub's disk; a copy refused on a disk that has
+        room for it; words that say a copy needs 2 GiB more than it does; words near the bound that say that the disk
+        has what the copy needs (free rounded down, need rounded up: the validator's finding W1)."""
+        self.work()
+        records = hub.q1("PRAGMA page_count")[0] * hub.q1("PRAGMA page_size")[0]
+        need, asked = 2 * records + (256 << 20), []      # the copy's two files and its own reserve
+        room = functools.partial(self.room, asked=asked)
+        with room(need - 1):
+            code, _headers, body = self.download()
+        self.assertEqual(code, 507)
+        self.assertEqual(json.loads(body), {
+            "code": "copy_no_room",
+            "names": {"free": hub.size_words(need - 1, "down"), "need": hub.size_words(need, "up")},
+            "error": f"The hub's server has {hub.size_words(need - 1, 'down')} free. A copy needs "
+                     f"{hub.size_words(need, 'up')} there while the hub makes it."})
+        self.assertLess(need, 300 << 20)                # some 256 MB for these small records, never 2 GB and more
+        self.assertEqual(asked, [os.path.dirname(self.path)])
+        self.assertEqual(self.copy_files(), [])
+        self.assertIsNone(hub.kv_get("backup_served"))
+        with room(need):
+            self.assertEqual(self.download()[0], 200)
+        with room(int(1.2 * (1 << 30))):                # room for the copy, and less than DISK_LOW: the copy is made
+            self.assertLess(int(1.2 * (1 << 30)), hub.DISK_LOW)
+            self.assertEqual(self.download()[0], 200)
+        self.assertEqual(self.copy_files(), [])
+        bound = int(1.13 * (1 << 30))                   # a copy that needs some 1.1 GB, and 1 MiB less free
+        with patch.object(hub, "COPY_RESERVE", bound - 2 * records), room(bound - (1 << 20)):
+            code, _headers, body = self.download()
+        self.assertEqual((code, json.loads(body)["names"]), (507, {"free": "1.1 GB", "need": "1.2 GB"}))
+
+    def test_the_end_record_is_found_as_far_as_python_3_10_finds_it(self):
+        """zipfile of Python 3.10 and 3.11 (Ubuntu 22.04's, Debian 12's) looks for a ZIP's end record in its last 65,536
+        bytes and 22, one more than 3.12 and later, which refuse a record that stands there. The hub reads a copy's
+        directory before zipfile does (zip_end_record, zip_file_shape), so it looks as far as that zipfile: else a copy
+        whose end record stands 65,558 bytes from its end reads as no ZIP here, and zipfile of 3.10 then reads its
+        directory of 5 MiB whole. The value of the hub's own function is checked, because this Python's zipfile refuses
+        such a file by itself (a finding of Fable's read of 22 November 2026). The bug that it catches: a search that
+        stops one byte short."""
+        data = many_entries(15_000, comment=300) + bytes(1 << 16)
+        end = len(data) - (1 << 16) - 22
+        stated = struct.unpack_from("<I", data, end + 12)[0]
+        self.assertEqual(data[end:end + 4], b"PK\x05\x06")
+        self.assertGreater(stated, hub.BACKUP_DIRECTORY_MAX)
+        self.assertEqual(hub.zip_end_record(data), (end, stated))
+        self.assertEqual(hub.zip_directory_bytes(data), stated)
+        self.assertEqual(hub.zip_file_shape(io.BytesIO(data)), (0, stated))     # refused before zipfile reads it
+
+    def test_no_copy_is_asked_for_inside_a_write(self):
+        """SQLite's backup answers "busy" to a source that is in a write, and Python asks it again for ever."""
+        folder = tempfile.mkdtemp(dir=self.tmp.name)
+        with hub.transaction():
+            hub.DB.execute("INSERT OR REPLACE INTO kv(k,v) VALUES('a write','that waits')")
+            with self.assertRaisesRegex(RuntimeError, "outside a transaction"):
+                hub.records_file(hub.DB, folder)
+        self.assertEqual(os.listdir(folder), [])
 
 
 # ---------------------------------------------------------------- what it cannot carry, and what to do then
@@ -983,6 +1245,9 @@ class Restore(Fixture):
         self.assertEqual(code, 422, answer)
         self.assertIn("team.json the hub can run", answer["error"])
         self.assertFalse(os.path.exists(self.path + hub.RESTORE_SUFFIX))
+        # the records were unpacked before the team was read, and they go with the refusal (stage_restore)
+        self.assertFalse(os.path.exists(self.path + hub.RESTORE_SUFFIX + ".part"))
+        self.assertEqual(self.copy_files(), [])
         self.assertEqual(json.loads(read(self.kit, "team.json"))["addresses"]["hub"], "127.0.0.9")
 
     @staticmethod
@@ -1001,6 +1266,318 @@ class Restore(Fixture):
                 zf.writestr(name, body)
         return buffer.getvalue()
 
+    def send_file(self, path, request_id=None):
+        """POST /ui/restore with the copy at `path` as the body, sent from the file in pieces, as the Mac app sends it."""
+        with open(path, "rb") as body:
+            req = urllib.request.Request(self.base + "/ui/restore?db=test-generation", data=body, method="POST",
+                                         headers={"Content-Type": "application/zip",
+                                                  "Content-Length": str(os.path.getsize(path)),
+                                                  "X-Fleet-Client": "founderizer-swift/1/test",
+                                                  "X-Fleet-Request-Id": request_id or str(uuid.uuid4())})
+            try:
+                with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=60) as r:
+                    return r.status, json.load(r)
+            except urllib.error.HTTPError as e:
+                with e:
+                    return e.code, json.load(e)
+
+    def test_a_copy_goes_back_through_files_and_never_whole_in_memory(self):
+        """A copy that the hub can make, the hub can take back: a copy that cannot go back is no copy. The restore read
+        its whole body into memory and unpacked the records there, and refused a body of more than 256 MiB. Now the body
+        goes to a file in pieces with its SHA-256, and the records are unpacked from it into the staged file in pieces:
+        a copy of 24 MiB of records that do not pack goes back with a peak of Python's memory of a few MiB, and the
+        fleet that starts on it is the fleet that was saved. A disk with no room for the body and 256 MiB besides refuses
+        it, with the sizes, and writes nothing, and its words say "at least": the records come beside the body, and the
+        head does not know their size (the hub-side second reader's note 2); so does a disk with room for the body and not for the files that the
+        copy states, before it unpacks one; a disk with room for the copy and less than DISK_LOW takes it back, as it
+        did when the hub needed no room for it. The bugs that it catches: a later change reads the body or the records
+        whole again; a restore refused on a disk that has room for it, with words that say 2 GiB more than it needs; a
+        copy that unpacks more than the disk holds."""
+        self.work()
+        self.records_of(24)
+        fleet = hub.fleet_id()
+        status, _headers, size, _digest, path = self.download_in_pieces()
+        self.assertEqual(status, 200)
+        self.new_machine()
+        need = size + (256 << 20)          # the body, and the reserve that stays free
+        with self.room(need - 1):
+            code, answer = self.send_file(path)
+        self.assertEqual((code, answer["code"]), (507, "restore_no_room"), answer)
+        self.assertEqual(answer["error"], f"The hub's server has {hub.size_words(need - 1, 'down')} free. "
+                                          f"This copy needs at least {hub.size_words(need, 'up')} there.")
+        bound = int(1.13 * (1 << 30))                   # a restore that needs some 1.1 GB, and 1 MiB less free
+        with self.room(bound - (1 << 20)), self.assertRaises(hub.Refusal) as near:
+            hub.restore_room(os.path.dirname(self.path), bound - (256 << 20))
+        self.assertEqual(near.exception.extra["names"], {"free": "1.1 GB", "need": "1.2 GB"})
+        self.assertEqual((self.copy_files(), os.path.exists(self.path + hub.RESTORE_SUFFIX + ".part")), ([], False))
+        with zipfile.ZipFile(path) as old:              # the same copy, which states its records as 1 GiB
+            members = {name: old.read(name) for name in old.namelist()}
+        manifest = json.loads(members["fleet.json"])
+        manifest["files"]["fleet.sqlite3"]["bytes"] = 1 << 30
+        members["fleet.json"] = json.dumps(manifest).encode()
+        stated = os.path.join(self.tmp.name, "stated.zip")
+        with zipfile.ZipFile(stated, "w", zipfile.ZIP_STORED) as zf:
+            for name, body in members.items():
+                zf.writestr(name, body)
+        del members
+        files = sum(says["bytes"] for says in manifest["files"].values()) + (256 << 20)
+        with self.room(os.path.getsize(stated) + (256 << 20)):      # room for the body, not for what it states
+            code, answer = self.send_file(stated)
+        self.assertEqual((code, answer.get("names")), (507, {"free": hub.size_words(os.path.getsize(stated) +
+                                                                                    (256 << 20), "down"),
+                                                             "need": hub.size_words(files, "up")}), answer)
+        self.assertEqual((self.copy_files(), os.path.exists(self.path + hub.RESTORE_SUFFIX + ".part")), ([], False))
+        tracemalloc.start()
+        try:
+            with self.room(int(1.2 * (1 << 30))):       # room for the copy, and less than DISK_LOW: it goes back
+                code, answer = self.send_file(path)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(int(1.2 * (1 << 30)), hub.DISK_LOW)
+        self.assertEqual(code, 200, answer)
+        self.assertEqual(answer["fleet_id"], fleet)
+        self.assertGreater(answer["records_bytes"], 24 << 20)
+        self.assertLess(peak, 8 << 20)
+        self.assertEqual(self.copy_files(), [])
+        self.assertEqual(os.path.getsize(self.path + hub.RESTORE_SUFFIX), answer["records_bytes"])
+        proc, _base = self.start_real_hub()
+        self.assertEqual(tuple(self.records().execute("SELECT count(*), sum(length(x)) FROM ballast").fetchone()),
+                         (384, 24 << 20))
+        proc.terminate()
+        proc.wait(timeout=20)
+
+    def test_a_restore_unpacks_its_records_with_the_hub_s_lock_free(self):
+        """The unpack of a copy's records (up to 2 GiB), its fsync and SQLite's check of them ran under kit_lock, KIT and
+        LOCK: each route, the tick and each agent's call waited for them, for minutes on a slow disk. They hold
+        RESTORE_LOCK only now, and the swap is the same: the answer, the staged records, the fleet that the copy holds.
+        A reader of LOCK gets in while the records are unpacked. And work that comes during the unpack is still seen:
+        a hub that holds a fleet's work by the end of it refuses the restore (409, without replace=yes) and stages
+        nothing. The bugs that it catches: an unpack that holds the hub's LOCK again (the hub-side second reader's
+        note 1, 22 November 2026), and a restore that puts another fleet over work that came while it unpacked."""
+        fleet, data = self.copy_of_a_fleet()
+        self.new_machine()
+        got, real, going = [], hub.records_unpacked, []
+
+        def unpacked(*args, **kwargs):                  # another thread asks for LOCK while the records are unpacked
+            going.append(hub.copies_going())            # a copy on its way: an update waits for it
+
+            def read():
+                if hub.LOCK.acquire(timeout=3):
+                    hub.LOCK.release()
+                    got.append(True)
+                else:
+                    got.append(False)
+            reader = threading.Thread(target=read)
+            reader.start()
+            reader.join()
+            return real(*args, **kwargs)
+        with patch.object(hub, "records_unpacked", unpacked):
+            code, answer = self.send(data)
+        self.assertEqual((code, answer.get("fleet_id")), (200, fleet), answer)
+        self.assertEqual(got, [True], "LOCK was held while the records were unpacked")
+        self.assertEqual(going, [["a copy comes back from the owner's computer"]])
+        self.assertTrue(os.path.exists(self.path + hub.RESTORE_SUFFIX))
+        self.assertFalse(os.path.exists(self.path + hub.RESTORE_SUFFIX + ".part"))
+        self.assertEqual(self.copy_files(), [])
+        staged = os.stat(self.path + hub.RESTORE_SUFFIX).st_ino
+
+        def meanwhile(*args, **kwargs):                 # a task comes while the second copy is unpacked
+            hub.q("INSERT INTO tasks(id,title,owner,requester,state,created,done_when) "
+                  "VALUES(9,'A task of this hub','manager','manager','open',1,'done')")
+            return real(*args, **kwargs)
+        with patch.object(hub, "records_unpacked", meanwhile):
+            code, answer = self.send(data)
+        self.assertEqual(code, 409, answer)
+        self.assertIn("already holds a fleet's work", answer["error"])
+        self.assertEqual(os.stat(self.path + hub.RESTORE_SUFFIX).st_ino, staged)    # the first copy's, untouched
+        self.assertFalse(os.path.exists(self.path + hub.RESTORE_SUFFIX + ".part"))
+        self.assertEqual((self.copy_files(), hub.q1("SELECT count(*) n FROM ui_controls")["n"]), ([], 1))
+
+    def test_a_write_of_the_fleet_s_files_during_the_unpack_waits_and_lands_after_the_restore(self):
+        """The unpack holds KIT, the turn of the writes of the fleet's files, and not LOCK. So an agent's knowledge that
+        comes meanwhile (write_knowledge, which commits in its turn) waits for the restore and lands after it: the
+        restore is not refused, and the copy undoes nothing that came during its unpack. A writer that holds LOCK alone,
+        which never waits for KIT, is refused meanwhile, as while an owner's write runs its git, with words that say
+        why and that it takes minutes (KIT_BUSY_RESTORE, R4-2). The bugs that it catches: a restore refused for an
+        agent's note (the hub-side second reader's R3-1, 22 November 2026), a copy that undoes a write that came during
+        its unpack (round 2, R2-4), and "try again in a few seconds" during an unpack of minutes."""
+        _fleet, data = self.copy_of_a_fleet()
+        self.new_machine()
+        real, seen, writers, note = hub.records_unpacked, {}, [], "An agent's note, written during the unpack.\n"
+
+        def knowledge():            # an agent's write_knowledge, from a thread that holds no lock
+            hub.commit_kit_file("knowledge/during.md", note.encode(), "manager wrote a note", author="manager",
+                                allow=hub.KNOWLEDGE_WRITE)
+
+        def under_lock():           # a write of the hub's own that holds LOCK alone
+            try:
+                with hub.LOCK:
+                    hub.commit_kit_file("knowledge/owner/brand.md", b"# Brand\n\nChanged.\n", "the hub's own write")
+                seen["under LOCK"] = "written"
+            except hub.KitFault as e:
+                seen["under LOCK"] = str(e)
+
+        def meanwhile(*args, **kwargs):
+            writers.append(threading.Thread(target=knowledge))
+            writers[0].start()
+            writers[0].join(1)
+            seen["the note waits"] = writers[0].is_alive()
+            other = threading.Thread(target=under_lock)
+            other.start()
+            other.join(10)
+            return real(*args, **kwargs)
+        with patch.object(hub, "records_unpacked", meanwhile):
+            code, answer = self.send(data)
+        writers[0].join(30)
+        self.assertEqual(code, 200, answer)
+        self.assertEqual(seen, {"the note waits": True, "under LOCK": hub.KIT_BUSY_RESTORE})     # its own words
+        self.assertEqual(read(self.kit, "knowledge", "during.md"), note)      # after the restore, and kept
+        self.assertNotIn("knowledge/during.md", answer["files"] + answer["removed"])
+
+    def test_no_write_of_the_hub_s_own_comes_between_the_unpack_and_the_staging(self):
+        """The flight of a restore (kit_flying) refuses a writer that holds LOCK alone until the staging holds LOCK:
+        between the end of the unpack and that moment, a tick's pass would commit a file of the fleet's, and the copy
+        would then go over it with no word. Here such a writer comes at the staging's turn, before it holds LOCK, and
+        is refused with the restore's own words. The bug that it catches: a flight that ends before the staging holds
+        LOCK (the second validator's H-3, 22 November 2026)."""
+        _fleet, data = self.copy_of_a_fleet()
+        self.new_machine()
+        real, turns, seen = hub.kit_lock, [], []
+
+        def under_lock():           # a tick's pass that commits, as a team plan or a machine's name does
+            try:
+                with hub.LOCK:
+                    hub.commit_kit_file("knowledge/owner/brand.md", b"# Brand\n\nChanged in between.\n",
+                                        "the hub's own write")
+                seen.append("written")
+            except hub.KitFault as e:
+                seen.append(str(e))
+
+        @contextlib.contextmanager
+        def watched():
+            turns.append(threading.get_ident())
+            if hub.RESTORE_LOCK.locked() and turns.count(threading.get_ident()) == 2:   # the staging's turn
+                writer = threading.Thread(target=under_lock)
+                writer.start()
+                writer.join(10)
+            with real():
+                yield
+        with patch.object(hub, "kit_lock", watched):
+            code, answer = self.send(data)
+        self.assertEqual(code, 200, answer)
+        self.assertEqual(seen, [hub.KIT_BUSY_RESTORE])
+        self.assertNotIn("Changed in between.", read(self.kit, "knowledge", "owner", "brand.md"))
+
+    def test_a_restore_that_moves_holds_the_updates_for_as_long_as_it_moves(self):
+        """A copy on its way holds the start of an update for RESTART_COPY_MOST seconds after a piece of it last moved,
+        not after its start: a restore of 2 GB on a home uplink of 2 Mbit/s takes some 2.3 hours, and a bound from its
+        start let each release cut it after the first hour. A real HTTP client sends the copy in pieces, and the
+        copies' clock moves one second at each piece (copy_clock), so the test reads no real time: past the bound from
+        its start, each whole MiB that the hub has read moves the mark, and the copy still holds updates. The bug that
+        it catches: a restore that moves and that a release cuts (the hub-side second reader's R3-4, 22 November
+        2026)."""
+        self.work()
+        self.records_of(6)
+        status, _headers, size, _digest, path = self.download_in_pieces()
+        self.assertEqual(status, 200)
+        self.new_machine()
+        with open(path, "rb") as f:
+            data = f.read()
+        piece, clock, held = 256 << 10, [0.0], []
+        client = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=30)
+        try:
+            with patch.object(hub, "copy_clock", lambda: clock[0]), patch.object(hub, "RESTART_COPY_MOST", 10.0):
+                client.putrequest("POST", "/ui/restore?db=test-generation", skip_accept_encoding=True)
+                for name, value in (("Content-Type", "application/zip"), ("Content-Length", str(len(data))),
+                                    ("X-Fleet-Client", "founderizer-swift/1/test"),
+                                    ("X-Fleet-Request-Id", str(uuid.uuid4()))):
+                    client.putheader(name, value)
+                client.endheaders()
+                for at in range(0, len(data), piece):
+                    clock[0] += 1
+                    client.send(data[at:at + piece])
+                    if (at + piece) % (1 << 20) == 0 and clock[0] > 10:     # a whole MiB, past the bound
+                        self.moved_at(clock[0])
+                        held.append(hub.copies_going())
+                reply = client.getresponse()
+                said = json.loads(reply.read())
+        finally:
+            client.close()
+        self.assertEqual(reply.status, 200, said)
+        self.assertGreater(size, 6 << 20)
+        self.assertEqual(held, [["a copy comes back from the owner's computer"]] * len(held))
+        self.assertGreaterEqual(len(held), 3)
+
+    def moved_at(self, t, within=5):
+        """Waits, `within` seconds at most, until the mark of the copy on its way reads `t` on the copies' clock (the
+        hub read the piece that moved it at that time); False when it did not."""
+        deadline = time.monotonic() + within
+        while time.monotonic() < deadline:
+            with hub.COPIES_LOCK:
+                if any(when == t for _what, when in hub.COPIES.values()):
+                    return True
+            time.sleep(0.01)
+        return False
+
+    def test_a_restore_is_refused_from_its_head_and_no_byte_of_a_stranger_s_body_is_read(self):
+        """The hub read up to 256 MiB of any caller's body into memory before it asked who sent it. Now the owner's
+        computer, the generation, the headers and the room are checked from the head: a caller that is not the owner's
+        computer gets its refusal at once, with no byte of its body read or written, and the connection ends, so a
+        stranger on the private network cannot fill the hub's memory or its disk. The owner's own computer gets its
+        refusal too (here a generation that moved), but only once its whole body is read and dropped: a server that
+        answers and ends the connection while an upload still sends gives the upload a lost connection in URLSession
+        in place of the answer, and the Mac app then reads an old generation's 409 as a restore that landed. A real HTTP
+        client sends the body in pieces over some six seconds, as an upload of a home line does. The bugs that it
+        catches: the stranger's body read; the owner's answer before the body's end, or a connection that ends under
+        it."""
+        self.new_machine()
+        port = self.server.server_port
+        head = (f"POST /ui/restore?db=test-generation HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                f"Content-Type: application/zip\r\nContent-Length: {100 << 20}\r\n"
+                f"X-Fleet-Client: founderizer-swift/1/test\r\nX-Fleet-Request-Id: {uuid.uuid4()}\r\n"
+                f"X-Test-Source: 127.0.0.5\r\n\r\n").encode()        # an address that is not the owner's
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+            s.sendall(head)
+            got = b""
+            for piece in iter(lambda: s.recv(1 << 16), b""):    # to the end of the connection, or the socket's time
+                got += piece
+        self.assertTrue(got.startswith(b"HTTP/1.1 403 "), got[:300])
+        piece, pieces, clock = b"PK\x03\x04" + bytes((256 << 10) - 4), 20, [0.0]
+        client = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+        moved = patch.object(hub, "copy_clock", lambda: clock[0])     # one second of it at each piece
+        moved.start()
+        try:
+            client.putrequest("POST", "/ui/restore?db=an-old-generation", skip_accept_encoding=True)
+            for name, value in (("Content-Type", "application/zip"), ("Content-Length", str(len(piece) * pieces)),
+                                ("X-Fleet-Client", "founderizer-swift/1/test"),
+                                ("X-Fleet-Request-Id", str(uuid.uuid4()))):
+                client.putheader(name, value)
+            client.endheaders()
+            clock[0] += 1
+            client.send(piece)
+            for sent in range(1, pieces):
+                early = select.select([client.sock], [], [], 0.3)[0]   # the hub still reads: no answer yet
+                self.assertEqual(early, [], f"the hub answered the owner's computer after {sent} of {pieces} pieces")
+                if sent == 1:       # a body that is read and dropped holds an update too (the second reader's R2-5)
+                    self.assertEqual(hub.copies_going(), ["a copy comes back from the owner's computer"])
+                if sent == 16:          # 16 s of the copies' clock from its start, with a bound of 10 s (R3-4)
+                    self.moved_at(clock[0])
+                    with patch.object(hub, "RESTART_COPY_MOST", 10.0):
+                        self.assertEqual(hub.copies_going(), ["a copy comes back from the owner's computer"])
+                clock[0] += 1
+                client.send(piece)
+            reply = client.getresponse()
+            said = json.loads(reply.read())
+        finally:
+            client.close()
+            moved.stop()
+        self.assertEqual((reply.status, said.get("code")), (409, "hub_changed_sending"), said)
+        self.assertEqual(self.copy_files(), [])
+        for suffix in (hub.RESTORE_SUFFIX, hub.RESTORE_SUFFIX + ".part"):
+            self.assertFalse(os.path.exists(self.path + suffix), suffix)
+        self.assertEqual(hub.q1("SELECT count(*) n FROM ui_controls")["n"], 0)
+
     def test_a_copy_that_is_not_what_it_says_is_refused_and_nothing_is_staged(self):
         _fleet, data = self.copy_of_a_fleet()
         self.new_machine()
@@ -1012,15 +1589,27 @@ class Restore(Fixture):
                     self.assertEqual(answer["error"], words[0])
                 if name in ("50,000 entries", "a central directory of 5 MiB", "an end record whose counts write its "
                             "signature", "a Zip64 record before an end record of 46 bytes"):  # before zipfile reads one
+                    path = os.path.join(self.tmp.name, "broken.zip")
+                    with open(path, "wb") as f:
+                        f.write(broken)
                     tracemalloc.start()
                     try:
                         with self.assertRaises(hub.Refusal):
-                            hub.read_bundle(broken)
+                            hub.read_bundle(path, path + ".records")
                         peak = tracemalloc.get_traced_memory()[1]
                     finally:
                         tracemalloc.stop()
                     self.assertLess(peak, 1 << 20, name)
+                    self.assertFalse(os.path.exists(path + ".records"), name)
+                # nothing of the copy stays: no staged records, no part of them, no folder of the upload, and no
+                # flight that would refuse the hub's own writes after it (the validator's N4). The route answers
+                # before its cleanup ends, and lets go of RESTORE_LOCK last (the hub reader's round 6 note).
+                with hub.RESTORE_LOCK:
+                    pass
+                self.assertEqual(hub.FLIGHT, {"thread": None, "restore": False}, name)
                 self.assertFalse(os.path.exists(self.path + hub.RESTORE_SUFFIX), name)
+                self.assertFalse(os.path.exists(self.path + hub.RESTORE_SUFFIX + ".part"), name)
+                self.assertEqual(self.copy_files(), [], name)
                 self.assertEqual(json.loads(read(self.kit, "team.json"))["addresses"]["hub"], "127.0.0.9")
                 self.assertEqual(hub.q1("SELECT count(*) n FROM ui_controls")["n"], 0)
 
@@ -1137,84 +1726,6 @@ class Restore(Fixture):
                  many_entries(160, comment=32 * 1024, counts=(0x4B50, 0x0605))),
                 ("a Zip64 record before an end record of 46 bytes", many_entries(160, comment=32 * 1024, zip64=True)),
                 ("an end record whose comment is not there", data[:-2] + (5).to_bytes(2, "little"))]
-
-
-class ThroughAFile(Restore):
-    """Python 3.10, which Ubuntu 22.04 has and the installers take, has no Connection.serialize and no deserialize:
-    there a copy is made and read through a file in a folder of mode 700 that goes at once (hub.SQLITE_IMAGES). Here
-    that way runs on this Python too, through the routes, and the copies of each way are read by the other."""
-
-    def setUp(self):
-        super().setUp()
-        self.temp = os.path.join(self.tmp.name, "temp")     # where the passing files are, to see that they go
-        os.makedirs(self.temp)
-        # Each folder of a passing file, so that a test sees that the way through a file ran: on this Python the
-        # calls in memory work too, and a change back to them would pass every other check here.
-        self.passing, made = [], tempfile.mkdtemp
-
-        def mkdtemp(*args, **kwargs):
-            folder = made(*args, **kwargs)
-            if kwargs.get("prefix") == "founderizer-records-":
-                self.passing.append(folder)
-            return folder
-        for change in (patch.object(hub, "SQLITE_IMAGES", False), patch.object(tempfile, "tempdir", self.temp),
-                       patch.object(tempfile, "mkdtemp", mkdtemp)):
-            change.start()
-            self.addCleanup(change.stop)
-
-    def test_a_new_machine_becomes_the_fleet_that_was_saved(self):
-        super().test_a_new_machine_becomes_the_fleet_that_was_saved()
-        self.assertEqual(len(self.passing), 2, "the copy, and the restore's check of it")
-        self.assertEqual(os.listdir(self.temp), [])
-
-    def test_a_copy_that_is_not_what_it_says_is_refused_and_nothing_is_staged(self):
-        super().test_a_copy_that_is_not_what_it_says_is_refused_and_nothing_is_staged()
-        self.assertTrue(self.passing, "records that are not a database were opened through a file")
-        self.assertEqual(os.listdir(self.temp), [])
-
-    def test_a_copy_through_a_file_is_the_records_and_leaves_no_file(self):
-        self.assertEqual(hub.wal_on(), (True, None))
-        self.work()
-        code, _headers, data = self.download()
-        self.assertEqual(code, 200)
-        self.assertEqual(len(self.passing), 1, "the copy went through a file")
-        records = zipfile.ZipFile(io.BytesIO(data)).read("fleet.sqlite3")
-        self.assertEqual(records[18:20], b"\x01\x01", "the header of rollback mode, as with serialize")
-        self.assertEqual(hub.read_bundle(data)["manifest"]["fleet_id"], hub.fleet_id())
-        self.assertEqual(len(self.passing), 2, "and so did the restore's check of it")
-        with hub.image_opened(records) as copy:
-            self.assertEqual(copy.execute("SELECT title FROM tasks").fetchone()[0], "Write the October report")
-        self.assertEqual(os.listdir(self.temp), [])
-
-    def test_each_way_reads_the_copy_of_the_other_and_holds_the_same_pages(self):
-        if not hasattr(sqlite3.Connection, "serialize"):
-            self.skipTest("this Python has only the way through a file")
-        self.work()
-        copies = {}
-        for images in (True, False):
-            with patch.object(hub, "SQLITE_IMAGES", images):
-                copies[images] = self.download()[2]
-        for images, other in ((True, copies[False]), (False, copies[True])):
-            with patch.object(hub, "SQLITE_IMAGES", images):
-                self.assertEqual(hub.read_bundle(other)["manifest"]["fleet_id"], hub.fleet_id())
-        with hub.LOCK:          # no write between the two
-            with patch.object(hub, "SQLITE_IMAGES", True):
-                memory = hub.records_image()
-            through = hub.records_image()
-        self.assertEqual(len(memory), len(through))
-        changed = {n for n in range(len(memory)) if memory[n] != through[n]}
-        # Only the change counter, its copy and the schema cookie: those of a new file.
-        self.assertLessEqual(changed, set(range(24, 28)) | set(range(40, 44)) | set(range(92, 96)))
-        self.assertEqual(len(self.passing), 3, "a copy, a restore's check and an image, each through a file")
-        self.assertEqual(os.listdir(self.temp), [])
-
-    def test_no_copy_is_asked_for_inside_a_transaction(self):
-        """SQLite's backup answers "busy" to a source that is in a write, and Python asks it again for ever."""
-        with hub.transaction():
-            hub.DB.execute("INSERT OR REPLACE INTO kv(k,v) VALUES('a write','that waits')")
-            with self.assertRaisesRegex(RuntimeError, "outside a transaction"):
-                hub.records_image()
-        self.assertEqual(os.listdir(self.temp), [])
 
 
 # ---------------------------------------------------------------- without the app

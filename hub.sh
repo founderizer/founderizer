@@ -75,6 +75,9 @@ HUB_PORT=8765
 # Root's own clone of the code, which the root steps of the owner's app run from (hubsetup.py ROOT_KIT, the same
 # path: test_hub_install holds the two equal).
 ROOT_KIT=/usr/local/lib/founderizer-kit
+# The pause of a second claim (ports.py PAUSE, the same path: test_ports holds the two equal). Root holds the lock of
+# this file, which only root can open, for the time of a claim with --reclaim (first_team).
+PAUSE_MARK=/run/founderizer-hub-pause
 # The mark of a hub that this install makes: a file in root's own folder, which only root can write. The step of the
 # hub's user writes it when it makes that user itself, with a new home folder, and the step of the repository takes
 # it away, before this script runs anything as that user. While it is there, this script has run nothing as the
@@ -91,7 +94,7 @@ PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo tzd
 # The Founderizer files this installer needs in the copy it runs from. The rules, the manager's parts of them and its
 # profile are in the list because the manager reads them at every start: a hub without them runs but has no manager
 # worth the name.
-NEEDED="hub.py fleet.py hubsetup.py releases.py selftest.py config-ref.sh team.json RULES.md rules/lead.md rules/manager.md profiles/manager.md"
+NEEDED="hub.py fleet.py hubsetup.py ports.py releases.py selftest.py config-ref.sh team.json RULES.md rules/lead.md rules/manager.md profiles/manager.md"
 # Seconds that each apt-get waits for the package lock: a new server runs its first updates for about 9 minutes after
 # its first boot, and they hold it (hubsetup.py's APT_LOCK_WAIT).
 APT_LOCK_WAIT=1200
@@ -593,15 +596,29 @@ this machine, approve it in the fleet's Tailscale admin console. Else make a new
 
 firewall() {    # before the claim: the owner's Mac must reach port $port while the install runs. SSH too comes in over
                 # the private network only, which this machine joined in the step before (hubsetup.py firewall).
+                # Then the hub's ports for their own users (hubsetup.py ports, ports.py): from here on, and from each
+                # start of the server on, no user but $HUB_USER and root answers on 8765 and 9418, and none but the
+                # connect gate's user and root on 127.0.0.1:8767. Before the claim and before the users' services,
+                # so that an agent's user never answers there as the hub. As root, from the copy this script runs
+                # from, as the firewall.
     heading "the firewall: the private network only"
     if [ "$check" = yes ]; then
         plan "let everything on tailscale0 in, deny other incoming traffic, remove the public SSH rule of an earlier \
 Founderizer, and turn the firewall on: SSH then reaches this server over the private network only; a firewall that \
 is off now keeps open the ports that answer from the internet now"
+        plan "run: python3 $tree/hubsetup.py ports --hub-user $HUB_USER --hub-port $port, which keeps the hub's \
+ports for their own users: a kernel rule (nftables) drops each answer from port $port or 9418 of a user that is not \
+$HUB_USER or root, and from 127.0.0.1:8767 of a user that is not the connect gate's or root; a unit of root's loads it \
+at each start of the server, before the users' services, and no user's services and no connect gate start \
+without it; and \
+$HUB_USER and the connect gate's user may run one root command with sudo, which ends another user's listener on \
+those ports"
         return 0
     fi
     python3 "$tree/hubsetup.py" firewall \
         || stop "the firewall of this server could not be set: the line above says why. Run the line again."
+    python3 "$tree/hubsetup.py" ports --hub-user "$HUB_USER" --hub-port "$port" </dev/null \
+        || stop "the hub's ports could not be kept for $HUB_USER: the line above says why. Run the line again."
 }
 
 repository() {
@@ -674,6 +691,8 @@ that Mac sends the code back; its address becomes addresses.owner"
         [ "$reclaim" = no ] || plan "stop the service fleet-hub of a hub that runs for the time of that claim, because \
 the claim listens on the hub's own address and port, and start it again when the claim ends, also when no Mac claims \
 in time; the hub then serves the owner's pages to the new address and refuses the one from before"
+        [ "$reclaim" = no ] || plan "hold the lock of $PAUSE_MARK, a file of root's alone, for the time of that claim: \
+the hub's port command then says that the claim pauses the hub"
         plan "commit team.json on config and push it to $bare"
         return 0
     fi
@@ -726,11 +745,25 @@ this hub keeps none" ;;
     # it has a new address) the claim itself stops fleet-hub for its time and starts it again in every case, so no
     # service is stopped here (hubsetup.py HubPause). It is the hub's own copy of hubsetup.py that runs, so an older
     # copy of this script gets that too.
+    # A second claim stops the hub and listens on its port for its time. Root holds the lock of PAUSE_MARK for that
+    # time, a file in /run that only root can open: the hub's port command (ports.py, the holder) then says that the
+    # claim pauses the hub, so that a start of the hub in that time can end quietly. The lock goes with this process
+    # in every case, also with a kill, and a start of the server empties /run. The claim runs as the hub's user and
+    # does not get the file (9>&-).
+    if [ "$reclaim" = yes ]; then
+        (umask 077 && : >> "$PAUSE_MARK") || stop "$PAUSE_MARK could not be made."
+        exec 9>>"$PAUSE_MARK"
+        flock -w 10 9 || stop "another second claim runs on this server: let it end, then run the line again."
+    fi
     # shellcheck disable=SC2086
     as_user python3 "$kit/hubsetup.py" claim --address "$address" --port "$port" --out "$kit/team.json" \
         --runtime "$runtime" --ssh-user "$HUB_USER" --ssh-port "$(printf '%s' "$ports" | head -n 1)" \
-        --wait "$claim_wait" --commit $zone $more \
+        --wait "$claim_wait" --commit $zone $more 9>&- \
         || stop "the owner claim did not finish: the line above says why."
+    if [ "$reclaim" = yes ]; then
+        rm -f "$PAUSE_MARK"
+        exec 9>&-
+    fi
 }
 
 services() {

@@ -40,6 +40,7 @@ from unittest.mock import patch
 import fleet
 import hub
 import hubsetup
+import ports
 import vault
 from leftovers import ROOT
 KIT = Path(ROOT)
@@ -100,7 +101,7 @@ def load_tests(loader, _tests, _pattern):
     for cls in (Template, Repository, Claim, SecondClaim, AgentUsers, FleetId, VerifyStep, Prompt, PromptThroughSudo,
                 CheckMode, Systems, ZoneData, NoProviderCredential, ProviderToolsRefuse, RuntimeInstall, Firewall,
                 Harden, HardenMemory, HardenRestart, HubTcp, NetworkStep, PackageStops, PackageLists, AptUpdate,
-                ReleasesReach):
+                ReleasesReach, PortStep):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     return suite
 
@@ -2259,6 +2260,69 @@ class Firewall(unittest.TestCase):
                 folder.parent.rmdir()
                 code, out = run_shell(start + sshd + "sshd_folder\n" + read + '\necho "ports=$ports"\n')
                 self.assertEqual((code, out.strip()), (0, "ports="), "a folder that cannot be made stops nothing")
+
+
+class PortStep(unittest.TestCase):
+    """The hub's ports for their own users (ports.py) in hub.sh: the firewall step puts the kernel rule in place,
+    before the claim and the users' services, and a second claim runs while root holds the lock of the pause's file.
+    The steps run with stand-ins for root's programs."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="fleet-hub-ports-"))
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+
+    def test_the_firewall_step_keeps_the_hubs_ports_for_their_own_users_and_stops_when_it_cannot(self):
+        """After the firewall, as root from the installer's own tree: `hubsetup.py ports`. A rule that cannot be put
+        in place stops the install with its words: an agent's user on this server could otherwise answer as the hub.
+        A joined server gets no such step. Bugs it catches: an install that leaves the hub's ports open to each user,
+        and one that goes on with no rule and says nothing."""
+        body = shell_function(SCRIPT, "firewall") + "firewall\necho after-the-step\n"
+        root = ("tree=/root/fleet-kit\nport=8790\n"           # hub.sh sets port at its top, from --port
+                "python3() { printf 'ROOT: python3 %s\\n' \"$*\"; case \"$*\" in *' ports '*) return ${PORTS:-0} ;; "
+                "esac; }\n")
+        code, out = run_shell(body, extra=root)
+        self.assertEqual(code, 0, out)
+        self.assertEqual([line for line in out.splitlines() if line.startswith("ROOT: ")],
+                         ["ROOT: python3 /root/fleet-kit/hubsetup.py firewall",
+                          "ROOT: python3 /root/fleet-kit/hubsetup.py ports --hub-user fleet --hub-port 8790"])
+        code, out = run_shell(body, extra=root + "PORTS=1\n")
+        self.assertEqual(code, 1, out)
+        self.assertIn("the hub's ports could not be kept for fleet: the line above says why", out)
+        self.assertNotIn("after-the-step", out)
+        self.assertNotIn("hubsetup.py\" ports", (KIT / "join.sh").read_text())
+        main = shell_function(SCRIPT, "main")
+        self.assertLess(main.index("    firewall\n"), main.index("    first_team\n"))
+        self.assertLess(main.index("    firewall\n"), main.index("    services\n"))
+
+    def test_a_second_claim_runs_while_root_holds_the_lock_of_the_pause_and_the_claim_has_no_hold_of_it(self):
+        """--reclaim: root makes the pause's file (mode 600, root's alone), holds its lock for the time of the claim,
+        and removes it after; the claim, a program of the hub's user, gets no descriptor of it, so it can keep no lock
+        alive after it. A first claim takes no lock. The file is the one that the holder reads (ports.PAUSE). Bugs it
+        catches: a pause that the hub's port command never sees (no lock, or another file), and a claim that keeps the
+        lock, and so the pause, after its end."""
+        self.assertEqual(re.findall(r"(?m)^PAUSE_MARK=(.*)$", SCRIPT.read_text()), [ports.PAUSE])
+        mark = self.tmp / "pause"
+        # ( : >&9 ) in a subshell: a redirection that fails on a special builtin would end the shell itself
+        stubs = ("sshd_folder() { :; }\nsshd() { :; }\n"
+                 "flock() { if ( : >&9 ) 2>/dev/null; then echo \"LOCK $* on an open file\"; else echo \"LOCK $*\"; "
+                 "fi; }\n"
+                 "as_user() {\n"
+                 "    if ( : >&9 ) 2>/dev/null; then echo 'CLAIM: fd 9 open'; else echo 'CLAIM: fd 9 closed'; fi\n"
+                 "    if [ -f \"$PAUSE_MARK\" ]; then echo \"CLAIM: mark $(ls -l \"$PAUSE_MARK\" | cut -c1-10)\"; "
+                 "else echo 'CLAIM: no mark'; fi\n"
+                 "}\n"
+                 f"PAUSE_MARK={mark}\naddress=100.80.1.2\nport=8765\ntimezone=\nmanager_later=no\nmanager_name=\n"
+                 "hub_shared=no\nshape_step=\nruntime=claude\nclaim_wait=1800\n")
+        body = shell_function(SCRIPT, "first_team") + "first_team\n"
+        code, out = run_shell(body, extra=stubs + "reclaim=yes\n")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([line for line in out.splitlines() if line.startswith(("LOCK", "CLAIM"))],
+                         ["LOCK -w 10 9 on an open file", "CLAIM: fd 9 closed", "CLAIM: mark -rw-------"])
+        self.assertFalse(mark.exists(), out)
+        code, out = run_shell(body, extra=stubs + "reclaim=no\n")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([line for line in out.splitlines() if line.startswith(("LOCK", "CLAIM"))],
+                         ["CLAIM: fd 9 closed", "CLAIM: no mark"])
 
 
 class Harden(unittest.TestCase):

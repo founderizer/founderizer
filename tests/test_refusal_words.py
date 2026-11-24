@@ -156,6 +156,14 @@ OLD = {
     "link_most": "This fleet has {most} Founderizer rows with an invite or a device, the most that it can have. "
                  "Remove one first.",
     "link_from_tool": "An invite is made in Founderizer on the Mac, never by an AI session or a program.",
+    # a copy of the fleet that the hub's disk has no room for, or whose records need Zip64 (F14 piece 1)
+    "copy_no_room": "The hub's server has {free} free. A copy needs {need} there while the hub makes it.",
+    "copy_over_format": "This fleet's records are larger than 2 GB. Founderizer cannot put them into one copy yet.",
+    # a copy coming back that the hub's disk has no room for (F14 piece 3)
+    "restore_no_room": "The hub's server has {free} free. This copy needs at least {need} there.",
+    # the Update press while a copy is on its way (F14, the first validator's ask of 22 November 2026)
+    "update_waits_for_copy": "A copy of this fleet is on its way ({copy}), and an update waits until it ends. When "
+                             "it is done, press Update again.",
 }
 
 # The places of hub.py that were converted to a code, by the function that holds each: the scan of 16 November 2026
@@ -167,7 +175,9 @@ SITES = {
     'answer_secret': {'command_reused_message': 1, 'request_answered': 1, 'request_unknown_ended': 1,
                       'secret_value_asked': 1},
     'attachment_check': {'login_as_file': 1},
+    'backup_packed': {'copy_over_format': 1},
     'command_run': {'command_interrupted': 1, 'command_reused': 1, 'hub_changed_sending': 1, 'login_as_text': 1},
+    'copy_fits': {'copy_no_room': 1, 'copy_over_format': 1},
     'enroll_new_device': {'not_owner_device_no_code': 1},
     'google_file_refusal': {'google_file_key': 1, 'google_file_lost': 1, 'google_file_mode': 1,
                             'google_file_unreadable': 1},
@@ -216,6 +226,8 @@ SITES = {
     'removed_files': {'profile_unread': 1, 'revision_unreadable': 1},     # a removal waits for its files' read
     'rename_agent': {'agent_open_signin': 1, 'no_such_agent': 1, 'profile_unread': 2, 'revision_unreadable': 2,
                      'server_silent': 1, 'team_changed': 1},
+    'restore_room': {'restore_no_room': 1},
+    'restore_settled': {'command_reused': 1},
     'save_access': {'team_changed': 1},
     'save_agent_settings': {'no_such_agent': 1, 'team_changed': 1},
     # build plan 04, S3 (UI-API.md 1.218)
@@ -239,6 +251,7 @@ SITES = {
     'set_shape': {'team_changed': 1},
     'skill_remove': {'revision_unreadable': 1},
     'start_machine_login': {'no_such_agent': 1},
+    'start_release_work': {'update_waits_for_copy': 1},
     'take_resource': {'no_such_agent': 1},
     'task_artifacts': {'login_not_shown': 2},
     'task_control_act': {'no_such_task': 1},
@@ -287,7 +300,7 @@ SITES = {
     'ui_resources': {'hub_changed': 1},
     'ui_responsibilities': {'hub_changed': 1},
     'ui_responsibility': {'hub_changed': 1},
-    'ui_restore': {'command_reused': 1, 'hub_changed_sending': 1},
+    'ui_restore': {'hub_changed_sending': 1},
     'ui_roles': {'hub_changed': 1},
     'ui_secret_salts': {'hub_changed': 1},
     'ui_secret_same': {'hub_changed': 1},
@@ -545,7 +558,7 @@ class Places(unittest.TestCase):
                 for function, codes in sorted(SITES.items()) for code, count in sorted(codes.items())
                 if found.get(function, {}).get(code, 0) < count]
         self.assertEqual(lost, [])
-        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 220)
+        self.assertEqual(sum(sum(codes.values()) for codes in SITES.values()), 225)
 
     def test_the_english_of_a_sentence_of_the_table_is_written_nowhere_else_in_hub_py(self):
         """One code for each sentence: a place that writes the sentence by hand again has no code. A new place of one

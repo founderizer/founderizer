@@ -1402,7 +1402,7 @@ class CentralCopy(WithCentral, Fixture):
         self.assertIn("The hub never opens it", notes)
         self.assertNotIn("no key anywhere in this copy", notes)
         # A restore reads it and writes it nowhere: it is not one of the owner's files.
-        bundle = hub.read_bundle(data)
+        bundle = self.bundle(data)
         self.assertEqual(bundle["central"], member)
         self.assertNotIn(hub.CENTRAL_MEMBER, bundle["config"])
         self.assertTrue(all(not name.startswith("vault/") for name in bundle["config"]))
@@ -1417,7 +1417,7 @@ class CentralCopy(WithCentral, Fixture):
                                                      "recovery key, so its store is not in this copy"})
         self.assertIn("**Your central vault.**", notes)
         self.assertEqual(self.vault.ops("export"), [])
-        self.assertEqual(hub.read_bundle(_data)["central"], None)
+        self.assertEqual(self.bundle(_data)["central"], None)
 
     def test_a_hub_with_no_central_vault_says_nothing_of_one(self):
         self.vault.close()                                # never read, and gone
@@ -1439,7 +1439,7 @@ class CentralCopy(WithCentral, Fixture):
             for name, body in members.items():
                 zf.writestr(name, body)
         with self.assertRaises(hub.Refusal) as refused:
-            hub.read_bundle(out.getvalue())
+            self.bundle(out.getvalue())
         self.assertIn(hub.CENTRAL_MEMBER, str(refused.exception))
 
 

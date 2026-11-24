@@ -100,14 +100,21 @@ OLDER_MOST = 10 ** 9            # a count of older tasks above this, or below 0,
 # call. A hub from before 1.256 does not know `head` and answers the state: with the window of STATE_READ from 1.254
 # on, and whole before. Each of those answers holds `db` too, so the one read serves every hub.
 STATE_HEAD = STATE_ROUTE + "?head=1&tasks=window"
-BACKUP_MAX = 256 * 1024 * 1024          # hub.py BACKUP_MAX: the largest copy the hub serves
 ATTACH_MAX = 25 * 1024 * 1024           # hub.py ATTACH_MAX: the largest file the owner attaches
-# The three tools that move a file (attach_file, read_attachment, take_backup) read up to the hub's own limit of that
-# file (ATTACH_MAX, BACKUP_MAX) and not READ_MAX, and they wait longer: FILE_WAIT seconds for each part of the transfer
-# and FILE_TOTAL for the whole read, as the Mac app reads a copy (FleetCopy.takeCopy: 60 and 900). The program inside
-# the Founderizer app has the same limits (`Transfer` in OwnerHub.swift).
+# The two tools that move a file of the owner's (attach_file, read_attachment) read up to the hub's own limit of that
+# file (ATTACH_MAX) and not READ_MAX, and they wait longer: FILE_WAIT seconds for each part of the transfer and
+# FILE_TOTAL for the whole read. The program inside the Founderizer app has the same limits (`Transfer` in
+# OwnerHub.swift).
 FILE_WAIT = 60
 FILE_TOTAL = 900
+# take_backup writes the copy into a file as it comes (`into` of `call`), so a copy of any size takes no more of this
+# Mac's memory than one part (the owner, 22 November 2026: "why is there a backup limit? it shouldn't?"). The hub makes
+# the copy before its first byte, so a byte may take COPY_WAIT seconds; the whole read stays under the 30 minutes of
+# one tool call (COPY_TOTAL), and a copy that takes longer is refused with its own words (COPY_SLOW).
+COPY_WAIT = 600
+COPY_TOTAL = 1500
+COPY_SLOW = (f"The copy did not arrive in {COPY_TOTAL // 60} minutes, the most that one tool call waits, so nothing was "
+             f"kept. Save copy in Settings \u203a Backup of the Founderizer app has no such limit of time.")
 # The media type of a file that the agent attaches with no `mime`, by its ending in lower case: the hub's own types
 # (hub.py ATTACH_TYPES and, since owner API 1.251, ATTACH_OFFICE, Word, Excel and PowerPoint; it takes no other) and the
 # other endings of the same types. Every other file is
@@ -613,27 +620,44 @@ def one_read(answer, size):
         raise OSError(f"the answer broke off ({type(e).__name__})") from None
 
 
-def read_whole(answer, limit, total, started):
+def read_whole(answer, limit, total, started, into=None):
     """The body of an answer, at most `limit` + 1 bytes. With `total`, the read stops with an OSError when the whole
     transfer took longer than that many seconds since `started`, so a hub that sends a file slowly cannot hold a call
     for ever (each wait has its own `timeout` too). A body that breaks off is an OSError too, so `call` says that the
     request can have arrived: `http.client.IncompleteRead` when a chunked answer closes inside a chunk, and a ValueError
-    for a bad chunk size (`one_read`)."""
+    for a bad chunk size (`one_read`). `into`: each part goes into it (`Into`) as it comes, with no limit of size, and
+    the answer holds no bytes (take_backup)."""
     if total is None:
         return one_read(answer, limit + 1)
     parts, size = [], 0
-    while size <= limit:
-        part = one_read(answer, min(1024 * 1024, limit + 1 - size))
+    while into is not None or size <= limit:
+        part = one_read(answer, 1024 * 1024 if into is not None else min(1024 * 1024, limit + 1 - size))
         if not part:
             break
-        parts.append(part)
+        if into is not None:
+            into.write(part)
+        else:
+            parts.append(part)
         size += len(part)
         if time.monotonic() - started > total:
             raise OSError(f"the transfer took longer than {total} seconds")
     return b"".join(parts)
 
 
-def call(method, path, body=None, base=None, timeout=TIMEOUT, limit=READ_MAX, mime=None, extra=None, total=None):
+class Into:
+    """The open file that the body of a successful answer goes into as it comes (`call`'s `into`), with its size and
+    SHA-256, read as it is written."""
+    def __init__(self, f):
+        self.file, self.size, self.digest = f, 0, hashlib.sha256()
+
+    def write(self, part):
+        self.file.write(part)
+        self.size += len(part)
+        self.digest.update(part)
+
+
+def call(method, path, body=None, base=None, timeout=TIMEOUT, limit=READ_MAX, mime=None, extra=None, total=None,
+         into=None):
     """One call to the owner API from this Mac: no Origin, which `ui_allowed` refuses on an owner route, and this
     Mac's key for that hub as the bearer when it has one (`owner_key`). The hub knows the owner by this Mac's address
     and that key, both.
@@ -650,21 +674,23 @@ def call(method, path, body=None, base=None, timeout=TIMEOUT, limit=READ_MAX, mi
 
     `mime`: the body is those bytes under that media type, instead of JSON — the one route whose body is a file
     (`POST /ui/attachments`). `extra`: that route's own headers, which carry what a JSON body would carry as fields.
-    `total`: the seconds that the read of the whole answer may take (the file tools, FILE_TOTAL)."""
+    `total`: the seconds that the read of the whole answer may take (the file tools, FILE_TOTAL). `into`: the body of a
+    success goes into this `Into` as it comes, and the answer holds none (take_backup); a refusal's body is words, and
+    the answer holds them."""
     base = base or hub_base()
     key, waits, file, numbered = owner_key_sent(base)
     sent = key or waits
     if sent and NO_KEY.get(base) == sent:   # this hub said that it expects no key, and the key is the same one
-        answer = _call(method, path, body, base, timeout, limit, mime, extra, total, None)
+        answer = _call(method, path, body, base, timeout, limit, mime, extra, total, into, None)
         if not (isinstance(answer.data, dict) and answer.status == 403
                 and answer.data.get("auth") == "owner_key_required"):
             return answer
         del NO_KEY[base]                    # the hub holds a key now: the call goes with this computer's key
-    answer = _call(method, path, body, numbered if sent else base, timeout, limit, mime, extra, total, sent)
+    answer = _call(method, path, body, numbered if sent else base, timeout, limit, mime, extra, total, into, sent)
     refused = isinstance(answer.data, dict) and answer.status == 403 and answer.data.get("auth")
     if sent and refused == "key_not_expected":
         NO_KEY[base] = sent                 # for this server's run: each later call goes once, not twice
-        return _call(method, path, body, base, timeout, limit, mime, extra, total, None)
+        return _call(method, path, body, base, timeout, limit, mime, extra, total, into, None)
     # The routes under /ui/owner/ are how a computer or a device gets its key: they ask nobody for this one.
     ruled = path.startswith("/ui/") and not path.startswith("/ui/owner/")
     if key and refused == "owner_key_mismatch":
@@ -673,7 +699,7 @@ def call(method, path, body=None, base=None, timeout=TIMEOUT, limit=READ_MAX, mi
         # anything, so the same call goes once more, with the key that waits.
         waits = key_in(file.with_name(file.name + ".pending"))
         if waits and waits != key:
-            again = _call(method, path, body, numbered, timeout, limit, mime, extra, total, waits)
+            again = _call(method, path, body, numbered, timeout, limit, mime, extra, total, into, waits)
             if not (isinstance(again.data, dict) and again.status == 403
                     and again.data.get("auth") in ("owner_key_mismatch", "owner_key_required", "key_not_expected")):
                 answer = again
@@ -707,7 +733,7 @@ def keep_owner_key(base, key, path=None):
 NO_KEY = {}             # a hub's base -> the key that it refused as not expected (a hub from before the key)
 
 
-def _call(method, path, body, base, timeout, limit, mime, extra, total, key):
+def _call(method, path, body, base, timeout, limit, mime, extra, total, into, key):
     """One request of `call`, with `key` as its bearer or with none."""
     next_step(f"the call {method} {path}")
     started = time.monotonic()
@@ -728,7 +754,7 @@ def _call(method, path, body, base, timeout, limit, mime, extra, total, key):
     request = urllib.request.Request(base + path, data=data, method=method, headers=headers)
     try:
         with OPENER.open(request, timeout=timeout) as answer:
-            raw, got, status = read_whole(answer, limit, total, started), answer.headers, answer.status
+            raw, got, status = read_whole(answer, limit, total, started, into), answer.headers, answer.status
     except urllib.error.HTTPError as e:
         # A refusal's body is words, never a file: at most READ_MAX, under the same total as the answer it stands for,
         # so a file route that answers 500 and then one byte a minute cannot hold the call.
@@ -835,15 +861,18 @@ def stale(answer):
     return answer.status == 409 and "generation" in (answer.error or "")
 
 
-def answered(route, transfer=None, **query):
+def answered(route, transfer=None, into=None, **query):
     """One owner read route, with the generation it asks for, and its answer whatever its status: a hub with a new
     generation is read again once. `/ui/state` takes none. The query words are the route's own (`path`, `agent`,
-    `after`, ...), so they are passed in and never named as parameters of this function, except `transfer`, which no
-    route takes: the largest answer of a file route, which then has the time of a file (FILE_WAIT, FILE_TOTAL)."""
+    `after`, ...), so they are passed in and never named as parameters of this function, except `transfer` and `into`,
+    which no route takes: the largest answer of a file route, which then has the time of a file (FILE_WAIT,
+    FILE_TOTAL); or the `Into` that the body of a copy goes into, with the time of a copy (COPY_WAIT, COPY_TOTAL)."""
     def once():
         q = dict({"db": generation()} if route != "/ui/state" else {},
                  **{k: v for k, v in query.items() if v is not None})
         path = route + ("?" + urllib.parse.urlencode(q) if q else "")
+        if into is not None:
+            return call("GET", path, timeout=COPY_WAIT, total=COPY_TOTAL, into=into)
         if transfer is None:
             return call("GET", path)
         return call("GET", path, timeout=FILE_WAIT, limit=transfer, total=FILE_TOTAL)
@@ -854,9 +883,9 @@ def answered(route, transfer=None, **query):
     return answer
 
 
-def get(route, what, transfer=None, **query):
+def get(route, what, transfer=None, into=None, **query):
     """One owner read route (`answered`), and the hub's own refusal for every answer that is not a 200."""
-    answer = answered(route, transfer, **query)
+    answer = answered(route, transfer, into, **query)
     if answer.status != 200:
         raise refusal(answer, what)
     return answer
@@ -1800,23 +1829,61 @@ def share_resource(args):
 
 def take_backup(args):
     """`GET /ui/backup` into a file on this Mac, then `POST /ui/backups/confirm` once the bytes are checked against
-    the hub's own SHA-256. Nothing is written on the hub machine."""
+    the hub's own SHA-256. No copy stays on the hub machine.
+
+    The copy goes into a new file of mode 600 in the folder where it is kept, as it comes (`Into`), so a copy of any
+    size takes no more of this Mac's memory than one part; the file gets its name only once its SHA-256 is the hub's,
+    and goes on every other way out. Its name, as the rules of `write_here` say: in a folder that the agent named, the
+    hub's name, made new and only new; a file that the agent named is replaced."""
     where = args.get("path")
     if not isinstance(where, str) or not where.strip():
         raise Refused("path must be where on this Mac the copy is written.")
     place = local_place(where)
-    answer = get("/ui/backup", "a copy of this fleet", transfer=BACKUP_MAX)
-    digest = hashlib.sha256(answer.raw).hexdigest()
-    said = answer.headers.get("X-Fleet-Backup-SHA256")
-    if said and said != digest:
-        raise Refused("the copy did not arrive whole: the hub's SHA-256 is not the one of the bytes received.")
-    folder = None
-    if place.is_dir():
-        folder, place = place, into_folder(place, hub_file_name(answer, f"founderizer-{int(time.time())}.zip"))
-    write_here(place, answer.raw, folder)          # before the confirmation: a write refused confirms nothing
-    receipt = command("/ui/backups/confirm", {"sha256": digest, "bytes": len(answer.raw)},
+    folder = place if place.is_dir() else None
+    try:
+        (folder or place.parent).mkdir(parents=True, exist_ok=True)
+        handle, coming = tempfile.mkstemp(prefix="founderizer-copy-", suffix=".part", dir=folder or place.parent)
+    except OSError as e:
+        raise Refused(f"{place} could not be written on this Mac: {e.strerror or e}.") from None
+    try:
+        with os.fdopen(handle, "wb") as f:
+            into, started = Into(f), time.monotonic()
+            try:
+                answer = get("/ui/backup", "a copy of this fleet", into=into)
+            except Refused:
+                if time.monotonic() - started >= COPY_TOTAL:
+                    raise Refused(COPY_SLOW) from None
+                raise
+        digest = into.digest.hexdigest()
+        said = answer.headers.get("X-Fleet-Backup-SHA256")
+        if said and said != digest:
+            raise Refused("the copy did not arrive whole: the hub's SHA-256 is not the one of the bytes received.")
+        if folder is not None:
+            place = into_folder(folder, hub_file_name(answer, f"founderizer-{int(time.time())}.zip"))
+        kept_as(coming, place, folder)          # before the confirmation: a write refused confirms nothing
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(coming)
+    receipt = command("/ui/backups/confirm", {"sha256": digest, "bytes": into.size},
                       "the confirmation of the copy", args.get("request_id"))
-    return dict(receipt, path=str(place), bytes=len(answer.raw), sha256=digest)
+    return dict(receipt, path=str(place), bytes=into.size, sha256=digest)
+
+
+def kept_as(coming, place, folder=None):
+    """The file `coming` under its name `place`, in one step (`os.replace`), as `write_here` writes a file: in a folder
+    that the agent named (`folder`), the name is made new and only new first (O_CREAT|O_EXCL, which follows no link at
+    its last part), so a file, a link or a folder of that name stays as it is and nothing is kept; a file that the agent
+    named is replaced."""
+    try:
+        if folder is not None:
+            try:
+                os.close(os.open(place, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            except FileExistsError:
+                raise Refused(f"{place.name} is there already in {folder}, so nothing was written. Name the file "
+                              f"itself in path to replace it, or name another folder.") from None
+        os.replace(coming, place)
+    except OSError as e:
+        raise Refused(f"{place} could not be written on this Mac: {e.strerror or e}.") from None
 
 
 # ---- the install, over the owner's own SSH, and the claim from this Mac
@@ -5590,7 +5657,8 @@ def tools():
         tool("Releases",
              "take_backup", "Take one copy of this fleet into a file on this Mac — the records, the owner's own "
                             "configuration, a manifest and RESTORE.md — check its SHA-256 and tell the hub it is "
-                            "saved. Nothing is written on the hub machine.",
+                            "saved. No copy stays on the hub machine. This copy carries no access key of the "
+                            "fleet: only a copy that the Founderizer app keeps has it.",
              {"path": S["text"], **rid}, ("path",), take_backup),
         tool("Setup",
              "which_hub", "Which hub this server reads, and on what authority.", {}, (), which_hub),

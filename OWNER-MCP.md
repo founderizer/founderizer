@@ -122,8 +122,8 @@ an id and no method, a method that is no text, and an empty batch each get the J
 set, and `owner` is its only set in this version. Calls run one at a time, and a `ping` is
 answered while a call runs. No call sends progress. That is enough in this version because no
 call waits for long: each request to the hub has a limit of 60 seconds, the one file of
-`attach_file`, `read_attachment` and `take_backup` a limit of 15 minutes (below), a tool makes a
-few requests, and the lock is held for one request at a time. That is under the 30 minutes after
+`attach_file` and `read_attachment` a limit of 15 minutes and the copy of `take_backup` one of 25
+minutes (below), a tool makes a few requests, and the lock is held for one request at a time. That is under the 30 minutes after
 which Claude Code ends a call that sends no answer and no progress. The one exception is the tools
 of a cloud (design 9), whose call runs a few commands of the cloud's own program of 120 seconds
 each. So the program takes a cancel (`notifications/cancelled`), as this server does: a call that
@@ -1112,13 +1112,21 @@ lines, counts and times, and no words), which the agent reads first.
 `X-Fleet-Name`), under the lock, and reads the hub's generation again once, with the same request
 id. A name of the file outside printable ASCII goes as `_` for each such character, which is the
 name that the hub keeps (before 14 November 2026 this server stopped on such a name, because a
-header carries Latin-1 only). `read_attachment` reads up to 25 MiB and `take_backup` up to 256 MiB
-(the hub's `BACKUP_MAX`, the largest copy that it serves); until 14 November 2026 both read at most
-8 MiB. All three wait 60 seconds for each part of the transfer and 15 minutes for the whole, as the
-Mac app reads a copy. The program stops an answer at its limit while it arrives (a `Content-Length`
-above the limit ends it at its headers), so a hub that sends a body with no end cannot fill the
-Mac's memory; this server reads at most the limit and one byte. An answer that is not a success is
-words, never a file: both programs read at most 8 MiB of it, under the same total time. The whole
+header carries Latin-1 only). `read_attachment` reads up to 25 MiB; until 14 November 2026 it read
+at most 8 MiB. Both wait 60 seconds for each part of the transfer and 15 minutes for the whole. The
+program stops an answer at its limit while it arrives (a `Content-Length` above the limit ends it at
+its headers), so a hub that sends a body with no end cannot fill the Mac's memory; this server reads
+at most the limit and one byte. `take_backup` has no limit of size since 22 November 2026 (the
+hub's copy has none): both programs write the copy into a new file of mode 600 in the folder where
+it is kept, as it arrives, read its SHA-256 as they write, and give the file its name only when the
+SHA-256 is the hub's, then confirm it; the file goes on every other way out. They wait 600 seconds
+for a part, because the hub makes the copy before its first byte, and 25 minutes for the whole,
+under the 30 minutes of one tool call; a copy that takes longer is refused with words that send the
+owner to Save copy in the app. A known limit: a copy from `take_backup` carries no access key of
+the fleet (`owner-access.key`), which only a copy that the Founderizer app keeps has
+(`OwnerAccess.withKey`), so after a lost Mac only such a copy is the way back into the servers; the
+hub counts both as the fleet's confirmed copy. An answer that is not a success is words, never a file: both
+programs read at most 8 MiB of it, under the same total time. The whole
 snapshot (`GET /ui/state`), which a process reads before its first call for the hub's generation,
 has a limit of its own in both programs, 64 MiB (`STATE_MAX`, `Transfer.state`): it is an
 answer that holds a fleet's whole history, and on 19 November 2026 a fleet with about 1,400 tasks

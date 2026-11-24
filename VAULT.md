@@ -430,8 +430,9 @@ server that joined before, it is off until root switches it on.
 - **Who runs the step.** A new server's install runs it after the vault step (`join.sh`, and `hub.sh` for a hub's
   own server that takes agents, through `hubsetup.py key-swap`). An install goes on when the step stops: it says
   why, and the server then gives each key as a value. `hubsetup.py vault --swap` runs it too. No rule of a server's
-  sudoers file reaches it: the service user's two root commands are other programs, and its third right is to run
-  a command as an agent user, which the step refuses (`hubsetup.py`).
+  sudoers file reaches it: the service user's root commands are other programs (on the hub's server also the
+  command of the hub's ports, `ports.py`), and its other right is to run a command as an agent user, which the step
+  refuses (`hubsetup.py`).
 - **Off.** `vault.py configure --swap off` takes the part away, restarts the broker and stops the proxy. Each session
   that runs on that server with a placeholder then gets no key until its next start, because the proxy stops with
   the switch.
@@ -1130,24 +1131,53 @@ host.
     a hub that is broken into at the time of a join can give the machine another program. On a Linux server that
     program is root, and it can know the key of the broker that it installs, which the owner's Mac then reads there
     and pins. The hub can then open each value that the owner gives to an agent of that server. A machine that joined
-    before does not change by this, nor does the hub's own server, which installs from GitHub (`hub.sh`).
+    before does not change by this, nor does the hub's own server, which installs from GitHub (`hub.sh`). Root's step
+    that gives a hub that runs one server for all (`hubsetup.py one-server`) runs from root's own clone, and it clones
+    the server service's checkout from the hub's own bare repository by its path, never over `git://`, which proves no
+    server; only then is that checkout's origin the `git://` address.
     **An installer that runs again** on a server runs root steps from the checkout of the service's own user: on the
     hub's server the agents' users and their list, and where agents share it the vault, the key swap and the outgoing
     gate (`hub.sh`); on a joined server also the firewall and the hardening (`join.sh`). If that user is broken into, root
     runs that user's code, and on the hub's server it can read the vault's store. The second claim of a lost Mac
     (`HUB-INSTALL.md`) is such a run. The check of a later update of the checkout is that user's program too.
 
-29. **The hub's ports on a server that also runs agents.** The hub listens on 8765, its git service on 9418, and the
-    link of a Mac's installer on 8767. A user of that server can listen on a port that no program holds. So while
-    the hub or the git service does not run (a crash, a restart by hand, a start of the server, a release that changes
-    the text of a service's unit), an agent's own user on that server can listen on the port in its place. The vault's
-    program on the server then takes that user's program as the hub, and gives it what it gives the hub: the keys of
-    other agents and of the pool. The local agents' keys of that server, its service key and the key of the chat
-    bridge reach it too, and they stay good. The agent needs no break-out of its account. This holds today for a fleet
-    of one server, and for each fleet that has an agent on the hub's server. In that time the program also answers the
-    other servers' helpers and brokers, and the door, as the hub does. The central vault answers the hub's own user
-    only, and the owner's pins stay as they are. A hub on a server with no agents does not have this limit (`hub.py`,
-    `vault.py`, `lifecycle.py`).
+29. **The hub's ports on a server that also runs agents.** The hub listens on its port (8765, or the port of `hub.sh
+    --port`) and its git service on 9418, as the hub's user, and the connect gate on 127.0.0.1:8767, as its own user.
+    Each port is above 1024, so each user of that server can listen there while the program does not run: a crash, a
+    restart by hand, a start of the server, a release that changes the text of a service's unit, a second claim. Root's
+    step of the hub's server (`hub.sh` in its firewall step, and `hubsetup.py one-server` before its other parts) puts a
+    kernel rule in place (`ports.py`): each packet from the hub's port or 9418 whose socket is not of the hub's user or
+    root, and each packet from 127.0.0.1 or ::1 port 8767 whose socket is not of the gate's user or root, is dropped, in
+    IPv4 and IPv6; so is each SYN-ACK from those ports that no socket of the port's own user or root sends, because the
+    kernel sends the SYN-ACK of a SYN cookie with no socket, and an agent's listener that filled its own queue would
+    else complete a client's handshake by cookie and read its first data. So a listener of an agent's user there gives
+    no client a handshake: the server's broker, the other servers' helpers and brokers, the door and Funnel get no
+    answer from it. Under a SYN flood the port's own program then answers no new client by cookie either, which is a
+    denial only. A unit of root's loads the rule at each start of the server, before the users' services, again at each
+    change of `/etc/passwd` and after each start, reload and stop of `nftables.service`; no user's services, no connect
+    gate, no vault broker of that server and no cron or at job start when it does not load, so the broker sends no
+    agent's key to a port that has no rule and no agent's job takes the port (root's own cron jobs wait as well); and no
+    agent user logs in by SSH there (a file of sshd's with `DenyGroups fleet-agents`, because an agent owns its home and
+    could put a key of its own in it; the step stops where sshd's own reading, `sshd -T`, does not deny that group). A
+    root command with no argument, which the hub's user and the gate's user may run with sudo, ends such a listener: it
+    stops each process that holds it and whose real UID is neither root's nor the port's own user's, and each process
+    that a fork gave the listener in the meantime, then ends them all; it ends no process whose real UID is root's or
+    the port's own user's. The units of the hub, of its git service and of the gate run it before each start (the git
+    service's unit of a hub that got the rule only from `hubsetup.py one-server` gets that line at its next `hub.sh`;
+    the hub's unit moves to it by itself), and root's unit at each load of the rule. What stays: when the rule does not
+    load at a start of the server (the boot unit's line in the journal says why), the hub stays down, and only root and
+    the hub's user can log in by SSH, for a repair; a listener of an agent's user can hold a port that it took while the
+    program did not run, and answer nobody, until the next start of that program by its unit; a socket of an agent's
+    user that is bound to one of these ports and does not listen is in no table of the kernel's listeners, so the
+    command does not see it, and it keeps the program's bind out (a denial only); an agent that keeps another of its
+    processes sending SIGCONT to the stopped holders, or that traces them, can fork past the command's looks, and a
+    socket that waits only in a UNIX socket's queue has no process to end: both keep the program's port taken, also a
+    denial only; a flush of the kernel's rules by hand (`nft flush ruleset`) takes the rule away until the next change
+    of `/etc/passwd`, the next start of the gate or the next start of the server; a sub-uid range of an agent that holds
+    the hub user's UID lets a process of that agent take that UID (the outgoing gate's step names such a range); and a
+    hub's server that no root step reached since this release has no rule until its next one (`hubsetup.py one-server`,
+    or `hub.sh` again). Root and the hub's own user are trusted for these ports. A hub on a server with no agents does
+    not have this limit (`ports.py`, `hub.py`, `vault.py`, `lifecycle.py`).
 
 30. **A hub's own server that takes agents with no key swap and no outgoing gate.** `hub.sh` switches on the key swap
     and the outgoing gate for a hub's own server only when it runs with the word of one server for all

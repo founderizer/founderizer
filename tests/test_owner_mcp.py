@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 import types
 import unittest
 import urllib.error
@@ -691,16 +692,57 @@ class FromNothing(WithServer):
         self.assertIn("already answered", str(again.exception))
 
     def test_it_takes_a_backup_to_this_mac_and_tells_the_hub_it_is_saved(self):
+        """The copy goes into a file on this Mac as it arrives, in parts, and that file has the hub's own SHA-256 before
+        the hub is told that the copy is kept: a copy of 12 MiB of records that do not pack is kept with a peak of
+        Python's memory of a few MiB, the hub's side of this process included, and no passing file stays beside it.
+        A copy that does not arrive within COPY_TOTAL gets the words that send the owner to Save copy in the app, the
+        hub is not told, and nothing stays. The bugs that it catches: the tool reads the whole copy into memory again,
+        under a limit of its size, which a fleet passes (the owner, 22 November 2026: "why is there a backup limit? it
+        shouldn't?"); a copy past the time of one tool call that the agent reads as a lost call, with no way on."""
         client = self.started()
         where = pathlib.Path(tempfile.mkdtemp(prefix="fleet-copy-"))
         self.addCleanup(shutil.rmtree, str(where), True)
         taken = client.call("take_backup", path=str(where))
-        saved = pathlib.Path(taken["path"])
-        self.assertTrue(saved.exists())
-        self.assertEqual(saved.stat().st_size, taken["bytes"])
-        self.assertEqual(hashlib.sha256(saved.read_bytes()).hexdigest(), taken["sha256"])
+        first = pathlib.Path(taken["path"])
+        self.assertTrue(first.exists())
+        self.assertEqual(first.stat().st_size, taken["bytes"])
+        self.assertEqual(hashlib.sha256(first.read_bytes()).hexdigest(), taken["sha256"])
         self.assertEqual(hub.kv_get("backup_sha256"), taken["sha256"])
         self.assertEqual(client.call("fleet_read", page="health")["backup"]["sha256"], taken["sha256"])
+        hub.q("CREATE TABLE ballast(x BLOB)")
+        for _ in range(12 * 16):
+            hub.q("INSERT INTO ballast VALUES(?)", (os.urandom(64 * 1024),))
+        parts, real = [], owner_mcp.one_read
+
+        def counted(answer, size):          # the length of each part of a copy's body, and not the part
+            part = real(answer, size)
+            if size == 1 << 20:
+                parts.append(len(part))
+            return part
+        tracemalloc.start()
+        try:
+            with patch.object(owner_mcp, "one_read", counted):
+                taken = self.direct("take_backup", path=str(where / "larger.zip"))
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        saved = where / "larger.zip"
+        self.assertEqual((taken["path"], saved.stat().st_size), (str(saved), taken["bytes"]))
+        self.assertGreater(taken["bytes"], 12 << 20)
+        self.assertGreater(len([n for n in parts if n]), 1)       # the body came in more than one part
+        digest = hashlib.sha256()
+        with open(saved, "rb") as f:
+            for piece in iter(lambda: f.read(1 << 20), b""):
+                digest.update(piece)
+        self.assertEqual((digest.hexdigest(), hub.kv_get("backup_sha256")), (taken["sha256"], taken["sha256"]))
+        self.assertLess(peak, 6 << 20)
+        with patch.object(owner_mcp, "COPY_TOTAL", 0), self.assertRaises(Refused) as slow:     # past its time
+            self.direct("take_backup", path=str(where))
+        self.assertEqual(str(slow.exception), owner_mcp.COPY_SLOW)
+        self.assertIn("has no such limit of time.", owner_mcp.COPY_SLOW)    # and no claim of size: 2 GB is a bound
+        self.assertEqual(hub.kv_get("backup_sha256"), taken["sha256"])
+        self.assertEqual(sorted(path.name for path in where.iterdir()), sorted([first.name, "larger.zip"]))
+        self.assertLess(owner_mcp.COPY_TOTAL, 30 * 60)          # under the 30 minutes of one tool call
 
     def test_a_machine_check_and_an_update_reach_the_machine_and_the_release_channel_is_asked(self):
         client = self.started()

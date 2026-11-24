@@ -62,8 +62,10 @@ step that the owner chose on that slider (`"shape": {"step"}`, UI-API.md 1.176);
 `one`. Both are words of a hub's first install. A fleet that runs changes to one server
 by the owner's command and one root step on the hub's server, from root's own clone, which
 `hubsetup.py kit-clone` brings to the hub's release first: `python3
-/usr/local/lib/founderizer-kit/hubsetup.py one-server`. It makes this server's vault broker
-and its server service and restarts no service of the hub. Founderizer does both from the
+/usr/local/lib/founderizer-kit/hubsetup.py one-server`. It first puts the kernel rule of the
+hub's ports in place (step 5), then makes this server's vault broker and its server service,
+whose checkout it clones from the hub's own repository by its path and not over `git://`, and
+it restarts no service of the hub. Founderizer does both from the
 manager's setup of a fleet that exists, on a hub that has them.
 
 What such a fleet does not have: **a door**. The hub knows the door's own calls by the
@@ -187,7 +189,15 @@ notification of a Needs-you item, the chat that opens first), so with those apps
    on the private network: `tailscale ip -4` must give an address, and `tailscale status` must
    succeed. A server that waits for an admin to approve it in Tailscale has an address
    already, but nothing on the private network reaches it. On such a server the step stops,
-   and the server keeps its public SSH.
+   and the server keeps its public SSH. Then **the hub's ports** (`hubsetup.py ports`,
+   `ports.py`): a kernel rule of root's lets only `fleet` and root answer on the hub's port
+   (8765, or the one of `--port`) and 9418, and only the connect gate's user and root on
+   127.0.0.1:8767, in IPv4 and IPv6, so that an agent's user on this server cannot answer as the
+   hub while the hub does not run (VAULT.md limit 29). The unit `founderizer-ports` loads it at
+   each start of the server, before the users' services, and no user's services and no connect
+   gate start without it. The
+   step installs the package `nftables` where the server has none, and it stops the install
+   when the rule does not load.
 6. **The Founderizer repository on this hub.** `~fleet/founderizer.git` is the bare
    repository and the origin of the whole fleet: `fleet-git` serves it read-only over
    `git://`, and every worker and joined server fetches its code from it.
@@ -370,6 +380,12 @@ moved in:
 - `/etc/sudoers.d/fleet-agents` — it gives the service user three rights and nothing else:
   those two commands as root, and any command as a member of the group `fleet-agents`,
   which holds the agent users and nobody else.
+
+On the hub's server, step 5 adds one more root command, `/usr/local/lib/founderizer-ports/holder`,
+in a sudoers file of its own, `/etc/sudoers.d/founderizer-ports`, for `fleet` and the connect
+gate's user `founderizer-connect`. It takes no argument and no input, and it ends only a
+listener on the hub's port, 9418 or 127.0.0.1:8767 whose user is neither root nor the port's own
+(VAULT.md limit 29).
 
 The service user needs the last right to install an agent under its own user, and
 `verify` needs it to read one. That user is not an agent and runs no AI session, so it is

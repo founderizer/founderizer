@@ -436,6 +436,22 @@ def unit_of_before(kit, python, home):
             "[Install]\nWantedBy=default.target\n")
 
 
+# The hub's unit as each release from 16 November 2026 until the port piece wrote it: the module form and
+# OOMPolicy=continue, with no line before its start. Written out here a second time, apart from lifecycle.hub_units_before.
+def unit_of_the_module_form(kit, python, home):
+    return ("[Unit]\nDescription=Founderizer hub\nAfter=network-online.target\nStartLimitIntervalSec=0\n"
+            "[Service]\nType=simple\nWorkingDirectory=" + kit + "\n"
+            'Environment="PATH=' + home + '/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:'
+            '/sbin"\n'
+            'ExecStart="' + python + '" "-m" "hub"\n'
+            "Restart=always\nRestartSec=5\nKillMode=process\nTimeoutStopSec=15\nOOMPolicy=continue\n"
+            "[Install]\nWantedBy=default.target\n")
+
+
+PORT_HOLD = ('ExecStartPre=-/bin/sh -c "test -x /usr/local/lib/founderizer-ports/holder && exec /usr/bin/sudo -n '
+             '/usr/local/lib/founderizer-ports/holder; exit 0"')
+
+
 class Unit(unittest.TestCase):
     KIT_AT, PYTHON, HOME = "/home/fleet/founderizer", "/usr/bin/python3", "/home/fleet"
 
@@ -521,7 +537,7 @@ class Unit(unittest.TestCase):
         before = unit_of_before(self.KIT_AT, self.PYTHON, self.HOME).splitlines()
         now = self.unit().splitlines()
         self.assertEqual([line for line in now if line not in before],
-                         ['ExecStart="/usr/bin/python3" "-m" "hub"', "OOMPolicy=continue"], new_text)
+                         ['ExecStart="/usr/bin/python3" "-m" "hub"', "OOMPolicy=continue", PORT_HOLD], new_text)
         self.assertEqual([line for line in before if line not in now],
                          ['ExecStart="/usr/bin/python3" "/home/fleet/founderizer/hub.py"'], new_text)
         path = lifecycle.service_path(self.HOME)
@@ -550,7 +566,8 @@ class Unit(unittest.TestCase):
         the unit of a hub that ran that day, by its SHA-256), for the folder as that installer named it. The text
         of today is never one of them: the hub would write its own text again at every start."""
         before = lifecycle.hub_units_before(self.KIT_AT, self.PYTHON, self.HOME)
-        self.assertEqual(before, [unit_of_before(self.KIT_AT, self.PYTHON, self.HOME)])
+        self.assertEqual(before, [unit_of_before(self.KIT_AT, self.PYTHON, self.HOME),
+                                  unit_of_the_module_form(self.KIT_AT, self.PYTHON, self.HOME)])
         self.assertNotIn(self.unit(), before)
         self.assertNotIn(lifecycle.hub_unit(self.KIT_AT, self.PYTHON, self.HOME), before)
         spaced = lifecycle.hub_units_before("/srv/my fleet/100%", self.PYTHON, self.HOME)[0]

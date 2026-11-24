@@ -36,6 +36,11 @@ Standard library only, and it reads no credential of a model provider.
                                                     package version newer than seven days, Tailscale updates itself,
                                                     and the memory gets a swap file and one limit for all users'
                                                     processes together
+    python3 hubsetup.py ports [--hub-user fleet] [--check]
+                                                    as root on the hub's Linux server: only the hub's user and root
+                                                    answer on 8765 and 9418, and only the connect gate's user and root
+                                                    on 127.0.0.1:8767, from the start of the server on (ports.py);
+                                                    --check changes nothing and says whether that holds
     python3 hubsetup.py check --address IP [--port N] [--kit PATH] [--no-selftest]
                                                     the end checks on this machine: selftest.py and GET /health;
                                                     --no-selftest for a caller that runs verify next
@@ -2295,6 +2300,35 @@ def egress_install(check=False, run=None):
     return state
 
 
+def ports_install(hub_user="fleet", kit=None, check=False, run=None, hub_port=8765):
+    """The hub's ports answer only as their own users (ports.py; VAULT.md limit 29): a kernel rule of root's, its
+    units, and the one root command that ends another user's listener on them. hub.sh runs it in its firewall step,
+    before the claim, and one_server before anything else, so that no listener of an agent's user answers on the
+    hub's ports while the step runs. The program is `ports.py` of `kit`, the copy that root runs from: hub.sh's own
+    tree, or root's own clone. It starts and stops no service of the hub. Stops when the rule does not hold: an agent
+    on this server could then answer as the hub. `hub_port` is the hub's own port (hub.sh --port, team.json's
+    hub.port), which the rule and the holder keep in place of 8765. Returns "made" or "there"; with check, the answer
+    of the reading, which changes nothing."""
+    run = run or _shell
+    program = os.path.join(kit or KIT, "ports.py")
+    code, out, err = run(f"python3 -I {shlex.quote(program)} install --hub-user {shlex.quote(hub_user)} "
+                         f"--hub-port {int(hub_port)}" + (" --check" if check else ""), timeout=2 * APT_LOCK_WAIT + 900)
+    answer = json_line(out)
+    if answer is None:
+        raise Stop(f"the program of the hub's ports did not answer, so they have no kernel rule: "
+                   f"{(err or out).strip()[-300:] or f'exit {code}'}")
+    for line in (answer.get("said") or []) + (answer.get("problems") or []):
+        say(f"  {line}")
+    if check:
+        return answer
+    if answer.get("ok") is not True:
+        raise Stop(f"the hub's ports are not kept for their own users: {answer.get('reason') or 'no reason given'}. "
+                   f"An agent's user on this server could answer as the hub, so this step stops here")
+    for line in answer.get("lines") or []:
+        say(f"  {line}")
+    return answer.get("state")
+
+
 def keep_fleet_id(db=None):
     """This fleet's own id in the hub's key store: sixteen hex characters, made once and never again.
 
@@ -2428,13 +2462,16 @@ def one_server(hub_user="fleet", kit=None, run=None, account=None, vault=None, k
     from root's own clone: what a first install with FLEET_HUB_SERVER=shared makes in its two steps, for a hub whose
     owner chose that step afterwards (hub.set_shape wrote `"hub": {"shared": true}` into team.json).
 
+    - The kernel rule of the hub's ports (ports_install), first: from then on no agent's user of this server answers
+      on 8765, 9418 or 127.0.0.1:8767, also after a start of the server, and the clone below meets none.
     - The root helpers of this server's agent users and its vault broker (agent_helper), which each hub's install
       makes: again here, because a hub from before them has none, and its server service needs them.
     - This server's own vault broker (vault_install), from root's clone: the program that root installs is one that
       the hub's user cannot change.
-    - As the hub's user: the server service's own clone beside the hub's checkout, and hub_server, which makes the
-      service's key, writes its SHA-256 into the hub's records and starts the service. That part needs no root, and
-      the key is a file of the hub's user.
+    - As the hub's user: the server service's own clone beside the hub's checkout, from the hub's own repository by
+      its path and never over git://, which proves no server; then its origin is the git:// address, as on a joined
+      server. And hub_server, which makes the service's key, writes its SHA-256 into the hub's records and starts the
+      service. That part needs no root, and the key is a file of the hub's user.
 
     It restarts no service of the hub, and it is safe to run again: each part reads first. The word is the owner's
     command alone: without it in team.json this stops and changes nothing. Returns {"server", "vault", "service"},
@@ -2461,6 +2498,7 @@ def one_server(hub_user="fleet", kit=None, run=None, account=None, vault=None, k
         raise Stop(f"the origin of the hub's checkout {checkout} is not the hub's own repository, so the address "
                    f"that this fleet's machines clone from is not known: {(err or origin)[-200:]}")
     repo = f"git://{address}/{served}"
+    ports_install(hub_user, kit=kit, run=run, hub_port=port)
     agent_helper(service_user=hub_user, repo=repo, run=run, kit=kit)
     broker = (vault or vault_install)(kit=kit, hub_address=f"http://{address}:{port}", run=run)
     had = (known or server_known)(os.path.join(info["home"], ".fleet", "pilot.db"), name)
@@ -2469,11 +2507,17 @@ def one_server(hub_user="fleet", kit=None, run=None, account=None, vault=None, k
                    "u": shlex.quote(hub_user), "home": shlex.quote(info["home"]), "uid": info["uid"]})
     server_kit = os.path.join(info["home"], "fleet-server")
     if not os.path.isdir(os.path.join(server_kit, ".git")):
-        code, out, err = run(f"cd / && {as_user}git clone -q -b {lifecycle.CONFIG_BRANCH} {shlex.quote(repo)} "
-                             f"{shlex.quote(server_kit)} </dev/null", timeout=600)
+        # From the hub's own bare repository, by its path in the hub user's home: the folder that the git service
+        # serves under the same name. git:// proves no server, and a listener of another user on 9418 would give the
+        # hub's user its code here. Then origin is the git:// address, which the service fetches from as on a joined
+        # server (MUST 3 of the read "F1 P8" of the area "Vault, keys and access").
+        source = os.path.join(info["home"], served)
+        code, out, err = run(f"cd / && {as_user}git clone -q -b {lifecycle.CONFIG_BRANCH} {shlex.quote(source)} "
+                             f"{shlex.quote(server_kit)} </dev/null && {as_user}git -C {shlex.quote(server_kit)} "
+                             f"remote set-url origin {shlex.quote(repo)} </dev/null", timeout=600)
         if code != 0:
-            raise Stop(f"the checkout of the server service could not be cloned from {repo}: "
-                       f"{(err or out).strip()[-300:]}. Check that the hub's git service runs.")
+            raise Stop(f"the checkout of the server service could not be cloned from {source} with the origin "
+                       f"{repo}: {(err or out).strip()[-300:]}")
     # This python3 has no -I, which central_status gives its own: this program is the hub user's own checkout, so
     # that user decides its code in any case, and root takes only its exit status and its lines, each said after
     # "Founderizer: ". -I would also take the program's own folder out of sys.path, and then its `import hub` fails.
@@ -4648,6 +4692,15 @@ def cmd_egress(args):
         raise SystemExit(1) from None
 
 
+def cmd_ports(args):
+    """ports: the hub's ports for their own users (ports_install). hub.sh runs it as root in its firewall step."""
+    if platform.system() != "Linux":
+        raise Stop("the hub's ports have a kernel rule on a Linux server, and this machine is not one.")
+    done = ports_install(hub_user=args.hub_user, check=args.check, hub_port=args.hub_port)
+    if args.check and not done.get("ok"):
+        raise Stop("the hub's ports are not kept for their own users: the lines above say what is missing.")
+
+
 def cmd_firewall(args):
     firewall(check=args.check)
 
@@ -4815,6 +4868,11 @@ def main(argv=None):
                                        "configure --egress on); an install goes on when it stops")
     eg.add_argument("--check", action="store_true", help="say what it would do, change nothing")
     eg.set_defaults(fn=cmd_egress)
+    po = sub.add_parser("ports", help="as root: only the hub's user and root answer on the hub's ports (ports.py)")
+    po.add_argument("--hub-user", default="fleet", help="the user the hub and its git service run as")
+    po.add_argument("--hub-port", type=int, default=8765, help="the hub's own port (hub.sh --port)")
+    po.add_argument("--check", action="store_true", help="change nothing; say whether the rule holds")
+    po.set_defaults(fn=cmd_ports)
     fw = sub.add_parser("firewall")
     fw.add_argument("--check", action="store_true", help="say what it would do, change nothing")
     fw.set_defaults(fn=cmd_firewall)

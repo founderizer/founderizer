@@ -676,8 +676,13 @@ class Later(HubService, Servers):
 
     def test_roots_step_makes_the_vault_and_the_server_service_of_a_hub_that_runs(self):
         """hubsetup.py one-server, which the owner's Mac runs as root from root's own clone after the owner's
-        command: the root helpers, the vault broker from root's clone, and, as the hub's user, the service's own
-        clone and hub-server. Without the owner's word in team.json it stops and runs nothing."""
+        command: first the kernel rule of the hub's ports (ports.py), then the root helpers, the vault broker from
+        root's clone, and, as the hub's user, the service's own clone and hub-server. The clone comes from the hub's
+        own bare repository by its path, and only then gets the git:// address as its origin: git:// proves no
+        server, and while the hub's git service does not run, a listener of an agent's user on 9418 would give the
+        hub's user its code (MUST 1 and MUST 3 of the read "F1 P8" of the area "Vault, keys and access"). Without
+        the owner's word in team.json it stops and runs nothing, and a rule that does not hold stops it before any
+        other part. A hub on another port than 8765 gets the rule on its own port."""
         home = self.root / "home-of-fleet"
         checkout = home / "fleet-pilot"
         checkout.mkdir(parents=True)
@@ -685,7 +690,14 @@ class Later(HubService, Servers):
         git("remote", "add", "origin", str(home / "fleet-pilot.git"), cwd=checkout)
         ran, parts = [], []
         account = lambda user: {"uid": 1000, "group": user, "home": str(home)}
-        run = lambda script, timeout=None: (ran.append(script), (0, "Founderizer: the server service of hub runs", ""))[1]
+        held = json.dumps({"ok": True, "state": "made", "said": ["the kernel rule holds"],
+                           "lines": ["port 8765: own (fleet)"]})
+
+        def run(script, timeout=None):
+            ran.append(script)
+            ports = "/ports.py install" in script
+            parts.append(("ports",) if ports else ("run",))
+            return (0, held, "") if ports else (0, "Founderizer: the server service of hub runs", "")
         fakes = dict(kit="/usr/local/lib/founderizer-kit", run=run, account=account,
                      vault=lambda **given: (parts.append(("vault", given["kit"], given["hub_address"])),
                                             {"state": "made"})[1],
@@ -706,26 +718,49 @@ class Later(HubService, Servers):
             done = hubsetup.one_server(**fakes)
         self.assertEqual(done, {"server": "hub", "vault": "made", "service": "made"})
         repo = f"git://{HUB}/fleet-pilot.git"
-        self.assertEqual(parts, [("helper", "fleet", repo, "/usr/local/lib/founderizer-kit"),
+        self.assertEqual(parts, [("ports",), ("helper", "fleet", repo, "/usr/local/lib/founderizer-kit"),
                                  ("vault", "/usr/local/lib/founderizer-kit", f"http://{HUB}:8765"),
-                                 ("known", str(home / ".fleet" / "pilot.db"), "hub")])
-        as_user = (f"cd / && runuser -u fleet -- env HOME={home} XDG_RUNTIME_DIR=/run/user/1000 "
+                                 ("known", str(home / ".fleet" / "pilot.db"), "hub"), ("run",), ("run",)])
+        as_user = (f"runuser -u fleet -- env HOME={home} XDG_RUNTIME_DIR=/run/user/1000 "
                    f"PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin ")
-        self.assertEqual(ran, [as_user + f"git clone -q -b config {repo} {home}/fleet-server </dev/null",
-                               as_user + f"python3 {home}/fleet-server/hubsetup.py hub-server --team "
-                                         f"{checkout}/team.json --repo {repo} </dev/null"])
-        # a second run: the vault is there, the hub knows the service, and the service's clone is not made again
+        self.assertEqual(ran, ["python3 -I /usr/local/lib/founderizer-kit/ports.py install --hub-user fleet "
+                               "--hub-port 8765",
+                               f"cd / && {as_user}git clone -q -b config {home}/fleet-pilot.git {home}/fleet-server "
+                               f"</dev/null && {as_user}git -C {home}/fleet-server remote set-url origin {repo} "
+                               f"</dev/null",
+                               f"cd / && {as_user}python3 {home}/fleet-server/hubsetup.py hub-server --team "
+                               f"{checkout}/team.json --repo {repo} </dev/null"])
+        # a second run: the rule is loaded again, the vault is there, the hub knows the service, and the service's
+        # clone is not made again
         (home / "fleet-server" / ".git").mkdir(parents=True)
         ran.clear()
         again = dict(fakes, vault=lambda **given: {"state": "there"}, known=lambda db, name: True)
         with helper, quiet:
             self.assertEqual(hubsetup.one_server(**again), {"server": "hub", "vault": "there", "service": "there"})
-            self.assertEqual(len(ran), 1)
-            self.assertIn("hub-server", ran[0])
-            # each stop has its reason: a hub-server that failed, and a checkout whose origin is no repository of the hub
-            failed = dict(again, run=lambda script, timeout=None: (1, "", "the hub keeps no records yet"))
+            self.assertEqual([("/ports.py install" in one, "hub-server" in one) for one in ran],
+                             [(True, False), (False, True)])
+            # a hub on another port (hub.sh --port, team.json's hub.port): the rule keeps that port, not 8765 (the
+            # coordinator's validator, 24 November 2026)
+            moved = json.loads((checkout / "team.json").read_text())
+            moved["hub"]["port"] = 8800
+            (checkout / "team.json").write_text(json.dumps(moved))
+            ran.clear()
+            hubsetup.one_server(**again)
+            self.assertIn("install --hub-user fleet --hub-port 8800", ran[0])
+            (checkout / "team.json").write_text(json.dumps(dict(moved, hub=dict(moved["hub"], port=8765))))
+            # each stop has its reason: a hub-server that failed, a rule of the hub's ports that does not hold (before
+            # any other part), and a checkout whose origin is no repository of the hub
+            failed = dict(again, run=lambda script, timeout=None: (0, held, "") if "/ports.py" in script
+                          else (1, "", "the hub keeps no records yet"))
             with self.assertRaisesRegex(hubsetup.Stop, "the server service of hub could not be made: the hub keeps"):
                 hubsetup.one_server(**failed)
+            parts.clear()
+            refused = dict(again, run=lambda script, timeout=None: (parts.append(script), (1, json.dumps(
+                {"ok": False, "reason": "this server has no /usr/sbin/nft"}), ""))[1])
+            with self.assertRaisesRegex(hubsetup.Stop, "the hub's ports are not kept for their own users: this "
+                                                       "server has no /usr/sbin/nft"):
+                hubsetup.one_server(**refused)
+            self.assertEqual(len(parts), 1)
             git("remote", "set-url", "origin", "https://example.com/another place", cwd=checkout)
             with self.assertRaisesRegex(hubsetup.Stop, "is not the hub's own repository"):
                 hubsetup.one_server(**again)
