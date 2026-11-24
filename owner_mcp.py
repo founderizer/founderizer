@@ -893,12 +893,16 @@ def get(route, what, transfer=None, into=None, **query):
     return answer
 
 
-def command(route, body, what, request_id=None, timeout=TIMEOUT):
+def command(route, body, what, request_id=None, timeout=TIMEOUT, client=None):
     """One owner command route: `hub.py` `ui_command`'s envelope, and its answer as the hub gave it.
 
     `request_id` makes the command idempotent. This server makes one for each call, and a tool takes the owner's
     agent's own when it is sending the same command again after a lost answer: the hub then gives the first result
-    with `replayed` true and does the work once (UI-API.md, "Submit a goal or answer")."""
+    with `replayed` true and does the work once (UI-API.md, "Submit a goal or answer").
+
+    `client`: the `X-Fleet-Client` of the request in place of this installation's own label (`client_label`), for a
+    program that is not the owner tools and uses this module to call the hub: the release job sends its own label, so
+    that the hub gives its message the hand `job` (owner API 1.325). Each other header stays as `call` makes it."""
     rid = str(request_id or uuid.uuid4())
     try:
         if str(uuid.UUID(rid)) != rid.lower():
@@ -909,7 +913,8 @@ def command(route, body, what, request_id=None, timeout=TIMEOUT):
     def once():
         db = generation()                   # a read: it takes no lock
         with command_lock():
-            return call("POST", route, dict(body, request_id=rid.lower(), db=db), timeout=timeout)
+            return call("POST", route, dict(body, request_id=rid.lower(), db=db), timeout=timeout,
+                        extra={"X-Fleet-Client": client} if client else None)
     answer = once()
     if stale(answer):
         generation(fresh=True)

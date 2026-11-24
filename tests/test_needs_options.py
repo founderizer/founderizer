@@ -543,18 +543,34 @@ class Talk(NeedsCase):
         # a session that names itself is a tool from an enrolled device too, and the PC app's label is the owner's
         self.assertEqual(hub.request_hand("founderizer-swift/1/a", device="Windows", session="claude-code/1"), "tool")
         self.assertEqual(hub.request_hand("founderizer-windows/1/a"), "app")
+        # Owner API 1.325: the release job's label is the hand "job", also when a session runs the job by hand, and a
+        # connected app's record and a chat app's origin still come first. Bug: a session that runs the job makes its
+        # words a session's, which the owner's chat shows as his own message again. On an enrolled device the label is
+        # a program's: bug, a program on a PC makes a hidden note that says it is the owner's Mac's
+        release = "founderizer-release/1/a"
+        self.assertEqual([hub.request_hand(release), hub.request_hand(release, session="claude-code/1"),
+                          hub.request_hand(release, device="Windows"),
+                          hub.request_hand(release, connection={"id": 3, "name": "Claude"}),
+                          hub.request_hand(release, origin={"app": "whatsapp"})],
+                         ["job", "job", "other", "connected", "chat"])
         # Fable's check of 20 November 2026, finding 1: a label that no app of the owner's gives (here curl's) has no
         # owner's force either: its words close no card that has its own answers, and its words to an item with none
-        # are a program's, never the owner's own
-        curl = {"Content-Type": "application/json", "X-Fleet-Client": "curl/8.7.1"}
-        self.raise_item(title="Window again?", options=["Go to 80", "Stay at 70"])     # N-7
-        code, refused = self.request("/ui/needs/7", self.command(answer="Go ahead, Leo decides."), headers=curl)
-        self.assertEqual((code, refused.get("code"), self.row(7)["answer"]), (409, "card_words_from_tool", None))
-        self.raise_item(title="Disk?")                          # N-8
-        self.assertEqual(self.request("/ui/needs/8", self.command(answer="Add one."), headers=curl)[0], 200)
-        said = hub.t_read_messages("manager", {})
-        self.assertIn("[owner via program] Answer to Needs-you N-8 (Disk?): Add one." + hub.NEED_PROGRAM_WORDS, said)
-        self.assertNotIn("their own words", said)
+        # are a program's, never the owner's own. So are the release job's (owner API 1.325 on each route but POST
+        # /ui/messages): bug, request_via gives the hand "job" no mark, and its answer reads "[owner]", his own words
+        for label, card in (("curl/8.7.1", 7), (release, 9)):
+            program = {"Content-Type": "application/json", "X-Fleet-Client": label}
+            self.raise_item(title="Window again?", options=["Go to 80", "Stay at 70"])     # N-7, N-9
+            code, refused = self.request(f"/ui/needs/{card}", self.command(answer="Go ahead, Leo decides."),
+                                         headers=program)
+            self.assertEqual((code, refused.get("code"), self.row(card)["answer"]),
+                             (409, "card_words_from_tool", None), label)
+            self.raise_item(title="Disk?")                          # N-8, N-10
+            self.assertEqual(self.request(f"/ui/needs/{card + 1}", self.command(answer="Add one."),
+                                          headers=program)[0], 200, label)
+            said = hub.t_read_messages("manager", {})
+            self.assertIn(f"[owner via program] Answer to Needs-you N-{card + 1} (Disk?): Add one."
+                          + hub.NEED_PROGRAM_WORDS, said)
+            self.assertNotIn("their own words", said)
 
     def test_an_item_of_another_agent_gets_no_word_about_a_new_item(self):
         """raise_needs_you is the manager's, so the words of an answer to another agent's item name no such step."""

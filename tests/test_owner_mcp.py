@@ -5705,6 +5705,35 @@ class Table(unittest.TestCase):
         owner_mcp.GENERATION["db"] = None
         self.assertEqual(sent, ["GET", "POST"])
 
+    def test_a_command_with_a_client_of_its_own_sends_that_label_and_each_other_header_as_before(self):
+        """command(..., client=...): the release job sends its own X-Fleet-Client through this module (owner API
+        1.325), so that the hub gives its message the hand job and no bubble of the owner's. Bugs: the installation's
+        label still goes (the client is not passed on, or the label is set after it), or the job's request loses the
+        session, the content type or another header that the hub reads."""
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix="fleet-client-"))
+        self.addCleanup(shutil.rmtree, str(scratch), True)
+        sent = []
+
+        class Body(io.BytesIO):
+            status, headers = 200, {"Content-Type": "application/json"}
+
+        def opened(request, timeout=None):
+            sent.append((request.get_method(), dict(request.header_items())))
+            return Body(json.dumps({"db": "g1", "ok": True}).encode())
+        owner_mcp.GENERATION["db"] = None
+        self.addCleanup(owner_mcp.GENERATION.update, db=None)
+        with patch.object(owner_mcp.OPENER, "open", opened), patch.object(owner_mcp, "HOME", scratch), \
+                patch.object(owner_mcp, "CLIENT_FILE", scratch / "client"), \
+                patch.dict(os.environ, {"FOUNDERIZER_HUB": "http://127.0.0.1:9", "CLAUDE_CODE_SESSION_ID": "0d8aa41c"}):
+            owner_mcp.command("/ui/messages", {"text": "Customers wait."}, "the message")
+            owner_mcp.command("/ui/messages", {"text": "Customers wait."}, "the message",
+                              client="founderizer-release/1/test")
+            label = owner_mcp.client_label()
+        own, job = [headers for method, headers in sent if method == "POST"]
+        self.assertTrue(label.startswith("founderizer-mcp/"), label)
+        self.assertEqual((own["X-fleet-client"], own["X-fleet-session"]), (label, "claude-code/0d8aa41c"))
+        self.assertEqual(job, dict(own, **{"X-fleet-client": "founderizer-release/1/test"}))
+
     def test_attach_file_takes_the_lock_for_its_upload(self):
         scratch = pathlib.Path(tempfile.mkdtemp(prefix="fleet-attach-lock-"))
         self.addCleanup(shutil.rmtree, str(scratch), True)

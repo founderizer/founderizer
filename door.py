@@ -21,7 +21,8 @@ for a grant that it names, which the door makes inside the agent's business pool
 reading of what the door's App reaches (GET /github/reach) and the state of one App key (POST /github/key: its
 fingerprint and whether GitHub takes it, never the key) for the same secret, and read the record (GET /record). With
 the same secret it asks what one secret store in an agent's GitOps repository is (POST /store): fixed words and ids,
-never a text of the manifest.
+never a text of the manifest; and whether a repository, by its id, is in an installation of the door's Apps (POST
+/github/repo-reach): ids, counts and fixed words, never a token or a repository's name.
 
 What it does. A call is a rule call (code passes it at once), the agent's own call (code does not list it as a rule,
 but the agent's grant covers it: it runs, and the agent answers for it), a call that the next mode allows (a host's
@@ -238,6 +239,18 @@ RECORD_TEXT = 300           # characters of one field of a record line: a caller
 HOST_OUT_MAX = 2 * 1024 * 1024
 HELP_WAIT = 60              # seconds for a host's help, which the host sweep asks of each host in turn
 GITHUB_REACH_PAGES = 30     # pages of 100 repositories that the door reads of one installation, at most
+# POST /github/repo-reach (github_repo_reach): pages of 100 that the read by repository id reads at most, of one
+# installation's repositories and of one App's installations; the Apps that one ask names, and the ids of known
+# repositories of each App, at most; the seconds of one read, after which the answer is "unknown" (out_of_time): a
+# caller waits 100 seconds more, for the GitHub call that runs at that time (30 s at most) and the end of its token; and
+# the words of an installation or an App that the door cannot read in full
+REACH_ID_PAGES = 100
+REACH_APPS_MOST = 10
+REACH_KNOWN_MOST = 20
+REACH_BUDGET = 300
+REACH_CLOCK = time.monotonic
+REACH_WORDS = ("no_key", "no_list", "no_token", "no_page", "short_page", "count_changed", "list_changed", "too_many",
+               "out_of_time", "failed")
 # The permissions of an agent's token at each grant level. A read or write token also gets actions: read where the
 # installation holds Actions, and a token of each level gets issues where the installation holds Issues: read at read,
 # write at write and deploy (token_permissions).
@@ -306,6 +319,10 @@ ERR_LOG_TIMEOUT = 10        # seconds for each request of that read
 ERR_BUDGET = 30             # seconds that a failed call waits for all of those lines, at most
 CHECKS_FIND = 45            # seconds after a GitOps commit in which its push's runs show up, the late ones too
 CHECKS_WAIT = 20 * 60       # how long the commit's call waits for those runs to end
+
+
+class ReachLate(Exception):
+    "The read by repository id (POST /github/repo-reach) passed REACH_BUDGET: its answer is unknown."
 
 
 class Refused(Exception):
@@ -850,6 +867,33 @@ GITHUB_LISTED = 1000        # entries of one folder that GitHub's contents API l
 # YAML's null, which the block reader gives as its text, and JSON's. A quoted "null" (and a JSON text "null") reads as
 # null too: a cluster refuses a store with a text in the place of its conditions, so it makes no store that serves more.
 YAML_NULL = (None, "null", "Null", "NULL", "~")
+
+
+def github_id(value):
+    "Whether a value of GitHub's JSON is an id of GitHub: a whole number from 1, and no boolean."
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 2 ** 53
+
+
+def reach_form(data):
+    """The two fields of a POST /github/repo-reach body, or Refused: repo_id, the id of the repository that the hub asks
+    about, and known: for each App that the hub expects the door to read (its id, as a string), the ids of 1 to
+    REACH_KNOWN_MOST other private repositories that the hub knows that App reaches. Each one that both readings find
+    is the control that the reads cover that App's installations."""
+    if set(data) != {"repo_id", "known"}:
+        raise Refused("the body is {repo_id, known}, and nothing else")
+    repo_id, known = data["repo_id"], data["known"]
+    if not github_id(repo_id):
+        raise Refused("repo_id is the repository's id of GitHub, a whole number")
+    if not isinstance(known, dict) or not 1 <= len(known) <= REACH_APPS_MOST:
+        raise Refused(f"known is an object of 1 to {REACH_APPS_MOST} Apps, by their ids")
+    for app_id, ids in known.items():
+        if not re.fullmatch(r"[1-9][0-9]{0,11}", app_id):
+            raise Refused("each key of known is an App's id")
+        if not isinstance(ids, list) or not 1 <= len(ids) <= REACH_KNOWN_MOST or \
+                not all(github_id(k) for k in ids) or len(set(ids)) != len(ids) or repo_id in ids:
+            raise Refused(f"each App of known has a list of 1 to {REACH_KNOWN_MOST} ids of other repositories, each "
+                          f"one once")
+    return repo_id, known
 
 
 def store_form(data):
@@ -2055,6 +2099,185 @@ class Door:
                                    r.split("/")[0] == login.lower()}
         return {"accounts": {a: {"name": e["name"], "repos": sorted(e["repos"])} for a, e in sorted(accounts.items())}}
 
+    REACH_LOCK = threading.Lock()   # one read by repository id at a time: a second ask gets 503 and does not wait
+
+    def github_repo_reach(self, data):
+        """POST /github/repo-reach, for the hub's owner route and the proof of step M5 of the order of `main` on GitHub
+        (version 17): whether one repository, by its id, is in an installation of the door's GitHub Apps (the agents'
+        App and the door's own App). By the id, so that a rename does not hide it, and in every installation, also one
+        with all its account's repositories (installation_holds). An installation or an App that the door cannot read in
+        full says why (a word of REACH_WORDS) and "unknown", never "no", and so does a read that takes more than
+        REACH_BUDGET seconds. "no" needs each installation's "no", the Apps of the door's file equal to the Apps of
+        known, and each App's known ids found in that App's installations. The answer holds ids, counts and fixed words
+        only: no token, no repository name and no account name."""
+        repo_id, known = reach_form(data)
+        deadline = REACH_CLOCK() + REACH_BUDGET
+        apps = {}
+        for k, c in (self.access().get("credentials") or {}).items():
+            if k.lower().startswith("github:") and isinstance(c, dict) and c.get("app_id") and c.get("secret"):
+                apps.setdefault(str(c["app_id"]), set()).add(str(c["secret"]).lower())
+        rows, found = [], {}
+        for app_id in sorted(apps):
+            found[app_id] = set()
+            try:
+                self.app_holds(app_id, sorted(apps[app_id]), repo_id, known.get(app_id) or [], deadline,
+                               found[app_id], rows)
+            except ReachLate:
+                rows.append({"app_id": app_id, "installation": None, "in": "unknown", "why": "out_of_time"})
+                break
+            except Exception:       # an answer cut short (IncompleteRead) or any other fault: "unknown", never none
+                rows.append({"app_id": app_id, "installation": None, "in": "unknown", "why": "failed"})
+        names = sorted(apps)
+        if any(r["in"] == "yes" for r in rows):
+            verdict = "yes"
+        elif rows and all(r["in"] == "no" for r in rows) and names == sorted(known) and \
+                all(found.get(a, set()) == set(known[a]) for a in names):
+            verdict = "no"      # an App that no read covered, or a known repository that its reads did not find
+        else:
+            verdict = "unknown"
+        return {"repo_id": repo_id, "in": verdict, "apps": names,
+                "known": {a: sorted(found.get(a, set())) for a in names}, "installations": rows}
+
+    def reach_call(self, deadline, method, url, headers, data=None):
+        "One call of GitHub for the read by repository id, while its time lasts."
+        if REACH_CLOCK() > deadline:
+            raise ReachLate()
+        return self.http(method, url, headers, data)
+
+    def app_holds(self, app_id, refs, repo_id, known, deadline, found, rows):
+        """The rows of one App, added to rows one by one, so that a read that stops keeps those before. With the first
+        of its keys that GitHub takes (a stale second key of the same App does not make each answer "unknown"), every
+        installation, each with a JWT made just before its use, so that the JWT's nine minutes do not end in a long
+        read. The list of installations is read again after the reads: an
+        installation that went from a page read already moves another one out of the read, and one can come during the
+        read, so two lists that differ are no_list."""
+        key = installs = None
+        signed = False
+        for ref in refs:
+            try:
+                key = self.secret(ref)
+                jwt = door_providers.app_jwt(app_id, key)
+            except (Refused, door_providers.Stop, ValueError, OSError, subprocess.SubprocessError):
+                continue
+            signed = True
+            installs = self.app_installations(jwt, deadline)
+            if installs is not None:
+                break
+        if installs is None:
+            rows.append({"app_id": app_id, "installation": None, "in": "unknown",
+                         "why": "no_list" if signed else "no_key"})
+            return
+        for one in installs:
+            row = dict({"app_id": app_id}, **self.installation_holds(door_providers.app_jwt(app_id, key), one, repo_id,
+                                                                     known, deadline))
+            found.update(row["known"])
+            rows.append(row)
+        again = self.app_installations(door_providers.app_jwt(app_id, key), deadline)
+        if again is None or {o["id"] for o in again} != {o["id"] for o in installs}:
+            rows.append({"app_id": app_id, "installation": None, "in": "unknown", "why": "no_list"})
+
+    def app_installations(self, jwt, deadline):
+        """Every installation of one App, page by page until a page of fewer than 100; None when GitHub does not give a
+        page, gives a row with no id or one installation twice, or has more than the door reads."""
+        rows, seen = [], set()
+        for page in range(1, REACH_ID_PAGES + 1):
+            status, got = self.reach_call(deadline, "GET", f"{GitHub.API}/app/installations?per_page=100&page={page}",
+                                          {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json"})
+            if status != 200 or not isinstance(got, list) or len(got) > 100:
+                return None
+            for one in got:
+                iid = one.get("id") if isinstance(one, dict) else None
+                if not github_id(iid) or iid in seen:
+                    return None
+                seen.add(iid)
+                rows.append(one)
+            if len(got) < 100:
+                return rows
+        return None
+
+    def installation_holds(self, jwt, one, repo_id, known, deadline):
+        """Whether one installation holds the repository repo_id, and which of the known ids it holds, in two readings
+        with one token of that installation that has metadata read only and no limit of repositories (a token limited
+        to some repositories reads only those), which the door ends after the read. First GitHub's own answer for the
+        id (repo_seen). Then every page of the installation's repositories (installation_ids). A repository that goes
+        and one that comes between two pages keep total_count, and move another one into a page that the door read
+        already, so a read of the pages alone can miss it: "no" needs the first reading's 404 too, and where the first
+        reading says nothing (a public repository, which every token reads, or an error), two reads of every page with
+        the same ids. A known id is found when both readings find it."""
+        iid, selection = one["id"], one.get("repository_selection")
+        row = {"installation": iid, "selection": selection if selection in ("all", "selected") else None,
+               "total_count": None, "read": 0, "direct": None}
+        status, got = self.reach_call(deadline, "POST", f"{GitHub.API}/app/installations/{iid}/access_tokens",
+                                      {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
+                                       "Content-Type": "application/json"},
+                                      json.dumps({"permissions": {"metadata": "read"}}).encode())
+        token = got.get("token") if status == 201 and isinstance(got, dict) else None
+        if not isinstance(token, str):      # also a suspended installation: GitHub gives it no token
+            return dict(row, known=[], why="no_token", **{"in": "unknown"})
+        try:
+            direct = self.repo_seen(token, repo_id, deadline)
+            row["direct"] = {True: "yes", False: "no", None: None}[direct]
+            ids, total, why = self.installation_ids(token, deadline)
+            row.update(total_count=total, read=len(ids))
+            again = set()
+            if not why and direct is not False and repo_id not in ids:
+                # two reads that end with no word each hold exactly total_count ids, so equal ids are equal counts
+                again, _, why = self.installation_ids(token, deadline)
+                if not why and again != ids:
+                    why = "list_changed"
+            out = dict(row, known=[k for k in known if k in ids and self.repo_seen(token, k, deadline) is True])
+        finally:
+            with contextlib.suppress(Exception):    # the token ends now, not an hour later
+                self.http("DELETE", f"{GitHub.API}/installation/token",
+                          {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json"}, None)
+        if direct is True or repo_id in ids | again:    # a read that stopped can say "yes", never "no"
+            return dict(out, **{"in": "yes"})
+        if why:
+            return dict(out, why=why, **{"in": "unknown"})
+        return dict(out, **{"in": "no"})
+
+    def repo_seen(self, token, repo_id, deadline):
+        """GitHub's own answer whether an installation's token reaches one repository, by its id (GET
+        /repositories/<id>): True for 200 with that id and a private repository, False for 404, and None for any
+        other answer: a public repository, which every token reads, or an error."""
+        status, got = self.reach_call(deadline, "GET", f"{GitHub.API}/repositories/{repo_id}",
+                                      {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json"})
+        if status == 404:
+            return False
+        if status == 200 and isinstance(got, dict) and github_id(got.get("id")) and got["id"] == repo_id and \
+                got.get("private") is True:
+            return True
+        return None
+
+    def installation_ids(self, token, deadline):
+        """One read of every page of an installation's repositories: (the ids, total_count, None) when it read exactly
+        total_count ids and then a page of fewer than 100 (an empty one after a full page: a total_count too low by a
+        whole page ends on a full page), or (what it read, total_count or None, a word of REACH_WORDS)."""
+        ids, total, page = set(), None, 0
+        while True:
+            page += 1
+            status, got = self.reach_call(deadline, "GET",
+                                          f"{GitHub.API}/installation/repositories?per_page=100&page={page}",
+                                          {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json"})
+            repos = got.get("repositories") if status == 200 and isinstance(got, dict) else None
+            count = got.get("total_count") if isinstance(repos, list) else None
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0 or len(repos) > 100 or \
+                    not all(isinstance(r, dict) and github_id(r.get("id")) for r in repos):
+                return ids, total, "no_page"
+            if total is None:
+                total = count
+                if count > REACH_ID_PAGES * 100:
+                    return ids, total, "too_many"
+            elif count != total:
+                return ids, total, "count_changed"
+            got_ids = {r["id"] for r in repos}
+            # an id twice, or more ids than total_count: the list changed while the door read it
+            if len(got_ids) != len(repos) or got_ids & ids or len(ids) + len(repos) > count:
+                return ids, total, "list_changed"
+            ids |= got_ids
+            if len(repos) < 100:
+                return (ids, total, None) if len(ids) == count else (ids, total, "short_page")
+
     def github_key(self, app_id, ref=None):
         """One key of an App of the door's file, for the hub's renewal of the key that it held (plan 13, item 4, the
         coordinator's yes of 7 November 2026): the references that the file names for that App, and of ref (the first
@@ -2907,6 +3130,18 @@ class Handler(BaseHTTPRequestHandler):
             except door_providers.Stop as e:
                 return self.answer(502, {"error": str(e)})
             return self.answer(status, answer)
+        if self.path == "/github/repo-reach":
+            if not self.door.hub_allowed(self.source(), self.bearer(), "token_sha256"):
+                return self.answer(403, {"error": "whether the Apps reach a repository is the hub's to ask, with its "
+                                                  "token secret"})
+            if not self.door.REACH_LOCK.acquire(blocking=False):
+                return self.answer(503, {"error": "a read by repository id runs already: ask again when it ends"})
+            try:
+                return self.answer(200, self.door.github_repo_reach(data))
+            except Refused as e:
+                return self.answer(400, {"error": str(e)})
+            finally:
+                self.door.REACH_LOCK.release()
         self.answer(404, {"error": "no such route"})
 
 

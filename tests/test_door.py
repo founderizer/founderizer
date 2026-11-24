@@ -123,7 +123,7 @@ def load_tests(loader, _tests, _pattern):
                                                     WorkKeys,
                                                     Workflows, RunnerNew, Probe, CallerGone, Rendered, RenderPath,
                                                     GeneratedFiles, GeneratedPath, OwnerFiles, OwnerPath,
-                                                    SecretReferences, SecretReferencePath, StoreFacts, LongLines,
+                                                    SecretReferences, SecretReferencePath, StoreFacts, RepoReach, LongLines,
                                                     ErrorLines, YamlTags, RenderBoxUnit, RenderBoxLive)
                               for name in cls.__dict__ if name.startswith("test_"))
 
@@ -10170,6 +10170,390 @@ class StoreFacts(Served):
         design's section 7). Until the pass (piece D2) brings that text, door.py must not hold it, also not in a
         comment, or the Mac writes records that this door does not check. D2 removes this test."""
         self.assertNotIn("store_keys", slurp(door.__file__, "r"))
+
+
+class RepoReach(Served):
+    """POST /github/repo-reach, for step M5 of the order of `main` on GitHub (version 17): whether a repository, by its
+    id, is in an installation of the door's Apps. The proof that no App reaches a repository rests on each "no", so a
+    "no" comes only from two readings that agree (GitHub's answer for the id, and every page until total_count), with a
+    token that GitHub did not limit, in every installation of every App of the door's file, read in a list of
+    installations that is the same after the reads, each App with its own known repositories found."""
+    API = "https://api.github.com"
+    TOKEN_BODY = {"permissions": {"metadata": "read"}}
+
+    def setUp(self):
+        super().setUp()
+        with patch("sys.stdout", io.StringIO()) as out:
+            door.cmd_hub_secrets(None)
+        self.secrets = json.loads(out.getvalue())
+        github_stubs(self)
+        # the JWT of this test names its App and its key: jwt<app id>-<the end of the key>, 0000 for ref 6 (DoorCase
+        # writes "value-of-0000") and 0012 for ref 12 (second_app)
+        patcher = patch.object(door_providers, "app_jwt", lambda app_id, pem, sign=None: f"jwt{app_id}-{pem[-4:]}")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.apps, self.held, self.public, self.names, self.stale, self.list_reads = {}, {}, set(), {}, set(), {}
+        self.raise_on = None
+        stubbed = self.door.http
+
+        def http(method, url, headers, data):
+            asked = urllib.parse.urlsplit(url)
+            page = int(urllib.parse.parse_qs(asked.query).get("page", ["0"])[0])
+            bearer = headers["Authorization"][len("Bearer "):]
+            if self.raise_on and self.raise_on in url:
+                import http.client
+                raise http.client.IncompleteRead(b"")
+            if method == "POST" and url.endswith("/access_tokens") and json.loads(data) != self.TOKEN_BODY:
+                # a token limited to some repositories lists only those, and one with more rights than the read needs
+                # is a key that the form does not use: this GitHub refuses both
+                self.calls.append((method, url, json.loads(data)))
+                return 422, {"message": "this test makes only a token of metadata read with no limit of repositories"}
+            if (method, url) in self.answers:
+                return stubbed(method, url, headers, data)
+            if method == "DELETE" and url == f"{self.API}/installation/token":
+                self.calls.append((method, url, bearer))
+                return 204, {}
+            if url.startswith(f"{self.API}/app/installations?"):
+                self.calls.append((method, url, bearer))
+                app_id, key = bearer[len("jwt"):].split("-")
+                if key in self.stale:
+                    return 401, {"message": "A JSON web token could not be decoded"}
+                self.list_reads[app_id] = self.list_reads.get(app_id, 0) + (page == 1)
+                listed = self.apps[app_id]
+                if callable(listed):
+                    return 200, listed(self.list_reads[app_id], page)
+                return 200, listed[(page - 1) * 100:page * 100]
+            if url.startswith(f"{self.API}/installation/repositories?"):
+                self.calls.append((method, url, bearer))
+                held = self.held[bearer]
+                held["reads"] += page == 1
+                ids = self.ids(held, held["reads"])
+                total = held["total"]
+                return 200, {"total_count": total(page) if callable(total) else len(ids) if total is None else total,
+                             "repositories": [self.repo(i) for i in ids[(page - 1) * 100:page * 100]]}
+            if asked.path.startswith("/repositories/"):
+                self.calls.append((method, url, bearer))
+                held, rid = self.held[bearer], int(asked.path.rsplit("/", 1)[1])
+                if rid in set(self.ids(held, 1)) | held["hidden"] or rid in self.public:
+                    return 200, self.repo(rid)          # every token reads a public repository
+                return 404, {"message": "Not Found"}
+            return stubbed(method, url, headers, data)
+        self.door.http = http
+
+    @staticmethod
+    def ids(held, read):
+        return list(held["rows"](read) if callable(held["rows"]) else held["rows"])
+
+    def repo(self, i):
+        "A repository as GitHub gives it: its id, its names and whether it is private."
+        name = self.names.get(i, f"one-org/repo-{i}")
+        return {"id": i, "name": name.split("/")[1], "full_name": name, "private": i not in self.public}
+
+    @staticmethod
+    def token(iid):
+        return f"ghs_reach{iid}" + "x" * 27
+
+    def app(self, app_id, *held):
+        """App app_id of the door's file, installed on these installations, each (its id, the ids of its repositories
+        in GitHub's order or a function of the read, and optionally total_count: a number or a function of the
+        page)."""
+        self.apps[app_id] = [{"id": one[0], "account": {"login": "One-Org", "type": "Organization"},
+                              "repository_selection": "selected"} for one in held]
+        for iid, ids, *total in held:
+            self.answers[("POST", f"{self.API}/app/installations/{iid}/access_tokens")] = (
+                201, {"token": self.token(iid)})
+            self.held[self.token(iid)] = {"rows": ids, "total": total[0] if total else None, "reads": 0,
+                                          "hidden": set()}
+
+    def second_app(self, app_id="67890"):
+        """A second key in the door's file (ref 12): the agents' App beside the door's own App, or a second key of the
+        same App."""
+        data = json.loads(json.dumps(ACCESS))
+        data["credentials"]["github:two-org"] = {"secret": ref(12), "app_id": app_id}
+        self.write_access(data)
+        with open(os.path.join(self.root + door.SECRETS_DIR, hashlib.sha256(ref(12).encode()).hexdigest()), "w") as f:
+            f.write("value-of-0012")
+
+    def ask(self, repo_id, known, token=None, source=HUB):
+        return HubRights.post(self, "/github/repo-reach", {"repo_id": repo_id, "known": known},
+                              token or self.secrets["token"], source)
+
+    def pages(self, token):
+        "The pages of its installation's repositories that the door read with this token."
+        return [int(u.rsplit("=", 1)[1]) for m, u, t in self.calls if "/installation/repositories" in u and t == token]
+
+    def test_a_repository_on_the_last_page_is_found(self):
+        """A public repository (GitHub's answer for its id says nothing: every token reads it) on the third page of 250
+        is "yes", and each installation of the App is read, also one with all its account's repositories: a read that
+        stops at the first page, or at the door's limit of the names that it reads (GITHUB_REACH_PAGES), says "no" for
+        it, and the proof would pass."""
+        self.public = {250}
+        self.app("12345", (77, range(1, 251)), (78, [900, 901]))
+        self.apps["12345"][1]["repository_selection"] = "all"
+        status, got = self.ask(250, {"12345": [1, 900]})
+        self.assertEqual(status, 200, got)
+        self.assertEqual((got["in"], got["known"]), ("yes", {"12345": [1, 900]}))
+        self.assertEqual([(r["installation"], r["selection"], r["in"], r["total_count"], r["read"])
+                          for r in got["installations"]], [(77, "selected", "yes", 250, 250), (78, "all", "no", 2, 2)])
+        self.assertEqual(self.pages(self.token(77)), [1, 2, 3])
+
+    def test_a_total_count_larger_than_what_was_read_says_unknown_never_no(self):
+        """An installation that the door cannot read in full is "unknown" with a word of why, and so is the answer,
+        never "no", also where GitHub's answer for the id is 404: a page shorter than total_count needs, a total_count
+        that changes between pages, a page that GitHub does not give, more repositories than the door reads, more ids
+        than total_count, and an id twice in one page. A read that takes a short page for the end of the list (as the
+        list of names did) says "no" for a repository that it did not see."""
+        many, grows = range(1, 251), (lambda page: 250 if page == 1 else 251)
+        for rows, total, broken, why, read in ((many, 260, None, "short_page", 250),
+                                               (many, grows, None, "count_changed", 100),
+                                               (many, 250, 2, "no_page", 100),
+                                               (many, door.REACH_ID_PAGES * 100 + 1, None, "too_many", 0),
+                                               (many, 150, None, "list_changed", 100),
+                                               ([1, 1, 2], 3, None, "list_changed", 0)):
+            with self.subTest(why=why, rows=len(rows)):
+                self.calls.clear()
+                self.answers.pop(("GET", f"{self.API}/installation/repositories?per_page=100&page=2"), None)
+                if broken:
+                    self.answers[("GET", f"{self.API}/installation/repositories?per_page=100&page={broken}")] = (
+                        502, {"message": "Bad gateway"})
+                self.app("12345", (77, rows, total))
+                status, got = self.ask(999, {"12345": [1]})
+                self.assertEqual(status, 200, got)
+                row = got["installations"][0]
+                self.assertEqual((got["in"], row["direct"], row["in"], row["why"], row["read"]),
+                                 ("unknown", "no", "unknown", why, read))
+                self.assertEqual(row["total_count"], total(1) if callable(total) else total)
+
+    def test_a_total_count_too_low_by_a_whole_page_is_list_changed(self):
+        """A total_count of 100 when the installation holds 101 ends the read on a full page: the door reads one page
+        more, which must be empty with the same total_count. A read that stops when it has total_count ids misses the
+        101st, and where GitHub's answer for the id is an error, both reads of the pages agree on the 100 and say
+        "no"."""
+        self.app("12345", (77, range(1, 102), 100))
+        self.answers[("GET", f"{self.API}/repositories/101")] = (500, {"message": "Server Error"})
+        status, got = self.ask(101, {"12345": [2]})
+        row = got["installations"][0]
+        self.assertEqual((status, got["in"], row["direct"], row["in"], row["why"], row["read"]),
+                         (200, "unknown", None, "unknown", "list_changed", 100))
+
+    def test_a_renamed_repository_is_found_by_its_id(self):
+        """GitHub keeps a repository's id through a rename, and both readings use ids: a repository with a new name is
+        "yes", private (GitHub's answer for its id) or public (the pages). A read by name (as the door's list of names
+        does) misses it, and the proof would pass."""
+        self.names = {4242: "other-owner/new-name"}
+        for public in (set(), {4242}):
+            with self.subTest(public=bool(public)):
+                self.public = public
+                self.app("12345", (77, [1, 4242, 3]))
+                status, got = self.ask(4242, {"12345": [1]})
+                self.assertEqual((status, got["in"], got["installations"][0]["in"]), (200, "yes", "yes"))
+
+    def test_github_s_answer_for_the_id_finds_a_repository_that_the_pages_miss(self):
+        """A repository that goes and one that comes between two pages keep total_count and move a repository into a
+        page that the door read already, so the pages miss it with no sign (the agents' new repositories come at any
+        time). GitHub's answer for the id (200, private) is "yes" whatever the pages say."""
+        self.app("12345", (77, [1, 2, 3]))
+        self.held[self.token(77)]["hidden"] = {9}
+        status, got = self.ask(9, {"12345": [2]})
+        self.assertEqual((status, got["in"]), (200, "yes"))
+        self.assertEqual([(r["direct"], r["in"]) for r in got["installations"]], [("yes", "yes")])
+
+    def test_where_github_says_nothing_of_the_id_two_reads_of_the_pages_must_agree(self):
+        """Where GitHub's answer for the id says nothing (an error, or a public repository, which every token reads),
+        "no" needs two reads of every page with the same ids; two reads that differ are list_changed. One read alone
+        cannot see a repository that moved into a page that it read already."""
+        for fault in ((500, {"message": "Server Error"}), None):
+            for second, said in (([1, 2, 3], "no"), ([1, 2, 4], "unknown")):
+                with self.subTest(fault=bool(fault), second=second):
+                    self.answers.pop(("GET", f"{self.API}/repositories/9"), None)
+                    self.public = set() if fault else {9}
+                    if fault:
+                        self.answers[("GET", f"{self.API}/repositories/9")] = fault
+                    self.app("12345", (77, lambda read, second=second: [1, 2, 3] if read == 1 else second))
+                    status, got = self.ask(9, {"12345": [2]})
+                    row = got["installations"][0]
+                    self.assertEqual((status, got["in"], row["direct"], row["in"], row.get("why")),
+                                     (200, said, None, said, None if said == "no" else "list_changed"))
+                    self.assertEqual(self.pages(self.token(77))[-2:], [1, 1])
+
+    def test_only_the_hub_with_its_token_secret_asks(self):
+        """An agent's machine, and the hub with the secret of the record, get 403 and make the door read nothing of
+        GitHub; so does a body out of its form (400). A route without the hub's check would let any caller of the
+        private network make the door read every installation of its Apps."""
+        self.app("12345", (77, [1, 2]))
+        self.assertEqual(self.ask(2, {"12345": [1]}, source=ONE)[0], 403)
+        self.assertEqual(self.ask(2, {"12345": [1]}, token=self.secrets["record"])[0], 403)
+        for repo_id, known in (("2", {"12345": [1]}), (True, {"12345": [1]}), (2, [1]), (2, {}), (2, {"12345": []}),
+                               (2, {"12345": [2]}), (2, {"12345": [1, 1]}), (2, {"12345": list(range(3, 24))}),
+                               (2, {"x": [1]}), (2, {str(n): [1] for n in range(1, 12)})):
+            self.assertEqual(self.ask(repo_id, known)[0], 400, (repo_id, known))
+        self.assertEqual(HubRights.post(self, "/github/repo-reach", {"repo_id": 2, "known": {"12345": [1]},
+                                                                     "name": "x"}, self.secrets["token"])[0], 400)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.ask(2, {"12345": [1]})[1]["in"], "yes")
+
+    def test_one_read_at_a_time(self):
+        """A second ask while a read runs gets 503 at once and makes the door read nothing: a hub that asks again would
+        stack reads on the installations' rate limits, which the agents' tokens share."""
+        self.app("12345", (77, [1, 2]))
+        self.assertTrue(door.Door.REACH_LOCK.acquire(blocking=False))
+        try:
+            status, got = self.ask(2, {"12345": [1]})
+        finally:
+            door.Door.REACH_LOCK.release()
+        self.assertEqual((status, got["error"]), (503, "a read by repository id runs already: ask again when it ends"))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.ask(2, {"12345": [1]})[1]["in"], "yes")
+
+    def test_a_read_past_its_time_is_unknown(self):
+        """A read that passes REACH_BUDGET makes no more calls of GitHub and is "unknown" (out_of_time): a caller waits
+        a known time, and an installation that the door did not read is never "no"."""
+        self.app("12345", (77, [1, 2, 3]), (78, [4]))
+        ticks = iter(range(100))
+        with patch.object(door, "REACH_BUDGET", 5), patch.object(door, "REACH_CLOCK", lambda: next(ticks)):
+            status, got = self.ask(9, {"12345": [2]})
+        self.assertEqual((status, got["in"]), (200, "unknown"))
+        self.assertEqual([(r["installation"], r["in"], r.get("why")) for r in got["installations"]],
+                         [(77, "no", None), (None, "unknown", "out_of_time")])
+        self.assertNotIn(("POST", f"{self.API}/app/installations/78/access_tokens", self.TOKEN_BODY), self.calls)
+
+    def test_the_answer_holds_no_token_no_repository_name_and_no_account(self):
+        """The answer holds ids, counts and fixed words only: the hub's owner route and the proof's record show it,
+        so a token, a repository's name or an account's name (a person's name) in it would leave the door."""
+        self.app("12345", (77, [1, 2, 3]))
+        status, got = self.ask(5, {"12345": [2]})
+        self.assertEqual(status, 200, got)
+        self.assertEqual(got, {"repo_id": 5, "in": "no", "apps": ["12345"], "known": {"12345": [2]}, "installations": [
+            {"app_id": "12345", "installation": 77, "selection": "selected", "total_count": 3, "read": 3,
+             "direct": "no", "in": "no", "known": [2]}]})
+        text = json.dumps(got)
+        for held in ("ghs_", "repo-", "One-Org"):
+            self.assertNotIn(held, text)
+
+    def test_the_token_has_metadata_read_only_and_no_limit_of_repositories(self):
+        """The token that reads an installation asks for metadata read and nothing more, and names no repositories:
+        a token limited to some repositories (as the door's token for a repository's delete is) reads only those, so
+        both readings say "no" for each other one, also in an installation with all its account's repositories. This
+        test's GitHub refuses any other token, so the answer is "unknown" for such a form. Each token ends after its
+        read, not an hour later."""
+        self.app("12345", (77, [1, 2]), (78, [3]))
+        status, got = self.ask(9, {"12345": [1, 3]})
+        self.assertEqual((status, got["in"]), (200, "no"), got)
+        self.assertEqual([d for m, u, d in self.calls if u.endswith("/access_tokens")], [self.TOKEN_BODY] * 2)
+        self.assertEqual([t for m, u, t in self.calls if m == "DELETE"], [self.token(77), self.token(78)])
+
+    def test_each_app_finds_its_own_known_repositories(self):
+        """The hub names known repositories for each App, and the answer says which of them each App's reads found:
+        the control that the reads covered that App's installations. A known one that its App did not find makes the
+        answer "unknown", also when each installation says "no" and another App found it: a find in the agents' App
+        says nothing of the door's own App."""
+        self.second_app()
+        self.app("12345", (77, [1, 2, 3]))
+        self.app("67890", (88, [4]))
+        status, got = self.ask(9, {"12345": [2], "67890": [4]})
+        self.assertEqual((status, got["in"], got["apps"], got["known"]),
+                         (200, "no", ["12345", "67890"], {"12345": [2], "67890": [4]}))
+        for known in ({"12345": [2], "67890": [2]}, {"12345": [2, 5], "67890": [4]}):
+            status, got = self.ask(9, known)
+            self.assertEqual((status, got["in"], [r["in"] for r in got["installations"]]),
+                             (200, "unknown", ["no", "no"]), known)
+
+    def test_an_app_that_the_door_did_not_read_makes_the_answer_unknown(self):
+        """The answer names every App of the door's file, and "no" needs them equal to the Apps of known: an App that
+        the door's file names otherwise, or not at all, gives no row, and its "no" would pass the proof for an App that
+        nobody read. An App that the door read but the hub did not name has no control, and is "unknown" too."""
+        self.app("12345", (77, [1, 2, 3]))
+        status, got = self.ask(9, {"12345": [2], "67890": [4]})
+        self.assertEqual((status, got["in"], got["apps"], [r["in"] for r in got["installations"]]),
+                         (200, "unknown", ["12345"], ["no"]))
+        self.second_app()
+        self.app("67890", (88, [4]))
+        status, got = self.ask(9, {"12345": [2]})
+        self.assertEqual((status, got["in"], got["apps"]), (200, "unknown", ["12345", "67890"]))
+
+    def test_every_page_of_an_app_s_installations_is_read(self):
+        """An App with more than 100 installations gives them in pages: the repository in an installation of the
+        second page is "yes". A read of the first page alone (as the door's other reads of installations do) says "no"
+        for it."""
+        self.app("12345", *[(1000 + n, [2000 + n]) for n in range(101)], (1101, [9]))
+        status, got = self.ask(9, {"12345": [2000]})
+        self.assertEqual((status, got["in"], len(got["installations"])), (200, "yes", 102))
+        self.assertEqual([r["installation"] for r in got["installations"] if r["in"] == "yes"], [1101])
+        self.assertIn(("GET", f"{self.API}/app/installations?per_page=100&page=2", "jwt12345-0000"), self.calls)
+
+    def test_the_list_of_installations_is_whole_and_the_same_after_the_reads(self):
+        """An installation that goes after page 1 of the list is read moves another one from page 2 to page 1, which
+        the read then never sees; one can also come during the reads. The door reads the list again after the reads,
+        and two lists that differ are no_list. A list with one installation twice or a page of more than 100 is
+        no_list too. In each case the installation that holds the repository is the one that a plain read misses."""
+        held = [(1000 + n, [2000 + n]) for n in range(100)] + [(1100, [9]), (1101, [2101])]
+        self.app("12345", *held)
+        every = list(self.apps["12345"])
+        gone = every[:99] + every[100:]         # 1099 went after page 1 was read: page 2 starts one row later
+
+        def shifted(read, page):
+            if read == 1:
+                return every[:100] if page == 1 else gone[100:]
+            return gone[(page - 1) * 100:page * 100]
+        for listed in (shifted, lambda read, page: every[:100] if page == 1 else [every[0]],
+                       lambda read, page: every[:101] if page == 1 else []):
+            with self.subTest(listed=listed):
+                self.app("12345", *held)
+                self.apps["12345"] = listed
+                self.list_reads.clear()
+                status, got = self.ask(9, {"12345": [2000]})
+                self.assertEqual((status, got["in"], got["installations"][-1]),
+                                 (200, "unknown", {"app_id": "12345", "installation": None, "in": "unknown",
+                                                   "why": "no_list"}))
+
+    def test_a_stale_key_of_an_app_does_not_hide_its_other_key(self):
+        """Two keys of one App in the door's file, the first of which GitHub no longer takes: the door reads with the
+        first key that GitHub takes, so the stale one does not make each answer "unknown"."""
+        self.second_app("12345")
+        self.stale = {"0000"}
+        self.app("12345", (77, [1, 2, 3]))
+        status, got = self.ask(9, {"12345": [2]})
+        self.assertEqual((status, got["in"], got["apps"]), (200, "no", ["12345"]))
+        self.assertEqual([t for m, u, t in self.calls if "/app/installations?" in u],
+                         ["jwt12345-0000", "jwt12345-0012", "jwt12345-0012"])
+
+    def test_an_installation_or_an_app_that_the_door_cannot_read_is_unknown(self):
+        """No token for an installation (GitHub gives none to a suspended one: 403), a list of installations that
+        GitHub does not give, an App key that openssl does not sign with (it can stop with a time-out), an answer cut
+        short, and an App key that the door does not hold are each "unknown" with their word, never "no" and never no
+        answer: the proof would pass for an installation that nobody read."""
+        url = f"{self.API}/app/installations?per_page=100&page=1"
+        # the key file goes last: the cases before it sign with it
+        for case, why in (("suspended", "no_token"), ("list", "no_list"), ("openssl", "no_key"), ("cut", "failed"),
+                          ("no file", "no_key")):
+            with self.subTest(case=case):
+                self.app("12345", (77, [1, 2, 3]))
+                self.raise_on = "/installation/repositories" if case == "cut" else None
+                signing = contextlib.nullcontext()
+                if case == "suspended":
+                    self.answers[("POST", f"{self.API}/app/installations/77/access_tokens")] = (
+                        403, {"message": "This installation has been suspended"})
+                if case == "list":
+                    self.answers[("GET", url)] = (500, {"message": "Server Error"})
+                if case == "openssl":
+                    signing = patch.object(door_providers, "app_jwt",
+                                           side_effect=subprocess.TimeoutExpired("openssl", 20))
+                if case == "no file":
+                    os.remove(os.path.join(self.root + door.SECRETS_DIR, hashlib.sha256(ref(6).encode()).hexdigest()))
+                with signing:
+                    status, got = self.ask(9, {"12345": [2]})
+                self.answers.pop(("GET", url), None)
+                self.assertEqual((status, got["in"], [(r["in"], r["why"]) for r in got["installations"]]),
+                                 (200, "unknown", [("unknown", why)]))
+
+    def test_a_known_repository_that_is_public_is_no_control(self):
+        """Every token reads a public repository, so GitHub's answer for a public one's id (200) shows nothing of the
+        token: a public known repository is not found, and the answer stays "unknown". The hub names private ones."""
+        self.public = {2}
+        self.app("12345", (77, [1, 2, 3]))
+        status, got = self.ask(9, {"12345": [2]})
+        self.assertEqual((status, got["in"], got["known"], got["installations"][0]["in"]),
+                         (200, "unknown", {"12345": []}, "no"))
 
 
 class LongLines(unittest.TestCase):
