@@ -856,6 +856,65 @@ class Capacity(OwnerAPI):
         self.assertIn("Almost nothing is left of it", self.said()[-1])
         self.assertEqual(len(self.said()), 2)
 
+    def test_the_manager_hears_of_each_account_of_its_team_by_itself_once_a_window(self):
+        """The owner, 24 November 2026: "The manager should proactively know and ASK me ONLY when it has a question
+        that's important, but it needs to MANAGE the team, not ask me to send a message." A worker's account left his
+        System status that day (test_health). The bug: the manager heard of it only when it called see_capacity or
+        when a session was refused, so nobody acted on a team's week before it was gone."""
+        later = hub.now() + 60.5 * 3600
+        hub.TEAM["agents"]["seo"]["screen_command"] = "codex app-server"
+        # big does all its work on the shared Codex account, seo only its screen work; seo's own account is at 5%.
+        self.reading("big", self.limits(SHARED, 74, later))
+        self.reading("seo", self.limits(SEO, 5, later, label="7 days"), self.limits(SHARED, 74, later))
+        hub.tick()
+        team = [r for r in hub.q("SELECT text, extra FROM events WHERE agent='manager' AND kind='say' ORDER BY id")
+                if "YOUR TEAM'S ALLOWANCE" in r["text"]]
+        self.assertEqual(len(team), 1)
+        said = team[0]["text"]
+        self.assertEqual(said.count("% used"), 1)               # one account: seo's own is not in it
+        # by the route that spends it, and never as the desktop tasks of both: big's own work spends it all
+        self.assertIn("big, and seo's desktop tasks: the ", said)
+        self.assertIn('window "codex / 7 days" of the account that they spend is 74% used and resets in 60 hours',
+                      said)
+        self.assertIn("At the pace of this window so far it is gone before then", said)
+        self.assertIn("Give the work that cannot wait for the reset to an agent that suits it and spends another "
+                      "account, and let the rest wait", said)
+        # one channel with rules/manager.md for capacity that is missing
+        self.assertIn("tell the owner with tell_owner what account capacity is missing", said)
+        self.assertIn("a usage limit that resets by itself is a warning, not a Needs-you item", said)
+        self.assertNotIn("wake_after", json.loads(team[0]["extra"]))          # a pace asks for nothing at once
+        news = lambda: [t for t in self.said() if "YOUR TEAM'S ALLOWANCE" in t]
+        hub.kv_set("allowance_sweep_at", 0)
+        hub.tick()
+        self.assertEqual(len(news()), 1)                                        # once for the window
+        self.reading("big", self.limits(SHARED, 96, later))
+        hub.kv_set("allowance_sweep_at", 0)
+        hub.tick()
+        self.assertEqual(len(news()), 2)                                        # again when it gets worse
+        self.assertIn("Almost nothing is left of it.", news()[-1])
+        # A hold says nothing: start_limit told the manager when it began.
+        self.reading("big", self.limits(SHARED, 100, later))
+        hub.q("INSERT INTO agent_limits(agent,since,until,reset_known) VALUES('big',?,?,1)", (hub.now(), later))
+        hub.kv_set("allowance_sweep_at", 0)
+        hub.tick()
+        self.assertEqual(len(news()), 2)
+        # A spent week with no hold yet, the span the owner's screen used to show, wakes the manager within the hour.
+        hub.q("DELETE FROM agent_limits")
+        hub.kv_set("allowance_sweep_at", 0)
+        hub.tick()
+        spent = hub.q("SELECT text, extra FROM events WHERE agent='manager' AND kind='say' AND text LIKE ? "
+                      "ORDER BY id", ("%YOUR TEAM'S ALLOWANCE%",))[-1]
+        self.assertIn("Nothing is left of it.", spent["text"])
+        self.assertEqual(json.loads(spent["extra"]), hub.LATER_SAY)
+        # Its reset with no hold since is one line to the manager, which tells the owner the end of what it told
+        # him: no reminder of its own has to carry it. Once.
+        hub.team_allowance_news("manager", later + 60)
+        hub.team_allowance_news("manager", later + 120)
+        back = [t for t in self.said() if "YOUR TEAM'S ALLOWANCE IS BACK" in t]
+        self.assertEqual(len(back), 1)
+        self.assertIn('big, and seo\'s desktop tasks: the window "codex / 7 days" of that account has reset.', back[0])
+        self.assertIn("If you told the owner of it, tell them that it has ended", back[0])
+
     def test_it_says_nothing_about_a_window_that_recovers_resets_itself_or_is_already_gone(self):
         for used, hours, why in ((40, 100, "a slow week"), (92, 1, "nearly reset"), (65, 20, "under the floor")):
             with self.subTest(why=why):

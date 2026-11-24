@@ -212,6 +212,16 @@ class Health(OwnerAPI):
                     "resets_at": None if hours_left is None else hub.now() + hours_left * 3600,
                     "window_minutes": minutes}]}})))
 
+    def screen(self, agent, used, hours_left, key, error=None):
+        """The reading of one agent's screen route, beside its own (allowance): one weekly window of the account `key`,
+        that many hours from its reset, with the reading's own error."""
+        data = json.loads(hub.q1("SELECT data FROM agent_usage WHERE name=?", (agent,))["data"])
+        data["screen"] = {"tokens": None, "limits": {
+            "collected_at": hub.now(), "source": "test", "plan": "plus", "account_key": key, "error": error,
+            "windows": [{"id": "w", "label": "7 days", "used_percent": used, "resets_at": hub.now() + hours_left * 3600,
+                         "window_minutes": 10080}]}}
+        hub.q("UPDATE agent_usage SET data=? WHERE name=?", (json.dumps(data), agent))
+
     def hold(self, agent, hours_left=31):
         """The hub's own usage-limit hold on one agent: written only when a session was actually refused and its
         helper reported it, which is the thing the reading cannot tell us."""
@@ -272,14 +282,15 @@ class Health(OwnerAPI):
         # left of a window, and this one has nothing left.
         self.assertEqual(w["fix"], "Sign Manager in to another account.")
         self.assertEqual(w["agent"], "manager")
-        # A worker's spent week leads to that worker, and its way out is the manager, as the pace line's is.
+        # A worker's spent week is no line of his: the manager hears of it by itself (test_capacity), moves the work
+        # or lets it wait, and asks him only for money or a new account. The bug: his screen said "Tell Manager what
+        # must not wait." under it, and the owner, 24 November 2026: "it needs to MANAGE the team, not ask me to
+        # send a message".
         hub.TEAM["agents"]["vps"] = {"role": "worker", "runtime": "codex", "machine": "vps", "can": ["shell"]}
         hub.TEAM["addresses"]["vps"] = "127.0.0.3"
         self.allowance("vps", 100, 31.5, key="openai:" + "a" * 32)
-        worker = next(x for x in self.health()["warnings"]
-                      if x["kind"] == "allowance_spent" and x["agent"] == "vps")
-        self.assertEqual(worker["detail"], "All of its 7-day limit is used; it resets in 31 hours.")
-        self.assertEqual(worker["fix"], "Tell Manager what must not wait.")
+        self.assertEqual([(x["kind"], x["agent"]) for x in self.health()["warnings"]
+                          if x["kind"].startswith("allowance_")], [("allowance_spent", "manager")])
 
     def test_one_hour_or_one_minute_is_said_in_the_singular(self):
         """Review A11: a spent window that resets 1.5 to 2 hours away said "it resets in 1 hours"."""
@@ -311,13 +322,6 @@ class Health(OwnerAPI):
         # And it is the hold that silences it, not the hold's own banner: the banner is written by the tick, and
         # this answer must not depend on a tick having run.
         self.assertNotIn("manager_limited", self.kinds())
-        # A hold on a worker silences that worker's account only.
-        hub.TEAM["agents"]["vps"] = {"role": "worker", "runtime": "codex", "machine": "vps", "can": ["shell"]}
-        hub.TEAM["addresses"]["vps"] = "127.0.0.3"
-        self.allowance("vps", 100, 31, key="openai:" + "a" * 32)
-        self.assertEqual(self.kinds().count("allowance_spent"), 1)
-        self.hold("vps")
-        self.assertNotIn("allowance_spent", self.kinds())
 
     def test_a_reading_the_hub_cannot_trust_and_a_window_nobody_reported_stay_silent(self):
         """100% from a reading an hour old is not a fact, and a window the account does not report is not a window
@@ -343,14 +347,42 @@ class Health(OwnerAPI):
         spent = next(x for x in self.health()["warnings"] if x["kind"] == "allowance_spent")
         self.assertEqual(spent["detail"], "All of its 7-day limit is used.")
 
-    def test_an_allowance_warning_about_a_worker_leads_to_that_worker_and_says_the_fleet_goes_on(self):
+    def test_a_workers_account_is_no_line_of_his_and_an_account_names_each_agent_by_the_route_that_spends_it(self):
+        """The owner, 24 November 2026, on his System status: "it is concerning that the fleet has wrong data about an
+        agent", and of the way on, "Tell Manager what must not wait.": "should definitely be gone!! The manager should
+        proactively know and ASK me ONLY when it has a question that's important". One agent spent 74% of its own
+        ChatGPT account, which a second agent's screen route also used; the second agent's own account was at 5%,
+        and the line named both as if the 74% were theirs. A worker's account is the manager's to manage now
+        (test_capacity has its message), and the manager's own account names each agent by the route that spends
+        it."""
+        chatgpt = "openai:" + "a" * 32
         hub.TEAM["agents"]["vps"] = {"role": "worker", "runtime": "codex", "machine": "vps", "can": ["shell"]}
+        hub.TEAM["agents"]["seo"] = {"role": "worker", "runtime": "claude", "machine": "vps",
+                                     "can": ["shell", "screen"], "screen_command": "codex app-server"}
         hub.TEAM["addresses"]["vps"] = "127.0.0.3"
-        self.allowance("vps", 96, 30.5, key="openai:" + "a" * 32)
-        w = next(x for x in self.health()["warnings"] if x["kind"] == "allowance_pace")
-        self.assertEqual(w["agent"], "vps")
-        self.assertEqual(w["detail"], "96% of its 7-day limit is used; it resets in 30 hours.")
-        self.assertEqual(w["fix"], "Tell Manager what must not wait.")
+        self.allowance("vps", 96, 30.5, key=chatgpt)
+        self.assertEqual([x for x in self.health()["warnings"] if x["kind"].startswith("allowance_")], [])
+        # vps does all its work on the ChatGPT account and seo only its screen work; seo's own account is at 5%.
+        self.allowance("vps", 74, 60, key=chatgpt)
+        self.allowance("seo", 5, 60, key="anthropic:" + "c" * 32)
+        self.screen("seo", 74, 60, key=chatgpt)
+        self.assertEqual([x for x in self.health()["warnings"] if x["kind"].startswith("allowance_")], [])
+        # The same desktop route on the account of a manager that runs on Codex: his line, which names seo by that
+        # route alone, in his apps' word for it.
+        own = "openai:" + "e" * 32
+        hub.TEAM["agents"]["manager"]["runtime"] = "codex"
+        self.allowance("manager", 74, 60, key=own)
+        self.screen("seo", 74, 60, key=own)
+        lines = [x for x in self.health()["warnings"] if x["kind"].startswith("allowance_")]
+        self.assertEqual([(x["kind"], x["agent"], x["fix"]) for x in lines],
+                         [("allowance_pace", "manager", "Keep your own sessions off this account until it resets.")])
+        self.assertTrue(lines[0]["detail"].startswith("Manager, and Seo's desktop tasks: 74% of their 7-day limit is "
+                                                      "used; "), lines[0]["detail"])
+        # A route that is signed out of the account spends it no more, though the hub keeps its reading under it.
+        self.screen("seo", 74, 60, key=own, error="CLI sign-in is required.")
+        self.allowance("manager", 74, 60, key=own)          # the newest reading of the account is the manager's own
+        line = next(x for x in self.health()["warnings"] if x["kind"] == "allowance_pace")
+        self.assertTrue(line["detail"].startswith("74% of its 7-day limit is used; "), line["detail"])
 
     def test_the_words_are_his_and_few(self):
         """T-37, the owner's System status: "What to do" held about 246 words, "The owner has no confirmed backup
@@ -360,9 +392,10 @@ class Health(OwnerAPI):
         hub.TEAM["addresses"]["vps"] = "127.0.0.3"
         hub.touch("vps")
         hub.q("UPDATE agents SET last_seen=? WHERE name='vps'", (hub.now() - 3600,))    # silent for an hour
-        # 92% of a week with 15 hours to go runs out before the reset; the provider's own name of the window is
-        # "codex / 7 days", which his screen showed in quotes
-        self.allowance("vps", 92, 15, key="openai:" + "a" * 32, windows=[
+        # 92% of the manager's week with 15 hours to go runs out before the reset (a worker's account is no line of
+        # his since 24 November 2026); the provider's own name of the window was "codex / 7 days", which his screen
+        # showed in quotes
+        self.allowance("manager", 92, 15, windows=[
             {"id": "w", "label": "codex / 7 days", "used_percent": 92, "resets_at": hub.now() + 15 * 3600,
              "window_minutes": 10080}])
         with unittest.mock.patch.object(hub, "STARTED", hub.now() - 7200):    # a hub that has heard it go quiet

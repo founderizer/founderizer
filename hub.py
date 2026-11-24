@@ -16543,6 +16543,31 @@ def account_groups(t0=None):
     return out
 
 
+def account_spenders(g):
+    """[(agent, whole)] of one account of account_groups, each agent once, by the route that spends from it now: whole
+    is False for an agent whose only route on it is its screen route, the desktop tasks of the owner's apps. The
+    agents whose own runtime spends it come first.
+
+    An account is named by the routes that use it, never by "every agent with any route on it": one agent's ChatGPT
+    account at 74%, which another agent's screen route also used, was the line of both on the owner's screen, and the
+    second agent's own account was at 5% (the owner, 24 November 2026: "it is concerning that the fleet has wrong
+    data about an agent"). A route spends the account only while its own runtime names it (route_account): one that is
+    signed out of it, or that names another account since, is filed under this key still (account_groups), and is no
+    spender, as the Mac app reads it (UsageBar.identityErrors)."""
+    now = {(n, route) for n, route in g["routes"] if route_account(n, route) == g["key"]}
+    whole = sorted({n for n, route in now if route == "primary"})
+    return [(n, True) for n in whole] + [(n, False) for n in sorted({n for n, _ in now} - set(whole))]
+
+
+def spender_words(spenders, name):
+    """account_spenders in one line, each agent by the route that spends the account, written by `name` (shown_role
+    for the owner, the agent's own name for an agent): "Manager and Vps", "Vps, and Nova's desktop tasks". The comma
+    before desktop tasks that follow a name keeps them from reading as the desktop tasks of both."""
+    words = [name(a) if whole else f"{name(a)}'s desktop tasks" for a, whole in spenders]
+    return f"{', '.join(words[:-1])}{'' if spenders[-1][1] else ','} and {words[-1]}" if len(words) > 1 else \
+        "".join(words)
+
+
 # A hold belongs to one agent; an allowance belongs to one account. So a session that reaches a usage limit spends
 # the allowance of every agent on that account, and the hub held only the one that reported it: create_task for the
 # other was taken, its helper was handed the task, and the session failed on its first call. The hold spreads here.
@@ -16623,8 +16648,8 @@ def allowance_ahead(agent, route="primary"):
     group = account_group(agent, route)
     if not group or group["state"]["state"] != "available":
         # A window at 100% makes the state "limited", so "spent" never reaches the text below: what to do about an
-        # allowance that is already gone is not this agent's own pacing but the owner's, and allowance_spent on his
-        # health screen carries it.
+        # allowance that is already gone is not this agent's own pacing. The manager's own is the owner's, and
+        # allowance_spent on his health screen carries it; a worker's is the manager's (team_allowance_news).
         return "", None, None
     found = allowance_worth_saying(group["reading"], t0)
     if not found:
@@ -24859,9 +24884,21 @@ def chat_paused():
 
 
 def agent_display(name):
-    """The agent's name in a chat app: its title, else its name with a capital first letter."""
-    title = str((agents().get(name) or {}).get("title") or "").strip()
-    return title or name[:1].upper() + name[1:]
+    """The agent in a short line of the hub about a person's conversation: what the person reads on a chat app ("Nova
+    cannot chat now.", "Linked. You can write to Nova here now."), and what the owner and the agent read of it. Its
+    label, as the owner's apps show it (shown_role; the owner, 22 November 2026: an agent shows by its name)."""
+    return shown_role(name)
+
+
+def agent_introduced(name):
+    """The agent as a person meets it in a conversation: the first message to them (CONVERSATION_NOTICE) and the first
+    line of the conversation's session. Its label, and its role in brackets where the label is not the role ("Nova
+    (Customer Support)"), so that the person reads the name and what the assistant is for (the owner's answer of 22
+    November 2026, of people on a chat app). The label alone for an agent with no role, and for a worker whose role
+    holds its name ("Studio Ops" for studio)."""
+    label = shown_role(name)
+    role = " ".join(str((agents().get(name) or {}).get("title") or "").split())
+    return f"{label} ({role})" if role and role != label else label
 
 
 def chat_day(ts):
@@ -29028,7 +29065,7 @@ def person_route(account, acc, person, m, t0, hit):
     chat_count(day_count, "inbound", t0, 1)
     conv, first = conversation_of(person, agent, m, account, t0)
     if first:
-        chat_reply(account, m["chat"], CONVERSATION_NOTICE.format(agent=agent_display(agent)), t0,       # EU AI Act 50
+        chat_reply(account, m["chat"], CONVERSATION_NOTICE.format(agent=agent_introduced(agent)), t0,     # EU AI Act 50
                    person["id"])
     sent = None if m["kind"] == "text" else m["kind"]      # what came with the words, which the agent reads of it
     # the mark of a narrowed pair's row (narrowed_mark), also in a pause, when the message gets no task
@@ -29497,7 +29534,7 @@ def conversation_rules(agent, person):
         return conversation_closed_rules(agent, person)
     tools = PERSON_TOOLS[person_role(person["role"])]
     lines = [
-        f"You are {agent_display(agent)}, an AI assistant of the owner of this fleet. You are in one conversation "
+        f"You are {agent_introduced(agent)}, an AI assistant of the owner of this fleet. You are in one conversation "
         f"with {person['name']}, who is {PERSON_ROLES[person_role(person['role'])]}",
         "",
         "The rules of this window:",
@@ -29540,7 +29577,7 @@ def conversation_closed_rules(agent, person):
     # lasting wishes go to ask_team. "cannot give you work" said the opposite of their role (19 November 2026).
     staff = bool(access["tools"])
     lines = [
-        f"You are {agent_display(agent)}, an AI assistant of the owner of this fleet. You are in one conversation "
+        f"You are {agent_introduced(agent)}, an AI assistant of the owner of this fleet. You are in one conversation "
         f"with {person['name']}, who is {person['role']}: {mask_secrets(access['prompt'])}",
         "",
         "The rules of this window:",
@@ -31877,7 +31914,7 @@ def t_message_contact(agent, a):
                 conv = DB.execute("SELECT * FROM conversations WHERE id=?", (cid,)).fetchone()
                 chat_queue("message", account, t0, chat=chat, recipient=recipient, reply_to=None,     # EU AI Act 50
                            person=person["id"],
-                           text=CONVERSATION_NOTICE.format(agent=agent_display(agent)))
+                           text=CONVERSATION_NOTICE.format(agent=agent_introduced(agent)))
             cm = unused_id("conversation_messages")
             files = chat_files_carry(rows, t0, cm=cm)
             item = chat_queue("message", account, t0, chat=chat, recipient=recipient, text=text, reply_to=None,
@@ -54409,29 +54446,21 @@ def allowance_sweep(t0):
     saying, so a reading that moved the reset by a moment said it all again, and so did a pace that dipped under the
     line for one sweep: every 15 minutes, each copy one more turn of the manager over its whole context. The warning
     about the allowance was what spent it. It is quiet too (QUIET_SAY): it asks for nothing at once, so it comes with
-    the manager's next read and wakes nothing."""
+    the manager's next read and wakes nothing.
+
+    The accounts of its team come in a message of their own (team_allowance_news), by the same rule."""
     if t0 - float(kv_get("allowance_sweep_at") or 0) < goal_settings()[0] * 60:
         return
     kv_set("allowance_sweep_at", t0)
     mgr = manager_name()
+    try:
+        team_allowance_news(mgr, t0)
+    except Exception:
+        print_fault()       # a fault of the team's part never costs the manager its own warning of this sweep
     said, w, why = allowance_ahead(mgr)
     if not said:
         return              # what was said stays: a pace that dips under the line and back is the same warning
-    try:
-        known = json.loads(kv_get("allowance_said") or "{}")
-    except ValueError:
-        known = {}
-    known = {k: v for k, v in (known if isinstance(known, dict) else {}).items() if isinstance(v, dict) and
-             not (isinstance(v.get("resets_at"), (int, float)) and v["resets_at"] < t0 - ALLOWANCE_SAME)}
-    last, reset = known.get(w["label"], {}), w["resets_at"]
-    was = last.get("resets_at")
-    same = bool(last) and (reset is None and was is None or reset is not None and isinstance(was, (int, float))
-                           and abs(reset - was) < ALLOWANCE_SAME)
-    worse = ALLOWANCE_STAGES[why] > (ALLOWANCE_STAGES.get(last.get("stage"), 0) if same else 0)
-    # The reset that this reading gives is kept even when nothing is said, so a reset that creeps is still this window.
-    known[w["label"]] = {"resets_at": reset, "stage": why if worse else last.get("stage")}
-    kv_set("allowance_said", json.dumps(known))
-    if not worse:
+    if not allowance_news("allowance_said", [(w["label"], w, why, {})], t0):
         return
     emit(mgr, "say", f"[hub] YOUR OWN ALLOWANCE: {said} Every question, every result and every permission prompt of "
          f"this fleet waits for you, so when it is gone the fleet stops with you. Until the reset, work in fewer and "
@@ -54440,6 +54469,103 @@ def allowance_sweep(t0):
          f"own allowance and not a reason to move "
          f"work to an agent with more left: suitability comes first, as it always does. The hub says this once for "
          f"this window, and again only if it gets worse.", extra=QUIET_SAY)
+
+
+def allowance_news(store, items, t0):
+    """The names of these (name, window, why, facts) items that are news: a window that was not said yet, or a worse
+    stage of one that was (ALLOWANCE_STAGES). What was said is kept in kv `store` ({name: its reset, the stage and the
+    facts of the item when it was news}), and only the window's own reset ends it, so a reading that moves the reset
+    by a moment, or a pace that dips under the line for one sweep, says nothing again (allowance_sweep). The reset that
+    a reading gives is kept even when nothing is said, so a reset that creeps is still this window."""
+    try:
+        known = json.loads(kv_get(store) or "{}")
+    except ValueError:
+        known = {}
+    known = {k: v for k, v in (known if isinstance(known, dict) else {}).items() if isinstance(v, dict) and
+             not (isinstance(v.get("resets_at"), (int, float)) and v["resets_at"] < t0 - ALLOWANCE_SAME)}
+    news = []
+    for name, w, why, facts in items:
+        last, reset = known.get(name, {}), w["resets_at"]
+        was = last.get("resets_at")
+        same = bool(last) and (reset is None and was is None or reset is not None and isinstance(was, (int, float))
+                               and abs(reset - was) < ALLOWANCE_SAME)
+        worse = ALLOWANCE_STAGES[why] > (ALLOWANCE_STAGES.get(last.get("stage"), 0) if same else 0)
+        known[name] = dict(last if same else {}, **(facts if worse else {}), resets_at=reset,
+                           stage=why if worse else last.get("stage"))
+        if worse:
+            news.append(name)
+    kv_set(store, json.dumps(known))
+    return news
+
+
+def team_allowance_news(mgr, t0):
+    """From allowance_sweep: each account of the team that the manager's own runtime does not spend, to the manager,
+    while there is something to do about it: once for each window, and once more for each worse stage of it, in one
+    message for the accounts whose news came in this sweep; and the end of each such window, in one line.
+
+    The owner's health screen says only the manager's own account (health_view). A worker's account was a line there
+    too, whose way on was "Tell Manager what must not wait.", and the manager itself heard of it only when it called
+    see_capacity or when a session was refused. The owner, 24 November 2026: "The manager should proactively know and
+    ASK me ONLY when it has a question that's important, but it needs to MANAGE the team, not ask me to send a
+    message." So the manager hears it here, by itself, and it asks him only as rules/manager.md says for capacity
+    that is missing: tell_owner, and a Needs-you item only for work that he asked for that only his change starts.
+
+    An account with a hold says nothing here: start_limit told the manager when the hold began, and end_limits tells
+    it the end. A window that it heard of here and that resets with no hold since gets its line of the end, so the
+    manager's own line to the owner at the end of a problem that it told him of waits for no reminder of its own. A
+    spent window and an end wake the manager within the hour (LATER_SAY), because the next session on a spent one is
+    refused and an end is the owner's news too; a pace is quiet (QUIET_SAY)."""
+    store = "allowance_said_team"
+    try:
+        known = json.loads(kv_get(store) or "{}")
+    except ValueError:
+        known = {}
+    known = {k: v for k, v in (known if isinstance(known, dict) else {}).items() if isinstance(v, dict)}
+    ended = [name for name, v in sorted(known.items()) if v.get("stage") and
+             isinstance(v.get("resets_at"), (int, float)) and v["resets_at"] <= t0]
+    if ended:
+        ends = [f'  {known[name].get("who") or "an account of your team"}: the window '
+                f'"{clip(known[name].get("label") or "", 40)}" of that account has reset.' for name in ended
+                if not read_row("SELECT 1 FROM agent_limits WHERE account=? AND since>=?",
+                                (known[name].get("account"), known[name].get("at") or 0))]
+        kv_set(store, json.dumps({k: v for k, v in known.items() if k not in ended}))
+        if ends:
+            emit(mgr, "say", "[hub] YOUR TEAM'S ALLOWANCE IS BACK:\n" + "\n".join(ends) + "\nIf you told the owner of "
+                 "it, tell them that it has ended, and withdraw a Needs-you item of yours about it (withdraw_need).",
+                 extra=LATER_SAY)
+    found = {}
+    for g in account_groups(t0).values():
+        if g["holds"] or g["state"]["state"] == "unknown":
+            continue        # a hold it was told of, or a reading the hub cannot trust
+        seen = allowance_worth_saying(g["reading"], t0)
+        spenders = account_spenders(g) if seen else []
+        if spenders and (mgr, True) not in spenders:        # its own account is allowance_sweep's
+            found[f"{g['key']} {seen[0]['label']}"] = (g, spenders, *seen)
+    words = {name: spender_words(spenders, lambda a: a) for name, (_g, spenders, *_seen) in found.items()}
+    news = allowance_news(store, [(name, w, why, {"who": words[name], "label": w["label"], "account": g["key"],
+                                                  "at": name not in ended and (known.get(name) or {}).get("at") or t0})
+                                  for name, (g, _s, w, _p, why) in found.items()], t0)
+    if not news:
+        return
+    lines = []
+    for name in sorted(news):
+        g, spenders, w, pace, why = found[name]
+        lines.append(f"  {words[name]}: the {g['runtime']} window \"{clip(w['label'], 40)}\" of the account that "
+                     f"{'they spend' if len(spenders) > 1 else 'it spends'} is {w['used_percent']:g}% used and resets "
+                     + (until_clock(w["resets_at"], t0) if w["resets_at"] else "at a time it did not give")
+                     + (f". At the pace of this window so far it is gone before then ({pace:.0f}% of it by the "
+                        f"reset)." if why == "pace" else ". Almost nothing is left of it." if why == "last" else
+                        ". Nothing is left of it.")
+                     + f" The reading is {span(t0 - g['reading']['collected_at'])} old.")
+    spent = any(found[name][4] == "spent" for name in news)
+    emit(mgr, "say", "[hub] YOUR TEAM'S ALLOWANCE:\n" + "\n".join(lines) + "\nThis is yours to manage: the owner gets "
+         "no warning about a worker's account. Give the work that cannot wait for the reset to an agent that suits it "
+         "and spends another account, and let the rest wait (set_reminder brings you back at the reset). When work "
+         "that cannot wait has no suitable agent with allowance left, tell the owner with tell_owner what account "
+         "capacity is missing: money and a new account are theirs. Raise it with raise_needs_you only when work the "
+         "owner asked for is stopped and only their change starts it again; a usage limit that resets by itself is a "
+         "warning, not a Needs-you item. The hub says this once for each window, and again only if it gets worse.",
+         extra=LATER_SAY if spent else QUIET_SAY)
 
 
 # ---------------------------------------------------------------- the manager's resume brief
@@ -76048,24 +76174,34 @@ def health_view(kinds_seen=None):
     # NOT at 97% - not updated! it is concerning"). That span is what allowance_spent is for. Once a hold exists
     # this falls silent again: the manager banner above and the agent's own start text carry it, and a third voice
     # saying the same thing is noise.
+    #
+    # **Only the manager's own account** (the account of its own runtime, not of its screen route): there the step is
+    # his, because his own sessions spend it and a manager whose allowance is gone can neither act nor ask. A worker's
+    # account is the manager's to manage (allowance_sweep tells it, once for each window): it moves the work or lets
+    # it wait, and asks him only for money or a new account. Until 24 November 2026 a worker's account was a row here
+    # whose way on was "Tell Manager what must not wait.", and the owner: "it needs to MANAGE the team, not ask me to
+    # send a message".
     for g in sorted(account_groups(t0).values(), key=lambda x: x["key"]):
         if g["holds"] or g["state"]["state"] == "unknown":
             continue        # a reading the hub cannot trust says nothing of its own; the fleet invents no reading
         found = allowance_worth_saying(g["reading"], t0)
         if not found:
             continue
+        spenders = account_spenders(g)
+        if (manager_name(), True) not in spenders:
+            continue        # a worker's account, or one that the manager's own runtime no longer names
         w, _pace, why = found
-        stops, spent = manager_name() in g["agents"], why == "spent"
+        spent = why == "spent"
         # In his voice and in few words (T-37): the app's title names the agent ("Nova nears its usage limit"), so
         # the line says how much of which limit is used and when that matters, and never a provider's own name of
-        # its window. An account that several agents share names them first. Spent carries no projection -- there
-        # is nothing left to project -- and its reset says how far off it is, because there the reset is the
-        # decision: waiting out seven hours and waiting out thirty-one are not the same answer.
-        names = [shown_role(a) for a in g["agents"]]
+        # its window. An account that several agents share names them first, each by the route that spends it
+        # ("Manager, and Nova's desktop tasks"; spender_words). Spent carries no projection -- there is nothing left
+        # to project -- and its reset says how far off it is, because there the reset is the decision: waiting out
+        # seven hours and waiting out thirty-one are not the same answer.
         minutes = w.get("window_minutes") or 0
         length = (f"{minutes // 1440}-day " if minutes % 1440 == 0 else f"{minutes // 60}-hour "
                   if minutes % 60 == 0 else "usage ") if minutes else "usage "
-        limit = ("its " if len(names) == 1 else "their ") + length + "limit"
+        limit = ("its " if len(spenders) == 1 else "their ") + length + "limit"
         left = max(0, (w["resets_at"] or 0) - t0)
         hours, mins = int(left // 3600), max(1, int(left // 60))       # "1 hour", never "1 hours" (review A11)
         resets = (f"; it resets in {hours} hour{'' if hours == 1 else 's'}." if left >= 5400 else
@@ -76074,15 +76210,13 @@ def health_view(kinds_seen=None):
                 f"{w['used_percent']:g}% of {limit} is used; it runs out before "
                 f"{owner_clock(w['resets_at'], t0)}." if why == "pace" else
                 f"{w['used_percent']:g}% of {limit} is used" + resets)
-        if len(names) > 1:
-            said = f"{', '.join(names[:-1])} and {names[-1]}: {said}"
+        if len(spenders) > 1:
+            said = f"{spender_words(spenders, shown_role)}: {said}"
         # The manager's way out: keeping his own sessions off the account saves what is left of a window, and a spent
-        # one has nothing left to save. A worker's is the manager, who decides what waits.
-        fix = (f"Sign {manager} in to another account." if stops and spent else
-               "Keep your own sessions off this account until it resets." if stops else
-               f"Tell {manager} what must not wait.")
-        warn("allowance_spent" if spent else "allowance_pace", said, fix,
-             agent=manager_name() if stops else (g["agents"][0] if len(g["agents"]) == 1 else None))
+        # one has nothing left to save.
+        fix = (f"Sign {manager} in to another account." if spent else
+               "Keep your own sessions off this account until it resets.")
+        warn("allowance_spent" if spent else "allowance_pace", said, fix, agent=manager_name())
     # The findings of the fleet's own sweeps, on the owner's screen (his rule, 19 October 2026: a screen that reports
     # something wrong must carry the way to put it right). He is told only what the manager has already had and is
     # not acting on: it had a turn after the notice and left the notice unread (plan C10). A circle the hub noticed a

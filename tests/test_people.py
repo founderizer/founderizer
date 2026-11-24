@@ -210,7 +210,14 @@ class People(test_chat_apps.ChatApps):
 
     # ---- the inbound path
     def test_a_person_reaches_the_agent_they_were_given_and_no_other(self):
-        self.person_with_handle()
+        """A person meets the agent by its name and what it is for (the owner's answer of 22 November 2026, of people
+        on a chat app: they read the name and what the assistant is for): the first message to them (EU AI Act
+        article 50) and the first line of the conversation's session give the name and the role in brackets; a short
+        line ("Studio cannot chat now.") the name alone; a role that says the name stands alone, never twice. The bug
+        that this catches: a customer reads the role alone, a name with no word of what it is for, or "Studio Ops
+        (Studio Ops)"."""
+        hub.TEAM["agents"]["studio"]["title"] = "Customer  Support"
+        person = self.person_with_handle()
         self.assertEqual(self.wrote(), "stored")
         conv = self.conversation()
         self.assertEqual((conv["agent"], conv["state"]), ("studio", "open"))
@@ -223,11 +230,23 @@ class People(test_chat_apps.ChatApps):
         self.assertEqual(self.wrote(account="discord-vps", sender=JORDI), "ignored")
         self.assertEqual(self.count("conversations"), 1)
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM chat_ignored")["n"], 0)
-        self.assertEqual(self.texts(), [hub.CONVERSATION_NOTICE.format(agent="Studio")])
+        self.assertEqual(self.texts(), ["You are talking to Studio (Customer Support), an AI assistant. It is not a "
+                                        "person, and the owner of this fleet can read this conversation."])
         # a sender that the owner never added stays unknown, as before
         self.assertEqual(self.wrote(sender="34600999999@s.whatsapp.net"), "ignored")
         self.assertEqual(self.count("conversations"), 1)
         self.assertEqual(hub.q1("SELECT COUNT(*) n FROM chat_ignored")["n"], 1)
+        row = hub.q1("SELECT * FROM people WHERE id=?", (person["id"],))
+        for v2 in (False, True):    # the window's first line without and with contacts.v2 (conversation_closed_rules)
+            with patch.object(hub, "contacts_v2", lambda v2=v2: v2):
+                rules = hub.conversation_rules("studio", row)
+            self.assertTrue(rules.startswith("You are Studio (Customer Support), an AI assistant of the owner of this "
+                                             "fleet. You are in one conversation with Ana"), (v2, rules))
+        self.assertEqual(hub.agent_display("studio"), "Studio")
+        hub.TEAM["agents"]["studio"]["title"] = "Studio Ops"
+        self.assertEqual((hub.agent_introduced("studio"), hub.agent_display("studio")), ("Studio Ops", "Studio Ops"))
+        del hub.TEAM["agents"]["studio"]["title"]
+        self.assertEqual((hub.agent_introduced("studio"), hub.agent_display("web-dev")), ("Studio", "Web-Dev"))
 
     def test_nothing_a_person_writes_widens_their_own_access(self):
         person = self.person_with_handle()

@@ -1623,6 +1623,7 @@ class Conversations(Base):
         self.assertTrue(error)
 
     def test_message_contact_writes_first_and_waits_and_the_answer_returns(self):
+        hub.TEAM["agents"]["studio"]["title"] = "Customer Support"     # the first message names the agent and its role
         kim = self.person("Kim", "manager", KIM, app="discord")
         tid, here = self.normal_task(title="Plan the refunds")
         sent = self.ok("message_contact", here, person="Kim", text="May I refund Ana's last month?",
@@ -1631,7 +1632,9 @@ class Conversations(Base):
         self.assertIn(f"{hub.tref(tid)} waits for their next message", sent)
         items = [i for i in self.out() if i["kind"] == "message" and i["account"] == "discord-studio"]
         self.assertEqual([(i["recipient"], i["chat"]) for i in items], [(KIM, None), (KIM, None)])
-        self.assertEqual(items[0]["text"], hub.CONVERSATION_NOTICE.format(agent="Studio"))       # EU AI Act 50
+        # EU AI Act 50: the first message says that it is an AI, with the agent's name and role
+        self.assertEqual(items[0]["text"], "You are talking to Studio (Customer Support), an AI assistant. It is not "
+                                           "a person, and the owner of this fleet can read this conversation.")
         self.assertEqual(items[1]["text"], "May I refund Ana's last month?")
         waiting = self.task(tid)
         self.assertEqual(waiting["state"], "input-required")
