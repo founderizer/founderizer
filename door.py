@@ -892,6 +892,23 @@ def finite(text):
     return value
 
 
+def bounded(text):
+    "An integer of JSON that a cluster's reader takes (64 bits), or ValueError (a number of 400 digits)."
+    value = int(text)
+    if not -2 ** 63 <= value < 2 ** 64:
+        raise ValueError(f"{text[:20]}... is no integer that a cluster's JSON reader takes")
+    return value
+
+
+def store_text(value):
+    """A value of a store's manifest as the text that a cluster reads, or None: a value that is no text, and a plain
+    value of YAML (door_targets.Plain) that YAML reads as no text (a store named on, yes, null or 123 with no quotes is
+    a bool, a null or a number for go-yaml, so the cluster makes no such store)."""
+    if not isinstance(value, str) or isinstance(value, door_targets.Plain) and door_targets.yaml_other(value):
+        return None
+    return value
+
+
 def store_docs(path, data):
     """The documents of a store's file as the door's own readers of a manifest read them, or None for a file that
     none of them reads: a YAML file that is not block style (door_targets.unread: no anchor, alias, merge key, tag,
@@ -903,7 +920,8 @@ def store_docs(path, data):
     if path.endswith(".json"):      # not through manifest_text: its block lines of a deep file take gigabytes
         try:
             return [json.loads(data.decode("utf-8"), object_pairs_hook=door_targets.no_key_twice,
-                               parse_constant=no_number, parse_float=finite)]   # a cluster's JSON reader takes no NaN
+                               parse_constant=no_number, parse_float=finite,     # a cluster's JSON reader takes no NaN
+                               parse_int=bounded)]
         except (ValueError, RecursionError):
             return None
     text, why = door_targets.manifest_text(path, data)
@@ -917,16 +935,17 @@ def store_docs(path, data):
 
 
 def store_items(value):
-    """A list of a store's manifest as a list, or None: a list as it is, and a flow sequence of plain or quoted values
-    on one line ([a, "b"]), which the block reader gives as one text, as its values. A quoted text that looks like
-    such a sequence reads as one too: a cluster refuses a store with such a text in the place of a list, so it makes
-    no store that serves more than its manifest says."""
+    """A list of a store's manifest as a list, or None: a list as it is (each text that YAML reads as no text as None,
+    store_text), and a flow sequence of plain or quoted values on one line ([a, "b"]), which the block reader gives as
+    one Plain text, as its values. A quoted text, of YAML or of JSON, in the place of a list is none: a cluster refuses
+    a store with a text there, so the door names no project for it."""
     if isinstance(value, list):
-        return value
-    if not isinstance(value, str) or not door_targets.FLOW_LIST.fullmatch(value):
+        return [store_text(x) if isinstance(x, str) else x for x in value]
+    if not isinstance(value, door_targets.Plain) or not door_targets.FLOW_LIST.fullmatch(value):
         return None
     items = [m.group() for m in re.finditer(door_targets.FLOW_ONE, value[1:-1])]
-    return [x[1:-1] if len(x) >= 2 and x[0] == x[-1] and x[0] in "\"'" else x for x in items]
+    return [x[1:-1] if len(x) >= 2 and x[0] == x[-1] and x[0] in "\"'" else
+            None if door_targets.yaml_other(x) else x for x in items]
 
 
 def store_answer(docs, kind, store, namespace):
@@ -941,7 +960,7 @@ def store_answer(docs, kind, store, namespace):
         return {"error": "rendered"}
     found = [o for o in door_targets.objects_in(docs) if o["kind"] == kind
              and o["apiVersion"].startswith(STORE_ANY_VERSION)
-             and isinstance(o.get("metadata"), dict) and isinstance(o["metadata"].get("name"), str)
+             and isinstance(o.get("metadata"), dict) and store_text(o["metadata"].get("name")) is not None
              and o["metadata"]["name"].strip() == store]      # stripped: a form that keeps spaces is counted too
     # and the answer is for the name as it is: a name with a space at an end is no name of the cluster
     if len(found) != 1 or found[0]["metadata"]["name"] != store or found[0]["apiVersion"] not in STORE_VERSIONS:
@@ -960,8 +979,9 @@ def store_answer(docs, kind, store, namespace):
     if region is None:
         return {"error": "not_own_address"}
     if kind == "SecretStore":
-        served = found[0]["metadata"].get("namespace") == namespace
-    elif spec.get("conditions") in YAML_NULL:
+        served = store_text(found[0]["metadata"].get("namespace")) == namespace
+    elif spec.get("conditions") is None or isinstance(spec["conditions"], door_targets.Plain) and \
+            spec["conditions"] in YAML_NULL:      # a quoted "null" is a text, which a cluster takes in no list's place
         served = True
     else:
         conditions = store_items(spec["conditions"])

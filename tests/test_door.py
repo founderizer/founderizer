@@ -1886,14 +1886,18 @@ class Refusals(DoorCase):
                 ('image:\n  repository: ghcr.io/one-org/web\n  "repository": ghcr.io/other/web\n  tag: "1111111"\n',
                  unsure),
                 ('image:\n  repository: #ghcr.io/one-org/web\n  tag: "1111111"\n', unsure),
-                ('sidecar:\n  image: ghcr.io/other/web\n  name: ghcr.io/one-org/web\n  tag: "1111111"\n', unsure),
+                # a tag's image is Helm's, and name is Kustomize's only for a newTag: a sidecar's own image counts
+                ('sidecar:\n  image: ghcr.io/other/web\n  name: ghcr.io/one-org/web\n  tag: "1111111"\n',
+                 "no green release run made ghcr.io/other/web:2222222"),
+                ('worker:\n  name: ghcr.io/one-org/web\n  tag: "1111111"\n', unsure),
                 ('image:\n  registry: ""\n  repository: ghcr.io/one-org/web\n  tag: "1111111"\n', True),
                 ('image:\n  repository: ghcr.io/one-org/web # the web app\n  tag: "1111111"\n', True),
                 ('image:\n  note: |\n    repository: ghcr.io/other/web\n  repository: ghcr.io/one-org/web\n'
                  '  tag: "1111111"\n', True),
                 # a key that starts with --- is no document mark, and a quoted text that a line leaves open makes the
                 # rest of its document unsure; a closed flow list and a key with a / are read
-                ('repository: ghcr.io/other/web\n---x: 1\nname: ghcr.io/one-org/web\ntag: "1111111"\n', unsure),
+                ('repository: ghcr.io/other/web\n---x: 1\nname: ghcr.io/one-org/web\ntag: "1111111"\n',
+                 "no green release run made ghcr.io/other/web:2222222"),
                 ('image:\n  repository: ghcr.io/other/web\n  note: "open\nx:\n  name: ghcr.io/one-org/web\n'
                  '  k: # "\n  tag: "1111111"\n', unsure),
                 ('image:\n  repository: ghcr.io/other/web\n  note: "open\nk: |\n  name: ghcr.io/one-org/web\n'
@@ -1942,6 +1946,12 @@ class Refusals(DoorCase):
                  '          repository: ghcr.io/one-org/web\n          tag: "1111111"\n  destination: {}\n', True)):
             with self.subTest(text=text):
                 self.assertEqual(rule(text, text.replace("1111111", "2222222")), said)
+        # a plain tag that YAML reads as a number or a bool is deployed as another tag (1.10 as 1.1, 010 as 8)
+        for tag in ("1.10", "010", "yes", "1234567", "0X1F", "0_x1f", "1e_3", "0b-1"):
+            with self.subTest(tag=tag):
+                self.assertEqual(rule(helm, helm.replace('"1111111"', tag)),
+                                 f"YAML reads the tag {tag} as a number or a bool, so a chart may deploy another tag")
+        self.assertEqual(rule(helm, helm.replace('"1111111"', "'1.10'")), "no green release run made ghcr.io/one-org/web:1.10")
         # and so in a GitOps commit
         for tag, kind in (("2222222", "rule"), ("3333333", "own")):
             with self.subTest(tag=tag):
@@ -9973,7 +9983,25 @@ class StoreFacts(Served):
                 "      namespaces:\n")),
             ("no_namespace", {"store_kind": "SecretStore"}, BW_STORE.replace(
                 "kind: ClusterSecretStore\nmetadata:\n", "kind: SecretStore\nmetadata:\n  namespace: web\n")),
-            ("no_namespace", {"store_kind": "SecretStore"}, BW_STORE.replace("kind: Cluster", "kind: "))]
+            ("no_namespace", {"store_kind": "SecretStore"}, BW_STORE.replace("kind: Cluster", "kind: ")),
+            # a name, an item or a SecretStore's namespace with no quotes that YAML reads as no text (a bool, a null, a
+            # number) is no store or namespace of the cluster; a tab after a list's dash, which a cluster's reader
+            # refuses, is no file that the door reads (the validator of D1 step 1)
+            *(("not_one", {"store": v}, BW_STORE.replace("name: bitwarden-example", f"name: {v}"))
+              for v in ("on", "yes", "null", "123", "0x1f", "1e3")),
+            ("no_namespace", {"namespace": "on"}, BW_STORE.replace("        - shop\n", "        - on\n")),
+            ("no_namespace", {"namespace": "on"}, BW_STORE.replace(
+                "    - namespaces:\n", "    - namespaces: [x, on]\n    - namespaces:\n")),
+            ("no_namespace", {"store_kind": "SecretStore", "namespace": "yes"}, BW_STORE.replace(
+                "kind: ClusterSecretStore\nmetadata:\n", "kind: SecretStore\nmetadata:\n  namespace: yes\n")),
+            # a quoted text in the place of a list: a cluster refuses the store
+            *(("no_namespace", {}, BW_STORE.replace(
+                "  conditions:\n    - namespaces:\n        - shop\n        - shop-jobs\n        - browsers\n",
+                f"  conditions: {text}\n")) for text in ('"null"', "'~'", '"[]"')),
+            ("no_namespace", {}, BW_STORE.replace(
+                "    - namespaces:\n        - shop\n        - shop-jobs\n        - browsers\n",
+                "    - namespaces: \"[shop]\"\n")),
+            ("rendered", {}, BW_STORE.replace("        - shop\n", "        -\tshop\n"))]
         for word, fields, text in cases:
             with self.subTest(word=word, fields=fields):
                 self.assertEqual(self.ask(text, **fields), (422, {"error": word}))
@@ -9987,6 +10015,15 @@ class StoreFacts(Served):
         spaced["metadata"]["name"] = "bitwarden-example\n"
         self.files({"platform/store.json": json.dumps(spaced)})
         self.assertEqual(self.ask(path="platform/store.json"), (422, {"error": "not_one"}))
+        # an integer of JSON that a cluster's reader takes in no 64 bits makes a store that no cluster takes
+        spaced["metadata"]["name"], spaced["spec"]["refreshInterval"] = "bitwarden-example", 10 ** 400
+        self.files({"platform/store.json": json.dumps(spaced)})
+        self.assertEqual(self.ask(path="platform/store.json"), (422, {"error": "rendered"}))
+        # and the same values in quotes are texts
+        self.assertEqual(self.ask(BW_STORE.replace("name: bitwarden-example", "name: '123'"), store="123"),
+                         (200, BW_FACTS))
+        self.assertEqual(self.ask(BW_STORE.replace("        - shop\n", "        - 'on'\n"), namespace="on"),
+                         (200, BW_FACTS))
         # a name as a reader gives it with the spaces of its lines is counted: a decoy beside it names no project
         decoy, store = (door.store_docs(BW_PATH, BW_STORE.encode())[0] for _ in range(2))
         store["metadata"]["name"] = "    bitwarden-example"
@@ -10241,7 +10278,7 @@ class LongLines(unittest.TestCase):
                 "apps/web/values.yaml", (" " * 60000 + "x\n").encode(),
                 {"base_file": lambda p: b"replicas: 1\n"}, "one-org/cluster"),
             "the tags of many changed lines in one mapping": lambda: t.image_rule(
-                b"image:\n  repository: r\n" + b"  tag: 1\n" * 30000, b"image:\n  repository: r\n" + b"  tag: 2\n" * 30000,
+                b"image:\n  repository: r\n" + b'  tag: "1"\n' * 30000, b"image:\n  repository: r\n" + b'  tag: "2"\n' * 30000,
                 {"image_made": lambda image: True}),
             "a word of secret": lambda: t.names_secret("secret" * 6000),
             "a word of serviceaccount": lambda: t.names_secret("serviceaccount" * 4000),

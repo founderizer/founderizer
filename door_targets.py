@@ -769,9 +769,10 @@ def registry_line(line):
     before an image's own registry): a key line whose key holds the word; and any other line that holds it anywhere
     (an explicit key, an anchor that an alias takes as a key, a flow mapping) or that has a backslash and a double
     quote (an escape in a quoted key); and so for a key that holds parameters (an Argo CD Application's Helm parameters
-    and fileParameters set any value of the chart, global.imageRegistry and image.repository too). A value of a key line that holds the word
-    (https://registry...) is none. A known limit: a chart that moves its images under another key (Istio's global.hub)
-    is not seen."""
+    and fileParameters set any value of the chart, global.imageRegistry and image.repository too). A value of a key
+    line that holds the word (https://registry...) is none. A known limit: a chart that moves its images under another
+    key (Istio's global.hub) is not seen, nor what a later values file, an Argo CD Application's parameters or values in
+    another file, or the chart's own default registry does to the image."""
     found = key_line(line)
     if found:
         return bool(MOVES_IMAGES.search(found[1]))
@@ -891,15 +892,20 @@ def line_maps(lines):
     return ids, keys, sure
 
 
-def image_name(keys):
-    """The one image that a mapping's keys name for its tag: Helm's registry and repository (an empty registry is
-    none), an image's own repository, and Kustomize's newName, else its name; or None where they name more than one
-    or none, or such a key stands twice or has no value."""
+def image_name(keys, kustomize=False):
+    """The one image that a mapping's keys name for its tag: for a tag, Helm's registry and repository (an empty
+    registry is none) and an image key's own repository; for a newTag (kustomize), Kustomize's newName, else its name,
+    in a mapping with none of Helm's keys. None where they name more than one or none, where such a key stands twice
+    or has no value, or where another key holds registry (imageRegistryOverride)."""
     def one(key):
         values = keys.get(key) or []
         return values[0] if len(values) == 1 and values[0] != BLOCK_TEXT else None
     if any(REGISTRY_WORD.search(key) for key in keys if key != "registry"):
         return None             # a chart's own key that can move the image (imageRegistryOverride)
+    if kustomize:
+        if keys.keys() & {"registry", "repository", "image"}:
+            return None
+        return one("newName" if "newName" in keys else "name") or None
     names = set()
     if "repository" in keys:
         registry, repository = one("registry") if "registry" in keys else "", one("repository")
@@ -910,11 +916,6 @@ def image_name(keys):
         if not one("image"):
             return None
         names.add(image_repo(one("image")))
-    if "newName" in keys or "name" in keys:
-        name = one("newName" if "newName" in keys else "name")
-        if not name:
-            return None
-        names.add(name)
     return names.pop() if len(names) == 1 else None
 
 
@@ -958,9 +959,12 @@ def image_rule(old, new, lookups):
             ids, keys, sure = maps = maps or line_maps(b)
             registries = registries if registries is not None else \
                 {ids[j] for j, line in enumerate(b) if ids[j] is not None and registry_line(line)}
-            name = image_name(keys[ids[i]]) if ids[i] is not None and sure[ids[i]] else None
+            name = image_name(keys[ids[i]], key == "newTag") if ids[i] is not None and sure[ids[i]] else None
             if not name:
                 return f"no image of its own mapping names the tag {now[:80]}"
+            quoted = y[KEY_HEAD.match(y).end():].lstrip(" \t")[:1] in ("\"", "'")
+            if not quoted and yaml_other(now):     # tag: 1.10 is deployed as 1.1, 010 as 8, yes as true
+                return f"YAML reads the tag {now[:80]} as a number or a bool, so a chart may deploy another tag"
             if registries - {ids[i]}:
                 return f"a registry outside the mapping of the tag {now[:80]} can move its image (global.imageRegistry)"
             if not made(f"{name}:{now}"):
@@ -1713,6 +1717,27 @@ def sensitive(docs):
 BLOCK_DASH = re.compile(r"-(?:[ \t]+|$)")      # the dash of a list item, with the blanks after it
 
 
+class Plain(str):
+    """A value that a line of block style gives with no quotes (block_tree's strict reading, for the door's store
+    route): YAML may read it as no text (yaml_other)."""
+
+
+# YAML 1.1's bools and nulls, which go-yaml (a cluster's reader) reads as no text when they stand with no quotes
+YAML_WORDS = frozenset(("y", "Y", "yes", "Yes", "YES", "n", "N", "no", "No", "NO", "true", "True", "TRUE", "false",
+                        "False", "FALSE", "on", "On", "ON", "off", "Off", "OFF", "~", "null", "Null", "NULL", ""))
+# YAML 1.1's and 1.2's numbers: an integer (also 0b, 0o, 0x, an old octal, with _, of base 60) or a float
+YAML_NUMBER = re.compile(r"[-+]?(?:0[bB][-+]?[01_]+|0[oO][-+]?[0-7_]+|0[0-7_]+|0[xX][0-9a-fA-F_]+"
+                         r"|(?:[0-9][0-9_]*(?::[0-5]?[0-9])*(?:\.[0-9_]*)?|[0-9_]*\.[0-9_]+)(?:[eE][-+]?[0-9]+)?)"
+                         r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)")
+
+
+def yaml_other(text):
+    """True when YAML 1.1 or 1.2 may read a plain value as no text: a bool, a null or a number. go-yaml takes each _
+    out of a value that starts as a number does before it reads one (0_x1f is 31, 1e_3 is 1000)."""
+    bare = text.replace("_", "") if text[:1] in "0123456789+-." else text
+    return text in YAML_WORDS or bool(YAML_NUMBER.fullmatch(bare))
+
+
 def block_tree(text, strict=False):
     """A text that unread reads as block style, as the tree of mappings, lists and texts that it says, for sensitive:
     a value is the text of its line with no comment and no quotes, and a block scalar's value its lines. Each
@@ -1722,10 +1747,12 @@ def block_tree(text, strict=False):
     double quotes, a '' in single quotes, and a # with space before it in either (this reader takes no escape, and it
     cuts a comment inside the quotes too, so "ma\\x69n" is another name for it than for a cluster); a block scalar as
     the value of a name or a namespace (its lines keep their spaces here, and not in YAML); .inf or .nan, which this
-    reader reads as a text and YAML as a number that no JSON of a cluster holds; and a document mark or an
+    reader reads as a text and YAML as a number that no JSON of a cluster holds; a tab after a list's dash, which a
+    cluster's reader (go-yaml, as libyaml) refuses (it takes one after a key's colon); and a document mark or an
     end mark with space before it, outside a block scalar (this reader skips it, and YAML reads a text). A comment
     starts at a # at the start of a text or after one space or tab, and strip takes the spaces before it: a pattern with
-    a run of spaces before its # reads a long run again from each of its places (a line of 1 MB took over an hour)."""
+    a run of spaces before its # reads a long run again from each of its places (a line of 1 MB took over an hour).
+    In the strict reading a value with no quotes is a Plain text: YAML may read it as no text (yaml_other)."""
     def split(text):
         colon = re.search(r":(?=[ \t]|$)", text)
         return (text[:colon.start()].rstrip(" \t"), text[colon.end():].strip(" \t")) if colon else (None, text)
@@ -1738,7 +1765,9 @@ def block_tree(text, strict=False):
         text = re.sub(r"(?:^|[ \t])#.*$", "", text).strip(" \t")
         if strict and re.fullmatch(r"[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)", text):
             raise ValueError("YAML's infinity or not-a-number, which no object of a cluster holds")
-        return text[1:-1] if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'" else text
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+            return text[1:-1]
+        return Plain(text) if strict else text
     rows = []                   # [column, text, the lines of its block scalar or None]
     scalar = None               # (the column that its lines stand to the right of, its lines)
     for line in text.replace("\r\n", "\n").split("\n"):
@@ -1757,6 +1786,8 @@ def block_tree(text, strict=False):
         owner = col             # col walks the line past its dashes: a copy of the rest at each dash took seconds
         dash = BLOCK_DASH.match(line, col)
         while dash:
+            if strict and "\t" in dash.group():
+                raise ValueError("a tab after a list's dash: a cluster's YAML reader takes no tab there")
             rows.append([col, "-", None])
             owner, col = col, dash.end()
             dash = BLOCK_DASH.match(line, col)
