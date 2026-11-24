@@ -56219,13 +56219,14 @@ TOOLS = [
     ("all", "message_owner", t_message_owner,
      "Write to the owner first, only when it changes what they do: a decision or a step that is theirs, the result of "
      "work they asked you for, or news they must have now (a customer, money, security). Never to say that nothing is "
-     "needed from them, never for progress, and never to correct a message that needed nothing from them: what can "
-     "wait goes into the next message they need. Say it once, with the answer first, and short (RULES.md, \"Short, "
-     "like a text to a friend\"). It goes where the owner last wrote to you (the app, or a chat app), else to your "
-     "own WhatsApp number, Discord bot or Telegram bot; without one it stays in the app. The first one after a task's "
-     "result came back into your owner chat answers the owner's message that opened that task, where they wrote it. "
-     "Answer an owner message with tell_owner instead. One request_id is one message: the same request_id again sends nothing more. Never put a login in the text. Name a task or a duty "
-     "by what it is about, never by its code (T-61, R-3), and an agent by its name.",
+     "needed from them, never for progress (the end of a problem you told them about, or that it did not end as you "
+     "said, is news), and never to correct a message that needed nothing from them: what can wait goes into the next "
+     "message they need. Say it once, with the answer first, and short. It goes where the owner last wrote to you (the "
+     "app, or a chat app), else to your own WhatsApp number, Discord bot or Telegram bot; without one it stays in the "
+     "app. The first one after a task's result came back into your owner chat answers the owner's message that opened "
+     "that task, where they wrote it. Answer an owner message with tell_owner instead. One request_id is one message: "
+     "the same request_id again sends nothing more. Never put a login in the text. Name a task or a duty by what it is "
+     "about, never by its code (T-61, R-3), and an agent by its name.",
      S({"request_id": REQUEST_ID,
         "text": {"type": "string", "description": "The message in Markdown, 1 to 4,000 characters"},
         "files": CHAT_FILES_FIELD},
