@@ -669,6 +669,37 @@ class HubOwnServer(ServerWatch):
         self.own(self.t0 + 240, ssh_keys_only=True, npm_rule=True)
         self.assertEqual(self.said()[2:], ["[hub] The server hub is in order again: its SSH takes keys only."])
 
+    def test_the_own_server_of_a_hub_that_takes_agents_with_no_gate_is_said_once_and_ends_by_a_post(self):
+        """The reads of the areas "Vault, keys and access" (MUST 2) and "Door and security" (M2), 23 November 2026: a
+        hub that took agents later (`hubsetup.py one-server` until that day) or from an install before 17 November had
+        no outgoing gate on its own server, and nothing said so, because a server with no gate posts nothing. On the
+        hub's own server of a hub that takes agents, no gate is said once, in the words of a table that is not loaded,
+        and a post of the gate ends it; a hub whose own server takes no agents says nothing of it, and neither does a
+        joined server with no gate post (root's `--egress off` there, or a join before 17 November), also in a
+        fleet whose hub takes agents."""
+        hub.q("INSERT INTO server_keys(server,sha256,created) VALUES('hub',?,?)", (sha(KEY), self.t0 - 2 * hub.JOIN_GRACE))
+        self.report("hub", source=HUB)
+        self.report()                   # box, a joined server, reads and posts no gate
+        self.own()
+        self.assertEqual(self.said(), [], "the own server of a hub that takes no agents")
+        with patch.dict(hub.TEAM["hub"], shared=True):
+            self.own(self.t0 + 60)
+            self.assertEqual(self.said(), [
+                "[hub] The server hub needs care: its outgoing gate's table is not loaded, so its agents connect with no "
+                "record (`journalctl -u fleet-egress-rules` there says why; where it has no gate, root's `python3 -I "
+                "/usr/local/lib/fleet-vault/vault.py configure --egress on` there makes one, and on the hub's own server "
+                "where no gate step ran, the owner's Mac's next key swap round does). Give it to the agent whose duty "
+                "covers this server; fix it yourself when no duty covers it; raise Needs-you only for a step that no "
+                "agent can take."])
+            self.own(self.t0 + 120)
+            self.assertEqual(len(self.said()), 1, "said once")
+            status, answer = self.service("/server/hub/egress", {"gate": {"table": 1, "mode": "records"}, "rows": [],
+                                                                 "other_users": 0}, source=HUB)
+            self.assertEqual(status, 200, answer)
+            self.own(self.t0 + 180)
+            self.assertEqual(self.said()[1:], ["[hub] The server hub is in order again: its outgoing gate has its table "
+                                               "again, or the gate is off."])
+
     def test_a_service_record_made_again_ends_no_fault_that_only_a_reading_says(self):
         """The session "One server for all: the hub's open parts" saw it on a real server, 15 November 2026: the
         installer's step that makes the hub's server service again (`hubsetup.py hub-server`, after a lost key file)

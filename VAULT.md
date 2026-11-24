@@ -49,7 +49,8 @@ The vault protects the value of each secret. The design gives these results:
   is in a Keychain group that only Fleet Vault's signed code can read (`vault.py`,
   `Sources/FleetVaultCore/VaultLocalStore.swift`).
 - **A copy of the central vault's backup is of no use without the owner's recovery code** (`vault.py`,
-  `Sources/FleetCore/RecoveryCode.swift`).
+  `Sources/FleetCore/RecoveryCode.swift`). A central vault with the list of the owner's devices makes no backup (see
+  "The list of the owner's devices").
 
 "What the vault does not protect", below, tells where these results stop.
 
@@ -238,7 +239,8 @@ The vault protects the value of each secret. The design gives these results:
 | Central store key | age (X25519) | `/var/lib/fleet-vault-central/store.key` | The central vault (`hubsetup.py`) |
 | Broker store key | age (X25519) | Linux: `/var/lib/fleet-vault/store.key`, mode 600, user `fleet-vault`. Mac: the Keychain item `store`. | The broker (`hubsetup.py`, `Sources/FleetVaultCore/VaultLocalStore.swift`) |
 | Broker handover key | age (X25519) | Linux: `/var/lib/fleet-vault/age.key`, mode 600. Mac: the Keychain item `age`. Made one time and never replaced. The hub pins its public half. | The broker, to open copies that are sealed to its machine (`hubsetup.py`, `Sources/FleetVaultCore/VaultPrograms.swift`) |
-| Recovery code | 26 symbols of Crockford's base32 (130 random bits) | The owner's Mac, in the login Keychain, and a phone that enrolled after the Mac had the code | The central vault seals its backup to an age key that comes from this code with HKDF-SHA-256 (`Sources/FleetCore/RecoveryCode.swift`, `Sources/Founderizer/RecoveryCopy.swift`) |
+| Recovery code | 26 symbols of Crockford's base32 (130 random bits) | The owner's Mac, in the login Keychain, and a phone that enrolled after the Mac had the code | The central vault seals its backup to an age key that comes from this code with HKDF-SHA-256 (`Sources/FleetCore/RecoveryCode.swift`, `Sources/Founderizer/RecoveryCopy.swift`). It opens nothing new once the vault has the list of the owner's devices (`vault.py`) |
+| Sign key, list key and save key of a device | ECDSA P-256, public halves only | `/var/lib/fleet-vault-central/clients.json`, mode 600, user `founderizer-vault`: the list of the owner's devices, when the vault has one | The central vault, to check who signs the owner's decisions and who changes the list (`vault.py`). No app makes a list key yet |
 | Fingerprint key | 32 random bytes | The hub's database | The hub, to make the salt of each fingerprint (`hub.py`) |
 | Google file key | 32 random bytes | `/var/lib/fleet-vault-central/hub-google.key`, mode 600, user `founderizer-vault`. On a hub with no central vault of this program yet, and on a Mac: `~/.config/founderizer/google-file.key` of the hub's user, outside `~/.fleet`. | The hub, to seal its Google file with ChaCha20-Poly1305 (`vault.py` `hub_key`, `hub.py`, `atrest.py`) |
 
@@ -258,14 +260,22 @@ The vault protects the value of each secret. The design gives these results:
   other users can write (`Sources/FleetVaultCore/VaultLocalStore.swift`). Fleet Vault has its own copy of age 1.3.2,
   which the build checks against a SHA-256 (`Vault/build.py`).
 - The central vault's backup is its locked store, and its store key sealed to the recovery key that the owner
-  signed. So only the owner's recovery code opens the backup (`vault.py`).
+  signed. So only the owner's recovery code opens the backup. A vault with the list of the owner's devices makes none
+  (`vault.py`).
+- Beside its state, the central vault keeps two files of its own, mode 600: `clients.json`, the list of the owner's
+  devices with the set of the keys that ended, and `signers.json`, who signed each record that is in force, and when
+  the vault took it. The state and the configuration keep the members that they had before, so the program from before
+  these files runs again when an update puts it back. While it runs, it reads the `owner_keys` of the configuration
+  (`vault.py`).
 
 ## The owner's signatures
 
 - The central vault reads eight kinds of statement that the owner key signs: `pin` and `unpin` (the key of a
-  machine), `recovery` (the key of the backup), `grant` and `ungrant` (a secret for an agent on a machine), `pool`
+  machine), `recovery` (the key of the backup, which a vault with the list of the owner's devices refuses), `grant` and
+  `ungrant` (a secret for an agent on a machine), `pool`
   and `unpool` (a secret that the fleet manager can give to an agent on any machine), and `replace` (a new value
   under a reference that the vault holds, for one sealed copy) (`vault.py`, `Sources/FleetCore/OwnerKey.swift`).
+  Three more are about the list of the owner's devices: `client-add`, `client-end` and `client-first` (`vault.py`).
 - Each statement is the canonical JSON text of exactly its own fields, and it names the fleet and a time. The
   signature is ECDSA over SHA-256 of the statement's bytes (`vault.py`, `Sources/FleetCore/OwnerKey.swift`).
 - The central vault checks each statement itself, with the owner's public key. It refuses a statement of another
@@ -290,8 +300,9 @@ The vault protects the value of each secret. The design gives these results:
   other Mac away.
   **What stays after the removal of a key.** The central vault refuses each new statement of the removed key, of each
   kind. Each record that the removed key signed before stays in force: a pin, a grant, a pool entry, the recovery key
-  and the newest replace of a reference, with the value that the replace put in the store. A record keeps a time and
-  no signer, and the vault checks no signature again when it seals a copy or makes a backup (`vault.py`). A record
+  and the newest replace of a reference, with the value that the replace put in the store. The vault keeps who signed
+  each record that it took since it has `signers.json`, and when it took it; no route gives that yet. It checks no
+  signature again when it seals a copy or makes a backup (`vault.py`). A record
   that the removed key dated after the vault's clock stops each newer statement of its kind until that time: one day
   at most for each kind but a replace, which has no such bound (limit 24). The pin that the hub keeps of a machine
   keeps the removed key's signature: a broker that no longer holds the key refuses it, and a broker that still holds
@@ -304,11 +315,34 @@ The vault protects the value of each secret. The design gives these results:
   each backup (`export`, which the hub's user can ask for) is locked to it; each value that a replace of the removed
   key put in stays in the store; and each pin, grant and pool entry that the removed key signed stays in force, but
   for a pin that the app signs again with a key that stays.
+- **The list of the owner's devices.** The central vault can hold a list of the owner's devices in place of its owner
+  keys (`vault.py` `held_clients`). No app makes such a list yet: without it, each fleet stays as the rest of this
+  document says. An entry has the device's name, kind and label and its public keys: the sign key, which signs the
+  owner's decisions (an iPhone's save key in its place), and the list key, which signs only `client-add` and
+  `client-end`. Each entry and each end keeps the hash of the key that signed it, and the vault's own time.
+  - **From the moment when the list is there, the vault reads the `owner_keys` of its configuration no more.** So the
+    root step's owner keys change nothing then: neither a Set up from a new Mac nor the forms that add or remove a key.
+    When each listed device is lost, no command of this release gives the vault a new device yet.
+  - **The first list key** comes one time, by root on the hub's server and with a signature of the owner key that it
+    is for (`vault.py owner`, the statement `client-first`). Each other owner key comes into the list with no list key.
+    A second first list key is refused, so nobody with the Mac's root puts a list key of their own into the list. The
+    command runs only as the installed program, with the vault's own configuration and as the vault's own user.
+  - **An add** needs a list key of the list. The list holds at most 8 devices, and each key is one device's. A device
+    with a key that ended is refused for ever.
+  - **An end** needs a list key of the list, and it counts at once, whatever its time. It ends the whole device, and it
+    never names the device that signs it. A key that the vault never held ends too, so a hub that holds an add back
+    cannot bring it after the end: at most 16 such keys for one list key. The set of ended keys only grows. It holds at
+    most 1,024 keys, and an add is refused before the end of a listed device could have no room. No limit refuses the
+    end of a listed device.
+  - **What an ended device signed stays**: its pins, grants, pool entries and replaces, and the devices that it added.
+  - **The recovery key ends with the list.** The vault takes no `recovery` statement and makes no backup, the copy of
+    the fleet carries no store of the vault (`hub.py` `central_backup`), and the hub keeps no new copy of the recovery
+    code for a phone. Copies from before, on the Mac, in iCloud and in Time Machine, still open with the old code.
 - **No statement from ahead.** The central vault keeps no pin, unpin, recovery, grant, ungrant, pool or unpool
-  statement of the owner's that is dated more than one day after its own clock, and the record before it stays
-  (`vault.py` `central_signed`). A replace statement is not checked so (limit 24). The app dates no grant, ungrant,
-  pool, unpool or replace statement more than 23 hours after the Mac's clock: a later time of a clock that ran ahead
-  once is not followed (`Sources/FleetCore/OwnerKey.swift` `GrantClock`). A statement from ahead would stay its
+  statement of the owner's, and none about the list of their devices, that is dated more than one day after its own
+  clock, and the record before it stays (`vault.py` `not_ahead`). A replace statement is not checked so (limit 24). The
+  app dates no grant, ungrant, pool, unpool or replace statement more than 23 hours after the Mac's clock: a later time
+  of a clock that ran ahead once is not followed (`Sources/FleetCore/OwnerKey.swift` `GrantClock`). A statement from ahead would stay its
   record's newest until its time, so no statement dated right could end it (choice C50).
 - **Each signed grant and pooled secret has its standing at the hub.** `GET /ui/vault` says beside each grant that the
   owner signed, and each secret that the owner signed into the pool, whether the hub's own records still hold it,
@@ -427,10 +461,13 @@ server that joined before, it is off until root switches it on.
   placeholder or not at all, never as the key. No agent can change the configuration. A broker that does not stay
   up gets the old configuration back. The step stops where each user can listen on the proxy's port. A second run
   changes nothing and restarts nothing. A lock lets only one step change a vault at one time.
-- **Who runs the step.** A new server's install runs it after the vault step (`join.sh`, and `hub.sh` for a hub's
-  own server that takes agents, through `hubsetup.py key-swap`). An install goes on when the step stops: it says
-  why, and the server then gives each key as a value. `hubsetup.py vault --swap` runs it too. No rule of a server's
-  sudoers file reaches it: the service user's root commands are other programs (on the hub's server also the
+- **Who runs the step.** A new server's install runs it after the vault step (`join.sh`, and `hub.sh` for a hub's own
+  server that takes agents, through `hubsetup.py key-swap`), and so does root's step for a hub's own server that takes
+  agents later (`hubsetup.py one-server`, only while no agent runs there: else the owner's Mac's rule switches it, which
+  asks the owner first where an agent reads a key with a site). An install goes on when the step stops: it says why, and
+  the server then gives each key as a value. The owner's Mac runs it on each joined Linux server, the hub's own server
+  with its server service included (UI-API.md 1.183 and 1.327). `hubsetup.py vault --swap` runs it too. No rule of a
+  server's sudoers file reaches it: the service user's root commands are other programs (on the hub's server also the
   command of the hub's ports, `ports.py`), and its other right is to run a command as an agent user, which the step
   refuses (`hubsetup.py`).
 - **Off.** `vault.py configure --swap off` takes the part away, restarts the broker and stops the proxy. Each session
@@ -614,13 +651,17 @@ host.
 
 - **The step.** `vault.py configure --egress on`, as root and only as the installed program, as the key swap's step
   (`vault.py`). A new Linux server takes it at its install after the key swap (`join.sh`, and `hub.sh` for a hub's own
-  server that takes agents, through `hubsetup.py egress`); an install goes on when it stops. It makes the gate's user,
+  server that takes agents, through `hubsetup.py egress`), and so does a hub's own server that takes agents later
+  (`hubsetup.py one-server`); an install goes on when it stops. The owner's Mac runs it on the hub's own server after
+  each keys step of the key swap there, so a hub that took agents before these steps gets the gate at the Mac's next
+  round (UI-API.md 1.327). It makes the gate's user,
   its root-owned files (`/etc/founderizer-egress/`, the launcher and a safe copy of the vault program in
   `/usr/local/lib/founderizer-egress/`), its units, and the drop-ins of the closures; it starts the gate, and only
   then loads the kernel rules, so no connection meets a table without a gate. A gate that does not start leaves no
   table: each agent then connects as before. It stops where each user can listen on the gate's ports (877 to 880).
   A second run changes nothing. `--egress off` takes the table first, then the rules file, the gate, its units, the
-  drop-ins and the closures.
+  drop-ins and the closures; it keeps `/etc/founderizer-egress/egress.json`. The owner's Mac's step on the hub's own
+  server runs `--egress on` only where that file is not there, so root's off stays there too (UI-API.md 1.327).
 - **A gate that does not run.** The table stays (`agent-outgoing-connections-proposal.md`, section 5.4): an agent's DNS
   and TCP fail at once, and the hub and each other Tailscale machine still answer. Nothing falls back to a direct connection, because a gap with no
   table would let an agent open a connection that it keeps after the gate is back. The unit starts the gate again in 2
@@ -638,13 +679,16 @@ host.
   rules file is there, the server's service posts the gate's state with each reading, also when the gate never started
   (then with root's word on the table); when it finds no gate in two reports in a row, or no table in the kernel in two
   reports in a row, the hub tells the manager once, and once when a report ends it (`hub.py` `egress_troubles`, the
-  server watch). Root's file `/run/founderizer-egress-table` names the version of the table that the kernel has, and the
-  gate's state (`table` in `GET /ui/hosts`) reads it. `nftables.service` flushes every table of the kernel at its start,
-  its reload and its stop (the stock `/etc/nftables.conf` begins with `flush ruleset`): a drop-in of that unit runs the
-  rules' step after each of them, which loads the table again. A timer runs the step every 5 minutes too, for a flush
-  that no unit saw (`nft flush ruleset` or `nft -f /etc/nftables.conf` by hand) and for a load that failed. In the
-  second or so after a flush by `nftables.service`, and until the timer's next run after one by hand, an agent connects
-  with no rule, and a connection that it opens then stays outside the records for its life.
+  server watch). A server with no gate posts nothing: on the hub's own server of a hub that takes agents, which root's
+  steps give a gate, that is a gate that is missing, and the hub tells the manager that its table is not loaded, with
+  the step that makes a gate. Root's own `--egress off` there is told to the manager in the same words, once. Root's
+  file `/run/founderizer-egress-table` names the version of the table that the
+  kernel has, and the gate's state (`table` in `GET /ui/hosts`) reads it. `nftables.service` flushes every table of the
+  kernel at its start, its reload and its stop (the stock `/etc/nftables.conf` begins with `flush ruleset`): a drop-in
+  of that unit runs the rules' step after each of them, which loads the table again. A timer runs the step every 5
+  minutes too, for a flush that no unit saw (`nft flush ruleset` or `nft -f /etc/nftables.conf` by hand) and for a load
+  that failed. In the second or so after a flush by `nftables.service`, and until the timer's next run after one by
+  hand, an agent connects with no rule, and a connection that it opens then stays outside the records for its life.
 - **The kernel rules.** One nftables table, `inet founderizer_egress`, matches each packet by the UID of the socket
   that made it, so it holds for each process of an agent's OS user: a session, a cron job, a program that ignores
   proxy variables. The hub's address with its port and its git port goes direct, also while the gate does not run,
@@ -795,7 +839,7 @@ host.
    registers the value.
 4. **Root, and the vault's own OS user.** On a Linux server, only file owners and modes protect the keys and the
    stores, so root and the vault user can read them (`vault.py`, `hubsetup.py`). On a Mac, root installs and replaces
-   Fleet Vault (`Vault/install.py`).
+   Fleet Vault (`Vault/install.py`). Root on the hub's server can also write the list of the owner's devices.
 5. **A hub that is broken into, inside one machine.** For an API key that a session reads, an API request and a new
    login, a broker has only the hub's word. So a hub that is broken into can make a broker give any value of that
    broker's store to the agent users of its machine, or send it to the saved site of that value. It can also put a
@@ -847,11 +891,14 @@ host.
    Macs, until a root step on that machine takes them out (`vault.py configure --remove-owner-key`, and on a Mac
    `Vault/install.py --owner-keys-only`), and it refuses a pin that another key signed (`hubsetup.py`,
    `Vault/install.py`). The central vault keeps each record that a removed owner key signed ("The owner's keys of the
-   central vault"). The app signs each kept pin again with the new Mac's owner key, so such a broker then refuses
+   central vault"). A broker and the door read no list of the owner's devices yet: an end at the central vault ends
+   nothing there ("The list of the owner's devices").
+   The app signs each kept pin again with the new Mac's owner key, so such a broker then refuses
    handovers until that root step (`Sources/FleetCore/CentralVaultPlan.swift`).
 8. **The end of a grant.** The end of a grant, of a pin and of a pool entry reaches the central vault only through
    the hub. A hub that is broken into can hold it back, and the central vault then still seals that secret
-   (`Sources/Founderizer/GrantSigning.swift`).
+   (`Sources/Founderizer/GrantSigning.swift`). The same is true of an add and an end of one of the owner's devices
+   (`hub.py` `ui_vault_client`).
 9. **The pool.** A value in the pool needs no grant. The fleet manager can give it to an agent on any machine, and the
    central vault seals it to each machine whose key the owner pinned (`Sources/FleetCore/OwnerKey.swift`, `vault.py`).
 10. **Agents of one Mac.** All agents of a Mac run as one OS user, and the hub key of each agent is a file of that user
@@ -1179,15 +1226,23 @@ host.
     or `hub.sh` again). Root and the hub's own user are trusted for these ports. A hub on a server with no agents does
     not have this limit (`ports.py`, `hub.py`, `vault.py`, `lifecycle.py`).
 
-30. **A hub's own server that takes agents with no key swap and no outgoing gate.** `hub.sh` switches on the key swap
-    and the outgoing gate for a hub's own server only when it runs with the word of one server for all
-    (`FLEET_HUB_SERVER=shared`, a word of a hub's first install): the key swap since 16 November 2026 and the gate
-    since 17 November 2026. A hub whose owner chose one server for all later
-    (Founderizer's step, `hubsetup.py one-server`) gets the root helpers, its own broker and the server service, but
-    neither of the two; a hub installed with the word before those days has neither, or only the key swap. Each agent
-    that then comes to that server (Add agent or a move) gets each API key of the pool as a value in its sessions, so it
-    can print it, and no gate records where it connects. Nothing tells the owner. Root switches both on there with
-    `hubsetup.py key-swap` and `hubsetup.py egress` (`hubsetup.py`, `hub.sh`).
+30. **A hub's own server that took agents before its key swap and its gate.** A hub whose owner chose one server for all
+    after its install, with a release before this one, or that was installed with that word before 16 and 17 November
+    2026, has no key swap or no outgoing gate on its own server until the owner's Mac runs its next key swap round
+    there, or root runs `hubsetup.py key-swap` and `hubsetup.py egress`. Where an agent runs there already, `hubsetup.py
+    one-server` leaves the key swap to the Mac, whose rule waits for the owner's yes on its card when an agent there
+    reads a key with a site. The Mac's gate step runs only where `/etc/founderizer-egress/egress.json` is not there, and
+    only after a keys step of the Mac there; the Mac keeps no record of it, so a gate step that failed comes again only
+    with the next keys step (for example a new `vault.py`, a new owner key of the central vault, the pin's weekly
+    signature, or a switch that the table wants). So the Mac leaves a gate that root turned off (`--egress off` keeps
+    that file), and a first gate step that stopped after it wrote that file (its gate did not start) keeps the file, so
+    there only root's `hubsetup.py egress` makes the gate. A Mac with no root connection to the hub's server counts a
+    try on the hub's row, and after six the Secrets page says "The fleet has no SSH connection to … on record. Record
+    one on its page in Servers.", a page that has no such field for the hub's own server. A fleet with no Mac round
+    keeps that hole. Until then each agent there gets each API key of the pool as a value, and no gate records where it
+    connects. For a hub that takes agents and whose own server has its server service, the hub tells the manager that
+    the gate's table is not loaded there. Each step also goes on when it stops, as at an install (`hubsetup.py`,
+    `hub.py` `egress_troubles`, `KeySwapPlan.swift`, `vault.py` `configure_egress`).
 
 31. **An API key with the name GH_TOKEN.** A task session's environment is the agent's keys first, and then the
     variables that Fleet sets for the task itself (`fleet.py`): for an agent with repositories, GH_TOKEN is the fleet's
@@ -1225,9 +1280,10 @@ host.
    backup.
 6. **Keep the recovery code.** It is only in the Mac's login Keychain and on a phone that enrolled after the Mac had
    the code (`Sources/FleetCore/RecoveryCode.swift`, `Sources/Founderizer/RecoveryCopy.swift`). Without it, a backup
-   of the central vault cannot be opened (`vault.py`).
+   of the central vault cannot be opened (`vault.py`). A vault with the list of the owner's devices makes no new backup.
 7. **Know what a new Mac changes.** The root step from a new Mac, whose key is not one of the central vault's owner
-   keys, makes its key the only owner key of the central vault (`hubsetup.py`, `Sources/FleetCore/OwnerKey.swift`). A
+   keys, makes its key the only owner key of the central vault (`hubsetup.py`, `Sources/FleetCore/OwnerKey.swift`),
+   while the vault has no list of the owner's devices. A
    run of that step from a Mac whose key is one of them keeps all of them. The recovery key does not change: a backup still opens only
    with the lost Mac's code, which only a phone that took a copy has (`Sources/FleetCore/CentralVaultPlan.swift`,
    `Sources/Founderizer/RecoveryCopy.swift`). A Linux broker, and Fleet Vault on a Mac that has the owner's keys,

@@ -709,7 +709,6 @@ class Manager(Base):
     def test_nothing_chases_it_and_no_screen_of_the_owner_counts_it(self):
         hub.settings_check()
         self.assertEqual(hub.open_reports(kinds=False), [])
-        self.assertEqual(hub.reports_waiting(hub.now()), [])
         self.assertEqual([r["id"] for r in hub.managers_reports()], [1])
         hub.q("UPDATE events SET read_at=?", (hub.now() + 1,))
         self.clock += 3600

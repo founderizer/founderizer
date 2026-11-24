@@ -846,7 +846,7 @@ class Runtime(unittest.TestCase):
         self.assertEqual(self.lose_the_session(tid, 50), (hub.SESSION_RESTARTS + 2, hub.SESSION_RESTARTS + 1))
         self.assertEqual(len(self.told_it_gave_up()), 1)
 
-    def test_the_stalled_mark_puts_a_task_on_the_owners_rung_until_a_new_attempt(self):
+    def test_the_stalled_mark_puts_a_task_on_the_stuck_list_until_a_new_attempt(self):
         """Plan C9: no silence clock. A task whose requester was told after two empty turn ends (nudge_level 2) is on
         the owner's stuck rung (tasks_stuck, version 1.35) until an event; a new attempt is one."""
         tid = self.task()

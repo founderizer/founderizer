@@ -1044,7 +1044,6 @@ class Proposals(Base):
         self.propose()
         self.assertEqual([r["id"] for r in hub.open_reports(kinds=False)], [])     # no chase, no owner warning
         self.assertEqual([r["id"] for r in hub.managers_reports()], [1])          # its start lists it
-        self.assertEqual(hub.reports_waiting(hub.now()), [])
         hub.q("UPDATE events SET read_at=?", (hub.now() + 1,))         # the manager read after the proposal came
         self.clock += 60
         self.assertIsNone(hub.requester_chase("manager", hub.now()))

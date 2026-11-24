@@ -574,39 +574,36 @@ class Health(OwnerAPI):
     def stuck(self):
         return [w for w in self.health()["warnings"] if w["kind"] == "tasks_stuck"]
 
-    def test_a_task_that_nothing_is_moving_reaches_the_owners_screen(self):
-        """Plan C10: no clock. Every alarm about one task goes to its requester once, and the owner sees the task
-        only while that requester had a turn after the notice and left it unread: then nobody is acting on it."""
+    def test_a_task_that_nothing_is_moving_is_the_manager_s_and_no_row_of_the_owner_s(self):
+        """Plan C10: no clock. Every alarm about one task goes to its requester once, and tasks_stuck lists the task
+        while that requester had a turn after the notice and left it unread: then nobody is acting on it. The owner,
+        24 November 2026: the manager manages the team, so his System status has no row that asks him to tell it what
+        to do with the task (owner API 1.331)."""
         self.worker()
         t0 = hub.now()
         gone = self.task(stalled_since=t0 - 2 * 3600, stalled_reason="its session is not running")
-        self.assertEqual(self.stuck(), [])                  # nobody was told
+        self.assertEqual(hub.tasks_stuck(hub.now()), [])    # nobody was told
         notice = self.told(gone, t0 - 60)
-        self.assertEqual(self.stuck(), [])                  # told, and the manager has had no turn since
+        self.assertEqual(hub.tasks_stuck(hub.now()), [])    # told, and the manager has had no turn since
         hub.kv_set("turn_ended:manager", t0 - 30)
-        w, = self.stuck()
-        # T-37: how many and that nobody acts on them, and the one way on; the task itself is the manager's to read
-        self.assertEqual((w["detail"], w["fix"]), ("1 task is stuck, and nobody is acting on it.",
-                                                   "Tell Manager what to do with it."))
         self.assertIn(f"T-{gone} (Build the thing, owner studio) has no live path and is still working: its session "
                       f"is not running", " ".join(line for _, line in hub.tasks_stuck(hub.now())))
-        self.assertEqual(w["agent"], "manager")             # so the app can draw a button to its page
+        # Bug: the tasks_stuck row comes back and asks the owner to tell the manager what to do with the task.
+        self.assertEqual(self.stuck(), [])
         hub.q("UPDATE events SET read_at=? WHERE id=?", (t0, notice))
-        self.assertEqual(self.stuck(), [])                  # it read it: the decision is its own
+        self.assertEqual(hub.tasks_stuck(hub.now()), [])    # it read it: the decision is its own
         # Two more kinds, the oldest notice first: two empty turns (plan C9), and losses that stopped its restarts.
         wedged = self.task(live_path="live session", nudged_at=t0 - 3 * 3600)
         self.told(wedged, t0 - 3 * 3600)
         lost = self.task(live_path="live session", restarts=hub.LOST_IN_A_ROW, nudge_level=0)
         self.told(lost, t0 - 600)
-        w, = self.stuck()
-        self.assertEqual(w["detail"], "2 tasks are stuck, and nobody is acting on them.")
-        lines = " ".join(line for _, line in hub.tasks_stuck(hub.now()))      # the manager's to read
+        lines = " ".join(line for _, line in hub.tasks_stuck(hub.now()))
         self.assertIn(f"T-{wedged} (Build the thing, owner studio) ended two turns in a row with nothing waiting "
                       f"for it", lines)
         self.assertIn(f"T-{lost} (Build the thing, owner studio) lost its session again and again", lines)
         self.assertLess(lines.index(f"T-{wedged}"), lines.index(f"T-{lost}"))
 
-    def test_the_owner_is_told_nothing_about_a_task_that_is_quiet_on_purpose(self):
+    def test_a_task_that_is_quiet_on_purpose_is_not_stuck(self):
         """The case that must not regress. Three kinds of task are quiet because something said so, and none of
         them is stuck: one that the owner or the manager held, one whose agent is at its usage limit, and one parked
         until the time its own agent named. A session inside one long call ends no turn, so nothing tells anybody
@@ -627,7 +624,7 @@ class Health(OwnerAPI):
         for tid in (held, limited, parked):
             self.told(tid, t0 - 3 * 3600)
         hub.kv_set("turn_ended:manager", t0)
-        self.assertEqual(self.stuck(), [])
+        self.assertEqual(hub.tasks_stuck(hub.now()), [])
         # Each of the three is quiet for its own reason: take that one reason away and its line appears.
         hub.q("UPDATE holds SET state='released' WHERE task=?", (held,))
         hub.q("UPDATE agent_limits SET ended=? WHERE agent='vps'", (t0 - 3 * 3600,))
@@ -636,19 +633,18 @@ class Health(OwnerAPI):
         for tid in (held, limited, parked):
             self.assertIn(f"T-{tid}", lines)
         self.assertNotIn(f"T-{busy}", lines)
-        self.assertEqual("3 tasks are stuck, and nobody is acting on them.", self.stuck()[0]["detail"])
 
-    def test_a_task_whose_requester_was_not_told_or_had_no_turn_since_is_not_the_owners_to_see(self):
-        """The owner is told only what the manager (or a lead) already had in front of it and did not settle. A lead
+    def test_a_task_whose_requester_was_not_told_or_had_no_turn_since_is_not_stuck(self):
+        """tasks_stuck lists only what the manager (or a lead) already had in front of it and did not settle. A lead
         is measured by the turns of its own task's session, where its notice is filed, and what it leaves unread goes
-        to the manager before the owner sees it."""
+        to the manager (lead_unread_sweep)."""
         self.worker()
         t0 = hub.now()
         tid = self.task(stalled_since=t0 - 2 * 3600, stalled_reason="its session is not running")
         hub.kv_set("turn_ended:manager", t0)
-        self.assertEqual(self.stuck(), [])                  # never told: the hub is still starting it again
+        self.assertEqual(hub.tasks_stuck(hub.now()), [])    # never told: the hub is still starting it again
         self.told(tid, t0 + 1)
-        self.assertEqual(self.stuck(), [])                  # told after the manager's last turn
+        self.assertEqual(hub.tasks_stuck(hub.now()), [])    # told after the manager's last turn
         hub.TEAM["agents"]["lead"] = {"role": "lead", "runtime": "claude", "machine": "studio", "can": ["shell"]}
         parent = self.task(owner="lead", live_path="live session", nudge_level=0)
         hub.q("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,1,?,'created')", (parent, t0))
@@ -659,8 +655,8 @@ class Health(OwnerAPI):
                                                                       "running": False, "how": "end_turn",
                                                                       "at": t0 + 2, "calls": {}, "said": None}),
                                                           parent))
-        # The owner, 29 October 2026: what a lead leaves unread goes to the manager first, and reaches his screen
-        # only when the manager had a turn after that and left it unread too (lead_unread_sweep).
+        # The owner, 29 October 2026: what a lead leaves unread goes to the manager (lead_unread_sweep), and
+        # tasks_stuck lists it only when the manager had a turn after that and left it unread too.
         self.assertNotIn(f"T-{sub}", " ".join(line for _, line in hub.tasks_stuck(hub.now())))
         hub.lead_unread_sweep(hub.now())
         told = hub.q1("SELECT text FROM events WHERE agent='manager' ORDER BY id DESC LIMIT 1")["text"]

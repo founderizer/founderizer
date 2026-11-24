@@ -624,6 +624,11 @@ CREATE TABLE IF NOT EXISTS owner_device_signing(device TEXT PRIMARY KEY, key TEX
 -- holds the code; then only the time it confirmed stays.
 CREATE TABLE IF NOT EXISTS owner_device_recovery(device TEXT PRIMARY KEY, sealed TEXT, created REAL NOT NULL,
   held REAL);
+-- F17, piece P1 (owner API 1.317): each statement about the list of the owner's devices (client-add, client-end) that
+-- the central vault took through this hub, as it came. The list key of a device signs it and the hub makes none, so the
+-- row is a record and no authority: the vault's own list says who is in it.
+CREATE TABLE IF NOT EXISTS owner_client_statements(id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
+  statement TEXT NOT NULL UNIQUE, signature TEXT NOT NULL, saved TEXT NOT NULL, taken REAL NOT NULL);
 -- Pings to the owner's devices (MOBILE-APP.md 9, owner feature push): the push token that each device gave, with its
 -- seal key (sealed_push, a column that migrate adds), and one row for each ping. A ping row holds no text, and it is
 -- sent once: queued, sending, then sent, failed, skipped or unknown. Kind `needs` names a Needs-you item in `item`;
@@ -3048,7 +3053,12 @@ def apps_draw(name):
 def save_recovery_copy(device, sealed):
     """POST /ui/owner/devices/<device>/recovery (owner feature recovery_copy, DevOps plan V12): the recovery code of
     the central vault, which the owner's Mac sealed to this phone's own recovery key once the key's HMAC of its QR's
-    one-time value matched. The hub carries the sealed box only, until the phone confirms that it holds the code."""
+    one-time value matched. The hub carries the sealed box only, until the phone confirms that it holds the code. None
+    is taken while the central vault has the list of the owner's devices (central_listed): the code opens nothing
+    then. No person meets that refusal, because ui_features leaves the feature out."""
+    if central_listed():
+        raise Refusal(409, "the central vault has the list of your devices, so it makes no copy that a recovery code "
+                           "opens, and no phone keeps one")
     row = q1("SELECT recovery_key FROM owner_device_signing WHERE device=?", (device,))
     if not row or not row["recovery_key"]:
         raise Refusal(404, "this device sent no recovery key at its enrollment")
@@ -7388,16 +7398,15 @@ WARNING_CODES = {
     "machine_stale": "helper",
     "vault_behind": "vault",                # a server's vault is out of date
 }
-# The kinds that never go: the owner's own work, plan or step (a copy of the fleet, an allowance, stuck tasks and
-# loops, reports that wait for a decision, a manager on the hub's own user, a trust in a server's vault that ends soon
-# or ended, because his Mac did not sign it again: its program is not out of date, and the privacy page names no such
-# code; and the manager's other kinds: a sign-out, a question on its screen, a limit, its silence, a switch), and what
-# goes already (hub_fault as faults, disk_low as the check disk). test_error_reports holds every kind that health_view
-# can make to be in WARNING_CODES or here, so that a new warning needs a decision.
+# The kinds that never go: the owner's own work, plan or step (a copy of the fleet, an allowance, a manager on the
+# hub's own user, a trust in a server's vault that ends soon or ended, because his Mac did not sign it again: its
+# program is not out of date, and the privacy page names no such code; and the manager's other kinds: a sign-out, a
+# question on its screen, a limit, its silence, a switch), and what goes already (hub_fault as faults, disk_low as the
+# check disk). test_error_reports holds every kind that health_view can make to be in WARNING_CODES or here, and no
+# other kind, so that a new warning needs a decision.
 WARNING_KEPT = ("backup_missing", "backup_old", "hub_fault", "vault_pin_ends", "vault_pin_ended", "manager_hub_user",
                 "manager_silent", "manager_limited", "manager_screen", "manager_signed_out", "manager_switch_stalled",
-                "manager_switching", "allowance_spent", "allowance_pace", "circles_stuck", "tasks_stuck",
-                "reports_undecided", "disk_low")
+                "manager_switching", "allowance_spent", "allowance_pace", "disk_low")
 WARNING_HUB = ("records", "schema", "timers")       # the hub's own: `servers` is 0
 # A code that turns bad asks for an early report. Not `helper`, `vault` and `server_update`: a Mac that sleeps silences
 # its helper, a vault catches itself up within ten minutes, and a server's update has the owner's own button (Update
@@ -11475,8 +11484,9 @@ def not_acting(receiver, event_id):
 
 
 def stuck_told(task_id, event_id):
-    """The notice that told a task's requester the task is stuck (plan C10): the owner's screen shows the task only
-    while its requester had a turn and left this notice unread (tasks_stuck)."""
+    """The notice that told a task's requester the task is stuck (plan C10). A requester that is not the manager, and
+    that had a turn after this notice and left it unread or cannot act on the task any more, makes lead_unread_sweep
+    tell the manager, once."""
     kv_set(f"stuck_notice:{task_id}", event_id)
 
 
@@ -11774,8 +11784,8 @@ def tools_never_came(t, t0):
             return "no_tools"
         if mark == str(attempt - 1):        # the hub's own restart of the attempt before, and again no tools
             kv_set(f"no_tools:{tid}", f"told:{attempt}")
-            # The Stalled mark (nudged_at), as for two empty turns: tasks_stuck shows the task to the owner when its
-            # requester, and the manager above a lead, leave this notice unread (the review of 20 November 2026).
+            # The Stalled mark (nudged_at), as for two empty turns (the review of 20 November 2026). When a lead leaves
+            # this notice unread, the hub passes it to the manager (lead_unread_sweep).
             q("UPDATE tasks SET nudge_level=2, nudged_at=? WHERE id=?", (t0, tid))
             said = clip((turn_state(tid, attempt) or {}).get("said") or "", 600).strip() or "nothing"
             words = ("words=not_passed_on (its Shell box is off)." if shell_off(t["owner"]) else
@@ -11854,8 +11864,9 @@ def requester_chase(agent, t0, task=None):
 
 
 def chased(agent, keys, event_id):
-    """The message that named each of these items to `agent` (requester_chase): each is named once, and the owner's
-    screen shows a report while its receiver had a turn after this message and left it unread (plan C10)."""
+    """The message that named each of these items to `agent` (requester_chase): each is named once. When a lead had a
+    turn after this message and left it unread, the hub passes its reports to the manager (lead_unread_sweep, plan
+    C10)."""
     for k in keys:
         kv_set(f"chased:{agent}:{k}", event_id)
 
@@ -23213,8 +23224,9 @@ def expire_deposits(t0):
 # owner signed (a pin), and its backup only to a recovery key the owner signed. So a hub that is broken into cannot
 # add a server of its own and pull every secret in one call.
 #
-# The hub reads its status, passes the owner's own commands through (intake, pin, recovery, and since the DevOps
-# plan's V1 his signed grants: grant, ungrant, pool, unpool), and reconciles: each pinned machine's vault gets the
+# The hub reads its status, passes the owner's own commands through (intake, pin, recovery, since the DevOps
+# plan's V1 his signed grants: grant, ungrant, pool, unpool, and since F17's P1 the statements of the list of the
+# owner's devices: client-add, client-end), and reconciles: each pinned machine's vault gets the
 # secrets its agents hold, that the owner signed for that machine and that the central vault has, sealed there to
 # that pin and carried by the deliveries above, and gives back the ones nobody there holds any more. A secret that
 # the owner took out of the catalog (Remove from Founderizer) then leaves the central vault too, once no machine's
@@ -23297,14 +23309,25 @@ def central_replaces(t0=None, ok=None):
     return (central_ok(t0) if ok is None else ok) and (status or {}).get("replaces") is True
 
 
+def central_listed():
+    """True while the last status of the central vault says that it has the list of the owner's devices (F17): from then
+    on it takes no recovery key and makes no copy of its store. A vault that is silent now keeps what it said last."""
+    with CENTRAL_LOCK:
+        return isinstance((CENTRAL["status"] or {}).get("clients"), dict)
+
+
 def ui_features():
     """The owner features this hub serves now: UI_FEATURES, central_vault only while central_ok(), secret_replace
     only while the central vault also says that it replaces a value (central_replaces), contact_roles only while
     contacts.v2 is on, connected_apps only while the hub's socket for them is open and the gate has forwarded to it
     (capp_ready), connect_offer only while the owner's Mac may turn connected apps on here or waits for them to be
-    ready (capp_offer), and the name of each Teams part that this hub serves now (teams_features)."""
+    ready (capp_offer), and the name of each Teams part that this hub serves now (teams_features). recovery_copy of
+    UI_FEATURES is left out while the central vault has the list of the owner's devices (central_listed): a recovery
+    code opens nothing then. client_list, the name of POST /ui/vault/client (owner API 1.317), is not in the list: no
+    app uses that route before the piece that gives each device its list key."""
     ok = central_ok()
-    return list(UI_FEATURES) + (["central_vault"] if ok else []) + \
+    return [name for name in UI_FEATURES if name != "recovery_copy" or not central_listed()] + \
+        (["central_vault"] if ok else []) + \
         (["secret_replace"] if central_replaces(ok=ok) else []) + \
         (["contact_roles"] if contacts_v2() else []) + (["connected_apps"] if capp_ready() else []) + \
         (["connect_offer"] if capp_offer() else []) + teams_features()
@@ -23985,11 +24008,12 @@ def central_intake(ref, text, statement=None, signature=None):
 
 
 CENTRAL_PRINTS = 16             # fingerprints of one kind that an intake gives the central vault: its newest ones
-CENTRAL_STATEMENT_MAX = 2000    # characters of one signed statement (pin, unpin or recovery)
+CENTRAL_STATEMENT_MAX = 2000    # characters of one signed statement; a client-end of 16 keys is the longest, about 1150
 CENTRAL_SIGNATURE = re.compile(r"[A-Za-z0-9+/]{8,200}={0,2}")      # base64 of a DER signature: about 96 characters
 
 
-CENTRAL_KINDS = ("pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool")     # the owner's signed statements
+CENTRAL_KINDS = ("pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool",     # the owner's signed statements
+                 "client-add", "client-end")            # and those of the list of their devices (F17, P1)
 
 
 def statement_kind(statement):
@@ -24013,8 +24037,8 @@ def replace_statement(statement):
 
 
 def central_statement(body):
-    """POST /ui/vault/pin, /recovery and /grant: the owner's signed statement and its signature, as they came, to the
-    central vault's op of the statement's own kind. The hub keeps no copy of the owner's key. Never under LOCK.
+    """POST /ui/vault/pin, /recovery, /grant and /client: the owner's signed statement and its signature, as they came,
+    to the central vault's op of the statement's own kind. The hub keeps no copy of the owner's key. Never under LOCK.
 
     A pin that the central vault took is kept as it came too (owner_pin), so that a machine's broker can check with the
     owner's own keys that a handover goes to a key the owner pinned (DevOps plan 0.3); an unpin ends it.
@@ -24039,6 +24063,27 @@ def central_statement(body):
             kv_set(f"owner_pin:{machine}", json.dumps({"statement": body["statement"], "signature": body["signature"]})
                    if kind == "pin" else None)
     return answer
+
+
+def central_takes_lists():
+    """True while the central vault answers and its program takes the statements of the list of the owner's devices (its
+    status says lists: true). An older program would refuse each one as an operation that it does not know."""
+    with CENTRAL_LOCK:
+        status = CENTRAL["status"]
+    return central_ok() and (status or {}).get("lists") is True
+
+
+def client_statement_taken(body, answer):
+    """The receipt of a statement about the list of the owner's devices that the central vault took: its kind, the
+    device that it added or the devices that it ended, and what the vault did (saved: new, replaced, ended or same). The
+    hub keeps the statement as it came (owner_client_statements): a record, and no list of its own. The same statement
+    again keeps its first row. The next pass reads the vault's list again."""
+    central_due()
+    q("INSERT OR IGNORE INTO owner_client_statements(kind,statement,signature,saved,taken) VALUES(?,?,?,?,?)",
+      (answer["kind"], body["statement"], body["signature"], str(answer.get("saved")), now()))
+    log("owner", f"the central vault took a {answer['kind']} statement of the list of the owner's devices "
+                 f"({answer.get('saved')})")
+    return {k: answer[k] for k in ("kind", "device", "devices", "left_out", "saved") if k in answer}
 
 
 def handover_unpinned(name, t0=None):
@@ -24326,12 +24371,13 @@ def expire_withdrawals(t0):
 def central_refusal():
     """None while the central vault answers and holds the owner's recovery key, else why no new secret comes in now:
     a value that the central vault cannot keep and back up must not enter the fleet at all (DevOps plan V1, "If the
-    vault does not answer, the save stops, and nothing is sent")."""
+    vault does not answer, the save stops, and nothing is sent"). A vault with the list of the owner's devices takes no
+    recovery key any more (central_listed), so it needs none."""
     if not central_ok():
         return "the central vault does not answer, so nothing was sent: try again in a moment"
     with CENTRAL_LOCK:
         status = CENTRAL["status"] or {}
-    if not status.get("recovery"):
+    if not status.get("recovery") and not central_listed():
         return "the central vault holds no recovery key yet, so nothing was sent: try again in a moment"
     return None
 
@@ -24340,7 +24386,8 @@ def central_backup():
     """(the export, the manifest's entry): the central vault's export for a copy of this fleet and what the manifest
     says of it, or None and the one line that says why not. The export is the store as it is on disk and the store's
     key sealed to the owner's recovery key, so only his recovery code in the app opens it, and the hub never does.
-    Asked only of a central vault that answers now and holds a recovery key. Never under LOCK (ui_backup).
+    Asked only of a central vault that answers now and holds a recovery key, and never of one with the list of the
+    owner's devices, which makes no copy of its store (central_listed). Never under LOCK (ui_backup).
 
     The sealed key is scanned for a registered value as every sealed copy is; the store is not, because it is an age
     file of megabytes, and secret_hit hashes a window at each character of it for each registered value."""
@@ -24348,6 +24395,9 @@ def central_backup():
         return None, {"in": None, "vault": False, "why": "no central vault answered this hub when this copy was made"}
     with CENTRAL_LOCK:
         status = CENTRAL["status"] or {}
+    if central_listed():
+        return None, {"in": None, "vault": True, "why": "the central vault has the list of your devices, so it makes no "
+                                                        "copy of its store"}
     if not status.get("recovery"):
         return None, {"in": None, "vault": True,
                       "why": "the central vault holds no recovery key, so its store is not in this copy"}
@@ -54312,9 +54362,9 @@ def circles(t0):
 
 
 def circle_watched(found, t0):
-    """When each circle the hub can see now was first seen, kept in kv. It is what lets the owner be told only about
-    the ones the manager has already had and not settled: a circle the hub noticed a minute ago is the manager's to
-    decide. A circle that is gone leaves the map, so the same thing coming back later is a new sighting."""
+    """When each circle the hub can see now was first seen, kept in kv: circle_sweep says the rule for a chain only in
+    the notice that first names that chain. A circle that is gone leaves the map, so the same thing coming back later
+    is a new sighting."""
     try:
         was = json.loads(kv_get("circle_watch") or "{}")
     except ValueError:
@@ -54330,44 +54380,10 @@ def circle_watched(found, t0):
     return kept
 
 
-def circles_waiting(t0):
-    """[(when it was first seen, its line)] of the circles that the manager was told of, while it had a turn after
-    that message and left it unread (plan C10), oldest first. health_view reads the sweep's own map and never
-    recomputes the circles: the owner's screen is polled, and a warning that says what the last sweep found is both
-    cheaper and honest."""
-    told = kv_get("circle_notice")
-    if not told or not not_acting(manager_name(), int(told)):
-        return []
-    try:
-        watch = json.loads(kv_get("circle_watch") or "{}")
-    except ValueError:
-        return []
-    out = []
-    for sig, entry in watch.items():
-        try:
-            out.append((float(entry[0]), str(entry[1])))
-        except (TypeError, ValueError, IndexError):
-            continue
-    return sorted(out)
-
-
-def reports_waiting(t0):
-    """The reports that wait for a decision whose receiver had a turn after the message that named them and left it
-    unread (plan C10: requester_chase names each one once), oldest first. A lead's goes to the manager first
-    (lead_unread_sweep), and only one that the manager left unread too reaches the owner's screen."""
-    out = []
-    for r in open_reports(kinds=False):
-        receiver = manager_name() if report_for_manager(r) else r["to_agent"]
-        told = kv_get(f"chased:{receiver}:{upref(r['id'])}")
-        if told and not_acting(receiver, int(told)) and up_unread(receiver, upref(r["id"])):
-            out.append(r)
-    return out
-
-
 def up_unread(receiver, key):
-    """True when what `receiver` left unread is the owner's to see now: the manager's own, or a lead's that the
-    manager was told of (lead_unread_sweep) and left unread too (the owner, 29 October 2026: the manager acts for a
-    lead that does not, and his Health screen shows only what the manager leaves as well)."""
+    """True when what `receiver` left unread went up to the top and stays unread there: the manager's own, or a
+    lead's that the manager was told of (lead_unread_sweep) and left unread too (the owner, 29 October 2026: the
+    manager acts for a lead that does not). tasks_stuck reads it; no screen of the owner's shows what it finds."""
     if receiver in (None, manager_name()):
         return True
     told = kv_get(f"lead_unread:{key}")
@@ -54376,10 +54392,10 @@ def up_unread(receiver, key):
 
 def lead_unread_sweep(t0):
     """From the hub tick: what a lead had a turn after and left unread -- the notice that a task it requested is
-    stuck (tasks_stuck), a report that it was named and did not decide (reports_waiting) -- goes to the manager, once
-    for each notice, before the owner's Health screen shows it (up_unread). So does a stuck notice of a lead that
-    cannot act on its task any more (lead_left), whose session reads nothing. The manager asks the lead, or acts where
-    it may."""
+    stuck (stuck_told), a report that it was named and did not decide (chased) -- goes to the manager, once for each
+    notice. So does a stuck notice of a lead that cannot act on its task any more (lead_left), whose session reads
+    nothing. The manager asks the lead, or acts where it may. The owner's System status shows none of them (owner API
+    1.331): the manager manages its team."""
     mgr, lines, keys = manager_name(), [], []
     for t in q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id"):
         told = kv_get(f"stuck_notice:{t['id']}")
@@ -54403,21 +54419,22 @@ def lead_unread_sweep(t0):
         return
     event = emit(mgr, "say", "[hub] An agent that gave out this work had a turn after these and left them unread:\n" +
                  "\n".join(f"  {line}" for line in lines) + "\nAsk that agent with message_agent, or settle them "
-                 "yourself where it cannot act any more. The owner sees them only if you leave them too.")
+                 "yourself where it cannot act any more.")
     for key in keys:
         kv_set(f"lead_unread:{key}", event)
 
 
 # A task that nothing is moving (tasks_stuck). Every alarm the hub raises about one task goes to its requester once,
-# and the owner's screen shows the task only while that requester is not acting on it (plan C10): it had a turn
-# after the notice and left the notice unread. No clock decides it, and the board's Stalled mark still shows it.
+# and a requester that is not the manager and is not acting on it (plan C10: it had a turn after the notice and left
+# the notice unread) passes it to the manager (lead_unread_sweep). No clock decides it, and the board's Stalled mark
+# shows it. Since owner API 1.331 no screen of the owner's shows this list: the manager manages its team.
 
 
 def tasks_stuck(t0):
     """[(when its requester was told, one line)] of the open tasks whose requester had a turn after the notice that
-    the task is stuck and left that notice unread, oldest first. A requester that read the notice decides, and the
-    owner is told only what the manager (or a lead) already had in front of it and did not settle: a lead's goes to
-    the manager first (lead_unread_sweep), and shows here only when the manager left it unread too.
+    the task is stuck and left that notice unread, oldest first. A requester that read the notice decides; what a lead
+    leaves unread goes to the manager (lead_unread_sweep), and shows here only when the manager left it unread too.
+    Since owner API 1.331 no screen of the owner's shows this list.
 
     **Deliberate quiet is not stuckness**: a held task, a task whose agent is at its usage limit or waits for its
     sign-in and a parked task are left out whole."""
@@ -54465,14 +54482,14 @@ def circle_sweep(t0):
     # follow-up is that reading once more. A chain's line stays in every later notice, because nothing ends a chain:
     # the sentence does not, or the manager would read it again for a chain that it settled.
     chain = any(sig.startswith("chain:") and seen[sig][0] == t0 for sig, _ in found[:CIRCLE_SHOWN])
-    kv_set("circle_notice", emit(manager_name(), "say", f"[hub] {len(found)} thing(s) look like running in circles:\n" +
+    emit(manager_name(), "say", f"[hub] {len(found)} thing(s) look like running in circles:\n" +
          "\n".join("  " + line for _, line in found[:CIRCLE_SHOWN]) +
          (f"\n  and {len(found) - CIRCLE_SHOWN} more." if len(found) > CIRCLE_SHOWN else "") +
          "\nThe hub only sees the pattern and changes nothing: the third attempt is sometimes the right one. Decide "
          "each: write the answer where it is read next time (a profile, a knowledge file, the task's own words), "
          "give the work to a suitable agent, settle the access, cancel what nothing needs, or leave it as it is. "
          "see_history tells you what moved and what did not." +
-         (CIRCLE_CHAIN_SAYS if chain else ""), extra=LATER_SAY))
+         (CIRCLE_CHAIN_SAYS if chain else ""), extra=LATER_SAY)
 
 
 ALLOWANCE_STAGES = {"pace": 1, "last": 2, "spent": 3}  # allowance_worth_saying's why, each one worse than the one before
@@ -62526,7 +62543,7 @@ def tick():
         step(kpi_sweep, t0)                 # lanes/agent-kpis.md: once a day, a KPI with no value for two windows
         step(circle_sweep, t0)              # what looks like running in circles
         step(outcome_check_sweep, t0)       # the owner, 23 November 2026: an unknown outcome goes up the chain first
-        step(lead_unread_sweep, t0)         # what a lead left unread, to the manager before the owner's screen
+        step(lead_unread_sweep, t0)         # what a lead left unread, to the manager
         step(allowance_sweep, t0)           # the manager's own allowance, while it can still act on it
         step(integrity_check, t0)
         step(expire_handovers, t0)
@@ -67487,7 +67504,9 @@ WATCH_WORDS = {                 # what stopped holding, and what holds again
     "egress": ("its outgoing gate does not answer, so its agents reach the hub and nothing else (`journalctl -u "
                "fleet-egress` there says why)", "its agents' connections go out again"),
     "egress_table": ("its outgoing gate's table is not loaded, so its agents connect with no record (`journalctl -u "
-                     "fleet-egress-rules` there says why)",
+                     "fleet-egress-rules` there says why; where it has no gate, root's `python3 -I "
+                     "/usr/local/lib/fleet-vault/vault.py configure --egress on` there makes one, and on the hub's own "
+                     "server where no gate step ran, the owner's Mac's next key swap round does)",
                      "its outgoing gate has its table again, or the gate is off"),
 }
 # Percent of a server's disk or memory (lifecycle.machine_load): it needs care from the first, and holds again under the
@@ -67519,17 +67538,21 @@ def watch_words(key, load, ended=False):
     return words
 
 
-def egress_troubles(server, t0, told=()):
+def egress_troubles(server, t0, told=(), hub_own=False):
     """The server's facts of its outgoing gate, as WATCH_WORDS keys, from its own service's posts, each after two posts
     in a row (one is a restart, or a load that runs): "egress_table" while a gate that answers has no table in the
     kernel (its agents then connect with no record), and it holds while the gate does not answer; and "egress" while
     the gate does not answer and its table is there, so that the server's agents reach the hub and nothing else
     (VAULT.md, "The outgoing gate"). Only a post ends a fact: a server whose service posts nothing for SERVER_QUIET
     while it reads keeps what was said, and one that said that it has no gate (`--egress off`) has no row, so
-    neither."""
+    neither. `hub_own`: the hub's own server of a hub that takes agents, whose gate root's steps make (hub.sh,
+    `hubsetup.py one-server`, and the owner's Mac's key swap round there): no row there is no gate, so its agents
+    connect with no record, "egress_table" in the words that the manager has (the reads of the areas "Vault, keys and
+    access", MUST 2, and "Door and security", M2, of 23 November 2026: a hub that took agents later had none, and
+    nothing said so)."""
     row = q1("SELECT down, unloaded, reported FROM egress_servers WHERE server=?", (server,))
     if row is None:
-        return set()
+        return {"egress_table"} if hub_own else set()
     if row["reported"] <= t0 - SERVER_QUIET:
         return set(told) & {"egress", "egress_table"}
     return {"egress_table"} if row["unloaded"] >= 2 else {"egress"} if row["down"] >= 2 else set()
@@ -67702,7 +67725,7 @@ def server_watch_sweep(t0):
             since = (since or t0) if sec.get("reboot_required") else None
             now_found = set(server_troubles(reading, joined[name], since, t0) + load_troubles(load, told))
             now_found |= left_out(sec, told, READING_FACTS)     # what this reading cannot say holds
-            now_found |= egress_troubles(name, t0, told)
+            now_found |= egress_troubles(name, t0, told, hub_own=own and hub_shared(TEAM))
         if own and kind == "linux":     # its SSH and npm by the hub's own read, never by a reading of its service
             now_found = (now_found - set(MENDED_BY_MAC)) | hub_hardening_troubles(hub_read, claimed, told, t0)
         new, ended = sorted(now_found - told), sorted(told - now_found)
@@ -76502,33 +76525,12 @@ def health_view(kinds_seen=None):
         fix = (f"Sign {manager} in to another account." if spent else
                "Keep your own sessions off this account until it resets.")
         warn("allowance_spent" if spent else "allowance_pace", said, fix, agent=manager_name())
-    # The findings of the fleet's own sweeps, on the owner's screen (his rule, 19 October 2026: a screen that reports
-    # something wrong must carry the way to put it right). He is told only what the manager has already had and is
-    # not acting on: it had a turn after the notice and left the notice unread (plan C10). A circle the hub noticed a
-    # minute ago is the manager's to decide, and interrupting the owner with it is the drowning this work set out to
-    # stop. The hub still changes nothing about either.
-    #
-    # In his words (T-37): how many, and that nobody acts on them, with the one way on. The items themselves are the
-    # manager's to read (and a stuck task has the board's Stalled mark); the line names no tool and no number of a
-    # record. The hub changes nothing about either by itself: the third attempt is sometimes the right one, and
-    # cancelling work is a decision.
-    stuck = circles_waiting(t0)
-    if stuck:
-        one = len(stuck) == 1
-        warn("circles_stuck", f"{manager} has not acted on {len(stuck)} {'loop' if one else 'loops'} it was told of.",
-             f"Tell {manager} what to do about {'it' if one else 'them'}.", agent=manager_name())
-    wedged = tasks_stuck(t0)
-    if wedged:
-        one = len(wedged) == 1
-        warn("tasks_stuck", f"{len(wedged)} {'task is' if one else 'tasks are'} stuck, and nobody is acting on "
-                            f"{'it' if one else 'them'}.",
-             f"Tell {manager} what to do with {'it' if one else 'them'}.", agent=manager_name())
-    waiting = reports_waiting(t0)
-    if waiting:
-        one = len(waiting) == 1
-        warn("reports_undecided", f"{len(waiting)} {'report' if one else 'reports'} from your agents "
-                                  f"{'waits' if one else 'wait'} for a decision.",
-             f"Ask {manager} to decide {'it' if one else 'them'}.", agent=manager_name())
+    # No row for the findings of the fleet's own sweeps (owner API 1.331). The hub tells the manager, once, of work
+    # that runs in circles (circle_sweep), of a stuck task that it gave (stuck_told) and of a report that waits for its
+    # decision (requester_chase); a lead hears of its own, and what it leaves unread goes to the manager
+    # (lead_unread_sweep). The owner, 24 November 2026: "The manager should proactively know and ASK me ONLY when it
+    # has a question that's important, but it needs to MANAGE the team, not ask me to send a message." Before, a row
+    # asked him to tell the manager what to do with them.
     free = total = None
     try:
         st = os.statvfs(os.path.dirname(CFG.get("db_path") or ".") or ".")
@@ -86270,10 +86272,27 @@ class Handler(BaseHTTPRequestHandler):
             return self.signed_statement(data, ("recovery",))
         return self.ui_command("vault/recovery", read, self.signed_receipt, outside=central_statement)
 
+    def ui_vault_client(self):
+        """POST /ui/vault/client (owner API 1.317, F17 piece P1; no app uses it yet): a statement about the list of the
+        owner's devices, client-add or client-end, which the list key of one of them signed, with its signature, as they
+        came, to the central vault (central_statement). The vault checks it against its own list. 409 while the vault's
+        program takes no list (its status says lists: true when it does)."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "statement", "signature"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            said = self.signed_statement(data, ("client-add", "client-end"))
+            if not central_ok():                # a vault that does not answer is a 503, as each statement of central_call
+                raise Refusal(503, "no central vault answers on this hub")
+            if not central_takes_lists():
+                raise Refusal(409, "the central vault's program takes no list of devices yet")
+            return said
+        return self.ui_command("vault/client", read, client_statement_taken, outside=central_statement)
+
     @staticmethod
     def signed_statement(data, kinds):
-        """The body of POST /ui/vault/pin, /recovery and /grant: a statement of one of these kinds and its signature,
-        as they came. The hub reads the statement's kind and nothing else of either."""
+        """The body of POST /ui/vault/pin, /recovery, /grant and /client: a statement of one of these kinds and its
+        signature, as they came. The hub reads the statement's kind and nothing else of either."""
         statement, signature = data.get("statement"), data.get("signature")
         if not (isinstance(statement, str) and 0 < len(statement) <= CENTRAL_STATEMENT_MAX) or \
                 statement_kind(statement) not in kinds:
@@ -89198,6 +89217,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_vault_recovery()
         if parts == ["ui", "vault", "grant"]:
             return self.ui_vault_grant()
+        if parts == ["ui", "vault", "client"]:
+            return self.ui_vault_client()
         if parts == ["ui", "team", "accounts"]:
             return self.ui_team_account()
         if parts == ["ui", "team", "repos"]:

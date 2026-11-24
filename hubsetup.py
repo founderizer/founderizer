@@ -2457,7 +2457,7 @@ def hub_server(team_path, db=None, repo=None):
     return digest
 
 
-def one_server(hub_user="fleet", kit=None, run=None, account=None, vault=None, known=None):
+def one_server(hub_user="fleet", kit=None, run=None, account=None, vault=None, known=None, swap=None, gate=None):
     """The root part of one server for a hub that runs (owner feature hub_shared_later), as root on the hub's server,
     from root's own clone: what a first install with FLEET_HUB_SERVER=shared makes in its two steps, for a hub whose
     owner chose that step afterwards (hub.set_shape wrote `"hub": {"shared": true}` into team.json).
@@ -2468,14 +2468,21 @@ def one_server(hub_user="fleet", kit=None, run=None, account=None, vault=None, k
       makes: again here, because a hub from before them has none, and its server service needs them.
     - This server's own vault broker (vault_install), from root's clone: the program that root installs is one that
       the hub's user cannot change.
+    - Its key swap and its outgoing gate (swap_install, egress_install), as hub.sh's vault step and join.sh switch
+      them on after the broker, before the service starts: else an agent here gets each API key as a value, and no
+      host of it is recorded (the reads of the areas "Vault, keys and access", MUST 2, and "Door and security", M2,
+      of 23 November 2026). Each goes on when it stops, as at an install, and says why; the answer names its state.
+      Where an agent runs here already, the key swap is left to the owner's Mac, whose rule asks the owner first
+      (C31; the validator's R3-S3): "left".
     - As the hub's user: the server service's own clone beside the hub's checkout, from the hub's own repository by
       its path and never over git://, which proves no server; then its origin is the git:// address, as on a joined
       server. And hub_server, which makes the service's key, writes its SHA-256 into the hub's records and starts the
       service. That part needs no root, and the key is a file of the hub's user.
 
     It restarts no service of the hub, and it is safe to run again: each part reads first. The word is the owner's
-    command alone: without it in team.json this stops and changes nothing. Returns {"server", "vault", "service"},
-    each of the last two "made" or "there"."""
+    command alone: without it in team.json this stops and changes nothing. Returns {"server", "vault", "service",
+    "swap", "egress"}: the vault and the service "made" or "there", the key swap and the gate as their steps said
+    ("made", "there"), or "stopped", and the key swap "left" where an agent runs here already."""
     run = run or _shell
     kit = kit or KIT
     info = (account or hub_account)(hub_user)
@@ -2501,6 +2508,25 @@ def one_server(hub_user="fleet", kit=None, run=None, account=None, vault=None, k
     ports_install(hub_user, kit=kit, run=run, hub_port=port)
     agent_helper(service_user=hub_user, repo=repo, run=run, kit=kit)
     broker = (vault or vault_install)(kit=kit, hub_address=f"http://{address}:{port}", run=run)
+    parts = {}
+    if agents_of(team, name):
+        # An agent runs here already (a manager from an install before 0.1.112): its keys with a site would become
+        # placeholders with no word of the owner's, and the fleet's rule switches such a server only on the owner's yes
+        # (C31, the card "Switch on the key swap on ...?"). The owner's Mac's key swap round does it by that rule.
+        say("the key swap is left to the owner's Mac: an agent runs on this server already, and the Mac switches it on "
+            "by the fleet's rule, which asks the owner first where an agent here reads a key with a site.")
+        parts["swap"] = "left"
+    for part, step, words, after in (
+            ("swap", swap or swap_install, "the key swap", "this server gives each API key to a session as a value"),
+            ("egress", gate or egress_install, "the outgoing gate",
+             "the agents of this server connect with no record of their hosts")):
+        if part in parts:
+            continue
+        try:
+            parts[part] = step(run=run)
+        except (Stop, subprocess.TimeoutExpired, OSError) as e:     # _shell's time-out too: hub.sh goes on after it
+            say(f"{words} is not switched on: {str(e).rstrip('. ')}. The step goes on, and {after}.")
+            parts[part] = "stopped"
     had = (known or server_known)(os.path.join(info["home"], ".fleet", "pilot.db"), name)
     as_user = ("runuser -u %(u)s -- env HOME=%(home)s XDG_RUNTIME_DIR=/run/user/%(uid)d "
                "PATH=%(home)s/.local/bin:/usr/local/bin:/usr/bin:/bin " % {
@@ -2529,7 +2555,7 @@ def one_server(hub_user="fleet", kit=None, run=None, account=None, vault=None, k
     if code != 0:
         raise Stop(f"the server service of {name} could not be made: {(err or out).strip()[-300:]}")
     return {"server": name, "vault": "there" if broker.get("state") == "there" else "made",
-            "service": "there" if had else "made"}
+            "service": "there" if had else "made", **parts}
 
 
 def server_known(db, name):
@@ -4791,8 +4817,8 @@ def cmd_connect(args):
 def cmd_one_server(args):
     """one-server, as root on the hub's Linux machine, from root's own clone. The owner's app runs it over its root
     connection and reads its last line on standard output, which is always one JSON object: {"ok": true, "server",
-    "vault", "service"}, or {"ok": false, "error": "<one sentence>"} with a non-zero exit. Every line before it is
-    progress."""
+    "vault", "service", "swap", "egress"}, or {"ok": false, "error": "<one sentence>"} with a non-zero exit. Every line
+    before it is progress."""
     try:
         if platform.system() != "Linux":
             raise Stop("one server for all is for a hub on a Linux server, and this machine is not one.")

@@ -63,9 +63,10 @@ step that the owner chose on that slider (`"shape": {"step"}`, UI-API.md 1.176);
 by the owner's command and one root step on the hub's server, from root's own clone, which
 `hubsetup.py kit-clone` brings to the hub's release first: `python3
 /usr/local/lib/founderizer-kit/hubsetup.py one-server`. It first puts the kernel rule of the
-hub's ports in place (step 5), then makes this server's vault broker and its server service,
-whose checkout it clones from the hub's own repository by its path and not over `git://`, and
-it restarts no service of the hub. Founderizer does both from the
+hub's ports in place (step 5), then makes this server's vault broker, its key swap (while no
+agent runs there; else the owner's Mac switches it by the fleet's rule), its outgoing gate and
+its server service, whose checkout it clones from the hub's own repository by its path and not
+over `git://`, and it restarts no service of the hub. Founderizer does both from the
 manager's setup of a fleet that exists, on a hub that has them.
 
 What such a fleet does not have: **a door**. The hub knows the door's own calls by the

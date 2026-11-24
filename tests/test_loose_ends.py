@@ -195,19 +195,6 @@ class LeadReports(test_report_up.Base):
         self.assertEqual((r["decided_by"], r["decision"]), ("manager", "task"))
         self.assertNotIn("Reports waiting for your decision", hub.manager_resume_text())
 
-    def test_the_chase_and_the_owner_s_screen_say_whose_it_is(self):
-        self.end_parent()
-        hub.call_tool("manager", "read_messages", {})               # its closing empty read (plan C9)
-        said = self.said()[-1]
-        self.assertIn("UP-1 [outside_task] from hand waits for decide_report", said)
-        hub.kv_set("turn_ended:manager", self.clock + 1)     # plan C10: it had a turn and left that message unread
-        code, health = self.request("/ui/health?db=test-generation")
-        w = {x["kind"]: x for x in health["warnings"]}["reports_undecided"]
-        self.assertNotIn("owe(s) one", w["fix"])       # no lead can decide it, so the manager is not sent to one
-        self.assertFalse(self.tool("manager", "decide_report", report_id="UP-1", decision="noted")[1])
-        code, health = self.request("/ui/health?db=test-generation")
-        self.assertNotIn("reports_undecided", {x["kind"] for x in health["warnings"]})
-
     def test_the_manager_hears_of_it_once_when_the_lead_s_task_ends(self):
         hub.call_tool("manager", "read_messages", {})
         self.assertEqual([t for t in self.said() if "UP-1" in t], [])  # the lead's, while its task runs

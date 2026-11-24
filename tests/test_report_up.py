@@ -564,10 +564,11 @@ class Resume(Base):
 
 
 class OwnerScreen(Base):
-    """What the hub's two new findings put on the owner's own screen. His rule, 19 October 2026: a screen that
-    reports something wrong must carry the way to put it right. And the other half of it: he is told only what the
-    manager has already had and not settled, because a circle the hub noticed a minute ago is the manager's to
-    decide and interrupting him with it is the drowning this work set out to stop."""
+    """Work that runs in circles and a report that waits for a decision are the manager's to manage. The owner,
+    24 November 2026: "The manager should proactively know and ASK me ONLY when it has a question that's important,
+    but it needs to MANAGE the team, not ask me to send a message." So the hub tells the manager of each, once, and his
+    System status has no row that asks him to send the manager a message about them (owner API 1.331), also when the
+    manager had a turn after the notice and left it unread."""
 
     def warnings(self):
         code, health = self.request("/ui/health?db=test-generation")
@@ -578,112 +579,68 @@ class OwnerScreen(Base):
         """The manager's helper reports that its session ended a turn (plan C1)."""
         hub.kv_set("turn_ended:manager", self.clock if at is None else at)
 
-    def test_a_fresh_circle_is_the_manager_s_and_one_it_leaves_unread_after_a_turn_is_his_too(self):
-        """Plan C10: no clock. The owner sees a circle only while the manager had a turn after it was told of it and
-        left that message unread, so nobody is acting on it."""
+    def test_a_circle_is_told_to_the_manager_and_is_no_row_of_the_owner_s(self):
         self.new_task(restarts=3, title="The task that keeps starting")
         hub.circle_sweep(self.clock)
-        self.assertEqual(len(self.said()), 1)                       # the manager is told at once
-        self.assertNotIn("circles_stuck", self.warnings())          # the owner is not
+        said, = self.said()                                         # the manager is told at once
+        self.assertIn("lost 3 sessions in a row that left nothing", said)
         self.clock += 7 * 86400
-        self.assertNotIn("circles_stuck", self.warnings())          # a week with no turn of the manager's: nothing
-        self.turn_of_the_manager()
-        w = self.warnings()["circles_stuck"]
-        # T-37: how many, who is not acting, and the one way on; the circle's own line is the manager's
-        self.assertEqual((w["detail"], w["fix"]), ("Manager has not acted on 1 loop it was told of.",
-                                                   "Tell Manager what to do about it."))
-        self.assertIn("lost 3 sessions in a row that left nothing", self.said()[0])
-        self.assertEqual(w["agent"], "manager")
-        hub.q("UPDATE events SET read_at=? WHERE agent='manager'", (self.clock,))
-        self.assertNotIn("circles_stuck", self.warnings())          # it read it: the decision is its own
+        self.turn_of_the_manager()                                  # it had a turn and left the notice unread
+        # Bug: the circles_stuck row comes back and asks the owner to tell the manager what to do about the circle.
+        self.assertNotIn("circles_stuck", self.warnings())
         hub.q("UPDATE tasks SET restarts=0")                        # the circle is gone
         self.clock += 16 * 60
         hub.circle_sweep(self.clock)
-        self.assertIsNone(hub.kv_get("circle_watch"))
+        self.assertIsNone(hub.kv_get("circle_watch"))               # it leaves the map of first sightings
 
     def test_a_circle_that_comes_back_later_is_a_new_notice(self):
         again = self.new_task(restarts=3, title="The task that keeps starting")
         hub.circle_sweep(self.clock)
-        first = hub.kv_get("circle_notice")
-        hub.q("UPDATE events SET read_at=? WHERE id=?", (self.clock, int(first)))
+        self.assertEqual(len(self.said()), 1)
         hub.q("UPDATE tasks SET restarts=0 WHERE id=?", (again,))
         self.clock += 3600
-        hub.circle_sweep(self.clock)                                # it went: it leaves the map
+        hub.circle_sweep(self.clock)                                # it went: it leaves the map, and says nothing
+        self.assertEqual(len(self.said()), 1)
         hub.q("UPDATE tasks SET restarts=3 WHERE id=?", (again,))
         self.clock += 3600
         hub.circle_sweep(self.clock)                                # it came back: told again
-        self.assertNotEqual(hub.kv_get("circle_notice"), first)
-        self.turn_of_the_manager(self.clock + hub.LATER_WAIT - 1)   # a turn before that message woke it
-        self.assertNotIn("circles_stuck", self.warnings())
-        self.turn_of_the_manager(self.clock + hub.LATER_WAIT + 1)
-        self.assertIn("circles_stuck", self.warnings())
+        # Bug: a circle that went and came back stays in the sweep's set, so the manager never hears of its return.
+        self.assertEqual(len(self.said()), 2)
 
-    def test_a_report_reaches_his_screen_only_when_nobody_is_deciding_it(self):
+    def test_a_report_that_waits_for_a_decision_is_told_to_the_manager_and_is_no_row_of_the_owner_s(self):
         parent = self.new_task(owner="lead", requester="manager", title="Ship the shop")
         hub.q("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,1,?,'created')", (parent, self.clock))
         sub = self.new_task(owner="hand", requester="lead", parent=parent)
         self.assertFalse(self.report("vps")[1])
         self.assertFalse(self.report("hand", task=sub, text="The theme is broken on mobile.")[1])
         hub.call_tool("manager", "read_messages", {})               # its closing empty read (plan C9)
-        self.assertEqual(len([t for t in self.said() if "You read these and left them open" in t]), 1)   # told
-        self.assertNotIn("reports_undecided", self.warnings())      # the owner is not
+        chase, = [t for t in self.said() if "You read these and left them open" in t]
+        self.assertIn("UP-1 [outside_task] from vps waits for decide_report", chase)     # told
         self.clock += 7 * 86400
-        self.assertNotIn("reports_undecided", self.warnings())      # plan C10: no clock
         self.turn_of_the_manager()                                  # it had a turn and left the message unread
-        w = self.warnings()["reports_undecided"]
-        # T-37: how many, and the one way on, with no tool's name
-        self.assertEqual((w["detail"], w["fix"]), ("1 report from your agents waits for a decision.",
-                                                   "Ask Manager to decide it."))
-        self.assertEqual(w["agent"], "manager")
+        # Bug: the reports_undecided row comes back and asks the owner to ask the manager to decide the report.
+        self.assertNotIn("reports_undecided", self.warnings())
         # The lead's own report is named to it in its task's session, and counts by that session's turns.
         chase = hub.requester_chase("lead", self.clock, task=hub.q1("SELECT * FROM tasks WHERE id=?", (parent,)))
         hub.chased("lead", chase[1], hub.emit("lead", "say", chase[0], task=parent))
-        self.assertIn("1 report from", self.warnings()["reports_undecided"]["detail"])
         hub.q("UPDATE attempts SET turn=? WHERE task=?", (json.dumps({"session": "s", "seq": 9, "turns": 1,
                                                                       "running": False, "how": "end_turn",
                                                                       "at": self.clock + 1, "calls": {},
                                                                       "said": None}), parent))
-        # The owner, 29 October 2026: what a lead leaves unread goes to the manager first, and reaches his screen
-        # only when the manager had a turn after that and left it unread too.
-        self.assertIn("1 report from", self.warnings()["reports_undecided"]["detail"])
+        # The owner, 29 October 2026: what a lead leaves unread goes to the manager, once.
         hub.lead_unread_sweep(self.clock)
-        self.assertIn("UP-2 [outside_task] from hand: lead was named it to decide", self.said()[-1])
-        self.turn_of_the_manager(self.clock + 2)
-        w = self.warnings()["reports_undecided"]
-        # one way on: the manager decides, and asks the lead that owes one itself
-        self.assertEqual((w["detail"], w["fix"]), ("2 reports from your agents wait for a decision.",
-                                                   "Ask Manager to decide them."))
-        self.assertFalse(self.tool("manager", "decide_report", report_id="UP-1", decision="noted")[1])
-        self.assertFalse(self.tool("lead", "decide_report", task=parent, report_id="UP-2", decision="wrong")[1])
-        self.assertNotIn("reports_undecided", self.warnings())      # decided is decided
+        told = self.said()
+        self.assertIn("UP-2 [outside_task] from hand: lead was named it to decide", told[-1])
+        hub.lead_unread_sweep(self.clock)
+        self.assertEqual(self.said(), told)                         # bug: the manager hears it again at each tick
+        self.turn_of_the_manager(self.clock + 2)                    # and the manager left that unread too
+        self.assertNotIn("reports_undecided", self.warnings())
 
-    def test_a_lesson_for_others_never_reaches_his_screen(self):
+    def test_a_lesson_for_others_asks_the_manager_for_no_decision(self):
         self.assertFalse(self.report(kind="lesson_for_others", text="A fact the others need.")[1])
-        hub.call_tool("manager", "read_messages", {})
-        self.clock += 60
-        self.turn_of_the_manager()
-        self.assertNotIn("reports_undecided", self.warnings())      # it wants a knowledge file, not a decision
-
-    def test_both_new_warnings_carry_the_way_out_and_name_an_agent_this_fleet_has(self):
-        self.new_task(restarts=3, title="The task that keeps starting")
-        hub.circle_sweep(self.clock)
-        self.assertFalse(self.report()[1])
-        hub.call_tool("manager", "read_messages", {})               # reads the circles
-        hub.call_tool("manager", "read_messages", {})               # its closing empty read names the report
-        self.clock += hub.LATER_WAIT + 60
-        hub.q("UPDATE tasks SET restarts=0")
-        hub.circle_sweep(self.clock)
-        hub.q("UPDATE tasks SET restarts=3")
-        self.clock += hub.LATER_WAIT + 60
-        hub.circle_sweep(self.clock)                                # told again, and not read
-        self.clock += hub.LATER_WAIT + 60
-        self.turn_of_the_manager()
-        got = self.warnings()
-        for kind in ("circles_stuck", "reports_undecided"):
-            self.assertIn(kind, got)
-            self.assertTrue(got[kind]["detail"].strip(), kind)
-            self.assertTrue(got[kind]["fix"].strip(), kind)
-            self.assertIn(got[kind]["agent"], hub.agents(), kind)
+        hub.call_tool("manager", "read_messages", {})               # its closing empty read (plan C9)
+        # Bug: the chase names a lesson, which wants a knowledge file and not a decision, as a report to decide.
+        self.assertEqual([t for t in self.said() if "UP-1" in t], [])
 
 
 class Bugs(Base):

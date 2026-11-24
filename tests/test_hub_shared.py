@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import json
 import os
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -677,12 +678,16 @@ class Later(HubService, Servers):
     def test_roots_step_makes_the_vault_and_the_server_service_of_a_hub_that_runs(self):
         """hubsetup.py one-server, which the owner's Mac runs as root from root's own clone after the owner's
         command: first the kernel rule of the hub's ports (ports.py), then the root helpers, the vault broker from
-        root's clone, and, as the hub's user, the service's own clone and hub-server. The clone comes from the hub's
-        own bare repository by its path, and only then gets the git:// address as its origin: git:// proves no
-        server, and while the hub's git service does not run, a listener of an agent's user on 9418 would give the
-        hub's user its code (MUST 1 and MUST 3 of the read "F1 P8" of the area "Vault, keys and access"). Without
-        the owner's word in team.json it stops and runs nothing, and a rule that does not hold stops it before any
-        other part. A hub on another port than 8765 gets the rule on its own port."""
+        root's clone, its key swap and its outgoing gate, and, as the hub's user, the service's own clone and
+        hub-server. The clone comes from the hub's own bare repository by its path, and only then gets the git://
+        address as its origin: git:// proves no server, and while the hub's git service does not run, a listener of
+        an agent's user on 9418 would give the hub's user its code (MUST 1 and MUST 3 of the read "F1 P8" of the area
+        "Vault, keys and access"). Without the owner's word in team.json it stops and runs nothing, and a rule that
+        does not hold stops it before any other part. A hub on another port than 8765 gets the rule on its own port.
+        The key swap and the gate come after the broker and before the service, as hub.sh's vault step has them:
+        until 23 November 2026 this step made neither, so an agent there got each API key as a value and no host of
+        it was recorded (the reads of the areas "Vault, keys and access", MUST 2, and "Door and security", M2). Each
+        goes on when it stops, and the answer says so."""
         home = self.root / "home-of-fleet"
         checkout = home / "fleet-pilot"
         checkout.mkdir(parents=True)
@@ -701,7 +706,9 @@ class Later(HubService, Servers):
         fakes = dict(kit="/usr/local/lib/founderizer-kit", run=run, account=account,
                      vault=lambda **given: (parts.append(("vault", given["kit"], given["hub_address"])),
                                             {"state": "made"})[1],
-                     known=lambda db, name: (parts.append(("known", db, name)), False)[1])
+                     known=lambda db, name: (parts.append(("known", db, name)), False)[1],
+                     swap=lambda run: (parts.append(("swap",)), "made")[1],
+                     gate=lambda run: (parts.append(("egress",)), "made")[1])
         helper = patch.object(hubsetup, "agent_helper", lambda **given: parts.append(
             ("helper", given["service_user"], given["repo"], given["kit"])))
         quiet = patch.object(hubsetup, "say", lambda *_a: None)
@@ -716,10 +723,11 @@ class Later(HubService, Servers):
             team["servers"] = {"hub": {"kind": "linux", "user": "fleet"}}
             (checkout / "team.json").write_text(json.dumps(team))
             done = hubsetup.one_server(**fakes)
-        self.assertEqual(done, {"server": "hub", "vault": "made", "service": "made"})
+        self.assertEqual(done, {"server": "hub", "vault": "made", "service": "made", "swap": "made", "egress": "made"})
         repo = f"git://{HUB}/fleet-pilot.git"
         self.assertEqual(parts, [("ports",), ("helper", "fleet", repo, "/usr/local/lib/founderizer-kit"),
                                  ("vault", "/usr/local/lib/founderizer-kit", f"http://{HUB}:8765"),
+                                 ("swap",), ("egress",),
                                  ("known", str(home / ".fleet" / "pilot.db"), "hub"), ("run",), ("run",)])
         as_user = (f"runuser -u fleet -- env HOME={home} XDG_RUNTIME_DIR=/run/user/1000 "
                    f"PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin ")
@@ -734,9 +742,11 @@ class Later(HubService, Servers):
         # clone is not made again
         (home / "fleet-server" / ".git").mkdir(parents=True)
         ran.clear()
-        again = dict(fakes, vault=lambda **given: {"state": "there"}, known=lambda db, name: True)
+        again = dict(fakes, vault=lambda **given: {"state": "there"}, known=lambda db, name: True,
+                     swap=lambda run: "there", gate=lambda run: "there")
         with helper, quiet:
-            self.assertEqual(hubsetup.one_server(**again), {"server": "hub", "vault": "there", "service": "there"})
+            self.assertEqual(hubsetup.one_server(**again), {"server": "hub", "vault": "there", "service": "there",
+                                                           "swap": "there", "egress": "there"})
             self.assertEqual([("/ports.py install" in one, "hub-server" in one) for one in ran],
                              [(True, False), (False, True)])
             # a hub on another port (hub.sh --port, team.json's hub.port): the rule keeps that port, not 8765 (the
@@ -748,6 +758,37 @@ class Later(HubService, Servers):
             hubsetup.one_server(**again)
             self.assertIn("install --hub-user fleet --hub-port 8800", ran[0])
             (checkout / "team.json").write_text(json.dumps(dict(moved, hub=dict(moved["hub"], port=8765))))
+        # a key swap that stops: the gate and the service still come, and the answer and a line say so
+        def stops(run):
+            raise hubsetup.Stop("This machine has no vault broker of its own to configure.")
+        said = []
+        with helper, patch.object(hubsetup, "say", said.append):
+            done = hubsetup.one_server(**dict(again, swap=stops))
+        self.assertEqual((done["swap"], done["egress"], done["service"]), ("stopped", "there", "there"))
+        self.assertIn("the key swap is not switched on: This machine has no vault broker of its own to configure. The "
+                      "step goes on, and this server gives each API key to a session as a value.", said)
+        # a step that runs past its time (_shell's time-out) goes on too, as hub.sh does, and the service still comes
+        def slow(run):
+            raise subprocess.TimeoutExpired("python3 -I /usr/local/lib/fleet-vault/vault.py configure", 300)
+        said.clear()
+        with helper, patch.object(hubsetup, "say", said.append):
+            done = hubsetup.one_server(**dict(again, gate=slow))
+        self.assertEqual((done["swap"], done["egress"], done["service"]), ("there", "stopped", "there"))
+        self.assertIn("the outgoing gate is not switched on: Command 'python3 -I /usr/local/lib/fleet-vault/vault.py "
+                      "configure' timed out after 300 seconds. The step goes on, and the agents of this server connect "
+                      "with no record of their hosts.", said)
+        # an agent runs on the hub's server already (a manager from an install before 0.1.112): root switches no key of
+        # it to a placeholder with no word of the owner's (C31; the validator's R3-S3), and the gate still comes
+        del team["agents"]["manager"]["placed"]
+        (checkout / "team.json").write_text(json.dumps(team))
+        said.clear()
+        with helper, patch.object(hubsetup, "say", said.append):
+            done = hubsetup.one_server(**dict(again, swap=stops))
+        self.assertEqual((done["swap"], done["egress"], done["service"]), ("left", "there", "there"))
+        self.assertIn("the key swap is left to the owner's Mac: an agent runs on this server already, and the Mac "
+                      "switches it on by the fleet's rule, which asks the owner first where an agent here reads a key "
+                      "with a site.", said)
+        with helper, quiet:
             # each stop has its reason: a hub-server that failed, a rule of the hub's ports that does not hold (before
             # any other part), and a checkout whose origin is no repository of the hub
             failed = dict(again, run=lambda script, timeout=None: (0, held, "") if "/ports.py" in script

@@ -102,6 +102,8 @@ class FakeCentral:
         self.grants, self.pool = [], []         # what the owner signed: {login, agent, machine}, and pooled logins
         self.removes = True                     # its status says that it serves remove; an older program's does not
         self.replaces = True                    # and that it takes the owner's signed replace of a value
+        self.lists = True                       # and the statements of the list of the owner's devices
+        self.clients = None                     # that list, {"entries", "ended"}, or none yet
         self.values = {}                        # the checksum of the copy of the newest replace of each login
         self.prints = None                      # the fingerprints that it names for the value of an intake
         self.stop = threading.Event()
@@ -159,7 +161,16 @@ class FakeCentral:
                     "pins": {m: {"recipient": k, "at": 1761300000} for m, k in self.pins.items()},
                     "recovery": self.recovery, "grants": list(self.grants), "pool": list(self.pool),
                     "items": len(self.items), "source": "0" * 64, **({"removes": True} if self.removes else {}),
-                    **({"replaces": True, "values": dict(self.values)} if self.replaces else {})}
+                    **({"replaces": True, "values": dict(self.values)} if self.replaces else {}),
+                    **({"lists": True, "clients": self.clients} if self.lists else {})}
+        if op in ("client-add", "client-end"):
+            said = json.loads(r["statement"])
+            if said["kind"] != op:
+                return self.no("this statement is not of this kind")
+            again = sum(1 for x in self.requests if x == r) > 1
+            return dict({"ok": True, "v": 2, "kind": op, "saved": "same" if again else "new" if op == "client-add" else
+                         "ended"}, **({"device": said["device"]} if op == "client-add" else
+                                      {"devices": ["pc"], "left_out": 0}))
         if op == "intake":
             saved = "new" if r["login"] not in self.items else "replaced" if "statement" in r else "same"
             self.items[r["login"]] = r["title"]
@@ -641,6 +652,76 @@ class Central(WithCentral, OwnerAPI):
         self.assertEqual(code, 409, body)
         self.assertIn("valid signature of the owner", body["error"])
         self.assertIn("signed_grants", hub.UI_FEATURES)
+
+    # ---- POST /ui/vault/client: the list of the owner's devices (owner API 1.317, F17 piece P1)
+    def client_rows(self):
+        return [tuple(r) for r in hub.q("SELECT kind, statement, signature, saved FROM owner_client_statements "
+                                        "ORDER BY id")]
+
+    def test_a_statement_of_the_list_of_devices_passes_through_as_it_came_and_is_kept_once(self):
+        """The hub carries a client-add or a client-end to the central vault byte for byte, keeps it as it came, and
+        makes none. Bugs: the hub changes a byte, and the vault refuses the owner's statement; a statement that the
+        vault refused is kept as one that it took; one that comes again is kept two times; another kind goes by this
+        route; an app shows the feature before its piece."""
+        fleet = hub.fleet_id()
+        add = statement(kind="client-add", fleet=fleet, device="pc", os="windows", label="PC", sign="S", list="L")
+        end = statement(kind="client-end", fleet=fleet, keys="ab" * 32)
+        hub.central_read()
+        code, receipt = self.signed("/ui/vault/client", add)
+        self.assertEqual(code, 200, receipt)
+        self.assertEqual({k: receipt.get(k) for k in ("kind", "device", "saved", "left_out")},
+                         {"kind": "client-add", "device": "pc", "saved": "new", "left_out": None})
+        self.assertEqual(self.vault.requests[-1], {"v": 2, "op": "client-add", "statement": add, "signature": SIGNATURE})
+        self.assertTrue(hub.CENTRAL["due"])                 # the next pass reads the vault's list again
+        self.assertEqual(self.signed("/ui/vault/client", add)[1]["saved"], "same")
+        code, receipt = self.signed("/ui/vault/client", end)
+        self.assertEqual((code, receipt["devices"], receipt["left_out"], receipt["saved"]), (200, ["pc"], 0, "ended"))
+        kept = [("client-add", add, SIGNATURE, "new"), ("client-end", end, SIGNATURE, "ended")]
+        self.assertEqual(self.client_rows(), kept)
+        for other in (statement(kind="pin", fleet=fleet, machine="vps", recipient=STORE_A),
+                      statement(kind="grant", fleet=fleet, login=LOGIN_B, agent="studio", machine="studio"),
+                      statement(kind="client-first", fleet=fleet, device="pc"), "not json"):
+            self.assertEqual(self.signed("/ui/vault/client", other)[0], 400)
+        self.assertEqual(self.signed("/ui/vault/pin", add)[0], 400)
+        self.assertEqual(self.signed("/ui/vault/grant", end)[0], 400)
+        self.vault.refuse["client-add"] = "the statement does not carry a valid signature of a list key"
+        code, body = self.signed("/ui/vault/client", statement(kind="client-add", fleet=fleet, device="next"))
+        self.assertEqual((code, body["error"]), (409, "the central vault refused: the statement does not carry a valid "
+                                                      "signature of a list key"))
+        self.assertEqual(self.client_rows(), kept)          # what the vault refused is no record
+        self.assertNotIn("client_list", hub.ui_features() + hub.UI_FEATURES)
+        self.assertEqual(self.vault.locked, [])
+
+    def test_a_vault_that_takes_no_list_is_asked_for_none(self):
+        """The central vault's program comes by root's step and not by a release, so it can be older than the hub. Bug:
+        the app reads "unknown operation" in place of a reason that it can wait for. And a vault that does not answer is
+        a 503, as UI-API says, not "takes no list": else an app would tell him to wait for an update that is there."""
+        self.vault.lists = False
+        end = statement(kind="client-end", fleet=hub.fleet_id(), keys="ab" * 32)
+        code, body = self.signed("/ui/vault/client", end)       # no reading of the vault yet: it does not answer
+        self.assertEqual((code, body["error"]), (503, "no central vault answers on this hub"))
+        hub.central_read()
+        code, body = self.signed("/ui/vault/client", end)
+        self.assertEqual((code, body["error"]), (409, "the central vault's program takes no list of devices yet"))
+        self.assertEqual((self.vault.ops("client-end"), self.client_rows()), ([], []))
+
+    def test_with_the_list_of_devices_no_recovery_key_is_needed_and_no_copy_of_the_code_is_taken(self):
+        """F17 4.2 (K6 ends), at the hub. Bugs: a vault with a list takes no recovery key and the hub takes no secret
+        without one, so no secret can be added at all; a phone still keeps a code that opens nothing."""
+        hub.central_read()
+        self.assertIn("holds no recovery key yet", hub.central_refusal())
+        self.assertIn("recovery_copy", hub.ui_features())
+        self.vault.clients = {"entries": [], "ended": 0}
+        hub.central_read()
+        self.assertIsNone(hub.central_refusal())
+        offered = [name for name in hub.UI_FEATURES if name != "recovery_copy"] + ["central_vault", "secret_replace"]
+        self.assertEqual(self.request()[1]["ui_features"], offered)
+        with self.assertRaises(hub.Refusal) as refused:
+            hub.save_recovery_copy("iphone", "AAAA")
+        self.assertIn("no phone keeps one", str(refused.exception))
+        self.vault.refuse["status"] = "the store does not open"         # a silent vault keeps what it said last
+        hub.central_read()
+        self.assertNotIn("recovery_copy", hub.ui_features())
 
     def test_the_reconciler_seals_only_what_the_owner_signed_for_that_machine(self):
         """A grant that team.json holds and the owner never signed reaches no machine, and one whose signature the
@@ -1418,6 +1499,18 @@ class CentralCopy(WithCentral, Fixture):
         self.assertIn("**Your central vault.**", notes)
         self.assertEqual(self.vault.ops("export"), [])
         self.assertEqual(self.bundle(_data)["central"], None)
+
+    def test_with_the_list_of_devices_no_copy_has_the_vaults_store(self):
+        """F17 4.2 (K6 ends, N26): a copy of the fleet carries nothing that a recovery code opens. Bug: the hub asks for
+        an export that the vault refuses, at each copy, and says only that the vault gave none."""
+        self.vault.recovery, self.vault.clients = RECOVERY, {"entries": [], "ended": 0}
+        hub.central_read()
+        _data, zf, manifest, notes = self.copy()
+        self.assertNotIn(hub.CENTRAL_MEMBER, zf.namelist())
+        self.assertEqual(manifest["central_vault"], {"in": None, "vault": True, "why": "the central vault has the list of "
+                                                     "your devices, so it makes no copy of its store"})
+        self.assertIn("no key anywhere in this copy", notes)
+        self.assertEqual(self.vault.ops("export"), [])
 
     def test_a_hub_with_no_central_vault_says_nothing_of_one(self):
         self.vault.close()                                # never read, and gone

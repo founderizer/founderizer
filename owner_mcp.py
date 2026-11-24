@@ -332,6 +332,8 @@ NOT_TOOLS = {
                          "none), puts the host's parts in place and writes the door's access file over the owner's "
                          "own SSH (DevOps plan C4)",
     "/ui/vault/recovery": "a statement signed with the owner's own key, which only their app on their Mac holds",
+    "/ui/vault/client": "a statement signed with the list key of one of the owner's devices, which only that device "
+                        "holds, and which asks for the owner's finger, face or password",
     "/ui/vault/grant": "a statement signed with the owner's own key, which only their app on their Mac holds; for a "
                        "grant of a secret to an agent, or its end, the app's program on the owner's Mac has "
                        "grant_secret (~/.founderizer/cli write grant_secret), and for a secret into the grantable "

@@ -910,6 +910,9 @@ class ConfigureEgress(unittest.TestCase):
         self.assertLess(off.index(f"flock {vault.EGRESS_LOCK} sh -c "), off.index("delete table"))
         self.assertIn("delete table inet founderizer_egress || exit 1; fi; rm -f", off)
         self.assertLess(off.index("rm -f " + vault.EGRESS_RULES), off.index("disable --now fleet-egress >"))
+        # root's off keeps the gate's configuration: the owner's Mac makes a gate on the hub's own server only where
+        # that file is not there (KeySwapRemote.gate), so without it the Mac's next keys step there undoes root's off
+        self.assertNotIn("rm -f " + vault.EGRESS_CONF, off)
         # a table that does not go stops the step before the gate stops: the agents still have their gate
         machine = Machine()
         self.step(machine)

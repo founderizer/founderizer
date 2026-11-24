@@ -30,7 +30,7 @@ import hub
 import vault
 from test_setup import git
 from test_ui_api import OwnerAPI
-from test_vault_central import OWNER_C, canon, owner_sign
+from test_vault_central import OWNER_C, about, canon, device, hashes, owner_sign, scalar
 from leftovers import scratch_home
 
 AGE, KEYGEN = shutil.which("age"), shutil.which("age-keygen")
@@ -649,6 +649,42 @@ class EndToEnd(OwnerAPI):
         self.give("vps", None)
         self.pass_once()
         self.assertEqual(self.held("vps"), {})
+
+    def test_a_device_that_the_list_takes_by_the_hub_signs_a_grant_and_signs_none_after_its_end(self):
+        """F17, piece P1, from the hub's route to the vault's own serving code: root gives the first list key, the hub
+        carries an add and an end, and each counts at the vault at once. Bugs: the hub's route and the vault's operation
+        do not fit; the running vault reads the list only at its start; the hub still asks for a recovery key, which
+        such a vault refuses, so no secret can be added."""
+        fleet_id, mac, pc = hub.fleet_id(), device("mac", sign=OWNER_C), device("pc", "windows")
+        said = about("client-first", fleet=fleet_id, **mac)
+        self.assertEqual(vault.first_list_key(self.central, {"statement": said,
+                                                             "signature": owner_sign(said)})["saved"], "new")
+        hub.central_read()
+        self.assertEqual(hub.CENTRAL["status"]["clients"]["entries"][0]["device"], "mac")
+
+        def client(kind, **fields):
+            said = about(kind, fleet=fleet_id, at=int(hub.now()), **fields)
+            return self.request("/ui/vault/client", self.cmd(statement=said,
+                                                             signature=owner_sign(said, scalar("mac list"))))
+
+        def granted(at):
+            said = canon({"v": 1, "kind": "grant", "fleet": fleet_id, "login": KEY_REF, "agent": "vps", "machine": "vps",
+                          "at": int(hub.now()) + at})
+            return self.request("/ui/vault/grant", self.cmd(statement=said, signature=owner_sign(said, scalar("pc sign"))))
+        self.assertEqual(granted(1)[0], 409)                            # not in the list yet
+        code, body = client("client-add", **pc)
+        self.assertEqual((code, body.get("saved"), body.get("device")), (200, "new", "pc"), body)
+        self.assertEqual(granted(2)[0], 200)
+        code, body = client("client-end", keys=",".join(sorted(hashes(pc))))
+        self.assertEqual((code, body.get("saved"), body.get("devices")), (200, "ended", ["pc"]), body)
+        code, body = granted(3)
+        self.assertEqual((code, "valid signature of the owner" in body["error"]), (409, True), body)
+        self.assertEqual([r["kind"] for r in hub.q("SELECT kind FROM owner_client_statements ORDER BY id")],
+                         ["client-add", "client-end"])
+        hub.central_read()
+        self.assertEqual(hub.CENTRAL["status"]["clients"]["ended"], 2)
+        self.assertIsNone(hub.central_refusal())
+        self.assertIsNone(hub.central_backup()[0])
 
 
 if __name__ == "__main__":

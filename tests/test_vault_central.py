@@ -9,9 +9,11 @@ network. The owner's P-256 keys and signatures are real. They were made with ope
 -verify`) before it was put here, so this test needs no openssl. They were made again in the same way on 11
 November 2026, when the fleet id of these statements became an example one, and no private half was kept.
 """
+import argparse
 import base64
 import contextlib
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -144,6 +146,39 @@ def pooled(ref, at, kind="pool"):
 
 def halves(signature):
     return vault.der_signature(base64.b64decode(signature))
+
+
+# ---- made-up devices of the owner's (F17): each key is the public half of a scalar from its name, which signs here
+def scalar(name):
+    found = hashlib.sha256(b"a key of the list of devices: " + name.encode()).digest()
+    return int.from_bytes(found, "big") % (vault.P256_N - 1) + 1
+
+
+def device(name, kind="mac", **changes):
+    """The fields of one device in a statement and in the list: its keys come from its name."""
+    made = {"device": name, "os": kind, "label": name.capitalize()}
+    for key in ("sign", "list") + (("save",) if kind == "iphone" else ()):
+        made[key] = changes.get(key) or owner_point(scalar(f"{name} {key}"))
+    return made
+
+
+def hashed(key):
+    """The name of a public key in an end and in a record, written out here: the SHA-256 of its 65 bytes."""
+    return hashlib.sha256(base64.b64decode(key)).hexdigest()
+
+
+def hashes(one):
+    return [hashed(one[key]) for key in ("sign", "list", "save") if key in one]
+
+
+def never_held(count):
+    """Names of keys that no list ever held."""
+    return [hashlib.sha256(f"never held {n}".encode()).hexdigest() for n in range(count)]
+
+
+def about(kind, at=T1, fleet=FLEET, **fields):
+    """The canonical text of a statement about the list of devices."""
+    return canon(dict({"v": 1, "kind": kind, "fleet": fleet, "at": at}, **fields))
 
 
 def registered(value, salts=SALTS):
@@ -508,8 +543,8 @@ class Configuration(unittest.TestCase):
             self.assertIn("Founderizer has no Bitwarden backend any more", str(refused.exception))
 
 
-class CentralVault(unittest.TestCase):
-    """The central vault's operations, as the hub's user asks them, with a stand-in age and its own store."""
+class CentralFixture:
+    """A central vault for one test, as the hub's user asks it, with a stand-in age and its own store."""
 
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix="fc-"))         # short: a Unix socket path has at most 104 bytes
@@ -582,6 +617,14 @@ class CentralVault(unittest.TestCase):
     def state(self):
         return json.loads(Path(self.conf["state"]).read_text())
 
+    def beside(self, name):
+        """A file beside the vault's state."""
+        return Path(self.conf["state"]).parent / name
+
+
+class CentralVault(CentralFixture, unittest.TestCase):
+    """The central vault's operations."""
+
     # ---- who may ask, and what
     def test_only_the_hubs_user_may_ask(self):
         for uid in (os.getuid(), HUB_UID + 1, 0):           # the vault's own user, another user, root
@@ -601,7 +644,8 @@ class CentralVault(unittest.TestCase):
                                               "store_recipient": STORE_KEY, "fleet": FLEET, "owner_keys": 3,
                                               "pins": {}, "recovery": None, "grants": [], "pool": [], "items": 1,
                                               "removes": True, "replaces": True, "key_addresses": True,
-                                              "hub_keys": True, "hub_key_ids": {}, "values": {}, "source": None})
+                                              "hub_keys": True, "hub_key_ids": {}, "values": {}, "lists": True,
+                                              "clients": None, "source": None})
         self.signed("pin", PIN_1, SIG_PIN_1)
         self.signed("recovery", RECOVERY_1, SIG_RECOVERY_1)
         status = self.ask("status")
@@ -1227,6 +1271,582 @@ class CentralVault(unittest.TestCase):
         for line in self.logged:
             for secret in (LOGIN["password"], LOGIN["totp"], "AGE-SECRET-KEY", R1, RR, FLEET, PIN_1, SIG_PIN_1):
                 self.assertNotIn(secret, line)
+
+    def test_a_vault_with_no_list_of_devices_is_as_it_was_and_takes_no_change_of_one(self):
+        """F17 4.2 with N10: the rules of the list turn on by the fleet's own list, never by a release. Bugs: a release
+        starts a list by itself, so that root's step for a new Mac of the owner's changes nothing and he is shut out; or
+        the sign key, with no list key anywhere, adds a device."""
+        self.signed("recovery", RECOVERY_1, SIG_RECOVERY_1)
+        for said in (about("client-add", **device("pc", "windows")), about("client-end", keys=never_held(1)[0])):
+            self.assertEqual(self.refused(json.loads(said)["kind"], statement=said, signature=owner_sign(said)),
+                             "this vault has no list of the owner's devices yet, so it takes no change of one")
+        self.assertEqual(self.refused("client-first"), "unknown operation")     # root's way alone gives the first one
+        self.assertEqual(self.ask("export")["recovery"], RR)
+        self.conf["owner_keys"] = [OWNER_B]                     # root's install took the other keys away: as before
+        self.assertIn("valid signature of the owner", self.refused("pin", statement=PIN_1, signature=SIG_PIN_1))
+        self.assertEqual(self.signed("pin", PIN_2, SIG_PIN_2)["saved"], "new")
+        self.assertFalse(self.beside("clients.json").exists())
+
+
+class Signers(CentralFixture, unittest.TestCase):
+    """Who signed each kept record, and when the vault took it (F17, design A, 1.1 and 1.5)."""
+
+    def signers(self):
+        return json.loads(self.beside("signers.json").read_text())
+
+    def decide(self, statement, secret=OWNER_C_SECRET):
+        return self.ask(json.loads(statement)["kind"], statement=statement, signature=owner_sign(statement, secret))
+
+    def test_each_kept_record_has_its_signer_and_the_vaults_own_time_in_a_file_of_its_own(self):
+        """F17 1.1 and 1.5 (N4): pin, unpin, grant, ungrant, pool, unpool and replace. Bugs: after the end of a device
+        nobody can say what it gave; a record names the signer of the record before it; the signer is written into the
+        state, which the program from before refuses after a put-back (N6)."""
+        before = int(time.time())
+        self.signed("pin", PIN_1, SIG_PIN_1)                                        # key A
+        self.decide(grant(REF, "vps", "vps", T1))                                   # key C
+        self.decide(pooled(OTHER_REF, T1))
+        self.intake()
+        new = dict(LOGIN, password="TheNewFakePassword-20261123")
+        fields = self.intake_fields(value=new, prints=registered(LOGIN) + registered(new))
+        said = canon({"v": 1, "kind": "replace", "fleet": FLEET, "login": REF, "at": T2,
+                      "sha256": hashlib.sha256(fields["ciphertext"].encode()).hexdigest()})
+        self.ask("intake", **dict(fields, statement=said, signature=owner_sign(said)))
+        a, b, c = hashed(OWNER_A), hashed(OWNER_B), hashed(OWNER_C)
+        kept = self.signers()
+
+        def of(record):
+            self.assertTrue(before <= record["when"] <= int(time.time()), record)
+            self.assertEqual(set(record), {"at", "by", "when"})
+            return record["by"], record["at"]
+        self.assertEqual(of(kept["pins"]["vps"]), (a, T1))
+        self.assertEqual(of(kept["grants"][REF]["vps"]), (c, T1))
+        self.assertEqual(of(kept["pool"][OTHER_REF]), (c, T1))
+        self.assertEqual(of(kept["values"][REF]), (c, T2))
+        self.assertEqual(stat.S_IMODE(self.beside("signers.json").stat().st_mode), 0o600)
+        # each record names the signer of its own newest statement, and the ends name theirs
+        self.signed("pin", PIN_2, SIG_PIN_2)                                        # key B
+        self.decide(grant(REF, "vps", None, T2, kind="ungrant"))
+        self.decide(pooled(OTHER_REF, T2, kind="unpool"))
+        kept = self.signers()
+        self.assertEqual((of(kept["pins"]["vps"]), of(kept["grants"][REF]["vps"]), of(kept["pool"][OTHER_REF])),
+                         ((b, T2), (c, T2), (c, T2)))
+        self.signed("unpin", UNPIN_3, SIG_UNPIN_3)                                  # key A again
+        self.assertEqual(of(self.signers()["pins"]["vps"]), (a, T3))
+        # the state's own members and records are those of the program from before
+        state = self.state()
+        self.assertEqual(set(state), {"v", "pins", "recovery", "grants", "pool", "removed", "values"})
+        self.assertEqual(state["pins"], {"vps": {"recipient": None, "at": T3}})
+        self.assertEqual(state["grants"], {REF: {"vps": {"machine": None, "at": T2}}})
+        self.assertEqual((set(state["values"][REF]), state["pool"]), ({"sha256", "at"},
+                                                                      {OTHER_REF: {"in": False, "at": T2}}))
+        self.assertEqual(set(self.conf), vault.CENTRAL_KEYS)
+
+    def test_the_same_statement_again_changes_no_signer(self):
+        """F17 1.5: `when` is the time when the vault took the statement. Bug: the hub, which sends a statement again,
+        moves the time of a grant to after the end of its signer."""
+        self.signed("pin", PIN_1, SIG_PIN_1)
+        kept = self.signers()
+        with patch.object(vault.time, "time", return_value=time.time() + 5000):
+            self.assertEqual(self.signed("pin", PIN_1, SIG_PIN_1)["saved"], "same")
+        self.assertEqual(self.signers(), kept)
+
+    def test_a_record_whose_signer_is_not_known_and_a_signers_file_that_cannot_be_read_stop_nothing(self):
+        """F17 1.1: a record from before the file, or one that the program from before it took after a put-back, has no
+        signer, and the vault serves as before. Bug: a damaged file that says only who signed stops each agent's
+        secrets."""
+        for spoil in (lambda p: p.write_text("not json"), lambda p: p.write_text(json.dumps({"v": 1, "pins": {}})),
+                      lambda p: p.write_text(json.dumps({"v": 1, "pins": {"vps": {"at": "now", "by": "x", "when": 1}},
+                                                         "grants": {}, "pool": {}, "values": {}})),
+                      lambda p: p.chmod(0o644)):
+            path = self.beside("signers.json")
+            self.decide(pooled(REF, int(time.time()) - 10 + len(self.logged)))
+            spoil(path)
+            self.intake()
+            self.assertIn(REF, self.ask("status")["pool"])
+            self.assertEqual(self.decide(pooled(OTHER_REF, int(time.time()) + len(self.logged)))["kind"], "pool")
+            self.assertEqual(set(self.signers()["pool"]), {OTHER_REF})          # REF's signer is not known now
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertIn("signers: the file cannot be read, so the signer of each record in it is not known",
+                          self.logged)
+
+    def test_a_statement_whose_signer_cannot_be_kept_is_not_taken(self):
+        """F17 1.5: each kept record has its signer. Bug: the state is written first, and a full disk leaves a grant
+        that no device gave."""
+        real = vault.keep_file
+
+        def full(path, data, what):
+            if path.endswith("signers.json"):
+                raise vault.Refused(f"the central vault's {what} could not be saved, so nothing changed")
+            return real(path, data, what)
+        statement = grant(REF, "vps", "vps", T1)
+        with patch.object(vault, "keep_file", full):
+            self.assertIn("could not be saved, so nothing changed",
+                          self.refused("grant", statement=statement, signature=owner_sign(statement)))
+        self.assertEqual(self.ask("status")["grants"], [])
+        self.assertEqual(self.decide(statement)["saved"], "new")
+
+
+class Devices(CentralFixture):
+    """A central vault whose list of the owner's devices has its first list key: the Mac of the third owner key."""
+
+    def setUp(self):
+        super().setUp()
+        self.mac = device("mac", sign=OWNER_C)
+        self.first()
+
+    # ---- helpers
+    @staticmethod
+    def secret(name, key):
+        return OWNER_C_SECRET if (name, key) == ("mac", "sign") else scalar(f"{name} {key}")
+
+    def first(self, one=None, secret=OWNER_C_SECRET, **fields):
+        said = about("client-first", **dict(one or self.mac, **fields))
+        return vault.first_list_key(self.conf, {"statement": said, "signature": owner_sign(said, secret)})
+
+    def add(self, one, by="mac", key="list", **fields):
+        said = about("client-add", **dict(one, **fields))
+        return self.ask("client-add", statement=said, signature=owner_sign(said, self.secret(by, key)))
+
+    def end(self, *keys, by="mac", key="list", **fields):
+        said = about("client-end", keys=",".join(sorted(keys)), **fields)
+        return self.ask("client-end", statement=said, signature=owner_sign(said, self.secret(by, key)))
+
+    def decide(self, statement, by="mac", key="sign"):
+        return self.ask(json.loads(statement)["kind"], statement=statement,
+                        signature=owner_sign(statement, self.secret(by, key)))
+
+    def no(self, call, *args, **fields):
+        with self.assertRaises(vault.Refused) as refused:
+            call(*args, **fields)
+        return str(refused.exception)
+
+    def held(self):
+        return json.loads(self.beside("clients.json").read_text())
+
+    def names(self):
+        return [e["device"] for e in self.held()["entries"]]
+
+    def full(self, count):
+        """The list with this many ended keys of devices that it held."""
+        data = dict(self.held(), ended={hashlib.sha256(f"ended {n}".encode()).hexdigest():
+                                        {"by": None, "when": T1, "held": True} for n in range(count)})
+        self.beside("clients.json").write_text(json.dumps(data))
+
+
+BARE = [f"computer-{hashed(key)[:8]}" for key in (OWNER_A, OWNER_B)]     # the other keys of owner_keys, in the list
+NO_LIST_KEY = "the statement does not carry a valid signature of a list key of the owner's devices"
+NO_OWNER = "the statement does not carry a valid signature of the owner"
+KEY_ENDED = "a key of this device ended, and a key that ended never comes back, so it is not added"
+
+
+class ClientList(Devices, unittest.TestCase):
+    """The list of the owner's devices (F17, design A, 1.2): client-add and client-end."""
+
+    def test_an_add_is_kept_with_who_signed_it_and_when_in_a_file_of_its_own(self):
+        """F17 1.1 and 1.5 (N4, N6). Bugs: the list is written into the state, and the program from before it answers
+        that the state cannot be read after a put-back, so no agent gets a secret; nobody can say which device added
+        another; the hub, which sends an add again, moves the time of it."""
+        phone, before = device("phone", "iphone"), int(time.time())
+        self.assertEqual(self.add(phone), {"ok": True, "kind": "client-add", "saved": "new", "device": "phone"})
+        entry = self.held()["entries"][-1]
+        self.assertEqual({key: entry[key] for key in phone}, phone)
+        self.assertEqual(entry["by"], hashed(self.mac["list"]))
+        self.assertTrue(before <= entry["when"] <= int(time.time()))
+        path = self.beside("clients.json")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertFalse(Path(str(path) + ".new").exists())
+        kept = path.read_text()
+        with patch.object(vault.time, "time", return_value=time.time() + 5000):
+            self.assertEqual(self.add(phone)["saved"], "same")                      # taken once
+        self.assertEqual(path.read_text(), kept)
+        self.decide(grant(REF, "vps", "vps", T1))
+        self.assertEqual(set(self.state()), {"v", "pins", "recovery", "grants", "pool", "removed"})
+        self.assertEqual(set(self.conf), vault.CENTRAL_KEYS)
+        self.assertEqual(self.ask("status")["clients"], {"entries": self.held()["entries"], "ended": 0})
+
+    def test_only_a_list_key_of_the_list_signs_an_add_or_an_end_and_both_checks_take_it(self):
+        """F17 1.2, rules 1 and 2. Bugs: a sign key or a save key adds a device or ends one; a device that is not in the
+        list, or one that ended, does; our own ECDSA decides alone."""
+        phone, pc = device("phone", "iphone"), device("pc", "windows")
+        self.add(phone)
+        for by, key in (("mac", "sign"), ("phone", "sign"), ("phone", "save"), ("pc", "list"), ("pc", "sign")):
+            self.assertEqual(self.no(self.add, pc, by=by, key=key), NO_LIST_KEY, (by, key))
+            self.assertEqual(self.no(self.end, *hashes(phone), by=by, key=key), NO_LIST_KEY, (by, key))
+        for takes, words in ((False, NO_LIST_KEY), (None, "the vault could not check the owner's signature this time")):
+            with patch.object(vault, "openssl_takes", return_value=takes):
+                self.assertIn(words, self.no(self.add, pc))
+                self.assertIn(words, self.no(self.end, *hashes(phone)))
+        self.assertEqual(self.names(), ["mac"] + BARE + ["phone"])
+        self.end(*hashes(phone))
+        self.assertEqual(self.no(self.add, pc, by="phone"), NO_LIST_KEY)            # its list key ended
+        self.assertEqual(self.names(), ["mac"] + BARE)
+
+    def test_a_statement_of_another_fleet_of_more_than_a_day_ahead_or_not_canonical_is_refused(self):
+        """F17 1.2, rule 1. Bugs: an add of another fleet counts here; a clock that runs ahead makes a statement that
+        the app cannot take back; a text that only reads the same is taken with another's bytes."""
+        pc, now = device("pc", "windows"), int(time.time())
+        for kind, call in (("client-add", lambda **f: self.add(pc, **f)),
+                           ("client-end", lambda **f: self.end(hashed(OWNER_A), **f))):
+            self.assertEqual(self.no(call, fleet=OTHER_FLEET), "the statement is for another fleet")
+            self.assertEqual(self.no(call, at=now + 2 * 86400),
+                             f"the owner's {kind} is dated more than a day after this vault's clock, so it is not kept")
+        loose = json.dumps(json.loads(about("client-add", **pc)), sort_keys=True)
+        self.assertEqual(self.refused("client-add", statement=loose, signature=owner_sign(loose, scalar("mac list"))),
+                         "the statement is not in its canonical form")
+        self.assertEqual(self.names(), ["mac"] + BARE)
+        self.assertEqual(self.add(pc, at=now + 86400 - 60)["saved"], "new")
+        self.assertEqual(self.end(*hashes(pc), at=1)["saved"], "ended")             # no time is too old for an end
+
+    def test_an_end_counts_at_once_and_for_ever_whatever_its_time_and_what_it_gave_stays(self):
+        """F17 1.2, rule 3, and 1.5. Bugs: an ended device still signs a grant; a newer add or another device brings an
+        ended key back; an end that comes again takes the first one's record away; the grants of a sold Mac stop."""
+        pc = device("pc", "windows")
+        self.add(pc, at=T3)
+        self.assertEqual(self.decide(grant(REF, "vps", "vps", T2), by="pc")["saved"], "new")
+        self.assertEqual(self.end(*hashes(pc), at=T0),
+                         {"ok": True, "kind": "client-end", "saved": "ended", "devices": ["pc"], "left_out": 0})
+        self.assertEqual(self.names(), ["mac"] + BARE)
+        for statement in (grant(REF, "vps", "studio", T3), grant(REF, "vps", "vps", T2), pooled(REF, T3)):
+            self.assertEqual(self.no(self.decide, statement, by="pc"), NO_OWNER)    # also the one that it signed before
+        self.assertEqual(self.ask("status")["grants"], [{"login": REF, "agent": "vps", "machine": "vps"}])
+        first = self.held()["ended"]
+        self.assertEqual({key: x["by"] for key, x in first.items()},
+                         {key: hashed(self.mac["list"]) for key in hashes(pc)})
+        self.assertEqual(self.no(self.add, pc, at=T3 + 60), KEY_ENDED)
+        for key in ("sign", "list"):
+            self.assertEqual(self.no(self.add, device("other", **{key: pc[key]})), KEY_ENDED)
+        self.assertEqual(self.end(*hashes(pc))["saved"], "same")
+        self.end(hashed(OWNER_A))
+        self.assertEqual({key: x for key, x in self.held()["ended"].items() if key in first}, first)    # it only grows
+        self.assertEqual(len(self.held()["ended"]), 3)
+
+    def test_an_end_before_the_add_of_its_device_counts_when_the_hub_brings_the_add(self):
+        """F17 1.2, rule 4 (N2): an end is kept for a key that this vault never held. Bug: a hub that is broken into
+        holds back the add of a phone, the owner ends the stolen phone, and the old add then makes it an owner."""
+        phone = device("phone", "iphone")
+        self.assertEqual(self.end(*hashes(phone)),
+                         {"ok": True, "kind": "client-end", "saved": "ended", "devices": [], "left_out": 0})
+        self.assertEqual(self.no(self.add, phone, at=T0), KEY_ENDED)
+        self.assertEqual(self.no(self.add, device("other", "iphone", save=phone["save"])), KEY_ENDED)
+
+    def test_an_end_that_names_one_key_of_a_device_ends_the_whole_device(self):
+        """F17 1.2: an end picks devices. Bug: the ending client did not know the lost Mac's list key, and that key
+        still adds a device."""
+        pc = device("pc", "windows")
+        self.add(pc)
+        self.assertEqual(self.end(hashed(pc["sign"]))["devices"], ["pc"])
+        self.assertEqual(set(self.held()["ended"]), set(hashes(pc)))
+        self.assertEqual(self.no(self.add, device("next"), by="pc"), NO_LIST_KEY)
+
+    def test_no_end_names_the_device_that_signs_it(self):
+        """F17 1.2, rule 5 (R2-1). Bug: an end from his phone names each device that the sold Mac added, the phone too,
+        and the owner is shut out."""
+        pc = device("pc", "windows")
+        self.add(pc)
+        for keys in (hashes(self.mac), hashes(self.mac) + hashes(pc), [hashed(self.mac["sign"])]):
+            self.assertEqual(self.no(self.end, *keys), "an end never names the device that signs it, so nothing ended")
+        self.assertEqual((self.names(), self.held()["ended"]), (["mac"] + BARE + ["pc"], {}))
+
+    def test_a_signer_ends_at_most_16_keys_that_the_vault_never_held_and_each_device_of_the_list(self):
+        """F17 1.2, rule 4, and 1.6. Bugs: a thief who passed the touch one time fills the set; or the cap refuses the
+        end of a device of the list that stands in the same statement."""
+        phone, pc, unknown = device("phone", "iphone"), device("pc", "windows"), sorted(never_held(20))
+        self.add(phone)
+        self.add(pc)
+        self.assertEqual(self.end(*unknown[:10])["left_out"], 0)
+        self.assertEqual(self.end(*unknown[10:], *hashes(pc)),
+                         {"ok": True, "kind": "client-end", "saved": "ended", "devices": ["pc"], "left_out": 4})
+        self.assertEqual(set(self.held()["ended"]), set(unknown[:16]) | set(hashes(pc)))
+        self.assertEqual(self.no(self.end, *unknown[16:]), "this list key ended as many keys that this vault never held "
+                                                           "as it may, so nothing ended")
+        self.assertEqual(self.end(*unknown[16:], by="phone")["left_out"], 0)        # another signer has its own 16
+        self.assertEqual(self.end(*hashes(phone))["devices"], ["phone"])            # and no count refuses this one
+        self.assertEqual(len(self.held()["ended"]), 20 + 2 + 3)
+
+    def test_the_set_holds_1024_keys_and_an_add_is_refused_before_an_end_is(self):
+        """F17 1.2, rule 4, and 1.6. Bugs: an add takes the room that the end of a device of the list needs, so a stolen
+        device cannot end; a full set refuses an end; the keys that this vault never held take that room."""
+        phone, pc = device("phone", "iphone"), device("pc", "windows")
+        held = 4                                            # the Mac's two keys and one of each other entry
+        self.full(1024 - held - 1)
+        room = "the list has no more room for the end of a new device, so this device is not added"
+        self.assertEqual(self.no(self.add, pc), room)
+        self.full(1024 - held - 2)                          # room for a PC's two keys, and not for an iPhone's three
+        self.assertEqual(self.no(self.add, phone), room)
+        self.assertEqual(self.add(pc)["saved"], "new")
+        self.assertIn("never held", self.no(self.end, *never_held(1)))
+        answer = self.end(*never_held(1), *hashes(pc))
+        self.assertEqual((answer["devices"], answer["left_out"]), (["pc"], 1))
+        self.assertEqual(len(self.held()["ended"]), 1024 - held)
+        self.full(1024)                                     # also a set that is full: an end of the list is taken
+        self.assertEqual(self.end(hashed(OWNER_A))["saved"], "ended")
+
+    def test_the_list_holds_eight_devices(self):
+        """F17 1.6. Bug: a list that grows without an end, or one that refuses the ninth device after an end made room."""
+        for n in range(5):
+            self.add(device(f"pc-{n}", "windows"))
+        ninth = device("pc-5", "windows")
+        self.assertEqual(self.no(self.add, ninth),
+                         "the list holds 8 devices, which is the most, so this device is not added")
+        self.assertEqual(self.add(device("studio", sign=OWNER_B))["saved"], "replaced")     # the place of an entry
+        self.end(*hashes(device("pc-0", "windows")))
+        self.assertEqual(self.add(ninth)["saved"], "new")
+
+    def test_the_first_end_wins_between_two_devices_that_end_each_other(self):
+        """F17 1.2, rule 7 (N32). Bug: a stolen Mac's end, which comes second, ends the device that ended it."""
+        pc = device("pc", "windows")
+        self.add(pc)
+        self.assertEqual(self.end(*hashes(self.mac), by="pc")["devices"], ["mac"])
+        self.assertEqual(self.no(self.end, *hashes(pc)), NO_LIST_KEY)
+        self.assertEqual(self.no(self.decide, grant(REF, "vps", "vps", T1)), NO_OWNER)
+        self.assertEqual(self.names(), BARE + ["pc"])
+
+    def test_a_key_or_a_name_that_another_device_has_is_not_added(self):
+        """F17 1.2: each key is one device's. Bugs: a list key that is another Mac's sign key signs an add with no
+        touch; an end of one device ends another one."""
+        pc = device("pc", "windows")
+        self.add(pc)
+        self.assertEqual(self.no(self.add, dict(device("other"), device="pc")),
+                         "another device of the list has this name, so this device is not added")
+        for key, taken in (("sign", pc["list"]), ("list", pc["sign"]), ("list", OWNER_C), ("list", OWNER_A),
+                           ("list", pc["list"])):
+            self.assertEqual(self.no(self.add, device("other", **{key: taken})),
+                             "another device of the list has a key of this device, so it is not added", key)
+        self.assertIn("has a key of this device", self.no(self.add, dict(pc, label="Another label")))
+        self.assertEqual(self.names(), ["mac"] + BARE + ["pc"])
+
+    def test_a_second_mac_of_the_owner_keys_gets_its_list_key_by_an_add_of_the_first(self):
+        """F17 1.2, rule 9 with R2-2: root's way gives one list key. Bug: the fleet's second Mac, whose sign key the
+        list has already, can get no list key at all."""
+        studio = device("studio", sign=OWNER_B)
+        self.assertEqual(self.add(studio)["saved"], "replaced")
+        self.assertEqual(self.names(), ["mac", BARE[0], "studio"])
+        self.assertEqual(self.end(*hashes(self.mac), by="studio")["devices"], ["mac"])
+
+    def test_with_a_list_the_configurations_owner_keys_count_no_more(self):
+        """F17 1.1 (R3.3 point 6). Bugs: an install's --owner-key, which a person with the Mac's root SSH runs, puts a
+        key of his own beside the list; or an end leaves the key in force through owner_keys."""
+        self.conf["owner_keys"] = [owner_point(scalar("thief sign"))]
+        statement = grant(REF, "vps", "vps", T1)
+        self.assertEqual(self.no(self.decide, statement, by="thief"), NO_OWNER)
+        self.assertEqual(self.decide(statement)["saved"], "new")                    # the Mac's, which the list has
+        self.assertEqual(self.signed("pin", PIN_1, SIG_PIN_1)["saved"], "new")      # key A, an entry with no list key
+        self.assertEqual(self.ask("status")["owner_keys"], 3)
+        self.conf["owner_keys"] = [OWNER_A]
+        self.end(hashed(OWNER_A))
+        self.assertEqual(self.refused("unpin", statement=UNPIN_3, signature=SIG_UNPIN_3), NO_OWNER)
+
+    def test_a_list_that_cannot_be_read_is_refused_and_owner_keys_never_take_its_place(self):
+        """F17 1.2, rule 3: an end is for ever. Bug: one damaged file brings back each key that ended, with owner_keys."""
+        path, good = self.beside("clients.json"), self.held()
+        mac = dict(good["entries"][0])
+        for damaged in ("not json", "{}", json.dumps(dict(good, v=2)), json.dumps(dict(good, entries={})),
+                        json.dumps(dict(good, entries=[dict(mac, list="BAAA")])),
+                        json.dumps(dict(good, entries=[dict(mac, os="iphone")])),
+                        json.dumps(dict(good, entries=[dict(mac, by="nobody")])),
+                        json.dumps(dict(good, ended={"x": {"by": None, "when": 1, "held": True}})),
+                        json.dumps(dict(good, ended={hashed(OWNER_A): {"by": None, "when": 1}}))):
+            path.write_text(damaged)
+            for call in (lambda: self.decide(grant(REF, "vps", "vps", T1)), lambda: self.ask("status"),
+                         lambda: self.end(hashed(OWNER_A)), lambda: self.ask("export")):
+                self.assertEqual(self.no(call), "the central vault's list of the owner's devices cannot be read", damaged)
+        path.write_text(json.dumps(good))
+        path.chmod(0o640)
+        self.assertIn("mode 600", self.no(self.decide, grant(REF, "vps", "vps", T1)))
+        path.chmod(0o600)
+        self.assertEqual(self.decide(grant(REF, "vps", "vps", T1))["saved"], "new")
+
+    def test_a_phone_signs_the_owners_decisions_with_its_save_key_alone(self):
+        """F17 1.3: on a phone the save key, which asks for the face, signs a pin, a grant, a pool and their ends. Bug:
+        the sign key, which signs a yes from a notification with no face, gives a secret."""
+        self.add(device("phone", "iphone"))
+        for key in ("sign", "list"):
+            self.assertEqual(self.no(self.decide, pooled(REF, T1), by="phone", key=key), NO_OWNER)
+        self.assertEqual(self.decide(pooled(REF, T1), by="phone", key="save")["saved"], "new")
+
+    def test_a_vault_with_a_list_takes_no_recovery_key_and_makes_no_copy_of_its_store(self):
+        """F17 4.2 and 1.5 (K6 ends, N17, N26): after the end of a device no key that it signed opens a copy. Bug: a
+        thief's device signs a recovery key, it ends, and each later backup opens with the thief's key. The status still
+        names the key of before, for which an older app asks."""
+        self.beside("clients.json").unlink()
+        self.signed("recovery", RECOVERY_1, SIG_RECOVERY_1)
+        self.assertEqual(self.ask("export")["recovery"], RR)
+        self.first()
+        newer = canon({"v": 1, "kind": "recovery", "fleet": FLEET, "recipient": RR2, "at": T3})
+        for call in (lambda: self.decide(newer), lambda: self.signed("recovery", RECOVERY_1, SIG_RECOVERY_1)):
+            self.assertEqual(self.no(call), "this vault has the list of the owner's devices, so it takes no recovery key "
+                                            "any more")
+        self.assertEqual(self.refused("export"), "this vault has the list of the owner's devices, so it makes no copy of "
+                                                 "its store any more")
+        self.assertEqual((self.ask("status")["recovery"], self.state()["recovery"]["recipient"]), (RR, RR))
+
+    def test_no_log_line_of_the_list_holds_a_key_a_hash_or_a_label(self):
+        """The vault's log says what it did, and no more. Bug: the log, which root's other programs read, lists the
+        owner's devices and their keys."""
+        pc = device("pc", "windows")
+        self.add(pc)
+        self.end(*hashes(pc), *never_held(2))
+        self.no(self.add, pc)
+        self.assertGreaterEqual(len(self.logged), 3)
+        for line in self.logged:
+            for part in [pc["sign"], pc["list"], pc["label"], FLEET] + hashes(pc) + never_held(2) + hashes(self.mac):
+                self.assertNotIn(part, line)
+
+
+class RootsWay(CentralFixture, unittest.TestCase):
+    """`vault.py owner`: the first list key of the owner's devices, which root gives one time (F17 1.2 rule 9)."""
+
+    def setUp(self):
+        super().setUp()
+        self.conf["owner_keys"] = [OWNER_C, owner_point(scalar("studio sign"))]
+        self.mac = device("mac", sign=OWNER_C)
+        self.program, self.config = self.dir / "vault.py", self.dir / "vault.json"
+        for path, text in ((self.program, "x"), (self.config, json.dumps(self.conf))):
+            path.write_text(text)
+            path.chmod(0o644)
+        for p in (patch.object(vault, "CENTRAL_PROGRAM", os.path.realpath(self.program)),
+                  patch.object(vault, "CENTRAL_CONF_PATH", str(self.config))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def owner(self, said, secret=OWNER_C_SECRET, program=None, euid=None, config=None):
+        """Root's command: (its status, its one JSON line)."""
+        args = argparse.Namespace(config=str(config or self.config), statement=said, signature=owner_sign(said, secret))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = vault.owner_main(args, euid=euid, program=str(program or self.program))
+        return code, json.loads(out.getvalue())
+
+    def held(self):
+        return json.loads(self.beside("clients.json").read_text())
+
+    def refuses(self, words, said, **how):
+        code, answer = self.owner(said, **how)
+        self.assertEqual((code, answer["ok"]), (1, False), answer)
+        self.assertIn(words, answer["error"])
+        return answer["error"]
+
+    def test_root_gives_the_first_list_key_and_the_list_has_each_owner_key(self):
+        """F17 1.2, rule 9, and 1.1: the list is made from owner_keys with the first list key, and it counts at the next
+        request. Bugs: the fleet's second Mac signs nothing from that moment; a file that the vault's own user cannot
+        read stops the vault; the running vault needs a restart before the list counts."""
+        before = int(time.time())
+        said = about("client-first", **self.mac)
+        out = io.StringIO()
+        with patch.object(vault, "__file__", str(self.program)), contextlib.redirect_stdout(out):
+            self.assertEqual(vault.main(["owner", "--statement", said, "--signature", owner_sign(said)]), 0)
+        self.assertEqual(json.loads(out.getvalue()),
+                         {"ok": True, "kind": "client-first", "saved": "new", "device": "mac"})
+        mac, studio = self.held()["entries"]
+        self.assertEqual({key: mac[key] for key in self.mac}, self.mac)
+        self.assertEqual(mac["by"], hashed(OWNER_C))
+        self.assertTrue(before <= mac["when"] <= int(time.time()))
+        self.assertEqual({key: studio[key] for key in ("os", "label", "sign", "list", "by")},
+                         {"os": None, "label": "", "sign": owner_point(scalar("studio sign")), "list": None, "by": None})
+        self.assertEqual(self.held()["ended"], {})
+        self.assertEqual(stat.S_IMODE(self.beside("clients.json").stat().st_mode), 0o600)
+        self.assertEqual([p.name for p in self.beside("x").parent.iterdir() if p.name.endswith(".new")], [])
+        grown = about("client-add", **device("phone", "iphone"))                    # the vault that serves
+        self.assertEqual(self.ask("client-add", statement=grown,
+                                  signature=owner_sign(grown, scalar("mac list")))["saved"], "new")
+        statement = grant(REF, "vps", "vps", T1)
+        self.assertEqual(self.ask("grant", statement=statement, signature=owner_sign(
+            statement, scalar("studio sign")))["saved"], "new")                     # the second Mac signs on
+
+    def test_a_second_first_list_key_is_refused(self):
+        """F17 1.2, rule 9 (R2-2). Bug: a person at the unlocked Mac uses the Mac's root to put a list key of his own
+        into the list, for this Mac or for another one of owner_keys."""
+        said = about("client-first", **self.mac)
+        self.assertEqual(self.owner(said)[1]["saved"], "new")
+        kept = self.beside("clients.json").read_text()
+        self.assertEqual(self.owner(said), (0, {"ok": True, "kind": "client-first", "saved": "same", "device": "mac"}))
+        second = "the list of the owner's devices has its first list key, so a second one is refused"
+        self.refuses(second, about("client-first", **dict(self.mac, list=owner_point(scalar("thief list")))))
+        studio = device("studio")
+        self.refuses(second, about("client-first", **studio), secret=scalar("studio sign"))
+        self.refuses(second, about("client-first", **dict(self.mac, label="Another label")))
+        # and a run that another run overtook between its read and its write
+        real, seen = vault.held_clients, iter([None])
+        with patch.object(vault, "held_clients", lambda conf: next(seen, real(conf))):
+            self.refuses(second, about("client-first", **studio), secret=scalar("studio sign"))
+        self.assertEqual(self.beside("clients.json").read_text(), kept)
+
+    def test_the_first_list_key_needs_an_owner_key_that_signs_for_itself(self):
+        """F17 1.2, rules 1 and 9. Bugs: root, or a person who has the Mac's root and not its key, makes a list key with
+        no signature of an owner key; a list key that another Mac's sign key is adds a device with no touch."""
+        stranger = device("stranger")
+        self.refuses(NO_OWNER, about("client-first", **stranger), secret=scalar("stranger sign"))
+        self.refuses(NO_OWNER, about("client-first", **self.mac), secret=scalar("mac list"))
+        self.refuses("the statement names another key than the one that signed it",
+                     about("client-first", **device("studio")))                     # the first Mac signs for the second
+        self.refuses("the list key is a key that signs the owner's decisions",
+                     about("client-first", **dict(self.mac, list=owner_point(scalar("studio sign")))))
+        self.refuses("the statement is for another fleet", about("client-first", fleet=OTHER_FLEET, **self.mac))
+        self.refuses("dated more than a day after", about("client-first", at=int(time.time()) + 2 * 86400, **self.mac))
+        self.refuses("not a valid client-first statement", about("client-add", **self.mac))
+        with patch.object(vault, "openssl_takes", return_value=False):
+            self.refuses(NO_OWNER, about("client-first", **self.mac))
+        self.assertFalse(self.beside("clients.json").exists())
+
+    def test_the_command_runs_only_as_the_vaults_own_user_and_as_the_installed_program(self):
+        """E1b (F8-vault-read.md R3.4): root's own program, root's configuration, and the user of the vault's files. Bugs:
+        a checkout that the hub's user writes runs as root's word; a list that root wrote stops the vault, which reads
+        only its own user's files."""
+        said = about("client-first", **self.mac)
+        self.refuses("never as root", said, euid=0)
+        self.refuses("the user that the vault's files belong to", said, euid=os.geteuid() + 7)
+        other = self.dir / "checkout.py"
+        other.write_text("x")
+        self.refuses("only as the installed program", said, program=other)
+        copy = self.dir / "other.json"
+        copy.write_text(json.dumps(self.conf))
+        self.refuses("only the central vault's own configuration", said, config=copy)
+        self.program.chmod(0o666)
+        self.refuses("writable by no one else", said)
+        self.program.chmod(0o644)
+        self.config.write_text(json.dumps(dict(self.conf, hub_uid=os.getuid())))
+        self.refuses("hub_uid must be the user ID of the hub's user", said)
+        self.assertFalse(self.beside("clients.json").exists())
+
+
+class ClientVectors(unittest.TestCase):
+    """app/vectors/client-list.json: the texts that the apps sign about the list of the owner's devices. The apps' own
+    tests read the same file with their piece. A published clone has no app folder, so nothing is held there."""
+
+    FOLDER = os.path.join(leftovers.ROOT, "app", "vectors")
+
+    @unittest.skipUnless(os.path.isdir(os.path.join(leftovers.ROOT, "app")), "this clone has no app folder")
+    def test_the_vectors_are_what_the_vault_checks_and_what_their_maker_writes(self):
+        """F17 1.2 and 1.3: the canonical text of exactly the fields. Bugs: the vault changes a field or an order, and
+        each device's statement is refused; the committed file is not what the maker writes; the vault takes a form that
+        the file refuses (a list key that is the sign key, an end whose keys are not sorted)."""
+        with open(os.path.join(self.FOLDER, "client-list.json"), encoding="ascii") as f:
+            text = f.read()
+        held = json.loads(text)
+        fleet = held["cases"][0]["fields"]["fleet"]
+
+        def says(case):
+            with self.assertRaises(vault.Refused) as refused:
+                vault.signed_statement({"fleet": fleet}, {"statement": case["statement"], "signature": ""},
+                                       case["kind"], [])
+            return str(refused.exception)
+        self.assertEqual({case["kind"] for case in held["cases"]}, {"client-add", "client-end", "client-first"})
+        for case in held["cases"]:
+            self.assertEqual(canon(case["fields"]), case["statement"], case["name"])
+            self.assertEqual(hashlib.sha256(case["statement"].encode("utf-8")).hexdigest(),
+                             case["statement_sha256_hex"], case["name"])
+            self.assertEqual(says(case), NO_OWNER, case["name"])            # its form is right, and nobody signed it
+        for case in held["refused"]:
+            self.assertEqual(says(case), f"the statement is not a valid {case['kind']} statement", case["name"])
+        for case in held["keys"]:
+            self.assertEqual((hashed(case["key"]), vault.key_hash(case["key"])), (case["hash"],) * 2)
+        spec = importlib.util.spec_from_file_location("client_list", os.path.join(self.FOLDER, "makers",
+                                                                                    "client_list.py"))
+        maker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(maker)
+        made = maker.python(None, vault, None, None)
+        self.assertEqual({name: json.dumps(value, indent=2, ensure_ascii=True) + "\n" for name, value in made.items()},
+                         {"client-list.json": text})
 
 
 class Withdrawals(unittest.TestCase):

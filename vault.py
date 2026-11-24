@@ -61,9 +61,12 @@ network. It takes a value that the owner sealed to its key in his app (intake), 
 that it holds only with the owner's signed statement about that very copy (replace). It seals a copy of a value only to
 a machine key that the owner signed (pin, unpin, seal), only for a grant of that value to an agent of that machine
 that the owner signed, or for a value that he signed into the grantable pool (grant, ungrant, pool, unpool), and its
-backup only to a recovery key that the owner signed (recovery, export). The owner signs with an ECDSA P-256 key of his Mac and the vault verifies every statement itself,
+backup only to a recovery key that the owner signed (recovery, export), while it has no list of his devices. The owner
+signs with an ECDSA P-256 key of his Mac and the vault verifies every statement itself,
 so a hub that is broken into cannot add a machine of its own and pull every secret in one call. It removes a value
-that the owner took out of the fleet (remove) only while no grant or pool that he signed names it. It runs as its own
+that the owner took out of the fleet (remove) only while no grant or pool that he signed names it. It keeps the list
+of the owner's devices once root gave it the first list key (owner): a device's list key adds and ends the devices
+whose keys sign the owner's decisions (client-add, client-end). It runs as its own
 user (CENTRAL_UNIT), and only root installs or updates it (`hubsetup.py central-vault`): no release reaches it.
 
 Run a copy that the worker's user cannot change (root-owned, outside the worker's checkout), with a root-owned
@@ -75,6 +78,9 @@ configuration and programs, because an agent can change every file in its own ch
     python3 /usr/local/lib/fleet-vault/vault.py store-list --config /etc/fleet-vault/vault.json
                                                                  (as the vault user; names only, never a value)
     python3 vault.py unit --central --config /etc/fleet-vault-central/vault.json --group <the hub user's group>
+    python3 -I /usr/local/lib/fleet-vault-central/vault.py owner --statement <text> --signature <base64>
+                                                                 (root runs it as the central vault's own user: the
+                                                                 first list key of the owner's devices, one time)
     python3 /usr/local/lib/fleet-vault/vault.py swap --config /etc/fleet-vault/vault.json
                                                                  (as the swap proxy's own user; its service runs it)
     python3 vault.py unit --swap --config /etc/fleet-vault/vault.json     (the swap proxy's service)
@@ -159,7 +165,7 @@ AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 CALLER_KEY = re.compile(r"[A-Za-z0-9_-]{43}")          # an agent key (owner API 1.12): 256 bits, base64url
 # The central vault's own operations, beside status: a central vault serves only these, and a machine's broker none.
 CENTRAL_OPERATIONS = ("intake", "pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool", "seal", "inventory",
-                      "export", "remove", "key_addresses", "hub_key")
+                      "export", "remove", "key_addresses", "hub_key", "client-add", "client-end")
 # The hub's own files whose key the central vault keeps for it (hub_key; UI-API.md 1.202): its Google file, which the
 # hub seals so that a copy of the hub user's files does not open it.
 HUB_KEYS = ("google",)
@@ -264,7 +270,27 @@ STATEMENTS = {"pin": {"v", "kind", "fleet", "machine", "recipient", "at"},
               "unpool": {"v", "kind", "fleet", "login", "at"},
               # replace: the owner puts a new value under a reference that the vault holds. sha256 is of the sealed
               # copy that his app made, so the statement is about that one copy and no other (intake).
-              "replace": {"v", "kind", "fleet", "login", "sha256", "at"}}
+              "replace": {"v", "kind", "fleet", "login", "sha256", "at"},
+              # The list of the owner's devices (F17, held_clients). client-add: one device with its keys, and an
+              # iPhone also with its save key; client-end: the hashes (key_hash) of each key of the devices that end,
+              # as one text. A list key signs both. client-first: the device that gets the list's first list key, which
+              # its own sign key signs and root gives (first_list_key).
+              "client-add": {"v", "kind", "fleet", "device", "os", "label", "sign", "list", "at"},
+              "client-end": {"v", "kind", "fleet", "keys", "at"},
+              "client-first": {"v", "kind", "fleet", "device", "os", "label", "sign", "list", "at"}}
+# The list of the owner's devices and the signers of the kept records (F17, design A, 1.1 and 1.2): two files of the
+# central vault beside its state, and never members of it, because the program from before them refuses a state with a
+# member that it does not know, and must run again when an update puts it back.
+CLIENTS = "clients.json"
+SIGNERS = "signers.json"
+CLIENT_LIST = 1                                     # the format of both files
+CLIENT_OS = ("mac", "iphone", "windows")            # an iPhone's entry has one key more, save, which asks for the face
+CLIENT_DEVICE = re.compile(r"[a-z][a-z0-9-]{1,30}")     # as the hub names an owner device (hub.ENTRY_ID)
+CLIENT_LABEL = 40                                   # characters of a device's label, as the hub's (validate_team)
+KEY_HASH = re.compile(r"[0-9a-f]{64}")              # the SHA-256 of the 65 bytes of one public key
+ENDED_KEYS = 1024                                   # the most keys of the ended set (1.2 rule 4)
+UNKNOWN_ENDED = 16                                  # of them, for one signer, the most that this vault never held
+END_KEYS = 16                                       # the most keys that one client-end names
 COPY_MAX = 16384            # characters of one sealed copy that the owner gives, as the hub's DEPOSIT_COPY_MAX
 CENTRAL_LINE = 65536        # bytes of one request line to the central vault: an intake carries a sealed copy
 # The central vault's own user. Not a fleet-* name: the hub's user may put any fleet-* user into the agents' group
@@ -2534,7 +2560,8 @@ def owner_key(text):
 
 # A second opinion on the owner's signature (the owner's "OpenSSL as a second check" of 20 November 2026, for "each
 # release and the vault's owner signatures"): a statement that the central vault or a machine broker takes
-# (owner_statement: the central vault's pin, unpin, recovery, grant, ungrant, pool, unpool and replace, and a broker's
+# (signed_statement: the central vault's pin, unpin, recovery, grant, ungrant, pool, unpool and replace, its list's
+# client-add, client-end and client-first, and a broker's
 # handover pin) counts only when our ECDSA above and this machine's OpenSSL both take its signature
 # (owner_signed_twice), wherever the machine has an OpenSSL that passes the probe: RFC 6979 A.2.5's signature of
 # "sample", and the same signature with one bit changed. Every supported Linux
@@ -2730,8 +2757,23 @@ def owner_signed_twice(conf, statement, signature):
     """owner_signed with this machine's OpenSSL as a second check (openssl_takes): True when both take the signature,
     False when one of them refuses it, None when OpenSSL could not be asked. The first key that our ECDSA takes
     decides, so one call makes one check of OpenSSL, however often a key is listed."""
+    return owner_signed_by(conf, statement, signature)[0]
+
+
+def owner_signed_by(conf, statement, signature):
+    """(owner_signed_twice's answer, the hash of the key that signed): the hash is key_hash's of that key, and None
+    when no key of conf signed these bytes by our own ECDSA."""
     found = owner_signer(conf, statement, signature)
-    return False if found is None else openssl_takes(found[0], statement.encode("utf-8"), found[1])
+    if found is None:
+        return False, None
+    (x, y), raw = found
+    by = hashlib.sha256(b"\x04" + x.to_bytes(32, "big") + y.to_bytes(32, "big")).hexdigest()
+    return openssl_takes((x, y), statement.encode("utf-8"), raw), by
+
+
+def key_hash(text):
+    """The name of one public key in an end and in a record: the SHA-256 of its 65 bytes, in lowercase hex."""
+    return hashlib.sha256(base64.b64decode(text)).hexdigest()
 
 
 def canonical(value):
@@ -2739,10 +2781,36 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def client_fields(said, kind):
+    """True when the own fields of a statement about the owner's devices have their form (F17, 1.2). An end names 1 to
+    END_KEYS different keys by their hashes, sorted, as one text with commas. A device has a name, a kind (an iPhone
+    never by client-first: no iPhone's key is one of owner_keys), one line as its label, and keys that are points of
+    the curve and all different: a list key that is the sign key too would sign with no touch."""
+    if kind == "client-end":
+        named = said["keys"].split(",") if isinstance(said["keys"], str) else []
+        return 1 <= len(named) <= END_KEYS and all(KEY_HASH.fullmatch(k) for k in named) and \
+            named == sorted(set(named))
+    if not (isinstance(said["device"], str) and CLIENT_DEVICE.fullmatch(said["device"]) and said["os"] in CLIENT_OS
+            and plain_line(said["label"], CLIENT_LABEL)) or (kind == "client-first" and said["os"] == "iphone"):
+        return False
+    try:
+        points = [owner_key(said[name]) for name in ("sign", "list", "save") if name in said]
+    except ValueError:
+        return False
+    return len(set(points)) == len(points)
+
+
 def owner_statement(conf, req, kind):
     """The owner's statement of this kind ({v, kind, fleet, at, and its machine, recipient, login, agent and sha256 as
-    STATEMENTS says}), after its form, its fleet and its signature. The statement must be the canonical text of what it holds, so the vault checks
-    the very bytes that the app signed; and it must name this fleet, so a statement of another fleet is no use here."""
+    STATEMENTS says}), signed by a key that signs his decisions (decision_keys, signed_statement)."""
+    return signed_statement(conf, req, kind, decision_keys(conf))[0]
+
+
+def signed_statement(conf, req, kind, keys, whose="the owner"):
+    """(a statement of this kind, the hash of the key that signed it), after its form, its fleet and a signature of one
+    of `keys`, by both checks (owner_signed_by). The statement must be the canonical text of what it holds, so the
+    vault checks the very bytes that the app signed; and it must name this fleet, so a statement of another fleet is no
+    use here. `whose` names the holder of the keys in the refusal."""
     statement, signature = req.get("statement"), req.get("signature")
     if not isinstance(statement, str) or not isinstance(signature, str):
         raise Refused("a signed statement needs its statement and its signature")
@@ -2752,24 +2820,32 @@ def owner_statement(conf, req, kind):
         said = None
     if not isinstance(said, dict) or canonical(said) != statement:
         raise Refused("the statement is not in its canonical form")
-    if set(said) != STATEMENTS[kind] or said["kind"] != kind or type(said["v"]) is not int or said["v"] != 1 \
+    fields = STATEMENTS[kind] | ({"save"} if kind == "client-add" and said.get("os") == "iphone" else set())
+    if set(said) != fields or said["kind"] != kind or type(said["v"]) is not int or said["v"] != 1 \
             or type(said["at"]) is not int or said["at"] < 0 or not isinstance(said["fleet"], str) \
             or not all(isinstance(said.get(k, ""), str) for k in ("machine", "recipient", "login", "agent", "sha256")) \
             or ("sha256" in said and not re.fullmatch(r"[0-9a-f]{64}", said["sha256"])) \
             or ("machine" in said and not MACHINE.fullmatch(said["machine"])) \
             or ("recipient" in said and not RECIPIENT.fullmatch(said["recipient"])) \
             or ("login" in said and not (SECRET_REF.fullmatch(said["login"]) and said["login"] == said["login"].lower())) \
-            or ("agent" in said and not AGENT_NAME.match(said["agent"])):
+            or ("agent" in said and not AGENT_NAME.match(said["agent"])) \
+            or (kind in ("client-add", "client-end", "client-first") and not client_fields(said, kind)):
         raise Refused(f"the statement is not a valid {kind} statement")
     if said["fleet"] != conf["fleet"]:
         raise Refused("the statement is for another fleet")
-    signed = owner_signed_twice(conf, statement, signature)
+    signed, by = owner_signed_by({"owner_keys": keys}, statement, signature)
     if signed is None:
         raise Refused("the vault could not check the owner's signature this time, so the statement is not taken; it "
                       "can be sent again")
     if not signed:
-        raise Refused("the statement does not carry a valid signature of the owner")
-    return said
+        raise Refused(f"the statement does not carry a valid signature of {whose}")
+    return said, by
+
+
+def not_ahead(said, kind):
+    """Refused when the statement is dated more than PIN_AHEAD after this vault's clock (choice C50)."""
+    if said["at"] - time.time() > PIN_AHEAD:
+        raise Refused(f"the owner's {kind} is dated more than a day after this vault's clock, so it is not kept")
 
 
 # ---------------------------------------------------------------- the central vault
@@ -2862,16 +2938,20 @@ def central_state(conf):
 
 
 def keep_state(conf, state):
-    """Write the central vault's state whole: a new file of mode 600, made complete beside the old one and then put in
-    its place, as the store is kept. "values" is written only when it has a record: until the owner's first replace,
-    the file is one that the program from before replace reads."""
-    state = {k: v for k, v in state.items() if k != "values" or v}
-    path, temp = conf["state"], conf["state"] + ".new"
+    """Write the central vault's state whole (keep_file). "values" is written only when it has a record: until the
+    owner's first replace, the file is one that the program from before replace reads."""
+    keep_file(conf["state"], {k: v for k, v in state.items() if k != "values" or v}, "state")
+
+
+def keep_file(path, data, what):
+    """Write one file of the central vault's whole: a new file of mode 600, made complete beside the old one and then
+    put in its place, as the store is kept."""
+    temp = path + ".new"
     try:
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             os.fchmod(f.fileno(), 0o600)        # also when a file of an earlier failure was there
-            f.write(json.dumps(state, sort_keys=True))
+            f.write(json.dumps(data, sort_keys=True))
             f.flush()
             os.fsync(f.fileno())
         os.replace(temp, path)
@@ -2880,11 +2960,307 @@ def keep_state(conf, state):
             os.unlink(temp)
         except OSError:
             pass
-        raise Refused("the central vault's state could not be saved, so nothing changed") from None
+        raise Refused(f"the central vault's {what} could not be saved, so nothing changed") from None
     try:
         sync_folder(os.path.dirname(os.path.abspath(path)))
     except OSError:
-        pass                            # the new state is already in its place: this is no failure of the save
+        pass                            # the new file is already in its place: this is no failure of the save
+
+
+def new_file(path, text):
+    """Make a file of mode 600 that nothing replaces, and give True; False when a file is there already, which stays.
+    It is written whole beside the name and synced, then linked to the name, which fails over a file that is there, and
+    the folder is synced, so the file is on the disk before anybody uses what it says. OSError when it cannot be made."""
+    temp, made = f"{path}.{secrets.token_hex(8)}.new", True
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(temp, path)
+        except FileExistsError:
+            made = False
+        sync_folder(os.path.dirname(os.path.abspath(path)))
+    finally:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+    return made
+
+
+# ---- the signer of each kept record (F17, design A, 1.1 and 1.5)
+#
+# The state keeps what the owner signed and the statement's own time, and no signer. So this vault keeps, in a file of
+# its own, who signed each record that is in force and when it took the statement, by its own clock: after the end of a
+# device, the app shows what that device gave. The kinds that have it: pin, unpin, grant, ungrant, pool, unpool and
+# replace; client-add and client-end keep the same two in the list itself. `recovery` has none: a vault with a list takes
+# none and makes no backup (central_signed, export).
+
+def beside(conf, name):
+    """A file of the central vault's own folder, which its state is in."""
+    return os.path.join(os.path.dirname(os.path.abspath(conf["state"])), name)
+
+
+def kept_signer(record):
+    """One record of the signers' file: {at, by, when}. `at` is the time that the statement names."""
+    return isinstance(record, dict) and set(record) == {"at", "by", "when"} and type(record["at"]) is int and \
+        type(record["when"]) is int and isinstance(record["by"], str) and KEY_HASH.fullmatch(record["by"]) is not None
+
+
+def held_signers(conf):
+    """{"v": 1, "pins": {machine: record}, "grants": {login: {agent: record}}, "pool": {login: record}, "values":
+    {login: record}}, the state's own places. A record says who signed the state's record only while the two have one
+    `at`; else the signer is not known, as for each record from before this file and for one that the program from
+    before it took after a put-back. So a file that cannot be read stops nothing: each signer in it is not known."""
+    none = {"v": CLIENT_LIST, "pins": {}, "grants": {}, "pool": {}, "values": {}}
+    path = beside(conf, SIGNERS)
+    if not os.path.lexists(path):
+        return none
+    try:
+        data = json.loads(read_private(path, "signers"))
+        good = isinstance(data, dict) and set(data) == set(none) and data["v"] == CLIENT_LIST \
+            and all(isinstance(data[part], dict) for part in ("pins", "grants", "pool", "values")) \
+            and all(kept_signer(x) for part in ("pins", "pool", "values") for x in data[part].values()) \
+            and all(isinstance(held, dict) and all(kept_signer(x) for x in held.values())
+                    for held in data["grants"].values())
+    except (ValueError, Refused):
+        good = False
+    if not good:
+        log("signers: the file cannot be read, so the signer of each record in it is not known")
+    return data if good else none
+
+
+def keep_signer(conf, kind, said, by):
+    """Keep who signed a statement that this vault takes now, before the state keeps the statement's record: a vault
+    that cannot keep the signer takes no statement. When the state's write fails after this one, the old record's
+    signer is not known until a statement of that record is taken again."""
+    signers = held_signers(conf)
+    record = {"at": said["at"], "by": by, "when": int(time.time())}
+    if kind in ("grant", "ungrant"):
+        signers["grants"].setdefault(said["login"], {})[said["agent"]] = record
+    elif kind in ("pool", "unpool"):
+        signers["pool"][said["login"]] = record
+    elif kind == "replace":
+        signers["values"][said["login"]] = record
+    else:
+        signers["pins"][said["machine"]] = record
+    keep_file(beside(conf, SIGNERS), signers, "record of who signed")
+
+
+# ---- the list of the owner's devices (F17, design A, 1.2)
+#
+# An entry is one device of the owner's: its name, its kind, its label and its public keys. Its sign key signs the
+# owner's decisions (an iPhone's save key, which asks for the face, in its place), and its list key signs only
+# client-add and client-end. `by` is the hash of the key that signed the entry in, and `when` this vault's own time of
+# it. The ended set is the hashes of each key that ended, with the same two: it only grows, and a key in it never
+# comes back. Each statement counts by itself: no time and no order decides between two, so an end counts at once, for
+# ever, and by whatever way it came, also before the add of its device, which the hub could hold back.
+#
+# The list is in force from the moment when its file is there, and then this vault reads no owner_keys of its
+# configuration any more: root's step that changes them changes nothing here. The file is made with the list's first
+# list key (first_list_key), and by nothing else. So a fleet whose devices have no list key stays as it was before the
+# list: its owner_keys count, root's install changes them, and its recovery key opens its backup (N10: the rule turns on
+# by the fleet's own state, and never by a release).
+# Not built here, and their places: the ends and the new list of `founderizer-reclaim` (F17 4.2 and 1.4) go through
+# `owner` too, and its write needs a lock of this file's writers, because the process that serves writes the same file
+# (F8-vault-read.md R3.4, point 6); the list intake (4.6), which gives several statements in one request (1.2 rule 6);
+# the signed status (1.3), which gives the whole ended set and the signers; keeper.age and keeper.json (1.1).
+
+def client_keys(entry):
+    """The public keys of one device: its sign key, its list key when it has one, and an iPhone's save key."""
+    return [entry[name] for name in ("sign", "list", "save") if entry.get(name)]
+
+
+def kept_key(text):
+    """True for the text of a public key that is a point of the curve."""
+    try:
+        owner_key(text)
+    except ValueError:
+        return False
+    return True
+
+
+def kept_by(record):
+    """The signer and the time of a kept entry or end: the hash of a key, or None for what root gave with no
+    statement."""
+    return (record["by"] is None or isinstance(record["by"], str) and KEY_HASH.fullmatch(record["by"]) is not None) \
+        and type(record["when"]) is int
+
+
+def kept_client(entry):
+    """One entry of the list. An entry that is only one of owner_keys has no kind, no label and no list key: nobody
+    told this vault more of it, until a listed device adds it (client_add)."""
+    if not isinstance(entry, dict) or set(entry) - {"save"} != {"device", "os", "label", "sign", "list", "by", "when"} \
+            or ("save" in entry) != (entry["os"] == "iphone"):
+        return False
+    bare = (entry["os"], entry["label"], entry["list"]) == (None, "", None)
+    return (bare or entry["os"] in CLIENT_OS and bool(plain_line(entry["label"], CLIENT_LABEL))) \
+        and isinstance(entry["device"], str) and CLIENT_DEVICE.fullmatch(entry["device"]) is not None \
+        and all(kept_key(entry[name]) for name in ("sign", "list", "save") if name in entry
+                and not (bare and name == "list")) and kept_by(entry)
+
+
+def kept_end(record):
+    """One key of the ended set: {by, when, held}; held: an entry of the list had it, so it counts for no signer."""
+    return isinstance(record, dict) and set(record) == {"by", "when", "held"} and isinstance(record["held"], bool) and \
+        kept_by(record)
+
+
+def held_clients(conf):
+    """The list of the owner's devices, read again for every request: {"v": 1, "entries": [entry], "ended": {hash:
+    {by, when, held}}}, or None while this vault has no list. A list that cannot be read is refused, and owner_keys
+    never take its place: else the damage of one file would bring back each key that ended."""
+    path = beside(conf, CLIENTS)
+    if not os.path.lexists(path):
+        return None
+    try:
+        data = json.loads(read_private(path, "list of devices"))
+        good = isinstance(data, dict) and set(data) == {"v", "entries", "ended"} and data["v"] == CLIENT_LIST \
+            and isinstance(data["entries"], list) and all(kept_client(e) for e in data["entries"]) \
+            and isinstance(data["ended"], dict) \
+            and all(KEY_HASH.fullmatch(k) and kept_end(x) for k, x in data["ended"].items())
+    except ValueError:
+        good = False
+    if not good:
+        raise Refused("the central vault's list of the owner's devices cannot be read")
+    return data
+
+
+def decision_keys(conf):
+    """The public keys that sign the owner's decisions: a broker's owner_keys, and those of a central vault with no
+    list; with a list, the sign key of each entry, and an iPhone's save key in its place (F17, 1.3)."""
+    clients = held_clients(conf) if conf.get("central") is True else None
+    if clients is None:
+        return conf["owner_keys"]
+    return [e["save"] if e["os"] == "iphone" else e["sign"] for e in clients["entries"]]
+
+
+def client_statement(conf, req, kind):
+    """(the list, the statement, the hash of its signer) of one client-add or client-end: the checks of 1.2, rules 1 and
+    2. Only a list key of an entry signs one, and an entry leaves the list with its end."""
+    clients = held_clients(conf)
+    if clients is None:
+        raise Refused("this vault has no list of the owner's devices yet, so it takes no change of one")
+    said, by = signed_statement(conf, req, kind, [e["list"] for e in clients["entries"] if e["list"]],
+                                "a list key of the owner's devices")
+    not_ahead(said, kind)
+    return clients, said, by
+
+
+def client_entry(said, by):
+    """The entry of a device that a statement adds now."""
+    return dict({name: said[name] for name in ("device", "os", "label", "sign", "list", "save") if name in said},
+                by=by, when=int(time.time()))
+
+
+def same_client(entry, said):
+    """True when this entry is the device of the statement, with the same keys, kind and label."""
+    return all(entry.get(name) == said.get(name) for name in ("device", "os", "label", "sign", "list", "save"))
+
+
+def client_add(conf, req):
+    """client-add: one device of the owner's into the list, signed by a list key of the list (F17, 1.2). The same
+    statement again answers "same", so a retry is no error and changes no record. A device with a key that ended is
+    refused, for ever: so is the add that the hub held back until after the end. A key or a name that another entry has
+    is refused. A device whose sign key is one of owner_keys (an entry with no list key) takes the place of that entry:
+    a fleet's second Mac gets its list key so, because root's way gives only the first one.
+
+    The list holds at most OWNER_KEYS devices, and an add is refused while the ended set, the keys of the entries and
+    this device's keys are more than ENDED_KEYS: then each key of the list can still end inside the cap (rule 4)."""
+    clients, said, by = client_statement(conf, req, "client-add")
+    saved = "same"
+    if not any(same_client(e, said) for e in clients["entries"]):
+        bare = next((e for e in clients["entries"] if not e["list"] and e["sign"] == said["sign"]), None)
+        others = [e for e in clients["entries"] if e is not bare]
+        entry = client_entry(said, by)
+        keys = client_keys(entry)
+        if any(key_hash(k) in clients["ended"] for k in keys):
+            raise Refused("a key of this device ended, and a key that ended never comes back, so it is not added")
+        if any(k in client_keys(e) for e in others for k in keys):
+            raise Refused("another device of the list has a key of this device, so it is not added")
+        if any(e["device"] == entry["device"] for e in others):
+            raise Refused("another device of the list has this name, so this device is not added")
+        if len(others) >= OWNER_KEYS:
+            raise Refused(f"the list holds {OWNER_KEYS} devices, which is the most, so this device is not added")
+        if len(clients["ended"]) + sum(len(client_keys(e)) for e in others) + len(keys) > ENDED_KEYS:
+            raise Refused("the list has no more room for the end of a new device, so this device is not added")
+        saved = "replaced" if bare else "new"
+        clients["entries"] = others + [entry]
+        keep_file(beside(conf, CLIENTS), clients, "list of the owner's devices")
+    log(f"client-add statement of the owner's devices: {saved}")
+    return {"ok": True, "kind": "client-add", "saved": saved, "device": said["device"]}
+
+
+def client_end(conf, req):
+    """client-end: the keys of one or more devices end, at once and for ever, signed by a list key of the list (F17,
+    1.2). Each device of the list that has a key of the statement ends whole: its entry leaves the list, and each of its
+    keys is in the ended set, also one that the signing device did not know. A key that this vault never held ends too
+    (rule 4), so that its add, which the hub holds back, comes too late: at most UNKNOWN_ENDED of them for one signer,
+    and never in the room that the ends of the list's own keys need. The end of a device of the list is never counted
+    and never refused by a cap. No end names the device that signs it (rule 5): a fleet cannot shut itself out so."""
+    clients, said, by = client_statement(conf, req, "client-end")
+    named, ended = said["keys"].split(","), clients["ended"]
+    held = {key_hash(k): e for e in clients["entries"] for k in client_keys(e)}
+    if any(held[k] is held[by] for k in named if k in held):
+        raise Refused("an end never names the device that signs it, so nothing ended")
+    gone = [e for e in clients["entries"] if any(held.get(k) is e for k in named)]
+    stay = [e for e in clients["entries"] if not any(e is g for g in gone)]
+    now = {key_hash(k): {"by": by, "when": int(time.time()), "held": True} for e in gone for k in client_keys(e)}
+    unknown = [k for k in named if k not in held and k not in ended]
+    room = min(UNKNOWN_ENDED - sum(1 for x in ended.values() if x["by"] == by and not x["held"]),
+               ENDED_KEYS - len(ended) - len(now) - sum(len(client_keys(e)) for e in stay))
+    taken = unknown[:max(0, room)]
+    now.update((k, {"by": by, "when": int(time.time()), "held": False}) for k in taken)
+    if not now and len(taken) < len(unknown):
+        raise Refused("this list key ended as many keys that this vault never held as it may, so nothing ended")
+    if now:
+        clients["entries"] = stay
+        ended.update(now)
+        keep_file(beside(conf, CLIENTS), clients, "list of the owner's devices")
+    saved = "ended" if now else "same"
+    log(f"client-end statement of the owner's devices: {saved}, {len(gone)} device(s) and {len(taken)} other key(s)")
+    return {"ok": True, "kind": "client-end", "saved": saved, "devices": [e["device"] for e in gone],
+            "left_out": len(unknown) - len(taken)}
+
+
+def first_list_key(conf, req):
+    """client-first, by root's way alone (`owner`, F17 1.2 rule 9): the list's first list key. The device's own sign key
+    signs the statement, and it must be one of owner_keys: so it takes root on the hub's server and the owner's key, and
+    neither of the two makes a list key alone. The list's file is made with it: this device with its list key, and each
+    other key of owner_keys as an entry with no name of its own, no kind and no list key, which signs the owner's
+    decisions as before. **A second first list key is refused** (R2-2), so nobody at the owner's unlocked Mac uses its
+    root to put a list key of his own into the list: each later device comes by client-add. The same statement again
+    answers "same": a lost answer is no error."""
+    clients = held_clients(conf)
+    said, by = signed_statement(conf, req, "client-first", conf["owner_keys"] if clients is None else
+                                [e["sign"] for e in clients["entries"]])
+    not_ahead(said, "client-first")
+    if by != key_hash(said["sign"]):
+        raise Refused("the statement names another key than the one that signed it, so nothing changed")
+    if clients is None:
+        keys = list(dict.fromkeys(conf["owner_keys"]))
+        if said["list"] in keys:
+            raise Refused("the list key is a key that signs the owner's decisions, so nothing changed")
+        entries = [client_entry(said, by)] + [
+            {"device": f"computer-{key_hash(k)[:8]}", "os": None, "label": "", "sign": k, "list": None, "by": None,
+             "when": int(time.time())} for k in keys if k != said["sign"]]
+        if len({e["device"] for e in entries}) < len(entries):
+            raise Refused("another key of the owner's has this name in the list, so nothing changed")
+        text = json.dumps({"v": CLIENT_LIST, "entries": entries, "ended": {}}, sort_keys=True)
+        try:
+            if new_file(beside(conf, CLIENTS), text):
+                log("client-first statement of the owner's devices, by root's way: new")
+                return {"ok": True, "kind": "client-first", "saved": "new", "device": said["device"]}
+        except OSError:
+            raise Refused("the central vault's list of the owner's devices could not be saved, so nothing "
+                          "changed") from None
+        clients = held_clients(conf)            # another run made the list first: that one counts
+    if any(e["by"] == by and same_client(e, said) for e in clients["entries"]):
+        return {"ok": True, "kind": "client-first", "saved": "same", "device": said["device"]}
+    raise Refused("the list of the owner's devices has its first list key, so a second one is refused")
 
 
 def pins(state):
@@ -2895,9 +3271,9 @@ def pins(state):
 def central_status(conf):
     """What the hub reads of the central vault: its keys, the owner's records and how many items it holds. Never a
     value and never a title."""
-    state, store = central_state(conf), LocalStore(conf)
+    state, store, clients = central_state(conf), LocalStore(conf), held_clients(conf)
     return {"ok": True, "v": PROTOCOL, "central": True, "recipient": public_key(conf["age_key"], "key"),
-            "store_recipient": store.recipient, "fleet": conf["fleet"], "owner_keys": len(conf["owner_keys"]),
+            "store_recipient": store.recipient, "fleet": conf["fleet"], "owner_keys": len(decision_keys(conf)),
             "pins": pins(state), "recovery": state["recovery"]["recipient"] if state["recovery"] else None,
             "grants": granted(state), "pool": pooled(state), "items": len(store.opened()),
             "removes": True, "replaces": True,      # this program serves remove, and replace in intake (the hub asks)
@@ -2907,6 +3283,10 @@ def central_status(conf):
             # the checksum of the copy of the newest replace of each login: no secret. A hub that stopped between
             # this vault's write and its own record of a replace reads here that a value changed.
             "values": {ref: x["sha256"] for ref, x in sorted(state["values"].items())},
+            "lists": True,                          # this program takes client-add and client-end (the hub asks)
+            # the list of the owner's devices, public keys alone, or None while this vault has none; the count of the
+            # ended set. A list in force ends the recovery key's work (central_signed, export).
+            "clients": {"entries": clients["entries"], "ended": len(clients["ended"])} if clients else None,
             "source": conf.get("_source")}
 
 
@@ -2951,7 +3331,7 @@ def intake(conf, req):
         raise Refused("this login was removed from the fleet, so no value is taken under its name again")
     said = None
     if "statement" in req or "signature" in req:
-        said = owner_statement(conf, req, "replace")
+        said, by = signed_statement(conf, req, "replace", decision_keys(conf))
         if said["login"] != ref.lower():
             raise Refused("the statement is about another login")
         if said["sha256"] != hashlib.sha256(text.encode("utf-8")).hexdigest():
@@ -2973,6 +3353,7 @@ def intake(conf, req):
     if said is not None:
         value = kept_address(value, store.opened().get(m.group(1).lower()))     # the key changes, its address stays
         if state["values"].get(ref.lower()) != record:
+            keep_signer(conf, "replace", said, by)
             state["values"][ref.lower()] = record   # first: from here no older statement of this login is taken
             keep_state(conf, state)
     saved = store.put(m.group(1).lower(), title, canonical(value), TAKEN, replace=said is not None)
@@ -3006,11 +3387,16 @@ def central_signed(conf, req, kind):
     be newer (its `at`) than the record of its machine, of the recovery key, of its grant (one secret to one agent) or
     of its secret in the pool, so an old one cannot be sent again; the exact statement of the record answers "same",
     so a retry is no error. A statement dated more than PIN_AHEAD after this vault's clock is not kept, of any of
-    these kinds, and the record before it stays. A pin's key is what seal locks a copy to, a grant or the pool is what lets seal lock
-    that secret at all, and the recovery key is what export locks the store's key to."""
-    said = owner_statement(conf, req, kind)
-    if said["at"] - time.time() > PIN_AHEAD:     # package 4 and C50: no statement of these kinds kept from the future
-        raise Refused(f"the owner's {kind} is dated more than a day after this vault's clock, so it is not kept")
+    these kinds, and the record before it stays. A pin's key is what seal locks a copy to, a grant or the pool is what
+    lets seal lock that secret at all, and the recovery key is what export locks the store's key to. Who signed each
+    record that this keeps, and when by this vault's clock, is kept beside it (keep_signer).
+
+    A vault with a list of the owner's devices takes no recovery key (F17, K6's end): after the loss of all devices
+    the way back is at the server's console, and no key that an ended device signed opens a copy of the store."""
+    if kind == "recovery" and held_clients(conf) is not None:
+        raise Refused("this vault has the list of the owner's devices, so it takes no recovery key any more")
+    said, by = signed_statement(conf, req, kind, decision_keys(conf))
+    not_ahead(said, kind)           # package 4 and C50: no statement of these kinds kept from the future
     state = central_state(conf)
     if kind in ("grant", "ungrant"):
         held = state["grants"].setdefault(said["login"], {})
@@ -3029,6 +3415,8 @@ def central_signed(conf, req, kind):
         raise Refused("the vault holds a statement that is as new or newer, so nothing changed")
     else:
         saved = "removed" if kind in ("unpin", "ungrant", "unpool") else "replaced" if was else "new"
+        if kind != "recovery":
+            keep_signer(conf, kind, said, by)
         if kind == "recovery":
             state["recovery"] = new
         elif kind in ("grant", "ungrant"):
@@ -3093,7 +3481,10 @@ def seal(conf, req):
 def export(conf):
     """export: the backup of the central store. The store file as it is (it holds no value in plain), and the store's
     key locked to the recovery key that the owner signed, so only the owner's recovery code opens the two. Nothing is
-    exported without that key."""
+    exported without that key, and nothing by a vault with a list of the owner's devices (F17, K6's end): a recovery
+    key has no signer in the state, and the device that signed it can be one that ended."""
+    if held_clients(conf) is not None:
+        raise Refused("this vault has the list of the owner's devices, so it makes no copy of its store any more")
     recovery = central_state(conf)["recovery"]
     if not recovery:
         raise Refused("the owner has not signed a recovery key, so nothing is exported")
@@ -3230,28 +3621,11 @@ def hub_key(conf, req):
 
 
 def hub_key_make(path):
-    """A new key file that nothing replaces: written whole beside it and synced, then linked to its name, which fails
-    over a file that is there (another request made it first, and that one is the key), and the folder synced, so the
-    key is on the disk before the hub seals anything with it."""
-    temp = f"{path}.{secrets.token_hex(8)}.new"
+    """A new key file that nothing replaces (new_file): when another request made it first, that one is the key."""
     try:
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w", encoding="ascii") as f:
-            f.write(secrets.token_hex(32) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        try:
-            os.link(temp, path)
-        except FileExistsError:
-            pass
-        sync_folder(os.path.dirname(path))
+        new_file(path, secrets.token_hex(32) + "\n")
     except OSError:
         raise Refused("the key of the hub's file could not be made") from None
-    finally:
-        try:
-            os.unlink(temp)
-        except OSError:
-            pass
 
 
 def central(conf, req):
@@ -3263,6 +3637,10 @@ def central(conf, req):
         return intake(conf, req)
     if op in ("pin", "unpin", "recovery", "grant", "ungrant", "pool", "unpool"):
         return central_signed(conf, req, op)
+    if op == "client-add":
+        return client_add(conf, req)
+    if op == "client-end":
+        return client_end(conf, req)
     if op == "seal":
         return seal(conf, req)
     if op == "inventory":
@@ -8407,6 +8785,49 @@ def configure_main(args, euid=None, program=None):
     return 0
 
 
+# ---------------------------------------------------------------- root's way into the central vault (owner)
+#
+# The one way to the list's first list key (first_list_key, F17 1.2 rule 9), on E1b's form (F8-vault-read.md R3.4): no
+# socket is in the path and no process of the hub's user, so a hub that is broken into can neither give it nor hold it
+# back. Root starts it as the central vault's own user, because the vault refuses a file that root wrote:
+#     runuser -u founderizer-vault -- /usr/bin/python3 -I /usr/local/lib/fleet-vault-central/vault.py owner \
+#         --statement <text> --signature <base64>
+# The process that serves reads the list at its next request and needs no restart.
+# Not built here, for P1b: the step of root's own clone that starts it (hubsetup.py), the list that `founderizer-reclaim`
+# writes by this way (F17 4.2, "Root's half", with the "Keep" marks of 1.5 (c)), and the lock that its write needs.
+CENTRAL_PROGRAM = "/usr/local/lib/fleet-vault-central/vault.py"     # hubsetup.CENTRAL_LIB + "/vault.py"
+CENTRAL_CONF_PATH = "/etc/fleet-vault-central/vault.json"           # hubsetup.CENTRAL_CONF
+
+
+def owner_main(args, euid=None, program=None):
+    """`vault.py owner`: one statement (client-first) into the list of the owner's devices, and one JSON line as the
+    answer. Only as the installed program, which no user can change; only with the central vault's one configuration;
+    and only as the user that the vault's files belong to: never as root, and never as the hub's user."""
+    euid = os.geteuid() if euid is None else euid
+    try:
+        if euid == 0:
+            raise Refused(f"run owner as the central vault's own user (runuser -u {CENTRAL_USER}), never as root: the "
+                          "vault refuses a file that root wrote")
+        here = os.path.realpath(program or __file__)
+        if here != CENTRAL_PROGRAM:
+            raise Refused(f"owner runs only as the installed program ({CENTRAL_PROGRAM}), never from a checkout")
+        if args.config != CENTRAL_CONF_PATH:
+            raise Refused(f"owner takes only the central vault's own configuration, {CENTRAL_CONF_PATH}")
+        unchangeable(here, "The central vault's program")
+        conf = load_config(args.config)
+        if conf.get("central") is not True:
+            raise Refused("this configuration is not a central vault's")
+        if os.stat(os.path.dirname(os.path.abspath(conf["state"]))).st_uid != euid:
+            raise Refused(f"run owner as the user that the vault's files belong to (runuser -u {CENTRAL_USER})")
+        answer = first_list_key(conf, {"statement": args.statement, "signature": args.signature})
+    except (Refused, SystemExit, OSError, ValueError) as e:
+        print(json.dumps({"ok": False, "error": str(e) if isinstance(e, (Refused, SystemExit)) else
+                          f"the central vault's files could not be read ({type(e).__name__})"}))
+        return 1
+    print(json.dumps(answer))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -8463,7 +8884,14 @@ def main(argv=None):
                                             "it at the service's start)")
     p.add_argument("--config", default=EGRESS_CONF)
     p.add_argument("which", choices=sorted(EGRESS_CLOSED) + ["daemons"])
+    p = sub.add_parser("owner", help="Root's way into the central vault, as the vault's own user (runuser) and only as "
+                                     "the installed program: the first list key of the owner's devices, one time")
+    p.add_argument("--config", default=CENTRAL_CONF_PATH)
+    p.add_argument("--statement", required=True, help="the client-first statement, as the device signed it")
+    p.add_argument("--signature", required=True, help="the base64 of its DER signature by the device's sign key")
     args = parser.parse_args(argv)
+    if args.cmd == "owner":
+        return owner_main(args)
     if args.cmd == "configure":
         return configure_main(args)
     if args.cmd == "egress":
