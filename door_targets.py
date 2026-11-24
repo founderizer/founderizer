@@ -53,7 +53,9 @@ OPS_READ = load("ops_read", os.path.join(HERE, "host", "ops-read"))
 # the old name of a moved repository to its new one, so an old name stays here: the hub's public repository moved from
 # miguelpieras/founderizer-fleet to founderizer/founderizer on 11 November 2026.
 VENDOR_REPOS = ("founderizer/founderizer", "founderizer/founderizer-apps", "miguelpieras/founderizer-fleet",
-                "miguelpieras/founderizer-web", "miguelpieras/agents")
+                "miguelpieras/founderizer-web", "miguelpieras/agents", "miguelpieras/founderizer-control",
+                "miguelpieras/founderizer-verdicts-reviewer-1", "miguelpieras/founderizer-verdicts-reviewer-2",
+                "miguelpieras/founderizer-verdicts-security")
 # The words with which a refusal of a root script with no box (the form run) begins, when only the owner's word is
 # missing: Run it once, or Full access on its server. The hub knows such a refusal in the door's record by them
 # (hub.door_full_waiting), so they are one constant.
