@@ -538,6 +538,7 @@ class MacRoot(unittest.TestCase):
     needs no terminal: each step of the Mac user still runs as that user, and the checks are the installer's."""
 
     STUBS = ('HUB=http://100.64.0.2:8765\nREPO=git://100.64.0.2/fleet.git\nHOME=/var/root\nRAN="$(mktemp)"\n'
+             "trap 'rm -f \"$RAN\"' EXIT\n"             # each test removes its record, also when mac stops early
              'id() { if [ "$1" = -u ]; then echo 0; else echo root; fi; }\n'
              'sw_vers() { echo 26.6; }\n'
              'dscl() { echo "NFSHomeDirectory: /Users/dana"; }\n'
@@ -550,10 +551,18 @@ class MacRoot(unittest.TestCase):
              'code=ABCD\n')
 
     def test_the_line_as_root_needs_the_mac_user_and_runs_each_of_its_steps_as_it(self):
-        if not Path("/opt/homebrew/bin/brew").exists() and not Path("/usr/local/bin/brew").exists():
-            self.skipTest("this machine has no Homebrew for the step that looks for it")
+        # mac looks for Homebrew in its two fixed places, which only root could make here: the test gives it a brew
+        # of its own in their place. Each command of the Mac user goes through the sudo stub, so this brew never runs.
+        tmp = Path(tempfile.mkdtemp(prefix="fleet-join-root-"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        brew = tmp / "brew"
+        brew.write_text("#!/bin/sh\nexit 0\n")
+        brew.chmod(0o755)
+        places = "/opt/homebrew/bin/brew /usr/local/bin/brew"
+        mac = shell_function(SCRIPT, "mac")
+        self.assertIn(f"for b in {places}; do", mac)
         call = 'FLEET_MAC_USER=dana mac\ncat "$RAN"\necho "home=$HOME"\n'
-        code, out = run_shell(shell_function(SCRIPT, "mac") + "\n" + shell_function(SCRIPT, "as_mac_user") + "\n" + call,
+        code, out = run_shell(mac.replace(places, str(brew)) + "\n" + shell_function(SCRIPT, "as_mac_user") + "\n" + call,
                               extra=self.STUBS + 'as_self() { "$@"; }\nsay() { :; }\nstop() { echo "STOP $*"; exit 1; }\n')
         self.assertEqual(code, 0, out)
         self.assertIn("checkout /Users/dana/fleet-server as_mac_user", out)
@@ -810,8 +819,11 @@ class MacVault(unittest.TestCase):
             (app / "Contents/Resources/install.py").write_text("installer")
         bin_ = self.tmp / "bin"
         bin_.mkdir()
+        # ditto is the Mac's, which Linux has not: its stand-in copies the bundle's contents into the stage as
+        # `ditto SOURCE DESTINATION` does, and takes no other form.
         for name, body in (("chown", "exit 0"), ("codesign", f'echo "codesign $*" >> {self.ran}; exit {signed}'),
-                           ("python3", f'echo "python3 $*" >> {self.ran}')):
+                           ("python3", f'echo "python3 $*" >> {self.ran}'),
+                           ("ditto", '[ "$#" -eq 2 ] || exit 64\nmkdir -p "$2" && cp -R "$1"/. "$2"/')):
             (bin_ / name).write_text(f"#!/bin/sh\n{body}\n")
             (bin_ / name).chmod(0o755)
         # The text between the quotes is what sh -c gets; root's own Python is the stub here.

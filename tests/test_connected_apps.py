@@ -639,9 +639,20 @@ class Opening(Socket):
         front = gate.Gate(NAME, socket_path=self.sock, port=port, log=lambda line: None)
         thread = threading.Thread(target=front.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(thread.join, 5)
-        self.addCleanup(front.close)
+        self.addCleanup(self.stop, front, thread)
         return front
+
+    def stop(self, front, thread):
+        """A gate stops as its process ends: its port refuses. On Linux, close() alone leaves the accept() of
+        serve_forever waiting on a socket that still listens, and the hub's next ask would find it there; one
+        connection ends that wait, the loop finds the gate stopped, and the socket goes (macOS refuses at once)."""
+        front.close()
+        try:
+            socket.create_connection(("127.0.0.1", front.port), timeout=2).close()
+        except OSError:
+            pass
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
 
     def test_the_hub_learns_the_gates_version_with_no_request_from_outside(self):
         self.opened()
@@ -693,8 +704,7 @@ class Opening(Socket):
                 patch.object(hub, "CAPP_GATE_EVERY", 0.05):
             self.opened()
             self.assertTrue(self.until(hub.capp_ready))
-            first.close()
-            thread.join(5)
+            self.stop(first, thread)
             time.sleep(0.3)
             self.assertTrue(hub.capp_ready())           # nobody looked, so nothing asked: the watch waits for an event
             hub.CAPP_GATE_ASKED[0] = 0.0
@@ -710,8 +720,7 @@ class Opening(Socket):
         other = gate.Gate("hub-2.tail1234.ts.net", socket_path=self.sock, port=0, log=lambda line: None)
         thread = threading.Thread(target=other.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(thread.join, 5)
-        self.addCleanup(other.close)
+        self.addCleanup(self.stop, other, thread)
         asked, real = [], hub.capp_gate_ask
 
         def ask():
@@ -821,9 +830,11 @@ class Opening(Socket):
         with patch.object(hub, "capp_gate_address", lambda: ("127.0.0.1", port)), \
                 patch.object(hub, "capp_gate_ask", ask), patch.object(hub, "CAPP_GATE_EVERY", 0.05):
             self.opened()                               # the socket is open, and no gate listens
-            self.assertIsNone(hub.CONNECT["why"])
-            self.assertIsNone(stopped())                # the watch has not asked CAPP_GATE_MISSES times yet
-            go.set()
+            try:
+                self.assertIsNone(hub.CONNECT["why"])
+                self.assertIsNone(stopped())            # the watch has not asked CAPP_GATE_MISSES times yet
+            finally:
+                go.set()        # a failed check holds no ask of the watch into the next test
             self.assertTrue(self.until(lambda: hub.CONNECT["gate_why"] == hub.CAPP_NO_GATE))
             self.assertEqual(stopped(), hub.CAPP_NO_GATE)
             self.front(port)                            # a gate is there again and forwards
@@ -846,11 +857,24 @@ class Opening(Socket):
         self.assertFalse(hub.capp_sync())
         self.assertEqual(page()["stopped"], hub.CAPP_NO_FUNNEL)
         self.serve = IN_PLACE                           # the reason ended, and nothing told the hub
+        asked = hub.CAPP_SYNC_ASKED[0]
         self.assertEqual(page()["stopped"], hub.CAPP_NO_FUNNEL)     # a read of the same moment starts no look
+        self.assertEqual(hub.CAPP_SYNC_ASKED[0], asked)             # (a look marks its start before its thread)
         self.assertIsNone(hub.CONNECT["server"])
         hub.CAPP_SYNC_ASKED[0] = hub.now() - hub.CAPP_GATE_LOOK - 1
-        self.assertEqual(page()["stopped"], hub.CAPP_NO_FUNNEL)     # this read starts the look, and keeps the row
-        self.assertTrue(self.until(lambda: hub.CONNECT["server"] is not None))
+        go = threading.Event()      # the look waits for this read's answer, as a real serve status (up to 5 s) does
+
+        def serve_status():
+            go.wait(10)
+            return self.serve
+        with patch.object(hub, "capp_serve_status", serve_status):
+            try:
+                self.assertEqual(page()["stopped"], hub.CAPP_NO_FUNNEL)     # this read starts the look, and keeps the row
+            finally:
+                go.set()            # a failed check holds no look, and so no CAPP_SYNC, into the next test
+                with hub.CAPP_SYNC:     # and the look ends before its stand-in goes
+                    pass
+            self.assertTrue(self.until(lambda: hub.CONNECT["server"] is not None))
         self.assertIsNone(page()["stopped"])
         # the setting, written again with no change (the Mac's Try again): a look at once, with no old reason
         hub.capp_close()

@@ -223,8 +223,11 @@ class TaskClones(unittest.TestCase):
                                           ("kai", GEN, "T-2")):
             Path(fleet.task_place(agent, generation, window), "acme").mkdir(parents=True)
         Path(fleet.task_place("ivy", OLD, "T-1"), "acme", "old.txt").write_text("before the wipe\n")
-        helper = types.SimpleNamespace(agent="ivy", say=self.said.append, places_at=0.0, poll_db=GEN,
-                                       open_tasks=["T-1"], conversations=[5], look_known=lambda: ["T-3"])
+        # its last sweep was PLACES_EVERY seconds ago: also on a machine that started less than that ago (a fresh
+        # Linux sandbox), where the monotonic clock is still below it
+        helper = types.SimpleNamespace(agent="ivy", say=self.said.append, poll_db=GEN, open_tasks=["T-1"],
+                                       places_at=time.monotonic() - fleet.PLACES_EVERY, conversations=[5],
+                                       look_known=lambda: ["T-3"])
 
         def left():
             root = Path(self.work, ".tasks")

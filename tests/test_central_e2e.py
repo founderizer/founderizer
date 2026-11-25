@@ -30,6 +30,7 @@ import hub
 import vault
 from test_setup import git
 from test_ui_api import OwnerAPI
+from test_vault import BrokerUser, VaultBroker
 from test_vault_central import OWNER_C, about, canon, device, hashes, owner_sign, scalar
 from leftovers import scratch_home
 
@@ -49,6 +50,8 @@ def load_tests(loader, _tests, _pattern):
 
 @unittest.skipUnless(AGE and KEYGEN, "the real age program is not installed")
 class EndToEnd(OwnerAPI):
+    stop_broker = VaultBroker.stop_broker     # shut, then closed: on Linux a close alone leaves accept() running
+
     def setUp(self):
         super().setUp()
         self.dir = Path(tempfile.mkdtemp(prefix="fe2e-", dir="/tmp"))     # a Unix socket's path is short
@@ -87,6 +90,8 @@ class EndToEnd(OwnerAPI):
                   patch.object(hub.Handler, "allowed", lambda handler, who, broker=False: True),
                   patch.object(vault, "log", lambda text: None),
                   patch.object(fleet, "HUB", self.base),
+                  # each machine's broker runs as its own user, as an installed one does: fleet sees its socket so
+                  patch.object(fleet, "os", BrokerUser(vault.os.getuid() + 1)),
                   patch.object(fleet, "load_agent_key", lambda agent: agent.ljust(43, "k")),
                   patch.object(fleet, "broker_status", lambda: {"callers": True})):
             p.start()
@@ -122,7 +127,7 @@ class EndToEnd(OwnerAPI):
     def serve(self, conf):
         broker = vault.Broker(conf).open()
         threading.Thread(target=broker.serve, daemon=True).start()
-        self.addCleanup(broker.close)
+        self.addCleanup(self.stop_broker, broker)
         return broker
 
     def broker(self, machine):
@@ -132,7 +137,7 @@ class EndToEnd(OwnerAPI):
         for old in folder.iterdir():
             old.unlink()
         if machine in self.brokers:
-            self.brokers[machine].close()
+            self.stop_broker(self.brokers[machine])
         key, public = self.keygen(folder / "age.key")
         conf = dict({"agent": machine, "hub": self.base, "worker_uid": vault.os.getuid(), "age_key": key,
                      "socket": str(self.dir / f"{machine}.sock"), "age": AGE}, **self.store(folder))

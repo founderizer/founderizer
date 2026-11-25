@@ -2405,7 +2405,10 @@ def request_hand(client, device=None, connection=None, origin=None, session=None
 # talk, and the owner's side of agents[].last of GET /ui/mobile, give the apps their hand, and the AI program of a
 # session, from this list only: the part of X-Fleet-Session before its first "/" (owner_mcp.session_label sends
 # claude-code/<session id>). The session's id stays in the hub's records.
-MESSAGE_RUNTIMES = ("claude-code", "codex")
+# The names are the runtime table's own (lifecycle.RUNTIMES, the one home of a runtime's facts: test_runtime_table):
+# each entry's label in lower case, its words joined by "-", so Claude Code's sessions give claude-code.
+MESSAGE_RUNTIMES = tuple(sorted({re.sub(r"[^a-z0-9]+", "-", entry["label"].lower()).strip("-")
+                                 for entry in RUNTIMES.values()}))
 # The hands that the apps read: a closed list, so that a hand that a later change adds to request_hand (the release
 # job's "job", for one) goes to the apps as "other", whatever the order of the merges, and never as a value that an app
 # may draw as the owner's own words.

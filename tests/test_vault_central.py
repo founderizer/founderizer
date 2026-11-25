@@ -35,7 +35,7 @@ from unittest.mock import patch
 import atrest
 import leftovers
 import vault
-from test_vault import FAKE_AGE, LOGIN
+from test_vault import FAKE_AGE, LOGIN, private_temp
 
 # ---- the owner's keys: base64 of 65 bytes, 04 || X || Y (CryptoKit's x963Representation)
 OWNER_A = "BEDhRbV+2lgCRXOSwH4LtMxxFYsIJwg/LXmahfO7XBJeF+8XNgnOQ0HB/kS35cQu9WhvCYpWaTLZjFV3CyrOlJI="
@@ -457,7 +457,7 @@ class Configuration(unittest.TestCase):
     """The central vault's configuration, and a machine's broker's, which loads as it did."""
 
     def setUp(self):
-        self.dir = Path(tempfile.mkdtemp(prefix="fcc-"))
+        self.dir = Path(private_temp("fcc-"))
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.dir.chmod(0o755)
         for name in ("age", "curl"):
@@ -547,7 +547,7 @@ class CentralFixture:
     """A central vault for one test, as the hub's user asks it, with a stand-in age and its own store."""
 
     def setUp(self):
-        self.dir = Path(tempfile.mkdtemp(prefix="fc-"))         # short: a Unix socket path has at most 104 bytes
+        self.dir = Path(private_temp("fc-"))                    # short: a Unix socket path has at most 104 bytes
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.dir.chmod(0o700)
         state = self.dir / "state"
@@ -2107,7 +2107,7 @@ class CentralSetup(unittest.TestCase):
     """What root runs to set the central vault up: store-init, the unit, and serve."""
 
     def setUp(self):
-        self.dir = Path(tempfile.mkdtemp(prefix="fcs-"))
+        self.dir = Path(private_temp("fcs-"))
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.dir.chmod(0o755)
         for name, text in (("age", FAKE_AGE), ("age-keygen", FAKE_KEYGEN)):

@@ -46,7 +46,7 @@ class Handover(VaultBroker):
         studio = dict(self.conf, agent="studio", age_key=str(self.keys["studio"]), socket=str(self.dir / "studio.sock"))
         broker = vault.Broker(studio).open()
         threading.Thread(target=broker.serve, daemon=True).start()
-        self.addCleanup(broker.close)
+        self.addCleanup(self.stop_broker, broker)
         self.sockets = {"vps": self.conf["socket"], "studio": studio["socket"]}
         self.ahead, self.signed_in, real = 0.0, [], vault.handle
 
@@ -110,9 +110,10 @@ class Handover(VaultBroker):
                     break
                 time.sleep(0.05)
             self.assertEqual(len(jobs), 1, events)
+            # until the tool's answer: on Linux a sign-in job runs in a thread of its own (Helper.signin_job)
             with patch.object(fleet, "vault_socket", return_value=self.sockets[agent]):
                 helper.handle(jobs[0])
-            return answer.result(30)
+                return answer.result(30)
 
     # ---- the flow
     def test_a_woken_lead_has_a_login_handed_over_between_its_workers_and_used_for_one_task(self):

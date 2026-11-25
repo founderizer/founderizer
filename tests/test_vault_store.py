@@ -16,7 +16,6 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
-import tempfile
 import unittest
 from unittest.mock import patch
 import uuid
@@ -24,7 +23,7 @@ import uuid
 import fleet
 import hub
 import vault
-from test_vault import EMPTY, FAKE_AGE, LOGIN, STORE_KEY, VaultBroker
+from test_vault import EMPTY, FAKE_AGE, LOGIN, STORE_KEY, VaultBroker, private_temp
 
 OTHER_STORE = "age1" + "q" * 58
 AKEY = "vps-store-agent-key-".ljust(43, "k")            # the agent key that the caller fields carry
@@ -204,7 +203,7 @@ class StoreSetup(unittest.TestCase):
     """The configuration of the one store, and the operations that root and the vault user run on it."""
 
     def setUp(self):
-        self.dir = Path(tempfile.mkdtemp(prefix="fs-"))
+        self.dir = Path(private_temp("fs-"))
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.dir.chmod(0o755)
         (self.dir / "age").write_text(FAKE_AGE.format(python=os.sys.executable))

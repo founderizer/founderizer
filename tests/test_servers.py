@@ -2,6 +2,7 @@
 removal of a server. A local hub with a temporary Fleet repository and a test source address for each machine. Also
 the hub's own startup on a team.json that does not validate (PRODUCT.md 4.8), in a real hub process."""
 import contextlib
+import functools
 import gzip
 import hashlib
 import http.client
@@ -1325,6 +1326,19 @@ class ServerService(Servers):
         self.homes = self.root / "homes"
         self.homes.mkdir()
         self.made, self.present, self.no_helper = {}, {"claude", "codex"}, False
+        # Nothing of the machine that runs the test decides it: the service reads the browser parts in an empty folder
+        # of the test (on an x86 Ubuntu host, lifecycle.browser_reading reads its /etc and runs dpkg-query and
+        # systemctl through the runner), and its own user has the runtimes of `present`, not those on this PATH. As
+        # the real lookup on a PATH that has the runtime, it gives the service's own whatever home it is asked about,
+        # so a reading of an agent that this service makes without the agent's own lookup gets the wrong program
+        # (test_an_agents_runtime_is_read_as_that_agent_and_never_as_this_service); runtimes() looks in each home.
+        nothing = self.root / "no-system"
+        nothing.mkdir()
+        for name, value in (("browser_reading", functools.partial(server.lifecycle.browser_reading, root=str(nothing))),
+                            ("exe", lambda name, home=None: self.exe_of(name, str(self.home)))):
+            patcher = patch.object(server.lifecycle, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def agent_user_made(self, user):
         """What the root helper of the installers answers: that OS user, with a home of mode 700 of its own."""

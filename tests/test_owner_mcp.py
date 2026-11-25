@@ -5949,9 +5949,11 @@ class GoogleConnect(unittest.TestCase):
     STATE, CODE = "state-" + "s" * 37, "4/0Acode-" + "c" * 30
     URL = "https://accounts.google.com/o/oauth2/v2/auth?client_id=456-x.apps.googleusercontent.com&state=" + "s" * 43
 
-    def connect(self, args, redirects=None, url=URL, early=False, dropped=()):
+    def connect(self, args, redirects=None, url=URL, early=False, dropped=(), mac=True):
         """(the tool's result or its Refused, the commands it sent, the pages it opened, the browser's answers).
-        early: a program of the Mac calls the listener before the hub's answer. dropped: what the finish says."""
+        early: a program of the Mac calls the listener before the hub's answer. dropped: what the finish says. mac:
+        whether the computer that the tool runs on is a Mac, whatever system runs the test: its platform, which the
+        tool's own check (on_a_mac) reads."""
         sent, opened, answers = [], [], []
         self.waits = {}
 
@@ -5978,7 +5980,8 @@ class GoogleConnect(unittest.TestCase):
             for path, query in redirects or [("", {"state": self.STATE, "code": self.CODE})]:
                 get(sent[0][1]["redirect_uri"], path, query)
 
-        with patch.object(owner_mcp, "command", command), patch.object(owner_mcp, "open_in_browser", browser):
+        with patch.object(owner_mcp, "command", command), patch.object(owner_mcp, "open_in_browser", browser), \
+                patch.object(owner_mcp.sys, "platform", "darwin" if mac else "linux"):
             try:
                 result = owner_mcp.connect_google(args)
             except owner_mcp.Refused as e:
@@ -6077,8 +6080,7 @@ class GoogleConnect(unittest.TestCase):
                 self.assertEqual((sent, opened), ([], []))
 
     def test_it_sends_nothing_off_a_mac_or_after_an_early_call_and_says_what_was_dropped(self):
-        with patch.object(owner_mcp, "on_a_mac", lambda: False):
-            result, sent, opened, _ = self.connect({"service": "gmail"})
+        result, sent, opened, _ = self.connect({"service": "gmail"}, mac=False)
         self.assertIsInstance(result, owner_mcp.Refused)
         self.assertEqual((sent, opened), ([], []))          # the app's waiting Connect is not replaced
         result, sent, opened, answers = self.connect({"service": "gmail"}, early=True)

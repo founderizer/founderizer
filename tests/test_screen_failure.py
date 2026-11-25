@@ -420,7 +420,10 @@ class ScreenFailure(unittest.TestCase):
         helper = self.helper(lambda session: None)
         conf = dict(DANA, start="claude --permission-mode dontAsk {chrome} {settings} {prompt}")
         helper.conf = conf
-        with patch.object(fleet, "session_command", lambda *a, **k: "claude"):
+        # dana's helper runs on its Mac (dana-mac), where a browser task's window starts as any other: on Linux the
+        # helper would first start the agent's own Chrome (fleet.linux_browser), which these checks are not about
+        with patch.object(fleet, "session_command", lambda *a, **k: "claude"), \
+                patch.object(fleet.sys, "platform", "darwin"):
             for needs in ("browser", "none"):
                 event = {"id": 2, "kind": "task", "task": "T-8", "text": "Do T-8.",
                          "extra": {"needs": needs, "attempt": 1, "generation": "gen1"}}

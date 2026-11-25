@@ -1,7 +1,7 @@
 """Vault isolation (V3): the store's key and the handover key belong to the vault broker, and no broker operation gives
 a login to the agents' user. Fake keys, a stand-in age program, the fleet's own store and an in-process hub; no
 network, account or real key. The broker and this test run as one OS user here, so the user check is tested with a
-different configured user ID."""
+different configured user ID, and fleet sees the broker's socket as the vault user's (BrokerUser)."""
 import base64
 import hashlib
 import contextlib
@@ -10,7 +10,10 @@ import io
 import json
 import os
 from pathlib import Path
+import pwd
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,6 +24,7 @@ from unittest.mock import patch
 
 import fleet
 import hub
+import leftovers
 import lifecycle
 import vault
 from test_ui_api import OwnerAPI
@@ -104,6 +108,41 @@ def lock(recipient, login):
     return "-----BEGIN AGE ENCRYPTED FILE-----\n" + body + "\n-----END AGE ENCRYPTED FILE-----\n"
 
 
+def private_temp(prefix):
+    """A new folder of the test's own, in a place that only root and this user can change: vault.unchangeable asks
+    that of every folder above a vault's configuration and its programs. On a Mac the system's temporary folder is
+    such a place (this user's own TMPDIR); on Linux it is /tmp, which every user can write, so there the folder goes
+    into HOME, or into this user's home in the password database when HOME is a folder in /tmp too (a module whose
+    setUpModule calls leftovers.scratch_home). The caller removes it, and leftovers' guard does after a killed run."""
+    for base in (tempfile.gettempdir(), os.path.expanduser("~"), pwd.getpwuid(os.getuid()).pw_dir):
+        try:
+            vault.unchangeable(base, "A test's folder")
+        except (SystemExit, OSError):
+            continue
+        return leftovers.removed_when_gone(tempfile.mkdtemp(prefix=prefix, dir=base))     # also after a killed run
+    raise AssertionError("neither the temporary folder nor HOME nor this user's home is a folder that only root and "
+                         "this user can change")
+
+
+class BrokerUser:
+    """fleet's own `os` in a test whose vault broker runs in this process, as this OS user. An installed broker runs
+    as a user of its own (fleet-vault), and on Linux fleet.vault_call refuses a broker whose socket belongs to the
+    agents' user. This stand-in gives each Unix socket of this user the owner `uid` when fleet looks at it; every
+    other name is os's own."""
+
+    def __init__(self, uid):
+        self.uid = uid
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def stat(self, path, *args, **kwargs):
+        info = os.stat(path, *args, **kwargs)
+        if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid():
+            info = os.stat_result(info[:stat.ST_UID] + (self.uid,) + info[stat.ST_UID + 1:])
+        return info
+
+
 def load_tests(loader, _tests, _pattern):
     suite = unittest.TestSuite(VaultBroker(name) for name in VaultBroker.__dict__ if name.startswith("test_"))
     suite.addTests(loader.loadTestsFromTestCase(BrokerConfiguration))
@@ -122,7 +161,7 @@ class VaultBroker(OwnerAPI):
             filey=dict(role="worker", runtime="codex", machine="filey", can=["shell"], vault="file"))
         hub.TEAM["addresses"].update(vps="127.0.0.1", studio="127.0.0.4", filey="127.0.0.5")
         self.server.machines = True             # each request comes from the machine that its route names
-        self.dir = Path(tempfile.mkdtemp(prefix="fv-"))         # short: a Unix socket path has at most 104 bytes
+        self.dir = Path(private_temp("fv-"))                    # short: a Unix socket path has at most 104 bytes
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.dir.chmod(0o700)
         state = self.dir / "state"
@@ -161,17 +200,28 @@ class VaultBroker(OwnerAPI):
             self.addCleanup(early.stop)
         self.broker = vault.Broker(self.conf).open()
         threading.Thread(target=self.broker.serve, daemon=True).start()
-        self.addCleanup(self.broker.close)
+        self.addCleanup(self.stop_broker, self.broker)
         self.home = self.dir / "worker-home"                      # the worker's ~/.fleet: no vault file there
         self.home.mkdir()
         team = {"agents": {n: dict(hub.TEAM["agents"][n]) for n in ("vps", "studio", "filey")}}
+        self.broker_user = BrokerUser(os.getuid() + 1)            # the broker's own user, as an installed one has
         for p in (patch.object(fleet, "HOME", str(self.home)), patch.object(fleet, "TEAM", team),
+                  patch.object(fleet, "os", self.broker_user),
                   patch.object(fleet, "HUB", self.base), patch.object(fleet, "vault_socket", return_value=self.conf["socket"]),
                   patch.object(hub, "kit_revision", return_value="a" * 40),
                   patch.object(hub, "profile_view", return_value=self.profile(REF))):
             p.start()
             self.addCleanup(p.stop)
         self.task = hub.ins("INSERT INTO tasks(title,owner,state,created) VALUES('Hand over','vps','working',?)", (hub.now(),))
+
+    def stop_broker(self, broker=None):
+        """The broker stops, and answers nothing more, as one that is not running. Its socket is shut before it is
+        closed: on Linux a close alone does not end the accept() that serve() waits in, and the next connection
+        still got an answer."""
+        broker = broker or self.broker
+        with contextlib.suppress(OSError):
+            broker.sock.shutdown(socket.SHUT_RDWR)
+        broker.close()
 
     @staticmethod
     def profile(*logins):
@@ -779,9 +829,12 @@ class VaultBroker(OwnerAPI):
         with patch.dict(self.broker.conf, worker_uid=os.getuid() + 1), self.assertRaises(fleet.Refused) as refused:
             fleet.vault_call({"op": "status"})
         self.assertIn("only an agent user of this machine", str(refused.exception))
-        with patch.object(fleet.sys, "platform", "linux"), self.assertRaises(fleet.Refused) as refused:
+        with patch.object(self.broker_user, "uid", os.getuid()), patch.object(fleet.sys, "platform", "linux"), \
+                self.assertRaises(fleet.Refused) as refused:          # a broker that runs as the agents' user
             fleet.vault_call({"op": "status"})
         self.assertIn("runs as the agents' user", str(refused.exception))
+        with patch.object(self.broker_user, "uid", os.getuid()), patch.object(fleet.sys, "platform", "darwin"):
+            self.assertIs(fleet.vault_call({"op": "status"})["ok"], True)     # a Mac's vault: no such refusal there
         self.assertIsNone(self.released(job))
         self.assertEqual(self.reads(), [])
 
@@ -927,7 +980,7 @@ class VaultBroker(OwnerAPI):
         with self.assertRaises(ValueError):
             hub.validate_status({"security": {"vault": dict(public, replaces="yes")}})
         self.assertIsInstance(public["broker_read_at"], float)
-        self.broker.close()
+        self.stop_broker()
         unread = {"callers": None, "creates": None, "captures": None, "requests": None, "broker_recipient": None,
                   "broker_source": None, "broker_read_at": None, "deposits": None,     # deposits: secret_deliveries
                   "withdrawals": None,                                                 # withdrawals: central_vault
@@ -993,7 +1046,7 @@ class VaultBroker(OwnerAPI):
             with self.assertRaises(ValueError):
                 hub.validate_status({"security": {"vault": {"mode": "broker", "broker_source": wrong}}})
         # A broker that does not answer says nothing either, and nothing invents a checksum for it.
-        self.broker.close()
+        self.stop_broker()
         self.assertIsNone(fleet.vault_status("vps")["broker_source"])
 
     def test_team_vault_setting_needs_a_pinned_key_in_broker_mode(self):
@@ -1011,7 +1064,7 @@ class VaultBroker(OwnerAPI):
 
 class BrokerConfiguration(unittest.TestCase):
     def setUp(self):
-        self.dir = Path(tempfile.mkdtemp(prefix="fv-"))
+        self.dir = Path(private_temp("fv-"))
         self.addCleanup(shutil.rmtree, self.dir, True)
         for name in ("age", "curl"):
             (self.dir / name).write_text("x")

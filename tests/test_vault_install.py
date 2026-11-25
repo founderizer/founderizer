@@ -251,7 +251,8 @@ class Callers(unittest.TestCase):
     """The broker's own half: who may ask it, and a broker that has no agent of its own."""
 
     def setUp(self):
-        self.dir = Path(tempfile.mkdtemp(prefix="fleet-vault-conf-"))
+        from test_vault import private_temp
+        self.dir = Path(private_temp("fleet-vault-conf-"))
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.dir.chmod(0o755)
         state = self.dir / "state"
@@ -379,9 +380,9 @@ class LiveConfigurations(unittest.TestCase):
     AGENT_UID = os.getuid() + 1             # an agent user of the machine, never the vault user
 
     def setUp(self):
-        from test_vault import FAKE_AGE, FLEET, OWNER
+        from test_vault import FAKE_AGE, FLEET, OWNER, private_temp
         self.fleet, self.owner = FLEET, OWNER
-        self.dir = Path(tempfile.mkdtemp(prefix="fvl-"))       # short: a Unix socket path has at most 104 bytes
+        self.dir = Path(private_temp("fvl-"))                   # short: a Unix socket path has at most 104 bytes
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.dir.chmod(0o755)                                   # as root's folders: nobody else may change it
         self.programs = {"age": self.dir / "age", "curl": self.dir / "curl"}
